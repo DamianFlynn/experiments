@@ -1,0 +1,177 @@
+{
+  "comment": "~~ Blueprint for Storage Template ~~",
+  "type": "Microsoft.Blueprint/blueprints/artifacts",
+  "kind": "template",
+  "name": "storage",
+
+  "properties": {
+    "displayName": "Blueprint storage account",
+    "resourceGroup": "rgNetwork",
+    "parameters": {
+      "purpose": {
+        "value": "[parameters('purpose')]"
+      },
+      "resilience": {
+        "value": "[parameters('resilience')]"
+      },
+      "kind": {
+        "value": "[parameters('kind')]"
+      },
+      "storage-lifecycle-rules": {
+        "value": "[parameters('storage-lifecycle-rules')]"
+      }
+    },
+    "template": {
+      "$schema": "http://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+      "contentVersion": "1.0.0.0",
+      "parameters": {
+        "purpose": {
+          "type": "string",
+          "allowedValues": [
+            "diag",
+            "log",
+            "audit",
+            "store"
+          ],
+          "defaultValue": "store",
+          "metadata": {
+            "description": "The designated purpose of the storage account. 'diag' for diagnostics, 'log' for logging, 'audit' for auditing, 'store' for data storage"
+          }
+        },
+        "resilience": {
+          "type": "string",
+          "allowedValues": [
+            "Standard_LRS",
+            "Standard_ZRS",
+            "Standard_GRS",
+            "Standard_RAGRS"
+          ],
+          "defaultValue": "Standard_LRS",
+          "metadata": {
+            "description": "Choose a level of resilience and tier suitable for the purpose and region"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "allowedValues": [
+            "Storage",
+            "StorageV2",
+            "BlobStorage",
+            "FileStorage",
+            "BlockBlobStorage"
+          ],
+          "defaultValue": "StorageV2",
+          "metadata": {
+            "description": "Choose a kind of storage account"
+          }
+        },
+        "storage-lifecycle-rules": {
+          "type": "array",
+          "metadata": {
+            "description": "Storage Life Cycle Rules"
+          }
+        }
+      },
+      "variables": {
+        "IaCBuild": "2.0.1",
+        "uniqueString": "[uniqueString(subscription().id, resourceGroup().id)]",
+        "storageAccountAffix": "[concat(replace(resourceGroup().name, '-', ''), parameters('purpose'))]",
+        "storageAccountName": "[toLower(substring(replace(concat(variables('storageAccountAffix'), variables('uniqueString')), '-', ''), 0, 23) )]",
+        "isCritical": "[bool(contains(toLower(parameters('purpose')), 'audit'))]"
+      },
+      "resources": [
+        {
+          "comments": "~~ Partner Deployment Tattoo ~~",
+          "apiVersion": "2018-02-01",
+          "name": "pid-d40f4895-5a21-5612-aa15-69cd25571694",
+          "type": "Microsoft.Resources/deployments",
+          "properties": {
+            "mode": "Incremental",
+            "template": {
+              "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+              "contentVersion": "1.0.0.0",
+              "resources": []
+            }
+          }
+        },
+        {
+          "comments": "~~ Diagnostics Storage Account  ~~",
+          "type": "Microsoft.Storage/storageAccounts",
+          "apiVersion": "2018-07-01",
+          "name": "[variables('storageAccountName')]",
+          "sku": {
+            "name": "[parameters('resilience')]",
+            "tier": "Standard"
+          },
+          "kind": "[parameters('kind')]",
+          "location": "[resourceGroup().location]",
+          "tags": {
+            "IaC": "[variables('IaCBuild')]"
+          },
+          "scale": null,
+          "properties": {
+            "isHnsEnabled": false,
+            "networkAcls": {
+              "bypass": "AzureServices",
+              "virtualNetworkRules": [],
+              "ipRules": [],
+              "defaultAction": "Allow"
+            },
+            "supportsHttpsTrafficOnly": true,
+            "encryption": {
+              "services": {
+                "file": {
+                  "enabled": true
+                },
+                "blob": {
+                  "enabled": true
+                }
+              },
+              "keySource": "Microsoft.Storage"
+            },
+            "accessTier": "Hot"
+          },
+          "dependsOn": []
+        },
+        {
+          "comments": "~~ Storage Life Cycle Rules  ~~",
+          "name": "[concat(variables('storageAccountName'), '/default')]",
+          "type": "Microsoft.Storage/storageAccounts/managementPolicies",
+          "condition": "[not(empty(parameters('storage-lifecycle-rules')))]",
+          "apiVersion": "2019-04-01",
+          "dependsOn": [
+            "[variables('storageAccountName')]"
+          ],
+          "properties": {
+            "policy": {
+              "rules": "[parameters('storage-lifecycle-rules')]"
+            }
+          }
+        },
+        {
+          "comments": "~~ Provider Lock for storage account  ~~",
+          "type": "Microsoft.Storage/storageAccounts/providers/locks",
+          "condition": "[variables('isCritical')]",
+          "apiVersion": "2016-09-01",
+          "name": "[concat(variables('storageAccountName'), '/Microsoft.Authorization/storageDoNotDelete')]",
+          "dependsOn": [
+            "[concat('Microsoft.Storage/storageAccounts/', variables('storageAccountName'))]"
+          ],
+          "properties": {
+            "level": "CannotDelete"
+          }
+        }
+      ],
+      "outputs": {
+        "storageId": {
+          "type": "string",
+          "value": "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+        },
+        "storageKey": {
+          "type": "object",
+          "value": "[listKeys(resourceId('Microsoft.Storage/storageAccounts',variables('storageAccountName')),'2015-05-01-preview')]"
+        }
+      }
+    }
+  }
+}

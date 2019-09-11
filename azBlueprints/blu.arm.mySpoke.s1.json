@@ -1,0 +1,62 @@
+{
+  "type": "Microsoft.Blueprint/blueprints",
+  "properties": {
+    "description": "Blueprint with Blueprint level parameters",
+    "targetScope": "subscription",
+    "parameters": {
+
+      "purpose": {
+        "type": "string",
+        "allowedValues": [
+          "diag",
+          "log",
+          "audit",
+          "store"
+        ],
+        "defaultValue": "store",
+        "metadata": {
+          "description": "The designated purpose of the storage account. 'diag' for diagnostics, 'log' for logging, 'audit' for auditing, 'store' for data storage"
+        }
+      },
+      "resilience": {
+        "type": "string",
+        "allowedValues": [
+          "Standard_LRS",
+          "Standard_ZRS",
+          "Standard_GRS",
+          "Standard_RAGRS"
+        ],
+        "defaultValue": "Standard_LRS",
+        "metadata": {
+          "description": "Choose a level of resilience and tier suitable for the purpose and region"
+        }
+      },
+      "kind": {
+        "type": "string",
+        "allowedValues": [
+          "Storage",
+          "StorageV2",
+          "BlobStorage",
+          "FileStorage",
+          "BlockBlobStorage"
+        ],
+        "defaultValue": "StorageV2",
+        "metadata": {
+          "description": "Choose a kind of storage account"
+        }
+      },
+      "storage-lifecycle-rules": {
+        "type": "array",
+        "metadata": {
+          "description": "Storage Life Cycle Rules"
+        }
+      }
+      
+    },
+    "resourceGroups": { 
+      "rgNetwork" : {
+        "description": "Contains the resource template deployment and a role assignment."
+      }  
+    }
+  }
+}

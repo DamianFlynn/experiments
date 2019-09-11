@@ -1,0 +1,41 @@
+{
+  "properties": {
+    "blueprintId": "/providers/Microsoft.Management/managementGroups/vdc/providers/Microsoft.Blueprint/blueprints/MySpokeBlueprint",
+
+    "resourceGroups": {
+      "rgNetwork": {
+        "name": "t-we1test-network",
+        "location": "westeurope"
+      }
+    },
+    "parameters": {
+      "purpose": {
+        "value": "diag"
+      },
+      "resilience": {
+        "value": "Standard_ZRS"
+      },
+      "kind": {
+        "value": "StorageV2"
+      },
+
+      "storage-lifecycle-rules": {
+        "value": []
+      }
+
+    }
+  },
+  "identity": {
+    "type": "systemAssigned"
+  },
+  "locks": {
+    "mode": "AllResourcesDoNotDelete",
+    "excludedPrincipals": [
+      "0738e5b4-84f3-4444-8888-f14a970a7252",
+      "cafc7c0f-f68d-4444-ffff-2a67d71e0e6c"
+    ]
+  },
+  "location": "westeurope"
+}
+
+
