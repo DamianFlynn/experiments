@@ -56,11 +56,29 @@ function Publish-Blueprint {
 }
 
 
+function New-RBACRoleAssignment {
+  param (
+    [string]$subscriptionID,
+    [string]$roleDefinitionId,
+    [string]$spn
+  )
+  
+  $rbacbody = '{"properties": {"roleDefinitionId": "/subscriptions/'+$subscriptionId+'/providers/Microsoft.Authorization/roleDefinitions/'+$roleDefinitionId+'","principalId": "'+$spn+'"}}'
+  $Id = [GUID]::NewGuid()
+
+  $restUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleAssignments/"+$Id+"?api-version=2015-07-01"
+  $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $rbacbody
+  return $response
+}
+
+
 function Assign-Blueprint {
   param(
     [string]$subscriptionID,
     [string]$assignmentName,
-    [string]$parametersFile
+    [string]$parametersFile,
+    [string[]]$peerSubscriptions
+
   )
 
   $body = Get-Content -Path $parametersFile
@@ -95,18 +113,18 @@ function Assign-Blueprint {
   
   ## Provide the blueprint with Owner privialges, if required
   if (! $roleAssigned) {
-    
-    $rbacbody = '{"properties": {"roleDefinitionId": "/subscriptions/'+$subscriptionId+'/providers/Microsoft.Authorization/roleDefinitions/'+$roleDefinitionId+'","principalId": "'+$spn+'"}}'
-    $Id = [GUID]::NewGuid()
-  
-    $restUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleAssignments/"+$Id+"?api-version=2015-07-01"
-    $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $rbacbody
-  
+    $rbac = New-RBACRoleAssignment -subscriptionID $subscriptionID -roleDefinitionId $roleDefinitionId -spn $spn
   }
   
   # With all the privilages checked, finally assign the Blueprint
   $restUri = "https://management.azure.com/subscriptions/$subscriptionID/providers/Microsoft.Blueprint/blueprintAssignments/"+$assignmentName+"?api-version=2018-11-01-preview"
   $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $body
+
+  ## Delegate the Blueprint access to peer subscriptions, eg Management and Hub Subscription
+  foreach($sub in $peerSubscriptions){
+    Add-AzRBACRole -subscriptionID $subscriptionID -roleDefinitionId $roleDefinitionId -spn $response.identity.principalId
+  }
+  
   return $response
 }
 
