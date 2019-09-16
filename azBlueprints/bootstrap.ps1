@@ -97,9 +97,9 @@ function Assign-Blueprint {
   if (! $roleAssigned) {
     
     $rbacbody = '{"properties": {"roleDefinitionId": "/subscriptions/'+$subscriptionId+'/providers/Microsoft.Authorization/roleDefinitions/'+$roleDefinitionId+'","principalId": "'+$spn+'"}}'
+    $Id = [GUID]::NewGuid()
   
-    $roleAssignmentName = "AzBlueprints"
-    $restUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleAssignments/"+$spn+"?api-version=2015-07-01"
+    $restUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleAssignments/"+$Id+"?api-version=2015-07-01"
     $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $rbacbody
   
   }
