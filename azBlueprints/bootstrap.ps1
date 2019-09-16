@@ -65,10 +65,45 @@ function Assign-Blueprint {
 
   $body = Get-Content -Path $parametersFile
 
+  ## Check the current AppID for the Blueprint RP
+  $restUri = "https://management.azure.com/subscriptions/$subscriptionID/providers/Microsoft.Blueprint/blueprintAssignments/"+$assignmentName+"/whoIsBlueprint?api-version=2018-11-01-preview"
+  $response = Invoke-RestMethod -Uri $restUri -Method POST -Headers $authHeader
+  $spn = $response.objectId
+  
+  ## Query the subscription for current objects with Owner Privilages?
+  $restUri = "https://management.azure.com/subscriptions/$subscriptionID/providers/Microsoft.Authorization/roleAssignments?api-version=2018-01-01-preview "
+  $response = Invoke-RestMethod -Uri $restUri -Method GET -Headers $authHeader
+
+  ## Determine if Bluepints has Owner Privilages Currently
+  $roleDefinitionId = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"
+  $roleAssigned = $false
+  foreach ($assignment in $response.value){
+    if ($assignment.properties.principalId -eq $spn -and
+        $assignment.properties.roleDefinitionId.Split("/")[-1] -eq $roleDefinitionId ) 
+    {
+      Write-Host "Blueprint SPN is Subscription Owner"
+      $roleAssigned = $true
+      break
+    } 
+  }
+  
+  ## Provide the blueprint with Owner privialges, if required
+  if (! $roleAssigned) {
+    
+    $body = '{"properties": {"roleDefinitionId": "/subscriptions/'+$subscriptionId+'/providers/Microsoft.Authorization/roleDefinitions/'+$roleDefinitionId+'","principalId": "'+$spn+'"}}'
+  
+    $roleAssignmentName = "AzBlueprints"
+    $restUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleAssignments/$roleAssignmentName?api-version=2015-07-01"
+    $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $body
+  
+  }
+  
+  # With all the privilages checked, finally assign the Blueprint
   $restUri = "https://management.azure.com/subscriptions/$subscriptionID/providers/Microsoft.Blueprint/blueprintAssignments/"+$assignmentName+"?api-version=2018-11-01-preview"
   $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $body
   return $response
 }
+
 
 ###
 ### POC Blueprint Deployment and Assignment
