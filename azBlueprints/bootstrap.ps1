@@ -66,9 +66,15 @@ function Assign-Blueprint {
   $body = Get-Content -Path $parametersFile
 
   ## Check the current AppID for the Blueprint RP
+  try {
   $restUri = "https://management.azure.com/subscriptions/$subscriptionID/providers/Microsoft.Blueprint/blueprintAssignments/"+$assignmentName+"/whoIsBlueprint?api-version=2018-11-01-preview"
   $response = Invoke-RestMethod -Uri $restUri -Method POST -Headers $authHeader
   $spn = $response.objectId
+  }
+
+  catch [Exception] {
+    write-host  $_.Exception|format-list -force
+  }
   
   ## Query the subscription for current objects with Owner Privilages?
   $restUri = "https://management.azure.com/subscriptions/$subscriptionID/providers/Microsoft.Authorization/roleAssignments?api-version=2018-01-01-preview "
@@ -90,11 +96,11 @@ function Assign-Blueprint {
   ## Provide the blueprint with Owner privialges, if required
   if (! $roleAssigned) {
     
-    $body = '{"properties": {"roleDefinitionId": "/subscriptions/'+$subscriptionId+'/providers/Microsoft.Authorization/roleDefinitions/'+$roleDefinitionId+'","principalId": "'+$spn+'"}}'
+    $rbacbody = '{"properties": {"roleDefinitionId": "/subscriptions/'+$subscriptionId+'/providers/Microsoft.Authorization/roleDefinitions/'+$roleDefinitionId+'","principalId": "'+$spn+'"}}'
   
     $roleAssignmentName = "AzBlueprints"
-    $restUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleAssignments/$roleAssignmentName?api-version=2015-07-01"
-    $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $body
+    $restUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleAssignments/"+$spn+"?api-version=2015-07-01"
+    $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $rbacbody
   
   }
   
@@ -103,7 +109,6 @@ function Assign-Blueprint {
   $response = Invoke-RestMethod -Uri $restUri -Method PUT -Headers $authHeader -Body $body
   return $response
 }
-
 
 ###
 ### POC Blueprint Deployment and Assignment
