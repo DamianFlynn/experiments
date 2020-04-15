@@ -1,0 +1,44 @@
+# Innofactor IaC Deployment Pipeline
+#
+# Requirements:
+#   Deployment variables:
+#     DeploymentPassword (Secret) - Password of deployment App Registration in customer tenant
+#     ContainerVersion - The container version to use
+#   Service Connection: innofactorazuredeploy_acr_connection - Docker registry connection to Innofactor Azure Container Registry
+#
+# Creating the service connection:
+#   The Azure Pipeline need to have a Docker Registry service connection. Set properties as follows:
+#     Registry Type: Others
+#     Docker Registry: https://innofactorazuredeploy.azurecr.io/
+#     Docker ID: Client/Application Id of deployment App Registration
+#     Docker Password: A valid client secret of deployment App Registration.
+#   Avoid using 'Grant access permission to all pipelines'. Instead grant permission on first run of the pipeline.
+#
+
+name: $(Date:yyyyMMdd)$(Rev:.rr)
+
+trigger:
+  batch: true 
+  branches:
+    include:
+    - '*'
+  tags:
+    include:
+    - '*'
+
+stages:
+  - stage: infrastructure
+    jobs:
+    - job: Deploy
+      displayName: Deploy Infrastructure
+      pool:
+        vmImage: ubuntu-18.04
+      container:
+        image: innofactorazuredeploy.azurecr.io/azuredeploy:$(ContainerVersion)
+        endpoint: innofactorazuredeploy_acr_connection
+      steps:
+        - pwsh: Start-AzureDeployment -ConfigFile cfg/InfraConfigAsCode.json -DeploymentPassword (ConvertTo-SecureString $env:DeploymentPassword -AsPlainText -Force) -Debug -Confirm:$false
+          displayName: Deploy Infrastructure Resources
+          timeoutInMinutes: 180
+          env:
+            DeploymentPassword: $(DeploymentPassword)
