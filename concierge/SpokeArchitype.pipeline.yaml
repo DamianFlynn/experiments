@@ -37,7 +37,7 @@ stages:
         image: innofactorazuredeploy.azurecr.io/azuredeploy:$(ContainerVersion)
         endpoint: innofactorazuredeploy_acr_connection
       steps:
-        - pwsh: Start-AzureDeployment -ConfigFile cfg/InfraConfigAsCode.json -DeploymentPassword (ConvertTo-SecureString $env:DeploymentPassword -AsPlainText -Force) -Debug -Confirm:$false
+        - pwsh: Start-AzureDeployment -ConfigFile InfraConfigAsCode.json -DeploymentPassword (ConvertTo-SecureString $env:DeploymentPassword -AsPlainText -Force) -Debug -Confirm:$false
           displayName: Deploy Infrastructure Resources
           timeoutInMinutes: 180
           env:
