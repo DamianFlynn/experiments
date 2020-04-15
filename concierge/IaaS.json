@@ -1,0 +1,1390 @@
+{
+    /* cSpell:disable */
+    // Requires ContainterVersion 20200414.3
+    "configVersion": "1.0.0.0",
+    "iacLibrary": "https://piacinnofactor1.blob.core.windows.net/unions-20200414-01",
+    //"iacLibrary": "C:/Repos/innofactor/Internal/AZ_IaC",
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         replaceStrings
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "replaceStrings": {
+        "[#_subscription.gov.auditstoragename_#]": "pgovlogauditvqkx7sd2tia",
+        "[#_subscription.gov.rgname.log_#]": "p-gov-log",
+        "[#_subscription.mgt.rgname.mon_#]": "p-mgt-mon",
+        "[#_subscription.mgt.workspacename_#]": "p-mgt-montmdhdmbcxm-ws",
+        "[#_subscription.net.rgname.network_#]": "p-we1net-network",
+        "[#_subscription.waf.rgname.network_#]": "p-we1waf-network",
+        "[#_recoveryservices.runtime_#]": "23:00:00",
+        "[#_recoveryservices.rundate_#]": "2020-04-24", // yyyy-mm-dd
+        "[#_tenant.001.id_#]": "d0bf45f5-b93b-4f96-9e73-4ea6caa2f3b4",
+        "[#_tenant.001.deployClientId_#]": "6b31b6a2-4558-43bb-896a-008e763058bd",
+        "[#_subscription.gov.id_#]": "f8354277-0bf9-4cbb-82d4-09593c068e1b",
+        "[#_subscription.mgt.id_#]": "15df4cd3-5085-498a-b9b8-10a7b67c3fdf",
+        "[#_subscription.net.id_#]": "fb8a2605-ec01-4172-8a03-ebc08e5a7567",
+        "[#_subscription.waf.id_#]": "922345cf-b5d1-47d6-b199-fe70b468fb0d",
+        "[#_subscription.spoke.id_#]": "b62811c4-d18f-4cd9-8710-e9ee0d6b4ada",
+        "[#_subscription.spoke.environment_#]": "t",
+        "[#_subscription.spoke.service_#]": "spoke",
+        "[#_securitycenter.contacts_#]": [
+            {
+                "email": "vdcsandbox@innofactor.com",
+                "phone": "",
+                "alertNotifications": "On",
+                "alertsToAdmins": "On"
+            }
+        ],
+        "[#_rbacGroups.prefix_#]": "AZ RBAC",
+        "[#_managementGroups.vdcroot.name_#]": "vdcroot",
+        "[#_datacenter.001.name_#]": "we1",
+        "[#_datacenter.001.name.caps_#]": "WE1",
+        "[#_datacenter.001.location_#]": "westeurope",
+        "[#_datacenter.001.net.firewall.ipAddress.fw001_#]": "10.162.1.4",
+        "[#_datacenter.001.waf.private.addressPrefix_#]": "10.162.4.0/24",
+        "[#_datacenter.001.waf.public.addressPrefix_#]": "10.162.5.0/24",
+        "[#_datacenter.001.dc.frontend.addressPrefix_#]": "10.162.8.0/26",
+        "[#_datacenter.001.rmt.frontend.addressPrefix_#]": "10.162.8.128/26",
+        "[#_datacenter.001.spoke.addressPrefix_#]": "10.162.9.0/25",
+        "[#_datacenter.001.spoke.frontend.addressPrefix_#]": "10.162.9.0/26",
+        "[#_datacenter.001.spoke.frontend.ipAddress.web01_#]": "10.162.9.4",
+        "[#_datacenter.001.spoke.frontend.ipAddress.web02_#]": "10.162.9.5",
+        "[#_datacenter.001.spoke.backend.addressPrefix_#]": "10.162.9.64/26",
+        "[#_log.retentiondays_#]": 30,
+        "[#_log.retentiondays.keyvault_#]": 90,
+        "[#_keyvault.sku_#]": "Premium",
+        "[#_virtualmachine.tst1web.vmSize_#]": "Standard_B2ms",
+        "[#_virtualmachine.tst1web.vmOs_#]": "WindowsServer_2019-DataCenter",
+        "[#_virtualmachine.tst1web.osDiskType_#]": "StandardSSD_LRS",
+        "[#_virtualmachine.tst1sql.vmSize_#]": "Standard_B2ms",
+        "[#_virtualmachine.tst1sql.vmOs_#]": "WindowsServer_2019-DataCenter",
+        "[#_virtualmachine.tst1sql.osDiskType_#]": "StandardSSD_LRS"
+    },
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         namingStandard
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "namingStandard": {
+        "rbacGroups": "{prefix} {type} {scope} [{resource} [{right}]] {delegation}",
+        "subscriptions": "[{environment}-]{service}",
+        "resourceGroups": "{environment}-{service}-[{role}]"
+    },
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         tenants
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "tenants": [
+        { // tenant 001
+            "configId": "tenant.001",
+            "tenantId": "[#_tenant.001.id_#]",
+            "deployClientId": "[#_tenant.001.deployClientId_#]",
+            "partnerId": 3741715
+        }
+    ],
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         rbacGroups
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "rbacGroups": [
+        { // mg.[#_datacenter.001.name_#]nonproductionspokes.subscriptionoperator
+            "configId": "mg.[#_datacenter.001.name_#]nonproductionspokes.subscriptionoperator",
+            "prefix": "[#_rbacGroups.prefix_#]",
+            "type": "mg",
+            "scope": "VDC [#_datacenter.001.name.caps_#] Non Production Spokes",
+            "resource": "",
+            "right": "",
+            "delegation": "Subscription Operator",
+            "description": "[Custom Role] This privilege should not be assigned to people but is reserved for DevOps automation. Lets you manage everything in VDC [#_datacenter.001.name.caps_#] Non Production Spokes subscriptions, including access to resources.",
+            "owners": {
+                "userObjectIds": [],
+                "servicePrincipalObjectIds": [],
+                "servicePrincipalNames": []
+            },
+            "members": {
+                "userObjectIds": [],
+                "servicePrincipalObjectIds": []
+            }
+        },
+        { // mg.[#_datacenter.001.name_#]nonproductionspokes.applicationoperator
+            "configId": "mg.[#_datacenter.001.name_#]nonproductionspokes.applicationoperator",
+            "prefix": "[#_rbacGroups.prefix_#]",
+            "type": "mg",
+            "scope": "VDC [#_datacenter.001.name.caps_#] Non Production Spokes",
+            "resource": "",
+            "right": "",
+            "delegation": "Application Operator",
+            "description": "[Custom Role] This privilege is primarily for application support personnel. Lets you access and manage basic operational services for deployed resources.",
+            "owners": {
+                "userObjectIds": [],
+                "servicePrincipalObjectIds": []
+            },
+            "members": {
+                "userObjectIds": [],
+                "servicePrincipalObjectIds": []
+            }
+        },
+        { // mg.[#_datacenter.001.name_#]nonproductionspokes.reader
+            "configId": "mg.[#_datacenter.001.name_#]nonproductionspokes.reader",
+            "prefix": "[#_rbacGroups.prefix_#]",
+            "type": "mg",
+            "scope": "VDC [#_datacenter.001.name.caps_#] Non Production Spokes",
+            "resource": "",
+            "right": "",
+            "delegation": "Reader",
+            "description": "Lets you view everything in VDC [#_datacenter.001.name.caps_#] Non Production Spokes subscriptions, but not make any changes.",
+            "owners": {
+                "userObjectIds": [],
+                "servicePrincipalObjectIds": []
+            },
+            "members": {
+                "userObjectIds": [],
+                "servicePrincipalObjectIds": []
+            }
+        }
+    ],
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         managementGroups
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "managementGroups": [
+        { // primary.locationnonproductionspokes
+            "name": "[#_datacenter.001.name_#]nonproductionspokes",
+            "displayName": "[#_datacenter.001.name.caps_#] Non Production Spokes",
+            "subscriptions": [
+                {
+                    "environment": "[#_subscription.spoke.environment_#]",
+                    "service": "[#_subscription.spoke.service_#]"
+                }
+            ],
+            "resources": [],
+            "rbacGroups": [
+                "mg.[#_datacenter.001.name_#]nonproductionspokes.subscriptionoperator",
+                "mg.[#_datacenter.001.name_#]nonproductionspokes.applicationoperator",
+                "mg.[#_datacenter.001.name_#]nonproductionspokes.reader"
+            ],
+            "parent": "[#_datacenter.001.name_#]spokes"
+        }
+    ],
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         subscriptions
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "subscriptions": [
+        { // net
+            "datacenter": "[#_datacenter.001.name_#]",
+            "environment": "p",
+            "service": "[#_datacenter.001.name_#]net",
+            "location": "[#_datacenter.001.location_#]",
+            "id": "[#_subscription.net.id_#]",
+            "deploymentOrder": 1,
+            "resources": []
+        },
+        { // waf
+            "datacenter": "[#_datacenter.001.name_#]",
+            "environment": "p",
+            "service": "[#_datacenter.001.name_#]waf",
+            "location": "[#_datacenter.001.location_#]",
+            "id": "[#_subscription.waf.id_#]",
+            "deploymentOrder": 2,
+            "resources": []
+        },
+        { // [#_subscription.spoke.service_#]
+            "datacenter": "[#_datacenter.001.name_#]",
+            "environment": "[#_subscription.spoke.environment_#]",
+            "service": "[#_subscription.spoke.service_#]",
+            "location": "[#_datacenter.001.location_#]",
+            "id": "[#_subscription.spoke.id_#]",
+            "resources": [
+                "sub.arm.subscriptiondiagnostics",
+                "sub.arm.securitycenter.free",
+                "sub.arm.policyassignment"
+            ],
+            "providers": [
+                "microsoft.insights",
+                "Microsoft.Management",
+                "Microsoft.Network",
+                "Microsoft.Storage",
+                "Microsoft.RecoveryServices",
+                "Microsoft.Security",
+                "Microsoft.PolicyInsights",
+                "Microsoft.KeyVault",
+                "Microsoft.Authorization",
+                "Microsoft.AlertsManagement",
+                "Microsoft.Compute",
+                "Microsoft.ResourceHealth",
+                "Microsoft.Resources",
+                "Microsoft.Advisor"
+            ]
+        }
+    ],
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         resourceGroups
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "resourceGroups": [
+        { // [#_subscription.spoke.service_#]
+            "datacenter": "[#_datacenter.001.name_#]",
+            "environment": "[#_subscription.spoke.environment_#]",
+            "service": "[#_subscription.spoke.service_#]",
+            "role": "",
+            "location": "[#_datacenter.001.location_#]",
+            "lockLevel": "", // CanNotDelete, ReadOnly
+            "ensure": "Present",
+            "resources": [
+                "res.arm.keyvault.vm",
+                "res.arm.recoveryservices",
+                "res.arm.virtualmachine.web",
+                "res.arm.virtualmachine.sql"
+            ]
+        },
+        { // [#_subscription.spoke.service_#]-network
+            "datacenter": "[#_datacenter.001.name_#]",
+            "environment": "[#_subscription.spoke.environment_#]",
+            "service": "[#_subscription.spoke.service_#]",
+            "role": "network",
+            "location": "[#_datacenter.001.location_#]",
+            "lockLevel": "",
+            "ensure": "Present",
+            "resources": [
+                "res.arm.storage.diag",
+                "res.arm.asg.[#_subscription.spoke.service_#]",
+                "res.arm.nsg.[#_subscription.spoke.service_#]",
+                "res.arm.networkwatcher",
+                "res.arm.network.[#_subscription.spoke.service_#]"
+            ]
+        }
+    ],
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         resourceParameters
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "resourceParameters": [
+        { // resource: storageId
+            "parameter": "storageId",
+            "resources": [
+                "res.arm.nsg.[#_subscription.spoke.service_#]"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "storageId",
+                "configId": "res.arm.storage.diag"
+            }
+        },
+        { // resource: networkwatcherId
+            "parameter": "networkwatcherId",
+            "resources": [
+                "res.arm.nsg.[#_subscription.spoke.service_#]"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "networkwatcherId",
+                "configId": "res.arm.networkwatcher"
+            }
+        },
+        { // resource: vnetResourceGroup
+            "parameter": "vnetResourceGroup",
+            "resources": [
+                "res.arm.virtualmachine.sql",
+                "res.arm.virtualmachine.web"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "vnetResourceGroup",
+                "role": "network",
+                "configId": "res.arm.network.[#_subscription.spoke.service_#]"
+            }
+        },
+        { // resource: vnetName
+            "parameter": "vnetName",
+            "resources": [
+                "res.arm.virtualmachine.sql",
+                "res.arm.virtualmachine.web"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "vnetName",
+                "role": "network",
+                "configId": "res.arm.network.[#_subscription.spoke.service_#]"
+            }
+        },
+        { // resource: kvId
+            "parameter": "kvId",
+            "resources": [
+                "res.arm.virtualmachine.sql",
+                "res.arm.virtualmachine.web"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "kvId",
+                "configId": "res.arm.keyvault.vm"
+            }
+        },
+        { // resource: rvId
+            "parameter": "rvId",
+            "resources": [
+                "res.arm.virtualmachine.sql",
+                "res.arm.virtualmachine.web"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "rvId",
+                "configId": "res.arm.recoveryservices"
+            }
+        },
+        // reference
+        { // resource: adminUsername
+            "parameter": "adminUsername",
+            "resources": [
+                "res.arm.virtualmachine.sql",
+                "res.arm.virtualmachine.web"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "kvId",
+                "configId": "res.arm.keyvault.vm",
+                "data": {
+                    "reference": {
+                        "keyVault": {
+                            "id": "[kvId]"
+                        },
+                        "secretName": "AdminUsername"
+                    }
+                }
+            }
+        },
+        { // resource: adminPasswordOrKey
+            "parameter": "adminPasswordOrKey",
+            "resources": [
+                "res.arm.virtualmachine.sql",
+                "res.arm.virtualmachine.web"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "kvId",
+                "configId": "res.arm.keyvault.vm",
+                "data": {
+                    "reference": {
+                        "keyVault": {
+                            "id": "[kvId]"
+                        },
+                        "secretName": "AdminPassword"
+                    }
+                }
+            }
+        },
+        // function
+        { // resource: secretsObject (res.arm.keyvault.vm)
+            "parameter": "secretsObject",
+            "resources": [
+                "res.arm.keyvault.vm"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "dependsOn",
+                "configId": "res.arm.recoveryservices",
+                "function": "Get-SecretsForVmKeyvault",
+                "params": {
+                    "AdminUsername": "sysadmin",
+                    "Prefix": ""
+                }
+            }
+        },
+        { // resource: accessPolicies (res.arm.keyvault.vm)
+            "parameter": "accessPolicies",
+            "resources": [
+                "res.arm.keyvault.vm"
+            ],
+            "source": {
+                "type": "resource",
+                "name": "dependsOn",
+                "configId": "res.arm.recoveryservices",
+                "function": "Get-AccessPolicyForKeyvault",
+                "params": {
+                    "BackupManagementService": true
+                }
+            }
+        },
+        // dependsOn
+        { // resource: nsg dependsOn asg
+            "parameter": "dependsOn",
+            "resources": [
+                "res.arm.nsg.[#_subscription.spoke.service_#]"
+            ],
+            "source": {
+                "type": "resource",
+                "configId": "res.arm.asg.[#_subscription.spoke.service_#]"
+            }
+        },
+        { // resource: res.arm.network dependsOn nsg
+            "parameter": "dependsOn",
+            "resources": [
+                "res.arm.network.[#_subscription.spoke.service_#]"
+            ],
+            "source": {
+                "type": "resource",
+                "configId": "res.arm.nsg.[#_subscription.spoke.service_#]"
+            }
+        }
+    ],
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //                         deployments / resources
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    "resources": [
+        { // Keyvault for VM's
+            "configId": "res.arm.keyvault.vm",
+            "templatePath": "modules/res.arm.keyvault/res.arm.keyvault.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.workspace.id_@]"
+            ],
+            "parameters": {
+                "logsRetentionDays": {
+                    "value": "[#_log.retentiondays.keyvault_#]"
+                },
+                "enableVaultForDeployment": {
+                    "value": true
+                },
+                "enableVaultForDiskEncryption": {
+                    "value": true
+                },
+                "enableVaultForTemplateDeployment": {
+                    "value": true
+                },
+                "enableVaultForSoftDelete": {
+                    "value": false // if true, set idempotent to false on the resource
+                },
+                "vaultSku": {
+                    "value": "[#_keyvault.sku_#]"
+                },
+                "accessPolicies": {
+                    "value": "[@_function.Get-AccessPolicyForKeyvaultBMS_@]"
+                },
+                "secretsObject": {
+                    "value": "[@_function.Get-SecretsForVmKeyvault_@]"
+                },
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        },
+        { // Recovery services
+            "configId": "res.arm.recoveryservices",
+            "templatePath": "modules/res.arm.recoveryservices/res.arm.recoveryservices.json",
+            "idempotent": false, // last time tested 12.2019
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.workspace.id_@]"
+            ],
+            "parameters": {
+                "recoveryPolicies": {
+                    "value": [
+                        {
+                            "name": "DailyLongTerm",
+                            "retainInstantRecoverySnapshotsDays": 2,
+                            "timeZone": "UTC",
+                            "schedule": {
+                                "frequency": "Daily",
+                                "runTimes": [
+                                    "[#_recoveryservices.rundate_#]T[#_recoveryservices.runtime_#]Z"
+                                ]
+                            },
+                            "retention": {
+                                "daily": {
+                                    "runTimes": [
+                                        "[#_recoveryservices.rundate_#]T[#_recoveryservices.runtime_#]Z"
+                                    ],
+                                    "count": 31
+                                },
+                                "weekly": {
+                                    "days": [
+                                        "Sunday",
+                                        "Tuesday",
+                                        "Thursday"
+                                    ],
+                                    "runTimes": [
+                                        "[#_recoveryservices.rundate_#]T[#_recoveryservices.runtime_#]Z"
+                                    ],
+                                    "count": 52
+                                },
+                                "monthly": {
+                                    "runTimes": [
+                                        "[#_recoveryservices.rundate_#]T[#_recoveryservices.runtime_#]Z"
+                                    ],
+                                    "count": 18
+                                },
+                                "yearly": {
+                                    "months": [
+                                        "January",
+                                        "March",
+                                        "August"
+                                    ],
+                                    "runTimes": [
+                                        "[#_recoveryservices.rundate_#]T[#_recoveryservices.runtime_#]Z"
+                                    ],
+                                    "count": 7
+                                }
+                            }
+                        }
+                    ]
+                },
+                "logsRetentionDays": {
+                    "value": "[#_log.retentiondays_#]"
+                },
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        },
+        { // Storage Diagnostics
+            "configId": "res.arm.storage.diag",
+            "templatePath": "modules/res.arm.storage/res.arm.storage.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "parameters": {
+                "purpose": {
+                    "value": "diag"
+                },
+                "resilience": {
+                    "value": "Standard_ZRS"
+                },
+                "kind": {
+                    "value": "StorageV2"
+                },
+                "storageLifecycleRules": {
+                    "value": []
+                },
+                "networkAclsBypass": {
+                    "value": "AzureServices"
+                },
+                "networkAclsDefaultAction": {
+                    "value": "Allow"
+                }
+            }
+        },
+        { // Application Security Groups
+            "configId": "res.arm.asg.[#_subscription.spoke.service_#]",
+            "templatePath": "modules/res.arm.asg/res.arm.asg.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "parameters": {
+                "applicationSecurityGroups": {
+                    "value": [
+                        {
+                            "name": "web"
+                        },
+                        {
+                            "name": "sql"
+                        }
+                    ]
+                }
+            }
+        },
+        { // Network Security Groups
+            "configId": "res.arm.nsg.[#_subscription.spoke.service_#]",
+            "templatePath": "modules/res.arm.nsg/res.arm.nsg.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.workspace.id_@]",
+                "[@_res.arm.storage.id_@]",
+                "[@_res.arm.networkwatcher.id_@]",
+                "[@_res.arm.asg.id_@]"
+            ],
+            "parameters": {
+                "networkSecurityGroups": {
+                    "value": [
+                        { // FrontendSubnet
+                            "name": "FrontendSubnet",
+                            "rules": [
+                                { // AllowRdpFromRdgwserversToFrontendsubnet
+                                    "name": "AllowRdpFromRdgwserversToFrontendsubnet",
+                                    "properties": {
+                                        "description": "Allow RDP from the RDGW servers to the Frontend Subnet",
+                                        "protocol": "Tcp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.rmt.frontend.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.frontend.addressPrefix_#]",
+                                        "destinationPortRange": "3389",
+                                        "access": "Allow",
+                                        "priority": 1000,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowSshFromSshserversToFrontendsubnet
+                                    "name": "AllowSshFromSshserversToFrontendsubnet",
+                                    "properties": {
+                                        "description": "Allow SSH from the SSH servers to the Frontend Subnet",
+                                        "protocol": "Tcp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.rmt.frontend.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.frontend.addressPrefix_#]",
+                                        "destinationPortRange": "22",
+                                        "access": "Allow",
+                                        "priority": 1100,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowDnsFromDcsubnetToFrontendsubnet
+                                    "name": "AllowDnsFromDcsubnetToFrontendsubnet",
+                                    "properties": {
+                                        "description": "Allow DNS replies from the domain controllers",
+                                        "protocol": "Udp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.dc.frontend.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.frontend.addressPrefix_#]",
+                                        "destinationPortRange": "53",
+                                        "access": "Allow",
+                                        "priority": 1200,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowHttpFromPrivatewafToWebservers
+                                    "name": "AllowHttpFromPrivatewafToWebservers",
+                                    "properties": {
+                                        "description": "Allow HTTP from the private WAF",
+                                        "protocol": "Tcp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.waf.private.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "",
+                                        "destinationPortRange": "80",
+                                        "access": "Allow",
+                                        "priority": 1300,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [
+                                            {
+                                                "name": "web"
+                                            }
+                                        ],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowHttpFromPublicwafToWebservers
+                                    "name": "AllowHttpFromPublicwafToWebservers",
+                                    "properties": {
+                                        "description": "Allow HTTP from the public WAF",
+                                        "protocol": "Tcp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.waf.public.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "",
+                                        "destinationPortRange": "80",
+                                        "access": "Allow",
+                                        "priority": 1400,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [
+                                            {
+                                                "name": "web"
+                                            }
+                                        ],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowProbeFromAzureloadbalancerToFrontendsubnet
+                                    "name": "AllowProbeFromAzureloadbalancerToFrontendsubnet",
+                                    "properties": {
+                                        "description": "Allow probe from Azure Load Balancer to the Frontend Subnet",
+                                        "protocol": "*",
+                                        "sourceAddressPrefix": "AzureLoadBalancer",
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.frontend.addressPrefix_#]",
+                                        "destinationPortRange": "*",
+                                        "access": "Allow",
+                                        "priority": 3900,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": [],
+                                        "sourceAddressPrefixes": []
+                                    }
+                                },
+                                { // DenyAll
+                                    "name": "DenyAll",
+                                    "properties": {
+                                        "description": "Deny all other traffic",
+                                        "protocol": "*",
+                                        "sourceAddressPrefix": "*",
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "*",
+                                        "destinationPortRange": "*",
+                                        "access": "Deny",
+                                        "priority": 4000,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": [],
+                                        "sourceAddressPrefixes": []
+                                    }
+                                }
+                            ]
+                        },
+                        { // BackendSubnet
+                            "name": "BackendSubnet",
+                            "rules": [
+                                { // AllowRdpFromRdgwserversToBackendsubnet
+                                    "name": "AllowRdpFromRdgwserversToBackendsubnet",
+                                    "properties": {
+                                        "description": "Allow RDP from the jumpbox servers to the Backend Subnet",
+                                        "protocol": "Tcp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.rmt.frontend.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.backend.addressPrefix_#]",
+                                        "destinationPortRange": "3389",
+                                        "access": "Allow",
+                                        "priority": 1000,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowSshFromSshserversToBackendsubnet
+                                    "name": "AllowSshFromSshserversToBackendsubnet",
+                                    "properties": {
+                                        "description": "Allow SSH from the hopbox servers to the Backend Subnet",
+                                        "protocol": "Tcp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.rmt.frontend.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.backend.addressPrefix_#]",
+                                        "destinationPortRange": "22",
+                                        "access": "Allow",
+                                        "priority": 1100,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowDnsFromDcsubnetBackendsubnet
+                                    "name": "AllowDnsFromDcsubnetBackendsubnet",
+                                    "properties": {
+                                        "description": "Allow DNS replies from the domain controllers",
+                                        "protocol": "Udp",
+                                        "sourceAddressPrefix": "[#_datacenter.001.dc.frontend.addressPrefix_#]",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.backend.addressPrefix_#]",
+                                        "destinationPortRange": "53",
+                                        "access": "Allow",
+                                        "priority": 1200,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": []
+                                    }
+                                },
+                                { // AllowSqlFromWebserversToSqlservers
+                                    "name": "AllowSqlFromWebserversToSqlservers",
+                                    "properties": {
+                                        "description": "Allow HTTP from the public WAF",
+                                        "protocol": "Tcp",
+                                        "sourceAddressPrefix": "",
+                                        "sourceAddressPrefixes": [],
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "",
+                                        "destinationPortRange": "1433",
+                                        "access": "Allow",
+                                        "priority": 1400,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [
+                                            {
+                                                "name": "sql"
+                                            }
+                                        ],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": [
+                                            {
+                                                "name": "web"
+                                            }
+                                        ]
+                                    }
+                                },
+                                { // AllowProbeFromAzureloadbalancerToBackendsubnet
+                                    "name": "AllowProbeFromAzureloadbalancerToBackendsubnet",
+                                    "properties": {
+                                        "description": "Allow probe from Azure Load Balancer to the Backend Subnet",
+                                        "protocol": "*",
+                                        "sourceAddressPrefix": "AzureLoadBalancer",
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "[#_datacenter.001.spoke.backend.addressPrefix_#]",
+                                        "destinationPortRange": "*",
+                                        "access": "Allow",
+                                        "priority": 3900,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": [],
+                                        "sourceAddressPrefixes": []
+                                    }
+                                },
+                                { // DenyAll
+                                    "name": "DenyAll",
+                                    "properties": {
+                                        "description": "Deny all other traffic",
+                                        "protocol": "*",
+                                        "sourceAddressPrefix": "*",
+                                        "sourcePortRange": "*",
+                                        "destinationAddressPrefix": "*",
+                                        "destinationPortRange": "*",
+                                        "access": "Deny",
+                                        "priority": 4000,
+                                        "direction": "Inbound",
+                                        "destinationAddressPrefixes": [],
+                                        "destinationPortRanges": [],
+                                        "destinationApplicationSecurityGroups": [],
+                                        "sourcePortRanges": [],
+                                        "sourceApplicationSecurityGroups": [],
+                                        "sourceAddressPrefixes": []
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "flowLogTrafficAnalyticsEnable": {
+                    "value": true
+                },
+                "logsRetentionDays": {
+                    "value": "[#_log.retentiondays_#]"
+                },
+                "networkwatcherId": {
+                    "value": "[@_res.arm.networkwatcher.id_@]"
+                },
+                "storageId": {
+                    "value": "[@_res.arm.storage.diag.id_@]"
+                },
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        },
+        { // Network Watcher
+            "configId": "res.arm.networkwatcher",
+            "templatePath": "modules/res.arm.networkwatcher/res.arm.networkwatcher.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "suffix": "networkwatcher",
+            "automation": {
+                "preFunction": "Remove-NetworkWatcherIfExist"
+            },
+            "parameters": {}
+        },
+        { // Network
+            "configId": "res.arm.network.[#_subscription.spoke.service_#]",
+            "templatePath": "modules/res.arm.network/res.arm.network.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.nsg.id_@]",
+                "[@_res.arm.gateway.id_@]",
+                "[@_res.arm.network.net.id_@]",
+                "[@_res.arm.network.waf.id_@]",
+                "[@_res.arm.workspace.id_@]"
+            ],
+            "parameters": {
+                "vnetAddressPrefix": {
+                    "value": "[#_datacenter.001.spoke.addressPrefix_#]"
+                },
+                "vnetDnsServers": {
+                    "value": []
+                },
+                "subnets": {
+                    "value": [
+                        { // FrontendSubnet
+                            "name": "FrontendSubnet",
+                            "addressPrefix": "[#_datacenter.001.spoke.frontend.addressPrefix_#]",
+                            "networkSecurityGroup": "FrontendSubnet",
+                            "userDefinedRoute": "FrontendSubnet",
+                            "serviceEndpoints": [
+                                {
+                                    "service": "Microsoft.Storage"
+                                },
+                                {
+                                    "service": "Microsoft.KeyVault"
+                                }
+                            ],
+                            "delegations": []
+                        },
+                        { // BackendSubnet
+                            "name": "BackendSubnet",
+                            "addressPrefix": "[#_datacenter.001.spoke.backend.addressPrefix_#]",
+                            "networkSecurityGroup": "BackendSubnet",
+                            "userDefinedRoute": "BackendSubnet",
+                            "serviceEndpoints": [
+                                {
+                                    "service": "Microsoft.Storage"
+                                },
+                                {
+                                    "service": "Microsoft.KeyVault"
+                                }
+                            ],
+                            "delegations": []
+                        }
+                    ]
+                },
+                "userDefinedRoutes": {
+                    "value": [
+                        { // FrontendSubnet
+                            "name": "FrontendSubnet",
+                            "routes": [
+                                { // Everywhere
+                                    "name": "Everywhere",
+                                    "properties": {
+                                        "addressPrefix": "0.0.0.0/0",
+                                        "nextHopType": "VirtualAppliance",
+                                        "nextHopIpAddress": "[#_datacenter.001.net.firewall.ipAddress.fw001_#]"
+                                    }
+                                }
+                            ],
+                            "disableBgpRoutePropagation": true
+                        },
+                        { // BackendSubnet
+                            "name": "BackendSubnet",
+                            "routes": [
+                                { // Everywhere
+                                    "name": "Everywhere",
+                                    "properties": {
+                                        "addressPrefix": "0.0.0.0/0",
+                                        "nextHopType": "VirtualAppliance",
+                                        "nextHopIpAddress": "[#_datacenter.001.net.firewall.ipAddress.fw001_#]"
+                                    }
+                                }
+                            ],
+                            "disableBgpRoutePropagation": true
+                        }
+                    ]
+                },
+                "peerings": {
+                    "value": [
+                        {
+                            "sharedServicesSubscriptionId": "[#_subscription.net.id_#]",
+                            "sharedServicesVnetRg": "[#_subscription.net.rgname.network_#]",
+                            "sharedServicesVnetName": "[#_subscription.net.rgname.network_#]-vnet",
+                            "sharedServicesRouteTableName": "[#_subscription.net.rgname.network_#]-vnet-GatewaySubnet-rt",
+                            "sharedServicesRouteNextHop": "[#_datacenter.001.net.firewall.ipAddress.fw001_#]",
+                            "allowVirtualNetworkAccess": true,
+                            "allowForwardedTraffic": true,
+                            "allowGatewayTransit": false,
+                            "useRemoteGateways": true
+                        },
+                        {
+                            "sharedServicesSubscriptionId": "[#_subscription.waf.id_#]",
+                            "sharedServicesVnetRg": "[#_subscription.waf.rgname.network_#]",
+                            "sharedServicesVnetName": "[#_subscription.waf.rgname.network_#]-vnet",
+                            "sharedServicesRouteTableName": "",
+                            "sharedServicesRouteNextHop": "",
+                            "allowVirtualNetworkAccess": true,
+                            "allowForwardedTraffic": false,
+                            "allowGatewayTransit": false,
+                            "useRemoteGateways": false
+                        }
+                    ]
+                },
+                "enableDdosProtection": {
+                    "value": false
+                },
+                "logsRetentionDays": {
+                    "value": "[#_log.retentiondays_#]"
+                },
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        },
+        { // Virtual Machine Web (Windows)
+            "configId": "res.arm.virtualmachine.web",
+            "templatePath": "modules/res.arm.virtualmachine/res.arm.virtualmachine.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.keyvault.id_@]",
+                "[@_res.arm.recoveryservices.id_@]",
+                "[@_res.arm.network.id_@]",
+                "[@_res.arm.workspace.id_@]"
+            ],
+            "parameters": {
+                "numberOfInstances": {
+                    "value": 2
+                },
+                "updatesTag": {
+                    "value": [
+                        "WE, W7, 23, Windows",
+                        "WE, W6, 23, Windows"
+                    ]
+                },
+                "tagValues": {
+                    "value": {}
+                },
+                "operatingSystem": {
+                    "value": "[#_virtualmachine.tst1web.vmOs_#]"
+                },
+                "zones": {
+                    "value": "-1"
+                },
+                "vmRole": {
+                    "value": "web"
+                },
+                "vmSize": {
+                    "value": "[#_virtualmachine.tst1web.vmSize_#]"
+                },
+                "osDiskType": {
+                    "value": "[#_virtualmachine.tst1web.osDiskType_#]"
+                },
+                "dataDiskType": {
+                    "value": "[#_virtualmachine.tst1web.osDiskType_#]"
+                },
+                "dataDiskSizes": {
+                    "value": []
+                },
+                "loadBalancer": {
+                    "value": false
+                },
+                "appSecurityGroup": {
+                    "value": "web"
+                },
+                "customScriptToExecute": {
+                    // Disable Automatic Updates (handled by Automation Account), install IIS
+                    "value": "powershell -ExecutionPolicy Bypass -Command \"& {Set-ItemProperty -Path HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU -Name AUOptions -Value 1;Get-WindowsFeature -Name Web-Server | Where-Object {-not($_.Installed) -and $_.InstallState -eq 'Available'} | Install-WindowsFeature -IncludeManagementTools}\""
+                },
+                "encryptionOperation": {
+                    "value": "EnableEncryption"
+                },
+                "kvId": {
+                    "value": "[@_res.arm.keyvault.id_@]"
+                },
+                "rvId": {
+                    "value": "[@_res.arm.recoveryservices.id_@]"
+                },
+                "vnetName": {
+                    "value": "[@_res.arm.network.name_@]"
+                },
+                "vnetResourceGroup": {
+                    "value": "[@_res.arm.network.resourcegroup_@]"
+                },
+                "vnetSubnet": {
+                    "value": "FrontendSubnet"
+                },
+                "vnicIPConfiguration": {
+                    "value": [
+                        {
+                            "PIPAssignment": "Static",
+                            "PIPAddress": "[#_datacenter.001.spoke.frontend.ipAddress.web01_#]",
+                            "PIPVersion": "IPv4"
+                        },
+                        {
+                            "PIPAssignment": "Static",
+                            "PIPAddress": "[#_datacenter.001.spoke.frontend.ipAddress.web02_#]",
+                            "PIPVersion": "IPv4"
+                        }
+                    ]
+                },
+                "diagStorageNetworkAclsDefaultAction": {
+                    "value": "Deny"
+                }/*,
+                "adminUsername": {
+                    "reference": {
+                        "keyVault": {
+                            "id": "[@_res.arm.keyvault.id_@]"
+                        },
+                        "secretName": "AdminUsername"
+                    }
+                },
+                "adminPasswordOrKey": {
+                    "reference": {
+                        "keyVault": {
+                            "id": "[@_res.arm.keyvault.id_@]"
+                        },
+                        "secretName": "AdminPassword"
+                    }
+                }*/,
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        },
+        { // Virtual Machine SQL (Windows)
+            "configId": "res.arm.virtualmachine.sql",
+            "templatePath": "modules/res.arm.virtualmachine/res.arm.virtualmachine.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.keyvault.id_@]",
+                "[@_res.arm.recoveryservices.id_@]",
+                "[@_res.arm.network.id_@]",
+                "[@_res.arm.workspace.id_@]"
+            ],
+            "parameters": {
+                "numberOfInstances": {
+                    "value": 2
+                },
+                "updatesTag": {
+                    "value": [
+                        "WE, W7, 23, Windows",
+                        "WE, W6, 23, Windows"
+                    ]
+                },
+                "tagValues": {
+                    "value": {}
+                },
+                "operatingSystem": {
+                    "value": "[#_virtualmachine.tst1sql.vmOs_#]"
+                },
+                "zones": {
+                    "value": "-1"
+                },
+                "vmRole": {
+                    "value": "sql"
+                },
+                "vmSize": {
+                    "value": "[#_virtualmachine.tst1sql.vmSize_#]"
+                },
+                "osDiskType": {
+                    "value": "[#_virtualmachine.tst1sql.osDiskType_#]"
+                },
+                "dataDiskType": {
+                    "value": "[#_virtualmachine.tst1sql.osDiskType_#]"
+                },
+                "dataDiskSizes": {
+                    "value": []
+                },
+                "loadBalancer": {
+                    "value": false
+                },
+                "appSecurityGroup": {
+                    "value": "sql"
+                },
+                "customScriptToExecute": {
+                    // Disable Automatic Updates (handled by Automation Account)
+                    "value": "powershell -ExecutionPolicy Bypass -Command \"& {Set-ItemProperty -Path HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU -Name AUOptions -Value 1}\""
+                },
+                "encryptionOperation": {
+                    "value": "EnableEncryption"
+                },
+                "kvId": {
+                    "value": "[@_res.arm.keyvault.id_@]"
+                },
+                "rvId": {
+                    "value": "[@_res.arm.recoveryservices.id_@]"
+                },
+                "vnetName": {
+                    "value": "[@_res.arm.network.name_@]"
+                },
+                "vnetResourceGroup": {
+                    "value": "[@_res.arm.network.resourcegroup_@]"
+                },
+                "vnetSubnet": {
+                    "value": "BackendSubnet"
+                },
+                "diagStorageNetworkAclsDefaultAction": {
+                    "value": "Deny"
+                }/*,
+                "adminUsername": {
+                    "reference": {
+                        "keyVault": {
+                            "id": "[@_res.arm.keyvault.id_@]"
+                        },
+                        "secretName": "AdminUsername"
+                    }
+                },
+                "adminPasswordOrKey": {
+                    "reference": {
+                        "keyVault": {
+                            "id": "[@_res.arm.keyvault.id_@]"
+                        },
+                        "secretName": "AdminPassword"
+                    }
+                }*/,
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        },
+        { // Policy Assignments
+            "configId": "sub.arm.policyassignment",
+            "templatePath": "modules/sub.arm.policyassignment/sub.arm.policyassignment.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "mg.arm.policyinitiative.vdcroot"
+            ],
+            "parameters": {
+                "subscriptionId": {
+                    "value": "[#_subscription.spoke.id_#]"
+                },
+                "subscriptionName": {
+                    "value": "[#_subscription.spoke.environment_#]-[#_subscription.spoke.service_#]"
+                },
+                "assignments": {
+                    "value": [
+                        { // [GOV]: VDC Governance (Subscription)
+                            "name": "governance",
+                            "displayName": "[GOV]: VDC Governance ([#_subscription.spoke.environment_#]-[#_subscription.spoke.service_#] subscription)",
+                            "description": "Regional Policies for the operations and audit of the Virtual Data Center [#_datacenter.001.name_#] subscription [#_subscription.spoke.environment_#]-[#_subscription.spoke.service_#]",
+                            "policyDefinitionId": "/providers/Microsoft.Management/managementGroups/[#_managementGroups.vdcroot.name_#]/providers/Microsoft.Authorization/policySetDefinitions/[#_managementGroups.vdcroot.name_#]-subscriptions",
+                            "parameters": {
+                                "existEffect": {
+                                    "value": "Audit"
+                                },
+                                "listOfAllowedVMSKUs": {
+                                    "value": [
+                                        "Standard_A1",
+                                        "Standard_A2",
+                                        "Standard_A2n",
+                                        "Standard_B1ms",
+                                        "Standard_B2s",
+                                        "Standard_B2ms",
+                                        "Standard_B4ms",
+                                        "Standard_D1",
+                                        "Standard_DS1",
+                                        "Standard_D2",
+                                        "Standard_DS2",
+                                        "Standard_D3",
+                                        "Standard_DS3",
+                                        "Standard_D12",
+                                        "Standard_DS12",
+                                        "Standard_F1",
+                                        "Standard_F1s",
+                                        "Standard_F2s_v2",
+                                        "Standard_F2",
+                                        "Standard_F2s",
+                                        "Standard_F4s_v2",
+                                        "Standard_F4",
+                                        "Standard_F4s",
+                                        "Standard_F8s_v2",
+                                        "Standard_F8",
+                                        "Standard_F8s" /*,
+                                        "Standard_F16s_v2",
+                                        "Standard_F16",
+                                        "Standard_F16s",
+                                        "Standard_F32s_v2",
+                                        "Standard_F48s_v2",
+                                        "Standard_F64s_v2",
+                                        "Standard_F72s_v2"*/
+                                    ]
+                                },
+                                "listOfAllowedStoreSKUs": {
+                                    "value": [
+                                        "Standard_LRS",
+                                        "Standard_GRS",
+                                        "Standard_ZRS" /*,
+                                        "Standard_RAGRS",
+                                        "Standard_RAGZRS",
+                                        "Standard_GZRS",
+                                        "Premium_LRS",
+                                        "Premium_ZRS"*/
+                                    ]
+                                }
+                            },
+                            "enforceState": "No"
+                        }
+                    ]
+                }
+            }
+        },
+        { // Subscription Diagnostics
+            "configId": "sub.arm.subscriptiondiagnostics",
+            "templatePath": "modules/sub.arm.subscriptiondiagnostics/sub.arm.subscriptiondiagnostics.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.storage.audit.id_@]",
+                "[@_res.arm.workspace.id_@]"
+            ],
+            "parameters": {
+                "logsRetentionDays": {
+                    "value": "[#_log.retentiondays_#]"
+                },
+                "storageId": {
+                    "value": "/subscriptions/[#_subscription.gov.id_#]/resourceGroups/[#_subscription.gov.rgname.log_#]/providers/Microsoft.Storage/storageAccounts/[#_subscription.gov.auditstoragename_#]"
+                },
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        },
+        { // Subscription - Security Center Free
+            "configId": "sub.arm.securitycenter.free",
+            "templatePath": "modules/sub.arm.securitycenter/sub.arm.securitycenter.json",
+            "idempotent": true,
+            "ensure": "Present",
+            "force": false,
+            "depend": [
+                "[@_res.arm.workspace.id_@]"
+            ],
+            "parameters": {
+                "pricingTier": {
+                    "value": "Free"
+                },
+                "autoProvisioning": {
+                    "value": "Off"
+                },
+                "recommendations": {
+                    "value": {
+                        "patch": "On",
+                        "baseline": "Off",
+                        "antimalware": "Off",
+                        "diskEncryption": "Off",
+                        "acls": "Off",
+                        "nsgs": "Off",
+                        "waf": "Off",
+                        "sqlAuditing": "Off",
+                        "sqlTde": "Off",
+                        "ngfw": "Off",
+                        "vulnerabilityAssessment": "Off",
+                        "storageEncryption": "Off",
+                        "jitNetworkAccess": "Off"
+                    }
+                },
+                "contacts": {
+                    "value": "[#_securitycenter.contacts_#]"
+                },
+                "workspaceId": {
+                    "value": "/subscriptions/[#_subscription.mgt.id_#]/resourceGroups/[#_subscription.mgt.rgname.mon_#]/providers/Microsoft.OperationalInsights/workspaces/[#_subscription.mgt.workspacename_#]"
+                }
+            }
+        }
+    ]
+}
