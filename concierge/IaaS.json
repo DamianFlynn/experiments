@@ -22,7 +22,7 @@
         "[#_subscription.mgt.id_#]": "15df4cd3-5085-498a-b9b8-10a7b67c3fdf",
         "[#_subscription.net.id_#]": "fb8a2605-ec01-4172-8a03-ebc08e5a7567",
         "[#_subscription.waf.id_#]": "922345cf-b5d1-47d6-b199-fe70b468fb0d",
-        "[#_subscription.spoke.id_#]": "b62811c4-d18f-4cd9-8710-e9ee0d6b4ada",
+        "[#_subscription.spoke.id_#]": "00001111-0000-1111-0000-111100001111",
         "[#_subscription.spoke.environment_#]": "t",
         "[#_subscription.spoke.service_#]": "spoke",
         "[#_securitycenter.contacts_#]": [
