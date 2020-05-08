@@ -21,11 +21,11 @@ trigger:
   batch: true 
   branches:
     include:
-    - '*'
-  tags:
+    - 'master'
+  paths:
     include:
-    - '*'
-
+    - 'InfraConfigAsCode.json'
+    
 stages:
   - stage: infrastructure
     jobs:
