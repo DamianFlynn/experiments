@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design (pre-implementation) — rev 4 (bundle-as-product + provenance)
+**Status:** Approved design (pre-implementation) — rev 5 (+ time-series continuity / series)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -139,6 +139,37 @@ of how a decision moved through the project. A *train* is the linked unit:
 **Analyze** then narrates each train with a per-train sub-agent. The bundle reserves a
 `trains` array so every later phase can thicken the same structure.
 
+## Continuity & time-series (publish as a series)
+
+Git is chronological, so reports are too: each run covers a **period**, and successive
+runs form a **series** the user can publish over time and look back across (last 6 months,
+last year). The bundle is therefore a **time-series record**, not a one-shot snapshot.
+
+- **Stable train identity.** A train's `id` is **deterministic from its anchor** — the root
+  issue number (`train-issue-<n>`), or the earliest PR number when issueless
+  (`train-pr-<n>`). The same thread keeps the same id across every period it appears in, so
+  "the AzureFirewall-policy thread" is recognizable whether it opened in March or is still
+  open in June. This is the single change that makes everything below composable.
+- **Bundles chain.** `meta.period` records the window; `meta.prev_bundle` points at the
+  prior installment. A run **loads the previous bundle/index first** so it can compute
+  cross-period state.
+- **Train lifecycle across periods.** `first_seen` (period a train appeared),
+  `last_activity`, `carried_over` (open at the prior period's end), and `prior_status` let
+  a report say *"deferred in April, shipped in June"* — the through-line that makes a series
+  read as a story, not disconnected snapshots.
+- **Closing the forecast loop (default).** Each report **revisits the previous report's
+  `next_candidates`** — did the predicted next-steps land? This is both a strong series
+  hook ("last month we expected X; here's what happened") and a free, honest accuracy check
+  on the forecast.
+- **Series index (`series.json`).** A small running ledger in the workspace records each
+  generated bundle (period, path, headline + open/carried trains). It's the entry point for
+  "show me the series" and the cheap path for long views.
+- **Long lookbacks: re-run is canonical, index is the fast path.** Because git is the source
+  of truth, **re-running over a wide window (e.g. 6-month `from/to`) always yields a correct
+  bundle** and is the authoritative way to produce a long view. The `series.json` index is
+  the inexpensive through-line for stitching installments without re-cloning; it never
+  overrides a fresh re-run.
+
 ## Non-goals (YAGNI)
 
 - No dependency on third-party **skills** (`repo-analyzer`, `github-issue-analyzer`,
@@ -263,7 +294,8 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   the reusable `--clone-dir` and `graphify-out/`. Bundle:
   ```json
   {
-    "meta": { "owner","repo","from","to","branches","ref_date","clone_dir","generated_at" },
+    "meta": { "owner","repo","from","to","branches","ref_date","clone_dir","generated_at",
+              "period":{ "from","to" },"prev_bundle":{ "period":{},"path","url" }|null },
     "commits": [ { "sha","message","author","date","files":[paths],"parents":[],"pr":num|null } ],
     "prs": [ { "number","title","body","labels":[],"reviewers":[],"milestone",
                "merged":bool,"merged_at","closed_at","files":[paths],"closes":[issue#],
@@ -287,6 +319,7 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "trains": [ { "id","root_issue":num|null,"prs":[num],"commits":[sha],
                   "spun_off":[issue#],"duplicate_of":issue#|null,"code_areas":[community],
                   "outcome":"shipped|rejected|abandoned|deferred",
+                  "first_seen":period,"last_activity","carried_over":bool,"prior_status",
                   "evidence":[{ "type","id","url" }] } ],
     "feature_deltas": [ { "area":community,"kind":"add|drop|change",
                           "subject":"param|resource|module|output|target-scope|...",
@@ -346,8 +379,12 @@ Procedure Claude follows:
    `owner`/`repo`/options from the request (incl. project-board settings if any).
 2. Resolve `from`/`to`, `ref-date`, milestone, clone dir, and optional transcript path.
 3. Verify `GITHUB_TOKEN`/`GH_TOKEN` is set (needs `read:project` for boards); if not, ask.
+3a. **Load prior installment:** read `series.json` + the `prev_bundle` it names (if any), so
+    Link/Analyze can compute carry-over and the forecast loop. Absent → treat as series start.
 4. **Acquire:** run `gather.py` (clone + API + optional graphify) → bundle.
-5. **Link:** run `link.py` → bundle enriched with trains + buckets + release_train + sprints.
+5. **Link:** run `link.py` → bundle enriched with trains (with **stable, anchor-derived ids**
+   + cross-period `first_seen`/`carried_over`/`prior_status`) + buckets + release_train +
+   sprints; sets `meta.period`/`meta.prev_bundle`.
 6. **Analyze:** for each significant train, **dispatch a parallel sub-agent** (see
    `superpowers:dispatching-parallel-agents`) that reads the train's thread + local diffs
    and returns a structured decision narrative **with an `evidence: [ref]` list — citing,
@@ -358,8 +395,10 @@ Procedure Claude follows:
    weaving per-train narratives + call context + a **forecast** over `buckets.next_candidates`.
    Every claim must carry/resolve to a bundle ref; **verify provenance before reporting
    done** (`superpowers:verification-before-completion`).
-9. Report the output paths to the user — both the **bundle** (the reusable fact base) and
-   the digest — since downstream renderers consume the bundle.
+9. **Update the series index:** append this run to `series.json` (period, bundle path,
+   headline + open/carried trains) so the next installment chains to it.
+10. Report the output paths to the user — both the **bundle** (the reusable fact base) and
+    the digest — since downstream renderers consume the bundle.
 
 ### 4. Community-call transcript handling
 
@@ -376,6 +415,10 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
 1. **Executive summary** — sprint goals vs. outcomes; 3–5 bullets (features, releases, CI
    health, key risks), informed by call + board context. Embeds `diagrams.buckets_pie`
    (at-a-glance shipped/in-flight/rejected/next).
+1a. **Since last installment** (omitted on the first report in a series) — closes the
+    forecast loop against the previous report's `next_candidates` (predicted → landed /
+    slipped / dropped) and lists **continuing threads** (`carried_over` trains with their
+    `prior_status` → current status), so the report reads as the next chapter of a series.
 2. **Release train context** — previous / current / next milestone (+ current sprint
    iteration window): dates, completion %, theme. Embeds `diagrams.timeline_gantt`.
 3. **Shipped this period** — merged PRs + completed issues grouped by **code area**
@@ -413,6 +456,15 @@ A human-readable reference for the bundle: every field, the **ref convention**
 fields back which narrative claims. This is the contract the user's other renderers (L400
 blog, video script, carousels) code against, so it ships with the skill and is kept in
 sync with `link.py` output. Includes a "how to fact-check a claim" walkthrough.
+
+### 5c. `series.json` (running series index — generated state)
+
+A small ledger in the workspace (one per repo) tracking every generated installment:
+`{ repo, installments: [ { period, bundle_path, report_path, generated_at, headline,
+open_trains:[id], carried_trains:[id] } ] }`. It's **generated output, not shipped config**
+— it lets a run chain to its predecessor (forecast loop + carry-over) and is the entry point
+for "show me the last 6 months as a series". Re-running a wide window stays canonical; the
+index is the cheap through-line, never an override.
 
 ### 6. `projects.json` (optional per-project config)
 
