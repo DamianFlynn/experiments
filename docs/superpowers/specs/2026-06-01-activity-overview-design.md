@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design (pre-implementation) — rev 6 (+ people graph, issue kinds, flow/blockers, graphify core)
+**Status:** Approved design (pre-implementation) — rev 7 (+ event-sourced timeline, artifact lifecycle, label facets)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -139,15 +139,26 @@ of how a decision moved through the project. A *train* is the linked unit:
 **Analyze** then narrates each train with a per-train sub-agent. The bundle reserves a
 `trains` array so every later phase can thicken the same structure.
 
-## Issue taxonomy (kind)
+## Issue taxonomy & label facets (kind)
 
 Issues are not monolithic; a train's shape differs by what kind of issue seeded it. Each
 issue is classified into `kind` — `feature` / `module-request` / `bug` / `idea` /
 `question` / `docs` / `other` — in priority order: GitHub **native issue types** (queried via
-`list_issue_types` when the repo uses them) → **labels** (`bug`, `enhancement`, `feature`,
-`idea`, …) → **issue template** filename → title/body heuristic. `kind` is carried onto the
-train so feature/module proposals, bug-fix threads, and ideas can be counted, charted, and
-narrated separately.
+`list_issue_types` when the repo uses them) → **label facets** (below) → **issue template**
+filename → title/body heuristic. `kind` is carried onto the train so feature/module
+proposals, bug-fix threads, and ideas can be counted, charted, and narrated separately.
+
+**Label taxonomy (auto-detect + config override).** Many of these repos use a structured
+label scheme, so labels are a strong typing signal — but only if the *structure* is read,
+not the flat strings. Link **auto-detects label namespaces** by splitting on the conventional
+separators (`area/…`, `type/…`, `priority/…`, `status/…`, `needs-…`, `Class:…`) and maps
+each namespace to a **facet** — `kind`, `area`, `priority`, `status`, `lifecycle`. A
+per-project `projects.json` `label_taxonomy` block can **override or extend** the auto-map
+(e.g. pin AVM's `Class: …`/`Type: …`/`Needs: …` labels to facets, or add repo-specific
+namespaces). Detected facets are stored top-level in `label_taxonomy` and applied to each
+issue/PR, feeding `kind`, code-`area` attribution, the `priority` used in forecasting, and
+the `status`/`lifecycle` signals the flow analysis keys on. Unprefixed labels stay as a flat
+list; auto-detect degrades to "no facets" rather than guessing.
 
 ## People & contribution graph (first-class)
 
@@ -163,6 +174,12 @@ who is contributing, reviewing, blocking, and maintaining — and feature them.
   **areas**, `prs_authored` / `prs_reviewed`, `review_latency`, `merge_rate`,
   `issues_reported`, `stale_owned:[#]`, and `first_seen`/`last_active`. Many dimensions, one
   object — the substrate for every people view.
+- **Authored-code dimensions (both layers, not just social):** a person's contribution is
+  not only comments/reviews but the **code, docs, and examples they authored**. From the
+  code-event timeline (below), `people` also carries `examples_authored`, `docs_authored`,
+  `symbols_authored`, and **`authored_then_removed`** (churn — their work later removed or
+  replaced, with the removing commit/author). So fame can say *"wrote 9 of the examples"* and
+  the narrative can trace a contribution all the way to where it lived and died.
 - **Internal vs. community:** derived from GitHub `author_association`
   (MEMBER/COLLABORATOR/CONTRIBUTOR/NONE) + org/team membership + CODEOWNERS, **supplemented
   by a `projects.json` internal config** (handle list and/or email domains/orgs — e.g.
@@ -191,6 +208,38 @@ lifecycle + cross-reference timeline, `flow` classifies each notable issue:
 **Common blockers / pile-ups** are surfaced as `blockers`: nodes that many trains reference
 as blocking them, **ranked by in-degree** — the structural reason work is stacking up. This
 analysis leans directly on graphify's graph (another reason it's now core).
+
+## Authored-content provenance — the timeline as an event stream
+
+The social layer is only half the record. A person also ships **code**, and that code
+carries embedded artifacts — **examples, READMEs/doc sections, code symbols, and inline
+code-comments/doc-comments** — each with its *own* lifecycle: introduced in one commit,
+changed in another, **removed or replaced** in a third. An example that shipped in March and
+was dropped in May is real context for a retrospective, and git already records every step
+of it in the clone. So the **timeline is the spine**, modeled as a single **event-sourced
+stream**: social events (comment, review, reaction) and **code events** (artifact
+add / change / remove, parsed from commit diffs) sit side by side, every event carrying
+`{ actor, timestamp, ref, subject }`. People, feature deltas, examples, docs, and flow all
+**derive** from this one stream rather than living in separate silos.
+
+- **Artifact lifecycle ledger (`artifacts`).** Each tracked artifact — `kind ∈
+  {example, doc, readme, symbol, comment}` — gets `path`/`name`, an ordered `lifecycle:
+  [{ event: add|change|remove, commit, author, date, hunk, ref }]`, a current `status`
+  (`live` | `removed` | `replaced`), and `replaced_by` when a rename/supersede is detected.
+  Inline code-comments and doc-comments are tracked as first-class artifacts here (your
+  call), so a single comment's birth and death are traceable — not just folded into an
+  enclosing diff.
+- **Full-window commit walk (your call).** Build the code-event stream by walking **every
+  commit in the window** (local clone, zero-token) bounded to recognized artifacts, with
+  git **rename/copy detection** (`-M -C`), so *added-then-removed-within-the-window* churn is
+  captured even when it isn't attached to any train. This is CPU-heavy at AVM scale, so it's
+  **phased**: Phase 1 computes net/tip-level deltas along trains; the full-window walk and
+  inline-comment granularity land in **Phase 3** (see phasing), behind the same schema.
+- **Feature deltas become a view.** `feature_deltas` (add/drop/change per code area) is now a
+  **projection over `artifacts`** — every delta resolves to the artifact's lifecycle events
+  and their authors, so "dropped" features carry *who removed it, when, and in which commit*.
+- **Evidence rule unchanged.** Both the introducing hunk *and* the removing hunk are
+  persisted inline as evidence; bulk diffs stay in the clone and are fetched on demand.
 
 ## Continuity & time-series (publish as a series)
 
@@ -304,6 +353,14 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     `git log --since --until --pretty --name-only` (+ `git show` for diffs when a train
     needs them). Captures `sha`, `message`, `author`, `date`, `files`, `parents`, and
     `pr` (resolved from merge structure / trailers in Link).
+  - **Full-window code-event walk (zero-token, local; Phase 3):** `git log -p -M -C
+    --since --until` over the window, **bounded to recognized artifact paths/blocks**
+    (examples dirs, `*.md`/README headings, fenced code blocks, language-aware symbols, and
+    inline code-/doc-comment blocks). Rename/copy detection (`-M -C`) links removals to
+    replacements. Emits per-artifact `add|change|remove` events with `{ commit, author, date,
+    hunk }` — the raw material Link folds into the `artifacts` ledger and the unified
+    `timeline`. Captures *added-then-removed-within-window* churn that a tip-only diff misses.
+    (Phase 1 ships tip/train-level deltas under the same schema; this walk turns on in Phase 3.)
 
 - **graphify code graph (required, local, zero-token):**
   - **Preflight:** assert `graphify` is on `PATH`; **fail fast** with install guidance if
@@ -363,12 +420,15 @@ transcript (Analyze input) nor the report prose (Synthesize output).
                "labels":[],"milestone","merged":bool,"merged_by","merged_at","closed_at",
                "files":[paths],"closes":[issue#],
                "review_comments":[{ "author","author_association","body","url","id" }],"url" } ],
-    "issues": [ { "number","title","body","kind","author","author_association","assignees":[],
+    "issues": [ { "number","title","body","kind","facets":{ "area","priority","status","lifecycle" },
+                  "author","author_association","assignees":[],
                   "labels":[],"state","state_reason","milestone","closed_at",
                   "reactions":{ "+1","-1","heart","hooray","total" },
                   "comments":[{ "author","author_association","body","url","id" }],"url",
                   "open_high_activity":bool } ],
-    "timeline": [ { "issue":num,"event","source":{ "type","number","sha" } } ],
+    "label_taxonomy": { "<facet>": { "<namespace-or-value>":[label] }, "source":"auto|config|merged" },
+    "timeline": [ { "ts","actor","layer":"social|code","event",
+                    "ref":{ "type","number|sha","url" },"subject":{ "kind","name","path" } } ],
     "workflows": [ { "name","conclusion","status","event","head_branch","created_at","url" } ],
     "releases": [ { "tag_name","name","published_at","prerelease":bool,"url" } ],
     "milestones": [ { "title","number","state","due_on","open_issues","closed_issues","url" } ],
@@ -387,15 +447,22 @@ transcript (Analyze input) nor the report prose (Synthesize output).
                   "outcome":"shipped|rejected|abandoned|deferred",
                   "first_seen":period,"last_activity","carried_over":bool,"prior_status",
                   "evidence":[{ "type","id","url" }] } ],
+    "artifacts": { "<artifact-id>": { "kind":"example|doc|readme|symbol|comment",
+                  "path","name","status":"live|removed|replaced","replaced_by":id|null,
+                  "code_area":community,
+                  "lifecycle":[{ "event":"add|change|remove","commit":sha,"author","date",
+                                 "hunk","ref":{ "type","id","url" } }] } },
     "feature_deltas": [ { "area":community,"kind":"add|drop|change",
-                          "subject":"param|resource|module|output|target-scope|...",
-                          "name","before","after","hunk","detail",
+                          "subject":"param|resource|module|output|example|doc|comment|...",
+                          "name","before","after","hunk","detail","artifact":id,"author",
                           "train":id,"pr":num,"commit":sha,"url" } ],
     "buckets": { "shipped":[ref],"in_flight":[ref],"rejected":[ref],"next_candidates":[ref] },
     "code_owners": { "<path|glob>":[login] },
     "people": { "<login>": { "internal":bool,"author_association","roles":{ "<role>":count },
                   "modules":[community],"areas":[],"prs_authored","prs_reviewed",
                   "review_latency","merge_rate","issues_reported","stale_owned":[issue#],
+                  "examples_authored","docs_authored","symbols_authored",
+                  "authored_then_removed":[{ "artifact":id,"removed_by":login,"commit":sha }],
                   "first_seen","last_active","evidence":[ref] } },
     "halls": { "fame":{ "top_shippers":[login],"top_reviewers":[login],"maintainers":[login],
                         "rising_community":[login] },
@@ -407,26 +474,40 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "diagrams": { "timeline_gantt":"<mermaid>","buckets_pie":"<mermaid>",
                   "deltas_bar":"<mermaid>","train_flowcharts":{ "<id>":"<mermaid>" },
                   "contributor_graph":"<mermaid>","blocker_graph":"<mermaid>",
-                  "kind_breakdown":"<mermaid>" }
+                  "kind_breakdown":"<mermaid>","content_timeline":"<mermaid>" }
   }
   ```
-  (`code_graph`, `timeline`, `trains`, `feature_deltas`, and `diagrams` may be thin/empty
-  in early vertical slices and thicken per phase — the schema reserves their place from
-  Phase 1.)
+  (`code_graph`, `timeline`, `trains`, `artifacts`, `feature_deltas`, and `diagrams` may be
+  thin/empty in early vertical slices and thicken per phase — the schema reserves their place
+  from Phase 1; the full-window `artifacts`/`timeline` code-event detail lands in Phase 3.)
   - **Ref convention:** every `url` field and every `evidence`/source entry is a
     `{ type, id|number|sha, url }` so any fact in any downstream renderer can be traced to
     its origin. The schema is documented for renderer authors in `BUNDLE.md`.
 
-- **Feature delta ledger (`feature_deltas`, computed in Link):** the deterministic
-  add/drop/change record per code area, derived from the local diffs along each train:
-  - **add** — a new parameter/resource/module/output appears in a diff (with the train/PR
-    that introduced it).
-  - **drop** — a parameter/resource removed or deprecated, *or* a PR closed-without-merge
-    (a rejected feature) / an issue closed `not_planned`.
-  - **change** — a parameter's default/type/allowed-values changed across a train's commits.
-  (Subject extraction is language-aware where cheap — e.g. Bicep/ARM `param`/`resource`/
-  `output`, Terraform `variable`/`resource`/`output` — else a generic added/removed-symbol
-  heuristic from the diff. Reserved Phase 1, populated from Phase 3.)
+- **Artifact ledger + unified timeline (`artifacts`/`timeline`, computed in Link):** Link
+  folds the code-event walk into per-artifact `lifecycle` chains (add→change→remove, with
+  author + commit + hunk), sets each artifact's `status`/`replaced_by` (via rename
+  detection), and **merges code events with social events into one chronological `timeline`**
+  keyed by `ts`/`actor`. This stream is the substrate the people churn stats, feature deltas,
+  and `content_timeline` diagram all derive from. (Phase 3 detail; tip-level in Phase 1.)
+
+- **Feature delta ledger (`feature_deltas`, a projection over `artifacts`):** the
+  deterministic add/drop/change record per code area, derived from artifact lifecycles +
+  train diffs:
+  - **add** — a new parameter/resource/module/output/example/doc appears (artifact's first
+    `add` event, with the train/PR + author that introduced it).
+  - **drop** — an artifact removed or deprecated (its `remove` event, **carrying who removed
+    it, when, and in which commit**), *or* a PR closed-without-merge / an issue closed
+    `not_planned`.
+  - **change** — a default/type/allowed-values/content change across a train's commits.
+  (Subject extraction is language-aware where cheap — Bicep/ARM `param`/`resource`/`output`,
+  Terraform `variable`/`resource`/`output`, Markdown headings/examples — else a generic
+  added/removed-symbol heuristic. Reserved Phase 1, populated from Phase 3.)
+
+- **Label facets (`label_taxonomy`, computed in Link):** auto-detect label namespaces, map
+  to facets (`kind`/`area`/`priority`/`status`/`lifecycle`), merge with any `projects.json`
+  `label_taxonomy` override (override wins), and stamp `facets` onto each issue/PR — feeding
+  `kind`, area attribution, forecast priority, and flow signals.
 
 - **People graph (`people`/`halls`, computed in Link):** from train `participants` +
   `author_association` + `code_owners` + the `projects.json` internal config, Link builds
@@ -444,17 +525,20 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   `timeline_gantt` (releases/sprints over the window), `buckets_pie` (shipped/in-flight/
   rejected/next counts), `deltas_bar` (add/drop/change per area), one `flowchart` per
   notable train (issue → PR(s) → commits → outcome), `contributor_graph` (people↔module/
-  train edges), `blocker_graph` (pile-ups by in-degree), and `kind_breakdown` (feature/bug/
-  idea mix). `SKILL.md`/template embed them verbatim. (Public renders omit shame/blame.)
+  train edges), `blocker_graph` (pile-ups by in-degree), `kind_breakdown` (feature/bug/idea
+  mix), and `content_timeline` (artifact lifecycles — added/changed/removed over the window).
+  `SKILL.md`/template embed them verbatim. (Public renders omit shame/blame.)
 
 ### 2. `link.py` (offline, deterministic — train graph + buckets + people + flow)
 
 Reads the bundle, writes it back enriched. No network. Builds `trains` from
-closing-refs + commit trailers + timeline cross-references + merge structure; classifies
-issue/train `kind`; attributes each train to `code_areas` (graphify communities) and to
-`participants`; computes `feature_deltas`, `buckets`, `release_train`, `sprints`, the
-`people`/`halls` graph (internal-vs-community via `author_association` + `code_owners` +
-config), and `flow`/`blockers`; and emits the deterministic `diagrams` from that data. Pure
+closing-refs + commit trailers + timeline cross-references + merge structure; resolves
+`label_taxonomy` facets and issue/train `kind`; folds the code-event walk into the
+`artifacts` ledger + unified `timeline`; attributes each train to `code_areas` (graphify
+communities) and to `participants`; computes `feature_deltas` (a projection over
+`artifacts`), `buckets`, `release_train`, `sprints`, the `people`/`halls` graph
+(internal-vs-community via `author_association` + `code_owners` + config, plus authored-code
+churn), and `flow`/`blockers`; and emits the deterministic `diagrams` from that data. Pure
 transforms over recorded data → fully unit-testable.
 
 ### 3. `SKILL.md` (procedure + analysis instructions)
@@ -528,6 +612,11 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
    `diagrams.train_flowcharts[id]`.
 4a. **Feature changes (add / drop / change)** — the `feature_deltas` ledger as a table per
    code area (subject, name, kind, the train/PR/commit), with `diagrams.deltas_bar`.
+4b. **Content lifecycle (built, changed, dropped)** — from `artifacts`: examples/docs/
+   symbols (and notable comments) introduced, revised, or **removed/replaced within the
+   window** — *who* authored and *who* removed each, with dates. Surfaces "we shipped an
+   example for X in March and dropped it in May", which a tip-only diff hides. Embeds
+   `diagrams.content_timeline`.
 5. **In flight** — open items in current sprint/milestone (`buckets.in_flight`) with board
    status; flag items at risk of slipping.
 6. **Rejected / abandoned** — PRs closed without merge + issues closed `not_planned`
@@ -587,6 +676,8 @@ index is the cheap through-line, never an override.
         "include_docs": true, "include_workflows": true, "include_releases": true,
         "transcript": "workspace/<name>-call-{period}.txt",
         "internal": { "domains": ["microsoft.com"], "orgs": ["Azure"], "logins": [] },
+        "label_taxonomy": { "kind": ["Type:"], "area": ["area/"],
+                            "priority": ["priority/"], "status": ["Status:","needs-"] },
         "project_v2": { "owner_type": "org", "number": 0,
                         "status_field": "Status", "iteration_field": "Sprint" }
       }
@@ -597,7 +688,8 @@ index is the cheap through-line, never an override.
   milestones + dates only. `graphify` is no longer a per-project toggle — it's always
   required. `internal` **supplements** the derived author_association/CODEOWNERS/team
   signal for classifying maintainers/staff — e.g. Microsoft folks on AVM repos — it does
-  not replace it.)
+  not replace it. `label_taxonomy` **overrides/extends** the auto-detected label→facet map
+  for repos whose scheme the auto-detector misses; omit it to rely on auto-detect alone.)
 - **Resolution order:** `--config PATH` → `./projects.json` (cwd) → skill-dir
   `projects.json`. If none found or `--project` not given, fall back to explicit args.
 - **Distribution:** ships `projects.example.json` (placeholders). User fills a real
@@ -671,19 +763,32 @@ against GitHub) after each.
   *Link:* full cross-references, `in_flight` / `rejected` / `next_candidates`; emit
   `diagrams.buckets_pie` + `diagrams.timeline_gantt`. *Report:* + CI/CD, releases,
   rejected/abandoned, in-flight sections with embedded bucket pie + timeline.
-- **Phase 3 — code areas (graphify) + feature deltas.**
-  *Acquire:* graphify code-graph pass. *Link:* attribute trains/commits to communities;
-  compute `feature_deltas` + `diagrams.deltas_bar`. *Report:* shipped grouped by code
-  area; **Feature changes (add/drop/change)** ledger; infrastructure & tooling;
-  decision-docs from diffs; graphify `graph.html` link.
+- **Phase 3 — code areas (graphify) + feature deltas + label facets.**
+  *Acquire:* graphify code-graph pass (now required) + CODEOWNERS; the **full-window
+  code-event walk** (`git log -p -M -C`) producing the `artifacts` ledger and the unified
+  `timeline` (incl. inline-comment granularity). *Link:* attribute trains/commits to
+  communities; resolve `label_taxonomy` facets; build `artifacts` + `feature_deltas`
+  (projection over artifacts) + `diagrams.deltas_bar` + `diagrams.content_timeline`.
+  *Report:* shipped grouped by code area; **Feature changes** ledger; **Content lifecycle
+  (built/changed/dropped)**; infrastructure & tooling; decision-docs from diffs; graphify
+  `graph.html` link. (Phase 1/2 carry the tip-level subset under the same schema.)
 - **Phase 4 — sub-agent train narratives + train graphs + forecast.**
   *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
   `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded
   flowcharts + next-release forecast.
-- **Phase 5 — Projects v2 + sprint framing.**
+- **Phase 5 — people graph + flow/stall analysis.**
+  *Acquire:* reactions, `author_association`, assignees, issue types. *Link:* `people`/
+  `halls` (internal-vs-community + authored-code churn), `code_owners`, `flow`/`blockers`;
+  emit `contributor_graph` + `blocker_graph` + `kind_breakdown`. *Report:* **Contributors &
+  community** (public) + **Stalled, blocked & pile-ups**; internal shame/blame appendix
+  gated off by default.
+- **Phase 6 — Projects v2 + sprint framing.**
   *Acquire:* GraphQL board. *Link:* iteration/status resolution. *Report:* previous/current/
   next sprint + release-train framing, board status on in-flight.
-- **Phase 6 — transcript, slash command, multi-repo.**
+- **Phase 7 — series continuity.**
+  `series.json` index + `meta.prev_bundle` chaining; carry-over (`first_seen`/`carried_over`/
+  `prior_status`) and the forecast-loop "Since last installment" section.
+- **Phase 8 — transcript, slash command, multi-repo.**
   Community-call section, `/activity` entrypoint, and **Terraform multi-repo aggregation**.
 
 ## Testing strategy
