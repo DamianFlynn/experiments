@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design (pre-implementation)
+**Status:** Approved design (pre-implementation) — rev 2 (clone + trains + vertical slices)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -10,48 +10,114 @@ A Claude Code skill that produces a time-boxed **engineering activity + sprint/r
 digest** for a GitHub repository. The user asks Claude to "run the activity-overview
 skill for `<project>` over `<period>`", and the skill produces a Markdown report that
 covers: what shipped, releases published, CI/CD health, what's in flight, what was
-rejected/abandoned, design decisions, community-call highlights, a **next-release
-forecast**, and open risks — framed around **previous / current / next** sprint and
-release.
+rejected/abandoned, **the decision trains** behind the work, design decisions,
+community-call highlights, a **next-release forecast**, and open risks — framed around
+**previous / current / next** sprint and release.
 
 This replaces a naive "Claude reads the whole repo and guesses" approach with a
-deterministic data fetch (REST + GraphQL) plus an LLM-authored narrative.
+deterministic **gather** step (local clone + REST/GraphQL + optional code graph) that
+writes a persisted bundle, followed by an **offline analysis** step that traces decision
+trains and authors the narrative.
 
 ### Host vs. target
 
 This repository (`damianflynn/experiments`) is **only the host** for the skill — its
 existing content is archive-only and is **never analyzed**. The skill is built and
-committed here but always runs against **external target repos**. There are **three
-target projects** in regular use; some hold a monthly/quarterly community YouTube call
-whose transcript is an additional context source, and the projects use GitHub
-milestones (releases) and/or Projects v2 boards (sprints) for planning.
+committed here but always runs against **external target repos** (the lead validation
+target is the large **AVM-Bicep** repo). There are **three target projects** in regular
+use; some hold a monthly/quarterly community YouTube call whose transcript is an
+additional context source, and the projects use GitHub milestones (releases) and/or
+Projects v2 boards (sprints) for planning.
 
 ## Core principle
 
-**Script = facts. Claude = narrative.**
+**Gather is deterministic and decoupled. Analysis is the model's judgment.**
 
-- A deterministic Python script (`fetch_activity.py`) is the *only* component that
-  touches the network. It pulls commits, PRs, issues, workflow runs, releases,
-  milestones, and Projects v2 board state from the GitHub **REST + GraphQL** APIs and
-  writes a single JSON "activity bundle," including deterministically-computed buckets
-  (shipped / in-flight / rejected / next-candidates).
-- `SKILL.md` instructs Claude to run the fetcher, read the bundle, optionally read a
-  community-call transcript, and write a Markdown report using a fixed template —
-  including a forecast *narrative* over the script-selected candidate items.
-- Claude does only the judgment work (grouping, summarizing, risk-spotting,
-  forecasting prose). It never gathers data or invents the candidate buckets.
+The skill is a four-layer pipeline with a **persisted bundle as the seam** between the
+online and offline halves:
 
-This keeps token cost low and report data reproducible.
+```
+  ┌─────────── online, deterministic ───────────┐   ┌──────── offline ────────┐
+  Acquire ──▶ Bundle (on-disk) ──▶ Link ──▶ Analyze (sub-agents) ──▶ Synthesize
+```
+
+1. **Acquire** (the *only* layer that touches the network) — shallow/partial **local
+   clone** of the target repo bounded to the window (commit tree + diffs, free, no rate
+   limits), plus a REST/GraphQL pull of the **social layer** (issues, PRs, comments,
+   reviews, timeline links, workflow runs, releases, milestones, Projects v2), plus an
+   optional local **graphify** code-graph pass. Writes one self-describing bundle.
+2. **Bundle** — a portable, inspectable, diffable on-disk artifact. Gather once; analyze
+   many times without re-fetching or re-touching GitHub. The bundle is the audit record
+   of exactly which facts a report was built from.
+3. **Link** (offline, deterministic) — builds the **decision-train graph**: connects each
+   issue → its linked PRs → their commits, via timeline cross-references and commit
+   trailers (`Fixes #123`, merge commits), and attributes each train to code areas via
+   the graphify communities / changed-path modules.
+4. **Analyze + Synthesize** (offline, the model) — **parallel sub-agents**, one per train,
+   read that train's full thread + local diffs and emit a structured decision narrative
+   (proposed → changed direction → rejected → spun off → shipped). The lead agent
+   synthesizes the per-train analyses + buckets into the report and forecast.
+
+Claude does only the judgment work (tracing trains, grouping, summarizing, risk-spotting,
+forecasting prose). It never invents facts: commits/diffs come from the clone, the social
+layer from the API, code areas from graphify, and the candidate buckets are computed
+deterministically in Link.
+
+This keeps token cost bounded (diffs are local; sub-agents are scoped to one train each)
+and report data reproducible.
+
+## Why a local clone (the scale unlock)
+
+Walking the commit tree and per-PR file lists **via the API** is what blows the rate
+limit on a busy month of a large repo like AVM-Bicep. A single shallow/partial clone
+bounded to the window gives the **entire commit tree + diffs locally, for free, with no
+rate-limit exposure**:
+
+- `git clone --filter=blob:none --shallow-since=<from>` (partial + windowed) keeps the
+  clone small and fast even on large histories.
+- Commit messages, diffs, parameter changes, and merge structure are then read with local
+  `git log` / `git show` / `git diff` — no API calls.
+
+What the clone does **not** contain (and so still needs the API) is the **social layer**:
+issue/PR bodies, review + issue comments, reactions, the issue↔PR↔commit linkage
+(timeline / cross-reference events), labels, milestones, Projects v2 board state, and
+Actions runs. That layer is bounded by **item count, not file count**, and is batched via
+GraphQL — hundreds of calls for a busy month, comfortably within budget.
+
+## Decision trains (first-class concept)
+
+The value of the digest is not a flat list of merged PRs — it is the **narrative thread**
+of how a decision moved through the project. A *train* is the linked unit:
+
+```
+  issue (idea / request)  ──┐
+        maybe-duplicate of ─┤
+                            ├─▶ PR(s)  ──▶ commits ──▶ diffs (param/feature changes)
+        spun-off issue   ◀──┤            (direction changes, rejects, additions)
+                            └─▶ outcome: shipped | rejected | abandoned | deferred
+```
+
+**Link** builds these deterministically from:
+- **Closing references** in PR bodies / commit trailers (`Fixes #`, `Closes #`, `Resolves #`).
+- **Timeline cross-reference events** (issue ↔ PR ↔ commit mentions, `connected`/`disconnected`).
+- **Merge commits** → which commits belong to which PR.
+- **Duplicate / spun-off** signals (`duplicate` label, `Duplicate of #`, references between issues).
+
+**Analyze** then narrates each train with a per-train sub-agent. The bundle reserves a
+`trains` array so every later phase can thicken the same structure.
 
 ## Non-goals (YAGNI)
 
-- No dependency on third-party skills (`repo-analyzer`, `github-issue-analyzer`,
-  `github-summary`). They are useful references but the skill is self-contained.
-- No `gh` CLI dependency. Auth is via `GITHUB_TOKEN` only.
+- No dependency on third-party **skills** (`repo-analyzer`, `github-issue-analyzer`,
+  `github-summary`). Useful references, but the skill is self-contained.
+- **graphify** is an *optional* tool dependency (code-area mapping). If `graphify` is not
+  on `PATH`, Acquire skips the code-graph pass and Link falls back to changed-path module
+  attribution — the rest of the pipeline is unaffected (graceful degradation).
+- No `gh` CLI dependency. Auth is via `GITHUB_TOKEN` only. `git` is assumed present.
 - No YouTube network access / transcript auto-fetch. The transcript is **user-provided**
   as a local file.
 - No multi-repo aggregation in v1 (single target repo per run; one optional linked
-  Projects v2 board).
+  Projects v2 board). **Terraform multi-repo aggregation is deferred to Phase 6.**
 - No write actions to GitHub. Read-only.
 - No HTML/PDF output, and no automated scheduling/delivery (cron, Slack) in v1 —
   invocation is manual / on-demand. (Noted as a future add.)
@@ -70,7 +136,7 @@ mechanisms are supported; either or both may be present:
   Given a **reference date** (`--ref-date`, default = `--to`), **current** = the
   iteration containing the ref date; **previous** / **next** are the adjacent ones.
 
-**Buckets** (computed deterministically in the fetcher; refs only, by item number):
+**Buckets** (computed deterministically in Link; refs only, by item number):
 - **shipped** — PRs merged in window + issues closed as completed in window.
 - **in_flight** — open PRs/issues assigned to the current sprint (iteration) or current
   milestone.
@@ -79,122 +145,151 @@ mechanisms are supported; either or both may be present:
 - **next_candidates** — open PRs/issues assigned to the next milestone or next
   iteration, plus open items labelled high-priority. Feeds the forecast narrative.
 
+Each bucket item carries its **train id** so the report can cross-link a shipped PR to the
+issue that started it and the decisions along the way.
+
 ## Components
 
-### 1. `fetch_activity.py` (deterministic fetcher — REST + GraphQL)
+### 1. `gather.py` (deterministic Acquire — clone + REST + GraphQL + graphify)
 
-- **Deps:** Python 3 stdlib only (`urllib`, `json`, `argparse`, `datetime`). GraphQL is
-  a plain `POST /graphql` with a JSON body via `urllib` — no pip install.
-- **Auth:** reads `GITHUB_TOKEN`, falling back to `GH_TOKEN`. Exits with a clear error
-  if neither is set. (Projects v2 needs a token with `read:project` scope.)
+The single component that touches the network. Produces the bundle; touches neither the
+transcript (Analyze input) nor the report prose (Synthesize output).
+
+- **Deps:** Python 3 stdlib only (`urllib`, `json`, `argparse`, `datetime`, `subprocess`).
+  GraphQL is a plain `POST /graphql` via `urllib`. Shells out to **`git`** (clone + log +
+  show) and, when available, **`graphify`** — no pip install required for the core.
+- **Auth:** reads `GITHUB_TOKEN`, falling back to `GH_TOKEN`. Exits with a clear error if
+  neither is set. (Projects v2 needs a token with `read:project` scope.)
 - **CLI:**
   ```
-  python fetch_activity.py --owner OWNER --repo REPO \
+  python gather.py --owner OWNER --repo REPO \
       --from YYYY-MM-DD --to YYYY-MM-DD \
-      [--branches main,develop] \
+      [--branches main,develop] [--clone-dir PATH] [--no-clone] \
+      [--graphify | --no-graphify] \
       [--include-docs] [--include-workflows] [--include-releases] \
       [--include-projects] [--project-number N] [--project-owner-type org|user] \
       [--status-field Status] [--iteration-field Sprint] \
       [--milestone "vX.Y"] [--ref-date YYYY-MM-DD] [--out PATH]
   ```
-  (`--include-workflows`/`--include-releases` default **on**. `--include-projects`
-  activates when a project number is provided via flag or config. When a project config
-  is used, `SKILL.md` resolves these args from the config — see component 6.)
-- **REST fetches / windowing:**
-  - **Commits:** on the listed branches (default: default branch), author/commit date in
-    `[from, to]`. `GET /repos/{o}/{r}/commits?since&until&sha`.
-  - **PRs:** all closed PRs touched in range via
-    `GET /repos/{o}/{r}/pulls?state=closed&sort=updated&direction=desc` (paginated).
-    Split into **merged in window** (`merged_at` in range) and **closed-without-merge in
-    window** (`closed_at` in range, `merged_at` null). Plus **open** PRs
-    (`state=open`) for in-flight/next buckets. For each: title, number, body, labels,
-    reviewers, milestone, merged flag, merged_at/closed_at, changed files
-    (`.../pulls/{n}/files`), review-comment bodies (`.../pulls/{n}/comments`).
-  - **Issues:** closed in window (`state=closed&since=`, excluding PRs via
-    `pull_request` key) with `state_reason` (`completed`|`not_planned`); plus **open**
-    issues (for in-flight/next/high-activity). Capture milestone + labels.
-  - **Workflow runs** (`--include-workflows`): runs created in `[from, to]` via
-    `GET /repos/{o}/{r}/actions/runs?created={from}..{to}` (paginated). Capture `name`,
-    `conclusion`, `status`, `event`, `head_branch`, `created_at`, `html_url`.
+  (`--include-workflows`/`--include-releases` default **on**; `--graphify` auto-enables
+  when `graphify` is on `PATH`. `--include-projects` activates when a project number is
+  provided. When a project config is used, `SKILL.md` resolves these from config — see
+  component 6.)
+
+- **Clone + local git (the commit/diff layer, network-free after clone):**
+  - `git clone --filter=blob:none --shallow-since=<from> --no-single-branch <repo> <clone-dir>`
+    (bounded, partial). `--no-clone` reuses an existing `--clone-dir`.
+  - Commits on the listed branches with author/commit date in `[from, to]` via local
+    `git log --since --until --pretty --name-only` (+ `git show` for diffs when a train
+    needs them). Captures `sha`, `message`, `author`, `date`, `files`, `parents`, and
+    `pr` (resolved from merge structure / trailers in Link).
+
+- **graphify code graph (optional, local, zero-token):**
+  - When enabled, run `graphify update <clone-dir>` (tree-sitter AST, no API/tokens) →
+    reads `graphify-out/graph.json`. Captures **communities** (≈ logical modules),
+    node→file mapping, and edges. Stored under `code_graph` in the bundle and used by Link
+    to attribute trains/commits to code areas. Absent graphify → this is omitted.
+
+- **REST fetches / windowing (the social layer):**
+  - **PRs:** closed PRs touched in range via
+    `GET /repos/{o}/{r}/pulls?state=closed&sort=updated&direction=desc` (paginated). Split
+    into **merged in window** (`merged_at` in range) and **closed-without-merge in window**
+    (`closed_at` in range, `merged_at` null). Plus **open** PRs for in-flight/next. For
+    each: title, number, body, labels, reviewers, milestone, merged flag,
+    merged_at/closed_at, **closing-issue refs**, review-comment bodies
+    (`.../pulls/{n}/comments`). **Diffs/changed-files come from the local clone, not the
+    API.**
+  - **Issues:** closed in window (`state=closed&since=`, excluding PRs via `pull_request`
+    key) with `state_reason` (`completed`|`not_planned`); plus **open** issues. Capture
+    milestone, labels, body, issue comments.
+  - **Timeline events** (for trains): `GET /repos/{o}/{r}/issues/{n}/timeline` for
+    cross-references, `connected`/`cross-referenced`/`closed`-by-commit events linking
+    issues ↔ PRs ↔ commits.
+  - **Workflow runs** (`--include-workflows`): `GET /repos/{o}/{r}/actions/runs?created={from}..{to}`
+    (paginated). Capture `name`, `conclusion`, `status`, `event`, `head_branch`,
+    `created_at`, `html_url`.
   - **Releases** (`--include-releases`): `GET /repos/{o}/{r}/releases` filtered on
     `published_at` in window; capture `tag_name`, `name`, `published_at`, `prerelease`, url.
   - **Milestones:** `GET /repos/{o}/{r}/milestones?state=all`; capture `title`, `number`,
-    `state`, `due_on`, `open_issues`, `closed_issues`, url. Used for release-train modeling.
+    `state`, `due_on`, `open_issues`, `closed_issues`, url.
   - **Pagination:** follow `Link` rel="next"; stop early using `from`/`to` where possible.
   - **Rate limiting:** on HTTP 403 with `X-RateLimit-Remaining: 0`, sleep until
-    `X-RateLimit-Reset`, bounded retries.
-- **GraphQL fetch (`--include-projects`):**
-  - Query `organization|user(login:owner).projectV2(number:N)` for: project title; the
-    **iteration field** (its iterations with `title`, `startDate`, `duration`); the
-    **status (single-select) field** options; and `items` (paginated) each resolving to
-    its linked issue/PR (`number`, `title`, `state`, `merged`) plus that item's `Status`
-    and `Iteration` field values.
-  - Field names are configurable (`--status-field`, `--iteration-field`) to match the
-    board.
-- **Derived fields (deterministic):**
-  - `modules`: top-level dir of each changed path → `{ commits, prs, files_changed }`.
-  - `workflow_stats` (`--include-workflows`): workflow name →
-    `{ total, success, failure, cancelled, other }`.
-  - `docsRefs` (`--include-docs`): changed files matching `docs/`, `adr/`, `adrs/`,
-    `decisions/`, `*ADR*.md`/`*adr*.md`, plus doc-like paths referenced in PR bodies.
-  - `release_train`: `{ previous, current, next }` milestone refs (per the model above).
-  - `sprints`: `{ previous, current, next, all: [...] }` iteration refs (when projects on).
-  - `buckets`: `{ shipped, in_flight, rejected, next_candidates }` — arrays of item refs
-    `{ type, number, url }` (see Sprint & release modeling).
-- **Output:** writes `workspace/activity-{from}-{to}.json` (override `--out`). Bundle:
+    `X-RateLimit-Reset`, bounded retries. (GraphQL batching keeps the social layer well
+    within budget.)
+
+- **GraphQL fetch (`--include-projects`):** Projects v2 board — project title; the
+  **iteration field** (iterations: `title`, `startDate`, `duration`); the **status
+  (single-select) field** options; and `items` (paginated) each resolving to its linked
+  issue/PR (`number`, `title`, `state`, `merged`) plus that item's `Status` and
+  `Iteration` values. Field names configurable (`--status-field`, `--iteration-field`).
+
+- **Output:** writes `workspace/activity-{from}-{to}.json` (override `--out`), alongside
+  the reusable `--clone-dir` and `graphify-out/`. Bundle:
   ```json
   {
-    "meta": { "owner", "repo", "from", "to", "branches", "ref_date", "generated_at" },
-    "commits": [ { "sha", "message", "author", "date", "files": [paths] } ],
-    "prs": [ { "number", "title", "body", "labels": [], "reviewers": [], "milestone",
-               "merged": bool, "merged_at", "closed_at", "files": [paths],
-               "review_comments": [str], "url" } ],
-    "issues": [ { "number", "title", "labels": [], "state", "state_reason",
-                  "milestone", "closed_at", "url", "open_high_activity": bool } ],
-    "workflows": [ { "name", "conclusion", "status", "event", "head_branch", "created_at", "url" } ],
-    "releases": [ { "tag_name", "name", "published_at", "prerelease": bool, "url" } ],
-    "milestones": [ { "title", "number", "state", "due_on", "open_issues", "closed_issues", "url" } ],
-    "project": { "number", "title",
-                 "iterations": [ { "title", "start", "end" } ],
-                 "items": [ { "type", "number", "title", "state", "merged",
-                              "status", "iteration", "url" } ] },
-    "modules": { "<dir>": { "commits", "prs", "files_changed" } },
-    "workflow_stats": { "<workflow>": { "total", "success", "failure", "cancelled", "other" } },
-    "docsRefs": [ { "path", "source": "changed|referenced", "pr": number|null } ],
-    "release_train": { "previous": {...}|null, "current": {...}|null, "next": {...}|null },
-    "sprints": { "previous": {...}|null, "current": {...}|null, "next": {...}|null, "all": [...] },
-    "buckets": { "shipped": [refs], "in_flight": [refs], "rejected": [refs], "next_candidates": [refs] }
+    "meta": { "owner","repo","from","to","branches","ref_date","clone_dir","generated_at" },
+    "commits": [ { "sha","message","author","date","files":[paths],"parents":[],"pr":num|null } ],
+    "prs": [ { "number","title","body","labels":[],"reviewers":[],"milestone",
+               "merged":bool,"merged_at","closed_at","files":[paths],
+               "closes":[issue#],"review_comments":[str],"url" } ],
+    "issues": [ { "number","title","body","labels":[],"state","state_reason",
+                  "milestone","closed_at","comments":[str],"url","open_high_activity":bool } ],
+    "timeline": [ { "issue":num,"event","source":{ "type","number","sha" } } ],
+    "workflows": [ { "name","conclusion","status","event","head_branch","created_at","url" } ],
+    "releases": [ { "tag_name","name","published_at","prerelease":bool,"url" } ],
+    "milestones": [ { "title","number","state","due_on","open_issues","closed_issues","url" } ],
+    "project": { "number","title","iterations":[{ "title","start","end" }],
+                 "items":[{ "type","number","title","state","merged","status","iteration","url" }] },
+    "code_graph": { "source":"graphify|null","communities":[{ "id","label","files":[] }],
+                    "nodes":[...],"edges":[...] },
+    "modules": { "<dir>": { "commits","prs","files_changed" } },
+    "workflow_stats": { "<workflow>": { "total","success","failure","cancelled","other" } },
+    "docsRefs": [ { "path","source":"changed|referenced","pr":num|null } ],
+    "release_train": { "previous":{}|null,"current":{}|null,"next":{}|null },
+    "sprints": { "previous":{}|null,"current":{}|null,"next":{}|null,"all":[] },
+    "trains": [ { "id","root_issue":num|null,"prs":[num],"commits":[sha],
+                  "spun_off":[issue#],"duplicate_of":issue#|null,"code_areas":[community],
+                  "outcome":"shipped|rejected|abandoned|deferred" } ],
+    "buckets": { "shipped":[ref],"in_flight":[ref],"rejected":[ref],"next_candidates":[ref] }
   }
   ```
-- **Scope note:** the fetcher does **not** read the transcript (Claude-side input) and
-  does **not** write forecast prose (Claude-side narrative). It only produces facts +
-  candidate buckets.
+  (`code_graph`, `timeline`, and `trains` may be thin/empty in early vertical slices and
+  thicken per phase — the schema reserves their place from Phase 1.)
 
-### 2. `SKILL.md` (procedure + narrative instructions)
+### 2. `link.py` (offline, deterministic — train graph + buckets)
+
+Reads the bundle, writes it back enriched. No network. Builds `trains` from
+closing-refs + commit trailers + timeline cross-references + merge structure; attributes
+each train to `code_areas` (graphify communities, else `modules`); computes `buckets`,
+`release_train`, and `sprints`. Pure transforms over recorded data → fully unit-testable.
+
+### 3. `SKILL.md` (procedure + analysis instructions)
 
 Frontmatter:
 ```yaml
 name: activity-overview
 description: Use when you need a time-boxed engineering + sprint/release digest for a
-  GitHub repo — shipped work, releases, CI/CD health, in-flight and abandoned items,
-  design decisions, community-call highlights, a next-release forecast, and open risks,
-  framed as previous/current/next sprint and release.
+  GitHub repo — shipped work, releases, CI/CD health, in-flight and abandoned items, the
+  decision trains behind the work, design decisions, community-call highlights, a
+  next-release forecast, and open risks, framed as previous/current/next sprint and release.
 ```
 
 Procedure Claude follows:
 1. Resolve the target: `--project <name>` from `projects.json`, or explicit
    `owner`/`repo`/options from the request (incl. project-board settings if any).
-2. Resolve `from`/`to`, `ref-date`, milestone, and optional transcript path.
+2. Resolve `from`/`to`, `ref-date`, milestone, clone dir, and optional transcript path.
 3. Verify `GITHUB_TOKEN`/`GH_TOKEN` is set (needs `read:project` for boards); if not, ask.
-4. Run `fetch_activity.py` with resolved parameters.
-5. Read the JSON bundle (facts + buckets + release_train + sprints).
-6. If a transcript is present, read it and extract community-call highlights; else skip.
-7. Write `workspace/activity-report-{from}-{to}.md` per `report-template.md`, including
-   a **forecast narrative** over `buckets.next_candidates` (likelihood / slippage risk),
-   weaving call context into relevant sections.
-8. Report the output path to the user.
+4. **Acquire:** run `gather.py` (clone + API + optional graphify) → bundle.
+5. **Link:** run `link.py` → bundle enriched with trains + buckets + release_train + sprints.
+6. **Analyze:** for each significant train, **dispatch a parallel sub-agent** (see
+   `superpowers:dispatching-parallel-agents`) that reads the train's thread + local diffs
+   and returns a structured decision narrative. (Early phases: a single inline pass.)
+7. If a transcript is present, read it and extract community-call highlights; else skip.
+8. **Synthesize:** write `workspace/activity-report-{from}-{to}.md` per `report-template.md`,
+   weaving per-train narratives + call context + a **forecast** over `buckets.next_candidates`.
+9. Report the output path to the user.
 
-### 3. Community-call transcript handling
+### 4. Community-call transcript handling
 
 - **Source:** user-provided local file (`.txt`, `.vtt`, `.srt`, `.md`). No network.
 - **Location:** from `projects.json` (`transcript`) or passed explicitly; conventionally
@@ -203,36 +298,39 @@ Procedure Claude follows:
   into executive summary, design decisions, forecast, and open risks.
 - **Optional:** absent transcript → section notes no call; rest of report unaffected.
 
-### 4. `report-template.md` (fixed report shape)
+### 5. `report-template.md` (fixed report shape)
 
 Sections, in order (sections gated on data are omitted gracefully when absent):
-1. **Executive summary** — sprint goals vs. outcomes; 3–5 bullets covering major
-   features, releases, CI health, key risks (informed by call + board context).
-2. **Release train context** — previous / current / next milestone (and current sprint
+1. **Executive summary** — sprint goals vs. outcomes; 3–5 bullets (features, releases, CI
+   health, key risks), informed by call + board context.
+2. **Release train context** — previous / current / next milestone (+ current sprint
    iteration window): dates, completion %, theme.
-3. **Shipped this period** — merged PRs + completed issues grouped by area (`modules`);
-   each links PR(s)/issues, summarizes the change, notes follow-ups.
+3. **Shipped this period** — merged PRs + completed issues grouped by **code area**
+   (graphify community / `modules`); each links its **train** (root issue → PR(s) →
+   commits), summarizes the change, notes follow-ups.
    - **Releases** (subsection) — versions published in window (tag, date, link;
      prereleases flagged).
-4. **In flight** — open items in current sprint/milestone (`buckets.in_flight`) with
-   board status; flag items at risk of slipping.
-5. **Rejected / abandoned** — PRs closed without merge + issues closed `not_planned`
+4. **Decision trains** — the notable threads: how an idea moved from issue → PR →
+   commits, where direction changed, what was rejected or spun off, and the outcome.
+   (Authored from the per-train sub-agent analyses.)
+5. **In flight** — open items in current sprint/milestone (`buckets.in_flight`) with board
+   status; flag items at risk of slipping.
+6. **Rejected / abandoned** — PRs closed without merge + issues closed `not_planned`
    (`buckets.rejected`), with a one-line "why" where evident.
-6. **CI/CD overview** — per-workflow success/fail counts (`workflow_stats`) + notable
+7. **CI/CD overview** — per-workflow success/fail counts (`workflow_stats`) + notable
    failed runs with links. (`--include-workflows`.)
-7. **Bugs & reliability** — `bug`/reliability-labelled items; fixed vs still-open; themes.
-8. **Infrastructure & tooling** — IaC (Terraform/Bicep/ARM), PowerShell, dependency
+8. **Bugs & reliability** — `bug`/reliability-labelled items; fixed vs still-open; themes.
+9. **Infrastructure & tooling** — IaC (Terraform/Bicep/ARM), PowerShell, dependency
    changes (inferred from area + labels).
-9. **Design decisions & docs** — ADRs/design docs touched or referenced (`docsRefs`),
-   1–2 sentence rationale each.
-10. **Community call highlights** — topics, decisions, asks, follow-ups (when transcript).
-11. **Next-release forecast** — over `buckets.next_candidates`: what's likely to land in
-    the next release/sprint, confidence, and slippage risks. Claude's judgment over the
-    script-selected candidates.
-12. **Open risks & next steps** — still-open high-activity issues + flagged PR review
+10. **Design decisions & docs** — ADRs/design docs touched or referenced (`docsRefs`) +
+    decisions surfaced from commit diffs along trains, 1–2 sentence rationale each.
+11. **Community call highlights** — topics, decisions, asks, follow-ups (when transcript).
+12. **Next-release forecast** — over `buckets.next_candidates`: what's likely to land next,
+    confidence, slippage risks. The model's judgment over script-selected candidates.
+13. **Open risks & next steps** — still-open high-activity issues + flagged PR review
     comments + call follow-ups + at-risk in-flight items.
 
-### 5. `projects.json` (optional per-project config)
+### 6. `projects.json` (optional per-project config)
 
 - **Purpose:** avoid re-entering details for the three target projects.
 - **Schema:**
@@ -240,96 +338,113 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
   {
     "projects": {
       "<short-name>": {
-        "owner": "string",
-        "repo": "string",
-        "branches": ["main"],
-        "include_docs": true,
-        "include_workflows": true,
-        "include_releases": true,
+        "owner": "string", "repo": "string", "branches": ["main"],
+        "clone_dir": "workspace/<name>-clone",
+        "graphify": true,
+        "include_docs": true, "include_workflows": true, "include_releases": true,
         "transcript": "workspace/<name>-call-{period}.txt",
-        "project_v2": {
-          "owner_type": "org",
-          "number": 0,
-          "status_field": "Status",
-          "iteration_field": "Sprint"
-        }
+        "project_v2": { "owner_type": "org", "number": 0,
+                        "status_field": "Status", "iteration_field": "Sprint" }
       }
     }
   }
   ```
-  (`project_v2` is optional — omit it for projects that don't use a board; the digest
-  then relies on milestones + dates only.)
+  (`project_v2` optional — omit for projects without a board; the digest then relies on
+  milestones + dates only.)
 - **Resolution order:** `--config PATH` → `./projects.json` (cwd) → skill-dir
   `projects.json`. If none found or `--project` not given, fall back to explicit args.
-- **Distribution:** ships `projects.example.json` (placeholders, no real names). User
-  fills a real `projects.json` (commit-or-local is their choice).
+- **Distribution:** ships `projects.example.json` (placeholders). User fills a real
+  `projects.json` (commit-or-local is their choice).
 
-### 6. `commands/activity.md` (slash-command entrypoint)
+### 7. `commands/activity.md` (slash-command entrypoint)
 
 - Thin wrapper so the skill triggers as
   `/activity <owner/repo|project> <fromDate> <toDate> [options]`.
 - Instructs Claude to invoke `activity-overview` with the parsed args — all logic stays
-  in `SKILL.md`/`fetch_activity.py`.
+  in `SKILL.md` / `gather.py` / `link.py`.
 - **Install note:** Claude Code discovers slash commands under `.claude/commands/`
   (project) or `~/.claude/commands/` (user). Ships at `commands/activity.md`; install
-  copies/symlinks it to the commands dir. Documented in `REFERENCE.md`.
+  copies/symlinks it. Documented in `REFERENCE.md`.
 
-### 7. `test_fetch_activity.py` (offline tests)
+### 8. Tests (offline)
 
-- Tests the deterministic transforms against **recorded REST + GraphQL fixtures**
-  (committed JSON): module grouping, doc-ref detection, window/merge filtering,
-  workflow-stats aggregation, release filtering, milestone release-train resolution
-  (previous/current/next), iteration sprint resolution, and bucket assignment
-  (shipped / in_flight / rejected / next_candidates). Runs with no network/token.
-- HTTP/GraphQL layer isolated behind small `_get(url)` / `_graphql(query, vars)`
-  functions that tests monkeypatch to return fixture pages.
+- `test_gather.py` — HTTP/GraphQL and `git`/`graphify` layers isolated behind small
+  `_get(url)` / `_graphql(query,vars)` / `_git(args)` / `_graphify(dir)` seams that tests
+  monkeypatch to return recorded fixtures. Covers window/merge filtering, commit parsing
+  from `git log` fixtures, code_graph ingestion, workflow-stats, release filtering.
+- `test_link.py` — train construction (closing-refs + trailers + timeline + merges),
+  duplicate/spin-off detection, code-area attribution, bucket assignment,
+  release-train/sprint resolution. Runs with no network/token.
 
 ## Layout (committed, portable)
 
 ```
 .claude/skills/activity-overview/
   SKILL.md
-  fetch_activity.py
+  gather.py                  # Acquire: clone + REST/GraphQL + graphify → bundle
+  link.py                    # offline: train graph + buckets
   report-template.md
   projects.example.json
   REFERENCE.md               # examples + install (incl. slash command) + troubleshooting
   commands/
     activity.md              # /activity slash-command wrapper
-  test_fetch_activity.py
+  test_gather.py
+  test_link.py
   fixtures/
-    rest_sample.json         # recorded REST responses for offline tests
+    rest_sample.json         # recorded REST responses
     graphql_sample.json      # recorded Projects v2 GraphQL response
+    git_log_sample.txt       # recorded git log/show output
+    graph_sample.json        # recorded graphify graph.json
 ```
 
-Self-contained: copying the folder into `~/.claude/skills/` makes the skill usable in
-any repo, with no setup beyond `GITHUB_TOKEN` (incl. `read:project`) and optionally a
-`projects.json` + transcript.
+Self-contained for the core (stdlib + `git`); graphify is an optional enricher. Copying
+the folder into `~/.claude/skills/` makes the skill usable in any repo, with no setup
+beyond `GITHUB_TOKEN` (incl. `read:project`) and optionally a `projects.json` + transcript.
 
-## Implementation phasing (for the plan)
+## Implementation phasing — **vertical slices**
 
-This is a large skill; the implementation plan should stage it so each phase is
-independently testable:
-1. **REST core** — commits/PRs/issues, modules, date-window report (template skeleton).
-2. **CI + releases + milestones** — workflow stats, releases, milestone release-train.
-3. **Buckets** — shipped / in_flight / rejected from REST; report sections 3–5, 12.
-4. **Projects v2 (GraphQL)** — board iterations + status, sprint resolution, in-flight by
-   board.
-5. **Forecast + transcript + slash command** — next_candidates forecast narrative,
-   community-call section, `/activity`.
+Each phase is a **complete vertical slice** (acquire → link → buckets → report) that
+produces a real, **verifiable report** against the target repo. Later phases *thicken
+every layer* rather than building one layer to completion. Test (and eyeball the report
+against GitHub) after each.
+
+- **Phase 1 — walking skeleton.**
+  *Acquire:* shallow/partial clone (window) + minimal API (merged PRs + their closing
+  issues + commit shas). *Link:* PR→commits (merge) + PR→issue (closing refs) → basic
+  trains; coarse `shipped` bucket. *Report:* a real digest — "N PRs across M trains,
+  bucketed as…, notable trains" — verifiable line-by-line against GitHub.
+- **Phase 2 — social layer + full buckets.**
+  *Acquire:* + comments, reviews, timeline events, workflow runs, releases, milestones.
+  *Link:* full cross-references, `in_flight` / `rejected` / `next_candidates`. *Report:*
+  + CI/CD, releases, rejected/abandoned, in-flight sections.
+- **Phase 3 — code areas (graphify).**
+  *Acquire:* graphify code-graph pass. *Link:* attribute trains/commits to communities.
+  *Report:* shipped grouped by code area; infrastructure & tooling; decision-docs from diffs.
+- **Phase 4 — sub-agent train narratives + forecast.**
+  *Analyze:* parallel sub-agent per train → decision narratives. *Report:* deepened
+  "Decision trains" section + next-release forecast.
+- **Phase 5 — Projects v2 + sprint framing.**
+  *Acquire:* GraphQL board. *Link:* iteration/status resolution. *Report:* previous/current/
+  next sprint + release-train framing, board status on in-flight.
+- **Phase 6 — transcript, slash command, multi-repo.**
+  Community-call section, `/activity` entrypoint, and **Terraform multi-repo aggregation**.
 
 ## Testing strategy
 
-- **Unit (offline):** `test_fetch_activity.py` covers all deterministic transforms +
-  bucket/release-train/sprint logic + config resolution against committed fixtures.
-  Must pass with no network/token.
-- **Smoke (manual, optional):** run against one real target repo+board for a real window
-  with a token; confirm bundle well-formed and report renders (with/without transcript,
-  with/without board).
+- **Unit (offline):** `test_gather.py` + `test_link.py` cover all deterministic transforms
+  + train/bucket/release-train/sprint logic + config resolution against committed
+  fixtures. Must pass with no network/token.
+- **Vertical verification (per phase):** run the slice against a real target window
+  (AVM-Bicep) with a token; confirm the bundle is well-formed and the report renders and
+  **checks out against GitHub** (with/without transcript, board, graphify).
 
 ## Error handling
 
 - Missing token → fail fast with actionable message; if `--include-projects` and token
   lacks `read:project`, name the missing scope.
+- `git` missing / clone failure → fail fast naming the cause; `--no-clone` requires an
+  existing `--clone-dir`.
+- `graphify` absent or failing → warn, omit `code_graph`, fall back to `modules`.
 - 404 (repo/project not found / no access) → clear error naming the resource.
 - GraphQL errors / project number not found / missing iteration|status field → warn and
   degrade gracefully to milestone+date modeling (board sections omitted), not a hard fail.
@@ -340,7 +455,9 @@ independently testable:
 
 ## Open questions
 
-- The three real project coordinates (owner/repo, branches, doc layout, which have
-  calls, Projects v2 numbers + field names) are not yet captured. The skill ships
+- The three real project coordinates (owner/repo, branches, doc layout, which have calls,
+  Projects v2 numbers + field names) are not yet captured. The skill ships
   `projects.example.json`; the user supplies real values into `projects.json` after the
   skill is built (or hands them to Claude to pre-populate).
+- graphify install/runtime cost on AVM-Bicep-scale clones to be measured during Phase 3
+  (tree-sitter is local/zero-token, but wall-clock on a large tree needs a real timing).
