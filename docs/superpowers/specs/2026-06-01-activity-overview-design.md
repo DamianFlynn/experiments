@@ -58,8 +58,10 @@ This keeps token cost low and report data reproducible.
   ```
   python fetch_activity.py --owner OWNER --repo REPO \
       --from YYYY-MM-DD --to YYYY-MM-DD \
-      [--branches main,develop] [--include-docs] [--out PATH]
+      [--branches main,develop] [--include-docs] \
+      [--include-workflows] [--include-releases] [--out PATH]
   ```
+  (`--include-workflows` and `--include-releases` default **on**; pass `--no-...` to skip.)
   (When a project config is used, `SKILL.md` resolves these args from the config —
   see component 5.)
 - **Behaviour / windowing:**
@@ -73,6 +75,15 @@ This keeps token cost low and report data reproducible.
   - **Issues:** issues **closed** within `[from, to]` (`GET /repos/{o}/{r}/issues?state=closed&since=`,
     excluding PRs via the `pull_request` key), plus **still-open** issues with high
     recent activity (comments/updates in window).
+  - **Workflow runs** (when `--include-workflows`): GitHub Actions runs created in
+    `[from, to]` via `GET /repos/{o}/{r}/actions/runs?created={from}..{to}` (paginated).
+    Capture `name`, `conclusion`, `status`, `event`, `head_branch`, `created_at`, `html_url`.
+    Especially valuable for IaC repos (failed deploys / lint). Aggregated into
+    per-workflow success/fail counts (see derived fields).
+  - **Releases & tags** (when `--include-releases`): releases published in `[from, to]`
+    via `GET /repos/{o}/{r}/releases` filtered on `published_at`; capture `tag_name`,
+    `name`, `published_at`, `html_url`, prerelease flag. (Tags without releases are out
+    of scope for v1.)
   - **Pagination:** follow `Link` rel="next" headers; respect `--from`/`--to` to stop early where possible.
   - **Rate limiting:** on HTTP 403 with `X-RateLimit-Remaining: 0`, sleep until
     `X-RateLimit-Reset`, then retry (bounded retries).
@@ -82,6 +93,8 @@ This keeps token cost low and report data reproducible.
   - `docsRefs` (only when `--include-docs`): changed files whose path matches
     `docs/`, `adr/`, `adrs/`, `decisions/`, or `*ADR*.md` / `*adr*.md`, plus any
     doc-like paths referenced in PR bodies (regex for `docs/...`, `*.md`).
+  - `workflow_stats` (when `--include-workflows`): map of workflow name →
+    `{ total, success, failure, cancelled, other }` counts over the window.
 - **Output:** writes `workspace/activity-{from}-{to}.json` (override with `--out`).
   Bundle schema:
   ```json
@@ -92,7 +105,11 @@ This keeps token cost low and report data reproducible.
                "merged_at", "files": [paths], "review_comments": [str], "url" } ],
     "issues": [ { "number", "title", "labels": [], "state",
                   "closed_at", "url", "open_high_activity": bool } ],
+    "workflows": [ { "name", "conclusion", "status", "event",
+                     "head_branch", "created_at", "url" } ],
+    "releases": [ { "tag_name", "name", "published_at", "prerelease": bool, "url" } ],
     "modules": { "<dir>": { "commits", "prs", "files_changed" } },
+    "workflow_stats": { "<workflow>": { "total", "success", "failure", "cancelled", "other" } },
     "docsRefs": [ { "path", "source": "changed|referenced", "pr": number|null } ]
   }
   ```
@@ -105,8 +122,8 @@ Frontmatter:
 ```yaml
 name: activity-overview
 description: Use when you need a time-boxed engineering activity report for a GitHub
-  repo — summarizing shipped features, bug fixes, infra changes, design decisions,
-  community-call highlights, and open risks over a date range.
+  repo — summarizing shipped features, releases, CI/CD health, bug fixes, infra
+  changes, design decisions, community-call highlights, and open risks over a date range.
 ```
 
 Procedure Claude follows:
@@ -140,15 +157,20 @@ Sections, in order:
    (informed by call context where relevant).
 2. **Shipped features** — grouped by area (from `modules`); each item links its PR(s)
    and related issues, summarizes the behaviour change, notes follow-ups.
-3. **Bugs & reliability** — issues/PRs labelled `bug`/reliability; fixed vs still-open;
+   - **Releases** (subsection) — versions published in the window (`releases`):
+     tag, date, link; prereleases flagged.
+3. **CI/CD overview** — per-workflow success/fail counts (`workflow_stats`) and a list
+   of notable failed runs (`workflows`), with links. Omitted when `--include-workflows`
+   is off. Especially relevant for IaC repos (failed deploys / lint).
+4. **Bugs & reliability** — issues/PRs labelled `bug`/reliability; fixed vs still-open;
    recurring themes.
-4. **Infrastructure & tooling** — CI/CD, IaC (Terraform/Bicep/ARM), PowerShell,
-   dependency changes (inferred from area + labels).
-5. **Design decisions & docs** — ADRs / design docs touched or referenced (`docsRefs`),
+5. **Infrastructure & tooling** — IaC (Terraform/Bicep/ARM), PowerShell, dependency
+   changes (inferred from area + labels).
+6. **Design decisions & docs** — ADRs / design docs touched or referenced (`docsRefs`),
    with a 1–2 sentence rationale each.
-6. **Community call highlights** — key topics, decisions, asks, and follow-ups from the
+7. **Community call highlights** — key topics, decisions, asks, and follow-ups from the
    transcript. Omitted/short-circuited when no transcript is provided.
-7. **Open risks & next steps** — from still-open high-activity issues + PR review
+8. **Open risks & next steps** — from still-open high-activity issues + PR review
    comments flagged as concerns + call follow-ups.
 
 ### 5. `projects.json` (optional per-project config)
@@ -176,11 +198,22 @@ Sections, in order:
   file is committed or kept local is the user's choice (the example is what ships in
   the portable skill).
 
-### 6. `test_fetch_activity.py` (offline tests)
+### 6. `commands/activity.md` (slash-command entrypoint)
+
+- Thin wrapper command so the skill can be triggered as
+  `/activity <owner/repo|project> <fromDate> <toDate> [options]` instead of a prose request.
+- It simply instructs Claude to invoke the `activity-overview` skill with the parsed
+  arguments — all logic stays in `SKILL.md`/`fetch_activity.py` (the command is just ergonomics).
+- **Install note:** Claude Code discovers slash commands under `.claude/commands/` (project)
+  or `~/.claude/commands/` (user). The skill ships the file at `commands/activity.md`; the
+  install step copies/symlinks it to the appropriate commands dir. Documented in `REFERENCE.md`.
+
+### 7. `test_fetch_activity.py` (offline tests)
 
 - Tests the deterministic transforms (module grouping, doc-ref detection, window
-  filtering, bundle assembly, config resolution) against a **recorded API fixture**
-  (committed JSON), so they run with no network and no token.
+  filtering, workflow stats aggregation, release filtering, bundle assembly, config
+  resolution) against a **recorded API fixture** (committed JSON), so they run with no
+  network and no token.
 - Network/HTTP layer is isolated behind a small `_get(url)` function that tests
   monkeypatch to return fixture pages.
 
@@ -192,6 +225,9 @@ Sections, in order:
   fetch_activity.py
   report-template.md
   projects.example.json
+  REFERENCE.md               # examples + install (incl. slash command) + troubleshooting
+  commands/
+    activity.md              # /activity slash-command wrapper
   test_fetch_activity.py
   fixtures/
     sample_api.json          # recorded responses for offline tests
