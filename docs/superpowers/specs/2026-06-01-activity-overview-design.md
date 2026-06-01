@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design (pre-implementation) — rev 5 (+ time-series continuity / series)
+**Status:** Approved design (pre-implementation) — rev 6 (+ people graph, issue kinds, flow/blockers, graphify core)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -44,8 +44,8 @@ online and offline halves:
 1. **Acquire** (the *only* layer that touches the network) — shallow/partial **local
    clone** of the target repo bounded to the window (commit tree + diffs, free, no rate
    limits), plus a REST/GraphQL pull of the **social layer** (issues, PRs, comments,
-   reviews, timeline links, workflow runs, releases, milestones, Projects v2), plus an
-   optional local **graphify** code-graph pass. Writes one self-describing bundle.
+   reviews, timeline links, workflow runs, releases, milestones, Projects v2), plus a
+   required local **graphify** code-graph pass. Writes one self-describing bundle.
 2. **Bundle** — a portable, inspectable, diffable on-disk artifact. Gather once; analyze
    many times without re-fetching or re-touching GitHub. The bundle is the audit record
    of exactly which facts a report was built from.
@@ -139,6 +139,59 @@ of how a decision moved through the project. A *train* is the linked unit:
 **Analyze** then narrates each train with a per-train sub-agent. The bundle reserves a
 `trains` array so every later phase can thicken the same structure.
 
+## Issue taxonomy (kind)
+
+Issues are not monolithic; a train's shape differs by what kind of issue seeded it. Each
+issue is classified into `kind` — `feature` / `module-request` / `bug` / `idea` /
+`question` / `docs` / `other` — in priority order: GitHub **native issue types** (queried via
+`list_issue_types` when the repo uses them) → **labels** (`bug`, `enhancement`, `feature`,
+`idea`, …) → **issue template** filename → title/body heuristic. `kind` is carried onto the
+train so feature/module proposals, bug-fix threads, and ideas can be counted, charted, and
+narrated separately.
+
+## People & contribution graph (first-class)
+
+Engagement is a product goal for these repos, so **people are first-class entities**, not
+just names on a PR. The intersection of *people × code areas × time* is what lets us draw
+who is contributing, reviewing, blocking, and maintaining — and feature them.
+
+- **Per-train participants:** each train records `participants: [{ login, role,
+  author_association }]` with roles **reporter / author / reviewer / merger / commenter /
+  blocker / reactor**. This is the edge list of the contribution graph.
+- **`people` aggregate (top-level):** per `login`, a profile with `internal:bool`, role
+  counts, **modules** touched/owned (joined via graphify communities + CODEOWNERS), tech
+  **areas**, `prs_authored` / `prs_reviewed`, `review_latency`, `merge_rate`,
+  `issues_reported`, `stale_owned:[#]`, and `first_seen`/`last_active`. Many dimensions, one
+  object — the substrate for every people view.
+- **Internal vs. community:** derived from GitHub `author_association`
+  (MEMBER/COLLABORATOR/CONTRIBUTOR/NONE) + org/team membership + CODEOWNERS, **supplemented
+  by a `projects.json` internal config** (handle list and/or email domains/orgs — e.g.
+  Microsoft staff on AVM repos). Config supplements the derived signal; it doesn't replace it.
+- **Halls — fame public, shame/blame internal (your call):** `halls.fame` (top shippers,
+  reviewers, maintainers, rising community contributors) is **publishable**;
+  `halls.internal.{shame,blame}` (slow reviews, stale-PR owners, regressions) is computed
+  but kept in a **private/internal section of the bundle and excluded from public renders by
+  default**, to avoid chilling the community engagement these repos exist to encourage.
+- **CODEOWNERS (`code_owners`):** parsed to map path/glob → owning logins, giving precise
+  person↔module ownership for the people graph and for "who maintains X".
+- **Provenance still applies:** every person stat resolves to source refs (the PRs/reviews/
+  comments it was counted from) — people facts are cited like any other.
+
+## Flow & stall analysis (why issues hang)
+
+Beyond *what shipped*, the bundle explains *what didn't move and why*. Over the issue
+lifecycle + cross-reference timeline, `flow` classifies each notable issue:
+
+- **hung** — high engagement, no assignee/PR, aging.
+- **upvoted-but-ignored** — high 👍 `reactions`, no movement (needs reaction counts from the API).
+- **traction-then-abandoned** — activity → silence → closed `not_planned`.
+- **blocked** — `blocked` label / "blocked by #" / depends-on references.
+
+…with `age_days`, `reactions`, `blocked_by:[#]`, and the `signals` that drove the call.
+**Common blockers / pile-ups** are surfaced as `blockers`: nodes that many trains reference
+as blocking them, **ranked by in-degree** — the structural reason work is stacking up. This
+analysis leans directly on graphify's graph (another reason it's now core).
+
 ## Continuity & time-series (publish as a series)
 
 Git is chronological, so reports are too: each run covers a **period**, and successive
@@ -174,9 +227,10 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
 
 - No dependency on third-party **skills** (`repo-analyzer`, `github-issue-analyzer`,
   `github-summary`). Useful references, but the skill is self-contained.
-- **graphify** is an *optional* tool dependency (code-area mapping). If `graphify` is not
-  on `PATH`, Acquire skips the code-graph pass and Link falls back to changed-path module
-  attribution — the rest of the pipeline is unaffected (graceful degradation).
+- **graphify** is a **required core dependency** (code-area mapping feeds the code-area,
+  people↔module, and blocker/stall dimensions). A **preflight** checks it is on `PATH` and
+  **fails fast** with install guidance if absent — no silent degradation. (`git` and
+  `GITHUB_TOKEN` are likewise required.)
 - No `gh` CLI dependency. Auth is via `GITHUB_TOKEN` only. `git` is assumed present.
 - No YouTube network access / transcript auto-fetch. The transcript is **user-provided**
   as a local file.
@@ -232,16 +286,16 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   python gather.py --owner OWNER --repo REPO \
       --from YYYY-MM-DD --to YYYY-MM-DD \
       [--branches main,develop] [--clone-dir PATH] [--no-clone] \
-      [--graphify | --no-graphify] \
-      [--include-docs] [--include-workflows] [--include-releases] \
+      [--include-docs] [--include-workflows] [--include-releases] [--include-internal] \
       [--include-projects] [--project-number N] [--project-owner-type org|user] \
       [--status-field Status] [--iteration-field Sprint] \
       [--milestone "vX.Y"] [--ref-date YYYY-MM-DD] [--out PATH]
   ```
-  (`--include-workflows`/`--include-releases` default **on**; `--graphify` auto-enables
-  when `graphify` is on `PATH`. `--include-projects` activates when a project number is
-  provided. When a project config is used, `SKILL.md` resolves these from config — see
-  component 6.)
+  (`--include-workflows`/`--include-releases` default **on**; **graphify always runs**
+  (required — preflight fails fast if absent). `--include-internal` opts the
+  shame/blame appendix into the output (off by default). `--include-projects` activates
+  when a project number is provided. When a project config is used, `SKILL.md` resolves
+  these from config — see component 6.)
 
 - **Clone + local git (the commit/diff layer, network-free after clone):**
   - `git clone --filter=blob:none --shallow-since=<from> --no-single-branch <repo> <clone-dir>`
@@ -251,24 +305,32 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     needs them). Captures `sha`, `message`, `author`, `date`, `files`, `parents`, and
     `pr` (resolved from merge structure / trailers in Link).
 
-- **graphify code graph (optional, local, zero-token):**
-  - When enabled, run `graphify update <clone-dir>` (tree-sitter AST, no API/tokens) →
-    reads `graphify-out/graph.json`. Captures **communities** (≈ logical modules),
-    node→file mapping, and edges. Stored under `code_graph` in the bundle and used by Link
-    to attribute trains/commits to code areas. Absent graphify → this is omitted.
+- **graphify code graph (required, local, zero-token):**
+  - **Preflight:** assert `graphify` is on `PATH`; **fail fast** with install guidance if
+    not (it's a core dependency now, feeding code-area + people↔module + blocker/stall
+    dimensions). Run `graphify update <clone-dir>` (tree-sitter AST, no API/tokens) → reads
+    `graphify-out/graph.json`. Captures **communities** (≈ logical modules), node→file
+    mapping, and edges. Stored under `code_graph` and used by Link to attribute trains/
+    commits/people to code areas and to compute the blocker graph.
 
 - **REST fetches / windowing (the social layer):**
   - **PRs:** closed PRs touched in range via
     `GET /repos/{o}/{r}/pulls?state=closed&sort=updated&direction=desc` (paginated). Split
     into **merged in window** (`merged_at` in range) and **closed-without-merge in window**
     (`closed_at` in range, `merged_at` null). Plus **open** PRs for in-flight/next. For
-    each: title, number, body, labels, reviewers, milestone, merged flag,
-    merged_at/closed_at, **closing-issue refs**, review-comment bodies
-    (`.../pulls/{n}/comments`). **Diffs/changed-files come from the local clone, not the
-    API.**
+    each: title, number, body, **author + `author_association`**, labels, reviewers,
+    milestone, merged flag, **merged_by**, merged_at/closed_at, **closing-issue refs**,
+    review comments with author + `author_association` (`.../pulls/{n}/comments`).
+    **Diffs/changed-files come from the local clone, not the API.**
   - **Issues:** closed in window (`state=closed&since=`, excluding PRs via `pull_request`
     key) with `state_reason` (`completed`|`not_planned`); plus **open** issues. Capture
-    milestone, labels, body, issue comments.
+    milestone, labels, body, author + `author_association`, assignees, comments (with
+    author + `author_association`), and **reaction counts** (`reactions` summary, for the
+    upvoted-but-ignored signal). **Issue `kind`:** GitHub **issue types**
+    (`GET /repos/{o}/{r}/issues/{n}` type, or repo issue-types list) → labels → template →
+    heuristic.
+  - **CODEOWNERS:** read from the clone (`.github/`/root/`docs/` CODEOWNERS) → `code_owners`
+    map (path/glob → owning logins) for person↔module ownership. Network-free (local file).
   - **Timeline events** (for trains): `GET /repos/{o}/{r}/issues/{n}/timeline` for
     cross-references, `connected`/`cross-referenced`/`closed`-by-commit events linking
     issues ↔ PRs ↔ commits.
@@ -297,11 +359,14 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "meta": { "owner","repo","from","to","branches","ref_date","clone_dir","generated_at",
               "period":{ "from","to" },"prev_bundle":{ "period":{},"path","url" }|null },
     "commits": [ { "sha","message","author","date","files":[paths],"parents":[],"pr":num|null } ],
-    "prs": [ { "number","title","body","labels":[],"reviewers":[],"milestone",
-               "merged":bool,"merged_at","closed_at","files":[paths],"closes":[issue#],
-               "review_comments":[{ "author","body","url","id" }],"url" } ],
-    "issues": [ { "number","title","body","labels":[],"state","state_reason","milestone",
-                  "closed_at","comments":[{ "author","body","url","id" }],"url",
+    "prs": [ { "number","title","body","author","author_association","reviewers":[],
+               "labels":[],"milestone","merged":bool,"merged_by","merged_at","closed_at",
+               "files":[paths],"closes":[issue#],
+               "review_comments":[{ "author","author_association","body","url","id" }],"url" } ],
+    "issues": [ { "number","title","body","kind","author","author_association","assignees":[],
+                  "labels":[],"state","state_reason","milestone","closed_at",
+                  "reactions":{ "+1","-1","heart","hooray","total" },
+                  "comments":[{ "author","author_association","body","url","id" }],"url",
                   "open_high_activity":bool } ],
     "timeline": [ { "issue":num,"event","source":{ "type","number","sha" } } ],
     "workflows": [ { "name","conclusion","status","event","head_branch","created_at","url" } ],
@@ -309,15 +374,16 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "milestones": [ { "title","number","state","due_on","open_issues","closed_issues","url" } ],
     "project": { "number","title","iterations":[{ "title","start","end" }],
                  "items":[{ "type","number","title","state","merged","status","iteration","url" }] },
-    "code_graph": { "source":"graphify|null","communities":[{ "id","label","files":[] }],
+    "code_graph": { "source":"graphify","communities":[{ "id","label","files":[] }],
                     "nodes":[...],"edges":[...] },
     "modules": { "<dir>": { "commits","prs","files_changed" } },
     "workflow_stats": { "<workflow>": { "total","success","failure","cancelled","other" } },
     "docsRefs": [ { "path","source":"changed|referenced","pr":num|null } ],
     "release_train": { "previous":{}|null,"current":{}|null,"next":{}|null },
     "sprints": { "previous":{}|null,"current":{}|null,"next":{}|null,"all":[] },
-    "trains": [ { "id","root_issue":num|null,"prs":[num],"commits":[sha],
+    "trains": [ { "id","kind","root_issue":num|null,"prs":[num],"commits":[sha],
                   "spun_off":[issue#],"duplicate_of":issue#|null,"code_areas":[community],
+                  "participants":[{ "login","role","author_association" }],
                   "outcome":"shipped|rejected|abandoned|deferred",
                   "first_seen":period,"last_activity","carried_over":bool,"prior_status",
                   "evidence":[{ "type","id","url" }] } ],
@@ -326,8 +392,22 @@ transcript (Analyze input) nor the report prose (Synthesize output).
                           "name","before","after","hunk","detail",
                           "train":id,"pr":num,"commit":sha,"url" } ],
     "buckets": { "shipped":[ref],"in_flight":[ref],"rejected":[ref],"next_candidates":[ref] },
+    "code_owners": { "<path|glob>":[login] },
+    "people": { "<login>": { "internal":bool,"author_association","roles":{ "<role>":count },
+                  "modules":[community],"areas":[],"prs_authored","prs_reviewed",
+                  "review_latency","merge_rate","issues_reported","stale_owned":[issue#],
+                  "first_seen","last_active","evidence":[ref] } },
+    "halls": { "fame":{ "top_shippers":[login],"top_reviewers":[login],"maintainers":[login],
+                        "rising_community":[login] },
+               "internal":{ "shame":[{ "login","metric","value","evidence":[ref] }],
+                            "blame":[{ "login","metric","value","evidence":[ref] }] } },
+    "flow": { "<issue#>": { "state":"hung|upvoted-but-ignored|traction-then-abandoned|blocked|healthy",
+                  "age_days","reactions","blocked_by":[issue#],"signals":[],"evidence":[ref] } },
+    "blockers": [ { "ref","kind","blocks":[issue#],"in_degree" } ],
     "diagrams": { "timeline_gantt":"<mermaid>","buckets_pie":"<mermaid>",
-                  "deltas_bar":"<mermaid>","train_flowcharts":{ "<id>":"<mermaid>" } }
+                  "deltas_bar":"<mermaid>","train_flowcharts":{ "<id>":"<mermaid>" },
+                  "contributor_graph":"<mermaid>","blocker_graph":"<mermaid>",
+                  "kind_breakdown":"<mermaid>" }
   }
   ```
   (`code_graph`, `timeline`, `trains`, `feature_deltas`, and `diagrams` may be thin/empty
@@ -348,20 +428,34 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   `output`, Terraform `variable`/`resource`/`output` — else a generic added/removed-symbol
   heuristic from the diff. Reserved Phase 1, populated from Phase 3.)
 
+- **People graph (`people`/`halls`, computed in Link):** from train `participants` +
+  `author_association` + `code_owners` + the `projects.json` internal config, Link builds
+  per-login profiles (roles, modules, areas, review latency, merge rate, stale-owned) and
+  ranks the **halls**. `halls.fame` is publishable; `halls.internal.{shame,blame}` is
+  computed but flagged **internal-only** and excluded from public renders by default.
+
+- **Flow & blockers (`flow`/`blockers`, computed in Link):** per-issue lifecycle state
+  (hung / upvoted-but-ignored / traction-then-abandoned / blocked / healthy) from age +
+  reactions + assignee/PR linkage + `blocked by #` refs; and a `blockers` list ranking
+  nodes by how many trains they block (in-degree over the cross-reference graph).
+
 - **Diagrams (`diagrams`, generated deterministically in Link):** Mermaid blocks built
   *from the data*, not hand-drawn by the model, so visuals are reproducible facts:
   `timeline_gantt` (releases/sprints over the window), `buckets_pie` (shipped/in-flight/
-  rejected/next counts), `deltas_bar` (add/drop/change per area), and one `flowchart` per
-  notable train (issue → PR(s) → commits → outcome). `SKILL.md`/template embed them verbatim.
+  rejected/next counts), `deltas_bar` (add/drop/change per area), one `flowchart` per
+  notable train (issue → PR(s) → commits → outcome), `contributor_graph` (people↔module/
+  train edges), `blocker_graph` (pile-ups by in-degree), and `kind_breakdown` (feature/bug/
+  idea mix). `SKILL.md`/template embed them verbatim. (Public renders omit shame/blame.)
 
-### 2. `link.py` (offline, deterministic — train graph + buckets)
+### 2. `link.py` (offline, deterministic — train graph + buckets + people + flow)
 
 Reads the bundle, writes it back enriched. No network. Builds `trains` from
-closing-refs + commit trailers + timeline cross-references + merge structure; attributes
-each train to `code_areas` (graphify communities, else `modules`); computes
-`feature_deltas` (add/drop/change per area from train diffs), `buckets`, `release_train`,
-and `sprints`; and emits the deterministic `diagrams` (Mermaid timeline/pie/bar/train
-flowcharts) from that data. Pure transforms over recorded data → fully unit-testable.
+closing-refs + commit trailers + timeline cross-references + merge structure; classifies
+issue/train `kind`; attributes each train to `code_areas` (graphify communities) and to
+`participants`; computes `feature_deltas`, `buckets`, `release_train`, `sprints`, the
+`people`/`halls` graph (internal-vs-community via `author_association` + `code_owners` +
+config), and `flow`/`blockers`; and emits the deterministic `diagrams` from that data. Pure
+transforms over recorded data → fully unit-testable.
 
 ### 3. `SKILL.md` (procedure + analysis instructions)
 
@@ -378,13 +472,15 @@ Procedure Claude follows:
 1. Resolve the target: `--project <name>` from `projects.json`, or explicit
    `owner`/`repo`/options from the request (incl. project-board settings if any).
 2. Resolve `from`/`to`, `ref-date`, milestone, clone dir, and optional transcript path.
-3. Verify `GITHUB_TOKEN`/`GH_TOKEN` is set (needs `read:project` for boards); if not, ask.
+3. **Preflight:** verify `GITHUB_TOKEN`/`GH_TOKEN` is set (needs `read:project` for boards)
+   **and `graphify` + `git` are on `PATH`** — fail fast with guidance if any is missing.
 3a. **Load prior installment:** read `series.json` + the `prev_bundle` it names (if any), so
     Link/Analyze can compute carry-over and the forecast loop. Absent → treat as series start.
-4. **Acquire:** run `gather.py` (clone + API + optional graphify) → bundle.
+4. **Acquire:** run `gather.py` (clone + API + graphify + CODEOWNERS) → bundle.
 5. **Link:** run `link.py` → bundle enriched with trains (with **stable, anchor-derived ids**
-   + cross-period `first_seen`/`carried_over`/`prior_status`) + buckets + release_train +
-   sprints; sets `meta.period`/`meta.prev_bundle`.
+   + cross-period `first_seen`/`carried_over`/`prior_status`), issue/train `kind`, buckets,
+   release_train, sprints, the `people`/`halls` graph, and `flow`/`blockers`; sets
+   `meta.period`/`meta.prev_bundle`.
 6. **Analyze:** for each significant train, **dispatch a parallel sub-agent** (see
    `superpowers:dispatching-parallel-agents`) that reads the train's thread + local diffs
    and returns a structured decision narrative **with an `evidence: [ref]` list — citing,
@@ -444,10 +540,20 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
 10. **Design decisions & docs** — ADRs/design docs touched or referenced (`docsRefs`) +
     decisions surfaced from commit diffs along trains, 1–2 sentence rationale each.
 11. **Community call highlights** — topics, decisions, asks, follow-ups (when transcript).
+11a. **Contributors & community** — the people view: internal-vs-community split, top
+    shippers/reviewers/maintainers and **rising community contributors** (`halls.fame`),
+    who owns/maintains which modules (`code_owners` + `people.modules`), and the
+    `contributor_graph`. Recognition-focused; **public**.
+11b. **Stalled, blocked & pile-ups** — `flow` pathologies (hung, upvoted-but-ignored,
+    traction-then-abandoned, blocked) and the ranked **common blockers** holding up the most
+    trains (`blockers` + `blocker_graph`), with the "why" where evident.
 12. **Next-release forecast** — over `buckets.next_candidates`: what's likely to land next,
     confidence, slippage risks. The model's judgment over script-selected candidates.
 13. **Open risks & next steps** — still-open high-activity issues + flagged PR review
     comments + call follow-ups + at-risk in-flight items.
+- **Internal appendix (not in public renders):** `halls.internal.{shame,blame}` — slow
+  reviews, stale-PR ownership, regression attribution. Gated behind an explicit
+  `--include-internal` flag; **never emitted into the public-facing digest by default.**
 
 ### 5b. `BUNDLE.md` (schema doc for downstream renderers)
 
@@ -455,7 +561,9 @@ A human-readable reference for the bundle: every field, the **ref convention**
 (`{ type, id|number|sha, url }`), where evidence lives inline vs. in the clone, and which
 fields back which narrative claims. This is the contract the user's other renderers (L400
 blog, video script, carousels) code against, so it ships with the skill and is kept in
-sync with `link.py` output. Includes a "how to fact-check a claim" walkthrough.
+sync with `link.py` output. Includes a "how to fact-check a claim" walkthrough and **marks
+which fields are internal-only** (`halls.internal.{shame,blame}`) so renderers never leak
+them into public output.
 
 ### 5c. `series.json` (running series index — generated state)
 
@@ -476,9 +584,9 @@ index is the cheap through-line, never an override.
       "<short-name>": {
         "owner": "string", "repo": "string", "branches": ["main"],
         "clone_dir": "workspace/<name>-clone",
-        "graphify": true,
         "include_docs": true, "include_workflows": true, "include_releases": true,
         "transcript": "workspace/<name>-call-{period}.txt",
+        "internal": { "domains": ["microsoft.com"], "orgs": ["Azure"], "logins": [] },
         "project_v2": { "owner_type": "org", "number": 0,
                         "status_field": "Status", "iteration_field": "Sprint" }
       }
@@ -486,7 +594,10 @@ index is the cheap through-line, never an override.
   }
   ```
   (`project_v2` optional — omit for projects without a board; the digest then relies on
-  milestones + dates only.)
+  milestones + dates only. `graphify` is no longer a per-project toggle — it's always
+  required. `internal` **supplements** the derived author_association/CODEOWNERS/team
+  signal for classifying maintainers/staff — e.g. Microsoft folks on AVM repos — it does
+  not replace it.)
 - **Resolution order:** `--config PATH` → `./projects.json` (cwd) → skill-dir
   `projects.json`. If none found or `--project` not given, fall back to explicit args.
 - **Distribution:** ships `projects.example.json` (placeholders). User fills a real
@@ -538,9 +649,10 @@ index is the cheap through-line, never an override.
     graph_sample.json        # recorded graphify graph.json
 ```
 
-Self-contained for the core (stdlib + `git`); graphify is an optional enricher. Copying
-the folder into `~/.claude/skills/` makes the skill usable in any repo, with no setup
-beyond `GITHUB_TOKEN` (incl. `read:project`) and optionally a `projects.json` + transcript.
+Self-contained for the core (Python stdlib + `git`); **`graphify` is a required external
+binary** (preflight fails fast if absent). Copying the folder into `~/.claude/skills/` makes
+the skill usable in any repo, with setup being `git` + `graphify` on `PATH`, `GITHUB_TOKEN`
+(incl. `read:project`), and optionally a `projects.json` + transcript.
 
 ## Implementation phasing — **vertical slices**
 
