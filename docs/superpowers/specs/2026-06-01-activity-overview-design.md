@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design (pre-implementation) — rev 2 (clone + trains + vertical slices)
+**Status:** Approved design (pre-implementation) — rev 3 (+ Mermaid visuals + feature-delta ledger)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -119,8 +119,11 @@ of how a decision moved through the project. A *train* is the linked unit:
 - No multi-repo aggregation in v1 (single target repo per run; one optional linked
   Projects v2 board). **Terraform multi-repo aggregation is deferred to Phase 6.**
 - No write actions to GitHub. Read-only.
-- No HTML/PDF output, and no automated scheduling/delivery (cron, Slack) in v1 —
-  invocation is manual / on-demand. (Noted as a future add.)
+- The report is **Markdown with embedded Mermaid** diagrams (timelines, decision-train
+  flowcharts, bucket charts) — renders on GitHub and most viewers, no new deps,
+  text-diffable. graphify's interactive `graph.html` is **linked**, not embedded. No
+  **standalone HTML/PDF** report and no automated scheduling/delivery (cron, Slack) in
+  v1 — invocation is manual / on-demand. (Noted as future adds.)
 
 ## Sprint & release modeling
 
@@ -250,18 +253,43 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "trains": [ { "id","root_issue":num|null,"prs":[num],"commits":[sha],
                   "spun_off":[issue#],"duplicate_of":issue#|null,"code_areas":[community],
                   "outcome":"shipped|rejected|abandoned|deferred" } ],
-    "buckets": { "shipped":[ref],"in_flight":[ref],"rejected":[ref],"next_candidates":[ref] }
+    "feature_deltas": [ { "area":community,"kind":"add|drop|change",
+                          "subject":"param|resource|module|output|target-scope|...",
+                          "name","detail","train":id,"pr":num,"commit":sha,"url" } ],
+    "buckets": { "shipped":[ref],"in_flight":[ref],"rejected":[ref],"next_candidates":[ref] },
+    "diagrams": { "timeline_gantt":"<mermaid>","buckets_pie":"<mermaid>",
+                  "deltas_bar":"<mermaid>","train_flowcharts":{ "<id>":"<mermaid>" } }
   }
   ```
-  (`code_graph`, `timeline`, and `trains` may be thin/empty in early vertical slices and
-  thicken per phase — the schema reserves their place from Phase 1.)
+  (`code_graph`, `timeline`, `trains`, `feature_deltas`, and `diagrams` may be thin/empty
+  in early vertical slices and thicken per phase — the schema reserves their place from
+  Phase 1.)
+
+- **Feature delta ledger (`feature_deltas`, computed in Link):** the deterministic
+  add/drop/change record per code area, derived from the local diffs along each train:
+  - **add** — a new parameter/resource/module/output appears in a diff (with the train/PR
+    that introduced it).
+  - **drop** — a parameter/resource removed or deprecated, *or* a PR closed-without-merge
+    (a rejected feature) / an issue closed `not_planned`.
+  - **change** — a parameter's default/type/allowed-values changed across a train's commits.
+  (Subject extraction is language-aware where cheap — e.g. Bicep/ARM `param`/`resource`/
+  `output`, Terraform `variable`/`resource`/`output` — else a generic added/removed-symbol
+  heuristic from the diff. Reserved Phase 1, populated from Phase 3.)
+
+- **Diagrams (`diagrams`, generated deterministically in Link):** Mermaid blocks built
+  *from the data*, not hand-drawn by the model, so visuals are reproducible facts:
+  `timeline_gantt` (releases/sprints over the window), `buckets_pie` (shipped/in-flight/
+  rejected/next counts), `deltas_bar` (add/drop/change per area), and one `flowchart` per
+  notable train (issue → PR(s) → commits → outcome). `SKILL.md`/template embed them verbatim.
 
 ### 2. `link.py` (offline, deterministic — train graph + buckets)
 
 Reads the bundle, writes it back enriched. No network. Builds `trains` from
 closing-refs + commit trailers + timeline cross-references + merge structure; attributes
-each train to `code_areas` (graphify communities, else `modules`); computes `buckets`,
-`release_train`, and `sprints`. Pure transforms over recorded data → fully unit-testable.
+each train to `code_areas` (graphify communities, else `modules`); computes
+`feature_deltas` (add/drop/change per area from train diffs), `buckets`, `release_train`,
+and `sprints`; and emits the deterministic `diagrams` (Mermaid timeline/pie/bar/train
+flowcharts) from that data. Pure transforms over recorded data → fully unit-testable.
 
 ### 3. `SKILL.md` (procedure + analysis instructions)
 
@@ -302,17 +330,21 @@ Procedure Claude follows:
 
 Sections, in order (sections gated on data are omitted gracefully when absent):
 1. **Executive summary** — sprint goals vs. outcomes; 3–5 bullets (features, releases, CI
-   health, key risks), informed by call + board context.
+   health, key risks), informed by call + board context. Embeds `diagrams.buckets_pie`
+   (at-a-glance shipped/in-flight/rejected/next).
 2. **Release train context** — previous / current / next milestone (+ current sprint
-   iteration window): dates, completion %, theme.
+   iteration window): dates, completion %, theme. Embeds `diagrams.timeline_gantt`.
 3. **Shipped this period** — merged PRs + completed issues grouped by **code area**
    (graphify community / `modules`); each links its **train** (root issue → PR(s) →
-   commits), summarizes the change, notes follow-ups.
+   commits), summarizes the change, notes follow-ups. Links graphify's `graph.html`.
    - **Releases** (subsection) — versions published in window (tag, date, link;
      prereleases flagged).
 4. **Decision trains** — the notable threads: how an idea moved from issue → PR →
    commits, where direction changed, what was rejected or spun off, and the outcome.
-   (Authored from the per-train sub-agent analyses.)
+   (Authored from the per-train sub-agent analyses.) Each notable train embeds its
+   `diagrams.train_flowcharts[id]`.
+4a. **Feature changes (add / drop / change)** — the `feature_deltas` ledger as a table per
+   code area (subject, name, kind, the train/PR/commit), with `diagrams.deltas_bar`.
 5. **In flight** — open items in current sprint/milestone (`buckets.in_flight`) with board
    status; flag items at risk of slipping.
 6. **Rejected / abandoned** — PRs closed without merge + issues closed `not_planned`
@@ -374,7 +406,9 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
   from `git log` fixtures, code_graph ingestion, workflow-stats, release filtering.
 - `test_link.py` — train construction (closing-refs + trailers + timeline + merges),
   duplicate/spin-off detection, code-area attribution, bucket assignment,
-  release-train/sprint resolution. Runs with no network/token.
+  release-train/sprint resolution, `feature_deltas` extraction (add/drop/change, incl.
+  Bicep/Terraform subjects), and `diagrams` generation (Mermaid blocks are deterministic
+  given fixtures). Runs with no network/token.
 
 ## Layout (committed, portable)
 
@@ -413,16 +447,20 @@ against GitHub) after each.
   issues + commit shas). *Link:* PR→commits (merge) + PR→issue (closing refs) → basic
   trains; coarse `shipped` bucket. *Report:* a real digest — "N PRs across M trains,
   bucketed as…, notable trains" — verifiable line-by-line against GitHub.
-- **Phase 2 — social layer + full buckets.**
+- **Phase 2 — social layer + full buckets + first visuals.**
   *Acquire:* + comments, reviews, timeline events, workflow runs, releases, milestones.
-  *Link:* full cross-references, `in_flight` / `rejected` / `next_candidates`. *Report:*
-  + CI/CD, releases, rejected/abandoned, in-flight sections.
-- **Phase 3 — code areas (graphify).**
-  *Acquire:* graphify code-graph pass. *Link:* attribute trains/commits to communities.
-  *Report:* shipped grouped by code area; infrastructure & tooling; decision-docs from diffs.
-- **Phase 4 — sub-agent train narratives + forecast.**
-  *Analyze:* parallel sub-agent per train → decision narratives. *Report:* deepened
-  "Decision trains" section + next-release forecast.
+  *Link:* full cross-references, `in_flight` / `rejected` / `next_candidates`; emit
+  `diagrams.buckets_pie` + `diagrams.timeline_gantt`. *Report:* + CI/CD, releases,
+  rejected/abandoned, in-flight sections with embedded bucket pie + timeline.
+- **Phase 3 — code areas (graphify) + feature deltas.**
+  *Acquire:* graphify code-graph pass. *Link:* attribute trains/commits to communities;
+  compute `feature_deltas` + `diagrams.deltas_bar`. *Report:* shipped grouped by code
+  area; **Feature changes (add/drop/change)** ledger; infrastructure & tooling;
+  decision-docs from diffs; graphify `graph.html` link.
+- **Phase 4 — sub-agent train narratives + train graphs + forecast.**
+  *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
+  `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded
+  flowcharts + next-release forecast.
 - **Phase 5 — Projects v2 + sprint framing.**
   *Acquire:* GraphQL board. *Link:* iteration/status resolution. *Report:* previous/current/
   next sprint + release-train framing, board status on in-flight.
