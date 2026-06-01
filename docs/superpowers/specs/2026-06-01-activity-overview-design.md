@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design (pre-implementation) — rev 3 (+ Mermaid visuals + feature-delta ledger)
+**Status:** Approved design (pre-implementation) — rev 4 (bundle-as-product + provenance)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -65,6 +65,39 @@ deterministically in Link.
 
 This keeps token cost bounded (diffs are local; sub-agents are scoped to one train each)
 and report data reproducible.
+
+## The bundle is the product (fact base for many outputs)
+
+The deliverable is the **provenance-rich bundle**, not just the digest. The user renders
+multiple downstream formats from the same fact base — a detailed **L400 long-form blog
+post**, a **video transcript / script**, and **social carousels** — so the bundle is the
+single source of truth those all draw on. v1 ships **the bundle + one renderer (the
+Markdown digest)** plus a documented schema (`BUNDLE.md`); the other renderers are the
+user's to build on top. This shapes two hard requirements below.
+
+## Fact discipline & provenance (hard requirement)
+
+Because downstream content **amplifies** errors (an L400 deep-dive that misstates a
+parameter change is worse than a wrong line in an internal note), the fact base is held to
+a citation standard:
+
+- **Every fact carries a source ref** — a `{ type, id/number/sha, url }` pointing at the
+  exact PR, issue, commit, comment, review, run, or release it came from. Refs are the
+  spine of the bundle; nothing narrative-bearing is unsourced.
+- **No unsourced claim.** The Analyze sub-agents and the lead **cite, they do not
+  paraphrase from memory.** Each per-train narrative returns an `evidence: [ref]` list, and
+  every statement in any rendered output must resolve to a bundle ref. (Enforced by
+  `superpowers:verification-before-completion` discipline before any output is published.)
+- **Hybrid evidence persistence** (chosen): the bundle persists, *inline*, the evidence
+  behind every claim that backs a narrative — the **actual diff hunk** for each feature
+  delta, the **quoted comment/review text** (with author + url) used as rationale, and a
+  source ref on every fact. **Bulk raw diffs stay in the referenced clone** (`clone_dir`),
+  not copied into the bundle. Net: the bundle alone is fact-checkable for everything that
+  drives a narrative, without re-cloning or re-hitting the API, while staying lean on a
+  repo the size of AVM-Bicep.
+- **Depth for L400.** Evidence is kept at the granularity a deep technical write-up needs:
+  precise param/resource/output names, before→after values, and the commit/PR/comment that
+  changed them — not just "module X changed".
 
 ## Why a local clone (the scale unlock)
 
@@ -233,10 +266,11 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "meta": { "owner","repo","from","to","branches","ref_date","clone_dir","generated_at" },
     "commits": [ { "sha","message","author","date","files":[paths],"parents":[],"pr":num|null } ],
     "prs": [ { "number","title","body","labels":[],"reviewers":[],"milestone",
-               "merged":bool,"merged_at","closed_at","files":[paths],
-               "closes":[issue#],"review_comments":[str],"url" } ],
-    "issues": [ { "number","title","body","labels":[],"state","state_reason",
-                  "milestone","closed_at","comments":[str],"url","open_high_activity":bool } ],
+               "merged":bool,"merged_at","closed_at","files":[paths],"closes":[issue#],
+               "review_comments":[{ "author","body","url","id" }],"url" } ],
+    "issues": [ { "number","title","body","labels":[],"state","state_reason","milestone",
+                  "closed_at","comments":[{ "author","body","url","id" }],"url",
+                  "open_high_activity":bool } ],
     "timeline": [ { "issue":num,"event","source":{ "type","number","sha" } } ],
     "workflows": [ { "name","conclusion","status","event","head_branch","created_at","url" } ],
     "releases": [ { "tag_name","name","published_at","prerelease":bool,"url" } ],
@@ -252,10 +286,12 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "sprints": { "previous":{}|null,"current":{}|null,"next":{}|null,"all":[] },
     "trains": [ { "id","root_issue":num|null,"prs":[num],"commits":[sha],
                   "spun_off":[issue#],"duplicate_of":issue#|null,"code_areas":[community],
-                  "outcome":"shipped|rejected|abandoned|deferred" } ],
+                  "outcome":"shipped|rejected|abandoned|deferred",
+                  "evidence":[{ "type","id","url" }] } ],
     "feature_deltas": [ { "area":community,"kind":"add|drop|change",
                           "subject":"param|resource|module|output|target-scope|...",
-                          "name","detail","train":id,"pr":num,"commit":sha,"url" } ],
+                          "name","before","after","hunk","detail",
+                          "train":id,"pr":num,"commit":sha,"url" } ],
     "buckets": { "shipped":[ref],"in_flight":[ref],"rejected":[ref],"next_candidates":[ref] },
     "diagrams": { "timeline_gantt":"<mermaid>","buckets_pie":"<mermaid>",
                   "deltas_bar":"<mermaid>","train_flowcharts":{ "<id>":"<mermaid>" } }
@@ -264,6 +300,9 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   (`code_graph`, `timeline`, `trains`, `feature_deltas`, and `diagrams` may be thin/empty
   in early vertical slices and thicken per phase — the schema reserves their place from
   Phase 1.)
+  - **Ref convention:** every `url` field and every `evidence`/source entry is a
+    `{ type, id|number|sha, url }` so any fact in any downstream renderer can be traced to
+    its origin. The schema is documented for renderer authors in `BUNDLE.md`.
 
 - **Feature delta ledger (`feature_deltas`, computed in Link):** the deterministic
   add/drop/change record per code area, derived from the local diffs along each train:
@@ -311,11 +350,16 @@ Procedure Claude follows:
 5. **Link:** run `link.py` → bundle enriched with trains + buckets + release_train + sprints.
 6. **Analyze:** for each significant train, **dispatch a parallel sub-agent** (see
    `superpowers:dispatching-parallel-agents`) that reads the train's thread + local diffs
-   and returns a structured decision narrative. (Early phases: a single inline pass.)
+   and returns a structured decision narrative **with an `evidence: [ref]` list — citing,
+   not paraphrasing from memory** (every claim resolves to a bundle ref). (Early phases: a
+   single inline pass.)
 7. If a transcript is present, read it and extract community-call highlights; else skip.
 8. **Synthesize:** write `workspace/activity-report-{from}-{to}.md` per `report-template.md`,
    weaving per-train narratives + call context + a **forecast** over `buckets.next_candidates`.
-9. Report the output path to the user.
+   Every claim must carry/resolve to a bundle ref; **verify provenance before reporting
+   done** (`superpowers:verification-before-completion`).
+9. Report the output paths to the user — both the **bundle** (the reusable fact base) and
+   the digest — since downstream renderers consume the bundle.
 
 ### 4. Community-call transcript handling
 
@@ -361,6 +405,14 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
     confidence, slippage risks. The model's judgment over script-selected candidates.
 13. **Open risks & next steps** — still-open high-activity issues + flagged PR review
     comments + call follow-ups + at-risk in-flight items.
+
+### 5b. `BUNDLE.md` (schema doc for downstream renderers)
+
+A human-readable reference for the bundle: every field, the **ref convention**
+(`{ type, id|number|sha, url }`), where evidence lives inline vs. in the clone, and which
+fields back which narrative claims. This is the contract the user's other renderers (L400
+blog, video script, carousels) code against, so it ships with the skill and is kept in
+sync with `link.py` output. Includes a "how to fact-check a claim" walkthrough.
 
 ### 6. `projects.json` (optional per-project config)
 
@@ -408,7 +460,9 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
   duplicate/spin-off detection, code-area attribution, bucket assignment,
   release-train/sprint resolution, `feature_deltas` extraction (add/drop/change, incl.
   Bicep/Terraform subjects), and `diagrams` generation (Mermaid blocks are deterministic
-  given fixtures). Runs with no network/token.
+  given fixtures). Includes a **provenance lint**: asserts every narrative-bearing fact
+  (train, feature delta, quoted comment) carries a well-formed source ref. Runs with no
+  network/token.
 
 ## Layout (committed, portable)
 
@@ -419,6 +473,7 @@ Sections, in order (sections gated on data are omitted gracefully when absent):
   link.py                    # offline: train graph + buckets
   report-template.md
   projects.example.json
+  BUNDLE.md                  # bundle schema + ref convention, for downstream renderer authors
   REFERENCE.md               # examples + install (incl. slash command) + troubleshooting
   commands/
     activity.md              # /activity slash-command wrapper
