@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,28 @@ FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 def _bundle():
     with open(os.path.join(FIX, "bundle_p2.json")) as fh:
         return json.load(fh)
+
+
+def _mmdc_works():
+    """True only if a real `mmdc` can compile a trivial diagram — guards the
+    live-validation test so a missing OR non-functional mmdc (e.g. Puppeteer
+    Chrome absent) skips rather than fails."""
+    if not shutil.which("mmdc"):
+        return False
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "probe.mmd")
+            out = os.path.join(d, "probe.svg")
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write('pie\n    "A" : 1\n')
+            result = subprocess.run([shutil.which("mmdc"), "-i", src, "-o", out, "-q"],
+                                    capture_output=True, text=True)
+            return result.returncode == 0
+    except Exception:
+        return False
+
+
+_MMDC_OK = _mmdc_works()
 
 
 class TestBucketsPie(unittest.TestCase):
@@ -120,7 +143,7 @@ class TestMmdcValidation(unittest.TestCase):
                                       which=lambda _n: "/usr/bin/mmdc")
         self.assertIn("Parse error", str(ctx.exception))
 
-    @unittest.skipUnless(shutil.which("mmdc"), "mmdc not installed")
+    @unittest.skipUnless(_MMDC_OK, "working mmdc (with browser) not available")
     def test_real_mmdc_compiles_emitted_diagrams(self):
         with tempfile.TemporaryDirectory() as d:
             manifest = render.write_diagrams(_bundle(), d)
