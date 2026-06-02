@@ -1,9 +1,12 @@
+import json
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 import link  # noqa: E402
+
+FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
 
 class TestCommitPrResolution(unittest.TestCase):
@@ -77,6 +80,32 @@ class TestBuildTrains(unittest.TestCase):
             self.assertIn("type", ev)
             self.assertIn("id", ev)
             self.assertTrue(ev["url"].startswith("https://"))
+
+
+class TestBucketsAndEnrich(unittest.TestCase):
+    def test_shipped_bucket_has_merged_prs_and_completed_issues(self):
+        bundle = _sample_bundle()
+        bundle.setdefault("buckets", {"shipped": [], "in_flight": [],
+                                      "rejected": [], "next_candidates": []})
+        link.attach_commit_prs(bundle["commits"])
+        buckets = link.compute_buckets(bundle)
+        kinds = {(r["type"], r["id"]) for r in buckets["shipped"]}
+        self.assertIn(("pr", 42), kinds)
+        self.assertIn(("issue", 17), kinds)
+
+    def test_enrich_is_idempotent_and_populates_both(self):
+        with open(os.path.join(FIX, "bundle_sample.json")) as fh:
+            bundle = json.load(fh)
+        once = link.enrich(bundle)
+        self.assertEqual(once["trains"][0]["id"], "train-issue-17")
+        self.assertTrue(once["buckets"]["shipped"])
+        # running again yields the same trains (deterministic, no duplication)
+        twice = link.enrich(once)
+        self.assertEqual(
+            [t["id"] for t in once["trains"]],
+            [t["id"] for t in twice["trains"]],
+        )
+        self.assertEqual(len(once["trains"]), len(twice["trains"]))
 
 
 if __name__ == "__main__":

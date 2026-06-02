@@ -73,3 +73,45 @@ def build_trains(bundle):
             "evidence": evidence,
         })
     return sorted(trains, key=lambda t: t["id"])
+
+
+def compute_buckets(bundle):
+    """Coarse Phase-1 buckets: shipped = merged PRs + completed issues."""
+    shipped = []
+    for pr in bundle["prs"]:
+        if pr.get("merged"):
+            shipped.append(ref("pr", pr["number"], pr["url"]))
+    for issue in bundle["issues"]:
+        if issue.get("state") == "closed" and issue.get("state_reason") == "completed":
+            shipped.append(ref("issue", issue["number"], issue["url"]))
+    return {"shipped": shipped, "in_flight": [], "rejected": [], "next_candidates": []}
+
+
+def enrich(bundle):
+    """Deterministically enrich a bundle in place: commit->PR, trains, buckets."""
+    attach_commit_prs(bundle["commits"])
+    bundle["trains"] = build_trains(bundle)
+    bundle["buckets"] = compute_buckets(bundle)
+    return bundle
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        sys.stderr.write("usage: link.py BUNDLE.json\n")
+        raise SystemExit(2)
+    path = argv[0]
+    with open(path) as fh:
+        bundle = json.load(fh)
+    enrich(bundle)
+    with open(path, "w") as fh:
+        json.dump(bundle, fh, indent=2)
+    sys.stderr.write(
+        f"linked {len(bundle['trains'])} trains, "
+        f"{len(bundle['buckets']['shipped'])} shipped into {path}\n"
+    )
+    return path
+
+
+if __name__ == "__main__":
+    main()
