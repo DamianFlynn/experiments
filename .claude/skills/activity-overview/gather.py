@@ -74,3 +74,23 @@ def parse_git_log(raw):
             "pr": None,  # resolved in link.py
         })
     return commits
+
+
+def build_clone_cmd(repo_url, from_date, clone_dir):
+    """Construct the bounded, partial clone command (network-free to build)."""
+    return [
+        "git", "clone",
+        "--filter=blob:none",
+        f"--shallow-since={from_date}",
+        "--no-single-branch",
+        repo_url, clone_dir,
+    ]
+
+
+def in_window(ts, from_date, to_date):
+    """True if ISO date/datetime string `ts` falls within [from_date, to_date]
+    inclusive, comparing on the date prefix. None/empty is never in window."""
+    if not ts:
+        return False
+    day = ts[:10]
+    return from_date <= day <= to_date

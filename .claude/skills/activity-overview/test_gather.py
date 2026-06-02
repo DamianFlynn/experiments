@@ -62,5 +62,27 @@ class TestParseGitLog(unittest.TestCase):
         self.assertEqual(gather.parse_git_log(""), [])
 
 
+class TestCloneAndWindow(unittest.TestCase):
+    def test_build_clone_cmd_is_bounded_and_partial(self):
+        cmd = gather.build_clone_cmd("https://github.com/o/r.git",
+                                     "2026-05-01", "/tmp/clone")
+        self.assertEqual(cmd[0], "git")
+        self.assertIn("clone", cmd)
+        self.assertIn("--filter=blob:none", cmd)
+        self.assertIn("--shallow-since=2026-05-01", cmd)
+        self.assertIn("--no-single-branch", cmd)
+        self.assertEqual(cmd[-2:], ["https://github.com/o/r.git", "/tmp/clone"])
+
+    def test_in_window_inclusive_bounds(self):
+        self.assertTrue(gather.in_window("2026-05-01", "2026-05-01", "2026-05-31"))
+        self.assertTrue(gather.in_window("2026-05-31", "2026-05-01", "2026-05-31"))
+        self.assertTrue(gather.in_window("2026-05-15T08:00:00Z", "2026-05-01", "2026-05-31"))
+
+    def test_in_window_rejects_outside_and_none(self):
+        self.assertFalse(gather.in_window("2026-04-30", "2026-05-01", "2026-05-31"))
+        self.assertFalse(gather.in_window("2026-06-01", "2026-05-01", "2026-05-31"))
+        self.assertFalse(gather.in_window(None, "2026-05-01", "2026-05-31"))
+
+
 if __name__ == "__main__":
     unittest.main()
