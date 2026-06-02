@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -84,9 +85,6 @@ class TestCloneAndWindow(unittest.TestCase):
         self.assertFalse(gather.in_window(None, "2026-05-01", "2026-05-31"))
 
 
-import json
-
-
 class TestPrNormalization(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "rest_sample.json")) as fh:
@@ -98,6 +96,7 @@ class TestPrNormalization(unittest.TestCase):
             gather.parse_closing_refs("Resolves #18 and closes #19"), [18, 19]
         )
         self.assertEqual(gather.parse_closing_refs("no references here"), [])
+        self.assertEqual(gather.parse_closing_refs(None), [])
         # de-duplicates while preserving order
         self.assertEqual(gather.parse_closing_refs("fix #5 fixed #5"), [5])
 
