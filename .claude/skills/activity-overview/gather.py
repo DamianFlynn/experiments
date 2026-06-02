@@ -606,7 +606,7 @@ def resolve_module_ref(ref_info, base_path, patterns=None):
         return classify_code_area(probe, patterns) or rp
     lp = ref_info.get("local_path")
     if lp:
-        base_dir = os.path.dirname(os.path.dirname(base_path or ""))
+        base_dir = os.path.dirname(base_path or "")
         joined = os.path.normpath(os.path.join(base_dir, lp))
         return classify_code_area(joined, patterns) or os.path.dirname(joined) or joined
     return None

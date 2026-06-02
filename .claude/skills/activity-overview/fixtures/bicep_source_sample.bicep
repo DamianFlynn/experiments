@@ -18,6 +18,6 @@ module keyVault 'br/public:avm/res/key-vault/vault:0.6.1' = {
   }
 }
 
-module shared '../../utl/types/avm-common-types/main.bicep' = {
+module shared '../../../utl/types/avm-common-types/main.bicep' = {
   name: 'sharedDeployment'
 }
