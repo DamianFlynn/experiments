@@ -679,7 +679,7 @@ def _labels_in_taxonomy(item, taxonomy, facet):
     facet_labels = set()
     for labs in (taxonomy.get(facet) or {}).values():
         facet_labels.update(labs)
-    return [lbl for lbl in item.get("labels", []) if lbl in facet_labels]
+    return [lbl for lbl in (item.get("labels") or []) if lbl in facet_labels]
 
 
 def apply_facets(item, taxonomy):
