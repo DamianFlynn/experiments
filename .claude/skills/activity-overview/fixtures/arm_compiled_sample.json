@@ -18,7 +18,7 @@
               "type": "Microsoft.Resources/deployments",
               "apiVersion": "2022-09-01",
               "name": "46d3xbcp.res.storage-storageaccount.0-9-0.abcde",
-              "properties": { "mode": "Incremental", "template": { "metadata": { "name": "storage-account" }, "resources": [] } }
+              "properties": { "mode": "Incremental", "template": { "metadata": { "name": "private-endpoint" }, "resources": [] } }
             }
           ]
         }

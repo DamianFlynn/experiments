@@ -670,10 +670,12 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     """Build inter-area dependency edges for one Bicep area.
 
     Immediate edges (transitive=False) come from the SOURCE refs — fully identified
-    (area-id + version), build-validated by the caller. Transitive edges
-    (transitive=True) come from the ARM tree but only when a nested deployment's
-    `metadata.name` confidently matches ANOTHER area in this repo (no fabricated
-    external ids). Pure; deterministic (deduped, then sorted)."""
+    (area-id + version), build-validated by the caller. They correspond to the
+    DEPTH-1 module instantiations in the ARM tree. Transitive edges (transitive=True)
+    come from deployments nested DEEPER (depth >= 2), and only when the nested
+    deployment's `metadata.name` confidently matches ANOTHER area in this repo (no
+    fabricated external ids) that is not already a direct dependency. Pure;
+    deterministic (deduped, then sorted)."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     edges = []
     seen = set()
@@ -689,11 +691,14 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
                       "provider": "bicep", "resolved": to is not None})
 
     self_id = classify_code_area(base_path, patterns)
+    immediate_tos = {e["to"] for e in edges}  # direct deps, already captured above
     for node in walk_arm_deployments(arm_json):
-        if node["depth"] < 1:
+        # depth 1 == the direct module instantiations (already emitted as immediate
+        # source refs); only genuinely-nested deployments are transitive.
+        if node["depth"] < 2:
             continue
         to = _match_repo_area(node.get("metadata_name"), area_ids)
-        if to is None or to == self_id:
+        if to is None or to == self_id or to in immediate_tos:
             continue
         key = (to, node.get("name"), True)
         if key in seen:
@@ -706,19 +711,39 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     return sorted(edges, key=lambda e: (e["transitive"], str(e["to"]), str(e["ref"])))
 
 
-_TF_MODULE_BLOCK_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{(?P<body>.*?)\}', re.DOTALL)
+_TF_MODULE_HEAD_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{')
 _TF_SOURCE_RE = re.compile(r'source\s*=\s*"(?P<src>[^"]+)"')
+_TF_VERSION_RE = re.compile(r'version\s*=\s*"(?P<ver>[^"]+)"')
 _TF_EDGE_RE = re.compile(r'"\[root\]\s*(?P<a>[^"]+)"\s*->\s*"\[root\]\s*(?P<b>[^"]+)"')
 _TF_MODULE_TOKEN_RE = re.compile(r"module\.([A-Za-z0-9_-]+)")
 
 
-def parse_terraform_module_blocks(tf_text):
-    """Map each `module "<name>" { source = "..." }` to its source string. Pure."""
+def _terraform_module_bodies(tf_text):
+    """Map each module name to its raw block body via brace-balancing.
+
+    Non-greedy regexes break on nested blocks (`tags { ... }`, `dynamic`), so the
+    body is scanned from the opening `{` to its matching close, counting depth.
+    Internal helper. Pure."""
+    text = tf_text or ""
     out = {}
-    for m in _TF_MODULE_BLOCK_RE.finditer(tf_text or ""):
-        sm = _TF_SOURCE_RE.search(m.group("body"))
+    for m in _TF_MODULE_HEAD_RE.finditer(text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += (text[i] == "{") - (text[i] == "}")
+            i += 1
+        out[m.group("name")] = text[m.end():i - 1]
+    return out
+
+
+def parse_terraform_module_blocks(tf_text):
+    """Map each `module "<name>" { source = "..." }` to its source string. Pure.
+
+    Brace-balanced so a `source` after a nested block is still found."""
+    out = {}
+    for name, body in _terraform_module_bodies(tf_text).items():
+        sm = _TF_SOURCE_RE.search(body)
         if sm:
-            out[m.group("name")] = sm.group("src")
+            out[name] = sm.group("src")
     return out
 
 
@@ -748,8 +773,13 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None)
     source resolves to an area-id (via classify_code_area, relative to base_path); a
     registry source is kept raw as the edge target. Pure; deterministic."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
+    bodies = _terraform_module_bodies(tf_text)
     sources = parse_terraform_module_blocks(tf_text)
     base_dir = os.path.dirname(base_path or "")
+
+    def version_of(name):
+        vm = _TF_VERSION_RE.search(bodies.get(name, ""))
+        return vm.group("ver") if vm else None
 
     def to_area(name):
         src = sources.get(name)
@@ -758,7 +788,8 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None)
         if src.startswith(".") or src.startswith("/"):
             joined = os.path.normpath(os.path.join(base_dir, src))
             return (classify_code_area(joined + "/main.tf", patterns) or joined), None
-        return src, None  # registry/module-registry source, kept raw
+        # registry/module-registry source, kept raw, with its pinned version
+        return src, version_of(name)
 
     edges = []
     seen = set()

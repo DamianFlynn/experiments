@@ -1078,8 +1078,10 @@ class TestBuildBicepEdges(unittest.TestCase):
             self.src = fh.read()
         with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
             self.arm = json.load(fh)
-        # key-vault/vault is ALSO a repo area -> exercises transitive repo-area match
-        self.area_ids = {"avm/ptn/foo/bar", "avm/res/key-vault/vault"}
+        # vault is a DIRECT dep (depth-1, immediate); private-endpoint is nested
+        # DEEPER in the ARM tree (depth-2) -> exercises the genuine transitive case.
+        self.area_ids = {"avm/ptn/foo/bar", "avm/res/key-vault/vault",
+                         "avm/res/network/private-endpoint"}
         self.base = "avm/ptn/foo/bar/main.bicep"
 
     def test_immediate_edges_carry_area_id_and_version(self):
@@ -1098,14 +1100,22 @@ class TestBuildBicepEdges(unittest.TestCase):
                                          self.area_ids, gather.DEFAULT_AREA_PATTERNS)
         self.assertEqual(sum(1 for e in edges if not e["transitive"]), 3)
 
-    def test_transitive_edge_only_for_repo_areas(self):
+    def test_transitive_edge_for_deeply_nested_repo_area(self):
         edges = gather.build_bicep_edges(self.src, self.arm, self.base,
                                          self.area_ids, gather.DEFAULT_AREA_PATTERNS)
         trans = {e["to"] for e in edges if e["transitive"]}
-        # vault is a repo area -> its nested deployment yields a transitive edge;
-        # storage-account is NOT in area_ids here -> no phantom transitive edge.
-        self.assertIn("avm/res/key-vault/vault", trans)
+        # private-endpoint is nested at depth 2 and is a repo area -> transitive edge.
+        self.assertIn("avm/res/network/private-endpoint", trans)
         self.assertNotIn(None, trans)
+
+    def test_direct_dep_not_duplicated_as_transitive(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        # vault is a DIRECT (depth-1) dependency: it must appear exactly once, as an
+        # immediate edge, never re-emitted as a transitive edge.
+        vault = [e for e in edges if e["to"] == "avm/res/key-vault/vault"]
+        self.assertEqual(len(vault), 1)
+        self.assertFalse(vault[0]["transitive"])
 
     def test_empty_build_inputs_yield_no_edges(self):
         self.assertEqual(
@@ -1125,6 +1135,19 @@ class TestTerraformParsers(unittest.TestCase):
         self.assertEqual(blocks["vnet"], "../../modules/vnet")
         self.assertEqual(blocks["naming"], "Azure/naming/azurerm")
         self.assertNotIn("azurerm_resource_group", blocks)  # resources are not modules
+
+    def test_source_found_after_a_nested_block(self):
+        # a non-greedy regex would stop at the first `}` and miss source; the
+        # brace-balanced parser must still find it.
+        tf = (
+            'module "x" {\n'
+            '  providers = {\n'
+            '    azurerm = azurerm.alt\n'
+            '  }\n'
+            '  source = "../mods/x"\n'
+            '}\n'
+        )
+        self.assertEqual(gather.parse_terraform_module_blocks(tf)["x"], "../mods/x")
 
     def test_graph_yields_module_dependency_pairs(self):
         pairs = gather.parse_terraform_graph(self.dot)
@@ -1164,6 +1187,8 @@ class TestBuildTerraformEdges(unittest.TestCase):
         self.assertTrue(naming)
         self.assertEqual(naming[0]["provider"], "terraform")
         self.assertTrue(naming[0]["resolved"])
+        # registry source keeps its pinned version (from the module block)
+        self.assertEqual(naming[0]["version"], "0.4.0")
 
     def test_edges_dedupe_and_are_marked_provider_terraform(self):
         edges = gather.build_terraform_edges(
