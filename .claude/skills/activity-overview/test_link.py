@@ -162,5 +162,43 @@ class TestProvenanceAndEndToEnd(unittest.TestCase):
         self.assertEqual(shipped, {("pr", 42), ("issue", 17)})
 
 
+class TestSelectMilestonesAndBuckets(unittest.TestCase):
+    def _p2_bundle(self):
+        with open(os.path.join(FIX, "bundle_p2.json")) as fh:
+            return link.enrich(json.load(fh))
+
+    def test_select_milestones_current_and_next(self):
+        ms = [
+            {"title": "v1.1.0", "state": "closed", "due_on": "2026-04-30T00:00:00Z", "number": 3},
+            {"title": "v1.2.0", "state": "open", "due_on": "2026-05-31T00:00:00Z", "number": 4},
+            {"title": "v1.3.0", "state": "open", "due_on": "2026-06-30T00:00:00Z", "number": 5},
+        ]
+        current, nxt = link.select_milestones(ms, "2026-05-20")
+        self.assertEqual(current["title"], "v1.2.0")
+        self.assertEqual(nxt["title"], "v1.3.0")
+
+    def test_buckets_classify_each_item_once(self):
+        b = self._p2_bundle()["buckets"]
+        def nums(key):
+            return {(r["type"], r["id"]) for r in b[key]}
+        self.assertIn(("pr", 42), nums("shipped"))
+        self.assertIn(("issue", 17), nums("shipped"))
+        self.assertIn(("pr", 43), nums("rejected"))
+        self.assertIn(("issue", 20), nums("rejected"))
+        # open #44 + #18 are on the NEXT milestone (v1.3.0) -> next_candidates
+        self.assertIn(("pr", 44), nums("next_candidates"))
+        self.assertIn(("issue", 18), nums("next_candidates"))
+        # open #21 is on the CURRENT milestone (v1.2.0) -> in_flight
+        self.assertIn(("issue", 21), nums("in_flight"))
+        # no item appears in two buckets
+        all_refs = [(r["type"], r["id"]) for k in b for r in b[k]]
+        self.assertEqual(len(all_refs), len(set(all_refs)))
+
+    def test_bucket_refs_carry_train_id_when_known(self):
+        b = self._p2_bundle()["buckets"]
+        pr42 = next(r for r in b["shipped"] if (r["type"], r["id"]) == ("pr", 42))
+        self.assertEqual(pr42["train"], "train-issue-17")
+
+
 if __name__ == "__main__":
     unittest.main()

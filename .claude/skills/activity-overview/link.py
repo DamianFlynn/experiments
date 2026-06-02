@@ -27,6 +27,56 @@ def ref(type_, id_, url):
     return {"type": type_, "id": id_, "url": url}
 
 
+HIGH_PRIORITY_LABELS = {
+    "priority/high", "priority/critical", "p0", "p1", "high-priority", "critical",
+}
+
+
+def _in_window(ts, period):
+    """True if `ts` (ISO) falls in `period`. Permissive when either is missing,
+    so dateless fixtures (and pre-window-free bundles) classify as in-window."""
+    if not period or not ts:
+        return True
+    frm, to = period.get("from"), period.get("to")
+    day = ts[:10]
+    return (not frm or day >= frm) and (not to or day <= to)
+
+
+def _high_priority(item):
+    return any((lbl or "").lower() in HIGH_PRIORITY_LABELS
+               for lbl in item.get("labels", []))
+
+
+def _ms_sort_key(m):
+    return ((m.get("due_on") or "9999-12-31")[:10], m.get("number") or 0)
+
+
+def select_milestones(milestones, ref_date):
+    """(current, next) open milestones by due date. current = earliest open whose
+    due date is on/after ref_date (else the earliest open); next = the one after."""
+    open_ms = sorted((m for m in milestones if m.get("state") == "open"),
+                     key=_ms_sort_key)
+    if not open_ms:
+        return None, None
+    current = next(
+        (m for m in open_ms if (m.get("due_on") or "9999-12-31")[:10] >= ref_date),
+        open_ms[0])
+    idx = open_ms.index(current)
+    nxt = open_ms[idx + 1] if idx + 1 < len(open_ms) else None
+    return current, nxt
+
+
+def train_index(trains):
+    """Map ('pr'|'issue', number) -> train id, for cross-linking bucket refs."""
+    idx = {}
+    for t in trains:
+        if t.get("root_issue") is not None:
+            idx[("issue", t["root_issue"])] = t["id"]
+        for n in t.get("prs", []):
+            idx[("pr", n)] = t["id"]
+    return idx
+
+
 def build_trains(bundle):
     """Group merged PRs (+ their commits + closing issue) into decision trains.
 
@@ -80,15 +130,54 @@ def build_trains(bundle):
 
 
 def compute_buckets(bundle):
-    """Coarse Phase-1 buckets: shipped = merged PRs + completed issues."""
-    shipped = []
-    for pr in bundle["prs"]:
-        if pr.get("merged"):
-            shipped.append(ref("pr", pr["number"], pr["url"]))
-    for issue in bundle["issues"]:
-        if issue.get("state") == "closed" and issue.get("state_reason") == "completed":
-            shipped.append(ref("issue", issue["number"], issue["url"]))
-    return {"shipped": shipped, "in_flight": [], "rejected": [], "next_candidates": []}
+    """Full four-way bucketing: one bucket per item, precedence
+    shipped > rejected > next_candidates > in_flight. Refs carry their train id."""
+    meta = bundle.get("meta", {})
+    period = meta.get("period")
+    ref_date = meta.get("ref_date") or meta.get("to") or ""
+    current_ms, next_ms = select_milestones(bundle.get("milestones", []), ref_date)
+    current_title = current_ms["title"] if current_ms else None
+    next_title = next_ms["title"] if next_ms else None
+    tindex = train_index(bundle.get("trains", []))
+
+    out = {"shipped": [], "rejected": [], "next_candidates": [], "in_flight": []}
+
+    def add(bucket, type_, num, url):
+        r = ref(type_, num, url)
+        tid = tindex.get((type_, num))
+        if tid:
+            r["train"] = tid
+        out[bucket].append(r)
+
+    def classify(item, type_):
+        num, url = item["number"], item.get("url")
+        state = item.get("state")
+        if type_ == "pr" and item.get("merged") and _in_window(item.get("merged_at"), period):
+            add("shipped", type_, num, url)
+        elif type_ == "issue" and state == "closed" \
+                and item.get("state_reason") == "completed" \
+                and _in_window(item.get("closed_at"), period):
+            add("shipped", type_, num, url)
+        elif state == "closed" and type_ == "pr" and not item.get("merged") \
+                and _in_window(item.get("closed_at"), period):
+            add("rejected", type_, num, url)
+        elif state == "closed" and type_ == "issue" \
+                and item.get("state_reason") == "not_planned" \
+                and _in_window(item.get("closed_at"), period):
+            add("rejected", type_, num, url)
+        elif state == "open":
+            on_next = next_title is not None and item.get("milestone") == next_title
+            on_current = current_title is not None and item.get("milestone") == current_title
+            if on_next or _high_priority(item):
+                add("next_candidates", type_, num, url)
+            elif on_current or _in_window(item.get("updated_at"), period):
+                add("in_flight", type_, num, url)
+
+    for pr in bundle.get("prs", []):
+        classify(pr, "pr")
+    for issue in bundle.get("issues", []):
+        classify(issue, "issue")
+    return out
 
 
 def enrich(bundle):
