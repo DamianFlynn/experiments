@@ -56,7 +56,7 @@ docsRefs, release_train, sprints, project, diagrams`.
 
 ## Phase 3a fields (narrative substrate)
 
-- **prs[]** gain `review_comments: [{author, author_association, body, url, id}]`
+- **prs[]** gain `review_comments: [{author, author_association, body, url, id, created_at}]`
   (inline diff comments) and `comments_list: [{...same shape}]` (conversation
   comments). The Phase 2 integer count stays under `comments` /
   `review_comments_count` — the spec's `comments` *body-array* name was already
@@ -72,10 +72,11 @@ docsRefs, release_train, sprints, project, diagrams`.
   lifecycle:[{event:"add|change|remove", commit, author, date, ref}] } }`.
   File granularity only in Phase 3a. **Deferred:** `symbol`/`comment` kinds (need
   `-p` hunk + tree-sitter), `code_area` (graphify, Phase 3b), and per-event `hunk`.
-- **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, number|sha,
-  url}, subject:{kind, name, path} }]` — sorted social (comments/reviews) + code
-  (artifact lifecycle) events. Social events have no file `subject.path` and (in
-  Phase 3a) no precise `ts`; code events carry both.
+- **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},
+  subject:{kind, name, path} }]` — sorted social (comments/reviews) + code
+  (artifact lifecycle) events. `ref.id` is the PR/issue number for social events
+  and the commit sha for code events (the bundle-wide `{type, id, url}` ref
+  convention). Social events have no file `subject.path`; code events carry both.
 - **feature_deltas** `[{ area:null, kind:"add|drop|change", subject, name, before,
   after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
   }]` — a projection over `artifacts` (add→add, remove→drop, change→change).

@@ -173,7 +173,9 @@ def build_timeline(bundle):
     def social(actor, event, ref_type, number, url, subject, ts):
         events.append({
             "ts": ts or "", "actor": actor, "layer": "social", "event": event,
-            "ref": {"type": ref_type, "number": number, "url": url},
+            # `id` (not `number`) to match the bundle-wide ref convention
+            # {type, id, url} used everywhere else (and the gate's well_formed).
+            "ref": {"type": ref_type, "id": number, "url": url},
             "subject": subject,
         })
 
