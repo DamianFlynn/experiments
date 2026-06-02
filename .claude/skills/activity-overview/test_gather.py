@@ -166,6 +166,24 @@ class TestIssueAndFetch(unittest.TestCase):
         self.assertEqual(issue["assignees"], ["alice"])
         self.assertEqual(issue["url"], "https://github.com/o/r/issues/17")
 
+    def test_normalize_issue_captures_phase2_fields(self):
+        raw = {
+            "number": 18, "title": "Open feature", "body": "",
+            "state": "open", "state_reason": None,
+            "updated_at": "2026-05-22T00:00:00Z",
+            "user": {"login": "carol"}, "author_association": "CONTRIBUTOR",
+            "labels": [{"name": "priority/high"}],
+            "assignees": [{"login": "alice"}],
+            "milestone": {"title": "v1.3.0"},
+            "comments": 7,
+            "html_url": "https://github.com/o/r/issues/18",
+        }
+        issue = gather.normalize_issue(raw)
+        self.assertEqual(issue["milestone"], "v1.3.0")
+        self.assertEqual(issue["updated_at"], "2026-05-22T00:00:00Z")
+        self.assertEqual(issue["comments"], 7)
+        self.assertEqual(issue["state"], "open")
+
     def test_fetch_all_follows_pages_until_short_page(self):
         pages = {
             "u?page=1": (["a", "b"], "u?page=2"),

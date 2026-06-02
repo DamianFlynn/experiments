@@ -158,6 +158,7 @@ def select_merged_prs(prs, from_date, to_date):
 
 def normalize_issue(raw):
     """Map a GitHub REST issue object to the bundle's issue shape."""
+    milestone = raw.get("milestone")
     return {
         "number": raw["number"],
         "title": raw.get("title", ""),
@@ -167,9 +168,12 @@ def normalize_issue(raw):
         "author_association": raw.get("author_association"),
         "labels": [lbl["name"] for lbl in raw.get("labels", [])],
         "assignees": [a["login"] for a in raw.get("assignees", [])],
+        "milestone": milestone.get("title") if milestone else None,
         "state": raw.get("state"),
         "state_reason": raw.get("state_reason"),
+        "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
+        "comments": raw.get("comments", 0) or 0,
         "url": raw.get("html_url"),
     }
 
