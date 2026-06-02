@@ -526,5 +526,68 @@ class TestCodeAreaAttribution(unittest.TestCase):
         self.assertIsNone(b["feature_deltas"][0]["area"])
 
 
+class TestTrainsModulesPeopleAreas(unittest.TestCase):
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "avm/res/network/firewall-policy", "label": "firewall-policy",
+                 "paths": ["avm/res/network/firewall-policy/main.bicep"],
+                 "edges": []},
+                {"id": "docs", "label": "docs",
+                 "paths": ["docs/firewall.md"], "edges": []},
+            ]},
+            "commits": [
+                {"sha": "c1", "author": "alice", "pr": 42,
+                 "files": ["avm/res/network/firewall-policy/main.bicep"]},
+                {"sha": "c2", "author": "bob", "pr": 42,
+                 "files": ["docs/firewall.md"]},
+            ],
+            "prs": [{"number": 42, "author": "alice", "reviewers": ["carol"],
+                     "url": "https://github.com/o/r/pull/42"}],
+            "issues": [],
+            "trains": [{"id": "train-pr-42", "prs": [42], "commits": ["c1", "c2"],
+                        "root_issue": None, "code_areas": []}],
+            "people": {},
+        }
+
+    def test_trains_gain_their_commits_code_areas(self):
+        b = self._bundle()
+        link.attribute_train_areas(b, link.area_index(b["code_graph"]))
+        t = b["trains"][0]
+        self.assertEqual(set(t["code_areas"]),
+                         {"avm/res/network/firewall-policy", "docs"})
+
+    def test_modules_field_aggregates_per_area(self):
+        b = self._bundle()
+        link.build_modules(b, link.area_index(b["code_graph"]))
+        mods = b["modules"]
+        fp = mods["avm/res/network/firewall-policy"]
+        self.assertEqual(fp["commits"], 1)
+        self.assertEqual(fp["files_changed"], 1)
+        # prs is a count of distinct PRs that touched the area (an int, not a list)
+        self.assertEqual(fp["prs"], 1)
+
+    def test_people_gain_modules_and_areas(self):
+        b = self._bundle()
+        idx = link.area_index(b["code_graph"])
+        link.attribute_people_areas(b, idx)
+        alice = b["people"]["alice"]
+        self.assertIn("avm/res/network/firewall-policy", alice["modules"])
+
+    @unittest.skipUnless(os.path.exists(os.path.join(FIX, "bundle_p3b.json")),
+                         "fixture pending")
+    def test_enrich_fills_all_phase3b_attribution(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        # at least one artifact and one feature_delta now carry a real area
+        arts = bundle["artifacts"]
+        self.assertTrue(any(a["code_area"] is not None for a in arts.values()))
+        self.assertTrue(any(d["area"] is not None for d in bundle["feature_deltas"]))
+        # trains carry code_areas; modules populated
+        self.assertTrue(any(t.get("code_areas") for t in bundle["trains"]))
+        self.assertTrue(bundle["modules"])
+
+
 if __name__ == "__main__":
     unittest.main()
