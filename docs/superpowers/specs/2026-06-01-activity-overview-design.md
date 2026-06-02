@@ -802,8 +802,9 @@ against GitHub) after each.
   runs (aggregated `workflow_stats`), releases, milestones; PRs gain `created_at`. *Link:*
   fold timeline cross-refs into PR↔issue linking; full `shipped` / `rejected` / `in_flight` /
   `next_candidates` buckets (one bucket per item, precedence shipped > rejected >
-  next_candidates > in_flight; `in_flight` = open-&-active-in-window ∪ on-next-milestone;
-  `next_candidates` = open items on the earliest open milestone). *Render:* new `render.py`
+  next_candidates > in_flight; `in_flight` = open items active in window ∪ on the current
+  (earliest-open) milestone; `next_candidates` = open items on the next milestone ∪
+  high-priority-labelled). *Render:* new `render.py`
   emits `diagrams/buckets_pie.mmd` (`pie`) + `diagrams/timeline_gantt.mmd` (`gantt`), derived
   from existing bundle fields and **validated by `mmdc`** (preflight-checked dependency).
   *Report:* + CI/CD, releases, rejected/abandoned, in-flight sections embedding the two
