@@ -43,7 +43,11 @@ def build_trains(bundle):
     for pr in bundle["prs"]:
         if not pr.get("merged"):
             continue
-        root = pr["closes"][0] if pr.get("closes") else None
+        links = list(pr.get("closes") or [])
+        for n in pr.get("crossref_issues") or []:
+            if n not in links:
+                links.append(n)
+        root = links[0] if links else None
         anchor = ("issue", root) if root is not None else ("pr", pr["number"])
         groups.setdefault(anchor, []).append(pr)
 

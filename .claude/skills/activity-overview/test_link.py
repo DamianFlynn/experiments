@@ -73,6 +73,15 @@ class TestBuildTrains(unittest.TestCase):
         self.assertEqual(trains[0]["id"], "train-pr-42")
         self.assertIsNone(trains[0]["root_issue"])
 
+    def test_train_anchors_on_crossref_when_no_closing_keyword(self):
+        bundle = _sample_bundle()
+        bundle["prs"][0]["closes"] = []
+        bundle["prs"][0]["crossref_issues"] = [17]
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual(trains[0]["id"], "train-issue-17")
+        self.assertEqual(trains[0]["root_issue"], 17)
+
     def test_train_evidence_refs_are_well_formed(self):
         bundle = _sample_bundle()
         link.attach_commit_prs(bundle["commits"])
