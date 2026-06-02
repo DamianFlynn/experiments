@@ -3,7 +3,13 @@
 The only component that touches the network. Produces a schema-complete bundle;
 later-phase fields are reserved empty here and filled by later phases.
 """
+import argparse
+import json
+import os
 import re
+import subprocess
+import sys
+import urllib.request
 
 SCHEMA_VERSION = 1
 RECORD_SEP = "\x1e"
@@ -168,3 +174,60 @@ def fetch_all(get_page, first_url):
         page_items, url = get_page(url)
         items.extend(page_items)
     return items
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="Acquire an activity-overview bundle.")
+    p.add_argument("--owner", required=True)
+    p.add_argument("--repo", required=True)
+    p.add_argument("--from", dest="from", required=True)
+    p.add_argument("--to", required=True)
+    p.add_argument("--branches", default="main")
+    p.add_argument("--clone-dir", default=None)
+    p.add_argument("--no-clone", action="store_true")
+    p.add_argument("--out", default=None)
+    return p.parse_args(argv)
+
+
+def resolve_token(env):
+    """Return a GitHub token from env, preferring GITHUB_TOKEN. Exit if absent."""
+    token = env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")
+    if not token:
+        sys.stderr.write(
+            "error: set GITHUB_TOKEN (or GH_TOKEN) with repo + read:project scope\n"
+        )
+        raise SystemExit(2)
+    return token
+
+
+def run_git(args, cwd=None):
+    """Thin wrapper around git (not unit-tested)."""
+    return subprocess.run(
+        args, cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def http_get_json(url, token):
+    """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested."""
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "activity-overview",
+    })
+    with urllib.request.urlopen(req) as resp:
+        body = json.loads(resp.read().decode())
+        link = resp.headers.get("Link", "")
+        nxt = _next_link(link)
+    return body, nxt
+
+
+def _next_link(link_header):
+    """Parse a GitHub Link header, returning the rel="next" url or None."""
+    for part in (link_header or "").split(","):
+        section = part.split(";")
+        if len(section) < 2:
+            continue
+        url = section[0].strip().strip("<>")
+        if 'rel="next"' in section[1]:
+            return url
+    return None

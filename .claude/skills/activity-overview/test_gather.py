@@ -154,5 +154,31 @@ class TestIssueAndFetch(unittest.TestCase):
         self.assertEqual(calls, ["u?page=1", "u?page=2"])
 
 
+class TestCliAndAuth(unittest.TestCase):
+    def test_parse_args_required_and_defaults(self):
+        args = gather.parse_args([
+            "--owner", "o", "--repo", "r",
+            "--from", "2026-05-01", "--to", "2026-05-31",
+        ])
+        self.assertEqual(args.owner, "o")
+        self.assertEqual(args.repo, "r")
+        self.assertEqual(getattr(args, "from"), "2026-05-01")
+        self.assertEqual(args.to, "2026-05-31")
+        self.assertEqual(args.branches, "main")
+        self.assertFalse(args.no_clone)
+
+    def test_resolve_token_prefers_github_token(self):
+        self.assertEqual(
+            gather.resolve_token({"GITHUB_TOKEN": "gh", "GH_TOKEN": "alt"}), "gh"
+        )
+
+    def test_resolve_token_falls_back_to_gh_token(self):
+        self.assertEqual(gather.resolve_token({"GH_TOKEN": "alt"}), "alt")
+
+    def test_resolve_token_missing_raises(self):
+        with self.assertRaises(SystemExit):
+            gather.resolve_token({})
+
+
 if __name__ == "__main__":
     unittest.main()
