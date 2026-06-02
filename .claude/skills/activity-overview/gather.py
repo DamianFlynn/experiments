@@ -430,6 +430,8 @@ def _runs_page(get_page, api, frm, to):
     """Walk actions/runs, whose pages wrap the list under `workflow_runs`."""
     runs = []
     url = f"{api}/actions/runs?created={frm}..{to}&per_page=100"
+    # The `created=` query param bounds the window server-side; the per-page
+    # `< frm` check below is a defensive early-exit guard.
     while url:
         payload, url = get_page(url)
         page = payload.get("workflow_runs", []) if isinstance(payload, dict) else payload
@@ -486,12 +488,12 @@ def acquire(args, env):
         )
         if not keep:
             continue
-        reviews, _ = http_get_json(f"{api}/pulls/{pr['number']}/reviews?per_page=100", token)
+        reviews = fetch_all(get_page, f"{api}/pulls/{pr['number']}/reviews?per_page=100")
         summary = summarize_reviews(reviews)
         pr["reviewers"] = summary["reviewers"]
         pr["review_decision"] = summary["decision"]
-        timeline, _ = http_get_json(
-            f"{api}/issues/{pr['number']}/timeline?per_page=100", token)
+        timeline = fetch_all(
+            get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
         pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
         prs.append(pr)
 
