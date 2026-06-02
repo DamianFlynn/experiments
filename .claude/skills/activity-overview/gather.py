@@ -201,10 +201,14 @@ def resolve_token(env):
 
 
 def run_git(args, cwd=None):
-    """Thin wrapper around git (not unit-tested)."""
-    return subprocess.run(
-        args, cwd=cwd, check=True, capture_output=True, text=True
-    ).stdout
+    """Thin wrapper around git (not unit-tested). Surfaces git's own stderr
+    on failure so errors like "not a git repository" reach the user."""
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args[1:3])} failed: {proc.stderr.strip()}"
+        )
+    return proc.stdout
 
 
 def http_get_json(url, token):
@@ -240,7 +244,7 @@ def _paginated(token):
     return get_page
 
 
-def gather(args, env):
+def acquire(args, env):
     token = resolve_token(env)
     owner, repo = args.owner, args.repo
     frm, to = getattr(args, "from"), args.to
@@ -285,7 +289,7 @@ def gather(args, env):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    bundle = gather(args, os.environ)
+    bundle = acquire(args, os.environ)
     out = args.out or f"workspace/activity-{getattr(args, 'from')}-{args.to}.json"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w") as fh:
