@@ -6,8 +6,11 @@ name: activity-overview integration (manual)
 #
 # Setup (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
 #   Settings -> Secrets and variables -> Actions -> New repository secret
-# Use a fine-grained PAT with read-only "Contents" + "Pull requests" +
-# "Issues" on the target repo. Do NOT paste the token anywhere but that page.
+# Use a classic PAT with the `public_repo` scope (read is all the smoke test
+# needs). If the target is owned by an enterprise that caps PAT lifetime —
+# e.g. Microsoft Open Source, which owns Azure/* — the token's expiry must be
+# <= 90 days or the API returns 403; a "no expiration" token is rejected.
+# Do NOT paste the token anywhere but that secret page.
 
 on:
   workflow_dispatch:
@@ -34,10 +37,10 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -133,7 +136,7 @@ jobs:
           PY
 
       - name: Upload the bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: activity-bundle
           path: .claude/skills/activity-overview/workspace/bundle.json
