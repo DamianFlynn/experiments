@@ -1,0 +1,24 @@
+{
+  "nodes": [
+    {"id": "n1", "label": "handler_auth", "file_type": "py",
+     "source_file": "src/app/auth.py", "source_location": "12:0",
+     "community": 0, "norm_label": "handler auth"},
+    {"id": "n2", "label": "handler_session", "file_type": "py",
+     "source_file": "src/app/session.py", "source_location": "40:0",
+     "community": 0, "norm_label": "handler session"},
+    {"id": "n3", "label": "store_user", "file_type": "py",
+     "source_file": "src/store/user.py", "source_location": "8:0",
+     "community": 1, "norm_label": "store user"},
+    {"id": "n4", "label": "store_index", "file_type": "py",
+     "source_file": "src/store/index.py", "source_location": "3:0",
+     "community": 1, "norm_label": "store index"},
+    {"id": "n5", "label": "util_log", "file_type": "py",
+     "source_file": "src/store/user.py", "source_location": "55:0",
+     "community": 1, "norm_label": "util log"}
+  ],
+  "links": [
+    {"source": "n1", "target": "n3", "weight": 2},
+    {"source": "n2", "target": "n1", "weight": 1},
+    {"source": "n3", "target": "n4", "weight": 1}
+  ]
+}

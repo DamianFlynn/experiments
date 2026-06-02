@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design (pre-implementation) — rev 7 (+ event-sourced timeline, artifact lifecycle, label facets)
+**Status:** Approved design — rev 8 (Phases 1/2/3a shipped; + pluggable directory-first code-area provider, graphify optional)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -276,10 +276,17 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
 
 - No dependency on third-party **skills** (`repo-analyzer`, `github-issue-analyzer`,
   `github-summary`). Useful references, but the skill is self-contained.
-- **graphify** is a **required core dependency** (code-area mapping feeds the code-area,
-  people↔module, and blocker/stall dimensions). A **preflight** checks it is on `PATH` and
-  **fails fast** with install guidance if absent — no silent degradation. (`git` and
-  `GITHUB_TOKEN` are likewise required.)
+- **Code areas come from a pluggable provider, directory-first** (rev 8). The primary
+  provider is a **directory-subtree** map (`area = module directory`) — zero-dep, offline,
+  and matching how IaC repos define a module (AVM `avm/res/<svc>/<module>/`, Terraform
+  `modules/<name>/`) — so code-area attribution works on Bicep/Terraform/any repo with no
+  external tool. **graphify** is an *optional* provider used only for its ~25 tree-sitter
+  languages (Python/TS/Go/Java/…); it does **not** parse Bicep/HCL, so it is no longer a hard
+  dependency — when absent or inapplicable, code areas fall back to the directory provider.
+  The provider yields an **area id** that every `code_area`/`area` field carries (a directory
+  path, or `community:<n>` from graphify). Dependency-edge enrichment (Bicep `bicep build`→ARM
+  `dependsOn`; Terraform `tree-sitter-hcl`) and symbol-granular artifacts are **deferred**.
+  (`git` and `GITHUB_TOKEN` remain required.)
 - **mermaid-cli (`mmdc`)** is a **required dependency for Render** (Phase 2+): `render.py`
   validates every emitted `.mmd` by compiling it (and optionally exports SVG/PNG), so a
   diagram that would not render fails the run rather than shipping broken. The preflight
@@ -368,13 +375,21 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     `timeline`. Captures *added-then-removed-within-window* churn that a tip-only diff misses.
     (Phase 1 ships tip/train-level deltas under the same schema; this walk turns on in Phase 3.)
 
-- **graphify code graph (required, local, zero-token):**
-  - **Preflight:** assert `graphify` is on `PATH`; **fail fast** with install guidance if
-    not (it's a core dependency now, feeding code-area + people↔module + blocker/stall
-    dimensions). Run `graphify update <clone-dir>` (tree-sitter AST, no API/tokens) → reads
-    `graphify-out/graph.json`. Captures **communities** (≈ logical modules), node→file
-    mapping, and edges. Stored under `code_graph` and used by Link to attribute trains/
-    commits/people to code areas and to compute the blocker graph.
+- **Code-area provider (local, zero-token, pluggable; rev 8):**
+  - **Directory provider (primary, always available).** Map each tracked file to its **module
+    directory** via config patterns (AVM `avm/res/<svc>/<module>/`, any dir with a
+    `main.bicep`; Terraform `modules/<name>/` or any dir with `*.tf`; otherwise a top-N-level
+    dir). Zero-dep, offline — this is what makes code areas work on Bicep/Terraform.
+  - **graphify provider (optional, supported languages only).** If `graphify` is on `PATH`
+    *and* the repo has files in its ~25 tree-sitter languages, run `graphify update
+    <clone-dir>` (no API/tokens) → read `graphify-out/graph.json` (real shape: each **node**
+    carries a `community` integer + `source_file`; **edges are under `links`**; no top-level
+    `communities` list and no labels without an LLM). Group nodes by `community` → areas; map
+    `source_file` → area. **Not required**: if absent or the repo is unsupported (e.g. Bicep),
+    silently use the directory provider.
+  - Areas (from whichever provider) are stored under `code_graph` and used by Link to
+    attribute trains/commits/people/artifacts/feature_deltas to code areas. Dependency
+    **edges** (Bicep ARM `dependsOn`, `tree-sitter-hcl`) are deferred.
 
 - **REST fetches / windowing (the social layer):**
   - **PRs:** closed PRs touched in range via
@@ -440,8 +455,8 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "milestones": [ { "title","number","state","due_on","open_issues","closed_issues","url" } ],
     "project": { "number","title","iterations":[{ "title","start","end" }],
                  "items":[{ "type","number","title","state","merged","status","iteration","url" }] },
-    "code_graph": { "source":"graphify","communities":[{ "id","label","files":[] }],
-                    "nodes":[...],"edges":[...] },
+    "code_graph": { "provider":"directory|graphify",
+                    "areas":[{ "id","label","paths":[],"edges":[] }] },
     "modules": { "<dir>": { "commits","prs","files_changed" } },
     "workflow_stats": { "<workflow>": { "total","success","failure","cancelled","other" } },
     "docsRefs": [ { "path","source":"changed|referenced","pr":num|null } ],
@@ -830,18 +845,19 @@ against GitHub) after each.
   from existing bundle fields and **validated by `mmdc`** (preflight-checked dependency).
   *Report:* + CI/CD, releases, rejected/abandoned, in-flight sections embedding the two
   `.mmd` files.
-- **Phase 3 — code areas (graphify) + feature deltas + label facets.**
-  *Acquire:* graphify code-graph pass (now required) + CODEOWNERS; **the actual discussion
-  text — issue/PR comment bodies, review and review-comment bodies, and timeline event text
-  (superseding Phase 2's counts/decisions)** so the Phase 4 train narratives have raw material
-  to mine for decisions, pushback, and reversals; the **full-window
-  code-event walk** (`git log -p -M -C`) producing the `artifacts` ledger and the unified
-  `timeline` (incl. inline-comment granularity). *Link:* attribute trains/commits to
-  communities; resolve `label_taxonomy` facets; build `artifacts` + `feature_deltas`
-  (projection over artifacts) + `diagrams.deltas_bar` + `diagrams.content_timeline`.
-  *Report:* shipped grouped by code area; **Feature changes** ledger; **Content lifecycle
-  (built/changed/dropped)**; infrastructure & tooling; decision-docs from diffs; graphify
-  `graph.html` link. (Phase 1/2 carry the tip-level subset under the same schema.)
+- **Phase 3a — narrative substrate (shipped).** The actual discussion text (issue/PR comment
+  bodies, review + review-comment bodies), reactions + `open_high_activity`, and the
+  full-window code-event walk (`git log --name-status -M -C`) → file-level `artifacts` ledger
+  + unified `timeline` + `feature_deltas` projection + `content_timeline`/`deltas_bar`
+  diagrams. (File-level artifacts; symbol/inline-comment granularity deferred.)
+- **Phase 3b — code areas (pluggable, directory-first) + label facets.**
+  *Acquire:* the **code-area provider** (directory primary; graphify optional for supported
+  languages) → `code_graph.areas`; CODEOWNERS. *Link:* attribute trains/commits/people/
+  artifacts/feature_deltas to `code_area`s; resolve `label_taxonomy` facets + issue `kind`
+  (native issue types → label facets → template → heuristic); `contributor_graph` diagram.
+  *Report:* shipped grouped by code area; module ownership (`code_owners` + `people.modules`);
+  facet-aware grouping. (Dependency-edge enrichment — Bicep ARM `dependsOn`, `tree-sitter-hcl`
+  — and symbol-granular artifacts are later slices.)
 - **Phase 4 — sub-agent train narratives + train graphs + forecast.**
   *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
   `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded

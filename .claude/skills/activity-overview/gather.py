@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -411,6 +412,318 @@ def classify_artifact_path(path):
     return None
 
 
+# Ordered code-area patterns for the directory provider (primary, zero-dep).
+# Each entry is (name, predicate(parts) -> area_id_or_None) tried in order; the
+# first match wins. `parts` is path.split("/"). Patterns are directory-first and
+# match how IaC repos define a module. The generic fallback is last.
+def _avm_area(parts):
+    # avm/res/<service>/<module>/...  -> the 4-segment module subtree.
+    if len(parts) >= 4 and parts[0] == "avm" and parts[1] in ("res", "ptn", "utl"):
+        return "/".join(parts[:4])
+    return None
+
+
+def _main_bicep_dir(parts):
+    # any directory containing a main.bicep -> that directory.
+    if parts and parts[-1] == "main.bicep":
+        return "/".join(parts[:-1]) or parts[0]
+    return None
+
+
+def _terraform_modules_dir(parts):
+    # modules/<name>/... -> modules/<name>.
+    if len(parts) >= 2 and parts[0] == "modules":
+        return "/".join(parts[:2])
+    return None
+
+
+def _tf_dir(parts):
+    # any directory containing a *.tf file -> that directory.
+    if parts and parts[-1].endswith(".tf"):
+        return "/".join(parts[:-1]) or parts[0]
+    return None
+
+
+def _topn_dir(parts, n=2):
+    # generic fallback: the first N path segments (or the file itself if shallower).
+    if not parts:
+        return None
+    return "/".join(parts[:n])
+
+
+DEFAULT_AREA_PATTERNS = [
+    ("avm", _avm_area),
+    ("main_bicep", _main_bicep_dir),
+    ("terraform_modules", _terraform_modules_dir),
+    ("tf_dir", _tf_dir),
+    ("topn", _topn_dir),
+]
+
+
+def classify_code_area(path, patterns):
+    """Map a tracked file path to a single area id (a directory path), or None.
+
+    Tries the ordered `patterns` (AVM module subtree, any main.bicep dir, Terraform
+    modules/<name>, any *.tf dir, else a top-2-segment fallback). Pure."""
+    if not path:
+        return None
+    parts = path.split("/")
+    for _name, fn in patterns:
+        area = fn(parts)
+        if area:
+            return area
+    return None
+
+
+def _area_label(area_id):
+    """A short, human tail for an area id (the last path segment)."""
+    return (area_id or "").rstrip("/").split("/")[-1] or area_id
+
+
+def build_directory_areas(paths, patterns):
+    """Fold a list of tracked file paths into the `code_graph` directory provider.
+
+    Shape: {"provider":"directory","areas":[{"id","label","paths":[...],"edges":[]}]}.
+    Area id is the directory path; label is its tail; edges are deferred (empty).
+    Deterministic (areas sorted by id, paths sorted). Pure."""
+    grouped = {}
+    for p in paths:
+        area = classify_code_area(p, patterns)
+        if area is None:
+            continue
+        grouped.setdefault(area, set()).add(p)
+    areas = [
+        {"id": area, "label": _area_label(area),
+         "paths": sorted(grouped[area]), "edges": []}
+        for area in sorted(grouped)
+    ]
+    return {"provider": "directory", "areas": areas}
+
+
+def parse_graphify_graph(graph_json):
+    """Group graphify nodes by their integer `community` into the code_graph shape.
+
+    Reads graphify's REAL output: top keys `nodes`/`links` (edges live under
+    `links`, NOT `edges`); each node carries `community` (int) + `source_file`;
+    there is NO top-level `communities` list. Produces
+    {"provider":"graphify","areas":[{"id":"community:<n>","label",
+    "paths":[distinct source_files],"edges":[]}]}. Area edges are deferred (empty);
+    `links` are graphify's symbol-level edges, not resolved area edges. Pure."""
+    by_comm = {}
+    for node in (graph_json or {}).get("nodes", []):
+        comm = node.get("community")
+        if comm is None:
+            continue
+        src = node.get("source_file")
+        if src:
+            by_comm.setdefault(int(comm), set()).add(src)
+    areas = []
+    for comm in sorted(by_comm):
+        paths = sorted(by_comm[comm])
+        # representative label: the shortest common-ish dir — use the first path's
+        # directory (deterministic given sorted paths), or the path itself.
+        head = paths[0]
+        label = head.rsplit("/", 1)[0] if "/" in head else head
+        areas.append({"id": f"community:{comm}", "label": label,
+                      "paths": paths, "edges": []})
+    return {"provider": "graphify", "areas": areas}
+
+
+def _read_json_file(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def select_code_area_provider(paths, clone_dir, which=shutil.which,
+                              run=None, read_json=_read_json_file,
+                              patterns=None):
+    """Pick the code-area provider, directory-first.
+
+    graphify is OPTIONAL: prefer it only if it is on PATH AND `graphify update
+    <clone>` yields a `graphify-out/graph.json` with nodes; any absence/failure/
+    nodeless-graph falls back to the directory provider (never fails fast). The
+    `which`/`run`/`read_json` seams make this offline-testable without graphify.
+    Returns the `code_graph` provider dict."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    if run is None:
+        run = run_git
+    directory = build_directory_areas(paths, patterns)
+    if not which("graphify"):
+        return directory
+    try:
+        run(["graphify", "update", clone_dir])
+        graph = read_json(os.path.join(clone_dir, "graphify-out", "graph.json"))
+    except Exception:
+        return directory
+    if not (graph or {}).get("nodes"):
+        return directory
+    graphified = parse_graphify_graph(graph)
+    return graphified if graphified["areas"] else directory
+
+
+def parse_codeowners(text):
+    """Parse a CODEOWNERS file into {pattern: [login, ...]}.
+
+    Each non-comment line is `<pattern> <owner...>`; `@user` / `@org/team` are
+    stripped of the leading `@`. Lines with a pattern but no owners are skipped.
+    Order-preserving owners, last-pattern-wins on duplicate patterns. Pure."""
+    owners = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        pattern, handles = parts[0], parts[1:]
+        logins = [h[1:] if h.startswith("@") else h for h in handles]
+        if not logins:
+            continue
+        owners[pattern] = logins
+    return owners
+
+
+# Conventional label namespace -> facet (auto-detect). AVM uses `Class:`/`Type:`/
+# `Needs:`; most repos use `area`/`priority`/`status`/`lifecycle` with `:` or `/`.
+_AUTO_FACET_NAMESPACES = {
+    "area": "area", "component": "area",
+    "priority": "priority", "p": "priority",
+    "status": "status", "needs": "status",
+    "lifecycle": "lifecycle",
+    "type": "kind", "kind": "kind", "class": "kind",
+}
+
+
+def _namespace_of(label):
+    """Return the lowercase namespace token of a structured label, or None.
+    A structured label looks like `<ns>: value` or `<ns>/value`."""
+    for sep in (":", "/"):
+        if sep in label:
+            ns = label.split(sep, 1)[0].strip().lower()
+            if ns:
+                return ns, label.split(sep, 1)[0].strip() + sep
+    return None
+
+
+def detect_label_taxonomy(labels, config=None):
+    """Auto-detect structured label namespaces and map them to facets.
+
+    Returns {"<facet>": {"<namespace>": [label, ...]}, "source": "auto|config|merged"}.
+    `config` (a {facet: [namespace-prefix, ...]} block) overrides/extends the
+    auto-map. Degrades to {"source": "auto"} (no facets) rather than guessing on
+    unprefixed labels. Pure."""
+    auto = {}
+    config_facets = {}
+
+    # Build the config namespace -> facet lookup (prefixes may end with ':' or '/').
+    cfg_lookup = {}
+    for facet, prefixes in (config or {}).items():
+        for pre in prefixes:
+            cfg_lookup[pre.rstrip(":/").lower()] = (facet, pre)
+
+    for label in labels or []:
+        parsed = _namespace_of(label)
+        if not parsed:
+            continue
+        ns_token, ns_display = parsed
+        # config wins over auto for the same namespace token.
+        if ns_token in cfg_lookup:
+            facet, pre = cfg_lookup[ns_token]
+            config_facets.setdefault(facet, {}).setdefault(pre, []).append(label)
+        elif ns_token in _AUTO_FACET_NAMESPACES:
+            facet = _AUTO_FACET_NAMESPACES[ns_token]
+            auto.setdefault(facet, {}).setdefault(ns_display, []).append(label)
+
+    # Merge config over auto.
+    merged = {f: dict(ns) for f, ns in auto.items()}
+    for facet, ns_map in config_facets.items():
+        merged.setdefault(facet, {})
+        for pre, labs in ns_map.items():
+            merged[facet][pre] = labs
+
+    if config_facets and auto:
+        source = "merged"
+    elif config_facets:
+        source = "config"
+    else:
+        source = "auto"
+    out = {f: ns for f, ns in merged.items()}
+    out["source"] = source
+    return out
+
+
+_FACET_KEYS = ("area", "priority", "status", "lifecycle")
+
+# Native issue-type / label-value tokens -> canonical kind.
+_KIND_TOKENS = {
+    "feature": "feature", "enhancement": "feature",
+    "module": "module-request", "module-request": "module-request",
+    "module request": "module-request",
+    "bug": "bug", "defect": "bug",
+    "idea": "idea", "proposal": "idea",
+    "question": "question", "support": "question",
+    "doc": "docs", "docs": "docs", "documentation": "docs",
+}
+_VALID_KINDS = {"feature", "module-request", "bug", "idea", "question", "docs", "other"}
+
+
+def _kind_from_token(text):
+    """Map a free token (issue-type name, label value, template stem) to a kind."""
+    low = (text or "").strip().lower()
+    for token, kind in _KIND_TOKENS.items():
+        if token in low:
+            return kind
+    return None
+
+
+def _labels_in_taxonomy(item, taxonomy, facet):
+    """Labels on `item` that belong to `facet` per the taxonomy, order-preserving."""
+    facet_labels = set()
+    for labs in (taxonomy.get(facet) or {}).values():
+        facet_labels.update(labs)
+    return [lbl for lbl in (item.get("labels") or []) if lbl in facet_labels]
+
+
+def apply_facets(item, taxonomy):
+    """Derive {area, priority, status, lifecycle} for an item from its labels.
+
+    Each facet takes the first matching label (or None). Pure; never raises on
+    an empty taxonomy (every facet is then None)."""
+    out = {}
+    for facet in _FACET_KEYS:
+        matches = _labels_in_taxonomy(item, taxonomy, facet)
+        out[facet] = matches[0] if matches else None
+    return out
+
+
+def classify_issue_kind(issue, taxonomy, types_present):
+    """Classify an issue into one of feature/module-request/bug/idea/question/docs/other.
+
+    Priority: native GitHub issue type (when present) -> label `kind` facet ->
+    issue-template filename -> title/body heuristic -> other. Pure."""
+    # 1. native issue type
+    if types_present:
+        kind = _kind_from_token(issue.get("issue_type"))
+        if kind:
+            return kind
+    # 2. label kind facet (the values carried under the taxonomy's `kind` facet)
+    for lbl in _labels_in_taxonomy(issue, taxonomy, "kind"):
+        value = lbl.split(":", 1)[-1] if ":" in lbl else lbl.split("/", 1)[-1]
+        kind = _kind_from_token(value)
+        if kind:
+            return kind
+    # 3. issue-template filename (e.g. module_request.md, bug_report.yml)
+    kind = _kind_from_token((issue.get("template") or "").replace("_", " "))
+    if kind:
+        return kind
+    # 4. title/body heuristic
+    text = f"{issue.get('title','')} {issue.get('body','')}"
+    if "?" in (issue.get("title") or ""):
+        return "question"
+    kind = _kind_from_token(text)
+    if kind:
+        return kind
+    return "other"
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
@@ -604,6 +917,23 @@ def acquire(args, env):
         ])
         code_events = parse_code_events(raw_walk)
 
+    # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
+    # from the code-event walk + the commit file lists (local, zero-token).
+    area_paths = sorted(
+        {e["path"] for e in code_events}
+        | {e["old_path"] for e in code_events if e.get("old_path")}
+        | {f for c in commits for f in c.get("files", [])})
+    code_graph = select_code_area_provider(area_paths, clone_dir)
+
+    # CODEOWNERS from the clone (local file; try the conventional locations).
+    code_owners = {}
+    for rel in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+        p = os.path.join(clone_dir, rel)
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as fh:
+                code_owners = parse_codeowners(fh.read())
+            break
+
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
     # Closed PRs (merged + rejected) bounded by update time, as in Phase 1...
@@ -685,6 +1015,22 @@ def acquire(args, env):
         issue["comments_list"] = [normalize_comment(c) for c in conv]
         issue["reactions"] = summarize_reactions(raw_by_num.get(n, {}).get("reactions"))
         issue["open_high_activity"] = derive_open_high_activity(issue)
+        issue["issue_type"] = (raw_by_num.get(n, {}).get("type") or {}).get("name") \
+            if isinstance(raw_by_num.get(n, {}).get("type"), dict) else None
+
+    # Phase 3b: label taxonomy over every repo label seen, then stamp facets + kind.
+    all_labels = sorted({lbl for it in prs + issues for lbl in (it.get("labels") or [])})
+    label_taxonomy = detect_label_taxonomy(all_labels)
+    # Derive from the issues already fetched (native `type` captured above) rather
+    # than a separate org-scoped probe — no extra call, always consistent with data.
+    types_present = any(i.get("issue_type") for i in issues)
+    for pr in prs:
+        pr["facets"] = apply_facets(pr, label_taxonomy)
+    for issue in issues:
+        issue["facets"] = apply_facets(issue, label_taxonomy)
+        # native issue type when the repo uses them (acquire fetches it per issue
+        # in the existing issue loop — see Step 3a); the classifier is pure.
+        issue["kind"] = classify_issue_kind(issue, label_taxonomy, types_present)
 
     workflows = []
     workflow_stats = {}
@@ -715,6 +1061,9 @@ def acquire(args, env):
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
+    bundle["code_graph"] = code_graph
+    bundle["code_owners"] = code_owners
+    bundle["label_taxonomy"] = label_taxonomy
     return bundle
 
 

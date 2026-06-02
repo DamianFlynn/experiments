@@ -23,13 +23,17 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    This adds `trains` and classifies all four `buckets` (`shipped`, `rejected`,
    `in_flight`, `next_candidates`).
 3. **Render diagrams.** Preflight: `mmdc` must be on PATH
-   (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`). Then:
+   (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
+   `graphify` is **optional** (used only for its supported languages); when it is
+   absent — e.g. on Bicep/Terraform repos — the **directory provider** supplies
+   code areas, so no install is required for code-area attribution to work. Then:
    ```bash
    python3 render.py workspace/bundle.json
    ```
    This writes `workspace/diagrams/*.mmd`, records `bundle.diagrams`, and **fails
    if any diagram does not compile** under `mmdc`.
-   The manifest now also includes `content_timeline` and `deltas_bar`.
+   The manifest now also includes `content_timeline`, `deltas_bar`,
+   `contributor_graph`, and `kind_breakdown`.
 4. **Write the report.** Read `workspace/bundle.json` and fill `report-template.md`,
    embedding each `bundle.diagrams` file as a ```mermaid block. Cite each fact with
    its `url`. Do not state anything the bundle does not contain.
@@ -46,3 +50,9 @@ claim in the report resolves to a source ref in the bundle — never invent fact
   and `diagrams.content_timeline` and citing `feature_deltas`/`artifacts` refs.
   PR/issue **comment and review-comment bodies** and issue **reactions** are now
   in the bundle for narrative grounding. Sections with no backing data are omitted.
+- Phase 3b reports additionally: **group Shipped by code area**, add **Module
+  ownership** (`code_owners` + `people.modules`/`modules`, embedding
+  `diagrams.contributor_graph`) and an **Issue kinds** breakdown (embedding
+  `diagrams.kind_breakdown`). Each issue/PR carries `facets`
+  (area/priority/status/lifecycle) and each issue a `kind`; group and label using
+  them. `code_area`/`area` are now populated where a path resolves to an area.

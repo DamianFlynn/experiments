@@ -461,5 +461,159 @@ class TestComputeFeatureDeltas(unittest.TestCase):
             {"artifacts": {}, "commits": [], "trains": []}), [])
 
 
+class TestCodeAreaAttribution(unittest.TestCase):
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "examples/basic", "label": "basic",
+                 "paths": ["examples/basic/main.bicep"], "edges": []},
+                {"id": "docs", "label": "docs",
+                 "paths": ["docs/firewall.md"], "edges": []},
+            ]},
+            "artifacts": {
+                "art:examples/basic/main.bicep": {
+                    "kind": "example", "path": "examples/basic/main.bicep",
+                    "name": "main.bicep", "status": "live", "replaced_by": None,
+                    "code_area": None, "lifecycle": []},
+                "art:docs/firewall.md": {
+                    "kind": "doc", "path": "docs/firewall.md", "name": "firewall.md",
+                    "status": "removed", "replaced_by": None, "code_area": None,
+                    "lifecycle": []},
+                "art:README.md": {
+                    "kind": "readme", "path": "README.md", "name": "README.md",
+                    "status": "live", "replaced_by": None, "code_area": None,
+                    "lifecycle": []},
+            },
+            "feature_deltas": [
+                {"kind": "add", "subject": "example", "name": "main.bicep",
+                 "artifact": "art:examples/basic/main.bicep", "area": None,
+                 "commit": "c1", "url": "u"},
+                {"kind": "drop", "subject": "doc", "name": "firewall.md",
+                 "artifact": "art:docs/firewall.md", "area": None,
+                 "commit": "c4", "url": "u"},
+            ],
+        }
+
+    def test_area_index_maps_each_path_to_its_area(self):
+        idx = link.area_index(self._bundle()["code_graph"])
+        self.assertEqual(idx["examples/basic/main.bicep"], "examples/basic")
+        self.assertEqual(idx["docs/firewall.md"], "docs")
+
+    def test_attribute_fills_artifact_code_area(self):
+        b = self._bundle()
+        link.attribute_code_areas(b)
+        arts = b["artifacts"]
+        self.assertEqual(arts["art:examples/basic/main.bicep"]["code_area"],
+                         "examples/basic")
+        self.assertEqual(arts["art:docs/firewall.md"]["code_area"], "docs")
+        # a path not in the graph stays null (no guessing)
+        self.assertIsNone(arts["art:README.md"]["code_area"])
+
+    def test_attribute_fills_feature_delta_area(self):
+        b = self._bundle()
+        link.attribute_code_areas(b)
+        by_artifact = {d["artifact"]: d for d in b["feature_deltas"]}
+        self.assertEqual(
+            by_artifact["art:examples/basic/main.bicep"]["area"], "examples/basic")
+        self.assertEqual(by_artifact["art:docs/firewall.md"]["area"], "docs")
+
+    def test_empty_code_graph_leaves_everything_null(self):
+        b = self._bundle()
+        b["code_graph"] = {}
+        link.attribute_code_areas(b)
+        self.assertIsNone(b["artifacts"]["art:docs/firewall.md"]["code_area"])
+        self.assertIsNone(b["feature_deltas"][0]["area"])
+
+
+class TestTrainsModulesPeopleAreas(unittest.TestCase):
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "avm/res/network/firewall-policy", "label": "firewall-policy",
+                 "paths": ["avm/res/network/firewall-policy/main.bicep"],
+                 "edges": []},
+                {"id": "docs", "label": "docs",
+                 "paths": ["docs/firewall.md"], "edges": []},
+            ]},
+            "commits": [
+                {"sha": "c1", "author": "alice", "pr": 42,
+                 "files": ["avm/res/network/firewall-policy/main.bicep"]},
+                {"sha": "c2", "author": "bob", "pr": 42,
+                 "files": ["docs/firewall.md"]},
+            ],
+            "prs": [{"number": 42, "author": "alice", "reviewers": ["carol"],
+                     "url": "https://github.com/o/r/pull/42"}],
+            "issues": [],
+            "trains": [{"id": "train-pr-42", "prs": [42], "commits": ["c1", "c2"],
+                        "root_issue": None, "code_areas": []}],
+            "people": {},
+        }
+
+    def test_trains_gain_their_commits_code_areas(self):
+        b = self._bundle()
+        link.attribute_train_areas(b, link.area_index(b["code_graph"]))
+        t = b["trains"][0]
+        self.assertEqual(set(t["code_areas"]),
+                         {"avm/res/network/firewall-policy", "docs"})
+
+    def test_modules_field_aggregates_per_area(self):
+        b = self._bundle()
+        link.build_modules(b, link.area_index(b["code_graph"]))
+        mods = b["modules"]
+        fp = mods["avm/res/network/firewall-policy"]
+        self.assertEqual(fp["commits"], 1)
+        self.assertEqual(fp["files_changed"], 1)
+        # prs is a count of distinct PRs that touched the area (an int, not a list)
+        self.assertEqual(fp["prs"], 1)
+
+    def test_people_gain_modules_and_areas(self):
+        b = self._bundle()
+        idx = link.area_index(b["code_graph"])
+        link.attribute_people_areas(b, idx)
+        alice = b["people"]["alice"]
+        self.assertIn("avm/res/network/firewall-policy", alice["modules"])
+
+    def test_enrich_fills_all_phase3b_attribution(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        # at least one artifact and one feature_delta now carry a real area
+        arts = bundle["artifacts"]
+        self.assertTrue(any(a["code_area"] is not None for a in arts.values()))
+        self.assertTrue(any(d["area"] is not None for d in bundle["feature_deltas"]))
+        # trains carry code_areas; modules populated
+        self.assertTrue(any(t.get("code_areas") for t in bundle["trains"]))
+        self.assertTrue(bundle["modules"])
+
+
+class TestPhase3bConsistency(unittest.TestCase):
+    def test_attribution_preserves_artifact_and_delta_refs(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            b = link.enrich(json.load(fh))
+        for d in b["feature_deltas"]:
+            self.assertTrue(str(d["url"]).startswith("https://"))
+            self.assertIn(d["artifact"], b["artifacts"])
+        for a in b["artifacts"].values():
+            for ev in a["lifecycle"]:
+                self.assertTrue(str(ev["ref"]["url"]).startswith("https://"))
+
+    def test_modules_counts_are_non_negative_and_sum_sane(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            b = link.enrich(json.load(fh))
+        for area, m in b["modules"].items():
+            self.assertGreaterEqual(m["commits"], 1)
+            self.assertGreaterEqual(m["files_changed"], 1)
+            self.assertGreaterEqual(m["prs"], 0)
+
+    def test_train_code_areas_are_known_area_ids(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            b = link.enrich(json.load(fh))
+        known = {a["id"] for a in b["code_graph"]["areas"]}
+        for t in b["trains"]:
+            for area in t.get("code_areas", []):
+                self.assertIn(area, known)
+
+
 if __name__ == "__main__":
     unittest.main()

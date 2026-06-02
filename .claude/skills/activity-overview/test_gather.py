@@ -632,5 +632,344 @@ class TestAcquireAssemblyP3(unittest.TestCase):
         self.assertEqual(kinds, {"add", "modify", "delete", "rename"})
 
 
+class TestDirectoryCodeAreaProvider(unittest.TestCase):
+    def test_avm_module_dir_is_the_four_segment_subtree(self):
+        # AVM: avm/res/<service>/<module>/...  -> area = that 4-seg dir
+        self.assertEqual(
+            gather.classify_code_area(
+                "avm/res/network/firewall-policy/main.bicep",
+                gather.DEFAULT_AREA_PATTERNS),
+            "avm/res/network/firewall-policy")
+        self.assertEqual(
+            gather.classify_code_area(
+                "avm/res/network/firewall-policy/tests/e2e/main.test.bicep",
+                gather.DEFAULT_AREA_PATTERNS),
+            "avm/res/network/firewall-policy")
+
+    def test_dir_containing_main_bicep_is_an_area(self):
+        # Any directory that holds a main.bicep is a module root.
+        paths = ["modules/keyvault/main.bicep", "modules/keyvault/README.md"]
+        areas = gather.build_directory_areas(paths, gather.DEFAULT_AREA_PATTERNS)
+        ids = {a["id"] for a in areas["areas"]}
+        self.assertIn("modules/keyvault", ids)
+
+    def test_terraform_modules_and_tf_dirs(self):
+        self.assertEqual(
+            gather.classify_code_area("modules/vnet/main.tf",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "modules/vnet")
+        # any dir containing *.tf becomes that dir
+        self.assertEqual(
+            gather.classify_code_area("infra/network/variables.tf",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "infra/network")
+
+    def test_generic_fallback_is_top_two_segments(self):
+        self.assertEqual(
+            gather.classify_code_area("src/app/handlers/auth.py",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "src/app")
+        # a top-level file falls back to its own segment
+        self.assertEqual(
+            gather.classify_code_area("README.md", gather.DEFAULT_AREA_PATTERNS),
+            "README.md")
+
+    def test_build_directory_areas_groups_paths_and_shapes_provider(self):
+        paths = [
+            "avm/res/network/firewall-policy/main.bicep",
+            "avm/res/network/firewall-policy/README.md",
+            "avm/res/storage/account/main.bicep",
+            "src/app/handlers/auth.py",
+        ]
+        cg = gather.build_directory_areas(paths, gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(cg["provider"], "directory")
+        by_id = {a["id"]: a for a in cg["areas"]}
+        self.assertEqual(
+            sorted(by_id["avm/res/network/firewall-policy"]["paths"]),
+            ["avm/res/network/firewall-policy/README.md",
+             "avm/res/network/firewall-policy/main.bicep"])
+        # label is a short tail of the id; edges deferred (always empty).
+        fp = by_id["avm/res/network/firewall-policy"]
+        self.assertEqual(fp["label"], "firewall-policy")
+        self.assertEqual(fp["edges"], [])
+
+    def test_empty_paths_yield_empty_provider(self):
+        cg = gather.build_directory_areas([], gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(cg, {"provider": "directory", "areas": []})
+
+    def test_none_path_classifies_to_none(self):
+        self.assertIsNone(
+            gather.classify_code_area(None, gather.DEFAULT_AREA_PATTERNS))
+        self.assertIsNone(
+            gather.classify_code_area("", gather.DEFAULT_AREA_PATTERNS))
+
+
+class TestGraphifyProvider(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "graphify_graph_sample.json")) as fh:
+            self.graph = json.load(fh)
+
+    def test_groups_nodes_by_community_into_areas(self):
+        cg = gather.parse_graphify_graph(self.graph)
+        self.assertEqual(cg["provider"], "graphify")
+        ids = {a["id"] for a in cg["areas"]}
+        self.assertEqual(ids, {"community:0", "community:1"})
+
+    def test_area_paths_are_distinct_source_files_in_the_community(self):
+        cg = gather.parse_graphify_graph(self.graph)
+        by_id = {a["id"]: a for a in cg["areas"]}
+        self.assertEqual(sorted(by_id["community:0"]["paths"]),
+                         ["src/app/auth.py", "src/app/session.py"])
+        # n3 and n5 share src/store/user.py -> de-duplicated to one path
+        self.assertEqual(sorted(by_id["community:1"]["paths"]),
+                         ["src/store/index.py", "src/store/user.py"])
+
+    def test_area_label_is_a_representative_dir(self):
+        cg = gather.parse_graphify_graph(self.graph)
+        by_id = {a["id"]: a for a in cg["areas"]}
+        # a representative path/dir for the community (not empty)
+        self.assertTrue(by_id["community:0"]["label"])
+        self.assertEqual(by_id["community:0"]["edges"], [])
+
+    def test_no_top_level_communities_key_required(self):
+        # The real shape has NO top-level `communities`; parser must not need it.
+        self.assertNotIn("communities", self.graph)
+        cg = gather.parse_graphify_graph(self.graph)
+        self.assertTrue(cg["areas"])
+
+    def test_empty_or_nodeless_graph_yields_empty_provider(self):
+        self.assertEqual(gather.parse_graphify_graph({}),
+                         {"provider": "graphify", "areas": []})
+        self.assertEqual(gather.parse_graphify_graph({"nodes": [], "links": []}),
+                         {"provider": "graphify", "areas": []})
+
+
+class TestProviderSelection(unittest.TestCase):
+    PATHS = ["avm/res/network/firewall-policy/main.bicep",
+             "src/app/handlers/auth.py"]
+
+    def test_uses_directory_provider_when_graphify_absent(self):
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone", which=lambda _n: None)
+        self.assertEqual(cg["provider"], "directory")
+        self.assertTrue(cg["areas"])
+
+    def test_uses_directory_provider_when_graphify_emits_no_nodes(self):
+        # graphify on PATH and runs, but graph.json has no nodes -> fall back.
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone",
+            which=lambda _n: "/usr/bin/graphify",
+            run=lambda cmd, **kw: None,
+            read_json=lambda _p: {"nodes": [], "links": []})
+        self.assertEqual(cg["provider"], "directory")
+
+    def test_prefers_graphify_when_present_and_nodes_exist(self):
+        with open(os.path.join(FIX, "graphify_graph_sample.json")) as fh:
+            graph = json.load(fh)
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone",
+            which=lambda _n: "/usr/bin/graphify",
+            run=lambda cmd, **kw: None,
+            read_json=lambda _p: graph)
+        self.assertEqual(cg["provider"], "graphify")
+        self.assertTrue(cg["areas"])
+
+    def test_graphify_run_failure_falls_back_silently(self):
+        def boom(cmd, **kw):
+            raise RuntimeError("graphify exploded")
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone",
+            which=lambda _n: "/usr/bin/graphify", run=boom,
+            read_json=lambda _p: {"nodes": []})
+        self.assertEqual(cg["provider"], "directory")
+
+
+class TestParseCodeowners(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "codeowners_sample.txt")) as fh:
+            self.text = fh.read()
+
+    def test_maps_glob_to_logins_stripping_at(self):
+        owners = gather.parse_codeowners(self.text)
+        self.assertEqual(owners["avm/res/network/"], ["alice", "bob"])
+        self.assertEqual(owners["avm/res/storage/"], ["carol"])
+        self.assertEqual(owners["*.bicep"], ["bicep-reviewers"])
+
+    def test_team_handles_are_kept_as_owners(self):
+        owners = gather.parse_codeowners(self.text)
+        self.assertEqual(owners["docs/"], ["org/docs-team", "dave"])
+        self.assertEqual(owners["*"], ["org/maintainers"])
+
+    def test_comments_and_blank_lines_ignored(self):
+        owners = gather.parse_codeowners(self.text)
+        self.assertNotIn("#", "".join(owners))
+        self.assertEqual(len(owners), 5)
+
+    def test_permissive_on_empty_or_none(self):
+        self.assertEqual(gather.parse_codeowners(""), {})
+        self.assertEqual(gather.parse_codeowners(None), {})
+
+    def test_pattern_with_no_owners_is_skipped(self):
+        self.assertEqual(gather.parse_codeowners("docs/   \n"), {})
+
+
+class TestDetectLabelTaxonomy(unittest.TestCase):
+    LABELS = ["area: networking", "area: storage", "priority: high",
+              "status: in progress", "Type: Bug", "Class: Resource Module",
+              "Needs: Triage", "lifecycle/stale", "good first issue"]
+
+    def test_auto_detects_known_namespaces_into_facets(self):
+        tax = gather.detect_label_taxonomy(self.LABELS)
+        self.assertEqual(tax["source"], "auto")
+        # area facet groups both area:* labels under the namespace
+        self.assertIn("area", tax)
+        self.assertEqual(sorted(tax["area"]["area:"]),
+                         ["area: networking", "area: storage"])
+        self.assertIn("priority", tax)
+        self.assertIn("status", tax)
+        # AVM Class:/Type:/Needs: map to kind/lifecycle facets
+        self.assertIn("kind", tax)
+        self.assertIn("Type:", tax["kind"])
+
+    def test_unprefixed_labels_do_not_create_facets(self):
+        tax = gather.detect_label_taxonomy(["good first issue", "bug"])
+        # nothing structured -> no facet buckets, just the source marker
+        self.assertEqual(set(tax) - {"source"}, set())
+        self.assertEqual(tax["source"], "auto")
+
+    def test_config_override_extends_and_marks_source_merged(self):
+        config = {"area": ["component:"], "priority": ["sev/"]}
+        tax = gather.detect_label_taxonomy(
+            ["component: api", "sev/1", "area: networking"], config=config)
+        self.assertEqual(tax["source"], "merged")
+        self.assertIn("component:", tax["area"])
+        self.assertIn("sev/", tax["priority"])
+        # auto-detected area:* still present alongside the config namespace
+        self.assertIn("area:", tax["area"])
+
+    def test_config_only_when_no_auto_marks_source_config(self):
+        tax = gather.detect_label_taxonomy(
+            ["component: api"], config={"area": ["component:"]})
+        self.assertEqual(tax["source"], "config")
+
+    def test_empty_labels_yield_no_facets(self):
+        self.assertEqual(gather.detect_label_taxonomy([]), {"source": "auto"})
+
+
+class TestFacetsAndKind(unittest.TestCase):
+    TAX = {
+        "area": {"area:": ["area: networking", "area: storage"]},
+        "priority": {"priority:": ["priority: high"]},
+        "status": {"status:": ["status: in progress"]},
+        "kind": {"Type:": ["Type: Bug", "Type: Feature"]},
+        "lifecycle": {"lifecycle/": ["lifecycle/stale"]},
+        "source": "auto",
+    }
+
+    def test_apply_facets_picks_one_value_per_facet_from_labels(self):
+        item = {"labels": ["area: networking", "priority: high", "Type: Bug"]}
+        f = gather.apply_facets(item, self.TAX)
+        self.assertEqual(f["area"], "area: networking")
+        self.assertEqual(f["priority"], "priority: high")
+        self.assertIsNone(f["status"])
+        self.assertIsNone(f["lifecycle"])
+
+    def test_apply_facets_returns_all_four_keys_even_when_empty(self):
+        f = gather.apply_facets({"labels": []}, self.TAX)
+        self.assertEqual(set(f), {"area", "priority", "status", "lifecycle"})
+        self.assertTrue(all(v is None for v in f.values()))
+
+    def test_kind_native_issue_type_wins(self):
+        issue = {"labels": ["Type: Bug"], "title": "crash",
+                 "issue_type": "Feature"}
+        self.assertEqual(
+            gather.classify_issue_kind(issue, self.TAX, types_present=True),
+            "feature")
+
+    def test_kind_label_facet_when_no_native_type(self):
+        issue = {"labels": ["Type: Bug"], "title": "whatever"}
+        self.assertEqual(
+            gather.classify_issue_kind(issue, self.TAX, types_present=False),
+            "bug")
+
+    def test_kind_template_filename_then_heuristic(self):
+        # template name maps module requests
+        issue = {"labels": [], "title": "x",
+                 "template": "module_request.md"}
+        self.assertEqual(
+            gather.classify_issue_kind(issue, self.TAX, types_present=False),
+            "module-request")
+        # title heuristic: a question
+        q = {"labels": [], "title": "How do I configure the firewall?"}
+        self.assertEqual(
+            gather.classify_issue_kind(q, self.TAX, types_present=False),
+            "question")
+
+    def test_kind_defaults_to_other(self):
+        self.assertEqual(
+            gather.classify_issue_kind({"labels": [], "title": "misc"},
+                                       self.TAX, types_present=False),
+            "other")
+
+
+class TestAcquireAssemblyP3b(unittest.TestCase):
+    """Compose the Phase 3b helpers over recorded inputs, offline."""
+
+    def _bundle(self):
+        with open(os.path.join(FIX, "git_log_p3_sample.txt")) as fh:
+            code_events = gather.parse_code_events(fh.read())
+        with open(os.path.join(FIX, "codeowners_sample.txt")) as fh:
+            code_owners = gather.parse_codeowners(fh.read())
+
+        # paths the provider sees come from code_events + commit file lists
+        paths = sorted({e["path"] for e in code_events}
+                       | {e["old_path"] for e in code_events if e.get("old_path")})
+        code_graph = gather.select_code_area_provider(
+            paths, "clone", which=lambda _n: None)  # graphify absent -> directory
+
+        prs = [{"number": 42, "labels": ["area: networking", "Type: Bug"],
+                "title": "fix policy", "body": ""}]
+        issues = [{"number": 18, "labels": ["area: storage", "priority: high"],
+                   "title": "Need storage module", "body": "module please",
+                   "state": "open"}]
+        all_labels = sorted({l for it in prs + issues for l in it["labels"]})
+        taxonomy = gather.detect_label_taxonomy(all_labels)
+        for it in prs + issues:
+            it["facets"] = gather.apply_facets(it, taxonomy)
+        for issue in issues:
+            issue["kind"] = gather.classify_issue_kind(
+                issue, taxonomy, types_present=False)
+
+        meta = {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"}
+        bundle = gather.build_bundle(meta, [], prs, issues)
+        bundle["code_events"] = code_events
+        bundle["code_graph"] = code_graph
+        bundle["code_owners"] = code_owners
+        bundle["label_taxonomy"] = taxonomy
+        return bundle
+
+    def test_code_graph_is_directory_provider_with_areas(self):
+        b = self._bundle()
+        self.assertEqual(b["code_graph"]["provider"], "directory")
+        self.assertTrue(b["code_graph"]["areas"])
+        for a in b["code_graph"]["areas"]:
+            self.assertTrue(a["id"] and a["paths"])
+
+    def test_label_taxonomy_and_facets_present(self):
+        b = self._bundle()
+        self.assertIn("source", b["label_taxonomy"])
+        pr = b["prs"][0]
+        self.assertEqual(pr["facets"]["area"], "area: networking")
+        issue = b["issues"][0]
+        self.assertEqual(issue["facets"]["priority"], "priority: high")
+        self.assertIn(issue["kind"],
+                      {"feature", "module-request", "bug", "idea",
+                       "question", "docs", "other"})
+
+    def test_code_owners_present(self):
+        b = self._bundle()
+        self.assertIn("avm/res/network/", b["code_owners"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,7 +70,8 @@ flagged high-priority — the basis for the next-release forecast.
 ## Feature changes (add / drop / change)
 
 The `feature_deltas` ledger as a table grouped by kind. Each row cites its
-artifact and the commit/PR that changed it (`area` is null until graphify lands).
+artifact and the commit/PR that changed it. `area` is now populated where the
+path resolves to a code area (no longer null when a `code_graph` area covers it).
 
 ```mermaid
 {contents of diagrams.deltas_bar}
@@ -97,3 +98,38 @@ For each artifact in `artifacts` (status `removed`/`replaced` first):
 - **{name}** ({kind}) — {status}. Lifecycle: {for each event} {event} by
   {author} on {date} ([{commit:7}]({ref.url})){end}.{ if replaced_by } Replaced by
   `{replaced_by}`.{end}
+
+## Shipped by code area
+
+Group `buckets.shipped` by each item's train `code_areas` (from `code_graph`).
+For each area, list the shipped PRs/issues with their train link. Items with no
+resolved area fall under "Unattributed".
+
+### {area label} (`{area id}`)
+
+- [{title}]({url}) (#{number}) — train `{train.id}`
+
+## Module ownership
+
+From `code_owners` + `people.modules`/`modules`: who owns and who touched each
+module this window.
+
+| Module | Owners (CODEOWNERS) | Top contributors | Commits | PRs | Files |
+|--------|---------------------|------------------|---------|-----|-------|
+| `{area}` | {code_owners[glob]} | {people whose modules include area} | {modules[area].commits} | {modules[area].prs} | {modules[area].files_changed} |
+
+Embeds `diagrams.contributor_graph` (people ↔ code-area edges):
+
+```mermaid
+{contents of diagrams.contributor_graph}
+```
+
+## Issue kinds
+
+The `kind` mix across the window's issues (feature / module-request / bug / idea /
+question / docs / other), derived from native issue types → label facets →
+template → heuristic.
+
+```mermaid
+{contents of diagrams.kind_breakdown}
+```
