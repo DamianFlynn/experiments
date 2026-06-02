@@ -26,7 +26,12 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
    `graphify` is **optional** (used only for its supported languages); when it is
    absent — e.g. on Bicep/Terraform repos — the **directory provider** supplies
-   code areas, so no install is required for code-area attribution to work. Then:
+   code areas, so no install is required for code-area attribution to work.
+   - **IaC dependency edges (Phase 3c):** if `bicep` and/or `terraform` are on `PATH`, `gather.py`
+     resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges`; absent the
+     CLIs (or the module registry), edges are left empty and the rest of the run is unaffected.
+
+   Then:
    ```bash
    python3 render.py workspace/bundle.json
    ```

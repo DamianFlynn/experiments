@@ -97,7 +97,27 @@ docsRefs, release_train, sprints, project, diagrams`.
   integer `community` + `source_file`; **no** top-level `communities` list; edges
   live under `links`) and groups nodes by `community` into `community:<n>` areas.
   graphify does NOT parse Bicep/HCL, so on those repos the directory provider runs.
-  **Deferred:** dependency `edges` between areas (Bicep `dependsOn`, `tree-sitter-hcl`).
+  **`code_graph.areas[].edges` (Phase 3c) — inter-area dependency edges.** Each edge:
+
+  | field | meaning |
+  |-------|---------|
+  | `to` | canonical target area-id (`avm/res/<svc>/<module>`, a local dir, or a registry source string), or `null` when unresolvable |
+  | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred to 3d) |
+  | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
+  | `version` | pinned version when present, else `null` |
+  | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
+  | `provider` | `"bicep"` or `"terraform"` |
+  | `resolved` | `true` when `to` is non-null |
+
+  **Build-only.** Edges are populated *only* from a successful `bicep restore`+`bicep build`
+  (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned
+  working tree. When the CLI or registry is unavailable, or a build fails, `edges` stays `[]` —
+  the skill never emits static, unvalidated edges. Immediate (`transitive:false`) edges are fully
+  identified (area-id + version) from source; transitive edges connect to *other areas in the
+  repo* (deep external-module internals are not fabricated into edges). The `bicep` and
+  `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
+  workflow for install). **Deferred:** symbol-granular artifacts (3d), symbol-identity tracking
+  (3e), resource-level `dependsOn` edges.
 - **code_owners** `{ "<path|glob>": ["login", ...] }` — parsed from the clone's
   CODEOWNERS (`.github/`/root/`docs/`); `@org/team` and `@user` kept as logins.
 - **label_taxonomy** `{ "<facet>": { "<namespace>": ["label", ...] }, "source":
@@ -117,5 +137,6 @@ docsRefs, release_train, sprints, project, diagrams`.
   commits' files) or reviewed (their reviewed PRs' areas).
 - **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
-- **Still deferred:** symbol/inline-comment artifacts, dependency-edge enrichment,
+- **Still deferred:** symbol/inline-comment artifacts, symbol-granular artifacts (3d),
+  symbol-identity tracking (3e), resource-level `dependsOn` edges (3d),
   `hunk`/`before`/`after`/`detail` on feature_deltas, multi-repo aggregation.
