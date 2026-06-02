@@ -178,6 +178,53 @@ def normalize_issue(raw):
     }
 
 
+# Review states ranked by how strongly they gate a merge. A PR's decision is
+# the strongest *latest-per-reviewer* signal: any outstanding changes-requested
+# dominates; otherwise an approval; otherwise a bare comment.
+_REVIEW_RANK = {"changes_requested": 3, "approved": 2, "commented": 1, "none": 0}
+
+
+def summarize_reviews(raw_reviews):
+    """Reduce raw PR reviews to {reviewers, decision}. Pure."""
+    latest = {}  # login -> (submitted_at, state)
+    for r in raw_reviews or []:
+        login = (r.get("user") or {}).get("login")
+        if not login:
+            continue
+        state = (r.get("state") or "").lower()
+        if state not in _REVIEW_RANK:
+            continue
+        ts = r.get("submitted_at") or ""
+        if login not in latest or ts >= latest[login][0]:
+            latest[login] = (ts, state)
+    reviewers = sorted(latest)
+    decision = "none"
+    for _, state in latest.values():
+        if _REVIEW_RANK[state] > _REVIEW_RANK[decision]:
+            decision = state
+    return {"reviewers": reviewers, "decision": decision}
+
+
+def parse_timeline_crossrefs(raw_timeline):
+    """Issue numbers cross-referenced/connected to a PR via timeline events.
+
+    De-duplicated, order-preserving. Skips cross-refs whose source is itself a
+    pull request (we only want issue links). Pure."""
+    out = []
+    for ev in raw_timeline or []:
+        kind = ev.get("event")
+        num = None
+        if kind == "cross-referenced":
+            issue = (ev.get("source") or {}).get("issue") or {}
+            if issue.get("pull_request") is None:
+                num = issue.get("number")
+        elif kind in ("connected", "disconnected"):
+            num = (ev.get("subject") or {}).get("number")
+        if num is not None and num not in out:
+            out.append(num)
+    return out
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with

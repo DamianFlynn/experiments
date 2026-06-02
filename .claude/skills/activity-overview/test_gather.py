@@ -274,5 +274,40 @@ class TestCliAndAuth(unittest.TestCase):
             gather.resolve_token({})
 
 
+class TestReviewsAndTimeline(unittest.TestCase):
+    def test_summarize_reviews_picks_latest_decision_per_reviewer(self):
+        raw = [
+            {"user": {"login": "bob"}, "state": "COMMENTED",
+             "submitted_at": "2026-05-08T10:00:00Z"},
+            {"user": {"login": "bob"}, "state": "CHANGES_REQUESTED",
+             "submitted_at": "2026-05-09T10:00:00Z"},
+            {"user": {"login": "carol"}, "state": "APPROVED",
+             "submitted_at": "2026-05-10T10:00:00Z"},
+        ]
+        out = gather.summarize_reviews(raw)
+        self.assertEqual(sorted(out["reviewers"]), ["bob", "carol"])
+        # changes_requested outranks approved when any reviewer still blocks
+        self.assertEqual(out["decision"], "changes_requested")
+
+    def test_summarize_reviews_approved_when_all_clear(self):
+        raw = [{"user": {"login": "carol"}, "state": "APPROVED",
+                "submitted_at": "2026-05-10T10:00:00Z"}]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+
+    def test_summarize_reviews_empty_is_none(self):
+        self.assertEqual(gather.summarize_reviews([])["decision"], "none")
+
+    def test_parse_timeline_crossrefs_collects_issue_numbers(self):
+        raw = [
+            {"event": "cross-referenced",
+             "source": {"issue": {"number": 18, "pull_request": None}}},
+            {"event": "connected", "subject": {"number": 19}},
+            {"event": "labeled"},
+            {"event": "cross-referenced",
+             "source": {"issue": {"number": 18, "pull_request": None}}},
+        ]
+        self.assertEqual(gather.parse_timeline_crossrefs(raw), [18, 19])
+
+
 if __name__ == "__main__":
     unittest.main()
