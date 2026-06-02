@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 INSTALL_HINT = (
-    "Install mermaid-cli so `mmdc` is on PATH: `npm install -g @mermaid-js/mermaid-cli`."
+    "Install mermaid-cli: `npm install -g @mermaid-js/mermaid-cli`."
 )
 
 _PIE_ROWS = [
@@ -132,7 +132,7 @@ def validate_with_mmdc(paths, export=None, runner=subprocess.run, which=shutil.w
                         capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"mmdc failed to render {path}:\n{result.stderr}")
-        if export is None:
+        if export is None and out != path:
             try:
                 os.remove(out)
             except OSError:
@@ -156,9 +156,15 @@ def main(argv=None):
         bundle = json.load(fh)
     manifest = write_diagrams(bundle, args.diagrams_dir)
     if not args.skip_validate:
-        validate_with_mmdc(list(manifest.values()), export=args.export)
-    with open(args.bundle, "w") as fh:
+        try:
+            validate_with_mmdc(list(manifest.values()), export=args.export)
+        except RuntimeError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            raise SystemExit(1)
+    tmp = args.bundle + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(bundle, fh, indent=2)
+    os.replace(tmp, args.bundle)
     sys.stderr.write(
         f"rendered {len(manifest)} diagrams into {args.diagrams_dir} "
         f"({'validated' if not args.skip_validate else 'unvalidated'})\n")

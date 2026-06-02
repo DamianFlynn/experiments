@@ -21,7 +21,8 @@ def _mmdc_works():
     """True only if a real `mmdc` can compile a trivial diagram — guards the
     live-validation test so a missing OR non-functional mmdc (e.g. Puppeteer
     Chrome absent) skips rather than fails."""
-    if not shutil.which("mmdc"):
+    mmdc = shutil.which("mmdc")
+    if not mmdc:
         return False
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -29,7 +30,7 @@ def _mmdc_works():
             out = os.path.join(d, "probe.svg")
             with open(src, "w", encoding="utf-8") as fh:
                 fh.write('pie\n    "A" : 1\n')
-            result = subprocess.run([shutil.which("mmdc"), "-i", src, "-o", out, "-q"],
+            result = subprocess.run([mmdc, "-i", src, "-o", out, "-q"],
                                     capture_output=True, text=True)
             return result.returncode == 0
     except Exception:
@@ -148,6 +149,64 @@ class TestMmdcValidation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             manifest = render.write_diagrams(_bundle(), d)
             render.validate_with_mmdc(list(manifest.values()))  # raises on failure
+
+    def test_ensure_mmdc_returns_path_when_present(self):
+        self.assertEqual(render.ensure_mmdc(which=lambda _n: "/usr/bin/mmdc"),
+                         "/usr/bin/mmdc")
+
+    def test_validate_removes_temp_svg_when_no_export(self):
+        created = []
+
+        def fake_run(cmd, **kw):
+            out = cmd[cmd.index("-o") + 1]
+            with open(out, "w") as fh:
+                fh.write("<svg/>")
+            created.append(out)
+
+            class R:
+                returncode = 0
+                stderr = ""
+            return R()
+
+        with tempfile.TemporaryDirectory() as d:
+            mmd = os.path.join(d, "x.mmd")
+            with open(mmd, "w") as fh:
+                fh.write("pie\n")
+            render.validate_with_mmdc([mmd], runner=fake_run,
+                                      which=lambda _n: "/usr/bin/mmdc")
+            self.assertTrue(created)
+            self.assertFalse(os.path.exists(created[0]))  # temp svg cleaned up
+
+    def test_validate_keeps_exported_image(self):
+        def fake_run(cmd, **kw):
+            out = cmd[cmd.index("-o") + 1]
+            with open(out, "w") as fh:
+                fh.write("<svg/>")
+
+            class R:
+                returncode = 0
+                stderr = ""
+            return R()
+
+        with tempfile.TemporaryDirectory() as d:
+            mmd = os.path.join(d, "x.mmd")
+            with open(mmd, "w") as fh:
+                fh.write("pie\n")
+            render.validate_with_mmdc([mmd], export="svg", runner=fake_run,
+                                      which=lambda _n: "/usr/bin/mmdc")
+            self.assertTrue(os.path.exists(os.path.join(d, "x.svg")))  # kept
+
+    def test_main_skip_validate_writes_diagrams_and_bundle(self):
+        with tempfile.TemporaryDirectory() as d:
+            bundle_path = os.path.join(d, "b.json")
+            with open(bundle_path, "w") as fh:
+                json.dump(_bundle(), fh)
+            manifest = render.main([bundle_path, "--diagrams-dir",
+                                    os.path.join(d, "dg"), "--skip-validate"])
+            self.assertEqual(set(manifest), {"buckets_pie", "timeline_gantt"})
+            written = json.load(open(bundle_path))
+            self.assertEqual(set(written["diagrams"]),
+                             {"buckets_pie", "timeline_gantt"})
 
 
 if __name__ == "__main__":
