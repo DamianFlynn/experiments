@@ -1,0 +1,29 @@
+# Bundle Schema (Phase 1)
+
+The bundle is a single JSON object. Phase 1 populates `meta`, `commits`, `prs`,
+`issues`, `trains`, and `buckets`; all other top-level keys are reserved and empty
+until later phases.
+
+## Ref convention
+
+Every provenance reference is `{ "type": "pr|issue|commit", "id": <number|sha>,
+"url": "https://..." }`. Every narrative-bearing fact (a train, a bucket entry)
+resolves to at least one such ref. To fact-check any claim in a report, follow its
+ref `url` to GitHub.
+
+## Top-level keys (Phase 1)
+
+- `meta` — `owner, repo, from, to, branches, clone_dir, period, prev_bundle, schema_version`.
+- `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
+- `prs` — merged-in-window PRs: `{ number, title, body, author, author_association,
+  labels, merged, merged_by, merged_at, closed_at, state, closes:[issue#], url }`.
+- `issues` — closing issues: `{ number, title, body, kind, author, author_association,
+  labels, assignees, state, state_reason, closed_at, url }`.
+- `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], outcome, evidence:[ref] }]`.
+- `buckets` — `{ shipped:[ref], in_flight:[], rejected:[], next_candidates:[] }`.
+
+## Reserved (empty in Phase 1)
+
+`timeline, artifacts, feature_deltas, people, halls, flow, blockers, code_owners,
+code_graph, label_taxonomy, modules, workflow_stats, workflows, releases, milestones,
+docsRefs, release_train, sprints, project, diagrams`.
