@@ -5,6 +5,8 @@ later-phase fields are reserved empty here and filled by later phases.
 """
 
 SCHEMA_VERSION = 1
+RECORD_SEP = "\x1e"
+FIELD_SEP = "\x1f"
 
 
 def build_bundle(meta, commits, prs, issues):
@@ -46,10 +48,6 @@ def build_bundle(meta, commits, prs, issues):
     }
 
 
-RECORD_SEP = "\x1e"
-FIELD_SEP = "\x1f"
-
-
 def parse_git_log(raw):
     """Parse `git log` output formatted with RECORD_SEP/FIELD_SEP separators.
 
@@ -64,7 +62,7 @@ def parse_git_log(raw):
         fields = lines[0].split(FIELD_SEP)
         if len(fields) < 5:
             continue
-        sha, parents, author, date, subject = fields[:5]
+        sha, parents, author, date, subject = (f.strip() for f in fields[:5])
         files = [ln for ln in lines[1:] if ln.strip()]
         commits.append({
             "sha": sha,
