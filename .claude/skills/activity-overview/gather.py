@@ -34,6 +34,7 @@ def build_bundle(meta, commits, prs, issues):
         "timeline": [],
         "artifacts": {},
         "feature_deltas": [],
+        "code_events": [],
         "trains": [],
         "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
         "people": {},
@@ -583,13 +584,24 @@ def acquire(args, env):
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
     # Multi-branch commit walking arrives in a later phase.
-    log_fmt = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
     raw = run_git([
         "git", "-C", clone_dir, "log",
         f"--since={frm}", f"--until={to}",
-        f"--pretty=format:{log_fmt}", "--date=short", "--name-only",
+        f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
     ])
     commits = parse_git_log(raw)
+
+    # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
+    # Guarded so --no-clone / missing clone degrades gracefully to empty.
+    code_events = []
+    if not args.no_clone or os.path.isdir(clone_dir):
+        raw_walk = run_git([
+            "git", "-C", clone_dir, "log",
+            f"--since={frm}", f"--until={to}",
+            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+            "--name-status", "-M", "-C",
+        ])
+        code_events = parse_code_events(raw_walk)
 
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
@@ -622,6 +634,12 @@ def acquire(args, env):
         timeline = fetch_all(
             get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
         pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+        review_comments = fetch_all(
+            get_page, f"{api}/pulls/{pr['number']}/comments?per_page=100")
+        pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
+        conv_comments = fetch_all(
+            get_page, f"{api}/issues/{pr['number']}/comments?per_page=100")
+        pr["comments_list"] = [normalize_comment(c) for c in conv_comments]
         prs.append(pr)
 
     # Issue set: every issue a kept PR closes or cross-references, plus open and
@@ -657,6 +675,14 @@ def acquire(args, env):
             continue
         issues.append(normalize_issue(raw_issue))
 
+    for issue in issues:
+        n = issue["number"]
+        conv = fetch_all(get_page, f"{api}/issues/{n}/comments?per_page=100")
+        issue["comments_list"] = [normalize_comment(c) for c in conv]
+        issue_obj, _ = http_get_json(f"{api}/issues/{n}", token)
+        issue["reactions"] = summarize_reactions(issue_obj.get("reactions"))
+        issue["open_high_activity"] = derive_open_high_activity(issue)
+
     workflows = []
     workflow_stats = {}
     if getattr(args, "include_workflows", True):
@@ -685,6 +711,7 @@ def acquire(args, env):
     bundle["workflow_stats"] = workflow_stats
     bundle["releases"] = releases
     bundle["milestones"] = milestones
+    bundle["code_events"] = code_events
     return bundle
 
 

@@ -570,5 +570,65 @@ class TestParseCodeEvents(unittest.TestCase):
         self.assertEqual(gather.parse_code_events(raw), [])
 
 
+class TestAcquireAssemblyP3(unittest.TestCase):
+    """Compose the Phase 3a helpers over recorded REST + git-log, offline."""
+
+    def _bundle(self):
+        with open(os.path.join(FIX, "rest_p2_sample.json")) as fh:
+            p2 = json.load(fh)
+        with open(os.path.join(FIX, "rest_p3_sample.json")) as fh:
+            p3 = json.load(fh)
+        with open(os.path.join(FIX, "git_log_p3_sample.txt")) as fh:
+            code_events = gather.parse_code_events(fh.read())
+
+        frm, to = p2["window"]["from"], p2["window"]["to"]
+        prs = [gather.normalize_pr(p) for p in p2["pulls"]]
+        for pr in prs:
+            n = str(pr["number"])
+            pr["review_comments"] = [gather.normalize_review_comment(c)
+                                     for c in p3["pr_review_comments"].get(n, [])]
+            pr["comments_list"] = [gather.normalize_comment(c)
+                                   for c in p3["pr_comments"].get(n, [])]
+        issues = [gather.normalize_issue(i) for i in p2["issues"].values()]
+        for issue in issues:
+            n = str(issue["number"])
+            issue["comments_list"] = [gather.normalize_comment(c)
+                                      for c in p3["issue_comments"].get(n, [])]
+            issue["reactions"] = gather.summarize_reactions(
+                p3["issue_reactions"].get(n))
+            issue["open_high_activity"] = gather.derive_open_high_activity(issue)
+        meta = {"owner": "o", "repo": "r", "from": frm, "to": to,
+                "period": {"from": frm, "to": to}, "ref_date": to}
+        bundle = gather.build_bundle(meta, [], prs, issues)
+        bundle["code_events"] = code_events
+        return bundle
+
+    def test_pr_carries_review_comment_bodies(self):
+        b = self._bundle()
+        pr42 = next(p for p in b["prs"] if p["number"] == 42)
+        self.assertEqual(pr42["review_comments"][0]["body"],
+                         "Inline: extract this branch.")
+        self.assertEqual(pr42["review_comments"][0]["author"], "bob")
+        # Phase 2's integer counts are preserved alongside the new arrays.
+        self.assertEqual(pr42["review_comments_count"], 1)
+        self.assertEqual(pr42["comments_list"][0]["body"],
+                         "LGTM once the example is added.")
+
+    def test_issue_carries_comments_reactions_and_signal(self):
+        b = self._bundle()
+        issue18 = next(i for i in b["issues"] if i["number"] == 18)
+        self.assertEqual(len(issue18["comments_list"]), 2)
+        self.assertEqual(issue18["reactions"]["+1"], 9)
+        self.assertEqual(issue18["reactions"]["total"], 12)
+        self.assertTrue(issue18["open_high_activity"])  # open + 9 upvotes
+        issue21 = next(i for i in b["issues"] if i["number"] == 21)
+        self.assertFalse(issue21["open_high_activity"])  # open but quiet
+
+    def test_code_events_present_on_bundle(self):
+        b = self._bundle()
+        kinds = {e["change"] for e in b["code_events"]}
+        self.assertEqual(kinds, {"add", "modify", "delete", "rename"})
+
+
 if __name__ == "__main__":
     unittest.main()
