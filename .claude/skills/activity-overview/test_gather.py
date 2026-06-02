@@ -120,6 +120,31 @@ class TestPrNormalization(unittest.TestCase):
         self.assertFalse(pr["merged"])
         self.assertIsNone(pr["merged_by"])
 
+    def test_normalize_pr_captures_phase2_fields(self):
+        raw = {
+            "number": 44, "title": "Still open", "body": "Resolves #18",
+            "state": "open", "merged_at": None, "closed_at": None,
+            "created_at": "2026-05-03T09:00:00Z", "updated_at": "2026-05-20T09:00:00Z",
+            "user": {"login": "alice"}, "author_association": "MEMBER",
+            "labels": [{"name": "priority/high"}],
+            "milestone": {"title": "v1.3.0"},
+            "comments": 4, "review_comments": 2,
+            "html_url": "https://github.com/o/r/pull/44",
+        }
+        pr = gather.normalize_pr(raw)
+        self.assertEqual(pr["created_at"], "2026-05-03T09:00:00Z")
+        self.assertEqual(pr["updated_at"], "2026-05-20T09:00:00Z")
+        self.assertEqual(pr["milestone"], "v1.3.0")
+        self.assertEqual(pr["comments"], 4)
+        self.assertEqual(pr["review_comments_count"], 2)
+        self.assertEqual(pr["state"], "open")
+        self.assertFalse(pr["merged"])
+
+    def test_normalize_pr_milestone_none_when_absent(self):
+        pr = gather.normalize_pr({"number": 1, "html_url": "u"})
+        self.assertIsNone(pr["milestone"])
+        self.assertEqual(pr["comments"], 0)
+
     def test_select_merged_prs_only_in_window(self):
         prs = [gather.normalize_pr(p) for p in self.data["pulls"]]
         merged = gather.select_merged_prs(prs, "2026-05-01", "2026-05-31")
@@ -140,6 +165,24 @@ class TestIssueAndFetch(unittest.TestCase):
         self.assertEqual(issue["labels"], ["enhancement"])
         self.assertEqual(issue["assignees"], ["alice"])
         self.assertEqual(issue["url"], "https://github.com/o/r/issues/17")
+
+    def test_normalize_issue_captures_phase2_fields(self):
+        raw = {
+            "number": 18, "title": "Open feature", "body": "",
+            "state": "open", "state_reason": None,
+            "updated_at": "2026-05-22T00:00:00Z",
+            "user": {"login": "carol"}, "author_association": "CONTRIBUTOR",
+            "labels": [{"name": "priority/high"}],
+            "assignees": [{"login": "alice"}],
+            "milestone": {"title": "v1.3.0"},
+            "comments": 7,
+            "html_url": "https://github.com/o/r/issues/18",
+        }
+        issue = gather.normalize_issue(raw)
+        self.assertEqual(issue["milestone"], "v1.3.0")
+        self.assertEqual(issue["updated_at"], "2026-05-22T00:00:00Z")
+        self.assertEqual(issue["comments"], 7)
+        self.assertEqual(issue["state"], "open")
 
     def test_fetch_all_follows_pages_until_short_page(self):
         pages = {
@@ -229,6 +272,135 @@ class TestCliAndAuth(unittest.TestCase):
         with self.assertRaises(SystemExit), \
                 contextlib.redirect_stderr(io.StringIO()):
             gather.resolve_token({})
+
+
+class TestReviewsAndTimeline(unittest.TestCase):
+    def test_summarize_reviews_picks_latest_decision_per_reviewer(self):
+        raw = [
+            {"user": {"login": "bob"}, "state": "COMMENTED",
+             "submitted_at": "2026-05-08T10:00:00Z"},
+            {"user": {"login": "bob"}, "state": "CHANGES_REQUESTED",
+             "submitted_at": "2026-05-09T10:00:00Z"},
+            {"user": {"login": "carol"}, "state": "APPROVED",
+             "submitted_at": "2026-05-10T10:00:00Z"},
+        ]
+        out = gather.summarize_reviews(raw)
+        self.assertEqual(sorted(out["reviewers"]), ["bob", "carol"])
+        # changes_requested outranks approved when any reviewer still blocks
+        self.assertEqual(out["decision"], "changes_requested")
+
+    def test_summarize_reviews_approved_when_all_clear(self):
+        raw = [{"user": {"login": "carol"}, "state": "APPROVED",
+                "submitted_at": "2026-05-10T10:00:00Z"}]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+
+    def test_summarize_reviews_empty_is_none(self):
+        self.assertEqual(gather.summarize_reviews([])["decision"], "none")
+
+    def test_parse_timeline_crossrefs_collects_issue_numbers(self):
+        raw = [
+            {"event": "cross-referenced",
+             "source": {"issue": {"number": 18, "pull_request": None}}},
+            {"event": "connected", "subject": {"number": 19}},
+            {"event": "labeled"},
+            {"event": "cross-referenced",
+             "source": {"issue": {"number": 18, "pull_request": None}}},
+        ]
+        self.assertEqual(gather.parse_timeline_crossrefs(raw), [18, 19])
+
+    def test_parse_timeline_crossrefs_skips_pr_sourced_xref(self):
+        raw = [{"event": "cross-referenced",
+                "source": {"issue": {"number": 99, "pull_request": {"url": "x"}}}}]
+        self.assertEqual(gather.parse_timeline_crossrefs(raw), [])
+
+    def test_parse_timeline_crossrefs_ignores_disconnected(self):
+        raw = [
+            {"event": "connected", "subject": {"number": 5}},
+            {"event": "disconnected", "subject": {"number": 5}},
+        ]
+        self.assertEqual(gather.parse_timeline_crossrefs(raw), [5])
+
+
+class TestWorkflowsReleasesMilestones(unittest.TestCase):
+    def test_normalize_workflow_maps_fields(self):
+        raw = {"name": "CI", "conclusion": "success", "status": "completed",
+               "event": "push", "head_branch": "main",
+               "created_at": "2026-05-10T00:00:00Z",
+               "html_url": "https://github.com/o/r/actions/runs/1"}
+        wf = gather.normalize_workflow(raw)
+        self.assertEqual(wf["name"], "CI")
+        self.assertEqual(wf["conclusion"], "success")
+        self.assertEqual(wf["url"], "https://github.com/o/r/actions/runs/1")
+
+    def test_aggregate_workflow_stats_counts_by_conclusion(self):
+        runs = [
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CI", "conclusion": "failure"},
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CI", "conclusion": "cancelled"},
+            {"name": "Release", "conclusion": "success"},
+            {"name": "CI", "conclusion": "neutral"},
+        ]
+        stats = gather.aggregate_workflow_stats(runs)
+        self.assertEqual(stats["CI"],
+                         {"total": 5, "success": 2, "failure": 1,
+                          "cancelled": 1, "other": 1})
+        self.assertEqual(stats["Release"]["success"], 1)
+
+    def test_normalize_release_and_milestone(self):
+        rel = gather.normalize_release({
+            "tag_name": "v1.2.0", "name": "1.2.0",
+            "published_at": "2026-05-15T00:00:00Z", "prerelease": False,
+            "html_url": "https://github.com/o/r/releases/tag/v1.2.0"})
+        self.assertEqual(rel["tag_name"], "v1.2.0")
+        self.assertFalse(rel["prerelease"])
+        ms = gather.normalize_milestone({
+            "title": "v1.3.0", "number": 5, "state": "open",
+            "due_on": "2026-06-30T00:00:00Z", "open_issues": 3,
+            "closed_issues": 7,
+            "html_url": "https://github.com/o/r/milestone/5"})
+        self.assertEqual(ms["title"], "v1.3.0")
+        self.assertEqual(ms["open_issues"], 3)
+        self.assertEqual(ms["state"], "open")
+
+
+class TestAcquireAssemblyP2(unittest.TestCase):
+    """Compose the pure helpers over recorded REST, as acquire() does, offline."""
+
+    def _bundle_from_fixture(self):
+        with open(os.path.join(FIX, "rest_p2_sample.json")) as fh:
+            data = json.load(fh)
+        frm, to = data["window"]["from"], data["window"]["to"]
+        prs = [gather.normalize_pr(p) for p in data["pulls"]]
+        for pr in prs:
+            rv = gather.summarize_reviews(data["reviews"].get(str(pr["number"]), []))
+            pr["reviewers"] = rv["reviewers"]
+            pr["review_decision"] = rv["decision"]
+            pr["crossref_issues"] = gather.parse_timeline_crossrefs(
+                data["timeline"].get(str(pr["number"]), []))
+        issues = [gather.normalize_issue(i) for i in data["issues"].values()]
+        workflows = [gather.normalize_workflow(w) for w in data["workflows"]]
+        releases = [gather.normalize_release(r) for r in data["releases"]]
+        milestones = [gather.normalize_milestone(m) for m in data["milestones"]]
+        meta = {"owner": "o", "repo": "r", "from": frm, "to": to,
+                "period": {"from": frm, "to": to}, "ref_date": to}
+        bundle = gather.build_bundle(meta, [], prs, issues)
+        bundle["workflows"] = workflows
+        bundle["workflow_stats"] = gather.aggregate_workflow_stats(workflows)
+        bundle["releases"] = releases
+        bundle["milestones"] = milestones
+        return bundle
+
+    def test_bundle_has_social_layer(self):
+        b = self._bundle_from_fixture()
+        self.assertEqual({p["number"] for p in b["prs"]}, {42, 43, 44})
+        pr44 = next(p for p in b["prs"] if p["number"] == 44)
+        self.assertEqual(pr44["crossref_issues"], [18])
+        pr43 = next(p for p in b["prs"] if p["number"] == 43)
+        self.assertEqual(pr43["review_decision"], "changes_requested")
+        self.assertEqual(b["workflow_stats"]["CI"]["total"], 3)
+        self.assertEqual(b["releases"][0]["tag_name"], "v1.2.0")
+        self.assertEqual(len(b["milestones"]), 3)
 
 
 if __name__ == "__main__":

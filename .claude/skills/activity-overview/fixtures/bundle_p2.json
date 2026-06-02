@@ -1,0 +1,52 @@
+{
+  "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31",
+           "ref_date": "2026-05-31", "period": {"from": "2026-05-01", "to": "2026-05-31"}},
+  "commits": [],
+  "prs": [
+    {"number": 42, "title": "Add policy param", "merged": true, "state": "closed",
+     "merged_at": "2026-05-10T12:00:00Z", "closed_at": "2026-05-10T12:00:00Z",
+     "created_at": "2026-05-02T08:00:00Z", "updated_at": "2026-05-10T12:00:00Z",
+     "milestone": "v1.2.0", "labels": ["enhancement"], "closes": [17],
+     "crossref_issues": [], "url": "https://github.com/o/r/pull/42"},
+    {"number": 43, "title": "WIP experiment", "merged": false, "state": "closed",
+     "merged_at": null, "closed_at": "2026-05-11T09:00:00Z",
+     "created_at": "2026-05-05T08:00:00Z", "updated_at": "2026-05-11T09:00:00Z",
+     "milestone": null, "labels": [], "closes": [], "crossref_issues": [],
+     "url": "https://github.com/o/r/pull/43"},
+    {"number": 44, "title": "Still open", "merged": false, "state": "open",
+     "merged_at": null, "closed_at": null,
+     "created_at": "2026-05-20T08:00:00Z", "updated_at": "2026-05-25T08:00:00Z",
+     "milestone": "v1.3.0", "labels": ["priority/high"], "closes": [],
+     "crossref_issues": [18], "url": "https://github.com/o/r/pull/44"}
+  ],
+  "issues": [
+    {"number": 17, "title": "Support policy param", "kind": "feature",
+     "state": "closed", "state_reason": "completed", "milestone": "v1.2.0",
+     "closed_at": "2026-05-10T12:00:00Z", "updated_at": "2026-05-10T12:00:00Z",
+     "labels": ["enhancement"], "url": "https://github.com/o/r/issues/17"},
+    {"number": 18, "title": "Open feature for next release", "kind": "other",
+     "state": "open", "state_reason": null, "milestone": "v1.3.0",
+     "closed_at": null, "updated_at": "2026-05-22T00:00:00Z",
+     "labels": [], "url": "https://github.com/o/r/issues/18"},
+    {"number": 20, "title": "Abandoned idea", "kind": "other",
+     "state": "closed", "state_reason": "not_planned", "milestone": null,
+     "closed_at": "2026-05-15T00:00:00Z", "updated_at": "2026-05-15T00:00:00Z",
+     "labels": [], "url": "https://github.com/o/r/issues/20"},
+    {"number": 21, "title": "Active in current release", "kind": "other",
+     "state": "open", "state_reason": null, "milestone": "v1.2.0",
+     "closed_at": null, "updated_at": "2026-05-18T00:00:00Z",
+     "labels": [], "url": "https://github.com/o/r/issues/21"}
+  ],
+  "milestones": [
+    {"title": "v1.1.0", "number": 3, "state": "closed", "due_on": "2026-04-30T00:00:00Z"},
+    {"title": "v1.2.0", "number": 4, "state": "open", "due_on": "2026-05-31T00:00:00Z"},
+    {"title": "v1.3.0", "number": 5, "state": "open", "due_on": "2026-06-30T00:00:00Z"}
+  ],
+  "releases": [
+    {"tag_name": "v1.2.0", "name": "1.2.0", "published_at": "2026-05-15T00:00:00Z",
+     "prerelease": false, "url": "https://github.com/o/r/releases/tag/v1.2.0"}
+  ],
+  "workflow_stats": {"CI": {"total": 3, "success": 2, "failure": 1, "cancelled": 0, "other": 0}},
+  "trains": [],
+  "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []}
+}

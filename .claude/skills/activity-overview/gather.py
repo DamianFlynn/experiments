@@ -122,6 +122,7 @@ def parse_closing_refs(text):
 
 def normalize_pr(raw):
     """Map a GitHub REST PR object to the bundle's PR shape."""
+    milestone = raw.get("milestone")
     return {
         "number": raw["number"],
         "title": raw.get("title", ""),
@@ -129,12 +130,20 @@ def normalize_pr(raw):
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
         "labels": [lbl["name"] for lbl in raw.get("labels", [])],
+        "milestone": milestone.get("title") if milestone else None,
         "merged": bool(raw.get("merged_at")),
         "merged_by": (raw.get("merged_by") or {}).get("login")
         if raw.get("merged_by") else None,
         "merged_at": raw.get("merged_at"),
+        "created_at": raw.get("created_at"),
+        "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
         "state": raw.get("state"),
+        "comments": raw.get("comments", 0) or 0,
+        "review_comments_count": raw.get("review_comments", 0) or 0,
+        "reviewers": [],
+        "review_decision": "none",
+        "crossref_issues": [],
         "closes": parse_closing_refs(
             (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
         ),
@@ -149,6 +158,7 @@ def select_merged_prs(prs, from_date, to_date):
 
 def normalize_issue(raw):
     """Map a GitHub REST issue object to the bundle's issue shape."""
+    milestone = raw.get("milestone")
     return {
         "number": raw["number"],
         "title": raw.get("title", ""),
@@ -158,9 +168,116 @@ def normalize_issue(raw):
         "author_association": raw.get("author_association"),
         "labels": [lbl["name"] for lbl in raw.get("labels", [])],
         "assignees": [a["login"] for a in raw.get("assignees", [])],
+        "milestone": milestone.get("title") if milestone else None,
         "state": raw.get("state"),
         "state_reason": raw.get("state_reason"),
+        "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
+        "comments": raw.get("comments", 0) or 0,
+        "url": raw.get("html_url"),
+    }
+
+
+# Review states ranked by how strongly they gate a merge. A PR's decision is
+# the strongest *latest-per-reviewer* signal: any outstanding changes-requested
+# dominates; otherwise an approval; otherwise a bare comment.
+_REVIEW_RANK = {"changes_requested": 3, "approved": 2, "commented": 1, "none": 0}
+
+
+def summarize_reviews(raw_reviews):
+    """Reduce raw PR reviews to {reviewers, decision}. Pure."""
+    latest = {}  # login -> (submitted_at, state)
+    for r in raw_reviews or []:
+        login = (r.get("user") or {}).get("login")
+        if not login:
+            continue
+        state = (r.get("state") or "").lower()
+        if state not in _REVIEW_RANK:
+            continue
+        ts = r.get("submitted_at") or ""
+        # ISO-8601 (UTC `Z`) timestamps sort correctly as plain strings.
+        if login not in latest or ts >= latest[login][0]:
+            latest[login] = (ts, state)
+    reviewers = sorted(latest)
+    decision = "none"
+    for _, state in latest.values():
+        if _REVIEW_RANK[state] > _REVIEW_RANK[decision]:
+            decision = state
+    return {"reviewers": reviewers, "decision": decision}
+
+
+def parse_timeline_crossrefs(raw_timeline):
+    """Issue numbers cross-referenced/connected to a PR via timeline events.
+
+    De-duplicated, order-preserving. Skips cross-refs whose source is itself a
+    pull request (we only want issue links). Pure."""
+    out = []
+    for ev in raw_timeline or []:
+        kind = ev.get("event")
+        num = None
+        if kind == "cross-referenced":
+            issue = (ev.get("source") or {}).get("issue") or {}
+            if issue.get("pull_request") is None:
+                num = issue.get("number")
+        elif kind == "connected":
+            num = (ev.get("subject") or {}).get("number")
+        if num is not None and num not in out:
+            out.append(num)
+    return out
+
+
+def normalize_workflow(raw):
+    """Map a GitHub Actions run object to the bundle's workflow shape."""
+    return {
+        "name": raw.get("name"),
+        "conclusion": raw.get("conclusion"),
+        "status": raw.get("status"),
+        "event": raw.get("event"),
+        "head_branch": raw.get("head_branch"),
+        "created_at": raw.get("created_at"),
+        "url": raw.get("html_url"),
+    }
+
+
+def aggregate_workflow_stats(workflows):
+    """Count runs per workflow name by conclusion. Pure.
+
+    Buckets conclusions into success/failure/cancelled/other so the report can
+    show a CI health line per workflow."""
+    stats = {}
+    for wf in workflows or []:
+        name = wf.get("name") or "(unnamed)"
+        s = stats.setdefault(
+            name, {"total": 0, "success": 0, "failure": 0, "cancelled": 0, "other": 0})
+        s["total"] += 1
+        conclusion = wf.get("conclusion")
+        if conclusion in ("success", "failure", "cancelled"):
+            s[conclusion] += 1
+        else:
+            s["other"] += 1
+    return stats
+
+
+def normalize_release(raw):
+    """Map a GitHub release object to the bundle's release shape."""
+    return {
+        "tag_name": raw.get("tag_name"),
+        "name": raw.get("name"),
+        "published_at": raw.get("published_at"),
+        "prerelease": bool(raw.get("prerelease")),
+        "url": raw.get("html_url"),
+    }
+
+
+def normalize_milestone(raw):
+    """Map a GitHub milestone object to the bundle's milestone shape."""
+    return {
+        "title": raw.get("title"),
+        "number": raw.get("number"),
+        "state": raw.get("state"),
+        "due_on": raw.get("due_on"),
+        "open_issues": raw.get("open_issues", 0) or 0,
+        "closed_issues": raw.get("closed_issues", 0) or 0,
         "url": raw.get("html_url"),
     }
 
@@ -201,6 +318,14 @@ def parse_args(argv):
     p.add_argument("--branches", default="main")
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
+    p.add_argument("--ref-date", default=None,
+                   help="Reference date for milestone framing (default: --to).")
+    p.add_argument("--include-workflows", dest="include_workflows",
+                   action="store_true", default=True)
+    p.add_argument("--no-workflows", dest="include_workflows", action="store_false")
+    p.add_argument("--include-releases", dest="include_releases",
+                   action="store_true", default=True)
+    p.add_argument("--no-releases", dest="include_releases", action="store_false")
     p.add_argument("--out", default=None)
     return p.parse_args(argv)
 
@@ -301,6 +426,21 @@ def _paginated(token):
     return get_page
 
 
+def _runs_page(get_page, api, frm, to):
+    """Walk actions/runs, whose pages wrap the list under `workflow_runs`."""
+    runs = []
+    url = f"{api}/actions/runs?created={frm}..{to}&per_page=100"
+    # The `created=` query param bounds the window server-side; the per-page
+    # `< frm` check below is a defensive early-exit guard.
+    while url:
+        payload, url = get_page(url)
+        page = payload.get("workflow_runs", []) if isinstance(payload, dict) else payload
+        runs.extend(page)
+        if page and page[-1].get("created_at", "")[:10] < frm:
+            break
+    return runs
+
+
 def acquire(args, env):
     token = resolve_token(env)
     owner, repo = args.owner, args.repo
@@ -326,33 +466,99 @@ def acquire(args, env):
 
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
-    # PRs come newest-updated first. A PR merged in-window must have been updated
-    # in-window or later, so once a page ends before `from` we can stop paging
-    # instead of walking the repo's entire PR history. Phase 1 consumes only
-    # merged (hence closed) PRs; open PRs are pulled in a later phase.
-    raw_pulls = fetch_until(
+    # Closed PRs (merged + rejected) bounded by update time, as in Phase 1...
+    raw_closed = fetch_until(
         get_page,
         f"{api}/pulls?state=closed&sort=updated&direction=desc&per_page=100",
         lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
     )
-    prs = select_merged_prs([normalize_pr(p) for p in raw_pulls], frm, to)
+    # ...plus all currently-open PRs (these feed in_flight / next_candidates).
+    raw_open = fetch_all(
+        get_page, f"{api}/pulls?state=open&sort=updated&direction=desc&per_page=100")
 
+    prs = []
+    for raw in raw_closed + raw_open:
+        pr = normalize_pr(raw)
+        # Keep: merged-in-window, closed-unmerged-in-window, or any open PR.
+        keep = (
+            (pr["merged"] and in_window(pr["merged_at"], frm, to))
+            or (pr["state"] == "closed" and not pr["merged"]
+                and in_window(pr["closed_at"], frm, to))
+            or pr["state"] == "open"
+        )
+        if not keep:
+            continue
+        reviews = fetch_all(get_page, f"{api}/pulls/{pr['number']}/reviews?per_page=100")
+        summary = summarize_reviews(reviews)
+        pr["reviewers"] = summary["reviewers"]
+        pr["review_decision"] = summary["decision"]
+        timeline = fetch_all(
+            get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
+        pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+        prs.append(pr)
+
+    # Issue set: every issue a kept PR closes or cross-references, plus open and
+    # recently-closed issues (for in_flight / next_candidates / rejected buckets).
+    wanted = set()
+    for pr in prs:
+        wanted.update(pr["closes"])
+        wanted.update(pr["crossref_issues"])
+    raw_repo_issues = fetch_until(
+        get_page,
+        f"{api}/issues?state=all&sort=updated&direction=desc&per_page=100",
+        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
+    )
+    # Open issues untouched during the window are still relevant to the in_flight
+    # / next_candidates buckets (e.g. milestone-scoped work that hasn't moved), so
+    # pull every open issue too — bounded only by state, like the open PRs above —
+    # and de-duplicate against the recently-updated set.
+    raw_open_issues = fetch_all(
+        get_page, f"{api}/issues?state=open&sort=updated&direction=desc&per_page=100")
     issues = []
     seen = set()
-    for pr in prs:
-        for n in pr["closes"]:
-            if n in seen:
-                continue
-            seen.add(n)
-            raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
-            issues.append(normalize_issue(raw_issue))
+    for raw in raw_repo_issues + raw_open_issues:
+        if raw.get("pull_request"):  # the issues endpoint also lists PRs; skip them
+            continue
+        if raw["number"] in seen:
+            continue
+        issue = normalize_issue(raw)
+        seen.add(issue["number"])
+        issues.append(issue)
+    for n in sorted(wanted - seen):
+        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
+        if raw_issue.get("pull_request"):
+            continue
+        issues.append(normalize_issue(raw_issue))
 
+    workflows = []
+    workflow_stats = {}
+    if getattr(args, "include_workflows", True):
+        raw_runs = _runs_page(get_page, api, frm, to)
+        workflows = [normalize_workflow(r) for r in raw_runs]
+        workflow_stats = aggregate_workflow_stats(workflows)
+
+    releases = []
+    if getattr(args, "include_releases", True):
+        raw_releases = fetch_all(get_page, f"{api}/releases?per_page=100")
+        releases = [normalize_release(r) for r in raw_releases
+                    if in_window(r.get("published_at"), frm, to)]
+
+    raw_milestones = fetch_all(get_page, f"{api}/milestones?state=all&per_page=100")
+    milestones = [normalize_milestone(m) for m in raw_milestones]
+
+    ref_date = getattr(args, "ref_date", None) or to
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
         "branches": args.branches.split(","), "clone_dir": clone_dir,
+        "ref_date": ref_date,
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
-    return build_bundle(meta, commits, prs, issues)
+    bundle = build_bundle(meta, commits, prs, issues)
+    bundle["workflows"] = workflows
+    bundle["workflow_stats"] = workflow_stats
+    bundle["releases"] = releases
+    bundle["milestones"] = milestones
+    return bundle
 
 
 def main(argv=None):
