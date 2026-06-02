@@ -4,6 +4,7 @@ The only component that touches the network. Produces a schema-complete bundle;
 later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -827,18 +828,21 @@ def _tf_entrypoint(area):
     return tfs[0] if tfs else None
 
 
-def _bicep_build_arm(run, clone_dir, rel_path):
-    """Run bicep restore + build; return the compiled ARM JSON text. Not unit-tested."""
+def _bicep_build_arm(run, clone_dir, rel_path, timeout=None):
+    """Run bicep restore + build; return the compiled ARM JSON text. Not unit-tested.
+    `timeout` (seconds) bounds each subprocess so a hung build can't stall the run."""
     full = os.path.join(clone_dir, rel_path)
-    run(["bicep", "restore", full])          # pull registry modules (best-effort)
-    return run(["bicep", "build", full, "--stdout"])
+    run(["bicep", "restore", full], timeout=timeout)   # pull registry modules
+    return run(["bicep", "build", full, "--stdout"], timeout=timeout)
 
 
-def _terraform_graph_dot(run, clone_dir, rel_dir):
-    """Run terraform init (no backend) + graph; return DOT text. Not unit-tested."""
+def _terraform_graph_dot(run, clone_dir, rel_dir, timeout=None):
+    """Run terraform init (no backend) + graph; return DOT text. Not unit-tested.
+    `timeout` (seconds) bounds each subprocess so a hung command can't stall the run."""
     full = os.path.join(clone_dir, rel_dir or ".")
-    run(["terraform", f"-chdir={full}", "init", "-backend=false", "-input=false"])
-    return run(["terraform", f"-chdir={full}", "graph"])
+    run(["terraform", f"-chdir={full}", "init", "-backend=false", "-input=false"],
+        timeout=timeout)
+    return run(["terraform", f"-chdir={full}", "graph"], timeout=timeout)
 
 
 def parse_codeowners(text):
@@ -1063,10 +1067,13 @@ def resolve_token(env):
     return token
 
 
-def run_git(args, cwd=None):
+def run_git(args, cwd=None, timeout=None):
     """Thin wrapper around git (not unit-tested). Surfaces git's own stderr
-    on failure so errors like "not a git repository" reach the user."""
-    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    on failure so errors like "not a git repository" reach the user. An optional
+    `timeout` (seconds) bounds the call — used by the IaC edge build so a hung
+    `bicep`/`terraform` cannot stall the run (TimeoutExpired propagates)."""
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                          timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(
             f"command failed (exit {proc.returncode}): {' '.join(args)}\n"
@@ -1075,40 +1082,90 @@ def run_git(args, cwd=None):
     return proc.stdout
 
 
+# IaC edge-extraction tuning. The timeout is GENEROUS — a healthy cold bicep/
+# terraform build finishes well under it, so the bound only trips a genuinely hung
+# process (never a slow-but-progressing one). Speed comes from bounded concurrency,
+# not a tight timeout. A timed-out/failed build is retried once, then recorded as a
+# VISIBLE gap (edges_status) rather than a silent empty.
+IAC_BUILD_TIMEOUT = 300   # seconds per bicep/terraform subprocess
+IAC_MAX_WORKERS = 8       # parallel per-module builds
+IAC_RETRIES = 1           # extra attempts after the first on timeout/failure
+
+
+def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf,
+                        run, read_text, timeout, retries):
+    """Resolve ONE area's edges. Returns (edges_or_None, status). Never raises.
+
+    status: `resolved` (build succeeded — edges may legitimately be empty),
+    `timeout` (build exceeded the bound after retries), `failed` (build errored
+    after retries), `skipped` (no entrypoint or its CLI absent). A timeout/failure
+    leaves edges untouched but is reported via the status so the gap is visible."""
+    bp = _bicep_entrypoint(area)
+    tp = _tf_entrypoint(area)
+    if bp and have_bicep:
+        kind = "bicep"
+    elif tp and have_tf:
+        kind = "terraform"
+    else:
+        return None, "skipped"
+
+    status = "failed"
+    for _attempt in range(retries + 1):
+        try:
+            if kind == "bicep":
+                arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
+                src = read_text(os.path.join(clone_dir, bp))
+                return build_bicep_edges(src, arm, bp, area_ids, patterns), "resolved"
+            dot = _terraform_graph_dot(run, clone_dir, os.path.dirname(tp), timeout)
+            src = read_text(os.path.join(clone_dir, tp))
+            return build_terraform_edges(src, dot, tp, area_ids, patterns), "resolved"
+        except subprocess.TimeoutExpired:
+            status = "timeout"   # hung build: bounded, retried, then recorded
+        except Exception:
+            status = "failed"
+    return None, status
+
+
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
-                      read_text=_read_text_file, patterns=None):
+                      read_text=_read_text_file, patterns=None,
+                      max_workers=IAC_MAX_WORKERS, timeout=IAC_BUILD_TIMEOUT,
+                      retries=IAC_RETRIES):
     """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
 
-    For each area: if it has a main.bicep AND `bicep` is on PATH, compile it and
-    build edges; else if it has a *.tf AND `terraform` is on PATH, graph it and
-    build edges. ANY missing CLI, restore failure, or build error leaves `edges`
-    untouched ([]). Injectable `which`/`run`/`read_text` make this offline-testable.
-    Mutates and returns `code_graph`."""
+    Each area with a main.bicep (and `bicep` on PATH) or a *.tf (and `terraform` on
+    PATH) is built — in PARALLEL across `max_workers`, each subprocess bounded by
+    `timeout` and retried `retries` times — to resolve its edges. ANY missing CLI,
+    restore failure, build error, or timeout leaves `edges` as-is ([]) but stamps
+    `area["edges_status"]` so the gap is VISIBLE, never a silent empty. An aggregate
+    `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
+    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     areas = code_graph.get("areas", [])
     area_ids = {a["id"] for a in areas}
     have_bicep = bool(which("bicep"))
     have_tf = bool(which("terraform"))
+    summary = {"resolved": 0, "timeout": 0, "failed": 0, "skipped": 0}
 
-    for area in areas:
-        bp = _bicep_entrypoint(area)
-        if bp and have_bicep:
-            try:
-                arm = json.loads(_bicep_build_arm(run, clone_dir, bp))
-                src = read_text(os.path.join(clone_dir, bp))
-                area["edges"] = build_bicep_edges(src, arm, bp, area_ids, patterns)
-            except Exception:
-                area["edges"] = []           # build-only: no fabricated edges
-            continue
-        tp = _tf_entrypoint(area)
-        if tp and have_tf:
-            try:
-                dot = _terraform_graph_dot(run, clone_dir, os.path.dirname(tp))
-                src = read_text(os.path.join(clone_dir, tp))
-                area["edges"] = build_terraform_edges(src, dot, tp, area_ids, patterns)
-            except Exception:
-                area["edges"] = []
-            continue
+    if not (have_bicep or have_tf):
+        for area in areas:               # build-only: nothing to build
+            area["edges_status"] = "skipped"
+        summary["skipped"] = len(areas)
+        code_graph["edge_extraction"] = summary
+        return code_graph
+
+    def work(area):
+        return area, _extract_area_edges(area, clone_dir, area_ids, patterns,
+                                         have_bicep, have_tf, run, read_text,
+                                         timeout, retries)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for area, (edges, status) in pool.map(work, areas):
+            if edges is not None:
+                area["edges"] = edges
+            area["edges_status"] = status
+            summary[status] += 1
+
+    code_graph["edge_extraction"] = summary
     return code_graph
 
 

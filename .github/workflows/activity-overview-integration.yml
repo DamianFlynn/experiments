@@ -379,9 +379,27 @@ jobs:
               assert any(e["version"] for e in bicep_imm), \
                   "resolved Bicep edges carry no version"
           assert "module_graph" in dg, "diagrams manifest missing module_graph"
+
+          # 17. Phase 3c.1: edge-extraction gaps are VISIBLE (edges_status +
+          # edge_extraction summary) and a meaningful gap rate reds the gate so the
+          # incomplete graph is re-run rather than silently shipped. A healthy run
+          # times out ~never (the per-build bound only trips a hung process).
+          ee = cg.get("edge_extraction", {})
+          assert set(ee) >= {"resolved", "timeout", "failed", "skipped"}, \
+              f"missing edge_extraction summary: {ee}"
+          for a in areas:
+              assert a.get("edges_status") in \
+                  {"resolved", "timeout", "failed", "skipped"}, \
+                  f"area missing/!invalid edges_status: {a.get('id')}={a.get('edges_status')}"
+          built = ee["resolved"] + ee["timeout"] + ee["failed"]
+          unresolved = ee["timeout"] + ee["failed"]
+          # tolerate a couple of stray failures; red on a systematic gap (>10%).
+          assert unresolved <= max(2, built // 10), \
+              f"too many unresolved modules ({unresolved}/{built}); graph is incomplete: {ee}"
           print(f"  phase3c: edges={len(all_edges)} "
                 f"bicep_resolved_immediate={len(bicep_imm)} "
                 f"with_version={sum(1 for e in bicep_imm if e['version'])}")
+          print(f"  phase3c.1: edge_extraction={ee}")
 
           print(f"OK prs={len(prs)} (merged={len(merged_nums)} "
                 f"open={sum(1 for p in prs if p['state'] == 'open')} "

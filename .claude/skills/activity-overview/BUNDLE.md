@@ -118,6 +118,16 @@ docsRefs, release_train, sprints, project, diagrams`.
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** symbol-granular artifacts (3d), symbol-identity tracking
   (3e), resource-level `dependsOn` edges.
+
+  **Visible gaps (Phase 3c.1).** Per-module builds run in parallel, each bounded by a generous
+  per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
+  genuinely hung process) and retried once. Each area carries `edges_status` ∈
+  `{resolved, timeout, failed, skipped}` and `code_graph.edge_extraction` carries the aggregate
+  `{ "resolved", "timeout", "failed", "skipped" }` counts — so a build that timed out or failed
+  is a **visible, counted gap**, never mistaken for a module with no dependencies. `resolved`
+  with an empty `edges` list genuinely means "no inter-area dependencies"; `timeout`/`failed`
+  mean "not determined" (re-run to resolve). The integration gate reds when the unresolved rate
+  is non-trivial, so an incomplete graph is re-run rather than silently shipped.
 - **code_owners** `{ "<path|glob>": ["login", ...] }` — parsed from the clone's
   CODEOWNERS (`.github/`/root/`docs/`); `@org/team` and `@user` kept as logins.
 - **label_taxonomy** `{ "<facet>": { "<namespace>": ["label", ...] }, "source":

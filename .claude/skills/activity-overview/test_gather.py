@@ -1272,6 +1272,77 @@ class TestExtractIacEdges(unittest.TestCase):
         self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
 
 
+class TestIacEdgeHardening(unittest.TestCase):
+    """Phase 3c.1: per-build timeout, retry, and VISIBLE gaps (edges_status +
+    edge_extraction summary) so a killed/slow build is never a silent empty."""
+
+    def _cg(self):
+        return {"provider": "directory", "areas": [
+            {"id": "avm/ptn/foo/bar", "label": "bar",
+             "paths": ["avm/ptn/foo/bar/main.bicep"], "edges": []},
+            {"id": "live/prod", "label": "prod",
+             "paths": ["live/prod/main.tf"], "edges": []},
+        ]}
+
+    @staticmethod
+    def _bicep_only(name):
+        return "/usr/bin/bicep" if name == "bicep" else None
+
+    def test_timeout_is_recorded_not_a_silent_empty(self):
+        def run(cmd, **kw):
+            if cmd[:2] == ["bicep", "build"]:
+                raise gather.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+            return ""
+        cg = gather.extract_iac_edges(self._cg(), "clone", which=self._bicep_only,
+                                      run=run, read_text=lambda _p: "", retries=1)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertEqual(bar["edges"], [])
+        self.assertEqual(bar["edges_status"], "timeout")
+        self.assertEqual(cg["edge_extraction"]["timeout"], 1)
+        self.assertEqual(cg["edge_extraction"]["skipped"], 1)  # the tf area
+
+    def test_retry_recovers_a_transient_failure(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            src = fh.read()
+        calls = {"build": 0}
+
+        def run(cmd, **kw):
+            if cmd[:2] == ["bicep", "build"]:
+                calls["build"] += 1
+                if calls["build"] == 1:
+                    raise gather.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+                return arm
+            return ""
+        cg = gather.extract_iac_edges(self._cg(), "clone", which=self._bicep_only,
+                                      run=run, read_text=lambda _p: src, retries=1)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertEqual(bar["edges_status"], "resolved")
+        self.assertTrue(bar["edges"])
+        self.assertEqual(calls["build"], 2)  # failed once, retried, then succeeded
+
+    def test_no_tools_marks_every_area_skipped(self):
+        cg = gather.extract_iac_edges(self._cg(), "clone", which=lambda _n: None)
+        self.assertEqual(cg["edge_extraction"]["skipped"], 2)
+        self.assertTrue(all(a["edges_status"] == "skipped" for a in cg["areas"]))
+
+    def test_summary_counts_resolved_and_skipped(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            src = fh.read()
+        cg = gather.extract_iac_edges(
+            self._cg(), "clone", which=self._bicep_only,
+            run=lambda cmd, **kw: arm if cmd[:2] == ["bicep", "build"] else "",
+            read_text=lambda _p: src)
+        summ = cg["edge_extraction"]
+        self.assertEqual(summ["resolved"], 1)  # the bicep area
+        self.assertEqual(summ["skipped"], 1)   # the tf area (terraform absent)
+        self.assertEqual(summ["timeout"], 0)
+        self.assertEqual(summ["failed"], 0)
+
+
 class TestAcquireEdgesP3c(unittest.TestCase):
     """Compose the provider + edge seam offline (graphify + bicep absent ->
     directory provider, edges empty; bicep stubbed -> edges populate)."""
