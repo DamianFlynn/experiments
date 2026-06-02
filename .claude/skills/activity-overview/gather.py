@@ -351,11 +351,14 @@ def classify_artifact_path(path):
         return None
     parts = path.split("/")
     base = parts[-1]
+    low = base.lower()
     if base.upper().startswith("README"):
         return "readme"
-    if "examples" in parts[:-1] or ".example" in base.lower():
+    # `.example` only when it is a dot-segment (config.example.json, foo.example),
+    # not an incidental substring (counter-example.md must stay a doc).
+    if "examples" in parts[:-1] or ".example." in low or low.endswith(".example"):
         return "example"
-    if base.lower().endswith(".md") or "docs" in parts[:-1]:
+    if low.endswith(".md") or "docs" in parts[:-1]:
         return "doc"
     return None
 

@@ -455,6 +455,14 @@ class TestArtifactPathClassifier(unittest.TestCase):
         self.assertIsNone(gather.classify_artifact_path(""))
         self.assertIsNone(gather.classify_artifact_path(None))
 
+    def test_example_segment_not_incidental_substring(self):
+        # `.example` must be a dot-segment, not any substring
+        self.assertEqual(gather.classify_artifact_path("main.example.json"), "example")
+        self.assertEqual(gather.classify_artifact_path("config.example"), "example")
+        # "counter-example.md" is a doc, not an example
+        self.assertEqual(gather.classify_artifact_path("docs/counter-example.md"), "doc")
+        self.assertEqual(gather.classify_artifact_path("notes/counter-example.md"), "doc")
+
     def test_precedence_readme_over_example_over_doc(self):
         # a README inside an examples dir is still a README (basename wins)
         self.assertEqual(
