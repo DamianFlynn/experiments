@@ -110,3 +110,60 @@ def write_diagrams(bundle, outdir="workspace/diagrams"):
         manifest[name] = path
     bundle["diagrams"] = manifest
     return manifest
+
+
+def ensure_mmdc(which=shutil.which):
+    """Return the mmdc path or fail fast with install guidance."""
+    path = which("mmdc")
+    if not path:
+        sys.stderr.write("error: `mmdc` not found on PATH. " + INSTALL_HINT + "\n")
+        raise SystemExit(3)
+    return path
+
+
+def validate_with_mmdc(paths, export=None, runner=subprocess.run, which=shutil.which):
+    """Compile each .mmd with mmdc; raise RuntimeError on the first that fails to
+    render. When `export` is 'svg'/'png' the image is kept beside the .mmd;
+    otherwise it is rendered to a temp .svg purely to validate, then removed."""
+    mmdc = ensure_mmdc(which)
+    for path in paths:
+        out = os.path.splitext(path)[0] + "." + (export or "svg")
+        result = runner([mmdc, "-i", path, "-o", out, "-q"],
+                        capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"mmdc failed to render {path}:\n{result.stderr}")
+        if export is None:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="Render + validate activity-overview diagrams.")
+    p.add_argument("bundle", help="Path to the enriched bundle JSON.")
+    p.add_argument("--diagrams-dir", default="workspace/diagrams")
+    p.add_argument("--export", choices=["svg", "png"], default=None,
+                   help="Also export images beside each .mmd.")
+    p.add_argument("--skip-validate", action="store_true",
+                   help="Skip the mmdc compile check (not recommended).")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    with open(args.bundle) as fh:
+        bundle = json.load(fh)
+    manifest = write_diagrams(bundle, args.diagrams_dir)
+    if not args.skip_validate:
+        validate_with_mmdc(list(manifest.values()), export=args.export)
+    with open(args.bundle, "w") as fh:
+        json.dump(bundle, fh, indent=2)
+    sys.stderr.write(
+        f"rendered {len(manifest)} diagrams into {args.diagrams_dir} "
+        f"({'validated' if not args.skip_validate else 'unvalidated'})\n")
+    return manifest
+
+
+if __name__ == "__main__":
+    main()

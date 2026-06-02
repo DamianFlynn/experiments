@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -96,6 +97,34 @@ class TestWriteDiagrams(unittest.TestCase):
         out = render.render(_bundle())
         self.assertTrue(out["buckets_pie"].startswith("pie"))
         self.assertTrue(out["timeline_gantt"].startswith("gantt"))
+
+
+class TestMmdcValidation(unittest.TestCase):
+    def test_ensure_mmdc_raises_with_hint_when_absent(self):
+        with self.assertRaises(SystemExit) as ctx:
+            render.ensure_mmdc(which=lambda _name: None)
+        self.assertEqual(ctx.exception.code, 3)
+
+    def test_validate_raises_on_nonzero_mmdc(self):
+        calls = {}
+
+        def fake_run(cmd, **kw):
+            calls["cmd"] = cmd
+            class R:
+                returncode = 1
+                stderr = "Parse error on line 2"
+            return R()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            render.validate_with_mmdc(["a.mmd"], runner=fake_run,
+                                      which=lambda _n: "/usr/bin/mmdc")
+        self.assertIn("Parse error", str(ctx.exception))
+
+    @unittest.skipUnless(shutil.which("mmdc"), "mmdc not installed")
+    def test_real_mmdc_compiles_emitted_diagrams(self):
+        with tempfile.TemporaryDirectory() as d:
+            manifest = render.write_diagrams(_bundle(), d)
+            render.validate_with_mmdc(list(manifest.values()))  # raises on failure
 
 
 if __name__ == "__main__":
