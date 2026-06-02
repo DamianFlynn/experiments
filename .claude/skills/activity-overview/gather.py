@@ -318,6 +318,14 @@ def parse_args(argv):
     p.add_argument("--branches", default="main")
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
+    p.add_argument("--ref-date", default=None,
+                   help="Reference date for milestone framing (default: --to).")
+    p.add_argument("--include-workflows", dest="include_workflows",
+                   action="store_true", default=True)
+    p.add_argument("--no-workflows", dest="include_workflows", action="store_false")
+    p.add_argument("--include-releases", dest="include_releases",
+                   action="store_true", default=True)
+    p.add_argument("--no-releases", dest="include_releases", action="store_false")
     p.add_argument("--out", default=None)
     return p.parse_args(argv)
 
@@ -418,6 +426,19 @@ def _paginated(token):
     return get_page
 
 
+def _runs_page(get_page, api, frm, to):
+    """Walk actions/runs, whose pages wrap the list under `workflow_runs`."""
+    runs = []
+    url = f"{api}/actions/runs?created={frm}..{to}&per_page=100"
+    while url:
+        payload, url = get_page(url)
+        page = payload.get("workflow_runs", []) if isinstance(payload, dict) else payload
+        runs.extend(page)
+        if page and page[-1].get("created_at", "")[:10] < frm:
+            break
+    return runs
+
+
 def acquire(args, env):
     token = resolve_token(env)
     owner, repo = args.owner, args.repo
@@ -443,33 +464,91 @@ def acquire(args, env):
 
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
-    # PRs come newest-updated first. A PR merged in-window must have been updated
-    # in-window or later, so once a page ends before `from` we can stop paging
-    # instead of walking the repo's entire PR history. Phase 1 consumes only
-    # merged (hence closed) PRs; open PRs are pulled in a later phase.
-    raw_pulls = fetch_until(
+    # Closed PRs (merged + rejected) bounded by update time, as in Phase 1...
+    raw_closed = fetch_until(
         get_page,
         f"{api}/pulls?state=closed&sort=updated&direction=desc&per_page=100",
         lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
     )
-    prs = select_merged_prs([normalize_pr(p) for p in raw_pulls], frm, to)
+    # ...plus all currently-open PRs (these feed in_flight / next_candidates).
+    raw_open = fetch_all(
+        get_page, f"{api}/pulls?state=open&sort=updated&direction=desc&per_page=100")
 
+    prs = []
+    for raw in raw_closed + raw_open:
+        pr = normalize_pr(raw)
+        # Keep: merged-in-window, closed-unmerged-in-window, or any open PR.
+        keep = (
+            (pr["merged"] and in_window(pr["merged_at"], frm, to))
+            or (pr["state"] == "closed" and not pr["merged"]
+                and in_window(pr["closed_at"], frm, to))
+            or pr["state"] == "open"
+        )
+        if not keep:
+            continue
+        reviews, _ = http_get_json(f"{api}/pulls/{pr['number']}/reviews?per_page=100", token)
+        summary = summarize_reviews(reviews)
+        pr["reviewers"] = summary["reviewers"]
+        pr["review_decision"] = summary["decision"]
+        timeline, _ = http_get_json(
+            f"{api}/issues/{pr['number']}/timeline?per_page=100", token)
+        pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+        prs.append(pr)
+
+    # Issue set: every issue a kept PR closes or cross-references, plus open and
+    # recently-closed issues (for in_flight / next_candidates / rejected buckets).
+    wanted = set()
+    for pr in prs:
+        wanted.update(pr["closes"])
+        wanted.update(pr["crossref_issues"])
+    raw_repo_issues = fetch_until(
+        get_page,
+        f"{api}/issues?state=all&sort=updated&direction=desc&per_page=100",
+        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
+    )
     issues = []
     seen = set()
-    for pr in prs:
-        for n in pr["closes"]:
-            if n in seen:
-                continue
-            seen.add(n)
-            raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
-            issues.append(normalize_issue(raw_issue))
+    for raw in raw_repo_issues:
+        if raw.get("pull_request"):  # the issues endpoint also lists PRs; skip them
+            continue
+        issue = normalize_issue(raw)
+        seen.add(issue["number"])
+        issues.append(issue)
+    for n in sorted(wanted - seen):
+        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
+        if raw_issue.get("pull_request"):
+            continue
+        issues.append(normalize_issue(raw_issue))
 
+    workflows = []
+    workflow_stats = {}
+    if getattr(args, "include_workflows", True):
+        raw_runs = _runs_page(get_page, api, frm, to)
+        workflows = [normalize_workflow(r) for r in raw_runs]
+        workflow_stats = aggregate_workflow_stats(workflows)
+
+    releases = []
+    if getattr(args, "include_releases", True):
+        raw_releases = fetch_all(get_page, f"{api}/releases?per_page=100")
+        releases = [normalize_release(r) for r in raw_releases
+                    if in_window(r.get("published_at"), frm, to)]
+
+    raw_milestones = fetch_all(get_page, f"{api}/milestones?state=all&per_page=100")
+    milestones = [normalize_milestone(m) for m in raw_milestones]
+
+    ref_date = getattr(args, "ref_date", None) or to
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
         "branches": args.branches.split(","), "clone_dir": clone_dir,
+        "ref_date": ref_date,
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
-    return build_bundle(meta, commits, prs, issues)
+    bundle = build_bundle(meta, commits, prs, issues)
+    bundle["workflows"] = workflows
+    bundle["workflow_stats"] = workflow_stats
+    bundle["releases"] = releases
+    bundle["milestones"] = milestones
+    return bundle
 
 
 def main(argv=None):

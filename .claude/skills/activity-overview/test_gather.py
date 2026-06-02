@@ -364,5 +364,44 @@ class TestWorkflowsReleasesMilestones(unittest.TestCase):
         self.assertEqual(ms["state"], "open")
 
 
+class TestAcquireAssemblyP2(unittest.TestCase):
+    """Compose the pure helpers over recorded REST, as acquire() does, offline."""
+
+    def _bundle_from_fixture(self):
+        with open(os.path.join(FIX, "rest_p2_sample.json")) as fh:
+            data = json.load(fh)
+        frm, to = data["window"]["from"], data["window"]["to"]
+        prs = [gather.normalize_pr(p) for p in data["pulls"]]
+        for pr in prs:
+            rv = gather.summarize_reviews(data["reviews"].get(str(pr["number"]), []))
+            pr["reviewers"] = rv["reviewers"]
+            pr["review_decision"] = rv["decision"]
+            pr["crossref_issues"] = gather.parse_timeline_crossrefs(
+                data["timeline"].get(str(pr["number"]), []))
+        issues = [gather.normalize_issue(i) for i in data["issues"].values()]
+        workflows = [gather.normalize_workflow(w) for w in data["workflows"]]
+        releases = [gather.normalize_release(r) for r in data["releases"]]
+        milestones = [gather.normalize_milestone(m) for m in data["milestones"]]
+        meta = {"owner": "o", "repo": "r", "from": frm, "to": to,
+                "period": {"from": frm, "to": to}, "ref_date": to}
+        bundle = gather.build_bundle(meta, [], prs, issues)
+        bundle["workflows"] = workflows
+        bundle["workflow_stats"] = gather.aggregate_workflow_stats(workflows)
+        bundle["releases"] = releases
+        bundle["milestones"] = milestones
+        return bundle
+
+    def test_bundle_has_social_layer(self):
+        b = self._bundle_from_fixture()
+        self.assertEqual({p["number"] for p in b["prs"]}, {42, 43, 44})
+        pr44 = next(p for p in b["prs"] if p["number"] == 44)
+        self.assertEqual(pr44["crossref_issues"], [18])
+        pr43 = next(p for p in b["prs"] if p["number"] == 43)
+        self.assertEqual(pr43["review_decision"], "changes_requested")
+        self.assertEqual(b["workflow_stats"]["CI"]["total"], 3)
+        self.assertEqual(b["releases"][0]["tag_name"], "v1.2.0")
+        self.assertEqual(len(b["milestones"]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
