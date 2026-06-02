@@ -645,6 +645,67 @@ def walk_arm_deployments(arm_json):
     return nodes
 
 
+def _normalize_id(text):
+    """Lowercase + strip separators, for lenient identity matching."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _match_repo_area(name, area_ids):
+    """Find the area-id in `area_ids` whose tail confidently matches `name`.
+
+    Lenient normalised comparison (the ARM `metadata.name` is a short module name
+    like `vault`; the area tail is `vault`/`key-vault`). Returns the area-id or None."""
+    target = _normalize_id(name)
+    if not target:
+        return None
+    for aid in area_ids:
+        tail = aid.rstrip("/").split("/")[-1]
+        nt = _normalize_id(tail)
+        if nt and (nt == target or nt in target or target in nt):
+            return aid
+    return None
+
+
+def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None):
+    """Build inter-area dependency edges for one Bicep area.
+
+    Immediate edges (transitive=False) come from the SOURCE refs — fully identified
+    (area-id + version), build-validated by the caller. Transitive edges
+    (transitive=True) come from the ARM tree but only when a nested deployment's
+    `metadata.name` confidently matches ANOTHER area in this repo (no fabricated
+    external ids). Pure; deterministic (deduped, then sorted)."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    edges = []
+    seen = set()
+
+    for ri in parse_bicep_module_refs(source_text):
+        to = resolve_module_ref(ri, base_path, patterns)
+        key = (to, ri["ref"], False)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"to": to, "kind": "module", "ref": ri["ref"],
+                      "version": ri["version"], "transitive": False,
+                      "provider": "bicep", "resolved": to is not None})
+
+    self_id = classify_code_area(base_path, patterns)
+    for node in walk_arm_deployments(arm_json):
+        if node["depth"] < 1:
+            continue
+        to = _match_repo_area(node.get("metadata_name"), area_ids)
+        if to is None or to == self_id:
+            continue
+        key = (to, node.get("name"), True)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"to": to, "kind": "module", "ref": node.get("name"),
+                      "version": None, "transitive": True,
+                      "provider": "bicep", "resolved": True})
+
+    return sorted(edges, key=lambda e: (e["transitive"], str(e["to"]), str(e["ref"])))
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 

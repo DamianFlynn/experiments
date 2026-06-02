@@ -1072,5 +1072,46 @@ class TestWalkArmDeployments(unittest.TestCase):
         self.assertEqual(gather.walk_arm_deployments(None), [])
 
 
+class TestBuildBicepEdges(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            self.src = fh.read()
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            self.arm = json.load(fh)
+        # key-vault/vault is ALSO a repo area -> exercises transitive repo-area match
+        self.area_ids = {"avm/ptn/foo/bar", "avm/res/key-vault/vault"}
+        self.base = "avm/ptn/foo/bar/main.bicep"
+
+    def test_immediate_edges_carry_area_id_and_version(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        imm = {e["to"]: e for e in edges if not e["transitive"]}
+        self.assertEqual(imm["avm/res/storage/storage-account"]["version"], "0.9.0")
+        self.assertEqual(imm["avm/res/storage/storage-account"]["provider"], "bicep")
+        self.assertTrue(imm["avm/res/storage/storage-account"]["resolved"])
+        self.assertEqual(imm["avm/res/key-vault/vault"]["version"], "0.6.1")
+        # the local ref resolved to its utl area
+        self.assertIn("avm/utl/types/avm-common-types", imm)
+
+    def test_all_three_source_refs_become_immediate_edges(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(sum(1 for e in edges if not e["transitive"]), 3)
+
+    def test_transitive_edge_only_for_repo_areas(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        trans = {e["to"] for e in edges if e["transitive"]}
+        # vault is a repo area -> its nested deployment yields a transitive edge;
+        # storage-account is NOT in area_ids here -> no phantom transitive edge.
+        self.assertIn("avm/res/key-vault/vault", trans)
+        self.assertNotIn(None, trans)
+
+    def test_empty_build_inputs_yield_no_edges(self):
+        self.assertEqual(
+            gather.build_bicep_edges("", {}, self.base, set(),
+                                     gather.DEFAULT_AREA_PATTERNS), [])
+
+
 if __name__ == "__main__":
     unittest.main()
