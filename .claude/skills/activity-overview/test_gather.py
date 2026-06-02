@@ -309,5 +309,48 @@ class TestReviewsAndTimeline(unittest.TestCase):
         self.assertEqual(gather.parse_timeline_crossrefs(raw), [18, 19])
 
 
+class TestWorkflowsReleasesMilestones(unittest.TestCase):
+    def test_normalize_workflow_maps_fields(self):
+        raw = {"name": "CI", "conclusion": "success", "status": "completed",
+               "event": "push", "head_branch": "main",
+               "created_at": "2026-05-10T00:00:00Z",
+               "html_url": "https://github.com/o/r/actions/runs/1"}
+        wf = gather.normalize_workflow(raw)
+        self.assertEqual(wf["name"], "CI")
+        self.assertEqual(wf["conclusion"], "success")
+        self.assertEqual(wf["url"], "https://github.com/o/r/actions/runs/1")
+
+    def test_aggregate_workflow_stats_counts_by_conclusion(self):
+        runs = [
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CI", "conclusion": "failure"},
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CI", "conclusion": "cancelled"},
+            {"name": "Release", "conclusion": "success"},
+            {"name": "CI", "conclusion": "neutral"},
+        ]
+        stats = gather.aggregate_workflow_stats(runs)
+        self.assertEqual(stats["CI"],
+                         {"total": 5, "success": 2, "failure": 1,
+                          "cancelled": 1, "other": 1})
+        self.assertEqual(stats["Release"]["success"], 1)
+
+    def test_normalize_release_and_milestone(self):
+        rel = gather.normalize_release({
+            "tag_name": "v1.2.0", "name": "1.2.0",
+            "published_at": "2026-05-15T00:00:00Z", "prerelease": False,
+            "html_url": "https://github.com/o/r/releases/tag/v1.2.0"})
+        self.assertEqual(rel["tag_name"], "v1.2.0")
+        self.assertFalse(rel["prerelease"])
+        ms = gather.normalize_milestone({
+            "title": "v1.3.0", "number": 5, "state": "open",
+            "due_on": "2026-06-30T00:00:00Z", "open_issues": 3,
+            "closed_issues": 7,
+            "html_url": "https://github.com/o/r/milestone/5"})
+        self.assertEqual(ms["title"], "v1.3.0")
+        self.assertEqual(ms["open_issues"], 3)
+        self.assertEqual(ms["state"], "open")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -225,6 +225,62 @@ def parse_timeline_crossrefs(raw_timeline):
     return out
 
 
+def normalize_workflow(raw):
+    """Map a GitHub Actions run object to the bundle's workflow shape."""
+    return {
+        "name": raw.get("name"),
+        "conclusion": raw.get("conclusion"),
+        "status": raw.get("status"),
+        "event": raw.get("event"),
+        "head_branch": raw.get("head_branch"),
+        "created_at": raw.get("created_at"),
+        "url": raw.get("html_url"),
+    }
+
+
+def aggregate_workflow_stats(workflows):
+    """Count runs per workflow name by conclusion. Pure.
+
+    Buckets conclusions into success/failure/cancelled/other so the report can
+    show a CI health line per workflow."""
+    stats = {}
+    for wf in workflows or []:
+        name = wf.get("name") or "(unnamed)"
+        s = stats.setdefault(
+            name, {"total": 0, "success": 0, "failure": 0, "cancelled": 0, "other": 0})
+        s["total"] += 1
+        conclusion = wf.get("conclusion")
+        if conclusion in ("success", "failure", "cancelled"):
+            s[conclusion] += 1
+        else:
+            s["other"] += 1
+    return stats
+
+
+def normalize_release(raw):
+    """Map a GitHub release object to the bundle's release shape."""
+    return {
+        "tag_name": raw.get("tag_name"),
+        "name": raw.get("name"),
+        "published_at": raw.get("published_at"),
+        "prerelease": bool(raw.get("prerelease")),
+        "url": raw.get("html_url"),
+    }
+
+
+def normalize_milestone(raw):
+    """Map a GitHub milestone object to the bundle's milestone shape."""
+    return {
+        "title": raw.get("title"),
+        "number": raw.get("number"),
+        "state": raw.get("state"),
+        "due_on": raw.get("due_on"),
+        "open_issues": raw.get("open_issues", 0) or 0,
+        "closed_issues": raw.get("closed_issues", 0) or 0,
+        "url": raw.get("html_url"),
+    }
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
