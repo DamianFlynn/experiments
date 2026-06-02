@@ -231,3 +231,68 @@ def _next_link(link_header):
         if 'rel="next"' in section[1]:
             return url
     return None
+
+
+def _paginated(token):
+    """Adapter: turn http_get_json into the (items, next) shape fetch_all wants."""
+    def get_page(url):
+        return http_get_json(url, token)
+    return get_page
+
+
+def gather(args, env):
+    token = resolve_token(env)
+    owner, repo = args.owner, args.repo
+    frm, to = getattr(args, "from"), args.to
+    clone_dir = args.clone_dir or f"workspace/{repo}-clone"
+    repo_url = f"https://github.com/{owner}/{repo}.git"
+
+    if not args.no_clone:
+        run_git(build_clone_cmd(repo_url, frm, clone_dir))
+
+    log_fmt = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
+    raw = run_git([
+        "git", "-C", clone_dir, "log",
+        f"--since={frm}", f"--until={to}",
+        f"--pretty=format:{log_fmt}", "--date=short", "--name-only",
+    ])
+    commits = parse_git_log(raw)
+
+    get_page = _paginated(token)
+    api = f"https://api.github.com/repos/{owner}/{repo}"
+    raw_pulls = fetch_all(
+        get_page, f"{api}/pulls?state=all&sort=updated&direction=desc&per_page=100"
+    )
+    prs = select_merged_prs([normalize_pr(p) for p in raw_pulls], frm, to)
+
+    issues = []
+    seen = set()
+    for pr in prs:
+        for n in pr["closes"]:
+            if n in seen:
+                continue
+            seen.add(n)
+            raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
+            issues.append(normalize_issue(raw_issue))
+
+    meta = {
+        "owner": owner, "repo": repo, "from": frm, "to": to,
+        "branches": args.branches.split(","), "clone_dir": clone_dir,
+        "period": {"from": frm, "to": to}, "prev_bundle": None,
+    }
+    return build_bundle(meta, commits, prs, issues)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    bundle = gather(args, os.environ)
+    out = args.out or f"workspace/activity-{getattr(args, 'from')}-{args.to}.json"
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w") as fh:
+        json.dump(bundle, fh, indent=2)
+    sys.stderr.write(f"wrote {out}\n")
+    return out
+
+
+if __name__ == "__main__":
+    main()
