@@ -831,7 +831,10 @@ against GitHub) after each.
   *Report:* + CI/CD, releases, rejected/abandoned, in-flight sections embedding the two
   `.mmd` files.
 - **Phase 3 — code areas (graphify) + feature deltas + label facets.**
-  *Acquire:* graphify code-graph pass (now required) + CODEOWNERS; the **full-window
+  *Acquire:* graphify code-graph pass (now required) + CODEOWNERS; **the actual discussion
+  text — issue/PR comment bodies, review and review-comment bodies, and timeline event text
+  (superseding Phase 2's counts/decisions)** so the Phase 4 train narratives have raw material
+  to mine for decisions, pushback, and reversals; the **full-window
   code-event walk** (`git log -p -M -C`) producing the `artifacts` ledger and the unified
   `timeline` (incl. inline-comment granularity). *Link:* attribute trains/commits to
   communities; resolve `label_taxonomy` facets; build `artifacts` + `feature_deltas`
