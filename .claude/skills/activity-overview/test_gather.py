@@ -155,6 +155,26 @@ class TestIssueAndFetch(unittest.TestCase):
         self.assertEqual(items, ["a", "b", "c"])
         self.assertEqual(calls, ["u?page=1", "u?page=2"])
 
+    def test_fetch_until_stops_once_page_falls_before_window(self):
+        pages = {
+            "u?p=1": ([{"updated_at": "2026-05-20"}, {"updated_at": "2026-05-10"}], "u?p=2"),
+            "u?p=2": ([{"updated_at": "2026-04-25"}, {"updated_at": "2026-04-20"}], "u?p=3"),
+            "u?p=3": ([{"updated_at": "2026-03-01"}], None),
+        }
+        calls = []
+
+        def fake_get(url):
+            calls.append(url)
+            return pages[url]
+
+        items = gather.fetch_until(
+            fake_get, "u?p=1",
+            lambda page: bool(page) and page[-1]["updated_at"][:10] >= "2026-05-01",
+        )
+        # Page 2 ends before the window, so it is included but page 3 is never fetched.
+        self.assertEqual(len(items), 4)
+        self.assertEqual(calls, ["u?p=1", "u?p=2"])
+
 
 class TestCliAndAuth(unittest.TestCase):
     def test_parse_args_required_and_defaults(self):

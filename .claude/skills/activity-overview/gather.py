@@ -176,6 +176,21 @@ def fetch_all(get_page, first_url):
     return items
 
 
+def fetch_until(get_page, first_url, more):
+    """Like `fetch_all`, but stop paging once `more(page_items)` returns False.
+    The page that triggered the stop is still included. Lets a caller bound a
+    sorted endpoint — e.g. stop once results fall before the window — instead of
+    walking the entire history of a large repo."""
+    items = []
+    url = first_url
+    while url:
+        page_items, url = get_page(url)
+        items.extend(page_items)
+        if not more(page_items):
+            break
+    return items
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Acquire an activity-overview bundle.")
     p.add_argument("--owner", required=True)
@@ -194,7 +209,7 @@ def resolve_token(env):
     token = env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")
     if not token:
         sys.stderr.write(
-            "error: set GITHUB_TOKEN (or GH_TOKEN) with repo + read:project scope\n"
+            "error: set GITHUB_TOKEN (or GH_TOKEN) with `repo` scope (read access)\n"
         )
         raise SystemExit(2)
     return token
@@ -206,7 +221,8 @@ def run_git(args, cwd=None):
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"git {' '.join(args[1:3])} failed: {proc.stderr.strip()}"
+            f"command failed (exit {proc.returncode}): {' '.join(args)}\n"
+            f"{proc.stderr.strip()}"
         )
     return proc.stdout
 
@@ -252,6 +268,8 @@ def acquire(args, env):
     repo_url = f"https://github.com/{owner}/{repo}.git"
 
     if not args.no_clone:
+        # git clone needs the parent dir to exist for the default workspace/ path.
+        os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
         run_git(build_clone_cmd(repo_url, frm, clone_dir))
 
     # Phase 1 walks the checked-out default branch only; `args.branches` is
@@ -267,8 +285,14 @@ def acquire(args, env):
 
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
-    raw_pulls = fetch_all(
-        get_page, f"{api}/pulls?state=all&sort=updated&direction=desc&per_page=100"
+    # PRs come newest-updated first. A PR merged in-window must have been updated
+    # in-window or later, so once a page ends before `from` we can stop paging
+    # instead of walking the repo's entire PR history. Phase 1 consumes only
+    # merged (hence closed) PRs; open PRs are pulled in a later phase.
+    raw_pulls = fetch_until(
+        get_page,
+        f"{api}/pulls?state=closed&sort=updated&direction=desc&per_page=100",
+        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
     )
     prs = select_merged_prs([normalize_pr(p) for p in raw_pulls], frm, to)
 

@@ -4,7 +4,8 @@
 
 Copy `.claude/skills/activity-overview/` into your repo (or `~/.claude/skills/`).
 Requirements: Python 3 (stdlib only), `git` on PATH, and a `GITHUB_TOKEN`
-(or `GH_TOKEN`) with `repo` + `read:project` scope.
+(or `GH_TOKEN`) with `repo` scope (read access). `read:project` is only required
+once Projects v2 support lands in a later phase.
 
 ## Usage
 

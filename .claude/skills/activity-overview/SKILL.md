@@ -10,8 +10,8 @@ claim in the report resolves to a source ref in the bundle — never invent fact
 
 ## Procedure
 
-1. **Acquire.** Run the gather CLI (requires `GITHUB_TOKEN` with repo + read:project
-   scope, and `git` on PATH):
+1. **Acquire.** Run the gather CLI (requires `GITHUB_TOKEN` with `repo` scope and `git`
+   on PATH; `read:project` is only needed once later phases enable Projects v2):
    ```bash
    python3 gather.py --owner OWNER --repo REPO --from FROM --to TO --out workspace/bundle.json
    ```

@@ -806,7 +806,8 @@ against GitHub) after each.
   lacks `read:project`, name the missing scope.
 - `git` missing / clone failure → fail fast naming the cause; `--no-clone` requires an
   existing `--clone-dir`.
-- `graphify` absent or failing → warn, omit `code_graph`, fall back to `modules`.
+- `graphify` absent or failing → **fail fast** with install guidance (it is a required core
+  dependency with a preflight check; the run does not silently degrade without it).
 - 404 (repo/project not found / no access) → clear error naming the resource.
 - GraphQL errors / project number not found / missing iteration|status field → warn and
   degrade gracefully to milestone+date modeling (board sections omitted), not a hard fail.
