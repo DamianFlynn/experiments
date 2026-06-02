@@ -499,6 +499,35 @@ def build_directory_areas(paths, patterns):
     return {"provider": "directory", "areas": areas}
 
 
+def parse_graphify_graph(graph_json):
+    """Group graphify nodes by their integer `community` into the code_graph shape.
+
+    Reads graphify's REAL output: top keys `nodes`/`links` (edges live under
+    `links`, NOT `edges`); each node carries `community` (int) + `source_file`;
+    there is NO top-level `communities` list. Produces
+    {"provider":"graphify","areas":[{"id":"community:<n>","label",
+    "paths":[distinct source_files],"edges":[]}]}. Area edges are deferred (empty);
+    `links` are graphify's symbol-level edges, not resolved area edges. Pure."""
+    by_comm = {}
+    for node in (graph_json or {}).get("nodes", []):
+        comm = node.get("community")
+        if comm is None:
+            continue
+        src = node.get("source_file")
+        if src:
+            by_comm.setdefault(int(comm), set()).add(src)
+    areas = []
+    for comm in sorted(by_comm):
+        paths = sorted(by_comm[comm])
+        # representative label: the shortest common-ish dir — use the first path's
+        # directory (deterministic given sorted paths), or the path itself.
+        head = paths[0]
+        label = head.rsplit("/", 1)[0] if "/" in head else head
+        areas.append({"id": f"community:{comm}", "label": label,
+                      "paths": paths, "edges": []})
+    return {"provider": "graphify", "areas": areas}
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with

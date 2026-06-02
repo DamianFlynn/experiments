@@ -704,5 +704,45 @@ class TestDirectoryCodeAreaProvider(unittest.TestCase):
             gather.classify_code_area("", gather.DEFAULT_AREA_PATTERNS))
 
 
+class TestGraphifyProvider(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "graphify_graph_sample.json")) as fh:
+            self.graph = json.load(fh)
+
+    def test_groups_nodes_by_community_into_areas(self):
+        cg = gather.parse_graphify_graph(self.graph)
+        self.assertEqual(cg["provider"], "graphify")
+        ids = {a["id"] for a in cg["areas"]}
+        self.assertEqual(ids, {"community:0", "community:1"})
+
+    def test_area_paths_are_distinct_source_files_in_the_community(self):
+        cg = gather.parse_graphify_graph(self.graph)
+        by_id = {a["id"]: a for a in cg["areas"]}
+        self.assertEqual(sorted(by_id["community:0"]["paths"]),
+                         ["src/app/auth.py", "src/app/session.py"])
+        # n3 and n5 share src/store/user.py -> de-duplicated to one path
+        self.assertEqual(sorted(by_id["community:1"]["paths"]),
+                         ["src/store/index.py", "src/store/user.py"])
+
+    def test_area_label_is_a_representative_dir(self):
+        cg = gather.parse_graphify_graph(self.graph)
+        by_id = {a["id"]: a for a in cg["areas"]}
+        # a representative path/dir for the community (not empty)
+        self.assertTrue(by_id["community:0"]["label"])
+        self.assertEqual(by_id["community:0"]["edges"], [])
+
+    def test_no_top_level_communities_key_required(self):
+        # The real shape has NO top-level `communities`; parser must not need it.
+        self.assertNotIn("communities", self.graph)
+        cg = gather.parse_graphify_graph(self.graph)
+        self.assertTrue(cg["areas"])
+
+    def test_empty_or_nodeless_graph_yields_empty_provider(self):
+        self.assertEqual(gather.parse_graphify_graph({}),
+                         {"provider": "graphify", "areas": []})
+        self.assertEqual(gather.parse_graphify_graph({"nodes": [], "links": []}),
+                         {"provider": "graphify", "areas": []})
+
+
 if __name__ == "__main__":
     unittest.main()
