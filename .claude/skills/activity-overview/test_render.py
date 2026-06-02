@@ -37,5 +37,38 @@ class TestBucketsPie(unittest.TestCase):
         self.assertIn('"No activity" : 1', mmd)
 
 
+class TestTimelineGantt(unittest.TestCase):
+    def test_gantt_header_and_tasks(self):
+        mmd = render.emit_timeline_gantt(_bundle())
+        self.assertTrue(mmd.startswith("gantt"))
+        self.assertIn("dateFormat YYYY-MM-DD", mmd)
+        self.assertIn("section Pull requests", mmd)
+        # merged PR -> done; open PR -> active; closed-unmerged -> crit
+        self.assertIn(":done,", mmd)
+        self.assertIn(":active,", mmd)
+        self.assertIn(":crit,", mmd)
+        self.assertIn("section Releases", mmd)
+        self.assertIn(":milestone,", mmd)
+
+    def test_gantt_labels_have_no_colons(self):
+        b = _bundle()
+        b["prs"][0]["title"] = "Fix: thing: with colons"
+        mmd = render.emit_timeline_gantt(b)
+        for line in mmd.splitlines():
+            if line.strip().startswith("#42"):
+                # only the status-separator colon may remain
+                self.assertEqual(line.count(":"), 1)
+
+    def test_gantt_clamps_end_after_start(self):
+        b = _bundle()
+        b["prs"] = [{"number": 9, "title": "weird", "state": "open",
+                     "created_at": "2026-05-20T00:00:00Z",
+                     "merged_at": None, "closed_at": None, "merged": False}]
+        b["releases"] = []
+        mmd = render.emit_timeline_gantt(b)
+        # open PR with no end uses `to`; start <= end always
+        self.assertIn("2026-05-20", mmd)
+
+
 if __name__ == "__main__":
     unittest.main()
