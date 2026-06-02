@@ -181,9 +181,9 @@ digraph {
 	compound = "true"
 	newrank = "true"
 	subgraph "root" {
+		"[root] azurerm_resource_group.this (expand)" -> "[root] module.vnet (expand)"
 		"[root] azurerm_resource_group.this (expand)" -> "[root] module.naming (expand)"
 		"[root] module.vnet.azurerm_virtual_network.this (expand)" -> "[root] module.naming.output.prefix (expand)"
-		"[root] module.vnet (expand)" -> "[root] provider[\"registry.terraform.io/hashicorp/azurerm\"]"
 	}
 }
 ```
