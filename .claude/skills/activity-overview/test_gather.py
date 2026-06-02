@@ -1142,5 +1142,41 @@ class TestTerraformParsers(unittest.TestCase):
         self.assertEqual(gather.parse_terraform_module_blocks(None), {})
 
 
+class TestBuildTerraformEdges(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            self.tf = fh.read()
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            self.dot = fh.read()
+        self.base = "live/prod/main.tf"
+
+    def test_local_module_source_resolves_to_area(self):
+        edges = gather.build_terraform_edges(
+            self.tf, self.dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        tos = {e["to"] for e in edges}
+        # ../../modules/vnet relative to live/prod -> modules/vnet
+        self.assertIn("modules/vnet", tos)
+
+    def test_registry_module_source_kept_as_ref(self):
+        edges = gather.build_terraform_edges(
+            self.tf, self.dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        naming = [e for e in edges if e["to"] == "Azure/naming/azurerm"]
+        self.assertTrue(naming)
+        self.assertEqual(naming[0]["provider"], "terraform")
+        self.assertTrue(naming[0]["resolved"])
+
+    def test_edges_dedupe_and_are_marked_provider_terraform(self):
+        edges = gather.build_terraform_edges(
+            self.tf, self.dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertTrue(all(e["provider"] == "terraform" for e in edges))
+        keys = [(e["to"], e["ref"]) for e in edges]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_empty_inputs_yield_no_edges(self):
+        self.assertEqual(
+            gather.build_terraform_edges("", "", self.base, set(),
+                                         gather.DEFAULT_AREA_PATTERNS), [])
+
+
 if __name__ == "__main__":
     unittest.main()

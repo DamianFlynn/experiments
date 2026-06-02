@@ -741,6 +741,41 @@ def parse_terraform_graph(dot_text):
     return sorted(pairs, key=lambda p: (p[0] or "", p[1]))
 
 
+def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None):
+    """Build inter-area dependency edges for one Terraform area.
+
+    Joins terraform-graph module pairs with the `module {source=}` blocks: a local
+    source resolves to an area-id (via classify_code_area, relative to base_path); a
+    registry source is kept raw as the edge target. Pure; deterministic."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    sources = parse_terraform_module_blocks(tf_text)
+    base_dir = os.path.dirname(base_path or "")
+
+    def to_area(name):
+        src = sources.get(name)
+        if not src:
+            return None, None
+        if src.startswith(".") or src.startswith("/"):
+            joined = os.path.normpath(os.path.join(base_dir, src))
+            return (classify_code_area(joined + "/main.tf", patterns) or joined), None
+        return src, None  # registry/module-registry source, kept raw
+
+    edges = []
+    seen = set()
+    for _a, b in parse_terraform_graph(dot_text):
+        to, version = to_area(b)
+        if to is None:
+            continue
+        key = (to, sources.get(b, b))
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"to": to, "kind": "module", "ref": sources.get(b, b),
+                      "version": version, "transitive": False,
+                      "provider": "terraform", "resolved": to is not None})
+    return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 
