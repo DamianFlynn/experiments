@@ -280,6 +280,10 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
   people↔module, and blocker/stall dimensions). A **preflight** checks it is on `PATH` and
   **fails fast** with install guidance if absent — no silent degradation. (`git` and
   `GITHUB_TOKEN` are likewise required.)
+- **mermaid-cli (`mmdc`)** is a **required dependency for Render** (Phase 2+): `render.py`
+  validates every emitted `.mmd` by compiling it (and optionally exports SVG/PNG), so a
+  diagram that would not render fails the run rather than shipping broken. The preflight
+  checks `mmdc` is on `PATH` and **fails fast** with install guidance if absent.
 - No `gh` CLI dependency. Auth is via `GITHUB_TOKEN` only. `git` is assumed present.
 - No YouTube network access / transcript auto-fetch. The transcript is **user-provided**
   as a local file.
@@ -287,8 +291,10 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
   Projects v2 board). **Terraform multi-repo aggregation is deferred to Phase 6.**
 - No write actions to GitHub. Read-only.
 - The report is **Markdown with embedded Mermaid** diagrams (timelines, decision-train
-  flowcharts, bucket charts) — renders on GitHub and most viewers, no new deps,
-  text-diffable. graphify's interactive `graph.html` is **linked**, not embedded. No
+  flowcharts, bucket charts) — renders on GitHub and most viewers with **no deps to view**,
+  text-diffable. (`mmdc` is a build-time dependency used by Render to validate/pre-render the
+  diagrams, not something a reader needs.) graphify's interactive `graph.html` is **linked**,
+  not embedded. No
   **standalone HTML/PDF** report and no automated scheduling/delivery (cron, Slack) in
   v1 — invocation is manual / on-demand. (Noted as future adds.)
 
@@ -533,12 +539,24 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   `bundle.diagrams` is a **manifest** mapping each diagram name to its `.mmd` path, so any
   post-stage (the Markdown digest, or another output) can discover and embed the files it
   needs. Adding a new diagram = a new emitter reading existing fields + a manifest entry.
-  The set: `timeline_gantt` (item lifespans/releases over the window), `buckets_pie`
-  (shipped/in-flight/rejected/next counts), `deltas_bar` (add/drop/change per area), one
-  `train_flowcharts[id]` per notable train (issue → PR(s) → commits → outcome),
-  `contributor_graph` (people↔module/train edges), `blocker_graph` (pile-ups by in-degree),
-  `kind_breakdown` (feature/bug/idea mix), and `content_timeline` (artifact lifecycles).
-  Post-stages embed the referenced `.mmd` files. (Public renders omit shame/blame.)
+  - **Each diagram uses the Mermaid type that fits its data** — not one shape forced
+    everywhere. The set and their types:
+    - `buckets_pie` — **`pie`** (shipped/in-flight/rejected/next counts).
+    - `timeline_gantt` — **`gantt`** (item lifespans + releases over the window).
+    - `train_flowcharts[id]` — **`flowchart`** per notable train (issue → PR(s) → commits → outcome).
+    - `content_timeline` — **`timeline`** (artifact lifecycles — added/changed/removed).
+    - `deltas_bar` — **`xychart-beta`** bar (add/drop/change per code area).
+    - `contributor_graph` — **`flowchart`** graph (people↔module/train edges).
+    - `blocker_graph` — **`flowchart`** graph (pile-ups ranked by in-degree).
+    - `kind_breakdown` — **`pie`** (feature/bug/idea mix).
+    - Reserved in the palette for later diagrams where they fit best: **`gitGraph`** (commit/
+      branch/merge history of a train or window) and **`sequenceDiagram`** (review/CI
+      interaction on a PR). Emitters pick the clearest type for the data they read.
+  - **Validation (required):** `render.py` compiles every emitted `.mmd` with **`mmdc`**
+    (mermaid-cli) and **fails the run** if any diagram does not render; optional SVG/PNG
+    export lands beside the `.mmd`. This makes "the visual is a reproducible fact" literally
+    enforced — a malformed diagram cannot ship. `mmdc` is a preflight-checked dependency.
+  - Post-stages embed the referenced `.mmd` files. (Public renders omit shame/blame.)
 
 ### 2. `link.py` (offline, deterministic — train graph + buckets + people + flow)
 
@@ -568,7 +586,7 @@ Procedure Claude follows:
    `owner`/`repo`/options from the request (incl. project-board settings if any).
 2. Resolve `from`/`to`, `ref-date`, milestone, clone dir, and optional transcript path.
 3. **Preflight:** verify `GITHUB_TOKEN`/`GH_TOKEN` is set (needs `read:project` for boards)
-   **and `graphify` + `git` are on `PATH`** — fail fast with guidance if any is missing.
+   **and `graphify` + `git` + `mmdc` are on `PATH`** — fail fast with guidance if any is missing.
 3a. **Load prior installment:** read `series.json` + the `prev_bundle` it names (if any), so
     Link/Analyze can compute carry-over and the forecast loop. Absent → treat as series start.
 4. **Acquire:** run `gather.py` (clone + API + graphify + CODEOWNERS) → bundle.
@@ -578,6 +596,8 @@ Procedure Claude follows:
    `meta.period`/`meta.prev_bundle`.
 5b. **Render diagrams:** run `render.py` → emits `workspace/diagrams/*.mmd` derived from the
     enriched bundle's existing fields, recording the name→path manifest in `bundle.diagrams`.
+    Each `.mmd` is **validated by compiling it with `mmdc`** (optional SVG/PNG export); a
+    diagram that fails to render fails the run.
 6. **Analyze:** for each significant train, **dispatch a parallel sub-agent** (see
    `superpowers:dispatching-parallel-agents`) that reads the train's thread + local diffs
    and returns a structured decision narrative **with an `evidence: [ref]` list — citing,
@@ -724,8 +744,10 @@ index is the cheap through-line, never an override.
   `_get(url)` / `_graphql(query,vars)` / `_git(args)` / `_graphify(dir)` seams that tests
   monkeypatch to return recorded fixtures. Covers window/merge filtering, commit parsing
   from `git log` fixtures, code_graph ingestion, workflow-stats, release filtering.
-- `test_render.py` — diagram generation: each `.mmd` is deterministic given a fixture bundle
-  and derives solely from existing bundle fields. Runs with no network/token.
+- `test_render.py` — diagram generation: each `.mmd` is deterministic given a fixture bundle,
+  derives solely from existing bundle fields, and carries the correct Mermaid type header per
+  diagram. The pure `.mmd`-string emitters run with no network/token (mmdc not required); the
+  `mmdc` compile-validation is exercised in the integration workflow (where mmdc is installed).
 - `test_link.py` — train construction (closing-refs + trailers + timeline + merges),
   duplicate/spin-off detection, code-area attribution, bucket assignment,
   release-train/sprint resolution, and `feature_deltas` extraction (add/drop/change, incl.
@@ -757,10 +779,11 @@ index is the cheap through-line, never an override.
     graph_sample.json        # recorded graphify graph.json
 ```
 
-Self-contained for the core (Python stdlib + `git`); **`graphify` is a required external
-binary** (preflight fails fast if absent). Copying the folder into `~/.claude/skills/` makes
-the skill usable in any repo, with setup being `git` + `graphify` on `PATH`, `GITHUB_TOKEN`
-(incl. `read:project`), and optionally a `projects.json` + transcript.
+Self-contained for the core (Python stdlib + `git`); **`graphify` and `mmdc` (mermaid-cli)
+are required external binaries** (preflight fails fast if absent — `mmdc` from Render in
+Phase 2+). Copying the folder into `~/.claude/skills/` makes the skill usable in any repo,
+with setup being `git` + `graphify` + `mmdc` on `PATH`, `GITHUB_TOKEN` (incl. `read:project`),
+and optionally a `projects.json` + transcript.
 
 ## Implementation phasing — **vertical slices**
 
@@ -781,9 +804,10 @@ against GitHub) after each.
   `next_candidates` buckets (one bucket per item, precedence shipped > rejected >
   next_candidates > in_flight; `in_flight` = open-&-active-in-window ∪ on-next-milestone;
   `next_candidates` = open items on the earliest open milestone). *Render:* new `render.py`
-  emits `diagrams/buckets_pie.mmd` + `diagrams/timeline_gantt.mmd`, derived from existing
-  bundle fields. *Report:* + CI/CD, releases, rejected/abandoned, in-flight sections
-  embedding the two `.mmd` files.
+  emits `diagrams/buckets_pie.mmd` (`pie`) + `diagrams/timeline_gantt.mmd` (`gantt`), derived
+  from existing bundle fields and **validated by `mmdc`** (preflight-checked dependency).
+  *Report:* + CI/CD, releases, rejected/abandoned, in-flight sections embedding the two
+  `.mmd` files.
 - **Phase 3 — code areas (graphify) + feature deltas + label facets.**
   *Acquire:* graphify code-graph pass (now required) + CODEOWNERS; the **full-window
   code-event walk** (`git log -p -M -C`) producing the `artifacts` ledger and the unified
