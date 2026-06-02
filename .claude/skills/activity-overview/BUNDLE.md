@@ -84,3 +84,38 @@ docsRefs, release_train, sprints, project, diagrams`.
   parsing (later slice). `pr`/`train` resolve best-effort via the commit→PR map.
 - **diagrams{}** now also maps `content_timeline` (Mermaid `timeline`) and
   `deltas_bar` (Mermaid `xychart-beta` bar).
+
+## Phase 3b fields (code areas + label facets)
+
+- **code_graph** `{ "provider": "directory|graphify", "areas": [{ "id", "label",
+  "paths": [...], "edges": [] }] }`. The **directory provider** (primary,
+  zero-dep, offline) maps each tracked file to its module directory (AVM
+  `avm/res/<svc>/<module>/`, any `main.bicep` dir, Terraform `modules/<name>/` or
+  any `*.tf` dir, else a top-2-segment fallback); the area `id` is that directory.
+  **graphify** is an OPTIONAL provider for its ~25 tree-sitter languages — it reads
+  graphify's real `graph.json` (top keys `nodes`/`links`; each node carries an
+  integer `community` + `source_file`; **no** top-level `communities` list; edges
+  live under `links`) and groups nodes by `community` into `community:<n>` areas.
+  graphify does NOT parse Bicep/HCL, so on those repos the directory provider runs.
+  **Deferred:** dependency `edges` between areas (Bicep `dependsOn`, `tree-sitter-hcl`).
+- **code_owners** `{ "<path|glob>": ["login", ...] }` — parsed from the clone's
+  CODEOWNERS (`.github/`/root/`docs/`); `@org/team` and `@user` kept as logins.
+- **label_taxonomy** `{ "<facet>": { "<namespace>": ["label", ...] }, "source":
+  "auto|config|merged" }` — auto-detected structured label namespaces mapped to
+  facets (`area`/`priority`/`status`/`lifecycle`/`kind`), with optional config
+  override/extend. Degrades to `{ "source": "auto" }` (no facets) on unstructured labels.
+- **issues[]/prs[]** gain **facets** `{ area, priority, status, lifecycle }`
+  (each the first matching label or null). **issues[]** gain **kind** ∈
+  `feature|module-request|bug|idea|question|docs|other` (native issue type →
+  label kind facet → template filename → title/body heuristic → other).
+- **artifacts[].code_area** and **feature_deltas[].area** are now **populated**
+  (were null in Phase 3a) when the path resolves to a `code_graph` area; null otherwise.
+- **trains[].code_areas** — the distinct areas of a train's commits' files.
+- **modules** `{ "<area>": { "commits", "prs", "files_changed" } }` — per-area
+  activity counts across the window's commits.
+- **people[].modules / people[].areas** — the areas a person authored (their
+  commits' files) or reviewed (their reviewed PRs' areas).
+- **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
+  people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
+- **Still deferred:** symbol/inline-comment artifacts, dependency-edge enrichment,
+  `hunk`/`before`/`after`/`detail` on feature_deltas, multi-repo aggregation.
