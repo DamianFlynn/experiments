@@ -29,3 +29,18 @@ SHAs in `trains[].commits` — wrapped `commit` refs arrive in a later phase.)
 `timeline, artifacts, feature_deltas, people, halls, flow, blockers, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, workflows, releases, milestones,
 docsRefs, release_train, sprints, project, diagrams`.
+
+## Phase 2 fields
+
+- **prs[]** gain `created_at`, `updated_at`, `milestone`, `comments`,
+  `review_comments_count`, `reviewers`, `review_decision`
+  (`approved|changes_requested|commented|none`), and `crossref_issues`.
+- **issues[]** gain `milestone`, `updated_at`, `comments`. Open and
+  not-planned-closed issues are now included, not just PR-closing issues.
+- **workflows[]**, **workflow_stats{}**, **releases[]**, **milestones[]** are
+  populated (see the schema block in the design spec).
+- **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
+  `next_candidates` (one bucket per item; precedence shipped > rejected >
+  next_candidates > in_flight). Each ref may carry a `train` id.
+- **diagrams{}** maps `buckets_pie` / `timeline_gantt` to their `.mmd` paths,
+  written and mmdc-validated by `render.py`.
