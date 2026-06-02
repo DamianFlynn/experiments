@@ -138,3 +138,33 @@ def normalize_pr(raw):
 def select_merged_prs(prs, from_date, to_date):
     """Return normalized PRs merged within [from_date, to_date]."""
     return [p for p in prs if p["merged"] and in_window(p["merged_at"], from_date, to_date)]
+
+
+def normalize_issue(raw):
+    """Map a GitHub REST issue object to the bundle's issue shape."""
+    return {
+        "number": raw["number"],
+        "title": raw.get("title", ""),
+        "body": raw.get("body") or "",
+        "kind": "other",  # refined in later phases (issue types/labels/template)
+        "author": (raw.get("user") or {}).get("login"),
+        "author_association": raw.get("author_association"),
+        "labels": [lbl["name"] for lbl in raw.get("labels", [])],
+        "assignees": [a["login"] for a in raw.get("assignees", [])],
+        "state": raw.get("state"),
+        "state_reason": raw.get("state_reason"),
+        "closed_at": raw.get("closed_at"),
+        "url": raw.get("html_url"),
+    }
+
+
+def fetch_all(get_page, first_url):
+    """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
+    Network/parse details live in the caller's closure, so this is testable with
+    a fake."""
+    items = []
+    url = first_url
+    while url:
+        page_items, url = get_page(url)
+        items.extend(page_items)
+    return items

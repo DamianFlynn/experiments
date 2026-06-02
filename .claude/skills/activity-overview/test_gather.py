@@ -122,5 +122,36 @@ class TestPrNormalization(unittest.TestCase):
         self.assertEqual([p["number"] for p in merged], [42])
 
 
+class TestIssueAndFetch(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "rest_sample.json")) as fh:
+            self.data = json.load(fh)
+
+    def test_normalize_issue_maps_kind_and_state_reason(self):
+        issue = gather.normalize_issue(self.data["issues"]["17"])
+        self.assertEqual(issue["number"], 17)
+        self.assertEqual(issue["author"], "dave")
+        self.assertEqual(issue["state_reason"], "completed")
+        self.assertEqual(issue["labels"], ["enhancement"])
+        self.assertEqual(issue["assignees"], ["alice"])
+        self.assertEqual(issue["url"], "https://github.com/o/r/issues/17")
+
+    def test_fetch_all_follows_pages_until_short_page(self):
+        pages = {
+            "u?page=1": (["a", "b"], "u?page=2"),
+            "u?page=2": (["c"], None),
+        }
+        calls = []
+
+        def fake_get(url):
+            calls.append(url)
+            body, nxt = pages[url]
+            return body, nxt
+
+        items = gather.fetch_all(fake_get, "u?page=1")
+        self.assertEqual(items, ["a", "b", "c"])
+        self.assertEqual(calls, ["u?page=1", "u?page=2"])
+
+
 if __name__ == "__main__":
     unittest.main()
