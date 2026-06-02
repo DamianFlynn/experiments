@@ -21,7 +21,7 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    python3 link.py workspace/bundle.json
    ```
    This adds `trains` and `buckets.shipped`.
-3. **Render diagrams.** Preflight: `git`, `graphify`, and `mmdc` must be on PATH
+3. **Render diagrams.** Preflight: `mmdc` must be on PATH
    (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`). Then:
    ```bash
    python3 render.py workspace/bundle.json
