@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -526,6 +527,58 @@ def parse_graphify_graph(graph_json):
         areas.append({"id": f"community:{comm}", "label": label,
                       "paths": paths, "edges": []})
     return {"provider": "graphify", "areas": areas}
+
+
+def _read_json_file(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def select_code_area_provider(paths, clone_dir, which=shutil.which,
+                              run=None, read_json=_read_json_file,
+                              patterns=None):
+    """Pick the code-area provider, directory-first.
+
+    graphify is OPTIONAL: prefer it only if it is on PATH AND `graphify update
+    <clone>` yields a `graphify-out/graph.json` with nodes; any absence/failure/
+    nodeless-graph falls back to the directory provider (never fails fast). The
+    `which`/`run`/`read_json` seams make this offline-testable without graphify.
+    Returns the `code_graph` provider dict."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    if run is None:
+        run = run_git
+    directory = build_directory_areas(paths, patterns)
+    if not which("graphify"):
+        return directory
+    try:
+        run(["graphify", "update", clone_dir])
+        graph = read_json(os.path.join(clone_dir, "graphify-out", "graph.json"))
+    except Exception:
+        return directory
+    if not (graph or {}).get("nodes"):
+        return directory
+    graphified = parse_graphify_graph(graph)
+    return graphified if graphified["areas"] else directory
+
+
+def parse_codeowners(text):
+    """Parse a CODEOWNERS file into {pattern: [login, ...]}.
+
+    Each non-comment line is `<pattern> <owner...>`; `@user` / `@org/team` are
+    stripped of the leading `@`. Lines with a pattern but no owners are skipped.
+    Order-preserving owners, last-pattern-wins on duplicate patterns. Pure."""
+    owners = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        pattern, handles = parts[0], parts[1:]
+        logins = [h[1:] if h.startswith("@") else h for h in handles]
+        if not logins:
+            continue
+        owners[pattern] = logins
+    return owners
 
 
 def fetch_all(get_page, first_url):

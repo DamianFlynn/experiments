@@ -744,5 +744,74 @@ class TestGraphifyProvider(unittest.TestCase):
                          {"provider": "graphify", "areas": []})
 
 
+class TestProviderSelection(unittest.TestCase):
+    PATHS = ["avm/res/network/firewall-policy/main.bicep",
+             "src/app/handlers/auth.py"]
+
+    def test_uses_directory_provider_when_graphify_absent(self):
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone", which=lambda _n: None)
+        self.assertEqual(cg["provider"], "directory")
+        self.assertTrue(cg["areas"])
+
+    def test_uses_directory_provider_when_graphify_emits_no_nodes(self):
+        # graphify on PATH and runs, but graph.json has no nodes -> fall back.
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone",
+            which=lambda _n: "/usr/bin/graphify",
+            run=lambda cmd, **kw: None,
+            read_json=lambda _p: {"nodes": [], "links": []})
+        self.assertEqual(cg["provider"], "directory")
+
+    def test_prefers_graphify_when_present_and_nodes_exist(self):
+        with open(os.path.join(FIX, "graphify_graph_sample.json")) as fh:
+            graph = json.load(fh)
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone",
+            which=lambda _n: "/usr/bin/graphify",
+            run=lambda cmd, **kw: None,
+            read_json=lambda _p: graph)
+        self.assertEqual(cg["provider"], "graphify")
+        self.assertTrue(cg["areas"])
+
+    def test_graphify_run_failure_falls_back_silently(self):
+        def boom(cmd, **kw):
+            raise RuntimeError("graphify exploded")
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone",
+            which=lambda _n: "/usr/bin/graphify", run=boom,
+            read_json=lambda _p: {"nodes": []})
+        self.assertEqual(cg["provider"], "directory")
+
+
+class TestParseCodeowners(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "codeowners_sample.txt")) as fh:
+            self.text = fh.read()
+
+    def test_maps_glob_to_logins_stripping_at(self):
+        owners = gather.parse_codeowners(self.text)
+        self.assertEqual(owners["avm/res/network/"], ["alice", "bob"])
+        self.assertEqual(owners["avm/res/storage/"], ["carol"])
+        self.assertEqual(owners["*.bicep"], ["bicep-reviewers"])
+
+    def test_team_handles_are_kept_as_owners(self):
+        owners = gather.parse_codeowners(self.text)
+        self.assertEqual(owners["docs/"], ["org/docs-team", "dave"])
+        self.assertEqual(owners["*"], ["org/maintainers"])
+
+    def test_comments_and_blank_lines_ignored(self):
+        owners = gather.parse_codeowners(self.text)
+        self.assertNotIn("#", "".join(owners))
+        self.assertEqual(len(owners), 5)
+
+    def test_permissive_on_empty_or_none(self):
+        self.assertEqual(gather.parse_codeowners(""), {})
+        self.assertEqual(gather.parse_codeowners(None), {})
+
+    def test_pattern_with_no_owners_is_skipped(self):
+        self.assertEqual(gather.parse_codeowners("docs/   \n"), {})
+
+
 if __name__ == "__main__":
     unittest.main()
