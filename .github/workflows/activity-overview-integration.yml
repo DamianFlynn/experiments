@@ -20,7 +20,12 @@ name: activity-overview integration (live smoke test)
 #   render diagram manifest) PLUS Phase 3a (discussion bodies on PRs/issues,
 #   issue reactions + open_high_activity, artifacts lifecycle ledger, unified
 #   timeline, feature_deltas projection, and the content_timeline + deltas_bar
-#   diagram manifest entries).
+#   diagram manifest entries) PLUS Phase 3b (directory code-area provider with
+#   non-empty areas on Bicep where graphify is absent, resolved code_area/area
+#   on artifacts/feature_deltas, label_taxonomy + facets on every issue/PR +
+#   valid kind on every issue, trains.code_areas resolving to known area ids,
+#   modules dict with per-area counts, code_owners dict, and the
+#   contributor_graph + kind_breakdown entries in the diagrams manifest).
 #
 # SECRET (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
 #   Settings -> Secrets and variables -> Actions -> New repository secret
@@ -95,9 +100,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Resolved target $OWNER/$REPO over window $FROM -> $TO"
 
-      # Phase 3 will add graphify here (gather.py does not invoke it yet), e.g.:
-      #   - name: Install graphify
-      #     run: <install step>
+      # graphify is OPTIONAL and intentionally NOT installed here. The directory
+      # provider is the primary provider and is what runs on Bicep (graphify does
+      # not parse Bicep/HCL). graphify is exercised only via the unit fixture
+      # (fixtures/graphify_graph_sample.json) in the offline test suite. Do NOT
+      # add a graphify install step to this workflow.
 
       - name: Gather + link + render a real window
         env:
@@ -120,7 +127,7 @@ jobs:
           python3 render.py workspace/bundle.json \
             --diagrams-dir workspace/diagrams --skip-validate
 
-      - name: Assert the bundle is well-formed and self-consistent (Phase 3a)
+      - name: Assert the bundle is well-formed and self-consistent (Phase 3b)
         env:
           FROM: ${{ steps.cfg.outputs.from }}
           TO: ${{ steps.cfg.outputs.to }}
@@ -240,7 +247,6 @@ jobs:
                   assert well_formed(ev["ref"]) and ev["ref"]["type"] == "commit", aid
               if a["status"] == "replaced":
                   assert a["replaced_by"] in arts, f"{aid} replaced_by dangles"
-              assert a["code_area"] is None, "code_area is deferred to Phase 3b"
 
           # 8. Phase 3a: timeline — well-formed events, layer in {social,code}.
           tl = b.get("timeline", [])
@@ -258,7 +264,6 @@ jobs:
           for d in b.get("feature_deltas", []):
               assert d["kind"] in {"add", "drop", "change"}, d
               assert d["artifact"] in arts, f"delta references unknown artifact {d['artifact']}"
-              assert d["area"] is None, "feature_delta area is deferred to Phase 3b"
               assert str(d.get("url", "")).startswith("https://"), d
               if d.get("pr") is not None:
                   assert d["pr"] in pr_by, f"delta pr {d['pr']} unknown"
@@ -267,6 +272,71 @@ jobs:
           assert set(dg) >= {"buckets_pie", "timeline_gantt",
                              "content_timeline", "deltas_bar"}, \
               "diagrams manifest missing Phase 3a keys"
+
+          # 11. Phase 3b: code_graph is the directory provider with non-empty areas.
+          cg = b.get("code_graph", {})
+          assert cg.get("provider") == "directory", \
+              f"expected directory provider on Bicep (graphify absent), got {cg.get('provider')}"
+          areas = cg.get("areas", [])
+          assert areas, "code_graph.areas is empty — directory provider produced no areas"
+          area_ids = set()
+          for a in areas:
+              assert a.get("id") and isinstance(a.get("paths"), list) and a["paths"], \
+                  f"area missing id/paths: {a}"
+              assert a.get("edges") == [], "area edges are deferred (must be empty)"
+              area_ids.add(a["id"])
+
+          # 12. Phase 3b: code_area/area now RESOLVE (no longer all null) where covered.
+          arts = b.get("artifacts", {})
+          attributed_art = sum(1 for a in arts.values() if a.get("code_area") is not None)
+          for a in arts.values():
+              if a.get("code_area") is not None:
+                  assert a["code_area"] in area_ids, \
+                      f"artifact code_area {a['code_area']} not a known area"
+          deltas = b.get("feature_deltas", [])
+          for d in deltas:
+              if d.get("area") is not None:
+                  assert d["area"] in area_ids, f"delta area {d['area']} not a known area"
+          # On a busy Bicep window the directory provider must attribute SOMETHING.
+          if arts:
+              assert attributed_art > 0, \
+                  "no artifact resolved to a code area — attribution is broken"
+
+          # 13. Phase 3b: label_taxonomy present (possibly empty) + facets/kind on issues.
+          tax = b.get("label_taxonomy", {})
+          assert "source" in tax, "label_taxonomy missing source marker"
+          assert tax["source"] in {"auto", "config", "merged"}, tax["source"]
+          valid_kinds = {"feature", "module-request", "bug", "idea",
+                         "question", "docs", "other"}
+          for i in issues:
+              f = i.get("facets", {})
+              assert set(f) >= {"area", "priority", "status", "lifecycle"}, \
+                  f"issue {i['number']} facets missing keys: {f}"
+              assert i.get("kind") in valid_kinds, \
+                  f"issue {i['number']} kind {i.get('kind')} invalid"
+          for p in prs:
+              f = p.get("facets", {})
+              assert set(f) >= {"area", "priority", "status", "lifecycle"}, \
+                  f"pr {p['number']} facets missing keys: {f}"
+
+          # 14. Phase 3b: trains carry code_areas; modules populated; people areas.
+          for t in trains:
+              assert isinstance(t.get("code_areas", []), list), t["id"]
+              for area in t.get("code_areas", []):
+                  assert area in area_ids, f"{t['id']} code_area {area} unknown"
+          mods = b.get("code_owners", {})
+          assert isinstance(mods, dict), "code_owners must be a dict"
+          modules = b.get("modules", {})
+          assert isinstance(modules, dict), "modules must be a dict"
+          for area, m in modules.items():
+              assert isinstance(m.get("commits"), int) and m["commits"] >= 0 \
+                  and m.get("files_changed", 0) >= 1, \
+                  f"modules[{area}] has invalid counts: {m}"
+
+          # 15. Phase 3b: diagrams manifest now includes the two new diagrams.
+          assert set(dg) >= {"buckets_pie", "timeline_gantt", "content_timeline",
+                             "deltas_bar", "contributor_graph", "kind_breakdown"}, \
+              "diagrams manifest missing Phase 3b keys"
 
           print(f"OK prs={len(prs)} (merged={len(merged_nums)} "
                 f"open={sum(1 for p in prs if p['state'] == 'open')} "
@@ -279,6 +349,10 @@ jobs:
           print(f"  phase3a: artifacts={len(arts)} timeline={len(tl)} "
                 f"feature_deltas={len(b.get('feature_deltas', []))} "
                 f"pr_review_comments={sum(len(p.get('review_comments', [])) for p in prs)}")
+          print(f"  phase3b: provider={cg.get('provider')} areas={len(areas)} "
+                f"attributed_artifacts={attributed_art} modules={len(modules)} "
+                f"label_taxonomy_source={tax.get('source')} "
+                f"code_owners={len(b.get('code_owners', {}))}")
           if not merged_nums:
               print("::warning::no merged PRs in window — shipped/trains held "
                     "vacuously; pick a busier window")
