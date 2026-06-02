@@ -1,0 +1,66 @@
+{
+  "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31",
+           "ref_date": "2026-05-31", "period": {"from": "2026-05-01", "to": "2026-05-31"}},
+  "commits": [
+    {"sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+     "message": "Add basic example (#42)", "pr": null},
+    {"sha": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+     "message": "Revise README and example", "pr": null}
+  ],
+  "code_events": [
+    {"commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "author": "Alice",
+     "date": "2026-05-03", "change": "add", "path": "examples/basic/main.bicep"},
+    {"commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "author": "Alice",
+     "date": "2026-05-03", "change": "add", "path": "docs/firewall.md"},
+    {"commit": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2", "author": "Bob",
+     "date": "2026-05-10", "change": "modify", "path": "README.md"},
+    {"commit": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3", "author": "Carol",
+     "date": "2026-05-18", "change": "rename",
+     "old_path": "examples/basic/main.bicep",
+     "path": "examples/advanced/main.bicep"},
+    {"commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4", "author": "Dave",
+     "date": "2026-05-25", "change": "delete", "path": "docs/firewall.md"}
+  ],
+  "prs": [
+    {"number": 42, "title": "Add policy param", "merged": true, "state": "closed",
+     "merged_at": "2026-05-10T12:00:00Z", "closed_at": "2026-05-10T12:00:00Z",
+     "milestone": "v1.2.0", "labels": ["enhancement"], "closes": [17],
+     "crossref_issues": [], "url": "https://github.com/o/r/pull/42",
+     "review_comments": [
+       {"id": 7001, "author": "bob", "author_association": "MEMBER",
+        "body": "Inline: extract this branch.",
+        "url": "https://github.com/o/r/pull/42#discussion_r7001"}],
+     "comments_list": [
+       {"id": 8001, "author": "carol", "author_association": "CONTRIBUTOR",
+        "body": "LGTM once the example is added.",
+        "url": "https://github.com/o/r/pull/42#issuecomment-8001"}]}
+  ],
+  "issues": [
+    {"number": 17, "title": "Support policy param", "kind": "feature",
+     "state": "closed", "state_reason": "completed", "milestone": "v1.2.0",
+     "closed_at": "2026-05-10T12:00:00Z", "updated_at": "2026-05-10T12:00:00Z",
+     "labels": ["enhancement"], "url": "https://github.com/o/r/issues/17",
+     "comments_list": [], "reactions": {"+1": 0, "-1": 0, "heart": 0, "hooray": 0, "total": 0},
+     "open_high_activity": false},
+    {"number": 18, "title": "Open feature for next release", "kind": "other",
+     "state": "open", "state_reason": null, "milestone": "v1.3.0",
+     "closed_at": null, "updated_at": "2026-05-22T00:00:00Z",
+     "labels": [], "url": "https://github.com/o/r/issues/18",
+     "comments_list": [
+       {"id": 9001, "author": "dave", "author_association": "CONTRIBUTOR",
+        "body": "+1, we need this for the firewall module.",
+        "url": "https://github.com/o/r/issues/18#issuecomment-9001"}],
+     "reactions": {"+1": 9, "-1": 0, "heart": 1, "hooray": 2, "total": 12},
+     "open_high_activity": true}
+  ],
+  "milestones": [
+    {"title": "v1.2.0", "number": 4, "state": "open", "due_on": "2026-05-31T00:00:00Z"},
+    {"title": "v1.3.0", "number": 5, "state": "open", "due_on": "2026-06-30T00:00:00Z"}
+  ],
+  "releases": [],
+  "trains": [],
+  "artifacts": {},
+  "timeline": [],
+  "feature_deltas": [],
+  "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []}
+}

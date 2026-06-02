@@ -358,5 +358,48 @@ class TestRenderManifestP3(unittest.TestCase):
             self.assertIn("deltas_bar", b["diagrams"])
 
 
+class TestEndToEndOfflineP3(unittest.TestCase):
+    def test_link_then_render_builds_full_substrate(self):
+        with open(os.path.join(FIX, "bundle_p3.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+
+        # artifacts: README change (live), doc add+remove (removed),
+        # example renamed (old replaced -> new live)
+        arts = bundle["artifacts"]
+        doc = next(a for a in arts.values() if a["path"] == "docs/firewall.md")
+        self.assertEqual(doc["status"], "removed")
+        old_ex = arts[link.artifact_id("examples/basic/main.bicep")]
+        self.assertEqual(old_ex["status"], "replaced")
+        self.assertEqual(old_ex["replaced_by"],
+                         link.artifact_id("examples/advanced/main.bicep"))
+
+        # timeline: both layers, sorted, well-formed refs
+        tl = bundle["timeline"]
+        self.assertTrue(tl)
+        self.assertEqual({e["layer"] for e in tl}, {"social", "code"})
+        self.assertEqual([e["ts"] for e in tl], sorted(e["ts"] for e in tl))
+
+        # feature_deltas: add/drop/change present; c1 -> PR 42
+        kinds = {d["kind"] for d in bundle["feature_deltas"]}
+        self.assertEqual(kinds, {"add", "drop", "change"})
+        add42 = next(d for d in bundle["feature_deltas"]
+                     if d["commit"].startswith("c1") and d["kind"] == "add")
+        self.assertEqual(add42["pr"], 42)
+
+        # render: four-diagram manifest, validation stubbed (mmdc absent here)
+        with tempfile.TemporaryDirectory() as d:
+            real = render.write_diagrams(bundle, os.path.join(d, "diagrams"))
+            self.assertEqual(
+                set(real),
+                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"})
+
+            class Ok:
+                returncode = 0
+                stderr = ""
+            render.validate_with_mmdc(list(real.values()),
+                                      runner=lambda cmd, **kw: Ok(),
+                                      which=lambda _n: "/usr/bin/mmdc")
+
+
 if __name__ == "__main__":
     unittest.main()
