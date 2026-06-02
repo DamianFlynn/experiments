@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import sys
@@ -176,7 +178,8 @@ class TestCliAndAuth(unittest.TestCase):
         self.assertEqual(gather.resolve_token({"GH_TOKEN": "alt"}), "alt")
 
     def test_resolve_token_missing_raises(self):
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
             gather.resolve_token({})
 
 
