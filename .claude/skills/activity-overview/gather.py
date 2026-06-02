@@ -706,6 +706,41 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     return sorted(edges, key=lambda e: (e["transitive"], str(e["to"]), str(e["ref"])))
 
 
+_TF_MODULE_BLOCK_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{(?P<body>.*?)\}', re.DOTALL)
+_TF_SOURCE_RE = re.compile(r'source\s*=\s*"(?P<src>[^"]+)"')
+_TF_EDGE_RE = re.compile(r'"\[root\]\s*(?P<a>[^"]+)"\s*->\s*"\[root\]\s*(?P<b>[^"]+)"')
+_TF_MODULE_TOKEN_RE = re.compile(r"module\.([A-Za-z0-9_-]+)")
+
+
+def parse_terraform_module_blocks(tf_text):
+    """Map each `module "<name>" { source = "..." }` to its source string. Pure."""
+    out = {}
+    for m in _TF_MODULE_BLOCK_RE.finditer(tf_text or ""):
+        sm = _TF_SOURCE_RE.search(m.group("body"))
+        if sm:
+            out[m.group("name")] = sm.group("src")
+    return out
+
+
+def _first_tf_module(node):
+    m = _TF_MODULE_TOKEN_RE.search(node or "")
+    return m.group(1) if m else None
+
+
+def parse_terraform_graph(dot_text):
+    """Extract (from_module|None, to_module) dependency pairs from terraform graph DOT.
+
+    A node's first `module.<name>` token is its owning module (None = root). An edge
+    A->B becomes (module(A), module(B)) when B is in a module and differs from A.
+    Deterministic (sorted, deduped). Pure."""
+    pairs = set()
+    for m in _TF_EDGE_RE.finditer(dot_text or ""):
+        a, b = _first_tf_module(m.group("a")), _first_tf_module(m.group("b"))
+        if b and a != b:
+            pairs.add((a, b))
+    return sorted(pairs, key=lambda p: (p[0] or "", p[1]))
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 

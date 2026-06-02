@@ -1113,5 +1113,34 @@ class TestBuildBicepEdges(unittest.TestCase):
                                      gather.DEFAULT_AREA_PATTERNS), [])
 
 
+class TestTerraformParsers(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            self.tf = fh.read()
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            self.dot = fh.read()
+
+    def test_module_blocks_map_name_to_source(self):
+        blocks = gather.parse_terraform_module_blocks(self.tf)
+        self.assertEqual(blocks["vnet"], "../../modules/vnet")
+        self.assertEqual(blocks["naming"], "Azure/naming/azurerm")
+        self.assertNotIn("azurerm_resource_group", blocks)  # resources are not modules
+
+    def test_graph_yields_module_dependency_pairs(self):
+        pairs = gather.parse_terraform_graph(self.dot)
+        # root (None) -> naming ; vnet -> naming
+        self.assertIn((None, "naming"), pairs)
+        self.assertIn(("vnet", "naming"), pairs)
+
+    def test_graph_ignores_same_module_self_edges(self):
+        pairs = gather.parse_terraform_graph(self.dot)
+        self.assertFalse([p for p in pairs if p[0] == p[1] and p[0] is not None])
+
+    def test_empty_inputs(self):
+        self.assertEqual(gather.parse_terraform_module_blocks(""), {})
+        self.assertEqual(gather.parse_terraform_graph(""), [])
+        self.assertEqual(gather.parse_terraform_module_blocks(None), {})
+
+
 if __name__ == "__main__":
     unittest.main()
