@@ -650,6 +650,80 @@ def detect_label_taxonomy(labels, config=None):
     return out
 
 
+_FACET_KEYS = ("area", "priority", "status", "lifecycle")
+
+# Native issue-type / label-value tokens -> canonical kind.
+_KIND_TOKENS = {
+    "feature": "feature", "enhancement": "feature",
+    "module": "module-request", "module-request": "module-request",
+    "module request": "module-request",
+    "bug": "bug", "defect": "bug",
+    "idea": "idea", "proposal": "idea",
+    "question": "question", "support": "question",
+    "doc": "docs", "docs": "docs", "documentation": "docs",
+}
+_VALID_KINDS = {"feature", "module-request", "bug", "idea", "question", "docs", "other"}
+
+
+def _kind_from_token(text):
+    """Map a free token (issue-type name, label value, template stem) to a kind."""
+    low = (text or "").strip().lower()
+    for token, kind in _KIND_TOKENS.items():
+        if token in low:
+            return kind
+    return None
+
+
+def _labels_in_taxonomy(item, taxonomy, facet):
+    """Labels on `item` that belong to `facet` per the taxonomy, order-preserving."""
+    facet_labels = set()
+    for labs in (taxonomy.get(facet) or {}).values():
+        facet_labels.update(labs)
+    return [lbl for lbl in item.get("labels", []) if lbl in facet_labels]
+
+
+def apply_facets(item, taxonomy):
+    """Derive {area, priority, status, lifecycle} for an item from its labels.
+
+    Each facet takes the first matching label (or None). Pure; never raises on
+    an empty taxonomy (every facet is then None)."""
+    out = {}
+    for facet in _FACET_KEYS:
+        matches = _labels_in_taxonomy(item, taxonomy, facet)
+        out[facet] = matches[0] if matches else None
+    return out
+
+
+def classify_issue_kind(issue, taxonomy, types_present):
+    """Classify an issue into one of feature/module-request/bug/idea/question/docs/other.
+
+    Priority: native GitHub issue type (when present) -> label `kind` facet ->
+    issue-template filename -> title/body heuristic -> other. Pure."""
+    # 1. native issue type
+    if types_present:
+        kind = _kind_from_token(issue.get("issue_type"))
+        if kind:
+            return kind
+    # 2. label kind facet (the values carried under the taxonomy's `kind` facet)
+    for lbl in _labels_in_taxonomy(issue, taxonomy, "kind"):
+        value = lbl.split(":", 1)[-1] if ":" in lbl else lbl.split("/", 1)[-1]
+        kind = _kind_from_token(value)
+        if kind:
+            return kind
+    # 3. issue-template filename (e.g. module_request.md, bug_report.yml)
+    kind = _kind_from_token((issue.get("template") or "").replace("_", " "))
+    if kind:
+        return kind
+    # 4. title/body heuristic
+    text = f"{issue.get('title','')} {issue.get('body','')}"
+    if "?" in (issue.get("title") or ""):
+        return "question"
+    kind = _kind_from_token(text)
+    if kind:
+        return kind
+    return "other"
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with

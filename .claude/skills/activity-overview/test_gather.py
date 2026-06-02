@@ -856,5 +856,61 @@ class TestDetectLabelTaxonomy(unittest.TestCase):
         self.assertEqual(gather.detect_label_taxonomy([]), {"source": "auto"})
 
 
+class TestFacetsAndKind(unittest.TestCase):
+    TAX = {
+        "area": {"area:": ["area: networking", "area: storage"]},
+        "priority": {"priority:": ["priority: high"]},
+        "status": {"status:": ["status: in progress"]},
+        "kind": {"Type:": ["Type: Bug", "Type: Feature"]},
+        "lifecycle": {"lifecycle/": ["lifecycle/stale"]},
+        "source": "auto",
+    }
+
+    def test_apply_facets_picks_one_value_per_facet_from_labels(self):
+        item = {"labels": ["area: networking", "priority: high", "Type: Bug"]}
+        f = gather.apply_facets(item, self.TAX)
+        self.assertEqual(f["area"], "area: networking")
+        self.assertEqual(f["priority"], "priority: high")
+        self.assertIsNone(f["status"])
+        self.assertIsNone(f["lifecycle"])
+
+    def test_apply_facets_returns_all_four_keys_even_when_empty(self):
+        f = gather.apply_facets({"labels": []}, self.TAX)
+        self.assertEqual(set(f), {"area", "priority", "status", "lifecycle"})
+        self.assertTrue(all(v is None for v in f.values()))
+
+    def test_kind_native_issue_type_wins(self):
+        issue = {"labels": ["Type: Bug"], "title": "crash",
+                 "issue_type": "Feature"}
+        self.assertEqual(
+            gather.classify_issue_kind(issue, self.TAX, types_present=True),
+            "feature")
+
+    def test_kind_label_facet_when_no_native_type(self):
+        issue = {"labels": ["Type: Bug"], "title": "whatever"}
+        self.assertEqual(
+            gather.classify_issue_kind(issue, self.TAX, types_present=False),
+            "bug")
+
+    def test_kind_template_filename_then_heuristic(self):
+        # template name maps module requests
+        issue = {"labels": [], "title": "x",
+                 "template": "module_request.md"}
+        self.assertEqual(
+            gather.classify_issue_kind(issue, self.TAX, types_present=False),
+            "module-request")
+        # title heuristic: a question
+        q = {"labels": [], "title": "How do I configure the firewall?"}
+        self.assertEqual(
+            gather.classify_issue_kind(q, self.TAX, types_present=False),
+            "question")
+
+    def test_kind_defaults_to_other(self):
+        self.assertEqual(
+            gather.classify_issue_kind({"labels": [], "title": "misc"},
+                                       self.TAX, types_present=False),
+            "other")
+
+
 if __name__ == "__main__":
     unittest.main()
