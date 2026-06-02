@@ -134,14 +134,16 @@ def build_artifacts(bundle):
     for ev in bundle.get("code_events", []):
         change = ev["change"]
         if change in ("rename", "copy") and ev.get("old_path"):
-            old_aid = ensure(ev["old_path"])
             new_aid = ensure(ev["path"])
             if new_aid is not None:
                 append_event(new_aid, "add", ev)
-            if old_aid is not None:
-                append_event(old_aid, "remove", ev)
-                artifacts[old_aid]["status"] = "replaced"
-                artifacts[old_aid]["replaced_by"] = new_aid
+            if change == "rename":
+                old_aid = ensure(ev["old_path"])
+                if old_aid is not None:
+                    append_event(old_aid, "remove", ev)
+                    artifacts[old_aid]["status"] = "replaced"
+                    # replaced_by is the direct successor; consumers walk the chain for terminal paths (A->B->C).
+                    artifacts[old_aid]["replaced_by"] = new_aid
             continue
         aid = ensure(ev["path"])
         if aid is None:
@@ -162,9 +164,9 @@ def build_timeline(bundle):
 
     Event shape: {ts, actor, layer:'social'|'code', event, ref:{type,...,url},
     subject:{kind,name,path}}. Social events come from PR/issue comments + review
-    comments; code events from artifact lifecycle entries. Sorted by ts. Comments
-    in early phases may lack a precise per-comment timestamp, so ts falls back to
-    the comment url ordering via a stable secondary key. Pure.
+    comments; code events from artifact lifecycle entries. Sorted by ts.
+    Malformed records that lack created_at fall back to URL ordering as a last
+    resort (not a normal case — well-formed comment objects carry created_at). Pure.
     """
     events = []
 
@@ -367,7 +369,9 @@ def enrich(bundle):
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle)
     bundle["artifacts"] = build_artifacts(bundle)
+    # build_timeline depends on build_artifacts having run (reads bundle["artifacts"]).
     bundle["timeline"] = build_timeline(bundle)
+    # compute_feature_deltas depends on build_trains having run (resolves trains).
     bundle["feature_deltas"] = compute_feature_deltas(bundle)
     return bundle
 

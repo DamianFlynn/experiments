@@ -331,13 +331,14 @@ def normalize_milestone(raw):
 
 def _normalize_comment_obj(raw):
     """Shared mapping for conversation + review comments: the bundle's comment
-    shape {id, author, author_association, body, url}. Pure, permissive."""
+    shape {id, author, author_association, body, url, created_at}. Pure, permissive."""
     return {
         "id": raw.get("id"),
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
         "body": raw.get("body") or "",
         "url": raw.get("html_url"),
+        "created_at": raw.get("created_at"),
     }
 
 

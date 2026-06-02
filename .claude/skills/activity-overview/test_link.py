@@ -287,6 +287,34 @@ class TestBuildArtifacts(unittest.TestCase):
     def test_empty_code_events_yields_empty_map(self):
         self.assertEqual(link.build_artifacts({"code_events": []}), {})
 
+    def test_copy_creates_new_artifact_but_leaves_source_live(self):
+        """A 'copy' event introduces the new path but must NOT supersede the source."""
+        bundle = {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                {"commit": "c1" * 20, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "examples/a.bicep"},
+                {"commit": "c2" * 20, "author": "Bob", "date": "2026-05-10",
+                 "change": "copy", "old_path": "examples/a.bicep",
+                 "path": "examples/b.bicep"},
+            ],
+        }
+        arts = link.build_artifacts(bundle)
+        src_id = link.artifact_id("examples/a.bicep")
+        dst_id = link.artifact_id("examples/b.bicep")
+
+        # source artifact must still be live — copy does not supersede it
+        self.assertIn(src_id, arts)
+        self.assertEqual(arts[src_id]["status"], "live")
+        self.assertIsNone(arts[src_id]["replaced_by"])
+        src_events = [e["event"] for e in arts[src_id]["lifecycle"]]
+        self.assertNotIn("remove", src_events)
+
+        # destination artifact must exist with a leading 'add' event
+        self.assertIn(dst_id, arts)
+        self.assertEqual(arts[dst_id]["lifecycle"][0]["event"], "add")
+        self.assertEqual(arts[dst_id]["status"], "live")
+
 
 class TestBuildTimeline(unittest.TestCase):
     def _bundle(self):
@@ -300,15 +328,18 @@ class TestBuildTimeline(unittest.TestCase):
                 {"number": 42, "url": "https://github.com/o/r/pull/42",
                  "review_comments": [
                      {"id": 7001, "author": "bob", "body": "x",
+                      "created_at": "2026-05-12T10:00:00Z",
                       "url": "https://github.com/o/r/pull/42#discussion_r7001"}],
                  "comments_list": [
                      {"id": 8001, "author": "carol", "body": "y",
+                      "created_at": "2026-05-13T09:00:00Z",
                       "url": "https://github.com/o/r/pull/42#issuecomment-8001"}]},
             ],
             "issues": [
                 {"number": 18, "url": "https://github.com/o/r/issues/18",
                  "comments_list": [
                      {"id": 9001, "author": "dave", "body": "z",
+                      "created_at": "2026-05-15T08:00:00Z",
                       "url": "https://github.com/o/r/issues/18#issuecomment-9001"}],
                  "reactions": {"+1": 9, "total": 12}, "open_high_activity": True},
             ],
@@ -349,6 +380,31 @@ class TestBuildTimeline(unittest.TestCase):
     def test_empty_bundle_yields_empty_timeline(self):
         self.assertEqual(link.build_timeline(
             {"prs": [], "issues": [], "artifacts": {}}), [])
+
+    def test_social_events_carry_iso_timestamps_not_urls(self):
+        """Social events must have a real ISO date in ts, not a URL."""
+        import re
+        iso_re = re.compile(r"^\d{4}-\d{2}-\d{2}")
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        social = [e for e in tl if e["layer"] == "social"]
+        self.assertTrue(social, "must have social events")
+        for ev in social:
+            self.assertRegex(ev["ts"], iso_re,
+                             f"social ts looks like a URL or is blank: {ev['ts']!r}")
+
+    def test_timeline_is_sorted_chronologically_code_and_social_interleaved(self):
+        """Code event (2026-05-03) precedes social events (2026-05-12+)."""
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        ts_list = [e["ts"] for e in tl]
+        self.assertEqual(ts_list, sorted(ts_list))
+        layers = [e["layer"] for e in tl]
+        # code event at 2026-05-03 is first; social events follow
+        self.assertEqual(layers[0], "code")
+        self.assertTrue(all(lay == "social" for lay in layers[1:]))
 
 
 class TestComputeFeatureDeltas(unittest.TestCase):

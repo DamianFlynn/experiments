@@ -392,12 +392,14 @@ class TestCommentsAndReactions(unittest.TestCase):
             "id": 7002, "body": "nit: rename `x`.",
             "user": {"login": "carol"}, "author_association": "CONTRIBUTOR",
             "html_url": "https://github.com/o/r/pull/42#discussion_r7002",
+            "created_at": "2026-05-12T10:00:00Z",
         }
         rc = gather.normalize_review_comment(raw)
         self.assertEqual(rc, {"id": 7002, "author": "carol",
                               "author_association": "CONTRIBUTOR",
                               "body": "nit: rename `x`.",
-                              "url": "https://github.com/o/r/pull/42#discussion_r7002"})
+                              "url": "https://github.com/o/r/pull/42#discussion_r7002",
+                              "created_at": "2026-05-12T10:00:00Z"})
 
     def test_summarize_reactions_picks_the_tracked_keys(self):
         raw = {"+1": 12, "-1": 1, "laugh": 0, "hooray": 3, "confused": 0,
