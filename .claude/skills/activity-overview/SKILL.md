@@ -32,7 +32,8 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    ```
    This writes `workspace/diagrams/*.mmd`, records `bundle.diagrams`, and **fails
    if any diagram does not compile** under `mmdc`.
-   The manifest now also includes `content_timeline` and `deltas_bar`.
+   The manifest now also includes `content_timeline`, `deltas_bar`,
+   `contributor_graph`, and `kind_breakdown`.
 4. **Write the report.** Read `workspace/bundle.json` and fill `report-template.md`,
    embedding each `bundle.diagrams` file as a ```mermaid block. Cite each fact with
    its `url`. Do not state anything the bundle does not contain.
