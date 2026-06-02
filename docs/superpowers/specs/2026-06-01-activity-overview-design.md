@@ -471,12 +471,16 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "flow": { "<issue#>": { "state":"hung|upvoted-but-ignored|traction-then-abandoned|blocked|healthy",
                   "age_days","reactions","blocked_by":[issue#],"signals":[],"evidence":[ref] } },
     "blockers": [ { "ref","kind","blocks":[issue#],"in_degree" } ],
-    "diagrams": { "timeline_gantt":"<mermaid>","buckets_pie":"<mermaid>",
-                  "deltas_bar":"<mermaid>","train_flowcharts":{ "<id>":"<mermaid>" },
-                  "contributor_graph":"<mermaid>","blocker_graph":"<mermaid>",
-                  "kind_breakdown":"<mermaid>","content_timeline":"<mermaid>" }
+    "diagrams": { "timeline_gantt":"diagrams/timeline_gantt.mmd","buckets_pie":"diagrams/buckets_pie.mmd",
+                  "deltas_bar":"diagrams/deltas_bar.mmd","train_flowcharts":{ "<id>":"diagrams/train-<id>.mmd" },
+                  "contributor_graph":"diagrams/contributor_graph.mmd","blocker_graph":"diagrams/blocker_graph.mmd",
+                  "kind_breakdown":"diagrams/kind_breakdown.mmd","content_timeline":"diagrams/content_timeline.mmd" }
   }
   ```
+  (`diagrams` is a **manifest**: each value is the workspace-relative path of a standalone
+  `.mmd` file emitted by `render.py`, not an inline Mermaid string — see the Diagrams
+  component below. References elsewhere to `diagrams.<name>` mean "the diagram named
+  `<name>`", which now resolves to its `.mmd` file.)
   (`code_graph`, `timeline`, `trains`, `artifacts`, `feature_deltas`, and `diagrams` may be
   thin/empty in early vertical slices and thicken per phase — the schema reserves their place
   from Phase 1; the full-window `artifacts`/`timeline` code-event detail lands in Phase 3.)
@@ -520,14 +524,21 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   reactions + assignee/PR linkage + `blocked by #` refs; and a `blockers` list ranking
   nodes by how many trains they block (in-degree over the cross-reference graph).
 
-- **Diagrams (`diagrams`, generated deterministically in Link):** Mermaid blocks built
-  *from the data*, not hand-drawn by the model, so visuals are reproducible facts:
-  `timeline_gantt` (releases/sprints over the window), `buckets_pie` (shipped/in-flight/
-  rejected/next counts), `deltas_bar` (add/drop/change per area), one `flowchart` per
-  notable train (issue → PR(s) → commits → outcome), `contributor_graph` (people↔module/
-  train edges), `blocker_graph` (pile-ups by in-degree), `kind_breakdown` (feature/bug/idea
-  mix), and `content_timeline` (artifact lifecycles — added/changed/removed over the window).
-  `SKILL.md`/template embed them verbatim. (Public renders omit shame/blame.)
+- **Diagrams (`diagrams`, generated deterministically by `render.py`):** A dedicated
+  offline stage (`render.py`) reads the **enriched bundle's existing fields** and emits each
+  visual as a standalone Mermaid file under `workspace/diagrams/*.mmd` — built *from the
+  data*, not hand-drawn by the model, so visuals are reproducible facts. The diagram inputs
+  are **derived from the fields already in the bundle** (buckets, trains, prs/issues dates,
+  releases, milestones, …); no presentation-specific data is duplicated into the schema.
+  `bundle.diagrams` is a **manifest** mapping each diagram name to its `.mmd` path, so any
+  post-stage (the Markdown digest, or another output) can discover and embed the files it
+  needs. Adding a new diagram = a new emitter reading existing fields + a manifest entry.
+  The set: `timeline_gantt` (item lifespans/releases over the window), `buckets_pie`
+  (shipped/in-flight/rejected/next counts), `deltas_bar` (add/drop/change per area), one
+  `train_flowcharts[id]` per notable train (issue → PR(s) → commits → outcome),
+  `contributor_graph` (people↔module/train edges), `blocker_graph` (pile-ups by in-degree),
+  `kind_breakdown` (feature/bug/idea mix), and `content_timeline` (artifact lifecycles).
+  Post-stages embed the referenced `.mmd` files. (Public renders omit shame/blame.)
 
 ### 2. `link.py` (offline, deterministic — train graph + buckets + people + flow)
 
@@ -565,6 +576,8 @@ Procedure Claude follows:
    + cross-period `first_seen`/`carried_over`/`prior_status`), issue/train `kind`, buckets,
    release_train, sprints, the `people`/`halls` graph, and `flow`/`blockers`; sets
    `meta.period`/`meta.prev_bundle`.
+5b. **Render diagrams:** run `render.py` → emits `workspace/diagrams/*.mmd` derived from the
+    enriched bundle's existing fields, recording the name→path manifest in `bundle.diagrams`.
 6. **Analyze:** for each significant train, **dispatch a parallel sub-agent** (see
    `superpowers:dispatching-parallel-agents`) that reads the train's thread + local diffs
    and returns a structured decision narrative **with an `evidence: [ref]` list — citing,
@@ -711,11 +724,12 @@ index is the cheap through-line, never an override.
   `_get(url)` / `_graphql(query,vars)` / `_git(args)` / `_graphify(dir)` seams that tests
   monkeypatch to return recorded fixtures. Covers window/merge filtering, commit parsing
   from `git log` fixtures, code_graph ingestion, workflow-stats, release filtering.
+- `test_render.py` — diagram generation: each `.mmd` is deterministic given a fixture bundle
+  and derives solely from existing bundle fields. Runs with no network/token.
 - `test_link.py` — train construction (closing-refs + trailers + timeline + merges),
   duplicate/spin-off detection, code-area attribution, bucket assignment,
-  release-train/sprint resolution, `feature_deltas` extraction (add/drop/change, incl.
-  Bicep/Terraform subjects), and `diagrams` generation (Mermaid blocks are deterministic
-  given fixtures). Includes a **provenance lint**: asserts every narrative-bearing fact
+  release-train/sprint resolution, and `feature_deltas` extraction (add/drop/change, incl.
+  Bicep/Terraform subjects). Includes a **provenance lint**: asserts every narrative-bearing fact
   (train, feature delta, quoted comment) carries a well-formed source ref. Runs with no
   network/token.
 
@@ -726,6 +740,7 @@ index is the cheap through-line, never an override.
   SKILL.md
   gather.py                  # Acquire: clone + REST/GraphQL + graphify → bundle
   link.py                    # offline: train graph + buckets
+  render.py                  # offline: bundle → workspace/diagrams/*.mmd (Mermaid)
   report-template.md
   projects.example.json
   BUNDLE.md                  # bundle schema + ref convention, for downstream renderer authors
@@ -734,6 +749,7 @@ index is the cheap through-line, never an override.
     activity.md              # /activity slash-command wrapper
   test_gather.py
   test_link.py
+  test_render.py
   fixtures/
     rest_sample.json         # recorded REST responses
     graphql_sample.json      # recorded Projects v2 GraphQL response
@@ -759,10 +775,15 @@ against GitHub) after each.
   trains; coarse `shipped` bucket. *Report:* a real digest — "N PRs across M trains,
   bucketed as…, notable trains" — verifiable line-by-line against GitHub.
 - **Phase 2 — social layer + full buckets + first visuals.**
-  *Acquire:* + comments, reviews, timeline events, workflow runs, releases, milestones.
-  *Link:* full cross-references, `in_flight` / `rejected` / `next_candidates`; emit
-  `diagrams.buckets_pie` + `diagrams.timeline_gantt`. *Report:* + CI/CD, releases,
-  rejected/abandoned, in-flight sections with embedded bucket pie + timeline.
+  *Acquire:* + comments (counts), reviews (decision), timeline events (cross-refs), workflow
+  runs (aggregated `workflow_stats`), releases, milestones; PRs gain `created_at`. *Link:*
+  fold timeline cross-refs into PR↔issue linking; full `shipped` / `rejected` / `in_flight` /
+  `next_candidates` buckets (one bucket per item, precedence shipped > rejected >
+  next_candidates > in_flight; `in_flight` = open-&-active-in-window ∪ on-next-milestone;
+  `next_candidates` = open items on the earliest open milestone). *Render:* new `render.py`
+  emits `diagrams/buckets_pie.mmd` + `diagrams/timeline_gantt.mmd`, derived from existing
+  bundle fields. *Report:* + CI/CD, releases, rejected/abandoned, in-flight sections
+  embedding the two `.mmd` files.
 - **Phase 3 — code areas (graphify) + feature deltas + label facets.**
   *Acquire:* graphify code-graph pass (now required) + CODEOWNERS; the **full-window
   code-event walk** (`git log -p -M -C`) producing the `artifacts` ledger and the unified
