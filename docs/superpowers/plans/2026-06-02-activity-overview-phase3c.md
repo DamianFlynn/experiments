@@ -102,7 +102,7 @@ module keyVault 'br/public:avm/res/key-vault/vault:0.6.1' = {
   }
 }
 
-module shared '../../utl/types/avm-common-types/main.bicep' = {
+module shared '../../../utl/types/avm-common-types/main.bicep' = {
   name: 'sharedDeployment'
 }
 ```
@@ -248,7 +248,7 @@ class TestParseBicepModuleRefs(unittest.TestCase):
         locals_ = [r for r in refs if r["local_path"]]
         self.assertEqual(len(locals_), 1)
         self.assertEqual(locals_[0]["local_path"],
-                         "../../utl/types/avm-common-types/main.bicep")
+                         "../../../utl/types/avm-common-types/main.bicep")
         self.assertIsNone(locals_[0]["registry_path"])
 
     def test_br_with_explicit_registry_host_strips_to_path(self):
@@ -347,8 +347,8 @@ class TestResolveModuleRef(unittest.TestCase):
 
     def test_local_ref_resolves_relative_to_base(self):
         ri = {"registry_path": None, "version": None,
-              "local_path": "../../utl/types/avm-common-types/main.bicep"}
-        # base is avm/ptn/foo/bar/main.bicep -> up two -> avm/utl/types/...
+              "local_path": "../../../utl/types/avm-common-types/main.bicep"}
+        # base dir avm/ptn/foo/bar -> up three (file-relative) -> avm/utl/types/...
         self.assertEqual(
             gather.resolve_module_ref(ri, "avm/ptn/foo/bar/main.bicep",
                                       gather.DEFAULT_AREA_PATTERNS),
