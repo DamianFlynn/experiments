@@ -593,6 +593,25 @@ def parse_bicep_module_refs(source_text):
     return refs
 
 
+def resolve_module_ref(ref_info, base_path, patterns=None):
+    """Map a parsed bicep/tf ref to a canonical area-id (reusing classify_code_area).
+
+    Registry refs classify their `<path>/main.bicep`; local refs are normalised
+    relative to `base_path`'s directory then classified. Returns the area-id, or
+    the raw path when classification declines, or None when nothing is set. Pure."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    rp = ref_info.get("registry_path")
+    if rp:
+        probe = rp.rstrip("/") + "/main.bicep"
+        return classify_code_area(probe, patterns) or rp
+    lp = ref_info.get("local_path")
+    if lp:
+        base_dir = os.path.dirname(os.path.dirname(base_path or ""))
+        joined = os.path.normpath(os.path.join(base_dir, lp))
+        return classify_code_area(joined, patterns) or os.path.dirname(joined) or joined
+    return None
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 

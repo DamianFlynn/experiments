@@ -1007,5 +1007,38 @@ class TestParseBicepModuleRefs(unittest.TestCase):
         self.assertEqual(gather.parse_bicep_module_refs(None), [])
 
 
+class TestResolveModuleRef(unittest.TestCase):
+    def test_registry_path_resolves_to_avm_area_id(self):
+        ri = {"registry_path": "avm/res/storage/storage-account",
+              "version": "0.9.0", "local_path": None}
+        self.assertEqual(
+            gather.resolve_module_ref(ri, "avm/ptn/foo/bar/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "avm/res/storage/storage-account")
+
+    def test_local_ref_resolves_relative_to_base(self):
+        ri = {"registry_path": None, "version": None,
+              "local_path": "../../utl/types/avm-common-types/main.bicep"}
+        # base is avm/ptn/foo/bar/main.bicep -> up two -> avm/utl/types/...
+        self.assertEqual(
+            gather.resolve_module_ref(ri, "avm/ptn/foo/bar/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "avm/utl/types/avm-common-types")
+
+    def test_unrecognised_registry_path_falls_back_to_the_path(self):
+        ri = {"registry_path": "some/custom/thing", "version": "1.0.0",
+              "local_path": None}
+        self.assertEqual(
+            gather.resolve_module_ref(ri, "x/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "some/custom/thing")
+
+    def test_empty_ref_resolves_to_none(self):
+        self.assertIsNone(
+            gather.resolve_module_ref({"registry_path": None, "version": None,
+                                       "local_path": None}, "x/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS))
+
+
 if __name__ == "__main__":
     unittest.main()
