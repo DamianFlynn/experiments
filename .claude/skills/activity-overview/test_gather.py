@@ -813,5 +813,48 @@ class TestParseCodeowners(unittest.TestCase):
         self.assertEqual(gather.parse_codeowners("docs/   \n"), {})
 
 
+class TestDetectLabelTaxonomy(unittest.TestCase):
+    LABELS = ["area: networking", "area: storage", "priority: high",
+              "status: in progress", "Type: Bug", "Class: Resource Module",
+              "Needs: Triage", "lifecycle/stale", "good first issue"]
+
+    def test_auto_detects_known_namespaces_into_facets(self):
+        tax = gather.detect_label_taxonomy(self.LABELS)
+        self.assertEqual(tax["source"], "auto")
+        # area facet groups both area:* labels under the namespace
+        self.assertIn("area", tax)
+        self.assertEqual(sorted(tax["area"]["area:"]),
+                         ["area: networking", "area: storage"])
+        self.assertIn("priority", tax)
+        self.assertIn("status", tax)
+        # AVM Class:/Type:/Needs: map to kind/lifecycle facets
+        self.assertIn("kind", tax)
+        self.assertIn("Type:", tax["kind"])
+
+    def test_unprefixed_labels_do_not_create_facets(self):
+        tax = gather.detect_label_taxonomy(["good first issue", "bug"])
+        # nothing structured -> no facet buckets, just the source marker
+        self.assertEqual(set(tax) - {"source"}, set())
+        self.assertEqual(tax["source"], "auto")
+
+    def test_config_override_extends_and_marks_source_merged(self):
+        config = {"area": ["component:"], "priority": ["sev/"]}
+        tax = gather.detect_label_taxonomy(
+            ["component: api", "sev/1", "area: networking"], config=config)
+        self.assertEqual(tax["source"], "merged")
+        self.assertIn("component:", tax["area"])
+        self.assertIn("sev/", tax["priority"])
+        # auto-detected area:* still present alongside the config namespace
+        self.assertIn("area:", tax["area"])
+
+    def test_config_only_when_no_auto_marks_source_config(self):
+        tax = gather.detect_label_taxonomy(
+            ["component: api"], config={"area": ["component:"]})
+        self.assertEqual(tax["source"], "config")
+
+    def test_empty_labels_yield_no_facets(self):
+        self.assertEqual(gather.detect_label_taxonomy([]), {"source": "auto"})
+
+
 if __name__ == "__main__":
     unittest.main()

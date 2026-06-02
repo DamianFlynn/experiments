@@ -581,6 +581,75 @@ def parse_codeowners(text):
     return owners
 
 
+# Conventional label namespace -> facet (auto-detect). AVM uses `Class:`/`Type:`/
+# `Needs:`; most repos use `area`/`priority`/`status`/`lifecycle` with `:` or `/`.
+_AUTO_FACET_NAMESPACES = {
+    "area": "area", "component": "area",
+    "priority": "priority", "p": "priority",
+    "status": "status", "needs": "status",
+    "lifecycle": "lifecycle",
+    "type": "kind", "kind": "kind", "class": "kind",
+}
+
+
+def _namespace_of(label):
+    """Return the lowercase namespace token of a structured label, or None.
+    A structured label looks like `<ns>: value` or `<ns>/value`."""
+    for sep in (":", "/"):
+        if sep in label:
+            ns = label.split(sep, 1)[0].strip().lower()
+            if ns:
+                return ns, label.split(sep, 1)[0].strip() + sep
+    return None
+
+
+def detect_label_taxonomy(labels, config=None):
+    """Auto-detect structured label namespaces and map them to facets.
+
+    Returns {"<facet>": {"<namespace>": [label, ...]}, "source": "auto|config|merged"}.
+    `config` (a {facet: [namespace-prefix, ...]} block) overrides/extends the
+    auto-map. Degrades to {"source": "auto"} (no facets) rather than guessing on
+    unprefixed labels. Pure."""
+    auto = {}
+    config_facets = {}
+
+    # Build the config namespace -> facet lookup (prefixes may end with ':' or '/').
+    cfg_lookup = {}
+    for facet, prefixes in (config or {}).items():
+        for pre in prefixes:
+            cfg_lookup[pre.rstrip(":/").lower()] = (facet, pre)
+
+    for label in labels or []:
+        parsed = _namespace_of(label)
+        if not parsed:
+            continue
+        ns_token, ns_display = parsed
+        # config wins over auto for the same namespace token.
+        if ns_token in cfg_lookup:
+            facet, pre = cfg_lookup[ns_token]
+            config_facets.setdefault(facet, {}).setdefault(pre, []).append(label)
+        elif ns_token in _AUTO_FACET_NAMESPACES:
+            facet = _AUTO_FACET_NAMESPACES[ns_token]
+            auto.setdefault(facet, {}).setdefault(ns_display, []).append(label)
+
+    # Merge config over auto.
+    merged = {f: dict(ns) for f, ns in auto.items()}
+    for facet, ns_map in config_facets.items():
+        merged.setdefault(facet, {})
+        for pre, labs in ns_map.items():
+            merged[facet][pre] = labs
+
+    if config_facets and auto:
+        source = "merged"
+    elif config_facets:
+        source = "config"
+    else:
+        source = "auto"
+    out = {f: ns for f, ns in merged.items()}
+    out["source"] = source
+    return out
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
