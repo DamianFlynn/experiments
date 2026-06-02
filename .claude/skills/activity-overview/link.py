@@ -459,8 +459,8 @@ def attribute_people_areas(bundle, idx):
         if not login or area is None:
             return
         p = people.setdefault(login, {"modules": [], "areas": []})
-        if area not in p["modules"]:
-            p.setdefault("modules", []).append(area)
+        if area not in p.setdefault("modules", []):
+            p["modules"].append(area)
         if area not in p.setdefault("areas", []):
             p["areas"].append(area)
 
