@@ -1211,6 +1211,12 @@ def acquire(args, env):
         | {f for c in commits for f in c.get("files", [])})
     code_graph = select_code_area_provider(area_paths, clone_dir)
 
+    # Phase 3c: enrich area edges via the real IaC toolchain (BUILD-ONLY — edges
+    # stay [] when bicep/terraform or the registry are unavailable). No-op without
+    # a clone on disk.
+    if not args.no_clone or os.path.isdir(clone_dir):
+        code_graph = extract_iac_edges(code_graph, clone_dir)
+
     # CODEOWNERS from the clone (local file; try the conventional locations).
     code_owners = {}
     for rel in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):

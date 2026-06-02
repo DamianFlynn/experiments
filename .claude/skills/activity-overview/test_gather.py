@@ -1247,5 +1247,39 @@ class TestExtractIacEdges(unittest.TestCase):
         self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
 
 
+class TestAcquireEdgesP3c(unittest.TestCase):
+    """Compose the provider + edge seam offline (graphify + bicep absent ->
+    directory provider, edges empty; bicep stubbed -> edges populate)."""
+
+    PATHS = ["avm/ptn/foo/bar/main.bicep", "avm/ptn/foo/bar/README.md",
+             "avm/res/key-vault/vault/main.bicep"]
+
+    def test_directory_provider_edges_empty_without_tools(self):
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone", which=lambda _n: None)
+        cg = gather.extract_iac_edges(cg, "clone", which=lambda _n: None)
+        self.assertEqual(cg["provider"], "directory")
+        self.assertTrue(cg["areas"])
+        for a in cg["areas"]:
+            self.assertEqual(a["edges"], [])
+
+    def test_edges_populate_when_bicep_present(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm_text = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            src = fh.read()
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone", which=lambda _n: None)
+        cg = gather.extract_iac_edges(
+            cg, "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            run=lambda cmd, **kw: arm_text if cmd[:2] == ["bicep", "build"] else "",
+            read_text=lambda _p: src)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertTrue(bar["edges"])
+        self.assertTrue(any(e["to"] == "avm/res/storage/storage-account"
+                            for e in bar["edges"]))
+
+
 if __name__ == "__main__":
     unittest.main()
