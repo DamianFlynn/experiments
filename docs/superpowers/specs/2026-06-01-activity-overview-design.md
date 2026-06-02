@@ -747,13 +747,34 @@ index is the cheap through-line, never an override.
 - `test_render.py` — diagram generation: each `.mmd` is deterministic given a fixture bundle,
   derives solely from existing bundle fields, and carries the correct Mermaid type header per
   diagram. The pure `.mmd`-string emitters run with no network/token (mmdc not required); the
-  `mmdc` compile-validation is exercised in the integration workflow (where mmdc is installed).
+  `mmdc` compile-validation runs in `test_render.py` only when a working `mmdc` is on PATH
+  (skip-guarded otherwise, so the suite stays green without it).
 - `test_link.py` — train construction (closing-refs + trailers + timeline + merges),
   duplicate/spin-off detection, code-area attribution, bucket assignment,
   release-train/sprint resolution, and `feature_deltas` extraction (add/drop/change, incl.
   Bicep/Terraform subjects). Includes a **provenance lint**: asserts every narrative-bearing fact
   (train, feature delta, quoted comment) carries a well-formed source ref. Runs with no
   network/token.
+
+### 8b. Live integration smoke test (per-phase gate)
+
+`.github/workflows/activity-overview-integration.yml` runs the **real** gather → link →
+render pipeline against a live repo (default `Azure/bicep-registry-modules`) and asserts the
+resulting bundle against the **current** contract. It runs automatically **twice a month**
+(1st & 15th, trailing-14-day window) and **on demand** (`workflow_dispatch`, with an optional
+owner/repo/window), authenticated by the `ACTIVITY_TEST_TOKEN` secret — a classic PAT with
+`public_repo`; Microsoft-enterprise targets (e.g. `Azure/*`) cap PAT lifetime at ≤90 days, so
+scheduled runs go red once it expires until the token is rotated.
+
+**This is a required per-phase gate, not just background CI.** Every phase that changes what
+the pipeline produces (new fields, buckets, sections) MUST, in the same PR: (1) update this
+workflow's assertion block to the new bundle contract, and (2) run it — manually via
+*Run workflow*, or by waiting for a scheduled run — and confirm it is **green on real data**
+before the phase is considered done. The offline unit tests prove the units in isolation;
+this proves the whole vertical slice still works end-to-end against a real repository. The
+runner has no headless browser, so render runs with `--skip-validate` here (mmdc
+compile-validation lives in `test_render.py`); the bundle and emitted `.mmd` files are
+uploaded as a build artifact for inspection.
 
 ## Layout (committed, portable)
 

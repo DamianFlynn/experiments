@@ -1,34 +1,55 @@
-name: activity-overview integration (manual)
+name: activity-overview integration (live smoke test)
 
-# Live smoke test: runs the real gather -> link pipeline against a real repo
-# and window, hitting the GitHub API and cloning the target. Manual-only so it
-# never runs automatically and never needs a secret unless you trigger it.
+# Live smoke test: runs the real gather -> link -> render pipeline against a real
+# repo and window, hitting the GitHub API and cloning the target. This is the
+# end-to-end confirmation that the skill still works on real data.
 #
-# Setup (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
+# WHEN IT RUNS
+#   - Automatically twice a month (1st and 15th) over the trailing 14 days.
+#   - On demand via "Run workflow" (workflow_dispatch) with an optional
+#     owner/repo/window — use this DURING DEVELOPMENT of every phase to confirm
+#     the change works against a real repo before merging.
+#
+# MAINTENANCE (read this when starting a new phase!)
+#   The "Assert" step below encodes the CURRENT bundle contract. Each phase that
+#   changes what gather/link/render produce (new fields, new buckets, new
+#   sections) MUST update these assertions in the same PR, and the phase is not
+#   "done" until this workflow has been run (manually) and is green on real data.
+#   The assertions currently cover Phase 2 (open + closed-unmerged PRs, the broad
+#   issue set, four-way buckets, workflow_stats/releases/milestones, and the
+#   render diagram manifest).
+#
+# SECRET (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
 #   Settings -> Secrets and variables -> Actions -> New repository secret
-# Use a classic PAT with the `public_repo` scope (read is all the smoke test
-# needs). If the target is owned by an enterprise that caps PAT lifetime —
-# e.g. Microsoft Open Source, which owns Azure/* — the token's expiry must be
-# <= 90 days or the API returns 403; a "no expiration" token is rejected.
-# Do NOT paste the token anywhere but that secret page.
+# Use a classic PAT with the `public_repo` scope (read is all this needs). If the
+# target is owned by an enterprise that caps PAT lifetime — e.g. Microsoft Open
+# Source, which owns Azure/* — the token's expiry must be <= 90 days or the API
+# returns 403; a "no expiration" token is rejected. The scheduled runs will go
+# red once the PAT expires until it is rotated. Do NOT paste the token anywhere
+# but that secret page.
 
 on:
+  schedule:
+    # 07:00 UTC on the 1st and 15th of each month (trailing-14-day window).
+    - cron: "0 7 1,15 * *"
   workflow_dispatch:
     inputs:
       owner:
         description: "Target repo owner"
-        required: true
+        required: false
         default: "Azure"
       repo:
         description: "Target repo name"
-        required: true
+        required: false
         default: "bicep-registry-modules"
       from:
-        description: "Window start (YYYY-MM-DD)"
-        required: true
+        description: "Window start (YYYY-MM-DD; blank = 14 days before --to)"
+        required: false
+        default: ""
       to:
-        description: "Window end (YYYY-MM-DD)"
-        required: true
+        description: "Window end (YYYY-MM-DD; blank = today, UTC)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -55,59 +76,91 @@ jobs:
           fi
           echo "secret present"
 
-      # Phase 3 will add graphify here, e.g.:
+      - name: Resolve target and window
+        id: cfg
+        run: |
+          OWNER="${{ inputs.owner }}"; REPO="${{ inputs.repo }}"
+          FROM="${{ inputs.from }}"; TO="${{ inputs.to }}"
+          # Defaults apply to scheduled runs (no inputs) and blank manual fields.
+          [ -z "$OWNER" ] && OWNER="Azure"
+          [ -z "$REPO" ] && REPO="bicep-registry-modules"
+          [ -z "$TO" ] && TO="$(date -u +%F)"
+          [ -z "$FROM" ] && FROM="$(date -u -d "$TO -14 days" +%F)"
+          {
+            echo "owner=$OWNER"; echo "repo=$REPO"
+            echo "from=$FROM"; echo "to=$TO"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved target $OWNER/$REPO over window $FROM -> $TO"
+
+      # Phase 3 will add graphify here (gather.py does not invoke it yet), e.g.:
       #   - name: Install graphify
       #     run: <install step>
-      # Until gather.py invokes graphify (Phase 3), there is nothing for it to
-      # exercise, so it is intentionally omitted from this smoke test for now.
 
-      - name: Gather + link a real window
+      - name: Gather + link + render a real window
         env:
           GITHUB_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+          OWNER: ${{ steps.cfg.outputs.owner }}
+          REPO: ${{ steps.cfg.outputs.repo }}
+          FROM: ${{ steps.cfg.outputs.from }}
+          TO: ${{ steps.cfg.outputs.to }}
         run: |
           cd .claude/skills/activity-overview
           python3 gather.py \
-            --owner "${{ inputs.owner }}" --repo "${{ inputs.repo }}" \
-            --from "${{ inputs.from }}" --to "${{ inputs.to }}" \
+            --owner "$OWNER" --repo "$REPO" \
+            --from "$FROM" --to "$TO" \
             --out workspace/bundle.json
           python3 link.py workspace/bundle.json
+          # Diagrams: emit + record the manifest. mmdc (and its headless browser)
+          # is not installed on the runner, so skip the compile check here — the
+          # mmdc validation path is covered by unit tests. This still exercises
+          # the real emitters against live data and writes workspace/diagrams/.
+          python3 render.py workspace/bundle.json \
+            --diagrams-dir workspace/diagrams --skip-validate
 
-      - name: Assert the bundle is well-formed and self-consistent
+      - name: Assert the bundle is well-formed and self-consistent (Phase 2)
         env:
-          FROM: ${{ inputs.from }}
-          TO: ${{ inputs.to }}
+          FROM: ${{ steps.cfg.outputs.from }}
+          TO: ${{ steps.cfg.outputs.to }}
         run: |
           cd .claude/skills/activity-overview
           python3 - <<'PY'
           import json, os, re
+
           frm, to = os.environ["FROM"], os.environ["TO"]
           b = json.load(open("workspace/bundle.json"))
 
           assert b["meta"]["schema_version"] == 1, "missing schema_version"
           prs, issues = b["prs"], b["issues"]
-          commits, trains = b["commits"], b["trains"]
-          shipped = b["buckets"]["shipped"]
-          pr_nums = {p["number"] for p in prs}
+          commits, trains, buckets = b["commits"], b["trains"], b["buckets"]
+          pr_by = {p["number"]: p for p in prs}
+          issue_by = {i["number"]: i for i in issues}
+          pr_nums = set(pr_by)
           shas = {c["sha"] for c in commits}
 
           def well_formed(r):
               return (isinstance(r.get("type"), str) and r.get("id") is not None
                       and str(r.get("url", "")).startswith("https://"))
 
-          # 1. Every PR in the bundle is actually merged within the window.
+          def in_win(ts):
+              return bool(ts) and frm <= ts[:10] <= to
+
+          def lookup(r):
+              return pr_by.get(r["id"]) if r["type"] == "pr" else issue_by.get(r["id"])
+
+          # 1. PR scope (Phase 2): merged-in-window, closed-unmerged-in-window, or open.
           for p in prs:
-              assert p["merged"] and p["merged_at"], f"PR {p['number']} not merged"
-              assert frm <= p["merged_at"][:10] <= to, \
-                  f"PR {p['number']} merged_at {p['merged_at']} outside [{frm},{to}]"
               assert str(p["url"]).startswith("https://"), p
+              ok = ((p["merged"] and in_win(p.get("merged_at")))
+                    or (p["state"] == "closed" and not p["merged"] and in_win(p.get("closed_at")))
+                    or p["state"] == "open")
+              assert ok, f"PR {p['number']} ({p['state']}, merged={p['merged']}) in no Phase-2 scope"
 
-          # 2. The only issues are closing issues, each referenced by some PR.
-          closed_refs = {n for p in prs for n in p["closes"]}
+          # 2. Issues well-formed (Phase 2 broadens beyond closing issues).
           for i in issues:
-              assert i["number"] in closed_refs, \
-                  f"issue {i['number']} not referenced by any PR's closes"
+              assert str(i["url"]).startswith("https://"), i
 
-          # 3. Trains: id shape, evidence, and referential integrity to prs/commits.
+          # 3. Trains group exactly the merged-in-window PRs; ids/evidence/refs sound.
+          merged_nums = {p["number"] for p in prs if p["merged"] and in_win(p.get("merged_at"))}
           id_re = re.compile(r"^train-(issue|pr)-\d+$")
           for t in trains:
               assert id_re.match(t["id"]), f"bad train id {t['id']}"
@@ -117,27 +170,64 @@ jobs:
               assert set(t["commits"]) <= shas, f"{t['id']} references unknown commit"
               if t["root_issue"] is not None:
                   assert t["id"] == f"train-issue-{t['root_issue']}", t["id"]
-
-          # 4. Every merged PR is grouped into exactly one train.
           trained = [n for t in trains for n in t["prs"]]
-          assert sorted(trained) == sorted(pr_nums), "PRs not all grouped into trains"
           assert len(trained) == len(set(trained)), "a PR appears in multiple trains"
+          assert set(trained) == merged_nums, "trains must group exactly the merged-in-window PRs"
 
-          # 5. shipped bucket = merged PRs (+ completed issues), all well-formed.
-          assert all(well_formed(r) for r in shipped), "malformed shipped ref"
-          assert {r["id"] for r in shipped if r["type"] == "pr"} == pr_nums, \
-              "shipped PR set does not match merged PRs"
+          # 4. Buckets: four keys, well-formed, ONE bucket per item; per-bucket semantics.
+          assert set(buckets) == {"shipped", "rejected", "in_flight", "next_candidates"}, "bucket keys"
+          seen = {}
+          for name, refs in buckets.items():
+              for r in refs:
+                  assert well_formed(r), f"malformed ref in {name}: {r}"
+                  key = (r["type"], r["id"])
+                  assert key not in seen, f"{key} appears in both {seen[key]} and {name}"
+                  seen[key] = name
+          assert {r["id"] for r in buckets["shipped"] if r["type"] == "pr"} == merged_nums, \
+              "shipped PR set must equal merged-in-window PRs"
+          for r in buckets["rejected"]:
+              if r["type"] == "pr":
+                  p = pr_by[r["id"]]
+                  assert p["state"] == "closed" and not p["merged"], \
+                      f"rejected PR {r['id']} is not closed-unmerged"
+          for name in ("in_flight", "next_candidates"):
+              for r in buckets[name]:
+                  it = lookup(r)
+                  assert it is not None and it["state"] == "open", \
+                      f"{name} ref {r} is not an open item"
 
-          print(f"OK: prs={len(prs)} issues={len(issues)} "
-                f"commits={len(commits)} trains={len(trains)} shipped={len(shipped)}")
-          if not prs:
-              print("::warning::window produced no merged PRs — "
-                    "invariants held vacuously; pick a window with known activity")
+          # 5. Phase 2 sections present and self-consistent.
+          ws = b.get("workflow_stats", {})
+          assert isinstance(ws, dict), "workflow_stats must be a dict"
+          for name, s in ws.items():
+              assert s["total"] == s["success"] + s["failure"] + s["cancelled"] + s["other"], \
+                  f"workflow_stats[{name}] counts do not sum"
+          assert isinstance(b.get("releases", []), list), "releases must be a list"
+          assert isinstance(b.get("milestones", []), list), "milestones must be a list"
+          dg = b.get("diagrams", {})
+          assert set(dg) >= {"buckets_pie", "timeline_gantt"}, "diagrams manifest missing keys"
+          for name, pth in dg.items():
+              assert not str(pth).startswith("workspace/") and str(pth).endswith(".mmd"), \
+                  f"diagram {name} path not workspace-relative: {pth}"
+
+          print(f"OK prs={len(prs)} (merged={len(merged_nums)} "
+                f"open={sum(1 for p in prs if p['state'] == 'open')} "
+                f"closed_unmerged={sum(1 for p in prs if p['state'] == 'closed' and not p['merged'])}) "
+                f"issues={len(issues)} commits={len(commits)} trains={len(trains)} "
+                f"buckets[shipped={len(buckets['shipped'])} in_flight={len(buckets['in_flight'])} "
+                f"rejected={len(buckets['rejected'])} next={len(buckets['next_candidates'])}] "
+                f"workflows={len(ws)} releases={len(b.get('releases', []))} "
+                f"milestones={len(b.get('milestones', []))}")
+          if not merged_nums:
+              print("::warning::no merged PRs in window — shipped/trains held "
+                    "vacuously; pick a busier window")
           PY
 
-      - name: Upload the bundle artifact
+      - name: Upload the bundle + diagrams
         uses: actions/upload-artifact@v6
         with:
           name: activity-bundle
-          path: .claude/skills/activity-overview/workspace/bundle.json
+          path: |
+            .claude/skills/activity-overview/workspace/bundle.json
+            .claude/skills/activity-overview/workspace/diagrams/*.mmd
           if-no-files-found: error
