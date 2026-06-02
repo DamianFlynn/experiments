@@ -561,6 +561,38 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
     return graphified if graphified["areas"] else directory
 
 
+# Phase 3c: IaC dependency-edge extraction (build-only). The edge object is
+# {to, kind, ref, version, transitive, provider, resolved}; see BUNDLE.md.
+
+_BICEP_MODULE_RE = re.compile(r"module\s+\w+\s+'(?P<ref>[^']+)'")
+
+
+def parse_bicep_module_refs(source_text):
+    """Extract `module <sym> '<ref>'` references from a .bicep source.
+
+    Each result is {ref, registry_path, version, local_path}. Registry refs
+    (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
+    `registry_path` + `version`; everything else is a `local_path`. Pure."""
+    refs = []
+    for m in _BICEP_MODULE_RE.finditer(source_text or ""):
+        ref = m.group("ref")
+        registry_path = version = local_path = None
+        if ref.startswith("br/public:") or ref.startswith("br:"):
+            body = ref.split(":", 1)[1]              # drop the br/public or br scheme
+            if ":" in body:
+                path_part, version = body.rsplit(":", 1)
+            else:
+                path_part = body
+            if "/bicep/" in path_part:               # strip an explicit registry host
+                path_part = path_part.split("/bicep/", 1)[1]
+            registry_path = path_part
+        else:
+            local_path = ref
+        refs.append({"ref": ref, "registry_path": registry_path,
+                     "version": version, "local_path": local_path})
+    return refs
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 

@@ -971,5 +971,41 @@ class TestAcquireAssemblyP3b(unittest.TestCase):
         self.assertIn("avm/res/network/", b["code_owners"])
 
 
+class TestParseBicepModuleRefs(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            self.src = fh.read()
+
+    def test_extracts_all_three_module_refs(self):
+        refs = gather.parse_bicep_module_refs(self.src)
+        self.assertEqual(len(refs), 3)
+
+    def test_registry_ref_splits_path_and_version(self):
+        refs = gather.parse_bicep_module_refs(self.src)
+        by_path = {r["registry_path"]: r for r in refs if r["registry_path"]}
+        self.assertIn("avm/res/storage/storage-account", by_path)
+        self.assertEqual(by_path["avm/res/storage/storage-account"]["version"], "0.9.0")
+        self.assertEqual(by_path["avm/res/key-vault/vault"]["version"], "0.6.1")
+        self.assertIsNone(by_path["avm/res/storage/storage-account"]["local_path"])
+
+    def test_local_ref_is_kept_as_local_path(self):
+        refs = gather.parse_bicep_module_refs(self.src)
+        locals_ = [r for r in refs if r["local_path"]]
+        self.assertEqual(len(locals_), 1)
+        self.assertEqual(locals_[0]["local_path"],
+                         "../../utl/types/avm-common-types/main.bicep")
+        self.assertIsNone(locals_[0]["registry_path"])
+
+    def test_br_with_explicit_registry_host_strips_to_path(self):
+        src = "module x 'br:mcr.microsoft.com/bicep/avm/res/network/vnet:1.2.3' = {}"
+        r = gather.parse_bicep_module_refs(src)[0]
+        self.assertEqual(r["registry_path"], "avm/res/network/vnet")
+        self.assertEqual(r["version"], "1.2.3")
+
+    def test_empty_or_none_source_yields_no_refs(self):
+        self.assertEqual(gather.parse_bicep_module_refs(""), [])
+        self.assertEqual(gather.parse_bicep_module_refs(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()
