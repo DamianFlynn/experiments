@@ -489,5 +489,40 @@ class TestRenderManifestP3b(unittest.TestCase):
             self.assertIn("kind_breakdown", b["diagrams"])
 
 
+class TestEndToEndOfflineP3b(unittest.TestCase):
+    def test_link_then_render_attributes_areas_and_renders_six(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+
+        # code_area filled on the example artifact (covered by the AVM area)
+        ex = bundle["artifacts"][
+            link.artifact_id(
+                "avm/res/network/firewall-policy/examples/basic/main.bicep")]
+        self.assertEqual(ex["code_area"], "avm/res/network/firewall-policy")
+        # docs artifact -> docs area
+        doc = bundle["artifacts"][link.artifact_id("docs/firewall.md")]
+        self.assertEqual(doc["code_area"], "docs")
+
+        # feature_deltas carry a real area now (no longer all null)
+        self.assertTrue(any(d["area"] is not None for d in bundle["feature_deltas"]))
+
+        # train for #17/PR42 carries the firewall-policy area
+        t = next(t for t in bundle["trains"] if t["id"] == "train-issue-17")
+        self.assertIn("avm/res/network/firewall-policy", t["code_areas"])
+
+        # modules populated; alice owns the firewall-policy module
+        self.assertIn("avm/res/network/firewall-policy", bundle["modules"])
+        self.assertIn("avm/res/network/firewall-policy",
+                      bundle["people"]["alice"]["modules"])
+
+        # render: six-diagram manifest
+        with tempfile.TemporaryDirectory() as d:
+            real = render.write_diagrams(bundle, os.path.join(d, "diagrams"))
+            self.assertEqual(
+                set(real),
+                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar",
+                 "contributor_graph", "kind_breakdown"})
+
+
 if __name__ == "__main__":
     unittest.main()
