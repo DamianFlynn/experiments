@@ -4,6 +4,8 @@ import json
 import re
 import sys
 
+import gather  # for classify_artifact_path (shared artifact-kind gate)
+
 _PR_RE = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
 
 
@@ -78,6 +80,183 @@ def train_index(trains):
         for n in t.get("prs", []):
             idx[("pr", n)] = t["id"]
     return idx
+
+
+def artifact_id(path):
+    """Stable artifact id from a path. Deterministic so the same file keeps the
+    same id across periods (the spec's series-continuity rule)."""
+    return "art:" + (path or "")
+
+
+def _commit_url(bundle, sha):
+    meta = bundle.get("meta", {})
+    owner, repo = meta.get("owner"), meta.get("repo")
+    if owner and repo:
+        return f"https://github.com/{owner}/{repo}/commit/{sha}"
+    return f"https://github.com/commit/{sha}"
+
+
+# git change -> artifact lifecycle event. add/copy introduce; modify changes;
+# delete removes; rename is handled specially (remove old + add new).
+_CHANGE_TO_EVENT = {"add": "add", "copy": "add", "modify": "change", "delete": "remove"}
+
+
+def build_artifacts(bundle):
+    """Fold raw `code_events` into the per-artifact lifecycle ledger (file-level).
+
+    Each tracked path (readme/doc/example) gets one entry with an ordered
+    lifecycle. Renames link the old artifact (status `replaced`, `replaced_by`)
+    to the new one. `code_area` is null in Phase 3a (graphify is Phase 3b). Pure.
+    """
+    artifacts = {}
+
+    def ensure(path):
+        kind = gather.classify_artifact_path(path)
+        if kind is None:
+            return None
+        aid = artifact_id(path)
+        if aid not in artifacts:
+            artifacts[aid] = {
+                "kind": kind, "path": path, "name": path.split("/")[-1],
+                "status": "live", "replaced_by": None, "code_area": None,
+                "lifecycle": [],
+            }
+        return aid
+
+    def append_event(aid, event, ev):
+        artifacts[aid]["lifecycle"].append({
+            "event": event, "commit": ev["commit"], "author": ev["author"],
+            "date": ev["date"],
+            "ref": {"type": "commit", "id": ev["commit"],
+                    "url": _commit_url(bundle, ev["commit"])},
+        })
+
+    for ev in bundle.get("code_events", []):
+        change = ev["change"]
+        if change in ("rename", "copy") and ev.get("old_path"):
+            new_aid = ensure(ev["path"])
+            if new_aid is not None:
+                append_event(new_aid, "add", ev)
+            if change == "rename":
+                old_aid = ensure(ev["old_path"])
+                if old_aid is not None:
+                    append_event(old_aid, "remove", ev)
+                    artifacts[old_aid]["status"] = "replaced"
+                    # replaced_by is the direct successor; consumers walk the chain for terminal paths (A->B->C).
+                    artifacts[old_aid]["replaced_by"] = new_aid
+            continue
+        aid = ensure(ev["path"])
+        if aid is None:
+            continue
+        append_event(aid, _CHANGE_TO_EVENT.get(change, "change"), ev)
+
+    # Final status from the last lifecycle event (unless already `replaced`).
+    for a in artifacts.values():
+        if a["status"] == "replaced":
+            continue
+        last = a["lifecycle"][-1]["event"] if a["lifecycle"] else None
+        a["status"] = "removed" if last == "remove" else "live"
+    return artifacts
+
+
+def build_timeline(bundle):
+    """Merge social + code events into one chronological event stream.
+
+    Event shape: {ts, actor, layer:'social'|'code', event, ref:{type,...,url},
+    subject:{kind,name,path}}. Social events come from PR/issue comments + review
+    comments; code events from artifact lifecycle entries. Sorted by ts.
+    Malformed records that lack created_at fall back to URL ordering as a last
+    resort (not a normal case — well-formed comment objects carry created_at). Pure.
+    """
+    events = []
+
+    def social(actor, event, ref_type, number, url, subject, ts):
+        events.append({
+            "ts": ts or "", "actor": actor, "layer": "social", "event": event,
+            # `id` (not `number`) to match the bundle-wide ref convention
+            # {type, id, url} used everywhere else (and the gate's well_formed).
+            "ref": {"type": ref_type, "id": number, "url": url},
+            "subject": subject,
+        })
+
+    for pr in bundle.get("prs", []):
+        url = pr.get("url")
+        for c in pr.get("review_comments", []):
+            curl = c.get("url") or url
+            social(c.get("author"), "review_comment", "pr", pr["number"],
+                   curl,
+                   {"kind": "review_comment", "name": None, "path": None},
+                   c.get("created_at") or curl)
+        for c in pr.get("comments_list", []):
+            curl = c.get("url") or url
+            social(c.get("author"), "comment", "pr", pr["number"],
+                   curl,
+                   {"kind": "comment", "name": None, "path": None},
+                   c.get("created_at") or curl)
+
+    for issue in bundle.get("issues", []):
+        url = issue.get("url")
+        for c in issue.get("comments_list", []):
+            curl = c.get("url") or url
+            social(c.get("author"), "comment", "issue", issue["number"],
+                   curl,
+                   {"kind": "comment", "name": None, "path": None},
+                   c.get("created_at") or curl)
+
+    for art in bundle.get("artifacts", {}).values():
+        for ev in art.get("lifecycle", []):
+            events.append({
+                "ts": ev.get("date") or "", "actor": ev.get("author"),
+                "layer": "code", "event": ev["event"], "ref": ev["ref"],
+                "subject": {"kind": art["kind"], "name": art["name"],
+                            "path": art["path"]},
+            })
+
+    # Stable sort by ts (then by url so equal-ts events are deterministic).
+    events.sort(key=lambda e: (e["ts"], str(e["ref"].get("url") or "")))
+    return events
+
+
+_EVENT_TO_DELTA = {"add": "add", "remove": "drop", "change": "change"}
+
+
+def compute_feature_deltas(bundle):
+    """Project the artifacts ledger into the feature_deltas view.
+
+    One delta per lifecycle event: add->add, remove->drop, change->change. Each
+    attributes author/commit/url + (best-effort) the owning pr/train via the
+    commit->PR map Link already builds. `area`/`before`/`after`/`detail` are null
+    in Phase 3a (graphify + hunk parsing are later slices). Pure.
+    """
+    commit_to_pr = {c["sha"]: c.get("pr") for c in bundle.get("commits", [])}
+    pr_to_train = {}
+    for t in bundle.get("trains", []):
+        for n in t.get("prs", []):
+            pr_to_train[n] = t["id"]
+
+    deltas = []
+    for aid, art in bundle.get("artifacts", {}).items():
+        for ev in art.get("lifecycle", []):
+            kind = _EVENT_TO_DELTA.get(ev["event"])
+            if kind is None:
+                continue
+            pr = commit_to_pr.get(ev["commit"])
+            deltas.append({
+                "area": None,
+                "kind": kind,
+                "subject": art["kind"],
+                "name": art["name"],
+                "before": None,
+                "after": None,
+                "detail": None,
+                "artifact": aid,
+                "author": ev["author"],
+                "train": pr_to_train.get(pr) if pr is not None else None,
+                "pr": pr,
+                "commit": ev["commit"],
+                "url": ev["ref"]["url"],
+            })
+    return deltas
 
 
 def build_trains(bundle):
@@ -186,10 +365,16 @@ def compute_buckets(bundle):
 
 
 def enrich(bundle):
-    """Deterministically enrich a bundle in place: commit->PR, trains, buckets."""
+    """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
+    and the Phase 3a narrative substrate (artifacts, timeline, feature_deltas)."""
     attach_commit_prs(bundle["commits"])
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle)
+    bundle["artifacts"] = build_artifacts(bundle)
+    # build_timeline depends on build_artifacts having run (reads bundle["artifacts"]).
+    bundle["timeline"] = build_timeline(bundle)
+    # compute_feature_deltas depends on build_trains having run (resolves trains).
+    bundle["feature_deltas"] = compute_feature_deltas(bundle)
     return bundle
 
 

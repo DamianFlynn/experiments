@@ -222,5 +222,244 @@ class TestSelectMilestonesAndBuckets(unittest.TestCase):
         self.assertNotIn(("pr", 1), all_refs)
 
 
+class TestBuildArtifacts(unittest.TestCase):
+    def _events(self):
+        return [
+            {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+             "change": "add", "path": "examples/basic/main.bicep"},
+            {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+             "change": "add", "path": "docs/firewall.md"},
+            {"commit": "c2"*20, "author": "Bob", "date": "2026-05-10",
+             "change": "modify", "path": "README.md"},
+            {"commit": "c2"*20, "author": "Bob", "date": "2026-05-10",
+             "change": "modify", "path": "examples/basic/main.bicep"},
+            {"commit": "c3"*20, "author": "Carol", "date": "2026-05-18",
+             "change": "rename", "old_path": "examples/basic/main.bicep",
+             "path": "examples/advanced/main.bicep"},
+            {"commit": "c4"*20, "author": "Dave", "date": "2026-05-25",
+             "change": "delete", "path": "docs/firewall.md"},
+            {"commit": "c4"*20, "author": "Dave", "date": "2026-05-25",
+             "change": "modify", "path": "src/app.py"},
+        ]
+
+    def _bundle(self):
+        return {"meta": {"owner": "o", "repo": "r"}, "code_events": self._events(),
+                "commits": [], "prs": [], "issues": []}
+
+    def test_unrecognized_paths_are_ignored(self):
+        arts = link.build_artifacts(self._bundle())
+        paths = {a["path"] for a in arts.values()}
+        self.assertNotIn("src/app.py", paths)  # not a tracked artifact kind
+
+    def test_add_then_change_builds_ordered_lifecycle(self):
+        arts = link.build_artifacts(self._bundle())
+        readme = next(a for a in arts.values() if a["path"] == "README.md")
+        self.assertEqual(readme["kind"], "readme")
+        self.assertEqual([e["event"] for e in readme["lifecycle"]], ["change"])
+        self.assertEqual(readme["status"], "live")
+        self.assertIsNone(readme["code_area"])  # graphify deferred to Phase 3b
+
+    def test_delete_sets_status_removed(self):
+        arts = link.build_artifacts(self._bundle())
+        doc = next(a for a in arts.values() if a["path"] == "docs/firewall.md")
+        self.assertEqual([e["event"] for e in doc["lifecycle"]],
+                         ["add", "remove"])
+        self.assertEqual(doc["status"], "removed")
+
+    def test_rename_links_replaced_and_replaced_by(self):
+        arts = link.build_artifacts(self._bundle())
+        old_id = link.artifact_id("examples/basic/main.bicep")
+        new_id = link.artifact_id("examples/advanced/main.bicep")
+        self.assertEqual(arts[old_id]["status"], "replaced")
+        self.assertEqual(arts[old_id]["replaced_by"], new_id)
+        # the new artifact records an `add` event from the rename commit
+        self.assertEqual(arts[new_id]["lifecycle"][0]["event"], "add")
+        self.assertEqual(arts[new_id]["status"], "live")
+
+    def test_lifecycle_refs_are_well_formed_commit_refs(self):
+        arts = link.build_artifacts(self._bundle())
+        for a in arts.values():
+            for ev in a["lifecycle"]:
+                self.assertEqual(ev["ref"]["type"], "commit")
+                self.assertEqual(len(ev["ref"]["id"]), 40)
+                self.assertTrue(ev["ref"]["url"].startswith("https://"))
+
+    def test_empty_code_events_yields_empty_map(self):
+        self.assertEqual(link.build_artifacts({"code_events": []}), {})
+
+    def test_copy_creates_new_artifact_but_leaves_source_live(self):
+        """A 'copy' event introduces the new path but must NOT supersede the source."""
+        bundle = {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                {"commit": "c1" * 20, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "examples/a.bicep"},
+                {"commit": "c2" * 20, "author": "Bob", "date": "2026-05-10",
+                 "change": "copy", "old_path": "examples/a.bicep",
+                 "path": "examples/b.bicep"},
+            ],
+        }
+        arts = link.build_artifacts(bundle)
+        src_id = link.artifact_id("examples/a.bicep")
+        dst_id = link.artifact_id("examples/b.bicep")
+
+        # source artifact must still be live — copy does not supersede it
+        self.assertIn(src_id, arts)
+        self.assertEqual(arts[src_id]["status"], "live")
+        self.assertIsNone(arts[src_id]["replaced_by"])
+        src_events = [e["event"] for e in arts[src_id]["lifecycle"]]
+        self.assertNotIn("remove", src_events)
+
+        # destination artifact must exist with a leading 'add' event
+        self.assertIn(dst_id, arts)
+        self.assertEqual(arts[dst_id]["lifecycle"][0]["event"], "add")
+        self.assertEqual(arts[dst_id]["status"], "live")
+
+
+class TestBuildTimeline(unittest.TestCase):
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "docs/firewall.md"},
+            ],
+            "commits": [], "prs": [
+                {"number": 42, "url": "https://github.com/o/r/pull/42",
+                 "review_comments": [
+                     {"id": 7001, "author": "bob", "body": "x",
+                      "created_at": "2026-05-12T10:00:00Z",
+                      "url": "https://github.com/o/r/pull/42#discussion_r7001"}],
+                 "comments_list": [
+                     {"id": 8001, "author": "carol", "body": "y",
+                      "created_at": "2026-05-13T09:00:00Z",
+                      "url": "https://github.com/o/r/pull/42#issuecomment-8001"}]},
+            ],
+            "issues": [
+                {"number": 18, "url": "https://github.com/o/r/issues/18",
+                 "comments_list": [
+                     {"id": 9001, "author": "dave", "body": "z",
+                      "created_at": "2026-05-15T08:00:00Z",
+                      "url": "https://github.com/o/r/issues/18#issuecomment-9001"}],
+                 "reactions": {"+1": 9, "total": 12}, "open_high_activity": True},
+            ],
+        }
+
+    def test_timeline_merges_social_and_code_layers(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        layers = {e["layer"] for e in tl}
+        self.assertEqual(layers, {"social", "code"})
+
+    def test_every_event_has_required_shape(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        for e in link.build_timeline(b):
+            self.assertIn(e["layer"], {"social", "code"})
+            self.assertTrue(e["ts"])
+            self.assertIn("actor", e)
+            self.assertIn("event", e)
+            self.assertIn("type", e["ref"])
+            self.assertTrue(str(e["ref"]["url"]).startswith("https://"))
+            self.assertIn("kind", e["subject"])
+
+    def test_timeline_sorted_by_ts(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        self.assertEqual([e["ts"] for e in tl], sorted(e["ts"] for e in tl))
+
+    def test_code_event_subject_carries_path_and_kind(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        code = [e for e in link.build_timeline(b) if e["layer"] == "code"][0]
+        self.assertEqual(code["subject"]["path"], "docs/firewall.md")
+        self.assertEqual(code["subject"]["kind"], "doc")
+
+    def test_empty_bundle_yields_empty_timeline(self):
+        self.assertEqual(link.build_timeline(
+            {"prs": [], "issues": [], "artifacts": {}}), [])
+
+    def test_social_events_carry_iso_timestamps_not_urls(self):
+        """Social events must have a real ISO date in ts, not a URL."""
+        import re
+        iso_re = re.compile(r"^\d{4}-\d{2}-\d{2}")
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        social = [e for e in tl if e["layer"] == "social"]
+        self.assertTrue(social, "must have social events")
+        for ev in social:
+            self.assertRegex(ev["ts"], iso_re,
+                             f"social ts looks like a URL or is blank: {ev['ts']!r}")
+
+    def test_timeline_is_sorted_chronologically_code_and_social_interleaved(self):
+        """Code event (2026-05-03) precedes social events (2026-05-12+)."""
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        ts_list = [e["ts"] for e in tl]
+        self.assertEqual(ts_list, sorted(ts_list))
+        layers = [e["layer"] for e in tl]
+        # code event at 2026-05-03 is first; social events follow
+        self.assertEqual(layers[0], "code")
+        self.assertTrue(all(lay == "social" for lay in layers[1:]))
+
+
+class TestComputeFeatureDeltas(unittest.TestCase):
+    def _bundle(self):
+        b = {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "examples/basic/main.bicep"},
+                {"commit": "c4"*20, "author": "Dave", "date": "2026-05-25",
+                 "change": "delete", "path": "docs/firewall.md"},
+                {"commit": "c2"*20, "author": "Bob", "date": "2026-05-10",
+                 "change": "modify", "path": "README.md"},
+            ],
+            # commit c1 resolves to PR 42 via its message; others do not.
+            "commits": [
+                {"sha": "c1"*20, "message": "Add basic example (#42)", "pr": None},
+            ],
+            "prs": [{"number": 42, "url": "https://github.com/o/r/pull/42"}],
+            "issues": [], "trains": [
+                {"id": "train-pr-42", "prs": [42], "root_issue": None}],
+        }
+        link.attach_commit_prs(b["commits"])
+        b["artifacts"] = link.build_artifacts(b)
+        return b
+
+    def test_add_remove_change_map_to_delta_kinds(self):
+        deltas = link.compute_feature_deltas(self._bundle())
+        kinds = {(d["subject"], d["kind"]) for d in deltas}
+        self.assertIn(("example", "add"), kinds)
+        self.assertIn(("readme", "change"), kinds)
+        self.assertIn(("doc", "drop"), kinds)
+
+    def test_delta_attributes_author_commit_and_artifact(self):
+        deltas = link.compute_feature_deltas(self._bundle())
+        add = next(d for d in deltas if d["kind"] == "add")
+        self.assertEqual(add["author"], "Alice")
+        self.assertEqual(add["commit"], "c1"*20)
+        self.assertEqual(add["artifact"], link.artifact_id("examples/basic/main.bicep"))
+        self.assertTrue(add["url"].startswith("https://"))
+        self.assertIsNone(add["area"])  # graphify deferred
+
+    def test_delta_resolves_owning_pr_and_train_when_known(self):
+        deltas = link.compute_feature_deltas(self._bundle())
+        add = next(d for d in deltas if d["kind"] == "add")
+        self.assertEqual(add["pr"], 42)          # c1 -> (#42)
+        self.assertEqual(add["train"], "train-pr-42")
+        drop = next(d for d in deltas if d["kind"] == "drop")
+        self.assertIsNone(drop["pr"])            # c4 has no resolvable PR
+        self.assertIsNone(drop["train"])
+
+    def test_empty_artifacts_yield_no_deltas(self):
+        self.assertEqual(link.compute_feature_deltas(
+            {"artifacts": {}, "commits": [], "trains": []}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

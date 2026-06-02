@@ -364,6 +364,116 @@ class TestWorkflowsReleasesMilestones(unittest.TestCase):
         self.assertEqual(ms["state"], "open")
 
 
+class TestCommentsAndReactions(unittest.TestCase):
+    def test_normalize_comment_maps_body_author_url_id(self):
+        raw = {
+            "id": 9001, "body": "Could you split this into two functions?",
+            "user": {"login": "bob"}, "author_association": "MEMBER",
+            "html_url": "https://github.com/o/r/issues/17#issuecomment-9001",
+        }
+        c = gather.normalize_comment(raw)
+        self.assertEqual(c["id"], 9001)
+        self.assertEqual(c["author"], "bob")
+        self.assertEqual(c["author_association"], "MEMBER")
+        self.assertEqual(c["body"], "Could you split this into two functions?")
+        self.assertEqual(c["url"],
+                         "https://github.com/o/r/issues/17#issuecomment-9001")
+
+    def test_normalize_comment_permissive_on_missing_fields(self):
+        c = gather.normalize_comment({"id": 1})
+        self.assertEqual(c["id"], 1)
+        self.assertIsNone(c["author"])
+        self.assertEqual(c["body"], "")
+        self.assertIsNone(c["url"])
+        self.assertIsNone(c["author_association"])
+
+    def test_normalize_review_comment_maps_same_shape(self):
+        raw = {
+            "id": 7002, "body": "nit: rename `x`.",
+            "user": {"login": "carol"}, "author_association": "CONTRIBUTOR",
+            "html_url": "https://github.com/o/r/pull/42#discussion_r7002",
+            "created_at": "2026-05-12T10:00:00Z",
+        }
+        rc = gather.normalize_review_comment(raw)
+        self.assertEqual(rc, {"id": 7002, "author": "carol",
+                              "author_association": "CONTRIBUTOR",
+                              "body": "nit: rename `x`.",
+                              "url": "https://github.com/o/r/pull/42#discussion_r7002",
+                              "created_at": "2026-05-12T10:00:00Z"})
+
+    def test_summarize_reactions_picks_the_tracked_keys(self):
+        raw = {"+1": 12, "-1": 1, "laugh": 0, "hooray": 3, "confused": 0,
+               "heart": 4, "rocket": 2, "eyes": 1, "total_count": 23}
+        r = gather.summarize_reactions(raw)
+        self.assertEqual(r, {"+1": 12, "-1": 1, "heart": 4, "hooray": 3, "total": 23})
+
+    def test_summarize_reactions_permissive_on_missing(self):
+        self.assertEqual(gather.summarize_reactions(None),
+                         {"+1": 0, "-1": 0, "heart": 0, "hooray": 0, "total": 0})
+        self.assertEqual(gather.summarize_reactions({})["total"], 0)
+
+    def test_summarize_reactions_falls_back_to_summing_when_total_absent(self):
+        # GitHub usually sends total_count; if it's missing we sum the tracked keys.
+        r = gather.summarize_reactions({"+1": 5, "heart": 2})
+        self.assertEqual(r["total"], 7)
+
+    def test_derive_open_high_activity_true_when_open_and_engaged(self):
+        issue = {"state": "open", "comments": 7,
+                 "reactions": {"+1": 9, "-1": 0, "heart": 0, "hooray": 0, "total": 9}}
+        self.assertTrue(gather.derive_open_high_activity(issue))
+
+    def test_derive_open_high_activity_false_when_closed_or_quiet(self):
+        self.assertFalse(gather.derive_open_high_activity(
+            {"state": "closed", "comments": 50,
+             "reactions": {"+1": 99, "total": 99}}))
+        self.assertFalse(gather.derive_open_high_activity(
+            {"state": "open", "comments": 1,
+             "reactions": {"+1": 1, "total": 1}}))
+
+
+class TestArtifactPathClassifier(unittest.TestCase):
+    def test_readme_basename_wins(self):
+        self.assertEqual(gather.classify_artifact_path("README.md"), "readme")
+        self.assertEqual(gather.classify_artifact_path("modules/x/README"), "readme")
+        self.assertEqual(
+            gather.classify_artifact_path("docs/README.markdown"), "readme")
+
+    def test_example_dir_or_suffix(self):
+        self.assertEqual(
+            gather.classify_artifact_path("examples/basic/main.bicep"), "example")
+        self.assertEqual(
+            gather.classify_artifact_path("modules/x/examples/full/main.tf"), "example")
+        self.assertEqual(
+            gather.classify_artifact_path("config.example.json"), "example")
+
+    def test_doc_md_or_under_docs(self):
+        self.assertEqual(gather.classify_artifact_path("docs/design.md"), "doc")
+        self.assertEqual(gather.classify_artifact_path("notes/CHANGELOG.md"), "doc")
+        self.assertEqual(gather.classify_artifact_path("docs/spec.txt"), "doc")
+
+    def test_unrecognized_paths_are_none(self):
+        self.assertIsNone(gather.classify_artifact_path("modules/x/main.bicep"))
+        self.assertIsNone(gather.classify_artifact_path("src/app.py"))
+        self.assertIsNone(gather.classify_artifact_path(""))
+        self.assertIsNone(gather.classify_artifact_path(None))
+
+    def test_example_segment_not_incidental_substring(self):
+        # `.example` must be a dot-segment, not any substring
+        self.assertEqual(gather.classify_artifact_path("main.example.json"), "example")
+        self.assertEqual(gather.classify_artifact_path("config.example"), "example")
+        # "counter-example.md" is a doc, not an example
+        self.assertEqual(gather.classify_artifact_path("docs/counter-example.md"), "doc")
+        self.assertEqual(gather.classify_artifact_path("notes/counter-example.md"), "doc")
+
+    def test_precedence_readme_over_example_over_doc(self):
+        # a README inside an examples dir is still a README (basename wins)
+        self.assertEqual(
+            gather.classify_artifact_path("examples/basic/README.md"), "readme")
+        # an example markdown under examples/ is an example, not a doc
+        self.assertEqual(
+            gather.classify_artifact_path("examples/basic/notes.md"), "example")
+
+
 class TestAcquireAssemblyP2(unittest.TestCase):
     """Compose the pure helpers over recorded REST, as acquire() does, offline."""
 
@@ -401,6 +511,125 @@ class TestAcquireAssemblyP2(unittest.TestCase):
         self.assertEqual(b["workflow_stats"]["CI"]["total"], 3)
         self.assertEqual(b["releases"][0]["tag_name"], "v1.2.0")
         self.assertEqual(len(b["milestones"]), 3)
+
+
+class TestParseCodeEvents(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "git_log_p3_sample.txt")) as fh:
+            self.raw = fh.read()
+
+    def test_parses_adds_modifies_deletes(self):
+        events = gather.parse_code_events(self.raw)
+        adds = [e for e in events if e["change"] == "add"]
+        self.assertIn(("examples/basic/main.bicep", "Alice", "2026-05-03"),
+                      [(e["path"], e["author"], e["date"]) for e in adds])
+        deletes = [e for e in events if e["change"] == "delete"]
+        self.assertEqual([e["path"] for e in deletes], ["docs/firewall.md"])
+        modifies = [e for e in events if e["change"] == "modify"]
+        self.assertIn("README.md", [e["path"] for e in modifies])
+
+    def test_rename_carries_old_and_new_path(self):
+        events = gather.parse_code_events(self.raw)
+        renames = [e for e in events if e["change"] == "rename"]
+        self.assertEqual(len(renames), 1)
+        r = renames[0]
+        self.assertEqual(r["old_path"], "examples/basic/main.bicep")
+        self.assertEqual(r["path"], "examples/advanced/main.bicep")
+        self.assertEqual(r["author"], "Carol")
+
+    def test_every_event_carries_commit_author_date(self):
+        for e in gather.parse_code_events(self.raw):
+            self.assertEqual(len(e["commit"]), 40)
+            self.assertTrue(e["author"])
+            self.assertEqual(len(e["date"]), 10)
+            self.assertIn(e["change"], {"add", "modify", "delete", "rename", "copy"})
+
+    def test_non_rename_events_have_no_old_path_key(self):
+        events = gather.parse_code_events(self.raw)
+        add = next(e for e in events if e["change"] == "add")
+        self.assertNotIn("old_path", add)
+
+    def test_empty_input_yields_no_events(self):
+        self.assertEqual(gather.parse_code_events(""), [])
+
+    def test_copy_and_type_change_status_codes(self):
+        # C### (copy) -> copy with old+new path; T (type-change) -> modify.
+        raw = (
+            "\x1e" + "f" * 40 + "\x1f" + "p" * 40 + "\x1fEve\x1f2026-05-20\x1fmix\n"
+            "C085\told/x.bicep\tnew/x.bicep\n"
+            "T\tlinks/sym.bicep\n"
+        )
+        events = gather.parse_code_events(raw)
+        copy = next(e for e in events if e["change"] == "copy")
+        self.assertEqual((copy["old_path"], copy["path"]), ("old/x.bicep", "new/x.bicep"))
+        tchg = next(e for e in events if e["path"] == "links/sym.bicep")
+        self.assertEqual(tchg["change"], "modify")
+
+    def test_malformed_rename_line_is_skipped(self):
+        # A rename status with only one path column is dropped, not mis-parsed.
+        raw = ("\x1e" + "f" * 40 + "\x1f\x1fEve\x1f2026-05-20\x1fbad\n"
+               "R096\tonly/old/path.bicep\n")
+        self.assertEqual(gather.parse_code_events(raw), [])
+
+
+class TestAcquireAssemblyP3(unittest.TestCase):
+    """Compose the Phase 3a helpers over recorded REST + git-log, offline."""
+
+    def _bundle(self):
+        with open(os.path.join(FIX, "rest_p2_sample.json")) as fh:
+            p2 = json.load(fh)
+        with open(os.path.join(FIX, "rest_p3_sample.json")) as fh:
+            p3 = json.load(fh)
+        with open(os.path.join(FIX, "git_log_p3_sample.txt")) as fh:
+            code_events = gather.parse_code_events(fh.read())
+
+        frm, to = p2["window"]["from"], p2["window"]["to"]
+        prs = [gather.normalize_pr(p) for p in p2["pulls"]]
+        for pr in prs:
+            n = str(pr["number"])
+            pr["review_comments"] = [gather.normalize_review_comment(c)
+                                     for c in p3["pr_review_comments"].get(n, [])]
+            pr["comments_list"] = [gather.normalize_comment(c)
+                                   for c in p3["pr_comments"].get(n, [])]
+        issues = [gather.normalize_issue(i) for i in p2["issues"].values()]
+        for issue in issues:
+            n = str(issue["number"])
+            issue["comments_list"] = [gather.normalize_comment(c)
+                                      for c in p3["issue_comments"].get(n, [])]
+            issue["reactions"] = gather.summarize_reactions(
+                p3["issue_reactions"].get(n))
+            issue["open_high_activity"] = gather.derive_open_high_activity(issue)
+        meta = {"owner": "o", "repo": "r", "from": frm, "to": to,
+                "period": {"from": frm, "to": to}, "ref_date": to}
+        bundle = gather.build_bundle(meta, [], prs, issues)
+        bundle["code_events"] = code_events
+        return bundle
+
+    def test_pr_carries_review_comment_bodies(self):
+        b = self._bundle()
+        pr42 = next(p for p in b["prs"] if p["number"] == 42)
+        self.assertEqual(pr42["review_comments"][0]["body"],
+                         "Inline: extract this branch.")
+        self.assertEqual(pr42["review_comments"][0]["author"], "bob")
+        # Phase 2's integer counts are preserved alongside the new arrays.
+        self.assertEqual(pr42["review_comments_count"], 1)
+        self.assertEqual(pr42["comments_list"][0]["body"],
+                         "LGTM once the example is added.")
+
+    def test_issue_carries_comments_reactions_and_signal(self):
+        b = self._bundle()
+        issue18 = next(i for i in b["issues"] if i["number"] == 18)
+        self.assertEqual(len(issue18["comments_list"]), 2)
+        self.assertEqual(issue18["reactions"]["+1"], 9)
+        self.assertEqual(issue18["reactions"]["total"], 12)
+        self.assertTrue(issue18["open_high_activity"])  # open + 9 upvotes
+        issue21 = next(i for i in b["issues"] if i["number"] == 21)
+        self.assertFalse(issue21["open_high_activity"])  # open but quiet
+
+    def test_code_events_present_on_bundle(self):
+        b = self._bundle()
+        kinds = {e["change"] for e in b["code_events"]}
+        self.assertEqual(kinds, {"add", "modify", "delete", "rename"})
 
 
 if __name__ == "__main__":

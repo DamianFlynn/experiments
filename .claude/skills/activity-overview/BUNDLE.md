@@ -53,3 +53,34 @@ docsRefs, release_train, sprints, project, diagrams`.
   next_candidates > in_flight). Each ref may carry a `train` id.
 - **diagrams{}** maps `buckets_pie` / `timeline_gantt` to their `.mmd` paths,
   written and mmdc-validated by `render.py`.
+
+## Phase 3a fields (narrative substrate)
+
+- **prs[]** gain `review_comments: [{author, author_association, body, url, id, created_at}]`
+  (inline diff comments) and `comments_list: [{...same shape}]` (conversation
+  comments). The Phase 2 integer count stays under `comments` /
+  `review_comments_count` — the spec's `comments` *body-array* name was already
+  taken by the Phase 2 count, so bodies live under `comments_list`.
+- **issues[]** gain `comments_list: [{...}]`, `reactions: {"+1","-1","heart",
+  "hooray","total"}`, and `open_high_activity: bool` (open issue with notable
+  comments/upvotes).
+- **code_events** (gather) — raw file-level events from the full-window
+  `git log --name-status -M -C` walk: `[{commit, author, date, change:
+  add|modify|delete|rename|copy, path, old_path?}]`. The raw material Link folds.
+- **artifacts** `{ "<id>": { kind:"example|doc|readme", path, name,
+  status:"live|removed|replaced", replaced_by:id|null, code_area:null,
+  lifecycle:[{event:"add|change|remove", commit, author, date, ref}] } }`.
+  File granularity only in Phase 3a. **Deferred:** `symbol`/`comment` kinds (need
+  `-p` hunk + tree-sitter), `code_area` (graphify, Phase 3b), and per-event `hunk`.
+- **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},
+  subject:{kind, name, path} }]` — sorted social (comments/reviews) + code
+  (artifact lifecycle) events. `ref.id` is the PR/issue number for social events
+  and the commit sha for code events (the bundle-wide `{type, id, url}` ref
+  convention). Social events have no file `subject.path`; code events carry both.
+- **feature_deltas** `[{ area:null, kind:"add|drop|change", subject, name, before,
+  after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
+  }]` — a projection over `artifacts` (add→add, remove→drop, change→change).
+  `area`/`before`/`after`/`detail`/`hunk` are null/absent until graphify + hunk
+  parsing (later slice). `pr`/`train` resolve best-effort via the commit→PR map.
+- **diagrams{}** now also maps `content_timeline` (Mermaid `timeline`) and
+  `deltas_bar` (Mermaid `xychart-beta` bar).

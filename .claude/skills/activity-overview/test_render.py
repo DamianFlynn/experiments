@@ -112,14 +112,17 @@ class TestWriteDiagrams(unittest.TestCase):
             outdir = os.path.join(d, "diagrams")
             real_paths = render.write_diagrams(b, outdir)
             # return value is the real on-disk paths (for validation)
-            self.assertEqual(set(real_paths), {"buckets_pie", "timeline_gantt"})
+            # Phase 3a grows the manifest; assert Phase 2 keys are still present.
+            self.assertLessEqual({"buckets_pie", "timeline_gantt"}, set(real_paths))
             for name, path in real_paths.items():
                 self.assertTrue(os.path.exists(path))
                 self.assertTrue(path.endswith(f"{name}.mmd"))
-            # bundle records workspace-relative manifest paths (spec contract)
-            self.assertEqual(b["diagrams"],
-                             {"buckets_pie": os.path.join("diagrams", "buckets_pie.mmd"),
-                              "timeline_gantt": os.path.join("diagrams", "timeline_gantt.mmd")})
+            # Phase 3a grows the manifest; assert the Phase 2 entries are still
+            # present and correct rather than pinning the full set.
+            self.assertEqual(b["diagrams"]["buckets_pie"],
+                             os.path.join("diagrams", "buckets_pie.mmd"))
+            self.assertEqual(b["diagrams"]["timeline_gantt"],
+                             os.path.join("diagrams", "timeline_gantt.mmd"))
 
     def test_render_returns_mmd_text_per_diagram(self):
         out = render.render(_bundle())
@@ -234,10 +237,10 @@ class TestMmdcValidation(unittest.TestCase):
                 json.dump(_bundle(), fh)
             manifest = render.main([bundle_path, "--diagrams-dir",
                                     os.path.join(d, "dg"), "--skip-validate"])
-            self.assertEqual(set(manifest), {"buckets_pie", "timeline_gantt"})
+            self.assertLessEqual({"buckets_pie", "timeline_gantt"}, set(manifest))
             written = json.load(open(bundle_path))
-            self.assertEqual(set(written["diagrams"]),
-                             {"buckets_pie", "timeline_gantt"})
+            self.assertLessEqual({"buckets_pie", "timeline_gantt"},
+                                 set(written["diagrams"]))
 
 
 class TestEndToEndOffline(unittest.TestCase):
@@ -256,8 +259,158 @@ class TestEndToEndOffline(unittest.TestCase):
             render.validate_with_mmdc(list(manifest.values()),
                                       runner=lambda cmd, **kw: Ok(),
                                       which=lambda _n: "/usr/bin/mmdc")
-            self.assertEqual(set(bundle["diagrams"]), {"buckets_pie", "timeline_gantt"})
+            self.assertLessEqual({"buckets_pie", "timeline_gantt"}, set(bundle["diagrams"]))
             self.assertTrue(os.path.exists(manifest["buckets_pie"]))
+
+
+def _p3_bundle():
+    return {
+        "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
+        "artifacts": {
+            "art:docs/firewall.md": {
+                "kind": "doc", "path": "docs/firewall.md", "name": "firewall.md",
+                "status": "removed", "replaced_by": None, "code_area": None,
+                "lifecycle": [
+                    {"event": "add", "commit": "c1"*20, "author": "Alice",
+                     "date": "2026-05-03", "ref": {"type": "commit", "id": "c1"*20,
+                     "url": "https://github.com/o/r/commit/" + "c1"*20}},
+                    {"event": "remove", "commit": "c4"*20, "author": "Dave",
+                     "date": "2026-05-25", "ref": {"type": "commit", "id": "c4"*20,
+                     "url": "https://github.com/o/r/commit/" + "c4"*20}},
+                ]},
+            "art:examples/basic/main.bicep": {
+                "kind": "example", "path": "examples/basic/main.bicep",
+                "name": "main.bicep", "status": "live", "replaced_by": None,
+                "code_area": None,
+                "lifecycle": [
+                    {"event": "add", "commit": "c1"*20, "author": "Alice",
+                     "date": "2026-05-03", "ref": {"type": "commit", "id": "c1"*20,
+                     "url": "https://github.com/o/r/commit/" + "c1"*20}}]},
+        },
+        "feature_deltas": [
+            {"kind": "add", "subject": "example", "name": "main.bicep",
+             "artifact": "art:examples/basic/main.bicep", "author": "Alice",
+             "url": "u", "area": None, "pr": 42, "train": "train-pr-42",
+             "commit": "c1"*20},
+            {"kind": "add", "subject": "doc", "name": "firewall.md",
+             "artifact": "art:docs/firewall.md", "author": "Alice", "url": "u",
+             "area": None, "pr": None, "train": None, "commit": "c1"*20},
+            {"kind": "drop", "subject": "doc", "name": "firewall.md",
+             "artifact": "art:docs/firewall.md", "author": "Dave", "url": "u",
+             "area": None, "pr": None, "train": None, "commit": "c4"*20},
+        ],
+    }
+
+
+class TestContentTimeline(unittest.TestCase):
+    def test_timeline_header_and_dated_events(self):
+        mmd = render.emit_content_timeline(_p3_bundle())
+        self.assertTrue(mmd.startswith("timeline"))
+        # idiomatic form: "<date> : <event...>" — date is the period
+        self.assertIn("2026-05-03", mmd)
+        self.assertIn("2026-05-25", mmd)
+        # artifact names surface in the event text
+        self.assertIn("firewall.md", mmd)
+        # each dated line has the date as the period (not as an event)
+        dated_lines = [ln for ln in mmd.splitlines() if "2026-05-03" in ln]
+        self.assertTrue(dated_lines)
+        self.assertTrue(dated_lines[0].strip().startswith("2026-05-03"))
+
+    def test_timeline_placeholder_when_no_artifacts(self):
+        mmd = render.emit_content_timeline(
+            {"meta": {"from": "2026-05-01"}, "artifacts": {}, "feature_deltas": []})
+        self.assertTrue(mmd.startswith("timeline"))
+        # empty-case placeholder: "<from> : no content events"
+        self.assertIn("2026-05-01 : no content events", mmd)
+
+    def test_timeline_placeholder_no_from_uses_em_dash(self):
+        mmd = render.emit_content_timeline(
+            {"meta": {}, "artifacts": {}, "feature_deltas": []})
+        self.assertTrue(mmd.startswith("timeline"))
+        self.assertIn("no content events", mmd)
+
+
+class TestDeltasBar(unittest.TestCase):
+    def test_bar_uses_xychart_and_counts_by_kind(self):
+        mmd = render.emit_deltas_bar(_p3_bundle())
+        self.assertTrue(mmd.startswith("xychart-beta"))
+        # 2 add, 1 drop, 0 change -> bar series [2, 1, 0]
+        self.assertIn("bar [2, 1, 0]", mmd)
+        self.assertIn("add", mmd)
+        self.assertIn("drop", mmd)
+        self.assertIn("change", mmd)
+
+    def test_bar_placeholder_when_no_deltas(self):
+        mmd = render.emit_deltas_bar({"meta": {}, "feature_deltas": []})
+        self.assertTrue(mmd.startswith("xychart-beta"))
+        self.assertIn("bar [0, 0, 0]", mmd)
+
+
+class TestRenderManifestP3(unittest.TestCase):
+    def test_render_includes_phase3a_diagrams(self):
+        out = render.render(_p3_bundle())
+        self.assertTrue(out["content_timeline"].startswith("timeline"))
+        self.assertTrue(out["deltas_bar"].startswith("xychart-beta"))
+        # Phase 2 diagrams still present
+        self.assertIn("buckets_pie", out)
+        self.assertIn("timeline_gantt", out)
+
+    def test_write_diagrams_manifest_gains_two_keys(self):
+        b = _p3_bundle()
+        b["buckets"] = {"shipped": [], "in_flight": [], "rejected": [],
+                        "next_candidates": []}
+        b["prs"] = []
+        b["releases"] = []
+        with tempfile.TemporaryDirectory() as d:
+            real = render.write_diagrams(b, os.path.join(d, "diagrams"))
+            self.assertEqual(
+                set(real),
+                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"})
+            self.assertIn("content_timeline", b["diagrams"])
+            self.assertIn("deltas_bar", b["diagrams"])
+
+
+class TestEndToEndOfflineP3(unittest.TestCase):
+    def test_link_then_render_builds_full_substrate(self):
+        with open(os.path.join(FIX, "bundle_p3.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+
+        # artifacts: README change (live), doc add+remove (removed),
+        # example renamed (old replaced -> new live)
+        arts = bundle["artifacts"]
+        doc = next(a for a in arts.values() if a["path"] == "docs/firewall.md")
+        self.assertEqual(doc["status"], "removed")
+        old_ex = arts[link.artifact_id("examples/basic/main.bicep")]
+        self.assertEqual(old_ex["status"], "replaced")
+        self.assertEqual(old_ex["replaced_by"],
+                         link.artifact_id("examples/advanced/main.bicep"))
+
+        # timeline: both layers, sorted, well-formed refs
+        tl = bundle["timeline"]
+        self.assertTrue(tl)
+        self.assertEqual({e["layer"] for e in tl}, {"social", "code"})
+        self.assertEqual([e["ts"] for e in tl], sorted(e["ts"] for e in tl))
+
+        # feature_deltas: add/drop/change present; c1 -> PR 42
+        kinds = {d["kind"] for d in bundle["feature_deltas"]}
+        self.assertEqual(kinds, {"add", "drop", "change"})
+        add42 = next(d for d in bundle["feature_deltas"]
+                     if d["commit"].startswith("c1") and d["kind"] == "add")
+        self.assertEqual(add42["pr"], 42)
+
+        # render: four-diagram manifest, validation stubbed (mmdc absent here)
+        with tempfile.TemporaryDirectory() as d:
+            real = render.write_diagrams(bundle, os.path.join(d, "diagrams"))
+            self.assertEqual(
+                set(real),
+                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"})
+
+            class Ok:
+                returncode = 0
+                stderr = ""
+            render.validate_with_mmdc(list(real.values()),
+                                      runner=lambda cmd, **kw: Ok(),
+                                      which=lambda _n: "/usr/bin/mmdc")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,10 @@ name: activity-overview integration (live smoke test)
 #   "done" until this workflow has been run (manually) and is green on real data.
 #   The assertions currently cover Phase 2 (open + closed-unmerged PRs, the broad
 #   issue set, four-way buckets, workflow_stats/releases/milestones, and the
-#   render diagram manifest).
+#   render diagram manifest) PLUS Phase 3a (discussion bodies on PRs/issues,
+#   issue reactions + open_high_activity, artifacts lifecycle ledger, unified
+#   timeline, feature_deltas projection, and the content_timeline + deltas_bar
+#   diagram manifest entries).
 #
 # SECRET (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
 #   Settings -> Secrets and variables -> Actions -> New repository secret
@@ -117,7 +120,7 @@ jobs:
           python3 render.py workspace/bundle.json \
             --diagrams-dir workspace/diagrams --skip-validate
 
-      - name: Assert the bundle is well-formed and self-consistent (Phase 2)
+      - name: Assert the bundle is well-formed and self-consistent (Phase 3a)
         env:
           FROM: ${{ steps.cfg.outputs.from }}
           TO: ${{ steps.cfg.outputs.to }}
@@ -210,6 +213,61 @@ jobs:
               assert not str(pth).startswith("workspace/") and str(pth).endswith(".mmd"), \
                   f"diagram {name} path not workspace-relative: {pth}"
 
+          # 6. Phase 3a: discussion bodies on PRs/issues.
+          for p in prs:
+              assert isinstance(p.get("review_comments", []), list), p["number"]
+              assert isinstance(p.get("comments_list", []), list), p["number"]
+              for c in p.get("review_comments", []):
+                  assert "author" in c and "body" in c \
+                      and str(c.get("url", "")).startswith("https://"), c
+          for i in issues:
+              assert isinstance(i.get("comments_list", []), list), i["number"]
+              r = i.get("reactions", {})
+              assert set(r) >= {"+1", "-1", "heart", "hooray", "total"}, \
+                  f"issue {i['number']} reactions missing keys: {r}"
+              assert isinstance(i.get("open_high_activity", False), bool), i["number"]
+
+          # 7. Phase 3a: artifacts ledger — non-empty ordered lifecycle, valid status.
+          arts = b.get("artifacts", {})
+          assert isinstance(arts, dict), "artifacts must be a dict"
+          for aid, a in arts.items():
+              assert a["kind"] in {"example", "doc", "readme"}, \
+                  f"{aid} unexpected kind {a['kind']} (symbol/comment deferred)"
+              assert a["status"] in {"live", "removed", "replaced"}, aid
+              assert a["lifecycle"], f"{aid} has empty lifecycle"
+              for ev in a["lifecycle"]:
+                  assert ev["event"] in {"add", "change", "remove"}, aid
+                  assert well_formed(ev["ref"]) and ev["ref"]["type"] == "commit", aid
+              if a["status"] == "replaced":
+                  assert a["replaced_by"] in arts, f"{aid} replaced_by dangles"
+              assert a["code_area"] is None, "code_area is deferred to Phase 3b"
+
+          # 8. Phase 3a: timeline — well-formed events, layer in {social,code}.
+          tl = b.get("timeline", [])
+          assert isinstance(tl, list), "timeline must be a list"
+          for e in tl:
+              assert e["layer"] in {"social", "code"}, e
+              assert "actor" in e and "event" in e and "ts" in e, e
+              assert isinstance(e.get("ref"), dict) \
+                  and str(e["ref"].get("url", "")).startswith("https://"), e
+              assert set(e.get("subject", {})) >= {"kind", "name", "path"}, e
+          assert [e["ts"] for e in tl] == sorted(e["ts"] for e in tl), \
+              "timeline must be sorted by ts"
+
+          # 9. Phase 3a: feature_deltas reference real artifacts; kinds valid.
+          for d in b.get("feature_deltas", []):
+              assert d["kind"] in {"add", "drop", "change"}, d
+              assert d["artifact"] in arts, f"delta references unknown artifact {d['artifact']}"
+              assert d["area"] is None, "feature_delta area is deferred to Phase 3b"
+              assert str(d.get("url", "")).startswith("https://"), d
+              if d.get("pr") is not None:
+                  assert d["pr"] in pr_by, f"delta pr {d['pr']} unknown"
+
+          # 10. Phase 3a: diagrams manifest now includes the two new diagrams.
+          assert set(dg) >= {"buckets_pie", "timeline_gantt",
+                             "content_timeline", "deltas_bar"}, \
+              "diagrams manifest missing Phase 3a keys"
+
           print(f"OK prs={len(prs)} (merged={len(merged_nums)} "
                 f"open={sum(1 for p in prs if p['state'] == 'open')} "
                 f"closed_unmerged={sum(1 for p in prs if p['state'] == 'closed' and not p['merged'])}) "
@@ -218,6 +276,9 @@ jobs:
                 f"rejected={len(buckets['rejected'])} next={len(buckets['next_candidates'])}] "
                 f"workflows={len(ws)} releases={len(b.get('releases', []))} "
                 f"milestones={len(b.get('milestones', []))}")
+          print(f"  phase3a: artifacts={len(arts)} timeline={len(tl)} "
+                f"feature_deltas={len(b.get('feature_deltas', []))} "
+                f"pr_review_comments={sum(len(p.get('review_comments', [])) for p in prs)}")
           if not merged_nums:
               print("::warning::no merged PRs in window — shipped/trains held "
                     "vacuously; pick a busier window")

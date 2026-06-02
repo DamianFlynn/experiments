@@ -34,6 +34,7 @@ def build_bundle(meta, commits, prs, issues):
         "timeline": [],
         "artifacts": {},
         "feature_deltas": [],
+        "code_events": [],
         "trains": [],
         "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
         "people": {},
@@ -82,6 +83,52 @@ def parse_git_log(raw):
             "pr": None,  # resolved in link.py
         })
     return commits
+
+
+# git log format for the full-window code-event walk (Phase 3a). Same RECORD_SEP/
+# FIELD_SEP header as parse_git_log, but the BODY is `--name-status` lines so each
+# changed path carries its change type (and rename/copy detection via -M -C gives
+# `R###`/`C###` with old+new paths).
+CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
+
+_STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
+                     "R": "rename", "C": "copy", "T": "modify"}
+
+
+def parse_code_events(raw):
+    """Parse `git log --name-status -M -C` output into raw code-events.
+
+    Each event: {commit, author, date, change, path[, old_path]} where change is
+    add|modify|delete|rename|copy. Rename/copy lines (`R###`/`C###`) carry the old
+    path in `old_path` and the new path in `path`. Pure; permissive on junk lines.
+    """
+    events = []
+    for chunk in raw.split(RECORD_SEP):
+        if not chunk.strip():
+            continue
+        lines = chunk.splitlines()
+        fields = lines[0].split(FIELD_SEP)
+        if len(fields) < 5:
+            continue
+        sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
+        for ln in lines[1:]:
+            if not ln.strip():
+                continue
+            cols = ln.split("\t")
+            status = cols[0].strip()
+            change = _STATUS_TO_CHANGE.get(status[:1])
+            if change is None or len(cols) < 2:
+                continue
+            ev = {"commit": sha, "author": author, "date": date, "change": change}
+            if change in ("rename", "copy"):
+                if len(cols) < 3:
+                    continue  # malformed R/C line (real `-M -C` always has old+new)
+                ev["old_path"] = cols[1].strip()
+                ev["path"] = cols[2].strip()
+            else:
+                ev["path"] = cols[1].strip()
+            events.append(ev)
+    return events
 
 
 def build_clone_cmd(repo_url, from_date, clone_dir):
@@ -282,6 +329,88 @@ def normalize_milestone(raw):
     }
 
 
+def _normalize_comment_obj(raw):
+    """Shared mapping for conversation + review comments: the bundle's comment
+    shape {id, author, author_association, body, url, created_at}. Pure, permissive."""
+    return {
+        "id": raw.get("id"),
+        "author": (raw.get("user") or {}).get("login"),
+        "author_association": raw.get("author_association"),
+        "body": raw.get("body") or "",
+        "url": raw.get("html_url"),
+        "created_at": raw.get("created_at"),
+    }
+
+
+def normalize_comment(raw):
+    """Map a GitHub issue/PR conversation comment to the bundle's comment shape."""
+    return _normalize_comment_obj(raw)
+
+
+def normalize_review_comment(raw):
+    """Map a GitHub PR review comment (inline diff comment) to the same shape."""
+    return _normalize_comment_obj(raw)
+
+
+# The four reaction kinds the bundle tracks (the upvote/downvote/affinity signal
+# the flow analysis keys on), plus a derived total.
+_TRACKED_REACTIONS = ("+1", "-1", "heart", "hooray")
+
+# Thresholds for the Phase-3a `open_high_activity` signal: an OPEN issue with
+# meaningful discussion or upvotes. Deliberately permissive — it is a hint for
+# the "open risks" report section, not a hard classification.
+_HIGH_ACTIVITY_COMMENTS = 5
+_HIGH_ACTIVITY_UPVOTES = 5
+
+
+def summarize_reactions(raw):
+    """Reduce a GitHub reactions object to {'+1','-1','heart','hooray','total'}.
+    Pure, permissive: missing keys count as 0; total prefers `total_count`, else
+    sums the tracked keys."""
+    raw = raw or {}
+    out = {k: int(raw.get(k) or 0) for k in _TRACKED_REACTIONS}
+    if raw.get("total_count") is not None:
+        out["total"] = int(raw["total_count"])
+    else:
+        out["total"] = sum(out[k] for k in _TRACKED_REACTIONS)
+    return out
+
+
+def derive_open_high_activity(issue):
+    """True for an OPEN issue with notable engagement (many comments or upvotes).
+    A cheap surface for the report's open-risks section. Pure."""
+    if issue.get("state") != "open":
+        return False
+    comments = issue.get("comments", 0) or 0
+    upvotes = (issue.get("reactions") or {}).get("+1", 0) or 0
+    return comments >= _HIGH_ACTIVITY_COMMENTS or upvotes >= _HIGH_ACTIVITY_UPVOTES
+
+
+def classify_artifact_path(path):
+    """Classify a changed file path into a tracked artifact kind, or None.
+
+    File granularity only (Phase 3a). Precedence: readme > example > doc.
+      - readme : basename matches README* (any/no extension)
+      - example: under an `examples/` directory, or a `*.example*` filename
+      - doc    : a `*.md` file, or any file under a `docs/` directory
+      - else   : None (ignored at file granularity)
+    `symbol` and `comment` kinds need hunk/AST parsing and are deferred."""
+    if not path:
+        return None
+    parts = path.split("/")
+    base = parts[-1]
+    low = base.lower()
+    if base.upper().startswith("README"):
+        return "readme"
+    # `.example` only when it is a dot-segment (config.example.json, foo.example),
+    # not an incidental substring (counter-example.md must stay a doc).
+    if "examples" in parts[:-1] or ".example." in low or low.endswith(".example"):
+        return "example"
+    if low.endswith(".md") or "docs" in parts[:-1]:
+        return "doc"
+    return None
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
@@ -456,13 +585,24 @@ def acquire(args, env):
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
     # Multi-branch commit walking arrives in a later phase.
-    log_fmt = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
     raw = run_git([
         "git", "-C", clone_dir, "log",
         f"--since={frm}", f"--until={to}",
-        f"--pretty=format:{log_fmt}", "--date=short", "--name-only",
+        f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
     ])
     commits = parse_git_log(raw)
+
+    # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
+    # Guarded so --no-clone / missing clone degrades gracefully to empty.
+    code_events = []
+    if not args.no_clone or os.path.isdir(clone_dir):
+        raw_walk = run_git([
+            "git", "-C", clone_dir, "log",
+            f"--since={frm}", f"--until={to}",
+            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+            "--name-status", "-M", "-C",
+        ])
+        code_events = parse_code_events(raw_walk)
 
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
@@ -495,6 +635,12 @@ def acquire(args, env):
         timeline = fetch_all(
             get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
         pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+        review_comments = fetch_all(
+            get_page, f"{api}/pulls/{pr['number']}/comments?per_page=100")
+        pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
+        conv_comments = fetch_all(
+            get_page, f"{api}/issues/{pr['number']}/comments?per_page=100")
+        pr["comments_list"] = [normalize_comment(c) for c in conv_comments]
         prs.append(pr)
 
     # Issue set: every issue a kept PR closes or cross-references, plus open and
@@ -516,19 +662,29 @@ def acquire(args, env):
         get_page, f"{api}/issues?state=open&sort=updated&direction=desc&per_page=100")
     issues = []
     seen = set()
+    raw_by_num = {}
     for raw in raw_repo_issues + raw_open_issues:
         if raw.get("pull_request"):  # the issues endpoint also lists PRs; skip them
             continue
         if raw["number"] in seen:
             continue
         issue = normalize_issue(raw)
+        raw_by_num[raw["number"]] = raw
         seen.add(issue["number"])
         issues.append(issue)
     for n in sorted(wanted - seen):
         raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
         if raw_issue.get("pull_request"):
             continue
+        raw_by_num[raw_issue["number"]] = raw_issue
         issues.append(normalize_issue(raw_issue))
+
+    for issue in issues:
+        n = issue["number"]
+        conv = fetch_all(get_page, f"{api}/issues/{n}/comments?per_page=100")
+        issue["comments_list"] = [normalize_comment(c) for c in conv]
+        issue["reactions"] = summarize_reactions(raw_by_num.get(n, {}).get("reactions"))
+        issue["open_high_activity"] = derive_open_high_activity(issue)
 
     workflows = []
     workflow_stats = {}
@@ -558,6 +714,7 @@ def acquire(args, env):
     bundle["workflow_stats"] = workflow_stats
     bundle["releases"] = releases
     bundle["milestones"] = milestones
+    bundle["code_events"] = code_events
     return bundle
 
 
