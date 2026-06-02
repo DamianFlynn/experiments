@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 
 SCHEMA_VERSION = 1
@@ -228,17 +229,57 @@ def run_git(args, cwd=None):
 
 
 def http_get_json(url, token):
-    """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested."""
+    """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested.
+
+    On an HTTP error, GitHub explains the cause in the response body and a few
+    headers (rate limit vs. SAML SSO vs. token scope). urllib discards both by
+    default, leaving only a bare "HTTP Error 403", so we surface them ourselves.
+    """
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "User-Agent": "activity-overview",
     })
-    with urllib.request.urlopen(req) as resp:
-        body = json.loads(resp.read().decode())
-        link = resp.headers.get("Link", "")
-        nxt = _next_link(link)
-    return body, nxt
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = json.loads(resp.read().decode())
+            nxt = _next_link(resp.headers.get("Link", ""))
+        return body, nxt
+    except urllib.error.HTTPError as err:
+        raise SystemExit(_format_http_error(url, err)) from err
+
+
+# Headers GitHub uses to explain a refusal; surfaced verbatim on error so the
+# distinction (rate limit / SAML SSO / missing scope) is visible without guessing.
+_DIAGNOSTIC_HEADERS = (
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "x-github-sso",
+    "x-accepted-oauth-scopes",
+    "x-oauth-scopes",
+)
+
+
+def _format_http_error(url, err):
+    """Build a one-screen diagnostic from an HTTPError: status, GitHub's message,
+    and the headers that disambiguate a 403."""
+    try:
+        detail = json.loads(err.read().decode()).get("message", "")
+    except Exception:
+        detail = ""
+    lines = [f"error: GitHub API {err.code} for {url}"]
+    if detail:
+        lines.append(f"  message: {detail}")
+    for name in _DIAGNOSTIC_HEADERS:
+        value = err.headers.get(name)
+        if value:
+            lines.append(f"  {name}: {value}")
+    if err.code == 403:
+        lines.append(
+            "  hint: 403 with rate-limit headers = rate limited; with x-github-sso "
+            "= authorize the PAT for the org's SAML SSO; otherwise check token scope."
+        )
+    return "\n".join(lines)
 
 
 def _next_link(link_header):

@@ -1,9 +1,11 @@
 import contextlib
+import email.message
 import io
 import json
 import os
 import sys
 import unittest
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(__file__))
 import gather  # noqa: E402
@@ -174,6 +176,32 @@ class TestIssueAndFetch(unittest.TestCase):
         # Page 2 ends before the window, so it is included but page 3 is never fetched.
         self.assertEqual(len(items), 4)
         self.assertEqual(calls, ["u?p=1", "u?p=2"])
+
+
+class TestHttpErrorDiagnostics(unittest.TestCase):
+    def _http_error(self, code, message, headers):
+        hdrs = email.message.Message()
+        for k, v in headers.items():
+            hdrs[k] = v
+        body = io.BytesIO(json.dumps({"message": message}).encode())
+        return urllib.error.HTTPError("https://api/x", code, "Forbidden", hdrs, body)
+
+    def test_rate_limited_403_reports_message_and_remaining(self):
+        out = gather._format_http_error("https://api/x", self._http_error(
+            403, "API rate limit exceeded for 1.2.3.4.",
+            {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1780395758"},
+        ))
+        self.assertIn("403", out)
+        self.assertIn("rate limit exceeded", out)
+        self.assertIn("x-ratelimit-remaining: 0", out)
+
+    def test_saml_sso_403_surfaces_the_sso_header(self):
+        out = gather._format_http_error("https://api/x", self._http_error(
+            403, "Resource protected by organization SAML enforcement.",
+            {"x-github-sso": "required; organizations=Azure"},
+        ))
+        self.assertIn("x-github-sso: required; organizations=Azure", out)
+        self.assertIn("SAML SSO", out)
 
 
 class TestCliAndAuth(unittest.TestCase):
