@@ -494,7 +494,8 @@ def attribute_people_areas(bundle, idx):
 def enrich(bundle):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the Phase 3a narrative substrate (artifacts/timeline/feature_deltas), and the
-    Phase 3b code-area attribution + label facets."""
+    Phase 3b code-area attribution (code_area/area/modules/people). Label facets
+    and `kind` are stamped in gather.py's acquire(), not here."""
     attach_commit_prs(bundle["commits"])
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle)

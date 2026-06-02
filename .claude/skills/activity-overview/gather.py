@@ -724,19 +724,6 @@ def classify_issue_kind(issue, taxonomy, types_present):
     return "other"
 
 
-def _repo_has_issue_types(api, token):
-    """True if the repo defines native issue types. Best-effort: any failure
-    (older API, no types, 404) is treated as 'no native types'."""
-    try:
-        owner_repo = api.rsplit("/repos/", 1)[-1]
-        owner = owner_repo.split("/")[0]
-        data, _ = http_get_json(
-            f"https://api.github.com/orgs/{owner}/issue-types", token)
-        return bool(data)
-    except Exception:
-        return False
-
-
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
@@ -1032,9 +1019,11 @@ def acquire(args, env):
             if isinstance(raw_by_num.get(n, {}).get("type"), dict) else None
 
     # Phase 3b: label taxonomy over every repo label seen, then stamp facets + kind.
-    all_labels = sorted({lbl for it in prs + issues for lbl in it.get("labels", [])})
+    all_labels = sorted({lbl for it in prs + issues for lbl in (it.get("labels") or [])})
     label_taxonomy = detect_label_taxonomy(all_labels)
-    types_present = _repo_has_issue_types(api, token)  # thin seam, best-effort
+    # Derive from the issues already fetched (native `type` captured above) rather
+    # than a separate org-scoped probe — no extra call, always consistent with data.
+    types_present = any(i.get("issue_type") for i in issues)
     for pr in prs:
         pr["facets"] = apply_facets(pr, label_taxonomy)
     for issue in issues:

@@ -171,9 +171,9 @@ def _flow_label(text):
 def emit_contributor_graph(bundle):
     """A Mermaid `flowchart` of people <-> code-area edges.
 
-    Each person links to the areas they authored/reviewed in (from `people.modules`).
-    Falls back to people<->train edges only if no module data exists. Derived from
-    existing bundle fields."""
+    Each person links to the areas they authored/reviewed in (from `people.modules`,
+    falling back to `people.areas`). Emits a `No contributor data` placeholder when
+    no edges can be built. Derived from existing bundle fields."""
     people = bundle.get("people", {})
     lines = ["flowchart LR"]
     edges = []
