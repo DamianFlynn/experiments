@@ -776,6 +776,40 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None)
     return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
 
 
+def _read_text_file(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _bicep_entrypoint(area):
+    for p in area.get("paths", []):
+        if p == "main.bicep" or p.endswith("/main.bicep"):
+            return p
+    return None
+
+
+def _tf_entrypoint(area):
+    tfs = [p for p in area.get("paths", []) if p.endswith(".tf")]
+    for p in tfs:
+        if p == "main.tf" or p.endswith("/main.tf"):
+            return p
+    return tfs[0] if tfs else None
+
+
+def _bicep_build_arm(run, clone_dir, rel_path):
+    """Run bicep restore + build; return the compiled ARM JSON text. Not unit-tested."""
+    full = os.path.join(clone_dir, rel_path)
+    run(["bicep", "restore", full])          # pull registry modules (best-effort)
+    return run(["bicep", "build", full, "--stdout"])
+
+
+def _terraform_graph_dot(run, clone_dir, rel_dir):
+    """Run terraform init (no backend) + graph; return DOT text. Not unit-tested."""
+    full = os.path.join(clone_dir, rel_dir or ".")
+    run(["terraform", f"-chdir={full}", "init", "-backend=false", "-input=false"])
+    return run(["terraform", f"-chdir={full}", "graph"])
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 
@@ -1008,6 +1042,43 @@ def run_git(args, cwd=None):
             f"{proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
+                      read_text=_read_text_file, patterns=None):
+    """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
+
+    For each area: if it has a main.bicep AND `bicep` is on PATH, compile it and
+    build edges; else if it has a *.tf AND `terraform` is on PATH, graph it and
+    build edges. ANY missing CLI, restore failure, or build error leaves `edges`
+    untouched ([]). Injectable `which`/`run`/`read_text` make this offline-testable.
+    Mutates and returns `code_graph`."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    areas = code_graph.get("areas", [])
+    area_ids = {a["id"] for a in areas}
+    have_bicep = bool(which("bicep"))
+    have_tf = bool(which("terraform"))
+
+    for area in areas:
+        bp = _bicep_entrypoint(area)
+        if bp and have_bicep:
+            try:
+                arm = json.loads(_bicep_build_arm(run, clone_dir, bp))
+                src = read_text(os.path.join(clone_dir, bp))
+                area["edges"] = build_bicep_edges(src, arm, bp, area_ids, patterns)
+            except Exception:
+                area["edges"] = []           # build-only: no fabricated edges
+            continue
+        tp = _tf_entrypoint(area)
+        if tp and have_tf:
+            try:
+                dot = _terraform_graph_dot(run, clone_dir, os.path.dirname(tp))
+                src = read_text(os.path.join(clone_dir, tp))
+                area["edges"] = build_terraform_edges(src, dot, tp, area_ids, patterns)
+            except Exception:
+                area["edges"] = []
+            continue
+    return code_graph
 
 
 def http_get_json(url, token):

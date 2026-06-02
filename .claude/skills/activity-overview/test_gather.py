@@ -1178,5 +1178,74 @@ class TestBuildTerraformEdges(unittest.TestCase):
                                          gather.DEFAULT_AREA_PATTERNS), [])
 
 
+class TestExtractIacEdges(unittest.TestCase):
+    def _code_graph(self):
+        return {"provider": "directory", "areas": [
+            {"id": "avm/ptn/foo/bar", "label": "bar",
+             "paths": ["avm/ptn/foo/bar/main.bicep",
+                       "avm/ptn/foo/bar/README.md"], "edges": []},
+            {"id": "avm/res/key-vault/vault", "label": "vault",
+             "paths": ["avm/res/key-vault/vault/main.bicep"], "edges": []},
+            {"id": "live/prod", "label": "prod",
+             "paths": ["live/prod/main.tf"], "edges": []},
+        ]}
+
+    def test_build_only_no_tools_leaves_edges_empty(self):
+        cg = gather.extract_iac_edges(self._code_graph(), "clone",
+                                      which=lambda _n: None)
+        for a in cg["areas"]:
+            self.assertEqual(a["edges"], [])
+
+    def test_bicep_present_populates_edges_for_bicep_areas(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm_text = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            bicep_src = fh.read()
+
+        def which(name):
+            return "/usr/bin/bicep" if name == "bicep" else None
+
+        def run(cmd, **kw):
+            return arm_text if cmd[:2] == ["bicep", "build"] else ""
+
+        cg = gather.extract_iac_edges(
+            self._code_graph(), "clone",
+            which=which, run=run, read_text=lambda _p: bicep_src)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        tos = {e["to"] for e in bar["edges"]}
+        self.assertIn("avm/res/storage/storage-account", tos)
+        self.assertTrue(any(e["version"] == "0.9.0" for e in bar["edges"]))
+        # terraform area stays empty (terraform absent)
+        prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
+        self.assertEqual(prod["edges"], [])
+
+    def test_bicep_build_failure_leaves_edges_empty(self):
+        def boom(cmd, **kw):
+            raise RuntimeError("restore blocked by network policy")
+        cg = gather.extract_iac_edges(
+            self._code_graph(), "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            run=boom, read_text=lambda _p: "")
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertEqual(bar["edges"], [])
+
+    def test_terraform_present_populates_tf_area(self):
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+
+        def run(cmd, **kw):
+            return dot if cmd[-1] == "graph" else ""
+
+        cg = gather.extract_iac_edges(
+            self._code_graph(), "clone",
+            which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+            run=run, read_text=lambda _p: tf)
+        prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
+        self.assertTrue(prod["edges"])
+        self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
+
+
 if __name__ == "__main__":
     unittest.main()
