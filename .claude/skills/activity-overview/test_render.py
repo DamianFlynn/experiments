@@ -481,10 +481,10 @@ class TestRenderManifestP3b(unittest.TestCase):
         b["artifacts"] = {}; b["feature_deltas"] = []
         with tempfile.TemporaryDirectory() as d:
             real = render.write_diagrams(b, os.path.join(d, "diagrams"))
-            self.assertEqual(
-                set(real),
+            self.assertLessEqual(
                 {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar",
-                 "contributor_graph", "kind_breakdown"})
+                 "contributor_graph", "kind_breakdown"},
+                set(real))
             self.assertIn("contributor_graph", b["diagrams"])
             self.assertIn("kind_breakdown", b["diagrams"])
 
@@ -515,13 +515,40 @@ class TestEndToEndOfflineP3b(unittest.TestCase):
         self.assertIn("avm/res/network/firewall-policy",
                       bundle["people"]["alice"]["modules"])
 
-        # render: six-diagram manifest
+        # render: six-diagram manifest (Phase 3c grows it; assert the earlier
+        # keys remain present rather than pinning the exact set)
         with tempfile.TemporaryDirectory() as d:
             real = render.write_diagrams(bundle, os.path.join(d, "diagrams"))
-            self.assertEqual(
-                set(real),
+            self.assertLessEqual(
                 {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar",
-                 "contributor_graph", "kind_breakdown"})
+                 "contributor_graph", "kind_breakdown"},
+                set(real))
+
+
+class TestModuleGraph(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "bundle_p3c.json")) as fh:
+            self.bundle = json.load(fh)
+
+    def test_flowchart_has_resolved_area_edges(self):
+        mmd = render.emit_module_graph(self.bundle)
+        self.assertTrue(mmd.startswith("flowchart"))
+        # an edge from the ptn area to each resolved target
+        self.assertEqual(mmd.count("-->"), 2)
+
+    def test_edge_label_shows_version(self):
+        mmd = render.emit_module_graph(self.bundle)
+        self.assertIn("0.9.0", mmd)
+
+    def test_placeholder_when_no_edges(self):
+        empty = {"code_graph": {"provider": "directory", "areas": [
+            {"id": "a", "label": "a", "paths": ["a/main.bicep"], "edges": []}]}}
+        mmd = render.emit_module_graph(empty)
+        self.assertIn("No module dependencies", mmd)
+
+    def test_registered_in_render_manifest(self):
+        names = set(render.render(self.bundle))
+        self.assertIn("module_graph", names)
 
 
 if __name__ == "__main__":
