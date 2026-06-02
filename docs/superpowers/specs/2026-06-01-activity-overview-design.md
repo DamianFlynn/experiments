@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 8 (Phases 1/2/3a shipped; + pluggable directory-first code-area provider, graphify optional)
+**Status:** Approved design — rev 9 (Phases 1/2/3a/3b shipped; + Phase 3c IaC dependency edges via `bicep build`→ARM + `terraform graph`, full-transitive, build-only; symbol artifacts (3d) + symbol-identity tracking (3e) sequenced as separate slices)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -284,9 +284,17 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
   languages (Python/TS/Go/Java/…); it does **not** parse Bicep/HCL, so it is no longer a hard
   dependency — when absent or inapplicable, code areas fall back to the directory provider.
   The provider yields an **area id** that every `code_area`/`area` field carries (a directory
-  path, or `community:<n>` from graphify). Dependency-edge enrichment (Bicep `bicep build`→ARM
-  `dependsOn`; Terraform `tree-sitter-hcl`) and symbol-granular artifacts are **deferred**.
-  (`git` and `GITHUB_TOKEN` remain required.)
+  path, or `community:<n>` from graphify). **Dependency-edge enrichment lands in Phase 3c
+  (rev 9):** inter-area `code_graph.areas[].edges` are resolved **authoritatively** — Bicep
+  via `bicep build`→ARM (walking the full **transitive** nested-deployment tree, joined with
+  source-ref parsing to recover each `br/public:…:<version>` identity), Terraform via
+  `terraform init && terraform graph` (the resolved transitive module/resource graph). Edge
+  extraction is **build-only**: edges populate solely from a successful build/restore and are
+  left **empty** when the toolchain or registry is unavailable — never best-effort static text
+  with unresolved versions/sub-deps. The `bicep` and `terraform` CLIs are therefore required
+  for the edge gate (installed in CI/setup). **Symbol-granular artifacts (3d)** and **symbol-
+  identity tracking across renames/moves (3e)** remain sequenced as later slices. (`git` and
+  `GITHUB_TOKEN` remain required.)
 - **mermaid-cli (`mmdc`)** is a **required dependency for Render** (Phase 2+): `render.py`
   validates every emitted `.mmd` by compiling it (and optionally exports SVG/PNG), so a
   diagram that would not render fails the run rather than shipping broken. The preflight
@@ -388,8 +396,20 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     `source_file` → area. **Not required**: if absent or the repo is unsupported (e.g. Bicep),
     silently use the directory provider.
   - Areas (from whichever provider) are stored under `code_graph` and used by Link to
-    attribute trains/commits/people/artifacts/feature_deltas to code areas. Dependency
-    **edges** (Bicep ARM `dependsOn`, `tree-sitter-hcl`) are deferred.
+    attribute trains/commits/people/artifacts/feature_deltas to code areas.
+  - **Dependency edges (Phase 3c, rev 9; `gather.py`, build-only).** After the provider
+    selects areas, `gather.py` enriches each area's `edges` with **inter-area dependency
+    edges** by running the real IaC toolchain against the working-tree clone:
+    - **Bicep:** `bicep restore` + `bicep build <area-entrypoint>` → ARM JSON; walk the
+      **full transitive** `Microsoft.Resources/deployments` tree for the validated dependency
+      structure, and parse the entrypoint **source** for `module … '<ref>'` / `br/public:…:<ver>`
+      references to recover each immediate edge's resolved **area-id + version** label.
+    - **Terraform:** `terraform init -backend=false` + `terraform graph` → parse the DOT
+      output for the resolved **transitive** `module.*` / resource dependency graph.
+    - Each edge is `{to, kind, ref, version, transitive, provider, resolved}` (see schema).
+      **Build-only:** if the CLI/registry is unavailable the build is skipped and `edges`
+      stays `[]` — the skill never emits static, unvalidated edges. (`bicep`/`terraform`
+      are required for the edge gate; absent them edges are simply empty.)
 
 - **REST fetches / windowing (the social layer):**
   - **PRs:** closed PRs touched in range via
@@ -456,7 +476,11 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "project": { "number","title","iterations":[{ "title","start","end" }],
                  "items":[{ "type","number","title","state","merged","status","iteration","url" }] },
     "code_graph": { "provider":"directory|graphify",
-                    "areas":[{ "id","label","paths":[],"edges":[] }] },
+                    "areas":[{ "id","label","paths":[],
+                               "edges":[{ "to":area-id|null,"kind":"module|resource",
+                                          "ref":"<raw bicep/tf reference>","version":str|null,
+                                          "transitive":bool,"provider":"bicep|terraform",
+                                          "resolved":bool }] }] },
     "modules": { "<dir>": { "commits","prs","files_changed" } },
     "workflow_stats": { "<workflow>": { "total","success","failure","cancelled","other" } },
     "docsRefs": [ { "path","source":"changed|referenced","pr":num|null } ],
@@ -856,8 +880,31 @@ against GitHub) after each.
   artifacts/feature_deltas to `code_area`s; resolve `label_taxonomy` facets + issue `kind`
   (native issue types → label facets → template → heuristic); `contributor_graph` diagram.
   *Report:* shipped grouped by code area; module ownership (`code_owners` + `people.modules`);
-  facet-aware grouping. (Dependency-edge enrichment — Bicep ARM `dependsOn`, `tree-sitter-hcl`
-  — and symbol-granular artifacts are later slices.)
+  facet-aware grouping. (Dependency-edge enrichment and symbol-granular artifacts are later
+  slices — 3c/3d/3e below.)
+- **Phase 3c — IaC dependency edges (build-only, full-transitive).**
+  *Acquire:* after the code-area provider selects areas, `gather.py` enriches
+  `code_graph.areas[].edges` with **inter-area dependency edges** resolved by the real IaC
+  toolchain against the working-tree clone — **Bicep** via `bicep restore`+`bicep build`→ARM
+  (walk the full transitive `Microsoft.Resources/deployments` tree, joined with source-ref
+  parsing for the `br/public:…:<version>` identity) and **Terraform** via
+  `terraform init -backend=false`+`terraform graph` (parse the resolved transitive DOT graph).
+  **Build-only:** edges populate solely from a successful build/restore and stay `[]` when the
+  CLI/registry is unavailable (no static fallback). *Render:* a `module_graph` flowchart of the
+  resolved area→area edges. *Report:* a "Module dependency graph / blast radius" subsection.
+  *Gate:* the integration workflow installs `bicep`+`terraform` and flips its prior
+  `edges == []` assertion to the new edge contract, asserting Bicep edges resolve (with
+  versions) on real data. (Symbol-granular artifacts and identity tracking still deferred to
+  3d/3e.)
+- **Phase 3d — symbol-granular artifacts.** Extend the artifact ledger from file-granularity
+  to **symbols** (Bicep/ARM `param`/`resource`/`output`, Terraform `variable`/`resource`/
+  `output`, graphify nodes) with `-p` hunk parsing; `artifacts[].kind` gains `symbol`/`comment`
+  and `feature_deltas` gain `hunk`/`before`/`after`/`detail`. Builds on the 3c edge/area
+  foundation. (Sequenced slice.)
+- **Phase 3e — symbol-identity tracking.** Follow a symbol across renames/moves/file-splits
+  via per-commit before/after fingerprinting + heuristic cross-diff matching (multi-language),
+  layered on the 3d symbol ledger — the highest-risk slice, built last on a validated
+  foundation. (Sequenced slice.)
 - **Phase 4 — sub-agent train narratives + train graphs + forecast.**
   *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
   `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded
