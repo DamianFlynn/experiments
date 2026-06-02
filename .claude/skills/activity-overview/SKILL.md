@@ -29,6 +29,7 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    ```
    This writes `workspace/diagrams/*.mmd`, records `bundle.diagrams`, and **fails
    if any diagram does not compile** under `mmdc`.
+   The manifest now also includes `content_timeline` and `deltas_bar`.
 4. **Write the report.** Read `workspace/bundle.json` and fill `report-template.md`,
    embedding each `bundle.diagrams` file as a ```mermaid block. Cite each fact with
    its `url`. Do not state anything the bundle does not contain.
@@ -40,3 +41,8 @@ claim in the report resolves to a source ref in the bundle — never invent fact
 - Phase 2 reports cover: executive summary, shipped, decision trains, **activity-at-a-glance
   diagrams, releases, CI/CD health, in-flight, rejected/abandoned, and next-up candidates**.
   Sections with no backing data are omitted rather than padded.
+- Phase 3a reports additionally cover: **Feature changes (add/drop/change)** and
+  **Content lifecycle (built/changed/dropped)**, embedding `diagrams.deltas_bar`
+  and `diagrams.content_timeline` and citing `feature_deltas`/`artifacts` refs.
+  PR/issue **comment and review-comment bodies** and issue **reactions** are now
+  in the bundle for narrative grounding. Sections with no backing data are omitted.

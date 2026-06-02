@@ -66,3 +66,34 @@ For each ref in `buckets.next_candidates`: open items on the next milestone or
 flagged high-priority — the basis for the next-release forecast.
 
 - [{title}]({url}) (#{number}){ — train `{train}`}
+
+## Feature changes (add / drop / change)
+
+The `feature_deltas` ledger as a table grouped by kind. Each row cites its
+artifact and the commit/PR that changed it (`area` is null until graphify lands).
+
+```mermaid
+{contents of diagrams.deltas_bar}
+```
+
+| Kind | Subject | Name | Author | PR | Commit |
+|------|---------|------|--------|----|--------|
+| {kind} | {subject} | {name} | {author} | {pr or "—"} | [{commit:7}]({url}) |
+
+## Content lifecycle (built / changed / dropped)
+
+From `artifacts`: examples, docs, and READMEs introduced, revised, or
+removed/replaced within the window — *who* authored and *who* removed each, with
+dates. Surfaces "we shipped an example in March and dropped it in May", which a
+tip-only diff hides. (Inline code-symbols and comments are a later slice;
+`code_area` lands with graphify.)
+
+```mermaid
+{contents of diagrams.content_timeline}
+```
+
+For each artifact in `artifacts` (status `removed`/`replaced` first):
+
+- **{name}** ({kind}) — {status}. Lifecycle: {for each event} {event} by
+  {author} on {date} ([{commit:7}]({ref.url})){end}.{ if replaced_by } Replaced by
+  `{replaced_by}`.{end}
