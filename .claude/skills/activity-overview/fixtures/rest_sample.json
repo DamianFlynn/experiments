@@ -1,0 +1,71 @@
+{
+  "pulls": [
+    {
+      "number": 42,
+      "title": "Add AzureFirewall policy param",
+      "body": "Implements the policy parameter. Fixes #17.",
+      "state": "closed",
+      "merged_at": "2026-05-10T12:00:00Z",
+      "closed_at": "2026-05-10T12:00:00Z",
+      "user": {"login": "alice"},
+      "author_association": "MEMBER",
+      "labels": [{"name": "enhancement"}],
+      "merged_by": {"login": "bob"},
+      "html_url": "https://github.com/o/r/pull/42"
+    },
+    {
+      "number": 43,
+      "title": "WIP experiment",
+      "body": "no references here",
+      "state": "closed",
+      "merged_at": null,
+      "closed_at": "2026-05-11T09:00:00Z",
+      "user": {"login": "carol"},
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "merged_by": null,
+      "html_url": "https://github.com/o/r/pull/43"
+    },
+    {
+      "number": 44,
+      "title": "Still open",
+      "body": "Resolves #18 and closes #19",
+      "state": "open",
+      "merged_at": null,
+      "closed_at": null,
+      "user": {"login": "alice"},
+      "author_association": "MEMBER",
+      "labels": [],
+      "merged_by": null,
+      "html_url": "https://github.com/o/r/pull/44"
+    },
+    {
+      "number": 41,
+      "title": "Merged before the window",
+      "body": "Fixes #10",
+      "state": "closed",
+      "merged_at": "2026-04-20T12:00:00Z",
+      "closed_at": "2026-04-20T12:00:00Z",
+      "user": {"login": "alice"},
+      "author_association": "MEMBER",
+      "labels": [],
+      "merged_by": {"login": "bob"},
+      "html_url": "https://github.com/o/r/pull/41"
+    }
+  ],
+  "issues": {
+    "17": {
+      "number": 17,
+      "title": "Support firewall policy parameter",
+      "body": "We need a policy param.",
+      "state": "closed",
+      "state_reason": "completed",
+      "user": {"login": "dave"},
+      "author_association": "CONTRIBUTOR",
+      "labels": [{"name": "enhancement"}],
+      "assignees": [{"login": "alice"}],
+      "closed_at": "2026-05-10T12:00:00Z",
+      "html_url": "https://github.com/o/r/issues/17"
+    }
+  }
+}

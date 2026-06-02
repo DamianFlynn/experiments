@@ -3,6 +3,7 @@
 The only component that touches the network. Produces a schema-complete bundle;
 later-phase fields are reserved empty here and filled by later phases.
 """
+import re
 
 SCHEMA_VERSION = 1
 RECORD_SEP = "\x1e"
@@ -94,3 +95,46 @@ def in_window(ts, from_date, to_date):
         return False
     day = ts[:10]
     return from_date <= day <= to_date
+
+
+_CLOSING_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
+)
+
+
+def parse_closing_refs(text):
+    """Extract issue numbers from GitHub closing keywords, de-duplicated,
+    order-preserving."""
+    out = []
+    for m in _CLOSING_RE.finditer(text or ""):
+        n = int(m.group(1))
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def normalize_pr(raw):
+    """Map a GitHub REST PR object to the bundle's PR shape."""
+    return {
+        "number": raw["number"],
+        "title": raw.get("title", ""),
+        "body": raw.get("body") or "",
+        "author": (raw.get("user") or {}).get("login"),
+        "author_association": raw.get("author_association"),
+        "labels": [lbl["name"] for lbl in raw.get("labels", [])],
+        "merged": bool(raw.get("merged_at")),
+        "merged_by": (raw.get("merged_by") or {}).get("login")
+        if raw.get("merged_by") else None,
+        "merged_at": raw.get("merged_at"),
+        "closed_at": raw.get("closed_at"),
+        "state": raw.get("state"),
+        "closes": parse_closing_refs(
+            (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
+        ),
+        "url": raw.get("html_url"),
+    }
+
+
+def select_merged_prs(prs, from_date, to_date):
+    """Return normalized PRs merged within [from_date, to_date]."""
+    return [p for p in prs if p["merged"] and in_window(p["merged_at"], from_date, to_date)]

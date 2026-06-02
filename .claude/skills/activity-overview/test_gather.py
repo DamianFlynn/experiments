@@ -84,5 +84,44 @@ class TestCloneAndWindow(unittest.TestCase):
         self.assertFalse(gather.in_window(None, "2026-05-01", "2026-05-31"))
 
 
+import json
+
+
+class TestPrNormalization(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "rest_sample.json")) as fh:
+            self.data = json.load(fh)
+
+    def test_parse_closing_refs_all_keywords(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes #17"), [17])
+        self.assertEqual(
+            gather.parse_closing_refs("Resolves #18 and closes #19"), [18, 19]
+        )
+        self.assertEqual(gather.parse_closing_refs("no references here"), [])
+        # de-duplicates while preserving order
+        self.assertEqual(gather.parse_closing_refs("fix #5 fixed #5"), [5])
+
+    def test_normalize_pr_maps_fields_and_parses_closes(self):
+        pr = gather.normalize_pr(self.data["pulls"][0])
+        self.assertEqual(pr["number"], 42)
+        self.assertEqual(pr["author"], "alice")
+        self.assertEqual(pr["author_association"], "MEMBER")
+        self.assertTrue(pr["merged"])
+        self.assertEqual(pr["merged_by"], "bob")
+        self.assertEqual(pr["labels"], ["enhancement"])
+        self.assertEqual(pr["closes"], [17])
+        self.assertEqual(pr["url"], "https://github.com/o/r/pull/42")
+
+    def test_normalize_pr_unmerged_has_merged_false(self):
+        pr = gather.normalize_pr(self.data["pulls"][1])
+        self.assertFalse(pr["merged"])
+        self.assertIsNone(pr["merged_by"])
+
+    def test_select_merged_prs_only_in_window(self):
+        prs = [gather.normalize_pr(p) for p in self.data["pulls"]]
+        merged = gather.select_merged_prs(prs, "2026-05-01", "2026-05-31")
+        self.assertEqual([p["number"] for p in merged], [42])
+
+
 if __name__ == "__main__":
     unittest.main()
