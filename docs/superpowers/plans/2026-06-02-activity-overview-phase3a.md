@@ -14,7 +14,7 @@
 
 **Branch:** continue on the existing `claude/activity-overview-phase2`-style branch. All commits are local; the only push is the final task.
 
-**Backward-compatibility rule (applies to every task):** Phase 1 **and Phase 2** tests must stay green. Do **not** mutate `fixtures/rest_sample.json`, `fixtures/rest_p2_sample.json`, `fixtures/bundle_sample.json`, or `fixtures/bundle_p2.json`, and do **not** change any existing test assertion. Add **new** fixture files for Phase 3a (`fixtures/git_log_p3_sample.txt`, `fixtures/rest_p3_sample.json`, `fixtures/bundle_p3.json`). Phase 2 keeps its `comments` / `review_comments_count` integer counts on PRs/issues — Phase 3a **adds** the body arrays alongside them, it does not remove the counts. All new windowed/folding logic must degrade permissively when fields are absent (so the Phase 1/2 dateless and bodiless fixtures still process as before — an empty code-walk yields empty `artifacts`/`feature_deltas` and a social-only `timeline`).
+**Backward-compatibility rule (applies to every task):** Phase 1 **and Phase 2** tests must stay green. Do **not** mutate `fixtures/rest_sample.json`, `fixtures/rest_p2_sample.json`, `fixtures/bundle_sample.json`, or `fixtures/bundle_p2.json`, and do **not** change any existing test assertion. **Exception:** Task 10 Step 4a legitimately relaxes the pre-existing render manifest-equality assertions (the manifest legitimately grows by two diagram keys — `content_timeline` and `deltas_bar`), so those specific assertions are updated to per-key/superset checks rather than strict-equality comparisons. Add **new** fixture files for Phase 3a (`fixtures/git_log_p3_sample.txt`, `fixtures/rest_p3_sample.json`, `fixtures/bundle_p3.json`). Phase 2 keeps its `comments` / `review_comments_count` integer counts on PRs/issues — Phase 3a **adds** the body arrays alongside them, it does not remove the counts. All new windowed/folding logic must degrade permissively when fields are absent (so the Phase 1/2 dateless and bodiless fixtures still process as before — an empty code-walk yields empty `artifacts`/`feature_deltas` and a social-only `timeline`).
 
 ---
 
@@ -38,7 +38,7 @@ All paths are under `.claude/skills/activity-overview/`.
 - **Modify `gather.py`** — add pure `normalize_comment`, `normalize_review_comment`, `summarize_reactions`, `derive_open_high_activity`, `parse_code_events`, `classify_artifact_path`; widen `acquire()` to fetch per-PR review comments + per-PR/issue conversation comments + per-issue reactions and to run the full-window `git log --name-status -M -C` walk; record the new PR/issue body arrays + `reactions`/`open_high_activity`.
 - **Modify `link.py`** — add pure `artifact_id`, `build_artifacts`, `build_timeline`, `compute_feature_deltas`; call them from `enrich()` so `bundle["artifacts"]`, `bundle["timeline"]`, `bundle["feature_deltas"]` are populated.
 - **Modify `render.py`** — add pure `emit_content_timeline`, `emit_deltas_bar`; register both in `render()` so `write_diagrams`/manifest gain `content_timeline` + `deltas_bar`.
-- **Modify `test_gather.py`, `test_link.py`, `test_render.py`** — add Phase 3a test classes only; touch no existing assertion.
+- **Modify `test_gather.py`, `test_link.py`, `test_render.py`** — add Phase 3a test classes only; touch no existing assertion. **Exception:** Task 10 Step 4a legitimately relaxes the two pre-existing render manifest-equality assertions in `test_render.py` (the manifest legitimately grows by two diagram keys — `content_timeline` and `deltas_bar`), so those specific assertions are updated to per-key/superset checks rather than strict-equality comparisons.
 - **Create fixtures:** `fixtures/git_log_p3_sample.txt` (recorded `--name-status -M -C` walk), `fixtures/rest_p3_sample.json` (recorded comment/review-comment/reaction arrays), `fixtures/bundle_p3.json` (a bundle carrying raw code-events + comments for the link/render folds).
 - **Modify docs:** `report-template.md` (Content lifecycle + Feature changes sections), `SKILL.md` (mention the new sections), `BUNDLE.md` (document `timeline`, `artifacts`, `feature_deltas`, the new comment/reaction fields; note the deferrals).
 - **Modify `.github/workflows/activity-overview-integration.yml`** — extend the assertion block (Phase 3a contract) and run it green on real data before the phase is done.
@@ -47,7 +47,7 @@ All paths are under `.claude/skills/activity-overview/`.
 
 ## Task 1: Pure comment + review-comment normalizers
 
-The Phase-4 train narratives mine the **actual text** of the discussion. Two pure normalizers map raw GitHub comment objects to the bundle's comment shape `{author, author_association, body, url, id}`, tested offline.
+The Phase-4 train narratives mine the **actual text** of the discussion. Two pure normalizers map raw GitHub comment objects to the bundle's comment shape `{author, author_association, body, url, id, created_at}`, tested offline.
 
 **Files:**
 - Modify: `.claude/skills/activity-overview/gather.py` (add after `normalize_milestone`, before `fetch_all`)
@@ -106,13 +106,14 @@ Add to `gather.py` after `normalize_milestone` (and before `fetch_all`):
 ```python
 def _normalize_comment_obj(raw):
     """Shared mapping for conversation + review comments: the bundle's comment
-    shape {id, author, author_association, body, url}. Pure, permissive."""
+    shape {id, author, author_association, body, url, created_at}. Pure, permissive."""
     return {
         "id": raw.get("id"),
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
         "body": raw.get("body") or "",
         "url": raw.get("html_url"),
+        "created_at": raw.get("created_at"),
     }
 
 
@@ -126,7 +127,7 @@ def normalize_review_comment(raw):
     return _normalize_comment_obj(raw)
 ```
 
-(Both share one mapping because the bundle persists the same five fields for either source — the distinction is which array they land in: `prs[].review_comments` vs `prs[].comments` / `issues[].comments`.)
+(Both share one mapping because the bundle persists the same six fields for either source — the distinction is which array they land in: `prs[].review_comments` vs `prs[].comments` / `issues[].comments`.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1094,7 +1095,7 @@ def build_timeline(bundle):
     return events
 ```
 
-> Note: GitHub comment objects carry `created_at`; the Phase 3a normalizers (Task 1) do not persist it (the spec's comment shape is `{author, author_association, body, url, id}` only), so social `ts` is empty here and code events (which carry `date`) sort first. That is acceptable for Phase 3a — the timeline still merges both layers with well-formed refs; precise social timestamps are a later enrichment. The `subject.path`/`name` are `None` for social events (a comment has no file subject) and populated for code events.
+> Note: GitHub comment objects carry `created_at`; the Phase 3a normalizers (Task 1) persist it in the comment shape `{author, author_association, body, url, id, created_at}`, so social `ts` is populated when the field is present in the bundle. Code events (which carry `date`) sort by their date string. The `subject.path`/`name` are `None` for social events (a comment has no file subject) and populated for code events.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1598,7 +1599,7 @@ Append a Phase 3a section to `BUNDLE.md`:
 
 ## Phase 3a fields (narrative substrate)
 
-- **prs[]** gain `review_comments: [{author, author_association, body, url, id}]`
+- **prs[]** gain `review_comments: [{author, author_association, body, url, id, created_at}]`
   (inline diff comments) and `comments_list: [{...same shape}]` (conversation
   comments). The Phase 2 integer count stays under `comments` /
   `review_comments_count` — the spec's `comments` *body-array* name was already
@@ -1983,7 +1984,7 @@ No "TBD/TODO/handle the edge cases" left as work: every implementation step show
 
 ### 3. Type / name consistency across tasks
 
-- `normalize_comment` / `normalize_review_comment` → `{id, author, author_association, body, url}` — produced in Task 1, consumed in Task 6 (PR/issue arrays) and Task 8 (`build_timeline` reads `author`/`url`). Consistent.
+- `normalize_comment` / `normalize_review_comment` → `{id, author, author_association, body, url, created_at}` — produced in Task 1, consumed in Task 6 (PR/issue arrays) and Task 8 (`build_timeline` reads `author`/`url`/`created_at` for social `ts`). Consistent.
 - `summarize_reactions` → `{"+1","-1","heart","hooray","total"}` — Task 2; read by `derive_open_high_activity` (`reactions["+1"]`), the Task 6 issue enrichment, the Task 12 fixture, and integration assert #6. Keys identical everywhere.
 - `parse_code_events` → `{commit(40), author, date, change∈{add,modify,delete,rename,copy}, path, old_path?}` — Task 4; consumed by `build_artifacts` (Task 7), which dispatches on `change` via `_CHANGE_TO_EVENT` and the rename/copy special-case. `old_path` only on rename/copy — asserted in Task 4 and relied on in Task 7.
 - `classify_artifact_path` lives in `gather.py` (Task 3) and is imported by `link.py` (`import gather`) in Task 7 — single shared gate, returns exactly `readme|doc|example|None`. `build_artifacts` and the integration assert (#7) both restrict `kind ∈ {example,doc,readme}`.
@@ -2009,6 +2010,6 @@ No "TBD/TODO/handle the edge cases" left as work: every implementation step show
 - **`hunk` evidence** on lifecycle events + feature_deltas — needs `-p` diffs; omitted in Phase 3a.
 - **`prs[].files`** — needs PR↔file attribution via merge structure; deferred (events attribute to commits, deltas to pr via commit→PR map best-effort).
 - **`before`/`after`/`detail`** on feature_deltas — language-aware subject extraction; null in Phase 3a.
-- **Precise social `ts`** on timeline comment events — `created_at` not persisted by the Phase 3a comment shape; social events sort with empty ts (code events carry `date`). A later enrichment.
+- **Precise social `ts`** on timeline comment events — `created_at` is persisted by the Phase 3a comment shape (`normalize_comment`/`normalize_review_comment` include it), so social events that carry a real timestamp will sort correctly; events where `created_at` is absent or null fall back to the comment URL as a stable secondary key.
 
 All deferrals are stated in the LOCKED SCOPE section, repeated at their point of use, documented in BUNDLE.md (Task 11), and enforced as `is None` assertions in the integration gate (Task 13 #7/#9) so a future slice that populates them will deliberately flip those asserts.

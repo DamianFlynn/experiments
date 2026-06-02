@@ -104,11 +104,10 @@ def _timeline_text(text):
 
 def emit_content_timeline(bundle):
     """A Mermaid `timeline` of artifact lifecycle events (built/changed/dropped),
-    grouped by date. Derived from `artifacts`."""
+    one period per date with its events. Derived from `artifacts`."""
     meta = bundle.get("meta", {})
     lines = ["timeline",
              f"    title Content lifecycle ({meta.get('from','')} - {meta.get('to','')})"]
-    # Collect (date, text) for every lifecycle event, grouped under its date.
     by_date = {}
     verb = {"add": "built", "change": "changed", "remove": "dropped"}
     for art in bundle.get("artifacts", {}).values():
@@ -120,13 +119,11 @@ def emit_content_timeline(bundle):
                 f"({art.get('kind', '?')}) by {ev.get('author') or '?'}")
             by_date.setdefault(day, []).append(label)
     if not by_date:
-        lines.append("    section Activity")
-        lines.append("        No content events : none")
+        lines.append(f"    {meta.get('from') or '—'} : no content events")
         return "\n".join(lines) + "\n"
     for day in sorted(by_date):
-        lines.append(f"    section {day}")
-        for label in by_date[day]:
-            lines.append(f"        {label} : {day}")
+        events = " : ".join(by_date[day])
+        lines.append(f"    {day} : {events}")
     return "\n".join(lines) + "\n"
 
 

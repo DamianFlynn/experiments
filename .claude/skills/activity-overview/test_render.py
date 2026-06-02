@@ -306,16 +306,28 @@ class TestContentTimeline(unittest.TestCase):
     def test_timeline_header_and_dated_events(self):
         mmd = render.emit_content_timeline(_p3_bundle())
         self.assertTrue(mmd.startswith("timeline"))
+        # idiomatic form: "<date> : <event...>" — date is the period
         self.assertIn("2026-05-03", mmd)
         self.assertIn("2026-05-25", mmd)
         # artifact names surface in the event text
         self.assertIn("firewall.md", mmd)
+        # each dated line has the date as the period (not as an event)
+        dated_lines = [ln for ln in mmd.splitlines() if "2026-05-03" in ln]
+        self.assertTrue(dated_lines)
+        self.assertTrue(dated_lines[0].strip().startswith("2026-05-03"))
 
     def test_timeline_placeholder_when_no_artifacts(self):
         mmd = render.emit_content_timeline(
+            {"meta": {"from": "2026-05-01"}, "artifacts": {}, "feature_deltas": []})
+        self.assertTrue(mmd.startswith("timeline"))
+        # empty-case placeholder: "<from> : no content events"
+        self.assertIn("2026-05-01 : no content events", mmd)
+
+    def test_timeline_placeholder_no_from_uses_em_dash(self):
+        mmd = render.emit_content_timeline(
             {"meta": {}, "artifacts": {}, "feature_deltas": []})
         self.assertTrue(mmd.startswith("timeline"))
-        self.assertIn("No content events", mmd)
+        self.assertIn("no content events", mmd)
 
 
 class TestDeltasBar(unittest.TestCase):

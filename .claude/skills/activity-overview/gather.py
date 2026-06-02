@@ -662,26 +662,28 @@ def acquire(args, env):
         get_page, f"{api}/issues?state=open&sort=updated&direction=desc&per_page=100")
     issues = []
     seen = set()
+    raw_by_num = {}
     for raw in raw_repo_issues + raw_open_issues:
         if raw.get("pull_request"):  # the issues endpoint also lists PRs; skip them
             continue
         if raw["number"] in seen:
             continue
         issue = normalize_issue(raw)
+        raw_by_num[raw["number"]] = raw
         seen.add(issue["number"])
         issues.append(issue)
     for n in sorted(wanted - seen):
         raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
         if raw_issue.get("pull_request"):
             continue
+        raw_by_num[raw_issue["number"]] = raw_issue
         issues.append(normalize_issue(raw_issue))
 
     for issue in issues:
         n = issue["number"]
         conv = fetch_all(get_page, f"{api}/issues/{n}/comments?per_page=100")
         issue["comments_list"] = [normalize_comment(c) for c in conv]
-        issue_obj, _ = http_get_json(f"{api}/issues/{n}", token)
-        issue["reactions"] = summarize_reactions(issue_obj.get("reactions"))
+        issue["reactions"] = summarize_reactions(raw_by_num.get(n, {}).get("reactions"))
         issue["open_high_activity"] = derive_open_high_activity(issue)
 
     workflows = []
