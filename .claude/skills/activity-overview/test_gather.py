@@ -130,6 +130,7 @@ class TestIssueAndFetch(unittest.TestCase):
     def test_normalize_issue_maps_kind_and_state_reason(self):
         issue = gather.normalize_issue(self.data["issues"]["17"])
         self.assertEqual(issue["number"], 17)
+        self.assertEqual(issue["kind"], "other")
         self.assertEqual(issue["author"], "dave")
         self.assertEqual(issue["state_reason"], "completed")
         self.assertEqual(issue["labels"], ["enhancement"])
