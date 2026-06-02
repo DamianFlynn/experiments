@@ -84,6 +84,50 @@ def parse_git_log(raw):
     return commits
 
 
+# git log format for the full-window code-event walk (Phase 3a). Same RECORD_SEP/
+# FIELD_SEP header as parse_git_log, but the BODY is `--name-status` lines so each
+# changed path carries its change type (and rename/copy detection via -M -C gives
+# `R###`/`C###` with old+new paths).
+CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
+
+_STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
+                     "R": "rename", "C": "copy", "T": "modify"}
+
+
+def parse_code_events(raw):
+    """Parse `git log --name-status -M -C` output into raw code-events.
+
+    Each event: {commit, author, date, change, path[, old_path]} where change is
+    add|modify|delete|rename|copy. Rename/copy lines (`R###`/`C###`) carry the old
+    path in `old_path` and the new path in `path`. Pure; permissive on junk lines.
+    """
+    events = []
+    for chunk in raw.split(RECORD_SEP):
+        if not chunk.strip():
+            continue
+        lines = chunk.splitlines()
+        fields = lines[0].split(FIELD_SEP)
+        if len(fields) < 5:
+            continue
+        sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
+        for ln in lines[1:]:
+            if not ln.strip():
+                continue
+            cols = ln.split("\t")
+            status = cols[0].strip()
+            change = _STATUS_TO_CHANGE.get(status[:1])
+            if change is None or len(cols) < 2:
+                continue
+            ev = {"commit": sha, "author": author, "date": date, "change": change}
+            if change in ("rename", "copy") and len(cols) >= 3:
+                ev["old_path"] = cols[1].strip()
+                ev["path"] = cols[2].strip()
+            else:
+                ev["path"] = cols[1].strip()
+            events.append(ev)
+    return events
+
+
 def build_clone_cmd(repo_url, from_date, clone_dir):
     """Construct the bounded, partial clone command (network-free to build)."""
     return [

@@ -511,5 +511,45 @@ class TestAcquireAssemblyP2(unittest.TestCase):
         self.assertEqual(len(b["milestones"]), 3)
 
 
+class TestParseCodeEvents(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "git_log_p3_sample.txt")) as fh:
+            self.raw = fh.read()
+
+    def test_parses_adds_modifies_deletes(self):
+        events = gather.parse_code_events(self.raw)
+        adds = [e for e in events if e["change"] == "add"]
+        self.assertIn(("examples/basic/main.bicep", "Alice", "2026-05-03"),
+                      [(e["path"], e["author"], e["date"]) for e in adds])
+        deletes = [e for e in events if e["change"] == "delete"]
+        self.assertEqual([e["path"] for e in deletes], ["docs/firewall.md"])
+        modifies = [e for e in events if e["change"] == "modify"]
+        self.assertIn("README.md", [e["path"] for e in modifies])
+
+    def test_rename_carries_old_and_new_path(self):
+        events = gather.parse_code_events(self.raw)
+        renames = [e for e in events if e["change"] == "rename"]
+        self.assertEqual(len(renames), 1)
+        r = renames[0]
+        self.assertEqual(r["old_path"], "examples/basic/main.bicep")
+        self.assertEqual(r["path"], "examples/advanced/main.bicep")
+        self.assertEqual(r["author"], "Carol")
+
+    def test_every_event_carries_commit_author_date(self):
+        for e in gather.parse_code_events(self.raw):
+            self.assertEqual(len(e["commit"]), 40)
+            self.assertTrue(e["author"])
+            self.assertEqual(len(e["date"]), 10)
+            self.assertIn(e["change"], {"add", "modify", "delete", "rename", "copy"})
+
+    def test_non_rename_events_have_no_old_path_key(self):
+        events = gather.parse_code_events(self.raw)
+        add = next(e for e in events if e["change"] == "add")
+        self.assertNotIn("old_path", add)
+
+    def test_empty_input_yields_no_events(self):
+        self.assertEqual(gather.parse_code_events(""), [])
+
+
 if __name__ == "__main__":
     unittest.main()

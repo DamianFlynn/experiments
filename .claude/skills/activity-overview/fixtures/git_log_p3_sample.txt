@@ -1,0 +1,11 @@
+c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1Alice2026-05-03Add basic example
+A	examples/basic/main.bicep
+A	docs/firewall.md
+c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2p2a p2bBob2026-05-10Revise README and example
+M	README.md
+M	examples/basic/main.bicep
+c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3Carol2026-05-18Rename example to advanced
+R096	examples/basic/main.bicep	examples/advanced/main.bicep
+c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4Dave2026-05-25Drop stale doc and a source file
+D	docs/firewall.md
+M	src/app.py
