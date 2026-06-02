@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import link  # noqa: E402
 import render  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -207,6 +208,26 @@ class TestMmdcValidation(unittest.TestCase):
             written = json.load(open(bundle_path))
             self.assertEqual(set(written["diagrams"]),
                              {"buckets_pie", "timeline_gantt"})
+
+
+class TestEndToEndOffline(unittest.TestCase):
+    def test_link_then_render_produces_validated_diagrams(self):
+        with open(os.path.join(FIX, "bundle_p2.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        # buckets populated by link
+        self.assertTrue(bundle["buckets"]["shipped"])
+        self.assertTrue(bundle["buckets"]["next_candidates"])
+        with tempfile.TemporaryDirectory() as d:
+            manifest = render.write_diagrams(bundle, d)
+            # validation path runs with a stubbed mmdc (returncode 0)
+            class Ok:
+                returncode = 0
+                stderr = ""
+            render.validate_with_mmdc(list(manifest.values()),
+                                      runner=lambda cmd, **kw: Ok(),
+                                      which=lambda _n: "/usr/bin/mmdc")
+            self.assertEqual(set(bundle["diagrams"]), {"buckets_pie", "timeline_gantt"})
+            self.assertTrue(os.path.exists(manifest["buckets_pie"]))
 
 
 if __name__ == "__main__":
