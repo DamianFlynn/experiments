@@ -254,6 +254,9 @@ def acquire(args, env):
     if not args.no_clone:
         run_git(build_clone_cmd(repo_url, frm, clone_dir))
 
+    # Phase 1 walks the checked-out default branch only; `args.branches` is
+    # recorded in meta for provenance but not yet applied to the log/clone.
+    # Multi-branch commit walking arrives in a later phase.
     log_fmt = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
     raw = run_git([
         "git", "-C", clone_dir, "log",

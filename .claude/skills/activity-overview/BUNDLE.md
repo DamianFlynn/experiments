@@ -10,7 +10,8 @@ empty by gather and populated in later phases.
 Every provenance reference is `{ "type": "pr|issue|commit", "id": <number|sha>,
 "url": "https://..." }`. Every narrative-bearing fact (a train, a bucket entry)
 resolves to at least one such ref. To fact-check any claim in a report, follow its
-ref `url` to GitHub.
+ref `url` to GitHub. (Phase 1 emits `pr` and `issue` refs; commits appear as bare
+SHAs in `trains[].commits` — wrapped `commit` refs arrive in a later phase.)
 
 ## Top-level keys (Phase 1)
 
