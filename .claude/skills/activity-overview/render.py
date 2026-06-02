@@ -114,9 +114,10 @@ def emit_content_timeline(bundle):
     for art in bundle.get("artifacts", {}).values():
         for ev in art.get("lifecycle", []):
             day = (ev.get("date") or "")[:10] or "undated"
+            evt = ev.get("event", "")
             label = _timeline_text(
-                f"{verb.get(ev['event'], ev['event'])} {art['name']} "
-                f"({art['kind']}) by {ev.get('author') or '?'}")
+                f"{verb.get(evt, evt)} {art.get('name', '?')} "
+                f"({art.get('kind', '?')}) by {ev.get('author') or '?'}")
             by_date.setdefault(day, []).append(label)
     if not by_date:
         lines.append("    section Activity")
