@@ -411,6 +411,94 @@ def classify_artifact_path(path):
     return None
 
 
+# Ordered code-area patterns for the directory provider (primary, zero-dep).
+# Each entry is (name, predicate(parts) -> area_id_or_None) tried in order; the
+# first match wins. `parts` is path.split("/"). Patterns are directory-first and
+# match how IaC repos define a module. The generic fallback is last.
+def _avm_area(parts):
+    # avm/res/<service>/<module>/...  -> the 4-segment module subtree.
+    if len(parts) >= 4 and parts[0] == "avm" and parts[1] in ("res", "ptn", "utl"):
+        return "/".join(parts[:4])
+    return None
+
+
+def _main_bicep_dir(parts):
+    # any directory containing a main.bicep -> that directory.
+    if parts and parts[-1] == "main.bicep":
+        return "/".join(parts[:-1]) or parts[0]
+    return None
+
+
+def _terraform_modules_dir(parts):
+    # modules/<name>/... -> modules/<name>.
+    if len(parts) >= 2 and parts[0] == "modules":
+        return "/".join(parts[:2])
+    return None
+
+
+def _tf_dir(parts):
+    # any directory containing a *.tf file -> that directory.
+    if parts and parts[-1].endswith(".tf"):
+        return "/".join(parts[:-1]) or parts[0]
+    return None
+
+
+def _topn_dir(parts, n=2):
+    # generic fallback: the first N path segments (or the file itself if shallower).
+    if not parts:
+        return None
+    return "/".join(parts[:n])
+
+
+DEFAULT_AREA_PATTERNS = [
+    ("avm", _avm_area),
+    ("main_bicep", _main_bicep_dir),
+    ("terraform_modules", _terraform_modules_dir),
+    ("tf_dir", _tf_dir),
+    ("topn", _topn_dir),
+]
+
+
+def classify_code_area(path, patterns):
+    """Map a tracked file path to a single area id (a directory path), or None.
+
+    Tries the ordered `patterns` (AVM module subtree, any main.bicep dir, Terraform
+    modules/<name>, any *.tf dir, else a top-2-segment fallback). Pure."""
+    if not path:
+        return None
+    parts = path.split("/")
+    for _name, fn in patterns:
+        area = fn(parts)
+        if area:
+            return area
+    return None
+
+
+def _area_label(area_id):
+    """A short, human tail for an area id (the last path segment)."""
+    return (area_id or "").rstrip("/").split("/")[-1] or area_id
+
+
+def build_directory_areas(paths, patterns):
+    """Fold a list of tracked file paths into the `code_graph` directory provider.
+
+    Shape: {"provider":"directory","areas":[{"id","label","paths":[...],"edges":[]}]}.
+    Area id is the directory path; label is its tail; edges are deferred (empty).
+    Deterministic (areas sorted by id, paths sorted). Pure."""
+    grouped = {}
+    for p in paths:
+        area = classify_code_area(p, patterns)
+        if area is None:
+            continue
+        grouped.setdefault(area, set()).add(p)
+    areas = [
+        {"id": area, "label": _area_label(area),
+         "paths": sorted(grouped[area]), "edges": []}
+        for area in sorted(grouped)
+    ]
+    return {"provider": "directory", "areas": areas}
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with

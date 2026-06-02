@@ -632,5 +632,77 @@ class TestAcquireAssemblyP3(unittest.TestCase):
         self.assertEqual(kinds, {"add", "modify", "delete", "rename"})
 
 
+class TestDirectoryCodeAreaProvider(unittest.TestCase):
+    def test_avm_module_dir_is_the_four_segment_subtree(self):
+        # AVM: avm/res/<service>/<module>/...  -> area = that 4-seg dir
+        self.assertEqual(
+            gather.classify_code_area(
+                "avm/res/network/firewall-policy/main.bicep",
+                gather.DEFAULT_AREA_PATTERNS),
+            "avm/res/network/firewall-policy")
+        self.assertEqual(
+            gather.classify_code_area(
+                "avm/res/network/firewall-policy/tests/e2e/main.test.bicep",
+                gather.DEFAULT_AREA_PATTERNS),
+            "avm/res/network/firewall-policy")
+
+    def test_dir_containing_main_bicep_is_an_area(self):
+        # Any directory that holds a main.bicep is a module root.
+        paths = ["modules/keyvault/main.bicep", "modules/keyvault/README.md"]
+        areas = gather.build_directory_areas(paths, gather.DEFAULT_AREA_PATTERNS)
+        ids = {a["id"] for a in areas["areas"]}
+        self.assertIn("modules/keyvault", ids)
+
+    def test_terraform_modules_and_tf_dirs(self):
+        self.assertEqual(
+            gather.classify_code_area("modules/vnet/main.tf",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "modules/vnet")
+        # any dir containing *.tf becomes that dir
+        self.assertEqual(
+            gather.classify_code_area("infra/network/variables.tf",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "infra/network")
+
+    def test_generic_fallback_is_top_two_segments(self):
+        self.assertEqual(
+            gather.classify_code_area("src/app/handlers/auth.py",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "src/app")
+        # a top-level file falls back to its own segment
+        self.assertEqual(
+            gather.classify_code_area("README.md", gather.DEFAULT_AREA_PATTERNS),
+            "README.md")
+
+    def test_build_directory_areas_groups_paths_and_shapes_provider(self):
+        paths = [
+            "avm/res/network/firewall-policy/main.bicep",
+            "avm/res/network/firewall-policy/README.md",
+            "avm/res/storage/account/main.bicep",
+            "src/app/handlers/auth.py",
+        ]
+        cg = gather.build_directory_areas(paths, gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(cg["provider"], "directory")
+        by_id = {a["id"]: a for a in cg["areas"]}
+        self.assertEqual(
+            sorted(by_id["avm/res/network/firewall-policy"]["paths"]),
+            ["avm/res/network/firewall-policy/README.md",
+             "avm/res/network/firewall-policy/main.bicep"])
+        # label is a short tail of the id; edges deferred (always empty).
+        fp = by_id["avm/res/network/firewall-policy"]
+        self.assertEqual(fp["label"], "firewall-policy")
+        self.assertEqual(fp["edges"], [])
+
+    def test_empty_paths_yield_empty_provider(self):
+        cg = gather.build_directory_areas([], gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(cg, {"provider": "directory", "areas": []})
+
+    def test_none_path_classifies_to_none(self):
+        self.assertIsNone(
+            gather.classify_code_area(None, gather.DEFAULT_AREA_PATTERNS))
+        self.assertIsNone(
+            gather.classify_code_area("", gather.DEFAULT_AREA_PATTERNS))
+
+
 if __name__ == "__main__":
     unittest.main()
