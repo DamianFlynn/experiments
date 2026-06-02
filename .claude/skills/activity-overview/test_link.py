@@ -4,6 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import gather  # noqa: E402
 import link  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -106,6 +107,50 @@ class TestBucketsAndEnrich(unittest.TestCase):
             [t["id"] for t in twice["trains"]],
         )
         self.assertEqual(len(once["trains"]), len(twice["trains"]))
+
+
+def _well_formed(r):
+    return (
+        isinstance(r, dict)
+        and isinstance(r.get("type"), str)
+        and r.get("id") is not None
+        and isinstance(r.get("url"), str)
+        and r["url"].startswith("https://")
+    )
+
+
+class TestProvenanceAndEndToEnd(unittest.TestCase):
+    def test_every_train_and_bucket_ref_is_well_formed(self):
+        with open(os.path.join(FIX, "bundle_sample.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        for t in bundle["trains"]:
+            self.assertTrue(t["evidence"], "train must carry evidence")
+            for ev in t["evidence"]:
+                self.assertTrue(_well_formed(ev), f"bad ref {ev}")
+        for r in bundle["buckets"]["shipped"]:
+            self.assertTrue(_well_formed(r), f"bad ref {r}")
+
+    def test_gather_assembly_into_link_offline(self):
+        # Build a bundle purely from fixtures — no git, no network.
+        with open(os.path.join(FIX, "git_log_sample.txt")) as fh:
+            commits = gather.parse_git_log(fh.read())
+        with open(os.path.join(FIX, "rest_sample.json")) as fh:
+            data = json.load(fh)
+        prs = gather.select_merged_prs(
+            [gather.normalize_pr(p) for p in data["pulls"]],
+            "2026-05-01", "2026-05-31",
+        )
+        issues = [gather.normalize_issue(data["issues"][str(n)])
+                  for p in prs for n in p["closes"] if str(n) in data["issues"]]
+        meta = {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"}
+        bundle = gather.build_bundle(meta, commits, prs, issues)
+
+        link.enrich(bundle)
+
+        self.assertEqual([p["number"] for p in bundle["prs"]], [42])
+        self.assertEqual(bundle["trains"][0]["id"], "train-issue-17")
+        shipped = {(r["type"], r["id"]) for r in bundle["buckets"]["shipped"]}
+        self.assertEqual(shipped, {("pr", 42), ("issue", 17)})
 
 
 if __name__ == "__main__":
