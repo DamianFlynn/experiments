@@ -282,6 +282,28 @@ def normalize_milestone(raw):
     }
 
 
+def _normalize_comment_obj(raw):
+    """Shared mapping for conversation + review comments: the bundle's comment
+    shape {id, author, author_association, body, url}. Pure, permissive."""
+    return {
+        "id": raw.get("id"),
+        "author": (raw.get("user") or {}).get("login"),
+        "author_association": raw.get("author_association"),
+        "body": raw.get("body") or "",
+        "url": raw.get("html_url"),
+    }
+
+
+def normalize_comment(raw):
+    """Map a GitHub issue/PR conversation comment to the bundle's comment shape."""
+    return _normalize_comment_obj(raw)
+
+
+def normalize_review_comment(raw):
+    """Map a GitHub PR review comment (inline diff comment) to the same shape."""
+    return _normalize_comment_obj(raw)
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with

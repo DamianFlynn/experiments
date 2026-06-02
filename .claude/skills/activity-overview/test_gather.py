@@ -364,6 +364,42 @@ class TestWorkflowsReleasesMilestones(unittest.TestCase):
         self.assertEqual(ms["state"], "open")
 
 
+class TestCommentsAndReactions(unittest.TestCase):
+    def test_normalize_comment_maps_body_author_url_id(self):
+        raw = {
+            "id": 9001, "body": "Could you split this into two functions?",
+            "user": {"login": "bob"}, "author_association": "MEMBER",
+            "html_url": "https://github.com/o/r/issues/17#issuecomment-9001",
+        }
+        c = gather.normalize_comment(raw)
+        self.assertEqual(c["id"], 9001)
+        self.assertEqual(c["author"], "bob")
+        self.assertEqual(c["author_association"], "MEMBER")
+        self.assertEqual(c["body"], "Could you split this into two functions?")
+        self.assertEqual(c["url"],
+                         "https://github.com/o/r/issues/17#issuecomment-9001")
+
+    def test_normalize_comment_permissive_on_missing_fields(self):
+        c = gather.normalize_comment({"id": 1})
+        self.assertEqual(c["id"], 1)
+        self.assertIsNone(c["author"])
+        self.assertEqual(c["body"], "")
+        self.assertIsNone(c["url"])
+        self.assertIsNone(c["author_association"])
+
+    def test_normalize_review_comment_maps_same_shape(self):
+        raw = {
+            "id": 7002, "body": "nit: rename `x`.",
+            "user": {"login": "carol"}, "author_association": "CONTRIBUTOR",
+            "html_url": "https://github.com/o/r/pull/42#discussion_r7002",
+        }
+        rc = gather.normalize_review_comment(raw)
+        self.assertEqual(rc, {"id": 7002, "author": "carol",
+                              "author_association": "CONTRIBUTOR",
+                              "body": "nit: rename `x`.",
+                              "url": "https://github.com/o/r/pull/42#discussion_r7002"})
+
+
 class TestAcquireAssemblyP2(unittest.TestCase):
     """Compose the pure helpers over recorded REST, as acquire() does, offline."""
 
