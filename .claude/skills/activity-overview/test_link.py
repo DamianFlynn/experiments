@@ -222,5 +222,71 @@ class TestSelectMilestonesAndBuckets(unittest.TestCase):
         self.assertNotIn(("pr", 1), all_refs)
 
 
+class TestBuildArtifacts(unittest.TestCase):
+    def _events(self):
+        return [
+            {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+             "change": "add", "path": "examples/basic/main.bicep"},
+            {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+             "change": "add", "path": "docs/firewall.md"},
+            {"commit": "c2"*20, "author": "Bob", "date": "2026-05-10",
+             "change": "modify", "path": "README.md"},
+            {"commit": "c2"*20, "author": "Bob", "date": "2026-05-10",
+             "change": "modify", "path": "examples/basic/main.bicep"},
+            {"commit": "c3"*20, "author": "Carol", "date": "2026-05-18",
+             "change": "rename", "old_path": "examples/basic/main.bicep",
+             "path": "examples/advanced/main.bicep"},
+            {"commit": "c4"*20, "author": "Dave", "date": "2026-05-25",
+             "change": "delete", "path": "docs/firewall.md"},
+            {"commit": "c4"*20, "author": "Dave", "date": "2026-05-25",
+             "change": "modify", "path": "src/app.py"},
+        ]
+
+    def _bundle(self):
+        return {"meta": {"owner": "o", "repo": "r"}, "code_events": self._events(),
+                "commits": [], "prs": [], "issues": []}
+
+    def test_unrecognized_paths_are_ignored(self):
+        arts = link.build_artifacts(self._bundle())
+        paths = {a["path"] for a in arts.values()}
+        self.assertNotIn("src/app.py", paths)  # not a tracked artifact kind
+
+    def test_add_then_change_builds_ordered_lifecycle(self):
+        arts = link.build_artifacts(self._bundle())
+        readme = next(a for a in arts.values() if a["path"] == "README.md")
+        self.assertEqual(readme["kind"], "readme")
+        self.assertEqual([e["event"] for e in readme["lifecycle"]], ["change"])
+        self.assertEqual(readme["status"], "live")
+        self.assertIsNone(readme["code_area"])  # graphify deferred to Phase 3b
+
+    def test_delete_sets_status_removed(self):
+        arts = link.build_artifacts(self._bundle())
+        doc = next(a for a in arts.values() if a["path"] == "docs/firewall.md")
+        self.assertEqual([e["event"] for e in doc["lifecycle"]],
+                         ["add", "remove"])
+        self.assertEqual(doc["status"], "removed")
+
+    def test_rename_links_replaced_and_replaced_by(self):
+        arts = link.build_artifacts(self._bundle())
+        old_id = link.artifact_id("examples/basic/main.bicep")
+        new_id = link.artifact_id("examples/advanced/main.bicep")
+        self.assertEqual(arts[old_id]["status"], "replaced")
+        self.assertEqual(arts[old_id]["replaced_by"], new_id)
+        # the new artifact records an `add` event from the rename commit
+        self.assertEqual(arts[new_id]["lifecycle"][0]["event"], "add")
+        self.assertEqual(arts[new_id]["status"], "live")
+
+    def test_lifecycle_refs_are_well_formed_commit_refs(self):
+        arts = link.build_artifacts(self._bundle())
+        for a in arts.values():
+            for ev in a["lifecycle"]:
+                self.assertEqual(ev["ref"]["type"], "commit")
+                self.assertEqual(len(ev["ref"]["id"]), 40)
+                self.assertTrue(ev["ref"]["url"].startswith("https://"))
+
+    def test_empty_code_events_yields_empty_map(self):
+        self.assertEqual(link.build_artifacts({"code_events": []}), {})
+
+
 if __name__ == "__main__":
     unittest.main()

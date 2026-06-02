@@ -4,6 +4,8 @@ import json
 import re
 import sys
 
+import gather  # for classify_artifact_path (shared artifact-kind gate)
+
 _PR_RE = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
 
 
@@ -78,6 +80,81 @@ def train_index(trains):
         for n in t.get("prs", []):
             idx[("pr", n)] = t["id"]
     return idx
+
+
+def artifact_id(path):
+    """Stable artifact id from a path. Deterministic so the same file keeps the
+    same id across periods (the spec's series-continuity rule)."""
+    return "art:" + (path or "")
+
+
+def _commit_url(bundle, sha):
+    meta = bundle.get("meta", {})
+    owner, repo = meta.get("owner"), meta.get("repo")
+    if owner and repo:
+        return f"https://github.com/{owner}/{repo}/commit/{sha}"
+    return f"https://github.com/commit/{sha}"
+
+
+# git change -> artifact lifecycle event. add/copy introduce; modify changes;
+# delete removes; rename is handled specially (remove old + add new).
+_CHANGE_TO_EVENT = {"add": "add", "copy": "add", "modify": "change", "delete": "remove"}
+
+
+def build_artifacts(bundle):
+    """Fold raw `code_events` into the per-artifact lifecycle ledger (file-level).
+
+    Each tracked path (readme/doc/example) gets one entry with an ordered
+    lifecycle. Renames link the old artifact (status `replaced`, `replaced_by`)
+    to the new one. `code_area` is null in Phase 3a (graphify is Phase 3b). Pure.
+    """
+    artifacts = {}
+
+    def ensure(path):
+        kind = gather.classify_artifact_path(path)
+        if kind is None:
+            return None
+        aid = artifact_id(path)
+        if aid not in artifacts:
+            artifacts[aid] = {
+                "kind": kind, "path": path, "name": path.split("/")[-1],
+                "status": "live", "replaced_by": None, "code_area": None,
+                "lifecycle": [],
+            }
+        return aid
+
+    def append_event(aid, event, ev):
+        artifacts[aid]["lifecycle"].append({
+            "event": event, "commit": ev["commit"], "author": ev["author"],
+            "date": ev["date"],
+            "ref": {"type": "commit", "id": ev["commit"],
+                    "url": _commit_url(bundle, ev["commit"])},
+        })
+
+    for ev in bundle.get("code_events", []):
+        change = ev["change"]
+        if change in ("rename", "copy") and ev.get("old_path"):
+            old_aid = ensure(ev["old_path"])
+            new_aid = ensure(ev["path"])
+            if new_aid is not None:
+                append_event(new_aid, "add", ev)
+            if old_aid is not None:
+                append_event(old_aid, "remove", ev)
+                artifacts[old_aid]["status"] = "replaced"
+                artifacts[old_aid]["replaced_by"] = new_aid
+            continue
+        aid = ensure(ev["path"])
+        if aid is None:
+            continue
+        append_event(aid, _CHANGE_TO_EVENT.get(change, "change"), ev)
+
+    # Final status from the last lifecycle event (unless already `replaced`).
+    for a in artifacts.values():
+        if a["status"] == "replaced":
+            continue
+        last = a["lifecycle"][-1]["event"] if a["lifecycle"] else None
+        a["status"] = "removed" if last == "remove" else "live"
+    return artifacts
 
 
 def build_trains(bundle):
