@@ -1,0 +1,140 @@
+name: activity-overview integration (manual)
+
+# Live smoke test: runs the real gather -> link pipeline against a real repo
+# and window, hitting the GitHub API and cloning the target. Manual-only so it
+# never runs automatically and never needs a secret unless you trigger it.
+#
+# Setup (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
+#   Settings -> Secrets and variables -> Actions -> New repository secret
+# Use a fine-grained PAT with read-only "Contents" + "Pull requests" +
+# "Issues" on the target repo. Do NOT paste the token anywhere but that page.
+
+on:
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "Target repo owner"
+        required: true
+        default: "Azure"
+      repo:
+        description: "Target repo name"
+        required: true
+        default: "bicep-registry-modules"
+      from:
+        description: "Window start (YYYY-MM-DD)"
+        required: true
+      to:
+        description: "Window end (YYYY-MM-DD)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify the integration secret is present
+        env:
+          ACTIVITY_TEST_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+        run: |
+          if [ -z "$ACTIVITY_TEST_TOKEN" ]; then
+            echo "::error::ACTIVITY_TEST_TOKEN secret is not set. Add it under" \
+                 "Settings -> Secrets and variables -> Actions, then re-run."
+            exit 1
+          fi
+          echo "secret present"
+
+      # Phase 3 will add graphify here, e.g.:
+      #   - name: Install graphify
+      #     run: <install step>
+      # Until gather.py invokes graphify (Phase 3), there is nothing for it to
+      # exercise, so it is intentionally omitted from this smoke test for now.
+
+      - name: Gather + link a real window
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+        run: |
+          cd .claude/skills/activity-overview
+          python3 gather.py \
+            --owner "${{ inputs.owner }}" --repo "${{ inputs.repo }}" \
+            --from "${{ inputs.from }}" --to "${{ inputs.to }}" \
+            --out workspace/bundle.json
+          python3 link.py workspace/bundle.json
+
+      - name: Assert the bundle is well-formed and self-consistent
+        env:
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+        run: |
+          cd .claude/skills/activity-overview
+          python3 - <<'PY'
+          import json, os, re
+          frm, to = os.environ["FROM"], os.environ["TO"]
+          b = json.load(open("workspace/bundle.json"))
+
+          assert b["meta"]["schema_version"] == 1, "missing schema_version"
+          prs, issues = b["prs"], b["issues"]
+          commits, trains = b["commits"], b["trains"]
+          shipped = b["buckets"]["shipped"]
+          pr_nums = {p["number"] for p in prs}
+          shas = {c["sha"] for c in commits}
+
+          def well_formed(r):
+              return (isinstance(r.get("type"), str) and r.get("id") is not None
+                      and str(r.get("url", "")).startswith("https://"))
+
+          # 1. Every PR in the bundle is actually merged within the window.
+          for p in prs:
+              assert p["merged"] and p["merged_at"], f"PR {p['number']} not merged"
+              assert frm <= p["merged_at"][:10] <= to, \
+                  f"PR {p['number']} merged_at {p['merged_at']} outside [{frm},{to}]"
+              assert str(p["url"]).startswith("https://"), p
+
+          # 2. The only issues are closing issues, each referenced by some PR.
+          closed_refs = {n for p in prs for n in p["closes"]}
+          for i in issues:
+              assert i["number"] in closed_refs, \
+                  f"issue {i['number']} not referenced by any PR's closes"
+
+          # 3. Trains: id shape, evidence, and referential integrity to prs/commits.
+          id_re = re.compile(r"^train-(issue|pr)-\d+$")
+          for t in trains:
+              assert id_re.match(t["id"]), f"bad train id {t['id']}"
+              assert t["outcome"] == "shipped", t["id"]
+              assert t["evidence"] and all(well_formed(r) for r in t["evidence"]), t["id"]
+              assert set(t["prs"]) <= pr_nums, f"{t['id']} references unknown PR"
+              assert set(t["commits"]) <= shas, f"{t['id']} references unknown commit"
+              if t["root_issue"] is not None:
+                  assert t["id"] == f"train-issue-{t['root_issue']}", t["id"]
+
+          # 4. Every merged PR is grouped into exactly one train.
+          trained = [n for t in trains for n in t["prs"]]
+          assert sorted(trained) == sorted(pr_nums), "PRs not all grouped into trains"
+          assert len(trained) == len(set(trained)), "a PR appears in multiple trains"
+
+          # 5. shipped bucket = merged PRs (+ completed issues), all well-formed.
+          assert all(well_formed(r) for r in shipped), "malformed shipped ref"
+          assert {r["id"] for r in shipped if r["type"] == "pr"} == pr_nums, \
+              "shipped PR set does not match merged PRs"
+
+          print(f"OK: prs={len(prs)} issues={len(issues)} "
+                f"commits={len(commits)} trains={len(trains)} shipped={len(shipped)}")
+          if not prs:
+              print("::warning::window produced no merged PRs — "
+                    "invariants held vacuously; pick a window with known activity")
+          PY
+
+      - name: Upload the bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: activity-bundle
+          path: .claude/skills/activity-overview/workspace/bundle.json
+          if-no-files-found: error
