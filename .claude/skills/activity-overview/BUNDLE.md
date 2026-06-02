@@ -1,9 +1,12 @@
-# Bundle Schema (Phase 1)
+# Bundle Schema
 
-The bundle is a single JSON object produced by the Phase 1 pipeline. The **gather**
-step (`gather.py`) fills `meta`, `commits`, `prs`, and `issues`; the **link** step
-(`link.py`) then fills `trains` and `buckets`. Every other top-level key is reserved
-empty by gather and populated in later phases.
+The bundle is a single JSON object produced by the pipeline. The **gather** step
+(`gather.py`) fills `meta`, `commits`, `prs`, `issues`, and — from Phase 2 —
+`workflows`, `workflow_stats`, `releases`, `milestones`; the **link** step
+(`link.py`) then fills `trains` and `buckets`; the **render** step (`render.py`)
+fills `diagrams`. Every other top-level key is reserved empty by gather and
+populated in later phases. (See **Phase 2 fields** below for the fields added
+after the walking skeleton.)
 
 ## Ref convention
 
