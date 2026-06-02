@@ -308,6 +308,18 @@ class TestReviewsAndTimeline(unittest.TestCase):
         ]
         self.assertEqual(gather.parse_timeline_crossrefs(raw), [18, 19])
 
+    def test_parse_timeline_crossrefs_skips_pr_sourced_xref(self):
+        raw = [{"event": "cross-referenced",
+                "source": {"issue": {"number": 99, "pull_request": {"url": "x"}}}}]
+        self.assertEqual(gather.parse_timeline_crossrefs(raw), [])
+
+    def test_parse_timeline_crossrefs_ignores_disconnected(self):
+        raw = [
+            {"event": "connected", "subject": {"number": 5}},
+            {"event": "disconnected", "subject": {"number": 5}},
+        ]
+        self.assertEqual(gather.parse_timeline_crossrefs(raw), [5])
+
 
 class TestWorkflowsReleasesMilestones(unittest.TestCase):
     def test_normalize_workflow_maps_fields(self):

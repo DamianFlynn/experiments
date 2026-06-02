@@ -195,6 +195,7 @@ def summarize_reviews(raw_reviews):
         if state not in _REVIEW_RANK:
             continue
         ts = r.get("submitted_at") or ""
+        # ISO-8601 (UTC `Z`) timestamps sort correctly as plain strings.
         if login not in latest or ts >= latest[login][0]:
             latest[login] = (ts, state)
     reviewers = sorted(latest)
@@ -218,7 +219,7 @@ def parse_timeline_crossrefs(raw_timeline):
             issue = (ev.get("source") or {}).get("issue") or {}
             if issue.get("pull_request") is None:
                 num = issue.get("number")
-        elif kind in ("connected", "disconnected"):
+        elif kind == "connected":
             num = (ev.get("subject") or {}).get("number")
         if num is not None and num not in out:
             out.append(num)
