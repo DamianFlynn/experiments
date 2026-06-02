@@ -22,16 +22,17 @@ class TestBuildBundle(unittest.TestCase):
 
         # later-phase fields are reserved but empty
         for key in ["timeline", "feature_deltas", "trains", "blockers",
-                    "releases", "milestones", "docsRefs"]:
+                    "releases", "milestones", "docsRefs", "workflows"]:
             self.assertEqual(bundle[key], [], f"{key} should be reserved empty list")
         for key in ["artifacts", "people", "modules", "code_owners", "flow",
-                    "label_taxonomy", "diagrams", "workflow_stats"]:
+                    "label_taxonomy", "diagrams", "workflow_stats", "halls",
+                    "code_graph", "release_train", "sprints", "project"]:
             self.assertEqual(bundle[key], {}, f"{key} should be reserved empty dict")
         self.assertEqual(
             bundle["buckets"],
             {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
         )
-        self.assertIn("schema_version", bundle["meta"])
+        self.assertEqual(bundle["meta"]["schema_version"], 1)
 
 
 if __name__ == "__main__":
