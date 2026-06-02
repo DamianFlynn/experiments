@@ -429,6 +429,41 @@ class TestCommentsAndReactions(unittest.TestCase):
              "reactions": {"+1": 1, "total": 1}}))
 
 
+class TestArtifactPathClassifier(unittest.TestCase):
+    def test_readme_basename_wins(self):
+        self.assertEqual(gather.classify_artifact_path("README.md"), "readme")
+        self.assertEqual(gather.classify_artifact_path("modules/x/README"), "readme")
+        self.assertEqual(
+            gather.classify_artifact_path("docs/README.markdown"), "readme")
+
+    def test_example_dir_or_suffix(self):
+        self.assertEqual(
+            gather.classify_artifact_path("examples/basic/main.bicep"), "example")
+        self.assertEqual(
+            gather.classify_artifact_path("modules/x/examples/full/main.tf"), "example")
+        self.assertEqual(
+            gather.classify_artifact_path("config.example.json"), "example")
+
+    def test_doc_md_or_under_docs(self):
+        self.assertEqual(gather.classify_artifact_path("docs/design.md"), "doc")
+        self.assertEqual(gather.classify_artifact_path("notes/CHANGELOG.md"), "doc")
+        self.assertEqual(gather.classify_artifact_path("docs/spec.txt"), "doc")
+
+    def test_unrecognized_paths_are_none(self):
+        self.assertIsNone(gather.classify_artifact_path("modules/x/main.bicep"))
+        self.assertIsNone(gather.classify_artifact_path("src/app.py"))
+        self.assertIsNone(gather.classify_artifact_path(""))
+        self.assertIsNone(gather.classify_artifact_path(None))
+
+    def test_precedence_readme_over_example_over_doc(self):
+        # a README inside an examples dir is still a README (basename wins)
+        self.assertEqual(
+            gather.classify_artifact_path("examples/basic/README.md"), "readme")
+        # an example markdown under examples/ is an example, not a doc
+        self.assertEqual(
+            gather.classify_artifact_path("examples/basic/notes.md"), "example")
+
+
 class TestAcquireAssemblyP2(unittest.TestCase):
     """Compose the pure helpers over recorded REST, as acquire() does, offline."""
 

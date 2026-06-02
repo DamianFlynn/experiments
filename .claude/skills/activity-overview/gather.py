@@ -338,6 +338,28 @@ def derive_open_high_activity(issue):
     return comments >= _HIGH_ACTIVITY_COMMENTS or upvotes >= _HIGH_ACTIVITY_UPVOTES
 
 
+def classify_artifact_path(path):
+    """Classify a changed file path into a tracked artifact kind, or None.
+
+    File granularity only (Phase 3a). Precedence: readme > example > doc.
+      - readme : basename matches README* (any/no extension)
+      - example: under an `examples/` directory, or a `*.example*` filename
+      - doc    : a `*.md` file, or any file under a `docs/` directory
+      - else   : None (ignored at file granularity)
+    `symbol` and `comment` kinds need hunk/AST parsing and are deferred."""
+    if not path:
+        return None
+    parts = path.split("/")
+    base = parts[-1]
+    if base.upper().startswith("README"):
+        return "readme"
+    if "examples" in parts[:-1] or ".example" in base.lower():
+        return "example"
+    if base.lower().endswith(".md") or "docs" in parts[:-1]:
+        return "doc"
+    return None
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
