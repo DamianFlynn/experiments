@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 INSTALL_HINT = (
     "Install mermaid-cli: `npm install -g @mermaid-js/mermaid-cli`."
@@ -44,9 +45,11 @@ def _day(ts, default):
 
 def _gantt_label(text):
     """Mermaid gantt task names cannot contain ':' (the field separator) or
-    newlines. Collapse them and trim."""
-    clean = (text or "").replace("%%", "%").replace(":", " -").replace("\n", " ").strip()
-    return clean[:60] or "item"
+    newlines, and `%%` starts a comment. Sanitise and trim."""
+    clean = (text or "").replace(":", " -").replace("\n", " ")
+    while "%%" in clean:  # collapse any run of '%' down so no comment marker survives
+        clean = clean.replace("%%", "%")
+    return clean.strip()[:60] or "item"
 
 
 def emit_timeline_gantt(bundle):
@@ -131,20 +134,23 @@ def ensure_mmdc(which=shutil.which):
 
 def validate_with_mmdc(paths, export=None, runner=subprocess.run, which=shutil.which):
     """Compile each .mmd with mmdc; raise RuntimeError on the first that fails to
-    render. When `export` is 'svg'/'png' the image is kept beside the .mmd;
-    otherwise it is rendered to a temp .svg purely to validate, then removed."""
+    render. When `export` is 'svg'/'png' the image is written beside the .mmd;
+    when `export` is None the diagram is compiled to a throwaway temp file purely
+    to validate, so a validation-only run never overwrites or deletes a user's
+    own exported images next to the `.mmd`."""
     mmdc = ensure_mmdc(which)
     for path in paths:
-        out = os.path.splitext(path)[0] + "." + (export or "svg")
-        result = runner([mmdc, "-i", path, "-o", out, "-q"],
-                        capture_output=True, text=True)
+        if export in ("svg", "png"):
+            out = os.path.splitext(path)[0] + "." + export
+            result = runner([mmdc, "-i", path, "-o", out, "-q"],
+                            capture_output=True, text=True)
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "validate.svg")
+                result = runner([mmdc, "-i", path, "-o", out, "-q"],
+                                capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"mmdc failed to render {path}:\n{result.stderr}")
-        if export is None and out != path:
-            try:
-                os.remove(out)
-            except OSError:
-                pass
 
 
 def parse_args(argv):

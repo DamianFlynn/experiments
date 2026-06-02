@@ -97,10 +97,12 @@ class TestTimelineGantt(unittest.TestCase):
         self.assertEqual(task.count("2026-06-15"), 2)
 
     def test_gantt_label_strips_comment_marker(self):
-        b = _bundle()
-        b["prs"][0]["title"] = "Fix %% parser"
-        mmd = render.emit_timeline_gantt(b)
-        self.assertNotIn("%%", mmd)
+        # even a run longer than two percents must not leave a `%%` comment marker
+        for title in ("Fix %% parser", "weird %%%% title"):
+            b = _bundle()
+            b["prs"][0]["title"] = title
+            mmd = render.emit_timeline_gantt(b)
+            self.assertNotIn("%%", mmd)
 
 
 class TestWriteDiagrams(unittest.TestCase):
@@ -182,6 +184,29 @@ class TestMmdcValidation(unittest.TestCase):
                                       which=lambda _n: "/usr/bin/mmdc")
             self.assertTrue(created)
             self.assertFalse(os.path.exists(created[0]))  # temp svg cleaned up
+
+    def test_validate_no_export_preserves_existing_sibling_svg(self):
+        def fake_run(cmd, **kw):
+            out = cmd[cmd.index("-o") + 1]
+            with open(out, "w") as fh:
+                fh.write("<svg/>")
+
+            class R:
+                returncode = 0
+                stderr = ""
+            return R()
+
+        with tempfile.TemporaryDirectory() as d:
+            mmd = os.path.join(d, "x.mmd")
+            with open(mmd, "w") as fh:
+                fh.write("pie\n")
+            sibling = os.path.join(d, "x.svg")  # a user's pre-existing export
+            with open(sibling, "w") as fh:
+                fh.write("USER EXPORT")
+            render.validate_with_mmdc([mmd], runner=fake_run,
+                                      which=lambda _n: "/usr/bin/mmdc")
+            self.assertTrue(os.path.exists(sibling))               # not deleted
+            self.assertEqual(open(sibling).read(), "USER EXPORT")  # not overwritten
 
     def test_validate_keeps_exported_image(self):
         def fake_run(cmd, **kw):

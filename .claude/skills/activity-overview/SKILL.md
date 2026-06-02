@@ -20,7 +20,8 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    ```bash
    python3 link.py workspace/bundle.json
    ```
-   This adds `trains` and `buckets.shipped`.
+   This adds `trains` and classifies all four `buckets` (`shipped`, `rejected`,
+   `in_flight`, `next_candidates`).
 3. **Render diagrams.** Preflight: `mmdc` must be on PATH
    (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`). Then:
    ```bash
