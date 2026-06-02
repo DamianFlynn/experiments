@@ -1,0 +1,7 @@
+# CODEOWNERS — comments and blank lines are ignored
+
+*                       @org/maintainers
+avm/res/network/        @alice @bob
+avm/res/storage/        @carol
+docs/                   @org/docs-team @dave
+*.bicep                 @bicep-reviewers
