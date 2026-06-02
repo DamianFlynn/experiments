@@ -1040,5 +1040,37 @@ class TestResolveModuleRef(unittest.TestCase):
                                       gather.DEFAULT_AREA_PATTERNS))
 
 
+class TestWalkArmDeployments(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            self.arm = json.load(fh)
+
+    def test_walks_full_transitive_tree(self):
+        nodes = gather.walk_arm_deployments(self.arm)
+        # storageDeployment (d1) + its nested telemetry (d2) + kvDeployment (d1) = 3
+        self.assertEqual(len(nodes), 3)
+
+    def test_records_depth_and_metadata_name(self):
+        nodes = gather.walk_arm_deployments(self.arm)
+        by_name = {n["name"]: n for n in nodes}
+        self.assertEqual(by_name["storageDeployment"]["depth"], 1)
+        self.assertEqual(by_name["storageDeployment"]["metadata_name"], "storage-account")
+        self.assertEqual(by_name["kvDeployment"]["metadata_name"], "vault")
+        # the telemetry deployment is one level deeper
+        self.assertEqual(
+            by_name["46d3xbcp.res.storage-storageaccount.0-9-0.abcde"]["depth"], 2)
+
+    def test_handles_resources_as_dict_symbolic_names(self):
+        arm = {"resources": {
+            "dep": {"type": "Microsoft.Resources/deployments", "name": "d",
+                    "properties": {"template": {"metadata": {"name": "x"},
+                                                "resources": []}}}}}
+        self.assertEqual(len(gather.walk_arm_deployments(arm)), 1)
+
+    def test_empty_or_none_arm_yields_nothing(self):
+        self.assertEqual(gather.walk_arm_deployments({}), [])
+        self.assertEqual(gather.walk_arm_deployments(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

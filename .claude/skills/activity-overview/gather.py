@@ -612,6 +612,39 @@ def resolve_module_ref(ref_info, base_path, patterns=None):
     return None
 
 
+def _arm_resources(template):
+    """ARM `resources` may be a list or (symbolic-name) dict; normalise to a list."""
+    res = (template or {}).get("resources", [])
+    return list(res.values()) if isinstance(res, dict) else (res or [])
+
+
+def walk_arm_deployments(arm_json):
+    """Yield every Microsoft.Resources/deployments node in the full transitive tree.
+
+    Each node is {name, depth, metadata_name, depends_on}. `depth` is 1 for a
+    top-level module instantiation and increments per nesting level. `metadata_name`
+    is the inner template's `metadata.name` (a short module name, best-effort
+    identity hint). Pure."""
+    nodes = []
+
+    def visit(template, depth):
+        for res in _arm_resources(template):
+            if not isinstance(res, dict):
+                continue
+            if res.get("type") == "Microsoft.Resources/deployments":
+                inner = (res.get("properties") or {}).get("template") or {}
+                nodes.append({
+                    "name": res.get("name"),
+                    "depth": depth + 1,
+                    "metadata_name": (inner.get("metadata") or {}).get("name"),
+                    "depends_on": res.get("dependsOn", []),
+                })
+                visit(inner, depth + 1)
+
+    visit(arm_json or {}, 0)
+    return nodes
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 
