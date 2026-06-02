@@ -912,5 +912,64 @@ class TestFacetsAndKind(unittest.TestCase):
             "other")
 
 
+class TestAcquireAssemblyP3b(unittest.TestCase):
+    """Compose the Phase 3b helpers over recorded inputs, offline."""
+
+    def _bundle(self):
+        with open(os.path.join(FIX, "git_log_p3_sample.txt")) as fh:
+            code_events = gather.parse_code_events(fh.read())
+        with open(os.path.join(FIX, "codeowners_sample.txt")) as fh:
+            code_owners = gather.parse_codeowners(fh.read())
+
+        # paths the provider sees come from code_events + commit file lists
+        paths = sorted({e["path"] for e in code_events}
+                       | {e["old_path"] for e in code_events if e.get("old_path")})
+        code_graph = gather.select_code_area_provider(
+            paths, "clone", which=lambda _n: None)  # graphify absent -> directory
+
+        prs = [{"number": 42, "labels": ["area: networking", "Type: Bug"],
+                "title": "fix policy", "body": ""}]
+        issues = [{"number": 18, "labels": ["area: storage", "priority: high"],
+                   "title": "Need storage module", "body": "module please",
+                   "state": "open"}]
+        all_labels = sorted({l for it in prs + issues for l in it["labels"]})
+        taxonomy = gather.detect_label_taxonomy(all_labels)
+        for it in prs + issues:
+            it["facets"] = gather.apply_facets(it, taxonomy)
+        for issue in issues:
+            issue["kind"] = gather.classify_issue_kind(
+                issue, taxonomy, types_present=False)
+
+        meta = {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"}
+        bundle = gather.build_bundle(meta, [], prs, issues)
+        bundle["code_events"] = code_events
+        bundle["code_graph"] = code_graph
+        bundle["code_owners"] = code_owners
+        bundle["label_taxonomy"] = taxonomy
+        return bundle
+
+    def test_code_graph_is_directory_provider_with_areas(self):
+        b = self._bundle()
+        self.assertEqual(b["code_graph"]["provider"], "directory")
+        self.assertTrue(b["code_graph"]["areas"])
+        for a in b["code_graph"]["areas"]:
+            self.assertTrue(a["id"] and a["paths"])
+
+    def test_label_taxonomy_and_facets_present(self):
+        b = self._bundle()
+        self.assertIn("source", b["label_taxonomy"])
+        pr = b["prs"][0]
+        self.assertEqual(pr["facets"]["area"], "area: networking")
+        issue = b["issues"][0]
+        self.assertEqual(issue["facets"]["priority"], "priority: high")
+        self.assertIn(issue["kind"],
+                      {"feature", "module-request", "bug", "idea",
+                       "question", "docs", "other"})
+
+    def test_code_owners_present(self):
+        b = self._bundle()
+        self.assertIn("avm/res/network/", b["code_owners"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -724,6 +724,19 @@ def classify_issue_kind(issue, taxonomy, types_present):
     return "other"
 
 
+def _repo_has_issue_types(api, token):
+    """True if the repo defines native issue types. Best-effort: any failure
+    (older API, no types, 404) is treated as 'no native types'."""
+    try:
+        owner_repo = api.rsplit("/repos/", 1)[-1]
+        owner = owner_repo.split("/")[0]
+        data, _ = http_get_json(
+            f"https://api.github.com/orgs/{owner}/issue-types", token)
+        return bool(data)
+    except Exception:
+        return False
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
@@ -917,6 +930,23 @@ def acquire(args, env):
         ])
         code_events = parse_code_events(raw_walk)
 
+    # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
+    # from the code-event walk + the commit file lists (local, zero-token).
+    area_paths = sorted(
+        {e["path"] for e in code_events}
+        | {e["old_path"] for e in code_events if e.get("old_path")}
+        | {f for c in commits for f in c.get("files", [])})
+    code_graph = select_code_area_provider(area_paths, clone_dir)
+
+    # CODEOWNERS from the clone (local file; try the conventional locations).
+    code_owners = {}
+    for rel in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+        p = os.path.join(clone_dir, rel)
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as fh:
+                code_owners = parse_codeowners(fh.read())
+            break
+
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
     # Closed PRs (merged + rejected) bounded by update time, as in Phase 1...
@@ -998,6 +1028,20 @@ def acquire(args, env):
         issue["comments_list"] = [normalize_comment(c) for c in conv]
         issue["reactions"] = summarize_reactions(raw_by_num.get(n, {}).get("reactions"))
         issue["open_high_activity"] = derive_open_high_activity(issue)
+        issue["issue_type"] = (raw_by_num.get(n, {}).get("type") or {}).get("name") \
+            if isinstance(raw_by_num.get(n, {}).get("type"), dict) else None
+
+    # Phase 3b: label taxonomy over every repo label seen, then stamp facets + kind.
+    all_labels = sorted({lbl for it in prs + issues for lbl in it.get("labels", [])})
+    label_taxonomy = detect_label_taxonomy(all_labels)
+    types_present = _repo_has_issue_types(api, token)  # thin seam, best-effort
+    for pr in prs:
+        pr["facets"] = apply_facets(pr, label_taxonomy)
+    for issue in issues:
+        issue["facets"] = apply_facets(issue, label_taxonomy)
+        # native issue type when the repo uses them (acquire fetches it per issue
+        # in the existing issue loop — see Step 3a); the classifier is pure.
+        issue["kind"] = classify_issue_kind(issue, label_taxonomy, types_present)
 
     workflows = []
     workflow_stats = {}
@@ -1028,6 +1072,9 @@ def acquire(args, env):
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
+    bundle["code_graph"] = code_graph
+    bundle["code_owners"] = code_owners
+    bundle["label_taxonomy"] = label_taxonomy
     return bundle
 
 
