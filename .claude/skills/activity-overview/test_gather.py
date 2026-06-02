@@ -35,5 +35,32 @@ class TestBuildBundle(unittest.TestCase):
         self.assertEqual(bundle["meta"]["schema_version"], 1)
 
 
+class TestParseGitLog(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "git_log_sample.txt")) as fh:
+            self.raw = fh.read()
+
+    def test_parses_three_commits_in_order(self):
+        commits = gather.parse_git_log(self.raw)
+        self.assertEqual(len(commits), 3)
+        self.assertEqual(commits[0]["sha"], "a1" * 20)
+        self.assertEqual(commits[0]["author"], "Alice")
+        self.assertEqual(commits[0]["date"], "2026-05-10")
+        self.assertEqual(commits[0]["message"], "Add policy param (#42)")
+        self.assertEqual(
+            commits[0]["files"],
+            ["modules/firewall/main.bicep", "modules/firewall/README.md"],
+        )
+
+    def test_merge_commit_has_two_parents_and_no_files(self):
+        commits = gather.parse_git_log(self.raw)
+        merge = commits[1]
+        self.assertEqual(len(merge["parents"]), 2)
+        self.assertEqual(merge["files"], [])
+
+    def test_empty_input_yields_no_commits(self):
+        self.assertEqual(gather.parse_git_log(""), [])
+
+
 if __name__ == "__main__":
     unittest.main()
