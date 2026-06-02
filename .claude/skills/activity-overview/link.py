@@ -213,6 +213,48 @@ def build_timeline(bundle):
     return events
 
 
+_EVENT_TO_DELTA = {"add": "add", "remove": "drop", "change": "change"}
+
+
+def compute_feature_deltas(bundle):
+    """Project the artifacts ledger into the feature_deltas view.
+
+    One delta per lifecycle event: add->add, remove->drop, change->change. Each
+    attributes author/commit/url + (best-effort) the owning pr/train via the
+    commit->PR map Link already builds. `area`/`before`/`after`/`detail` are null
+    in Phase 3a (graphify + hunk parsing are later slices). Pure.
+    """
+    commit_to_pr = {c["sha"]: c.get("pr") for c in bundle.get("commits", [])}
+    pr_to_train = {}
+    for t in bundle.get("trains", []):
+        for n in t.get("prs", []):
+            pr_to_train[n] = t["id"]
+
+    deltas = []
+    for aid, art in bundle.get("artifacts", {}).items():
+        for ev in art.get("lifecycle", []):
+            kind = _EVENT_TO_DELTA.get(ev["event"])
+            if kind is None:
+                continue
+            pr = commit_to_pr.get(ev["commit"])
+            deltas.append({
+                "area": None,
+                "kind": kind,
+                "subject": art["kind"],
+                "name": art["name"],
+                "before": None,
+                "after": None,
+                "detail": None,
+                "artifact": aid,
+                "author": ev["author"],
+                "train": pr_to_train.get(pr) if pr is not None else None,
+                "pr": pr,
+                "commit": ev["commit"],
+                "url": ev["ref"]["url"],
+            })
+    return deltas
+
+
 def build_trains(bundle):
     """Group merged PRs (+ their commits + closing issue) into decision trains.
 
@@ -319,10 +361,14 @@ def compute_buckets(bundle):
 
 
 def enrich(bundle):
-    """Deterministically enrich a bundle in place: commit->PR, trains, buckets."""
+    """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
+    and the Phase 3a narrative substrate (artifacts, timeline, feature_deltas)."""
     attach_commit_prs(bundle["commits"])
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle)
+    bundle["artifacts"] = build_artifacts(bundle)
+    bundle["timeline"] = build_timeline(bundle)
+    bundle["feature_deltas"] = compute_feature_deltas(bundle)
     return bundle
 
 

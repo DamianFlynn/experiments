@@ -351,5 +351,59 @@ class TestBuildTimeline(unittest.TestCase):
             {"prs": [], "issues": [], "artifacts": {}}), [])
 
 
+class TestComputeFeatureDeltas(unittest.TestCase):
+    def _bundle(self):
+        b = {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "examples/basic/main.bicep"},
+                {"commit": "c4"*20, "author": "Dave", "date": "2026-05-25",
+                 "change": "delete", "path": "docs/firewall.md"},
+                {"commit": "c2"*20, "author": "Bob", "date": "2026-05-10",
+                 "change": "modify", "path": "README.md"},
+            ],
+            # commit c1 resolves to PR 42 via its message; others do not.
+            "commits": [
+                {"sha": "c1"*20, "message": "Add basic example (#42)", "pr": None},
+            ],
+            "prs": [{"number": 42, "url": "https://github.com/o/r/pull/42"}],
+            "issues": [], "trains": [
+                {"id": "train-pr-42", "prs": [42], "root_issue": None}],
+        }
+        link.attach_commit_prs(b["commits"])
+        b["artifacts"] = link.build_artifacts(b)
+        return b
+
+    def test_add_remove_change_map_to_delta_kinds(self):
+        deltas = link.compute_feature_deltas(self._bundle())
+        kinds = {(d["subject"], d["kind"]) for d in deltas}
+        self.assertIn(("example", "add"), kinds)
+        self.assertIn(("readme", "change"), kinds)
+        self.assertIn(("doc", "drop"), kinds)
+
+    def test_delta_attributes_author_commit_and_artifact(self):
+        deltas = link.compute_feature_deltas(self._bundle())
+        add = next(d for d in deltas if d["kind"] == "add")
+        self.assertEqual(add["author"], "Alice")
+        self.assertEqual(add["commit"], "c1"*20)
+        self.assertEqual(add["artifact"], link.artifact_id("examples/basic/main.bicep"))
+        self.assertTrue(add["url"].startswith("https://"))
+        self.assertIsNone(add["area"])  # graphify deferred
+
+    def test_delta_resolves_owning_pr_and_train_when_known(self):
+        deltas = link.compute_feature_deltas(self._bundle())
+        add = next(d for d in deltas if d["kind"] == "add")
+        self.assertEqual(add["pr"], 42)          # c1 -> (#42)
+        self.assertEqual(add["train"], "train-pr-42")
+        drop = next(d for d in deltas if d["kind"] == "drop")
+        self.assertIsNone(drop["pr"])            # c4 has no resolvable PR
+        self.assertIsNone(drop["train"])
+
+    def test_empty_artifacts_yield_no_deltas(self):
+        self.assertEqual(link.compute_feature_deltas(
+            {"artifacts": {}, "commits": [], "trains": []}), [])
+
+
 if __name__ == "__main__":
     unittest.main()
