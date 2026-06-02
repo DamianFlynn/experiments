@@ -199,6 +199,28 @@ class TestSelectMilestonesAndBuckets(unittest.TestCase):
         pr42 = next(r for r in b["shipped"] if (r["type"], r["id"]) == ("pr", 42))
         self.assertEqual(pr42["train"], "train-issue-17")
 
+    def test_closed_pr_outside_window_is_excluded(self):
+        bundle = {
+            "meta": {"period": {"from": "2026-05-01", "to": "2026-05-31"},
+                     "ref_date": "2026-05-31"},
+            "prs": [
+                {"number": 1, "merged": True, "state": "closed",
+                 "merged_at": "2026-04-15T00:00:00Z",
+                 "url": "https://github.com/o/r/pull/1"},
+                {"number": 2, "merged": True, "state": "closed",
+                 "merged_at": "2026-05-15T00:00:00Z",
+                 "url": "https://github.com/o/r/pull/2"},
+            ],
+            "issues": [], "milestones": [], "trains": [],
+        }
+        buckets = link.compute_buckets(bundle)
+        shipped = {(r["type"], r["id"]) for r in buckets["shipped"]}
+        self.assertIn(("pr", 2), shipped)       # in window -> shipped
+        self.assertNotIn(("pr", 1), shipped)    # before window -> excluded
+        # and #1 lands in no bucket at all
+        all_refs = [(r["type"], r["id"]) for k in buckets for r in buckets[k]]
+        self.assertNotIn(("pr", 1), all_refs)
+
 
 if __name__ == "__main__":
     unittest.main()

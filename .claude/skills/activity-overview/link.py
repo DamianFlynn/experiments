@@ -48,7 +48,7 @@ def _high_priority(item):
 
 
 def _ms_sort_key(m):
-    return ((m.get("due_on") or "9999-12-31")[:10], m.get("number") or 0)
+    return ((m.get("due_on") or "9999-12-31")[:10], m.get("number", 0))
 
 
 def select_milestones(milestones, ref_date):
@@ -172,6 +172,8 @@ def compute_buckets(bundle):
                 add("next_candidates", type_, num, url)
             elif on_current or _in_window(item.get("updated_at"), period):
                 add("in_flight", type_, num, url)
+        # Anything else (stale open items off any milestone; closed items with an
+        # unrecognised state_reason) is intentionally left in no bucket.
 
     for pr in bundle.get("prs", []):
         classify(pr, "pr")
