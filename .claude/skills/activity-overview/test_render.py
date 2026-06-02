@@ -62,13 +62,22 @@ class TestTimelineGantt(unittest.TestCase):
 
     def test_gantt_clamps_end_after_start(self):
         b = _bundle()
-        b["prs"] = [{"number": 9, "title": "weird", "state": "open",
-                     "created_at": "2026-05-20T00:00:00Z",
+        b["meta"]["to"] = "2026-05-31"
+        b["prs"] = [{"number": 9, "title": "late", "state": "open",
+                     "created_at": "2026-06-15T00:00:00Z",
                      "merged_at": None, "closed_at": None, "merged": False}]
         b["releases"] = []
         mmd = render.emit_timeline_gantt(b)
-        # open PR with no end uses `to`; start <= end always
-        self.assertIn("2026-05-20", mmd)
+        # created_at (2026-06-15) is after window end; end is clamped to start,
+        # so the task line uses 2026-06-15 for BOTH start and end.
+        task = [ln for ln in mmd.splitlines() if "late" in ln.strip()][0]
+        self.assertEqual(task.count("2026-06-15"), 2)
+
+    def test_gantt_label_strips_comment_marker(self):
+        b = _bundle()
+        b["prs"][0]["title"] = "Fix %% parser"
+        mmd = render.emit_timeline_gantt(b)
+        self.assertNotIn("%%", mmd)
 
 
 class TestWriteDiagrams(unittest.TestCase):

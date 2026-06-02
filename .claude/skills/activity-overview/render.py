@@ -45,14 +45,15 @@ def _day(ts, default):
 def _gantt_label(text):
     """Mermaid gantt task names cannot contain ':' (the field separator) or
     newlines. Collapse them and trim."""
-    clean = (text or "").replace(":", " -").replace("\n", " ").strip()
+    clean = (text or "").replace("%%", "%").replace(":", " -").replace("\n", " ").strip()
     return clean[:60] or "item"
 
 
 def emit_timeline_gantt(bundle):
     """A Mermaid `gantt` of PR lifespans + releases across the window."""
     meta = bundle.get("meta", {})
-    frm, to = meta.get("from", ""), meta.get("to", "")
+    frm = meta.get("from") or "1970-01-01"
+    to = meta.get("to") or frm
     lines = [
         "gantt",
         f"    title Timeline ({frm} → {to})",
@@ -74,7 +75,7 @@ def emit_timeline_gantt(bundle):
                 status = "crit"
             else:
                 status = "active"
-            label = _gantt_label(f"#{p['number']} {p.get('title', '')}")
+            label = _gantt_label(f"#{p.get('number', '?')} {p.get('title') or ''}")
             lines.append(f"    {label} :{status}, {start}, {end}")
     releases = bundle.get("releases", [])
     if releases:
@@ -104,7 +105,7 @@ def write_diagrams(bundle, outdir="workspace/diagrams"):
     manifest = {}
     for name, text in render(bundle).items():
         path = os.path.join(outdir, f"{name}.mmd")
-        with open(path, "w") as fh:
+        with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         manifest[name] = path
     bundle["diagrams"] = manifest
