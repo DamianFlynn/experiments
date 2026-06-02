@@ -120,6 +120,31 @@ class TestPrNormalization(unittest.TestCase):
         self.assertFalse(pr["merged"])
         self.assertIsNone(pr["merged_by"])
 
+    def test_normalize_pr_captures_phase2_fields(self):
+        raw = {
+            "number": 44, "title": "Still open", "body": "Resolves #18",
+            "state": "open", "merged_at": None, "closed_at": None,
+            "created_at": "2026-05-03T09:00:00Z", "updated_at": "2026-05-20T09:00:00Z",
+            "user": {"login": "alice"}, "author_association": "MEMBER",
+            "labels": [{"name": "priority/high"}],
+            "milestone": {"title": "v1.3.0"},
+            "comments": 4, "review_comments": 2,
+            "html_url": "https://github.com/o/r/pull/44",
+        }
+        pr = gather.normalize_pr(raw)
+        self.assertEqual(pr["created_at"], "2026-05-03T09:00:00Z")
+        self.assertEqual(pr["updated_at"], "2026-05-20T09:00:00Z")
+        self.assertEqual(pr["milestone"], "v1.3.0")
+        self.assertEqual(pr["comments"], 4)
+        self.assertEqual(pr["review_comments_count"], 2)
+        self.assertEqual(pr["state"], "open")
+        self.assertFalse(pr["merged"])
+
+    def test_normalize_pr_milestone_none_when_absent(self):
+        pr = gather.normalize_pr({"number": 1, "html_url": "u"})
+        self.assertIsNone(pr["milestone"])
+        self.assertEqual(pr["comments"], 0)
+
     def test_select_merged_prs_only_in_window(self):
         prs = [gather.normalize_pr(p) for p in self.data["pulls"]]
         merged = gather.select_merged_prs(prs, "2026-05-01", "2026-05-31")

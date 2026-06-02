@@ -122,6 +122,7 @@ def parse_closing_refs(text):
 
 def normalize_pr(raw):
     """Map a GitHub REST PR object to the bundle's PR shape."""
+    milestone = raw.get("milestone")
     return {
         "number": raw["number"],
         "title": raw.get("title", ""),
@@ -129,12 +130,20 @@ def normalize_pr(raw):
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
         "labels": [lbl["name"] for lbl in raw.get("labels", [])],
+        "milestone": milestone.get("title") if milestone else None,
         "merged": bool(raw.get("merged_at")),
         "merged_by": (raw.get("merged_by") or {}).get("login")
         if raw.get("merged_by") else None,
         "merged_at": raw.get("merged_at"),
+        "created_at": raw.get("created_at"),
+        "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
         "state": raw.get("state"),
+        "comments": raw.get("comments", 0) or 0,
+        "review_comments_count": raw.get("review_comments", 0) or 0,
+        "reviewers": [],
+        "review_decision": "none",
+        "crossref_issues": [],
         "closes": parse_closing_refs(
             (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
         ),
