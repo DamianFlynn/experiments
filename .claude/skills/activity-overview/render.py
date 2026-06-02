@@ -152,6 +152,71 @@ def emit_deltas_bar(bundle):
     return "\n".join(lines) + "\n"
 
 
+def _node_id(prefix, text):
+    """A safe Mermaid node id from arbitrary text (alnum + underscore)."""
+    safe = "".join(ch if ch.isalnum() else "_" for ch in (text or ""))
+    return f"{prefix}_{safe}"[:60]
+
+
+def _area_tail(area):
+    return (area or "").rstrip("/").split("/")[-1] or area
+
+
+def _flow_label(text):
+    """Sanitise a flowchart label: drop quotes/newlines that would break the node."""
+    clean = (text or "").replace('"', "'").replace("\n", " ")
+    return clean.strip()[:40] or "?"
+
+
+def emit_contributor_graph(bundle):
+    """A Mermaid `flowchart` of people <-> code-area edges.
+
+    Each person links to the areas they authored/reviewed in (from `people.modules`).
+    Falls back to people<->train edges only if no module data exists. Derived from
+    existing bundle fields."""
+    people = bundle.get("people", {})
+    lines = ["flowchart LR"]
+    edges = []
+    area_nodes = {}
+    person_nodes = {}
+    for login, p in sorted(people.items()):
+        mods = p.get("modules") or p.get("areas") or []
+        if not mods:
+            continue
+        pid = _node_id("p", login)
+        person_nodes[pid] = login
+        for area in mods:
+            aid = _node_id("a", area)
+            area_nodes[aid] = _area_tail(area)
+            edges.append((pid, aid))
+    if not edges:
+        lines.append("    none[No contributor data]")
+        return "\n".join(lines) + "\n"
+    for pid, login in sorted(person_nodes.items()):
+        lines.append(f'    {pid}["{_flow_label(login)}"]')
+    for aid, label in sorted(area_nodes.items()):
+        lines.append(f'    {aid}("{_flow_label(label)}")')
+    for pid, aid in sorted(set(edges)):
+        lines.append(f"    {pid} --> {aid}")
+    return "\n".join(lines) + "\n"
+
+
+def emit_kind_breakdown(bundle):
+    """A Mermaid `pie` of issues by `kind` (feature/bug/idea/...). The at-a-glance
+    kind mix; proportions are the point, so `pie` (the spec palette entry)."""
+    counts = {}
+    for issue in bundle.get("issues", []):
+        kind = issue.get("kind") or "other"
+        counts[kind] = counts.get(kind, 0) + 1
+    lines = ["pie showData", "    title Issues by kind"]
+    if not counts:
+        lines.append('    "No issues" : 1')
+        return "\n".join(lines) + "\n"
+    for kind in sorted(counts, key=lambda k: (-counts[k], k)):
+        lines.append(f'    "{kind}" : {counts[kind]}')
+    return "\n".join(lines) + "\n"
+
+
 def render(bundle):
     """Name -> Mermaid text for every diagram this phase emits."""
     return {
@@ -159,6 +224,8 @@ def render(bundle):
         "timeline_gantt": emit_timeline_gantt(bundle),
         "content_timeline": emit_content_timeline(bundle),
         "deltas_bar": emit_deltas_bar(bundle),
+        "contributor_graph": emit_contributor_graph(bundle),
+        "kind_breakdown": emit_kind_breakdown(bundle),
     }
 
 

@@ -363,9 +363,11 @@ class TestRenderManifestP3(unittest.TestCase):
         b["releases"] = []
         with tempfile.TemporaryDirectory() as d:
             real = render.write_diagrams(b, os.path.join(d, "diagrams"))
-            self.assertEqual(
-                set(real),
-                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"})
+            # Phase 3b grows the manifest to six diagrams; assert the earlier
+            # keys remain present rather than pinning the exact set.
+            self.assertLessEqual(
+                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"},
+                set(real))
             self.assertIn("content_timeline", b["diagrams"])
             self.assertIn("deltas_bar", b["diagrams"])
 
@@ -398,12 +400,13 @@ class TestEndToEndOfflineP3(unittest.TestCase):
                      if d["commit"].startswith("c1") and d["kind"] == "add")
         self.assertEqual(add42["pr"], 42)
 
-        # render: four-diagram manifest, validation stubbed (mmdc absent here)
+        # render: four-diagram manifest (Phase 3b grows it; assert the earlier
+        # keys remain present rather than pinning the exact set), validation stubbed
         with tempfile.TemporaryDirectory() as d:
             real = render.write_diagrams(bundle, os.path.join(d, "diagrams"))
-            self.assertEqual(
-                set(real),
-                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"})
+            self.assertLessEqual(
+                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"},
+                set(real))
 
             class Ok:
                 returncode = 0
@@ -411,6 +414,79 @@ class TestEndToEndOfflineP3(unittest.TestCase):
             render.validate_with_mmdc(list(real.values()),
                                       runner=lambda cmd, **kw: Ok(),
                                       which=lambda _n: "/usr/bin/mmdc")
+
+
+def _p3b_bundle():
+    return {
+        "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
+        "people": {
+            "alice": {"modules": ["avm/res/network/firewall-policy"],
+                      "areas": ["avm/res/network/firewall-policy"]},
+            "carol": {"modules": ["docs"], "areas": ["docs"]},
+        },
+        "modules": {
+            "avm/res/network/firewall-policy": {"commits": 2, "prs": 1, "files_changed": 3},
+            "docs": {"commits": 1, "prs": 1, "files_changed": 1},
+        },
+        "issues": [
+            {"number": 1, "kind": "feature"}, {"number": 2, "kind": "feature"},
+            {"number": 3, "kind": "bug"}, {"number": 4, "kind": "module-request"},
+            {"number": 5, "kind": "other"},
+        ],
+    }
+
+
+class TestContributorGraph(unittest.TestCase):
+    def test_flowchart_header_and_people_area_edges(self):
+        mmd = render.emit_contributor_graph(_p3b_bundle())
+        self.assertTrue(mmd.startswith("flowchart"))
+        self.assertIn("alice", mmd)
+        self.assertIn("firewall-policy", mmd)
+        # an edge arrow connects a person to an area
+        self.assertIn("-->", mmd)
+
+    def test_placeholder_when_no_people(self):
+        mmd = render.emit_contributor_graph({"meta": {}, "people": {}, "modules": {}})
+        self.assertTrue(mmd.startswith("flowchart"))
+        self.assertIn("No contributor", mmd)
+
+
+class TestKindBreakdown(unittest.TestCase):
+    def test_pie_counts_by_kind(self):
+        mmd = render.emit_kind_breakdown(_p3b_bundle())
+        self.assertTrue(mmd.startswith("pie"))
+        self.assertIn('"feature" : 2', mmd)
+        self.assertIn('"bug" : 1', mmd)
+        self.assertIn('"module-request" : 1', mmd)
+
+    def test_pie_placeholder_when_no_issues(self):
+        mmd = render.emit_kind_breakdown({"meta": {}, "issues": []})
+        self.assertTrue(mmd.startswith("pie"))
+        self.assertIn("No issues", mmd)
+
+
+class TestRenderManifestP3b(unittest.TestCase):
+    def test_render_includes_phase3b_diagrams(self):
+        out = render.render(_p3b_bundle())
+        self.assertTrue(out["contributor_graph"].startswith("flowchart"))
+        self.assertTrue(out["kind_breakdown"].startswith("pie"))
+        # Phase 2/3a diagrams still present
+        for key in ("buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"):
+            self.assertIn(key, out)
+
+    def test_write_diagrams_manifest_gains_two_more_keys(self):
+        b = _p3b_bundle()
+        b["buckets"] = {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []}
+        b["prs"] = []; b["releases"] = []
+        b["artifacts"] = {}; b["feature_deltas"] = []
+        with tempfile.TemporaryDirectory() as d:
+            real = render.write_diagrams(b, os.path.join(d, "diagrams"))
+            self.assertEqual(
+                set(real),
+                {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar",
+                 "contributor_graph", "kind_breakdown"})
+            self.assertIn("contributor_graph", b["diagrams"])
+            self.assertIn("kind_breakdown", b["diagrams"])
 
 
 if __name__ == "__main__":
