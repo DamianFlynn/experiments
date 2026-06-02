@@ -1,8 +1,9 @@
 # Bundle Schema (Phase 1)
 
-The bundle is a single JSON object. Phase 1 populates `meta`, `commits`, `prs`,
-`issues`, `trains`, and `buckets`; all other top-level keys are reserved and empty
-until later phases.
+The bundle is a single JSON object produced by the Phase 1 pipeline. The **gather**
+step (`gather.py`) fills `meta`, `commits`, `prs`, and `issues`; the **link** step
+(`link.py`) then fills `trains` and `buckets`. Every other top-level key is reserved
+empty by gather and populated in later phases.
 
 ## Ref convention
 
