@@ -93,11 +93,74 @@ def emit_timeline_gantt(bundle):
     return "\n".join(lines) + "\n"
 
 
+def _timeline_text(text):
+    """Mermaid `timeline` event text cannot contain ':' (section/event separator)
+    or newlines. Sanitise like the gantt labels."""
+    clean = (text or "").replace(":", " -").replace("\n", " ")
+    while "%%" in clean:
+        clean = clean.replace("%%", "%")
+    return clean.strip()[:60] or "event"
+
+
+def emit_content_timeline(bundle):
+    """A Mermaid `timeline` of artifact lifecycle events (built/changed/dropped),
+    grouped by date. Derived from `artifacts`."""
+    meta = bundle.get("meta", {})
+    lines = ["timeline",
+             f"    title Content lifecycle ({meta.get('from','')} - {meta.get('to','')})"]
+    # Collect (date, text) for every lifecycle event, grouped under its date.
+    by_date = {}
+    verb = {"add": "built", "change": "changed", "remove": "dropped"}
+    for art in bundle.get("artifacts", {}).values():
+        for ev in art.get("lifecycle", []):
+            day = (ev.get("date") or "")[:10] or "undated"
+            label = _timeline_text(
+                f"{verb.get(ev['event'], ev['event'])} {art['name']} "
+                f"({art['kind']}) by {ev.get('author') or '?'}")
+            by_date.setdefault(day, []).append(label)
+    if not by_date:
+        lines.append("    section Activity")
+        lines.append("        No content events : none")
+        return "\n".join(lines) + "\n"
+    for day in sorted(by_date):
+        lines.append(f"    section {day}")
+        for label in by_date[day]:
+            lines.append(f"        {label} : {day}")
+    return "\n".join(lines) + "\n"
+
+
+_DELTA_KINDS = ["add", "drop", "change"]
+
+
+def emit_deltas_bar(bundle):
+    """A Mermaid `xychart-beta` bar of feature_delta counts by kind.
+
+    Mermaid has no standalone bar diagram; `xychart-beta` is its native bar chart
+    (category x-axis + numeric bar series), which renders counts-by-category
+    correctly — unlike `pie`, which would read as proportions and lose ordering."""
+    counts = {k: 0 for k in _DELTA_KINDS}
+    for d in bundle.get("feature_deltas", []):
+        if d.get("kind") in counts:
+            counts[d["kind"]] += 1
+    values = [counts[k] for k in _DELTA_KINDS]
+    top = max(values) or 1
+    lines = [
+        "xychart-beta",
+        '    title "Feature changes by kind"',
+        '    x-axis [add, drop, change]',
+        f'    y-axis "Count" 0 --> {top}',
+        f"    bar [{', '.join(str(v) for v in values)}]",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def render(bundle):
     """Name -> Mermaid text for every diagram this phase emits."""
     return {
         "buckets_pie": emit_buckets_pie(bundle),
         "timeline_gantt": emit_timeline_gantt(bundle),
+        "content_timeline": emit_content_timeline(bundle),
+        "deltas_bar": emit_deltas_bar(bundle),
     }
 
 
