@@ -87,3 +87,25 @@ def emit_timeline_gantt(bundle):
         lines.append("    section Activity")
         lines.append(f"    No dated items :active, {_day(frm, '2026-01-01')}, {_day(to, frm)}")
     return "\n".join(lines) + "\n"
+
+
+def render(bundle):
+    """Name -> Mermaid text for every diagram this phase emits."""
+    return {
+        "buckets_pie": emit_buckets_pie(bundle),
+        "timeline_gantt": emit_timeline_gantt(bundle),
+    }
+
+
+def write_diagrams(bundle, outdir="workspace/diagrams"):
+    """Write each diagram to <outdir>/<name>.mmd and record the manifest on the
+    bundle. Returns the name->path manifest."""
+    os.makedirs(outdir, exist_ok=True)
+    manifest = {}
+    for name, text in render(bundle).items():
+        path = os.path.join(outdir, f"{name}.mmd")
+        with open(path, "w") as fh:
+            fh.write(text)
+        manifest[name] = path
+    bundle["diagrams"] = manifest
+    return manifest

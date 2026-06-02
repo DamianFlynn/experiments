@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -68,6 +69,24 @@ class TestTimelineGantt(unittest.TestCase):
         mmd = render.emit_timeline_gantt(b)
         # open PR with no end uses `to`; start <= end always
         self.assertIn("2026-05-20", mmd)
+
+
+class TestWriteDiagrams(unittest.TestCase):
+    def test_writes_files_and_manifest(self):
+        b = _bundle()
+        with tempfile.TemporaryDirectory() as d:
+            manifest = render.write_diagrams(b, d)
+            self.assertEqual(set(manifest), {"buckets_pie", "timeline_gantt"})
+            for name, path in manifest.items():
+                self.assertTrue(os.path.exists(path))
+                self.assertTrue(path.endswith(f"{name}.mmd"))
+            # manifest is recorded back onto the bundle for downstream stages
+            self.assertEqual(b["diagrams"], manifest)
+
+    def test_render_returns_mmd_text_per_diagram(self):
+        out = render.render(_bundle())
+        self.assertTrue(out["buckets_pie"].startswith("pie"))
+        self.assertTrue(out["timeline_gantt"].startswith("gantt"))
 
 
 if __name__ == "__main__":
