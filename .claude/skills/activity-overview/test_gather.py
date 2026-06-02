@@ -399,6 +399,35 @@ class TestCommentsAndReactions(unittest.TestCase):
                               "body": "nit: rename `x`.",
                               "url": "https://github.com/o/r/pull/42#discussion_r7002"})
 
+    def test_summarize_reactions_picks_the_tracked_keys(self):
+        raw = {"+1": 12, "-1": 1, "laugh": 0, "hooray": 3, "confused": 0,
+               "heart": 4, "rocket": 2, "eyes": 1, "total_count": 23}
+        r = gather.summarize_reactions(raw)
+        self.assertEqual(r, {"+1": 12, "-1": 1, "heart": 4, "hooray": 3, "total": 23})
+
+    def test_summarize_reactions_permissive_on_missing(self):
+        self.assertEqual(gather.summarize_reactions(None),
+                         {"+1": 0, "-1": 0, "heart": 0, "hooray": 0, "total": 0})
+        self.assertEqual(gather.summarize_reactions({})["total"], 0)
+
+    def test_summarize_reactions_falls_back_to_summing_when_total_absent(self):
+        # GitHub usually sends total_count; if it's missing we sum the tracked keys.
+        r = gather.summarize_reactions({"+1": 5, "heart": 2})
+        self.assertEqual(r["total"], 7)
+
+    def test_derive_open_high_activity_true_when_open_and_engaged(self):
+        issue = {"state": "open", "comments": 7,
+                 "reactions": {"+1": 9, "-1": 0, "heart": 0, "hooray": 0, "total": 9}}
+        self.assertTrue(gather.derive_open_high_activity(issue))
+
+    def test_derive_open_high_activity_false_when_closed_or_quiet(self):
+        self.assertFalse(gather.derive_open_high_activity(
+            {"state": "closed", "comments": 50,
+             "reactions": {"+1": 99, "total": 99}}))
+        self.assertFalse(gather.derive_open_high_activity(
+            {"state": "open", "comments": 1,
+             "reactions": {"+1": 1, "total": 1}}))
+
 
 class TestAcquireAssemblyP2(unittest.TestCase):
     """Compose the pure helpers over recorded REST, as acquire() does, offline."""

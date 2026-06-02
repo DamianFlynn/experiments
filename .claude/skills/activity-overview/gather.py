@@ -304,6 +304,40 @@ def normalize_review_comment(raw):
     return _normalize_comment_obj(raw)
 
 
+# The four reaction kinds the bundle tracks (the upvote/downvote/affinity signal
+# the flow analysis keys on), plus a derived total.
+_TRACKED_REACTIONS = ("+1", "-1", "heart", "hooray")
+
+# Thresholds for the Phase-3a `open_high_activity` signal: an OPEN issue with
+# meaningful discussion or upvotes. Deliberately permissive — it is a hint for
+# the "open risks" report section, not a hard classification.
+_HIGH_ACTIVITY_COMMENTS = 5
+_HIGH_ACTIVITY_UPVOTES = 5
+
+
+def summarize_reactions(raw):
+    """Reduce a GitHub reactions object to {'+1','-1','heart','hooray','total'}.
+    Pure, permissive: missing keys count as 0; total prefers `total_count`, else
+    sums the tracked keys."""
+    raw = raw or {}
+    out = {k: int(raw.get(k) or 0) for k in _TRACKED_REACTIONS}
+    if raw.get("total_count") is not None:
+        out["total"] = int(raw["total_count"])
+    else:
+        out["total"] = sum(out[k] for k in _TRACKED_REACTIONS)
+    return out
+
+
+def derive_open_high_activity(issue):
+    """True for an OPEN issue with notable engagement (many comments or upvotes).
+    A cheap surface for the report's open-risks section. Pure."""
+    if issue.get("state") != "open":
+        return False
+    comments = issue.get("comments", 0) or 0
+    upvotes = (issue.get("reactions") or {}).get("+1", 0) or 0
+    return comments >= _HIGH_ACTIVITY_COMMENTS or upvotes >= _HIGH_ACTIVITY_UPVOTES
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with
