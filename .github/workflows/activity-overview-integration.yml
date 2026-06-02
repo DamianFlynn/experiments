@@ -136,7 +136,7 @@ jobs:
           PY
 
       - name: Upload the bundle artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: activity-bundle
           path: .claude/skills/activity-overview/workspace/bundle.json
