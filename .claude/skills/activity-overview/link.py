@@ -157,6 +157,62 @@ def build_artifacts(bundle):
     return artifacts
 
 
+def build_timeline(bundle):
+    """Merge social + code events into one chronological event stream.
+
+    Event shape: {ts, actor, layer:'social'|'code', event, ref:{type,...,url},
+    subject:{kind,name,path}}. Social events come from PR/issue comments + review
+    comments; code events from artifact lifecycle entries. Sorted by ts. Comments
+    in early phases may lack a precise per-comment timestamp, so ts falls back to
+    the comment url ordering via a stable secondary key. Pure.
+    """
+    events = []
+
+    def social(actor, event, ref_type, number, url, subject, ts):
+        events.append({
+            "ts": ts or "", "actor": actor, "layer": "social", "event": event,
+            "ref": {"type": ref_type, "number": number, "url": url},
+            "subject": subject,
+        })
+
+    for pr in bundle.get("prs", []):
+        url = pr.get("url")
+        for c in pr.get("review_comments", []):
+            curl = c.get("url") or url
+            social(c.get("author"), "review_comment", "pr", pr["number"],
+                   curl,
+                   {"kind": "review_comment", "name": None, "path": None},
+                   c.get("created_at") or curl)
+        for c in pr.get("comments_list", []):
+            curl = c.get("url") or url
+            social(c.get("author"), "comment", "pr", pr["number"],
+                   curl,
+                   {"kind": "comment", "name": None, "path": None},
+                   c.get("created_at") or curl)
+
+    for issue in bundle.get("issues", []):
+        url = issue.get("url")
+        for c in issue.get("comments_list", []):
+            curl = c.get("url") or url
+            social(c.get("author"), "comment", "issue", issue["number"],
+                   curl,
+                   {"kind": "comment", "name": None, "path": None},
+                   c.get("created_at") or curl)
+
+    for art in bundle.get("artifacts", {}).values():
+        for ev in art.get("lifecycle", []):
+            events.append({
+                "ts": ev.get("date") or "", "actor": ev.get("author"),
+                "layer": "code", "event": ev["event"], "ref": ev["ref"],
+                "subject": {"kind": art["kind"], "name": art["name"],
+                            "path": art["path"]},
+            })
+
+    # Stable sort by ts (then by url so equal-ts events are deterministic).
+    events.sort(key=lambda e: (e["ts"], str(e["ref"].get("url") or "")))
+    return events
+
+
 def build_trains(bundle):
     """Group merged PRs (+ their commits + closing issue) into decision trains.
 

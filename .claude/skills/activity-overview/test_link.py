@@ -288,5 +288,68 @@ class TestBuildArtifacts(unittest.TestCase):
         self.assertEqual(link.build_artifacts({"code_events": []}), {})
 
 
+class TestBuildTimeline(unittest.TestCase):
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                {"commit": "c1"*20, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "docs/firewall.md"},
+            ],
+            "commits": [], "prs": [
+                {"number": 42, "url": "https://github.com/o/r/pull/42",
+                 "review_comments": [
+                     {"id": 7001, "author": "bob", "body": "x",
+                      "url": "https://github.com/o/r/pull/42#discussion_r7001"}],
+                 "comments_list": [
+                     {"id": 8001, "author": "carol", "body": "y",
+                      "url": "https://github.com/o/r/pull/42#issuecomment-8001"}]},
+            ],
+            "issues": [
+                {"number": 18, "url": "https://github.com/o/r/issues/18",
+                 "comments_list": [
+                     {"id": 9001, "author": "dave", "body": "z",
+                      "url": "https://github.com/o/r/issues/18#issuecomment-9001"}],
+                 "reactions": {"+1": 9, "total": 12}, "open_high_activity": True},
+            ],
+        }
+
+    def test_timeline_merges_social_and_code_layers(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        layers = {e["layer"] for e in tl}
+        self.assertEqual(layers, {"social", "code"})
+
+    def test_every_event_has_required_shape(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        for e in link.build_timeline(b):
+            self.assertIn(e["layer"], {"social", "code"})
+            self.assertTrue(e["ts"])
+            self.assertIn("actor", e)
+            self.assertIn("event", e)
+            self.assertIn("type", e["ref"])
+            self.assertTrue(str(e["ref"]["url"]).startswith("https://"))
+            self.assertIn("kind", e["subject"])
+
+    def test_timeline_sorted_by_ts(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        tl = link.build_timeline(b)
+        self.assertEqual([e["ts"] for e in tl], sorted(e["ts"] for e in tl))
+
+    def test_code_event_subject_carries_path_and_kind(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        code = [e for e in link.build_timeline(b) if e["layer"] == "code"][0]
+        self.assertEqual(code["subject"]["path"], "docs/firewall.md")
+        self.assertEqual(code["subject"]["kind"], "doc")
+
+    def test_empty_bundle_yields_empty_timeline(self):
+        self.assertEqual(link.build_timeline(
+            {"prs": [], "issues": [], "artifacts": {}}), [])
+
+
 if __name__ == "__main__":
     unittest.main()
