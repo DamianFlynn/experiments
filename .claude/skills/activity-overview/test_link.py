@@ -461,5 +461,70 @@ class TestComputeFeatureDeltas(unittest.TestCase):
             {"artifacts": {}, "commits": [], "trains": []}), [])
 
 
+class TestCodeAreaAttribution(unittest.TestCase):
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "examples/basic", "label": "basic",
+                 "paths": ["examples/basic/main.bicep"], "edges": []},
+                {"id": "docs", "label": "docs",
+                 "paths": ["docs/firewall.md"], "edges": []},
+            ]},
+            "artifacts": {
+                "art:examples/basic/main.bicep": {
+                    "kind": "example", "path": "examples/basic/main.bicep",
+                    "name": "main.bicep", "status": "live", "replaced_by": None,
+                    "code_area": None, "lifecycle": []},
+                "art:docs/firewall.md": {
+                    "kind": "doc", "path": "docs/firewall.md", "name": "firewall.md",
+                    "status": "removed", "replaced_by": None, "code_area": None,
+                    "lifecycle": []},
+                "art:README.md": {
+                    "kind": "readme", "path": "README.md", "name": "README.md",
+                    "status": "live", "replaced_by": None, "code_area": None,
+                    "lifecycle": []},
+            },
+            "feature_deltas": [
+                {"kind": "add", "subject": "example", "name": "main.bicep",
+                 "artifact": "art:examples/basic/main.bicep", "area": None,
+                 "commit": "c1", "url": "u"},
+                {"kind": "drop", "subject": "doc", "name": "firewall.md",
+                 "artifact": "art:docs/firewall.md", "area": None,
+                 "commit": "c4", "url": "u"},
+            ],
+        }
+
+    def test_area_index_maps_each_path_to_its_area(self):
+        idx = link.area_index(self._bundle()["code_graph"])
+        self.assertEqual(idx["examples/basic/main.bicep"], "examples/basic")
+        self.assertEqual(idx["docs/firewall.md"], "docs")
+
+    def test_attribute_fills_artifact_code_area(self):
+        b = self._bundle()
+        link.attribute_code_areas(b)
+        arts = b["artifacts"]
+        self.assertEqual(arts["art:examples/basic/main.bicep"]["code_area"],
+                         "examples/basic")
+        self.assertEqual(arts["art:docs/firewall.md"]["code_area"], "docs")
+        # a path not in the graph stays null (no guessing)
+        self.assertIsNone(arts["art:README.md"]["code_area"])
+
+    def test_attribute_fills_feature_delta_area(self):
+        b = self._bundle()
+        link.attribute_code_areas(b)
+        by_artifact = {d["artifact"]: d for d in b["feature_deltas"]}
+        self.assertEqual(
+            by_artifact["art:examples/basic/main.bicep"]["area"], "examples/basic")
+        self.assertEqual(by_artifact["art:docs/firewall.md"]["area"], "docs")
+
+    def test_empty_code_graph_leaves_everything_null(self):
+        b = self._bundle()
+        b["code_graph"] = {}
+        link.attribute_code_areas(b)
+        self.assertIsNone(b["artifacts"]["art:docs/firewall.md"]["code_area"])
+        self.assertIsNone(b["feature_deltas"][0]["area"])
+
+
 if __name__ == "__main__":
     unittest.main()

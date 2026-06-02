@@ -305,6 +305,7 @@ def build_trains(bundle):
             "root_issue": root_issue,
             "prs": pr_numbers,
             "commits": sorted(shas),
+            "code_areas": [],
             "outcome": "shipped",
             "evidence": evidence,
         })
@@ -364,9 +365,136 @@ def compute_buckets(bundle):
     return out
 
 
+def area_index(code_graph):
+    """Build a path -> area id index from a code_graph's areas. Pure."""
+    idx = {}
+    for area in (code_graph or {}).get("areas", []):
+        for path in area.get("paths", []):
+            idx[path] = area["id"]
+    return idx
+
+
+def _area_for_path(path, idx):
+    """Direct lookup; None when the path is not covered by any area (no guessing)."""
+    return idx.get(path)
+
+
+def attribute_code_areas(bundle):
+    """Fill `code_area` on artifacts and `area` on feature_deltas from code_graph.
+
+    Replaces the Phase 3a nulls where the path is covered by an area; leaves null
+    otherwise (degrades cleanly on an empty/absent code_graph). Mutates in place,
+    returns the index for reuse by trains/people attribution. Pure-ish (in-place)."""
+    idx = area_index(bundle.get("code_graph", {}))
+    for art in bundle.get("artifacts", {}).values():
+        area = _area_for_path(art.get("path"), idx)
+        if area is not None:
+            art["code_area"] = area
+    for delta in bundle.get("feature_deltas", []):
+        art = bundle.get("artifacts", {}).get(delta.get("artifact"), {})
+        area = art.get("code_area") or _area_for_path(delta.get("name"), idx)
+        if area is not None:
+            delta["area"] = area
+    return idx
+
+
+def _commit_areas(commit, idx):
+    """Distinct area ids touched by a commit's files."""
+    areas = set()
+    for f in commit.get("files", []):
+        area = idx.get(f)
+        if area is not None:
+            areas.add(area)
+    return areas
+
+
+def attribute_train_areas(bundle, idx):
+    """Set each train's `code_areas` from its commits' files. In place. Pure."""
+    by_sha = {c["sha"]: c for c in bundle.get("commits", [])}
+    for t in bundle.get("trains", []):
+        areas = set()
+        for sha in t.get("commits", []):
+            c = by_sha.get(sha)
+            if c:
+                areas |= _commit_areas(c, idx)
+        t["code_areas"] = sorted(areas)
+    return bundle
+
+
+def build_modules(bundle, idx):
+    """Populate bundle['modules'] = {<area>: {commits, prs, files_changed}}.
+
+    Counts per area: distinct commits, distinct PRs, and distinct files changed
+    across the window's commits. Pure (in place)."""
+    mods = {}
+    for c in bundle.get("commits", []):
+        pr = c.get("pr")
+        for f in c.get("files", []):
+            area = idx.get(f)
+            if area is None:
+                continue
+            m = mods.setdefault(
+                area, {"_commits": set(), "_prs": set(), "_files": set()})
+            m["_commits"].add(c["sha"])
+            if pr is not None:
+                m["_prs"].add(pr)
+            m["_files"].add(f)
+    bundle["modules"] = {
+        area: {"commits": len(m["_commits"]), "prs": len(m["_prs"]),
+               "files_changed": len(m["_files"])}
+        for area, m in mods.items()}
+    return bundle
+
+
+def attribute_people_areas(bundle, idx):
+    """Give each authoring/reviewing person their modules + areas.
+
+    A person's modules = the areas of files in commits they authored; areas mirror
+    modules (the directory-provider id doubles as the area). Reviewers inherit the
+    areas of the PRs they reviewed. Creates minimal people entries as needed. Pure
+    (in place)."""
+    people = bundle.setdefault("people", {})
+
+    def touch(login, area):
+        if not login or area is None:
+            return
+        p = people.setdefault(login, {"modules": [], "areas": []})
+        if area not in p["modules"]:
+            p.setdefault("modules", []).append(area)
+        if area not in p.setdefault("areas", []):
+            p["areas"].append(area)
+
+    by_sha = {c["sha"]: c for c in bundle.get("commits", [])}
+    for c in bundle.get("commits", []):
+        for area in _commit_areas(c, idx):
+            touch(c.get("author"), area)
+    # reviewers inherit their PR's commit areas via the trains map.
+    pr_commits = {}
+    for c in bundle.get("commits", []):
+        if c.get("pr") is not None:
+            pr_commits.setdefault(c["pr"], []).append(c["sha"])
+    for pr in bundle.get("prs", []):
+        areas = set()
+        for sha in pr_commits.get(pr.get("number"), []):
+            c = by_sha.get(sha)
+            if c:
+                areas |= _commit_areas(c, idx)
+        for reviewer in pr.get("reviewers", []):
+            for area in areas:
+                touch(reviewer, area)
+    # normalize lists deterministically
+    for p in people.values():
+        if "modules" in p:
+            p["modules"] = sorted(p["modules"])
+        if "areas" in p:
+            p["areas"] = sorted(p["areas"])
+    return bundle
+
+
 def enrich(bundle):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
-    and the Phase 3a narrative substrate (artifacts, timeline, feature_deltas)."""
+    the Phase 3a narrative substrate (artifacts/timeline/feature_deltas), and the
+    Phase 3b code-area attribution + label facets."""
     attach_commit_prs(bundle["commits"])
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle)
@@ -375,6 +503,11 @@ def enrich(bundle):
     bundle["timeline"] = build_timeline(bundle)
     # compute_feature_deltas depends on build_trains having run (resolves trains).
     bundle["feature_deltas"] = compute_feature_deltas(bundle)
+    # Phase 3b: attribute code areas everywhere the schema reserved a null.
+    idx = attribute_code_areas(bundle)
+    attribute_train_areas(bundle, idx)
+    build_modules(bundle, idx)
+    attribute_people_areas(bundle, idx)
     return bundle
 
 
