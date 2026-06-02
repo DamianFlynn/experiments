@@ -99,17 +99,25 @@ def render(bundle):
 
 
 def write_diagrams(bundle, outdir="workspace/diagrams"):
-    """Write each diagram to <outdir>/<name>.mmd and record the manifest on the
-    bundle. Returns the name->path manifest."""
+    """Write each diagram to <outdir>/<name>.mmd.
+
+    Records a **workspace-relative** manifest on `bundle["diagrams"]` (e.g.
+    `diagrams/<name>.mmd` — paths relative to the parent of `outdir`) so the
+    persisted bundle is portable for downstream embedding, per the design spec.
+    RETURNS the real on-disk paths (name -> path as written) so the caller can
+    hand them straight to `validate_with_mmdc`."""
     os.makedirs(outdir, exist_ok=True)
-    manifest = {}
+    root = os.path.dirname(os.path.normpath(outdir)) or "."
+    real_paths = {}
+    relative = {}
     for name, text in render(bundle).items():
         path = os.path.join(outdir, f"{name}.mmd")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
-        manifest[name] = path
-    bundle["diagrams"] = manifest
-    return manifest
+        real_paths[name] = path
+        relative[name] = os.path.relpath(path, root)
+    bundle["diagrams"] = relative
+    return real_paths
 
 
 def ensure_mmdc(which=shutil.which):

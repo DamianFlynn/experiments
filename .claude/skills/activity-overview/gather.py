@@ -508,10 +508,18 @@ def acquire(args, env):
         f"{api}/issues?state=all&sort=updated&direction=desc&per_page=100",
         lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
     )
+    # Open issues untouched during the window are still relevant to the in_flight
+    # / next_candidates buckets (e.g. milestone-scoped work that hasn't moved), so
+    # pull every open issue too — bounded only by state, like the open PRs above —
+    # and de-duplicate against the recently-updated set.
+    raw_open_issues = fetch_all(
+        get_page, f"{api}/issues?state=open&sort=updated&direction=desc&per_page=100")
     issues = []
     seen = set()
-    for raw in raw_repo_issues:
+    for raw in raw_repo_issues + raw_open_issues:
         if raw.get("pull_request"):  # the issues endpoint also lists PRs; skip them
+            continue
+        if raw["number"] in seen:
             continue
         issue = normalize_issue(raw)
         seen.add(issue["number"])

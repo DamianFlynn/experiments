@@ -48,7 +48,10 @@ def _high_priority(item):
 
 
 def _ms_sort_key(m):
-    return ((m.get("due_on") or "9999-12-31")[:10], m.get("number", 0))
+    # `or 0` (not a default arg) guarantees an int secondary key even when
+    # `number` is present-but-null; real GitHub milestone numbers are >= 1, so
+    # collapsing a hypothetical 0 to 0 is harmless.
+    return ((m.get("due_on") or "9999-12-31")[:10], m.get("number") or 0)
 
 
 def select_milestones(milestones, ref_date):

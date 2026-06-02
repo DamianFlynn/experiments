@@ -38,9 +38,6 @@ def _mmdc_works():
         return False
 
 
-_MMDC_OK = _mmdc_works()
-
-
 class TestBucketsPie(unittest.TestCase):
     def test_pie_header_and_counts(self):
         b = _bundle()
@@ -110,13 +107,17 @@ class TestWriteDiagrams(unittest.TestCase):
     def test_writes_files_and_manifest(self):
         b = _bundle()
         with tempfile.TemporaryDirectory() as d:
-            manifest = render.write_diagrams(b, d)
-            self.assertEqual(set(manifest), {"buckets_pie", "timeline_gantt"})
-            for name, path in manifest.items():
+            outdir = os.path.join(d, "diagrams")
+            real_paths = render.write_diagrams(b, outdir)
+            # return value is the real on-disk paths (for validation)
+            self.assertEqual(set(real_paths), {"buckets_pie", "timeline_gantt"})
+            for name, path in real_paths.items():
                 self.assertTrue(os.path.exists(path))
                 self.assertTrue(path.endswith(f"{name}.mmd"))
-            # manifest is recorded back onto the bundle for downstream stages
-            self.assertEqual(b["diagrams"], manifest)
+            # bundle records workspace-relative manifest paths (spec contract)
+            self.assertEqual(b["diagrams"],
+                             {"buckets_pie": os.path.join("diagrams", "buckets_pie.mmd"),
+                              "timeline_gantt": os.path.join("diagrams", "timeline_gantt.mmd")})
 
     def test_render_returns_mmd_text_per_diagram(self):
         out = render.render(_bundle())
@@ -145,11 +146,15 @@ class TestMmdcValidation(unittest.TestCase):
                                       which=lambda _n: "/usr/bin/mmdc")
         self.assertIn("Parse error", str(ctx.exception))
 
-    @unittest.skipUnless(_MMDC_OK, "working mmdc (with browser) not available")
     def test_real_mmdc_compiles_emitted_diagrams(self):
+        # Probe lazily inside the test (not at import time) so collecting/​running
+        # other tests never spawns mmdc, and an installed-but-broken mmdc skips
+        # rather than fails.
+        if not _mmdc_works():
+            self.skipTest("working mmdc (with browser) not available")
         with tempfile.TemporaryDirectory() as d:
-            manifest = render.write_diagrams(_bundle(), d)
-            render.validate_with_mmdc(list(manifest.values()))  # raises on failure
+            real_paths = render.write_diagrams(_bundle(), d)
+            render.validate_with_mmdc(list(real_paths.values()))  # raises on failure
 
     def test_ensure_mmdc_returns_path_when_present(self):
         self.assertEqual(render.ensure_mmdc(which=lambda _n: "/usr/bin/mmdc"),
