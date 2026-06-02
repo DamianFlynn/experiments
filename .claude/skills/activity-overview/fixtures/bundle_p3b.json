@@ -1,0 +1,69 @@
+{
+  "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31",
+           "ref_date": "2026-05-31", "period": {"from": "2026-05-01", "to": "2026-05-31"}},
+  "commits": [
+    {"sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+     "message": "Add policy example (#42)", "pr": null, "author": "alice",
+     "files": ["avm/res/network/firewall-policy/examples/basic/main.bicep",
+               "avm/res/network/firewall-policy/main.bicep"]},
+    {"sha": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+     "message": "Drop stale firewall doc", "pr": null, "author": "dave",
+     "files": ["docs/firewall.md"]}
+  ],
+  "code_events": [
+    {"commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "author": "alice",
+     "date": "2026-05-03", "change": "add",
+     "path": "avm/res/network/firewall-policy/examples/basic/main.bicep"},
+    {"commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "author": "alice",
+     "date": "2026-05-03", "change": "add", "path": "docs/firewall.md"},
+    {"commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4", "author": "dave",
+     "date": "2026-05-25", "change": "delete", "path": "docs/firewall.md"}
+  ],
+  "code_graph": {"provider": "directory", "areas": [
+    {"id": "avm/res/network/firewall-policy", "label": "firewall-policy",
+     "paths": ["avm/res/network/firewall-policy/examples/basic/main.bicep",
+               "avm/res/network/firewall-policy/main.bicep"], "edges": []},
+    {"id": "docs", "label": "docs", "paths": ["docs/firewall.md"], "edges": []}
+  ]},
+  "code_owners": {"avm/res/network/": ["alice", "bob"], "docs/": ["dave"]},
+  "label_taxonomy": {
+    "area": {"area:": ["area: networking", "area: storage"]},
+    "kind": {"Type:": ["Type: Bug", "Type: Feature"]},
+    "source": "auto"},
+  "prs": [
+    {"number": 42, "title": "Add policy example", "merged": true, "state": "closed",
+     "merged_at": "2026-05-10T12:00:00Z", "closed_at": "2026-05-10T12:00:00Z",
+     "milestone": "v1.2.0", "labels": ["area: networking", "Type: Feature"],
+     "facets": {"area": "area: networking", "priority": null, "status": null,
+                "lifecycle": null},
+     "author": "alice", "reviewers": ["carol"], "closes": [17],
+     "crossref_issues": [], "url": "https://github.com/o/r/pull/42",
+     "review_comments": [], "comments_list": []}
+  ],
+  "issues": [
+    {"number": 17, "title": "Support policy param", "kind": "feature",
+     "facets": {"area": "area: networking", "priority": null, "status": null,
+                "lifecycle": null},
+     "state": "closed", "state_reason": "completed", "milestone": "v1.2.0",
+     "closed_at": "2026-05-10T12:00:00Z", "updated_at": "2026-05-10T12:00:00Z",
+     "labels": ["area: networking", "Type: Feature"],
+     "url": "https://github.com/o/r/issues/17",
+     "comments_list": [], "reactions": {"+1": 0, "-1": 0, "heart": 0, "hooray": 0, "total": 0},
+     "open_high_activity": false},
+    {"number": 18, "title": "Add storage module", "kind": "module-request",
+     "facets": {"area": "area: storage", "priority": null, "status": null,
+                "lifecycle": null},
+     "state": "open", "state_reason": null, "milestone": "v1.3.0",
+     "closed_at": null, "updated_at": "2026-05-22T00:00:00Z",
+     "labels": ["area: storage"], "url": "https://github.com/o/r/issues/18",
+     "comments_list": [], "reactions": {"+1": 3, "-1": 0, "heart": 0, "hooray": 0, "total": 3},
+     "open_high_activity": false}
+  ],
+  "milestones": [
+    {"title": "v1.2.0", "number": 4, "state": "open", "due_on": "2026-05-31T00:00:00Z"},
+    {"title": "v1.3.0", "number": 5, "state": "open", "due_on": "2026-06-30T00:00:00Z"}
+  ],
+  "releases": [], "trains": [], "artifacts": {}, "timeline": [],
+  "feature_deltas": [], "modules": {}, "people": {},
+  "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []}
+}

@@ -575,8 +575,6 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
         alice = b["people"]["alice"]
         self.assertIn("avm/res/network/firewall-policy", alice["modules"])
 
-    @unittest.skipUnless(os.path.exists(os.path.join(FIX, "bundle_p3b.json")),
-                         "fixture pending")
     def test_enrich_fills_all_phase3b_attribution(self):
         with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
             bundle = link.enrich(json.load(fh))
@@ -587,6 +585,34 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
         # trains carry code_areas; modules populated
         self.assertTrue(any(t.get("code_areas") for t in bundle["trains"]))
         self.assertTrue(bundle["modules"])
+
+
+class TestPhase3bConsistency(unittest.TestCase):
+    def test_attribution_preserves_artifact_and_delta_refs(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            b = link.enrich(json.load(fh))
+        for d in b["feature_deltas"]:
+            self.assertTrue(str(d["url"]).startswith("https://"))
+            self.assertIn(d["artifact"], b["artifacts"])
+        for a in b["artifacts"].values():
+            for ev in a["lifecycle"]:
+                self.assertTrue(str(ev["ref"]["url"]).startswith("https://"))
+
+    def test_modules_counts_are_non_negative_and_sum_sane(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            b = link.enrich(json.load(fh))
+        for area, m in b["modules"].items():
+            self.assertGreaterEqual(m["commits"], 1)
+            self.assertGreaterEqual(m["files_changed"], 1)
+            self.assertGreaterEqual(m["prs"], 0)
+
+    def test_train_code_areas_are_known_area_ids(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            b = link.enrich(json.load(fh))
+        known = {a["id"] for a in b["code_graph"]["areas"]}
+        for t in b["trains"]:
+            for area in t.get("code_areas", []):
+                self.assertIn(area, known)
 
 
 if __name__ == "__main__":
