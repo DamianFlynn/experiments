@@ -110,6 +110,12 @@ jobs:
       # (fixtures/graphify_graph_sample.json) in the offline test suite. Do NOT
       # add a graphify install step to this workflow.
 
+      # The Phase 3c edge gate depends on `bicep restore` reaching the public
+      # module registry (mcr.microsoft.com). A registry outage -> empty edges ->
+      # the "bicep build path did not light up" assertion below fails. That is
+      # intentional (it proves the build path lit up), but is a latent source of
+      # flaky red runs unrelated to the skill itself — check registry reachability
+      # before assuming a regression.
       - name: Install bicep CLI
         run: |
           curl -sSLo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
