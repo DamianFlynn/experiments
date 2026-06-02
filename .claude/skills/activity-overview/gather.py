@@ -119,7 +119,9 @@ def parse_code_events(raw):
             if change is None or len(cols) < 2:
                 continue
             ev = {"commit": sha, "author": author, "date": date, "change": change}
-            if change in ("rename", "copy") and len(cols) >= 3:
+            if change in ("rename", "copy"):
+                if len(cols) < 3:
+                    continue  # malformed R/C line (real `-M -C` always has old+new)
                 ev["old_path"] = cols[1].strip()
                 ev["path"] = cols[2].strip()
             else:

@@ -550,6 +550,25 @@ class TestParseCodeEvents(unittest.TestCase):
     def test_empty_input_yields_no_events(self):
         self.assertEqual(gather.parse_code_events(""), [])
 
+    def test_copy_and_type_change_status_codes(self):
+        # C### (copy) -> copy with old+new path; T (type-change) -> modify.
+        raw = (
+            "\x1e" + "f" * 40 + "\x1f" + "p" * 40 + "\x1fEve\x1f2026-05-20\x1fmix\n"
+            "C085\told/x.bicep\tnew/x.bicep\n"
+            "T\tlinks/sym.bicep\n"
+        )
+        events = gather.parse_code_events(raw)
+        copy = next(e for e in events if e["change"] == "copy")
+        self.assertEqual((copy["old_path"], copy["path"]), ("old/x.bicep", "new/x.bicep"))
+        tchg = next(e for e in events if e["path"] == "links/sym.bicep")
+        self.assertEqual(tchg["change"], "modify")
+
+    def test_malformed_rename_line_is_skipped(self):
+        # A rename status with only one path column is dropped, not mis-parsed.
+        raw = ("\x1e" + "f" * 40 + "\x1f\x1fEve\x1f2026-05-20\x1fbad\n"
+               "R096\tonly/old/path.bicep\n")
+        self.assertEqual(gather.parse_code_events(raw), [])
+
 
 if __name__ == "__main__":
     unittest.main()
