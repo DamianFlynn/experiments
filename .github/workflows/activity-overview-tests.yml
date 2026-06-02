@@ -1,0 +1,40 @@
+name: activity-overview tests
+
+on:
+  push:
+    paths:
+      - ".claude/skills/activity-overview/**"
+      - ".github/workflows/activity-overview-tests.yml"
+  pull_request:
+    paths:
+      - ".claude/skills/activity-overview/**"
+      - ".github/workflows/activity-overview-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile the CLIs
+        run: |
+          python -m py_compile \
+            .claude/skills/activity-overview/gather.py \
+            .claude/skills/activity-overview/link.py
+
+      - name: Run the offline test suite
+        run: |
+          python -m unittest discover \
+            -s .claude/skills/activity-overview -p 'test_*.py' -v

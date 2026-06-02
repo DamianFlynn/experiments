@@ -1,0 +1,10 @@
+{
+  "projects": {
+    "example": {
+      "owner": "OWNER",
+      "repo": "REPO",
+      "branches": ["main"],
+      "clone_dir": "workspace/example-clone"
+    }
+  }
+}

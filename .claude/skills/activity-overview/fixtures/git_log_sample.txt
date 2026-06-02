@@ -1,0 +1,4 @@
+a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1Alice2026-05-10Add policy param (#42)
+modules/firewall/main.bicep
+modules/firewall/README.mdb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2 p3p3p3p3p3p3p3p3p3p3p3p3p3p3p3p3p3p3p3p3Bob2026-05-10Merge pull request #42 from feature/policyc3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3p4p4p4p4p4p4p4p4p4p4p4p4p4p4p4p4p4p4p4p4Carol2026-05-12Tidy outputs
+modules/firewall/outputs.bicep

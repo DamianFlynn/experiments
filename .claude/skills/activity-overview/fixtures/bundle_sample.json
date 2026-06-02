@@ -1,0 +1,19 @@
+{
+  "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
+  "commits": [
+    {"sha": "a", "message": "Add policy param (#42)", "pr": null},
+    {"sha": "b", "message": "Merge pull request #42 from x", "pr": null},
+    {"sha": "c", "message": "Tidy outputs", "pr": null}
+  ],
+  "prs": [
+    {"number": 42, "title": "Add policy param", "merged": true, "closes": [17],
+     "url": "https://github.com/o/r/pull/42"}
+  ],
+  "issues": [
+    {"number": 17, "title": "Support policy param", "kind": "feature",
+     "state": "closed", "state_reason": "completed",
+     "url": "https://github.com/o/r/issues/17"}
+  ],
+  "trains": [],
+  "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []}
+}
