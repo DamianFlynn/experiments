@@ -154,6 +154,25 @@ Sub-agent dispatch and all narrative prose — both the standard per-train narra
 long-form single-train **spotlight**. 4a ships the slice + effort + forecast scaffold +
 flowcharts; 4b consumes them. The predicted-vs-landed **forecast loop** remains Phase 7.
 
+## Backlog — findings from the real AVM validation run
+
+Validated end-to-end against `Azure/bicep-registry-modules` (window 2026-05-25..06-01): gather →
+link → render → `mmdc`, all diagrams compiled, structural cross-checks clean, and random PRs/
+issues + the forecast candidate spot-checked against the live GitHub API all matched. Two
+accuracy observations (neither a Phase 4a logic bug):
+
+- **Train `kind` is "other" for most AVM trains (16/18)** because kind derives from the root
+  *issue*, but AVM PRs are conventional-commit titled (`feat:`/`fix:`) and usually don't close a
+  typed issue. So `significance` is effectively footprint-only there and doesn't surface feature
+  vs fix. Backlog: derive a train's kind from its PR title (conventional-commit prefix) when there
+  is no typed root issue, so the kind weight actually differentiates real work.
+- **6/18 merged-in-window PRs carried no commit in the bounded clone** (squash commit dates
+  fall outside the window even though the PR merged inside it), so those trains under-report code
+  areas/deltas. Pre-existing Phase 3a clone-window behaviour. Backlog: window commits by the
+  owning PR's merge, or widen the clone margin.
+- Without the `bicep` CLI the code graph uses the directory provider (areas only, no resolved
+  dependency edges → `module_graph` is a placeholder). Install `bicep` for full edges.
+
 ## Backlog — non-shipped train outcomes (awareness)
 
 `build_trains` currently builds trains only from MERGED PRs and hardcodes `outcome:"shipped"`,
