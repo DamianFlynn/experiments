@@ -128,6 +128,28 @@ class TestBuildTrains(unittest.TestCase):
         trains = link.build_trains(bundle)
         self.assertEqual(trains[0]["kind"], "other")
 
+    def test_stacked_pr_to_non_main_base_excluded_from_trains(self):
+        """A PR merged into another branch (base != meta.base_branch) is a stacked/
+        fork contribution, not shipped-to-main, so it builds no main-line train."""
+        bundle = _sample_bundle()
+        bundle["meta"] = {"base_branch": "main"}
+        bundle["prs"][0]["base"] = "users/x/feature"
+        link.attach_commit_prs(bundle["commits"])
+        self.assertEqual(link.build_trains(bundle), [])
+
+    def test_pr_merged_to_main_base_included(self):
+        bundle = _sample_bundle()
+        bundle["meta"] = {"base_branch": "main"}
+        bundle["prs"][0]["base"] = "main"
+        link.attach_commit_prs(bundle["commits"])
+        self.assertEqual(len(link.build_trains(bundle)), 1)
+
+    def test_unknown_base_treated_as_mainline(self):
+        """Older bundles without a base/base_branch keep the prior behaviour."""
+        bundle = _sample_bundle()              # no meta.base_branch, pr has no base
+        link.attach_commit_prs(bundle["commits"])
+        self.assertEqual(len(link.build_trains(bundle)), 1)
+
 
 class TestBucketsAndEnrich(unittest.TestCase):
     def test_shipped_bucket_has_merged_prs_and_completed_issues(self):
@@ -139,6 +161,18 @@ class TestBucketsAndEnrich(unittest.TestCase):
         kinds = {(r["type"], r["id"]) for r in buckets["shipped"]}
         self.assertIn(("pr", 42), kinds)
         self.assertIn(("issue", 17), kinds)
+
+    def test_stacked_pr_not_in_shipped_bucket(self):
+        """A merged PR whose base isn't the analyzed branch is kept in the bundle
+        but is not classified as shipped-to-main."""
+        bundle = _sample_bundle()
+        bundle["meta"] = {"base_branch": "main"}
+        bundle["prs"][0]["base"] = "users/x/feature"
+        bundle.setdefault("buckets", {"shipped": [], "in_flight": [],
+                                      "rejected": [], "next_candidates": []})
+        link.attach_commit_prs(bundle["commits"])
+        buckets = link.compute_buckets(bundle)
+        self.assertNotIn(("pr", 42), {(r["type"], r["id"]) for r in buckets["shipped"]})
 
     def test_enrich_is_idempotent_and_populates_both(self):
         with open(os.path.join(FIX, "bundle_sample.json")) as fh:

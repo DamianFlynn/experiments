@@ -94,7 +94,7 @@ def parse_git_log(raw):
 # FIELD_SEP header as parse_git_log, but the BODY is `--name-status` lines so each
 # changed path carries its change type (and rename/copy detection via -M -C gives
 # `R###`/`C###` with old+new paths).
-CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
+CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
 
 _STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
                      "R": "rename", "C": "copy", "T": "modify"}
@@ -204,6 +204,14 @@ def in_window(ts, from_date, to_date):
     return from_date <= day <= to_date
 
 
+def window_records(records, from_date, to_date):
+    """Keep only commits/events whose `date` (committer/landing date) falls in
+    [from,to] inclusive. Pure. Used instead of git's `--since/--until`, which
+    silently prunes valid in-window commits when commit dates are non-monotonic
+    across committer timezones (and excludes the upper boundary day)."""
+    return [r for r in records if in_window(r.get("date"), from_date, to_date)]
+
+
 _CLOSING_RE = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
 )
@@ -239,6 +247,11 @@ def normalize_pr(raw):
         "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
         "state": raw.get("state"),
+        # base/head branch refs: a PR whose base isn't the analyzed branch is a
+        # stacked/fork PR (it merged into another branch, not main) — kept as
+        # context but not counted as shipped-to-main (see link.build_trains).
+        "base": (raw.get("base") or {}).get("ref"),
+        "head": (raw.get("head") or {}).get("ref"),
         "comments": raw.get("comments", 0) or 0,
         "review_comments_count": raw.get("review_comments", 0) or 0,
         "reviewers": [],
@@ -1711,12 +1724,14 @@ def acquire(args, env):
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
     # Multi-branch commit walking arrives in a later phase.
+    # The shallow clone already bounds history to ~CLONE_MARGIN_DAYS before `frm`;
+    # we walk it fully and window in Python (window_records) rather than with git's
+    # `--since/--until`, which prunes valid in-window commits across timezones.
     raw = run_git([
         "git", "-C", clone_dir, "log",
-        f"--since={frm}", f"--until={to}",
         f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
     ])
-    commits = parse_git_log(raw)
+    commits = window_records(parse_git_log(raw), frm, to)
 
     # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
     # Guarded so --no-clone / missing clone degrades gracefully to empty.
@@ -1726,11 +1741,10 @@ def acquire(args, env):
     if not args.no_clone or os.path.isdir(clone_dir):
         raw_walk = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
-            f"--since={frm}", f"--until={to}",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
             "--name-status", "-M", "-C",
         ])
-        code_events = parse_code_events(raw_walk)
+        code_events = window_records(parse_code_events(raw_walk), frm, to)
 
     # Phase 3d: symbol-granular change attribution via a single `git log -p` walk
     # (diff-local, no per-commit checkout). Same guard/degradation + oldest→newest
@@ -1739,11 +1753,10 @@ def acquire(args, env):
     if not args.no_clone or os.path.isdir(clone_dir):
         raw_patch = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
-            f"--since={frm}", f"--until={to}",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
             "-p", "--unified=3", "-M", "-C",
         ])
-        symbol_events = parse_symbol_events(raw_patch)
+        symbol_events = window_records(parse_symbol_events(raw_patch), frm, to)
 
     # Drop any shallow-boundary commit whose diff is a whole-tree phantom (its parent
     # was grafted away by the bounded clone) — guards both walks against inflation.
@@ -1899,6 +1912,9 @@ def acquire(args, env):
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
         "branches": args.branches.split(","), "clone_dir": clone_dir,
+        # the analyzed mainline branch: PRs merged into other branches are stacked/
+        # fork contributions, not shipped-to-main (link.build_trains keys on this).
+        "base_branch": args.branches.split(",")[0],
         "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
         "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,

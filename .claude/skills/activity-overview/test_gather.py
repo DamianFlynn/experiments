@@ -117,11 +117,38 @@ class TestCloneAndWindow(unittest.TestCase):
         self.assertFalse(gather.in_window("2026-06-01", "2026-05-01", "2026-05-31"))
         self.assertFalse(gather.in_window(None, "2026-05-01", "2026-05-31"))
 
+    def test_window_records_filters_by_date_inclusive(self):
+        recs = [{"date": "2026-05-10", "commit": "a"},
+                {"date": "2026-05-25", "commit": "b"},
+                {"date": "2026-06-01", "commit": "c"},
+                {"date": "2026-06-02", "commit": "d"},
+                {"date": "", "commit": "e"}]
+        out = gather.window_records(recs, "2026-05-25", "2026-06-01")
+        self.assertEqual([r["commit"] for r in out], ["b", "c"])
+
+    def test_window_records_preserves_order(self):
+        recs = [{"date": "2026-05-26"}, {"date": "2026-05-25"}, {"date": "2026-05-27"}]
+        self.assertEqual([r["date"] for r in gather.window_records(
+            recs, "2026-05-25", "2026-05-31")],
+            ["2026-05-26", "2026-05-25", "2026-05-27"])
+
 
 class TestPrNormalization(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "rest_sample.json")) as fh:
             self.data = json.load(fh)
+
+    def test_normalize_captures_base_and_head_refs(self):
+        raw = {"number": 5, "base": {"ref": "users/x/feat"},
+               "head": {"ref": "fix-branch"}}
+        pr = gather.normalize_pr(raw)
+        self.assertEqual(pr["base"], "users/x/feat")
+        self.assertEqual(pr["head"], "fix-branch")
+
+    def test_normalize_missing_base_head_is_none(self):
+        pr = gather.normalize_pr({"number": 6})
+        self.assertIsNone(pr["base"])
+        self.assertIsNone(pr["head"])
 
     def test_parse_closing_refs_all_keywords(self):
         self.assertEqual(gather.parse_closing_refs("Fixes #17"), [17])

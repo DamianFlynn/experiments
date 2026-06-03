@@ -286,21 +286,36 @@ def compute_feature_deltas(bundle):
     return deltas
 
 
+def _mainline_merge(pr, base_branch):
+    """True if `pr` merged into the analyzed mainline branch. A merged PR whose
+    KNOWN base differs from `base_branch` is a stacked/fork contribution (it merged
+    into another branch, not main) — kept in the bundle as context but not counted
+    as shipped-to-main. A missing/None base or base_branch (older bundles) is
+    treated as mainline so prior behaviour is preserved. Pure."""
+    if not pr.get("merged"):
+        return False
+    base = pr.get("base")
+    return base_branch is None or base is None or base == base_branch
+
+
 def build_trains(bundle):
     """Group merged PRs (+ their commits + closing issue) into decision trains.
 
     Train id is deterministic from its anchor: the root issue number when the PR
-    closes one (`train-issue-<n>`), else the PR number (`train-pr-<n>`).
+    closes one (`train-issue-<n>`), else the PR number (`train-pr-<n>`). Only PRs
+    merged into the analyzed mainline branch build trains; stacked/fork PRs merged
+    into other branches are excluded (see `_mainline_merge`).
     """
     commits_by_pr = {}
     for c in bundle["commits"]:
         commits_by_pr.setdefault(c.get("pr"), []).append(c["sha"])
     issues_by_num = {i["number"]: i for i in bundle["issues"]}
+    base_branch = bundle.get("meta", {}).get("base_branch")
 
     # Group merged PRs by anchor so multiple PRs on one issue share a train.
     groups = {}
     for pr in bundle["prs"]:
-        if not pr.get("merged"):
+        if not _mainline_merge(pr, base_branch):
             continue
         links = list(pr.get("closes") or [])
         for n in pr.get("crossref_issues") or []:
@@ -354,6 +369,7 @@ def compute_buckets(bundle):
     shipped > rejected > next_candidates > in_flight. Refs carry their train id."""
     meta = bundle.get("meta", {})
     period = meta.get("period")
+    base_branch = meta.get("base_branch")
     ref_date = meta.get("ref_date") or meta.get("to") or ""
     current_ms, next_ms = select_milestones(bundle.get("milestones", []), ref_date)
     current_title = current_ms["title"] if current_ms else None
@@ -372,7 +388,8 @@ def compute_buckets(bundle):
     def classify(item, type_):
         num, url = item["number"], item.get("url")
         state = item.get("state")
-        if type_ == "pr" and item.get("merged") and _in_window(item.get("merged_at"), period):
+        if type_ == "pr" and _mainline_merge(item, base_branch) \
+                and _in_window(item.get("merged_at"), period):
             add("shipped", type_, num, url)
         elif type_ == "issue" and state == "closed" \
                 and item.get("state_reason") == "completed" \
