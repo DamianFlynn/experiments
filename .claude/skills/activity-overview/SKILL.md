@@ -16,6 +16,26 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    python3 gather.py --owner OWNER --repo REPO --from FROM --to TO --out workspace/bundle.json
    ```
    This writes a schema-complete bundle (see `BUNDLE.md`).
+   - **IaC dependency edges (Phase 3c):** if `bicep` and/or `terraform` are on `PATH`, gather
+     resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges` and records
+     `code_graph.edge_extraction` (`resolved`/`timeout`/`failed`/`skipped`); absent the CLIs (or
+     the module registry), edges are left empty and the rest of the run is unaffected.
+
+   **Alternative acquire modes (Phase 3c.2):**
+   - **Resume a partial edge gap.** If a prior run left areas `timeout`/`failed` (see
+     `edge_extraction`), re-resolve *only those* against the bundle's pinned `meta.clone_sha`
+     (same source tree) — no full re-gather:
+     ```bash
+     python3 gather.py --resume workspace/bundle.json --out workspace/bundle.json
+     ```
+     Then continue at **Link** (re-run link + render so the diagrams pick up the new edges).
+   - **Roll up a long view.** Merge monthly installments (overlap-safe — union by stable
+     identity, structure from the latest) into one multi-period bundle:
+     ```bash
+     python3 gather.py --rollup apr.json may.json jun.json --out half.json
+     ```
+     Roll-up emits a *raw* bundle (derived fields dropped), so continue at **Link** then Render.
+     (A fresh wide-window re-gather always yields a correct bundle and stays canonical.)
 2. **Link.** Enrich it offline (no network):
    ```bash
    python3 link.py workspace/bundle.json
@@ -27,15 +47,6 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    `graphify` is **optional** (used only for its supported languages); when it is
    absent — e.g. on Bicep/Terraform repos — the **directory provider** supplies
    code areas, so no install is required for code-area attribution to work.
-   - **IaC dependency edges (Phase 3c):** if `bicep` and/or `terraform` are on `PATH`, `gather.py`
-     resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges`; absent the
-     CLIs (or the module registry), edges are left empty and the rest of the run is unaffected.
-   - **Resume a partial edge gap (Phase 3c.2):** if a prior run left some areas `timeout`/`failed`
-     (see `code_graph.edge_extraction`), re-resolve just those against the same source — no full
-     re-gather: `python3 gather.py --resume workspace/bundle.json --out workspace/bundle.json`.
-   - **Roll up a long view:** merge monthly installments (overlap-safe) into one multi-period
-     bundle, then render: `python3 gather.py --rollup apr.json may.json jun.json --out half.json`
-     then re-run `link.py`/`render.py` on it. (A fresh wide-window re-gather stays canonical.)
 
    Then:
    ```bash

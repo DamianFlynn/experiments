@@ -4,6 +4,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 import urllib.error
 
@@ -1519,6 +1520,24 @@ class TestRollupBundles(unittest.TestCase):
     def test_empty_raises(self):
         with self.assertRaises(ValueError):
             gather.rollup_bundles([])
+
+    def test_rollup_cli_end_to_end(self):
+        # Exercise the --rollup CLI path (acquire dispatch + file IO + out write),
+        # codifying the operational flow so it's covered offline (no clone/token).
+        d = tempfile.mkdtemp()
+        f1 = os.path.join(d, "apr.json")
+        f2 = os.path.join(d, "may.json")
+        out = os.path.join(d, "half.json")
+        json.dump(self._bundle("2026-04-01", "2026-05-02", "a" * 40,
+                                [{"number": 1}], [], "apr"), open(f1, "w"))
+        json.dump(self._bundle("2026-04-29", "2026-06-01", "b" * 40,
+                               [{"number": 1}, {"number": 2}], [], "may"), open(f2, "w"))
+        gather.main(["--rollup", f1, f2, "--out", out])
+        merged = json.load(open(out))
+        self.assertEqual(sorted(p["number"] for p in merged["prs"]), [1, 2])  # deduped
+        self.assertEqual(merged["meta"]["period"],
+                         {"from": "2026-04-01", "to": "2026-06-01"})
+        self.assertEqual(merged["code_graph"]["areas"][0]["label"], "may")  # latest
 
 
 class TestAcquireEdgesP3c(unittest.TestCase):
