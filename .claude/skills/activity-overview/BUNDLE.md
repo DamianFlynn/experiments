@@ -91,7 +91,8 @@ docsRefs, release_train, sprints, project, diagrams`.
   carry the bounded `before`/`after`.
 - **symbol_moves** (link, Phase 3e) — window-wide symbol-identity links: `{ links:[{subkind,
   name, from_path, to_path, from:<src aid>, to:<dst aid>, confidence:"high|medium", basis:
-  "file_rename|unique_name"}], by_confidence:{high,medium} }`. A move = the same `(subkind,name)`
+  "file_rename|unique_name"}], by_confidence:{high,medium} }`. Each link object also carries
+  `lang`. A move = the same `(lang, subkind, name)`
   symbol dropped in ONE file and added in ONE other (precision over recall — ambiguous/boilerplate
   names are skipped). On the linked artifacts the source is `status:"replaced"` + `replaced_by`
   the dest, the dest carries `identity_from`, and both carry `move_confidence`/`move_basis`.

@@ -23,8 +23,9 @@ didn't change produce no events. The valuable case — a `resource`/`module` **e
 Over all window symbol_events (kind `symbol` only; comments excluded — their text identity already
 captures evolution and would be noisy):
 
-1. Index drops by `(subkind, name)` → set of source paths; adds likewise → dest paths.
-2. **Link only UNIQUE pairings:** a `(subkind, name)` dropped in exactly ONE file `A` and added in
+1. Index drops by `(lang, subkind, name)` → set of source paths; adds likewise → dest paths.
+   (`lang` is in the key so a Bicep symbol can't link to a same-named Terraform one.)
+2. **Link only UNIQUE pairings:** a `(lang, subkind, name)` dropped in exactly ONE file `A` and added in
    exactly ONE different file `B` (`A != B`) → a move `A → B`. **Ambiguous names** (dropped or
    added in >1 file — e.g. boilerplate `param location`) are **skipped** (the key false-positive
    guard).

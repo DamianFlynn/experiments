@@ -953,7 +953,7 @@ against GitHub) after each.
   and `feature_deltas` gain `hunk`/`before`/`after`/`detail`. Builds on the 3c edge/area
   foundation. (Sequenced slice.)
 - **Phase 3e — symbol-identity tracking (shipped).** Window-wide symbol MOVES: link a symbol
-  dropped in one file to the same `(subkind, name)` added in another (`link.match_symbol_moves`
+  dropped in one file to the same `(lang, subkind, name)` added in another (`link.match_symbol_moves`
   / `link_symbol_identity` → `symbol_moves` + artifact `replaced_by`/`identity_from`/
   `move_confidence`). **Precision over recall** (the spec's highest-risk slice): only UNIQUE
   pairings link (ambiguous/boilerplate names skipped) — validated on a refactor-heavy AVM window
