@@ -1383,6 +1383,78 @@ class TestIacEdgeHardening(unittest.TestCase):
         self.assertEqual(summ["failed"], 0)
 
 
+class TestResumeEdges(unittest.TestCase):
+    """Phase 3c.2: targeted re-resolution rebuilds ONLY the timeout/failed areas
+    and retains the rest, converging to a full run's result."""
+
+    def setUp(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            self.arm = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            self.src = fh.read()
+
+    def _prior(self):
+        # A prior bundle: bar resolved (real edges), baz failed, qux skipped.
+        return {"meta": {"clone_sha": "f" * 40},
+                "code_graph": {"provider": "directory", "areas": [
+                    {"id": "avm/ptn/foo/bar", "label": "bar",
+                     "paths": ["avm/ptn/foo/bar/main.bicep"],
+                     "edges": [{"to": "avm/res/x/y", "kind": "module"}],
+                     "edges_status": "resolved"},
+                    {"id": "avm/ptn/foo/baz", "label": "baz",
+                     "paths": ["avm/ptn/foo/baz/main.bicep"],
+                     "edges": [], "edges_status": "failed"},
+                    {"id": "avm/ptn/foo/qux", "label": "qux",
+                     "paths": ["avm/ptn/foo/qux/readme.md"],
+                     "edges": [], "edges_status": "skipped"},
+                ]}}
+
+    def test_resume_rebuilds_only_failed_and_retains_resolved(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd[:2])
+            return self.arm if cmd[:2] == ["bicep", "build"] else ""
+        prior = self._prior()
+        resumed = gather.resume_bundle(
+            prior, "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            read_text=lambda _p: self.src, run=run)
+        areas = {a["id"]: a for a in resumed["code_graph"]["areas"]}
+        # resolved area untouched — its edges are NOT rebuilt (no build for bar)
+        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
+                         [{"to": "avm/res/x/y", "kind": "module"}])
+        # failed area rebuilt → now resolved with real edges
+        self.assertEqual(areas["avm/ptn/foo/baz"]["edges_status"], "resolved")
+        self.assertTrue(areas["avm/ptn/foo/baz"]["edges"])
+        # only baz triggered a build (bar/qux were retained, no subprocess)
+        built = [c for c in calls if c == ["bicep", "build"]]
+        self.assertEqual(len(built), 1)
+
+    def test_resume_summary_reflects_merged_state(self):
+        prior = self._prior()
+        gather.resume_bundle(
+            prior, "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            read_text=lambda _p: self.src,
+            run=lambda cmd, **kw: self.arm if cmd[:2] == ["bicep", "build"] else "")
+        summ = prior["code_graph"]["edge_extraction"]
+        self.assertEqual(summ["resolved"], 2)   # bar (retained) + baz (rebuilt)
+        self.assertEqual(summ["skipped"], 1)    # qux (retained)
+        self.assertEqual(summ["failed"], 0)
+
+    def test_only_status_does_not_clobber_when_no_toolchain(self):
+        # Resume with no CLI present must NOT wipe prior resolved edges.
+        prior = self._prior()
+        gather.extract_iac_edges(prior["code_graph"], "clone",
+                                 which=lambda _n: None,
+                                 only_status={"timeout", "failed"})
+        areas = {a["id"]: a for a in prior["code_graph"]["areas"]}
+        self.assertEqual(areas["avm/ptn/foo/bar"]["edges_status"], "resolved")
+        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
+                         [{"to": "avm/res/x/y", "kind": "module"}])
+
+
 class TestAcquireEdgesP3c(unittest.TestCase):
     """Compose the provider + edge seam offline (graphify + bicep absent ->
     directory provider, edges empty; bicep stubbed -> edges populate)."""

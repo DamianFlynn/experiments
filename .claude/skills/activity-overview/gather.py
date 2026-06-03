@@ -1049,10 +1049,12 @@ def fetch_until(get_page, first_url, more):
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Acquire an activity-overview bundle.")
-    p.add_argument("--owner", required=True)
-    p.add_argument("--repo", required=True)
-    p.add_argument("--from", dest="from", required=True)
-    p.add_argument("--to", required=True)
+    # Not argparse-required: a --resume run derives these from the prior bundle's
+    # meta. acquire() enforces them for a normal (non-resume) run.
+    p.add_argument("--owner")
+    p.add_argument("--repo")
+    p.add_argument("--from", dest="from")
+    p.add_argument("--to")
     p.add_argument("--branches", default="main")
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
@@ -1064,6 +1066,9 @@ def parse_args(argv):
     p.add_argument("--include-releases", dest="include_releases",
                    action="store_true", default=True)
     p.add_argument("--no-releases", dest="include_releases", action="store_false")
+    p.add_argument("--resume", default=None,
+                   help="Prior bundle JSON: re-resolve only its timeout/failed edges "
+                        "against the pinned meta.clone_sha; reuse everything else.")
     p.add_argument("--out", default=None)
     return p.parse_args(argv)
 
@@ -1154,7 +1159,7 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
                       read_text=_read_text_file, patterns=None,
                       max_workers=IAC_MAX_WORKERS, timeout=IAC_BUILD_TIMEOUT,
-                      retries=IAC_RETRIES):
+                      retries=IAC_RETRIES, only_status=None):
     """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
 
     Each area with a main.bicep (and `bicep` on PATH) or a *.tf (and `terraform` on
@@ -1163,7 +1168,12 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     restore failure, build error, or timeout leaves `edges` as-is ([]) but stamps
     `area["edges_status"]` so the gap is VISIBLE, never a silent empty. An aggregate
     `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
-    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
+    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph.
+
+    `only_status` (a set, e.g. {"timeout","failed"}) drives RESUME: only areas whose
+    current `edges_status` is in the set are rebuilt; every other area keeps its prior
+    edges + status untouched. The summary is recomputed across ALL areas so it reflects
+    the merged state. Sound because an area's edges are a pure function of its source."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     areas = code_graph.get("areas", [])
     area_ids = {a["id"] for a in areas}
@@ -1171,14 +1181,18 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     have_tf = bool(which("terraform"))
     summary = {"resolved": 0, "timeout": 0, "failed": 0, "skipped": 0}
 
-    if not (have_bicep or have_tf):
-        for area in areas:               # build-only: nothing to build
+    # Fresh full run with no toolchain: build-only ⇒ everything skipped. (For a
+    # resume, fall through so retained areas keep their prior resolved edges.)
+    if only_status is None and not (have_bicep or have_tf):
+        for area in areas:
             area["edges_status"] = "skipped"
         summary["skipped"] = len(areas)
         code_graph["edge_extraction"] = summary
         return code_graph
 
     def work(area):
+        if only_status is not None and area.get("edges_status") not in only_status:
+            return area, (None, area.get("edges_status") or "skipped")   # retain
         return area, _extract_area_edges(area, clone_dir, area_ids, patterns,
                                          have_bicep, have_tf, run, read_text,
                                          timeout, retries)
@@ -1192,6 +1206,18 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
 
     code_graph["edge_extraction"] = summary
     return code_graph
+
+
+def resume_bundle(prior_bundle, clone_dir, **extract_kw):
+    """Re-resolve ONLY the unresolved (timeout/failed) edges of a prior bundle, in
+    place, reusing everything else. Cheap way to close a partial edge gap without
+    recomputing the window — correct only when the clone is checked out at the prior
+    `meta.clone_sha` (same source tree). Returns the updated bundle. Mutates it."""
+    code_graph = prior_bundle.get("code_graph") or {}
+    extract_iac_edges(code_graph, clone_dir,
+                      only_status={"timeout", "failed"}, **extract_kw)
+    prior_bundle["code_graph"] = code_graph
+    return prior_bundle
 
 
 def http_get_json(url, token):
@@ -1282,7 +1308,41 @@ def _runs_page(get_page, api, frm, to):
     return runs
 
 
+def resume_acquire(args):
+    """`--resume` path: load a prior bundle, check the clone out at its pinned
+    `meta.clone_sha`, re-resolve only the timeout/failed edges, reuse everything
+    else. Not unit-tested (git/IO orchestration); the merge core is resume_bundle."""
+    with open(args.resume) as fh:
+        prior = json.load(fh)
+    meta = prior.get("meta") or {}
+    owner, repo = meta.get("owner"), meta.get("repo")
+    clone_dir = args.clone_dir or meta.get("clone_dir") or f"workspace/{repo}-clone"
+    sha = meta.get("clone_sha")
+    if not sha:
+        sys.stderr.write("error: prior bundle has no meta.clone_sha to resume against\n")
+        raise SystemExit(2)
+    if not args.no_clone:
+        os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
+        if not os.path.isdir(os.path.join(clone_dir, ".git")):
+            run_git(["git", "clone", f"https://github.com/{owner}/{repo}.git", clone_dir])
+        # fetch the exact pinned commit (works on a shallow clone) and check it out,
+        # so the rebuild runs against the IDENTICAL tree the prior run resolved.
+        run_git(["git", "-C", clone_dir, "fetch", "--depth", "1", "origin", sha])
+        run_git(["git", "-C", clone_dir, "checkout", "--force", sha])
+    before = dict((prior.get("code_graph") or {}).get("edge_extraction") or {})
+    resume_bundle(prior, clone_dir)
+    after = (prior.get("code_graph") or {}).get("edge_extraction") or {}
+    sys.stderr.write(f"resume: edge_extraction {before} -> {after}\n")
+    return prior
+
+
 def acquire(args, env):
+    if getattr(args, "resume", None):
+        return resume_acquire(args)
+    if not (args.owner and args.repo and getattr(args, "from") and args.to):
+        sys.stderr.write("error: --owner --repo --from --to are required "
+                         "(or pass --resume <prior-bundle>)\n")
+        raise SystemExit(2)
     token = resolve_token(env)
     owner, repo = args.owner, args.repo
     frm, to = getattr(args, "from"), args.to
@@ -1475,7 +1535,9 @@ def acquire(args, env):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     bundle = acquire(args, os.environ)
-    out = args.out or f"workspace/activity-{getattr(args, 'from')}-{args.to}.json"
+    period = bundle.get("meta", {}).get("period", {})
+    out = (args.out or f"workspace/activity-{getattr(args, 'from', None) or period.get('from')}"
+           f"-{args.to or period.get('to')}.json")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w") as fh:
         json.dump(bundle, fh, indent=2)

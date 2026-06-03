@@ -21,7 +21,11 @@ SHAs in `trains[].commits` — wrapped `commit` refs arrive in a later phase.)
 Scope notes mark where Phase 2 widens what Phase 1 collected; field lists below
 are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 
-- `meta` — `owner, repo, from, to, branches, clone_dir, period, prev_bundle, schema_version`.
+- `meta` — `owner, repo, from, to, branches, clone_dir, period, prev_bundle, schema_version`,
+  plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
+  It pins the exact source tree so `gather.py --resume <prior-bundle>` can re-resolve **only**
+  the `timeout`/`failed` edges against the identical tree (edges are a pure function of source),
+  and a multi-bundle roll-up can pick the newest structural snapshot deterministically.
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
 - `prs` — PRs in scope (Phase 1: merged-in-window only; **Phase 2** also includes
   open and closed-unmerged PRs): `{ number, title, body, author, author_association,
