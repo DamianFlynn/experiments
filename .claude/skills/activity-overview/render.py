@@ -231,7 +231,7 @@ def emit_train_flowchart(bundle, train):
 
     Adaptive layout:
       mode C (default): PR nodes annotated with distinct code_area nodes when
-        len(prs) <= TRAIN_FLOW_MAX_PRS and len(code_areas) <= TRAIN_FLOW_MAX_AREAS.
+        len(prs) <= TRAIN_FLOW_MAX_PRS and len(distinct code_areas) <= TRAIN_FLOW_MAX_AREAS.
       mode A: bare issue -> PR -> outcome chain when either threshold is exceeded.
     """
     issues_by_num = {i["number"]: i for i in bundle.get("issues", [])}

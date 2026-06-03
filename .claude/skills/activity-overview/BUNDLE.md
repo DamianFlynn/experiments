@@ -38,8 +38,9 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
   reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
   `significance = footprint × kind_weight + breadth`; `tier` = `"deep"` for the top-N
   by significance ∪ any train ≥ the significance floor, else `"mention"` (Phase 4a).
-  `effort`: `reviewers` = distinct reviewer logins; `review_comments` = summed
-  `review_comments_count`; `participants` = distinct authors + reviewers + comment-authors;
+  `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed
+  `review_comments_count` (int); `participants` = count of distinct authors + reviewers +
+  comment-authors (int);
   `stalled` = merged but `elapsed_days > TRAIN_STALL_DAYS`. All fields degrade to null/0
   when data is thin. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
   `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`.
@@ -68,7 +69,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   written and mmdc-validated by `render.py`. **`diagrams.train_flowcharts`** is a nested
   map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written by `render.py` (one adaptive
   Mermaid `flowchart` per DEEP train; mode C with code-area annotation nodes when
-  `len(prs) ≤ TRAIN_FLOW_MAX_PRS` and `len(code_areas) ≤ TRAIN_FLOW_MAX_AREAS`, else
+  `len(prs) ≤ TRAIN_FLOW_MAX_PRS` and `len(distinct code_areas) ≤ TRAIN_FLOW_MAX_AREAS`, else
   mode A bare chain). On-demand spotlight render via `render.py --train <id>` (any tier).
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
   train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
