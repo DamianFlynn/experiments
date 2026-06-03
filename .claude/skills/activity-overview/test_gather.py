@@ -75,9 +75,29 @@ class TestCloneAndWindow(unittest.TestCase):
         self.assertEqual(cmd[0], "git")
         self.assertIn("clone", cmd)
         self.assertIn("--filter=blob:none", cmd)
-        self.assertIn("--shallow-since=2026-05-01", cmd)
+        # shallow-since reaches CLONE_MARGIN_DAYS (14) BEFORE the window start so the
+        # grafted boundary commit's whole-tree phantom diff falls outside the window.
+        self.assertIn("--shallow-since=2026-04-17", cmd)
         self.assertIn("--no-single-branch", cmd)
         self.assertEqual(cmd[-2:], ["https://github.com/o/r.git", "/tmp/clone"])
+
+    def test_shift_date(self):
+        self.assertEqual(gather._shift_date("2026-05-01", -14), "2026-04-17")
+        self.assertEqual(gather._shift_date("bad", -14), "bad")  # parse-error fallback
+
+    def test_shallow_boundary_and_drop(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".git"))
+            with open(os.path.join(d, ".git", "shallow"), "w") as fh:
+                fh.write("aaaa\nbbbb\n")
+            self.assertEqual(gather.shallow_boundary_shas(d), {"aaaa", "bbbb"})
+        # absent file -> empty set; drop filters by commit; empty boundary is a no-op
+        self.assertEqual(gather.shallow_boundary_shas("/no/such/clone"), set())
+        evs = [{"commit": "aaaa", "x": 1}, {"commit": "cccc", "x": 2}]
+        self.assertEqual(gather.drop_boundary_events(evs, {"aaaa"}),
+                         [{"commit": "cccc", "x": 2}])
+        self.assertEqual(gather.drop_boundary_events(evs, set()), evs)
 
     def test_in_window_inclusive_bounds(self):
         self.assertTrue(gather.in_window("2026-05-01", "2026-05-01", "2026-05-31"))

@@ -5,6 +5,7 @@ later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
 import concurrent.futures
+import datetime
 import json
 import os
 import re
@@ -134,15 +135,54 @@ def parse_code_events(raw):
     return events
 
 
+# Fetch a margin of history BEFORE the window so the shallow-clone boundary commit
+# predates it. The boundary commit's parent is grafted away, so `git log -p` /
+# `--name-status` diff it against the EMPTY tree — a whole-tree phantom that would
+# otherwise flood code_events/symbol_events with thousands of spurious "add"s. With
+# the margin the first in-window commit keeps its real parent; shallow_boundary_shas
+# is the belt-and-suspenders that drops any boundary commit that still lands in-window.
+CLONE_MARGIN_DAYS = 14
+
+
+def _shift_date(date_str, days):
+    """YYYY-MM-DD shifted by `days` (negative = earlier); input returned on parse error."""
+    try:
+        d = datetime.date.fromisoformat(date_str[:10])
+        return (d + datetime.timedelta(days=days)).isoformat()
+    except (ValueError, TypeError):
+        return date_str
+
+
 def build_clone_cmd(repo_url, from_date, clone_dir):
-    """Construct the bounded, partial clone command (network-free to build)."""
+    """Construct the bounded, partial clone command (network-free to build).
+
+    `--shallow-since` reaches CLONE_MARGIN_DAYS before `from_date` so the shallow
+    boundary commit (whole-tree phantom diff) sits OUTSIDE the report window."""
     return [
         "git", "clone",
         "--filter=blob:none",
-        f"--shallow-since={from_date}",
+        f"--shallow-since={_shift_date(from_date, -CLONE_MARGIN_DAYS)}",
         "--no-single-branch",
         repo_url, clone_dir,
     ]
+
+
+def shallow_boundary_shas(clone_dir):
+    """SHAs at the shallow-clone boundary (from `.git/shallow`). Their parents are
+    grafted away, so a diff against them is a whole-tree phantom — exclude them from
+    the code/symbol walks. Empty for a full clone or when the file is absent."""
+    try:
+        with open(os.path.join(clone_dir, ".git", "shallow")) as fh:
+            return {ln.strip() for ln in fh if ln.strip()}
+    except OSError:
+        return set()
+
+
+def drop_boundary_events(events, boundary):
+    """Drop events whose commit is a shallow boundary SHA (phantom whole-tree diffs)."""
+    if not boundary:
+        return events
+    return [e for e in events if e.get("commit") not in boundary]
 
 
 def in_window(ts, from_date, to_date):
@@ -1629,6 +1669,12 @@ def acquire(args, env):
             "-p", "--unified=3", "-M", "-C",
         ])
         symbol_events = parse_symbol_events(raw_patch)
+
+    # Drop any shallow-boundary commit whose diff is a whole-tree phantom (its parent
+    # was grafted away by the bounded clone) — guards both walks against inflation.
+    _boundary = shallow_boundary_shas(clone_dir)
+    code_events = drop_boundary_events(code_events, _boundary)
+    symbol_events = drop_boundary_events(symbol_events, _boundary)
 
     # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
     # from the code-event walk + the commit file lists (local, zero-token).

@@ -327,6 +327,16 @@ jobs:
                   "symbol feature_deltas carry no before/after snippet"
               assert any(d.get("detail") for d in sym_deltas), "symbol deltas carry no detail"
 
+          # 9c. Regression guard: a shallow-clone boundary commit's parent is grafted
+          # away, so a diff against it is a whole-tree phantom that would inflate the
+          # ledger ~100x. Such commits must NOT appear in code_events/symbol_events.
+          shp = os.path.join(b["meta"].get("clone_dir", ""), ".git", "shallow")
+          boundary = {ln.strip() for ln in open(shp)} if os.path.exists(shp) else set()
+          boundary.discard("")
+          leaked = {e["commit"] for e in b.get("symbol_events", []) if e.get("commit") in boundary} | \
+                   {e["commit"] for e in b.get("code_events", []) if e.get("commit") in boundary}
+          assert not leaked, f"shallow-boundary commits leaked into the ledger: {leaked}"
+
           # 10. Phase 3a: diagrams manifest now includes the two new diagrams.
           assert set(dg) >= {"buckets_pie", "timeline_gantt",
                              "content_timeline", "deltas_bar"}, \
