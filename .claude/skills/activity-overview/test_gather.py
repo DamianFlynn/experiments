@@ -1455,6 +1455,55 @@ class TestResumeEdges(unittest.TestCase):
                          [{"to": "avm/res/x/y", "kind": "module"}])
 
 
+class TestRollupBundles(unittest.TestCase):
+    """Phase 3c.2: overlap-safe roll-up of monthly installments."""
+
+    def _bundle(self, frm, to, sha, prs, issues, cg_label):
+        return {
+            "meta": {"owner": "o", "repo": "r", "from": frm, "to": to,
+                     "clone_sha": sha, "period": {"from": frm, "to": to}},
+            "prs": prs, "issues": issues,
+            "commits": [], "code_events": [], "releases": [], "milestones": [],
+            "code_graph": {"provider": "directory",
+                           "areas": [{"id": "a", "label": cg_label}]},
+        }
+
+    def test_overlap_pr_deduped_by_number(self):
+        # PR #10 merged on the seam appears in both windows → once in the roll-up.
+        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40,
+                            [{"number": 10, "title": "seam"}], [], "apr")
+        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40,
+                            [{"number": 10, "title": "seam"}, {"number": 11}], [], "may")
+        merged = gather.rollup_bundles([apr, may])
+        nums = sorted(p["number"] for p in merged["prs"])
+        self.assertEqual(nums, [10, 11])
+
+    def test_mutable_item_takes_freshest_observation(self):
+        # issue #5 is open in April, closed by June → roll-up keeps the later state.
+        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [],
+                            [{"number": 5, "state": "open"}], "apr")
+        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [],
+                            [{"number": 5, "state": "closed"}], "may")
+        merged = gather.rollup_bundles([apr, may])
+        self.assertEqual(len(merged["issues"]), 1)
+        self.assertEqual(merged["issues"][0]["state"], "closed")
+
+    def test_structure_and_period_from_span_and_latest(self):
+        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [], [], "apr")
+        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [], [], "may")
+        # pass out of order to prove it sorts by period
+        merged = gather.rollup_bundles([may, apr])
+        self.assertEqual(merged["meta"]["period"],
+                         {"from": "2026-04-01", "to": "2026-06-01"})
+        self.assertEqual(merged["meta"]["clone_sha"], "b" * 40)        # latest
+        self.assertEqual(merged["code_graph"]["areas"][0]["label"], "may")  # latest
+        self.assertEqual(len(merged["meta"]["rolled_up_from"]), 2)
+
+    def test_empty_raises(self):
+        with self.assertRaises(ValueError):
+            gather.rollup_bundles([])
+
+
 class TestAcquireEdgesP3c(unittest.TestCase):
     """Compose the provider + edge seam offline (graphify + bicep absent ->
     directory provider, edges empty; bicep stubbed -> edges populate)."""

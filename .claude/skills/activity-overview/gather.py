@@ -1069,6 +1069,10 @@ def parse_args(argv):
     p.add_argument("--resume", default=None,
                    help="Prior bundle JSON: re-resolve only its timeout/failed edges "
                         "against the pinned meta.clone_sha; reuse everything else.")
+    p.add_argument("--rollup", nargs="+", default=None, metavar="BUNDLE",
+                   help="Merge 2+ monthly bundle JSONs into one multi-period bundle "
+                        "(overlap-safe union by identity; structure from the latest). "
+                        "Re-run link on the result. No clone/token needed.")
     p.add_argument("--out", default=None)
     return p.parse_args(argv)
 
@@ -1220,6 +1224,69 @@ def resume_bundle(prior_bundle, clone_dir, **extract_kw):
     return prior_bundle
 
 
+# Stable identity keys for overlap-safe roll-up. Monthly runs may overlap by a day
+# or two (a gap guarantee against late merges / clock skew); these immutable keys are
+# the dedup guarantee, so overlap never double-counts. (commit,path,change) keys a
+# code-event; PRs/issues by number; commits by sha; releases by tag; milestones by id.
+ROLLUP_ACTIVITY_KEYS = {
+    "prs": lambda x: x.get("number"),
+    "issues": lambda x: x.get("number"),
+    "commits": lambda x: x.get("sha"),
+    "releases": lambda x: x.get("tag") or x.get("id") or x.get("name"),
+    "milestones": lambda x: x.get("number") or x.get("id") or x.get("title"),
+    "code_events": lambda x: (x.get("commit"), x.get("path"), x.get("change")),
+}
+# Structure/derived fields are a point-in-time snapshot of a moving tree, so the
+# roll-up takes them whole from the LATEST installment rather than merging.
+ROLLUP_LATEST_FIELDS = ("code_graph", "code_owners", "label_taxonomy",
+                        "workflows", "workflow_stats")
+
+
+def _period_to(bundle):
+    m = bundle.get("meta") or {}
+    return (m.get("period") or {}).get("to") or m.get("to") or ""
+
+
+def rollup_bundles(bundles):
+    """Merge monthly installments into one multi-period bundle (the cheap through-line
+    for a long view; a fresh wide-window re-run stays canonical). ACTIVITY (prs/issues/
+    commits/code_events/releases/milestones) is UNIONED by stable identity — overlap
+    never double-counts, and the freshest observation of a mutable item (issue state,
+    open PR) wins (last-write). STRUCTURE (code_graph/owners/taxonomy/workflows) is taken
+    from the latest installment (newest `clone_sha`). `meta.period` spans the union window.
+    Derived link/report fields are intentionally dropped — re-run link on the result."""
+    if not bundles:
+        raise ValueError("rollup_bundles: no bundles given")
+    ordered = sorted(bundles, key=_period_to)
+    latest = ordered[-1]
+    merged = {}
+
+    for field, keyfn in ROLLUP_ACTIVITY_KEYS.items():
+        seen = {}
+        for i, b in enumerate(ordered):
+            for j, item in enumerate(b.get(field) or []):
+                k = keyfn(item)
+                seen[k if k is not None else (i, j)] = item   # last (freshest) wins
+        merged[field] = list(seen.values())
+
+    for field in ROLLUP_LATEST_FIELDS:
+        if field in latest:
+            merged[field] = latest[field]
+
+    metas = [b.get("meta") or {} for b in ordered]
+    froms = [(m.get("period") or {}).get("from") or m.get("from") for m in metas]
+    froms = [f for f in froms if f]
+    tos = [t for t in (_period_to(b) for b in ordered) if t]
+    lm = latest.get("meta") or {}
+    span = {"from": min(froms) if froms else lm.get("from"),
+            "to": max(tos) if tos else lm.get("to")}
+    merged["meta"] = {**lm, "from": span["from"], "to": span["to"],
+                      "period": span, "clone_sha": lm.get("clone_sha"),
+                      "rolled_up_from": [(m.get("period") or {"from": m.get("from"),
+                                          "to": m.get("to")}) for m in metas]}
+    return merged
+
+
 def http_get_json(url, token):
     """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested.
 
@@ -1337,6 +1404,12 @@ def resume_acquire(args):
 
 
 def acquire(args, env):
+    if getattr(args, "rollup", None):
+        bundles = []
+        for path in args.rollup:
+            with open(path) as fh:
+                bundles.append(json.load(fh))
+        return rollup_bundles(bundles)
     if getattr(args, "resume", None):
         return resume_acquire(args)
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
