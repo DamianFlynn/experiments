@@ -993,7 +993,9 @@ def build_forecast(bundle):
         # Age in days from created_at to ref_date (for overdue signal).
         created_ts = item.get("created_at", "")
         created_dt = _parse_ts(created_ts)
-        ref_dt     = _parse_ts(ref_date + "T00:00:00Z") if ref_date else None
+        # ref_date is normally YYYY-MM-DD; slice to the date so a full ISO
+        # timestamp can't produce a doubled "...ZT00:00:00Z" that fails to parse.
+        ref_dt     = _parse_ts(ref_date[:10] + "T00:00:00Z") if ref_date else None
         age_days   = (ref_dt - created_dt).days if (created_dt and ref_dt) else None
 
         # Determine in_motion:

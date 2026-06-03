@@ -153,6 +153,14 @@ Sub-agent dispatch and all narrative prose — both the standard per-train narra
 long-form single-train **spotlight**. 4a ships the slice + effort + forecast scaffold +
 flowcharts; 4b consumes them. The predicted-vs-landed **forecast loop** remains Phase 7.
 
+## Backlog — forecast tuning (minor)
+
+`FORECAST_OVERDUE_DAYS` ships at 200. Code review noted a quarter (90 days) is a more
+natural domain default for a "long-open" signal. Lowering it cleanly also means decoupling
+the `TestBuildForecast` fixture's default `created_at` from the threshold (so signal-isolation
+tests don't start firing `overdue`) and re-pinning the ±1-day boundary tests. Deferred as a
+mild (weight 1.0) tunable — revisit when the forecast is validated against a real window.
+
 ## Backlog — gather enrichment (prerequisite slice for 4b)
 
 `gather.py` already **fetches and then discards** two signals: the raw PR review submissions

@@ -1882,7 +1882,7 @@ class TestBuildForecast(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
-    # Signal + tier: likely requires both on_next_milestone AND high_priority
+    # Signal + tier: on_next_milestone alone clears "likely"; combined scores higher
     # ------------------------------------------------------------------
 
     def test_milestone_plus_high_priority_scores_higher_than_bare(self):
@@ -1979,7 +1979,11 @@ class TestBuildForecast(unittest.TestCase):
         bundle = self._bundle(next_candidates=ncs, issues=issues, prs=prs)
         link.build_forecast(bundle)
         cand = bundle["forecast"]["candidates"][0]
-        self.assertGreater(cand["score"], 0.0)
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["in_motion"],
+            places=4,
+        )
 
     def test_in_motion_for_pr_candidate(self):
         """A PR next_candidate is itself open -> in_motion signal."""
@@ -2063,6 +2067,28 @@ class TestBuildForecast(unittest.TestCase):
         """A recently created issue does NOT trigger the overdue signal."""
         issues = [self._issue(111, created_at="2026-05-20T00:00:00Z")]
         ncs = [self._nc_ref("issue", 111)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues, ref_date="2026-05-31")
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertNotIn("long-open", cand["signals"])
+
+    def test_overdue_fires_just_above_threshold(self):
+        """Issue created just over FORECAST_OVERDUE_DAYS ago triggers overdue (boundary +1)."""
+        # ref_date = 2026-05-31; FORECAST_OVERDUE_DAYS = 200.
+        # 2026-05-31 - 201 days = 2025-11-11; age_days = 201 -> fires.
+        issues = [self._issue(112, created_at="2025-11-11T00:00:00Z")]
+        ncs = [self._nc_ref("issue", 112)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues, ref_date="2026-05-31")
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertIn("long-open", cand["signals"])
+
+    def test_overdue_does_not_fire_just_below_threshold(self):
+        """Issue created just under FORECAST_OVERDUE_DAYS ago does NOT trigger overdue (boundary -1)."""
+        # ref_date = 2026-05-31; FORECAST_OVERDUE_DAYS = 200.
+        # 2026-05-31 - 199 days = 2025-11-13; age_days = 199 -> does not fire.
+        issues = [self._issue(113, created_at="2025-11-13T00:00:00Z")]
+        ncs = [self._nc_ref("issue", 113)]
         bundle = self._bundle(next_candidates=ncs, issues=issues, ref_date="2026-05-31")
         link.build_forecast(bundle)
         cand = bundle["forecast"]["candidates"][0]
