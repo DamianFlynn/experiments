@@ -1674,5 +1674,468 @@ class TestSliceTrain(unittest.TestCase):
         self.assertEqual(s["symbol_moves"], [])
 
 
+class TestBuildForecast(unittest.TestCase):
+    """Phase 4a: next-release forecast over next_candidates."""
+
+    # ------------------------------------------------------------------
+    # Shared fixture builder
+    # ------------------------------------------------------------------
+
+    def _bundle(self, next_candidates=None, milestones=None, prs=None, issues=None,
+                period=None, ref_date=None):
+        """In-memory bundle with meta, milestones, prs, issues, and buckets."""
+        return {
+            "meta": {
+                "period": period or {"from": "2026-05-01", "to": "2026-05-31"},
+                "ref_date": ref_date or "2026-05-31",
+            },
+            "milestones": milestones or [],
+            "prs": prs or [],
+            "issues": issues or [],
+            "buckets": {
+                "shipped": [],
+                "rejected": [],
+                "next_candidates": next_candidates or [],
+                "in_flight": [],
+            },
+            "trains": [],
+        }
+
+    def _open_ms(self, title, due_on, number):
+        return {"title": title, "state": "open", "due_on": due_on, "number": number}
+
+    def _issue(self, number, title="Issue", state="open", labels=None,
+               milestone=None, created_at="2026-01-01T00:00:00Z",
+               updated_at="2026-04-01T00:00:00Z", url=None,
+               closes=None, crossref_issues=None):
+        return {
+            "number": number,
+            "title": title,
+            "state": state,
+            "labels": labels or [],
+            "milestone": milestone,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "url": url or f"https://github.com/o/r/issues/{number}",
+        }
+
+    def _pr(self, number, title="PR", state="open", merged=False, labels=None,
+            milestone=None, created_at="2026-05-01T00:00:00Z",
+            updated_at="2026-04-01T00:00:00Z", url=None,
+            closes=None, crossref_issues=None):
+        return {
+            "number": number,
+            "title": title,
+            "state": state,
+            "merged": merged,
+            "labels": labels or [],
+            "milestone": milestone,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "url": url or f"https://github.com/o/r/pull/{number}",
+            "closes": closes or [],
+            "crossref_issues": crossref_issues or [],
+        }
+
+    def _nc_ref(self, type_, id_, url=None, train=None):
+        """Build a next_candidate ref (possibly with train key)."""
+        r = {"type": type_, "id": id_,
+             "url": url or f"https://github.com/o/r/{type_}/{id_}"}
+        if train is not None:
+            r["train"] = train
+        return r
+
+    # ------------------------------------------------------------------
+    # Structure: one candidate per next_candidate
+    # ------------------------------------------------------------------
+
+    def test_candidates_one_per_next_candidate(self):
+        """Exactly one forecast candidate per next_candidate ref."""
+        issues = [
+            self._issue(10, milestone="v1.3.0"),
+            self._issue(11, milestone="v1.3.0"),
+        ]
+        ncs = [
+            self._nc_ref("issue", 10),
+            self._nc_ref("issue", 11),
+        ]
+        milestones = [
+            self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1),
+            self._open_ms("v1.3.0", "2026-06-30T00:00:00Z", 2),
+        ]
+        bundle = self._bundle(next_candidates=ncs, milestones=milestones, issues=issues)
+        link.build_forecast(bundle)
+        fc = bundle["forecast"]
+        self.assertEqual(len(fc["candidates"]), 2)
+
+    def test_empty_next_candidates_yields_empty_candidates_list(self):
+        """Empty next_candidates -> empty candidates list, next_milestone still resolved."""
+        milestones = [
+            self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1),
+            self._open_ms("v1.3.0", "2026-06-30T00:00:00Z", 2),
+        ]
+        bundle = self._bundle(next_candidates=[], milestones=milestones)
+        link.build_forecast(bundle)
+        fc = bundle["forecast"]
+        self.assertEqual(fc["candidates"], [])
+        self.assertEqual(fc["next_milestone"], "v1.3.0")
+
+    def test_train_id_preserved_on_candidate(self):
+        """Candidate carries train id from the next_candidate ref when present."""
+        issues = [self._issue(20)]
+        ncs = [self._nc_ref("issue", 20, train="train-issue-20")]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertEqual(cand["train"], "train-issue-20")
+
+    def test_no_train_on_candidate_when_ref_lacks_it(self):
+        """Candidate train is None when the next_candidate ref has no train key."""
+        issues = [self._issue(21)]
+        ncs = [self._nc_ref("issue", 21)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertIsNone(cand["train"])
+
+    # ------------------------------------------------------------------
+    # ref sub-dict: type/id/url copied from next_candidate
+    # ------------------------------------------------------------------
+
+    def test_candidate_ref_carries_type_id_url(self):
+        """candidate.ref copies type/id/url from the next_candidate ref."""
+        url = "https://github.com/o/r/issues/30"
+        issues = [self._issue(30, url=url)]
+        ncs = [self._nc_ref("issue", 30, url=url)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertEqual(cand["ref"]["type"], "issue")
+        self.assertEqual(cand["ref"]["id"], 30)
+        self.assertEqual(cand["ref"]["url"], url)
+
+    # ------------------------------------------------------------------
+    # next_milestone resolution
+    # ------------------------------------------------------------------
+
+    def test_next_milestone_resolved_from_milestones(self):
+        """next_milestone = title of the NEXT open milestone after ref_date."""
+        milestones = [
+            self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1),
+            self._open_ms("v1.3.0", "2026-06-30T00:00:00Z", 2),
+        ]
+        bundle = self._bundle(milestones=milestones)
+        link.build_forecast(bundle)
+        self.assertEqual(bundle["forecast"]["next_milestone"], "v1.3.0")
+
+    def test_next_milestone_none_when_no_open_milestones(self):
+        """next_milestone is None when there are no open milestones."""
+        bundle = self._bundle(milestones=[])
+        link.build_forecast(bundle)
+        self.assertIsNone(bundle["forecast"]["next_milestone"])
+
+    def test_next_milestone_none_when_only_one_open_milestone(self):
+        """next_milestone is None when there is only one open milestone (no 'next')."""
+        milestones = [self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1)]
+        bundle = self._bundle(milestones=milestones)
+        link.build_forecast(bundle)
+        self.assertIsNone(bundle["forecast"]["next_milestone"])
+
+    # ------------------------------------------------------------------
+    # Signal: on_next_milestone (heavy)
+    # ------------------------------------------------------------------
+
+    def test_on_next_milestone_signal_present_and_score_high(self):
+        """Issue on the next milestone scores heavily and includes signal text."""
+        milestones = [
+            self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1),
+            self._open_ms("v1.3.0", "2026-06-30T00:00:00Z", 2),
+        ]
+        issues = [self._issue(40, milestone="v1.3.0")]
+        ncs = [self._nc_ref("issue", 40)]
+        bundle = self._bundle(next_candidates=ncs, milestones=milestones, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["on_next_milestone"],
+            places=4,
+        )
+        self.assertTrue(any("milestone" in s for s in cand["signals"]))
+
+    # ------------------------------------------------------------------
+    # Signal: high_priority (uses _high_priority helper)
+    # ------------------------------------------------------------------
+
+    def test_high_priority_signal_added_for_high_priority_label(self):
+        """A 'priority/high' label triggers the high-priority signal."""
+        issues = [self._issue(50, labels=["priority/high"])]
+        ncs = [self._nc_ref("issue", 50)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertIn("high-priority", cand["signals"])
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["high_priority"],
+            places=4,
+        )
+
+    # ------------------------------------------------------------------
+    # Signal + tier: likely requires both on_next_milestone AND high_priority
+    # ------------------------------------------------------------------
+
+    def test_milestone_plus_high_priority_scores_higher_than_bare(self):
+        """Issue on next milestone + high-priority scores more than a bare issue."""
+        milestones = [
+            self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1),
+            self._open_ms("v1.3.0", "2026-06-30T00:00:00Z", 2),
+        ]
+        issues = [
+            self._issue(60, milestone="v1.3.0", labels=["priority/high"]),
+            self._issue(61),
+        ]
+        ncs = [self._nc_ref("issue", 60), self._nc_ref("issue", 61)]
+        bundle = self._bundle(next_candidates=ncs, milestones=milestones, issues=issues)
+        link.build_forecast(bundle)
+        cands = {c["ref"]["id"]: c for c in bundle["forecast"]["candidates"]}
+        self.assertGreater(cands[60]["score"], cands[61]["score"])
+        # likely tier requires hitting the high threshold
+        self.assertEqual(cands[60]["tier"], "likely")
+
+    def test_bare_issue_no_signals_is_longshot(self):
+        """An issue with no signals scores 0 and lands in longshot tier."""
+        issues = [self._issue(70)]
+        ncs = [self._nc_ref("issue", 70)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertAlmostEqual(cand["score"], 0.0, places=4)
+        self.assertEqual(cand["tier"], "longshot")
+        self.assertEqual(cand["signals"], [])
+
+    # ------------------------------------------------------------------
+    # Tier bands: likely / possible / longshot
+    # ------------------------------------------------------------------
+
+    def test_tier_likely_at_high_score(self):
+        """Score >= FORECAST_TIER_LIKELY_THRESHOLD -> likely."""
+        milestones = [
+            self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1),
+            self._open_ms("v1.3.0", "2026-06-30T00:00:00Z", 2),
+        ]
+        # on_next_milestone (5.0) + high_priority (3.0) = 8.0 >= likely threshold (5.0)
+        issues = [self._issue(80, milestone="v1.3.0", labels=["priority/high"])]
+        ncs = [self._nc_ref("issue", 80)]
+        bundle = self._bundle(next_candidates=ncs, milestones=milestones, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertEqual(cand["tier"], "likely")
+
+    def test_tier_possible_at_mid_score(self):
+        """Score >= FORECAST_TIER_POSSIBLE_THRESHOLD (but < likely) -> possible."""
+        # high_priority alone = 3.0 -> possible (between 2.0 and 5.0)
+        issues = [self._issue(81, labels=["priority/high"])]
+        ncs = [self._nc_ref("issue", 81)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertEqual(cand["tier"], "possible")
+
+    def test_tier_longshot_below_mid_threshold(self):
+        """Score < FORECAST_TIER_POSSIBLE_THRESHOLD -> longshot."""
+        issues = [self._issue(82)]
+        ncs = [self._nc_ref("issue", 82)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertEqual(cand["tier"], "longshot")
+
+    # ------------------------------------------------------------------
+    # Signal: in_motion via open PR referencing an issue candidate
+    # ------------------------------------------------------------------
+
+    def test_in_motion_via_open_pr_referencing_issue(self):
+        """An open PR whose closes list references the issue candidate triggers in_motion."""
+        issues = [self._issue(90)]
+        prs = [self._pr(900, state="open", merged=False, closes=[90])]
+        ncs = [self._nc_ref("issue", 90)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues, prs=prs)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertTrue(any("PR" in s or "work" in s or "motion" in s or "open" in s.lower()
+                             for s in cand["signals"]))
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["in_motion"],
+            places=4,
+        )
+
+    def test_in_motion_via_crossref_issues(self):
+        """An open PR with crossref_issues referencing the candidate also triggers in_motion."""
+        issues = [self._issue(91)]
+        prs = [self._pr(910, state="open", merged=False, crossref_issues=[91])]
+        ncs = [self._nc_ref("issue", 91)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues, prs=prs)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertGreater(cand["score"], 0.0)
+
+    def test_in_motion_for_pr_candidate(self):
+        """A PR next_candidate is itself open -> in_motion signal."""
+        prs = [self._pr(920, state="open", merged=False)]
+        ncs = [self._nc_ref("pr", 920)]
+        bundle = self._bundle(next_candidates=ncs, prs=prs)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["in_motion"],
+            places=4,
+        )
+
+    def test_in_motion_via_train_id_on_ref(self):
+        """A next_candidate ref with a train id triggers in_motion."""
+        issues = [self._issue(93)]
+        ncs = [self._nc_ref("issue", 93, train="train-issue-93")]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["in_motion"],
+            places=4,
+        )
+
+    # ------------------------------------------------------------------
+    # Signal: recent_activity via updated_at inside vs outside the window
+    # ------------------------------------------------------------------
+
+    def test_recent_activity_inside_window(self):
+        """updated_at inside the period window triggers recent_activity signal."""
+        issues = [self._issue(100, updated_at="2026-05-15T00:00:00Z")]
+        ncs = [self._nc_ref("issue", 100)]
+        bundle = self._bundle(
+            next_candidates=ncs, issues=issues,
+            period={"from": "2026-05-01", "to": "2026-05-31"},
+        )
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertTrue(any("active" in s or "window" in s for s in cand["signals"]))
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["recent_activity"],
+            places=4,
+        )
+
+    def test_no_recent_activity_outside_window(self):
+        """updated_at outside the period window does NOT trigger recent_activity signal."""
+        issues = [self._issue(101, updated_at="2026-03-01T00:00:00Z")]
+        ncs = [self._nc_ref("issue", 101)]
+        bundle = self._bundle(
+            next_candidates=ncs, issues=issues,
+            period={"from": "2026-05-01", "to": "2026-05-31"},
+        )
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertAlmostEqual(cand["score"], 0.0, places=4)
+
+    # ------------------------------------------------------------------
+    # Signal: overdue (age >= FORECAST_OVERDUE_DAYS)
+    # ------------------------------------------------------------------
+
+    def test_overdue_signal_for_old_issue(self):
+        """An issue older than FORECAST_OVERDUE_DAYS triggers the overdue signal."""
+        # Use a created_at far enough in the past (definitely > 90 days before ref_date)
+        issues = [self._issue(110, created_at="2025-01-01T00:00:00Z")]
+        ncs = [self._nc_ref("issue", 110)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues, ref_date="2026-05-31")
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertTrue(any("long" in s or "overdue" in s for s in cand["signals"]))
+        self.assertAlmostEqual(
+            cand["score"],
+            link.FORECAST_WEIGHTS["overdue"],
+            places=4,
+        )
+
+    def test_no_overdue_for_new_issue(self):
+        """A recently created issue does NOT trigger the overdue signal."""
+        issues = [self._issue(111, created_at="2026-05-20T00:00:00Z")]
+        ncs = [self._nc_ref("issue", 111)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues, ref_date="2026-05-31")
+        link.build_forecast(bundle)
+        cand = bundle["forecast"]["candidates"][0]
+        self.assertNotIn("long-open", cand["signals"])
+
+    # ------------------------------------------------------------------
+    # Sorting: score descending, ref id ascending for ties
+    # ------------------------------------------------------------------
+
+    def test_sorted_by_score_descending(self):
+        """Higher-scored candidates appear first."""
+        milestones = [
+            self._open_ms("v1.2.0", "2026-05-31T00:00:00Z", 1),
+            self._open_ms("v1.3.0", "2026-06-30T00:00:00Z", 2),
+        ]
+        issues = [
+            self._issue(120, milestone="v1.3.0"),  # on next milestone -> high score
+            self._issue(121),                       # no signals -> score 0
+        ]
+        ncs = [self._nc_ref("issue", 121), self._nc_ref("issue", 120)]
+        bundle = self._bundle(next_candidates=ncs, milestones=milestones, issues=issues)
+        link.build_forecast(bundle)
+        cands = bundle["forecast"]["candidates"]
+        self.assertEqual(cands[0]["ref"]["id"], 120)
+        self.assertEqual(cands[1]["ref"]["id"], 121)
+
+    def test_deterministic_order_on_score_tie(self):
+        """When scores tie, lower ref id appears first."""
+        issues = [self._issue(130), self._issue(131)]
+        ncs = [self._nc_ref("issue", 131), self._nc_ref("issue", 130)]
+        bundle = self._bundle(next_candidates=ncs, issues=issues)
+        link.build_forecast(bundle)
+        cands = bundle["forecast"]["candidates"]
+        # both score 0 -> id-ascending order: 130 before 131
+        self.assertEqual(cands[0]["ref"]["id"], 130)
+        self.assertEqual(cands[1]["ref"]["id"], 131)
+
+    # ------------------------------------------------------------------
+    # Wired into enrich()
+    # ------------------------------------------------------------------
+
+    def test_enrich_sets_forecast_key(self):
+        """enrich() must produce bundle['forecast'] with the required shape."""
+        with open(os.path.join(FIX, "bundle_p2.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        self.assertIn("forecast", bundle)
+        fc = bundle["forecast"]
+        self.assertIn("next_milestone", fc)
+        self.assertIn("candidates", fc)
+        self.assertIsInstance(fc["candidates"], list)
+        for cand in fc["candidates"]:
+            for key in ("ref", "train", "score", "tier", "signals"):
+                self.assertIn(key, cand, f"candidate missing '{key}'")
+            self.assertIn(cand["tier"], {"likely", "possible", "longshot"})
+            self.assertIsInstance(cand["score"], float)
+            self.assertIsInstance(cand["signals"], list)
+
+    # ------------------------------------------------------------------
+    # Module-level constants exist
+    # ------------------------------------------------------------------
+
+    def test_module_constants_exist(self):
+        """FORECAST_WEIGHTS, FORECAST_TIER_LIKELY_THRESHOLD,
+        FORECAST_TIER_POSSIBLE_THRESHOLD, and FORECAST_OVERDUE_DAYS are defined."""
+        self.assertTrue(hasattr(link, "FORECAST_WEIGHTS"))
+        self.assertTrue(hasattr(link, "FORECAST_TIER_LIKELY_THRESHOLD"))
+        self.assertTrue(hasattr(link, "FORECAST_TIER_POSSIBLE_THRESHOLD"))
+        self.assertTrue(hasattr(link, "FORECAST_OVERDUE_DAYS"))
+        w = link.FORECAST_WEIGHTS
+        for key in ("on_next_milestone", "high_priority", "in_motion",
+                    "recent_activity", "overdue"):
+            self.assertIn(key, w, f"FORECAST_WEIGHTS missing '{key}'")
+
+
 if __name__ == "__main__":
     unittest.main()

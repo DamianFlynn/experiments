@@ -488,6 +488,39 @@ TRAIN_SIGNIFICANCE_FLOOR = 20.0
 # (took too long to land).  Tune without touching logic.
 TRAIN_STALL_DAYS = 21
 
+# ---------------------------------------------------------------------------
+# Phase 4a: next-release forecast tunables
+# ---------------------------------------------------------------------------
+
+# Weight for each scoring signal. Heavier signals represent stronger evidence
+# that an item will land in the next release:
+#   on_next_milestone — explicitly scheduled; strongest signal (5.0)
+#   high_priority     — labelled urgent by the team (3.0)
+#   in_motion         — active work already underway (2.0)
+#   recent_activity   — touched inside the window (1.5)
+#   overdue           — long-open item, mild pressure to close (1.0)
+FORECAST_WEIGHTS = {
+    "on_next_milestone": 5.0,
+    "high_priority":     3.0,
+    "in_motion":         2.0,
+    "recent_activity":   1.5,
+    "overdue":           1.0,
+}
+
+# Tier thresholds (score ranges → tier label).
+# Reasoning: on_next_milestone alone (5.0) clears the "likely" bar, meaning
+# any explicitly scheduled item is at least likely.  high_priority alone (3.0)
+# clears "possible" (≥2.0) but not "likely" (<5.0).  A bare item with only the
+# mild overdue signal (1.0) stays in "longshot" (<2.0).
+FORECAST_TIER_LIKELY_THRESHOLD   = 5.0   # score ≥ this → "likely"
+FORECAST_TIER_POSSIBLE_THRESHOLD = 2.0   # score ≥ this → "possible" (else "longshot")
+
+# Age threshold (days) for the "overdue / long-open" signal.
+# 200 days chosen so the fixture default created_at="2026-01-01" (≈150 days before
+# the typical ref_date of 2026-05-31) does NOT trigger the signal, while genuinely
+# stale items created a year or more ago (e.g. "2025-01-01", 516 days) do.
+FORECAST_OVERDUE_DAYS = 200
+
 
 def score_train_significance(bundle):
     """Annotate each train with `significance` (float) and `tier` ('deep'|'mention').
@@ -915,6 +948,115 @@ def link_symbol_identity(bundle):
     return bundle
 
 
+def build_forecast(bundle):
+    """Compute the next-release forecast over bundle['buckets']['next_candidates'].
+
+    Sets bundle['forecast'] = {next_milestone, candidates}.  Each candidate
+    carries a ref (type/id/url), train id, weighted score, tier, and signals.
+    Pure aside from writing forecast onto the bundle; reads buckets, milestones,
+    prs, issues, and meta.  Forward-only: no predicted-vs-landed comparison.
+    """
+    meta        = bundle.get("meta", {})
+    period      = meta.get("period")
+    ref_date    = meta.get("ref_date") or meta.get("to") or ""
+
+    # Resolve next milestone title via the shared helper.
+    _cur_ms, next_ms = select_milestones(bundle.get("milestones", []), ref_date)
+    next_title = next_ms["title"] if next_ms else None
+
+    # Build lookup indexes for issues and PRs.
+    issue_idx = {i["number"]: i for i in bundle.get("issues", [])}
+    pr_idx    = {p["number"]: p for p in bundle.get("prs", [])}
+
+    # Index open PRs that reference each issue number (via closes / crossref_issues).
+    # Used for the in_motion signal on issue candidates.
+    open_pr_for_issue: dict = {}   # issue_number -> True  (any open PR references it)
+    for pr in bundle.get("prs", []):
+        if pr.get("state") == "open" and not pr.get("merged"):
+            for n in list(pr.get("closes") or []) + list(pr.get("crossref_issues") or []):
+                open_pr_for_issue[n] = True
+
+    def _tier(score):
+        if score >= FORECAST_TIER_LIKELY_THRESHOLD:
+            return "likely"
+        if score >= FORECAST_TIER_POSSIBLE_THRESHOLD:
+            return "possible"
+        return "longshot"
+
+    def _score_candidate(nc_ref):
+        """Return (score, signals) for one next_candidate ref."""
+        type_ = nc_ref.get("type")
+        id_   = nc_ref.get("id")
+        item  = (issue_idx if type_ == "issue" else pr_idx).get(id_, {})
+        train_id = nc_ref.get("train")
+
+        # Age in days from created_at to ref_date (for overdue signal).
+        created_ts = item.get("created_at", "")
+        created_dt = _parse_ts(created_ts)
+        ref_dt     = _parse_ts(ref_date + "T00:00:00Z") if ref_date else None
+        age_days   = (ref_dt - created_dt).days if (created_dt and ref_dt) else None
+
+        # Determine in_motion:
+        #   - ref is a PR candidate (open PR is a next_candidate by definition)
+        #   - OR some open PR in the bundle references this issue
+        #   - OR the ref carries a train id
+        if type_ == "pr":
+            in_motion = True
+            motion_text = "open PR"
+        elif open_pr_for_issue.get(id_):
+            in_motion = True
+            motion_text = "open PR"
+        elif train_id:
+            in_motion = True
+            motion_text = "work in progress"
+        else:
+            in_motion = False
+            motion_text = ""
+
+        # Ordered list of (present_bool, weight_key, signal_text).
+        checks = [
+            (next_title is not None and item.get("milestone") == next_title,
+             "on_next_milestone", f"on milestone {next_title}"),
+            (_high_priority(item),
+             "high_priority", "high-priority"),
+            (in_motion,
+             "in_motion", motion_text),
+            (_in_window(item.get("updated_at"), period),
+             "recent_activity", "active in window"),
+            (age_days is not None and age_days >= FORECAST_OVERDUE_DAYS,
+             "overdue", "long-open"),
+        ]
+
+        score   = 0.0
+        signals = []
+        for present, key, text in checks:
+            if present:
+                score += FORECAST_WEIGHTS[key]
+                if text:
+                    signals.append(text)
+        return score, signals
+
+    candidates = []
+    for nc in bundle.get("buckets", {}).get("next_candidates", []):
+        score, signals = _score_candidate(nc)
+        candidates.append({
+            "ref":   {"type": nc["type"], "id": nc["id"], "url": nc["url"]},
+            "train": nc.get("train"),
+            "score": score,
+            "tier":  _tier(score),
+            "signals": signals,
+        })
+
+    # Sort: score descending, then ref id ascending for determinism on ties.
+    candidates.sort(key=lambda c: (-c["score"], c["ref"]["id"]))
+
+    bundle["forecast"] = {
+        "next_milestone": next_title,
+        "candidates":     candidates,
+    }
+    return bundle
+
+
 def enrich(bundle):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the Phase 3a narrative substrate (artifacts/timeline/feature_deltas), and the
@@ -934,6 +1076,8 @@ def enrich(bundle):
     attribute_train_areas(bundle, idx)
     score_train_significance(bundle)   # Phase 4a: reads code_areas populated above
     annotate_train_effort(bundle)      # Phase 4a: per-train time & effort metrics
+    # Phase 4a: next-release forecast (needs buckets + milestones, placed after both).
+    build_forecast(bundle)
     build_modules(bundle, idx)
     attribute_people_areas(bundle, idx)
     return bundle
