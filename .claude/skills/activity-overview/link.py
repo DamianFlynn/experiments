@@ -315,9 +315,12 @@ def build_trains(bundle):
     """Group PRs (+ their commits + closing issue) into decision trains.
 
     A train is anchored deterministically by its root issue (`train-issue-<n>`) or,
-    failing that, its PR (`train-pr-<n>`). Outcomes:
+    failing that, its PR (`train-pr-<n>`). One train per anchor, by precedence
+    shipped > in_flight > rejected > abandoned:
       - `shipped`   — at least one PR merged into the analyzed mainline branch.
       - `in_flight` — only OPEN PR(s) targeting mainline; the effort is in progress.
+      - `rejected`  — only CLOSED-unmerged PR(s) targeting mainline; the change was dropped.
+      - `abandoned` — an issue closed `not_planned` with no PR train of its own.
     A PR merged into ANOTHER PR's branch (base == that PR's head) is a stacked/fork
     contribution: it lands as a `contributing_prs` entry on the parent PR's train —
     the journey-to-main context — not its own train and not shipped-to-main.
@@ -367,26 +370,37 @@ def build_trains(bundle):
             "evidence": evidence,
         }
 
-    # 1. Shipped trains: PRs merged into mainline, grouped by anchor.
-    shipped_groups = {}
+    # 1. Partition mainline-targeting PRs by outcome class, grouped by anchor.
+    shipped_groups, inflight_groups, rejected_groups = {}, {}, {}
     for pr in prs_all:
+        anchor = _pr_anchor(pr)
         if _mainline_merge(pr, base_branch):
-            shipped_groups.setdefault(_pr_anchor(pr), []).append(pr)
+            shipped_groups.setdefault(anchor, []).append(pr)
+        elif not _targets_mainline(pr, base_branch):
+            continue  # stacked/fork PR — handled as a contribution in step 3
+        elif pr.get("state") == "open" and not pr.get("merged"):
+            inflight_groups.setdefault(anchor, []).append(pr)
+        elif pr.get("state") == "closed" and not pr.get("merged"):
+            rejected_groups.setdefault(anchor, []).append(pr)
 
-    # 2. In-flight trains: OPEN PRs targeting mainline, for anchors not yet shipped.
-    inflight_groups = {}
-    for pr in prs_all:
-        if pr.get("state") == "open" and not pr.get("merged") \
-                and _targets_mainline(pr, base_branch):
-            anchor = _pr_anchor(pr)
-            if anchor not in shipped_groups:
-                inflight_groups.setdefault(anchor, []).append(pr)
-
+    # 2. Materialise trains by precedence — one per anchor:
+    #    shipped > in_flight > rejected > abandoned.
     train_by_anchor = {}
-    for anchor, prs in shipped_groups.items():
-        train_by_anchor[anchor] = _make_train(anchor, prs, "shipped")
-    for anchor, prs in inflight_groups.items():
-        train_by_anchor[anchor] = _make_train(anchor, prs, "in_flight")
+
+    def _claim(groups, outcome):
+        for anchor, prs in groups.items():
+            if anchor not in train_by_anchor:
+                train_by_anchor[anchor] = _make_train(anchor, prs, outcome)
+
+    _claim(shipped_groups, "shipped")
+    _claim(inflight_groups, "in_flight")
+    _claim(rejected_groups, "rejected")
+    # abandoned: issues closed not-planned with no PR-anchored train of their own.
+    for iss in bundle["issues"]:
+        if iss.get("state") == "closed" and iss.get("state_reason") == "not_planned":
+            anchor = ("issue", iss["number"])
+            if anchor not in train_by_anchor:
+                train_by_anchor[anchor] = _make_train(anchor, [], "abandoned")
 
     # 3. Attach stacked contributions: a PR merged into a NON-mainline branch that is
     #    some mainline-targeting PR's head feeds that parent's train (its journey).

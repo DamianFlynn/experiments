@@ -208,6 +208,81 @@ class TestBuildTrains(unittest.TestCase):
         self.assertEqual(ids.count("train-issue-17"), 1)
         self.assertEqual(trains[0]["outcome"], "shipped")
 
+    def test_rejected_train_from_closed_unmerged_pr(self):
+        """A PR closed WITHOUT merging (a dropped/rejected change) builds a
+        `rejected` train so the dead-end is still on record."""
+        bundle = {
+            "meta": {"base_branch": "main"}, "commits": [],
+            "issues": [{"number": 62, "title": "Bug Y", "kind": "bug",
+                        "url": "https://github.com/o/r/issues/62"}],
+            "prs": [{"number": 116, "title": "fix: Y", "merged": False,
+                     "state": "closed", "base": "main", "head": "issue62",
+                     "closes": [62], "crossref_issues": [],
+                     "url": "https://github.com/o/r/pull/116"}],
+        }
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual([t["id"] for t in trains], ["train-issue-62"])
+        self.assertEqual(trains[0]["outcome"], "rejected")
+
+    def test_stacked_pr_attaches_to_rejected_parent_train(self):
+        """Contributions to an abandoned effort attach to the (rejected) parent
+        train — the real #7116/#7117/#7118 case where the parent was closed."""
+        bundle = {
+            "meta": {"base_branch": "main"}, "commits": [],
+            "issues": [{"number": 62, "kind": "bug",
+                        "url": "https://github.com/o/r/issues/62"}],
+            "prs": [
+                {"number": 116, "title": "fix: Y", "merged": False, "state": "closed",
+                 "base": "main", "head": "issue62", "closes": [62],
+                 "crossref_issues": [], "url": "https://github.com/o/r/pull/116"},
+                {"number": 118, "title": "fix: Y part", "merged": True,
+                 "state": "closed", "base": "issue62", "head": "issue62-sub",
+                 "closes": [], "crossref_issues": [],
+                 "url": "https://github.com/o/r/pull/118"},
+            ],
+        }
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual([t["id"] for t in trains], ["train-issue-62"])
+        self.assertEqual(trains[0]["outcome"], "rejected")
+        self.assertEqual(trains[0]["contributing_prs"], [118])
+
+    def test_abandoned_train_from_not_planned_issue(self):
+        """An issue closed `not_planned` with no PR is an abandoned train (an
+        idea that went nowhere)."""
+        bundle = {
+            "meta": {"base_branch": "main"}, "commits": [], "prs": [],
+            "issues": [{"number": 70, "title": "Idea", "kind": "feature",
+                        "state": "closed", "state_reason": "not_planned",
+                        "url": "https://github.com/o/r/issues/70"}],
+        }
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual([t["id"] for t in trains], ["train-issue-70"])
+        self.assertEqual(trains[0]["outcome"], "abandoned")
+        self.assertEqual(trains[0]["prs"], [])
+
+    def test_shipped_outranks_closed_unmerged_sibling(self):
+        """An anchor with both a merged and a closed-unmerged PR stays shipped."""
+        bundle = {
+            "meta": {"base_branch": "main"}, "commits": [],
+            "issues": [{"number": 80, "kind": "feature",
+                        "url": "https://github.com/o/r/issues/80"}],
+            "prs": [
+                {"number": 200, "merged": True, "state": "closed", "base": "main",
+                 "head": "a", "closes": [80], "crossref_issues": [],
+                 "url": "https://github.com/o/r/pull/200"},
+                {"number": 201, "merged": False, "state": "closed", "base": "main",
+                 "head": "b", "closes": [80], "crossref_issues": [],
+                 "url": "https://github.com/o/r/pull/201"},
+            ],
+        }
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual([t["id"] for t in trains], ["train-issue-80"])
+        self.assertEqual(trains[0]["outcome"], "shipped")
+
 
 class TestBucketsAndEnrich(unittest.TestCase):
     def test_shipped_bucket_has_merged_prs_and_completed_issues(self):

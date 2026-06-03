@@ -44,9 +44,11 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
   contributing_prs:[#], significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at,
   elapsed_days, reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
   A train is anchored by its root **issue** (`train-issue-<n>`) or, when no issue is linked
-  (process not followed / a forked PR), by its **PR** (`train-pr-<n>`). `outcome` is `"shipped"`
-  (≥1 PR merged to `meta.base_branch`) or `"in_flight"` (only OPEN PR(s) targeting it; effort in
-  progress) — `rejected`/abandoned efforts are not yet trains (backlog). **`contributing_prs`** are
+  (process not followed / a forked PR), by its **PR** (`train-pr-<n>`). One train per anchor, by
+  precedence shipped > in_flight > rejected > abandoned: `"shipped"` (≥1 PR merged to
+  `meta.base_branch`), `"in_flight"` (only OPEN PR(s) targeting it; in progress), `"rejected"`
+  (only CLOSED-unmerged PR(s) targeting it; change dropped), `"abandoned"` (an issue closed
+  `not_planned` with no PR train — an idea that went nowhere). **`contributing_prs`** are
   PRs merged into another PR's branch (`base == that PR's head`) — stacked/fork contributions to
   this train's journey-to-main, tracked but not counted as shipped.
   `kind` derives from the typed root issue; when there is no typed root issue it falls back to
