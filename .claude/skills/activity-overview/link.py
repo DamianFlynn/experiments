@@ -452,6 +452,12 @@ def attribute_train_areas(bundle, idx):
 # Phase 4a: train significance scoring + treatment tier
 # ---------------------------------------------------------------------------
 
+# Bounding constants for slice_train (Phase 4a).  Tune without touching logic.
+# Any body/message/comment text longer than this is truncated with a marker.
+SLICE_TEXT_CAP = 1500
+# For each comment list, keep at most this many bodies and record the overflow.
+SLICE_COMMENTS_KEPT = 6
+
 # Per-kind multiplier on the raw footprint.  feature/module-request represent
 # the heaviest intentional work; bug is medium; idea captures light exploration;
 # docs/chore/other are lightweight.  Tune these values without touching the
@@ -620,6 +626,154 @@ def annotate_train_effort(bundle):
     for train in bundle.get("trains", []):
         train["effort"] = _effort_for_train(train, pr_index, issue_index)
     return bundle
+
+
+def _cap_text(s):
+    """Truncate `s` to SLICE_TEXT_CAP chars; append '…[+N chars]' when cut. Pure."""
+    if not s or len(s) <= SLICE_TEXT_CAP:
+        return s
+    overflow = len(s) - SLICE_TEXT_CAP
+    return s[:SLICE_TEXT_CAP] + f"…[+{overflow} chars]"
+
+
+def _cap_comments(comment_objs):
+    """Return (kept_bodies, overflow_count) from a list of comment dicts.
+
+    Keeps up to SLICE_COMMENTS_KEPT comment bodies (strings, text-capped);
+    overflow_count is the number of comments dropped beyond the cap.
+    """
+    bodies = [_cap_text(c.get("body") or "") for c in (comment_objs or [])]
+    kept = bodies[:SLICE_COMMENTS_KEPT]
+    return kept, max(0, len(bodies) - len(kept))
+
+
+def slice_train(bundle, train_id):
+    """Return a bounded, self-contained dict describing one train.
+
+    All long text is truncated to SLICE_TEXT_CAP chars (with a '…[+N chars]'
+    marker).  For each comment list (issue comments, PR conversation comments,
+    PR review comments) at most SLICE_COMMENTS_KEPT bodies are kept; the count
+    of dropped comments is recorded as '<key>_overflow' alongside the list key
+    (e.g. 'comments' / 'comments_overflow').
+
+    Shape::
+
+        {
+          "train":   { id, kind, outcome, significance, tier, effort,
+                       code_areas, evidence },
+          "issue":   { number, title, body*, url, labels, kind,
+                       comments*:[body*], comments_overflow } | None,
+          "prs":     [ { number, title, body*, state, merged, created_at,
+                         merged_at, url, reviewers:[login], review_decision,
+                         review_comments*:[body*], review_comments_overflow,
+                         comments*:[body*], comments_overflow } ],
+          "commits": [ { sha, message*, author, date } ],
+          "feature_deltas": [ ... only this train's deltas ... ],
+          "symbol_moves":   [ ... only moves whose from/to artifact id is
+                               referenced by this train's feature_deltas ... ]
+        }
+
+    Raises KeyError when train_id is not found.  Does NOT mutate the bundle.
+    """
+    # --- locate the train ---------------------------------------------------
+    trains_by_id = {t["id"]: t for t in bundle.get("trains", [])}
+    if train_id not in trains_by_id:
+        raise KeyError(f"train_id {train_id!r} not found in bundle")
+    train = trains_by_id[train_id]
+
+    # --- train block (copy listed fields only) ------------------------------
+    train_block = {
+        "id":           train.get("id"),
+        "kind":         train.get("kind"),
+        "outcome":      train.get("outcome"),
+        "significance": train.get("significance"),
+        "tier":         train.get("tier"),
+        "effort":       train.get("effort"),
+        "code_areas":   train.get("code_areas", []),
+        "evidence":     train.get("evidence", []),
+    }
+
+    # --- resolve issue ------------------------------------------------------
+    root_num = train.get("root_issue")
+    issues_by_num = {i["number"]: i for i in bundle.get("issues", [])}
+    raw_issue = issues_by_num.get(root_num) if root_num is not None else None
+    if raw_issue is None:
+        issue_block = None
+    else:
+        comments, comments_overflow = _cap_comments(raw_issue.get("comments_list", []))
+        issue_block = {
+            "number":           raw_issue.get("number"),
+            "title":            raw_issue.get("title"),
+            "body":             _cap_text(raw_issue.get("body") or ""),
+            "url":              raw_issue.get("url"),
+            "labels":           raw_issue.get("labels", []),
+            "kind":             raw_issue.get("kind"),
+            "comments":         comments,
+            "comments_overflow": comments_overflow,
+        }
+
+    # --- resolve PRs --------------------------------------------------------
+    prs_by_num = {p["number"]: p for p in bundle.get("prs", [])}
+    pr_blocks = []
+    for pr_num in train.get("prs", []):
+        raw_pr = prs_by_num.get(pr_num)
+        if raw_pr is None:
+            continue
+        rev_comments, rev_overflow = _cap_comments(raw_pr.get("review_comments", []))
+        conv_comments, conv_overflow = _cap_comments(raw_pr.get("comments_list", []))
+        pr_blocks.append({
+            "number":                 raw_pr.get("number"),
+            "title":                  raw_pr.get("title"),
+            "body":                   _cap_text(raw_pr.get("body") or ""),
+            "state":                  raw_pr.get("state"),
+            "merged":                 raw_pr.get("merged"),
+            "created_at":             raw_pr.get("created_at"),
+            "merged_at":              raw_pr.get("merged_at"),
+            "url":                    raw_pr.get("url"),
+            "reviewers":              list(raw_pr.get("reviewers") or []),
+            "review_decision":        raw_pr.get("review_decision"),
+            "review_comments":        rev_comments,
+            "review_comments_overflow": rev_overflow,
+            "comments":               conv_comments,
+            "comments_overflow":      conv_overflow,
+        })
+
+    # --- resolve commits ----------------------------------------------------
+    commits_by_sha = {c["sha"]: c for c in bundle.get("commits", [])}
+    commit_blocks = []
+    for sha in train.get("commits", []):
+        raw_c = commits_by_sha.get(sha)
+        if raw_c is None:
+            continue
+        commit_blocks.append({
+            "sha":     raw_c.get("sha"),
+            "message": _cap_text(raw_c.get("message") or ""),
+            "author":  raw_c.get("author", None),
+            "date":    raw_c.get("date", None),
+        })
+
+    # --- feature_deltas filtered to this train ------------------------------
+    own_deltas = [d for d in bundle.get("feature_deltas", [])
+                  if d.get("train") == train_id]
+
+    # --- symbol_moves filtered to this train's artifact ids -----------------
+    # Build the set of artifact ids referenced by this train's feature_deltas.
+    # Each link has 'from' and 'to' fields carrying artifact ids (set by
+    # link_symbol_identity).  Keep a link when either endpoint is in the set.
+    own_artifact_ids = {d.get("artifact") for d in own_deltas if d.get("artifact")}
+    own_moves = [
+        lnk for lnk in bundle.get("symbol_moves", {}).get("links", [])
+        if lnk.get("from") in own_artifact_ids or lnk.get("to") in own_artifact_ids
+    ]
+
+    return {
+        "train":          train_block,
+        "issue":          issue_block,
+        "prs":            pr_blocks,
+        "commits":        commit_blocks,
+        "feature_deltas": own_deltas,
+        "symbol_moves":   own_moves,
+    }
 
 
 def build_modules(bundle, idx):

@@ -1235,5 +1235,422 @@ class TestTrainEffort(unittest.TestCase):
             self.assertIn("effort", t)
 
 
+class TestSliceTrain(unittest.TestCase):
+    """Phase 4a: bounded, self-contained per-train slice (slice_train)."""
+
+    # ------------------------------------------------------------------
+    # Shared fixture builder
+    # ------------------------------------------------------------------
+
+    def _bundle(self):
+        """In-memory bundle with two trains, two PRs, two issues, commits,
+        feature_deltas across both trains, and a symbol_moves links list."""
+        long_body = "x" * 2000   # longer than SLICE_TEXT_CAP (1500)
+
+        issue_1 = {
+            "number": 10,
+            "title": "Support feature A",
+            "body": "short body",
+            "url": "https://github.com/o/r/issues/10",
+            "labels": ["feature"],
+            "kind": "feature",
+            "state": "closed",
+            "comments_list": [
+                {"author": "alice", "body": f"comment {i}"} for i in range(8)
+            ],  # 8 comments -> overflow with cap=6
+        }
+        issue_2 = {
+            "number": 11,
+            "title": "Support feature B",
+            "body": "short body B",
+            "url": "https://github.com/o/r/issues/11",
+            "labels": [],
+            "kind": "bug",
+            "state": "closed",
+            "comments_list": [],
+        }
+        pr_1 = {
+            "number": 100,
+            "title": "Implement feature A part 1",
+            "body": long_body,
+            "state": "closed",
+            "merged": True,
+            "created_at": "2026-05-01T00:00:00Z",
+            "merged_at": "2026-05-10T00:00:00Z",
+            "url": "https://github.com/o/r/pull/100",
+            "reviewers": ["carol"],
+            "review_decision": "APPROVED",
+            "review_comments": [
+                {"author": "carol", "body": f"review {i}"} for i in range(7)
+            ],  # 7 review comments -> overflow
+            "comments_list": [
+                {"author": "dave", "body": f"conv {i}"} for i in range(3)
+            ],  # 3 < 6 -> no overflow
+            "closes": [10],
+        }
+        pr_2 = {
+            "number": 101,
+            "title": "Implement feature A part 2",
+            "body": "pr body 2",
+            "state": "closed",
+            "merged": True,
+            "created_at": "2026-05-11T00:00:00Z",
+            "merged_at": "2026-05-20T00:00:00Z",
+            "url": "https://github.com/o/r/pull/101",
+            "reviewers": ["eve"],
+            "review_decision": "APPROVED",
+            "review_comments": [],
+            "comments_list": [],
+            "closes": [10],
+        }
+        pr_3 = {
+            "number": 200,
+            "title": "Fix bug B",
+            "body": "bug fix body",
+            "state": "closed",
+            "merged": True,
+            "created_at": "2026-05-15T00:00:00Z",
+            "merged_at": "2026-05-22T00:00:00Z",
+            "url": "https://github.com/o/r/pull/200",
+            "reviewers": [],
+            "review_decision": None,
+            "review_comments": [],
+            "comments_list": [],
+            "closes": [11],
+        }
+        commits = [
+            {"sha": "aaa111", "message": "Add feature A part 1 (#100)",
+             "author": "alice", "date": "2026-05-01", "pr": 100},
+            {"sha": "aaa222", "message": "Add feature A part 2 (#101)",
+             "author": "bob", "date": "2026-05-11", "pr": 101},
+            {"sha": "bbb111", "message": "Fix bug B (#200)",
+             "author": "frank", "date": "2026-05-15", "pr": 200},
+        ]
+        # train-issue-10 has PRs 100+101 and commits aaa111, aaa222
+        # train-issue-11 has PR 200 and commit bbb111
+        train_a = {
+            "id": "train-issue-10",
+            "kind": "feature",
+            "root_issue": 10,
+            "prs": [100, 101],
+            "commits": ["aaa111", "aaa222"],
+            "code_areas": ["area-api"],
+            "outcome": "shipped",
+            "evidence": [
+                {"type": "issue", "id": 10, "url": "https://github.com/o/r/issues/10"},
+            ],
+            "significance": 15.0,
+            "tier": "deep",
+            "effort": {"opened_at": "2026-05-01T00:00:00Z", "merged_at": "2026-05-20T00:00:00Z",
+                        "elapsed_days": 19, "reviewers": 2, "review_comments": 7,
+                        "commits": 2, "participants": 4, "stalled": False},
+        }
+        train_b = {
+            "id": "train-issue-11",
+            "kind": "bug",
+            "root_issue": 11,
+            "prs": [200],
+            "commits": ["bbb111"],
+            "code_areas": ["area-core"],
+            "outcome": "shipped",
+            "evidence": [
+                {"type": "issue", "id": 11, "url": "https://github.com/o/r/issues/11"},
+            ],
+            "significance": 5.0,
+            "tier": "mention",
+            "effort": {"opened_at": "2026-05-15T00:00:00Z", "merged_at": "2026-05-22T00:00:00Z",
+                        "elapsed_days": 7, "reviewers": 0, "review_comments": 0,
+                        "commits": 1, "participants": 1, "stalled": False},
+        }
+        # feature_deltas: two belong to train_a, one to train_b, one unowned
+        art_a = "art:examples/main.bicep"
+        art_b = "art:src/api.py"
+        art_c = "art:docs/guide.md"
+        art_sym_src = "src/old.py#py:function:do_it"
+        art_sym_dst = "src/new.py#py:function:do_it"
+        feature_deltas = [
+            {"artifact": art_a, "train": "train-issue-10", "kind": "add",
+             "subject": "example", "name": "main.bicep", "area": "area-api",
+             "author": "alice", "pr": 100, "commit": "aaa111",
+             "url": "https://github.com/o/r/commit/aaa111",
+             "before": None, "after": None, "detail": None},
+            {"artifact": art_b, "train": "train-issue-10", "kind": "change",
+             "subject": "symbol", "name": "api.py", "area": "area-api",
+             "author": "bob", "pr": 101, "commit": "aaa222",
+             "url": "https://github.com/o/r/commit/aaa222",
+             "before": None, "after": None, "detail": None},
+            {"artifact": art_c, "train": "train-issue-11", "kind": "change",
+             "subject": "doc", "name": "guide.md", "area": "area-core",
+             "author": "frank", "pr": 200, "commit": "bbb111",
+             "url": "https://github.com/o/r/commit/bbb111",
+             "before": None, "after": None, "detail": None},
+            # delta belonging to art_sym_src -> train-issue-10 (for symbol_moves test)
+            {"artifact": art_sym_src, "train": "train-issue-10", "kind": "drop",
+             "subject": "symbol", "name": "do_it", "area": "area-api",
+             "author": "alice", "pr": 100, "commit": "aaa111",
+             "url": "https://github.com/o/r/commit/aaa111",
+             "before": "def do_it(): pass", "after": None, "detail": "py function do_it"},
+        ]
+        # symbol_moves: one move whose endpoints are in train-issue-10's artifacts,
+        # one unrelated move
+        symbol_moves = {
+            "links": [
+                {
+                    "lang": "py", "subkind": "function", "name": "do_it",
+                    "from_path": "src/old.py", "to_path": "src/new.py",
+                    "confidence": "medium", "basis": "unique_name",
+                    "from": art_sym_src,   # artifact id -> in train_a's deltas
+                    "to": art_sym_dst,
+                },
+                {
+                    "lang": "tf", "subkind": "resource", "name": "bucket",
+                    "from_path": "infra/old.tf", "to_path": "infra/new.tf",
+                    "confidence": "high", "basis": "file_rename",
+                    "from": "infra/old.tf#tf:resource:bucket",  # unrelated
+                    "to": "infra/new.tf#tf:resource:bucket",
+                },
+            ],
+            "by_confidence": {"high": 1, "medium": 1},
+        }
+        return {
+            "issues": [issue_1, issue_2],
+            "prs": [pr_1, pr_2, pr_3],
+            "commits": commits,
+            "trains": [train_a, train_b],
+            "feature_deltas": feature_deltas,
+            "symbol_moves": symbol_moves,
+        }
+
+    # ------------------------------------------------------------------
+    # Structure / self-containment
+    # ------------------------------------------------------------------
+
+    def test_slice_returns_all_top_level_keys(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        for key in ("train", "issue", "prs", "commits", "feature_deltas", "symbol_moves"):
+            self.assertIn(key, s, f"missing top-level key '{key}'")
+
+    def test_train_block_carries_phase4a_fields(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        t = s["train"]
+        for field in ("id", "kind", "outcome", "significance", "tier", "effort",
+                      "code_areas", "evidence"):
+            self.assertIn(field, t, f"train block missing '{field}'")
+        self.assertEqual(t["id"], "train-issue-10")
+        self.assertEqual(t["significance"], 15.0)
+        self.assertEqual(t["tier"], "deep")
+
+    def test_issue_block_resolved_from_bundle(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        issue = s["issue"]
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["number"], 10)
+        self.assertEqual(issue["title"], "Support feature A")
+        self.assertIn("url", issue)
+        self.assertIn("labels", issue)
+        self.assertIn("kind", issue)
+
+    def test_prs_resolved_and_contain_required_fields(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        self.assertEqual(len(s["prs"]), 2)
+        pr_nums = {p["number"] for p in s["prs"]}
+        self.assertEqual(pr_nums, {100, 101})
+        for pr in s["prs"]:
+            for field in ("number", "title", "body", "state", "merged", "created_at",
+                          "merged_at", "url", "reviewers", "review_decision"):
+                self.assertIn(field, pr, f"PR block missing field '{field}'")
+
+    def test_commits_resolved_with_required_fields(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        self.assertEqual(len(s["commits"]), 2)
+        shas = {c["sha"] for c in s["commits"]}
+        self.assertEqual(shas, {"aaa111", "aaa222"})
+        for c in s["commits"]:
+            for field in ("sha", "message", "author", "date"):
+                self.assertIn(field, c, f"commit block missing field '{field}'")
+
+    def test_only_trains_own_feature_deltas_included(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        for d in s["feature_deltas"]:
+            self.assertEqual(d["train"], "train-issue-10")
+        # train-issue-11's delta must not appear
+        self.assertTrue(all(d["train"] != "train-issue-11" for d in s["feature_deltas"]))
+
+    # ------------------------------------------------------------------
+    # Text truncation
+    # ------------------------------------------------------------------
+
+    def test_long_body_is_truncated_to_cap_with_marker(self):
+        bundle = self._bundle()
+        cap = link.SLICE_TEXT_CAP
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        body = pr_100["body"]
+        self.assertLessEqual(len(body), cap + 50,
+                             "truncated body should not be much longer than cap")
+        self.assertIn("…", body + "[+", "truncated body must carry an overflow marker")
+        # verify it's actually shorter than the original (which is 2000 chars)
+        self.assertLess(len(body), 2000)
+
+    def test_short_body_is_unchanged(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_101 = next(p for p in s["prs"] if p["number"] == 101)
+        self.assertEqual(pr_101["body"], "pr body 2")
+
+    def test_issue_body_truncated_when_long(self):
+        bundle = self._bundle()
+        bundle["issues"][0]["body"] = "y" * 2000
+        cap = link.SLICE_TEXT_CAP
+        s = link.slice_train(bundle, "train-issue-10")
+        self.assertLessEqual(len(s["issue"]["body"]), cap + 50)
+
+    # ------------------------------------------------------------------
+    # Comment overflow
+    # ------------------------------------------------------------------
+
+    def test_issue_comments_overflow_when_above_cap(self):
+        bundle = self._bundle()
+        cap = link.SLICE_COMMENTS_KEPT
+        s = link.slice_train(bundle, "train-issue-10")
+        issue = s["issue"]
+        # fixture has 8 comments; cap is 6
+        self.assertIn("comments", issue)
+        self.assertIn("comments_overflow", issue)
+        self.assertEqual(len(issue["comments"]), cap)
+        self.assertEqual(issue["comments_overflow"], 8 - cap)
+
+    def test_pr_review_comments_overflow(self):
+        bundle = self._bundle()
+        cap = link.SLICE_COMMENTS_KEPT
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        # fixture has 7 review comments -> overflow
+        self.assertEqual(len(pr_100["review_comments"]), cap)
+        self.assertEqual(pr_100["review_comments_overflow"], 7 - cap)
+
+    def test_pr_conversation_comments_no_overflow_when_under_cap(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        # fixture has 3 conv comments; cap is 6 -> no overflow
+        self.assertEqual(len(pr_100["comments"]), 3)
+        self.assertEqual(pr_100["comments_overflow"], 0)
+
+    def test_comment_bodies_are_strings_not_dicts(self):
+        """Comment lists emit just the body text, not the full comment object."""
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        for body in s["issue"]["comments"]:
+            self.assertIsInstance(body, str)
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        for body in pr_100["review_comments"]:
+            self.assertIsInstance(body, str)
+
+    # ------------------------------------------------------------------
+    # feature_deltas filtered correctly
+    # ------------------------------------------------------------------
+
+    def test_feature_deltas_count_correct(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        # fixture: 3 deltas for train-issue-10 (art_a, art_b, art_sym_src)
+        self.assertEqual(len(s["feature_deltas"]), 3)
+
+    def test_other_train_delta_excluded(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        artifacts = {d["artifact"] for d in s["feature_deltas"]}
+        self.assertNotIn("art:docs/guide.md", artifacts)
+
+    # ------------------------------------------------------------------
+    # symbol_moves filtered to train's artifacts
+    # ------------------------------------------------------------------
+
+    def test_symbol_moves_filtered_to_train_artifacts(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        # Only the py:function:do_it move (from=art_sym_src) should appear
+        self.assertEqual(len(s["symbol_moves"]), 1)
+        move = s["symbol_moves"][0]
+        self.assertEqual(move["name"], "do_it")
+
+    def test_unrelated_symbol_move_excluded(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        names = [m["name"] for m in s["symbol_moves"]]
+        self.assertNotIn("bucket", names)
+
+    # ------------------------------------------------------------------
+    # PR-only train (root_issue=None) -> issue is None
+    # ------------------------------------------------------------------
+
+    def test_pr_only_train_has_null_issue(self):
+        bundle = self._bundle()
+        # Directly build a PR-only train
+        bundle["trains"].append({
+            "id": "train-pr-999",
+            "kind": "other",
+            "root_issue": None,
+            "prs": [],
+            "commits": [],
+            "code_areas": [],
+            "outcome": "shipped",
+            "evidence": [],
+            "significance": 1.0,
+            "tier": "mention",
+            "effort": {},
+        })
+        s = link.slice_train(bundle, "train-pr-999")
+        self.assertIsNone(s["issue"])
+
+    # ------------------------------------------------------------------
+    # Unknown train_id raises
+    # ------------------------------------------------------------------
+
+    def test_unknown_train_id_raises(self):
+        bundle = self._bundle()
+        with self.assertRaises((KeyError, ValueError)):
+            link.slice_train(bundle, "train-issue-99999")
+
+    # ------------------------------------------------------------------
+    # Does NOT mutate the bundle
+    # ------------------------------------------------------------------
+
+    def test_slice_does_not_mutate_bundle(self):
+        import copy
+        bundle = self._bundle()
+        original = copy.deepcopy(bundle)
+        link.slice_train(bundle, "train-issue-10")
+        self.assertEqual(bundle["issues"][0]["body"], original["issues"][0]["body"])
+        self.assertEqual(len(bundle["feature_deltas"]), len(original["feature_deltas"]))
+
+    # ------------------------------------------------------------------
+    # slice for the other train (train-issue-11)
+    # ------------------------------------------------------------------
+
+    def test_slice_train_b_has_correct_prs_and_commits(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-11")
+        self.assertEqual(len(s["prs"]), 1)
+        self.assertEqual(s["prs"][0]["number"], 200)
+        self.assertEqual(len(s["commits"]), 1)
+        self.assertEqual(s["commits"][0]["sha"], "bbb111")
+        self.assertEqual(len(s["feature_deltas"]), 1)
+        self.assertEqual(s["feature_deltas"][0]["artifact"], "art:docs/guide.md")
+
+    def test_slice_train_b_symbol_moves_empty_when_no_artifacts_match(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-11")
+        # train-issue-11's deltas only reference art:docs/guide.md -> no symbol move endpoint matches
+        self.assertEqual(s["symbol_moves"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
