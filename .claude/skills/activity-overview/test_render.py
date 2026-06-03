@@ -555,8 +555,9 @@ class TestModuleGraph(unittest.TestCase):
                  "ref": "nat-rule/main.bicep", "version": None, "transitive": False,
                  "local": True, "instances": "many", "resolved": True}]}]}}
         mmd = render.emit_module_graph(bundle)
-        self.assertIn("nat-rule", mmd)        # child submodule named
-        self.assertIn("child[]", mmd)         # local + multi-instance marker
+        self.assertIn("nat-rule", mmd)            # child submodule named
+        # local + multi-instance marker, quoted so `[]` doesn't break Mermaid.
+        self.assertIn('|"child[]"|', mmd)
 
     def test_registered_in_render_manifest(self):
         names = set(render.render(self.bundle))

@@ -350,7 +350,9 @@ def emit_module_graph(bundle):
         lines.append(f'    {nid}("{_flow_label(label)}")')
     for src_id, dst_id, label in sorted(set(drawn)):
         if label:
-            lines.append(f'    {src_id} -->|{_flow_label(label)}| {dst_id}')
+            # quote the edge label so markers with Mermaid-special chars (e.g. the
+            # `child[]` multi-instance marker) don't break the flowchart parser.
+            lines.append(f'    {src_id} -->|"{_flow_label(label)}"| {dst_id}')
         else:
             lines.append(f"    {src_id} --> {dst_id}")
     return "\n".join(lines) + "\n"
