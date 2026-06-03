@@ -38,21 +38,24 @@ still significant (the "why it didn't land" story matters).
 
 ### 2. Per-train `effort` block (link.py)
 
-The "time & effort to land it" signal, computed from data already in the bundle (PR
-created/merged dates, reviews, comments, commits, timeline) — feeds both the forecast and the
-spotlight. On each train:
+The "time & effort to land it" signal, computed **only from data already in the bundle** (PR
+`created_at`/`merged_at`/`updated_at`, `reviewers`, `review_comments_count`, `comments_list`,
+issue `comments_list`, commits) — feeds both the forecast and the spotlight. On each train:
 
 ```
-effort: { opened_at, merged_at, elapsed_days, review_rounds,
-          commits, participants, reopen_count, stalled }
+effort: { opened_at, merged_at, elapsed_days, reviewers, review_comments,
+          commits, participants, stalled }
 ```
 
-- `opened_at` = earliest of root-issue created / first PR created; `merged_at` = latest PR merged
-  (null if none merged).
+- `opened_at` = earliest of root-issue `created_at` / first PR `created_at`; `merged_at` = latest
+  PR `merged_at` (null if none merged).
 - `elapsed_days` = `merged_at − opened_at` (null when not yet merged → reported as "open N days").
-- `review_rounds` = count of review submissions across the train's PRs; `participants` = distinct
-  authors + reviewers + commenters; `reopen_count` from timeline reopen events; `stalled` = true
-  when the longest no-activity gap before merge exceeds a tunable threshold (start 21 days).
+- `reviewers` = distinct reviewer logins across the train's PRs (raw review *submissions* aren't
+  persisted, so distinct reviewers is the honest review-effort proxy); `review_comments` = summed
+  `review_comments_count`; `participants` = distinct PR/issue authors + reviewers + comment authors
+  (from `comments_list`); `commits` = `len(train.commits)`.
+- `stalled` = true when `elapsed_days` exceeds a tunable threshold (start 21 days) while the train
+  merged — a long-running train. (Per-PR reopen events aren't in the bundle, so no `reopen_count`.)
 
 All fields degrade to null/0 when the source data is thin (e.g. PR-only train with no issue) —
 never invented.
@@ -118,8 +121,8 @@ on demand for an arbitrary train to back a spotlight (`render.py --train <id>`).
 ## Report + docs wiring
 
 - **report-template / SKILL.md:** deepen **"Decision trains"** — deep trains embed
-  `diagrams.train_flowcharts[id]` + an **effort line** (e.g. "landed in 9 days · 3 review rounds ·
-  2 contributors") with a placeholder for the 4b narrative; mention trains collapse to one line.
+  `diagrams.train_flowcharts[id]` + an **effort line** (e.g. "landed in 9 days · 2 reviewers ·
+  3 contributors") with a placeholder for the 4b narrative; mention trains collapse to one line.
   Add **"Next-release forecast"** rendering the forecast tiers + per-candidate signals.
 - **BUNDLE.md:** document `trains[].{significance,tier,effort}`, the `slice_train` contract +
   caps, `forecast`, and `diagrams.train_flowcharts` going live.
@@ -129,7 +132,7 @@ on demand for an arbitrary train to back a spotlight (`render.py --train <id>`).
 - **Offline unit tests:**
   - `score_train_significance` — ranking order by footprint/kind/breadth; deep = top-N ∪
     ≥floor; large rejected train still deep; tiny docs train → mention.
-  - `effort` — elapsed/review-rounds/participants/reopen/stall computed from fixtures; null
+  - `effort` — elapsed/reviewers/review_comments/participants/stalled computed from fixtures; null
     degradation when issue/merge absent.
   - `slice_train` — self-contained (no dangling refs); bodies truncated at cap with marker;
     comment overflow counted; symbol_moves filtered to the train's endpoints.
