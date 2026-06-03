@@ -241,9 +241,11 @@ def emit_train_flowchart(bundle, train):
     code_areas = train.get("code_areas", [])
     outcome = train.get("outcome", "")
 
-    # Determine mode
+    # Determine mode using DISTINCT non-empty areas so duplicates don't
+    # wrongly push over the threshold.
+    distinct_areas = set(a for a in code_areas if a)
     mode_c = (len(train_prs) <= TRAIN_FLOW_MAX_PRS and
-              len(code_areas) <= TRAIN_FLOW_MAX_AREAS)
+              len(distinct_areas) <= TRAIN_FLOW_MAX_AREAS)
 
     lines = ["flowchart LR"]
 
@@ -297,9 +299,9 @@ def emit_train_flowchart(bundle, train):
         lines.append(f"    {pr_id} --> {outcome_node_id}")
 
     # --- mode C: area annotation nodes and edges ---
-    if mode_c and code_areas:
+    if mode_c and distinct_areas:
         area_nodes = {}
-        for area in code_areas:
+        for area in distinct_areas:
             aid = _node_id("area", area)
             area_nodes[aid] = _area_tail(area)
         for aid, label in sorted(area_nodes.items()):
@@ -384,11 +386,11 @@ def write_diagrams(bundle, outdir="workspace/diagrams", train_id=None):
             raise KeyError(f"train_id {train_id!r} not found in bundle")
         train = trains_by_id[train_id]
         text = emit_train_flowchart(bundle, train)
-        fname = f"train-{train_id}.mmd"
+        fname = f"{train_id}.mmd"
         path = os.path.join(outdir, fname)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
-        key = f"train-{train_id}"
+        key = train_id
         real_paths[key] = path
         rel = os.path.relpath(path, root)
         # Merge into the bundle diagrams (preserve existing flat keys if any)
@@ -413,11 +415,11 @@ def write_diagrams(bundle, outdir="workspace/diagrams", train_id=None):
             continue
         tid = train["id"]
         text = emit_train_flowchart(bundle, train)
-        fname = f"train-{tid}.mmd"
+        fname = f"{tid}.mmd"
         path = os.path.join(outdir, fname)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
-        key = f"train-{tid}"
+        key = tid
         real_paths[key] = path
         train_rel_map[tid] = os.path.relpath(path, root)
 

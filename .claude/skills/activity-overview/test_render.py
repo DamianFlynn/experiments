@@ -616,11 +616,17 @@ class TestEmitTrainFlowchart(unittest.TestCase):
     def test_shipped_issue_rooted_has_issue_to_pr_edge(self):
         b = _train_bundle()
         train = b["trains"][0]
+        issue_number = train["root_issue"]   # 17
+        pr_number = train["prs"][0]          # 42
         mmd = render.emit_train_flowchart(b, train)
         lines = mmd.splitlines()
-        arrows = [ln for ln in lines if "-->" in ln]
-        # At least one arrow and they go through PR to outcome
-        self.assertGreater(len(arrows), 0)
+        iss_id = render._node_id("iss", str(issue_number))
+        pr_id = render._node_id("pr", str(pr_number))
+        out_id = render._node_id("out", train["id"])
+        # The specific issue -> PR edge must be present
+        self.assertIn(f"    {iss_id} --> {pr_id}", lines)
+        # The PR -> outcome edge must also be present
+        self.assertIn(f"    {pr_id} --> {out_id}", lines)
 
     def test_pr_only_train_has_no_issue_node(self):
         b = _train_bundle()
@@ -672,9 +678,24 @@ class TestEmitTrainFlowchart(unittest.TestCase):
         b["prs"][0]["milestone"] = None
         train = b["trains"][0]
         mmd = render.emit_train_flowchart(b, train)
-        self.assertIn("Shipped", mmd)
-        # No milestone arrow-label in outcome line
-        self.assertNotIn("Shipped -->", mmd)
+        # Find the outcome node line (contains the outcome label)
+        outcome_lines = [ln for ln in mmd.splitlines() if "Shipped" in ln]
+        self.assertTrue(outcome_lines, "Expected an outcome node line containing 'Shipped'")
+        outcome_line = outcome_lines[0]
+        # When there is no milestone, the arrow glyph must NOT appear in the outcome node
+        self.assertNotIn("Shipped →", outcome_line)
+
+    def test_shipped_with_milestone_has_arrow_in_outcome_line(self):
+        b = _train_bundle()
+        train = b["trains"][0]  # outcome=shipped, PR milestone=v1.2.0
+        mmd = render.emit_train_flowchart(b, train)
+        # Find the outcome node line
+        outcome_lines = [ln for ln in mmd.splitlines() if "Shipped" in ln]
+        self.assertTrue(outcome_lines, "Expected an outcome node line containing 'Shipped'")
+        outcome_line = outcome_lines[0]
+        # Milestone arrow should appear in the outcome node label
+        self.assertIn("Shipped →", outcome_line)
+        self.assertIn("v1.2.0", outcome_line)
 
     def test_mode_c_adds_area_nodes(self):
         """Under the threshold: area nodes are emitted (mode C)."""
@@ -752,6 +773,39 @@ class TestEmitTrainFlowchart(unittest.TestCase):
         # In mode C: area node tails present
         self.assertIn("zone0", mmd)
 
+    def test_duplicate_areas_do_not_force_mode_a(self):
+        """6 code_areas entries with only 2 distinct values should stay in mode C."""
+        b = _train_bundle()
+        max_areas = render.TRAIN_FLOW_MAX_AREAS  # 5
+        # Raw length (6) exceeds max_areas (5) but distinct count (2) does not.
+        areas = ["area/alpha", "area/beta"] * 3  # 6 entries, 2 distinct
+        self.assertGreater(len(areas), max_areas)
+        self.assertLessEqual(len(set(areas)), max_areas)
+        train = {
+            "id": "train-issue-17",
+            "kind": "feature",
+            "root_issue": 17,
+            "prs": [42],
+            "commits": [],
+            "code_areas": areas,
+            "outcome": "shipped",
+            "evidence": [],
+        }
+        mmd = render.emit_train_flowchart(b, train)
+        # Must stay in mode C: area tails are present
+        self.assertIn("alpha", mmd)
+        self.assertIn("beta", mmd)
+        # Only one node per distinct area (node id is deterministic from area name)
+        alpha_id = render._node_id("area", "area/alpha")
+        beta_id = render._node_id("area", "area/beta")
+        # Each distinct area node declaration appears exactly once
+        node_lines = [ln for ln in mmd.splitlines()
+                      if alpha_id in ln and '("' in ln]
+        self.assertEqual(len(node_lines), 1, "alpha area node should appear exactly once")
+        node_lines_b = [ln for ln in mmd.splitlines()
+                        if beta_id in ln and '("' in ln]
+        self.assertEqual(len(node_lines_b), 1, "beta area node should appear exactly once")
+
 
 class TestWriteDiagramsTrainFlowcharts(unittest.TestCase):
     def test_train_flowcharts_map_registered_for_deep_trains(self):
@@ -772,8 +826,8 @@ class TestWriteDiagramsTrainFlowcharts(unittest.TestCase):
             render.write_diagrams(b, outdir)
             tf = b["diagrams"]["train_flowcharts"]
             path = tf["train-issue-17"]
-            # workspace-relative: should be diagrams/train-train-issue-17.mmd
-            self.assertTrue(path.endswith("train-train-issue-17.mmd"))
+            # workspace-relative: should be diagrams/train-issue-17.mmd
+            self.assertTrue(path.endswith("train-issue-17.mmd"))
             self.assertFalse(os.path.isabs(path))
 
     def test_train_flowchart_file_written_to_disk(self):
@@ -784,7 +838,7 @@ class TestWriteDiagramsTrainFlowcharts(unittest.TestCase):
             # Real path for the deep train should be a key or in return value
             # It may be returned as a separate key in real_paths or embedded
             # Check the file exists on disk
-            mmd_path = os.path.join(outdir, "train-train-issue-17.mmd")
+            mmd_path = os.path.join(outdir, "train-issue-17.mmd")
             self.assertTrue(os.path.exists(mmd_path))
 
     def test_train_flowchart_real_paths_returned_for_validation(self):
@@ -794,7 +848,7 @@ class TestWriteDiagramsTrainFlowcharts(unittest.TestCase):
             real_paths = render.write_diagrams(b, outdir)
             # real_paths should contain entries for each deep train flowchart
             # so mmdc can validate them
-            self.assertIn("train-train-issue-17", real_paths)
+            self.assertIn("train-issue-17", real_paths)
 
     def test_flat_diagrams_unaffected(self):
         """The existing flat diagram keys must still be present."""
@@ -826,7 +880,7 @@ class TestTrainSpotlightCLI(unittest.TestCase):
             manifest = render.main([bundle_path, "--diagrams-dir", outdir,
                                     "--train", "train-issue-17", "--skip-validate"])
             # Only the single train file was produced in the manifest
-            self.assertIn("train-train-issue-17", manifest)
+            self.assertIn("train-issue-17", manifest)
             # Flat diagrams should NOT appear in spotlight-only manifest
             self.assertNotIn("buckets_pie", manifest)
 
@@ -843,7 +897,7 @@ class TestTrainSpotlightCLI(unittest.TestCase):
             outdir = os.path.join(d, "diagrams")
             manifest = render.main([bundle_path, "--diagrams-dir", outdir,
                                     "--train", "train-pr-99", "--skip-validate"])
-            self.assertIn("train-train-pr-99", manifest)
+            self.assertIn("train-pr-99", manifest)
 
     def test_main_train_registers_in_bundle_train_flowcharts_map(self):
         b = _train_bundle()
