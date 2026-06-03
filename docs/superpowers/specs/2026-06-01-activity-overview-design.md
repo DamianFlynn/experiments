@@ -929,6 +929,11 @@ against GitHub) after each.
   `edge_extraction`; (c) optional **`--edges-only`** to skip the PR/issue re-pull entirely (under
   "nothing landed" they're unchanged), making resume just *re-clone-at-SHA + rebuild the gap*.
   The same `clone_sha` underpins deterministic multi-bundle roll-up (below).
+  *Coverage status:* the merge cores (`extract_iac_edges(only_status=…)`, `resume_bundle`,
+  `rollup_bundles`) and the `--rollup` CLI are offline-tested; the **resume git orchestration**
+  (`fetch --depth 1 origin <clone_sha>` + checkout, in `resume_acquire`) has **no live/CI
+  coverage yet** — a resume smoke step on the gate is **deferred** until resume/roll-up are wired
+  into the skill's operational flow (the bicep-only gate doesn't exercise them today).
 - **Phase 3d — symbol-granular artifacts.** Extend the artifact ledger from file-granularity
   to **symbols** (Bicep/ARM `param`/`resource`/`output`, Terraform `variable`/`resource`/
   `output`, graphify nodes) with `-p` hunk parsing; `artifacts[].kind` gains `symbol`/`comment`
