@@ -165,8 +165,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   identified (area-id + version) from source; transitive edges connect to *other areas in the
   repo* (deep external-module internals are not fabricated into edges). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
-  workflow for install). **Deferred:** symbol-granular artifacts (3d), symbol-identity tracking
-  (3e), resource-level `dependsOn` edges.
+  workflow for install). **Deferred:** resource-level `dependsOn` edges.
 
   **Visible gaps (Phase 3c.1).** Per-module builds run in parallel, each bounded by a generous
   per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
@@ -198,8 +197,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
 - **Phase 3d (shipped):** symbol/comment artifacts + `before`/`after`/`detail` on
   feature_deltas (see `symbol_events` above), diff-local from a `git log -p` walk.
-- **Still deferred:** symbol-identity tracking across renames/moves (3e), resource-level
-  `dependsOn` edges, multi-repo aggregation.
+- **Still deferred:** resource-level `dependsOn` edges, multi-repo aggregation.
 
 ## Phase 4a fields (train significance + effort + forecast + per-train slice)
 

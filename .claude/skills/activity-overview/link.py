@@ -889,7 +889,7 @@ _COMMENT_SUBKINDS = {"comment", "todo"}
 
 def match_symbol_moves(symbol_events, rename_pairs=()):
     """Detect window-wide symbol MOVES — the same symbol dropped in one file and added
-    in another. Pure; precision over recall. Only UNIQUE `(subkind, name)` pairings (one
+    in another. Pure; precision over recall. Only UNIQUE `(lang, subkind, name)` pairings (one
     source file, one dest file, different) are linked; ambiguous names (boilerplate
     dropped/added in >1 file) are SKIPPED — the key false-positive guard. `confidence`
     is `high` when `(src, dst)` is also a git rename/copy pair, else `medium`. Comments
