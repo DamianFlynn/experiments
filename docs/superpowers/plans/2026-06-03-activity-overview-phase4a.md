@@ -152,3 +152,16 @@ on demand for an arbitrary train to back a spotlight (`render.py --train <id>`).
 Sub-agent dispatch and all narrative prose — both the standard per-train narrative and the
 long-form single-train **spotlight**. 4a ships the slice + effort + forecast scaffold +
 flowcharts; 4b consumes them. The predicted-vs-landed **forecast loop** remains Phase 7.
+
+## Backlog — gather enrichment (prerequisite slice for 4b)
+
+`gather.py` already **fetches and then discards** two signals: the raw PR review submissions
+(`/pulls/{n}/reviews` at `gather.py:1762` — only `reviewers`/`review_decision` are kept) and the
+PR timeline lifecycle events (`/issues/{n}/timeline` at `:1766` — only `crossref_issues` is kept).
+A small dedicated gather slice — **sequenced before Phase 4b** — should persist `pr["reviews"]`
+(`{author, state, submitted_at, body}`) and selected PR timeline lifecycle events
+(`reopened` / `closed` / `ready_for_review` / `converted_to_draft`). No new API surface (data is
+already in hand). This upgrades the `effort` block to **true `review_rounds` + `reopen_count` +
+real stall detection** and gives the 4b spotlight review-round texture (changes-requested rounds,
+review bodies). 4a deliberately ships on the current available-data `effort` block and does **not**
+depend on this slice.
