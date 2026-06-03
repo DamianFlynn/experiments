@@ -83,3 +83,6 @@ claim in the report resolves to a source ref in the bundle — never invent fact
 - Phase 3d reports additionally: a **Symbol-level changes** subsection under Feature
   changes — `feature_deltas` with `subject` `symbol`/`comment` carry a bounded
   `before`/`after` + `detail` (`<lang> <subkind> <name>`); show the actual change text.
+- Phase 3e: when `symbol_moves.links` is non-empty, collapse the matching add/drop
+  deltas into a single **"moved"** row (`from_path → to_path`), labelling `confidence`;
+  `medium`-confidence moves are heuristic, so present them as likely-not-certain.

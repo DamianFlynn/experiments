@@ -39,6 +39,7 @@ def build_bundle(meta, commits, prs, issues):
         "feature_deltas": [],
         "code_events": [],
         "symbol_events": [],
+        "symbol_moves": {"links": [], "by_confidence": {"high": 0, "medium": 0}},
         "trains": [],
         "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
         "people": {},

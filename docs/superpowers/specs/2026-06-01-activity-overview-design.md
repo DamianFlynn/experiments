@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 11 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; symbol-identity tracking across renames (3e) sequenced next)
+**Status:** Approved design — rev 11 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -952,10 +952,14 @@ against GitHub) after each.
   parsing; `artifacts[].kind` gains `symbol`/`comment`
   and `feature_deltas` gain `hunk`/`before`/`after`/`detail`. Builds on the 3c edge/area
   foundation. (Sequenced slice.)
-- **Phase 3e — symbol-identity tracking.** Follow a symbol across renames/moves/file-splits
-  via per-commit before/after fingerprinting + heuristic cross-diff matching (multi-language),
-  layered on the 3d symbol ledger — the highest-risk slice, built last on a validated
-  foundation. (Sequenced slice.)
+- **Phase 3e — symbol-identity tracking (shipped).** Window-wide symbol MOVES: link a symbol
+  dropped in one file to the same `(subkind, name)` added in another (`link.match_symbol_moves`
+  / `link_symbol_identity` → `symbol_moves` + artifact `replaced_by`/`identity_from`/
+  `move_confidence`). **Precision over recall** (the spec's highest-risk slice): only UNIQUE
+  pairings link (ambiguous/boilerplate names skipped) — validated on a refactor-heavy AVM window
+  where a telemetry param/resource dropped-in-4/added-in-72 correctly yields **0** links instead
+  of 288 false ones. `confidence` is `high` when git also flags the file pair as a rename/copy,
+  else `medium`. Name-changed renames via body fingerprint (fuzzy) and 1→many splits are deferred.
 - **Phase 4 — sub-agent train narratives + train graphs + forecast.**
   *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
   `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded
