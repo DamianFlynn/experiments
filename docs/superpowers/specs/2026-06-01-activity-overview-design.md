@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 12 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`)
+**Status:** Approved design — rev 13 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -960,6 +960,26 @@ against GitHub) after each.
   where a telemetry param/resource dropped-in-4/added-in-72 correctly yields **0** links instead
   of 288 false ones. `confidence` is `high` when git also flags the file pair as a rename/copy,
   else `medium`. Name-changed renames via body fingerprint (fuzzy) and 1→many splits are deferred.
+- **Phase 4a — train significance + effort + forecast scaffold + flowcharts live (shipped).**
+  *Link:* `score_train_significance` annotates each train with `significance` (float =
+  `footprint × kind_weight + breadth`) and `tier` (`"deep"` for top-N by significance ∪ any
+  train ≥ the floor, else `"mention"`); `annotate_train_effort` adds an `effort` block
+  (`opened_at`, `merged_at`, `elapsed_days`, `reviewers`, `review_comments`, `commits`,
+  `participants`, `stalled`). `slice_train(bundle, train_id)` is a pure, bounded, read-only
+  per-train slice (six blocks: train / issue / prs / commits / feature_deltas / symbol_moves;
+  text capped at `SLICE_TEXT_CAP`=1500 chars, comment lists capped at `SLICE_COMMENTS_KEPT`=6
+  with `<key>_overflow` counts; raises `KeyError` on unknown id). `build_forecast` computes
+  `bundle["forecast"]` over `buckets.next_candidates` — scored candidates with `tier`
+  (`"likely"|"possible"|"longshot"`) and `signals`. *Render:* `diagrams.train_flowcharts` is
+  now LIVE — a map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written for every DEEP train
+  (adaptive flowchart: mode C with code-area nodes when within `TRAIN_FLOW_MAX_PRS`/
+  `TRAIN_FLOW_MAX_AREAS` thresholds, else mode A bare chain); on-demand spotlight render via
+  `render.py --train <id>` (any tier). *Report:* DEEP trains embed their flowchart + an effort
+  line; MENTION trains collapse to one-liners; Next-release forecast section renders tiered
+  candidates with signals. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
+  `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`, `FORECAST_WEIGHTS`,
+  `FORECAST_TIER_LIKELY_THRESHOLD`, `FORECAST_TIER_POSSIBLE_THRESHOLD`, `FORECAST_OVERDUE_DAYS`.
+  *Still pending (4b):* sub-agent per-train narration; gather review/lifecycle slice.
 - **Phase 4 — sub-agent train narratives + train graphs + forecast.**
   *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
   `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded

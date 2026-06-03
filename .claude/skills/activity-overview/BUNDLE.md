@@ -33,7 +33,16 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 - `issues` — issues in scope (Phase 1: PR-closing issues only; **Phase 2** also
   includes open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
-- `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], outcome, evidence:[ref] }]`.
+- `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
+  significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at, elapsed_days,
+  reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
+  `significance = footprint × kind_weight + breadth`; `tier` = `"deep"` for the top-N
+  by significance ∪ any train ≥ the significance floor, else `"mention"` (Phase 4a).
+  `effort`: `reviewers` = distinct reviewer logins; `review_comments` = summed
+  `review_comments_count`; `participants` = distinct authors + reviewers + comment-authors;
+  `stalled` = merged but `elapsed_days > TRAIN_STALL_DAYS`. All fields degrade to null/0
+  when data is thin. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
+  `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`.
 - `buckets` — `{ shipped:[ref], in_flight:[ref], rejected:[ref], next_candidates:[ref] }`
   (Phase 1 fills only `shipped`; Phase 2 classifies all four — see below).
 
@@ -56,7 +65,18 @@ docsRefs, release_train, sprints, project, diagrams`.
   `next_candidates` (one bucket per item; precedence shipped > rejected >
   next_candidates > in_flight). Each ref may carry a `train` id.
 - **diagrams{}** maps `buckets_pie` / `timeline_gantt` to their `.mmd` paths,
-  written and mmdc-validated by `render.py`.
+  written and mmdc-validated by `render.py`. **`diagrams.train_flowcharts`** is a nested
+  map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written by `render.py` (one adaptive
+  Mermaid `flowchart` per DEEP train; mode C with code-area annotation nodes when
+  `len(prs) ≤ TRAIN_FLOW_MAX_PRS` and `len(code_areas) ≤ TRAIN_FLOW_MAX_AREAS`, else
+  mode A bare chain). On-demand spotlight render via `render.py --train <id>` (any tier).
+- **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
+  train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
+  — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
+  desc. Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
+  / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
+  `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
+  (≥2.0 → possible), `FORECAST_OVERDUE_DAYS` (Phase 4a).
 
 ## Phase 3a fields (narrative substrate)
 
@@ -179,3 +199,34 @@ docsRefs, release_train, sprints, project, diagrams`.
   feature_deltas (see `symbol_events` above), diff-local from a `git log -p` walk.
 - **Still deferred:** symbol-identity tracking across renames/moves (3e), resource-level
   `dependsOn` edges, multi-repo aggregation.
+
+## Phase 4a fields (train significance + effort + forecast + per-train slice)
+
+- **trains[]** gain `significance`, `tier`, and `effort` (see top-level `trains` bullet
+  above for the exact shapes and tunables).
+- **forecast** — top-level `forecast` block (see Phase 2 fields above).
+- **diagrams.train_flowcharts** — now LIVE: the per-deep-train `.mmd` map (see Phase 2
+  fields above).
+- **`slice_train(bundle, train_id)`** — a pure, read-only, bounded helper (not a bundle
+  field; called by the report ranker and future sub-agents). Returns a self-contained dict:
+
+  ```
+  {
+    "train":          { id, kind, outcome, significance, tier, effort,
+                        code_areas, evidence },
+    "issue":          { number, title, body*, url, labels, kind,
+                        comments*:[body*], comments_overflow } | None,
+    "prs":            [ { number, title, body*, state, merged, created_at,
+                          merged_at, url, reviewers:[login], review_decision,
+                          review_comments*:[body*], review_comments_overflow,
+                          comments*:[body*], comments_overflow } ],
+    "commits":        [ { sha, message*, author, date } ],
+    "feature_deltas": [ ...this train's deltas only... ],
+    "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ]
+  }
+  ```
+
+  (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
+  chars with a `…[+N chars]` marker; each comment list capped at `SLICE_COMMENTS_KEPT` = 6
+  bodies, overflow count in `<key>_overflow`.) Raises `KeyError` on unknown id. Does not
+  mutate the bundle.

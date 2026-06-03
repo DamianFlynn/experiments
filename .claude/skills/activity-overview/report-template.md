@@ -12,15 +12,31 @@ For each ref in `buckets.shipped`, one line: the PR/issue title, number, and lin
 
 ## Decision trains
 
-For each train in `trains`:
+DEEP trains (`tier == "deep"`) get a full sub-section with flowchart + effort line.
+MENTION trains (`tier == "mention"`) are one-liners at the end of the section.
 
-### {train.id} — {issue or PR title}
+### {train.id} — {issue or PR title}  *(DEEP)*
+
+```mermaid
+{contents of diagrams.train_flowcharts[train.id]}
+```
+
+*Effort: landed in {effort.elapsed_days} days · {effort.reviewers} reviewer(s) · {effort.participants} contributor(s)*
+*(or "open N days" when effort.merged_at is null; append "— stalled" when effort.stalled is true)*
+
+<!-- narrative: {train.id} -->
 
 - **Root issue:** #{root_issue} (or "none — PR-anchored")
 - **PRs:** {prs}
 - **Commits:** {commit count}
 - **Outcome:** {outcome}
 - **Evidence:** {evidence urls}
+
+---
+
+*MENTION trains (one line each):*
+
+- `{train.id}` — {title} — {outcome} ({PR count} PR(s))
 
 ## Activity at a glance
 
@@ -60,12 +76,29 @@ not planned.
 
 - [{title}]({url}) (#{number})
 
-## Next up (forecast candidates)
+## Next-release forecast
 
-For each ref in `buckets.next_candidates`: open items on the next milestone or
-flagged high-priority — the basis for the next-release forecast.
+From `bundle["forecast"]` (forward-only; predicted-vs-landed loop is Phase 7).
 
-- [{title}]({url}) (#{number}){ — train `{train}`}
+**Next milestone:** {forecast.next_milestone} *(or "none identified")*
+
+### Likely
+
+For each candidate with `tier == "likely"` (score ≥ 5.0), score descending:
+
+- [{title}]({url}) (#{number}){ — train `{train}`} — *{signals joined with " · "}*
+
+### Possible
+
+For each candidate with `tier == "possible"` (score ≥ 2.0):
+
+- [{title}]({url}) (#{number}){ — train `{train}`} — *{signals joined with " · "}*
+
+### Longshot
+
+For each candidate with `tier == "longshot"` (score < 2.0):
+
+- [{title}]({url}) (#{number}){ — train `{train}`} — *{signals joined with " · "}*
 
 ## Feature changes (add / drop / change)
 
