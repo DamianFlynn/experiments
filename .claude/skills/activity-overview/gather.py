@@ -1255,6 +1255,28 @@ def classify_issue_kind(issue, taxonomy, types_present):
     return "other"
 
 
+# Conventional-commit type prefix -> canonical kind (only the prefixes that map
+# cleanly onto _VALID_KINDS; everything else falls through to None/"other").
+_CC_TYPE_TO_KIND = {"feat": "feature", "fix": "bug", "docs": "docs"}
+_CC_PREFIX_RE = re.compile(r"^([a-z]+)(?:\([^)]*\))?!?:")
+
+
+def classify_pr_kind(pr):
+    """Kind from a PR's conventional-commit title prefix: feat->feature, fix->bug,
+    docs->docs. Returns None when the title has no recognized prefix, so callers
+    can fall through to 'other'. Pure.
+
+    Used as a fallback for trains with no typed root issue: repos like AVM title
+    PRs conventionally (`feat:`/`fix:`) but rarely close a typed issue, so without
+    this every train's kind would be 'other' and significance could not weight
+    feature vs fix."""
+    title = (pr.get("title") or "").strip().lower()
+    m = _CC_PREFIX_RE.match(title)
+    if not m:
+        return None
+    return _CC_TYPE_TO_KIND.get(m.group(1))
+
+
 def fetch_all(get_page, first_url):
     """Walk a paginated endpoint. `get_page(url)` returns (items, next_url|None).
     Network/parse details live in the caller's closure, so this is testable with

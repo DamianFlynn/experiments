@@ -1768,5 +1768,31 @@ class TestParseSymbolEvents(unittest.TestCase):
         self.assertEqual(gather.parse_symbol_events(""), [])
 
 
+class TestClassifyPrKind(unittest.TestCase):
+    """Conventional-commit PR title -> canonical kind (train fallback)."""
+
+    def test_conventional_prefixes_map_to_kinds(self):
+        self.assertEqual(gather.classify_pr_kind({"title": "feat: add redis cmk"}),
+                         "feature")
+        self.assertEqual(gather.classify_pr_kind({"title": "fix: null deref"}), "bug")
+        self.assertEqual(gather.classify_pr_kind({"title": "docs: clarify readme"}),
+                         "docs")
+
+    def test_scope_breaking_and_case_are_handled(self):
+        self.assertEqual(
+            gather.classify_pr_kind({"title": "feat(avm/res/cache/redis): add"}),
+            "feature")
+        self.assertEqual(gather.classify_pr_kind({"title": "fix!: drop output"}), "bug")
+        self.assertEqual(gather.classify_pr_kind({"title": "Feat: Case Insensitive"}),
+                         "feature")
+
+    def test_unmapped_or_absent_prefix_returns_none(self):
+        for title in ("chore: bump deps", "refactor: tidy", "perf: faster",
+                      "Add policy param", "feat add no colon", ""):
+            self.assertIsNone(gather.classify_pr_kind({"title": title}),
+                              f"expected None for {title!r}")
+        self.assertIsNone(gather.classify_pr_kind({}))
+
+
 if __name__ == "__main__":
     unittest.main()

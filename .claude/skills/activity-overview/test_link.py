@@ -91,6 +91,43 @@ class TestBuildTrains(unittest.TestCase):
             self.assertIn("id", ev)
             self.assertTrue(ev["url"].startswith("https://"))
 
+    def test_kind_falls_back_to_pr_title_when_no_typed_issue(self):
+        """A PR-anchored train (no root issue) derives kind from the PR's
+        conventional-commit title prefix instead of defaulting to 'other'."""
+        bundle = _sample_bundle()
+        bundle["prs"][0]["closes"] = []
+        bundle["prs"][0]["title"] = "feat: add policy param"
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual(trains[0]["id"], "train-pr-42")
+        self.assertEqual(trains[0]["kind"], "feature")
+
+    def test_typed_root_issue_kind_wins_over_pr_title(self):
+        """A typed root issue takes precedence over the PR title prefix."""
+        bundle = _sample_bundle()
+        bundle["prs"][0]["title"] = "fix: tweak"   # would be 'bug' on its own
+        link.attach_commit_prs(bundle["commits"])  # issue 17 kind == 'feature'
+        trains = link.build_trains(bundle)
+        self.assertEqual(trains[0]["root_issue"], 17)
+        self.assertEqual(trains[0]["kind"], "feature")
+
+    def test_untyped_root_issue_falls_back_to_pr_title(self):
+        """An 'other'-kind root issue still falls back to the PR title prefix."""
+        bundle = _sample_bundle()
+        bundle["issues"][0]["kind"] = "other"
+        bundle["prs"][0]["title"] = "fix: tweak"
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual(trains[0]["root_issue"], 17)
+        self.assertEqual(trains[0]["kind"], "bug")
+
+    def test_kind_stays_other_when_pr_title_has_no_prefix(self):
+        bundle = _sample_bundle()
+        bundle["prs"][0]["closes"] = []            # PR-anchored
+        link.attach_commit_prs(bundle["commits"])  # title "Add policy param"
+        trains = link.build_trains(bundle)
+        self.assertEqual(trains[0]["kind"], "other")
+
 
 class TestBucketsAndEnrich(unittest.TestCase):
     def test_shipped_bucket_has_merged_prs_and_completed_issues(self):

@@ -325,6 +325,16 @@ def build_trains(bundle):
             issue = issues_by_num[root_issue]
             train_kind = issue.get("kind", "other")
             evidence.insert(0, ref("issue", root_issue, issue["url"]))
+        if train_kind == "other":
+            # No typed root issue: derive kind from the PRs' conventional-commit
+            # titles (feat->feature, fix->bug, docs->docs) so significance can
+            # weight real work on repos that title PRs but rarely type issues.
+            # `prs` is sorted by number, so the lowest-numbered match wins.
+            for p in prs:
+                pk = gather.classify_pr_kind(p)
+                if pk:
+                    train_kind = pk
+                    break
         trains.append({
             "id": f"train-issue-{root_issue}" if root_issue is not None
             else f"train-pr-{pr_numbers[0]}",
