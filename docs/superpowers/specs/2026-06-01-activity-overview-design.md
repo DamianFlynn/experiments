@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 10 (Phases 1/2/3a/3b shipped; + Phase 3c IaC dependency edges via `bicep build`→ARM + `terraform graph`, full-transitive, build-only; + Phase 3c.1 edge-build hardening shipped — parallel/bounded/retried builds with visible gaps via `edges_status`+`edge_extraction`; targeted resume (3c.2, with `clone_sha` pinning + overlap-safe roll-up), symbol artifacts (3d) + symbol-identity tracking (3e) sequenced as separate slices)
+**Status:** Approved design — rev 11 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; symbol-identity tracking across renames (3e) sequenced next)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -936,9 +936,20 @@ against GitHub) after each.
   live clone (round-trips the bundle, must not regress resolution). Both modes are wired into the
   SKILL procedure as alternative acquire steps (resume → re-run link+render; roll-up → link then
   render). A fresh wide-window re-gather remains the canonical long view.
-- **Phase 3d — symbol-granular artifacts.** Extend the artifact ledger from file-granularity
-  to **symbols** (Bicep/ARM `param`/`resource`/`output`, Terraform `variable`/`resource`/
-  `output`, graphify nodes) with `-p` hunk parsing; `artifacts[].kind` gains `symbol`/`comment`
+- **Phase 3d — symbol-granular artifacts (shipped).** A single full-window `git log -p
+  --unified=3` walk → `symbol_events`, attributed **diff-locally** (symbol declarations
+  recognised within each hunk's lines — no per-commit checkout, no build). Link folds them into
+  `kind:symbol|comment` artifacts (`<path>#<lang>:<subkind>:<name>`) and `feature_deltas` with a
+  **bounded** (≤200 char) `before`/`after` + `detail` (`<lang> <subkind> <name>`). Covers Bicep
+  (`param`/`var`/`output`/`resource`/`module`) and Terraform (`resource`/`variable`/`output`/
+  `module`); graphify-language symbols are best-effort where the optional CLI is present.
+  **Comments** are tracked by text, so one **replaced as a decision evolves** is captured as
+  old-dropped + new-added (the decision trail — context for how ideas break into follow-on
+  issues/PRs); markers (`TODO`/`FIXME`/`HACK`/`XXX`/`BUG`) carry subkind `todo`; decorative
+  banners are ignored. The gate
+  asserts the symbol ledger lights up (with bounded snippets) on a busy code window. *Original
+  scope note:* extend the artifact ledger from file-granularity to **symbols** with `-p` hunk
+  parsing; `artifacts[].kind` gains `symbol`/`comment`
   and `feature_deltas` gain `hunk`/`before`/`after`/`detail`. Builds on the 3c edge/area
   foundation. (Sequenced slice.)
 - **Phase 3e — symbol-identity tracking.** Follow a symbol across renames/moves/file-splits

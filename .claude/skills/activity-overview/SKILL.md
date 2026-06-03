@@ -78,3 +78,8 @@ claim in the report resolves to a source ref in the bundle — never invent fact
   `diagrams.kind_breakdown`). Each issue/PR carries `facets`
   (area/priority/status/lifecycle) and each issue a `kind`; group and label using
   them. `code_area`/`area` are now populated where a path resolves to an area.
+- Phase 3c reports additionally: a **Module dependency graph / blast radius** section
+  embedding `diagrams.module_graph` from `code_graph.areas[].edges`.
+- Phase 3d reports additionally: a **Symbol-level changes** subsection under Feature
+  changes — `feature_deltas` with `subject` `symbol`/`comment` carry a bounded
+  `before`/`after` + `detail` (`<lang> <subkind> <name>`); show the actual change text.

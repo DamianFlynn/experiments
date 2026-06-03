@@ -75,9 +75,37 @@ class TestCloneAndWindow(unittest.TestCase):
         self.assertEqual(cmd[0], "git")
         self.assertIn("clone", cmd)
         self.assertIn("--filter=blob:none", cmd)
-        self.assertIn("--shallow-since=2026-05-01", cmd)
+        # shallow-since reaches CLONE_MARGIN_DAYS (14) BEFORE the window start so the
+        # grafted boundary commit's whole-tree phantom diff falls outside the window.
+        self.assertIn("--shallow-since=2026-04-17", cmd)
         self.assertIn("--no-single-branch", cmd)
         self.assertEqual(cmd[-2:], ["https://github.com/o/r.git", "/tmp/clone"])
+
+    def test_shift_date(self):
+        self.assertEqual(gather._shift_date("2026-05-01", -14), "2026-04-17")
+        self.assertEqual(gather._shift_date("bad", -14), "bad")  # parse-error fallback
+
+    def test_shallow_boundary_and_drop(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".git"))
+            with open(os.path.join(d, ".git", "shallow"), "w") as fh:
+                fh.write("aaaa\nbbbb\n")
+            self.assertEqual(gather.shallow_boundary_shas(d), {"aaaa", "bbbb"})
+        # absent file -> empty set; drop filters by commit; empty boundary is a no-op
+        self.assertEqual(gather.shallow_boundary_shas("/no/such/clone"), set())
+        evs = [{"commit": "aaaa", "x": 1}, {"commit": "cccc", "x": 2}]
+        self.assertEqual(gather.drop_boundary_events(evs, {"aaaa"}),
+                         [{"commit": "cccc", "x": 2}])
+        self.assertEqual(gather.drop_boundary_events(evs, set()), evs)
+
+    def test_in_window_boundary_commits(self):
+        commits = [{"sha": "aaaa"}, {"sha": "dddd"}]
+        # boundary "aaaa" is also an in-window commit -> reported (visible gap);
+        # "bbbb" is a pre-window boundary -> not reported.
+        self.assertEqual(
+            gather.in_window_boundary_commits({"aaaa", "bbbb"}, commits), ["aaaa"])
+        self.assertEqual(gather.in_window_boundary_commits(set(), commits), [])
 
     def test_in_window_inclusive_bounds(self):
         self.assertTrue(gather.in_window("2026-05-01", "2026-05-01", "2026-05-31"))
@@ -1575,6 +1603,169 @@ class TestAcquireEdgesP3c(unittest.TestCase):
         self.assertTrue(bar["edges"])
         self.assertTrue(any(e["to"] == "avm/res/storage/storage-account"
                             for e in bar["edges"]))
+
+
+BICEP_DIFF = """diff --git a/avm/res/foo/main.bicep b/avm/res/foo/main.bicep
+index 1111111..2222222 100644
+--- a/avm/res/foo/main.bicep
++++ b/avm/res/foo/main.bicep
+@@ -1,5 +1,7 @@
+ param location string = resourceGroup().location
+-param oldParam string
++param newParam string
++@description('the vault')
+ resource vault 'Microsoft.KeyVault/vaults@2023-01-01' = {
+-  name: 'old'
++  name: 'new'
+ }
+"""
+
+TF_DIFF = """diff --git a/live/prod/main.tf b/live/prod/main.tf
+--- a/live/prod/main.tf
++++ b/live/prod/main.tf
+@@ -1,4 +1,7 @@
+ resource "azurerm_resource_group" "this" {
+-  name = "old"
++  name = "new"
+ }
++variable "region" {
++  type = string
++}
+"""
+
+
+class TestUnifiedDiffParser(unittest.TestCase):
+    def test_parses_path_and_hunk_lines(self):
+        files = gather.parse_unified_diff(BICEP_DIFF)
+        self.assertEqual(len(files), 1)
+        f = files[0]
+        self.assertEqual(f["path"], "avm/res/foo/main.bicep")
+        self.assertEqual(f["old_path"], "avm/res/foo/main.bicep")
+        self.assertEqual(f["hunks"][0]["new_start"], 1)
+        signs = [s for s, _ in f["hunks"][0]["lines"]]
+        self.assertIn("+", signs)
+        self.assertIn("-", signs)
+
+    def test_added_file_old_path_is_none(self):
+        diff = ("diff --git a/x.bicep b/x.bicep\n--- /dev/null\n+++ b/x.bicep\n"
+                "@@ -0,0 +1,1 @@\n+param a string\n")
+        f = gather.parse_unified_diff(diff)[0]
+        self.assertIsNone(f["old_path"])
+        self.assertEqual(f["path"], "x.bicep")
+
+
+class TestDetectSymbolDecl(unittest.TestCase):
+    def test_bicep_decls(self):
+        self.assertEqual(gather.detect_symbol_decl("bicep", "param foo string"),
+                         ("symbol", "param", "foo"))
+        self.assertEqual(gather.detect_symbol_decl(
+            "bicep", "resource vault 'Microsoft.KeyVault/vaults@2023-01-01' = {"),
+            ("symbol", "resource", "vault"))
+        self.assertEqual(gather.detect_symbol_decl("bicep", "  // a note")[0], "comment")
+        self.assertIsNone(gather.detect_symbol_decl("bicep", "  name: 'x'"))
+
+    def test_terraform_decls(self):
+        self.assertEqual(gather.detect_symbol_decl(
+            "terraform", 'resource "azurerm_kv" "this" {'),
+            ("symbol", "resource", "azurerm_kv.this"))
+        self.assertEqual(gather.detect_symbol_decl("terraform", 'variable "region" {'),
+                         ("symbol", "variable", "region"))
+        self.assertEqual(gather.detect_symbol_decl("terraform", "# comment")[0], "comment")
+
+    def test_comment_subkinds_and_decorative_filter(self):
+        self.assertEqual(gather.detect_symbol_decl("bicep", "// TODO: revisit"),
+                         ("comment", "todo", "// TODO: revisit"))
+        self.assertEqual(gather.detect_symbol_decl("bicep", "// a real note")[1], "comment")
+        # decorative separators carry no decision content -> not tracked
+        self.assertIsNone(gather.detect_symbol_decl("bicep", "// ============ //"))
+        self.assertIsNone(gather.detect_symbol_decl("terraform", "# -----------"))
+
+    def test_unknown_lang_is_none(self):
+        self.assertIsNone(gather.detect_symbol_decl("python", "def f():"))
+
+
+class TestBuildSymbolDeltas(unittest.TestCase):
+    def _by_name(self, path, diff):
+        f = gather.parse_unified_diff(diff)[0]
+        return {(d["subkind"], d["name"]): d
+                for d in gather.build_symbol_deltas(path, f["hunks"])}
+
+    def test_bicep_add_drop_change_comment(self):
+        d = self._by_name("avm/res/foo/main.bicep", BICEP_DIFF)
+        self.assertEqual(d[("param", "newParam")]["change"], "add")
+        self.assertEqual(d[("param", "oldParam")]["change"], "drop")
+        self.assertEqual(d[("resource", "vault")]["change"], "change")
+        self.assertIn("name: 'old'", d[("resource", "vault")]["before"])
+        self.assertIn("name: 'new'", d[("resource", "vault")]["after"])
+        # comments are keyed by TEXT (not collapsed to one per file)
+        self.assertEqual(d[("comment", "@description('the vault')")]["change"], "add")
+
+    def test_comment_replacement_keeps_both_old_and_new_text(self):
+        # A comment replaced as a decision evolves -> old text dropped, new text added,
+        # both preserved (the decision trail), not collapsed into one blob.
+        diff = ("diff --git a/m.bicep b/m.bicep\n--- a/m.bicep\n+++ b/m.bicep\n"
+                "@@ -1,2 +1,2 @@\n"
+                "-// TODO: decide retention window\n"
+                "+// retention fixed at 90d per #123\n"
+                " param x string\n")
+        f = gather.parse_unified_diff(diff)[0]
+        deltas = {(d["subkind"], d["name"]): d
+                  for d in gather.build_symbol_deltas("m.bicep", f["hunks"])}
+        # old TODO dropped (and recognised as a decision marker)...
+        old = deltas[("todo", "// TODO: decide retention window")]
+        self.assertEqual(old["change"], "drop")
+        # ...new note added — both texts captured as distinct deltas
+        new = deltas[("comment", "// retention fixed at 90d per #123")]
+        self.assertEqual(new["change"], "add")
+
+    def test_comment_does_not_swallow_following_body_edit(self):
+        # a comment must not become the enclosing symbol for a later body change
+        diff = ("diff --git a/m.bicep b/m.bicep\n--- a/m.bicep\n+++ b/m.bicep\n"
+                "@@ -1,3 +1,3 @@\n"
+                " resource vault 'x' = {\n"
+                " // note\n"
+                "-  sku: 'A'\n+  sku: 'B'\n }\n")
+        f = gather.parse_unified_diff(diff)[0]
+        d = {(x["subkind"], x["name"]): x
+             for x in gather.build_symbol_deltas("m.bicep", f["hunks"])}
+        self.assertEqual(d[("resource", "vault")]["change"], "change")  # body edit -> resource
+
+    def test_terraform_change_and_add(self):
+        d = self._by_name("live/prod/main.tf", TF_DIFF)
+        self.assertEqual(d[("resource", "azurerm_resource_group.this")]["change"], "change")
+        self.assertEqual(d[("variable", "region")]["change"], "add")
+
+    def test_non_source_file_yields_nothing(self):
+        f = gather.parse_unified_diff(
+            "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+            "@@ -1 +1 @@\n-old\n+new\n")[0]
+        self.assertEqual(gather.build_symbol_deltas("README.md", f["hunks"]), [])
+
+    def test_before_after_bounded(self):
+        long = "x" * 500
+        diff = (f"diff --git a/m.bicep b/m.bicep\n--- a/m.bicep\n+++ b/m.bicep\n"
+                f"@@ -1 +1 @@\n-param a string // {long}\n+param a int // {long}\n")
+        f = gather.parse_unified_diff(diff)[0]
+        d = gather.build_symbol_deltas("m.bicep", f["hunks"])[0]
+        self.assertLessEqual(len(d["before"]), 200)
+        self.assertLessEqual(len(d["after"]), 200)
+
+
+class TestParseSymbolEvents(unittest.TestCase):
+    def test_record_splitting_attaches_commit_metadata(self):
+        sha = "a" * 40
+        header = gather.FIELD_SEP.join([sha, "parent", "Alice", "2026-05-03", "subj"])
+        raw = gather.RECORD_SEP + header + "\n" + BICEP_DIFF
+        events = gather.parse_symbol_events(raw)
+        self.assertTrue(events)
+        self.assertTrue(all(e["commit"] == sha and e["author"] == "Alice"
+                            and e["date"] == "2026-05-03" for e in events))
+        names = {(e["subkind"], e["name"], e["change"]) for e in events}
+        self.assertIn(("param", "newParam", "add"), names)
+        self.assertIn(("resource", "vault", "change"), names)
+
+    def test_empty_input_yields_no_events(self):
+        self.assertEqual(gather.parse_symbol_events(""), [])
 
 
 if __name__ == "__main__":

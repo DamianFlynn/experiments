@@ -99,6 +99,7 @@ def _commit_url(bundle, sha):
 # git change -> artifact lifecycle event. add/copy introduce; modify changes;
 # delete removes; rename is handled specially (remove old + add new).
 _CHANGE_TO_EVENT = {"add": "add", "copy": "add", "modify": "change", "delete": "remove"}
+_SYMBOL_CHANGE_TO_EVENT = {"add": "add", "drop": "remove", "change": "change"}
 
 
 def build_artifacts(bundle):
@@ -149,6 +150,26 @@ def build_artifacts(bundle):
         if aid is None:
             continue
         append_event(aid, _CHANGE_TO_EVENT.get(change, "change"), ev)
+
+    # Phase 3d: fold symbol-granular events into kind:symbol/comment artifacts.
+    # Each carries a bounded before/after on its lifecycle entry (file-level entries
+    # leave those absent). id = "<path>#<lang>:<subkind>:<name>" (stable per symbol).
+    for ev in bundle.get("symbol_events", []):
+        kind = "comment" if ev["subkind"] in ("comment", "todo") else "symbol"
+        aid = f'{ev["path"]}#{ev["lang"]}:{ev["subkind"]}:{ev["name"] or ""}'
+        if aid not in artifacts:
+            artifacts[aid] = {
+                "kind": kind, "path": ev["path"], "name": ev["name"] or "comment",
+                "subkind": ev["subkind"], "lang": ev["lang"], "status": "live",
+                "replaced_by": None, "code_area": None, "lifecycle": [],
+            }
+        artifacts[aid]["lifecycle"].append({
+            "event": _SYMBOL_CHANGE_TO_EVENT.get(ev["change"], "change"),
+            "commit": ev["commit"], "author": ev["author"], "date": ev["date"],
+            "before": ev["before"], "after": ev["after"],
+            "ref": {"type": "commit", "id": ev["commit"],
+                    "url": _commit_url(bundle, ev["commit"])},
+        })
 
     # Final status from the last lifecycle event (unless already `replaced`).
     for a in artifacts.values():
@@ -225,8 +246,10 @@ def compute_feature_deltas(bundle):
 
     One delta per lifecycle event: add->add, remove->drop, change->change. Each
     attributes author/commit/url + (best-effort) the owning pr/train via the
-    commit->PR map Link already builds. `area`/`before`/`after`/`detail` are null
-    in Phase 3a (graphify + hunk parsing are later slices). Pure.
+    commit->PR map Link already builds. For SYMBOL/COMMENT artifacts (Phase 3d)
+    `before`/`after` carry the bounded hunk snippet and `detail` is
+    "<lang> <subkind> <name>"; file-level deltas leave them null. `area` is filled
+    later by attribute_code_areas. Pure.
     """
     commit_to_pr = {c["sha"]: c.get("pr") for c in bundle.get("commits", [])}
     pr_to_train = {}
@@ -241,14 +264,17 @@ def compute_feature_deltas(bundle):
             if kind is None:
                 continue
             pr = commit_to_pr.get(ev["commit"])
+            is_symbol = art["kind"] in ("symbol", "comment")
+            detail = (f'{art.get("lang", "")} {art.get("subkind", "")} '
+                      f'{art["name"]}').strip() if is_symbol else None
             deltas.append({
                 "area": None,
                 "kind": kind,
                 "subject": art["kind"],
                 "name": art["name"],
-                "before": None,
-                "after": None,
-                "detail": None,
+                "before": ev.get("before"),
+                "after": ev.get("after"),
+                "detail": detail,
                 "artifact": aid,
                 "author": ev["author"],
                 "train": pr_to_train.get(pr) if pr is not None else None,
