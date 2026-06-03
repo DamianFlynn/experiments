@@ -1139,6 +1139,18 @@ class TestTrainEffort(unittest.TestCase):
         self.assertEqual(eff["elapsed_days"], 5)
         self.assertFalse(eff["stalled"])
 
+    def test_stalled_false_at_exact_boundary(self):
+        """elapsed_days == TRAIN_STALL_DAYS is NOT stalled (strict >)."""
+        # PR opened 2026-05-01, merged exactly TRAIN_STALL_DAYS (21) days later -> 2026-05-22
+        pr = self._pr(52, "alice", "2026-05-01T00:00:00Z",
+                      merged=True, merged_at="2026-05-22T00:00:00Z")
+        train = self._train("train-pr-52", None, [52], [])
+        bundle = self._bundle([train], [pr], [])
+        link.annotate_train_effort(bundle)
+        eff = train["effort"]
+        self.assertEqual(eff["elapsed_days"], link.TRAIN_STALL_DAYS)
+        self.assertFalse(eff["stalled"])
+
     # ------------------------------------------------------------------
     # Distinctness: same login in multiple roles counts once
     # ------------------------------------------------------------------

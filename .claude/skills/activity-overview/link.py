@@ -478,6 +478,10 @@ TRAIN_SIGNIFICANCE_TOP_N = 8
 # stays well below it.
 TRAIN_SIGNIFICANCE_FLOOR = 20.0
 
+# Elapsed-days threshold above which a merged train is considered "stalled"
+# (took too long to land).  Tune without touching logic.
+TRAIN_STALL_DAYS = 21
+
 
 def score_train_significance(bundle):
     """Annotate each train with `significance` (float) and `tier` ('deep'|'mention').
@@ -512,18 +516,14 @@ def score_train_significance(bundle):
     return bundle
 
 
-# Elapsed-days threshold above which a merged train is considered "stalled"
-# (took too long to land).  Tune without touching logic.
-TRAIN_STALL_DAYS = 21
-
-
 def _parse_ts(ts):
     """Parse an ISO-8601 timestamp string (with or without trailing Z) to a
     timezone-aware datetime, or return None when ts is absent/unparseable."""
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.rstrip("Z")).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(ts.rstrip("Z"))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
     except (ValueError, AttributeError):
         return None
 
