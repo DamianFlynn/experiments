@@ -99,6 +99,14 @@ class TestCloneAndWindow(unittest.TestCase):
                          [{"commit": "cccc", "x": 2}])
         self.assertEqual(gather.drop_boundary_events(evs, set()), evs)
 
+    def test_in_window_boundary_commits(self):
+        commits = [{"sha": "aaaa"}, {"sha": "dddd"}]
+        # boundary "aaaa" is also an in-window commit -> reported (visible gap);
+        # "bbbb" is a pre-window boundary -> not reported.
+        self.assertEqual(
+            gather.in_window_boundary_commits({"aaaa", "bbbb"}, commits), ["aaaa"])
+        self.assertEqual(gather.in_window_boundary_commits(set(), commits), [])
+
     def test_in_window_inclusive_bounds(self):
         self.assertTrue(gather.in_window("2026-05-01", "2026-05-01", "2026-05-31"))
         self.assertTrue(gather.in_window("2026-05-31", "2026-05-01", "2026-05-31"))

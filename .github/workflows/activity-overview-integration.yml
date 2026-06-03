@@ -331,7 +331,10 @@ jobs:
           # away, so a diff against it is a whole-tree phantom that would inflate the
           # ledger ~100x. Such commits must NOT appear in code_events/symbol_events.
           shp = os.path.join(b["meta"].get("clone_dir", ""), ".git", "shallow")
-          boundary = {ln.strip() for ln in open(shp)} if os.path.exists(shp) else set()
+          boundary = set()
+          if os.path.exists(shp):
+              with open(shp) as _fh:
+                  boundary = {ln.strip() for ln in _fh}
           boundary.discard("")
           leaked = {e["commit"] for e in b.get("symbol_events", []) if e.get("commit") in boundary} | \
                    {e["commit"] for e in b.get("code_events", []) if e.get("commit") in boundary}

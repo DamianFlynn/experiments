@@ -86,9 +86,10 @@ path resolves to a code area (no longer null when a `code_graph` area covers it)
 For `feature_deltas` with `subject` of `symbol`/`comment`, show the actual change using
 the bounded `before`/`after` and `detail` (`<lang> <subkind> <name>`). Omit when no
 symbol deltas resolved. **Call out decision context:** comment deltas whose `detail`
-begins `… todo …` (`TODO`/`FIXME`/etc.) and comment **drops/changes** (a note or
-`@description` replaced as a decision evolved) are strong focus signals for follow-on
-issues/PRs — surface these first.
+contains the `todo` subkind (`detail` format is `<lang> <subkind> <name>`, e.g.
+`bicep todo // TODO: …`) and comment **drops/changes** (a note or `@description`
+replaced as a decision evolved) are strong focus signals for follow-on issues/PRs —
+surface these first.
 
 | Detail | Kind | Before | After | PR | Commit |
 |--------|------|--------|-------|----|--------|

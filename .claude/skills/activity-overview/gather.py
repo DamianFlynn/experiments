@@ -185,6 +185,15 @@ def drop_boundary_events(events, boundary):
     return [e for e in events if e.get("commit") not in boundary]
 
 
+def in_window_boundary_commits(boundary, commits):
+    """Boundary SHAs that are ALSO in-window commits. Their diffs were dropped as
+    whole-tree phantoms (parent grafted away), so their real changes are a gap — the
+    margin had no earlier commit to anchor them. Surfaced in meta so it's never silent;
+    widening CLONE_MARGIN_DAYS recovers them. Sorted; empty in the common case."""
+    shas = {c.get("sha") for c in commits}
+    return sorted(s for s in boundary if s in shas)
+
+
 def in_window(ts, from_date, to_date):
     """True if ISO date/datetime string `ts` falls within [from_date, to_date]
     inclusive, comparing on the date prefix. None/empty is never in window."""
@@ -1694,6 +1703,13 @@ def acquire(args, env):
     _boundary = shallow_boundary_shas(clone_dir)
     code_events = drop_boundary_events(code_events, _boundary)
     symbol_events = drop_boundary_events(symbol_events, _boundary)
+    _boundary_dropped = in_window_boundary_commits(_boundary, commits)
+    if _boundary_dropped:
+        sys.stderr.write(
+            f"warning: {len(_boundary_dropped)} in-window commit(s) sit at the shallow "
+            f"clone boundary; their whole-tree phantom diffs were dropped (a visible gap "
+            f"in meta.boundary_dropped_commits) — widen CLONE_MARGIN_DAYS to recover: "
+            f"{_boundary_dropped}\n")
 
     # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
     # from the code-event walk + the commit file lists (local, zero-token).
@@ -1837,6 +1853,7 @@ def acquire(args, env):
         "owner": owner, "repo": repo, "from": frm, "to": to,
         "branches": args.branches.split(","), "clone_dir": clone_dir,
         "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
+        "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
     bundle = build_bundle(meta, commits, prs, issues)
