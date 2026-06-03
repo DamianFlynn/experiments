@@ -782,9 +782,14 @@ def parse_terraform_graph(dot_text):
 def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None):
     """Build inter-area dependency edges for one Terraform area.
 
-    Joins terraform-graph module pairs with the `module {source=}` blocks: a local
-    source resolves to an area-id (via classify_code_area, relative to base_path); a
-    registry source is kept raw as the edge target. Pure; deterministic."""
+    Joins terraform-graph module pairs with the `module {source=}` blocks. A LOCAL
+    source resolves to a repo area-id (via classify_code_area, relative to base_path)
+    → `to`=area, `resolved`=True. A REGISTRY/external source cannot map to a repo area,
+    so — like the Bicep path and the schema (`to`: area-id|null) — `to`=None,
+    `resolved`=False, with the source kept in `ref` (+ pinned `version`). The DOT graph
+    is transitive: a module the root depends on directly is `transitive`=False; one
+    reached ONLY through another module is `transitive`=True (and direct wins if both).
+    Pure; deterministic."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     bodies = _terraform_module_bodies(tf_text)
     sources = parse_terraform_module_blocks(tf_text)
@@ -794,29 +799,31 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None)
         vm = _TF_VERSION_RE.search(bodies.get(name, ""))
         return vm.group("ver") if vm else None
 
-    def to_area(name):
+    def resolve(name):
+        """-> (to_area_or_None, ref_or_None, version). ref None = unknown module."""
         src = sources.get(name)
         if not src:
-            return None, None
+            return None, None, None
         if src.startswith(".") or src.startswith("/"):
             joined = os.path.normpath(os.path.join(base_dir, src))
-            return (classify_code_area(joined + "/main.tf", patterns) or joined), None
-        # registry/module-registry source, kept raw, with its pinned version
-        return src, version_of(name)
+            return (classify_code_area(joined + "/main.tf", patterns) or joined), src, None
+        return None, src, version_of(name)        # external: to=None, identity in ref
 
+    pairs = parse_terraform_graph(dot_text)
+    direct = {b for a, b in pairs if a is None}    # modules the root depends on
     edges = []
     seen = set()
-    for _a, b in parse_terraform_graph(dot_text):
-        to, version = to_area(b)
-        if to is None:
+    for _a, b in pairs:
+        to, ref, version = resolve(b)
+        if ref is None:                            # module block with no source
             continue
-        key = (to, sources.get(b, b))
+        key = (to, ref)
         if key in seen:
             continue
         seen.add(key)
-        edges.append({"to": to, "kind": "module", "ref": sources.get(b, b),
-                      "version": version, "transitive": False,
-                      "provider": "terraform", "resolved": to is not None})
+        edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
+                      "transitive": b not in direct, "provider": "terraform",
+                      "resolved": to is not None})
     return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
 
 

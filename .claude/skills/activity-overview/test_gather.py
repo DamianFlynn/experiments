@@ -1223,12 +1223,29 @@ class TestBuildTerraformEdges(unittest.TestCase):
     def test_registry_module_source_kept_as_ref(self):
         edges = gather.build_terraform_edges(
             self.tf, self.dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
-        naming = [e for e in edges if e["to"] == "Azure/naming/azurerm"]
+        # An external registry module is NOT a repo area: identity lives in `ref`
+        # (+version), `to` is None and `resolved` is False (schema: to=area-id|null).
+        naming = [e for e in edges if e["ref"] == "Azure/naming/azurerm"]
         self.assertTrue(naming)
-        self.assertEqual(naming[0]["provider"], "terraform")
-        self.assertTrue(naming[0]["resolved"])
-        # registry source keeps its pinned version (from the module block)
+        self.assertIsNone(naming[0]["to"])
+        self.assertFalse(naming[0]["resolved"])
         self.assertEqual(naming[0]["version"], "0.4.0")
+        self.assertEqual(naming[0]["provider"], "terraform")
+
+    def test_only_transitive_local_module_is_marked_transitive(self):
+        # subnet is reached ONLY through vnet (never from root) -> transitive=True;
+        # vnet is a direct root dependency -> transitive=False.
+        tf = ('module "vnet" { source = "../../modules/vnet" }\n'
+              'module "subnet" { source = "../../modules/subnet" }\n')
+        dot = ('digraph {\n'
+               '"[root] x (expand)" -> "[root] module.vnet (expand)"\n'
+               '"[root] module.vnet.y (expand)" -> "[root] module.subnet.z (expand)"\n'
+               '}\n')
+        edges = gather.build_terraform_edges(
+            tf, dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        by_to = {e["to"]: e for e in edges}
+        self.assertFalse(by_to["modules/vnet"]["transitive"])
+        self.assertTrue(by_to["modules/subnet"]["transitive"])
 
     def test_edges_dedupe_and_are_marked_provider_terraform(self):
         edges = gather.build_terraform_edges(

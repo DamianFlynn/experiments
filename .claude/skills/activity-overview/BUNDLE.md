@@ -105,7 +105,7 @@ docsRefs, release_train, sprints, project, diagrams`.
 
   | field | meaning |
   |-------|---------|
-  | `to` | canonical target area-id (`avm/res/<svc>/<module>`, a local dir, or a registry source string), or `null` when unresolvable |
+  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable (e.g. a registry module — its identity is in `ref`) |
   | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred to 3d) |
   | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
   | `version` | pinned version when present, else `null` |

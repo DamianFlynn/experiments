@@ -297,7 +297,8 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
   dependency — when absent or inapplicable, code areas fall back to the directory provider.
   The provider yields an **area id** that every `code_area`/`area` field carries (a directory
   path, or `community:<n>` from graphify). **Dependency-edge enrichment lands in Phase 3c
-  (rev 9):** inter-area `code_graph.areas[].edges` are resolved **authoritatively** — Bicep
+  (rev 9; hardened in 3c.1/3c.2 — see rev 10 status):** inter-area
+  `code_graph.areas[].edges` are resolved **authoritatively** — Bicep
   via `bicep build`→ARM (walking the full **transitive** nested-deployment tree, joined with
   source-ref parsing to recover each `br/public:…:<version>` identity), Terraform via
   `terraform init && terraform graph` (the resolved transitive module/resource graph). Edge

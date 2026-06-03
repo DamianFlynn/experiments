@@ -114,7 +114,8 @@ resolved area fall under "Unattributed".
 Resolved inter-area dependencies from `code_graph.areas[].edges` (Bicep
 `bicep build`→ARM; Terraform `terraform graph`), embedding `diagrams.module_graph`.
 Direct dependencies carry pinned versions; cross-module edges show which areas a
-change ripples into. (Omitted when no edges resolved.)
+change ripples into. When no edges resolve, `module_graph` renders a
+`No module dependencies` placeholder (the diagram is always present).
 
 ## Module ownership
 
