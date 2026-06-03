@@ -953,5 +953,275 @@ class TestTrainSignificance(unittest.TestCase):
         self.assertAlmostEqual(t["significance"], expected)
 
 
+class TestTrainEffort(unittest.TestCase):
+    """Phase 4a: per-train effort metrics block."""
+
+    # ------------------------------------------------------------------
+    # Helpers / fixtures
+    # ------------------------------------------------------------------
+
+    def _pr(self, number, author, created_at, merged=True, merged_at=None,
+            reviewers=None, review_comments_count=0, comments_list=None):
+        return {
+            "number": number,
+            "title": f"PR {number}",
+            "url": f"https://github.com/o/r/pull/{number}",
+            "author": author,
+            "created_at": created_at,
+            "merged": merged,
+            "merged_at": merged_at,
+            "reviewers": reviewers or [],
+            "review_comments_count": review_comments_count,
+            "comments_list": comments_list or [],
+        }
+
+    def _issue(self, number, author, created_at, comments_list=None):
+        return {
+            "number": number,
+            "title": f"Issue {number}",
+            "url": f"https://github.com/o/r/issues/{number}",
+            "author": author,
+            "created_at": created_at,
+            "comments_list": comments_list or [],
+        }
+
+    def _train(self, id_, root_issue, pr_numbers, commit_shas):
+        return {
+            "id": id_,
+            "kind": "feature",
+            "root_issue": root_issue,
+            "prs": pr_numbers,
+            "commits": commit_shas,
+            "code_areas": [],
+            "outcome": "shipped",
+            "evidence": [],
+        }
+
+    def _bundle(self, trains, prs, issues):
+        return {"trains": trains, "prs": prs, "issues": issues}
+
+    # ------------------------------------------------------------------
+    # Happy-path: all fields populated correctly
+    # ------------------------------------------------------------------
+
+    def test_full_happy_path(self):
+        """opened_at = earliest of issue/PR; merged_at = latest merged PR;
+        elapsed correct; reviewers de-duplicated; review_comments summed;
+        commits counted; participants de-duplicated."""
+        issue = self._issue(
+            1, "alice", "2026-05-01T00:00:00Z",
+            comments_list=[{"author": "bob", "body": "looks good"}],
+        )
+        pr_a = self._pr(
+            10, "alice", "2026-05-03T00:00:00Z",
+            merged=True, merged_at="2026-05-10T00:00:00Z",
+            reviewers=["carol", "dave"],
+            review_comments_count=3,
+            comments_list=[{"author": "eve", "body": "nit"}],
+        )
+        pr_b = self._pr(
+            11, "frank", "2026-05-04T00:00:00Z",
+            merged=True, merged_at="2026-05-12T00:00:00Z",
+            reviewers=["carol", "grace"],   # carol appears in both PRs -> dedup
+            review_comments_count=2,
+            comments_list=[{"author": "alice", "body": "lgtm"}],  # alice is also PR author/issue author
+        )
+        train = self._train("train-issue-1", 1, [10, 11], ["sha1", "sha2", "sha3"])
+        bundle = self._bundle([train], [pr_a, pr_b], [issue])
+
+        link.annotate_train_effort(bundle)
+
+        eff = train["effort"]
+
+        # opened_at: issue created 2026-05-01, earliest PR created 2026-05-03 -> issue wins
+        self.assertEqual(eff["opened_at"], "2026-05-01T00:00:00Z")
+
+        # merged_at: latest of 2026-05-10 and 2026-05-12 -> 2026-05-12
+        self.assertEqual(eff["merged_at"], "2026-05-12T00:00:00Z")
+
+        # elapsed_days: 11 days (May 1 -> May 12)
+        self.assertEqual(eff["elapsed_days"], 11)
+
+        # reviewers: {carol, dave, grace} -> 3 (carol deduped)
+        self.assertEqual(eff["reviewers"], 3)
+
+        # review_comments: 3 + 2 = 5
+        self.assertEqual(eff["review_comments"], 5)
+
+        # commits: 3
+        self.assertEqual(eff["commits"], 3)
+
+        # participants: alice (PR author + issue author + PR commenter), frank (PR author),
+        #   carol, dave, grace (reviewers), bob (issue commenter), eve (PR commenter)
+        # = {alice, frank, carol, dave, grace, bob, eve} -> 7
+        self.assertEqual(eff["participants"], 7)
+
+    # ------------------------------------------------------------------
+    # opened_at: earliest wins
+    # ------------------------------------------------------------------
+
+    def test_opened_at_uses_pr_when_issue_is_later(self):
+        """When PR created_at < issue created_at, PR wins."""
+        issue = self._issue(2, "alice", "2026-05-10T00:00:00Z")
+        pr = self._pr(20, "alice", "2026-05-05T00:00:00Z",
+                      merged=True, merged_at="2026-05-20T00:00:00Z")
+        train = self._train("train-issue-2", 2, [20], ["s1"])
+        bundle = self._bundle([train], [pr], [issue])
+        link.annotate_train_effort(bundle)
+        self.assertEqual(train["effort"]["opened_at"], "2026-05-05T00:00:00Z")
+
+    # ------------------------------------------------------------------
+    # Null degradation: no merged PR
+    # ------------------------------------------------------------------
+
+    def test_no_merged_pr_gives_null_merged_and_elapsed_and_stalled_false(self):
+        """A train with only an unmerged PR has merged_at=None, elapsed_days=None, stalled=False."""
+        issue = self._issue(3, "alice", "2026-05-01T00:00:00Z")
+        pr = self._pr(30, "alice", "2026-05-02T00:00:00Z",
+                      merged=False, merged_at=None)
+        train = self._train("train-issue-3", 3, [30], [])
+        bundle = self._bundle([train], [pr], [issue])
+        link.annotate_train_effort(bundle)
+        eff = train["effort"]
+        self.assertIsNone(eff["merged_at"])
+        self.assertIsNone(eff["elapsed_days"])
+        self.assertFalse(eff["stalled"])
+
+    # ------------------------------------------------------------------
+    # Null degradation: PR-only train (root_issue=None)
+    # ------------------------------------------------------------------
+
+    def test_pr_only_train_opened_at_from_pr_no_issue_author_in_participants(self):
+        """A PR-only train (root_issue=None) uses PR created_at for opened_at;
+        no issue author is counted in participants."""
+        pr = self._pr(
+            40, "bob", "2026-05-07T00:00:00Z",
+            merged=True, merged_at="2026-05-14T00:00:00Z",
+            reviewers=["carol"],
+        )
+        train = self._train("train-pr-40", None, [40], ["s1", "s2"])
+        bundle = self._bundle([train], [pr], [])
+        link.annotate_train_effort(bundle)
+        eff = train["effort"]
+        self.assertEqual(eff["opened_at"], "2026-05-07T00:00:00Z")
+        # participants: bob (author), carol (reviewer) -> 2
+        self.assertEqual(eff["participants"], 2)
+        # elapsed: 7 days (May 7 -> May 14)
+        self.assertEqual(eff["elapsed_days"], 7)
+
+    # ------------------------------------------------------------------
+    # stalled boundary: just over vs under TRAIN_STALL_DAYS
+    # ------------------------------------------------------------------
+
+    def test_stalled_true_when_elapsed_exceeds_threshold(self):
+        """A merged train whose elapsed_days exceeds TRAIN_STALL_DAYS is stalled."""
+        # Use 22 days apart — should be over any reasonable threshold (>21)
+        pr = self._pr(50, "alice", "2026-05-01T00:00:00Z",
+                      merged=True, merged_at="2026-05-23T00:00:00Z")
+        train = self._train("train-pr-50", None, [50], [])
+        bundle = self._bundle([train], [pr], [])
+        link.annotate_train_effort(bundle)
+        eff = train["effort"]
+        self.assertEqual(eff["elapsed_days"], 22)
+        # Only stalled if elapsed > TRAIN_STALL_DAYS (e.g. >21 -> True for 22)
+        self.assertEqual(eff["stalled"], eff["elapsed_days"] > link.TRAIN_STALL_DAYS)
+        self.assertTrue(eff["stalled"])
+
+    def test_stalled_false_when_elapsed_under_threshold(self):
+        """A merged train whose elapsed_days is well below TRAIN_STALL_DAYS is not stalled."""
+        # Use 5 days apart — well under any reasonable threshold
+        pr = self._pr(51, "alice", "2026-05-01T00:00:00Z",
+                      merged=True, merged_at="2026-05-06T00:00:00Z")
+        train = self._train("train-pr-51", None, [51], [])
+        bundle = self._bundle([train], [pr], [])
+        link.annotate_train_effort(bundle)
+        eff = train["effort"]
+        self.assertEqual(eff["elapsed_days"], 5)
+        self.assertFalse(eff["stalled"])
+
+    # ------------------------------------------------------------------
+    # Distinctness: same login in multiple roles counts once
+    # ------------------------------------------------------------------
+
+    def test_same_login_across_roles_counted_once_in_participants(self):
+        """alice as PR author AND reviewer AND commenter is only 1 participant."""
+        pr = self._pr(
+            60, "alice", "2026-05-01T00:00:00Z",
+            merged=True, merged_at="2026-05-08T00:00:00Z",
+            reviewers=["alice"],   # also a reviewer
+            review_comments_count=2,
+            comments_list=[{"author": "alice", "body": "self-review"}],  # also a commenter
+        )
+        train = self._train("train-pr-60", None, [60], ["s1"])
+        bundle = self._bundle([train], [pr], [])
+        link.annotate_train_effort(bundle)
+        self.assertEqual(train["effort"]["participants"], 1)
+
+    # ------------------------------------------------------------------
+    # reviewers: distinct across multiple PRs
+    # ------------------------------------------------------------------
+
+    def test_reviewers_deduplicated_across_prs(self):
+        """Same reviewer on two PRs counts once."""
+        pr_a = self._pr(70, "alice", "2026-05-01T00:00:00Z",
+                        merged=True, merged_at="2026-05-05T00:00:00Z",
+                        reviewers=["bob", "carol"])
+        pr_b = self._pr(71, "dave", "2026-05-02T00:00:00Z",
+                        merged=True, merged_at="2026-05-08T00:00:00Z",
+                        reviewers=["bob", "eve"])  # bob appears in both
+        train = self._train("train-pr-70", None, [70, 71], [])
+        bundle = self._bundle([train], [pr_a, pr_b], [])
+        link.annotate_train_effort(bundle)
+        # distinct reviewers: {bob, carol, eve} -> 3
+        self.assertEqual(train["effort"]["reviewers"], 3)
+
+    # ------------------------------------------------------------------
+    # None/empty logins ignored in participants
+    # ------------------------------------------------------------------
+
+    def test_none_logins_ignored_in_participants(self):
+        """None/empty comment authors do not inflate the participant count."""
+        pr = self._pr(
+            80, "alice", "2026-05-01T00:00:00Z",
+            merged=True, merged_at="2026-05-03T00:00:00Z",
+            comments_list=[
+                {"author": None, "body": "ghost"},
+                {"author": "", "body": "empty"},
+                {"author": "bob", "body": "real"},
+            ],
+        )
+        train = self._train("train-pr-80", None, [80], [])
+        bundle = self._bundle([train], [pr], [])
+        link.annotate_train_effort(bundle)
+        # participants: alice (author) + bob (commenter) = 2
+        self.assertEqual(train["effort"]["participants"], 2)
+
+    # ------------------------------------------------------------------
+    # Wired into enrich()
+    # ------------------------------------------------------------------
+
+    def test_enrich_stamps_effort_on_all_trains(self):
+        """enrich() must leave an effort block on every train."""
+        with open(os.path.join(FIX, "bundle_sample.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        self.assertTrue(bundle["trains"], "fixture must have at least one train")
+        for t in bundle["trains"]:
+            self.assertIn("effort", t, f"train {t['id']} missing effort")
+            eff = t["effort"]
+            for field in ("opened_at", "merged_at", "elapsed_days",
+                          "reviewers", "review_comments", "commits",
+                          "participants", "stalled"):
+                self.assertIn(field, eff, f"train {t['id']} effort missing '{field}'")
+
+    def test_effort_after_significance_in_enrich(self):
+        """effort block must coexist with significance/tier (both wired in enrich)."""
+        with open(os.path.join(FIX, "bundle_sample.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        for t in bundle["trains"]:
+            self.assertIn("significance", t)
+            self.assertIn("tier", t)
+            self.assertIn("effort", t)
+
+
 if __name__ == "__main__":
     unittest.main()

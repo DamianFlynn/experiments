@@ -3,6 +3,7 @@
 import json
 import re
 import sys
+from datetime import datetime, timezone
 
 import gather  # for classify_artifact_path (shared artifact-kind gate)
 
@@ -511,6 +512,116 @@ def score_train_significance(bundle):
     return bundle
 
 
+# Elapsed-days threshold above which a merged train is considered "stalled"
+# (took too long to land).  Tune without touching logic.
+TRAIN_STALL_DAYS = 21
+
+
+def _parse_ts(ts):
+    """Parse an ISO-8601 timestamp string (with or without trailing Z) to a
+    timezone-aware datetime, or return None when ts is absent/unparseable."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.rstrip("Z")).replace(tzinfo=timezone.utc)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _effort_for_train(train, pr_index, issue_index):
+    """Compute the effort dict for one train.  Pure; never mutates arguments."""
+    pr_nums = train.get("prs", [])
+    train_prs = [pr_index[n] for n in pr_nums if n in pr_index]
+
+    # ---- dates --------------------------------------------------------
+    root_num = train.get("root_issue")
+    root_issue = issue_index.get(root_num) if root_num is not None else None
+
+    issue_created = _parse_ts((root_issue or {}).get("created_at"))
+    pr_created_dates = [d for d in
+                        (_parse_ts(p.get("created_at")) for p in train_prs)
+                        if d is not None]
+    earliest_pr = min(pr_created_dates) if pr_created_dates else None
+
+    candidates = [d for d in (issue_created, earliest_pr) if d is not None]
+    opened_dt = min(candidates) if candidates else None
+    opened_at = opened_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if opened_dt else None
+
+    merged_dates = [d for d in
+                    (_parse_ts(p.get("merged_at")) for p in train_prs
+                     if p.get("merged"))
+                    if d is not None]
+    merged_dt = max(merged_dates) if merged_dates else None
+    merged_at = merged_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if merged_dt else None
+
+    if opened_dt is not None and merged_dt is not None:
+        elapsed_days = (merged_dt - opened_dt).days
+    else:
+        elapsed_days = None
+
+    # ---- review effort ------------------------------------------------
+    all_reviewers = set()
+    review_comments = 0
+    for p in train_prs:
+        for r in p.get("reviewers", []):
+            if r:
+                all_reviewers.add(r)
+        review_comments += p.get("review_comments_count", 0) or 0
+
+    # ---- commits ------------------------------------------------------
+    commits = len(train.get("commits", []))
+
+    # ---- participants -------------------------------------------------
+    participants = set()
+
+    def add_login(login):
+        if login:
+            participants.add(login)
+
+    # PR authors
+    for p in train_prs:
+        add_login(p.get("author"))
+    # root issue author
+    if root_issue:
+        add_login(root_issue.get("author"))
+    # all reviewers
+    participants |= all_reviewers
+    # PR comment authors
+    for p in train_prs:
+        for c in p.get("comments_list", []):
+            add_login(c.get("author"))
+    # root issue comment authors
+    if root_issue:
+        for c in root_issue.get("comments_list", []):
+            add_login(c.get("author"))
+
+    # ---- stalled ------------------------------------------------------
+    stalled = (elapsed_days is not None and elapsed_days > TRAIN_STALL_DAYS)
+
+    return {
+        "opened_at": opened_at,
+        "merged_at": merged_at,
+        "elapsed_days": elapsed_days,
+        "reviewers": len(all_reviewers),
+        "review_comments": review_comments,
+        "commits": commits,
+        "participants": len(participants),
+        "stalled": stalled,
+    }
+
+
+def annotate_train_effort(bundle):
+    """Annotate each train in bundle['trains'] with an `effort` dict.
+
+    Computes time-and-effort signals purely from bundle data (prs + issues).
+    Mutates trains in place; returns bundle for convenience."""
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    for train in bundle.get("trains", []):
+        train["effort"] = _effort_for_train(train, pr_index, issue_index)
+    return bundle
+
+
 def build_modules(bundle, idx):
     """Populate bundle['modules'] = {<area>: {commits, prs, files_changed}}.
 
@@ -665,6 +776,7 @@ def enrich(bundle):
     idx = attribute_code_areas(bundle)
     attribute_train_areas(bundle, idx)
     score_train_significance(bundle)   # Phase 4a: reads code_areas populated above
+    annotate_train_effort(bundle)      # Phase 4a: per-train time & effort metrics
     build_modules(bundle, idx)
     attribute_people_areas(bundle, idx)
     return bundle
