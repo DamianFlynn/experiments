@@ -277,7 +277,10 @@ def emit_train_flowchart(bundle, train):
                 milestone = ms
                 break
         if milestone:
-            outcome_label = f"Shipped → {_flow_label(str(milestone))}"
+            # The outer _flow_label on outcome_label (below) sanitises/truncates the
+            # whole string, so don't pre-truncate the milestone here (double-capping
+            # would silently shrink the visible name).
+            outcome_label = f"Shipped → {milestone}"
         else:
             outcome_label = "Shipped"
     elif outcome == "rejected":
@@ -306,7 +309,8 @@ def emit_train_flowchart(bundle, train):
             area_nodes[aid] = _area_tail(area)
         for aid, label in sorted(area_nodes.items()):
             lines.append(f'    {aid}("{_flow_label(label)}")')
-        # link each PR -> its area nodes
+        # code_areas is per-train (not per-PR in the bundle), so every PR links to
+        # every train area — the finest granularity the schema supports.
         for pr_id in pr_node_ids:
             for aid in sorted(area_nodes):
                 lines.append(f"    {pr_id} --> {aid}")
@@ -390,8 +394,7 @@ def write_diagrams(bundle, outdir="workspace/diagrams", train_id=None):
         path = os.path.join(outdir, fname)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
-        key = train_id
-        real_paths[key] = path
+        real_paths[train_id] = path
         rel = os.path.relpath(path, root)
         # Merge into the bundle diagrams (preserve existing flat keys if any)
         diags = bundle.setdefault("diagrams", {})
@@ -419,8 +422,7 @@ def write_diagrams(bundle, outdir="workspace/diagrams", train_id=None):
         path = os.path.join(outdir, fname)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
-        key = tid
-        real_paths[key] = path
+        real_paths[tid] = path
         train_rel_map[tid] = os.path.relpath(path, root)
 
     relative["train_flowcharts"] = train_rel_map

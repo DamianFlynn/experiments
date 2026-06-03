@@ -725,9 +725,11 @@ class TestEmitTrainFlowchart(unittest.TestCase):
             "evidence": [],
         }
         mmd = render.emit_train_flowchart(b, train)
-        # area tails should NOT appear
-        self.assertNotIn("foo", mmd)
-        self.assertNotIn("bar", mmd)
+        # No area-annotation node declarations: the ("label") rounded-node shape is
+        # unique to area nodes here, so assert those specific lines are absent
+        # (more precise than a bare substring that a PR/issue title could contain).
+        self.assertNotIn('("foo")', mmd)
+        self.assertNotIn('("bar")', mmd)
 
     def test_mode_a_no_area_nodes_when_too_many_areas(self):
         """Exceeding TRAIN_FLOW_MAX_AREAS drops area annotation (mode A)."""
