@@ -1,6 +1,6 @@
 # Phase 3d — symbol-granular artifacts (implementation plan)
 
-**Status:** in progress. Branch `claude/activity-phase3d`. Builds on the merged 3c/3c.1/3c.2
+**Status:** shipped (PR #8). Branch `claude/activity-phase3d`. Builds on the merged 3c/3c.1/3c.2
 edge+area foundation. Scope (confirmed): **everything in one slice** — Bicep + Terraform symbols,
 graphify-node symbols (best-effort, optional dep), and language-agnostic `comment` changes — with
 **bounded before/after** snippets in `feature_deltas`.

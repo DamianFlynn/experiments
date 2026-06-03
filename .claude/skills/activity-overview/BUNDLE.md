@@ -80,9 +80,10 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **artifacts** `{ "<id>": { kind:"example|doc|readme|symbol|comment", path, name,
   status:"live|removed|replaced", replaced_by:id|null, code_area, lifecycle:[{event:
   "add|change|remove", commit, author, date, ref[, before, after]}] } }`. File-level
-  ids are the path; **symbol/comment** ids are `<path>#<lang>:<subkind>:<name>` and
-  also carry `lang`/`subkind`. `code_area` is filled in Phase 3b. Symbol lifecycle
-  entries carry the bounded `before`/`after`.
+  ids are `art:<path>` (via `artifact_id`); **symbol/comment** ids are
+  `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
+  joins back to these keys. `code_area` is filled in Phase 3b. Symbol lifecycle entries
+  carry the bounded `before`/`after`.
 - **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},
   subject:{kind, name, path} }]` — sorted social (comments/reviews) + code
   (artifact lifecycle) events. `ref.id` is the PR/issue number for social events

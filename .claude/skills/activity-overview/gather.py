@@ -1605,10 +1605,12 @@ def acquire(args, env):
 
     # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
     # Guarded so --no-clone / missing clone degrades gracefully to empty.
+    # `--reverse` so events arrive OLDEST→NEWEST: build_artifacts appends lifecycle
+    # in walk order and derives status from the last (newest) event.
     code_events = []
     if not args.no_clone or os.path.isdir(clone_dir):
         raw_walk = run_git([
-            "git", "-C", clone_dir, "log",
+            "git", "-C", clone_dir, "log", "--reverse",
             f"--since={frm}", f"--until={to}",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
             "--name-status", "-M", "-C",
@@ -1616,11 +1618,12 @@ def acquire(args, env):
         code_events = parse_code_events(raw_walk)
 
     # Phase 3d: symbol-granular change attribution via a single `git log -p` walk
-    # (diff-local, no per-commit checkout). Same guard/degradation as the file walk.
+    # (diff-local, no per-commit checkout). Same guard/degradation + oldest→newest
+    # ordering (--reverse) as the file walk so symbol lifecycle/status is correct.
     symbol_events = []
     if not args.no_clone or os.path.isdir(clone_dir):
         raw_patch = run_git([
-            "git", "-C", clone_dir, "log",
+            "git", "-C", clone_dir, "log", "--reverse",
             f"--since={frm}", f"--until={to}",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
             "-p", "--unified=3", "-M", "-C",
