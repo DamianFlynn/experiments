@@ -217,6 +217,40 @@ def emit_kind_breakdown(bundle):
     return "\n".join(lines) + "\n"
 
 
+def emit_module_graph(bundle):
+    """A Mermaid `flowchart` of resolved area->area dependency edges (blast radius).
+
+    Reads `code_graph.areas[].edges` (Phase 3c). Each resolved edge draws
+    source-area --> target-area, labelled with the version when present. Emits a
+    `No module dependencies` placeholder when no resolved edges exist. Derived
+    solely from existing bundle fields."""
+    areas = (bundle.get("code_graph") or {}).get("areas", [])
+    lines = ["flowchart LR"]
+    nodes = {}
+    drawn = []
+    for area in areas:
+        src_id = _node_id("m", area["id"])
+        for edge in area.get("edges", []):
+            if not edge.get("resolved") or edge.get("to") is None:
+                continue
+            dst_id = _node_id("m", edge["to"])
+            nodes[src_id] = _area_tail(area["id"])
+            nodes[dst_id] = _area_tail(edge["to"])
+            label = edge.get("version") or ("transitive" if edge.get("transitive") else "")
+            drawn.append((src_id, dst_id, label))
+    if not drawn:
+        lines.append("    none[No module dependencies]")
+        return "\n".join(lines) + "\n"
+    for nid, label in sorted(nodes.items()):
+        lines.append(f'    {nid}("{_flow_label(label)}")')
+    for src_id, dst_id, label in sorted(set(drawn)):
+        if label:
+            lines.append(f'    {src_id} -->|{_flow_label(label)}| {dst_id}')
+        else:
+            lines.append(f"    {src_id} --> {dst_id}")
+    return "\n".join(lines) + "\n"
+
+
 def render(bundle):
     """Name -> Mermaid text for every diagram this phase emits."""
     return {
@@ -226,6 +260,7 @@ def render(bundle):
         "deltas_bar": emit_deltas_bar(bundle),
         "contributor_graph": emit_contributor_graph(bundle),
         "kind_breakdown": emit_kind_breakdown(bundle),
+        "module_graph": emit_module_graph(bundle),
     }
 
 

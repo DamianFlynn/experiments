@@ -971,5 +971,589 @@ class TestAcquireAssemblyP3b(unittest.TestCase):
         self.assertIn("avm/res/network/", b["code_owners"])
 
 
+class TestParseBicepModuleRefs(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            self.src = fh.read()
+
+    def test_extracts_all_three_module_refs(self):
+        refs = gather.parse_bicep_module_refs(self.src)
+        self.assertEqual(len(refs), 3)
+
+    def test_registry_ref_splits_path_and_version(self):
+        refs = gather.parse_bicep_module_refs(self.src)
+        by_path = {r["registry_path"]: r for r in refs if r["registry_path"]}
+        self.assertIn("avm/res/storage/storage-account", by_path)
+        self.assertEqual(by_path["avm/res/storage/storage-account"]["version"], "0.9.0")
+        self.assertEqual(by_path["avm/res/key-vault/vault"]["version"], "0.6.1")
+        self.assertIsNone(by_path["avm/res/storage/storage-account"]["local_path"])
+
+    def test_local_ref_is_kept_as_local_path(self):
+        refs = gather.parse_bicep_module_refs(self.src)
+        locals_ = [r for r in refs if r["local_path"]]
+        self.assertEqual(len(locals_), 1)
+        self.assertEqual(locals_[0]["local_path"],
+                         "../../../utl/types/avm-common-types/main.bicep")
+        self.assertIsNone(locals_[0]["registry_path"])
+
+    def test_br_with_explicit_registry_host_strips_to_path(self):
+        src = "module x 'br:mcr.microsoft.com/bicep/avm/res/network/vnet:1.2.3' = {}"
+        r = gather.parse_bicep_module_refs(src)[0]
+        self.assertEqual(r["registry_path"], "avm/res/network/vnet")
+        self.assertEqual(r["version"], "1.2.3")
+
+    def test_empty_or_none_source_yields_no_refs(self):
+        self.assertEqual(gather.parse_bicep_module_refs(""), [])
+        self.assertEqual(gather.parse_bicep_module_refs(None), [])
+
+
+class TestResolveModuleRef(unittest.TestCase):
+    def test_registry_path_resolves_to_avm_area_id(self):
+        ri = {"registry_path": "avm/res/storage/storage-account",
+              "version": "0.9.0", "local_path": None}
+        self.assertEqual(
+            gather.resolve_module_ref(ri, "avm/ptn/foo/bar/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "avm/res/storage/storage-account")
+
+    def test_local_ref_resolves_relative_to_base(self):
+        ri = {"registry_path": None, "version": None,
+              "local_path": "../../../utl/types/avm-common-types/main.bicep"}
+        # base dir avm/ptn/foo/bar -> up three (file-relative) -> avm/utl/types/...
+        self.assertEqual(
+            gather.resolve_module_ref(ri, "avm/ptn/foo/bar/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "avm/utl/types/avm-common-types")
+
+    def test_unrecognised_registry_path_falls_back_to_the_path(self):
+        ri = {"registry_path": "some/custom/thing", "version": "1.0.0",
+              "local_path": None}
+        self.assertEqual(
+            gather.resolve_module_ref(ri, "x/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "some/custom/thing")
+
+    def test_empty_ref_resolves_to_none(self):
+        self.assertIsNone(
+            gather.resolve_module_ref({"registry_path": None, "version": None,
+                                       "local_path": None}, "x/main.bicep",
+                                      gather.DEFAULT_AREA_PATTERNS))
+
+
+class TestWalkArmDeployments(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            self.arm = json.load(fh)
+
+    def test_walks_full_transitive_tree(self):
+        nodes = gather.walk_arm_deployments(self.arm)
+        # storageDeployment (d1) + its nested telemetry (d2) + kvDeployment (d1) = 3
+        self.assertEqual(len(nodes), 3)
+
+    def test_records_depth_and_metadata_name(self):
+        nodes = gather.walk_arm_deployments(self.arm)
+        by_name = {n["name"]: n for n in nodes}
+        self.assertEqual(by_name["storageDeployment"]["depth"], 1)
+        self.assertEqual(by_name["storageDeployment"]["metadata_name"], "storage-account")
+        self.assertEqual(by_name["kvDeployment"]["metadata_name"], "vault")
+        # the telemetry deployment is one level deeper
+        self.assertEqual(
+            by_name["46d3xbcp.res.storage-storageaccount.0-9-0.abcde"]["depth"], 2)
+
+    def test_handles_resources_as_dict_symbolic_names(self):
+        arm = {"resources": {
+            "dep": {"type": "Microsoft.Resources/deployments", "name": "d",
+                    "properties": {"template": {"metadata": {"name": "x"},
+                                                "resources": []}}}}}
+        self.assertEqual(len(gather.walk_arm_deployments(arm)), 1)
+
+    def test_empty_or_none_arm_yields_nothing(self):
+        self.assertEqual(gather.walk_arm_deployments({}), [])
+        self.assertEqual(gather.walk_arm_deployments(None), [])
+
+
+class TestBuildBicepEdges(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            self.src = fh.read()
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            self.arm = json.load(fh)
+        # vault is a DIRECT dep (depth-1, immediate); private-endpoint is nested
+        # DEEPER in the ARM tree (depth-2) -> exercises the genuine transitive case.
+        self.area_ids = {"avm/ptn/foo/bar", "avm/res/key-vault/vault",
+                         "avm/res/network/private-endpoint"}
+        self.base = "avm/ptn/foo/bar/main.bicep"
+
+    def test_immediate_edges_carry_area_id_and_version(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        imm = {e["to"]: e for e in edges if not e["transitive"]}
+        self.assertEqual(imm["avm/res/storage/storage-account"]["version"], "0.9.0")
+        self.assertEqual(imm["avm/res/storage/storage-account"]["provider"], "bicep")
+        self.assertTrue(imm["avm/res/storage/storage-account"]["resolved"])
+        self.assertEqual(imm["avm/res/key-vault/vault"]["version"], "0.6.1")
+        # the local ref resolved to its utl area
+        self.assertIn("avm/utl/types/avm-common-types", imm)
+
+    def test_all_three_source_refs_become_immediate_edges(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(sum(1 for e in edges if not e["transitive"]), 3)
+
+    def test_transitive_edge_for_deeply_nested_repo_area(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        trans = {e["to"] for e in edges if e["transitive"]}
+        # private-endpoint is nested at depth 2 and is a repo area -> transitive edge.
+        self.assertIn("avm/res/network/private-endpoint", trans)
+        self.assertNotIn(None, trans)
+
+    def test_direct_dep_not_duplicated_as_transitive(self):
+        edges = gather.build_bicep_edges(self.src, self.arm, self.base,
+                                         self.area_ids, gather.DEFAULT_AREA_PATTERNS)
+        # vault is a DIRECT (depth-1) dependency: it must appear exactly once, as an
+        # immediate edge, never re-emitted as a transitive edge.
+        vault = [e for e in edges if e["to"] == "avm/res/key-vault/vault"]
+        self.assertEqual(len(vault), 1)
+        self.assertFalse(vault[0]["transitive"])
+
+    def test_empty_build_inputs_yield_no_edges(self):
+        self.assertEqual(
+            gather.build_bicep_edges("", {}, self.base, set(),
+                                     gather.DEFAULT_AREA_PATTERNS), [])
+
+
+class TestMatchRepoArea(unittest.TestCase):
+    """Deterministic area matching (Copilot review): never depends on set order."""
+
+    def test_exact_normalized_match_beats_substring(self):
+        # "vault" exactly matches avm/res/key-vault/vault, not the substring
+        # candidate avm/res/key-vault/vault-secret — exact must always win.
+        ids = {"avm/res/key-vault/vault", "avm/res/key-vault/vault-secret"}
+        self.assertEqual(gather._match_repo_area("vault", ids),
+                         "avm/res/key-vault/vault")
+
+    def test_longest_tail_substring_wins_and_is_stable(self):
+        # No exact match; "storageaccountblob" should resolve to the most specific
+        # (longest) tail, deterministically, regardless of set iteration order.
+        ids = {"avm/res/storage/account", "avm/res/storage/account-blob-service"}
+        results = {gather._match_repo_area("storage-account-blob-service", ids)
+                   for _ in range(20)}
+        self.assertEqual(results, {"avm/res/storage/account-blob-service"})
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(gather._match_repo_area(
+            "network", {"avm/res/key-vault/vault"}))
+
+
+class TestCloneHeadSha(unittest.TestCase):
+    """Phase 3c.2: provenance pin for resume + roll-up."""
+
+    def test_returns_stripped_sha(self):
+        sha = "a" * 40
+        got = gather.clone_head_sha("clone", run=lambda cmd, **kw: sha + "\n")
+        self.assertEqual(got, sha)
+
+    def test_missing_clone_returns_none(self):
+        def boom(cmd, **kw):
+            raise RuntimeError("not a git repository")
+        self.assertIsNone(gather.clone_head_sha("clone", run=boom))
+
+    def test_empty_output_returns_none(self):
+        self.assertIsNone(gather.clone_head_sha("clone", run=lambda cmd, **kw: "\n"))
+
+
+class TestTerraformParsers(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            self.tf = fh.read()
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            self.dot = fh.read()
+
+    def test_module_blocks_map_name_to_source(self):
+        blocks = gather.parse_terraform_module_blocks(self.tf)
+        self.assertEqual(blocks["vnet"], "../../modules/vnet")
+        self.assertEqual(blocks["naming"], "Azure/naming/azurerm")
+        self.assertNotIn("azurerm_resource_group", blocks)  # resources are not modules
+
+    def test_source_found_after_a_nested_block(self):
+        # a non-greedy regex would stop at the first `}` and miss source; the
+        # brace-balanced parser must still find it.
+        tf = (
+            'module "x" {\n'
+            '  providers = {\n'
+            '    azurerm = azurerm.alt\n'
+            '  }\n'
+            '  source = "../mods/x"\n'
+            '}\n'
+        )
+        self.assertEqual(gather.parse_terraform_module_blocks(tf)["x"], "../mods/x")
+
+    def test_graph_yields_module_dependency_pairs(self):
+        pairs = gather.parse_terraform_graph(self.dot)
+        # root (None) -> naming ; vnet -> naming
+        self.assertIn((None, "naming"), pairs)
+        self.assertIn(("vnet", "naming"), pairs)
+
+    def test_graph_ignores_same_module_self_edges(self):
+        pairs = gather.parse_terraform_graph(self.dot)
+        self.assertFalse([p for p in pairs if p[0] == p[1] and p[0] is not None])
+
+    def test_empty_inputs(self):
+        self.assertEqual(gather.parse_terraform_module_blocks(""), {})
+        self.assertEqual(gather.parse_terraform_graph(""), [])
+        self.assertEqual(gather.parse_terraform_module_blocks(None), {})
+
+
+class TestBuildTerraformEdges(unittest.TestCase):
+    def setUp(self):
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            self.tf = fh.read()
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            self.dot = fh.read()
+        self.base = "live/prod/main.tf"
+
+    def test_local_module_source_resolves_to_area(self):
+        edges = gather.build_terraform_edges(
+            self.tf, self.dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        tos = {e["to"] for e in edges}
+        # ../../modules/vnet relative to live/prod -> modules/vnet
+        self.assertIn("modules/vnet", tos)
+
+    def test_registry_module_source_kept_as_ref(self):
+        edges = gather.build_terraform_edges(
+            self.tf, self.dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        # An external registry module is NOT a repo area: identity lives in `ref`
+        # (+version), `to` is None and `resolved` is False (schema: to=area-id|null).
+        naming = [e for e in edges if e["ref"] == "Azure/naming/azurerm"]
+        self.assertTrue(naming)
+        self.assertIsNone(naming[0]["to"])
+        self.assertFalse(naming[0]["resolved"])
+        self.assertEqual(naming[0]["version"], "0.4.0")
+        self.assertEqual(naming[0]["provider"], "terraform")
+
+    def test_only_transitive_local_module_is_marked_transitive(self):
+        # subnet is reached ONLY through vnet (never from root) -> transitive=True;
+        # vnet is a direct root dependency -> transitive=False.
+        tf = ('module "vnet" { source = "../../modules/vnet" }\n'
+              'module "subnet" { source = "../../modules/subnet" }\n')
+        dot = ('digraph {\n'
+               '"[root] x (expand)" -> "[root] module.vnet (expand)"\n'
+               '"[root] module.vnet.y (expand)" -> "[root] module.subnet.z (expand)"\n'
+               '}\n')
+        edges = gather.build_terraform_edges(
+            tf, dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        by_to = {e["to"]: e for e in edges}
+        self.assertFalse(by_to["modules/vnet"]["transitive"])
+        self.assertTrue(by_to["modules/subnet"]["transitive"])
+
+    def test_edges_dedupe_and_are_marked_provider_terraform(self):
+        edges = gather.build_terraform_edges(
+            self.tf, self.dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertTrue(all(e["provider"] == "terraform" for e in edges))
+        keys = [(e["to"], e["ref"]) for e in edges]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_empty_inputs_yield_no_edges(self):
+        self.assertEqual(
+            gather.build_terraform_edges("", "", self.base, set(),
+                                         gather.DEFAULT_AREA_PATTERNS), [])
+
+
+class TestExtractIacEdges(unittest.TestCase):
+    def _code_graph(self):
+        return {"provider": "directory", "areas": [
+            {"id": "avm/ptn/foo/bar", "label": "bar",
+             "paths": ["avm/ptn/foo/bar/main.bicep",
+                       "avm/ptn/foo/bar/README.md"], "edges": []},
+            {"id": "avm/res/key-vault/vault", "label": "vault",
+             "paths": ["avm/res/key-vault/vault/main.bicep"], "edges": []},
+            {"id": "live/prod", "label": "prod",
+             "paths": ["live/prod/main.tf"], "edges": []},
+        ]}
+
+    def test_build_only_no_tools_leaves_edges_empty(self):
+        cg = gather.extract_iac_edges(self._code_graph(), "clone",
+                                      which=lambda _n: None)
+        for a in cg["areas"]:
+            self.assertEqual(a["edges"], [])
+
+    def test_bicep_present_populates_edges_for_bicep_areas(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm_text = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            bicep_src = fh.read()
+
+        def which(name):
+            return "/usr/bin/bicep" if name == "bicep" else None
+
+        def run(cmd, **kw):
+            return arm_text if cmd[:2] == ["bicep", "build"] else ""
+
+        cg = gather.extract_iac_edges(
+            self._code_graph(), "clone",
+            which=which, run=run, read_text=lambda _p: bicep_src)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        tos = {e["to"] for e in bar["edges"]}
+        self.assertIn("avm/res/storage/storage-account", tos)
+        self.assertTrue(any(e["version"] == "0.9.0" for e in bar["edges"]))
+        # terraform area stays empty (terraform absent)
+        prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
+        self.assertEqual(prod["edges"], [])
+
+    def test_bicep_build_failure_leaves_edges_empty(self):
+        def boom(cmd, **kw):
+            raise RuntimeError("restore blocked by network policy")
+        cg = gather.extract_iac_edges(
+            self._code_graph(), "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            run=boom, read_text=lambda _p: "")
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertEqual(bar["edges"], [])
+
+    def test_terraform_present_populates_tf_area(self):
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+
+        def run(cmd, **kw):
+            return dot if cmd[-1] == "graph" else ""
+
+        cg = gather.extract_iac_edges(
+            self._code_graph(), "clone",
+            which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+            run=run, read_text=lambda _p: tf)
+        prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
+        self.assertTrue(prod["edges"])
+        self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
+
+
+class TestIacEdgeHardening(unittest.TestCase):
+    """Phase 3c.1: per-build timeout, retry, and VISIBLE gaps (edges_status +
+    edge_extraction summary) so a killed/slow build is never a silent empty."""
+
+    def _cg(self):
+        return {"provider": "directory", "areas": [
+            {"id": "avm/ptn/foo/bar", "label": "bar",
+             "paths": ["avm/ptn/foo/bar/main.bicep"], "edges": []},
+            {"id": "live/prod", "label": "prod",
+             "paths": ["live/prod/main.tf"], "edges": []},
+        ]}
+
+    @staticmethod
+    def _bicep_only(name):
+        return "/usr/bin/bicep" if name == "bicep" else None
+
+    def test_timeout_is_recorded_not_a_silent_empty(self):
+        def run(cmd, **kw):
+            if cmd[:2] == ["bicep", "build"]:
+                raise gather.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+            return ""
+        cg = gather.extract_iac_edges(self._cg(), "clone", which=self._bicep_only,
+                                      run=run, read_text=lambda _p: "", retries=1)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertEqual(bar["edges"], [])
+        self.assertEqual(bar["edges_status"], "timeout")
+        self.assertEqual(cg["edge_extraction"]["timeout"], 1)
+        self.assertEqual(cg["edge_extraction"]["skipped"], 1)  # the tf area
+
+    def test_retry_recovers_a_transient_failure(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            src = fh.read()
+        calls = {"build": 0}
+
+        def run(cmd, **kw):
+            if cmd[:2] == ["bicep", "build"]:
+                calls["build"] += 1
+                if calls["build"] == 1:
+                    raise gather.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+                return arm
+            return ""
+        cg = gather.extract_iac_edges(self._cg(), "clone", which=self._bicep_only,
+                                      run=run, read_text=lambda _p: src, retries=1)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertEqual(bar["edges_status"], "resolved")
+        self.assertTrue(bar["edges"])
+        self.assertEqual(calls["build"], 2)  # failed once, retried, then succeeded
+
+    def test_no_tools_marks_every_area_skipped(self):
+        cg = gather.extract_iac_edges(self._cg(), "clone", which=lambda _n: None)
+        self.assertEqual(cg["edge_extraction"]["skipped"], 2)
+        self.assertTrue(all(a["edges_status"] == "skipped" for a in cg["areas"]))
+
+    def test_summary_counts_resolved_and_skipped(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            src = fh.read()
+        cg = gather.extract_iac_edges(
+            self._cg(), "clone", which=self._bicep_only,
+            run=lambda cmd, **kw: arm if cmd[:2] == ["bicep", "build"] else "",
+            read_text=lambda _p: src)
+        summ = cg["edge_extraction"]
+        self.assertEqual(summ["resolved"], 1)  # the bicep area
+        self.assertEqual(summ["skipped"], 1)   # the tf area (terraform absent)
+        self.assertEqual(summ["timeout"], 0)
+        self.assertEqual(summ["failed"], 0)
+
+
+class TestResumeEdges(unittest.TestCase):
+    """Phase 3c.2: targeted re-resolution rebuilds ONLY the timeout/failed areas
+    and retains the rest, converging to a full run's result."""
+
+    def setUp(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            self.arm = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            self.src = fh.read()
+
+    def _prior(self):
+        # A prior bundle: bar resolved (real edges), baz failed, qux skipped.
+        return {"meta": {"clone_sha": "f" * 40},
+                "code_graph": {"provider": "directory", "areas": [
+                    {"id": "avm/ptn/foo/bar", "label": "bar",
+                     "paths": ["avm/ptn/foo/bar/main.bicep"],
+                     "edges": [{"to": "avm/res/x/y", "kind": "module"}],
+                     "edges_status": "resolved"},
+                    {"id": "avm/ptn/foo/baz", "label": "baz",
+                     "paths": ["avm/ptn/foo/baz/main.bicep"],
+                     "edges": [], "edges_status": "failed"},
+                    {"id": "avm/ptn/foo/qux", "label": "qux",
+                     "paths": ["avm/ptn/foo/qux/readme.md"],
+                     "edges": [], "edges_status": "skipped"},
+                ]}}
+
+    def test_resume_rebuilds_only_failed_and_retains_resolved(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd[:2])
+            return self.arm if cmd[:2] == ["bicep", "build"] else ""
+        prior = self._prior()
+        resumed = gather.resume_bundle(
+            prior, "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            read_text=lambda _p: self.src, run=run)
+        areas = {a["id"]: a for a in resumed["code_graph"]["areas"]}
+        # resolved area untouched — its edges are NOT rebuilt (no build for bar)
+        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
+                         [{"to": "avm/res/x/y", "kind": "module"}])
+        # failed area rebuilt → now resolved with real edges
+        self.assertEqual(areas["avm/ptn/foo/baz"]["edges_status"], "resolved")
+        self.assertTrue(areas["avm/ptn/foo/baz"]["edges"])
+        # only baz triggered a build (bar/qux were retained, no subprocess)
+        built = [c for c in calls if c == ["bicep", "build"]]
+        self.assertEqual(len(built), 1)
+
+    def test_resume_summary_reflects_merged_state(self):
+        prior = self._prior()
+        gather.resume_bundle(
+            prior, "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            read_text=lambda _p: self.src,
+            run=lambda cmd, **kw: self.arm if cmd[:2] == ["bicep", "build"] else "")
+        summ = prior["code_graph"]["edge_extraction"]
+        self.assertEqual(summ["resolved"], 2)   # bar (retained) + baz (rebuilt)
+        self.assertEqual(summ["skipped"], 1)    # qux (retained)
+        self.assertEqual(summ["failed"], 0)
+
+    def test_only_status_does_not_clobber_when_no_toolchain(self):
+        # Resume with no CLI present must NOT wipe prior resolved edges.
+        prior = self._prior()
+        gather.extract_iac_edges(prior["code_graph"], "clone",
+                                 which=lambda _n: None,
+                                 only_status={"timeout", "failed"})
+        areas = {a["id"]: a for a in prior["code_graph"]["areas"]}
+        self.assertEqual(areas["avm/ptn/foo/bar"]["edges_status"], "resolved")
+        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
+                         [{"to": "avm/res/x/y", "kind": "module"}])
+
+
+class TestRollupBundles(unittest.TestCase):
+    """Phase 3c.2: overlap-safe roll-up of monthly installments."""
+
+    def _bundle(self, frm, to, sha, prs, issues, cg_label):
+        return {
+            "meta": {"owner": "o", "repo": "r", "from": frm, "to": to,
+                     "clone_sha": sha, "period": {"from": frm, "to": to}},
+            "prs": prs, "issues": issues,
+            "commits": [], "code_events": [], "releases": [], "milestones": [],
+            "code_graph": {"provider": "directory",
+                           "areas": [{"id": "a", "label": cg_label}]},
+        }
+
+    def test_overlap_pr_deduped_by_number(self):
+        # PR #10 merged on the seam appears in both windows → once in the roll-up.
+        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40,
+                            [{"number": 10, "title": "seam"}], [], "apr")
+        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40,
+                            [{"number": 10, "title": "seam"}, {"number": 11}], [], "may")
+        merged = gather.rollup_bundles([apr, may])
+        nums = sorted(p["number"] for p in merged["prs"])
+        self.assertEqual(nums, [10, 11])
+
+    def test_mutable_item_takes_freshest_observation(self):
+        # issue #5 is open in April, closed by June → roll-up keeps the later state.
+        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [],
+                            [{"number": 5, "state": "open"}], "apr")
+        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [],
+                            [{"number": 5, "state": "closed"}], "may")
+        merged = gather.rollup_bundles([apr, may])
+        self.assertEqual(len(merged["issues"]), 1)
+        self.assertEqual(merged["issues"][0]["state"], "closed")
+
+    def test_structure_and_period_from_span_and_latest(self):
+        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [], [], "apr")
+        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [], [], "may")
+        # pass out of order to prove it sorts by period
+        merged = gather.rollup_bundles([may, apr])
+        self.assertEqual(merged["meta"]["period"],
+                         {"from": "2026-04-01", "to": "2026-06-01"})
+        self.assertEqual(merged["meta"]["clone_sha"], "b" * 40)        # latest
+        self.assertEqual(merged["code_graph"]["areas"][0]["label"], "may")  # latest
+        self.assertEqual(len(merged["meta"]["rolled_up_from"]), 2)
+
+    def test_empty_raises(self):
+        with self.assertRaises(ValueError):
+            gather.rollup_bundles([])
+
+
+class TestAcquireEdgesP3c(unittest.TestCase):
+    """Compose the provider + edge seam offline (graphify + bicep absent ->
+    directory provider, edges empty; bicep stubbed -> edges populate)."""
+
+    PATHS = ["avm/ptn/foo/bar/main.bicep", "avm/ptn/foo/bar/README.md",
+             "avm/res/key-vault/vault/main.bicep"]
+
+    def test_directory_provider_edges_empty_without_tools(self):
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone", which=lambda _n: None)
+        cg = gather.extract_iac_edges(cg, "clone", which=lambda _n: None)
+        self.assertEqual(cg["provider"], "directory")
+        self.assertTrue(cg["areas"])
+        for a in cg["areas"]:
+            self.assertEqual(a["edges"], [])
+
+    def test_edges_populate_when_bicep_present(self):
+        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
+            arm_text = fh.read()
+        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
+            src = fh.read()
+        cg = gather.select_code_area_provider(
+            self.PATHS, "clone", which=lambda _n: None)
+        cg = gather.extract_iac_edges(
+            cg, "clone",
+            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+            run=lambda cmd, **kw: arm_text if cmd[:2] == ["bicep", "build"] else "",
+            read_text=lambda _p: src)
+        bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
+        self.assertTrue(bar["edges"])
+        self.assertTrue(any(e["to"] == "avm/res/storage/storage-account"
+                            for e in bar["edges"]))
+
+
 if __name__ == "__main__":
     unittest.main()

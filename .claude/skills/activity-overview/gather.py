@@ -4,6 +4,7 @@ The only component that touches the network. Produces a schema-complete bundle;
 later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -561,6 +562,308 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
     return graphified if graphified["areas"] else directory
 
 
+# Phase 3c: IaC dependency-edge extraction (build-only). The edge object is
+# {to, kind, ref, version, transitive, provider, resolved}; see BUNDLE.md.
+
+_BICEP_MODULE_RE = re.compile(r"module\s+\w+\s+'(?P<ref>[^']+)'")
+
+
+def parse_bicep_module_refs(source_text):
+    """Extract `module <sym> '<ref>'` references from a .bicep source.
+
+    Each result is {ref, registry_path, version, local_path}. Registry refs
+    (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
+    `registry_path` + `version`; everything else is a `local_path`. Pure."""
+    refs = []
+    for m in _BICEP_MODULE_RE.finditer(source_text or ""):
+        ref = m.group("ref")
+        registry_path = version = local_path = None
+        if ref.startswith("br/public:") or ref.startswith("br:"):
+            body = ref.split(":", 1)[1]              # drop the br/public or br scheme
+            if ":" in body:
+                path_part, version = body.rsplit(":", 1)
+            else:
+                path_part = body
+            if "/bicep/" in path_part:               # strip an explicit registry host
+                path_part = path_part.split("/bicep/", 1)[1]
+            registry_path = path_part
+        else:
+            local_path = ref
+        refs.append({"ref": ref, "registry_path": registry_path,
+                     "version": version, "local_path": local_path})
+    return refs
+
+
+def resolve_module_ref(ref_info, base_path, patterns=None):
+    """Map a parsed bicep/tf ref to a canonical area-id (reusing classify_code_area).
+
+    Registry refs classify their `<path>/main.bicep`; local refs are normalised
+    relative to `base_path`'s directory then classified. Returns the area-id, or
+    the raw path when classification declines, or None when nothing is set. Pure."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    rp = ref_info.get("registry_path")
+    if rp:
+        probe = rp.rstrip("/") + "/main.bicep"
+        return classify_code_area(probe, patterns) or rp
+    lp = ref_info.get("local_path")
+    if lp:
+        base_dir = os.path.dirname(base_path or "")
+        joined = os.path.normpath(os.path.join(base_dir, lp))
+        return classify_code_area(joined, patterns) or os.path.dirname(joined) or joined
+    return None
+
+
+def _arm_resources(template):
+    """ARM `resources` may be a list or (symbolic-name) dict; normalise to a list."""
+    res = (template or {}).get("resources", [])
+    return list(res.values()) if isinstance(res, dict) else (res or [])
+
+
+def walk_arm_deployments(arm_json):
+    """Yield every Microsoft.Resources/deployments node in the full transitive tree.
+
+    Each node is {name, depth, metadata_name, depends_on}. `depth` is 1 for a
+    top-level module instantiation and increments per nesting level. `metadata_name`
+    is the inner template's `metadata.name` (a short module name, best-effort
+    identity hint). Pure."""
+    nodes = []
+
+    def visit(template, depth):
+        for res in _arm_resources(template):
+            if not isinstance(res, dict):
+                continue
+            if res.get("type") == "Microsoft.Resources/deployments":
+                inner = (res.get("properties") or {}).get("template") or {}
+                nodes.append({
+                    "name": res.get("name"),
+                    "depth": depth + 1,
+                    "metadata_name": (inner.get("metadata") or {}).get("name"),
+                    "depends_on": res.get("dependsOn", []),
+                })
+                visit(inner, depth + 1)
+
+    visit(arm_json or {}, 0)
+    return nodes
+
+
+def _normalize_id(text):
+    """Lowercase + strip separators, for lenient identity matching."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _match_repo_area(name, area_ids):
+    """Find the area-id in `area_ids` whose tail confidently matches `name`.
+
+    Lenient normalised comparison (the ARM `metadata.name` is a short module name
+    like `vault`; the area tail is `vault`/`key-vault`). DETERMINISTIC: an exact
+    normalised tail match always wins; otherwise the most specific (longest tail)
+    substring match wins, ties broken by area-id — so the result never depends on
+    `set` iteration order. Returns the area-id or None."""
+    target = _normalize_id(name)
+    if not target:
+        return None
+    exact, partial = [], []
+    for aid in area_ids:
+        tail = aid.rstrip("/").split("/")[-1]
+        nt = _normalize_id(tail)
+        if not nt:
+            continue
+        if nt == target:
+            exact.append(aid)
+        elif nt in target or target in nt:
+            partial.append((nt, aid))
+    if exact:
+        return min(exact)                                   # exact wins; stable
+    if partial:
+        return min(partial, key=lambda p: (-len(p[0]), p[1]))[1]  # longest tail, stable
+    return None
+
+
+def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None):
+    """Build inter-area dependency edges for one Bicep area.
+
+    Immediate edges (transitive=False) come from the SOURCE refs — fully identified
+    (area-id + version), build-validated by the caller. They correspond to the
+    DEPTH-1 module instantiations in the ARM tree. Transitive edges (transitive=True)
+    come from deployments nested DEEPER (depth >= 2), and only when the nested
+    deployment's `metadata.name` confidently matches ANOTHER area in this repo (no
+    fabricated external ids) that is not already a direct dependency. Pure;
+    deterministic (deduped, then sorted)."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    edges = []
+    seen = set()
+
+    for ri in parse_bicep_module_refs(source_text):
+        to = resolve_module_ref(ri, base_path, patterns)
+        key = (to, ri["ref"], False)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"to": to, "kind": "module", "ref": ri["ref"],
+                      "version": ri["version"], "transitive": False,
+                      "provider": "bicep", "resolved": to is not None})
+
+    self_id = classify_code_area(base_path, patterns)
+    immediate_tos = {e["to"] for e in edges}  # direct deps, already captured above
+    for node in walk_arm_deployments(arm_json):
+        # depth 1 == the direct module instantiations (already emitted as immediate
+        # source refs); only genuinely-nested deployments are transitive.
+        if node["depth"] < 2:
+            continue
+        to = _match_repo_area(node.get("metadata_name"), area_ids)
+        if to is None or to == self_id or to in immediate_tos:
+            continue
+        key = (to, node.get("name"), True)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"to": to, "kind": "module", "ref": node.get("name"),
+                      "version": None, "transitive": True,
+                      "provider": "bicep", "resolved": True})
+
+    return sorted(edges, key=lambda e: (e["transitive"], str(e["to"]), str(e["ref"])))
+
+
+_TF_MODULE_HEAD_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{')
+_TF_SOURCE_RE = re.compile(r'source\s*=\s*"(?P<src>[^"]+)"')
+_TF_VERSION_RE = re.compile(r'version\s*=\s*"(?P<ver>[^"]+)"')
+_TF_EDGE_RE = re.compile(r'"\[root\]\s*(?P<a>[^"]+)"\s*->\s*"\[root\]\s*(?P<b>[^"]+)"')
+_TF_MODULE_TOKEN_RE = re.compile(r"module\.([A-Za-z0-9_-]+)")
+
+
+def _terraform_module_bodies(tf_text):
+    """Map each module name to its raw block body via brace-balancing.
+
+    Non-greedy regexes break on nested blocks (`tags { ... }`, `dynamic`), so the
+    body is scanned from the opening `{` to its matching close, counting depth.
+    Internal helper. Pure."""
+    text = tf_text or ""
+    out = {}
+    for m in _TF_MODULE_HEAD_RE.finditer(text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += (text[i] == "{") - (text[i] == "}")
+            i += 1
+        out[m.group("name")] = text[m.end():i - 1]
+    return out
+
+
+def parse_terraform_module_blocks(tf_text):
+    """Map each `module "<name>" { source = "..." }` to its source string. Pure.
+
+    Brace-balanced so a `source` after a nested block is still found."""
+    out = {}
+    for name, body in _terraform_module_bodies(tf_text).items():
+        sm = _TF_SOURCE_RE.search(body)
+        if sm:
+            out[name] = sm.group("src")
+    return out
+
+
+def _first_tf_module(node):
+    m = _TF_MODULE_TOKEN_RE.search(node or "")
+    return m.group(1) if m else None
+
+
+def parse_terraform_graph(dot_text):
+    """Extract (from_module|None, to_module) dependency pairs from terraform graph DOT.
+
+    A node's first `module.<name>` token is its owning module (None = root). An edge
+    A->B becomes (module(A), module(B)) when B is in a module and differs from A.
+    Deterministic (sorted, deduped). Pure."""
+    pairs = set()
+    for m in _TF_EDGE_RE.finditer(dot_text or ""):
+        a, b = _first_tf_module(m.group("a")), _first_tf_module(m.group("b"))
+        if b and a != b:
+            pairs.add((a, b))
+    return sorted(pairs, key=lambda p: (p[0] or "", p[1]))
+
+
+def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None):
+    """Build inter-area dependency edges for one Terraform area.
+
+    Joins terraform-graph module pairs with the `module {source=}` blocks. A LOCAL
+    source resolves to a repo area-id (via classify_code_area, relative to base_path)
+    → `to`=area, `resolved`=True. A REGISTRY/external source cannot map to a repo area,
+    so — like the Bicep path and the schema (`to`: area-id|null) — `to`=None,
+    `resolved`=False, with the source kept in `ref` (+ pinned `version`). The DOT graph
+    is transitive: a module the root depends on directly is `transitive`=False; one
+    reached ONLY through another module is `transitive`=True (and direct wins if both).
+    Pure; deterministic."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    bodies = _terraform_module_bodies(tf_text)
+    sources = parse_terraform_module_blocks(tf_text)
+    base_dir = os.path.dirname(base_path or "")
+
+    def version_of(name):
+        vm = _TF_VERSION_RE.search(bodies.get(name, ""))
+        return vm.group("ver") if vm else None
+
+    def resolve(name):
+        """-> (to_area_or_None, ref_or_None, version). ref None = unknown module."""
+        src = sources.get(name)
+        if not src:
+            return None, None, None
+        if src.startswith(".") or src.startswith("/"):
+            joined = os.path.normpath(os.path.join(base_dir, src))
+            return (classify_code_area(joined + "/main.tf", patterns) or joined), src, None
+        return None, src, version_of(name)        # external: to=None, identity in ref
+
+    pairs = parse_terraform_graph(dot_text)
+    direct = {b for a, b in pairs if a is None}    # modules the root depends on
+    edges = []
+    seen = set()
+    for _a, b in pairs:
+        to, ref, version = resolve(b)
+        if ref is None:                            # module block with no source
+            continue
+        key = (to, ref)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
+                      "transitive": b not in direct, "provider": "terraform",
+                      "resolved": to is not None})
+    return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
+
+
+def _read_text_file(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _bicep_entrypoint(area):
+    for p in area.get("paths", []):
+        if p == "main.bicep" or p.endswith("/main.bicep"):
+            return p
+    return None
+
+
+def _tf_entrypoint(area):
+    tfs = [p for p in area.get("paths", []) if p.endswith(".tf")]
+    for p in tfs:
+        if p == "main.tf" or p.endswith("/main.tf"):
+            return p
+    return tfs[0] if tfs else None
+
+
+def _bicep_build_arm(run, clone_dir, rel_path, timeout=None):
+    """Run bicep restore + build; return the compiled ARM JSON text. Not unit-tested.
+    `timeout` (seconds) bounds each subprocess so a hung build can't stall the run."""
+    full = os.path.join(clone_dir, rel_path)
+    run(["bicep", "restore", full], timeout=timeout)   # pull registry modules
+    return run(["bicep", "build", full, "--stdout"], timeout=timeout)
+
+
+def _terraform_graph_dot(run, clone_dir, rel_dir, timeout=None):
+    """Run terraform init (no backend) + graph; return DOT text. Not unit-tested.
+    `timeout` (seconds) bounds each subprocess so a hung command can't stall the run."""
+    full = os.path.join(clone_dir, rel_dir or ".")
+    run(["terraform", f"-chdir={full}", "init", "-backend=false", "-input=false"],
+        timeout=timeout)
+    return run(["terraform", f"-chdir={full}", "graph"], timeout=timeout)
+
+
 def parse_codeowners(text):
     """Parse a CODEOWNERS file into {pattern: [login, ...]}.
 
@@ -753,10 +1056,12 @@ def fetch_until(get_page, first_url, more):
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Acquire an activity-overview bundle.")
-    p.add_argument("--owner", required=True)
-    p.add_argument("--repo", required=True)
-    p.add_argument("--from", dest="from", required=True)
-    p.add_argument("--to", required=True)
+    # Not argparse-required: a --resume run derives these from the prior bundle's
+    # meta. acquire() enforces them for a normal (non-resume) run.
+    p.add_argument("--owner")
+    p.add_argument("--repo")
+    p.add_argument("--from", dest="from")
+    p.add_argument("--to")
     p.add_argument("--branches", default="main")
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
@@ -768,6 +1073,13 @@ def parse_args(argv):
     p.add_argument("--include-releases", dest="include_releases",
                    action="store_true", default=True)
     p.add_argument("--no-releases", dest="include_releases", action="store_false")
+    p.add_argument("--resume", default=None,
+                   help="Prior bundle JSON: re-resolve only its timeout/failed edges "
+                        "against the pinned meta.clone_sha; reuse everything else.")
+    p.add_argument("--rollup", nargs="+", default=None, metavar="BUNDLE",
+                   help="Merge 2+ monthly bundle JSONs into one multi-period bundle "
+                        "(overlap-safe union by identity; structure from the latest). "
+                        "Re-run link on the result. No clone/token needed.")
     p.add_argument("--out", default=None)
     return p.parse_args(argv)
 
@@ -783,16 +1095,203 @@ def resolve_token(env):
     return token
 
 
-def run_git(args, cwd=None):
+def run_git(args, cwd=None, timeout=None):
     """Thin wrapper around git (not unit-tested). Surfaces git's own stderr
-    on failure so errors like "not a git repository" reach the user."""
-    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    on failure so errors like "not a git repository" reach the user. An optional
+    `timeout` (seconds) bounds the call — used by the IaC edge build so a hung
+    `bicep`/`terraform` cannot stall the run (TimeoutExpired propagates)."""
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                          timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(
             f"command failed (exit {proc.returncode}): {' '.join(args)}\n"
             f"{proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def clone_head_sha(clone_dir, run=run_git):
+    """Resolve the clone's HEAD commit SHA (provenance for resume + roll-up).
+
+    Pins the exact tree the code_graph/edges were built against so a `--resume`
+    rebuilds against the identical source (no mixed-SHA graph) and a multi-bundle
+    roll-up can pick the newest structural snapshot deterministically. Returns the
+    40-char SHA, or None when there is no clone (e.g. --no-clone with nothing on disk)."""
+    try:
+        return run(["git", "-C", clone_dir, "rev-parse", "HEAD"]).strip() or None
+    except Exception:
+        return None
+
+
+# IaC edge-extraction tuning. The timeout is GENEROUS — a healthy cold bicep/
+# terraform build finishes well under it, so the bound only trips a genuinely hung
+# process (never a slow-but-progressing one). Speed comes from bounded concurrency,
+# not a tight timeout. A timed-out/failed build is retried once, then recorded as a
+# VISIBLE gap (edges_status) rather than a silent empty.
+IAC_BUILD_TIMEOUT = 300   # seconds per bicep/terraform subprocess
+IAC_MAX_WORKERS = 8       # parallel per-module builds
+IAC_RETRIES = 1           # extra attempts after the first on timeout/failure
+
+
+def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf,
+                        run, read_text, timeout, retries):
+    """Resolve ONE area's edges. Returns (edges_or_None, status). Never raises.
+
+    status: `resolved` (build succeeded — edges may legitimately be empty),
+    `timeout` (build exceeded the bound after retries), `failed` (build errored
+    after retries), `skipped` (no entrypoint or its CLI absent). A timeout/failure
+    leaves edges untouched but is reported via the status so the gap is visible."""
+    bp = _bicep_entrypoint(area)
+    tp = _tf_entrypoint(area)
+    if bp and have_bicep:
+        kind = "bicep"
+    elif tp and have_tf:
+        kind = "terraform"
+    else:
+        return None, "skipped"
+
+    status = "failed"
+    for _attempt in range(retries + 1):
+        try:
+            if kind == "bicep":
+                arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
+                src = read_text(os.path.join(clone_dir, bp))
+                return build_bicep_edges(src, arm, bp, area_ids, patterns), "resolved"
+            dot = _terraform_graph_dot(run, clone_dir, os.path.dirname(tp), timeout)
+            src = read_text(os.path.join(clone_dir, tp))
+            return build_terraform_edges(src, dot, tp, area_ids, patterns), "resolved"
+        except subprocess.TimeoutExpired:
+            status = "timeout"   # hung build: bounded, retried, then recorded
+        except Exception:
+            status = "failed"
+    return None, status
+
+
+def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
+                      read_text=_read_text_file, patterns=None,
+                      max_workers=IAC_MAX_WORKERS, timeout=IAC_BUILD_TIMEOUT,
+                      retries=IAC_RETRIES, only_status=None):
+    """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
+
+    Each area with a main.bicep (and `bicep` on PATH) or a *.tf (and `terraform` on
+    PATH) is built — in PARALLEL across `max_workers`, each subprocess bounded by
+    `timeout` and retried `retries` times — to resolve its edges. ANY missing CLI,
+    restore failure, build error, or timeout leaves `edges` as-is ([]) but stamps
+    `area["edges_status"]` so the gap is VISIBLE, never a silent empty. An aggregate
+    `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
+    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph.
+
+    `only_status` (a set, e.g. {"timeout","failed"}) drives RESUME: only areas whose
+    current `edges_status` is in the set are rebuilt; every other area keeps its prior
+    edges + status untouched. The summary is recomputed across ALL areas so it reflects
+    the merged state. Sound because an area's edges are a pure function of its source."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    areas = code_graph.get("areas", [])
+    area_ids = {a["id"] for a in areas}
+    have_bicep = bool(which("bicep"))
+    have_tf = bool(which("terraform"))
+    summary = {"resolved": 0, "timeout": 0, "failed": 0, "skipped": 0}
+
+    # Fresh full run with no toolchain: build-only ⇒ everything skipped. (For a
+    # resume, fall through so retained areas keep their prior resolved edges.)
+    if only_status is None and not (have_bicep or have_tf):
+        for area in areas:
+            area["edges_status"] = "skipped"
+        summary["skipped"] = len(areas)
+        code_graph["edge_extraction"] = summary
+        return code_graph
+
+    def work(area):
+        if only_status is not None and area.get("edges_status") not in only_status:
+            return area, (None, area.get("edges_status") or "skipped")   # retain
+        return area, _extract_area_edges(area, clone_dir, area_ids, patterns,
+                                         have_bicep, have_tf, run, read_text,
+                                         timeout, retries)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for area, (edges, status) in pool.map(work, areas):
+            if edges is not None:
+                area["edges"] = edges
+            area["edges_status"] = status
+            summary[status] += 1
+
+    code_graph["edge_extraction"] = summary
+    return code_graph
+
+
+def resume_bundle(prior_bundle, clone_dir, **extract_kw):
+    """Re-resolve ONLY the unresolved (timeout/failed) edges of a prior bundle, in
+    place, reusing everything else. Cheap way to close a partial edge gap without
+    recomputing the window — correct only when the clone is checked out at the prior
+    `meta.clone_sha` (same source tree). Returns the updated bundle. Mutates it."""
+    code_graph = prior_bundle.get("code_graph") or {}
+    extract_iac_edges(code_graph, clone_dir,
+                      only_status={"timeout", "failed"}, **extract_kw)
+    prior_bundle["code_graph"] = code_graph
+    return prior_bundle
+
+
+# Stable identity keys for overlap-safe roll-up. Monthly runs may overlap by a day
+# or two (a gap guarantee against late merges / clock skew); these immutable keys are
+# the dedup guarantee, so overlap never double-counts. (commit,path,change) keys a
+# code-event; PRs/issues by number; commits by sha; releases by tag; milestones by id.
+ROLLUP_ACTIVITY_KEYS = {
+    "prs": lambda x: x.get("number"),
+    "issues": lambda x: x.get("number"),
+    "commits": lambda x: x.get("sha"),
+    "releases": lambda x: x.get("tag") or x.get("id") or x.get("name"),
+    "milestones": lambda x: x.get("number") or x.get("id") or x.get("title"),
+    "code_events": lambda x: (x.get("commit"), x.get("path"), x.get("change")),
+}
+# Structure/derived fields are a point-in-time snapshot of a moving tree, so the
+# roll-up takes them whole from the LATEST installment rather than merging.
+ROLLUP_LATEST_FIELDS = ("code_graph", "code_owners", "label_taxonomy",
+                        "workflows", "workflow_stats")
+
+
+def _period_to(bundle):
+    m = bundle.get("meta") or {}
+    return (m.get("period") or {}).get("to") or m.get("to") or ""
+
+
+def rollup_bundles(bundles):
+    """Merge monthly installments into one multi-period bundle (the cheap through-line
+    for a long view; a fresh wide-window re-run stays canonical). ACTIVITY (prs/issues/
+    commits/code_events/releases/milestones) is UNIONED by stable identity — overlap
+    never double-counts, and the freshest observation of a mutable item (issue state,
+    open PR) wins (last-write). STRUCTURE (code_graph/owners/taxonomy/workflows) is taken
+    from the latest installment (newest `clone_sha`). `meta.period` spans the union window.
+    Derived link/report fields are intentionally dropped — re-run link on the result."""
+    if not bundles:
+        raise ValueError("rollup_bundles: no bundles given")
+    ordered = sorted(bundles, key=_period_to)
+    latest = ordered[-1]
+    merged = {}
+
+    for field, keyfn in ROLLUP_ACTIVITY_KEYS.items():
+        seen = {}
+        for i, b in enumerate(ordered):
+            for j, item in enumerate(b.get(field) or []):
+                k = keyfn(item)
+                seen[k if k is not None else (i, j)] = item   # last (freshest) wins
+        merged[field] = list(seen.values())
+
+    for field in ROLLUP_LATEST_FIELDS:
+        if field in latest:
+            merged[field] = latest[field]
+
+    metas = [b.get("meta") or {} for b in ordered]
+    froms = [(m.get("period") or {}).get("from") or m.get("from") for m in metas]
+    froms = [f for f in froms if f]
+    tos = [t for t in (_period_to(b) for b in ordered) if t]
+    lm = latest.get("meta") or {}
+    span = {"from": min(froms) if froms else lm.get("from"),
+            "to": max(tos) if tos else lm.get("to")}
+    merged["meta"] = {**lm, "from": span["from"], "to": span["to"],
+                      "period": span, "clone_sha": lm.get("clone_sha"),
+                      "rolled_up_from": [(m.get("period") or {"from": m.get("from"),
+                                          "to": m.get("to")}) for m in metas]}
+    return merged
 
 
 def http_get_json(url, token):
@@ -883,7 +1382,47 @@ def _runs_page(get_page, api, frm, to):
     return runs
 
 
+def resume_acquire(args):
+    """`--resume` path: load a prior bundle, check the clone out at its pinned
+    `meta.clone_sha`, re-resolve only the timeout/failed edges, reuse everything
+    else. Not unit-tested (git/IO orchestration); the merge core is resume_bundle."""
+    with open(args.resume) as fh:
+        prior = json.load(fh)
+    meta = prior.get("meta") or {}
+    owner, repo = meta.get("owner"), meta.get("repo")
+    clone_dir = args.clone_dir or meta.get("clone_dir") or f"workspace/{repo}-clone"
+    sha = meta.get("clone_sha")
+    if not sha:
+        sys.stderr.write("error: prior bundle has no meta.clone_sha to resume against\n")
+        raise SystemExit(2)
+    if not args.no_clone:
+        os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
+        if not os.path.isdir(os.path.join(clone_dir, ".git")):
+            run_git(["git", "clone", f"https://github.com/{owner}/{repo}.git", clone_dir])
+        # fetch the exact pinned commit (works on a shallow clone) and check it out,
+        # so the rebuild runs against the IDENTICAL tree the prior run resolved.
+        run_git(["git", "-C", clone_dir, "fetch", "--depth", "1", "origin", sha])
+        run_git(["git", "-C", clone_dir, "checkout", "--force", sha])
+    before = dict((prior.get("code_graph") or {}).get("edge_extraction") or {})
+    resume_bundle(prior, clone_dir)
+    after = (prior.get("code_graph") or {}).get("edge_extraction") or {}
+    sys.stderr.write(f"resume: edge_extraction {before} -> {after}\n")
+    return prior
+
+
 def acquire(args, env):
+    if getattr(args, "rollup", None):
+        bundles = []
+        for path in args.rollup:
+            with open(path) as fh:
+                bundles.append(json.load(fh))
+        return rollup_bundles(bundles)
+    if getattr(args, "resume", None):
+        return resume_acquire(args)
+    if not (args.owner and args.repo and getattr(args, "from") and args.to):
+        sys.stderr.write("error: --owner --repo --from --to are required "
+                         "(or pass --resume <prior-bundle>)\n")
+        raise SystemExit(2)
     token = resolve_token(env)
     owner, repo = args.owner, args.repo
     frm, to = getattr(args, "from"), args.to
@@ -924,6 +1463,12 @@ def acquire(args, env):
         | {e["old_path"] for e in code_events if e.get("old_path")}
         | {f for c in commits for f in c.get("files", [])})
     code_graph = select_code_area_provider(area_paths, clone_dir)
+
+    # Phase 3c: enrich area edges via the real IaC toolchain (BUILD-ONLY — edges
+    # stay [] when bicep/terraform or the registry are unavailable). No-op without
+    # a clone on disk.
+    if not args.no_clone or os.path.isdir(clone_dir):
+        code_graph = extract_iac_edges(code_graph, clone_dir)
 
     # CODEOWNERS from the clone (local file; try the conventional locations).
     code_owners = {}
@@ -1052,7 +1597,7 @@ def acquire(args, env):
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
         "branches": args.branches.split(","), "clone_dir": clone_dir,
-        "ref_date": ref_date,
+        "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
     bundle = build_bundle(meta, commits, prs, issues)
@@ -1070,7 +1615,9 @@ def acquire(args, env):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     bundle = acquire(args, os.environ)
-    out = args.out or f"workspace/activity-{getattr(args, 'from')}-{args.to}.json"
+    period = bundle.get("meta", {}).get("period", {})
+    out = (args.out or f"workspace/activity-{getattr(args, 'from', None) or period.get('from')}"
+           f"-{args.to or period.get('to')}.json")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w") as fh:
         json.dump(bundle, fh, indent=2)

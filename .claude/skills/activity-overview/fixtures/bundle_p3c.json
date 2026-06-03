@@ -1,0 +1,23 @@
+{
+  "meta": { "schema_version": 1, "owner": "o", "repo": "r",
+            "from": "2026-05-01", "to": "2026-05-31" },
+  "prs": [], "issues": [], "commits": [], "trains": [],
+  "buckets": { "shipped": [], "rejected": [], "in_flight": [], "next_candidates": [] },
+  "artifacts": {}, "feature_deltas": [], "timeline": [],
+  "people": {}, "releases": [], "milestones": [], "workflow_stats": {},
+  "code_graph": { "provider": "directory", "areas": [
+    { "id": "avm/ptn/foo/bar", "label": "bar",
+      "paths": ["avm/ptn/foo/bar/main.bicep"], "edges": [
+        { "to": "avm/res/storage/storage-account", "kind": "module",
+          "ref": "br/public:avm/res/storage/storage-account:0.9.0",
+          "version": "0.9.0", "transitive": false, "provider": "bicep",
+          "resolved": true },
+        { "to": "avm/res/key-vault/vault", "kind": "module",
+          "ref": "br/public:avm/res/key-vault/vault:0.6.1", "version": "0.6.1",
+          "transitive": false, "provider": "bicep", "resolved": true } ] },
+    { "id": "avm/res/storage/storage-account", "label": "storage-account",
+      "paths": ["avm/res/storage/storage-account/main.bicep"], "edges": [] },
+    { "id": "avm/res/key-vault/vault", "label": "vault",
+      "paths": ["avm/res/key-vault/vault/main.bicep"], "edges": [] }
+  ] }
+}

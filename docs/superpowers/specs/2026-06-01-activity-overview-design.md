@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 8 (Phases 1/2/3a shipped; + pluggable directory-first code-area provider, graphify optional)
+**Status:** Approved design — rev 10 (Phases 1/2/3a/3b shipped; + Phase 3c IaC dependency edges via `bicep build`→ARM + `terraform graph`, full-transitive, build-only; + Phase 3c.1 edge-build hardening shipped — parallel/bounded/retried builds with visible gaps via `edges_status`+`edge_extraction`; targeted resume (3c.2, with `clone_sha` pinning + overlap-safe roll-up), symbol artifacts (3d) + symbol-identity tracking (3e) sequenced as separate slices)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -255,6 +255,18 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
 - **Bundles chain.** `meta.period` records the window; `meta.prev_bundle` points at the
   prior installment. A run **loads the previous bundle/index first** so it can compute
   cross-period state.
+- **Overlap is safe because merge is by stable identity.** Monthly runs may deliberately
+  **overlap by a day or two** so no item falls in the seam between windows (late merges,
+  timezone/clock skew, backdating). Overlap never double-counts because a roll-up **unions by
+  immutable identity** — PRs/issues by **number**, commits/code-events by **SHA (+path)** — not
+  by appending. The overlap is a *gap guarantee*, the identity keys are the *dedup guarantee*.
+- **Roll-up separates activity from structure.** A multi-month view (e.g. 6 months from existing
+  monthly bundles) **unions the time-bound activity** (PRs/issues/commits/code-events/decision
+  trains, deduped as above) across all installments, but takes **structure from the latest
+  bundle** — `code_graph` areas/edges are a point-in-time snapshot of a moving tree, so the most
+  recent `clone_sha` (Phase 3c.2) is the authoritative structural picture; older edge sets aren't
+  merged in. Decision-train linking re-runs across the merged activity so a train spanning months
+  (issue opened in April, PR merged in June) reads as one thread.
 - **Train lifecycle across periods.** `first_seen` (period a train appeared),
   `last_activity`, `carried_over` (open at the prior period's end), and `prior_status` let
   a report say *"deferred in April, shipped in June"* — the through-line that makes a series
@@ -284,9 +296,18 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
   languages (Python/TS/Go/Java/…); it does **not** parse Bicep/HCL, so it is no longer a hard
   dependency — when absent or inapplicable, code areas fall back to the directory provider.
   The provider yields an **area id** that every `code_area`/`area` field carries (a directory
-  path, or `community:<n>` from graphify). Dependency-edge enrichment (Bicep `bicep build`→ARM
-  `dependsOn`; Terraform `tree-sitter-hcl`) and symbol-granular artifacts are **deferred**.
-  (`git` and `GITHUB_TOKEN` remain required.)
+  path, or `community:<n>` from graphify). **Dependency-edge enrichment lands in Phase 3c
+  (rev 9; hardened in 3c.1/3c.2 — see rev 10 status):** inter-area
+  `code_graph.areas[].edges` are resolved **authoritatively** — Bicep
+  via `bicep build`→ARM (walking the full **transitive** nested-deployment tree, joined with
+  source-ref parsing to recover each `br/public:…:<version>` identity), Terraform via
+  `terraform init && terraform graph` (the resolved transitive module/resource graph). Edge
+  extraction is **build-only**: edges populate solely from a successful build/restore and are
+  left **empty** when the toolchain or registry is unavailable — never best-effort static text
+  with unresolved versions/sub-deps. The `bicep` and `terraform` CLIs are therefore required
+  for the edge gate (installed in CI/setup). **Symbol-granular artifacts (3d)** and **symbol-
+  identity tracking across renames/moves (3e)** remain sequenced as later slices. (`git` and
+  `GITHUB_TOKEN` remain required.)
 - **mermaid-cli (`mmdc`)** is a **required dependency for Render** (Phase 2+): `render.py`
   validates every emitted `.mmd` by compiling it (and optionally exports SVG/PNG), so a
   diagram that would not render fails the run rather than shipping broken. The preflight
@@ -388,8 +409,20 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     `source_file` → area. **Not required**: if absent or the repo is unsupported (e.g. Bicep),
     silently use the directory provider.
   - Areas (from whichever provider) are stored under `code_graph` and used by Link to
-    attribute trains/commits/people/artifacts/feature_deltas to code areas. Dependency
-    **edges** (Bicep ARM `dependsOn`, `tree-sitter-hcl`) are deferred.
+    attribute trains/commits/people/artifacts/feature_deltas to code areas.
+  - **Dependency edges (Phase 3c, rev 9; `gather.py`, build-only).** After the provider
+    selects areas, `gather.py` enriches each area's `edges` with **inter-area dependency
+    edges** by running the real IaC toolchain against the working-tree clone:
+    - **Bicep:** `bicep restore` + `bicep build <area-entrypoint>` → ARM JSON; walk the
+      **full transitive** `Microsoft.Resources/deployments` tree for the validated dependency
+      structure, and parse the entrypoint **source** for `module … '<ref>'` / `br/public:…:<ver>`
+      references to recover each immediate edge's resolved **area-id + version** label.
+    - **Terraform:** `terraform init -backend=false` + `terraform graph` → parse the DOT
+      output for the resolved **transitive** `module.*` / resource dependency graph.
+    - Each edge is `{to, kind, ref, version, transitive, provider, resolved}` (see schema).
+      **Build-only:** if the CLI/registry is unavailable the build is skipped and `edges`
+      stays `[]` — the skill never emits static, unvalidated edges. (`bicep`/`terraform`
+      are required for the edge gate; absent them edges are simply empty.)
 
 - **REST fetches / windowing (the social layer):**
   - **PRs:** closed PRs touched in range via
@@ -456,7 +489,13 @@ transcript (Analyze input) nor the report prose (Synthesize output).
     "project": { "number","title","iterations":[{ "title","start","end" }],
                  "items":[{ "type","number","title","state","merged","status","iteration","url" }] },
     "code_graph": { "provider":"directory|graphify",
-                    "areas":[{ "id","label","paths":[],"edges":[] }] },
+                    "edge_extraction":{ "resolved","timeout","failed","skipped" },
+                    "areas":[{ "id","label","paths":[],
+                               "edges_status":"resolved|timeout|failed|skipped",
+                               "edges":[{ "to":area-id|null,"kind":"module|resource",
+                                          "ref":"<raw bicep/tf reference>","version":str|null,
+                                          "transitive":bool,"provider":"bicep|terraform",
+                                          "resolved":bool }] }] },
     "modules": { "<dir>": { "commits","prs","files_changed" } },
     "workflow_stats": { "<workflow>": { "total","success","failure","cancelled","other" } },
     "docsRefs": [ { "path","source":"changed|referenced","pr":num|null } ],
@@ -856,8 +895,54 @@ against GitHub) after each.
   artifacts/feature_deltas to `code_area`s; resolve `label_taxonomy` facets + issue `kind`
   (native issue types → label facets → template → heuristic); `contributor_graph` diagram.
   *Report:* shipped grouped by code area; module ownership (`code_owners` + `people.modules`);
-  facet-aware grouping. (Dependency-edge enrichment — Bicep ARM `dependsOn`, `tree-sitter-hcl`
-  — and symbol-granular artifacts are later slices.)
+  facet-aware grouping. (Dependency-edge enrichment and symbol-granular artifacts are later
+  slices — 3c/3d/3e below.)
+- **Phase 3c — IaC dependency edges (build-only, full-transitive).**
+  *Acquire:* after the code-area provider selects areas, `gather.py` enriches
+  `code_graph.areas[].edges` with **inter-area dependency edges** resolved by the real IaC
+  toolchain against the working-tree clone — **Bicep** via `bicep restore`+`bicep build`→ARM
+  (walk the full transitive `Microsoft.Resources/deployments` tree, joined with source-ref
+  parsing for the `br/public:…:<version>` identity) and **Terraform** via
+  `terraform init -backend=false`+`terraform graph` (parse the resolved transitive DOT graph).
+  **Build-only:** edges populate solely from a successful build/restore and stay `[]` when the
+  CLI/registry is unavailable (no static fallback). *Render:* a `module_graph` flowchart of the
+  resolved area→area edges. *Report:* a "Module dependency graph / blast radius" subsection.
+  *Gate:* the integration workflow installs `bicep`+`terraform` and flips its prior
+  `edges == []` assertion to the new edge contract, asserting Bicep edges resolve (with
+  versions) on real data. (Symbol-granular artifacts and identity tracking still deferred to
+  3d/3e.)
+- **Phase 3c.1 — edge-build hardening (shipped).** Per-module builds run in **parallel** across
+  a bounded worker pool (cuts the AVM-scale edge build ~24.5→~13 min on the live gate); each
+  `bicep`/`terraform` subprocess is bounded by a **generous timeout** (only trips a genuinely
+  hung process) and **retried once**. Gaps are made **visible, never silent**: each area carries
+  `edges_status` ∈ `{resolved, timeout, failed, skipped}` and `code_graph.edge_extraction` carries
+  the aggregate counts — `resolved`+empty means "no deps", `timeout`/`failed` means "not
+  determined". The gate surfaces the summary and reds when the unresolved rate is non-trivial.
+- **Phase 3c.2 — targeted edge re-resolution / resume (follow-on, post-review).** Make a partial
+  failure cheap to close *without* recomputing the whole window. Edge resolution for an area is a
+  **pure function of (its source at a commit, toolchain)** — independent of PRs/issues/comments —
+  so only the `timeout`/`failed` areas need rebuilding to converge to a full run's result.
+  Requires: (a) **pin provenance** — record `meta.clone_sha` (`git rev-parse HEAD` after clone)
+  so a resume rebuilds against the *identical* tree (avoids a mixed-SHA graph if repo HEAD moved);
+  (b) a **`--resume <prior-bundle>`** path that loads the prior `code_graph`, checks out
+  `clone_sha`, re-runs `extract_iac_edges` over only the unresolved areas, merges, and recomputes
+  `edge_extraction`; (c) optional **`--edges-only`** to skip the PR/issue re-pull entirely (under
+  "nothing landed" they're unchanged), making resume just *re-clone-at-SHA + rebuild the gap*.
+  The same `clone_sha` underpins deterministic multi-bundle roll-up (below).
+  *Coverage status:* the merge cores (`extract_iac_edges(only_status=…)`, `resume_bundle`,
+  `rollup_bundles`) and the `--rollup` CLI are offline-tested; the **resume git orchestration**
+  (`fetch --depth 1 origin <clone_sha>` + checkout, in `resume_acquire`) has **no live/CI
+  coverage yet** — a resume smoke step on the gate is **deferred** until resume/roll-up are wired
+  into the skill's operational flow (the bicep-only gate doesn't exercise them today).
+- **Phase 3d — symbol-granular artifacts.** Extend the artifact ledger from file-granularity
+  to **symbols** (Bicep/ARM `param`/`resource`/`output`, Terraform `variable`/`resource`/
+  `output`, graphify nodes) with `-p` hunk parsing; `artifacts[].kind` gains `symbol`/`comment`
+  and `feature_deltas` gain `hunk`/`before`/`after`/`detail`. Builds on the 3c edge/area
+  foundation. (Sequenced slice.)
+- **Phase 3e — symbol-identity tracking.** Follow a symbol across renames/moves/file-splits
+  via per-commit before/after fingerprinting + heuristic cross-diff matching (multi-language),
+  layered on the 3d symbol ledger — the highest-risk slice, built last on a validated
+  foundation. (Sequenced slice.)
 - **Phase 4 — sub-agent train narratives + train graphs + forecast.**
   *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
   `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded

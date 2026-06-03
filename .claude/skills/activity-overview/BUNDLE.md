@@ -21,7 +21,11 @@ SHAs in `trains[].commits` — wrapped `commit` refs arrive in a later phase.)
 Scope notes mark where Phase 2 widens what Phase 1 collected; field lists below
 are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 
-- `meta` — `owner, repo, from, to, branches, clone_dir, period, prev_bundle, schema_version`.
+- `meta` — `owner, repo, from, to, branches, clone_dir, period, prev_bundle, schema_version`,
+  plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
+  It pins the exact source tree so `gather.py --resume <prior-bundle>` can re-resolve **only**
+  the `timeout`/`failed` edges against the identical tree (edges are a pure function of source),
+  and a multi-bundle roll-up can pick the newest structural snapshot deterministically.
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
 - `prs` — PRs in scope (Phase 1: merged-in-window only; **Phase 2** also includes
   open and closed-unmerged PRs): `{ number, title, body, author, author_association,
@@ -97,7 +101,37 @@ docsRefs, release_train, sprints, project, diagrams`.
   integer `community` + `source_file`; **no** top-level `communities` list; edges
   live under `links`) and groups nodes by `community` into `community:<n>` areas.
   graphify does NOT parse Bicep/HCL, so on those repos the directory provider runs.
-  **Deferred:** dependency `edges` between areas (Bicep `dependsOn`, `tree-sitter-hcl`).
+  **`code_graph.areas[].edges` (Phase 3c) — inter-area dependency edges.** Each edge:
+
+  | field | meaning |
+  |-------|---------|
+  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable (e.g. a registry module — its identity is in `ref`) |
+  | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred to 3d) |
+  | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
+  | `version` | pinned version when present, else `null` |
+  | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
+  | `provider` | `"bicep"` or `"terraform"` |
+  | `resolved` | `true` when `to` is non-null |
+
+  **Build-only.** Edges are populated *only* from a successful `bicep restore`+`bicep build`
+  (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned
+  working tree. When the CLI or registry is unavailable, or a build fails, `edges` stays `[]` —
+  the skill never emits static, unvalidated edges. Immediate (`transitive:false`) edges are fully
+  identified (area-id + version) from source; transitive edges connect to *other areas in the
+  repo* (deep external-module internals are not fabricated into edges). The `bicep` and
+  `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
+  workflow for install). **Deferred:** symbol-granular artifacts (3d), symbol-identity tracking
+  (3e), resource-level `dependsOn` edges.
+
+  **Visible gaps (Phase 3c.1).** Per-module builds run in parallel, each bounded by a generous
+  per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
+  genuinely hung process) and retried once. Each area carries `edges_status` ∈
+  `{resolved, timeout, failed, skipped}` and `code_graph.edge_extraction` carries the aggregate
+  `{ "resolved", "timeout", "failed", "skipped" }` counts — so a build that timed out or failed
+  is a **visible, counted gap**, never mistaken for a module with no dependencies. `resolved`
+  with an empty `edges` list genuinely means "no inter-area dependencies"; `timeout`/`failed`
+  mean "not determined" (re-run to resolve). The integration gate reds when the unresolved rate
+  is non-trivial, so an incomplete graph is re-run rather than silently shipped.
 - **code_owners** `{ "<path|glob>": ["login", ...] }` — parsed from the clone's
   CODEOWNERS (`.github/`/root/`docs/`); `@org/team` and `@user` kept as logins.
 - **label_taxonomy** `{ "<facet>": { "<namespace>": ["label", ...] }, "source":
@@ -117,5 +151,6 @@ docsRefs, release_train, sprints, project, diagrams`.
   commits' files) or reviewed (their reviewed PRs' areas).
 - **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
-- **Still deferred:** symbol/inline-comment artifacts, dependency-edge enrichment,
+- **Still deferred:** symbol/inline-comment artifacts, symbol-granular artifacts (3d),
+  symbol-identity tracking (3e), resource-level `dependsOn` edges (3d),
   `hunk`/`before`/`after`/`detail` on feature_deltas, multi-repo aggregation.

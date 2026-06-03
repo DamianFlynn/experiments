@@ -26,7 +26,18 @@ claim in the report resolves to a source ref in the bundle — never invent fact
    (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
    `graphify` is **optional** (used only for its supported languages); when it is
    absent — e.g. on Bicep/Terraform repos — the **directory provider** supplies
-   code areas, so no install is required for code-area attribution to work. Then:
+   code areas, so no install is required for code-area attribution to work.
+   - **IaC dependency edges (Phase 3c):** if `bicep` and/or `terraform` are on `PATH`, `gather.py`
+     resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges`; absent the
+     CLIs (or the module registry), edges are left empty and the rest of the run is unaffected.
+   - **Resume a partial edge gap (Phase 3c.2):** if a prior run left some areas `timeout`/`failed`
+     (see `code_graph.edge_extraction`), re-resolve just those against the same source — no full
+     re-gather: `python3 gather.py --resume workspace/bundle.json --out workspace/bundle.json`.
+   - **Roll up a long view:** merge monthly installments (overlap-safe) into one multi-period
+     bundle, then render: `python3 gather.py --rollup apr.json may.json jun.json --out half.json`
+     then re-run `link.py`/`render.py` on it. (A fresh wide-window re-gather stays canonical.)
+
+   Then:
    ```bash
    python3 render.py workspace/bundle.json
    ```

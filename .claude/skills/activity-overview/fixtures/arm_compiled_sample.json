@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "metadata": { "_generator": { "name": "bicep", "version": "0.30.23" }, "name": "Example Pattern Module" },
+  "parameters": { "name": { "type": "string" } },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2022-09-01",
+      "name": "storageDeployment",
+      "properties": {
+        "expressionEvaluationOptions": { "scope": "inner" },
+        "mode": "Incremental",
+        "template": {
+          "metadata": { "name": "storage-account", "_generator": { "name": "bicep" } },
+          "resources": [
+            { "type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01", "name": "[parameters('name')]" },
+            {
+              "type": "Microsoft.Resources/deployments",
+              "apiVersion": "2022-09-01",
+              "name": "46d3xbcp.res.storage-storageaccount.0-9-0.abcde",
+              "properties": { "mode": "Incremental", "template": { "metadata": { "name": "private-endpoint" }, "resources": [] } }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2022-09-01",
+      "name": "kvDeployment",
+      "properties": {
+        "expressionEvaluationOptions": { "scope": "inner" },
+        "mode": "Incremental",
+        "template": { "metadata": { "name": "vault", "_generator": { "name": "bicep" } }, "resources": [] }
+      }
+    }
+  ]
+}

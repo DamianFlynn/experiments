@@ -26,6 +26,10 @@ name: activity-overview integration (live smoke test)
 #   valid kind on every issue, trains.code_areas resolving to known area ids,
 #   modules dict with per-area counts, code_owners dict, and the
 #   contributor_graph + kind_breakdown entries in the diagrams manifest).
+#   PLUS Phase 3c (code_graph.areas[].edges resolved build-only via bicep build ->
+#   ARM and terraform graph: well-formed edge objects, at least one Bicep area with
+#   a resolved immediate edge carrying a version on a busy Bicep window, and the
+#   module_graph entry in the diagrams manifest).
 #
 # SECRET (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
 #   Settings -> Secrets and variables -> Actions -> New repository secret
@@ -106,6 +110,35 @@ jobs:
       # (fixtures/graphify_graph_sample.json) in the offline test suite. Do NOT
       # add a graphify install step to this workflow.
 
+      # The Phase 3c edge gate depends on `bicep restore` reaching the public
+      # module registry (mcr.microsoft.com). A registry outage -> empty edges ->
+      # the "bicep build path did not light up" assertion below fails. That is
+      # intentional (it proves the build path lit up), but is a latent source of
+      # flaky red runs unrelated to the skill itself — check registry reachability
+      # before assuming a regression.
+      - name: Install bicep CLI
+        env:
+          # Pinned (was `latest`) so the gate is reproducible and a new bicep
+          # release cannot silently change build output / break this run. Bump
+          # deliberately. Bicep publishes no checksums asset to verify against, so
+          # we instead assert the installed binary IS the pinned version below.
+          BICEP_VERSION: v0.43.8
+        run: |
+          curl -sSLo bicep "https://github.com/Azure/bicep/releases/download/${BICEP_VERSION}/bicep-linux-x64"
+          chmod +x bicep
+          sudo mv bicep /usr/local/bin/bicep
+          installed="$(bicep --version)"
+          echo "$installed"
+          case "$installed" in
+            *"${BICEP_VERSION#v}"*) ;;
+            *) echo "::error::bicep version mismatch: wanted ${BICEP_VERSION}, got '$installed'"; exit 1 ;;
+          esac
+
+      - name: Install terraform CLI
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
       - name: Gather + link + render a real window
         env:
           GITHUB_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
@@ -140,6 +173,10 @@ jobs:
           b = json.load(open("workspace/bundle.json"))
 
           assert b["meta"]["schema_version"] == 1, "missing schema_version"
+          # Phase 3c.2: clone HEAD pinned in meta (provenance for resume + roll-up).
+          clone_sha = b["meta"].get("clone_sha")
+          assert clone_sha and re.fullmatch(r"[0-9a-f]{40}", clone_sha), \
+              f"meta.clone_sha not a resolved commit SHA: {clone_sha!r}"
           prs, issues = b["prs"], b["issues"]
           commits, trains, buckets = b["commits"], b["trains"], b["buckets"]
           pr_by = {p["number"]: p for p in prs}
@@ -283,7 +320,7 @@ jobs:
           for a in areas:
               assert a.get("id") and isinstance(a.get("paths"), list) and a["paths"], \
                   f"area missing id/paths: {a}"
-              assert a.get("edges") == [], "area edges are deferred (must be empty)"
+              assert isinstance(a.get("edges"), list), f"area edges must be a list: {a}"
               area_ids.add(a["id"])
 
           # 12. Phase 3b: code_area/area now RESOLVE (no longer all null) where covered.
@@ -337,6 +374,47 @@ jobs:
           assert set(dg) >= {"buckets_pie", "timeline_gantt", "content_timeline",
                              "deltas_bar", "contributor_graph", "kind_breakdown"}, \
               "diagrams manifest missing Phase 3b keys"
+
+          # 16. Phase 3c: edges are well-formed; bicep edges resolve with versions.
+          all_edges = [e for a in areas for e in a.get("edges", [])]
+          for e in all_edges:
+              assert e.get("kind") == "module", f"unexpected edge kind: {e}"
+              assert e.get("provider") in {"bicep", "terraform"}, f"bad edge provider: {e}"
+              assert isinstance(e.get("transitive"), bool), e
+              assert isinstance(e.get("resolved"), bool), e
+              assert ("to" in e) and ("ref" in e) and ("version" in e), e
+              if e["resolved"]:
+                  assert e["to"] is not None, e
+          bicep_imm = [e for e in all_edges
+                       if e["provider"] == "bicep" and not e["transitive"] and e["resolved"]]
+          # On a busy Bicep window with the CLI installed, at least one module edge
+          # must resolve with a version (proves bicep build -> ARM lit up).
+          if any(p["merged"] for p in prs):
+              assert bicep_imm, "no resolved Bicep edges — bicep build path did not light up"
+              assert any(e["version"] for e in bicep_imm), \
+                  "resolved Bicep edges carry no version"
+          assert "module_graph" in dg, "diagrams manifest missing module_graph"
+
+          # 17. Phase 3c.1: edge-extraction gaps are VISIBLE (edges_status +
+          # edge_extraction summary) and a meaningful gap rate reds the gate so the
+          # incomplete graph is re-run rather than silently shipped. A healthy run
+          # times out ~never (the per-build bound only trips a hung process).
+          ee = cg.get("edge_extraction", {})
+          assert set(ee) >= {"resolved", "timeout", "failed", "skipped"}, \
+              f"missing edge_extraction summary: {ee}"
+          for a in areas:
+              assert a.get("edges_status") in \
+                  {"resolved", "timeout", "failed", "skipped"}, \
+                  f"area missing/!invalid edges_status: {a.get('id')}={a.get('edges_status')}"
+          built = ee["resolved"] + ee["timeout"] + ee["failed"]
+          unresolved = ee["timeout"] + ee["failed"]
+          # tolerate a couple of stray failures; red on a systematic gap (>10%).
+          assert unresolved <= max(2, built // 10), \
+              f"too many unresolved modules ({unresolved}/{built}); graph is incomplete: {ee}"
+          print(f"  phase3c: edges={len(all_edges)} "
+                f"bicep_resolved_immediate={len(bicep_imm)} "
+                f"with_version={sum(1 for e in bicep_imm if e['version'])}")
+          print(f"  phase3c.1: edge_extraction={ee}")
 
           print(f"OK prs={len(prs)} (merged={len(merged_nums)} "
                 f"open={sum(1 for p in prs if p['state'] == 'open')} "
