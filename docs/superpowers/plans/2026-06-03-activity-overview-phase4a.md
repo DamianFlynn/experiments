@@ -153,6 +153,14 @@ Sub-agent dispatch and all narrative prose — both the standard per-train narra
 long-form single-train **spotlight**. 4a ships the slice + effort + forecast scaffold +
 flowcharts; 4b consumes them. The predicted-vs-landed **forecast loop** remains Phase 7.
 
+## Backlog — non-shipped train outcomes (awareness)
+
+`build_trains` currently builds trains only from MERGED PRs and hardcodes `outcome:"shipped"`,
+so `emit_train_flowchart`'s `rejected` / `In flight` branches (and their unit tests) are
+forward-looking but never exercised on a real bundle. When trains can carry non-shipped
+outcomes (rejected/abandoned/in-flight threads), those branches activate — until then they're
+defensive, deterministic code validated only by unit fixtures.
+
 ## Backlog — forecast tuning (minor)
 
 `FORECAST_OVERDUE_DAYS` ships at 200. Code review noted a quarter (90 days) is a more
