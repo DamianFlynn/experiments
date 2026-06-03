@@ -36,6 +36,9 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 - `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
   significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at, elapsed_days,
   reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
+  `kind` derives from the typed root issue; when there is no typed root issue it falls back to
+  the anchor PRs' conventional-commit title prefix (`feat→feature`, `fix→bug`, `docs→docs`), else
+  `other` — so significance still differentiates work on repos that title PRs but rarely type issues.
   `significance = footprint × kind_weight + breadth`; `tier` = `"deep"` for the top-N
   by significance ∪ any train ≥ the significance floor, else `"mention"` (Phase 4a).
   `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed

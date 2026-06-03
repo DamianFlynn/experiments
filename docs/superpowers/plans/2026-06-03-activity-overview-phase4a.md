@@ -154,24 +154,29 @@ Sub-agent dispatch and all narrative prose — both the standard per-train narra
 long-form single-train **spotlight**. 4a ships the slice + effort + forecast scaffold +
 flowcharts; 4b consumes them. The predicted-vs-landed **forecast loop** remains Phase 7.
 
-## Backlog — findings from the real AVM validation run
+## Validation findings — real AVM run (Azure/bicep-registry-modules)
 
 Validated end-to-end against `Azure/bicep-registry-modules` (window 2026-05-25..06-01): gather →
-link → render → `mmdc`, all diagrams compiled, structural cross-checks clean, and random PRs/
-issues + the forecast candidate spot-checked against the live GitHub API all matched. Two
-accuracy observations (neither a Phase 4a logic bug):
+link → render → `mmdc`, all 15 diagrams compiled, structural cross-checks clean, and random PRs/
+issues + the forecast candidate spot-checked against the live GitHub API all matched.
 
-- **Train `kind` is "other" for most AVM trains (16/18)** because kind derives from the root
-  *issue*, but AVM PRs are conventional-commit titled (`feat:`/`fix:`) and usually don't close a
-  typed issue. So `significance` is effectively footprint-only there and doesn't surface feature
-  vs fix. Backlog: derive a train's kind from its PR title (conventional-commit prefix) when there
-  is no typed root issue, so the kind weight actually differentiates real work.
-- **6/18 merged-in-window PRs carried no commit in the bounded clone** (squash commit dates
-  fall outside the window even though the PR merged inside it), so those trains under-report code
-  areas/deltas. Pre-existing Phase 3a clone-window behaviour. Backlog: window commits by the
-  owning PR's merge, or widen the clone margin.
-- Without the `bicep` CLI the code graph uses the directory provider (areas only, no resolved
-  dependency edges → `module_graph` is a placeholder). Install `bicep` for full edges.
+- **DONE — derive train kind from the PR title.** Train kind previously derived only from a typed
+  root *issue*; AVM PRs are conventional-commit titled (`feat:`/`fix:`) but rarely close a typed
+  issue, so 16/18 trains were `other` and `significance` was footprint-only. `gather.classify_pr_kind`
+  + a `build_trains` fallback now map `feat→feature`, `fix→bug`, `docs→docs` when there is no typed
+  root issue (typed issue still wins). On AVM this turned 16 `other`/2 `bug` into **12 `feature`/6
+  `bug`**, and significance now ranks features into the deep tier.
+- **DONE — full code graph with the `bicep` CLI.** With `bicep` on PATH the run extracts real,
+  version-pinned module-dependency edges (e.g. `workspace → private-endpoint v0.12.1`;
+  `edge_extraction: 11 resolved, 1 failed, 1 skipped`) and `module_graph` renders the real diagram
+  instead of a placeholder.
+- **Backlog (Phase 3c) — module-graph self-edges.** The bicep edge extraction emits a few
+  self-referential edges (e.g. `vpn-gateway → vpn-gateway`, sometimes duplicated) where a child
+  module references its own area id. Filter self-loops and dedupe edges before rendering.
+- **Backlog (Phase 3a) — clone commit window.** 6/18 merged-in-window PRs carried no commit in the
+  bounded clone (squash commit dates fall just outside the window even though the PR merged inside),
+  so those trains under-report code areas/deltas. Window commits by the owning PR's merge, or widen
+  the clone margin.
 
 ## Backlog — non-shipped train outcomes (awareness)
 
