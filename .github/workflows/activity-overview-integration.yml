@@ -436,6 +436,28 @@ jobs:
                     "vacuously; pick a busier window")
           PY
 
+      - name: Resume smoke (Phase 3c.2) — re-resolve gaps against the pinned clone_sha
+        run: |
+          cd .claude/skills/activity-overview
+          # Exercises resume_acquire's git fetch+checkout @meta.clone_sha + targeted
+          # rebuild against the SAME live clone — the one path the offline suite can't
+          # cover. On a healthy window with no gaps this is a clean no-op; it must
+          # round-trip the bundle and never regress resolution.
+          python3 gather.py --resume workspace/bundle.json --out workspace/resumed.json
+          python3 - <<'PY'
+          import json
+          before = json.load(open("workspace/bundle.json"))
+          after = json.load(open("workspace/resumed.json"))
+          bsha, asha = before["meta"]["clone_sha"], after["meta"]["clone_sha"]
+          assert asha == bsha, f"clone_sha drifted on resume: {bsha} -> {asha}"
+          bee = before["code_graph"]["edge_extraction"]
+          aee = after["code_graph"]["edge_extraction"]
+          assert aee["resolved"] >= bee["resolved"], f"resume regressed: {bee} -> {aee}"
+          assert aee["timeout"] + aee["failed"] <= bee["timeout"] + bee["failed"], \
+              f"resume increased gaps: {bee} -> {aee}"
+          print(f"  phase3c.2 resume smoke OK: {bee} -> {aee}")
+          PY
+
       - name: Upload the bundle + diagrams
         uses: actions/upload-artifact@v6
         with:
