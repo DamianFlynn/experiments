@@ -37,6 +37,7 @@ def build_bundle(meta, commits, prs, issues):
         "artifacts": {},
         "feature_deltas": [],
         "code_events": [],
+        "symbol_events": [],
         "trains": [],
         "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
         "people": {},
@@ -396,7 +397,8 @@ def classify_artifact_path(path):
       - example: under an `examples/` directory, or a `*.example*` filename
       - doc    : a `*.md` file, or any file under a `docs/` directory
       - else   : None (ignored at file granularity)
-    `symbol` and `comment` kinds need hunk/AST parsing and are deferred."""
+    `symbol`/`comment` artifacts come from the Phase 3d hunk walk (parse_symbol_events),
+    not this path classifier."""
     if not path:
         return None
     parts = path.split("/")
@@ -411,6 +413,163 @@ def classify_artifact_path(path):
     if low.endswith(".md") or "docs" in parts[:-1]:
         return "doc"
     return None
+
+
+# ---- Phase 3d: symbol-granular change attribution (diff-local, build-free) ----
+# A single `git log -p` walk yields per-(commit,path) hunks; we attribute changes to
+# symbol DECLARATIONS recognised within each hunk's lines (no per-commit `git show`,
+# no build). Heuristic but pure and offline-testable. Identity across renames is 3e.
+
+_BICEP_DECL_RE = re.compile(r"^\s*(param|var|output|resource|module)\s+([A-Za-z_]\w*)")
+_BICEP_COMMENT_RE = re.compile(r"^\s*(//|/\*|\*/|\*|@sys\.description|@description)")
+_TF_RES_RE = re.compile(r'^\s*resource\s+"([^"]+)"\s+"([^"]+)"')
+_TF_BLOCK_RE = re.compile(r'^\s*(variable|output|module)\s+"([^"]+)"')
+_TF_COMMENT_RE = re.compile(r"^\s*(#|//)")
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def symbol_lang(path):
+    """Source language for symbol attribution, or None (file-level only)."""
+    if (path or "").endswith(".bicep"):
+        return "bicep"
+    if (path or "").endswith(".tf"):
+        return "terraform"
+    return None
+
+
+def detect_symbol_decl(lang, text):
+    """One source line (diff sign already stripped) -> (kind, subkind, name) or None.
+
+    kind is `symbol` (param/var/output/resource/module) or `comment` (name None). Pure."""
+    if lang == "bicep":
+        m = _BICEP_DECL_RE.match(text)
+        if m:
+            return ("symbol", m.group(1), m.group(2))
+        if _BICEP_COMMENT_RE.match(text):
+            return ("comment", "comment", None)
+        return None
+    if lang == "terraform":
+        m = _TF_RES_RE.match(text)
+        if m:
+            return ("symbol", "resource", f"{m.group(1)}.{m.group(2)}")
+        m = _TF_BLOCK_RE.match(text)
+        if m:
+            return ("symbol", m.group(1), m.group(2))
+        if _TF_COMMENT_RE.match(text):
+            return ("comment", "comment", None)
+        return None
+    return None
+
+
+def parse_unified_diff(patch):
+    """Parse a (multi-file) unified diff into per-file hunks. Pure.
+
+    -> [{"path","old_path","hunks":[{"new_start":int,"lines":[(sign,text), ...]}]}]
+    sign in {' ','+','-'}; `/dev/null` paths normalise to None (pure add/delete)."""
+    files, cur, hunk = [], None, None
+    for line in (patch or "").split("\n"):
+        if line.startswith("diff --git "):
+            cur = {"path": None, "old_path": None, "hunks": []}
+            files.append(cur)
+            hunk = None
+        elif cur is None:
+            continue
+        elif line.startswith("--- "):
+            p = line[4:].strip()
+            cur["old_path"] = None if p == "/dev/null" else (p[2:] if p[:2] in ("a/", "b/") else p)
+        elif line.startswith("+++ "):
+            p = line[4:].strip()
+            cur["path"] = None if p == "/dev/null" else (p[2:] if p[:2] in ("a/", "b/") else p)
+        else:
+            m = _HUNK_RE.match(line)
+            if m:
+                hunk = {"new_start": int(m.group(1)), "lines": []}
+                cur["hunks"].append(hunk)
+            elif hunk is not None and line[:1] in (" ", "+", "-"):
+                hunk["lines"].append((line[0], line[1:]))
+    return files
+
+
+def _cap_snippet(text, limit=200):
+    return (text or "").strip()[:limit] or None
+
+
+def build_symbol_deltas(path, hunks):
+    """Attribute a file's diff hunks to symbol-level changes (diff-local). Pure.
+
+    -> [{"path","lang","subkind","name","change":add|drop|change,"before","after"}]
+    A declaration on a `+` line ⇒ add; on a `-` line ⇒ drop; a same-key decl on both,
+    or a body edit inside a symbol whose declaration is in context ⇒ change. `before`/
+    `after` are bounded snippets (first removed/added line of the symbol's region)."""
+    lang = symbol_lang(path)
+    if lang is None:
+        return []
+    added, removed, touched = {}, {}, set()
+    befores, afters = {}, {}
+
+    def note(key, sign, text):
+        if sign == "+":
+            afters.setdefault(key, _cap_snippet(text))
+        elif sign == "-":
+            befores.setdefault(key, _cap_snippet(text))
+
+    for hunk in hunks:
+        current = None
+        for sign, text in hunk["lines"]:
+            decl = detect_symbol_decl(lang, text)
+            if decl is None:
+                if sign in ("+", "-") and current is not None:
+                    touched.add(current)
+                    note(current, sign, text)
+                continue
+            kind, subkind, name = decl
+            key = (subkind, name) if kind == "symbol" else ("comment", None)
+            current = key
+            if sign == "+":
+                added[key] = key
+                note(key, "+", text)
+            elif sign == "-":
+                removed[key] = key
+                note(key, "-", text)
+            # a context declaration only updates `current`
+
+    deltas = []
+    for key in dict.fromkeys(list(added) + list(removed) + list(touched)):
+        subkind, name = key
+        in_a, in_r = key in added, key in removed
+        change = "change" if (in_a and in_r) or (not in_a and not in_r) else \
+                 ("add" if in_a else "drop")
+        deltas.append({"path": path, "lang": lang, "subkind": subkind, "name": name,
+                       "change": change, "before": befores.get(key),
+                       "after": afters.get(key)})
+    return sorted(deltas, key=lambda d: (str(d["subkind"]), str(d["name"]), d["change"]))
+
+
+def parse_symbol_events(raw):
+    """Parse `git log -p` output into symbol-level change events. Pure.
+
+    Each event: {commit, author, date, path, lang, subkind, name, change, before, after}.
+    Only tracked source files (symbol_lang) contribute; file-level lifecycle still comes
+    from parse_code_events. Merge commits show no patch and yield nothing."""
+    events = []
+    for chunk in (raw or "").split(RECORD_SEP):
+        if not chunk.strip():
+            continue
+        lines = chunk.split("\n")
+        fields = lines[0].split(FIELD_SEP)
+        if len(fields) < 5:
+            continue
+        sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
+        body = "\n".join(lines[1:])
+        for f in parse_unified_diff(body):
+            path = f["path"] or f["old_path"]
+            for d in build_symbol_deltas(path, f["hunks"]):
+                events.append({
+                    "commit": sha, "author": author, "date": date, "path": d["path"],
+                    "lang": d["lang"], "subkind": d["subkind"], "name": d["name"],
+                    "change": d["change"], "before": d["before"], "after": d["after"],
+                })
+    return events
 
 
 # Ordered code-area patterns for the directory provider (primary, zero-dep).
@@ -1456,6 +1615,18 @@ def acquire(args, env):
         ])
         code_events = parse_code_events(raw_walk)
 
+    # Phase 3d: symbol-granular change attribution via a single `git log -p` walk
+    # (diff-local, no per-commit checkout). Same guard/degradation as the file walk.
+    symbol_events = []
+    if not args.no_clone or os.path.isdir(clone_dir):
+        raw_patch = run_git([
+            "git", "-C", clone_dir, "log",
+            f"--since={frm}", f"--until={to}",
+            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+            "-p", "--unified=3", "-M", "-C",
+        ])
+        symbol_events = parse_symbol_events(raw_patch)
+
     # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
     # from the code-event walk + the commit file lists (local, zero-token).
     area_paths = sorted(
@@ -1606,6 +1777,7 @@ def acquire(args, env):
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
+    bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph
     bundle["code_owners"] = code_owners
     bundle["label_taxonomy"] = label_taxonomy

@@ -71,21 +71,30 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **code_events** (gather) — raw file-level events from the full-window
   `git log --name-status -M -C` walk: `[{commit, author, date, change:
   add|modify|delete|rename|copy, path, old_path?}]`. The raw material Link folds.
-- **artifacts** `{ "<id>": { kind:"example|doc|readme", path, name,
-  status:"live|removed|replaced", replaced_by:id|null, code_area:null,
-  lifecycle:[{event:"add|change|remove", commit, author, date, ref}] } }`.
-  File granularity only in Phase 3a. **Deferred:** `symbol`/`comment` kinds (need
-  `-p` hunk + tree-sitter), `code_area` (graphify, Phase 3b), and per-event `hunk`.
+- **symbol_events** (gather, Phase 3d) — symbol-granular change events from a single
+  full-window `git log -p --unified=3` walk, attributed **diff-locally**: `[{commit,
+  author, date, path, lang:"bicep|terraform", subkind:"param|var|output|resource|
+  module|variable|comment", name|null, change:"add|drop|change", before, after}]`.
+  `before`/`after` are bounded (≤200 char) hunk snippets. The raw material Link folds
+  into symbol artifacts. (graphify-language symbols are best-effort where present.)
+- **artifacts** `{ "<id>": { kind:"example|doc|readme|symbol|comment", path, name,
+  status:"live|removed|replaced", replaced_by:id|null, code_area, lifecycle:[{event:
+  "add|change|remove", commit, author, date, ref[, before, after]}] } }`. File-level
+  ids are the path; **symbol/comment** ids are `<path>#<lang>:<subkind>:<name>` and
+  also carry `lang`/`subkind`. `code_area` is filled in Phase 3b. Symbol lifecycle
+  entries carry the bounded `before`/`after`.
 - **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},
   subject:{kind, name, path} }]` — sorted social (comments/reviews) + code
   (artifact lifecycle) events. `ref.id` is the PR/issue number for social events
   and the commit sha for code events (the bundle-wide `{type, id, url}` ref
   convention). Social events have no file `subject.path`; code events carry both.
-- **feature_deltas** `[{ area:null, kind:"add|drop|change", subject, name, before,
+- **feature_deltas** `[{ area, kind:"add|drop|change", subject, name, before,
   after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
-  }]` — a projection over `artifacts` (add→add, remove→drop, change→change).
-  `area`/`before`/`after`/`detail`/`hunk` are null/absent until graphify + hunk
-  parsing (later slice). `pr`/`train` resolve best-effort via the commit→PR map.
+  }]` — a projection over `artifacts` (add→add, remove→drop, change→change). For
+  **symbol/comment** subjects (Phase 3d) `before`/`after` carry the bounded hunk
+  snippet and `detail` is `"<lang> <subkind> <name>"`; file-level deltas leave them
+  null. `area` is filled by area attribution. `pr`/`train` resolve best-effort via
+  the commit→PR map.
 - **diagrams{}** now also maps `content_timeline` (Mermaid `timeline`) and
   `deltas_bar` (Mermaid `xychart-beta` bar).
 
@@ -151,6 +160,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   commits' files) or reviewed (their reviewed PRs' areas).
 - **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
-- **Still deferred:** symbol/inline-comment artifacts, symbol-granular artifacts (3d),
-  symbol-identity tracking (3e), resource-level `dependsOn` edges (3d),
-  `hunk`/`before`/`after`/`detail` on feature_deltas, multi-repo aggregation.
+- **Phase 3d (shipped):** symbol/comment artifacts + `before`/`after`/`detail` on
+  feature_deltas (see `symbol_events` above), diff-local from a `git log -p` walk.
+- **Still deferred:** symbol-identity tracking across renames/moves (3e), resource-level
+  `dependsOn` edges, multi-repo aggregation.

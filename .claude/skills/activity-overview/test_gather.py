@@ -1577,5 +1577,129 @@ class TestAcquireEdgesP3c(unittest.TestCase):
                             for e in bar["edges"]))
 
 
+BICEP_DIFF = """diff --git a/avm/res/foo/main.bicep b/avm/res/foo/main.bicep
+index 1111111..2222222 100644
+--- a/avm/res/foo/main.bicep
++++ b/avm/res/foo/main.bicep
+@@ -1,5 +1,7 @@
+ param location string = resourceGroup().location
+-param oldParam string
++param newParam string
++@description('the vault')
+ resource vault 'Microsoft.KeyVault/vaults@2023-01-01' = {
+-  name: 'old'
++  name: 'new'
+ }
+"""
+
+TF_DIFF = """diff --git a/live/prod/main.tf b/live/prod/main.tf
+--- a/live/prod/main.tf
++++ b/live/prod/main.tf
+@@ -1,4 +1,7 @@
+ resource "azurerm_resource_group" "this" {
+-  name = "old"
++  name = "new"
+ }
++variable "region" {
++  type = string
++}
+"""
+
+
+class TestUnifiedDiffParser(unittest.TestCase):
+    def test_parses_path_and_hunk_lines(self):
+        files = gather.parse_unified_diff(BICEP_DIFF)
+        self.assertEqual(len(files), 1)
+        f = files[0]
+        self.assertEqual(f["path"], "avm/res/foo/main.bicep")
+        self.assertEqual(f["old_path"], "avm/res/foo/main.bicep")
+        self.assertEqual(f["hunks"][0]["new_start"], 1)
+        signs = [s for s, _ in f["hunks"][0]["lines"]]
+        self.assertIn("+", signs)
+        self.assertIn("-", signs)
+
+    def test_added_file_old_path_is_none(self):
+        diff = ("diff --git a/x.bicep b/x.bicep\n--- /dev/null\n+++ b/x.bicep\n"
+                "@@ -0,0 +1,1 @@\n+param a string\n")
+        f = gather.parse_unified_diff(diff)[0]
+        self.assertIsNone(f["old_path"])
+        self.assertEqual(f["path"], "x.bicep")
+
+
+class TestDetectSymbolDecl(unittest.TestCase):
+    def test_bicep_decls(self):
+        self.assertEqual(gather.detect_symbol_decl("bicep", "param foo string"),
+                         ("symbol", "param", "foo"))
+        self.assertEqual(gather.detect_symbol_decl(
+            "bicep", "resource vault 'Microsoft.KeyVault/vaults@2023-01-01' = {"),
+            ("symbol", "resource", "vault"))
+        self.assertEqual(gather.detect_symbol_decl("bicep", "  // a note")[0], "comment")
+        self.assertIsNone(gather.detect_symbol_decl("bicep", "  name: 'x'"))
+
+    def test_terraform_decls(self):
+        self.assertEqual(gather.detect_symbol_decl(
+            "terraform", 'resource "azurerm_kv" "this" {'),
+            ("symbol", "resource", "azurerm_kv.this"))
+        self.assertEqual(gather.detect_symbol_decl("terraform", 'variable "region" {'),
+                         ("symbol", "variable", "region"))
+        self.assertEqual(gather.detect_symbol_decl("terraform", "# comment")[0], "comment")
+
+    def test_unknown_lang_is_none(self):
+        self.assertIsNone(gather.detect_symbol_decl("python", "def f():"))
+
+
+class TestBuildSymbolDeltas(unittest.TestCase):
+    def _by_name(self, path, diff):
+        f = gather.parse_unified_diff(diff)[0]
+        return {(d["subkind"], d["name"]): d
+                for d in gather.build_symbol_deltas(path, f["hunks"])}
+
+    def test_bicep_add_drop_change_comment(self):
+        d = self._by_name("avm/res/foo/main.bicep", BICEP_DIFF)
+        self.assertEqual(d[("param", "newParam")]["change"], "add")
+        self.assertEqual(d[("param", "oldParam")]["change"], "drop")
+        self.assertEqual(d[("resource", "vault")]["change"], "change")
+        self.assertIn("name: 'old'", d[("resource", "vault")]["before"])
+        self.assertIn("name: 'new'", d[("resource", "vault")]["after"])
+        self.assertEqual(d[("comment", None)]["change"], "add")
+
+    def test_terraform_change_and_add(self):
+        d = self._by_name("live/prod/main.tf", TF_DIFF)
+        self.assertEqual(d[("resource", "azurerm_resource_group.this")]["change"], "change")
+        self.assertEqual(d[("variable", "region")]["change"], "add")
+
+    def test_non_source_file_yields_nothing(self):
+        f = gather.parse_unified_diff(
+            "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+            "@@ -1 +1 @@\n-old\n+new\n")[0]
+        self.assertEqual(gather.build_symbol_deltas("README.md", f["hunks"]), [])
+
+    def test_before_after_bounded(self):
+        long = "x" * 500
+        diff = (f"diff --git a/m.bicep b/m.bicep\n--- a/m.bicep\n+++ b/m.bicep\n"
+                f"@@ -1 +1 @@\n-param a string // {long}\n+param a int // {long}\n")
+        f = gather.parse_unified_diff(diff)[0]
+        d = gather.build_symbol_deltas("m.bicep", f["hunks"])[0]
+        self.assertLessEqual(len(d["before"]), 200)
+        self.assertLessEqual(len(d["after"]), 200)
+
+
+class TestParseSymbolEvents(unittest.TestCase):
+    def test_record_splitting_attaches_commit_metadata(self):
+        sha = "a" * 40
+        header = gather.FIELD_SEP.join([sha, "parent", "Alice", "2026-05-03", "subj"])
+        raw = gather.RECORD_SEP + header + "\n" + BICEP_DIFF
+        events = gather.parse_symbol_events(raw)
+        self.assertTrue(events)
+        self.assertTrue(all(e["commit"] == sha and e["author"] == "Alice"
+                            and e["date"] == "2026-05-03" for e in events))
+        names = {(e["subkind"], e["name"], e["change"]) for e in events}
+        self.assertIn(("param", "newParam", "add"), names)
+        self.assertIn(("resource", "vault", "change"), names)
+
+    def test_empty_input_yields_no_events(self):
+        self.assertEqual(gather.parse_symbol_events(""), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -615,5 +615,55 @@ class TestPhase3bConsistency(unittest.TestCase):
                 self.assertIn(area, known)
 
 
+class TestSymbolArtifacts(unittest.TestCase):
+    """Phase 3d: symbol_events fold into kind:symbol/comment artifacts + feature_deltas
+    carry the bounded before/after/detail."""
+
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r"}, "code_events": [], "commits": [],
+            "prs": [], "issues": [], "trains": [],
+            "symbol_events": [
+                {"commit": "a" * 40, "author": "Alice", "date": "2026-05-03",
+                 "path": "avm/res/foo/main.bicep", "lang": "bicep",
+                 "subkind": "resource", "name": "vault", "change": "change",
+                 "before": "name: 'old'", "after": "name: 'new'"},
+                {"commit": "a" * 40, "author": "Alice", "date": "2026-05-03",
+                 "path": "avm/res/foo/main.bicep", "lang": "bicep",
+                 "subkind": "param", "name": "newParam", "change": "add",
+                 "before": None, "after": "param newParam string"},
+            ],
+        }
+
+    def test_symbol_events_become_symbol_artifacts(self):
+        arts = link.build_artifacts(self._bundle())
+        sym = [a for a in arts.values() if a["kind"] == "symbol"]
+        self.assertEqual(len(sym), 2)
+        vault = next(a for a in sym if a["name"] == "vault")
+        self.assertEqual(vault["subkind"], "resource")
+        self.assertEqual(vault["lang"], "bicep")
+        self.assertEqual(vault["lifecycle"][0]["after"], "name: 'new'")
+
+    def test_feature_deltas_carry_before_after_detail(self):
+        b = self._bundle()
+        b["artifacts"] = link.build_artifacts(b)
+        deltas = link.compute_feature_deltas(b)
+        vault = next(d for d in deltas if d["name"] == "vault")
+        self.assertEqual(vault["kind"], "change")
+        self.assertEqual(vault["subject"], "symbol")
+        self.assertEqual(vault["before"], "name: 'old'")
+        self.assertEqual(vault["after"], "name: 'new'")
+        self.assertEqual(vault["detail"], "bicep resource vault")
+
+    def test_symbol_artifacts_get_code_area(self):
+        b = self._bundle()
+        b["code_graph"] = {"areas": [{"id": "avm/res/foo",
+                                      "paths": ["avm/res/foo/main.bicep"]}]}
+        b["artifacts"] = link.build_artifacts(b)
+        link.attribute_code_areas(b)
+        vault = next(a for a in b["artifacts"].values() if a["name"] == "vault")
+        self.assertEqual(vault["code_area"], "avm/res/foo")
+
+
 if __name__ == "__main__":
     unittest.main()

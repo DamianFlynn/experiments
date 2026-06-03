@@ -81,6 +81,16 @@ path resolves to a code area (no longer null when a `code_graph` area covers it)
 |------|---------|------|--------|----|--------|
 | {kind} | {subject} | {name} | {author} | {pr or "—"} | [{commit:7}]({url}) |
 
+### Symbol-level changes (Phase 3d)
+
+For `feature_deltas` with `subject` of `symbol`/`comment`, show the actual change using
+the bounded `before`/`after` and `detail` (`<lang> <subkind> <name>`). Omit when no
+symbol deltas resolved.
+
+| Detail | Kind | Before | After | PR | Commit |
+|--------|------|--------|-------|----|--------|
+| {detail} | {kind} | `{before or "—"}` | `{after or "—"}` | {pr or "—"} | [{commit:7}]({url}) |
+
 ## Content lifecycle (built / changed / dropped)
 
 From `artifacts`: examples, docs, and READMEs introduced, revised, or

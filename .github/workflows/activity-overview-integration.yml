@@ -275,8 +275,8 @@ jobs:
           arts = b.get("artifacts", {})
           assert isinstance(arts, dict), "artifacts must be a dict"
           for aid, a in arts.items():
-              assert a["kind"] in {"example", "doc", "readme"}, \
-                  f"{aid} unexpected kind {a['kind']} (symbol/comment deferred)"
+              assert a["kind"] in {"example", "doc", "readme", "symbol", "comment"}, \
+                  f"{aid} unexpected kind {a['kind']}"
               assert a["status"] in {"live", "removed", "replaced"}, aid
               assert a["lifecycle"], f"{aid} has empty lifecycle"
               for ev in a["lifecycle"]:
@@ -304,6 +304,28 @@ jobs:
               assert str(d.get("url", "")).startswith("https://"), d
               if d.get("pr") is not None:
                   assert d["pr"] in pr_by, f"delta pr {d['pr']} unknown"
+
+          # 9b. Phase 3d: symbol-granular ledger. When source files (.bicep/.tf)
+          # changed in the window the symbol walk must light up; symbol artifacts
+          # carry lang/subkind, and their feature_deltas carry a BOUNDED before/after
+          # (<=200 chars) + a detail string.
+          src_changed = any(str(e.get("path", "")).endswith((".bicep", ".tf"))
+                            for e in b.get("code_events", []))
+          sym_arts = {aid: a for aid, a in arts.items()
+                      if a["kind"] in {"symbol", "comment"}}
+          if src_changed:
+              assert sym_arts, "source files changed but no symbol/comment artifacts (3d walk dark)"
+          for aid, a in sym_arts.items():
+              assert a.get("lang") and "subkind" in a, f"symbol artifact missing lang/subkind: {aid}"
+          sym_deltas = [d for d in b.get("feature_deltas", [])
+                        if d["subject"] in {"symbol", "comment"}]
+          assert all(len(d.get("before") or "") <= 200 and len(d.get("after") or "") <= 200
+                     for d in sym_deltas), "symbol before/after snippet exceeds the 200-char bound"
+          if sym_arts:
+              assert sym_deltas, "symbol artifacts but no symbol feature_deltas"
+              assert any(d.get("after") or d.get("before") for d in sym_deltas), \
+                  "symbol feature_deltas carry no before/after snippet"
+              assert any(d.get("detail") for d in sym_deltas), "symbol deltas carry no detail"
 
           # 10. Phase 3a: diagrams manifest now includes the two new diagrams.
           assert set(dg) >= {"buckets_pie", "timeline_gantt",
@@ -427,6 +449,8 @@ jobs:
           print(f"  phase3a: artifacts={len(arts)} timeline={len(tl)} "
                 f"feature_deltas={len(b.get('feature_deltas', []))} "
                 f"pr_review_comments={sum(len(p.get('review_comments', [])) for p in prs)}")
+          print(f"  phase3d: symbol_events={len(b.get('symbol_events', []))} "
+                f"symbol_artifacts={len(sym_arts)} symbol_deltas={len(sym_deltas)}")
           print(f"  phase3b: provider={cg.get('provider')} areas={len(areas)} "
                 f"attributed_artifacts={attributed_art} modules={len(modules)} "
                 f"label_taxonomy_source={tax.get('source')} "
