@@ -2162,6 +2162,59 @@ class TestBuildForecast(unittest.TestCase):
                     "recent_activity", "overdue"):
             self.assertIn(key, w, f"FORECAST_WEIGHTS missing '{key}'")
 
+    # ------------------------------------------------------------------
+    # Review regressions: window from meta.from/to; in_motion needs open PR
+    # ------------------------------------------------------------------
+
+    def test_recent_activity_windows_when_meta_has_from_to_not_period(self):
+        """A bundle whose meta carries `from`/`to` (no `period` key) must still
+        window recent_activity — an item updated OUTSIDE the window must NOT
+        score recent_activity, and one inside MUST. Guards against _in_window
+        treating every item as in-window when `period` is absent."""
+        b_out = self._bundle(
+            next_candidates=[self._nc_ref("issue", 1)],
+            issues=[self._issue(1, updated_at="2026-04-01T00:00:00Z")],  # before window
+        )
+        b_out["meta"] = {"from": "2026-05-01", "to": "2026-05-31",
+                         "ref_date": "2026-05-31"}  # no "period"
+        link.build_forecast(b_out)
+        self.assertNotIn("active in window",
+                         b_out["forecast"]["candidates"][0]["signals"])
+
+        b_in = self._bundle(
+            next_candidates=[self._nc_ref("issue", 1)],
+            issues=[self._issue(1, updated_at="2026-05-15T00:00:00Z")],  # inside window
+        )
+        b_in["meta"] = {"from": "2026-05-01", "to": "2026-05-31",
+                        "ref_date": "2026-05-31"}  # no "period"
+        link.build_forecast(b_in)
+        self.assertIn("active in window",
+                      b_in["forecast"]["candidates"][0]["signals"])
+
+    def test_in_motion_not_awarded_to_merged_or_missing_pr_candidate(self):
+        """in_motion (and its weight) must only fire for an OPEN PR candidate.
+        A merged/closed PR candidate, or one missing from the bundle's prs,
+        must not be awarded the in_motion signal."""
+        # Merged PR candidate present in prs -> not in motion.
+        merged = self._pr(50, state="closed", merged=True,
+                          updated_at="2026-04-01T00:00:00Z")
+        b = self._bundle(next_candidates=[self._nc_ref("pr", 50)], prs=[merged])
+        link.build_forecast(b)
+        self.assertNotIn("open PR", b["forecast"]["candidates"][0]["signals"])
+
+        # PR candidate missing from prs (item == {}) -> not in motion.
+        b2 = self._bundle(next_candidates=[self._nc_ref("pr", 99)], prs=[])
+        link.build_forecast(b2)
+        self.assertNotIn("open PR", b2["forecast"]["candidates"][0]["signals"])
+
+        # Open PR candidate -> in motion.
+        b3 = self._bundle(
+            next_candidates=[self._nc_ref("pr", 60)],
+            prs=[self._pr(60, state="open", merged=False)],
+        )
+        link.build_forecast(b3)
+        self.assertIn("open PR", b3["forecast"]["candidates"][0]["signals"])
+
 
 if __name__ == "__main__":
     unittest.main()

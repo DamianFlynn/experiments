@@ -1,6 +1,6 @@
 # Phase 4a — train significance + slices + forecast scaffold (implementation plan)
 
-**Status:** planned. Branch `claude/activity-phase4a`. Builds on the merged 3a–3e `trains`,
+**Status:** shipped (PR #10). Branch `claude/activity-phase4a`. Builds on the merged 3a–3e `trains`,
 `feature_deltas`, `symbol_moves`, `buckets`, and `label_taxonomy`. Splits the original Phase 4
 into a **deterministic scaffold (4a, this plan)** and **sub-agent narration (4b, next)**. 4a is
 pure Python under TDD + the live gate; it produces everything a narrator needs but writes no prose.
@@ -77,8 +77,8 @@ never re-reads the full bundle:
 ```
 
 `*` = **bounded** text: bodies/messages/review text truncated to a tunable cap (start ~1500
-chars) with a truncation marker; long comment lists keep first/last K and record an
-`overflow` count. Bounding keeps the slice token-predictable regardless of a train's real size,
+chars) with a truncation marker; long comment lists keep the first `SLICE_COMMENTS_KEPT`
+and record an `overflow` count of those dropped. Bounding keeps the slice token-predictable regardless of a train's real size,
 which is what makes a 400-line spotlight safe to dispatch. The report **summarizes** the slice;
 the spotlight **expands** it — one contract, depth chosen by the consumer.
 
@@ -106,7 +106,8 @@ forecast: { next_milestone,
 ### 5. `train_flowcharts` (render.py) — adaptive Mermaid, one per deep train
 
 Registered as the **map** the schema already reserves: `diagrams.train_flowcharts[id] =
-"diagrams/train-<id>.mmd"`. Emitted for every **deep** train (bounds the count); also renderable
+"diagrams/<id>.mmd"` (the key is the full train id, e.g. `train-issue-17`, so the file is
+`diagrams/train-issue-17.mmd`). Emitted for every **deep** train (bounds the count); also renderable
 on demand for an arbitrary train to back a spotlight (`render.py --train <id>`).
 
 **Adaptive shape** ("which layout fits best", deterministic):

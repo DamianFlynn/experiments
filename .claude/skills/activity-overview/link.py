@@ -957,7 +957,10 @@ def build_forecast(bundle):
     prs, issues, and meta.  Forward-only: no predicted-vs-landed comparison.
     """
     meta        = bundle.get("meta", {})
-    period      = meta.get("period")
+    # Production bundles carry meta.period; fall back to meta.from/to so bundles
+    # built via build_bundle (no period key) still window `recent_activity`
+    # correctly instead of _in_window treating every item as in-window.
+    period      = meta.get("period") or {"from": meta.get("from"), "to": meta.get("to")}
     ref_date    = meta.get("ref_date") or meta.get("to") or ""
 
     # Resolve next milestone title via the shared helper.
@@ -1002,7 +1005,7 @@ def build_forecast(bundle):
         #   - ref is a PR candidate (open PR is a next_candidate by definition)
         #   - OR some open PR in the bundle references this issue
         #   - OR the ref carries a train id
-        if type_ == "pr":
+        if type_ == "pr" and item.get("state") == "open" and not item.get("merged"):
             in_motion = True
             motion_text = "open PR"
         elif open_pr_for_issue.get(id_):
