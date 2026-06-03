@@ -150,6 +150,64 @@ class TestBuildTrains(unittest.TestCase):
         link.attach_commit_prs(bundle["commits"])
         self.assertEqual(len(link.build_trains(bundle)), 1)
 
+    def test_inflight_train_from_open_pr_to_main(self):
+        """An OPEN PR targeting main (its work not yet shipped) builds an in_flight
+        train so in-progress efforts are tracked, not just merged ones."""
+        bundle = {
+            "meta": {"base_branch": "main"}, "commits": [],
+            "issues": [{"number": 50, "title": "Feature X", "kind": "feature",
+                        "url": "https://github.com/o/r/issues/50"}],
+            "prs": [{"number": 80, "title": "feat: wip X", "merged": False,
+                     "state": "open", "base": "main", "head": "feat-x",
+                     "closes": [50], "crossref_issues": [],
+                     "url": "https://github.com/o/r/pull/80"}],
+        }
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual([t["id"] for t in trains], ["train-issue-50"])
+        self.assertEqual(trains[0]["outcome"], "in_flight")
+        self.assertEqual(trains[0]["prs"], [80])
+        self.assertEqual(trains[0]["contributing_prs"], [])
+
+    def test_stacked_pr_attaches_as_contributing_to_parent_train(self):
+        """A PR merged into another PR's branch (base == that PR's head) is tracked
+        as a contributing_pr on the parent's train — the journey-to-main context —
+        not as its own train and not as shipped."""
+        bundle = {
+            "meta": {"base_branch": "main"}, "commits": [],
+            "issues": [{"number": 62, "title": "Bug Y", "kind": "bug",
+                        "url": "https://github.com/o/r/issues/62"}],
+            "prs": [
+                {"number": 116, "title": "fix: Y", "merged": False, "state": "open",
+                 "base": "main", "head": "issue62", "closes": [62],
+                 "crossref_issues": [], "url": "https://github.com/o/r/pull/116"},
+                {"number": 118, "title": "fix: Y part", "merged": True,
+                 "state": "closed", "base": "issue62", "head": "issue62-sub",
+                 "closes": [], "crossref_issues": [],
+                 "url": "https://github.com/o/r/pull/118"},
+            ],
+        }
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        self.assertEqual([t["id"] for t in trains], ["train-issue-62"])
+        self.assertEqual(trains[0]["prs"], [116])
+        self.assertEqual(trains[0]["contributing_prs"], [118])
+
+    def test_open_pr_for_already_shipped_anchor_does_not_duplicate(self):
+        bundle = _sample_bundle()
+        bundle["meta"] = {"base_branch": "main"}
+        bundle["prs"][0]["base"] = "main"
+        bundle["prs"][0]["head"] = "h1"
+        bundle["prs"].append({"number": 99, "title": "feat: more", "merged": False,
+                              "state": "open", "base": "main", "head": "h2",
+                              "closes": [17], "crossref_issues": [],
+                              "url": "https://github.com/o/r/pull/99"})
+        link.attach_commit_prs(bundle["commits"])
+        trains = link.build_trains(bundle)
+        ids = [t["id"] for t in trains]
+        self.assertEqual(ids.count("train-issue-17"), 1)
+        self.assertEqual(trains[0]["outcome"], "shipped")
+
 
 class TestBucketsAndEnrich(unittest.TestCase):
     def test_shipped_bucket_has_merged_prs_and_completed_issues(self):
@@ -837,6 +895,15 @@ class TestTrainSignificance(unittest.TestCase):
 
     def _bundle(self, trains):
         return {"trains": trains}
+
+    def test_contributing_prs_add_to_footprint(self):
+        """Stacked/fork contributions on a train earn it significance — a train
+        with contributing_prs outscores an otherwise-identical train without."""
+        a = self._train("train-pr-1", "other", [1], [], [])
+        b = self._train("train-pr-2", "other", [2], [], [])
+        b["contributing_prs"] = [10, 11]
+        link.score_train_significance(self._bundle([a, b]))
+        self.assertGreater(b["significance"], a["significance"])
 
     # ----- ranking order -----
 

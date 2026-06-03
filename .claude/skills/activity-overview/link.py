@@ -286,82 +286,125 @@ def compute_feature_deltas(bundle):
     return deltas
 
 
-def _mainline_merge(pr, base_branch):
-    """True if `pr` merged into the analyzed mainline branch. A merged PR whose
-    KNOWN base differs from `base_branch` is a stacked/fork contribution (it merged
-    into another branch, not main) — kept in the bundle as context but not counted
-    as shipped-to-main. A missing/None base or base_branch (older bundles) is
-    treated as mainline so prior behaviour is preserved. Pure."""
-    if not pr.get("merged"):
-        return False
+def _targets_mainline(pr, base_branch):
+    """True if `pr` TARGETS the analyzed mainline branch (base == base_branch), or
+    the base/base_branch is unknown (older bundles). Independent of merge state."""
     base = pr.get("base")
     return base_branch is None or base is None or base == base_branch
 
 
-def build_trains(bundle):
-    """Group merged PRs (+ their commits + closing issue) into decision trains.
+def _mainline_merge(pr, base_branch):
+    """True if `pr` merged INTO the analyzed mainline branch. A merged PR whose
+    KNOWN base differs from `base_branch` is a stacked/fork contribution (it merged
+    into another branch, not main) — tracked as a `contributing_pr` on the parent's
+    train rather than counted as shipped-to-main. Pure."""
+    return bool(pr.get("merged")) and _targets_mainline(pr, base_branch)
 
-    Train id is deterministic from its anchor: the root issue number when the PR
-    closes one (`train-issue-<n>`), else the PR number (`train-pr-<n>`). Only PRs
-    merged into the analyzed mainline branch build trains; stacked/fork PRs merged
-    into other branches are excluded (see `_mainline_merge`).
+
+def _pr_anchor(pr):
+    """A PR's train anchor: its first closing/crossref issue, else the PR itself."""
+    links = list(pr.get("closes") or [])
+    for n in pr.get("crossref_issues") or []:
+        if n not in links:
+            links.append(n)
+    root = links[0] if links else None
+    return ("issue", root) if root is not None else ("pr", pr["number"])
+
+
+def build_trains(bundle):
+    """Group PRs (+ their commits + closing issue) into decision trains.
+
+    A train is anchored deterministically by its root issue (`train-issue-<n>`) or,
+    failing that, its PR (`train-pr-<n>`). Outcomes:
+      - `shipped`   — at least one PR merged into the analyzed mainline branch.
+      - `in_flight` — only OPEN PR(s) targeting mainline; the effort is in progress.
+    A PR merged into ANOTHER PR's branch (base == that PR's head) is a stacked/fork
+    contribution: it lands as a `contributing_prs` entry on the parent PR's train —
+    the journey-to-main context — not its own train and not shipped-to-main.
     """
     commits_by_pr = {}
     for c in bundle["commits"]:
         commits_by_pr.setdefault(c.get("pr"), []).append(c["sha"])
     issues_by_num = {i["number"]: i for i in bundle["issues"]}
     base_branch = bundle.get("meta", {}).get("base_branch")
+    prs_all = bundle["prs"]
 
-    # Group merged PRs by anchor so multiple PRs on one issue share a train.
-    groups = {}
-    for pr in bundle["prs"]:
-        if not _mainline_merge(pr, base_branch):
-            continue
-        links = list(pr.get("closes") or [])
-        for n in pr.get("crossref_issues") or []:
-            if n not in links:
-                links.append(n)
-        root = links[0] if links else None
-        anchor = ("issue", root) if root is not None else ("pr", pr["number"])
-        groups.setdefault(anchor, []).append(pr)
-
-    trains = []
-    for (kind, key), prs in groups.items():
-        prs = sorted(prs, key=lambda p: p["number"])
-        pr_numbers = [p["number"] for p in prs]
-        shas = []
-        evidence = []
-        for p in prs:
-            shas.extend(commits_by_pr.get(p["number"], []))
-            evidence.append(ref("pr", p["number"], p["url"]))
-        root_issue = key if kind == "issue" else None
-        train_kind = "other"
+    def _kind_for(root_issue, prs):
+        kind = "other"
         if root_issue is not None and root_issue in issues_by_num:
-            issue = issues_by_num[root_issue]
-            train_kind = issue.get("kind", "other")
-            evidence.insert(0, ref("issue", root_issue, issue["url"]))
-        if train_kind == "other":
-            # No typed root issue: derive kind from the PRs' conventional-commit
-            # titles (feat->feature, fix->bug, docs->docs) so significance can
-            # weight real work on repos that title PRs but rarely type issues.
-            # `prs` is sorted by number, so the lowest-numbered match wins.
+            kind = issues_by_num[root_issue].get("kind", "other")
+        if kind == "other":
+            # No typed root issue: derive from the PRs' conventional-commit titles
+            # (feat->feature, fix->bug, docs->docs). `prs` sorted, lowest # wins.
             for p in prs:
                 pk = gather.classify_pr_kind(p)
                 if pk:
-                    train_kind = pk
+                    kind = pk
                     break
-        trains.append({
+        return kind
+
+    def _make_train(anchor, prs, outcome):
+        akind, key = anchor
+        prs = sorted(prs, key=lambda p: p["number"])
+        pr_numbers = [p["number"] for p in prs]
+        root_issue = key if akind == "issue" else None
+        evidence, shas = [], []
+        if root_issue is not None and root_issue in issues_by_num:
+            evidence.append(ref("issue", root_issue, issues_by_num[root_issue]["url"]))
+        for p in prs:
+            shas.extend(commits_by_pr.get(p["number"], []))
+            evidence.append(ref("pr", p["number"], p["url"]))
+        return {
             "id": f"train-issue-{root_issue}" if root_issue is not None
             else f"train-pr-{pr_numbers[0]}",
-            "kind": train_kind,
+            "kind": _kind_for(root_issue, prs),
             "root_issue": root_issue,
             "prs": pr_numbers,
             "commits": sorted(shas),
             "code_areas": [],
-            "outcome": "shipped",
+            "outcome": outcome,
+            "contributing_prs": [],
             "evidence": evidence,
-        })
-    return sorted(trains, key=lambda t: t["id"])
+        }
+
+    # 1. Shipped trains: PRs merged into mainline, grouped by anchor.
+    shipped_groups = {}
+    for pr in prs_all:
+        if _mainline_merge(pr, base_branch):
+            shipped_groups.setdefault(_pr_anchor(pr), []).append(pr)
+
+    # 2. In-flight trains: OPEN PRs targeting mainline, for anchors not yet shipped.
+    inflight_groups = {}
+    for pr in prs_all:
+        if pr.get("state") == "open" and not pr.get("merged") \
+                and _targets_mainline(pr, base_branch):
+            anchor = _pr_anchor(pr)
+            if anchor not in shipped_groups:
+                inflight_groups.setdefault(anchor, []).append(pr)
+
+    train_by_anchor = {}
+    for anchor, prs in shipped_groups.items():
+        train_by_anchor[anchor] = _make_train(anchor, prs, "shipped")
+    for anchor, prs in inflight_groups.items():
+        train_by_anchor[anchor] = _make_train(anchor, prs, "in_flight")
+
+    # 3. Attach stacked contributions: a PR merged into a NON-mainline branch that is
+    #    some mainline-targeting PR's head feeds that parent's train (its journey).
+    head_to_parent = {p["head"]: p for p in prs_all
+                      if p.get("head") and _targets_mainline(p, base_branch)}
+    for pr in prs_all:
+        if not (pr.get("merged") and base_branch and pr.get("base")
+                and pr["base"] != base_branch):
+            continue  # only stacked (merged into a known non-mainline branch)
+        parent = head_to_parent.get(pr["base"])
+        if parent is None or parent["number"] == pr["number"]:
+            continue
+        train = train_by_anchor.get(_pr_anchor(parent))
+        if train is not None and pr["number"] not in train["contributing_prs"]:
+            train["contributing_prs"].append(pr["number"])
+            train["contributing_prs"].sort()
+
+    return sorted(train_by_anchor.values(), key=lambda t: t["id"])
 
 
 def compute_buckets(bundle):
@@ -553,7 +596,7 @@ def score_train_significance(bundle):
     """Annotate each train with `significance` (float) and `tier` ('deep'|'mention').
 
     significance = footprint * kind_weight + breadth, where:
-      footprint = len(prs) + len(commits) + len(code_areas)  # note: code_areas also feeds the breadth term
+      footprint = len(prs) + len(commits) + len(code_areas) + len(contributing_prs)
       kind_weight from TRAIN_KIND_WEIGHTS (unknown kinds → 'other' weight)
       breadth = len(code_areas)
     tier = 'deep' for the top-TRAIN_SIGNIFICANCE_TOP_N trains OR any train
@@ -564,7 +607,8 @@ def score_train_significance(bundle):
     other_weight = TRAIN_KIND_WEIGHTS["other"]
 
     for t in trains:
-        footprint = len(t.get("prs", [])) + len(t.get("commits", [])) + len(t.get("code_areas", []))
+        footprint = (len(t.get("prs", [])) + len(t.get("commits", []))
+                     + len(t.get("code_areas", [])) + len(t.get("contributing_prs", [])))
         kind_weight = TRAIN_KIND_WEIGHTS.get(t.get("kind", "other"), other_weight)
         breadth = len(t.get("code_areas", []))
         t["significance"] = float(footprint * kind_weight + breadth)

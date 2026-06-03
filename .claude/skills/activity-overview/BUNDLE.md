@@ -41,13 +41,20 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
   includes open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
 - `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
-  significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at, elapsed_days,
-  reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
+  contributing_prs:[#], significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at,
+  elapsed_days, reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
+  A train is anchored by its root **issue** (`train-issue-<n>`) or, when no issue is linked
+  (process not followed / a forked PR), by its **PR** (`train-pr-<n>`). `outcome` is `"shipped"`
+  (≥1 PR merged to `meta.base_branch`) or `"in_flight"` (only OPEN PR(s) targeting it; effort in
+  progress) — `rejected`/abandoned efforts are not yet trains (backlog). **`contributing_prs`** are
+  PRs merged into another PR's branch (`base == that PR's head`) — stacked/fork contributions to
+  this train's journey-to-main, tracked but not counted as shipped.
   `kind` derives from the typed root issue; when there is no typed root issue it falls back to
   the anchor PRs' conventional-commit title prefix (`feat→feature`, `fix→bug`, `docs→docs`), else
   `other` — so significance still differentiates work on repos that title PRs but rarely type issues.
-  `significance = footprint × kind_weight + breadth`; `tier` = `"deep"` for the top-N
-  by significance ∪ any train ≥ the significance floor, else `"mention"` (Phase 4a).
+  `significance = footprint × kind_weight + breadth` (footprint counts prs + commits + code_areas +
+  contributing_prs); `tier` = `"deep"` for the top-N by significance ∪ any train ≥ the significance
+  floor, else `"mention"` (Phase 4a).
   `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed
   `review_comments_count` (int); `participants` = count of distinct authors + reviewers +
   comment-authors (int);
