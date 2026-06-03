@@ -1146,6 +1146,23 @@ class TestMatchRepoArea(unittest.TestCase):
             "network", {"avm/res/key-vault/vault"}))
 
 
+class TestCloneHeadSha(unittest.TestCase):
+    """Phase 3c.2: provenance pin for resume + roll-up."""
+
+    def test_returns_stripped_sha(self):
+        sha = "a" * 40
+        got = gather.clone_head_sha("clone", run=lambda cmd, **kw: sha + "\n")
+        self.assertEqual(got, sha)
+
+    def test_missing_clone_returns_none(self):
+        def boom(cmd, **kw):
+            raise RuntimeError("not a git repository")
+        self.assertIsNone(gather.clone_head_sha("clone", run=boom))
+
+    def test_empty_output_returns_none(self):
+        self.assertIsNone(gather.clone_head_sha("clone", run=lambda cmd, **kw: "\n"))
+
+
 class TestTerraformParsers(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:

@@ -173,6 +173,10 @@ jobs:
           b = json.load(open("workspace/bundle.json"))
 
           assert b["meta"]["schema_version"] == 1, "missing schema_version"
+          # Phase 3c.2: clone HEAD pinned in meta (provenance for resume + roll-up).
+          clone_sha = b["meta"].get("clone_sha")
+          assert clone_sha and re.fullmatch(r"[0-9a-f]{40}", clone_sha), \
+              f"meta.clone_sha not a resolved commit SHA: {clone_sha!r}"
           prs, issues = b["prs"], b["issues"]
           commits, trains, buckets = b["commits"], b["trains"], b["buckets"]
           pr_by = {p["number"]: p for p in prs}

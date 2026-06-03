@@ -1094,6 +1094,19 @@ def run_git(args, cwd=None, timeout=None):
     return proc.stdout
 
 
+def clone_head_sha(clone_dir, run=run_git):
+    """Resolve the clone's HEAD commit SHA (provenance for resume + roll-up).
+
+    Pins the exact tree the code_graph/edges were built against so a `--resume`
+    rebuilds against the identical source (no mixed-SHA graph) and a multi-bundle
+    roll-up can pick the newest structural snapshot deterministically. Returns the
+    40-char SHA, or None when there is no clone (e.g. --no-clone with nothing on disk)."""
+    try:
+        return run(["git", "-C", clone_dir, "rev-parse", "HEAD"]).strip() or None
+    except Exception:
+        return None
+
+
 # IaC edge-extraction tuning. The timeout is GENEROUS — a healthy cold bicep/
 # terraform build finishes well under it, so the bound only trips a genuinely hung
 # process (never a slow-but-progressing one). Speed comes from bounded concurrency,
@@ -1444,7 +1457,7 @@ def acquire(args, env):
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
         "branches": args.branches.split(","), "clone_dir": clone_dir,
-        "ref_date": ref_date,
+        "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
     bundle = build_bundle(meta, commits, prs, issues)
