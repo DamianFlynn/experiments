@@ -340,6 +340,22 @@ jobs:
                    {e["commit"] for e in b.get("code_events", []) if e.get("commit") in boundary}
           assert not leaked, f"shallow-boundary commits leaked into the ledger: {leaked}"
 
+          # 9d. Phase 3e: symbol-identity moves — well-formed, endpoints exist, summary
+          # consistent. Real moves can be 0 in a window (the uniqueness guard skips
+          # boilerplate refactors), so assert SHAPE, not presence.
+          sm = b.get("symbol_moves", {})
+          assert isinstance(sm, dict) and isinstance(sm.get("links"), list) \
+              and isinstance(sm.get("by_confidence"), dict), f"symbol_moves malformed: {sm}"
+          for lk in sm["links"]:
+              assert lk["confidence"] in {"high", "medium"}, lk
+              assert lk["basis"] in {"file_rename", "unique_name"}, lk
+              assert lk["from"] in arts and lk["to"] in arts, f"move endpoint missing: {lk}"
+              assert arts[lk["from"]]["replaced_by"] == lk["to"], lk
+              assert arts[lk["to"]]["identity_from"] == lk["from"], lk
+          assert sm["by_confidence"].get("high", 0) + sm["by_confidence"].get("medium", 0) \
+              == len(sm["links"]), sm
+          print(f"  phase3e: symbol_moves={len(sm['links'])} by_confidence={sm['by_confidence']}")
+
           # 10. Phase 3a: diagrams manifest now includes the two new diagrams.
           assert set(dg) >= {"buckets_pie", "timeline_gantt",
                              "content_timeline", "deltas_bar"}, \

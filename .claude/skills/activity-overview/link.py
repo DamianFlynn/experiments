@@ -517,6 +517,72 @@ def attribute_people_areas(bundle, idx):
     return bundle
 
 
+# Phase 3e: symbol-identity (window-wide moves). Comments are excluded — their text
+# identity already captures evolution and would match noisily.
+_COMMENT_SUBKINDS = {"comment", "todo"}
+
+
+def match_symbol_moves(symbol_events, rename_pairs=()):
+    """Detect window-wide symbol MOVES — the same symbol dropped in one file and added
+    in another. Pure; precision over recall. Only UNIQUE `(subkind, name)` pairings (one
+    source file, one dest file, different) are linked; ambiguous names (boilerplate
+    dropped/added in >1 file) are SKIPPED — the key false-positive guard. `confidence`
+    is `high` when `(src, dst)` is also a git rename/copy pair, else `medium`. Comments
+    are excluded. -> [{lang, subkind, name, from_path, to_path, confidence, basis}] (sorted).
+    Keyed by `lang` too, so a Bicep symbol can't link to a same-named Terraform one."""
+    drops, adds = {}, {}
+    for e in symbol_events:
+        if e.get("subkind") in _COMMENT_SUBKINDS:
+            continue
+        key = (e.get("lang"), e.get("subkind"), e.get("name"))
+        bucket = drops if e.get("change") == "drop" else adds if e.get("change") == "add" else None
+        if bucket is not None and e.get("path"):
+            bucket.setdefault(key, set()).add(e["path"])
+    renames = {(a, b) for a, b in rename_pairs}
+    moves = []
+    for key, src in drops.items():
+        dst = adds.get(key)
+        if not dst or len(src) != 1 or len(dst) != 1:
+            continue                       # absent or ambiguous -> not a confident move
+        a, b = next(iter(src)), next(iter(dst))
+        if a == b:
+            continue                       # re-added in the same file -> not a move
+        lang, subkind, name = key
+        basis = "file_rename" if (a, b) in renames else "unique_name"
+        moves.append({"lang": lang, "subkind": subkind, "name": name, "from_path": a,
+                      "to_path": b, "confidence": "high" if basis == "file_rename" else "medium",
+                      "basis": basis})
+    return sorted(moves, key=lambda m: (m["from_path"], str(m["subkind"]), str(m["name"])))
+
+
+def link_symbol_identity(bundle):
+    """Apply window-wide symbol moves onto the artifact ledger (Phase 3e). For each move
+    the source symbol artifact is `status:"replaced"` + `replaced_by` the dest, the dest
+    gets `identity_from`, and both carry `move_confidence`/`move_basis`. Records a
+    `symbol_moves` summary on the bundle. Mutates; safe when there are no symbol_events."""
+    arts = bundle.get("artifacts", {})
+    renames = [(e.get("old_path"), e["path"]) for e in bundle.get("code_events", [])
+               if e.get("change") in ("rename", "copy") and e.get("old_path")]
+    moves = match_symbol_moves(bundle.get("symbol_events", []), renames)
+    summary = {"high": 0, "medium": 0}
+    linked = []
+    for m in moves:
+        lang = m["lang"] or ""             # both endpoints share lang (move key includes it)
+        src = f'{m["from_path"]}#{lang}:{m["subkind"]}:{m["name"]}'
+        dst = f'{m["to_path"]}#{lang}:{m["subkind"]}:{m["name"]}'
+        if src in arts and dst in arts:
+            arts[src]["status"] = "replaced"
+            arts[src]["replaced_by"] = dst
+            arts[dst]["identity_from"] = src
+            for aid in (src, dst):
+                arts[aid]["move_confidence"] = m["confidence"]
+                arts[aid]["move_basis"] = m["basis"]
+            summary[m["confidence"]] += 1
+            linked.append({**m, "from": src, "to": dst})
+    bundle["symbol_moves"] = {"links": linked, "by_confidence": summary}
+    return bundle
+
+
 def enrich(bundle):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the Phase 3a narrative substrate (artifacts/timeline/feature_deltas), and the
@@ -526,6 +592,7 @@ def enrich(bundle):
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle)
     bundle["artifacts"] = build_artifacts(bundle)
+    link_symbol_identity(bundle)   # Phase 3e: window-wide symbol moves over the ledger
     # build_timeline depends on build_artifacts having run (reads bundle["artifacts"]).
     bundle["timeline"] = build_timeline(bundle)
     # compute_feature_deltas depends on build_trains having run (resolves trains).

@@ -89,6 +89,15 @@ docsRefs, release_train, sprints, project, diagrams`.
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled in Phase 3b. Symbol lifecycle entries
   carry the bounded `before`/`after`.
+- **symbol_moves** (link, Phase 3e) — window-wide symbol-identity links: `{ links:[{subkind,
+  name, from_path, to_path, from:<src aid>, to:<dst aid>, confidence:"high|medium", basis:
+  "file_rename|unique_name"}], by_confidence:{high,medium} }`. Each link object also carries
+  `lang`. A move = the same `(lang, subkind, name)`
+  symbol dropped in ONE file and added in ONE other (precision over recall — ambiguous/boilerplate
+  names are skipped). On the linked artifacts the source is `status:"replaced"` + `replaced_by`
+  the dest, the dest carries `identity_from`, and both carry `move_confidence`/`move_basis`.
+  `confidence` is `high` only when git also flags the file pair as a rename/copy. (Name-changed
+  renames via body fingerprint are deferred.)
 - **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},
   subject:{kind, name, path} }]` — sorted social (comments/reviews) + code
   (artifact lifecycle) events. `ref.id` is the PR/issue number for social events

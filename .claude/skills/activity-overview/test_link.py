@@ -683,5 +683,70 @@ class TestSymbolArtifacts(unittest.TestCase):
         self.assertEqual(delta["detail"], "bicep todo // TODO: revisit retention")
 
 
+class TestSymbolIdentity(unittest.TestCase):
+    """Phase 3e: window-wide symbol move detection (precision over recall)."""
+
+    def _ev(self, path, subkind, name, change):
+        return {"commit": "c", "author": "A", "date": "2026-05-03", "path": path,
+                "lang": "bicep", "subkind": subkind, "name": name, "change": change,
+                "before": None, "after": None}
+
+    def test_unique_move_linked_medium(self):
+        evs = [self._ev("a/main.bicep", "resource", "vault", "drop"),
+               self._ev("b/main.bicep", "resource", "vault", "add")]
+        moves = link.match_symbol_moves(evs)
+        self.assertEqual(len(moves), 1)
+        self.assertEqual((moves[0]["from_path"], moves[0]["to_path"]),
+                         ("a/main.bicep", "b/main.bicep"))
+        self.assertEqual(moves[0]["confidence"], "medium")
+        self.assertEqual(moves[0]["basis"], "unique_name")
+
+    def test_file_rename_pair_is_high_confidence(self):
+        evs = [self._ev("a/main.bicep", "resource", "vault", "drop"),
+               self._ev("b/main.bicep", "resource", "vault", "add")]
+        moves = link.match_symbol_moves(evs, [("a/main.bicep", "b/main.bicep")])
+        self.assertEqual(moves[0]["confidence"], "high")
+        self.assertEqual(moves[0]["basis"], "file_rename")
+
+    def test_ambiguous_name_is_skipped(self):
+        # boilerplate `location` dropped in two files and added in two -> NOT a move
+        evs = [self._ev("a/main.bicep", "param", "location", "drop"),
+               self._ev("c/main.bicep", "param", "location", "drop"),
+               self._ev("b/main.bicep", "param", "location", "add"),
+               self._ev("d/main.bicep", "param", "location", "add")]
+        self.assertEqual(link.match_symbol_moves(evs), [])
+
+    def test_same_file_readd_is_not_a_move(self):
+        evs = [self._ev("a/main.bicep", "param", "x", "drop"),
+               self._ev("a/main.bicep", "param", "x", "add")]
+        self.assertEqual(link.match_symbol_moves(evs), [])
+
+    def test_comments_excluded(self):
+        evs = [self._ev("a/m.bicep", "comment", "// note", "drop"),
+               self._ev("b/m.bicep", "comment", "// note", "add")]
+        self.assertEqual(link.match_symbol_moves(evs), [])
+
+    def test_cross_language_not_linked(self):
+        # same subkind+name but different language -> NOT the same symbol
+        evs = [{**self._ev("a/main.bicep", "module", "net", "drop")},
+               {**self._ev("b/main.tf", "module", "net", "add"), "lang": "terraform"}]
+        self.assertEqual(link.match_symbol_moves(evs), [])
+
+    def test_link_symbol_identity_sets_replaced_by_and_confidence(self):
+        b = {"meta": {"owner": "o", "repo": "r"}, "commits": [], "prs": [], "issues": [],
+             "code_events": [], "symbol_events": [
+                 self._ev("a/main.bicep", "resource", "vault", "drop"),
+                 self._ev("b/main.bicep", "resource", "vault", "add")]}
+        b["artifacts"] = link.build_artifacts(b)
+        link.link_symbol_identity(b)
+        src = "a/main.bicep#bicep:resource:vault"
+        dst = "b/main.bicep#bicep:resource:vault"
+        self.assertEqual(b["artifacts"][src]["status"], "replaced")
+        self.assertEqual(b["artifacts"][src]["replaced_by"], dst)
+        self.assertEqual(b["artifacts"][dst]["identity_from"], src)
+        self.assertEqual(b["artifacts"][dst]["move_confidence"], "medium")
+        self.assertEqual(b["symbol_moves"]["by_confidence"], {"high": 0, "medium": 1})
+
+
 if __name__ == "__main__":
     unittest.main()
