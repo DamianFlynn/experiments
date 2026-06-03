@@ -109,10 +109,12 @@ resolved area fall under "Unattributed".
 
 - [{title}]({url}) (#{number}) — train `{train.id}`
 
-3b. **Module dependency graph / blast radius** — resolved inter-area dependencies from
-    `code_graph.areas[].edges` (Bicep `bicep build`→ARM; Terraform `terraform graph`), embedding
-    `diagrams.module_graph`. Direct dependencies carry pinned versions; cross-module edges show
-    which areas a change ripples into. (Omitted when no edges resolved.)
+## Module dependency graph / blast radius
+
+Resolved inter-area dependencies from `code_graph.areas[].edges` (Bicep
+`bicep build`→ARM; Terraform `terraform graph`), embedding `diagrams.module_graph`.
+Direct dependencies carry pinned versions; cross-module edges show which areas a
+change ripples into. (Omitted when no edges resolved.)
 
 ## Module ownership
 

@@ -655,15 +655,27 @@ def _match_repo_area(name, area_ids):
     """Find the area-id in `area_ids` whose tail confidently matches `name`.
 
     Lenient normalised comparison (the ARM `metadata.name` is a short module name
-    like `vault`; the area tail is `vault`/`key-vault`). Returns the area-id or None."""
+    like `vault`; the area tail is `vault`/`key-vault`). DETERMINISTIC: an exact
+    normalised tail match always wins; otherwise the most specific (longest tail)
+    substring match wins, ties broken by area-id — so the result never depends on
+    `set` iteration order. Returns the area-id or None."""
     target = _normalize_id(name)
     if not target:
         return None
+    exact, partial = [], []
     for aid in area_ids:
         tail = aid.rstrip("/").split("/")[-1]
         nt = _normalize_id(tail)
-        if nt and (nt == target or nt in target or target in nt):
-            return aid
+        if not nt:
+            continue
+        if nt == target:
+            exact.append(aid)
+        elif nt in target or target in nt:
+            partial.append((nt, aid))
+    if exact:
+        return min(exact)                                   # exact wins; stable
+    if partial:
+        return min(partial, key=lambda p: (-len(p[0]), p[1]))[1]  # longest tail, stable
     return None
 
 

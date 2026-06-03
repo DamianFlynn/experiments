@@ -1123,6 +1123,29 @@ class TestBuildBicepEdges(unittest.TestCase):
                                      gather.DEFAULT_AREA_PATTERNS), [])
 
 
+class TestMatchRepoArea(unittest.TestCase):
+    """Deterministic area matching (Copilot review): never depends on set order."""
+
+    def test_exact_normalized_match_beats_substring(self):
+        # "vault" exactly matches avm/res/key-vault/vault, not the substring
+        # candidate avm/res/key-vault/vault-secret — exact must always win.
+        ids = {"avm/res/key-vault/vault", "avm/res/key-vault/vault-secret"}
+        self.assertEqual(gather._match_repo_area("vault", ids),
+                         "avm/res/key-vault/vault")
+
+    def test_longest_tail_substring_wins_and_is_stable(self):
+        # No exact match; "storageaccountblob" should resolve to the most specific
+        # (longest) tail, deterministically, regardless of set iteration order.
+        ids = {"avm/res/storage/account", "avm/res/storage/account-blob-service"}
+        results = {gather._match_repo_area("storage-account-blob-service", ids)
+                   for _ in range(20)}
+        self.assertEqual(results, {"avm/res/storage/account-blob-service"})
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(gather._match_repo_area(
+            "network", {"avm/res/key-vault/vault"}))
+
+
 class TestTerraformParsers(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:

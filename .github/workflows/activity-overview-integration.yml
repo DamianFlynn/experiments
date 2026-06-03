@@ -117,11 +117,22 @@ jobs:
       # flaky red runs unrelated to the skill itself — check registry reachability
       # before assuming a regression.
       - name: Install bicep CLI
+        env:
+          # Pinned (was `latest`) so the gate is reproducible and a new bicep
+          # release cannot silently change build output / break this run. Bump
+          # deliberately. Bicep publishes no checksums asset to verify against, so
+          # we instead assert the installed binary IS the pinned version below.
+          BICEP_VERSION: v0.43.8
         run: |
-          curl -sSLo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          curl -sSLo bicep "https://github.com/Azure/bicep/releases/download/${BICEP_VERSION}/bicep-linux-x64"
           chmod +x bicep
           sudo mv bicep /usr/local/bin/bicep
-          bicep --version
+          installed="$(bicep --version)"
+          echo "$installed"
+          case "$installed" in
+            *"${BICEP_VERSION#v}"*) ;;
+            *) echo "::error::bicep version mismatch: wanted ${BICEP_VERSION}, got '$installed'"; exit 1 ;;
+          esac
 
       - name: Install terraform CLI
         uses: hashicorp/setup-terraform@v3
