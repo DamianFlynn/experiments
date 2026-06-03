@@ -664,6 +664,24 @@ class TestSymbolArtifacts(unittest.TestCase):
         vault = next(a for a in b["artifacts"].values() if a["name"] == "vault")
         self.assertEqual(vault["code_area"], "avm/res/foo")
 
+    def test_todo_comment_event_folds_into_comment_artifact(self):
+        # subkind:"todo" (TODO/FIXME markers) must fold into a kind:"comment" artifact,
+        # not "symbol", so feature_deltas[].subject and comment reporting are correct.
+        b = {"meta": {"owner": "o", "repo": "r"}, "code_events": [], "commits": [],
+             "prs": [], "issues": [], "trains": [],
+             "symbol_events": [
+                 {"commit": "a" * 40, "author": "A", "date": "2026-05-03",
+                  "path": "avm/res/foo/main.bicep", "lang": "bicep", "subkind": "todo",
+                  "name": "// TODO: revisit retention", "change": "add",
+                  "before": None, "after": "// TODO: revisit retention"}]}
+        b["artifacts"] = link.build_artifacts(b)
+        todo = next(iter(b["artifacts"].values()))
+        self.assertEqual(todo["kind"], "comment")
+        self.assertEqual(todo["subkind"], "todo")
+        delta = link.compute_feature_deltas(b)[0]
+        self.assertEqual(delta["subject"], "comment")
+        self.assertEqual(delta["detail"], "bicep todo // TODO: revisit retention")
+
 
 if __name__ == "__main__":
     unittest.main()

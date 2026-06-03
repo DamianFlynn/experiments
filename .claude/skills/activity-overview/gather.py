@@ -495,7 +495,9 @@ def symbol_lang(path):
 def detect_symbol_decl(lang, text):
     """One source line (diff sign already stripped) -> (kind, subkind, name) or None.
 
-    kind is `symbol` (param/var/output/resource/module) or `comment` (name None). Pure."""
+    kind is `symbol` (param/var/output/resource/module) or `comment`. For comments the
+    `name` is the comment TEXT (capped) and subkind is `todo` for decision markers else
+    `comment`; decorative banners return None. Pure."""
     if lang == "bicep":
         m = _BICEP_DECL_RE.match(text)
         if m:

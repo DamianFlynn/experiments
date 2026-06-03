@@ -155,7 +155,7 @@ def build_artifacts(bundle):
     # Each carries a bounded before/after on its lifecycle entry (file-level entries
     # leave those absent). id = "<path>#<lang>:<subkind>:<name>" (stable per symbol).
     for ev in bundle.get("symbol_events", []):
-        kind = "comment" if ev["subkind"] == "comment" else "symbol"
+        kind = "comment" if ev["subkind"] in ("comment", "todo") else "symbol"
         aid = f'{ev["path"]}#{ev["lang"]}:{ev["subkind"]}:{ev["name"] or ""}'
         if aid not in artifacts:
             artifacts[aid] = {
