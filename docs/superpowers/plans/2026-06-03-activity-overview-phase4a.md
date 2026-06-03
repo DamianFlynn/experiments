@@ -170,13 +170,22 @@ issues + the forecast candidate spot-checked against the live GitHub API all mat
   version-pinned module-dependency edges (e.g. `workspace → private-endpoint v0.12.1`;
   `edge_extraction: 11 resolved, 1 failed, 1 skipped`) and `module_graph` renders the real diagram
   instead of a placeholder.
-- **Backlog (Phase 3c) — module-graph self-edges.** The bicep edge extraction emits a few
-  self-referential edges (e.g. `vpn-gateway → vpn-gateway`, sometimes duplicated) where a child
-  module references its own area id. Filter self-loops and dedupe edges before rendering.
-- **Backlog (Phase 3a) — clone commit window.** 6/18 merged-in-window PRs carried no commit in the
-  bounded clone (squash commit dates fall just outside the window even though the PR merged inside),
-  so those trains under-report code areas/deltas. Window commits by the owning PR's merge, or widen
-  the clone margin.
+- **DONE — name local child submodules (was: "module-graph self-edges").** The `vpn-gateway →
+  vpn-gateway` self edges were not noise: they are local relative refs to *private child
+  submodules* (`nat-rule/main.bicep`, `vpn-connection/main.bicep`, `container/main.bicep`, …),
+  instantiated as `= [for ...]` arrays (multiple instances). `build_bicep_edges` now resolves such
+  a ref to the named child node `<area>/<child>` with `local:true` + instance cardinality; a ref to
+  the area's own `main.bicep` is genuine recursion and stays a self edge. `module_graph` labels
+  these `child[]` (quoted so the brackets don't break Mermaid). AVM: 0 self-edges, 6 named child
+  edges (vpn-gateway uses nat-rule[] + vpn-connection[], storage-account uses container[], …).
+- **DONE — correct in-window commit capture + exclude stacked PRs (was: "clone commit window").**
+  Two causes were behind merged PRs missing their commits: (a) `git log --since/--until` pruned
+  valid in-window commits across committer timezones — now a full shallow-clone walk windowed in
+  Python on committer date (`window_records`, `%cd`); recovered AVM #7072/#6915/#6920. (b) Three
+  "merged" PRs (#7099/#7117/#7118) targeted *other feature branches* (`base = users/.../…`), i.e.
+  stacked/fork contributions that never shipped to main — now `meta.base_branch` + `_mainline_merge`
+  exclude them from shipped/trains while keeping them in the bundle as journey context. AVM result:
+  commits 12→15, **all 15 trains now carry commits** (was 12/18), shipped 24→21.
 
 ## Backlog — non-shipped train outcomes (awareness)
 

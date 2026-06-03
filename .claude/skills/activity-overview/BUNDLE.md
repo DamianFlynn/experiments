@@ -21,15 +21,22 @@ SHAs in `trains[].commits` — wrapped `commit` refs arrive in a later phase.)
 Scope notes mark where Phase 2 widens what Phase 1 collected; field lists below
 are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 
-- `meta` — `owner, repo, from, to, branches, clone_dir, period, prev_bundle, schema_version`,
-  plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
+- `meta` — `owner, repo, from, to, branches, base_branch, clone_dir, period, prev_bundle,
+  schema_version`. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
+  from it is a stacked/fork contribution (merged into another branch, not main) — kept in `prs`
+  as context but not counted as shipped-to-main (see `commits`/`date` note below and trains).
+  Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
   It pins the exact source tree so `gather.py --resume <prior-bundle>` can re-resolve **only**
   the `timeout`/`failed` edges against the identical tree (edges are a pure function of source),
   and a multi-bundle roll-up can pick the newest structural snapshot deterministically.
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
+  `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
+  (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
+  across committer timezones.
 - `prs` — PRs in scope (Phase 1: merged-in-window only; **Phase 2** also includes
   open and closed-unmerged PRs): `{ number, title, body, author, author_association,
-  labels, merged, merged_by, merged_at, closed_at, state, closes:[issue#], url }`.
+  labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
+  `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
 - `issues` — issues in scope (Phase 1: PR-closing issues only; **Phase 2** also
   includes open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
@@ -158,6 +165,8 @@ docsRefs, release_train, sprints, project, diagrams`.
   | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
   | `version` | pinned version when present, else `null` |
   | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
+  | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge |
+  | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
   | `resolved` | `true` when `to` is non-null |
 
