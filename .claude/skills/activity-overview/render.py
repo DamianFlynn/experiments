@@ -337,7 +337,11 @@ def emit_module_graph(bundle):
             dst_id = _node_id("m", edge["to"])
             nodes[src_id] = _area_tail(area["id"])
             nodes[dst_id] = _area_tail(edge["to"])
-            label = edge.get("version") or ("transitive" if edge.get("transitive") else "")
+            if edge.get("local"):
+                # private child submodule: mark multi-instance arrays as child[].
+                label = "child[]" if edge.get("instances") == "many" else "child"
+            else:
+                label = edge.get("version") or ("transitive" if edge.get("transitive") else "")
             drawn.append((src_id, dst_id, label))
     if not drawn:
         lines.append("    none[No module dependencies]")

@@ -793,18 +793,23 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
 # Phase 3c: IaC dependency-edge extraction (build-only). The edge object is
 # {to, kind, ref, version, transitive, provider, resolved}; see BUNDLE.md.
 
-_BICEP_MODULE_RE = re.compile(r"module\s+\w+\s+'(?P<ref>[^']+)'")
+_BICEP_MODULE_RE = re.compile(
+    r"module\s+\w+\s+'(?P<ref>[^']+)'(?:\s*=\s*(?P<open>[\[{]))?")
 
 
 def parse_bicep_module_refs(source_text):
     """Extract `module <sym> '<ref>'` references from a .bicep source.
 
-    Each result is {ref, registry_path, version, local_path}. Registry refs
-    (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
-    `registry_path` + `version`; everything else is a `local_path`. Pure."""
+    Each result is {ref, registry_path, version, local_path, instances}. Registry
+    refs (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
+    `registry_path` + `version`; everything else is a `local_path`. `instances` is
+    `"many"` when the module is instantiated as an array (`= [for ...]`), `"one"`
+    for a single `= {`, else None. Pure."""
     refs = []
     for m in _BICEP_MODULE_RE.finditer(source_text or ""):
         ref = m.group("ref")
+        open_ch = m.group("open")
+        instances = "many" if open_ch == "[" else "one" if open_ch == "{" else None
         registry_path = version = local_path = None
         if ref.startswith("br/public:") or ref.startswith("br:"):
             body = ref.split(":", 1)[1]              # drop the br/public or br scheme
@@ -818,7 +823,8 @@ def parse_bicep_module_refs(source_text):
         else:
             local_path = ref
         refs.append({"ref": ref, "registry_path": registry_path,
-                     "version": version, "local_path": local_path})
+                     "version": version, "local_path": local_path,
+                     "instances": instances})
     return refs
 
 
@@ -920,18 +926,36 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     patterns = patterns or DEFAULT_AREA_PATTERNS
     edges = []
     seen = set()
+    self_id = classify_code_area(base_path, patterns)
 
     for ri in parse_bicep_module_refs(source_text):
         to = resolve_module_ref(ri, base_path, patterns)
+        local = False
+        # A local relative ref that resolves back to THIS area is a private child
+        # submodule (e.g. `nat-rule/main.bicep`), not a self-dependency. Name the
+        # child node (`<area>/<child>`) so the graph shows which private submodule
+        # is used; a ref to the area's own main.bicep is genuine recursion and is
+        # left as a self edge.
+        if ri.get("local_path") and to is not None and to == self_id:
+            joined = os.path.normpath(
+                os.path.join(os.path.dirname(base_path or ""), ri["local_path"]))
+            child_dir = os.path.dirname(joined)
+            if child_dir != self_id and child_dir.startswith(str(self_id) + "/"):
+                to = child_dir
+                local = True
         key = (to, ri["ref"], False)
         if key in seen:
             continue
         seen.add(key)
-        edges.append({"to": to, "kind": "module", "ref": ri["ref"],
-                      "version": ri["version"], "transitive": False,
-                      "provider": "bicep", "resolved": to is not None})
+        edge = {"to": to, "kind": "module", "ref": ri["ref"],
+                "version": ri["version"], "transitive": False,
+                "provider": "bicep", "resolved": to is not None}
+        if local:
+            edge["local"] = True
+            if ri.get("instances"):
+                edge["instances"] = ri["instances"]
+        edges.append(edge)
 
-    self_id = classify_code_area(base_path, patterns)
     immediate_tos = {e["to"] for e in edges}  # direct deps, already captured above
     for node in walk_arm_deployments(arm_json):
         # depth 1 == the direct module instantiations (already emitted as immediate

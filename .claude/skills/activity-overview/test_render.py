@@ -546,6 +546,18 @@ class TestModuleGraph(unittest.TestCase):
         mmd = render.emit_module_graph(empty)
         self.assertIn("No module dependencies", mmd)
 
+    def test_local_child_edge_is_named_and_marked_multi_instance(self):
+        """A local child-submodule edge renders the named child node and a marker
+        that distinguishes it as a local, multi-instance (array) dependency."""
+        bundle = {"code_graph": {"areas": [
+            {"id": "avm/res/network/vpn-gateway", "edges": [
+                {"to": "avm/res/network/vpn-gateway/nat-rule", "kind": "module",
+                 "ref": "nat-rule/main.bicep", "version": None, "transitive": False,
+                 "local": True, "instances": "many", "resolved": True}]}]}}
+        mmd = render.emit_module_graph(bundle)
+        self.assertIn("nat-rule", mmd)        # child submodule named
+        self.assertIn("child[]", mmd)         # local + multi-instance marker
+
     def test_registered_in_render_manifest(self):
         names = set(render.render(self.bundle))
         self.assertIn("module_graph", names)
