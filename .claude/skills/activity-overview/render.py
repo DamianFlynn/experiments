@@ -15,6 +15,12 @@ INSTALL_HINT = (
     "Install mermaid-cli: `npm install -g @mermaid-js/mermaid-cli`."
 )
 
+# Adaptive layout thresholds for emit_train_flowchart:
+#   mode C (full, with area nodes) when prs <= MAX_PRS and areas <= MAX_AREAS;
+#   mode A (bare issue→PR→outcome only) otherwise.
+TRAIN_FLOW_MAX_PRS = 4
+TRAIN_FLOW_MAX_AREAS = 5
+
 _PIE_ROWS = [
     ("Shipped", "shipped"),
     ("In flight", "in_flight"),
@@ -217,6 +223,95 @@ def emit_kind_breakdown(bundle):
     return "\n".join(lines) + "\n"
 
 
+def emit_train_flowchart(bundle, train):
+    """A Mermaid `flowchart` telling the life story of one train.
+
+    Outcome mapping: 'shipped' -> 'Shipped [-> <milestone>]';
+    'rejected' -> 'Rejected'; anything else (open, in_flight, ...) -> 'In flight'.
+
+    Adaptive layout:
+      mode C (default): PR nodes annotated with distinct code_area nodes when
+        len(prs) <= TRAIN_FLOW_MAX_PRS and len(code_areas) <= TRAIN_FLOW_MAX_AREAS.
+      mode A: bare issue -> PR -> outcome chain when either threshold is exceeded.
+    """
+    issues_by_num = {i["number"]: i for i in bundle.get("issues", [])}
+    prs_by_num = {p["number"]: p for p in bundle.get("prs", [])}
+
+    train_prs = train.get("prs", [])
+    code_areas = train.get("code_areas", [])
+    outcome = train.get("outcome", "")
+
+    # Determine mode
+    mode_c = (len(train_prs) <= TRAIN_FLOW_MAX_PRS and
+              len(code_areas) <= TRAIN_FLOW_MAX_AREAS)
+
+    lines = ["flowchart LR"]
+
+    # --- issue node (when root_issue present) ---
+    root_issue_num = train.get("root_issue")
+    issue_node_id = None
+    if root_issue_num is not None:
+        issue = issues_by_num.get(root_issue_num, {})
+        issue_title = issue.get("title") or f"Issue #{root_issue_num}"
+        issue_node_id = _node_id("iss", str(root_issue_num))
+        lines.append(f'    {issue_node_id}["{_flow_label(issue_title)}"]')
+
+    # --- PR nodes ---
+    pr_node_ids = []
+    for pr_num in train_prs:
+        pr = prs_by_num.get(pr_num, {})
+        pr_title = pr.get("title") or f"PR #{pr_num}"
+        pr_id = _node_id("pr", str(pr_num))
+        pr_node_ids.append(pr_id)
+        lines.append(f'    {pr_id}["{_flow_label(pr_title)}"]')
+
+    # --- outcome node ---
+    if outcome == "shipped":
+        # best-effort: take first non-empty PR milestone
+        milestone = None
+        for pr_num in train_prs:
+            ms = (prs_by_num.get(pr_num) or {}).get("milestone")
+            if ms:
+                milestone = ms
+                break
+        if milestone:
+            outcome_label = f"Shipped → {_flow_label(str(milestone))}"
+        else:
+            outcome_label = "Shipped"
+    elif outcome == "rejected":
+        outcome_label = "Rejected"
+    else:
+        outcome_label = "In flight"
+
+    outcome_node_id = _node_id("out", train.get("id", "train"))
+    lines.append(f'    {outcome_node_id}(["{_flow_label(outcome_label)}"])')
+
+    # --- edges: issue -> PRs ---
+    if issue_node_id:
+        for pr_id in pr_node_ids:
+            lines.append(f"    {issue_node_id} --> {pr_id}")
+    # If PR-only train and no issue node, PRs are the start nodes (no extra edge needed)
+
+    # --- edges: PRs -> outcome ---
+    for pr_id in pr_node_ids:
+        lines.append(f"    {pr_id} --> {outcome_node_id}")
+
+    # --- mode C: area annotation nodes and edges ---
+    if mode_c and code_areas:
+        area_nodes = {}
+        for area in code_areas:
+            aid = _node_id("area", area)
+            area_nodes[aid] = _area_tail(area)
+        for aid, label in sorted(area_nodes.items()):
+            lines.append(f'    {aid}("{_flow_label(label)}")')
+        # link each PR -> its area nodes
+        for pr_id in pr_node_ids:
+            for aid in sorted(area_nodes):
+                lines.append(f"    {pr_id} --> {aid}")
+
+    return "\n".join(lines) + "\n"
+
+
 def emit_module_graph(bundle):
     """A Mermaid `flowchart` of resolved area->area dependency edges (blast radius).
 
@@ -264,17 +359,45 @@ def render(bundle):
     }
 
 
-def write_diagrams(bundle, outdir="workspace/diagrams"):
+def write_diagrams(bundle, outdir="workspace/diagrams", train_id=None):
     """Write each diagram to <outdir>/<name>.mmd.
 
     Records a **workspace-relative** manifest on `bundle["diagrams"]` (e.g.
     `diagrams/<name>.mmd` — paths relative to the parent of `outdir`) so the
     persisted bundle is portable for downstream embedding, per the design spec.
     RETURNS the real on-disk paths (name -> path as written) so the caller can
-    hand them straight to `validate_with_mmdc`."""
+    hand them straight to `validate_with_mmdc`.
+
+    When `train_id` is given, renders ONLY that one train's flowchart (spotlight
+    mode); the flat single-instance diagrams are skipped. Otherwise, all flat
+    diagrams are written plus train flowcharts for every deep-tier train.
+    `bundle["diagrams"]["train_flowcharts"]` is always a nested map
+    {<train-id>: <workspace-relative-path>}."""
     os.makedirs(outdir, exist_ok=True)
     root = os.path.dirname(os.path.normpath(outdir)) or "."
     real_paths = {}
+
+    if train_id is not None:
+        # Spotlight: render exactly one train (any tier)
+        trains_by_id = {t["id"]: t for t in bundle.get("trains", [])}
+        if train_id not in trains_by_id:
+            raise KeyError(f"train_id {train_id!r} not found in bundle")
+        train = trains_by_id[train_id]
+        text = emit_train_flowchart(bundle, train)
+        fname = f"train-{train_id}.mmd"
+        path = os.path.join(outdir, fname)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        key = f"train-{train_id}"
+        real_paths[key] = path
+        rel = os.path.relpath(path, root)
+        # Merge into the bundle diagrams (preserve existing flat keys if any)
+        diags = bundle.setdefault("diagrams", {})
+        tf = diags.setdefault("train_flowcharts", {})
+        tf[train_id] = rel
+        return real_paths
+
+    # Default: write flat single-instance diagrams
     relative = {}
     for name, text in render(bundle).items():
         path = os.path.join(outdir, f"{name}.mmd")
@@ -282,6 +405,23 @@ def write_diagrams(bundle, outdir="workspace/diagrams"):
             fh.write(text)
         real_paths[name] = path
         relative[name] = os.path.relpath(path, root)
+
+    # Write train flowcharts for every deep train
+    train_rel_map = {}
+    for train in bundle.get("trains", []):
+        if train.get("tier") != "deep":
+            continue
+        tid = train["id"]
+        text = emit_train_flowchart(bundle, train)
+        fname = f"train-{tid}.mmd"
+        path = os.path.join(outdir, fname)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        key = f"train-{tid}"
+        real_paths[key] = path
+        train_rel_map[tid] = os.path.relpath(path, root)
+
+    relative["train_flowcharts"] = train_rel_map
     bundle["diagrams"] = relative
     return real_paths
 
@@ -324,6 +464,8 @@ def parse_args(argv):
                    help="Also export images beside each .mmd.")
     p.add_argument("--skip-validate", action="store_true",
                    help="Skip the mmdc compile check (not recommended).")
+    p.add_argument("--train", default=None, metavar="TRAIN_ID",
+                   help="Spotlight: render only this one train's flowchart (any tier).")
     return p.parse_args(argv)
 
 
@@ -331,7 +473,7 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     with open(args.bundle) as fh:
         bundle = json.load(fh)
-    manifest = write_diagrams(bundle, args.diagrams_dir)
+    manifest = write_diagrams(bundle, args.diagrams_dir, train_id=args.train)
     if not args.skip_validate:
         try:
             validate_with_mmdc(list(manifest.values()), export=args.export)
