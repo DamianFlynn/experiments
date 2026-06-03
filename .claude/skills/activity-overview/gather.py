@@ -466,6 +466,21 @@ _TF_RES_RE = re.compile(r'^\s*resource\s+"([^"]+)"\s+"([^"]+)"')
 _TF_BLOCK_RE = re.compile(r'^\s*(variable|output|module)\s+"([^"]+)"')
 _TF_COMMENT_RE = re.compile(r"^\s*(#|//)")
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# Actionable/decision markers — surfaced as subkind `todo` so the report can focus on
+# them (these are where ideas get broken down into follow-on issues/PRs).
+_TODO_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX|BUG)\b", re.IGNORECASE)
+
+
+def _comment_decl(text):
+    """Classify a matched comment line -> (kind, subkind, name), or None. The comment
+    TEXT is the identity (capped) so a comment REPLACED as a decision evolves is tracked
+    as the old text dropped + the new text added, not collapsed away. `todo` flags
+    markers. Decorative separators/banners (no alphanumeric content) are not tracked."""
+    body = text.strip()
+    if not re.search(r"[A-Za-z0-9]", body):
+        return None   # e.g. `// ======`, `// ------` — no decision content
+    subkind = "todo" if _TODO_RE.search(body) else "comment"
+    return ("comment", subkind, body[:140])
 
 
 def symbol_lang(path):
@@ -486,7 +501,7 @@ def detect_symbol_decl(lang, text):
         if m:
             return ("symbol", m.group(1), m.group(2))
         if _BICEP_COMMENT_RE.match(text):
-            return ("comment", "comment", None)
+            return _comment_decl(text)
         return None
     if lang == "terraform":
         m = _TF_RES_RE.match(text)
@@ -496,7 +511,7 @@ def detect_symbol_decl(lang, text):
         if m:
             return ("symbol", m.group(1), m.group(2))
         if _TF_COMMENT_RE.match(text):
-            return ("comment", "comment", None)
+            return _comment_decl(text)
         return None
     return None
 
@@ -563,15 +578,17 @@ def build_symbol_deltas(path, hunks):
                     note(current, sign, text)
                 continue
             kind, subkind, name = decl
-            key = (subkind, name) if kind == "symbol" else ("comment", None)
-            current = key
+            key = (subkind, name)
             if sign == "+":
                 added[key] = key
                 note(key, "+", text)
             elif sign == "-":
                 removed[key] = key
                 note(key, "-", text)
-            # a context declaration only updates `current`
+            # Symbol declarations become the enclosing `current` for body edits;
+            # comments are identified by text and never own a following body edit.
+            if kind == "symbol":
+                current = key
 
     deltas = []
     for key in dict.fromkeys(list(added) + list(removed) + list(touched)):

@@ -1664,6 +1664,14 @@ class TestDetectSymbolDecl(unittest.TestCase):
                          ("symbol", "variable", "region"))
         self.assertEqual(gather.detect_symbol_decl("terraform", "# comment")[0], "comment")
 
+    def test_comment_subkinds_and_decorative_filter(self):
+        self.assertEqual(gather.detect_symbol_decl("bicep", "// TODO: revisit"),
+                         ("comment", "todo", "// TODO: revisit"))
+        self.assertEqual(gather.detect_symbol_decl("bicep", "// a real note")[1], "comment")
+        # decorative separators carry no decision content -> not tracked
+        self.assertIsNone(gather.detect_symbol_decl("bicep", "// ============ //"))
+        self.assertIsNone(gather.detect_symbol_decl("terraform", "# -----------"))
+
     def test_unknown_lang_is_none(self):
         self.assertIsNone(gather.detect_symbol_decl("python", "def f():"))
 
@@ -1681,7 +1689,38 @@ class TestBuildSymbolDeltas(unittest.TestCase):
         self.assertEqual(d[("resource", "vault")]["change"], "change")
         self.assertIn("name: 'old'", d[("resource", "vault")]["before"])
         self.assertIn("name: 'new'", d[("resource", "vault")]["after"])
-        self.assertEqual(d[("comment", None)]["change"], "add")
+        # comments are keyed by TEXT (not collapsed to one per file)
+        self.assertEqual(d[("comment", "@description('the vault')")]["change"], "add")
+
+    def test_comment_replacement_keeps_both_old_and_new_text(self):
+        # A comment replaced as a decision evolves -> old text dropped, new text added,
+        # both preserved (the decision trail), not collapsed into one blob.
+        diff = ("diff --git a/m.bicep b/m.bicep\n--- a/m.bicep\n+++ b/m.bicep\n"
+                "@@ -1,2 +1,2 @@\n"
+                "-// TODO: decide retention window\n"
+                "+// retention fixed at 90d per #123\n"
+                " param x string\n")
+        f = gather.parse_unified_diff(diff)[0]
+        deltas = {(d["subkind"], d["name"]): d
+                  for d in gather.build_symbol_deltas("m.bicep", f["hunks"])}
+        # old TODO dropped (and recognised as a decision marker)...
+        old = deltas[("todo", "// TODO: decide retention window")]
+        self.assertEqual(old["change"], "drop")
+        # ...new note added — both texts captured as distinct deltas
+        new = deltas[("comment", "// retention fixed at 90d per #123")]
+        self.assertEqual(new["change"], "add")
+
+    def test_comment_does_not_swallow_following_body_edit(self):
+        # a comment must not become the enclosing symbol for a later body change
+        diff = ("diff --git a/m.bicep b/m.bicep\n--- a/m.bicep\n+++ b/m.bicep\n"
+                "@@ -1,3 +1,3 @@\n"
+                " resource vault 'x' = {\n"
+                " // note\n"
+                "-  sku: 'A'\n+  sku: 'B'\n }\n")
+        f = gather.parse_unified_diff(diff)[0]
+        d = {(x["subkind"], x["name"]): x
+             for x in gather.build_symbol_deltas("m.bicep", f["hunks"])}
+        self.assertEqual(d[("resource", "vault")]["change"], "change")  # body edit -> resource
 
     def test_terraform_change_and_add(self):
         d = self._by_name("live/prod/main.tf", TF_DIFF)

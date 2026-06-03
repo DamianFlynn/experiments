@@ -74,9 +74,14 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **symbol_events** (gather, Phase 3d) — symbol-granular change events from a single
   full-window `git log -p --unified=3` walk, attributed **diff-locally**: `[{commit,
   author, date, path, lang:"bicep|terraform", subkind:"param|var|output|resource|
-  module|variable|comment", name|null, change:"add|drop|change", before, after}]`.
-  `before`/`after` are bounded (≤200 char) hunk snippets. The raw material Link folds
-  into symbol artifacts. (graphify-language symbols are best-effort where present.)
+  module|variable|comment|todo", name, change:"add|drop|change", before, after}]`.
+  `before`/`after` are bounded (≤200 char) hunk snippets. **Comments** are identified by
+  their TEXT (`name` = the comment, capped), so a comment **replaced as a decision
+  evolves** is tracked as the old text dropped + the new text added (the decision trail)
+  rather than collapsed; actionable/decision markers (`TODO`/`FIXME`/`HACK`/`XXX`/`BUG`)
+  get subkind **`todo`**; decorative banner comments (no alphanumeric content) are
+  ignored. The raw material Link folds into symbol artifacts. (graphify-language symbols
+  are best-effort where present.)
 - **artifacts** `{ "<id>": { kind:"example|doc|readme|symbol|comment", path, name,
   status:"live|removed|replaced", replaced_by:id|null, code_area, lifecycle:[{event:
   "add|change|remove", commit, author, date, ref[, before, after]}] } }`. File-level

@@ -942,7 +942,11 @@ against GitHub) after each.
   `kind:symbol|comment` artifacts (`<path>#<lang>:<subkind>:<name>`) and `feature_deltas` with a
   **bounded** (≤200 char) `before`/`after` + `detail` (`<lang> <subkind> <name>`). Covers Bicep
   (`param`/`var`/`output`/`resource`/`module`) and Terraform (`resource`/`variable`/`output`/
-  `module`); graphify-language symbols are best-effort where the optional CLI is present. The gate
+  `module`); graphify-language symbols are best-effort where the optional CLI is present.
+  **Comments** are tracked by text, so one **replaced as a decision evolves** is captured as
+  old-dropped + new-added (the decision trail — context for how ideas break into follow-on
+  issues/PRs); markers (`TODO`/`FIXME`/`HACK`/`XXX`/`BUG`) carry subkind `todo`; decorative
+  banners are ignored. The gate
   asserts the symbol ledger lights up (with bounded snippets) on a busy code window. *Original
   scope note:* extend the artifact ledger from file-granularity to **symbols** with `-p` hunk
   parsing; `artifacts[].kind` gains `symbol`/`comment`
