@@ -482,7 +482,7 @@ def score_train_significance(bundle):
     """Annotate each train with `significance` (float) and `tier` ('deep'|'mention').
 
     significance = footprint * kind_weight + breadth, where:
-      footprint = len(prs) + len(commits) + len(code_areas)
+      footprint = len(prs) + len(commits) + len(code_areas)  # note: code_areas also feeds the breadth term
       kind_weight from TRAIN_KIND_WEIGHTS (unknown kinds → 'other' weight)
       breadth = len(code_areas)
     tier = 'deep' for the top-TRAIN_SIGNIFICANCE_TOP_N trains OR any train

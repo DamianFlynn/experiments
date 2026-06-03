@@ -865,13 +865,18 @@ class TestTrainSignificance(unittest.TestCase):
         self.assertGreater(big_rejected["significance"], 0)
         # given it's a large feature train, it should be deep
         self.assertEqual(big_rejected["tier"], "deep")
+        # prove outcome-independence: an equivalently-sized shipped train gets the same tier
+        equiv_shipped = self._train("train-issue-31", "feature", [30, 31, 32], ["c1", "c2", "c3"], ["area-a", "area-b"])
+        b2 = self._bundle([equiv_shipped])
+        link.score_train_significance(b2)
+        self.assertEqual(big_rejected["tier"], equiv_shipped["tier"])
 
-    def test_tiny_docs_train_is_mention(self):
-        """A tiny docs train with a single PR and no areas is mention tier
-        when it is outranked by enough larger trains to fall outside the top-N."""
+    def test_tiny_lightweight_trains_are_mention(self):
+        """Tiny docs and chore trains with minimal footprint are both mention tier
+        when outranked by enough larger trains to fall outside the top-N."""
         N = link.TRAIN_SIGNIFICANCE_TOP_N
-        # Populate N large feature trains so the tiny docs train falls below top-N
-        # and also below the floor (its sig = 2*1.0+0 = 2.0, well under floor).
+        # Populate N large feature trains so both tiny trains fall below top-N
+        # and also below the floor (their sig = 2*1.0+0 = 2.0, well under floor).
         large = [
             self._train(f"train-issue-{i}", "feature",
                         list(range(i * 10, i * 10 + 5)),
@@ -879,26 +884,12 @@ class TestTrainSignificance(unittest.TestCase):
                         [f"area-x{i}", f"area-y{i}", f"area-z{i}"])
             for i in range(N)
         ]
-        tiny = self._train("train-pr-200", "docs", [200], ["c200"], [])
-        bundle = self._bundle(large + [tiny])
+        tiny_docs = self._train("train-pr-200", "docs", [200], ["c200"], [])
+        tiny_chore = self._train("train-pr-201", "chore", [201], ["c201"], [])
+        bundle = self._bundle(large + [tiny_docs, tiny_chore])
         link.score_train_significance(bundle)
-        self.assertEqual(tiny["tier"], "mention")
-
-    def test_tiny_other_train_is_mention(self):
-        """A tiny other/chore train with minimal footprint is mention tier
-        when it is outranked by enough larger trains to fall outside the top-N."""
-        N = link.TRAIN_SIGNIFICANCE_TOP_N
-        large = [
-            self._train(f"train-issue-{i}", "feature",
-                        list(range(i * 10, i * 10 + 5)),
-                        [f"sha{i}{j}" for j in range(5)],
-                        [f"area-x{i}", f"area-y{i}", f"area-z{i}"])
-            for i in range(N)
-        ]
-        tiny = self._train("train-pr-201", "chore", [201], ["c201"], [])
-        bundle = self._bundle(large + [tiny])
-        link.score_train_significance(bundle)
-        self.assertEqual(tiny["tier"], "mention")
+        self.assertEqual(tiny_docs["tier"], "mention")
+        self.assertEqual(tiny_chore["tier"], "mention")
 
     # ----- determinism / stable ordering -----
 
@@ -918,18 +909,19 @@ class TestTrainSignificance(unittest.TestCase):
         self.assertEqual([t["significance"] for t in trains], sigs_first)
 
     def test_tied_significance_breaks_by_id(self):
-        """Two trains with identical scores get consistent tiers (id-based tiebreak)."""
-        # Two identical trains except for id — they'll have the same significance
+        """When two trains tie on significance and only one fits in top-N, the
+        lexicographically-lower id wins the 'deep' slot."""
         t1 = self._train("train-issue-60", "bug", [60], ["c1"], ["area-a"])
         t2 = self._train("train-issue-70", "bug", [70], ["c2"], ["area-b"])
-        bundle = self._bundle([t1, t2])
-        link.score_train_significance(bundle)
-        # Both have equal significance; with N>=2 they'd both be deep — the key
-        # assertion is that the result is stable (same id -> same tier across calls).
-        tier1, tier2 = t1["tier"], t2["tier"]
-        link.score_train_significance(bundle)
-        self.assertEqual(t1["tier"], tier1)
-        self.assertEqual(t2["tier"], tier2)
+        orig_n = link.TRAIN_SIGNIFICANCE_TOP_N
+        link.TRAIN_SIGNIFICANCE_TOP_N = 1
+        try:
+            bundle = self._bundle([t1, t2])
+            link.score_train_significance(bundle)
+            self.assertEqual(t1["tier"], "deep")
+            self.assertEqual(t2["tier"], "mention")
+        finally:
+            link.TRAIN_SIGNIFICANCE_TOP_N = orig_n
 
     # ----- wired into enrich -----
 
