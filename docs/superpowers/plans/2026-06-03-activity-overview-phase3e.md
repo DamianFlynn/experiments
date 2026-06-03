@@ -1,6 +1,6 @@
 # Phase 3e — symbol-identity tracking (implementation plan)
 
-**Status:** in progress. Branch `claude/activity-phase3e`. Builds on the merged 3d symbol
+**Status:** shipped (PR #9). Branch `claude/activity-phase3e`. Builds on the merged 3d symbol
 ledger. Scope (confirmed): **window-wide matching** — link a symbol dropped in one file to the
 same symbol added in another, anywhere in the window, with strong guards + confidence. The
 highest-risk slice, so precision (no false links) is valued over recall.
@@ -38,9 +38,9 @@ splits (one symbol → many).
 
 For each detected move, on the symbol artifacts: source `status="replaced"`,
 `replaced_by=<dest aid>`; dest `identity_from=<source aid>`; both carry `move_confidence` +
-`move_basis`. A `symbol_moves` summary (count by confidence) goes on the bundle. Feature_deltas
-for the linked add/drop gain `moved_from`/`moved_to` so the report can collapse them into one
-"moved" row.
+`move_basis`. A `symbol_moves` summary (count by confidence) goes on the bundle. (Deferred — NOT
+in this slice: enriching the linked add/drop feature_deltas with `moved_from`/`moved_to`. The
+report instead collapses a move via the artifacts' `replaced_by`/`identity_from`, per SKILL.md.)
 
 ## Validation
 

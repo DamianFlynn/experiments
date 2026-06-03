@@ -726,6 +726,12 @@ class TestSymbolIdentity(unittest.TestCase):
                self._ev("b/m.bicep", "comment", "// note", "add")]
         self.assertEqual(link.match_symbol_moves(evs), [])
 
+    def test_cross_language_not_linked(self):
+        # same subkind+name but different language -> NOT the same symbol
+        evs = [{**self._ev("a/main.bicep", "module", "net", "drop")},
+               {**self._ev("b/main.tf", "module", "net", "add"), "lang": "terraform"}]
+        self.assertEqual(link.match_symbol_moves(evs), [])
+
     def test_link_symbol_identity_sets_replaced_by_and_confidence(self):
         b = {"meta": {"owner": "o", "repo": "r"}, "commits": [], "prs": [], "issues": [],
              "code_events": [], "symbol_events": [

@@ -528,12 +528,13 @@ def match_symbol_moves(symbol_events, rename_pairs=()):
     source file, one dest file, different) are linked; ambiguous names (boilerplate
     dropped/added in >1 file) are SKIPPED — the key false-positive guard. `confidence`
     is `high` when `(src, dst)` is also a git rename/copy pair, else `medium`. Comments
-    are excluded. -> [{subkind, name, from_path, to_path, confidence, basis}] (sorted)."""
+    are excluded. -> [{lang, subkind, name, from_path, to_path, confidence, basis}] (sorted).
+    Keyed by `lang` too, so a Bicep symbol can't link to a same-named Terraform one."""
     drops, adds = {}, {}
     for e in symbol_events:
         if e.get("subkind") in _COMMENT_SUBKINDS:
             continue
-        key = (e.get("subkind"), e.get("name"))
+        key = (e.get("lang"), e.get("subkind"), e.get("name"))
         bucket = drops if e.get("change") == "drop" else adds if e.get("change") == "add" else None
         if bucket is not None and e.get("path"):
             bucket.setdefault(key, set()).add(e["path"])
@@ -546,10 +547,10 @@ def match_symbol_moves(symbol_events, rename_pairs=()):
         a, b = next(iter(src)), next(iter(dst))
         if a == b:
             continue                       # re-added in the same file -> not a move
-        subkind, name = key
+        lang, subkind, name = key
         basis = "file_rename" if (a, b) in renames else "unique_name"
-        moves.append({"subkind": subkind, "name": name, "from_path": a, "to_path": b,
-                      "confidence": "high" if basis == "file_rename" else "medium",
+        moves.append({"lang": lang, "subkind": subkind, "name": name, "from_path": a,
+                      "to_path": b, "confidence": "high" if basis == "file_rename" else "medium",
                       "basis": basis})
     return sorted(moves, key=lambda m: (m["from_path"], str(m["subkind"]), str(m["name"])))
 
@@ -566,10 +567,9 @@ def link_symbol_identity(bundle):
     summary = {"high": 0, "medium": 0}
     linked = []
     for m in moves:
-        la = gather.symbol_lang(m["from_path"]) or ""
-        lb = gather.symbol_lang(m["to_path"]) or ""
-        src = f'{m["from_path"]}#{la}:{m["subkind"]}:{m["name"]}'
-        dst = f'{m["to_path"]}#{lb}:{m["subkind"]}:{m["name"]}'
+        lang = m["lang"] or ""             # both endpoints share lang (move key includes it)
+        src = f'{m["from_path"]}#{lang}:{m["subkind"]}:{m["name"]}'
+        dst = f'{m["to_path"]}#{lang}:{m["subkind"]}:{m["name"]}'
         if src in arts and dst in arts:
             arts[src]["status"] = "replaced"
             arts[src]["replaced_by"] = dst

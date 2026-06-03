@@ -344,7 +344,8 @@ jobs:
           # consistent. Real moves can be 0 in a window (the uniqueness guard skips
           # boilerplate refactors), so assert SHAPE, not presence.
           sm = b.get("symbol_moves", {})
-          assert set(sm) >= {"links", "by_confidence"}, f"symbol_moves malformed: {sm}"
+          assert isinstance(sm, dict) and isinstance(sm.get("links"), list) \
+              and isinstance(sm.get("by_confidence"), dict), f"symbol_moves malformed: {sm}"
           for lk in sm["links"]:
               assert lk["confidence"] in {"high", "medium"}, lk
               assert lk["basis"] in {"file_rename", "unique_name"}, lk
