@@ -674,6 +674,9 @@ def slice_train(bundle, train_id):
         }
 
     Raises KeyError when train_id is not found.  Does NOT mutate the bundle.
+    The `train` block's effort/evidence/code_areas and the feature_deltas /
+    symbol_moves lists are taken by reference from the bundle, so callers must
+    treat the returned slice as read-only and not mutate it in place.
     """
     # --- locate the train ---------------------------------------------------
     trains_by_id = {t["id"]: t for t in bundle.get("trains", [])}
@@ -748,8 +751,8 @@ def slice_train(bundle, train_id):
         commit_blocks.append({
             "sha":     raw_c.get("sha"),
             "message": _cap_text(raw_c.get("message") or ""),
-            "author":  raw_c.get("author", None),
-            "date":    raw_c.get("date", None),
+            "author":  raw_c.get("author"),
+            "date":    raw_c.get("date"),
         })
 
     # --- feature_deltas filtered to this train ------------------------------

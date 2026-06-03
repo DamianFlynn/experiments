@@ -1492,10 +1492,9 @@ class TestSliceTrain(unittest.TestCase):
         s = link.slice_train(bundle, "train-issue-10")
         pr_100 = next(p for p in s["prs"] if p["number"] == 100)
         body = pr_100["body"]
-        self.assertLessEqual(len(body), cap + 50,
-                             "truncated body should not be much longer than cap")
-        self.assertIn("…", body + "[+", "truncated body must carry an overflow marker")
-        # verify it's actually shorter than the original (which is 2000 chars)
+        # fixture PR body is "x" * 2000; overflow = 2000 - 1500 = 500
+        self.assertTrue(body.endswith("…[+500 chars]"),
+                        f"expected exact '…[+500 chars]' marker, got: {body[-30]!r}")
         self.assertLess(len(body), 2000)
 
     def test_short_body_is_unchanged(self):
@@ -1510,6 +1509,19 @@ class TestSliceTrain(unittest.TestCase):
         cap = link.SLICE_TEXT_CAP
         s = link.slice_train(bundle, "train-issue-10")
         self.assertLessEqual(len(s["issue"]["body"]), cap + 50)
+
+    def test_commit_message_truncated_when_long(self):
+        """Commit messages over SLICE_TEXT_CAP are truncated with the exact marker."""
+        bundle = self._bundle()
+        # Override aaa111's message with a long one: 2000 chars -> overflow = 500
+        bundle["commits"][0]["message"] = "z" * 2000
+        s = link.slice_train(bundle, "train-issue-10")
+        commit = next(c for c in s["commits"] if c["sha"] == "aaa111")
+        self.assertTrue(
+            commit["message"].endswith("…[+500 chars]"),
+            f"expected '…[+500 chars]' marker, got tail: {commit['message'][-30:]!r}",
+        )
+        self.assertLess(len(commit["message"]), 2000)
 
     # ------------------------------------------------------------------
     # Comment overflow
@@ -1628,8 +1640,18 @@ class TestSliceTrain(unittest.TestCase):
         bundle = self._bundle()
         original = copy.deepcopy(bundle)
         link.slice_train(bundle, "train-issue-10")
+        # Scalar fields and list lengths of the bundle itself must be unchanged.
         self.assertEqual(bundle["issues"][0]["body"], original["issues"][0]["body"])
         self.assertEqual(len(bundle["feature_deltas"]), len(original["feature_deltas"]))
+        # By-reference aliased fields on the train dict must not have been mutated
+        # (effort, evidence, code_areas are assigned by reference into the slice).
+        train_orig = original["trains"][0]
+        train_now = bundle["trains"][0]
+        self.assertEqual(train_now["effort"], train_orig["effort"])
+        self.assertEqual(train_now["evidence"], train_orig["evidence"])
+        self.assertEqual(train_now["code_areas"], train_orig["code_areas"])
+        # Delta dicts themselves must be unchanged (they are aliased into own_deltas).
+        self.assertEqual(bundle["feature_deltas"], original["feature_deltas"])
 
     # ------------------------------------------------------------------
     # slice for the other train (train-issue-11)
