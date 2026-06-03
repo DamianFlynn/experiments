@@ -447,6 +447,70 @@ def attribute_train_areas(bundle, idx):
     return bundle
 
 
+# ---------------------------------------------------------------------------
+# Phase 4a: train significance scoring + treatment tier
+# ---------------------------------------------------------------------------
+
+# Per-kind multiplier on the raw footprint.  feature/module-request represent
+# the heaviest intentional work; bug is medium; idea captures light exploration;
+# docs/chore/other are lightweight.  Tune these values without touching the
+# scoring formula — that's why they're a named constant.
+TRAIN_KIND_WEIGHTS = {
+    "feature": 3.0,
+    "module-request": 3.0,
+    "bug": 2.0,
+    "idea": 1.5,
+    "docs": 1.0,
+    "chore": 1.0,
+    "other": 1.0,
+}
+
+# Top-N trains (by significance desc, then id) that always receive the "deep"
+# treatment tier regardless of absolute score.
+TRAIN_SIGNIFICANCE_TOP_N = 8
+
+# Absolute floor: any train at or above this value is "deep" even when ranked
+# outside the top-N.  Reasoning: a single multi-PR feature train with 3 PRs
+# + 3 commits + 2 areas has footprint=8 and weight=3.0, so significance=8*3+2
+# = 26.  Setting the floor at 20 ensures any such train always clears it while
+# a minimal 1-PR docs train (footprint=2, weight=1.0, breadth=0 → sig=2.0)
+# stays well below it.
+TRAIN_SIGNIFICANCE_FLOOR = 20.0
+
+
+def score_train_significance(bundle):
+    """Annotate each train with `significance` (float) and `tier` ('deep'|'mention').
+
+    significance = footprint * kind_weight + breadth, where:
+      footprint = len(prs) + len(commits) + len(code_areas)
+      kind_weight from TRAIN_KIND_WEIGHTS (unknown kinds → 'other' weight)
+      breadth = len(code_areas)
+    tier = 'deep' for the top-TRAIN_SIGNIFICANCE_TOP_N trains OR any train
+    whose significance >= TRAIN_SIGNIFICANCE_FLOOR; 'mention' otherwise.
+    Outcome is intentionally ignored — a rejected train's story still matters.
+    Mutates trains in place; returns bundle for convenience."""
+    trains = bundle.get("trains", [])
+    other_weight = TRAIN_KIND_WEIGHTS["other"]
+
+    for t in trains:
+        footprint = len(t.get("prs", [])) + len(t.get("commits", [])) + len(t.get("code_areas", []))
+        kind_weight = TRAIN_KIND_WEIGHTS.get(t.get("kind", "other"), other_weight)
+        breadth = len(t.get("code_areas", []))
+        t["significance"] = float(footprint * kind_weight + breadth)
+
+    # Stable sort: significance desc, then id asc for deterministic tiebreaking.
+    ranked = sorted(trains, key=lambda t: (-t["significance"], t["id"]))
+    top_ids = {t["id"] for t in ranked[:TRAIN_SIGNIFICANCE_TOP_N]}
+
+    for t in trains:
+        if t["id"] in top_ids or t["significance"] >= TRAIN_SIGNIFICANCE_FLOOR:
+            t["tier"] = "deep"
+        else:
+            t["tier"] = "mention"
+
+    return bundle
+
+
 def build_modules(bundle, idx):
     """Populate bundle['modules'] = {<area>: {commits, prs, files_changed}}.
 
@@ -600,6 +664,7 @@ def enrich(bundle):
     # Phase 3b: attribute code areas everywhere the schema reserved a null.
     idx = attribute_code_areas(bundle)
     attribute_train_areas(bundle, idx)
+    score_train_significance(bundle)   # Phase 4a: reads code_areas populated above
     build_modules(bundle, idx)
     attribute_people_areas(bundle, idx)
     return bundle

@@ -748,5 +748,218 @@ class TestSymbolIdentity(unittest.TestCase):
         self.assertEqual(b["symbol_moves"]["by_confidence"], {"high": 0, "medium": 1})
 
 
+class TestTrainSignificance(unittest.TestCase):
+    """Phase 4a: significance score + treatment tier on each train."""
+
+    def _train(self, id_, kind, prs, commits, code_areas):
+        """Minimal in-memory train fixture; code_areas already populated."""
+        return {
+            "id": id_,
+            "kind": kind,
+            "root_issue": None,
+            "prs": prs,
+            "commits": commits,
+            "code_areas": code_areas,
+            "outcome": "shipped",
+            "evidence": [],
+        }
+
+    def _bundle(self, trains):
+        return {"trains": trains}
+
+    # ----- ranking order -----
+
+    def test_larger_heavier_train_scores_above_small_one(self):
+        """A feature train with more PRs/commits/areas scores above a tiny other train."""
+        big = self._train("train-issue-1", "feature", [1, 2, 3], ["s1", "s2", "s3", "s4"], ["area-a", "area-b", "area-c"])
+        small = self._train("train-pr-99", "other", [99], ["x1"], [])
+        bundle = self._bundle([big, small])
+        link.score_train_significance(bundle)
+        self.assertGreater(big["significance"], small["significance"])
+
+    # ----- kind_weight applied -----
+
+    def test_kind_weight_differentiates_equal_footprint_trains(self):
+        """Two trains with identical prs/commits/areas rank by kind_weight alone."""
+        feature_train = self._train("train-issue-10", "feature", [10], ["c1"], ["area-a"])
+        bug_train = self._train("train-issue-11", "bug", [11], ["c2"], ["area-b"])
+        bundle = self._bundle([feature_train, bug_train])
+        link.score_train_significance(bundle)
+        # feature weight > bug weight -> feature scores higher
+        self.assertGreater(feature_train["significance"], bug_train["significance"])
+
+    def test_unknown_kind_falls_back_to_other_weight(self):
+        """An unknown kind falls back to 'other' weight, not zero/error."""
+        t = self._train("train-pr-5", "unknown-kind-xyz", [5], ["c1"], ["area-a"])
+        bundle = self._bundle([t])
+        link.score_train_significance(bundle)
+        # must produce the same score as an explicit 'other' train with equal footprint
+        other = self._train("train-pr-6", "other", [6], ["c2"], ["area-b"])
+        link.score_train_significance(self._bundle([other]))
+        self.assertEqual(t["significance"], other["significance"])
+
+    # ----- breadth contributes -----
+
+    def test_breadth_raises_score_for_cross_cutting_work(self):
+        """Same kind+prs+commits, more code_areas -> higher significance."""
+        narrow = self._train("train-issue-20", "bug", [20], ["c1"], ["area-a"])
+        wide = self._train("train-issue-21", "bug", [21], ["c2"], ["area-b", "area-c", "area-d"])
+        bundle = self._bundle([narrow, wide])
+        link.score_train_significance(bundle)
+        self.assertGreater(wide["significance"], narrow["significance"])
+
+    # ----- tier selection: deep vs mention -----
+
+    def test_top_n_trains_get_deep_tier(self):
+        """The top-N trains by significance should be tier 'deep'."""
+        N = link.TRAIN_SIGNIFICANCE_TOP_N
+        trains = [
+            self._train(f"train-issue-{i}", "feature",
+                        [i] * (N + 2 - i),  # descending size
+                        [f"c{i}"],
+                        [f"area-{i}"])
+            for i in range(1, N + 3)
+        ]
+        bundle = self._bundle(trains)
+        link.score_train_significance(bundle)
+        # sort by significance desc to identify the top-N
+        ranked = sorted(trains, key=lambda t: (-t["significance"], t["id"]))
+        for t in ranked[:N]:
+            self.assertEqual(t["tier"], "deep", f"{t['id']} should be deep")
+        # at least one mention below the top-N (the smallest trains)
+        mention_found = any(t["tier"] == "mention" for t in ranked[N:])
+        self.assertTrue(mention_found, "expected at least one mention-tier train below top-N")
+
+    def test_high_significance_train_gets_deep_regardless_of_rank(self):
+        """A train at or above the floor threshold is always deep, even if ranked > N."""
+        # Create N+1 identical large feature trains so the (N+1)th still clears the floor
+        N = link.TRAIN_SIGNIFICANCE_TOP_N
+        floor = link.TRAIN_SIGNIFICANCE_FLOOR
+        trains = []
+        for i in range(N + 1):
+            # Build a train whose significance >= floor
+            # footprint = prs + commits + areas; weight for feature = 3.0
+            # sig = footprint * 3.0 + breadth, breadth = len(areas)
+            # use 5 PRs + 5 commits + 5 areas -> footprint=15, breadth=5 -> 15*3+5=50
+            trains.append(self._train(
+                f"train-issue-{100 + i}", "feature",
+                list(range(i * 10, i * 10 + 5)),
+                [f"sha{i}{j}" for j in range(5)],
+                [f"area-x{i}", f"area-y{i}", f"area-z{i}", f"area-w{i}", f"area-v{i}"],
+            ))
+        bundle = self._bundle(trains)
+        link.score_train_significance(bundle)
+        # all should clear the floor -> all should be deep
+        for t in trains:
+            self.assertGreaterEqual(t["significance"], floor,
+                                    f"{t['id']} significance {t['significance']} < floor {floor}")
+            self.assertEqual(t["tier"], "deep", f"{t['id']} should be deep (clears floor)")
+
+    def test_large_rejected_train_is_still_deep(self):
+        """Outcome does not influence tier — a large rejected train is deep."""
+        big_rejected = self._train("train-issue-30", "feature", [30, 31, 32], ["c1", "c2", "c3"], ["area-a", "area-b"])
+        big_rejected["outcome"] = "rejected"
+        bundle = self._bundle([big_rejected])
+        link.score_train_significance(bundle)
+        # significance should reflect footprint, not outcome
+        self.assertGreater(big_rejected["significance"], 0)
+        # given it's a large feature train, it should be deep
+        self.assertEqual(big_rejected["tier"], "deep")
+
+    def test_tiny_docs_train_is_mention(self):
+        """A tiny docs train with a single PR and no areas is mention tier
+        when it is outranked by enough larger trains to fall outside the top-N."""
+        N = link.TRAIN_SIGNIFICANCE_TOP_N
+        # Populate N large feature trains so the tiny docs train falls below top-N
+        # and also below the floor (its sig = 2*1.0+0 = 2.0, well under floor).
+        large = [
+            self._train(f"train-issue-{i}", "feature",
+                        list(range(i * 10, i * 10 + 5)),
+                        [f"sha{i}{j}" for j in range(5)],
+                        [f"area-x{i}", f"area-y{i}", f"area-z{i}"])
+            for i in range(N)
+        ]
+        tiny = self._train("train-pr-200", "docs", [200], ["c200"], [])
+        bundle = self._bundle(large + [tiny])
+        link.score_train_significance(bundle)
+        self.assertEqual(tiny["tier"], "mention")
+
+    def test_tiny_other_train_is_mention(self):
+        """A tiny other/chore train with minimal footprint is mention tier
+        when it is outranked by enough larger trains to fall outside the top-N."""
+        N = link.TRAIN_SIGNIFICANCE_TOP_N
+        large = [
+            self._train(f"train-issue-{i}", "feature",
+                        list(range(i * 10, i * 10 + 5)),
+                        [f"sha{i}{j}" for j in range(5)],
+                        [f"area-x{i}", f"area-y{i}", f"area-z{i}"])
+            for i in range(N)
+        ]
+        tiny = self._train("train-pr-201", "chore", [201], ["c201"], [])
+        bundle = self._bundle(large + [tiny])
+        link.score_train_significance(bundle)
+        self.assertEqual(tiny["tier"], "mention")
+
+    # ----- determinism / stable ordering -----
+
+    def test_tier_is_deterministic_on_repeated_calls(self):
+        """Calling score_train_significance twice yields the same tiers."""
+        trains = [
+            self._train("train-issue-40", "feature", [40, 41], ["c1", "c2"], ["area-a"]),
+            self._train("train-pr-50", "docs", [50], ["c3"], []),
+        ]
+        bundle = self._bundle(trains)
+        link.score_train_significance(bundle)
+        tiers_first = [t["tier"] for t in trains]
+        sigs_first = [t["significance"] for t in trains]
+        # re-run (enrich pipeline calls it; significance + tier must be stable)
+        link.score_train_significance(bundle)
+        self.assertEqual([t["tier"] for t in trains], tiers_first)
+        self.assertEqual([t["significance"] for t in trains], sigs_first)
+
+    def test_tied_significance_breaks_by_id(self):
+        """Two trains with identical scores get consistent tiers (id-based tiebreak)."""
+        # Two identical trains except for id — they'll have the same significance
+        t1 = self._train("train-issue-60", "bug", [60], ["c1"], ["area-a"])
+        t2 = self._train("train-issue-70", "bug", [70], ["c2"], ["area-b"])
+        bundle = self._bundle([t1, t2])
+        link.score_train_significance(bundle)
+        # Both have equal significance; with N>=2 they'd both be deep — the key
+        # assertion is that the result is stable (same id -> same tier across calls).
+        tier1, tier2 = t1["tier"], t2["tier"]
+        link.score_train_significance(bundle)
+        self.assertEqual(t1["tier"], tier1)
+        self.assertEqual(t2["tier"], tier2)
+
+    # ----- wired into enrich -----
+
+    def test_enrich_stamps_significance_and_tier_on_all_trains(self):
+        """enrich() must leave significance + tier on every train."""
+        with open(os.path.join(FIX, "bundle_sample.json")) as fh:
+            bundle = link.enrich(json.load(fh))
+        self.assertTrue(bundle["trains"], "fixture must have at least one train")
+        for t in bundle["trains"]:
+            self.assertIn("significance", t, f"train {t['id']} missing significance")
+            self.assertIn("tier", t, f"train {t['id']} missing tier")
+            self.assertIsInstance(t["significance"], float)
+            self.assertIn(t["tier"], {"deep", "mention"})
+
+    def test_significance_formula_matches_spec(self):
+        """Verify the exact formula: sig = footprint * kind_weight + breadth."""
+        kind = "feature"
+        prs = [1, 2]
+        commits = ["c1", "c2", "c3"]
+        areas = ["area-a", "area-b"]
+        t = self._train("train-issue-80", kind, prs, commits, areas)
+        bundle = self._bundle([t])
+        link.score_train_significance(bundle)
+
+        footprint = len(prs) + len(commits) + len(areas)   # 2+3+2 = 7
+        kind_weight = link.TRAIN_KIND_WEIGHTS.get(kind, link.TRAIN_KIND_WEIGHTS["other"])
+        breadth = len(areas)                                # 2
+        expected = footprint * kind_weight + breadth        # 7*3.0+2 = 23.0
+        self.assertAlmostEqual(t["significance"], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
