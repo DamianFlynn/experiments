@@ -362,13 +362,13 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
     # --- contribution edges, grouped by type; collect spine seeds ---
     edges = graphstore.get_edges(conn, person_id, direction="out",
                                  edge_types=list(_CONTRIB_TYPES))
-    role_counts = {}
-    # touch_index: dst_id -> list of (edge_type) the login did there
+    # touch_edges: (edge_type, dst_id) for every contribution; seed_ids feeds the
+    # train traversal. Per-role counts are computed later over the trains actually
+    # delivered, so a time-scoped query's summary stays consistent with its body.
     touch_edges = []  # (edge_type, dst_id)
     seed_ids = []
     for e in edges:
         etype = e["edge_type"]
-        role_counts[etype] = role_counts.get(etype, 0) + 1
         touch_edges.append((etype, e["dst_id"]))
         # Seed train traversal from EVERY touched spine node, not just PR/issue
         # dsts: a commit a contributor authored (e.g. a direct push with no PR)
@@ -414,13 +414,16 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
 
     delivered = []
     shipped = 0
+    role_counts = {}  # per-role, over the trains actually delivered (scope-aware)
     for anchor, reached in trains_by_anchor.items():
         # which of the login's touched dsts fall in this train?
         focus_touch_ids = []
         role_of = {}
+        train_etypes = []  # contribution edge types landing in this train
         for etype, dst_id in touch_edges:
             if dst_id not in reached:
                 continue
+            train_etypes.append(etype)
             role = _ROLE_OF_EDGE.get(etype, etype)
             entry = {"role": role}
             if etype == "commented":
@@ -432,6 +435,10 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
         if (ts_from is not None or ts_to is not None) and not _date_in_range(
                 train["key_date"], ts_from, ts_to):
             continue
+        # count roles only for trains that survive the scope filter, so summary
+        # stays consistent with delivered (trains_touched / shipped are scoped too).
+        for etype in train_etypes:
+            role_counts[etype] = role_counts.get(etype, 0) + 1
         if train["outcome"] == "shipped":
             shipped += 1
         delivered.append(train)

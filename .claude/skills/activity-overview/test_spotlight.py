@@ -912,5 +912,24 @@ class TestReviewFixes(unittest.TestCase):
         self.assertNotIn(graphstore.qualify_id("acme", "r1", "bbb2222"), rows)
 
 
+    # #1 (2nd pass) — windowed summary counts stay consistent with delivered
+    def test_summary_counts_are_scope_consistent(self):
+        conn = self._store(_crafted_bundle())
+        full = spotlight.person_impact(conn, "acme", "alice")
+        # full history: alice reviewed + commented PR-2 (the storage train)
+        self.assertEqual(full["summary"].get("reviewed"), 1)
+        self.assertEqual(full["summary"].get("commented"), 1)
+        # scope to the firewall train's window — excludes the later PR-2 train
+        scoped = spotlight.person_impact(conn, "acme", "alice", ts_to="2026-01-10")
+        pr2 = graphstore.qualify_id("acme", "r1", "pr-2")
+        self.assertTrue(all(pr2 not in {r["id"] for r in t["timeline"]}
+                            for t in scoped["delivered"]),
+                        "PR-2 train should be filtered out by ts_to")
+        # the excluded review/comment on PR-2 must NOT inflate the scoped summary
+        self.assertNotIn("reviewed", scoped["summary"])
+        self.assertNotIn("commented", scoped["summary"])
+        self.assertEqual(scoped["summary"]["trains_touched"], len(scoped["delivered"]))
+
+
 if __name__ == "__main__":
     unittest.main()
