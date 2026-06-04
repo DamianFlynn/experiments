@@ -520,3 +520,33 @@ class TestBatchWrite(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeadRefs(unittest.TestCase):
+    def setUp(self):
+        self.conn = _store()
+
+    def test_record_then_is_dead(self):
+        qid = graphstore.qualify_id("acme", "widget", "issue-123")
+        self.assertFalse(graphstore.is_dead_ref(self.conn, qid))
+        graphstore.record_dead_ref(self.conn, qid)
+        self.assertTrue(graphstore.is_dead_ref(self.conn, qid))
+
+    def test_record_is_idempotent(self):
+        qid = graphstore.qualify_id("acme", "widget", "issue-123")
+        graphstore.record_dead_ref(self.conn, qid)
+        graphstore.record_dead_ref(self.conn, qid)  # second call must not raise
+        self.assertEqual(graphstore.get_dead_refs(self.conn), [qid])
+
+    def test_get_dead_refs_sorted(self):
+        for local in ("issue-9", "issue-1", "issue-5"):
+            graphstore.record_dead_ref(
+                self.conn, graphstore.qualify_id("acme", "widget", local))
+        got = graphstore.get_dead_refs(self.conn)
+        self.assertEqual(got, sorted(got))
+
+    def test_dead_refs_table_created_by_init(self):
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='dead_refs'"
+        ).fetchone()
+        self.assertIsNotNone(row)
