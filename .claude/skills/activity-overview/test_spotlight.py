@@ -1,8 +1,9 @@
-"""Phase 8a tests: the fts_text indexing prerequisite on the fold path, and the
-spotlight reader scaffold + person-impact query.
+"""Phase 8 tests: the fts_text indexing prerequisite on the fold path, and the
+spotlight reader realigned to the chronological delivery-train contract.
 
 TDD-first. A crafted small bundle is folded into an in-memory store; the
-person-impact JSON is asserted against an exact ordered, cited structure.
+query envelopes are asserted against the unified delivery-train shape
+(query/focus/focus_kind/project/status/scope/summary/<context>/delivered).
 A real-data smoke runs against workspace/journey.db when present.
 """
 
@@ -22,7 +23,7 @@ REAL_STORE = os.path.join(HERE, "workspace", "journey.db")
 
 
 def _crafted_bundle(repo="r1"):
-    """A small bundle exercising every person-impact field for login 'alice':
+    """A small bundle exercising every person field for login 'alice':
     she authors PR 1 (which closes issue 9 -> a train), reviews PR 2, comments
     on PR 2, reports issue 9, and authors a symbol in main.bicep that is later
     removed (by anyone). Searchable text lives in titles/bodies/comments/commit
@@ -114,54 +115,121 @@ class TestPersonImpact(unittest.TestCase):
         graphstore.init_schema(self.conn)
         gather.fold_bundle(self.conn, _crafted_bundle())
 
-    def test_golden(self):
+    def test_envelope(self):
         res = spotlight.person_impact(self.conn, "acme", "alice")
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["query"], "person")
-        self.assertEqual(res["login"], "alice")
+        self.assertEqual(res["focus"], "alice")
+        self.assertEqual(res["focus_kind"], "person")
+        self.assertEqual(res["project"], "acme")
+        # scope omitted -> all-history
+        self.assertEqual(res["scope"], "all-history")
+        # context blocks present
         self.assertEqual(res["is_bot"], False)
-        # areas/modules come from code_graph area attribution (none in this
-        # bundle), so they are empty here — the field is present and a list.
         self.assertEqual(res["areas"], [])
         self.assertEqual(res["modules"], [])
+        self.assertIn("symbols_authored", res)
+        self.assertIn("authored_then_removed", res)
 
-        contrib = res["contributions"]
-        # grouped by type, each with count + cited rows
-        self.assertEqual(contrib["authored"]["count"], 2)  # PR 1 + commit
-        self.assertEqual(contrib["reviewed"]["count"], 1)  # PR 2
-        self.assertEqual(contrib["commented"]["count"], 1)  # PR 2 comment
-        self.assertEqual(contrib["reported"]["count"], 1)  # issue 9
-        self.assertNotIn("merged", contrib)  # alice merged nothing
+    def test_summary_counts(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice")
+        s = res["summary"]
+        # per-role counts (authored = PR1 + commit)
+        self.assertEqual(s["authored"], 2)
+        self.assertEqual(s["reviewed"], 1)
+        self.assertEqual(s["commented"], 1)
+        self.assertEqual(s["reported"], 1)
+        self.assertNotIn("merged", s)  # alice merged nothing
+        self.assertIn("trains_touched", s)
+        self.assertIn("shipped", s)
+        # the PR1/issue9/commit train + the PR2 train she reviewed; both PRs
+        # merged, so both trains shipped
+        self.assertEqual(s["trains_touched"], 2)
+        self.assertEqual(s["shipped"], 2)
 
-        # citations present on rows
-        authored_pr = [r for r in contrib["authored"]["items"]
-                       if r["id"].endswith("#pr-1")][0]
-        self.assertEqual(authored_pr["number"], 1)
-        self.assertEqual(authored_pr["url"],
-                         "https://github.com/acme/r1/pull/1")
-        self.assertEqual(authored_pr["title"], "Add firewall policy")
-        authored_commit = [r for r in contrib["authored"]["items"]
-                           if r["id"].endswith("#c0ffee1")][0]
-        self.assertEqual(authored_commit["sha"], "c0ffee1")
+    def test_delivered_train(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice")
+        delivered = res["delivered"]
+        pr1 = graphstore.qualify_id("acme", "r1", "pr-1")
+        pr2 = graphstore.qualify_id("acme", "r1", "pr-2")
+        issue9 = graphstore.qualify_id("acme", "r1", "issue-9")
+        commit = graphstore.qualify_id("acme", "r1", "c0ffee1")
+        # the firewall train reaches issue9 <- pr1 <- commit (part_of/closes);
+        # its anchor is the deterministically smallest reached id.
+        fw_anchor = min(pr1, issue9, commit)
+        anchors = {t["anchor"] for t in delivered}
+        self.assertIn(fw_anchor, anchors)
+        self.assertIn(pr2, anchors)
 
-        # symbols authored + authored_then_removed
+        fw = [t for t in delivered if t["anchor"] == fw_anchor][0]
+        self.assertEqual(fw["outcome"], "shipped")
+        self.assertIn("title", fw)
+        self.assertIn("areas", fw)
+        self.assertIn("roles", fw)
+        # alice authored PR1 + reported issue9 -> both roles appear
+        self.assertIn("author", fw["roles"])
+        self.assertIn("reporter", fw["roles"])
+        # touchpoints are her own cited events in the train, chronological
+        tp_ids = [tp["id"] for tp in fw["touchpoints"]]
+        self.assertIn(pr1, tp_ids)
+        self.assertIn(issue9, tp_ids)
+        for tp in fw["touchpoints"]:
+            self.assertIn("role", tp)
+            self.assertIn("ts", tp)
+        # the PR1 touchpoint cites number/url/title
+        pr1_tp = [tp for tp in fw["touchpoints"] if tp["id"] == pr1][0]
+        self.assertEqual(pr1_tp["number"], 1)
+        self.assertEqual(pr1_tp["url"], "https://github.com/acme/r1/pull/1")
+        # timeline is the full cited spine, chronological by (ts, id)
+        keys = [(r.get("ts") or "", r["id"]) for r in fw["timeline"]]
+        self.assertEqual(keys, sorted(keys))
+        for r in fw["timeline"]:
+            self.assertIn("id", r)
+            self.assertIn("kind", r)
+
+    def test_comment_touchpoint_carries_excerpt(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice")
+        pr2 = graphstore.qualify_id("acme", "r1", "pr-2")
+        train = [t for t in res["delivered"] if t["anchor"] == pr2][0]
+        # alice commented + reviewed on PR2; the comment touchpoint (role
+        # 'commenter') carries the bounded excerpt of her own comment body
+        comment_tp = [tp for tp in train["touchpoints"]
+                      if tp["role"] == "commenter"]
+        self.assertTrue(comment_tp)
+        self.assertIn("excerpt", comment_tp[0])
+        self.assertIn("looks good", comment_tp[0]["excerpt"])
+
+    def test_delivered_chronological_shipped_emphasized(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice")
+        delivered = res["delivered"]
+        # ordered by (key_date, anchor); each carries its outcome
+        for t in delivered:
+            self.assertIn(t["outcome"],
+                          ("shipped", "rejected", "in_flight"))
+        keys = [(t.get("key_date") or "", t["anchor"]) for t in delivered]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_scope_echoed_when_bounded(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice",
+                                      ts_from="2026-01-01", ts_to="2026-01-31")
+        self.assertEqual(res["scope"], {"from": "2026-01-01", "to": "2026-01-31"})
+
+    def test_from_to_filters_trains(self):
+        # the PR2 train (key date 2026-01-20) is excluded by an early --to;
+        # the firewall train (PR1 merged 2026-01-10) survives.
+        res = spotlight.person_impact(self.conn, "acme", "alice",
+                                      ts_from="2026-01-01", ts_to="2026-01-12")
+        pr2 = graphstore.qualify_id("acme", "r1", "pr-2")
+        anchors = {t["anchor"] for t in res["delivered"]}
+        self.assertNotIn(pr2, anchors)
+        self.assertGreaterEqual(len(res["delivered"]), 1)
+
+    def test_symbols_context(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice")
         self.assertEqual(len(res["symbols_authored"]), 1)
         self.assertTrue(res["symbols_authored"][0]["id"].endswith(
             "main.bicep#bicep:resource:fw"))
         self.assertEqual(len(res["authored_then_removed"]), 1)
-
-        # trains anchored: the PR1/issue9 closes train
-        self.assertEqual(len(res["trains_anchored"]), 1)
-        train = res["trains_anchored"][0]
-        self.assertIn("anchor", train)
-        self.assertGreaterEqual(train["reached"], 2)
-
-    def test_contributions_ordered(self):
-        res = spotlight.person_impact(self.conn, "acme", "alice")
-        # authored items ordered by (ts, dst_id)
-        items = res["contributions"]["authored"]["items"]
-        keys = [(r.get("ts") or "", r["id"]) for r in items]
-        self.assertEqual(keys, sorted(keys))
 
     def test_needs_gather_unknown_login(self):
         res = spotlight.person_impact(self.conn, "acme", "nobody")
@@ -180,10 +248,10 @@ class TestPersonImpact(unittest.TestCase):
         # fold a second repo's window for the same login -> aggregates
         gather.fold_bundle(self.conn, _crafted_bundle(repo="r2"))
         res = spotlight.person_impact(self.conn, "acme", "alice")
-        # authored now spans both repos' PR-1 + commit (2 per repo)
-        ids = [r["id"] for r in res["contributions"]["authored"]["items"]]
-        self.assertTrue(any("/r1#" in i for i in ids))
-        self.assertTrue(any("/r2#" in i for i in ids))
+        # delivered now spans trains in both repos
+        anchors = [t["anchor"] for t in res["delivered"]]
+        self.assertTrue(any("/r1#" in a for a in anchors))
+        self.assertTrue(any("/r2#" in a for a in anchors))
 
 
 class TestCLI(unittest.TestCase):
@@ -213,7 +281,15 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout)
         self.assertEqual(out["status"], "ok")
-        self.assertEqual(out["login"], "alice")
+        self.assertEqual(out["focus"], "alice")
+        self.assertIn("delivered", out)
+
+    def test_person_from_to_flags(self):
+        r = self._run("person", "alice", "--store", self.store,
+                      "--from", "2026-01-01", "--to", "2026-01-12")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["scope"], {"from": "2026-01-01", "to": "2026-01-12"})
 
     def test_needs_gather_exits_zero(self):
         r = self._run("person", "nobody", "--store", self.store)
@@ -300,48 +376,74 @@ class TestPatternEvolution(unittest.TestCase):
         self.dst = graphstore.qualify_id(
             "acme", "r1", "new.bicep#bicep:resource:fw")
 
-    def test_golden_lifecycle(self):
+    def test_envelope(self):
         res = spotlight.pattern_evolution(self.conn, "acme", self.src)
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["query"], "symbol")
-        self.assertEqual(res["artifact_id"], self.src)
-        lc = res["lifecycle"]
-        # add -> change -> remove, in (date, commit) order
-        self.assertEqual([e["event"] for e in lc], ["add", "change", "remove"])
-        self.assertEqual([e["commit"] for e in lc],
-                         ["aaa1111", "bbb2222", "ccc3333"])
-        # symbols carry bounded before/after
-        self.assertEqual(lc[0]["before"], None)
-        self.assertEqual(lc[0]["after"], "resource fw v1")
-        self.assertEqual(lc[1]["before"], "resource fw v1")
-        # each cited by commit ref/commit
-        for e in lc:
-            self.assertIn("commit", e)
-            self.assertIn("author", e)
-            self.assertIn("date", e)
+        self.assertEqual(res["focus"], self.src)
+        self.assertEqual(res["focus_kind"], "symbol")
+        self.assertEqual(res["project"], "acme")
+        self.assertEqual(res["scope"], "all-history")
+        self.assertIn("identity_chain", res)  # context block
+        self.assertIn("summary", res)
 
-    def test_golden_identity_chain(self):
+    def test_delivered_single_lifecycle_train(self):
+        res = spotlight.pattern_evolution(self.conn, "acme", self.src)
+        delivered = res["delivered"]
+        # a single train = the artifact's lifecycle
+        self.assertEqual(len(delivered), 1)
+        train = delivered[0]
+        self.assertEqual(train["anchor"], self.src)
+        # outcome removed (last event is a remove)
+        self.assertEqual(train["outcome"], "removed")
+        # timeline rows in (date/ts, commit/id) order, each cited
+        tl = train["timeline"]
+        self.assertEqual([r["event"] for r in tl], ["add", "change", "remove"])
+        self.assertEqual([r.get("sha") for r in tl],
+                         ["aaa1111", "bbb2222", "ccc3333"])
+        for r in tl:
+            self.assertIn("kind", r)
+            self.assertIn("ts", r)
+        # before/after preserved as context on symbol rows
+        self.assertEqual(tl[0]["before"], None)
+        self.assertEqual(tl[0]["after"], "resource fw v1")
+        self.assertEqual(tl[1]["before"], "resource fw v1")
+
+    def test_summary(self):
+        res = spotlight.pattern_evolution(self.conn, "acme", self.src)
+        s = res["summary"]
+        self.assertEqual(s["events"], 3)
+        self.assertEqual(s["outcome"], "removed")
+
+    def test_identity_chain_context(self):
         res = spotlight.pattern_evolution(self.conn, "acme", self.src)
         chain = res["identity_chain"]
-        # ordered A -> B across the move
         self.assertEqual([c["id"] for c in chain], [self.src, self.dst])
-        # the move link carries confidence + basis
         link = [c for c in chain if c.get("confidence")]
         self.assertTrue(link)
         self.assertIn(link[0]["confidence"], ("high", "medium"))
         self.assertIn("basis", link[0])
 
     def test_chain_from_dst_same_chain(self):
-        # walking from the destination recovers the same ordered chain
         res = spotlight.pattern_evolution(self.conn, "acme", self.dst)
         self.assertEqual([c["id"] for c in res["identity_chain"]],
                          [self.src, self.dst])
+
+    def test_from_to_bounds_lifecycle(self):
+        # bound to window 1 only -> add + change, no remove; outcome alive
+        res = spotlight.pattern_evolution(
+            self.conn, "acme", self.src,
+            ts_from="2026-01-01", ts_to="2026-01-15")
+        self.assertEqual(res["scope"], {"from": "2026-01-01", "to": "2026-01-15"})
+        tl = res["delivered"][0]["timeline"]
+        self.assertEqual([r["event"] for r in tl], ["add", "change"])
+        self.assertEqual(res["delivered"][0]["outcome"], "alive")
 
     def test_accepts_local_id(self):
         res = spotlight.pattern_evolution(
             self.conn, "acme", "old.bicep#bicep:resource:fw")
         self.assertEqual(res["status"], "ok")
-        self.assertEqual(res["artifact_id"], self.src)
+        self.assertEqual(res["focus"], self.src)
 
     def test_needs_gather_unknown(self):
         res = spotlight.pattern_evolution(
@@ -360,8 +462,9 @@ class TestPatternEvolution(unittest.TestCase):
 def _subsystem_store(conn):
     """Seed a store directly (areas/owns/depends_on are sparse via fold, so we
     craft the graph) with one area that has: a codeowner (owns), two PRs that
-    touch it via their commits (one merged=shipped, one open=stalled), and a
-    depends_on edge in each direction."""
+    touch it via their commits (one merged=shipped, one open=stalled, and the
+    merged PR closes an issue so its train has a spine), and a depends_on edge
+    in each direction."""
     P, R = "acme", "r1"
     qid = lambda local: graphstore.qualify_id(P, R, local)
     area = "area-avm/res/net/fw"
@@ -375,13 +478,16 @@ def _subsystem_store(conn):
         (qid(dep_dn), P, R, "structure", None, {"id": "avm/res/net/app"}, fetched),
         (graphstore.qualify_person(P, "owner1"), P, "*", "structure", None,
          {"login": "owner1"}, fetched),
-        # PR 1 merged (shipped), PR 2 open (stalled)
+        # PR 1 merged (shipped), closes issue 9; PR 2 open (stalled)
         (qid("pr-1"), P, R, "social", "2026-01-10T00:00:00Z",
          {"number": 1, "title": "ship fw", "state": "closed", "merged": True,
           "url": "https://github.com/acme/r1/pull/1"}, fetched),
         (qid("pr-2"), P, R, "social", "2026-01-15T00:00:00Z",
          {"number": 2, "title": "wip fw", "state": "open", "merged": False,
           "url": "https://github.com/acme/r1/pull/2"}, fetched),
+        (qid("issue-9"), P, R, "social", "2026-01-08T00:00:00Z",
+         {"number": 9, "title": "need fw", "state": "closed",
+          "url": "https://github.com/acme/r1/issues/9"}, fetched),
         # commits that touch the area, each part_of a PR
         (qid("sha1"), P, R, "code", "2026-01-09T00:00:00Z",
          {"sha": "sha1", "author": "carol"}, fetched),
@@ -395,6 +501,7 @@ def _subsystem_store(conn):
         (qid("sha2"), qid(area), "touches", None, None),
         (qid("sha1"), qid("pr-1"), "part_of", None, None),
         (qid("sha2"), qid("pr-2"), "part_of", None, None),
+        (qid("pr-1"), qid("issue-9"), "closes", None, None),
         (qid(area), qid(dep_up), "depends_on", None,
          {"version": "1.0.0", "transitive": False}),
         (qid(dep_dn), qid(area), "depends_on", None,
@@ -409,31 +516,28 @@ class TestSubsystemSplit(unittest.TestCase):
         graphstore.init_schema(self.conn)
         _subsystem_store(self.conn)
 
-    def test_golden(self):
+    def test_envelope(self):
         res = spotlight.subsystem_split(self.conn, "acme", "avm/res/net/fw")
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["query"], "subsystem")
-        self.assertEqual(res["area"], "avm/res/net/fw")
+        self.assertEqual(res["focus"], "avm/res/net/fw")
+        self.assertEqual(res["focus_kind"], "subsystem")
+        self.assertEqual(res["project"], "acme")
+        self.assertEqual(res["scope"], "all-history")
+        self.assertIn("contributors", res)   # context block
+        self.assertIn("depends_on", res)     # context block
 
-        # contributors: owner1 (owns) + carol/dave via touching commits
+    def test_contributors_context(self):
+        res = spotlight.subsystem_split(self.conn, "acme", "avm/res/net/fw")
         relations = {c["login"]: c["relation"] for c in res["contributors"]}
         self.assertEqual(relations.get("owner1"), "owns")
-        # touching-commit authors surface as touches contributors
         self.assertIn("carol", relations)
         self.assertEqual(relations["carol"], "touches")
-        # ordered by login
         logins = [c["login"] for c in res["contributors"]]
         self.assertEqual(logins, sorted(logins))
 
-        # shipped (PR1 merged) vs stalled (PR2 open)
-        shipped = [i["number"] for i in res["shipped"]]
-        stalled = [i["number"] for i in res["stalled"]]
-        self.assertEqual(shipped, [1])
-        self.assertEqual(stalled, [2])
-        self.assertEqual(res["shipped"][0]["url"],
-                         "https://github.com/acme/r1/pull/1")
-
-        # blast radius both directions, carrying version/transitive
+    def test_depends_on_context(self):
+        res = spotlight.subsystem_split(self.conn, "acme", "avm/res/net/fw")
         deps_out = res["depends_on"]["out"]
         deps_in = res["depends_on"]["in"]
         self.assertEqual([d["area"] for d in deps_out], ["avm/res/net/base"])
@@ -441,13 +545,46 @@ class TestSubsystemSplit(unittest.TestCase):
         self.assertEqual([d["area"] for d in deps_in], ["avm/res/net/app"])
         self.assertEqual(deps_in[0]["transitive"], True)
 
+    def test_summary(self):
+        res = spotlight.subsystem_split(self.conn, "acme", "avm/res/net/fw")
+        s = res["summary"]
+        # two trains touched the area (PR1 train + PR2 train), one shipped
+        self.assertEqual(s["trains"], 2)
+        self.assertEqual(s["shipped"], 1)
+        self.assertEqual(s["contributors"], len(res["contributors"]))
+
+    def test_delivered_trains(self):
+        res = spotlight.subsystem_split(self.conn, "acme", "avm/res/net/fw")
+        delivered = res["delivered"]
+        outcomes = {t["anchor"]: t["outcome"] for t in delivered}
+        pr1 = graphstore.qualify_id("acme", "r1", "pr-1")
+        pr2 = graphstore.qualify_id("acme", "r1", "pr-2")
+        issue9 = graphstore.qualify_id("acme", "r1", "issue-9")
+        # PR1 train (anchored on the min reached id) shipped; PR2 in_flight
+        pr1_anchor = min(pr1, issue9)
+        self.assertEqual(outcomes[pr1_anchor], "shipped")
+        self.assertEqual(outcomes[pr2], "in_flight")
+        # touchpoints = the area-touching nodes in each train (the commits)
+        pr1_train = [t for t in delivered if t["anchor"] == pr1_anchor][0]
+        tp_ids = [tp["id"] for tp in pr1_train["touchpoints"]]
+        self.assertIn(graphstore.qualify_id("acme", "r1", "sha1"), tp_ids)
+        # chronological by (key_date, anchor)
+        keys = [(t.get("key_date") or "", t["anchor"]) for t in delivered]
+        self.assertEqual(keys, sorted(keys))
+        # full spine timeline cited
+        for t in delivered:
+            for r in t["timeline"]:
+                self.assertIn("kind", r)
+
     def test_time_range_filter(self):
-        # PR2 (ts 2026-01-15) excluded by an early --to
+        # PR2 train (key date 2026-01-15) excluded by an early --to
         res = spotlight.subsystem_split(
             self.conn, "acme", "avm/res/net/fw",
             ts_from="2026-01-01", ts_to="2026-01-12")
-        nums = [i["number"] for i in res["shipped"] + res["stalled"]]
-        self.assertEqual(nums, [1])
+        self.assertEqual(res["scope"], {"from": "2026-01-01", "to": "2026-01-12"})
+        pr2 = graphstore.qualify_id("acme", "r1", "pr-2")
+        anchors = {t["anchor"] for t in res["delivered"]}
+        self.assertNotIn(pr2, anchors)
 
     def test_needs_gather_unknown_area(self):
         res = spotlight.subsystem_split(self.conn, "acme", "no/such/area")
@@ -469,33 +606,29 @@ class TestRealDataSmoke(unittest.TestCase):
         res = spotlight.person_impact(conn, "Azure", "AlexanderSehr")
         conn.close()
         self.assertEqual(res["status"], "ok")
-        # non-empty contributions with citations
-        total = sum(g["count"] for g in res["contributions"].values())
-        self.assertGreater(total, 0)
-        # at least one cited row carries a url/number/sha
+        # non-empty delivered trains
+        self.assertGreater(len(res["delivered"]), 0)
+        # at least one touchpoint carries a url/number/sha citation
         any_cite = any(
-            ("url" in r or "number" in r or "sha" in r)
-            for g in res["contributions"].values() for r in g["items"])
+            ("url" in tp or "number" in tp or "sha" in tp)
+            for t in res["delivered"] for tp in t["touchpoints"])
         self.assertTrue(any_cite)
 
     def test_pattern_evolution_real(self):
-        # a real file artifact with a code_event lifecycle (109 events in store)
         conn = graphstore.open_store(REAL_STORE)
         aid = ("Azure/bicep-registry-modules#"
                "avm/res/cache/redis/main.bicep")
         res = spotlight.pattern_evolution(conn, "Azure", aid)
         conn.close()
         self.assertEqual(res["status"], "ok")
-        self.assertGreaterEqual(len(res["lifecycle"]), 1)
-        # each lifecycle row carries its commit citation
-        for e in res["lifecycle"]:
-            self.assertIn("commit", e)
-        # identity_chain is at least the artifact itself (no moves in store)
+        self.assertEqual(len(res["delivered"]), 1)
+        tl = res["delivered"][0]["timeline"]
+        self.assertGreaterEqual(len(tl), 1)
+        for r in tl:
+            self.assertIn("kind", r)
         self.assertEqual(res["identity_chain"][0]["id"], aid)
 
     def test_subsystem_split_real_sparse(self):
-        # owns/depends_on are empty in the short real window; touches has 4.
-        # The query must run cleanly and return ok or needs_gather.
         conn = graphstore.open_store(REAL_STORE)
         res = spotlight.subsystem_split(conn, "Azure", "avm/res/cache/redis")
         conn.close()

@@ -59,6 +59,9 @@ _CONTRIB_TYPES = ("authored", "reviewed", "merged", "reported", "commented")
 # Defensive cap on the identity-chain walk (renames/moves should be shallow).
 _CHAIN_DEPTH_CAP = 64
 
+# Bounded excerpt for a comment body carried on a touchpoint / timeline row.
+_EXCERPT_CAP = 200
+
 
 def _cite(node_id, data):
     """A citation row for a contribution target: its id plus whichever of
@@ -76,76 +79,253 @@ def _cite(node_id, data):
     return row
 
 
-def person_impact(conn, project, login):
-    """Everything `login` did across all repos in `project` (people are
-    project-scoped). Returns a deterministically-ordered, citation-bearing
-    Result dict. A miss (no person node) returns a needs_gather guidance result.
+# --------------------------------------------------------------------------
+# Shared output helpers — the one chronological delivery-train contract that
+# every query routes through (no per-query divergence).
+# --------------------------------------------------------------------------
 
-    Fields:
-      modules / areas / is_bot   — from the person structure node.
-      contributions              — get_edges(person, "out") grouped by type
-                                   (authored/reviewed/merged/reported/commented):
-                                   {count, items[ cited dst rows ]}.
-      symbols_authored           — code_events with author==login on SYMBOL
-                                   artifact ids (local part has a '#').
-      authored_then_removed      — those symbols that later have a remove event.
-      trains_anchored            — traverse_spine from her authored/reported
-                                   PR/issue dsts -> distinct trains (anchor +
-                                   reached size).
-    Determinism: contributions by (edge_type, ts, dst_id); symbols by id;
-    trains by anchor id.
+def _scope(ts_from, ts_to):
+    """Echo the query's time scope: {"from","to"} when bounded, else the
+    string "all-history". Carried on every Result."""
+    if ts_from is None and ts_to is None:
+        return "all-history"
+    return {"from": ts_from, "to": ts_to}
+
+
+def _node_kind(node_id, data):
+    """Derive a node's kind for a timeline row from its id / data: one of
+    pr / issue / commit / release / comment / symbol / file, else the node's
+    structural prefix. Deterministic."""
+    local = graphstore.parse_id(node_id)["local"]
+    if local.startswith("pr-"):
+        return "pr"
+    if local.startswith("issue-"):
+        return "issue"
+    if local.startswith("release-"):
+        return "release"
+    if local.startswith("comment-"):
+        return "comment"
+    if local.startswith("area-"):
+        return "area"
+    if local.startswith("milestone-"):
+        return "milestone"
+    if local.startswith("person-"):
+        return "person"
+    if "#" in local:
+        return "symbol"
+    if local.startswith("art:"):
+        return "file"
+    if (data or {}).get("sha") is not None:
+        return "commit"
+    return "node"
+
+
+def _excerpt(text):
+    """Bounded excerpt of a body for a comment touchpoint/row."""
+    if not text:
+        return ""
+    text = " ".join(str(text).split())
+    return text[:_EXCERPT_CAP]
+
+
+def _timeline_row(node):
+    """A cited chronological row for a spine node: {id, kind, ts, number?|sha?,
+    url?, title?, excerpt?} (reusing _cite for the citation fields). A comment
+    node carries a bounded excerpt of its body."""
+    nid = node["id"]
+    data = node.get("data") or {}
+    row = _cite(nid, data)
+    row["kind"] = _node_kind(nid, data)
+    row["ts"] = node.get("ts") or ""
+    if row["kind"] == "comment":
+        row["excerpt"] = _excerpt(data.get("body"))
+    return row
+
+
+def _outcome(reached_nodes):
+    """Deterministic train outcome over its reached spine nodes:
+      shipped   — a merged PR or a release node is present;
+      rejected  — the train's anchor/PR is closed-but-unmerged (no merge);
+      in_flight — otherwise (still open / unresolved).
+    `reached_nodes` is an iterable of node dicts."""
+    nodes = [n for n in reached_nodes if n is not None]
+    has_closed_unmerged = False
+    for n in nodes:
+        kind = _node_kind(n["id"], n.get("data") or {})
+        data = n.get("data") or {}
+        if kind == "release":
+            return "shipped"
+        if kind == "pr":
+            if data.get("merged"):
+                return "shipped"
+            if data.get("state") == "closed":
+                has_closed_unmerged = True
+    if has_closed_unmerged:
+        return "rejected"
+    return "in_flight"
+
+
+def _train(conn, anchor, reached, focus_touch_ids, role_of):
+    """Build one decision-train entry routed through the shared contract.
+
+    `anchor`           — the train's deterministic anchor id (min reached id).
+    `reached`          — iterable of node ids in the train.
+    `focus_touch_ids`  — the subset of `reached` the focus touched.
+    `role_of`          — maps a touched id -> the focus's role there
+                         (author/reviewer/commenter/reporter/owns/touches),
+                         OR id -> a list of {role, excerpt?} for multi-role /
+                         comment touchpoints.
+
+    Returns {anchor, key_date, title, outcome, areas[], roles[],
+             touchpoints[ cited focus events; comment carries excerpt ],
+             timeline[ _timeline_row…, chronological by (ts,id) ]}.
+    Determinism: timeline + touchpoints by (ts, id)."""
+    nodes = [graphstore.get_node(conn, nid) for nid in reached]
+    nodes = [n for n in nodes if n is not None]
+
+    anchor_node = graphstore.get_node(conn, anchor)
+    adata = (anchor_node["data"] if anchor_node else {}) or {}
+
+    # full cited spine timeline, chronological
+    timeline = [_timeline_row(n) for n in nodes]
+    timeline.sort(key=lambda r: (r["ts"], r["id"]))
+
+    # areas the train touches (area nodes reached, or area edges off members)
+    areas = set()
+    for n in nodes:
+        for e in graphstore.get_edges(conn, n["id"], direction="out",
+                                      edge_types=["touches"]):
+            if "#area-" in e["dst_id"]:
+                local = graphstore.parse_id(e["dst_id"])["local"]
+                areas.add(local[len("area-"):])
+
+    # the focus's own touchpoints inside the train, each carrying role(s)
+    by_id = {n["id"]: n for n in nodes}
+    touchpoints = []
+    roles = set()
+    for tid in focus_touch_ids:
+        if tid not in by_id and tid != anchor:
+            # the touched node may not itself be on the spine (e.g. a commit);
+            # still cite it from its node.
+            tnode = graphstore.get_node(conn, tid)
+        else:
+            tnode = by_id.get(tid) or anchor_node
+        tdata = (tnode["data"] if tnode else {}) or {}
+        spec = role_of.get(tid)
+        # normalize role spec -> list of (role, excerpt)
+        if isinstance(spec, list):
+            entries = spec
+        elif isinstance(spec, dict):
+            entries = [spec]
+        else:
+            entries = [{"role": spec}]
+        for entry in entries:
+            row = _cite(tid, tdata)
+            row["kind"] = _node_kind(tid, tdata)
+            row["ts"] = (tnode["ts"] if tnode else None) or ""
+            row["role"] = entry.get("role")
+            roles.add(entry.get("role"))
+            if entry.get("excerpt") is not None:
+                row["excerpt"] = entry["excerpt"]
+            touchpoints.append(row)
+    touchpoints.sort(key=lambda r: (r["ts"], r["id"], r.get("role") or ""))
+
+    # the train's key date = the earliest spine ts (story start), anchor tie-break
+    key_date = timeline[0]["ts"] if timeline else (
+        (anchor_node["ts"] if anchor_node else None) or "")
+
+    return {
+        "anchor": anchor,
+        "key_date": key_date,
+        "title": adata.get("title"),
+        "outcome": _outcome(nodes),
+        "areas": sorted(areas),
+        "roles": sorted(r for r in roles if r),
+        "touchpoints": touchpoints,
+        "timeline": timeline,
+    }
+
+
+def _result(query, focus, focus_kind, project, scope, summary, delivered,
+            **context):
+    """The unified envelope. `delivered` is sorted chronologically by the
+    train's (key_date, anchor); the per-train `outcome` flags shipped work so
+    the narration can emphasize it (order stays chronological, never resorted
+    by outcome)."""
+    delivered = sorted(delivered, key=lambda t: (t.get("key_date") or "",
+                                                  t["anchor"]))
+    res = {
+        "query": query,
+        "focus": focus,
+        "focus_kind": focus_kind,
+        "project": project,
+        "status": "ok",
+        "scope": scope,
+        "summary": summary,
+    }
+    res.update(context)
+    res["delivered"] = delivered
+    return res
+
+
+# The focus's contribution edge_type -> the role label on a touchpoint.
+_ROLE_OF_EDGE = {
+    "authored": "author",
+    "reviewed": "reviewer",
+    "merged": "merger",
+    "reported": "reporter",
+    "commented": "commenter",
+}
+
+
+def person_impact(conn, project, login, ts_from=None, ts_to=None):
+    """A contributor's impact across all repos in `project` (people are
+    project-scoped), as the chronological delivery trains they TOUCHED in any
+    role. Returns the unified citation-bearing envelope; a miss (no person
+    node) returns a needs_gather guidance result.
+
+    `delivered`: one `_train` per decision train the login touched (seed the
+    spine from authored/reviewed/merged/reported AND commented dsts that are
+    spine nodes; dedupe to anchors). A train's `touchpoints` are the login's
+    contribution events whose dst falls in that train, each with its role and —
+    for a comment — the bounded excerpt of the login's own comment body.
+    `summary`: per-role counts + trains_touched + shipped (a small header).
+    Context blocks: is_bot, modules, areas, symbols_authored,
+    authored_then_removed. `--from/--to` filter trains by their key date.
+    Determinism: trains by (key_date, anchor); touchpoints/timeline by (ts,id).
     """
     person_id = graphstore.qualify_person(project, login)
     person = graphstore.get_node(conn, person_id)
     if person is None:
         return {
             "query": "person",
-            "login": login,
+            "focus": login,
+            "focus_kind": "person",
             "project": project,
             "status": "needs_gather",
+            "scope": _scope(ts_from, ts_to),
             "guidance": (
                 "no person node for {}; gather a window where they "
                 "contributed".format(login)),
         }
 
     pdata = person["data"] or {}
-    result = {
-        "query": "person",
-        "login": login,
-        "project": project,
-        "status": "ok",
-        "modules": pdata.get("modules") or [],
-        "areas": pdata.get("areas") or [],
-        "is_bot": bool(pdata.get("is_bot")),
-    }
 
-    # --- contributions: out-edges grouped by type, each row cited ---
+    # --- contribution edges, grouped by type; collect spine seeds ---
     edges = graphstore.get_edges(conn, person_id, direction="out",
                                  edge_types=list(_CONTRIB_TYPES))
-    groups = {}
-    seed_ids = []  # authored/reported PR/issue dsts for the train traversal
+    role_counts = {}
+    # touch_index: dst_id -> list of (edge_type) the login did there
+    touch_edges = []  # (edge_type, dst_id)
+    seed_ids = []
     for e in edges:
         etype = e["edge_type"]
-        dst = graphstore.get_node(conn, e["dst_id"])
-        ddata = (dst["data"] if dst else {}) or {}
-        row = _cite(e["dst_id"], ddata)
-        row["ts"] = (dst["ts"] if dst else None) or ""
-        groups.setdefault(etype, []).append(row)
-        if etype in ("authored", "reported") and ("#pr-" in e["dst_id"]
-                                                   or "#issue-" in e["dst_id"]):
+        role_counts[etype] = role_counts.get(etype, 0) + 1
+        touch_edges.append((etype, e["dst_id"]))
+        if "#pr-" in e["dst_id"] or "#issue-" in e["dst_id"]:
             seed_ids.append(e["dst_id"])
-    contributions = {}
-    for etype in _CONTRIB_TYPES:
-        rows = groups.get(etype)
-        if not rows:
-            continue
-        rows.sort(key=lambda r: (r["ts"], r["id"]))
-        contributions[etype] = {"count": len(rows), "items": rows}
-    result["contributions"] = contributions
 
-    # --- symbols authored (+ authored_then_removed) ---
-    # SYMBOL artifact ids carry a '#' in their LOCAL part (path#lang:subkind:name).
-    # code_events is keyed by the repo-qualified id; scan the project's repos.
+    # --- symbols authored (+ authored_then_removed) — context ---
     symbols_authored = []
     removed = []
     for repo in _project_repos(conn, project):
@@ -160,7 +340,6 @@ def person_impact(conn, project, login):
             if "#" not in local:
                 continue  # file-level artifact, not a symbol
             symbols_authored.append({"id": aid})
-            # later remove event (by anyone) on the same artifact?
             rm = conn.execute(
                 "SELECT 1 FROM code_events "
                 "WHERE artifact_id=? AND event='remove' LIMIT 1",
@@ -169,34 +348,82 @@ def person_impact(conn, project, login):
                 removed.append({"id": aid})
     symbols_authored.sort(key=lambda r: r["id"])
     removed.sort(key=lambda r: r["id"])
-    result["symbols_authored"] = symbols_authored
-    result["authored_then_removed"] = removed
 
-    # --- trains anchored: spine traversal from her authored/reported PR/issues ---
-    trains = []
-    if seed_ids:
-        seen_anchors = set()
-        for seed in sorted(set(seed_ids)):
-            reach = graphstore.traverse_spine(conn, [seed])
-            reached = reach["reached"]
-            if not reached:
-                continue
-            # the anchor is the deterministically-smallest reached id, so the
-            # same train (whatever seed entered it) collapses to one entry.
-            anchor = min(reached)
-            if anchor in seen_anchors:
-                continue
-            seen_anchors.add(anchor)
-            anchor_node = graphstore.get_node(conn, anchor)
-            adata = (anchor_node["data"] if anchor_node else {}) or {}
-            train = _cite(anchor, adata)
-            train["anchor"] = anchor
-            train["reached"] = len(reached)
-            trains.append(train)
-        trains.sort(key=lambda t: t["anchor"])
-    result["trains_anchored"] = trains
+    # --- delivered: one train per anchor the login touched ---
+    # First map each seed to its train's reached set + anchor.
+    trains_by_anchor = {}  # anchor -> reached set (ids)
+    for seed in sorted(set(seed_ids)):
+        reach = graphstore.traverse_spine(conn, [seed])
+        reached = set(reach["reached"])
+        if not reached:
+            continue
+        anchor = min(reached)
+        # union reached sets sharing an anchor (a seed entering the same train)
+        trains_by_anchor.setdefault(anchor, set()).update(reached)
 
-    return result
+    delivered = []
+    shipped = 0
+    for anchor, reached in trains_by_anchor.items():
+        # which of the login's touched dsts fall in this train?
+        focus_touch_ids = []
+        role_of = {}
+        for etype, dst_id in touch_edges:
+            if dst_id not in reached:
+                continue
+            role = _ROLE_OF_EDGE.get(etype, etype)
+            entry = {"role": role}
+            if etype == "commented":
+                entry["excerpt"] = _person_comment_excerpt(conn, dst_id, login)
+            role_of.setdefault(dst_id, []).append(entry)
+            if dst_id not in focus_touch_ids:
+                focus_touch_ids.append(dst_id)
+        train = _train(conn, anchor, reached, focus_touch_ids, role_of)
+        if (ts_from is not None or ts_to is not None) and not _date_in_range(
+                train["key_date"], ts_from, ts_to):
+            continue
+        if train["outcome"] == "shipped":
+            shipped += 1
+        delivered.append(train)
+
+    summary = dict(role_counts)
+    summary["trains_touched"] = len(delivered)
+    summary["shipped"] = shipped
+
+    return _result(
+        "person", login, "person", project, _scope(ts_from, ts_to),
+        summary, delivered,
+        is_bot=bool(pdata.get("is_bot")),
+        modules=pdata.get("modules") or [],
+        areas=pdata.get("areas") or [],
+        symbols_authored=symbols_authored,
+        authored_then_removed=removed,
+    )
+
+
+def _date_in_range(ts, ts_from, ts_to):
+    """A train/event date filter. An empty ts is excluded once a bound is set."""
+    if not ts:
+        return False
+    if ts_from is not None and ts < ts_from:
+        return False
+    if ts_to is not None and ts > ts_to:
+        return False
+    return True
+
+
+def _person_comment_excerpt(conn, dst_id, login):
+    """The bounded excerpt of `login`'s own comment body on a PR/issue node
+    (comments live embedded in the node's data `comments_list`/
+    `review_comments`). The first matching comment by the login wins; empty
+    string if none is recoverable."""
+    node = graphstore.get_node(conn, dst_id)
+    data = (node["data"] if node else {}) or {}
+    comments = (data.get("comments_list") or []) + (
+        data.get("review_comments") or [])
+    for c in comments:
+        if c.get("author") == login:
+            return _excerpt(c.get("body"))
+    return ""
 
 
 def _normalize_artifact_id(conn, project, artifact_id):
@@ -219,22 +446,19 @@ def _normalize_artifact_id(conn, project, artifact_id):
     return None
 
 
-def pattern_evolution(conn, project, artifact_id):
+def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
     """A symbol/file artifact's FULL lifecycle across all history (not one
-    window). Returns a deterministically-ordered, citation-bearing Result; an
-    unknown id (no node and no code_events) yields a needs_gather result.
+    window), as a SINGLE chronological delivery train. Returns the unified
+    citation-bearing envelope; an unknown id (no node and no code_events)
+    yields a needs_gather result.
 
-    Fields:
-      lifecycle      — get_code_events(artifact_id) in (date, commit) order;
-                       each row {event, commit, author, date, before, after}
-                       cited by its commit ref. File artifacts leave
-                       before/after null; symbols carry bounded before/after.
-      identity_chain — the artifact's true cross-path history assembled by
-                       walking `replaced_by` (src->dst) forward and
-                       `identity_from` (dst->src) backward from the given id.
-                       Ordered A->B->C across renames/moves; each link past the
-                       head carries the move `confidence`/`basis` from edge data.
-    Determinism: lifecycle by (date, commit); chain in link order (depth-capped).
+    `delivered`: one train whose `timeline` is the artifact's `code_events` in
+    (date, commit) order, each row cited via the shared `_timeline_row` shape
+    ({id=artifact, kind, event, ts=date, sha, url?, before?, after?}); the
+    train's `outcome` is "removed" if the last event is a remove, else "alive".
+    Context: `identity_chain` — the cross-path history walked over
+    replaced_by/identity_from. `--from/--to` bound the lifecycle window.
+    Determinism: timeline by (date, commit); chain in link order (depth-capped).
     """
     qid = _normalize_artifact_id(conn, project, artifact_id)
     events = graphstore.get_code_events(conn, qid) if qid else []
@@ -242,34 +466,55 @@ def pattern_evolution(conn, project, artifact_id):
     if not events and node is None:
         return {
             "query": "symbol",
-            "artifact_id": artifact_id,
+            "focus": artifact_id,
+            "focus_kind": "symbol",
             "project": project,
             "status": "needs_gather",
+            "scope": _scope(ts_from, ts_to),
             "guidance": (
                 "no node or code_events for {}; gather a window that touches "
                 "this artifact".format(artifact_id)),
         }
 
-    # --- lifecycle: code_events in (date, commit) order, each cited ---
+    # --- timeline: code_events in (date, commit) order, each cited ---
     events.sort(key=lambda e: ((e["date"] or ""), e["commit_sha"]))
-    lifecycle = []
+    if ts_from is not None or ts_to is not None:
+        events = [e for e in events
+                  if _date_in_range(e["date"] or "", ts_from, ts_to)]
+    timeline = []
     for e in events:
         ref = e.get("ref")
         row = {
+            "id": qid,
+            "kind": _node_kind(qid, {}),
             "event": e["event"],
-            "commit": e["commit_sha"],
+            "ts": e["date"] or "",
+            "sha": e["commit_sha"],
             "author": e["author"],
-            "date": e["date"],
             "before": e["before"],
             "after": e["after"],
         }
-        # cite by the commit ref when present (url/sha), else the bare sha.
-        if isinstance(ref, dict):
-            if ref.get("url") is not None:
-                row["url"] = ref["url"]
-            if ref.get("sha") is not None:
-                row["ref_sha"] = ref["sha"]
-        lifecycle.append(row)
+        # cite by the commit ref's url when present.
+        if isinstance(ref, dict) and ref.get("url") is not None:
+            row["url"] = ref["url"]
+        timeline.append(row)
+
+    outcome = "removed" if (timeline and timeline[-1]["event"] == "remove") \
+        else "alive"
+    anchor_node = node
+    title = (anchor_node["data"].get("title") if anchor_node else None) \
+        if anchor_node else None
+    key_date = timeline[0]["ts"] if timeline else ""
+    train = {
+        "anchor": qid,
+        "key_date": key_date,
+        "title": title,
+        "outcome": outcome,
+        "areas": [],
+        "roles": [],
+        "touchpoints": [],
+        "timeline": timeline,
+    }
 
     # --- identity_chain: walk replaced_by forward + identity_from backward ---
     # Each artifact stores both edges (replaced_by src->dst, identity_from
@@ -336,35 +581,32 @@ def pattern_evolution(conn, project, artifact_id):
             c["basis"] = meta.get("basis")
         identity_chain.append(c)
 
-    return {
-        "query": "symbol",
-        "artifact_id": qid,
-        "project": project,
-        "status": "ok",
-        "lifecycle": lifecycle,
-        "identity_chain": identity_chain,
-    }
+    summary = {"events": len(timeline), "outcome": outcome}
+    return _result(
+        "symbol", qid, "symbol", project, _scope(ts_from, ts_to),
+        summary, [train],
+        identity_chain=identity_chain,
+    )
 
 
 def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
-    """An area's activity + blast radius (optional time range). Returns a
-    deterministically-ordered, citation-bearing Result; an unknown area (no
-    `area-<area>` structure node in any project repo) yields a needs_gather
-    result.
+    """An area's activity + blast radius as the chronological delivery trains
+    that TOUCHED the area (optional time range). Returns the unified
+    citation-bearing envelope; an unknown area (no `area-<area>` structure node
+    in any project repo) yields a needs_gather result.
 
-    Fields:
-      contributors  — codeowners (inverse `owns`, person->area) plus the authors
-                      of commits/PRs that `touches` the area, deduped to logins
-                      with their relation (`owns` wins over `touches`), cited.
-      shipped/stalled — the PRs attributed to the area (a PR is attributed when
-                      one of its `part_of` commits `touches` the area, or the PR
-                      itself `touches` the area), split by status: merged/closed
-                      -> shipped, open -> stalled. Filtered by node `ts` when
-                      --from/--to are given. Cited by number/url.
-      depends_on    — blast radius: `depends_on` edges OUT of the area (what it
-                      depends on) and INTO it (what depends on it), each carrying
-                      version/transitive from edge data.
-    Determinism: contributors by login; items by number then id; deps by area id.
+    `delivered`: one `_train` per train that touched the area (seed the spine
+    from the area's touching commits/PRs); each train's `touchpoints` are the
+    area-touching nodes within it. `summary`: trains + shipped + contributors.
+    Context blocks:
+      contributors  — codeowners (inverse `owns`) plus the authors of commits/
+                      PRs that `touches` the area, deduped (`owns` beats
+                      `touches`), ordered by login.
+      depends_on    — blast radius: `depends_on` edges OUT (what it depends on)
+                      and IN (what depends on it), each carrying version/
+                      transitive.
+    `--from/--to` filter trains by their key date.
+    Determinism: trains by (key_date, anchor); contributors by login; deps by id.
     """
     # resolve the area node across the project's repos
     area_qid = None
@@ -377,22 +619,15 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
     if area_qid is None:
         return {
             "query": "subsystem",
-            "area": area,
+            "focus": area,
+            "focus_kind": "subsystem",
             "project": project,
             "status": "needs_gather",
+            "scope": _scope(ts_from, ts_to),
             "guidance": (
                 "no area node for {}; gather a window that touches it (areas "
                 "are sparse in short windows)".format(area)),
         }
-
-    def _in_range(ts):
-        if ts is None:
-            return False
-        if ts_from is not None and ts < ts_from:
-            return False
-        if ts_to is not None and ts > ts_to:
-            return False
-        return True
 
     def _author_login(node):
         return (node["data"] or {}).get("author") if node else None
@@ -440,24 +675,34 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
         for login in sorted(relations)
     ]
 
-    # --- shipped / stalled split over the attributed PRs ---
-    shipped, stalled = [], []
-    for pr_id in sorted(attributed_prs):
-        pr = attributed_prs[pr_id]
-        if (ts_from is not None or ts_to is not None) and not _in_range(pr["ts"]):
+    # --- delivered: trains the area touched ---
+    # Seed the spine from the area's touching commits/PRs (and the PRs those
+    # commits are part_of), dedupe to anchors. Each train's touchpoints are the
+    # area-touching nodes that fall in it.
+    seed_ids = set(touching_src_ids) | set(attributed_prs)
+    trains_by_anchor = {}  # anchor -> reached set (ids)
+    for seed in sorted(seed_ids):
+        reach = graphstore.traverse_spine(conn, [seed])
+        reached = set(reach["reached"])
+        if not reached:
+            # a lone toucher with no spine still forms a single-node train
+            reached = {seed}
+        anchor = min(reached)
+        trains_by_anchor.setdefault(anchor, set()).update(reached)
+
+    touch_set = set(touching_src_ids)
+    delivered = []
+    shipped = 0
+    for anchor, reached in trains_by_anchor.items():
+        focus_touch_ids = sorted(touch_set & reached)
+        role_of = {tid: "touches" for tid in focus_touch_ids}
+        train = _train(conn, anchor, reached, focus_touch_ids, role_of)
+        if (ts_from is not None or ts_to is not None) and not _date_in_range(
+                train["key_date"], ts_from, ts_to):
             continue
-        pdata = pr["data"] or {}
-        row = _cite(pr_id, pdata)
-        merged = bool(pdata.get("merged"))
-        state = pdata.get("state")
-        if merged or state == "closed":
-            shipped.append(row)
-        else:
-            stalled.append(row)
-    _item_key = lambda r: (r.get("number") if r.get("number") is not None
-                           else float("inf"), r["id"])
-    shipped.sort(key=_item_key)
-    stalled.sort(key=_item_key)
+        if train["outcome"] == "shipped":
+            shipped += 1
+        delivered.append(train)
 
     # --- depends_on blast radius (out = depends on; in = depended upon by) ---
     def _dep_row(other_id, data):
@@ -482,69 +727,113 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
     deps_out.sort(key=lambda d: d["id"])
     deps_in.sort(key=lambda d: d["id"])
 
-    return {
-        "query": "subsystem",
-        "area": area,
-        "project": project,
-        "status": "ok",
-        "contributors": contributors,
+    summary = {
+        "trains": len(delivered),
         "shipped": shipped,
-        "stalled": stalled,
-        "depends_on": {"out": deps_out, "in": deps_in},
+        "contributors": len(contributors),
     }
+    return _result(
+        "subsystem", area, "subsystem", project, _scope(ts_from, ts_to),
+        summary, delivered,
+        contributors=contributors,
+        depends_on={"out": deps_out, "in": deps_in},
+    )
 
 
 # --------------------------------------------------------------------------
 # Markdown render (thin, deterministic formatter over the same JSON).
 # --------------------------------------------------------------------------
 
+_OUTCOME_BADGE = {
+    "shipped": "[shipped]",
+    "rejected": "[rejected]",
+    "in_flight": "[in-flight]",
+    "removed": "[removed]",
+    "alive": "[alive]",
+}
+
+
+def _scope_label(scope):
+    if scope == "all-history":
+        return "all-history"
+    return "{}..{}".format(scope.get("from") or "", scope.get("to") or "")
+
+
+def _render_train_md(t):
+    """One delivery train as deterministic markdown: outcome badge + the
+    focus's touchpoints, then the cited spine timeline."""
+    lines = []
+    badge = _OUTCOME_BADGE.get(t["outcome"], "[{}]".format(t["outcome"]))
+    title = t.get("title") or t["anchor"]
+    head = "#### {} {}".format(badge, title)
+    if t.get("roles"):
+        head += " ({})".format(", ".join(t["roles"]))
+    lines.append(head)
+    if t.get("areas"):
+        lines.append("- areas: {}".format(", ".join(t["areas"])))
+    if t["touchpoints"]:
+        lines.append("- touchpoints:")
+        for tp in t["touchpoints"]:
+            ref = tp.get("url") or tp.get("sha") or tp["id"]
+            extra = ""
+            if tp.get("excerpt"):
+                extra = " — \"{}\"".format(tp["excerpt"])
+            lines.append("  - [{}] {} — {}{}".format(
+                tp.get("role") or "?", tp.get("title") or tp["id"], ref, extra))
+    lines.append("- timeline:")
+    for r in t["timeline"]:
+        ref = r.get("url") or r.get("sha") or r["id"]
+        when = r.get("ts") or "?"
+        kind = r.get("kind") or "?"
+        ev = " {}".format(r["event"]) if r.get("event") else ""
+        excerpt = " — \"{}\"".format(r["excerpt"]) if r.get("excerpt") else ""
+        lines.append("  - {} {}{} — {}{}".format(when, kind, ev, ref, excerpt))
+    return "\n".join(lines)
+
+
+def _render_delivered_md(res):
+    lines = ["", "### delivered ({} trains)".format(len(res["delivered"]))]
+    for t in res["delivered"]:
+        lines.append(_render_train_md(t))
+        lines.append("")
+    return lines
+
+
 def _render_person_md(res):
     if res["status"] == "needs_gather":
         return "## spotlight: person `{}`\n\n_needs gather:_ {}".format(
-            res["login"], res["guidance"])
+            res["focus"], res["guidance"])
     if res["status"] == "fts_unavailable":
         return "## spotlight\n\n_FTS unavailable:_ {}".format(
             res.get("guidance", ""))
+    s = res["summary"]
     lines = ["## spotlight: person `{}`{}".format(
-        res["login"], " (bot)" if res["is_bot"] else "")]
+        res["focus"], " (bot)" if res["is_bot"] else "")]
     lines.append("")
+    lines.append("- scope: {}".format(_scope_label(res["scope"])))
     lines.append("- modules: {}".format(", ".join(res["modules"]) or "—"))
     lines.append("- areas: {}".format(", ".join(res["areas"]) or "—"))
-    lines.append("")
-    lines.append("### contributions")
-    for etype in _CONTRIB_TYPES:
-        g = res["contributions"].get(etype)
-        if not g:
-            continue
-        lines.append("- **{}** ({})".format(etype, g["count"]))
-        for row in g["items"]:
-            ref = row.get("url") or row.get("sha") or row["id"]
-            label = row.get("title") or row.get("id")
-            lines.append("  - {} — {}".format(label, ref))
-    lines.append("")
-    lines.append("### symbols authored ({}; {} later removed)".format(
+    lines.append("- summary: {} trains touched, {} shipped".format(
+        s.get("trains_touched", 0), s.get("shipped", 0)))
+    roles = ", ".join("{} {}".format(s[r], r) for r in _CONTRIB_TYPES
+                      if r in s)
+    if roles:
+        lines.append("- roles: {}".format(roles))
+    lines.append("- symbols authored: {} ({} later removed)".format(
         len(res["symbols_authored"]), len(res["authored_then_removed"])))
-    for s in res["symbols_authored"]:
-        lines.append("- {}".format(s["id"]))
-    lines.append("")
-    lines.append("### trains anchored ({})".format(len(res["trains_anchored"])))
-    for t in res["trains_anchored"]:
-        ref = t.get("url") or t["anchor"]
-        lines.append("- {} (reached {}) — {}".format(
-            t["anchor"], t["reached"], ref))
-    return "\n".join(lines)
+    lines.extend(_render_delivered_md(res))
+    return "\n".join(lines).rstrip()
 
 
 def _render_symbol_md(res):
     if res["status"] == "needs_gather":
         return "## spotlight: symbol `{}`\n\n_needs gather:_ {}".format(
-            res["artifact_id"], res["guidance"])
-    lines = ["## spotlight: symbol `{}`".format(res["artifact_id"]), ""]
-    lines.append("### lifecycle ({})".format(len(res["lifecycle"])))
-    for e in res["lifecycle"]:
-        ref = e.get("url") or e.get("ref_sha") or e["commit"]
-        lines.append("- **{}** by {} on {} — {}".format(
-            e["event"], e.get("author") or "?", e.get("date") or "?", ref))
+            res["focus"], res["guidance"])
+    s = res["summary"]
+    lines = ["## spotlight: symbol `{}`".format(res["focus"]), ""]
+    lines.append("- scope: {}".format(_scope_label(res["scope"])))
+    lines.append("- summary: {} events, outcome {}".format(
+        s.get("events", 0), s.get("outcome", "?")))
     lines.append("")
     lines.append("### identity chain ({})".format(len(res["identity_chain"])))
     for c in res["identity_chain"]:
@@ -553,25 +842,23 @@ def _render_symbol_md(res):
                 c["id"], c.get("confidence"), c.get("basis")))
         else:
             lines.append("- {}".format(c["id"]))
-    return "\n".join(lines)
+    lines.extend(_render_delivered_md(res))
+    return "\n".join(lines).rstrip()
 
 
 def _render_subsystem_md(res):
     if res["status"] == "needs_gather":
         return "## spotlight: subsystem `{}`\n\n_needs gather:_ {}".format(
-            res["area"], res["guidance"])
-    lines = ["## spotlight: subsystem `{}`".format(res["area"]), ""]
+            res["focus"], res["guidance"])
+    s = res["summary"]
+    lines = ["## spotlight: subsystem `{}`".format(res["focus"]), ""]
+    lines.append("- scope: {}".format(_scope_label(res["scope"])))
+    lines.append("- summary: {} trains, {} shipped, {} contributors".format(
+        s.get("trains", 0), s.get("shipped", 0), s.get("contributors", 0)))
+    lines.append("")
     lines.append("### contributors ({})".format(len(res["contributors"])))
     for c in res["contributors"]:
         lines.append("- {} ({})".format(c["login"], c["relation"]))
-    lines.append("")
-    lines.append("### shipped ({}) / stalled ({})".format(
-        len(res["shipped"]), len(res["stalled"])))
-    for label, items in (("shipped", res["shipped"]), ("stalled", res["stalled"])):
-        for r in items:
-            ref = r.get("url") or r["id"]
-            label2 = r.get("title") or r.get("id")
-            lines.append("- [{}] {} — {}".format(label, label2, ref))
     lines.append("")
     deps = res["depends_on"]
     lines.append("### depends_on blast radius (out {} / in {})".format(
@@ -584,7 +871,8 @@ def _render_subsystem_md(res):
         lines.append("- depended on by {} (v{}{})".format(
             d["area"], d.get("version"),
             ", transitive" if d.get("transitive") else ""))
-    return "\n".join(lines)
+    lines.extend(_render_delivered_md(res))
+    return "\n".join(lines).rstrip()
 
 
 _RENDERERS = {
@@ -614,9 +902,12 @@ def main(argv=None):
     parser.add_argument("--project", default=None,
                         help="project (auto-detected from the store if omitted)")
     parser.add_argument("--from", dest="ts_from", default=None,
-                        help="subsystem: filter items at/after this ts")
+                        help="bound the delivery train at/after this ts "
+                             "(person: train key date; symbol: lifecycle "
+                             "event date; subsystem: train key date)")
     parser.add_argument("--to", dest="ts_to", default=None,
-                        help="subsystem: filter items at/before this ts")
+                        help="bound the delivery train at/before this ts "
+                             "(see --from)")
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true",
                      help="emit raw cited JSON (default)")
@@ -633,9 +924,11 @@ def main(argv=None):
     project = _detect_project(conn, args.project)
 
     if args.query == "person":
-        res = person_impact(conn, project, args.args[0])
+        res = person_impact(conn, project, args.args[0],
+                            ts_from=args.ts_from, ts_to=args.ts_to)
     elif args.query == "symbol":
-        res = pattern_evolution(conn, project, args.args[0])
+        res = pattern_evolution(conn, project, args.args[0],
+                                ts_from=args.ts_from, ts_to=args.ts_to)
     elif args.query == "subsystem":
         res = subsystem_split(conn, project, args.args[0],
                               ts_from=args.ts_from, ts_to=args.ts_to)
