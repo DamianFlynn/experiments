@@ -1192,7 +1192,11 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   JSON-assembly to store upserts (per-batch transactions); pin `clone_sha`; record
   `gathered_windows`. `backfill(id)` single-node on-demand bridge. *Verifiable:* re-gather an
   overlapping window into a fresh `.db` → no duplication; a backfilled out-of-window node
-  appears exactly once.
+  appears exactly once. **P5 seam note (from the P5 final review):** graphstore's writers
+  (`upsert_node`/`upsert_edge`/`add_code_event`/`index_text`) each `commit()` per call — fine
+  for single ops, but P6's high-volume writes want per-batch atomicity/throughput, so P6 adds a
+  defer-commit path (e.g. an optional `commit=True` arg or a batch/transaction context) rather
+  than 50k individual commits.
 - **Phase 7 — extract → bundle-view equivalence (substrate; the gate).** `extract.py`: range
   query → train seeds → bounded spine traversal (`in_window` flags + backfill budget) →
   materialized bundle view in the rev-13 schema. *Gate:* the ⭐ golden-bundle equivalence test —

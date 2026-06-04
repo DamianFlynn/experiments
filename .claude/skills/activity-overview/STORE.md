@@ -71,6 +71,12 @@ index; `fts_search(query)` returns matching node ids ranked by relevance.
 Created only when the SQLite build supports FTS5 (`fts5_available`); the
 text-mining spotlight query depends on it.
 
+`fts_search` passes `query` straight to the FTS5 `MATCH` operator, so the
+argument must be a **valid FTS5 query**. Callers searching user-derived terms
+(e.g. the P8 spotlight text-mining query) must quote/escape them — FTS5
+operators (`AND`, `OR`, `NOT`, `*`, `"`, `-`, `:`) and unbalanced quotes are
+significant and otherwise raise `OperationalError`.
+
 ## Meta (`meta` table)
 
 Key/value provenance: `schema_version`; `gathered_windows` (JSON list of
