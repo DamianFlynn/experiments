@@ -1,6 +1,5 @@
 import os
 import sys
-import time as _time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -279,6 +278,16 @@ class TestTraversal(unittest.TestCase):
         res = graphstore.traverse_spine(conn, [], max_depth=6)
         self.assertEqual(res, {"reached": {}, "missing": []})
 
+    def test_empty_edge_types_returns_just_seeds(self):
+        conn = _store()
+        self._train(conn)
+        # no allowed edge types -> no traversal; degrades to just the seeds
+        # (SQLite permits `IN ()`, matching nothing — it does not raise).
+        res = graphstore.traverse_spine(
+            conn, ["p/r#issue-1"], max_depth=6, edge_types=[]
+        )
+        self.assertEqual(res, {"reached": {"p/r#issue-1": 0}, "missing": []})
+
 
 def _needs_fts5():
     conn = _store()
@@ -412,7 +421,7 @@ class TestDeterminism(unittest.TestCase):
 
 
 class TestScaleSmoke(unittest.TestCase):
-    def test_window_query_fast_over_50k_nodes(self):
+    def test_window_query_uses_index_over_50k_nodes(self):
         conn = _store()
         conn.execute("BEGIN")
         for i in range(50000):
@@ -426,13 +435,23 @@ class TestScaleSmoke(unittest.TestCase):
                 ("p/r#n{}".format(i), ts),
             )
         conn.commit()
-        start = _time.perf_counter()
+        # correctness at scale: the window returns the in-range rows
         got = graphstore.range_query(
             conn, "p", ["r"], "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z"
         )
-        elapsed = _time.perf_counter() - start
         self.assertGreater(len(got), 10000)
-        self.assertLess(elapsed, 2.0)  # generous ceiling; guards a missing index
+        # guard the real intent — the window scan must use idx_nodes_window, not
+        # a full table scan. A query-plan assertion is deterministic across CI
+        # runners/Python versions, unlike a wall-clock threshold. This EXPLAIN
+        # mirrors the query range_query runs for a single repo.
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM nodes WHERE project=? AND repo IN (?) "
+            "AND ts IS NOT NULL AND ts BETWEEN ? AND ? ORDER BY ts, id",
+            ["p", "r", "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z"],
+        ).fetchall()
+        detail = " ".join(str(row[-1]) for row in plan)
+        self.assertIn("idx_nodes_window", detail)
 
 
 if __name__ == "__main__":
