@@ -374,5 +374,36 @@ class TestIdempotentAccumulation(unittest.TestCase):
         self.assertEqual(_counts(conn)["nodes"], 4)
 
 
+class TestDeterminism(unittest.TestCase):
+    def test_data_blob_is_key_sorted(self):
+        conn = _store()
+        graphstore.upsert_node(
+            conn, id="p/r#x", project="p", repo="r", node_class="social",
+            ts="2026-04-01T00:00:00Z", data={"b": 2, "a": 1},
+            fetched_at="2026-04-01T00:00:00Z",
+        )
+        raw = conn.execute("SELECT data FROM nodes WHERE id='p/r#x'").fetchone()[0]
+        self.assertEqual(raw, '{"a": 1, "b": 2}')
+
+    def test_range_query_order_is_stable(self):
+        conn = _store()
+        for local, ts in [
+            ("c", "2026-04-03T00:00:00Z"),
+            ("a", "2026-04-01T00:00:00Z"),
+            ("b", "2026-04-01T00:00:00Z"),
+        ]:
+            graphstore.upsert_node(
+                conn, id=graphstore.qualify_id("p", "r", local),
+                project="p", repo="r", node_class="social", ts=ts,
+                data={}, fetched_at="2026-04-04T00:00:00Z",
+            )
+        got = graphstore.range_query(
+            conn, "p", ["r"], "2026-04-01T00:00:00Z", "2026-04-30T00:00:00Z"
+        )
+        # tie on ts -> ordered by id; a before b before later c
+        self.assertEqual([n["id"] for n in got],
+                         ["p/r#a", "p/r#b", "p/r#c"])
+
+
 if __name__ == "__main__":
     unittest.main()
