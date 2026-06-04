@@ -550,3 +550,22 @@ class TestDeadRefs(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE type='table' AND name='dead_refs'"
         ).fetchone()
         self.assertIsNotNone(row)
+
+    def test_traverse_spine_skip_dead_omits_tombstoned_missing(self):
+        # PR #10 closes issue #7 (absent). Seed PR #10's train.
+        pr = graphstore.qualify_id("acme", "widget", "pr-10")
+        issue = graphstore.qualify_id("acme", "widget", "issue-7")
+        graphstore.upsert_node(self.conn, pr, "acme", "widget", "social",
+                               "2026-03-15T00:00:00Z", {"number": 10})
+        graphstore.upsert_edge(self.conn, pr, issue, "closes")
+
+        # Default: issue #7 is reported missing.
+        m = graphstore.traverse_spine(self.conn, [pr])["missing"]
+        self.assertIn(issue, m)
+
+        # Tombstoned + skip_dead=True: it is omitted from missing.
+        graphstore.record_dead_ref(self.conn, issue)
+        m2 = graphstore.traverse_spine(self.conn, [pr], skip_dead=True)["missing"]
+        self.assertNotIn(issue, m2)
+        # Without skip_dead it is still reported (default unchanged).
+        self.assertIn(issue, graphstore.traverse_spine(self.conn, [pr])["missing"])

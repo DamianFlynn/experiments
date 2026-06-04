@@ -398,7 +398,8 @@ def repo_code_events(conn, project, repo):
     return out
 
 
-def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
+def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES,
+                   skip_dead=False):
     """Undirected reachability over the spine edge allowlist, depth-capped.
 
     Walks edges in both directions (a train links issue<->pr<->commit
@@ -439,6 +440,8 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
             )
         }
     missing = [i for i in reached if i not in present]
+    if skip_dead and missing:
+        missing = [i for i in missing if not is_dead_ref(conn, i)]
     return {"reached": reached, "missing": missing}
 
 
