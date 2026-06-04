@@ -62,6 +62,14 @@ _CHAIN_DEPTH_CAP = 64
 # Bounded excerpt for a comment body carried on a touchpoint / timeline row.
 _EXCERPT_CAP = 200
 
+# Causal spine edges for spotlight's decision-train grouping: graphstore's
+# SPINE_EDGE_TYPES minus `cross_ref`. A cross-reference is a casual mention
+# ("related to #123"), not causality, so following it over-groups unrelated
+# trains and mis-headlines them (e.g. a 2026 PR filed under a 2022 issue it
+# merely mentioned). Spotlight groups by causal links only; the report's
+# traversal (graphstore default) is intentionally left unchanged.
+_CAUSAL_SPINE = tuple(t for t in graphstore.SPINE_EDGE_TYPES if t != "cross_ref")
+
 
 def _cite(node_id, data):
     """A citation row for a contribution target: its id plus whichever of
@@ -393,7 +401,7 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
     # First map each seed to its train's reached set + anchor.
     trains_by_anchor = {}  # anchor -> reached set (ids)
     for seed in sorted(set(seed_ids)):
-        reach = graphstore.traverse_spine(conn, [seed])
+        reach = graphstore.traverse_spine(conn, [seed], edge_types=_CAUSAL_SPINE)
         reached = set(reach["reached"])
         if not reached:
             continue
@@ -722,7 +730,7 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
     seed_ids = set(touching_src_ids) | set(attributed_prs)
     trains_by_anchor = {}  # anchor -> reached set (ids)
     for seed in sorted(seed_ids):
-        reach = graphstore.traverse_spine(conn, [seed])
+        reach = graphstore.traverse_spine(conn, [seed], edge_types=_CAUSAL_SPINE)
         reached = set(reach["reached"])
         if not reached:
             # a lone toucher with no spine still forms a single-node train
@@ -840,7 +848,7 @@ def text_mining(conn, project, phrase, ts_from=None, ts_to=None):
     # trains are hydrated.
     trains_by_anchor = {}  # anchor -> reached set (ids)
     for mid in matched:
-        reach = graphstore.traverse_spine(conn, [mid])
+        reach = graphstore.traverse_spine(conn, [mid], edge_types=_CAUSAL_SPINE)
         reached = set(reach["reached"])
         if not reached:
             reached = {mid}

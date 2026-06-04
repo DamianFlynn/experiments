@@ -257,6 +257,39 @@ class TestPersonImpact(unittest.TestCase):
         self.assertTrue(any("/r2#" in a for a in anchors))
 
 
+class TestCausalOnlyTrains(unittest.TestCase):
+    """A `cross_ref` (a casual "related to #N" mention) must NOT merge spotlight
+    decision trains, even though the graph-level spine traversal — the one the
+    report uses — intentionally follows it. Spotlight groups by causal links only
+    (closes/part_of/spun_off/duplicate_of), so an unrelated PR that merely mentions
+    an issue does not get filed under (and mis-headlined by) that issue's train."""
+
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _crafted_bundle())
+        self.pr1 = graphstore.qualify_id("acme", "r1", "pr-1")    # closes #9 (causal)
+        self.pr2 = graphstore.qualify_id("acme", "r1", "pr-2")    # storage refactor
+        self.issue9 = graphstore.qualify_id("acme", "r1", "issue-9")
+        # pr-2 merely *mentions* the firewall issue -> a casual cross-reference.
+        graphstore.upsert_edge(self.conn, self.pr2, self.issue9, "cross_ref")
+
+    def test_graph_spine_bridges_via_cross_ref(self):
+        # Sanity: the default (report) traversal DOES bridge pr-2 -> issue-9.
+        reached = graphstore.traverse_spine(self.conn, [self.pr2])["reached"]
+        self.assertIn(self.issue9, reached)
+
+    def test_spotlight_keeps_cross_referenced_trains_separate(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice")
+        # The train carrying pr-2 must NOT pull in the firewall train (issue-9/pr-1).
+        carriers = [t for t in res["delivered"]
+                    if any(row["id"] == self.pr2 for row in t["timeline"])]
+        self.assertEqual(len(carriers), 1, "pr-2 should sit in exactly one train")
+        ids = {row["id"] for row in carriers[0]["timeline"]}
+        self.assertNotIn(self.issue9, ids)
+        self.assertNotIn(self.pr1, ids)
+
+
 class TestCLI(unittest.TestCase):
     def setUp(self):
         self.store = os.path.join(HERE, "workspace", "_spotlight_test.db")
