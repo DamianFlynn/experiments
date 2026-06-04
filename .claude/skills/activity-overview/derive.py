@@ -21,7 +21,7 @@ def artifact_id(path):
     return "art:" + (path or "")
 
 
-def _classify_artifact_path(path):
+def classify_artifact_path(path):
     """Classify a changed file path into a tracked artifact kind, or None.
 
     File granularity only (Phase 3a). Precedence: readme > example > doc.
@@ -29,9 +29,9 @@ def _classify_artifact_path(path):
       - example: under an `examples/` directory, or a `*.example*` filename
       - doc    : a `*.md` file, or any file under a `docs/` directory
       - else   : None (ignored at file granularity)
-    A pure copy of gather.classify_artifact_path kept here so derive stays a
-    leaf (no gather import); gather owns the canonical one for its own callers.
-    `symbol`/`comment` artifacts come from the Phase 3d hunk walk, not this."""
+    Canonical single source: `gather` re-exports this (gather→derive is acyclic
+    since derive is a leaf). `symbol`/`comment` artifacts come from the Phase 3d
+    hunk walk (gather.parse_symbol_events), not this path classifier."""
     if not path:
         return None
     parts = path.split("/")
@@ -72,7 +72,7 @@ def build_artifacts(bundle):
     artifacts = {}
 
     def ensure(path):
-        kind = _classify_artifact_path(path)
+        kind = classify_artifact_path(path)
         if kind is None:
             return None
         aid = artifact_id(path)

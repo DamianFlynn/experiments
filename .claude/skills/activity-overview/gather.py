@@ -15,6 +15,7 @@ import sys
 import urllib.error
 import urllib.request
 
+import derive
 import graphstore
 
 SCHEMA_VERSION = 1
@@ -472,30 +473,10 @@ def derive_open_high_activity(issue):
     return comments >= _HIGH_ACTIVITY_COMMENTS or upvotes >= _HIGH_ACTIVITY_UPVOTES
 
 
-def classify_artifact_path(path):
-    """Classify a changed file path into a tracked artifact kind, or None.
-
-    File granularity only (Phase 3a). Precedence: readme > example > doc.
-      - readme : basename matches README* (any/no extension)
-      - example: under an `examples/` directory, or a `*.example*` filename
-      - doc    : a `*.md` file, or any file under a `docs/` directory
-      - else   : None (ignored at file granularity)
-    `symbol`/`comment` artifacts come from the Phase 3d hunk walk (parse_symbol_events),
-    not this path classifier."""
-    if not path:
-        return None
-    parts = path.split("/")
-    base = parts[-1]
-    low = base.lower()
-    if base.upper().startswith("README"):
-        return "readme"
-    # `.example` only when it is a dot-segment (config.example.json, foo.example),
-    # not an incidental substring (counter-example.md must stay a doc).
-    if "examples" in parts[:-1] or ".example." in low or low.endswith(".example"):
-        return "example"
-    if low.endswith(".md") or "docs" in parts[:-1]:
-        return "doc"
-    return None
+# Re-export derive's canonical path classifier so `gather.classify_artifact_path`
+# (used by build_artifacts callers and test_gather) and `derive.classify_artifact_path`
+# are ONE function. gather→derive is acyclic (derive is a stdlib-only leaf).
+classify_artifact_path = derive.classify_artifact_path
 
 
 # ---- Phase 3d: symbol-granular change attribution (diff-local, build-free) ----
@@ -2011,6 +1992,46 @@ def fold_bundle(conn, bundle):
             qid(path), ev.get("change"), ev.get("commit"), ev.get("author"),
             ev.get("date"), None, None, None, None, ev.get("old_path"),
         ))
+
+    # code: artifact substrate (Phase 7b-1 step 2). Derive the per-artifact
+    # lifecycle ledger and symbol-identity moves from the raw bundle (pure, via
+    # `derive`), then persist them additively alongside the commit `code` nodes
+    # and the file-level ledger above. The artifact's own id form is the local
+    # id: `art:<path>` for file artifacts, `<path>#<lang>:<subkind>:<name>` for
+    # symbol/comment ones (see derive.build_artifacts).
+    artifacts = derive.build_artifacts(bundle)
+    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
+    for local, art in artifacts.items():
+        # ts: the artifact's last lifecycle event date (its most-recent activity);
+        # None when it has no events (degrades cleanly, excluded from window scans).
+        lc = art.get("lifecycle") or []
+        ts = lc[-1]["date"] if lc else None
+        nodes.append((qid(local), project, repo, "code", ts, art, fetched))
+
+    # code: symbol-granular lifecycle ledger, keyed by the SYMBOL artifact id,
+    # carrying the rich before/after fields (file-level entries leave them NULL).
+    for ev in bundle.get("symbol_events", []):
+        local = "{}#{}:{}:{}".format(
+            ev["path"], ev["lang"], ev["subkind"], ev["name"] or "")
+        event = derive._SYMBOL_CHANGE_TO_EVENT.get(ev.get("change"), "change")
+        events.append((
+            qid(local), event, ev.get("commit"), ev.get("author"),
+            ev.get("date"), None, None, ev.get("before"), ev.get("after"), None,
+        ))
+
+    # code: symbol-move edges (artifact -> artifact). Each confident move links
+    # the source symbol `replaced_by` the dest and the dest `identity_from` the
+    # source, both carrying move_confidence/move_basis. Idempotent by (src,dst,type).
+    for m in derive.match_symbol_moves(
+            bundle.get("symbol_events", []),
+            [(e.get("old_path"), e["path"]) for e in bundle.get("code_events", [])
+             if e.get("change") in ("rename", "copy") and e.get("old_path")]):
+        lang = m["lang"] or ""
+        src = qid("{}#{}:{}:{}".format(m["from_path"], lang, m["subkind"], m["name"]))
+        dst = qid("{}#{}:{}:{}".format(m["to_path"], lang, m["subkind"], m["name"]))
+        data = {"move_confidence": m["confidence"], "move_basis": m["basis"]}
+        edges.append((src, dst, "replaced_by", None, data))
+        edges.append((dst, src, "identity_from", None, data))
 
     # structure: milestones & areas (NULL ts -> excluded from window scans),
     # releases (dated point-in-time).

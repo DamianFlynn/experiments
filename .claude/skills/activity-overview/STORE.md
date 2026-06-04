@@ -100,11 +100,30 @@ scans), identity-keyed and idempotent. A singleton node is written only when its
 source value is present and non-empty, so a reader never reconstructs a
 fabricated empty key.
 
-Still written by **Phase 7 slice 7b** (lifting link's pure derivations onto the
-write path — see
+**Slice 7b-1 (step 2) additionally persists the artifact substrate** (derived on
+the write path via the shared `derive.py` leaf module — `derive.build_artifacts`
+/ `derive.link_symbol_identity`):
+
+- **Artifact `code` nodes.** Each lifecycle-tracked artifact upserts as a `code`
+  node keyed on its own id form — local id `art:<path>` for file artifacts
+  (readme/doc/example) and `<path>#<lang>:<subkind>:<name>` for symbol/comment
+  artifacts — with `ts` = the artifact's last lifecycle-event date and `data` =
+  the full artifact record. Additive to (and distinct from) the commit `code`
+  nodes, which keep their bare-`<sha>` local id. Idempotent by id.
+- **`symbol_events` ledger.** The symbol-granular lifecycle
+  (`gather.parse_symbol_events`) is persisted into the `code_events` table keyed
+  by the SYMBOL artifact id, carrying the rich `before`/`after` fields (file-level
+  rows leave them NULL). A symbol artifact's `lifecycle[]` is
+  `get_code_events(<symbol artifact id>)` in date order.
+- **Symbol-move edges.** Confident window-wide symbol moves
+  (`derive.match_symbol_moves`) upsert `replaced_by` (src→dst) and
+  `identity_from` (dst→src) artifact→artifact edges carrying
+  `move_confidence`/`move_basis` in the edge `data`. Idempotent by (src,dst,type).
+
+Still written by a later **slice 7b-1 step 3** (lifting the remaining link
+derivations onto the write path — see
 `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`): the
-**normalized** people & artifact nodes (link-derived), `symbol_events` (no
-current golden exercises it), and all non-spine edges
+**normalized** people nodes (link-derived) and the contribution / non-spine edges
 (`authored`/`reviewed`/`touches`/`owns`/…).
 
 ## Determinism

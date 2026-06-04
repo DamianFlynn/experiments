@@ -9,6 +9,7 @@ import unittest
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(__file__))
+import derive  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
 
@@ -2058,6 +2059,124 @@ class TestStoreFlag(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self._run_main([], d)
             self.assertEqual([f for f in os.listdir(d) if f.endswith(".db")], [])
+
+
+def _artifact_fold_bundle():
+    """A bundle with file artifacts + symbol_events that yield a confident move.
+
+    code_events introduce file-level artifacts (README/doc); symbol_events drop a
+    resource `foo` in a.bicep and re-add it in b.bicep (a unique-name move) plus a
+    second change on a separate symbol, so the symbol ledger has multiple entries.
+    """
+    return {
+        "meta": {"owner": "acme", "repo": "widget", "from": "2026-01-01",
+                 "to": "2026-01-31"},
+        "prs": [], "issues": [], "milestones": [], "releases": [],
+        "commits": [],
+        "code_events": [
+            {"commit": "c1", "author": "alice", "date": "2026-01-05T00:00:00Z",
+             "change": "add", "path": "README.md"},
+            {"commit": "c2", "author": "bob", "date": "2026-01-09T00:00:00Z",
+             "change": "modify", "path": "docs/guide.md"},
+        ],
+        "symbol_events": [
+            {"commit": "c3", "author": "alice", "date": "2026-01-10",
+             "path": "a.bicep", "lang": "bicep", "subkind": "resource",
+             "name": "foo", "change": "drop",
+             "before": "resource foo ...", "after": None},
+            {"commit": "c4", "author": "alice", "date": "2026-01-12",
+             "path": "b.bicep", "lang": "bicep", "subkind": "resource",
+             "name": "foo", "change": "add",
+             "before": None, "after": "resource foo ..."},
+            {"commit": "c3", "author": "alice", "date": "2026-01-08",
+             "path": "a.bicep", "lang": "bicep", "subkind": "param",
+             "name": "region", "change": "change",
+             "before": "param region string", "after": "param region int"},
+        ],
+    }
+
+
+class TestFoldArtifacts(unittest.TestCase):
+    """Slice 7b-1 step 2: artifact `code` nodes, the symbol_events ledger, and
+    symbol-move edges (replaced_by/identity_from) persisted on the write path."""
+
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        self.bundle = _artifact_fold_bundle()
+        gather.fold_bundle(self.conn, self.bundle)
+        # the canonical artifact records (write path derives the same).
+        self.arts = derive.build_artifacts(_artifact_fold_bundle())
+
+    def _qid(self, local):
+        return graphstore.qualify_id("acme", "widget", local)
+
+    def test_file_artifact_nodes_persisted(self):
+        readme = graphstore.get_node(self.conn, self._qid("art:README.md"))
+        self.assertIsNotNone(readme)
+        self.assertEqual(readme["node_class"], "code")
+        self.assertEqual(readme["data"]["kind"], "readme")
+        self.assertEqual(readme["data"]["path"], "README.md")
+        # ts is the artifact's last lifecycle event date.
+        self.assertEqual(readme["ts"], "2026-01-05T00:00:00Z")
+        doc = graphstore.get_node(self.conn, self._qid("art:docs/guide.md"))
+        self.assertEqual(doc["data"]["kind"], "doc")
+
+    def test_symbol_artifact_nodes_persisted(self):
+        sid = "a.bicep#bicep:resource:foo"
+        node = graphstore.get_node(self.conn, self._qid(sid))
+        self.assertIsNotNone(node)
+        self.assertEqual(node["node_class"], "code")
+        self.assertEqual(node["data"]["kind"], "symbol")
+        self.assertEqual(node["data"]["name"], "foo")
+        self.assertEqual(node["ts"], "2026-01-10")  # last event date
+
+    def test_symbol_event_ledger_retrievable_in_date_order(self):
+        sid = self._qid("a.bicep#bicep:param:region")
+        evs = graphstore.get_code_events(self.conn, sid)
+        self.assertEqual([e["event"] for e in evs], ["change"])
+        self.assertEqual(evs[0]["before"], "param region string")
+        self.assertEqual(evs[0]["after"], "param region int")
+        # the dropped `foo` symbol carries its remove event keyed by its own id.
+        foo = graphstore.get_code_events(self.conn, self._qid("a.bicep#bicep:resource:foo"))
+        self.assertEqual([e["event"] for e in foo], ["remove"])
+        self.assertEqual(foo[0]["before"], "resource foo ...")
+
+    def test_symbol_move_edges_with_confidence(self):
+        src = self._qid("a.bicep#bicep:resource:foo")
+        dst = self._qid("b.bicep#bicep:resource:foo")
+        rep = graphstore.get_edges(self.conn, src, direction="out",
+                                   edge_types=["replaced_by"])
+        self.assertEqual(len(rep), 1)
+        self.assertEqual(rep[0]["dst_id"], dst)
+        self.assertEqual(rep[0]["data"]["move_confidence"], "medium")
+        idf = graphstore.get_edges(self.conn, dst, direction="out",
+                                   edge_types=["identity_from"])
+        self.assertEqual(len(idf), 1)
+        self.assertEqual(idf[0]["dst_id"], src)
+        self.assertEqual(idf[0]["data"]["move_confidence"], "medium")
+
+    def test_artifact_substrate_does_not_leak_into_extract(self):
+        # extract reconstructs only raw commits/code_events; the artifact `code`
+        # nodes and symbol-event ledger rows must NOT pollute either.
+        import extract
+        b = extract.extract(self.conn, "acme", "widget", "2026-01-01", "2026-01-31")
+        self.assertEqual(b["commits"], [])  # no artifact node masquerades as a commit
+        paths = {e["path"] for e in b["code_events"]}
+        self.assertEqual(paths, {"README.md", "docs/guide.md"})  # no symbol paths
+        self.assertFalse(any("#" in e["path"] for e in b["code_events"]))
+
+    def test_idempotent_refold(self):
+        n_nodes = self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        n_events = self.conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0]
+        n_edges = self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        gather.fold_bundle(self.conn, _artifact_fold_bundle())
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], n_nodes)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0], n_events)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], n_edges)
 
 
 if __name__ == "__main__":

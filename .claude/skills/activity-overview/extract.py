@@ -71,6 +71,17 @@ def _local(node_id):
     return graphstore.parse_id(node_id)["local"]
 
 
+def _is_commit_node(node):
+    """True for a real commit `code` node, False for an artifact one. Commits are
+    keyed by a bare `<sha>` local id and their record carries `sha`; artifact
+    nodes use the `art:`/`<path>#…` id form and have no `sha`. Lets extract keep
+    reconstructing only commits while artifact `code` nodes coexist in the store."""
+    if "sha" not in node["data"]:
+        return False
+    local = _local(node["id"])
+    return not local.startswith("art:") and "#" not in local
+
+
 def _train_anchor(node):
     """Train-anchor id for an in-window social node — the spine seed. A PR
     anchors on itself; an issue anchors on itself. (The anchor is just the seed
@@ -117,9 +128,15 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None):
         [n["data"] for n in socials if _local(n["id"]).startswith("issue-")],
         key=lambda d: d.get("number"))
 
+    # `code` holds both commits (local id = bare <sha>) and artifact nodes
+    # (local id `art:<path>` for files, `<path>#<lang>:<subkind>:<name>` for
+    # symbols). Only commits reconstruct the raw `commits` array; artifact nodes
+    # are a derived projection a later slice materializes, so they are filtered
+    # out here (keeping extract's raw output unchanged from before they existed).
     codes = graphstore.repo_nodes(conn, project, repo, node_class="code")
-    bundle["commits"] = _by([n["data"] for n in codes],
-                            key=lambda d: str(d.get("sha")))
+    bundle["commits"] = _by(
+        [n["data"] for n in codes if _is_commit_node(n)],
+        key=lambda d: str(d.get("sha")))
 
     structure = graphstore.repo_nodes(conn, project, repo, node_class="structure")
     bundle["milestones"] = _by(
@@ -171,14 +188,23 @@ def _materialize_code_events(conn, project, repo):
     """Reconstruct the raw `code_events` array from the file-level ledger, in
     original source order (ledger rowid order). rename/copy recover `old_path`
     from the event's `detail` (fold_bundle stored old_path there)."""
+    prefix = "{}/{}#".format(project, repo)
     out = []
     for ev in graphstore.repo_code_events(conn, project, repo):
+        aid = ev["artifact_id"]
+        # The repo-qualified remainder is the artifact's local id form: `<path>`
+        # for a file event, `<path>#<lang>:<subkind>:<name>` for a symbol one.
+        # Skip symbol-granular rows — they are part of the artifact substrate, not
+        # this raw file-level `code_events` array (file paths have no `#`).
+        remainder = aid[len(prefix):] if aid.startswith(prefix) else _local(aid)
+        if "#" in remainder:
+            continue
         rec = {
             "commit": ev["commit_sha"],
             "author": ev["author"],
             "date": ev["date"],
             "change": ev["event"],
-            "path": _local(ev["artifact_id"]),
+            "path": remainder,
         }
         if ev["event"] in ("rename", "copy") and ev["detail"]:
             rec["old_path"] = ev["detail"]
