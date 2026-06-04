@@ -7,10 +7,30 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import extract  # noqa: E402
+import gather  # noqa: E402
+import graphstore  # noqa: E402
 import link  # noqa: E402
 import render  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _enrich_via_store(golden_name):
+    """End-to-end the new way (slice 7b-2): fold the raw fixture into the store,
+    extract the window (which materializes artifacts/people from the stored
+    nodes), then enrich. enrich no longer DERIVES artifacts/people, so a test that
+    needs them must route through extract rather than feed the raw fixture to
+    enrich directly."""
+    with open(os.path.join(FIX, golden_name)) as fh:
+        golden = json.load(fh)
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    gather.fold_bundle(conn, json.loads(json.dumps(golden)))
+    meta = golden["meta"]
+    extracted = extract.extract(
+        conn, meta["owner"], meta["repo"], meta["from"], meta["to"])
+    return link.enrich(extracted)
 
 
 def _bundle():
@@ -374,8 +394,7 @@ class TestRenderManifestP3(unittest.TestCase):
 
 class TestEndToEndOfflineP3(unittest.TestCase):
     def test_link_then_render_builds_full_substrate(self):
-        with open(os.path.join(FIX, "bundle_p3.json")) as fh:
-            bundle = link.enrich(json.load(fh))
+        bundle = _enrich_via_store("bundle_p3.json")
 
         # artifacts: README change (live), doc add+remove (removed),
         # example renamed (old replaced -> new live)
@@ -491,8 +510,7 @@ class TestRenderManifestP3b(unittest.TestCase):
 
 class TestEndToEndOfflineP3b(unittest.TestCase):
     def test_link_then_render_attributes_areas_and_renders_six(self):
-        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
-            bundle = link.enrich(json.load(fh))
+        bundle = _enrich_via_store("bundle_p3b.json")
 
         # code_area filled on the example artifact (covered by the AVM area)
         ex = bundle["artifacts"][

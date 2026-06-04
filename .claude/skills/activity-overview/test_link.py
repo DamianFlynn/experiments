@@ -4,10 +4,28 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import extract  # noqa: E402
 import gather  # noqa: E402
+import graphstore  # noqa: E402
 import link  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _enrich_via_store(golden_name):
+    """Slice 7b-2 end-to-end: enrich no longer DERIVES artifacts/people — fold
+    materializes them into the store and extract reads them back. A test that
+    needs the enriched artifacts/people (rather than a derivation it calls
+    directly) must route the raw fixture through fold -> extract -> enrich."""
+    with open(os.path.join(FIX, golden_name)) as fh:
+        golden = json.load(fh)
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    gather.fold_bundle(conn, json.loads(json.dumps(golden)))
+    meta = golden["meta"]
+    extracted = extract.extract(
+        conn, meta["owner"], meta["repo"], meta["from"], meta["to"])
+    return link.enrich(extracted)
 
 
 class TestCommitPrResolution(unittest.TestCase):
@@ -780,8 +798,7 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
         self.assertIn("avm/res/network/firewall-policy", alice["modules"])
 
     def test_enrich_fills_all_phase3b_attribution(self):
-        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
-            bundle = link.enrich(json.load(fh))
+        bundle = _enrich_via_store("bundle_p3b.json")
         # at least one artifact and one feature_delta now carry a real area
         arts = bundle["artifacts"]
         self.assertTrue(any(a["code_area"] is not None for a in arts.values()))
@@ -793,8 +810,7 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
 
 class TestPhase3bConsistency(unittest.TestCase):
     def test_attribution_preserves_artifact_and_delta_refs(self):
-        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
-            b = link.enrich(json.load(fh))
+        b = _enrich_via_store("bundle_p3b.json")
         for d in b["feature_deltas"]:
             self.assertTrue(str(d["url"]).startswith("https://"))
             self.assertIn(d["artifact"], b["artifacts"])

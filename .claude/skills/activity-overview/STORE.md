@@ -147,9 +147,33 @@ edges** (all derived on the write path via the shared `derive.py` leaf —
   the edge `data`. **`in_milestone` (social→structure)** from a PR/issue's
   `milestone` title → the milestone node (keyed on number when present).
 
-None of these leak into `extract`: person nodes are ignored by its
-`milestone-`/`release-` prefix structure reconstruction, and every edge above is
-non-spine so `traverse_spine` never follows it.
+The contribution / `owns` / `touches` / `depends_on` / `in_milestone` edges
+never leak into `extract`: every one is non-spine, so `traverse_spine` never
+follows it, and extract reads none of them.
+
+**Slice 7b-2 — reader contract: `extract` materializes `artifacts` + `people`
+from the stored nodes; `link.enrich` shrank.** Because the write path now derives
+those two projections identically to how `enrich` used to (store-derived ==
+link-derived, locked by `test_characterization.py`), `extract` no longer emits a
+RAW-only view — it additionally reconstructs:
+
+- **`artifacts`** by reading the artifact `code` nodes (the non-commit ones —
+  local id `art:<path>` / `<path>#…`), keyed by that local id (== `artifact_id`).
+  extract restores build_artifacts' code_events insertion order so order-sensitive
+  consumers (`build_timeline`'s same-`(ts,url)` tie-break) reproduce byte-for-byte.
+- **`people`** by reading the project-scoped person `structure` nodes (repo
+  sentinel `"*"`, local id `person-<login>`), keyed by login (the redundant stored
+  `login` field is dropped).
+
+extract READS these — it does NOT re-derive via `build_artifacts` /
+`attribute_people_areas`. Correspondingly `link.enrich` removed its
+`build_artifacts` + `attribute_people_areas` calls and now CONSUMES
+`bundle["artifacts"]`/`bundle["people"]` (with defensive
+`setdefault("artifacts", {})` / `setdefault("people", {})` so a raw bundle fed
+straight to enrich never KeyErrors and never silently recomputes them). enrich
+still owns the window-only projections (trains/buckets/timeline/feature_deltas/
+code-area attribution/modules/forecast/symbol-identity). `build_artifacts` and
+`attribute_people_areas` remain re-exported from `link` for direct callers.
 
 Still NOT on the write path after step 3: `blocks` (issue→issue) and
 `in_iteration` (social→sprint) — skipped for lack of source data in the current

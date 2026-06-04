@@ -182,12 +182,15 @@ class TestReviewerMessageResolvedPR(unittest.TestCase):
                       carol["data"]["areas"])
 
     def test_store_people_equal_link_people(self):
-        # The whole point: store-derived people == link-derived people. Folding
-        # the raw fixture and enriching a copy must produce identical person
-        # records (logins + modules + areas).
-        import link  # noqa: E402
-        enriched = link.enrich(json.loads(json.dumps(self.bundle)))
-        link_people = enriched.get("people", {})
+        # The whole point: store-derived people == link-derived people. The
+        # link-derivation is derive.attribute_people_areas (what enrich used to
+        # call before slice 7b-2 shrank it). It must see commit->PR links, so we
+        # resolve them first exactly as fold's write path does.
+        raw = json.loads(json.dumps(self.bundle))
+        gather.attach_commit_prs(raw["commits"])
+        area_idx = derive.area_index(raw.get("code_graph", {}) or {})
+        link_people = derive.attribute_people_areas(
+            {**raw, "people": {}}, area_idx)["people"]
         rows = self.conn.execute(
             "SELECT data FROM nodes WHERE id LIKE '%#person-%'").fetchall()
         store_people = {}
@@ -200,24 +203,30 @@ class TestReviewerMessageResolvedPR(unittest.TestCase):
 
 
 class TestPeopleNoLeak(unittest.TestCase):
-    """extract's raw output must be byte-identical with vs without the people
-    nodes + non-spine edges (they live outside the spine and the prefix-keyed
-    structure reconstruction, so they are naturally ignored)."""
+    """The person nodes + non-spine edges affect ONLY extract's `people`
+    projection (slice 7b-2: extract materializes `people` from those nodes).
+    Every OTHER key extract emits — the raw arrays, code_events, singletons —
+    must be byte-identical with vs without them, since extract reconstructs those
+    from prefix-keyed structure/code nodes and the spine, none of which these
+    touch. The contribution/owns/touches/depends_on/in_milestone edges below are
+    never read by extract at all."""
 
     # The contribution/owns/touches/depends_on/in_milestone edge types this
-    # slice adds; deleting them + the person nodes must not change extract's
-    # output (it reads neither — arrays come from prefix-keyed structure/code
-    # nodes and the spine, none of which these touch).
+    # slice adds; deleting them must not change extract's output (it reads none
+    # of them).
     _NEW_EDGE_TYPES = ("authored", "reviewed", "merged", "reported",
                        "commented", "reacted", "owns", "touches",
                        "depends_on", "in_milestone")
 
-    def test_extract_byte_identical_with_and_without_people(self):
+    def test_extract_unchanged_except_people_projection(self):
         # Fold once; extract WITH the people nodes + non-spine edges present.
         conn = graphstore.open_store(":memory:")
         graphstore.init_schema(conn)
         gather.fold_bundle(conn, _people_bundle())
         out_with = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31")
+
+        # Sanity: people were materialized from the nodes (the new contract).
+        self.assertTrue(out_with["people"], "extract must materialize people")
 
         # Sanity: the additions really are present before we remove them.
         n_people = conn.execute(
@@ -236,10 +245,16 @@ class TestPeopleNoLeak(unittest.TestCase):
         conn.commit()
         out_without = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31")
 
-        # Byte-identical: the additions never leaked into extract's raw bundle.
+        # `people` is the ONLY key the person nodes drive: empty without them.
+        self.assertEqual(out_without["people"], {})
+
+        # Every OTHER key is byte-identical: the additions never leaked into the
+        # raw substrate / singletons extract reconstructs.
+        rest_with = {k: v for k, v in out_with.items() if k != "people"}
+        rest_without = {k: v for k, v in out_without.items() if k != "people"}
         self.assertEqual(
-            json.dumps(out_with, sort_keys=True),
-            json.dumps(out_without, sort_keys=True))
+            json.dumps(rest_with, sort_keys=True),
+            json.dumps(rest_without, sort_keys=True))
         # And no person node ever masqueraded as a commit (code-node filter).
         self.assertFalse(any("person-" in str(c.get("sha"))
                              for c in out_with["commits"]))

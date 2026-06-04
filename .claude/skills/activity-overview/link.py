@@ -874,15 +874,23 @@ def build_forecast(bundle):
 
 def enrich(bundle):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
-    the Phase 3a narrative substrate (artifacts/timeline/feature_deltas), and the
-    Phase 3b code-area attribution (code_area/area/modules/people). Label facets
-    and `kind` are stamped in gather.py's acquire(), not here."""
+    the window narrative projections (timeline/feature_deltas) and Phase 3b
+    code-area attribution (code_area/area/modules). Label facets and `kind` are
+    stamped in gather.py's acquire(), not here.
+
+    Slice 7b-2: `artifacts` and `people` are NO LONGER derived here. fold_bundle
+    materializes them into the store and extract reads them back, so enrich now
+    CONSUMES them (build_timeline / attribute_code_areas read `artifacts`). The
+    setdefaults below keep enrich total for callers that hand it a bundle without
+    those keys (e.g. a raw fixture fed directly, not through extract): enrich
+    never KeyErrors and never recomputes them."""
+    bundle.setdefault("artifacts", {})
+    bundle.setdefault("people", {})
     attach_commit_prs(bundle["commits"])
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle)
-    bundle["artifacts"] = build_artifacts(bundle)
     link_symbol_identity(bundle)   # Phase 3e: window-wide symbol moves over the ledger
-    # build_timeline depends on build_artifacts having run (reads bundle["artifacts"]).
+    # build_timeline reads bundle["artifacts"] (supplied by extract / setdefault).
     bundle["timeline"] = build_timeline(bundle)
     # compute_feature_deltas depends on build_trains having run (resolves trains).
     bundle["feature_deltas"] = compute_feature_deltas(bundle)
@@ -894,7 +902,6 @@ def enrich(bundle):
     # Phase 4a: next-release forecast (needs buckets + milestones, placed after both).
     build_forecast(bundle)
     build_modules(bundle, idx)
-    attribute_people_areas(bundle, idx)
     return bundle
 
 

@@ -1,11 +1,15 @@
-"""extract.py — materialize a rev-13 RAW bundle view out of the journey-graph store.
+"""extract.py — materialize a bundle view out of the journey-graph store.
 
 This is the reader counterpart of `gather.fold_bundle`: where fold *writes* a raw
 bundle into the SQLite property graph by identity, `extract` *reads* a window back
-out and reconstructs the rev-13 raw bundle (`meta`, `prs`, `issues`, `commits`,
-`code_events`, `milestones`, `releases`). It emits ONLY raw keys — `link.enrich`
-adds every derived key (trains/buckets/artifacts/timeline/feature_deltas/people/
-modules/forecast) downstream, so render/report and their tests stay untouched.
+out and reconstructs the raw bundle (`meta`, `prs`, `issues`, `commits`,
+`code_events`, `milestones`, `releases`) PLUS the two derived projections fold
+already materialized into nodes — `artifacts` (the per-file lifecycle ledger) and
+`people` (the per-login modules/areas). Slice 7b-2 moved those two out of
+`link.enrich` and into the store: extract READS the stored nodes (it does NOT
+re-derive via build_artifacts / attribute_people_areas), and `link.enrich`
+shrank to the remaining window projections (trains/buckets/timeline/
+feature_deltas/modules/forecast/code-area attribution).
 
 Materialization approach (slice 7a part 1)
 ------------------------------------------
@@ -53,10 +57,11 @@ import sys
 
 import graphstore
 
-# Raw keys this slice materializes. (See module docstring for the not-yet list.)
+# Keys this reader materializes from the store: the raw substrate plus the two
+# derived projections fold persists into nodes (artifacts, people).
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events",
              "milestones", "releases", "workflow_stats", "code_graph",
-             "code_owners", "label_taxonomy")
+             "code_owners", "label_taxonomy", "artifacts", "people")
 
 # Per-repo singleton facts: raw bundle key -> well-known structure-node local id.
 _SINGLETON_FACTS = (
@@ -80,6 +85,14 @@ def _is_commit_node(node):
         return False
     local = _local(node["id"])
     return not local.startswith("art:") and "#" not in local
+
+
+def _is_artifact_node(node):
+    """True for an artifact `code` node (the non-commit ones `_is_commit_node`
+    excludes): file artifacts keyed `art:<path>`, symbol/comment artifacts keyed
+    `<path>#<lang>:<subkind>:<name>`. extract materializes the raw `artifacts`
+    dict by reading these nodes' data blobs (it does NOT re-run build_artifacts)."""
+    return not _is_commit_node(node)
 
 
 def _train_anchor(node):
@@ -130,13 +143,38 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None):
 
     # `code` holds both commits (local id = bare <sha>) and artifact nodes
     # (local id `art:<path>` for files, `<path>#<lang>:<subkind>:<name>` for
-    # symbols). Only commits reconstruct the raw `commits` array; artifact nodes
-    # are a derived projection a later slice materializes, so they are filtered
-    # out here (keeping extract's raw output unchanged from before they existed).
+    # symbols). Commits reconstruct the raw `commits` array; the artifact nodes
+    # (everything else) reconstruct the `artifacts` projection below.
     codes = graphstore.repo_nodes(conn, project, repo, node_class="code")
     bundle["commits"] = _by(
         [n["data"] for n in codes if _is_commit_node(n)],
         key=lambda d: str(d.get("sha")))
+
+    bundle["code_events"] = _materialize_code_events(conn, project, repo)
+
+    # artifacts: the per-file lifecycle ledger fold persisted as artifact `code`
+    # nodes (the non-commit ones). Read the stored data blobs back into the dict
+    # keyed by the artifact's local id (`art:<path>` / `<path>#…`) — the same key
+    # build_artifacts uses — so enrich/render consume it unchanged. Materialized
+    # from the store, NOT re-derived.
+    #
+    # ORDER MATTERS: build_timeline iterates `artifacts.values()` and its stable
+    # ts-sort lets the iteration order break ties between same-(ts,url) lifecycle
+    # events (e.g. a rename's remove-old + add-new from one commit). repo_nodes
+    # returns nodes by (ts, id), but build_artifacts inserts artifacts in
+    # code_events SOURCE order, so we restore that order here — first appearance of
+    # each artifact path in the (already source-ordered) code_events — to reproduce
+    # the same timeline byte-for-byte. Artifacts with no code_event (none today)
+    # fall to the end, ordered by id.
+    arts = {_local(n["id"]): n["data"] for n in codes if _is_artifact_node(n)}
+    bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"])
+
+    # people: the per-login modules/areas fold persisted as project-scoped person
+    # `structure` nodes (repo sentinel "*", local id `person-<login>`). Read them
+    # back into the dict keyed by login, dropping the redundant stored `login`
+    # field so the shape matches attribute_people_areas' output. Materialized from
+    # the store, NOT re-derived.
+    bundle["people"] = _materialize_people(conn, project)
 
     structure = graphstore.repo_nodes(conn, project, repo, node_class="structure")
     bundle["milestones"] = _by(
@@ -149,8 +187,6 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None):
          if _local(n["id"]).startswith("release-")],
         key=lambda d: d.get("tag_name") or d.get("name") or "")
 
-    bundle["code_events"] = _materialize_code_events(conn, project, repo)
-
     # Per-repo singleton facts: emit each key only when its node was stored.
     for key, local in _SINGLETON_FACTS:
         value = _materialize_singleton(conn, project, repo, local)
@@ -158,6 +194,43 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None):
             bundle[key] = value
 
     return bundle
+
+
+def _order_artifacts(arts, code_events):
+    """Order the artifact dict to match build_artifacts' insertion order (the
+    code_events source order) so order-sensitive consumers (build_timeline's
+    same-(ts,url) tie-break) reproduce byte-for-byte. The order is the first
+    appearance of each file artifact's path in `code_events` (the artifact id is
+    `art:<path>`). Any artifact never named by a code_event (e.g. symbol nodes)
+    is appended last, ordered by id. Pure; does not mutate the records."""
+    first_seen = {}
+    for i, ev in enumerate(code_events):
+        for path in (ev.get("path"), ev.get("old_path")):
+            if path:
+                first_seen.setdefault("art:" + path, i)
+    fallback = len(code_events)
+
+    def rank(aid):
+        return (first_seen.get(aid, fallback), aid)
+
+    return {aid: arts[aid] for aid in sorted(arts, key=rank)}
+
+
+def _materialize_people(conn, project):
+    """Reconstruct the `people` dict {login: {modules, areas, ...}} from the
+    project-scoped person `structure` nodes fold persisted (repo sentinel "*",
+    local id `person-<login>`). The stored blob carries a redundant `login`
+    field (fold wrote `{"login": login, **rec}`); pop it so the per-login record
+    matches attribute_people_areas' output exactly. Read, never re-derived."""
+    people = {}
+    for node in graphstore.repo_nodes(conn, project, "*", node_class="structure"):
+        if not _local(node["id"]).startswith("person-"):
+            continue
+        rec = dict(node["data"])
+        login = rec.pop("login", None)
+        if login:
+            people[login] = rec
+    return people
 
 
 def _materialize_singleton(conn, project, repo, local):
