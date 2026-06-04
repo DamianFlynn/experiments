@@ -161,6 +161,54 @@ def get_node(conn, id):
     return _row_to_node(row) if row else None
 
 
+def upsert_edge(conn, src_id, dst_id, edge_type, ts=None, data=None):
+    """Insert or update an edge keyed by (src, dst, type). Re-upsert unions
+    (refreshes ts/data); never appends a duplicate."""
+    conn.execute(
+        "INSERT INTO edges (src_id, dst_id, edge_type, ts, data) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(src_id, dst_id, edge_type) DO UPDATE SET "
+        "ts=excluded.ts, data=excluded.data",
+        (src_id, dst_id, edge_type, ts,
+         json.dumps(data, sort_keys=True) if data is not None else None),
+    )
+    conn.commit()
+
+
+def _row_to_edge(row):
+    return {
+        "src_id": row["src_id"],
+        "dst_id": row["dst_id"],
+        "edge_type": row["edge_type"],
+        "ts": row["ts"],
+        "data": json.loads(row["data"]) if row["data"] is not None else None,
+    }
+
+
+def get_edges(conn, node_id, direction="both", edge_types=None):
+    """Edges touching node_id. direction: 'out' (src=node), 'in' (dst=node),
+    or 'both'. Optional edge_types allowlist."""
+    clauses = []
+    params = []
+    if direction == "out":
+        clauses.append("src_id=?")
+        params.append(node_id)
+    elif direction == "in":
+        clauses.append("dst_id=?")
+        params.append(node_id)
+    else:
+        clauses.append("(src_id=? OR dst_id=?)")
+        params.extend([node_id, node_id])
+    if edge_types:
+        ph = ",".join("?" for _ in edge_types)
+        clauses.append("edge_type IN ({})".format(ph))
+        params.extend(edge_types)
+    sql = "SELECT * FROM edges WHERE {} ORDER BY edge_type, dst_id, src_id".format(
+        " AND ".join(clauses)
+    )
+    return [_row_to_edge(r) for r in conn.execute(sql, params)]
+
+
 def init_schema(conn):
     """Create all tables. FTS5 table is created when the build supports it."""
     conn.executescript(_CORE_SCHEMA)

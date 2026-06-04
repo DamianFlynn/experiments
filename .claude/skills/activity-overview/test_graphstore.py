@@ -93,5 +93,34 @@ class TestNodes(unittest.TestCase):
         self.assertEqual(node["fetched_at"], "2026-04-02T00:00:00Z")
 
 
+class TestEdges(unittest.TestCase):
+    def test_upsert_edge_then_get_both_directions(self):
+        conn = _store()
+        graphstore.upsert_edge(conn, "p/r#pr-1", "p/r#issue-1", "closes")
+        out = graphstore.get_edges(conn, "p/r#pr-1", direction="out")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["dst_id"], "p/r#issue-1")
+        self.assertEqual(out[0]["edge_type"], "closes")
+        inb = graphstore.get_edges(conn, "p/r#issue-1", direction="in")
+        self.assertEqual(len(inb), 1)
+        self.assertEqual(inb[0]["src_id"], "p/r#pr-1")
+
+    def test_reupsert_edge_unions_no_duplicate(self):
+        conn = _store()
+        graphstore.upsert_edge(conn, "a", "b", "closes")
+        graphstore.upsert_edge(conn, "a", "b", "closes", data={"via": "trailer"})
+        count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        self.assertEqual(count, 1)
+        edge = graphstore.get_edges(conn, "a", direction="out")[0]
+        self.assertEqual(edge["data"], {"via": "trailer"})
+
+    def test_get_edges_filters_by_type(self):
+        conn = _store()
+        graphstore.upsert_edge(conn, "a", "b", "closes")
+        graphstore.upsert_edge(conn, "a", "c", "cross_ref")
+        only = graphstore.get_edges(conn, "a", direction="out", edge_types=["closes"])
+        self.assertEqual([e["dst_id"] for e in only], ["b"])
+
+
 if __name__ == "__main__":
     unittest.main()
