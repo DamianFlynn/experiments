@@ -280,6 +280,37 @@ fetches itself — it calls in via an injected `backfill` callable).
   paths are therefore only exercisable against a real repo (relevant to the
   upcoming trust gate), not by the offline suite.
 
+## Train completion + dead-ref memory (Phase 8d — proposed)
+
+7c's `backfill` is a *single-node* bridge. **Phase 8d** promotes it into a shared
+**completion orchestrator** (`complete.py`) that closes a train **transitively**
+along the causal spine, **bounded by the query's time window** (level-0
+directly-referenced anchors always filled; transitive expansion stops at the
+window edge; closure when no window). Both readers call it — `extract` (refactored
+off its inline loop) and `spotlight` (its four queries gain optional `--complete`).
+`gather.backfill` stays the single-node primitive `complete.py` orchestrates
+through the **injected** fetch seam, so `complete.py` does no I/O and `spotlight`
+stays reader-only.
+
+Every train then carries an **honest edge contract**: `complete: bool` and
+`gaps: [{id, reason}]` with reason `not_gathered` (offline, no fetch attempted) /
+`outside_window` (beyond the query window, not chased) / `unreachable` (a fetch
+was attempted and failed) / `budget` (the per-query fetch ceiling was hit). A
+reference the seam reports **definitively absent** (a 404 phantom — e.g. a
+`Fixes #123` PR-template placeholder) is **pruned**, never a gap, and recorded in
+the `dead_refs` tombstone so no future query re-chases it.
+
+**`dead_refs` table** — `(id PK, project, reason, first_seen)`. Written *only* by
+`gather.backfill` when the seam returns the `ABSENT` outcome (preserving "only
+gather writes"); read via `is_dead_ref`/`get_dead_refs`. `traverse_spine(…,
+skip_dead=True)` drops known-dead ids from `missing` so even the report path stops
+re-surfacing pruned phantoms. The fetch seam grows a third outcome to make this
+possible: `fetched payload` | `ABSENT` (definitive 404 → prune + record dead) |
+`None` (transient/unreachable → an `unreachable` gap). The tombstone is additive,
+ignored by the trust gate, and `first_seen` is excluded from determinism asserts
+(like `fetched_at`). See
+`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`.
+
 ## Roll-up / resume (slice 7c)
 
 A multi-window "wider view" is a **single wider `range_query`** over the union of

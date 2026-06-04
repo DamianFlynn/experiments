@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 14 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending. **Rev 14 re-seats the storage/read seam onto a persistent SQLite graph substrate** — graphstore → gather-as-writer → extract → spotlight — keeping the rev-1–13 fact model verbatim while making full-history chronology, random-access analytics, and durable accumulation tractable; see the new *Architecture (rev 14) — persistent graph substrate* section below and the unified **P1–P14** ledger under *Implementation phasing*. The deferred 4b and the original P5–P8 features are re-sequenced as P10–P14, rebuilt on the store.)
+**Status:** Approved design — rev 15 (**rev 15 promotes backfill into a shared train-completion orchestrator** — `complete.py` makes train completion *transitive* and *window-bounded* and gives every train an *honest edge contract* (`complete`/`gaps` with reasons; 404 phantoms pruned + remembered dead via a `dead_refs` tombstone), shared by `extract` and `spotlight`; see the new *`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`* and **Phase 8d** in the ledger. Prior — rev 14, Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending. **Rev 14 re-seats the storage/read seam onto a persistent SQLite graph substrate** — graphstore → gather-as-writer → extract → spotlight — keeping the rev-1–13 fact model verbatim while making full-history chronology, random-access analytics, and durable accumulation tractable; see the new *Architecture (rev 14) — persistent graph substrate* section below and the unified **P1–P14** ledger under *Implementation phasing*. The deferred 4b and the original P5–P8 features are re-sequenced as P10–P14, rebuilt on the store.)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -1213,6 +1213,19 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   person-impact, subsystem-split, pattern-evolution, commit-text-mining queries + focused
   renders. *Verifiable:* each query against a seeded multi-window store returns the expected
   aggregate with citations; the FTS query returns matches `O(matches)`.
+- **Phase 8d — train completion (the completion orchestrator) (substrate; rev 15).** Promote
+  7c's single-node `backfill` + extract's inline loop into a shared **`complete.py`**: transitive
+  spine completion **bounded by the query window** (else closure; level-0 directly-referenced
+  anchors always filled), an **honest edge contract** on every train (`complete` + `gaps[{id,
+  reason}]`, reasons `not_gathered`/`outside_window`/`unreachable`/`budget`), and **phantom
+  pruning** (a 404 ref is removed, not reported, and remembered in a `dead_refs` tombstone so it
+  is never re-chased). Shared by `extract` (refactored onto it, byte-identical default) and
+  `spotlight` (the four queries gain optional `--complete`; trains carry `complete`/`gaps`
+  offline-by-default, no network). gather stays the only writer/network (the seam is injected;
+  `gather.backfill` gains an `absent`/`ABSENT` outcome and records dead refs). *Verifiable:*
+  transitive reach + each gap reason on a fixture-backed fake; phantom recorded once and never
+  re-fetched; extract 7c suite + trust gate green. Detailed design:
+  `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`.
 - **Phase 9 — multi-repo (substrate; absorbs original-P8 multi-repo).** Exercise qualified-id
   namespacing end-to-end: `repos[]` manifest, cross-repo trains (PR in repo A closing an issue
   in repo B traverses as one thread), project-scoped people aggregating across repos, and
