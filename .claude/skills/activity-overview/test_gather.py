@@ -1972,10 +1972,50 @@ class TestFoldBundle(unittest.TestCase):
 
     def test_idempotent_refold(self):
         gather.fold_bundle(self.conn, _fold_fixture_bundle())  # second fold
+        # 8 spine/structure nodes + 1 `codegraph` singleton (fixture's non-empty
+        # code_graph is round-tripped as a structure node; see fold_bundle).
         self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 8)
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 9)
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], 3)
+
+    def test_code_graph_singleton_node_roundtrip(self):
+        # the whole code_graph dict is round-tripped under local id `codegraph`,
+        # as a NULL-ts structure node (excluded from window scans).
+        cg = graphstore.get_node(self.conn, "acme/widget#codegraph")
+        self.assertIsNotNone(cg)
+        self.assertEqual(cg["node_class"], "structure")
+        self.assertIsNone(cg["ts"])
+        self.assertEqual(cg["data"], _fold_fixture_bundle()["code_graph"])
+
+    def test_absent_singletons_not_written(self):
+        # the fixture has no workflow_stats/code_owners/label_taxonomy -> no node.
+        for local in ("workflowstats", "codeowners", "labeltaxonomy"):
+            self.assertIsNone(
+                graphstore.get_node(self.conn, "acme/widget#" + local), local)
+
+    def test_singleton_facts_persist_and_roundtrip(self):
+        # fold a bundle carrying all four singleton facts; each lands as a node.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = _fold_fixture_bundle()
+        bundle["workflow_stats"] = {"CI": {"total": 2, "success": 2}}
+        bundle["code_owners"] = {"src/": ["alice"]}
+        bundle["label_taxonomy"] = {"area": {"area:": ["area: net"]},
+                                    "source": "auto"}
+        gather.fold_bundle(conn, bundle)
+        for local, key in (("workflowstats", "workflow_stats"),
+                           ("codeowners", "code_owners"),
+                           ("labeltaxonomy", "label_taxonomy")):
+            node = graphstore.get_node(conn, "acme/widget#" + local)
+            self.assertIsNotNone(node, local)
+            self.assertEqual(node["data"], bundle[key], local)
+        # empty workflow_stats must NOT create a node (no fabricated key).
+        bundle["workflow_stats"] = {}
+        conn2 = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn2)
+        gather.fold_bundle(conn2, bundle)
+        self.assertIsNone(graphstore.get_node(conn2, "acme/widget#workflowstats"))
 
     def test_range_query_excludes_structure_with_null_ts(self):
         social_code = graphstore.range_query(

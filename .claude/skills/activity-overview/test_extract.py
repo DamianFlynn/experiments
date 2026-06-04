@@ -41,8 +41,10 @@ import link  # noqa: E402
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
 # meta keys that P6 does not store (so extract cannot reconstruct them) or that
-# are volatile; enrich falls back to deterministic equivalents.
-_VOLATILE_META = ("ref_date", "period", "generated_at")
+# are volatile; enrich falls back to deterministic equivalents. schema_version is
+# bundle-provenance set at acquisition, not P6-stored and not consumed by enrich,
+# so it is dropped on both sides like ref_date/period.
+_VOLATILE_META = ("ref_date", "period", "generated_at", "schema_version")
 
 
 def _load_golden(name):
@@ -110,6 +112,65 @@ class ExtractEquivalenceGate(unittest.TestCase):
     def test_bundle_p3_gate(self):
         # adds code_events -> artifacts/timeline/feature_deltas, plus milestones.
         self._gate("bundle_p3.json")
+
+    def test_bundle_p2_gate(self):
+        # exercises workflow_stats (aggregate dict singleton).
+        self._gate("bundle_p2.json")
+
+    def test_bundle_p3b_gate(self):
+        # exercises code_graph + code_owners + label_taxonomy singletons.
+        self._gate("bundle_p3b.json")
+
+    def test_bundle_p3c_gate(self):
+        # exercises code_graph (with edges) + empty workflow_stats.
+        self._gate("bundle_p3c.json")
+
+
+class ExtractSingletonFacts(unittest.TestCase):
+    """Guard against a vacuous gate: each newly round-tripped per-repo singleton
+    must be present, non-empty, and equal to the golden's value after extract
+    (so _normalize is not silently dropping it and hiding a miss)."""
+
+    def _fold_extract(self, golden_name):
+        golden = _load_golden(golden_name)
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(golden))
+        meta = golden["meta"]
+        extracted = extract.extract(
+            conn, meta["owner"], meta["repo"], meta["from"], meta["to"])
+        return golden, extracted
+
+    def test_workflow_stats_roundtrips_p2(self):
+        golden, ex = self._fold_extract("bundle_p2.json")
+        self.assertTrue(golden["workflow_stats"], "fixture precondition")
+        self.assertIn("workflow_stats", ex)
+        self.assertTrue(ex["workflow_stats"])
+        self.assertEqual(ex["workflow_stats"], golden["workflow_stats"])
+
+    def test_code_graph_edges_roundtrip_p3c(self):
+        golden, ex = self._fold_extract("bundle_p3c.json")
+        self.assertIn("code_graph", ex)
+        edges = [e for a in ex["code_graph"]["areas"] for e in a.get("edges", [])]
+        self.assertTrue(edges, "p3c code_graph must carry non-empty edges")
+        self.assertEqual(ex["code_graph"], golden["code_graph"])
+
+    def test_code_graph_owners_taxonomy_roundtrip_p3b(self):
+        golden, ex = self._fold_extract("bundle_p3b.json")
+        for key in ("code_graph", "code_owners", "label_taxonomy"):
+            self.assertIn(key, ex, key)
+            self.assertTrue(ex[key], key + " must be non-empty")
+            self.assertEqual(ex[key], golden[key], key)
+
+    def test_absent_singletons_not_fabricated(self):
+        # bundle_p3 has none of these; extract must not invent empty keys.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(_load_golden("bundle_p3.json")))
+        ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31")
+        for key in ("workflow_stats", "code_graph", "code_owners",
+                    "label_taxonomy"):
+            self.assertNotIn(key, ex, key + " must not be fabricated")
 
 
 class ExtractRawShape(unittest.TestCase):

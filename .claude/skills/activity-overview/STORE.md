@@ -92,9 +92,17 @@ identity (re-folding an overlapping window mutates nothing already correct). P6
 writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
 `data` blob), `code` (commits) + the file-level `code_events` ledger,
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
-`cross_ref`, and `part_of`. People & artifact nodes (link-derived),
-`symbol_events`, and all non-spine edges (`authored`/`reviewed`/`touches`/
-`owns`/…) are written by a later phase.
+`cross_ref`, and `part_of`. It also persists the per-repo **singleton facts**
+`workflow_stats`, `code_graph`, `code_owners`, and `label_taxonomy` — each as a
+whole-dict `structure` node under a well-known local id (`workflowstats`,
+`codegraph`, `codeowners`, `labeltaxonomy`) with NULL `ts` (excluded from window
+scans), identity-keyed and idempotent. A singleton node is written only when its
+source value is present and non-empty, so a reader never reconstructs a
+fabricated empty key.
+
+Still written by a later phase (slice 7b): the **normalized** people & artifact
+nodes (link-derived), `symbol_events` (no current golden exercises it), and all
+non-spine edges (`authored`/`reviewed`/`touches`/`owns`/…).
 
 ## Determinism
 
