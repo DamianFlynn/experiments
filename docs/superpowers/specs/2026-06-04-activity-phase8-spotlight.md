@@ -1,0 +1,165 @@
+# Phase 8 — spotlight (substrate analytics reader) — design
+
+**Status: PROPOSED.** Detailed design for **Phase 8** of the journey-graph substrate
+(rev-14 ledger: *"Phase 8 — spotlight; absorbs original-P5 people view"*). Phase 7
+made the graph the trustworthy source of truth; Phase 8 adds **`spotlight.py`**, a
+second reader for **parameterized analytics queries orthogonal to the window** —
+the questions the flat bundle could never answer cheaply.
+
+Per-slice implementation plans land under `docs/superpowers/plans/` as each slice
+starts, in the established pattern.
+
+---
+
+## What spotlight is (and is not)
+
+`extract` answers *"what happened in this window?"* (a range query + spine
+traversal → the rev-13 bundle view). **`spotlight` answers cross-cutting questions
+orthogonal to any one window** — *"what has this person done across all repos?",
+"how did this symbol evolve over its whole history?", "who/what touches this
+subsystem?", "everywhere this phrase appears."*
+
+Design rules (rev-14 Section 4):
+- **Bounded SQL (+ CTE / FTS)** over the store — no full scans of JSON. Each query
+  is `O(matches)` / index-bounded, not `O(history)`.
+- **Deterministically ordered** results (explicit `ORDER BY`), so the model narrates
+  the same output every run and tests are byte-stable.
+- **Citation discipline** — every row carries its source ref (`url` / `sha` /
+  `number`), same as the report. Spotlight surfaces facts the model *cites*, never
+  prose it invents.
+- **Never re-fetches.** A query whose answer needs un-gathered data returns a
+  structured *"gather that window/repo first"* guidance result, not a partial lie.
+- **Reader only.** `spotlight` imports `graphstore` (+ `derive` for shared shaping);
+  it never writes the store and never calls the network.
+
+`spotlight` reuses the **trust gate's** guarantee: it reads the same nodes/edges/
+ledgers `validate.py` audits, so a spotlight answer is exactly as trustworthy as the
+graph (which Phase 7 proved).
+
+---
+
+## The four queries
+
+Each query: a Python API `spotlight.<name>(conn, project, **params) -> Result` and a
+CLI subcommand. `Result` is a deterministically-ordered, citation-bearing dict
+(JSON-serializable); a miss yields `{"status": "needs_gather", "guidance": ...}`.
+
+### 1. person-impact  `spotlight person <login>`
+**Q:** everything a contributor did across **all repos in the project** (people are
+project-scoped, repo sentinel `*`).
+- **Modules / areas** — from the person `structure` node (`modules`/`areas`).
+- **Authored / reviewed / merged / reported / commented** — counts + the cited
+  nodes, from the contribution edges (`get_edges(person, "out")`).
+- **Symbols authored (+ authored_then_removed)** — `code_events` rows with
+  `author == login` on symbol artifact ids; `authored_then_removed` = a symbol the
+  person `add`ed that later has a `remove` event (by anyone).
+- **Trains anchored** — `traverse_spine` seeded from the person's authored/reported
+  PRs/issues → the decision trains they drove.
+- **Bot-aware:** the `is_bot` flag is surfaced so a renderer can separate automation.
+- *Determinism:* edges ordered by `(edge_type, ts, dst_id)`; symbols by artifact id.
+- **Real data:** ✓ available now.
+
+### 2. subsystem-split  `spotlight subsystem <area> [--from --to]`
+**Q:** an area's activity + blast radius over an optional range.
+- **Contributors** — `owns` (codeowners) + `touches` (commits/PRs → area) inverted.
+- **Shipped / stalled** — PRs/issues attributed to the area, split by status.
+- **`depends_on` blast radius** — area→area `depends_on` edges (with version /
+  transitive in edge `data`), forward + reverse (what this area breaks if changed).
+- *Determinism:* areas/items ordered by id / number.
+- **Data caveat:** `owns`/`depends_on`/`touches` are **sparse in short real
+  windows** (0/0/4 in the 5-day AVM store). Built + tested primarily against
+  **seeded fixtures**; real-data coverage grows with window size / code_owners.
+
+### 3. pattern-evolution  `spotlight symbol <artifact-id>`
+**Q:** a symbol/file artifact's **full lifecycle across all history**, not one window.
+- **Lifecycle** — `get_code_events(artifact_id)` in date order (add/change/remove,
+  with bounded `before`/`after` for symbols).
+- **Identity chain** — follow `replaced_by` / `identity_from` edges across renames
+  /moves to assemble the artifact's true cross-path history (A→B→C).
+- *Determinism:* events by `(date, commit)`; chain by edge order.
+- **Real data:** ✓ available (109 code_events in the 5-day store).
+
+### 4. commit-text-mining  `spotlight grep <phrase>`
+**Q:** every comment / commit message / review / PR-issue body mentioning a phrase —
+the `O(matches)` FTS query that is a full file scan on the flat JSON.
+- **FTS5** via `graphstore.fts_search(query)` → matching node ids ranked by
+  relevance; spotlight hydrates each to a cited result.
+- **Input hardening:** user phrases must be quoted/escaped for the FTS5 `MATCH`
+  grammar (operators `AND/OR/NOT/*/"/-/:` and unbalanced quotes otherwise raise) —
+  spotlight owns this sanitization so callers can pass raw text.
+- **GATHER PREREQUISITE (slice 8a):** `fts_text` is currently **empty** —
+  `fold_bundle` does not yet `index_text`. Phase 8 must index the searchable text
+  on the write path: PR/issue titles+bodies, commit messages, and the
+  comment/review authors+bodies embedded in social node `data`. Without this the
+  query has nothing to search. FTS is created only when the SQLite build supports
+  FTS5 (`fts5_available`); the query degrades to a clear "FTS unavailable" result
+  otherwise.
+- **Real data:** ✓ after the indexing prerequisite lands.
+
+---
+
+## Focused renders (secondary)
+
+The **primary output is structured, cited JSON** for the model to build reports /
+media from — the skill's end objective. As a convenience, `--md` emits a compact,
+deterministic markdown render per query (person card, subsystem table, symbol
+lifecycle, grep hit-list) — text tables (no `mmdc`); Mermaid only where it adds
+signal (e.g. a symbol identity chain). Renders are thin formatters over the JSON,
+never a separate data path.
+
+## CLI / contract
+
+`python3 spotlight.py <query> <args> --store PATH [--json|--md]` → a deterministic,
+cited result on stdout. **Default is `--json`** (raw structured result): spotlight's
+primary consumer is the AI that builds the report / media from these answers, so the
+contract is clean, citation-bearing JSON the model narrates; `--md` renders are a
+convenience. Exit non-zero only on bad input (unknown query/param), **never** on an
+empty / needs-gather result (those are valid structured answers). Importable API
+mirrors the CLI. No network, no writes.
+
+## Testing strategy (rev-14: *"each query against a seeded multi-window store
+returns the expected aggregate with citations; FTS returns matches `O(matches)`"*)
+
+- **Seeded multi-window store fixtures** — fold 2–3 crafted windows (incl. a
+  cross-repo person, a rename/move chain, an area with owners + `depends_on`, and
+  searchable text) so each query has deterministic expected output. TDD: failing
+  query test first.
+- **Per-query golden** — assert the exact ordered, cited result.
+- **FTS** — assert `O(matches)` (only matching nodes hydrated) + input-sanitization
+  (operator-bearing phrases don't raise).
+- **Determinism** — same store → byte-identical result across runs.
+- **Trust still green** — `validate.py` and the Phase 7 suites unchanged; spotlight
+  is additive (reader-only).
+- **Real-data smoke** — person-impact / pattern-evolution / grep against the real
+  AVM store; subsystem-split where area data exists.
+
+## Gated slices
+
+- **8a — gather text-indexing prerequisite + spotlight scaffold + person-impact.**
+  `fold_bundle` indexes searchable text into `fts_text` (idempotent; FTS5-gated).
+  Stand up `spotlight.py` (CLI + Result shape + miss/guidance) and ship
+  **person-impact** end-to-end with seeded + real-data tests. *Gate:* person-impact
+  golden green; FTS populated on fold; Phase 7 suites unchanged.
+- **8b — pattern-evolution + subsystem-split.** The graph-traversal queries
+  (identity-chain lifecycle; area contributors/shipped/`depends_on`). Seeded
+  fixtures for subsystem (sparse real data). *Gate:* both query goldens green.
+- **8c — commit-text-mining + focused renders.** FTS query (input hardening,
+  `O(matches)`), plus the markdown renders for all four. *Gate:* FTS golden +
+  render goldens green; real-data smoke.
+
+Each slice ships green under the existing trust gate + suite; spotlight never
+mutates the store, so it cannot regress Phase 7's guarantees.
+
+---
+
+## Decisions (resolved in review)
+
+1. **Text-indexing scope (8a):** index **all four** sources — PR/issue
+   titles+bodies, commit messages, and comment/review bodies. "Every mention of a
+   phrase" includes discussion text, where much of the *why* lives.
+2. **subsystem-split:** **build it now** (slice 8b), tested against seeded fixtures;
+   sparse real data is a data property, not a spotlight gap.
+3. **Output default:** **`--json` (raw, cited)** — spotlight feeds the AI that builds
+   the report / media (the skill's objective); `--md` renders are a convenience.
+4. **Slice grouping:** 8a (FTS prereq + scaffold + person-impact) → 8b
+   (pattern-evolution + subsystem-split) → 8c (text-mining + renders).
