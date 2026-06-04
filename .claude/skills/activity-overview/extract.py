@@ -66,6 +66,7 @@ import sys
 
 import graphstore
 import derive
+import complete
 
 # Keys this reader materializes from the store: the raw substrate plus the two
 # derived projections fold persists into nodes (artifacts, people).
@@ -161,42 +162,32 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # 2. Seed trains from in-window social nodes, then bounded spine traversal to
     #    surface out-of-window context (in_window: false).
     seeds = [_train_anchor(n) for n in in_window if n["node_class"] == "social"]
-    spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth)
+    spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth,
+                                      skip_dead=True)
 
-    # 2b. Backfill the `missing` spine ids when a seam is injected (slice 7c).
-    #     Bounded by `backfill_budget`: once exhausted, warn and stop. After a
-    #     successful backfill the node is in the store, so re-traverse — a
-    #     backfilled node may itself reference further missing spine nodes, which
-    #     we keep resolving within the remaining budget. When `backfill` is None
-    #     this whole block is skipped and the original warn-only path runs.
-    if backfill is not None and spine["missing"]:
-        fetched = set()
-        budget_hit = False
-        while spine["missing"]:
-            progressed = False
-            for mid in sorted(spine["missing"]):
-                if mid in fetched:
-                    continue
-                if len(fetched) >= backfill_budget:
-                    budget_hit = True
-                    break
-                fetched.add(mid)
-                res = backfill(conn, mid)
-                if res and res.get("fetched"):
-                    progressed = True
-            if budget_hit or not progressed:
-                break
-            spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth)
-        if budget_hit:
-            warn("extract: backfill budget ({}) exhausted; {} spine context "
-                 "node(s) left un-fetched: {}".format(
-                     backfill_budget, len(spine["missing"]),
-                     ", ".join(sorted(spine["missing"]))))
+    # 2b. Complete the train via the shared orchestrator (slice 7c, now 8d).
+    #     window=None preserves 7c semantics: extract fills the whole reachable
+    #     spine (level-0 + transitive) within budget, exactly as the inline loop
+    #     did. backfill=None (the default) is byte-identical warn-only behaviour
+    #     (every missing id becomes a not_gathered gap and is warned, nothing is
+    #     fetched). After fetches, re-read the spine so the materialization below
+    #     sees the backfilled nodes.
+    result = complete.complete_train(
+        conn, spine["reached"], spine["missing"], window=None,
+        backfill=backfill, budget=backfill_budget, warn=warn)
+    if backfill is not None:
+        spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth,
+                                          skip_dead=True)
 
-    if spine["missing"]:
+    budget_gaps = [g["id"] for g in result["gaps"] if g["reason"] == "budget"]
+    real_gaps = [g["id"] for g in result["gaps"]]
+    if budget_gaps:
+        warn("extract: backfill budget ({}) exhausted; {} spine context "
+             "node(s) left un-fetched: {}".format(
+                 backfill_budget, len(budget_gaps), ", ".join(sorted(budget_gaps))))
+    if real_gaps:
         warn("extract: {} spine context node(s) referenced but not stored: "
-             "{}".format(len(spine["missing"]),
-                         ", ".join(sorted(spine["missing"]))))
+             "{}".format(len(real_gaps), ", ".join(sorted(real_gaps))))
     # context_ids: reached-but-out-of-window nodes (in_window: false). Recorded for
     # completeness / future per-node tagging; the raw arrays below are sourced from
     # repo_nodes so they already include these (including any just backfilled).
