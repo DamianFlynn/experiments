@@ -370,8 +370,11 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
         etype = e["edge_type"]
         role_counts[etype] = role_counts.get(etype, 0) + 1
         touch_edges.append((etype, e["dst_id"]))
-        if "#pr-" in e["dst_id"] or "#issue-" in e["dst_id"]:
-            seed_ids.append(e["dst_id"])
+        # Seed train traversal from EVERY touched spine node, not just PR/issue
+        # dsts: a commit a contributor authored (e.g. a direct push with no PR)
+        # anchors a train of its own that would otherwise be counted in summary
+        # yet missing from `delivered`.
+        seed_ids.append(e["dst_id"])
 
     # --- symbols authored (+ authored_then_removed) — context ---
     symbols_authored = []
@@ -448,13 +451,28 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
     )
 
 
+def _as_iso(bound, end_of_day=False):
+    """Normalize a date-only value (`YYYY-MM-DD`) to a full ISO datetime so
+    lexicographic comparison stays correct against ISO datetimes. A value that
+    already carries a time (`T...`) — or None — is returned unchanged."""
+    if bound is None or "T" in bound:
+        return bound
+    return bound + ("T23:59:59Z" if end_of_day else "T00:00:00Z")
+
+
 def _date_in_range(ts, ts_from, ts_to):
-    """A train/event date filter. An empty ts is excluded once a bound is set."""
+    """A train/event date filter. An empty ts is excluded once a bound is set.
+    Date-only bounds are normalized to the start/end of day, so an inclusive
+    `--to` of `2026-01-12` still matches a same-day ISO datetime like
+    `2026-01-12T14:00:00Z` (a raw string `>` would otherwise exclude it)."""
     if not ts:
         return False
-    if ts_from is not None and ts < ts_from:
+    t = _as_iso(ts)
+    lo = _as_iso(ts_from)
+    hi = _as_iso(ts_to, end_of_day=True)
+    if lo is not None and t < lo:
         return False
-    if ts_to is not None and ts > ts_to:
+    if hi is not None and t > hi:
         return False
     return True
 
@@ -684,7 +702,6 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
     in_edges = graphstore.get_edges(conn, area_qid, direction="in",
                                     edge_types=["owns", "touches"])
     relations = {}  # login -> relation ('owns' beats 'touches')
-    cite_by_login = {}
     touching_src_ids = []
     for e in in_edges:
         if e["edge_type"] == "owns":
@@ -798,7 +815,10 @@ def _fts_query(phrase):
     raises a syntax error and is searched as the words the user typed. An empty
     or whitespace-only phrase becomes `""` (matches nothing) rather than raising.
     """
-    return '"' + str(phrase or "").replace('"', '""') + '"'
+    cleaned = str(phrase or "").strip()
+    if not cleaned:
+        return '""'
+    return '"' + cleaned.replace('"', '""') + '"'
 
 
 def _match_excerpt(node):
@@ -1015,14 +1035,17 @@ def _render_subsystem_md(res):
     deps = res["depends_on"]
     lines.append("### depends_on blast radius (out {} / in {})".format(
         len(deps["out"]), len(deps["in"])))
+    def _dep_suffix(d):
+        bits = []
+        if d.get("version") is not None:
+            bits.append("v{}".format(d["version"]))
+        if d.get("transitive"):
+            bits.append("transitive")
+        return " ({})".format(", ".join(bits)) if bits else ""
     for d in deps["out"]:
-        lines.append("- depends on {} (v{}{})".format(
-            d["area"], d.get("version"),
-            ", transitive" if d.get("transitive") else ""))
+        lines.append("- depends on {}{}".format(d["area"], _dep_suffix(d)))
     for d in deps["in"]:
-        lines.append("- depended on by {} (v{}{})".format(
-            d["area"], d.get("version"),
-            ", transitive" if d.get("transitive") else ""))
+        lines.append("- depended on by {}{}".format(d["area"], _dep_suffix(d)))
     lines.extend(_render_delivered_md(res))
     return "\n".join(lines).rstrip()
 

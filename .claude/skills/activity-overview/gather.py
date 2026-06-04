@@ -2226,17 +2226,22 @@ def fold_bundle(conn, bundle):
     #   - issue social nodes: title + body + embedded comment authors+bodies
     #   - commit code nodes: the commit message
     if graphstore.fts5_available(conn):
+        # Batch the FTS writes into one transaction (index_text(commit=False) +
+        # a single commit) and skip empty text: many tiny commits over a large
+        # window is wasteful, and empty searchable text indexes nothing useful.
+        def _index(node_local, text):
+            if text:
+                graphstore.index_text(conn, qid(node_local), text, commit=False)
         for pr in bundle.get("prs", []):
-            text = _social_text(
+            _index("pr-{}".format(pr["number"]), _social_text(
                 pr,
-                (pr.get("comments_list") or []) + (pr.get("review_comments") or []))
-            graphstore.index_text(conn, qid("pr-{}".format(pr["number"])), text)
+                (pr.get("comments_list") or []) + (pr.get("review_comments") or [])))
         for iss in bundle.get("issues", []):
-            text = _social_text(iss, iss.get("comments_list") or [])
-            graphstore.index_text(
-                conn, qid("issue-{}".format(iss["number"])), text)
+            _index("issue-{}".format(iss["number"]),
+                   _social_text(iss, iss.get("comments_list") or []))
         for c in bundle.get("commits", []):
-            graphstore.index_text(conn, qid(c["sha"]), c.get("message") or "")
+            _index(c["sha"], c.get("message") or "")
+        conn.commit()
 
     graphstore.record_window(conn, project, repo, meta.get("from"), meta.get("to"))
     if meta.get("clone_sha"):

@@ -435,16 +435,20 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
     return {"reached": reached, "missing": missing}
 
 
-def index_text(conn, node_id, text):
+def index_text(conn, node_id, text, commit=True):
     """Index a node's searchable text. Delete-then-insert keeps it idempotent
-    (FTS5 has no UPSERT). Raises if the SQLite build lacks FTS5."""
+    (FTS5 has no UPSERT). Raises if the SQLite build lacks FTS5.
+
+    `commit=False` lets a caller batch many inserts into a single transaction
+    (e.g. folding a whole window) and commit once at the end."""
     if not fts5_available(conn):
         raise RuntimeError("FTS5 not available in this SQLite build")
     conn.execute("DELETE FROM fts_text WHERE node_id=?", (node_id,))
     conn.execute(
         "INSERT INTO fts_text (node_id, text) VALUES (?, ?)", (node_id, text)
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def fts_search(conn, query):

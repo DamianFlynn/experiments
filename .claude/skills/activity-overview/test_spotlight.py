@@ -828,5 +828,89 @@ class TestRealDataSmoke(unittest.TestCase):
                     self.assertIn("kind", r)
 
 
+class TestReviewFixes(unittest.TestCase):
+    """Regressions for the PR #14 review (Copilot): commit-only trains, date-only
+    range bounds, FTS phrase sanitization, dependency render, empty-text FTS."""
+
+    def _store(self, bundle):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, bundle)
+        return conn
+
+    # #1 — seed trains from every touched dst, not just PR/issue ids
+    def test_commit_only_contributor_has_a_train(self):
+        b = {"meta": {"owner": "acme", "repo": "r1",
+                      "from": "2026-02-01", "to": "2026-02-28"},
+             "prs": [], "issues": [],
+             "commits": [{"sha": "facade1", "message": "Direct push to the pipeline",
+                          "author": "zoe", "date": "2026-02-10T00:00:00Z"}]}
+        conn = self._store(b)
+        res = spotlight.person_impact(conn, "acme", "zoe")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["summary"].get("authored"), 1)
+        self.assertEqual(len(res["delivered"]), 1,
+                         "commit-only contributor's train must appear in delivered")
+        ids = {r["id"] for r in res["delivered"][0]["timeline"]}
+        self.assertIn(graphstore.qualify_id("acme", "r1", "facade1"), ids)
+
+    # #2 — date-only bounds normalized so inclusive --to matches same-day datetimes
+    def test_date_only_to_includes_same_day_datetime(self):
+        self.assertTrue(spotlight._date_in_range("2026-01-12T14:00:00Z", None, "2026-01-12"))
+
+    def test_date_only_from_includes_same_day_datetime(self):
+        self.assertTrue(spotlight._date_in_range("2026-01-12T00:00:00Z", "2026-01-12", None))
+
+    def test_date_range_excludes_outside(self):
+        self.assertFalse(spotlight._date_in_range("2026-01-13T00:00:00Z", None, "2026-01-12"))
+        self.assertFalse(spotlight._date_in_range("2026-01-11T23:00:00Z", "2026-01-12", None))
+
+    def test_date_range_empty_ts(self):
+        # an empty timestamp is excluded once filtering is in play
+        self.assertFalse(spotlight._date_in_range("", None, "2026-01-12"))
+        self.assertFalse(spotlight._date_in_range("", "2026-01-12", None))
+
+    # #3 — whitespace/empty FTS phrase -> match-nothing literal, never raises
+    def test_fts_query_whitespace_is_empty(self):
+        self.assertEqual(spotlight._fts_query("   "), '""')
+        self.assertEqual(spotlight._fts_query(""), '""')
+        self.assertEqual(spotlight._fts_query(None), '""')
+        self.assertEqual(spotlight._fts_query('a "b"'), '"a ""b"""')
+
+    # #5 — subsystem render omits a missing version (no "vNone")
+    def test_subsystem_render_omits_missing_version(self):
+        res = {"query": "subsystem", "focus": "x", "focus_kind": "subsystem",
+               "project": "acme", "status": "ok", "scope": "all-history",
+               "summary": {"trains": 0, "shipped": 0, "contributors": 0},
+               "contributors": [],
+               "depends_on": {
+                   "out": [{"area": "y", "id": "i", "version": None, "transitive": False}],
+                   "in": [{"area": "z", "id": "j", "version": "1.2", "transitive": True}]},
+               "delivered": []}
+        md = spotlight.render_md(res)
+        self.assertNotIn("vNone", md)
+        self.assertIn("- depends on y", md)
+        self.assertIn("- depended on by z (v1.2, transitive)", md)
+
+    # #6 — fold does not index empty searchable text
+    def test_fold_skips_empty_searchable_text(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        if not graphstore.fts5_available(conn):
+            self.skipTest("FTS5 unavailable")
+        b = {"meta": {"owner": "acme", "repo": "r1",
+                      "from": "2026-02-01", "to": "2026-02-28"},
+             "prs": [], "issues": [],
+             "commits": [
+                 {"sha": "aaa1111", "message": "Real change to the gateway",
+                  "author": "zoe", "date": "2026-02-10T00:00:00Z"},
+                 {"sha": "bbb2222", "message": "",
+                  "author": "zoe", "date": "2026-02-11T00:00:00Z"}]}
+        gather.fold_bundle(conn, b)
+        rows = {r[0] for r in conn.execute("SELECT node_id FROM fts_text")}
+        self.assertIn(graphstore.qualify_id("acme", "r1", "aaa1111"), rows)
+        self.assertNotIn(graphstore.qualify_id("acme", "r1", "bbb2222"), rows)
+
+
 if __name__ == "__main__":
     unittest.main()
