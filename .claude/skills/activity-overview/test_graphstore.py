@@ -31,5 +31,29 @@ class TestSchema(unittest.TestCase):
         )
 
 
+class TestIdentity(unittest.TestCase):
+    def test_qualify_id_repo_scoped(self):
+        self.assertEqual(
+            graphstore.qualify_id("avm", "bicep-registry-modules", "pr-4821"),
+            "avm/bicep-registry-modules#pr-4821",
+        )
+
+    def test_qualify_person_project_scoped(self):
+        self.assertEqual(
+            graphstore.qualify_person("avm", "octocat"),
+            "avm#person-octocat",
+        )
+
+    def test_parse_id_splits_on_last_hash(self):
+        parsed = graphstore.parse_id("avm/bicep-registry-modules#path/main.bicep#x")
+        self.assertEqual(parsed["scope"], "avm/bicep-registry-modules#path/main.bicep")
+        self.assertEqual(parsed["local"], "x")
+
+    def test_qualified_ids_do_not_collide_across_repos(self):
+        a = graphstore.qualify_id("avm", "repo-a", "issue-1")
+        b = graphstore.qualify_id("avm", "repo-b", "issue-1")
+        self.assertNotEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()

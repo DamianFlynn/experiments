@@ -104,6 +104,26 @@ def fts5_available(conn):
         return False
 
 
+def qualify_id(project, repo, local):
+    """Repo-scoped node id: '{project}/{repo}#{local}'."""
+    return "{}/{}#{}".format(project, repo, local)
+
+
+def qualify_person(project, login):
+    """Project-scoped person id: '{project}#person-{login}'.
+
+    People aggregate across all repos in a project, so they are not
+    repo-qualified (design decision 2).
+    """
+    return "{}#person-{}".format(project, login)
+
+
+def parse_id(qid):
+    """Split a qualified id into {scope, local} on the last '#'."""
+    scope, _, local = qid.rpartition("#")
+    return {"scope": scope, "local": local}
+
+
 def init_schema(conn):
     """Create all tables. FTS5 table is created when the build supports it."""
     conn.executescript(_CORE_SCHEMA)
