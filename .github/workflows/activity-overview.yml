@@ -142,7 +142,7 @@ jobs:
         run: |
           cd .claude/skills/activity-overview
           mkdir -p workspace
-          python3 gather.py \
+          python gather.py \
             --owner "$OWNER" --repo "$REPO" \
             --from "$FROM" --to "$TO" \
             --store workspace/journey.db
@@ -150,7 +150,7 @@ jobs:
       - name: Store sanity (gather produced a non-trivial graph)
         run: |
           cd .claude/skills/activity-overview
-          python3 - <<'PY'
+          python - <<'PY'
           import graphstore
           c = graphstore.open_store("workspace/journey.db")
           n = c.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
@@ -165,7 +165,7 @@ jobs:
           cd .claude/skills/activity-overview
           # validate self-sources the raw bundle from the store (no bundle file);
           # exits non-zero on any ERROR-severity trust violation.
-          python3 validate.py workspace/journey.db
+          python validate.py workspace/journey.db
 
       - name: Upload the journey-graph store
         if: always()

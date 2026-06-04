@@ -241,8 +241,9 @@ def check_participant_completeness(conn, project, repo, bundle):
     path is fixed, so a reviewer of a message-resolved PR MUST be present.
 
     Requires the raw bundle to know the expected participants; when no bundle is
-    passed the check degrades to an INFO note (it cannot enumerate raw records
-    from the store alone, since comments/reviews live embedded in node data).
+    passed it reconstructs the raw PR/issue/commit records from the store
+    (`_reconstruct_raw_from_store`, which reads the comment/review authors embedded
+    in node data) and still runs the full check.
     """
     if bundle is None:
         # Fall back to scanning the embedded raw records in stored node data.
