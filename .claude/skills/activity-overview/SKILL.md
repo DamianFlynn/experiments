@@ -6,47 +6,49 @@ description: Generate a verifiable repository activity digest for a date window 
 # Activity Overview
 
 Produce a **fact-based activity digest** for `OWNER/REPO` over `[FROM, TO]`. Every
-claim in the report resolves to a source ref in the bundle — never invent facts.
+claim in the report resolves to a source ref — never invent facts.
+
+> **Phase 7 status (store-only).** `gather` now folds facts directly into the
+> SQLite **journey-graph store** — that trustworthy graph is the deliverable. The
+> flat bundle JSON is no longer a produced artifact; it is a **transient view**
+> the reader stage materializes from the store via `extract`. The report vertical
+> (`extract → link → render → report`) is **restored in Phase 8**; steps 2–4
+> below describe that target shape and run once Phase 8 lands. Validate the store
+> with `python3 validate.py workspace/journey.db` (self-contained — no bundle file).
 
 ## Procedure
 
-1. **Acquire.** Run the gather CLI (requires `GITHUB_TOKEN` with `repo` scope and `git`
-   on PATH; `read:project` is only needed once later phases enable Projects v2):
+1. **Acquire → store.** Run the gather CLI (requires `GITHUB_TOKEN` with `repo` scope and
+   `git` on PATH; `read:project` is only needed once later phases enable Projects v2). The
+   **store is the sole output** — gather writes no bundle file:
    ```bash
-   python3 gather.py --owner OWNER --repo REPO --from FROM --to TO --out workspace/bundle.json
+   python3 gather.py --owner OWNER --repo REPO --from FROM --to TO --store workspace/journey.db
    ```
-   This writes a schema-complete bundle (see `BUNDLE.md`).
+   This folds a schema-complete graph into the SQLite substrate (see `STORE.md`); the fold is
+   idempotent, so re-running over an overlapping window never double-counts.
    - **IaC dependency edges (Phase 3c):** if `bicep` and/or `terraform` are on `PATH`, gather
      resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges` and records
      `code_graph.edge_extraction` (`resolved`/`timeout`/`failed`/`skipped`); absent the CLIs (or
      the module registry), edges are left empty and the rest of the run is unaffected.
-
-   **Alternative acquire modes (Phase 3c.2):**
-   - **Resume a partial edge gap.** If a prior run left areas `timeout`/`failed` (see
-     `edge_extraction`), re-resolve *only those* against the bundle's pinned `meta.clone_sha`
-     (same source tree) — no full re-gather:
+   - **Roll-up / resume are store-native.** A long view is a wider `range_query` over the store
+     (no separate roll-up artifact); a refresh re-folds the same window against the pinned
+     `meta.clone_sha` (idempotent dedup keeps it overlap-safe). The flat-bundle `--rollup` /
+     `--resume` / `--out` flags were retired with the bundle file.
+   - **Validate the store (trust gate).** Audit the graph for trustworthiness; this is the
+     Phase 7 deliverable's acceptance check and is fully self-contained on a store:
      ```bash
-     python3 gather.py --resume workspace/bundle.json --out workspace/bundle.json
+     python3 validate.py workspace/journey.db
      ```
-     Then continue at **Link** (re-run link + render so the diagrams pick up the new edges).
-   - **Roll up a long view.** Merge monthly installments (overlap-safe — union by stable
-     identity, structure from the latest) into one multi-period bundle:
-     ```bash
-     python3 gather.py --rollup apr.json may.json jun.json --out half.json
-     ```
-     Roll-up emits a *raw* bundle (derived fields dropped), so continue at **Link** then Render.
-     (A fresh wide-window re-gather always yields a correct bundle and stays canonical.)
-   - **Persist to the journey-graph store (optional).** Add `--store workspace/journey.db`
-     to also fold the bundle into the SQLite substrate (see `STORE.md`) — additive and
-     idempotent; the JSON bundle is still written and the rest of the procedure is
-     unchanged.
-2. **Link.** Enrich it offline (no network):
+     `no_drift` / `idempotency` self-source their raw bundle from the store via `extract`; an
+     external `--bundle` is an optional cross-check, never required.
+2. **(Phase 8) Materialize + Link.** The reader stage rebuilds the bundle view from the store
+   (`extract`) and enriches it offline (no network):
    ```bash
-   python3 link.py workspace/bundle.json
+   python3 link.py <bundle-view>
    ```
    This adds `trains` and classifies all four `buckets` (`shipped`, `rejected`,
    `in_flight`, `next_candidates`).
-3. **Render diagrams.** Preflight: `mmdc` must be on PATH
+3. **(Phase 8) Render diagrams.** Preflight: `mmdc` must be on PATH
    (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
    `graphify` is **optional** (used only for its supported languages); when it is
    absent — e.g. on Bicep/Terraform repos — the **directory provider** supplies
@@ -54,19 +56,20 @@ claim in the report resolves to a source ref in the bundle — never invent fact
 
    Then:
    ```bash
-   python3 render.py workspace/bundle.json
+   python3 render.py <bundle-view>
    ```
    This writes `workspace/diagrams/*.mmd`, records `bundle.diagrams`, and **fails
    if any diagram does not compile** under `mmdc`.
    The manifest now also includes `content_timeline`, `deltas_bar`,
    `contributor_graph`, and `kind_breakdown`.
-4. **Write the report.** Read `workspace/bundle.json` and fill `report-template.md`,
-   embedding each `bundle.diagrams` file as a ```mermaid block. Cite each fact with
-   its `url`. Do not state anything the bundle does not contain.
+4. **(Phase 8) Write the report.** Read the materialized bundle view and fill
+   `report-template.md`, embedding each `bundle.diagrams` file as a ```mermaid block.
+   Cite each fact with its `url`. Do not state anything the view does not contain.
 
 ## Rules
 
-- The bundle is the only source of truth. If a fact is not in the bundle, omit it.
+- The **store** is the only source of truth; the bundle view is materialized from it.
+  If a fact is not in the store/view, omit it.
 - Quote PR/issue numbers and link their `url`.
 - Phase 2 reports cover: executive summary, shipped, decision trains, **activity-at-a-glance
   diagrams, releases, CI/CD health, in-flight, rejected/abandoned, and next-up candidates**.

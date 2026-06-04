@@ -1,0 +1,623 @@
+{
+  "artifacts": {
+    "art:README.md": {
+      "code_area": null,
+      "kind": "readme",
+      "lifecycle": [
+        {
+          "author": "Bob",
+          "commit": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+          "date": "2026-05-10",
+          "event": "change",
+          "ref": {
+            "id": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+          }
+        }
+      ],
+      "name": "README.md",
+      "path": "README.md",
+      "replaced_by": null,
+      "status": "live"
+    },
+    "art:docs/firewall.md": {
+      "code_area": null,
+      "kind": "doc",
+      "lifecycle": [
+        {
+          "author": "Alice",
+          "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+          "date": "2026-05-03",
+          "event": "add",
+          "ref": {
+            "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+          }
+        },
+        {
+          "author": "Dave",
+          "commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+          "date": "2026-05-25",
+          "event": "remove",
+          "ref": {
+            "id": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+          }
+        }
+      ],
+      "name": "firewall.md",
+      "path": "docs/firewall.md",
+      "replaced_by": null,
+      "status": "removed"
+    },
+    "art:examples/advanced/main.bicep": {
+      "code_area": null,
+      "kind": "example",
+      "lifecycle": [
+        {
+          "author": "Carol",
+          "commit": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+          "date": "2026-05-18",
+          "event": "add",
+          "ref": {
+            "id": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+          }
+        }
+      ],
+      "name": "main.bicep",
+      "path": "examples/advanced/main.bicep",
+      "replaced_by": null,
+      "status": "live"
+    },
+    "art:examples/basic/main.bicep": {
+      "code_area": null,
+      "kind": "example",
+      "lifecycle": [
+        {
+          "author": "Alice",
+          "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+          "date": "2026-05-03",
+          "event": "add",
+          "ref": {
+            "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+          }
+        },
+        {
+          "author": "Carol",
+          "commit": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+          "date": "2026-05-18",
+          "event": "remove",
+          "ref": {
+            "id": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+          }
+        }
+      ],
+      "name": "main.bicep",
+      "path": "examples/basic/main.bicep",
+      "replaced_by": "art:examples/advanced/main.bicep",
+      "status": "replaced"
+    }
+  },
+  "buckets": {
+    "in_flight": [],
+    "next_candidates": [
+      {
+        "id": 18,
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/18"
+      }
+    ],
+    "rejected": [],
+    "shipped": [
+      {
+        "id": 42,
+        "train": "train-issue-17",
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/42"
+      },
+      {
+        "id": 17,
+        "train": "train-issue-17",
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/17"
+      }
+    ]
+  },
+  "code_events": [
+    {
+      "author": "Alice",
+      "change": "add",
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "date": "2026-05-03",
+      "path": "examples/basic/main.bicep"
+    },
+    {
+      "author": "Alice",
+      "change": "add",
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "date": "2026-05-03",
+      "path": "docs/firewall.md"
+    },
+    {
+      "author": "Bob",
+      "change": "modify",
+      "commit": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "date": "2026-05-10",
+      "path": "README.md"
+    },
+    {
+      "author": "Carol",
+      "change": "rename",
+      "commit": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+      "date": "2026-05-18",
+      "old_path": "examples/basic/main.bicep",
+      "path": "examples/advanced/main.bicep"
+    },
+    {
+      "author": "Dave",
+      "change": "delete",
+      "commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+      "date": "2026-05-25",
+      "path": "docs/firewall.md"
+    }
+  ],
+  "commits": [
+    {
+      "message": "Add basic example (#42)",
+      "pr": 42,
+      "sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    },
+    {
+      "message": "Revise README and example",
+      "pr": null,
+      "sha": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+    }
+  ],
+  "feature_deltas": [
+    {
+      "after": null,
+      "area": null,
+      "artifact": "art:examples/basic/main.bicep",
+      "author": "Alice",
+      "before": null,
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "detail": null,
+      "kind": "add",
+      "name": "main.bicep",
+      "pr": 42,
+      "subject": "example",
+      "train": "train-issue-17",
+      "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    },
+    {
+      "after": null,
+      "area": null,
+      "artifact": "art:examples/basic/main.bicep",
+      "author": "Carol",
+      "before": null,
+      "commit": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+      "detail": null,
+      "kind": "drop",
+      "name": "main.bicep",
+      "pr": null,
+      "subject": "example",
+      "train": null,
+      "url": "https://github.com/o/r/commit/c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+    },
+    {
+      "after": null,
+      "area": null,
+      "artifact": "art:docs/firewall.md",
+      "author": "Alice",
+      "before": null,
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "detail": null,
+      "kind": "add",
+      "name": "firewall.md",
+      "pr": 42,
+      "subject": "doc",
+      "train": "train-issue-17",
+      "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    },
+    {
+      "after": null,
+      "area": null,
+      "artifact": "art:docs/firewall.md",
+      "author": "Dave",
+      "before": null,
+      "commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+      "detail": null,
+      "kind": "drop",
+      "name": "firewall.md",
+      "pr": null,
+      "subject": "doc",
+      "train": null,
+      "url": "https://github.com/o/r/commit/c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+    },
+    {
+      "after": null,
+      "area": null,
+      "artifact": "art:README.md",
+      "author": "Bob",
+      "before": null,
+      "commit": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+      "detail": null,
+      "kind": "change",
+      "name": "README.md",
+      "pr": null,
+      "subject": "readme",
+      "train": null,
+      "url": "https://github.com/o/r/commit/c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+    },
+    {
+      "after": null,
+      "area": null,
+      "artifact": "art:examples/advanced/main.bicep",
+      "author": "Carol",
+      "before": null,
+      "commit": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+      "detail": null,
+      "kind": "add",
+      "name": "main.bicep",
+      "pr": null,
+      "subject": "example",
+      "train": null,
+      "url": "https://github.com/o/r/commit/c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+    }
+  ],
+  "forecast": {
+    "candidates": [
+      {
+        "ref": {
+          "id": 18,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/18"
+        },
+        "score": 6.5,
+        "signals": [
+          "on milestone v1.3.0",
+          "active in window"
+        ],
+        "tier": "likely",
+        "train": null
+      }
+    ],
+    "next_milestone": "v1.3.0"
+  },
+  "issues": [
+    {
+      "closed_at": "2026-05-10T12:00:00Z",
+      "comments_list": [],
+      "kind": "feature",
+      "labels": [
+        "enhancement"
+      ],
+      "milestone": "v1.2.0",
+      "number": 17,
+      "open_high_activity": false,
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "heart": 0,
+        "hooray": 0,
+        "total": 0
+      },
+      "state": "closed",
+      "state_reason": "completed",
+      "title": "Support policy param",
+      "updated_at": "2026-05-10T12:00:00Z",
+      "url": "https://github.com/o/r/issues/17"
+    },
+    {
+      "closed_at": null,
+      "comments_list": [
+        {
+          "author": "dave",
+          "author_association": "CONTRIBUTOR",
+          "body": "+1, we need this for the firewall module.",
+          "created_at": "2026-05-12T10:00:00Z",
+          "id": 9001,
+          "url": "https://github.com/o/r/issues/18#issuecomment-9001"
+        }
+      ],
+      "kind": "other",
+      "labels": [],
+      "milestone": "v1.3.0",
+      "number": 18,
+      "open_high_activity": true,
+      "reactions": {
+        "+1": 9,
+        "-1": 0,
+        "heart": 1,
+        "hooray": 2,
+        "total": 12
+      },
+      "state": "open",
+      "state_reason": null,
+      "title": "Open feature for next release",
+      "updated_at": "2026-05-22T00:00:00Z",
+      "url": "https://github.com/o/r/issues/18"
+    }
+  ],
+  "meta": {
+    "from": "2026-05-01",
+    "owner": "o",
+    "repo": "r",
+    "to": "2026-05-31"
+  },
+  "milestones": [
+    {
+      "due_on": "2026-05-31T00:00:00Z",
+      "number": 4,
+      "state": "open",
+      "title": "v1.2.0"
+    },
+    {
+      "due_on": "2026-06-30T00:00:00Z",
+      "number": 5,
+      "state": "open",
+      "title": "v1.3.0"
+    }
+  ],
+  "modules": {},
+  "people": {
+    "bob": {
+      "areas": [],
+      "is_bot": false,
+      "modules": []
+    },
+    "carol": {
+      "areas": [],
+      "is_bot": false,
+      "modules": []
+    },
+    "dave": {
+      "areas": [],
+      "is_bot": false,
+      "modules": []
+    }
+  },
+  "prs": [
+    {
+      "closed_at": "2026-05-10T12:00:00Z",
+      "closes": [
+        17
+      ],
+      "comments_list": [
+        {
+          "author": "carol",
+          "author_association": "CONTRIBUTOR",
+          "body": "LGTM once the example is added.",
+          "created_at": "2026-05-10T11:00:00Z",
+          "id": 8001,
+          "url": "https://github.com/o/r/pull/42#issuecomment-8001"
+        }
+      ],
+      "crossref_issues": [],
+      "labels": [
+        "enhancement"
+      ],
+      "merged": true,
+      "merged_at": "2026-05-10T12:00:00Z",
+      "milestone": "v1.2.0",
+      "number": 42,
+      "review_comments": [
+        {
+          "author": "bob",
+          "author_association": "MEMBER",
+          "body": "Inline: extract this branch.",
+          "created_at": "2026-05-10T10:00:00Z",
+          "id": 7001,
+          "url": "https://github.com/o/r/pull/42#discussion_r7001"
+        }
+      ],
+      "state": "closed",
+      "title": "Add policy param",
+      "url": "https://github.com/o/r/pull/42"
+    }
+  ],
+  "releases": [],
+  "symbol_events": [],
+  "symbol_moves": {
+    "by_confidence": {
+      "high": 0,
+      "medium": 0
+    },
+    "links": []
+  },
+  "timeline": [
+    {
+      "actor": "Alice",
+      "event": "add",
+      "layer": "code",
+      "ref": {
+        "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+      },
+      "subject": {
+        "kind": "example",
+        "name": "main.bicep",
+        "path": "examples/basic/main.bicep"
+      },
+      "ts": "2026-05-03"
+    },
+    {
+      "actor": "Alice",
+      "event": "add",
+      "layer": "code",
+      "ref": {
+        "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+      },
+      "subject": {
+        "kind": "doc",
+        "name": "firewall.md",
+        "path": "docs/firewall.md"
+      },
+      "ts": "2026-05-03"
+    },
+    {
+      "actor": "Bob",
+      "event": "change",
+      "layer": "code",
+      "ref": {
+        "id": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+      },
+      "subject": {
+        "kind": "readme",
+        "name": "README.md",
+        "path": "README.md"
+      },
+      "ts": "2026-05-10"
+    },
+    {
+      "actor": "bob",
+      "event": "review_comment",
+      "layer": "social",
+      "ref": {
+        "id": 42,
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/42#discussion_r7001"
+      },
+      "subject": {
+        "kind": "review_comment",
+        "name": null,
+        "path": null
+      },
+      "ts": "2026-05-10T10:00:00Z"
+    },
+    {
+      "actor": "carol",
+      "event": "comment",
+      "layer": "social",
+      "ref": {
+        "id": 42,
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/42#issuecomment-8001"
+      },
+      "subject": {
+        "kind": "comment",
+        "name": null,
+        "path": null
+      },
+      "ts": "2026-05-10T11:00:00Z"
+    },
+    {
+      "actor": "dave",
+      "event": "comment",
+      "layer": "social",
+      "ref": {
+        "id": 18,
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/18#issuecomment-9001"
+      },
+      "subject": {
+        "kind": "comment",
+        "name": null,
+        "path": null
+      },
+      "ts": "2026-05-12T10:00:00Z"
+    },
+    {
+      "actor": "Carol",
+      "event": "remove",
+      "layer": "code",
+      "ref": {
+        "id": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+      },
+      "subject": {
+        "kind": "example",
+        "name": "main.bicep",
+        "path": "examples/basic/main.bicep"
+      },
+      "ts": "2026-05-18"
+    },
+    {
+      "actor": "Carol",
+      "event": "add",
+      "layer": "code",
+      "ref": {
+        "id": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+      },
+      "subject": {
+        "kind": "example",
+        "name": "main.bicep",
+        "path": "examples/advanced/main.bicep"
+      },
+      "ts": "2026-05-18"
+    },
+    {
+      "actor": "Dave",
+      "event": "remove",
+      "layer": "code",
+      "ref": {
+        "id": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+      },
+      "subject": {
+        "kind": "doc",
+        "name": "firewall.md",
+        "path": "docs/firewall.md"
+      },
+      "ts": "2026-05-25"
+    }
+  ],
+  "trains": [
+    {
+      "code_areas": [],
+      "commits": [
+        "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+      ],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 1,
+        "elapsed_days": null,
+        "merged_at": "2026-05-10T12:00:00Z",
+        "opened_at": null,
+        "participants": 1,
+        "review_comments": 0,
+        "reviewers": 0,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 17,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/17"
+        },
+        {
+          "id": 42,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/42"
+        }
+      ],
+      "id": "train-issue-17",
+      "kind": "feature",
+      "outcome": "shipped",
+      "prs": [
+        42
+      ],
+      "root_issue": 17,
+      "significance": 6.0,
+      "tier": "deep"
+    }
+  ]
+}

@@ -9,6 +9,7 @@ import unittest
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(__file__))
+import derive  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
 
@@ -309,6 +310,7 @@ class TestCliAndAuth(unittest.TestCase):
         args = gather.parse_args([
             "--owner", "o", "--repo", "r",
             "--from", "2026-05-01", "--to", "2026-05-31",
+            "--store", "workspace/store.db",
         ])
         self.assertEqual(args.owner, "o")
         self.assertEqual(args.repo, "r")
@@ -316,6 +318,13 @@ class TestCliAndAuth(unittest.TestCase):
         self.assertEqual(args.to, "2026-05-31")
         self.assertEqual(args.branches, "main")
         self.assertFalse(args.no_clone)
+        self.assertEqual(args.store, "workspace/store.db")
+
+    def test_parse_args_store_is_required(self):
+        with self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gather.parse_args(["--owner", "o", "--repo", "r",
+                               "--from", "2026-05-01", "--to", "2026-05-31"])
 
     def test_resolve_token_prefers_github_token(self):
         self.assertEqual(
@@ -1491,148 +1500,6 @@ class TestIacEdgeHardening(unittest.TestCase):
         self.assertEqual(summ["failed"], 0)
 
 
-class TestResumeEdges(unittest.TestCase):
-    """Phase 3c.2: targeted re-resolution rebuilds ONLY the timeout/failed areas
-    and retains the rest, converging to a full run's result."""
-
-    def setUp(self):
-        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
-            self.arm = fh.read()
-        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
-            self.src = fh.read()
-
-    def _prior(self):
-        # A prior bundle: bar resolved (real edges), baz failed, qux skipped.
-        return {"meta": {"clone_sha": "f" * 40},
-                "code_graph": {"provider": "directory", "areas": [
-                    {"id": "avm/ptn/foo/bar", "label": "bar",
-                     "paths": ["avm/ptn/foo/bar/main.bicep"],
-                     "edges": [{"to": "avm/res/x/y", "kind": "module"}],
-                     "edges_status": "resolved"},
-                    {"id": "avm/ptn/foo/baz", "label": "baz",
-                     "paths": ["avm/ptn/foo/baz/main.bicep"],
-                     "edges": [], "edges_status": "failed"},
-                    {"id": "avm/ptn/foo/qux", "label": "qux",
-                     "paths": ["avm/ptn/foo/qux/readme.md"],
-                     "edges": [], "edges_status": "skipped"},
-                ]}}
-
-    def test_resume_rebuilds_only_failed_and_retains_resolved(self):
-        calls = []
-
-        def run(cmd, **kw):
-            calls.append(cmd[:2])
-            return self.arm if cmd[:2] == ["bicep", "build"] else ""
-        prior = self._prior()
-        resumed = gather.resume_bundle(
-            prior, "clone",
-            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
-            read_text=lambda _p: self.src, run=run)
-        areas = {a["id"]: a for a in resumed["code_graph"]["areas"]}
-        # resolved area untouched — its edges are NOT rebuilt (no build for bar)
-        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
-                         [{"to": "avm/res/x/y", "kind": "module"}])
-        # failed area rebuilt → now resolved with real edges
-        self.assertEqual(areas["avm/ptn/foo/baz"]["edges_status"], "resolved")
-        self.assertTrue(areas["avm/ptn/foo/baz"]["edges"])
-        # only baz triggered a build (bar/qux were retained, no subprocess)
-        built = [c for c in calls if c == ["bicep", "build"]]
-        self.assertEqual(len(built), 1)
-
-    def test_resume_summary_reflects_merged_state(self):
-        prior = self._prior()
-        gather.resume_bundle(
-            prior, "clone",
-            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
-            read_text=lambda _p: self.src,
-            run=lambda cmd, **kw: self.arm if cmd[:2] == ["bicep", "build"] else "")
-        summ = prior["code_graph"]["edge_extraction"]
-        self.assertEqual(summ["resolved"], 2)   # bar (retained) + baz (rebuilt)
-        self.assertEqual(summ["skipped"], 1)    # qux (retained)
-        self.assertEqual(summ["failed"], 0)
-
-    def test_only_status_does_not_clobber_when_no_toolchain(self):
-        # Resume with no CLI present must NOT wipe prior resolved edges.
-        prior = self._prior()
-        gather.extract_iac_edges(prior["code_graph"], "clone",
-                                 which=lambda _n: None,
-                                 only_status={"timeout", "failed"})
-        areas = {a["id"]: a for a in prior["code_graph"]["areas"]}
-        self.assertEqual(areas["avm/ptn/foo/bar"]["edges_status"], "resolved")
-        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
-                         [{"to": "avm/res/x/y", "kind": "module"}])
-
-
-class TestRollupBundles(unittest.TestCase):
-    """Phase 3c.2: overlap-safe roll-up of monthly installments."""
-
-    def _bundle(self, frm, to, sha, prs, issues, cg_label):
-        return {
-            "meta": {"owner": "o", "repo": "r", "from": frm, "to": to,
-                     "clone_sha": sha, "period": {"from": frm, "to": to}},
-            "prs": prs, "issues": issues,
-            "commits": [], "code_events": [], "releases": [], "milestones": [],
-            "code_graph": {"provider": "directory",
-                           "areas": [{"id": "a", "label": cg_label}]},
-        }
-
-    def test_overlap_pr_deduped_by_number(self):
-        # PR #10 merged on the seam appears in both windows → once in the roll-up.
-        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40,
-                            [{"number": 10, "title": "seam"}], [], "apr")
-        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40,
-                            [{"number": 10, "title": "seam"}, {"number": 11}], [], "may")
-        merged = gather.rollup_bundles([apr, may])
-        nums = sorted(p["number"] for p in merged["prs"])
-        self.assertEqual(nums, [10, 11])
-
-    def test_mutable_item_takes_freshest_observation(self):
-        # issue #5 is open in April, closed by June → roll-up keeps the later state.
-        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [],
-                            [{"number": 5, "state": "open"}], "apr")
-        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [],
-                            [{"number": 5, "state": "closed"}], "may")
-        merged = gather.rollup_bundles([apr, may])
-        self.assertEqual(len(merged["issues"]), 1)
-        self.assertEqual(merged["issues"][0]["state"], "closed")
-
-    def test_structure_and_period_from_span_and_latest(self):
-        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [], [], "apr")
-        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [], [], "may")
-        # pass out of order to prove it sorts by period
-        merged = gather.rollup_bundles([may, apr])
-        self.assertEqual(merged["meta"]["period"],
-                         {"from": "2026-04-01", "to": "2026-06-01"})
-        self.assertEqual(merged["meta"]["clone_sha"], "b" * 40)        # latest
-        self.assertEqual(merged["code_graph"]["areas"][0]["label"], "may")  # latest
-        self.assertEqual(len(merged["meta"]["rolled_up_from"]), 2)
-
-    def test_empty_raises(self):
-        with self.assertRaises(ValueError):
-            gather.rollup_bundles([])
-
-    def test_rollup_cli_end_to_end(self):
-        # Exercise the --rollup CLI path (acquire dispatch + file IO + out write),
-        # codifying the operational flow so it's covered offline (no clone/token).
-        with tempfile.TemporaryDirectory() as d:
-            f1 = os.path.join(d, "apr.json")
-            f2 = os.path.join(d, "may.json")
-            out = os.path.join(d, "half.json")
-            with open(f1, "w") as fh:
-                json.dump(self._bundle("2026-04-01", "2026-05-02", "a" * 40,
-                                       [{"number": 1}], [], "apr"), fh)
-            with open(f2, "w") as fh:
-                json.dump(self._bundle("2026-04-29", "2026-06-01", "b" * 40,
-                                       [{"number": 1}, {"number": 2}], [], "may"), fh)
-            gather.main(["--rollup", f1, f2, "--out", out])
-            with open(out) as fh:
-                merged = json.load(fh)
-        self.assertEqual(sorted(p["number"] for p in merged["prs"]), [1, 2])  # deduped
-        self.assertEqual(merged["meta"]["period"],
-                         {"from": "2026-04-01", "to": "2026-06-01"})
-        self.assertEqual(merged["code_graph"]["areas"][0]["label"], "may")  # latest
-
-
 class TestAcquireEdgesP3c(unittest.TestCase):
     """Compose the provider + edge seam offline (graphify + bicep absent ->
     directory provider, edges empty; bicep stubbed -> edges populate)."""
@@ -1972,10 +1839,58 @@ class TestFoldBundle(unittest.TestCase):
 
     def test_idempotent_refold(self):
         gather.fold_bundle(self.conn, _fold_fixture_bundle())  # second fold
+        # 8 spine/structure nodes + 1 `codegraph` singleton (fixture's non-empty
+        # code_graph is round-tripped as a structure node; see fold_bundle) + 2
+        # person nodes (alice/bob, the commit authors). Person nodes are now
+        # created for EVERY participant with a contribution edge (the BUG 1 fix:
+        # alice/bob's `authored` edges were previously dangling because their
+        # files map to no code area, so the old attribute_people_areas-only
+        # persistence skipped them).
         self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 8)
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 11)
+        # 3 spine edges (closes/cross_ref/part_of) + 2 `authored` person->commit
+        # edges (alice->abc123, bob->def456) from Phase 7b-1 step 3. Re-folding
+        # mutates nothing: still 5.
         self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], 3)
+            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], 5)
+
+    def test_code_graph_singleton_node_roundtrip(self):
+        # the whole code_graph dict is round-tripped under local id `codegraph`,
+        # as a NULL-ts structure node (excluded from window scans).
+        cg = graphstore.get_node(self.conn, "acme/widget#codegraph")
+        self.assertIsNotNone(cg)
+        self.assertEqual(cg["node_class"], "structure")
+        self.assertIsNone(cg["ts"])
+        self.assertEqual(cg["data"], _fold_fixture_bundle()["code_graph"])
+
+    def test_absent_singletons_not_written(self):
+        # the fixture has no workflow_stats/code_owners/label_taxonomy -> no node.
+        for local in ("workflowstats", "codeowners", "labeltaxonomy"):
+            self.assertIsNone(
+                graphstore.get_node(self.conn, "acme/widget#" + local), local)
+
+    def test_singleton_facts_persist_and_roundtrip(self):
+        # fold a bundle carrying all four singleton facts; each lands as a node.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = _fold_fixture_bundle()
+        bundle["workflow_stats"] = {"CI": {"total": 2, "success": 2}}
+        bundle["code_owners"] = {"src/": ["alice"]}
+        bundle["label_taxonomy"] = {"area": {"area:": ["area: net"]},
+                                    "source": "auto"}
+        gather.fold_bundle(conn, bundle)
+        for local, key in (("workflowstats", "workflow_stats"),
+                           ("codeowners", "code_owners"),
+                           ("labeltaxonomy", "label_taxonomy")):
+            node = graphstore.get_node(conn, "acme/widget#" + local)
+            self.assertIsNotNone(node, local)
+            self.assertEqual(node["data"], bundle[key], local)
+        # empty workflow_stats must NOT create a node (no fabricated key).
+        bundle["workflow_stats"] = {}
+        conn2 = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn2)
+        gather.fold_bundle(conn2, bundle)
+        self.assertIsNone(graphstore.get_node(conn2, "acme/widget#workflowstats"))
 
     def test_range_query_excludes_structure_with_null_ts(self):
         social_code = graphstore.range_query(
@@ -1989,23 +1904,25 @@ class TestFoldBundle(unittest.TestCase):
             gather.fold_bundle(self.conn, {"meta": {}})
 
 
-class TestStoreFlag(unittest.TestCase):
-    def _run_main(self, extra_args, out_dir):
-        out_path = os.path.join(out_dir, "bundle.json")
+class TestStoreOnly(unittest.TestCase):
+    """Phase 7 store-only: `gather --store` is THE deliverable. main folds the
+    in-memory bundle into the journey-graph store and writes NO bundle file
+    (--out is gone); --store is required."""
+
+    def _run_main(self, extra_args):
         orig = gather.acquire
         gather.acquire = lambda args, env: _fold_fixture_bundle()
         try:
-            gather.main(["--owner", "acme", "--repo", "widget",
-                         "--from", "2026-01-01", "--to", "2026-01-31",
-                         "--out", out_path] + extra_args)
+            return gather.main(["--owner", "acme", "--repo", "widget",
+                                "--from", "2026-01-01", "--to", "2026-01-31"]
+                               + extra_args)
         finally:
             gather.acquire = orig
-        return out_path
 
-    def test_main_folds_into_store_when_flag_set(self):
+    def test_main_folds_into_store(self):
         with tempfile.TemporaryDirectory() as d:
             store_path = os.path.join(d, "store.db")
-            self._run_main(["--store", store_path], d)
+            self._run_main(["--store", store_path])
             self.assertTrue(os.path.exists(store_path))
             conn = graphstore.open_store(store_path)
             try:
@@ -2013,11 +1930,130 @@ class TestStoreFlag(unittest.TestCase):
                     conn, "acme/widget#pr-10")["node_class"], "social")
             finally:
                 conn.close()
+            # store-only: NO bundle JSON file is emitted alongside the store.
+            self.assertEqual([f for f in os.listdir(d) if f.endswith(".json")], [])
 
-    def test_no_store_flag_writes_no_db(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._run_main([], d)
-            self.assertEqual([f for f in os.listdir(d) if f.endswith(".db")], [])
+    def test_main_requires_store(self):
+        with self.assertRaises(SystemExit):
+            self._run_main([])
+
+
+def _artifact_fold_bundle():
+    """A bundle with file artifacts + symbol_events that yield a confident move.
+
+    code_events introduce file-level artifacts (README/doc); symbol_events drop a
+    resource `foo` in a.bicep and re-add it in b.bicep (a unique-name move) plus a
+    second change on a separate symbol, so the symbol ledger has multiple entries.
+    """
+    return {
+        "meta": {"owner": "acme", "repo": "widget", "from": "2026-01-01",
+                 "to": "2026-01-31"},
+        "prs": [], "issues": [], "milestones": [], "releases": [],
+        "commits": [],
+        "code_events": [
+            {"commit": "c1", "author": "alice", "date": "2026-01-05T00:00:00Z",
+             "change": "add", "path": "README.md"},
+            {"commit": "c2", "author": "bob", "date": "2026-01-09T00:00:00Z",
+             "change": "modify", "path": "docs/guide.md"},
+        ],
+        "symbol_events": [
+            {"commit": "c3", "author": "alice", "date": "2026-01-10",
+             "path": "a.bicep", "lang": "bicep", "subkind": "resource",
+             "name": "foo", "change": "drop",
+             "before": "resource foo ...", "after": None},
+            {"commit": "c4", "author": "alice", "date": "2026-01-12",
+             "path": "b.bicep", "lang": "bicep", "subkind": "resource",
+             "name": "foo", "change": "add",
+             "before": None, "after": "resource foo ..."},
+            {"commit": "c3", "author": "alice", "date": "2026-01-08",
+             "path": "a.bicep", "lang": "bicep", "subkind": "param",
+             "name": "region", "change": "change",
+             "before": "param region string", "after": "param region int"},
+        ],
+    }
+
+
+class TestFoldArtifacts(unittest.TestCase):
+    """Slice 7b-1 step 2: artifact `code` nodes, the symbol_events ledger, and
+    symbol-move edges (replaced_by/identity_from) persisted on the write path."""
+
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        self.bundle = _artifact_fold_bundle()
+        gather.fold_bundle(self.conn, self.bundle)
+        # the canonical artifact records (write path derives the same).
+        self.arts = derive.build_artifacts(_artifact_fold_bundle())
+
+    def _qid(self, local):
+        return graphstore.qualify_id("acme", "widget", local)
+
+    def test_file_artifact_nodes_persisted(self):
+        readme = graphstore.get_node(self.conn, self._qid("art:README.md"))
+        self.assertIsNotNone(readme)
+        self.assertEqual(readme["node_class"], "code")
+        self.assertEqual(readme["data"]["kind"], "readme")
+        self.assertEqual(readme["data"]["path"], "README.md")
+        # ts is the artifact's last lifecycle event date.
+        self.assertEqual(readme["ts"], "2026-01-05T00:00:00Z")
+        doc = graphstore.get_node(self.conn, self._qid("art:docs/guide.md"))
+        self.assertEqual(doc["data"]["kind"], "doc")
+
+    def test_symbol_artifact_nodes_persisted(self):
+        sid = "a.bicep#bicep:resource:foo"
+        node = graphstore.get_node(self.conn, self._qid(sid))
+        self.assertIsNotNone(node)
+        self.assertEqual(node["node_class"], "code")
+        self.assertEqual(node["data"]["kind"], "symbol")
+        self.assertEqual(node["data"]["name"], "foo")
+        self.assertEqual(node["ts"], "2026-01-10")  # last event date
+
+    def test_symbol_event_ledger_retrievable_in_date_order(self):
+        sid = self._qid("a.bicep#bicep:param:region")
+        evs = graphstore.get_code_events(self.conn, sid)
+        self.assertEqual([e["event"] for e in evs], ["change"])
+        self.assertEqual(evs[0]["before"], "param region string")
+        self.assertEqual(evs[0]["after"], "param region int")
+        # the dropped `foo` symbol carries its remove event keyed by its own id.
+        foo = graphstore.get_code_events(self.conn, self._qid("a.bicep#bicep:resource:foo"))
+        self.assertEqual([e["event"] for e in foo], ["remove"])
+        self.assertEqual(foo[0]["before"], "resource foo ...")
+
+    def test_symbol_move_edges_with_confidence(self):
+        src = self._qid("a.bicep#bicep:resource:foo")
+        dst = self._qid("b.bicep#bicep:resource:foo")
+        rep = graphstore.get_edges(self.conn, src, direction="out",
+                                   edge_types=["replaced_by"])
+        self.assertEqual(len(rep), 1)
+        self.assertEqual(rep[0]["dst_id"], dst)
+        self.assertEqual(rep[0]["data"]["move_confidence"], "medium")
+        idf = graphstore.get_edges(self.conn, dst, direction="out",
+                                   edge_types=["identity_from"])
+        self.assertEqual(len(idf), 1)
+        self.assertEqual(idf[0]["dst_id"], src)
+        self.assertEqual(idf[0]["data"]["move_confidence"], "medium")
+
+    def test_artifact_substrate_does_not_leak_into_extract(self):
+        # extract reconstructs only raw commits/code_events; the artifact `code`
+        # nodes and symbol-event ledger rows must NOT pollute either.
+        import extract
+        b = extract.extract(self.conn, "acme", "widget", "2026-01-01", "2026-01-31")
+        self.assertEqual(b["commits"], [])  # no artifact node masquerades as a commit
+        paths = {e["path"] for e in b["code_events"]}
+        self.assertEqual(paths, {"README.md", "docs/guide.md"})  # no symbol paths
+        self.assertFalse(any("#" in e["path"] for e in b["code_events"]))
+
+    def test_idempotent_refold(self):
+        n_nodes = self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        n_events = self.conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0]
+        n_edges = self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        gather.fold_bundle(self.conn, _artifact_fold_bundle())
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], n_nodes)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0], n_events)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], n_edges)
 
 
 if __name__ == "__main__":

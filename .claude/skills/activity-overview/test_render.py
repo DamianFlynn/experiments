@@ -7,10 +7,31 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import derive  # noqa: E402
+import extract  # noqa: E402
+import gather  # noqa: E402
+import graphstore  # noqa: E402
 import link  # noqa: E402
 import render  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _enrich_via_store(golden_name):
+    """End-to-end the new way (slice 7b-2): fold the raw fixture into the store,
+    extract the window (which materializes artifacts/people from the stored
+    nodes), then enrich. enrich no longer DERIVES artifacts/people, so a test that
+    needs them must route through extract rather than feed the raw fixture to
+    enrich directly."""
+    with open(os.path.join(FIX, golden_name)) as fh:
+        golden = json.load(fh)
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    gather.fold_bundle(conn, json.loads(json.dumps(golden)))
+    meta = golden["meta"]
+    extracted = extract.extract(
+        conn, meta["owner"], meta["repo"], meta["from"], meta["to"])
+    return link.enrich(extracted)
 
 
 def _bundle():
@@ -374,18 +395,17 @@ class TestRenderManifestP3(unittest.TestCase):
 
 class TestEndToEndOfflineP3(unittest.TestCase):
     def test_link_then_render_builds_full_substrate(self):
-        with open(os.path.join(FIX, "bundle_p3.json")) as fh:
-            bundle = link.enrich(json.load(fh))
+        bundle = _enrich_via_store("bundle_p3.json")
 
         # artifacts: README change (live), doc add+remove (removed),
         # example renamed (old replaced -> new live)
         arts = bundle["artifacts"]
         doc = next(a for a in arts.values() if a["path"] == "docs/firewall.md")
         self.assertEqual(doc["status"], "removed")
-        old_ex = arts[link.artifact_id("examples/basic/main.bicep")]
+        old_ex = arts[derive.artifact_id("examples/basic/main.bicep")]
         self.assertEqual(old_ex["status"], "replaced")
         self.assertEqual(old_ex["replaced_by"],
-                         link.artifact_id("examples/advanced/main.bicep"))
+                         derive.artifact_id("examples/advanced/main.bicep"))
 
         # timeline: both layers, sorted, well-formed refs
         tl = bundle["timeline"]
@@ -491,16 +511,15 @@ class TestRenderManifestP3b(unittest.TestCase):
 
 class TestEndToEndOfflineP3b(unittest.TestCase):
     def test_link_then_render_attributes_areas_and_renders_six(self):
-        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
-            bundle = link.enrich(json.load(fh))
+        bundle = _enrich_via_store("bundle_p3b.json")
 
         # code_area filled on the example artifact (covered by the AVM area)
         ex = bundle["artifacts"][
-            link.artifact_id(
+            derive.artifact_id(
                 "avm/res/network/firewall-policy/examples/basic/main.bicep")]
         self.assertEqual(ex["code_area"], "avm/res/network/firewall-policy")
         # docs artifact -> docs area
-        doc = bundle["artifacts"][link.artifact_id("docs/firewall.md")]
+        doc = bundle["artifacts"][derive.artifact_id("docs/firewall.md")]
         self.assertEqual(doc["code_area"], "docs")
 
         # feature_deltas carry a real area now (no longer all null)

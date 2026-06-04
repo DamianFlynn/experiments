@@ -1197,11 +1197,18 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   for single ops, but P6's high-volume writes want per-batch atomicity/throughput, so P6 adds a
   defer-commit path (e.g. an optional `commit=True` arg or a batch/transaction context) rather
   than 50k individual commits.
-- **Phase 7 — extract → bundle-view equivalence (substrate; the gate).** `extract.py`: range
-  query → train seeds → bounded spine traversal (`in_window` flags + backfill budget) →
-  materialized bundle view in the rev-13 schema. *Gate:* the ⭐ golden-bundle equivalence test —
-  `extract` reproduces existing `bundle_*.json` so `link`/`render`/report and all existing tests
-  pass unchanged. Roll-up/resume collapse into wider range queries.
+- **Phase 7 — full graph substrate: extract + persisted derived facts (substrate; the gate).**
+  Expanded from "raw extract only" to stand up the **complete** substrate, built as three gated
+  vertical slices that hold the same end-to-end equivalence gate green: **7a** `extract.py`
+  (range query → train seeds → bounded spine traversal → materialized rev-13 view) + the ⭐
+  golden-bundle equivalence test with `link`/`render`/report unchanged; **7b** lift link's pure
+  derivations into a shared write-path module → persist **artifact** + **person** nodes and the
+  non-spine edges (`authored`/`reviewed`/`owns`/`touches`/`depends_on`/`replaced_by`/…),
+  `extract` materializes `artifacts[]`/`people[]`/`modules{}` from the store, `link` shrinks to
+  window projections — *this unblocks P8*; **7c** wire `backfill(id)` on a traversal miss +
+  roll-up/resume hardening. Persistence model: *facts (nodes/edges/ledgers, incl. backfilled
+  threads) are durable; only roll-ups are recomputed, from those facts.* Detailed design:
+  `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 - **Phase 8 — spotlight (substrate analytics; absorbs original-P5 people view).** `spotlight.py`:
   person-impact, subsystem-split, pattern-evolution, commit-text-mining queries + focused
   renders. *Verifiable:* each query against a seeded multi-window store returns the expected

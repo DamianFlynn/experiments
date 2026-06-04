@@ -4,10 +4,29 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import derive  # noqa: E402
+import extract  # noqa: E402
 import gather  # noqa: E402
+import graphstore  # noqa: E402
 import link  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _enrich_via_store(golden_name):
+    """Slice 7b-2 end-to-end: enrich no longer DERIVES artifacts/people — fold
+    materializes them into the store and extract reads them back. A test that
+    needs the enriched artifacts/people (rather than a derivation it calls
+    directly) must route the raw fixture through fold -> extract -> enrich."""
+    with open(os.path.join(FIX, golden_name)) as fh:
+        golden = json.load(fh)
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    gather.fold_bundle(conn, json.loads(json.dumps(golden)))
+    meta = golden["meta"]
+    extracted = extract.extract(
+        conn, meta["owner"], meta["repo"], meta["from"], meta["to"])
+    return link.enrich(extracted)
 
 
 class TestCommitPrResolution(unittest.TestCase):
@@ -451,12 +470,12 @@ class TestBuildArtifacts(unittest.TestCase):
                 "commits": [], "prs": [], "issues": []}
 
     def test_unrecognized_paths_are_ignored(self):
-        arts = link.build_artifacts(self._bundle())
+        arts = derive.build_artifacts(self._bundle())
         paths = {a["path"] for a in arts.values()}
         self.assertNotIn("src/app.py", paths)  # not a tracked artifact kind
 
     def test_add_then_change_builds_ordered_lifecycle(self):
-        arts = link.build_artifacts(self._bundle())
+        arts = derive.build_artifacts(self._bundle())
         readme = next(a for a in arts.values() if a["path"] == "README.md")
         self.assertEqual(readme["kind"], "readme")
         self.assertEqual([e["event"] for e in readme["lifecycle"]], ["change"])
@@ -464,16 +483,16 @@ class TestBuildArtifacts(unittest.TestCase):
         self.assertIsNone(readme["code_area"])  # graphify deferred to Phase 3b
 
     def test_delete_sets_status_removed(self):
-        arts = link.build_artifacts(self._bundle())
+        arts = derive.build_artifacts(self._bundle())
         doc = next(a for a in arts.values() if a["path"] == "docs/firewall.md")
         self.assertEqual([e["event"] for e in doc["lifecycle"]],
                          ["add", "remove"])
         self.assertEqual(doc["status"], "removed")
 
     def test_rename_links_replaced_and_replaced_by(self):
-        arts = link.build_artifacts(self._bundle())
-        old_id = link.artifact_id("examples/basic/main.bicep")
-        new_id = link.artifact_id("examples/advanced/main.bicep")
+        arts = derive.build_artifacts(self._bundle())
+        old_id = derive.artifact_id("examples/basic/main.bicep")
+        new_id = derive.artifact_id("examples/advanced/main.bicep")
         self.assertEqual(arts[old_id]["status"], "replaced")
         self.assertEqual(arts[old_id]["replaced_by"], new_id)
         # the new artifact records an `add` event from the rename commit
@@ -481,7 +500,7 @@ class TestBuildArtifacts(unittest.TestCase):
         self.assertEqual(arts[new_id]["status"], "live")
 
     def test_lifecycle_refs_are_well_formed_commit_refs(self):
-        arts = link.build_artifacts(self._bundle())
+        arts = derive.build_artifacts(self._bundle())
         for a in arts.values():
             for ev in a["lifecycle"]:
                 self.assertEqual(ev["ref"]["type"], "commit")
@@ -489,7 +508,7 @@ class TestBuildArtifacts(unittest.TestCase):
                 self.assertTrue(ev["ref"]["url"].startswith("https://"))
 
     def test_empty_code_events_yields_empty_map(self):
-        self.assertEqual(link.build_artifacts({"code_events": []}), {})
+        self.assertEqual(derive.build_artifacts({"code_events": []}), {})
 
     def test_copy_creates_new_artifact_but_leaves_source_live(self):
         """A 'copy' event introduces the new path but must NOT supersede the source."""
@@ -503,9 +522,9 @@ class TestBuildArtifacts(unittest.TestCase):
                  "path": "examples/b.bicep"},
             ],
         }
-        arts = link.build_artifacts(bundle)
-        src_id = link.artifact_id("examples/a.bicep")
-        dst_id = link.artifact_id("examples/b.bicep")
+        arts = derive.build_artifacts(bundle)
+        src_id = derive.artifact_id("examples/a.bicep")
+        dst_id = derive.artifact_id("examples/b.bicep")
 
         # source artifact must still be live — copy does not supersede it
         self.assertIn(src_id, arts)
@@ -551,14 +570,14 @@ class TestBuildTimeline(unittest.TestCase):
 
     def test_timeline_merges_social_and_code_layers(self):
         b = self._bundle()
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         tl = link.build_timeline(b)
         layers = {e["layer"] for e in tl}
         self.assertEqual(layers, {"social", "code"})
 
     def test_every_event_has_required_shape(self):
         b = self._bundle()
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         for e in link.build_timeline(b):
             self.assertIn(e["layer"], {"social", "code"})
             self.assertTrue(e["ts"])
@@ -570,13 +589,13 @@ class TestBuildTimeline(unittest.TestCase):
 
     def test_timeline_sorted_by_ts(self):
         b = self._bundle()
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         tl = link.build_timeline(b)
         self.assertEqual([e["ts"] for e in tl], sorted(e["ts"] for e in tl))
 
     def test_code_event_subject_carries_path_and_kind(self):
         b = self._bundle()
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         code = [e for e in link.build_timeline(b) if e["layer"] == "code"][0]
         self.assertEqual(code["subject"]["path"], "docs/firewall.md")
         self.assertEqual(code["subject"]["kind"], "doc")
@@ -590,7 +609,7 @@ class TestBuildTimeline(unittest.TestCase):
         import re
         iso_re = re.compile(r"^\d{4}-\d{2}-\d{2}")
         b = self._bundle()
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         tl = link.build_timeline(b)
         social = [e for e in tl if e["layer"] == "social"]
         self.assertTrue(social, "must have social events")
@@ -601,7 +620,7 @@ class TestBuildTimeline(unittest.TestCase):
     def test_timeline_is_sorted_chronologically_code_and_social_interleaved(self):
         """Code event (2026-05-03) precedes social events (2026-05-12+)."""
         b = self._bundle()
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         tl = link.build_timeline(b)
         ts_list = [e["ts"] for e in tl]
         self.assertEqual(ts_list, sorted(ts_list))
@@ -632,7 +651,7 @@ class TestComputeFeatureDeltas(unittest.TestCase):
                 {"id": "train-pr-42", "prs": [42], "root_issue": None}],
         }
         link.attach_commit_prs(b["commits"])
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         return b
 
     def test_add_remove_change_map_to_delta_kinds(self):
@@ -647,7 +666,7 @@ class TestComputeFeatureDeltas(unittest.TestCase):
         add = next(d for d in deltas if d["kind"] == "add")
         self.assertEqual(add["author"], "Alice")
         self.assertEqual(add["commit"], "c1"*20)
-        self.assertEqual(add["artifact"], link.artifact_id("examples/basic/main.bicep"))
+        self.assertEqual(add["artifact"], derive.artifact_id("examples/basic/main.bicep"))
         self.assertTrue(add["url"].startswith("https://"))
         self.assertIsNone(add["area"])  # graphify deferred
 
@@ -700,7 +719,7 @@ class TestCodeAreaAttribution(unittest.TestCase):
         }
 
     def test_area_index_maps_each_path_to_its_area(self):
-        idx = link.area_index(self._bundle()["code_graph"])
+        idx = derive.area_index(self._bundle()["code_graph"])
         self.assertEqual(idx["examples/basic/main.bicep"], "examples/basic")
         self.assertEqual(idx["docs/firewall.md"], "docs")
 
@@ -757,14 +776,14 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
 
     def test_trains_gain_their_commits_code_areas(self):
         b = self._bundle()
-        link.attribute_train_areas(b, link.area_index(b["code_graph"]))
+        link.attribute_train_areas(b, derive.area_index(b["code_graph"]))
         t = b["trains"][0]
         self.assertEqual(set(t["code_areas"]),
                          {"avm/res/network/firewall-policy", "docs"})
 
     def test_modules_field_aggregates_per_area(self):
         b = self._bundle()
-        link.build_modules(b, link.area_index(b["code_graph"]))
+        link.build_modules(b, derive.area_index(b["code_graph"]))
         mods = b["modules"]
         fp = mods["avm/res/network/firewall-policy"]
         self.assertEqual(fp["commits"], 1)
@@ -774,14 +793,13 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
 
     def test_people_gain_modules_and_areas(self):
         b = self._bundle()
-        idx = link.area_index(b["code_graph"])
-        link.attribute_people_areas(b, idx)
+        idx = derive.area_index(b["code_graph"])
+        derive.attribute_people_areas(b, idx)
         alice = b["people"]["alice"]
         self.assertIn("avm/res/network/firewall-policy", alice["modules"])
 
     def test_enrich_fills_all_phase3b_attribution(self):
-        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
-            bundle = link.enrich(json.load(fh))
+        bundle = _enrich_via_store("bundle_p3b.json")
         # at least one artifact and one feature_delta now carry a real area
         arts = bundle["artifacts"]
         self.assertTrue(any(a["code_area"] is not None for a in arts.values()))
@@ -793,8 +811,7 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
 
 class TestPhase3bConsistency(unittest.TestCase):
     def test_attribution_preserves_artifact_and_delta_refs(self):
-        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
-            b = link.enrich(json.load(fh))
+        b = _enrich_via_store("bundle_p3b.json")
         for d in b["feature_deltas"]:
             self.assertTrue(str(d["url"]).startswith("https://"))
             self.assertIn(d["artifact"], b["artifacts"])
@@ -840,7 +857,7 @@ class TestSymbolArtifacts(unittest.TestCase):
         }
 
     def test_symbol_events_become_symbol_artifacts(self):
-        arts = link.build_artifacts(self._bundle())
+        arts = derive.build_artifacts(self._bundle())
         sym = [a for a in arts.values() if a["kind"] == "symbol"]
         self.assertEqual(len(sym), 2)
         vault = next(a for a in sym if a["name"] == "vault")
@@ -850,7 +867,7 @@ class TestSymbolArtifacts(unittest.TestCase):
 
     def test_feature_deltas_carry_before_after_detail(self):
         b = self._bundle()
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         deltas = link.compute_feature_deltas(b)
         vault = next(d for d in deltas if d["name"] == "vault")
         self.assertEqual(vault["kind"], "change")
@@ -863,7 +880,7 @@ class TestSymbolArtifacts(unittest.TestCase):
         b = self._bundle()
         b["code_graph"] = {"areas": [{"id": "avm/res/foo",
                                       "paths": ["avm/res/foo/main.bicep"]}]}
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         link.attribute_code_areas(b)
         vault = next(a for a in b["artifacts"].values() if a["name"] == "vault")
         self.assertEqual(vault["code_area"], "avm/res/foo")
@@ -878,7 +895,7 @@ class TestSymbolArtifacts(unittest.TestCase):
                   "path": "avm/res/foo/main.bicep", "lang": "bicep", "subkind": "todo",
                   "name": "// TODO: revisit retention", "change": "add",
                   "before": None, "after": "// TODO: revisit retention"}]}
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         todo = next(iter(b["artifacts"].values()))
         self.assertEqual(todo["kind"], "comment")
         self.assertEqual(todo["subkind"], "todo")
@@ -898,7 +915,7 @@ class TestSymbolIdentity(unittest.TestCase):
     def test_unique_move_linked_medium(self):
         evs = [self._ev("a/main.bicep", "resource", "vault", "drop"),
                self._ev("b/main.bicep", "resource", "vault", "add")]
-        moves = link.match_symbol_moves(evs)
+        moves = derive.match_symbol_moves(evs)
         self.assertEqual(len(moves), 1)
         self.assertEqual((moves[0]["from_path"], moves[0]["to_path"]),
                          ("a/main.bicep", "b/main.bicep"))
@@ -908,7 +925,7 @@ class TestSymbolIdentity(unittest.TestCase):
     def test_file_rename_pair_is_high_confidence(self):
         evs = [self._ev("a/main.bicep", "resource", "vault", "drop"),
                self._ev("b/main.bicep", "resource", "vault", "add")]
-        moves = link.match_symbol_moves(evs, [("a/main.bicep", "b/main.bicep")])
+        moves = derive.match_symbol_moves(evs, [("a/main.bicep", "b/main.bicep")])
         self.assertEqual(moves[0]["confidence"], "high")
         self.assertEqual(moves[0]["basis"], "file_rename")
 
@@ -918,30 +935,30 @@ class TestSymbolIdentity(unittest.TestCase):
                self._ev("c/main.bicep", "param", "location", "drop"),
                self._ev("b/main.bicep", "param", "location", "add"),
                self._ev("d/main.bicep", "param", "location", "add")]
-        self.assertEqual(link.match_symbol_moves(evs), [])
+        self.assertEqual(derive.match_symbol_moves(evs), [])
 
     def test_same_file_readd_is_not_a_move(self):
         evs = [self._ev("a/main.bicep", "param", "x", "drop"),
                self._ev("a/main.bicep", "param", "x", "add")]
-        self.assertEqual(link.match_symbol_moves(evs), [])
+        self.assertEqual(derive.match_symbol_moves(evs), [])
 
     def test_comments_excluded(self):
         evs = [self._ev("a/m.bicep", "comment", "// note", "drop"),
                self._ev("b/m.bicep", "comment", "// note", "add")]
-        self.assertEqual(link.match_symbol_moves(evs), [])
+        self.assertEqual(derive.match_symbol_moves(evs), [])
 
     def test_cross_language_not_linked(self):
         # same subkind+name but different language -> NOT the same symbol
         evs = [{**self._ev("a/main.bicep", "module", "net", "drop")},
                {**self._ev("b/main.tf", "module", "net", "add"), "lang": "terraform"}]
-        self.assertEqual(link.match_symbol_moves(evs), [])
+        self.assertEqual(derive.match_symbol_moves(evs), [])
 
     def test_link_symbol_identity_sets_replaced_by_and_confidence(self):
         b = {"meta": {"owner": "o", "repo": "r"}, "commits": [], "prs": [], "issues": [],
              "code_events": [], "symbol_events": [
                  self._ev("a/main.bicep", "resource", "vault", "drop"),
                  self._ev("b/main.bicep", "resource", "vault", "add")]}
-        b["artifacts"] = link.build_artifacts(b)
+        b["artifacts"] = derive.build_artifacts(b)
         link.link_symbol_identity(b)
         src = "a/main.bicep#bicep:resource:vault"
         dst = "b/main.bicep#bicep:resource:vault"

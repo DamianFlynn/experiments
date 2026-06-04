@@ -347,6 +347,50 @@ def range_query(conn, project, repos, ts_from, ts_to, node_class=None):
     return [_row_to_node(r) for r in conn.execute(sql, params)]
 
 
+def repo_nodes(conn, project, repo, node_class=None):
+    """All nodes for one project/repo (optionally one node_class), ordered by
+    (ts NULLs last, id). Unlike range_query this is *not* window-filtered: it is
+    the materialization source a reader uses to reconstruct the full raw bundle
+    arrays (which include NULL-ts nodes the window scan excludes). The window
+    still governs the in_window flag a reader computes via range_query."""
+    sql = "SELECT * FROM nodes WHERE project=? AND repo=?"
+    params = [project, repo]
+    if node_class is not None:
+        sql += " AND node_class=?"
+        params.append(node_class)
+    sql += " ORDER BY ts IS NULL, ts, id"
+    return [_row_to_node(r) for r in conn.execute(sql, params)]
+
+
+def repo_code_events(conn, project, repo):
+    """Code-event ledger rows for one project/repo, in insertion (rowid) order.
+
+    rowid order == the order fold_bundle inserted them == the original bundle's
+    `code_events` source order, so a reader can reconstruct that array exactly
+    (the per-artifact get_code_events orders by date/event and cannot recover
+    cross-artifact source order)."""
+    pref = "{}/{}#".format(project, repo)
+    rows = conn.execute(
+        "SELECT * FROM code_events WHERE artifact_id LIKE ? ESCAPE '\\' ORDER BY rowid",
+        (pref.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
+    )
+    out = []
+    for r in rows:
+        out.append({
+            "artifact_id": r["artifact_id"],
+            "event": r["event"],
+            "commit_sha": r["commit_sha"],
+            "author": r["author"],
+            "date": r["date"],
+            "hunk": r["hunk"],
+            "ref": json.loads(r["ref"]) if r["ref"] is not None else None,
+            "before": r["before"],
+            "after": r["after"],
+            "detail": r["detail"],
+        })
+    return out
+
+
 def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
     """Undirected reachability over the spine edge allowlist, depth-capped.
 

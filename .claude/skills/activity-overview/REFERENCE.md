@@ -24,13 +24,19 @@ is named rather than guessed):
 
 ## Usage
 
+Phase 7 is **store-only**: `gather` folds facts into the SQLite journey-graph
+store (the sole deliverable; see `STORE.md`) and writes no bundle file. Audit the
+store with `validate.py` (self-contained — no bundle needed):
+
 ```bash
 python3 gather.py --owner OWNER --repo REPO --from 2026-05-01 --to 2026-05-31 \
-    --out workspace/bundle.json
-python3 link.py workspace/bundle.json
+    --store workspace/journey.db
+python3 validate.py workspace/journey.db
 ```
 
-Then render with the skill (see `SKILL.md`).
+The report vertical (`extract → link → render → report`) is restored in Phase 8,
+where the bundle is a transient view materialized from the store. Then render
+with the skill (see `SKILL.md`).
 
 ## Tests
 

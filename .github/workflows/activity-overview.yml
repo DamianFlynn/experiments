@@ -1,0 +1,176 @@
+name: activity-overview
+
+# One end-to-end pipeline for the activity-overview skill:
+#   tests (offline, every push/PR)  ->  live (real gather -> journey-graph
+#   store -> trust audit, on demand / scheduled / on a push to the default
+#   branch). The journey-graph store is the deliverable; `validate.py` is the
+#   gate that proves the graph is trustworthy before any report is built from
+#   it. The report vertical (extract -> link -> render) lands in Phase 8.
+
+on:
+  push:
+    paths:
+      - ".claude/skills/activity-overview/**"
+      - ".github/workflows/activity-overview.yml"
+  pull_request:
+    paths:
+      - ".claude/skills/activity-overview/**"
+      - ".github/workflows/activity-overview.yml"
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "Target repo owner"
+        required: false
+        default: "Azure"
+      repo:
+        description: "Target repo name"
+        required: false
+        default: "bicep-registry-modules"
+      from:
+        description: "Window start (YYYY-MM-DD; blank = 14 days before --to)"
+        required: false
+        default: ""
+      to:
+        description: "Window end (YYYY-MM-DD; blank = today, UTC)"
+        required: false
+        default: ""
+  schedule:
+    # 07:00 UTC on the 1st and 15th of each month (trailing-14-day window).
+    - cron: "0 7 1,15 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile the CLIs
+        run: |
+          python -m py_compile \
+            .claude/skills/activity-overview/gather.py \
+            .claude/skills/activity-overview/link.py \
+            .claude/skills/activity-overview/graphstore.py \
+            .claude/skills/activity-overview/extract.py \
+            .claude/skills/activity-overview/derive.py \
+            .claude/skills/activity-overview/validate.py
+
+      - name: Run the offline test suite
+        run: |
+          python -m unittest discover \
+            -s .claude/skills/activity-overview -p 'test_*.py' -v
+
+  live:
+    # The real gather is heavy (clone + API) and needs the ACTIVITY_TEST_TOKEN
+    # secret (never exposed to fork PRs), so it runs only on demand, on the
+    # schedule, or on a push to the default branch — not on every feature push.
+    needs: tests
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify the integration secret is present
+        env:
+          ACTIVITY_TEST_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+        run: |
+          if [ -z "$ACTIVITY_TEST_TOKEN" ]; then
+            echo "::error::ACTIVITY_TEST_TOKEN secret is not set. Add it under" \
+                 "Settings -> Secrets and variables -> Actions, then re-run."
+            exit 1
+          fi
+          echo "secret present"
+
+      - name: Resolve target and window
+        id: cfg
+        run: |
+          OWNER="${{ inputs.owner }}"; REPO="${{ inputs.repo }}"
+          FROM="${{ inputs.from }}"; TO="${{ inputs.to }}"
+          # Defaults apply to scheduled runs (no inputs) and blank manual fields.
+          [ -z "$OWNER" ] && OWNER="Azure"
+          [ -z "$REPO" ] && REPO="bicep-registry-modules"
+          [ -z "$TO" ] && TO="$(date -u +%F)"
+          [ -z "$FROM" ] && FROM="$(date -u -d "$TO -14 days" +%F)"
+          {
+            echo "owner=$OWNER"; echo "repo=$REPO"
+            echo "from=$FROM"; echo "to=$TO"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved target $OWNER/$REPO over window $FROM -> $TO"
+
+      - name: Install bicep CLI
+        env:
+          # Pinned so the gate is reproducible and a new bicep release cannot
+          # silently change build output. Bump deliberately.
+          BICEP_VERSION: v0.43.8
+        run: |
+          curl -sSLo bicep "https://github.com/Azure/bicep/releases/download/${BICEP_VERSION}/bicep-linux-x64"
+          chmod +x bicep
+          sudo mv bicep /usr/local/bin/bicep
+          installed="$(bicep --version)"
+          echo "$installed"
+          case "$installed" in
+            *"${BICEP_VERSION#v}"*) ;;
+            *) echo "::error::bicep version mismatch: wanted ${BICEP_VERSION}, got '$installed'"; exit 1 ;;
+          esac
+
+      - name: Gather the real window into the journey-graph store
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+          OWNER: ${{ steps.cfg.outputs.owner }}
+          REPO: ${{ steps.cfg.outputs.repo }}
+          FROM: ${{ steps.cfg.outputs.from }}
+          TO: ${{ steps.cfg.outputs.to }}
+        run: |
+          cd .claude/skills/activity-overview
+          mkdir -p workspace
+          python gather.py \
+            --owner "$OWNER" --repo "$REPO" \
+            --from "$FROM" --to "$TO" \
+            --store workspace/journey.db
+
+      - name: Store sanity (gather produced a non-trivial graph)
+        run: |
+          cd .claude/skills/activity-overview
+          python - <<'PY'
+          import graphstore
+          c = graphstore.open_store("workspace/journey.db")
+          n = c.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+          e = c.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+          ce = c.execute("SELECT COUNT(*) FROM code_events").fetchone()[0]
+          print(f"store: nodes={n} edges={e} code_events={ce}")
+          assert n > 0 and e > 0, "empty graph — gather produced nothing"
+          PY
+
+      - name: Trust gate — audit the real journey-graph
+        run: |
+          cd .claude/skills/activity-overview
+          # validate self-sources the raw bundle from the store (no bundle file);
+          # exits non-zero on any ERROR-severity trust violation.
+          python validate.py workspace/journey.db
+
+      - name: Upload the journey-graph store
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: journey-graph
+          path: .claude/skills/activity-overview/workspace/journey.db
+          if-no-files-found: warn

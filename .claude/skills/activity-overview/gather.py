@@ -5,6 +5,7 @@ later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
 import concurrent.futures
+import copy
 import datetime
 import json
 import os
@@ -15,6 +16,7 @@ import sys
 import urllib.error
 import urllib.request
 
+import derive
 import graphstore
 
 SCHEMA_VERSION = 1
@@ -472,30 +474,10 @@ def derive_open_high_activity(issue):
     return comments >= _HIGH_ACTIVITY_COMMENTS or upvotes >= _HIGH_ACTIVITY_UPVOTES
 
 
-def classify_artifact_path(path):
-    """Classify a changed file path into a tracked artifact kind, or None.
-
-    File granularity only (Phase 3a). Precedence: readme > example > doc.
-      - readme : basename matches README* (any/no extension)
-      - example: under an `examples/` directory, or a `*.example*` filename
-      - doc    : a `*.md` file, or any file under a `docs/` directory
-      - else   : None (ignored at file granularity)
-    `symbol`/`comment` artifacts come from the Phase 3d hunk walk (parse_symbol_events),
-    not this path classifier."""
-    if not path:
-        return None
-    parts = path.split("/")
-    base = parts[-1]
-    low = base.lower()
-    if base.upper().startswith("README"):
-        return "readme"
-    # `.example` only when it is a dot-segment (config.example.json, foo.example),
-    # not an incidental substring (counter-example.md must stay a doc).
-    if "examples" in parts[:-1] or ".example." in low or low.endswith(".example"):
-        return "example"
-    if low.endswith(".md") or "docs" in parts[:-1]:
-        return "doc"
-    return None
+# Re-export derive's canonical path classifier so `gather.classify_artifact_path`
+# (used by build_artifacts callers and test_gather) and `derive.classify_artifact_path`
+# are ONE function. gather→derive is acyclic (derive is a stdlib-only leaf).
+classify_artifact_path = derive.classify_artifact_path
 
 
 # ---- Phase 3d: symbol-granular change attribution (diff-local, build-free) ----
@@ -1362,9 +1344,7 @@ def fetch_until(get_page, first_url, more):
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(description="Acquire an activity-overview bundle.")
-    # Not argparse-required: a --resume run derives these from the prior bundle's
-    # meta. acquire() enforces them for a normal (non-resume) run.
+    p = argparse.ArgumentParser(description="Acquire an activity-overview store.")
     p.add_argument("--owner")
     p.add_argument("--repo")
     p.add_argument("--from", dest="from")
@@ -1380,17 +1360,14 @@ def parse_args(argv):
     p.add_argument("--include-releases", dest="include_releases",
                    action="store_true", default=True)
     p.add_argument("--no-releases", dest="include_releases", action="store_false")
-    p.add_argument("--resume", default=None,
-                   help="Prior bundle JSON: re-resolve only its timeout/failed edges "
-                        "against the pinned meta.clone_sha; reuse everything else.")
-    p.add_argument("--rollup", nargs="+", default=None, metavar="BUNDLE",
-                   help="Merge 2+ monthly bundle JSONs into one multi-period bundle "
-                        "(overlap-safe union by identity; structure from the latest). "
-                        "Re-run link on the result. No clone/token needed.")
-    p.add_argument("--out", default=None)
-    p.add_argument("--store", default=None,
-                   help="also fold the bundle into this SQLite journey-graph "
-                        "store (off by default; additive to the JSON bundle)")
+    # Store-only (Phase 7): the SQLite journey-graph store is THE deliverable.
+    # gather folds the assembled bundle into it and writes no bundle file. The
+    # bundle is a transient view extract materializes from the store (Phase 8
+    # reader stage). Roll-up = a wider range_query; resume = re-fold against the
+    # pinned clone_sha — both store-native, so the flat-bundle flags are gone.
+    p.add_argument("--store", required=True,
+                   help="path to the SQLite journey-graph store to fold into "
+                        "(the sole gather deliverable)")
     return p.parse_args(argv)
 
 
@@ -1421,12 +1398,13 @@ def run_git(args, cwd=None, timeout=None):
 
 
 def clone_head_sha(clone_dir, run=run_git):
-    """Resolve the clone's HEAD commit SHA (provenance for resume + roll-up).
+    """Resolve the clone's HEAD commit SHA — stamped into `meta.clone_sha` as
+    structural provenance.
 
-    Pins the exact tree the code_graph/edges were built against so a `--resume`
-    rebuilds against the identical source (no mixed-SHA graph) and a multi-bundle
-    roll-up can pick the newest structural snapshot deterministically. Returns the
-    40-char SHA, or None when there is no clone (e.g. --no-clone with nothing on disk)."""
+    Pins the exact tree the code_graph/edges were built against. The store-native
+    resume (re-fold against the pinned SHA) keys off it so a refresh rebuilds from
+    the identical source (no mixed-SHA graph). Returns the 40-char SHA, or None
+    when there is no clone (e.g. --no-clone with nothing on disk)."""
     try:
         return run(["git", "-C", clone_dir, "rev-parse", "HEAD"]).strip() or None
     except Exception:
@@ -1480,7 +1458,7 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
                       read_text=_read_text_file, patterns=None,
                       max_workers=IAC_MAX_WORKERS, timeout=IAC_BUILD_TIMEOUT,
-                      retries=IAC_RETRIES, only_status=None):
+                      retries=IAC_RETRIES):
     """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
 
     Each area with a main.bicep (and `bicep` on PATH) or a *.tf (and `terraform` on
@@ -1489,12 +1467,7 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     restore failure, build error, or timeout leaves `edges` as-is ([]) but stamps
     `area["edges_status"]` so the gap is VISIBLE, never a silent empty. An aggregate
     `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
-    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph.
-
-    `only_status` (a set, e.g. {"timeout","failed"}) drives RESUME: only areas whose
-    current `edges_status` is in the set are rebuilt; every other area keeps its prior
-    edges + status untouched. The summary is recomputed across ALL areas so it reflects
-    the merged state. Sound because an area's edges are a pure function of its source."""
+    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     areas = code_graph.get("areas", [])
     area_ids = {a["id"] for a in areas}
@@ -1502,9 +1475,8 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     have_tf = bool(which("terraform"))
     summary = {"resolved": 0, "timeout": 0, "failed": 0, "skipped": 0}
 
-    # Fresh full run with no toolchain: build-only ⇒ everything skipped. (For a
-    # resume, fall through so retained areas keep their prior resolved edges.)
-    if only_status is None and not (have_bicep or have_tf):
+    # No toolchain: build-only ⇒ everything skipped.
+    if not (have_bicep or have_tf):
         for area in areas:
             area["edges_status"] = "skipped"
         summary["skipped"] = len(areas)
@@ -1512,8 +1484,6 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
         return code_graph
 
     def work(area):
-        if only_status is not None and area.get("edges_status") not in only_status:
-            return area, (None, area.get("edges_status") or "skipped")   # retain
         return area, _extract_area_edges(area, clone_dir, area_ids, patterns,
                                          have_bicep, have_tf, run, read_text,
                                          timeout, retries)
@@ -1527,81 +1497,6 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
 
     code_graph["edge_extraction"] = summary
     return code_graph
-
-
-def resume_bundle(prior_bundle, clone_dir, **extract_kw):
-    """Re-resolve ONLY the unresolved (timeout/failed) edges of a prior bundle, in
-    place, reusing everything else. Cheap way to close a partial edge gap without
-    recomputing the window — correct only when the clone is checked out at the prior
-    `meta.clone_sha` (same source tree). Returns the updated bundle. Mutates it."""
-    code_graph = prior_bundle.get("code_graph") or {}
-    extract_iac_edges(code_graph, clone_dir,
-                      only_status={"timeout", "failed"}, **extract_kw)
-    prior_bundle["code_graph"] = code_graph
-    return prior_bundle
-
-
-# Stable identity keys for overlap-safe roll-up. Monthly runs may overlap by a day
-# or two (a gap guarantee against late merges / clock skew); these immutable keys are
-# the dedup guarantee, so overlap never double-counts. (commit,path,change) keys a
-# code-event; PRs/issues by number; commits by sha; releases by tag; milestones by id.
-ROLLUP_ACTIVITY_KEYS = {
-    "prs": lambda x: x.get("number"),
-    "issues": lambda x: x.get("number"),
-    "commits": lambda x: x.get("sha"),
-    "releases": lambda x: x.get("tag") or x.get("id") or x.get("name"),
-    "milestones": lambda x: x.get("number") or x.get("id") or x.get("title"),
-    "code_events": lambda x: (x.get("commit"), x.get("path"), x.get("change")),
-}
-# Structure/derived fields are a point-in-time snapshot of a moving tree, so the
-# roll-up takes them whole from the LATEST installment rather than merging.
-ROLLUP_LATEST_FIELDS = ("code_graph", "code_owners", "label_taxonomy",
-                        "workflows", "workflow_stats")
-
-
-def _period_to(bundle):
-    m = bundle.get("meta") or {}
-    return (m.get("period") or {}).get("to") or m.get("to") or ""
-
-
-def rollup_bundles(bundles):
-    """Merge monthly installments into one multi-period bundle (the cheap through-line
-    for a long view; a fresh wide-window re-run stays canonical). ACTIVITY (prs/issues/
-    commits/code_events/releases/milestones) is UNIONED by stable identity — overlap
-    never double-counts, and the freshest observation of a mutable item (issue state,
-    open PR) wins (last-write). STRUCTURE (code_graph/owners/taxonomy/workflows) is taken
-    from the latest installment (newest `clone_sha`). `meta.period` spans the union window.
-    Derived link/report fields are intentionally dropped — re-run link on the result."""
-    if not bundles:
-        raise ValueError("rollup_bundles: no bundles given")
-    ordered = sorted(bundles, key=_period_to)
-    latest = ordered[-1]
-    merged = {}
-
-    for field, keyfn in ROLLUP_ACTIVITY_KEYS.items():
-        seen = {}
-        for i, b in enumerate(ordered):
-            for j, item in enumerate(b.get(field) or []):
-                k = keyfn(item)
-                seen[k if k is not None else (i, j)] = item   # last (freshest) wins
-        merged[field] = list(seen.values())
-
-    for field in ROLLUP_LATEST_FIELDS:
-        if field in latest:
-            merged[field] = latest[field]
-
-    metas = [b.get("meta") or {} for b in ordered]
-    froms = [(m.get("period") or {}).get("from") or m.get("from") for m in metas]
-    froms = [f for f in froms if f]
-    tos = [t for t in (_period_to(b) for b in ordered) if t]
-    lm = latest.get("meta") or {}
-    span = {"from": min(froms) if froms else lm.get("from"),
-            "to": max(tos) if tos else lm.get("to")}
-    merged["meta"] = {**lm, "from": span["from"], "to": span["to"],
-                      "period": span, "clone_sha": lm.get("clone_sha"),
-                      "rolled_up_from": [(m.get("period") or {"from": m.get("from"),
-                                          "to": m.get("to")}) for m in metas]}
-    return merged
 
 
 def http_get_json(url, token):
@@ -1692,46 +1587,9 @@ def _runs_page(get_page, api, frm, to):
     return runs
 
 
-def resume_acquire(args):
-    """`--resume` path: load a prior bundle, check the clone out at its pinned
-    `meta.clone_sha`, re-resolve only the timeout/failed edges, reuse everything
-    else. Not unit-tested (git/IO orchestration); the merge core is resume_bundle."""
-    with open(args.resume) as fh:
-        prior = json.load(fh)
-    meta = prior.get("meta") or {}
-    owner, repo = meta.get("owner"), meta.get("repo")
-    clone_dir = args.clone_dir or meta.get("clone_dir") or f"workspace/{repo}-clone"
-    sha = meta.get("clone_sha")
-    if not sha:
-        sys.stderr.write("error: prior bundle has no meta.clone_sha to resume against\n")
-        raise SystemExit(2)
-    if not args.no_clone:
-        os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
-        if not os.path.isdir(os.path.join(clone_dir, ".git")):
-            run_git(["git", "clone", f"https://github.com/{owner}/{repo}.git", clone_dir])
-        # fetch the exact pinned commit (works on a shallow clone) and check it out,
-        # so the rebuild runs against the IDENTICAL tree the prior run resolved.
-        run_git(["git", "-C", clone_dir, "fetch", "--depth", "1", "origin", sha])
-        run_git(["git", "-C", clone_dir, "checkout", "--force", sha])
-    before = dict((prior.get("code_graph") or {}).get("edge_extraction") or {})
-    resume_bundle(prior, clone_dir)
-    after = (prior.get("code_graph") or {}).get("edge_extraction") or {}
-    sys.stderr.write(f"resume: edge_extraction {before} -> {after}\n")
-    return prior
-
-
 def acquire(args, env):
-    if getattr(args, "rollup", None):
-        bundles = []
-        for path in args.rollup:
-            with open(path) as fh:
-                bundles.append(json.load(fh))
-        return rollup_bundles(bundles)
-    if getattr(args, "resume", None):
-        return resume_acquire(args)
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
-        sys.stderr.write("error: --owner --repo --from --to are required "
-                         "(or pass --resume <prior-bundle>)\n")
+        sys.stderr.write("error: --owner --repo --from --to are required\n")
         raise SystemExit(2)
     token = resolve_token(env)
     owner, repo = args.owner, args.repo
@@ -1955,17 +1813,172 @@ def acquire(args, env):
     return bundle
 
 
+# --- Backfill (slice 7c): on-demand single-node fetch on a traversal MISS -----
+#
+# A reader (extract) traversing a decision train over the spine edges can hit an
+# edge pointing at a node never gathered (e.g. a windowed PR `closes` an issue
+# opened before the window) — a `missing` id. `backfill` fetches THAT ONE node +
+# its cheap immediate spine edges and upserts it. It is the ONLY network call
+# outside the main Acquire pass, so it lives here in gather.
+#
+# The actual fetch is SEAMED behind an injectable `fetch` callable so the test
+# suite never touches the network: tests pass a fixture-backed fake; production
+# passes `make_backfill_fetcher(token)` (REST for social, local/`git fetch
+# --depth 1` for code). `fetch(kind, local, qid)` returns either None (genuinely
+# unfetchable) or `{"node": <raw record dict>, "edges": [(dst_local, edge_type),
+# ...]}`. backfill shapes the result into store node/edge upserts, reusing the
+# same id/edge conventions fold_bundle uses.
+
+def classify_id(qid):
+    """Classify a qualified node id into its node_class + a fetch `kind`, from
+    the LOCAL id form (mirrors fold_bundle's id conventions):
+
+      social: `pr-<n>` / `issue-<n>` / `comment-<id>`
+      code:   a bare `<sha>` commit (artifact ids carry `art:`/`#` and are a
+              substrate detail, never a spine target — classified `code` too)
+      structure: everything else (milestones/releases/areas/singletons/person-)
+
+    Returns {"node_class", "kind", "local"}.
+    """
+    local = graphstore.parse_id(qid)["local"]
+    if local.startswith(("pr-", "issue-", "comment-")):
+        kind = "social"
+    elif local.startswith(("milestone-", "release-", "area-", "person-")) \
+            or local.startswith("art:") or "#" in local \
+            or local in ("workflowstats", "codegraph", "codeowners",
+                         "labeltaxonomy"):
+        kind = "structure"
+    else:
+        kind = "code"  # bare <sha> commit
+    node_class = "structure" if kind == "structure" else kind
+    return {"node_class": node_class, "kind": kind, "local": local}
+
+
+def backfill(conn, id, fetch=None):
+    """Fetch and upsert ONE missing spine node + its cheap immediate edges.
+
+    Idempotent: if `get_node(id)` already returns a node, this is a no-op and
+    NOTHING is fetched. Otherwise it classifies `id`, calls the injected `fetch`
+    seam for that one node, and (when the fetch yields a record) upserts the node
+    plus any immediate spine edges the seam returned.
+
+    `fetch(kind, local, qid)` is the network seam (None == unfetchable; a dict
+    `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched). Tests
+    pass a fixture-backed fake; production passes `make_backfill_fetcher(token)`.
+
+    Returns `{"fetched": bool, "id": id, "edges_added": int}`.
+    """
+    if graphstore.get_node(conn, id) is not None:
+        return {"fetched": False, "id": id, "edges_added": 0}  # already present
+
+    info = classify_id(id)
+    parsed = graphstore.parse_id(id)
+    # The scope is `{project}/{repo}`; recover project/repo so the upsert lands
+    # in the same identity columns fold_bundle uses.
+    project, _, repo = parsed["scope"].partition("/")
+
+    if fetch is None:
+        raise ValueError("backfill needs a `fetch` seam (production: "
+                         "make_backfill_fetcher(token); tests: a fake)")
+
+    result = fetch(info["kind"], info["local"], id)
+    if not result or not result.get("node"):
+        return {"fetched": False, "id": id, "edges_added": 0}  # unfetchable
+
+    raw = result["node"]
+    fetched_at = graphstore.now_iso()
+    # ts mirrors fold_bundle's choice per class: social PR -> merged/closed/
+    # created; social issue -> closed/updated; commit -> date; structure -> NULL.
+    if info["kind"] == "social" and info["local"].startswith("pr-"):
+        ts = raw.get("merged_at") or raw.get("closed_at") or raw.get("created_at")
+    elif info["kind"] == "social" and info["local"].startswith("issue-"):
+        ts = raw.get("closed_at") or raw.get("updated_at")
+    elif info["kind"] == "code":
+        ts = raw.get("date")
+    else:
+        ts = raw.get("published_at")  # release; milestone/area stay None
+
+    graphstore.upsert_node(
+        conn, id, project, repo, info["node_class"], ts, raw, fetched_at)
+
+    # Cheap immediate spine edges the seam surfaced (e.g. issue#7 spun_off #5).
+    # Only spine edge types are honored — backfill closes a TRAVERSAL gap, it does
+    # not re-derive the whole non-spine substrate. Edges to still-absent nodes are
+    # fine (a later traversal surfaces them as `missing` for another backfill).
+    edges = []
+    for dst_local, edge_type in result.get("edges") or []:
+        if edge_type not in graphstore.SPINE_EDGE_TYPES:
+            continue
+        edges.append((id, graphstore.qualify_id(project, repo, dst_local),
+                      edge_type, None, None))
+    if edges:
+        graphstore.upsert_edges(conn, edges)
+    return {"fetched": True, "id": id, "edges_added": len(edges)}
+
+
+def make_backfill_fetcher(token, clone_dir=None):
+    """Production `fetch` seam for `backfill`: resolves one node by REST (social)
+    or local git (code). Returns a `fetch(kind, local, qid)` callable.
+
+    NOT unit-tested (it is the live-network edge); the suite exercises backfill
+    with a fixture-backed fake instead. social -> GitHub REST (normalize_pr /
+    normalize_issue, plus the same `closes` spine edges fold derives); code -> a
+    bounded `git fetch --depth 1 <sha>` into the clone then a one-commit log;
+    structure -> not backfilled on demand (graphify/whole-dict facts come from
+    Acquire), so it returns None and the node stays a warned gap.
+    """
+    def fetch(kind, local, qid):
+        parsed = graphstore.parse_id(qid)
+        project, _, repo = parsed["scope"].partition("/")
+        api = f"https://api.github.com/repos/{project}/{repo}"
+        if kind == "social" and local.startswith("issue-"):
+            num = local[len("issue-"):]
+            raw, _ = http_get_json(f"{api}/issues/{num}", token)
+            if raw.get("pull_request"):
+                return None
+            return {"node": normalize_issue(raw), "edges": []}
+        if kind == "social" and local.startswith("pr-"):
+            num = local[len("pr-"):]
+            raw, _ = http_get_json(f"{api}/pulls/{num}", token)
+            pr = normalize_pr(raw)
+            edges = [("issue-{}".format(n), "closes") for n in pr.get("closes") or []]
+            return {"node": pr, "edges": edges}
+        if kind == "code" and clone_dir:
+            sha = local
+            try:
+                run_git(["git", "-C", clone_dir, "fetch", "--depth", "1",
+                         "origin", sha])
+                raw = run_git(["git", "-C", clone_dir, "log", "-1",
+                               f"--pretty=format:{CODE_LOG_FORMAT}",
+                               "--date=short", "--name-only", sha])
+            except Exception:
+                return None
+            commits = parse_git_log(raw)
+            if not commits:
+                return None
+            c = commits[0]
+            prn = resolve_commit_pr(c.get("message", ""))
+            edges = [("pr-{}".format(prn), "part_of")] if prn is not None else []
+            return {"node": c, "edges": edges}
+        return None  # structure / unfetchable on demand
+
+    return fetch
+
+
 def fold_bundle(conn, bundle):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
     — re-folding an overlapping window mutates nothing already correct. See
     STORE.md for the schema and identity rules.
 
-    P6 scope: social (prs/issues; comments/reviews stay embedded in the parent's
-    data blob), code (commits) + the file-level code_events ledger, structure
-    (milestones/releases/areas), and the spine edges closes/cross_ref/part_of.
-    People & artifact nodes (link-derived), symbol_events, and every non-spine
-    edge land in a later phase.
+    Scope: social (prs/issues; comments/reviews stay embedded in the parent's
+    data blob), code (commits + the artifact substrate) + the file-level and
+    symbol code_events ledgers, structure (milestones/releases/areas + the
+    project-scoped people nodes), the spine edges closes/cross_ref/part_of, and
+    the non-spine contribution / owns / touches / depends_on / in_milestone /
+    symbol-move edges — all derived on the write path via the `derive` leaf.
+    See STORE.md for the full edge/node inventory and what remains (blocks /
+    in_iteration / fts_text).
     """
     meta = bundle.get("meta", {})
     project, repo = meta.get("owner"), meta.get("repo")
@@ -2012,6 +2025,46 @@ def fold_bundle(conn, bundle):
             ev.get("date"), None, None, None, None, ev.get("old_path"),
         ))
 
+    # code: artifact substrate (Phase 7b-1 step 2). Derive the per-artifact
+    # lifecycle ledger and symbol-identity moves from the raw bundle (pure, via
+    # `derive`), then persist them additively alongside the commit `code` nodes
+    # and the file-level ledger above. The artifact's own id form is the local
+    # id: `art:<path>` for file artifacts, `<path>#<lang>:<subkind>:<name>` for
+    # symbol/comment ones (see derive.build_artifacts).
+    artifacts = derive.build_artifacts(bundle)
+    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
+    for local, art in artifacts.items():
+        # ts: the artifact's last lifecycle event date (its most-recent activity);
+        # None when it has no events (degrades cleanly, excluded from window scans).
+        lc = art.get("lifecycle") or []
+        ts = lc[-1]["date"] if lc else None
+        nodes.append((qid(local), project, repo, "code", ts, art, fetched))
+
+    # code: symbol-granular lifecycle ledger, keyed by the SYMBOL artifact id,
+    # carrying the rich before/after fields (file-level entries leave them NULL).
+    for ev in bundle.get("symbol_events", []):
+        local = "{}#{}:{}:{}".format(
+            ev["path"], ev["lang"], ev["subkind"], ev["name"] or "")
+        event = derive._SYMBOL_CHANGE_TO_EVENT.get(ev.get("change"), "change")
+        events.append((
+            qid(local), event, ev.get("commit"), ev.get("author"),
+            ev.get("date"), None, None, ev.get("before"), ev.get("after"), None,
+        ))
+
+    # code: symbol-move edges (artifact -> artifact). Each confident move links
+    # the source symbol `replaced_by` the dest and the dest `identity_from` the
+    # source, both carrying move_confidence/move_basis. Idempotent by (src,dst,type).
+    for m in derive.match_symbol_moves(
+            bundle.get("symbol_events", []),
+            [(e.get("old_path"), e["path"]) for e in bundle.get("code_events", [])
+             if e.get("change") in ("rename", "copy") and e.get("old_path")]):
+        lang = m["lang"] or ""
+        src = qid("{}#{}:{}:{}".format(m["from_path"], lang, m["subkind"], m["name"]))
+        dst = qid("{}#{}:{}:{}".format(m["to_path"], lang, m["subkind"], m["name"]))
+        data = {"move_confidence": m["confidence"], "move_basis": m["basis"]}
+        edges.append((src, dst, "replaced_by", None, data))
+        edges.append((dst, src, "identity_from", None, data))
+
     # structure: milestones & areas (NULL ts -> excluded from window scans),
     # releases (dated point-in-time).
     for m in bundle.get("milestones", []):
@@ -2025,6 +2078,128 @@ def fold_bundle(conn, bundle):
         local = "area-{}".format(area.get("id") or area.get("name") or area.get("path"))
         nodes.append((qid(local), project, repo, "structure", None, area, fetched))
 
+    # structure: people + contribution / owns / touches / depends_on /
+    # in_milestone edges (Phase 7b-1 step 3). All derived on the write path via
+    # the shared `derive` leaf module; none of these leak into extract (person
+    # nodes are project-scoped `person-<login>` structure nodes ignored by its
+    # milestone-/release- prefix reconstruction, and every edge below is
+    # non-spine, so traverse_spine never follows them).
+    area_idx = derive.area_index(bundle.get("code_graph", {}) or {})
+    # People derivation must see commit->PR links the same way enrich does, or a
+    # reviewer whose PR's commits are only MESSAGE-resolvable to that PR (their
+    # `pr` field is unset on the raw record) is silently dropped. enrich runs
+    # attach_commit_prs FIRST; mirror that here. Resolve on a COPY so the stored
+    # commit `code` nodes (built above) stay faithful to the raw record and
+    # extract's commit reconstruction is unchanged.
+    resolved = copy.deepcopy(bundle.get("commits") or [])
+    attach_commit_prs(resolved)
+    people_view = {**bundle, "commits": resolved,
+                   "people": dict(bundle.get("people") or {})}
+    # ONE shared enumerator: person nodes are created for EVERY participant with
+    # any contribution edge — not just commit-authors + mapped-PR reviewers. This
+    # is the anti-drift fix for the live-audit bug where 222 logins had
+    # contribution edges (commented/reported/authored/reviewed) but NO person
+    # node (dangling edges). Contributors carry their modules/areas; pure
+    # participants get empty ones; bots are tagged (is_bot), never dropped.
+    # validate.no_drift re-derives via the SAME enumerate_participants, so writer
+    # and auditor can never diverge.
+    people = derive.enumerate_participants(people_view, area_idx)
+
+    def qperson(login):
+        return graphstore.qualify_person(project, login)
+
+    # People `structure` nodes (project-scoped). The `repo` column is the
+    # project sentinel "*" so the SAME login folded from another repo in the
+    # project upserts the identical id (idempotency is by the project-scoped id;
+    # the sentinel keeps the row out of any single repo's repo_nodes view, an
+    # extra no-leak guard). NULL ts -> excluded from window scans.
+    for login, rec in people.items():
+        if not login:
+            continue
+        data = {"login": login, **rec}
+        nodes.append((qperson(login), project, "*", "structure", None, data, fetched))
+
+    def contrib(login, dst_local, etype):
+        if login:
+            edges.append((qperson(login), qid(dst_local), etype, None, None))
+
+    # Contribution edges from the RAW records (person -> node). Idempotent by
+    # (src,dst,type); absent logins/fields are skipped cleanly.
+    for pr in bundle.get("prs", []):
+        prlocal = "pr-{}".format(pr["number"])
+        contrib(pr.get("author"), prlocal, "authored")
+        contrib(pr.get("merged_by"), prlocal, "merged")
+        for reviewer in pr.get("reviewers") or []:
+            contrib(reviewer, prlocal, "reviewed")
+        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
+            contrib(c.get("author"), prlocal, "commented")
+    for iss in bundle.get("issues", []):
+        isslocal = "issue-{}".format(iss["number"])
+        contrib(iss.get("author"), isslocal, "reported")
+        for c in iss.get("comments_list") or []:
+            contrib(c.get("author"), isslocal, "commented")
+    for c in bundle.get("commits", []):
+        contrib(c.get("author"), c["sha"], "authored")
+
+    # owns (person -> area): code_owners maps a path-prefix to owner logins; an
+    # owner owns every area whose paths fall under that prefix.
+    owners = bundle.get("code_owners") or {}
+    if owners:
+        areas_by_id = {}
+        for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
+            areas_by_id[area.get("id") or area.get("name") or area.get("path")] = area
+        for prefix, logins in owners.items():
+            for aid, area in areas_by_id.items():
+                if any((p or "").startswith(prefix) for p in area.get("paths") or []):
+                    for login in logins or []:
+                        contrib(login, "area-{}".format(aid), "owns")
+
+    # touches (commit/pr -> area): the distinct areas a commit's files land in.
+    for c in bundle.get("commits", []):
+        touched = derive._commit_areas(c, area_idx)
+        for aid in sorted(touched):
+            edges.append((qid(c["sha"]), qid("area-{}".format(aid)),
+                          "touches", None, None))
+
+    # depends_on (area -> area): the code_graph dependency edges, carrying
+    # {version,transitive,...} on the edge `data`.
+    for e in (bundle.get("code_graph", {}) or {}).get("edges") or []:
+        src, dst = e.get("from"), e.get("to")
+        if src and dst:
+            data = {k: v for k, v in e.items() if k not in ("from", "to")}
+            edges.append((qid("area-{}".format(src)), qid("area-{}".format(dst)),
+                          "depends_on", None, data or None))
+
+    # in_milestone (social -> structure): a PR/issue's milestone title links to
+    # the milestone node (keyed on number when present, else title — matching
+    # the milestone node's own local id form above).
+    ms_local = {}
+    for m in bundle.get("milestones", []):
+        local = "milestone-{}".format(m.get("number") or m.get("title"))
+        if m.get("title") is not None:
+            ms_local[m["title"]] = local
+        if m.get("number") is not None:
+            ms_local.setdefault(m["number"], local)
+    for items, pref in ((bundle.get("prs", []), "pr-"),
+                        (bundle.get("issues", []), "issue-")):
+        for it in items:
+            local = ms_local.get(it.get("milestone"))
+            if local is not None:
+                edges.append((qid("{}{}".format(pref, it["number"])),
+                              qid(local), "in_milestone", None, None))
+
+    # structure: per-repo singleton facts (whole dict round-tripped under a
+    # well-known local id, NULL ts so window scans skip it, identity-keyed /
+    # idempotent). Only emitted when present and non-empty so extract never
+    # fabricates an empty key. See STORE.md and extract._materialize_singleton.
+    for local, value in (("workflowstats", bundle.get("workflow_stats")),
+                         ("codegraph", bundle.get("code_graph")),
+                         ("codeowners", bundle.get("code_owners")),
+                         ("labeltaxonomy", bundle.get("label_taxonomy"))):
+        if value:
+            nodes.append((qid(local), project, repo, "structure", None,
+                          value, fetched))
+
     graphstore.upsert_nodes(conn, nodes)
     graphstore.upsert_edges(conn, edges)
     graphstore.add_code_events(conn, events)
@@ -2036,20 +2211,16 @@ def fold_bundle(conn, bundle):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     bundle = acquire(args, os.environ)
-    period = bundle.get("meta", {}).get("period", {})
-    out = (args.out or f"workspace/activity-{getattr(args, 'from', None) or period.get('from')}"
-           f"-{args.to or period.get('to')}.json")
-    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    with open(out, "w") as fh:
-        json.dump(bundle, fh, indent=2)
-    sys.stderr.write(f"wrote {out}\n")
-    if getattr(args, "store", None):
-        conn = graphstore.open_store(args.store)
-        graphstore.init_schema(conn)
-        fold_bundle(conn, bundle)
-        conn.close()
-        sys.stderr.write(f"folded bundle into store {args.store}\n")
-    return out
+    # Store-only (Phase 7): fold the assembled bundle into the journey-graph store
+    # — the sole deliverable. No bundle JSON file is written; the bundle is a
+    # transient view the Phase 8 reader materializes via extract.
+    os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
+    conn = graphstore.open_store(args.store)
+    graphstore.init_schema(conn)
+    fold_bundle(conn, bundle)
+    conn.close()
+    sys.stderr.write(f"folded bundle into store {args.store}\n")
+    return args.store
 
 
 if __name__ == "__main__":

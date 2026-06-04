@@ -1,0 +1,389 @@
+{
+  "artifacts": {},
+  "buckets": {
+    "in_flight": [
+      {
+        "id": 21,
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/21"
+      }
+    ],
+    "next_candidates": [
+      {
+        "id": 44,
+        "train": "train-issue-18",
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/44"
+      },
+      {
+        "id": 18,
+        "train": "train-issue-18",
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/18"
+      }
+    ],
+    "rejected": [
+      {
+        "id": 43,
+        "train": "train-pr-43",
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/43"
+      },
+      {
+        "id": 20,
+        "train": "train-issue-20",
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/20"
+      }
+    ],
+    "shipped": [
+      {
+        "id": 42,
+        "train": "train-issue-17",
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/42"
+      },
+      {
+        "id": 17,
+        "train": "train-issue-17",
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/17"
+      }
+    ]
+  },
+  "code_events": [],
+  "commits": [],
+  "feature_deltas": [],
+  "forecast": {
+    "candidates": [
+      {
+        "ref": {
+          "id": 44,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/44"
+        },
+        "score": 11.5,
+        "signals": [
+          "on milestone v1.3.0",
+          "high-priority",
+          "open PR",
+          "active in window"
+        ],
+        "tier": "likely",
+        "train": "train-issue-18"
+      },
+      {
+        "ref": {
+          "id": 18,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/18"
+        },
+        "score": 8.5,
+        "signals": [
+          "on milestone v1.3.0",
+          "open PR",
+          "active in window"
+        ],
+        "tier": "likely",
+        "train": "train-issue-18"
+      }
+    ],
+    "next_milestone": "v1.3.0"
+  },
+  "issues": [
+    {
+      "closed_at": "2026-05-10T12:00:00Z",
+      "kind": "feature",
+      "labels": [
+        "enhancement"
+      ],
+      "milestone": "v1.2.0",
+      "number": 17,
+      "state": "closed",
+      "state_reason": "completed",
+      "title": "Support policy param",
+      "updated_at": "2026-05-10T12:00:00Z",
+      "url": "https://github.com/o/r/issues/17"
+    },
+    {
+      "closed_at": null,
+      "kind": "other",
+      "labels": [],
+      "milestone": "v1.3.0",
+      "number": 18,
+      "state": "open",
+      "state_reason": null,
+      "title": "Open feature for next release",
+      "updated_at": "2026-05-22T00:00:00Z",
+      "url": "https://github.com/o/r/issues/18"
+    },
+    {
+      "closed_at": "2026-05-15T00:00:00Z",
+      "kind": "other",
+      "labels": [],
+      "milestone": null,
+      "number": 20,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "title": "Abandoned idea",
+      "updated_at": "2026-05-15T00:00:00Z",
+      "url": "https://github.com/o/r/issues/20"
+    },
+    {
+      "closed_at": null,
+      "kind": "other",
+      "labels": [],
+      "milestone": "v1.2.0",
+      "number": 21,
+      "state": "open",
+      "state_reason": null,
+      "title": "Active in current release",
+      "updated_at": "2026-05-18T00:00:00Z",
+      "url": "https://github.com/o/r/issues/21"
+    }
+  ],
+  "meta": {
+    "from": "2026-05-01",
+    "owner": "o",
+    "repo": "r",
+    "to": "2026-05-31"
+  },
+  "milestones": [
+    {
+      "due_on": "2026-04-30T00:00:00Z",
+      "number": 3,
+      "state": "closed",
+      "title": "v1.1.0"
+    },
+    {
+      "due_on": "2026-05-31T00:00:00Z",
+      "number": 4,
+      "state": "open",
+      "title": "v1.2.0"
+    },
+    {
+      "due_on": "2026-06-30T00:00:00Z",
+      "number": 5,
+      "state": "open",
+      "title": "v1.3.0"
+    }
+  ],
+  "modules": {},
+  "people": {},
+  "prs": [
+    {
+      "closed_at": "2026-05-10T12:00:00Z",
+      "closes": [
+        17
+      ],
+      "created_at": "2026-05-02T08:00:00Z",
+      "crossref_issues": [],
+      "labels": [
+        "enhancement"
+      ],
+      "merged": true,
+      "merged_at": "2026-05-10T12:00:00Z",
+      "milestone": "v1.2.0",
+      "number": 42,
+      "state": "closed",
+      "title": "Add policy param",
+      "updated_at": "2026-05-10T12:00:00Z",
+      "url": "https://github.com/o/r/pull/42"
+    },
+    {
+      "closed_at": "2026-05-11T09:00:00Z",
+      "closes": [],
+      "created_at": "2026-05-05T08:00:00Z",
+      "crossref_issues": [],
+      "labels": [],
+      "merged": false,
+      "merged_at": null,
+      "milestone": null,
+      "number": 43,
+      "state": "closed",
+      "title": "WIP experiment",
+      "updated_at": "2026-05-11T09:00:00Z",
+      "url": "https://github.com/o/r/pull/43"
+    },
+    {
+      "closed_at": null,
+      "closes": [],
+      "created_at": "2026-05-20T08:00:00Z",
+      "crossref_issues": [
+        18
+      ],
+      "labels": [
+        "priority/high"
+      ],
+      "merged": false,
+      "merged_at": null,
+      "milestone": "v1.3.0",
+      "number": 44,
+      "state": "open",
+      "title": "Still open",
+      "updated_at": "2026-05-25T08:00:00Z",
+      "url": "https://github.com/o/r/pull/44"
+    }
+  ],
+  "releases": [
+    {
+      "name": "1.2.0",
+      "prerelease": false,
+      "published_at": "2026-05-15T00:00:00Z",
+      "tag_name": "v1.2.0",
+      "url": "https://github.com/o/r/releases/tag/v1.2.0"
+    }
+  ],
+  "symbol_events": [],
+  "symbol_moves": {
+    "by_confidence": {
+      "high": 0,
+      "medium": 0
+    },
+    "links": []
+  },
+  "timeline": [],
+  "trains": [
+    {
+      "code_areas": [],
+      "commits": [],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 0,
+        "elapsed_days": 8,
+        "merged_at": "2026-05-10T12:00:00Z",
+        "opened_at": "2026-05-02T08:00:00Z",
+        "participants": 0,
+        "review_comments": 0,
+        "reviewers": 0,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 17,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/17"
+        },
+        {
+          "id": 42,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/42"
+        }
+      ],
+      "id": "train-issue-17",
+      "kind": "feature",
+      "outcome": "shipped",
+      "prs": [
+        42
+      ],
+      "root_issue": 17,
+      "significance": 3.0,
+      "tier": "deep"
+    },
+    {
+      "code_areas": [],
+      "commits": [],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 0,
+        "elapsed_days": null,
+        "merged_at": null,
+        "opened_at": "2026-05-20T08:00:00Z",
+        "participants": 0,
+        "review_comments": 0,
+        "reviewers": 0,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 18,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/18"
+        },
+        {
+          "id": 44,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/44"
+        }
+      ],
+      "id": "train-issue-18",
+      "kind": "other",
+      "outcome": "in_flight",
+      "prs": [
+        44
+      ],
+      "root_issue": 18,
+      "significance": 1.0,
+      "tier": "deep"
+    },
+    {
+      "code_areas": [],
+      "commits": [],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 0,
+        "elapsed_days": null,
+        "merged_at": null,
+        "opened_at": null,
+        "participants": 0,
+        "review_comments": 0,
+        "reviewers": 0,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 20,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/20"
+        }
+      ],
+      "id": "train-issue-20",
+      "kind": "other",
+      "outcome": "abandoned",
+      "prs": [],
+      "root_issue": 20,
+      "significance": 0.0,
+      "tier": "deep"
+    },
+    {
+      "code_areas": [],
+      "commits": [],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 0,
+        "elapsed_days": null,
+        "merged_at": null,
+        "opened_at": "2026-05-05T08:00:00Z",
+        "participants": 0,
+        "review_comments": 0,
+        "reviewers": 0,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 43,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/43"
+        }
+      ],
+      "id": "train-pr-43",
+      "kind": "other",
+      "outcome": "rejected",
+      "prs": [
+        43
+      ],
+      "root_issue": null,
+      "significance": 1.0,
+      "tier": "deep"
+    }
+  ],
+  "workflow_stats": {
+    "CI": {
+      "cancelled": 0,
+      "failure": 1,
+      "other": 0,
+      "success": 2,
+      "total": 3
+    }
+  }
+}
