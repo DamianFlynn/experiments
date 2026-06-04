@@ -64,7 +64,9 @@ jobs:
             .claude/skills/activity-overview/graphstore.py \
             .claude/skills/activity-overview/extract.py \
             .claude/skills/activity-overview/derive.py \
-            .claude/skills/activity-overview/validate.py
+            .claude/skills/activity-overview/validate.py \
+            .claude/skills/activity-overview/spotlight.py \
+            .claude/skills/activity-overview/ci_spotlight_integration.py
 
       - name: Run the offline test suite
         run: |
@@ -173,4 +175,70 @@ jobs:
         with:
           name: journey-graph
           path: .claude/skills/activity-overview/workspace/journey.db
+          if-no-files-found: warn
+
+  spotlight:
+    # Build a real db for a FIXED historical AVM week and run all four spotlight
+    # queries against it — "query it exactly as real execution would", not a mock
+    # and not a crafted fixture. The window is pinned (early March 2026): historical
+    # data does not change, so the gathered graph is stable and the gate is
+    # reproducible run to run. Heavy (clone + API) and needs the ACTIVITY_TEST_TOKEN
+    # secret, so it is gated like `live` — on demand, on schedule, or on a push to
+    # the default branch, never on a feature/fork PR.
+    needs: tests
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    env:
+      # Pinned historical week. Bump deliberately (and re-confirm assertions hold).
+      SPOTLIGHT_FROM: "2026-03-02"
+      SPOTLIGHT_TO: "2026-03-08"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify the integration secret is present
+        env:
+          ACTIVITY_TEST_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+        run: |
+          if [ -z "$ACTIVITY_TEST_TOKEN" ]; then
+            echo "::error::ACTIVITY_TEST_TOKEN secret is not set. Add it under" \
+                 "Settings -> Secrets and variables -> Actions, then re-run."
+            exit 1
+          fi
+          echo "secret present"
+
+      - name: Gather the fixed historical window into a journey-graph store
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+        run: |
+          cd .claude/skills/activity-overview
+          mkdir -p workspace
+          python gather.py \
+            --owner Azure --repo bicep-registry-modules \
+            --from "$SPOTLIGHT_FROM" --to "$SPOTLIGHT_TO" \
+            --store workspace/journey_spotlight.db
+
+      - name: Trust gate — audit the gathered graph
+        run: |
+          cd .claude/skills/activity-overview
+          python validate.py workspace/journey_spotlight.db
+
+      - name: Spotlight integration — run all four queries against the real store
+        run: |
+          cd .claude/skills/activity-overview
+          python ci_spotlight_integration.py --store workspace/journey_spotlight.db
+
+      - name: Upload the journey-graph store
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: journey-graph-spotlight
+          path: .claude/skills/activity-overview/workspace/journey_spotlight.db
           if-no-files-found: warn
