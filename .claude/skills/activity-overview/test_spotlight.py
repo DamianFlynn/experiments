@@ -764,6 +764,26 @@ class TestTextMining(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class TestGapRender(unittest.TestCase):
+    def test_complete_train_renders_no_gap_line(self):
+        t = {"anchor": "a", "title": "x", "outcome": "shipped",
+             "key_date": "2026-03-01", "areas": [], "roles": [],
+             "touchpoints": [], "timeline": [], "complete": True, "gaps": []}
+        md = spotlight._render_train_md(t)
+        self.assertNotIn("gaps", md.lower())
+
+    def test_gappy_train_renders_compact_summary(self):
+        t = {"anchor": "a", "title": "x", "outcome": "shipped",
+             "key_date": "2026-03-01", "areas": [], "roles": [],
+             "touchpoints": [], "timeline": [], "complete": False,
+             "gaps": [{"id": "acme/w#issue-5", "reason": "outside_window"},
+                      {"id": "acme/w#issue-9", "reason": "not_gathered"}]}
+        md = spotlight._render_train_md(t)
+        self.assertIn("2 gaps", md)
+        self.assertIn("outside-window", md)
+        self.assertIn("not-gathered", md)
+
+
 class TestGrepRender(unittest.TestCase):
     def setUp(self):
         self.conn = graphstore.open_store(":memory:")

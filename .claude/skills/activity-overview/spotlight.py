@@ -992,6 +992,14 @@ def _render_train_md(t):
         ev = " {}".format(r["event"]) if r.get("event") else ""
         excerpt = " — \"{}\"".format(r["excerpt"]) if r.get("excerpt") else ""
         lines.append("  - {} {}{} — {}{}".format(when, kind, ev, ref, excerpt))
+    gaps = t.get("gaps") or []
+    if gaps:
+        counts = {}
+        for g in gaps:
+            counts[g["reason"]] = counts.get(g["reason"], 0) + 1
+        parts = ["{} {}".format(counts[r], r.replace("_", "-"))
+                 for r in sorted(counts)]
+        lines.append("> ⚠ {} gaps: {}".format(len(gaps), ", ".join(parts)))
     return "\n".join(lines)
 
 
