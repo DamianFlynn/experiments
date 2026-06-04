@@ -1,7 +1,8 @@
 # activity-overview → journey-graph substrate — design
 
 **Status: SUPERSEDED / MERGED.** This standalone design has been folded into the canonical,
-evolving spec as **rev 14**:
+evolving spec and now lives there as **rev 15** (it landed as rev 14 and was extended by the
+rev-15 train-completion orchestrator):
 
 → **`docs/superpowers/specs/2026-06-01-activity-overview-design.md`**
   (see *Architecture (rev 14) — persistent graph substrate*, and the unified **P1–P14**
