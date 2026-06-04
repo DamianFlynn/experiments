@@ -276,21 +276,33 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
 
 
 def _order_artifacts(arts, code_events):
-    """Order the artifact dict to match build_artifacts' insertion order (the
-    code_events source order) so order-sensitive consumers (build_timeline's
-    same-(ts,url) tie-break) reproduce byte-for-byte. The order is the first
-    appearance of each file artifact's path in `code_events` (the artifact id is
-    `art:<path>`). Any artifact never named by a code_event (e.g. symbol nodes)
-    is appended last, ordered by id. Pure; does not mutate the records."""
-    first_seen = {}
-    for i, ev in enumerate(code_events):
-        for path in (ev.get("path"), ev.get("old_path")):
-            if path:
-                first_seen.setdefault("art:" + path, i)
-    fallback = len(code_events)
+    """Order the artifact dict to match build_artifacts' INSERTION order so
+    order-sensitive consumers (build_timeline's same-(ts,url) tie-break) reproduce
+    byte-for-byte. build_artifacts, per code_event in source order, ensures the
+    `path` artifact first and — on a rename — the `old_path` (replaced) artifact
+    second; first occurrence wins. We replay that exact first-ensure sequence as a
+    monotonic ordinal, so a rename whose old/new ids sort against insertion order
+    (e.g. a->z, which must stay [new, old]) is not flipped by a lexical tie-break.
+    Artifacts never named by a code_event (symbol/comment nodes) fall last, ordered
+    by id. Pure; does not mutate the records."""
+    order = {}
+
+    def _see(path):
+        if path:
+            order.setdefault("art:" + path, len(order))
+
+    for ev in code_events:
+        change = ev.get("change")
+        if change in ("rename", "copy") and ev.get("old_path"):
+            _see(ev.get("path"))            # new-path artifact: ensured first
+            if change == "rename":
+                _see(ev.get("old_path"))    # then the replaced old-path artifact
+        else:
+            _see(ev.get("path"))
+    fallback = len(order)
 
     def rank(aid):
-        return (first_seen.get(aid, fallback), aid)
+        return (order.get(aid, fallback), aid)
 
     return {aid: arts[aid] for aid in sorted(arts, key=rank)}
 

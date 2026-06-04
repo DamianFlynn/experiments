@@ -218,8 +218,11 @@ extract READS these — it does NOT re-derive via `build_artifacts` /
 `setdefault("artifacts", {})` / `setdefault("people", {})` so a raw bundle fed
 straight to enrich never KeyErrors and never silently recomputes them). enrich
 still owns the window-only projections (trains/buckets/timeline/feature_deltas/
-code-area attribution/modules/forecast/symbol-identity). `build_artifacts` and
-`attribute_people_areas` remain re-exported from `link` for direct callers.
+code-area attribution/modules/forecast/symbol-identity). The pure derivations
+`build_artifacts`/`attribute_people_areas` live in `derive.py`; `link` no longer
+re-exports them — call `derive.*` directly. (`link` re-exports only the
+window-projection helpers it still uses: `attribute_code_areas`/`build_modules`/
+`link_symbol_identity`/`ref`, plus `resolve_commit_pr`/`attach_commit_prs`.)
 
 Still NOT on the write path after step 3: `blocks` (issue→issue) and
 `in_iteration` (social→sprint) — skipped for lack of source data in the current
