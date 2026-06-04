@@ -1,7 +1,15 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 15 (**rev 15 promotes backfill into a shared train-completion orchestrator** — `complete.py` makes train completion *transitive* and *window-bounded* and gives every train an *honest edge contract* (`complete`/`gaps` with reasons; 404 phantoms pruned + remembered dead via a `dead_refs` tombstone), shared by `extract` and `spotlight`; see the new *`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`* and **Phase 8d** in the ledger. Prior — rev 14, Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending. **Rev 14 re-seats the storage/read seam onto a persistent SQLite graph substrate** — graphstore → gather-as-writer → extract → spotlight — keeping the rev-1–13 fact model verbatim while making full-history chronology, random-access analytics, and durable accumulation tractable; see the new *Architecture (rev 14) — persistent graph substrate* section below and the unified **P1–P14** ledger under *Implementation phasing*. The deferred 4b and the original P5–P8 features are re-sequenced as P10–P14, rebuilt on the store.)
+**Status:** rev 15 — design approved; implementation in progress.
+
+**Where we are (2026-06-04):**
+- **Shipped to `master`:** Phases 1–4a (the flat-bundle digest) plus the rev-14 substrate phases **5** (graphstore foundation, #11), **6** (gather-as-writer + on-demand `backfill`, #12) and **7** (full graph substrate — `extract` slices 7a/7b/7c, #13). The persistent SQLite graph is the live seam; `extract` reproduces the rev-13 bundle byte-for-byte under the equivalence gate.
+- **In review:** **Phase 8 — spotlight** (the four substrate-analytics queries + focused renders + CI gate) on **PR #14** (`claude/phase8-spotlight`, mergeable-clean).
+- **Designed + planned, not yet built:** **Phase 8d — the train-completion orchestrator** (`complete.py`) — *this rev*. Design: `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`; implementation plan: `docs/superpowers/plans/2026-06-04-activity-phase8d-completion.md`. No `complete.py` exists yet; `gather.backfill` (single-node) and `extract`'s inline 7c loop are the code it will absorb.
+- **Future:** Phases 9–14 (multi-repo, 4b sub-agent narration, report/community/forecast views) — see the **P1–P14** ledger under *Implementation phasing*.
+
+**Rev history.** (**rev 15 promotes backfill into a shared train-completion orchestrator** — `complete.py` makes train completion *transitive* and *window-bounded* and gives every train an *honest edge contract* (`complete`/`gaps` with reasons; 404 phantoms pruned + remembered dead via a `dead_refs` tombstone), shared by `extract` and `spotlight`; see the new *`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`* and **Phase 8d** in the ledger. Prior — rev 14, Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending. **Rev 14 re-seats the storage/read seam onto a persistent SQLite graph substrate** — graphstore → gather-as-writer → extract → spotlight — keeping the rev-1–13 fact model verbatim while making full-history chronology, random-access analytics, and durable accumulation tractable; see the new *Architecture (rev 14) — persistent graph substrate* section below and the unified **P1–P14** ledger under *Implementation phasing*. The deferred 4b and the original P5–P8 features are re-sequenced as P10–P14, rebuilt on the store.)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -1183,12 +1191,12 @@ then rebuild the deferred 4b and the original P5–P8 features **on the store** 
 shrink because the store does their heavy lifting — noted per phase). Each remains a verifiable
 vertical slice; the **golden-bundle equivalence test gates every substrate phase**.
 
-- **Phase 5 — graphstore foundation (substrate).** `graphstore.py`: 3 node classes + typed
+- **Phase 5 — graphstore foundation (substrate; shipped, #11).** `graphstore.py`: 3 node classes + typed
   edge table + `code_events` + FTS5 + `meta`; identity-keyed idempotent upserts; windowed range
   query; bounded spine traversal; `STORE.md`. Full offline unit + idempotency + determinism +
   scale tests. *Verifiable:* seed from existing fixtures, round-trip, assert idempotent union.
   Plan: `docs/superpowers/plans/2026-06-04-activity-overview-phase5-graphstore.md`.
-- **Phase 6 — gather as writer + backfill (substrate).** Repoint `gather.py`'s sink from
+- **Phase 6 — gather as writer + backfill (substrate; shipped, #12).** Repoint `gather.py`'s sink from
   JSON-assembly to store upserts (per-batch transactions); pin `clone_sha`; record
   `gathered_windows`. `backfill(id)` single-node on-demand bridge. *Verifiable:* re-gather an
   overlapping window into a fresh `.db` → no duplication; a backfilled out-of-window node
@@ -1197,7 +1205,7 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   for single ops, but P6's high-volume writes want per-batch atomicity/throughput, so P6 adds a
   defer-commit path (e.g. an optional `commit=True` arg or a batch/transaction context) rather
   than 50k individual commits.
-- **Phase 7 — full graph substrate: extract + persisted derived facts (substrate; the gate).**
+- **Phase 7 — full graph substrate: extract + persisted derived facts (substrate; the gate; shipped, #13).**
   Expanded from "raw extract only" to stand up the **complete** substrate, built as three gated
   vertical slices that hold the same end-to-end equivalence gate green: **7a** `extract.py`
   (range query → train seeds → bounded spine traversal → materialized rev-13 view) + the ⭐
@@ -1209,11 +1217,11 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   roll-up/resume hardening. Persistence model: *facts (nodes/edges/ledgers, incl. backfilled
   threads) are durable; only roll-ups are recomputed, from those facts.* Detailed design:
   `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
-- **Phase 8 — spotlight (substrate analytics; absorbs original-P5 people view).** `spotlight.py`:
+- **Phase 8 — spotlight (substrate analytics; absorbs original-P5 people view) (in review — PR #14).** `spotlight.py`:
   person-impact, subsystem-split, pattern-evolution, commit-text-mining queries + focused
   renders. *Verifiable:* each query against a seeded multi-window store returns the expected
   aggregate with citations; the FTS query returns matches `O(matches)`.
-- **Phase 8d — train completion (the completion orchestrator) (substrate; rev 15).** Promote
+- **Phase 8d — train completion (the completion orchestrator) (substrate; rev 15; designed + planned, not yet built).** Promote
   7c's single-node `backfill` + extract's inline loop into a shared **`complete.py`**: transitive
   spine completion **bounded by the query window** (else closure; level-0 directly-referenced
   anchors always filled), an **honest edge contract** on every train (`complete` + `gaps[{id,
