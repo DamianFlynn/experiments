@@ -94,7 +94,9 @@ writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
 `cross_ref`, and `part_of`. People & artifact nodes (link-derived),
 `symbol_events`, and all non-spine edges (`authored`/`reviewed`/`touches`/
-`owns`/…) are written by a later phase.
+`owns`/…) are written by **Phase 7 slice 7b** (lifting link's pure derivations
+onto the write path) — see
+`docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
 ## Determinism
 
