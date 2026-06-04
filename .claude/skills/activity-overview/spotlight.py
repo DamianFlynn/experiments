@@ -165,10 +165,45 @@ def _outcome(reached_nodes):
     return "in_flight"
 
 
+# Origin kind priority for choosing a train's anchor: the originating
+# issue/PR headlines a train, never a commit sha. Lower wins.
+_ORIGIN_PRIORITY = {"issue": 0, "pr": 1, "release": 2, "commit": 3}
+
+
+def _origin_anchor(nodes):
+    """Choose a train's anchor as its ORIGIN: the reached node with the best
+    (kind_priority, ts, id) where issue < pr < release < commit < other. This
+    keeps the headline on the originating issue/PR (its title) rather than a
+    commit message, and is fully deterministic — the same reached set always
+    yields the same origin however the train was entered. `nodes` is the list
+    of hydrated node dicts (None-filtered)."""
+    def key(n):
+        kind = _node_kind(n["id"], n.get("data") or {})
+        prio = _ORIGIN_PRIORITY.get(kind, 4)
+        return (prio, n.get("ts") or "", n["id"])
+    return min(nodes, key=key)["id"]
+
+
+def _reached_anchor(conn, reached):
+    """The origin anchor for a reached id set (hydrates the ids and applies
+    `_origin_anchor`), so the dedup/seed key a query groups trains by is the
+    SAME origin `_train` will headline — issue/PR over a commit sha — and two
+    seeds entering one train collapse to one entry. Falls back to min(id) when
+    nothing hydrates (e.g. a lone toucher with no node yet)."""
+    nodes = [graphstore.get_node(conn, nid) for nid in reached]
+    nodes = [n for n in nodes if n is not None]
+    if not nodes:
+        return min(reached)
+    return _origin_anchor(nodes)
+
+
 def _train(conn, anchor, reached, focus_touch_ids, role_of):
     """Build one decision-train entry routed through the shared contract.
 
-    `anchor`           — the train's deterministic anchor id (min reached id).
+    `anchor`           — the train's deterministic anchor id; superseded here by
+                         the train's ORIGIN (see `_origin_anchor`) when the
+                         reached set is non-empty, so the headline lands on the
+                         originating issue/PR rather than a commit sha.
     `reached`          — iterable of node ids in the train.
     `focus_touch_ids`  — the subset of `reached` the focus touched.
     `role_of`          — maps a touched id -> the focus's role there
@@ -183,6 +218,11 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of):
     nodes = [graphstore.get_node(conn, nid) for nid in reached]
     nodes = [n for n in nodes if n is not None]
 
+    # the anchor is the train's ORIGIN (issue beats pr beats release beats
+    # commit), so the headline reads as the originating issue/PR title — not a
+    # commit message. Falls back to the passed anchor if nothing hydrated.
+    if nodes:
+        anchor = _origin_anchor(nodes)
     anchor_node = graphstore.get_node(conn, anchor)
     adata = (anchor_node["data"] if anchor_node else {}) or {}
 
@@ -357,7 +397,7 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
         reached = set(reach["reached"])
         if not reached:
             continue
-        anchor = min(reached)
+        anchor = _reached_anchor(conn, reached)
         # union reached sets sharing an anchor (a seed entering the same train)
         trains_by_anchor.setdefault(anchor, set()).update(reached)
 
@@ -687,7 +727,7 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
         if not reached:
             # a lone toucher with no spine still forms a single-node train
             reached = {seed}
-        anchor = min(reached)
+        anchor = _reached_anchor(conn, reached)
         trains_by_anchor.setdefault(anchor, set()).update(reached)
 
     touch_set = set(touching_src_ids)
@@ -737,6 +777,98 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
         summary, delivered,
         contributors=contributors,
         depends_on={"out": deps_out, "in": deps_in},
+    )
+
+
+def _fts_query(phrase):
+    """Sanitize a raw user phrase into a safe FTS5 MATCH expression.
+
+    Design choice: a LITERAL phrase match. We wrap the whole phrase in double
+    quotes (FTS5's string literal) and double any embedded `"`. Inside a quoted
+    string FTS5 treats the operators (AND OR NOT * - : ^) and parentheses as
+    ordinary tokens, not grammar — so operator/quote-bearing user text never
+    raises a syntax error and is searched as the words the user typed. An empty
+    or whitespace-only phrase becomes `""` (matches nothing) rather than raising.
+    """
+    return '"' + str(phrase or "").replace('"', '""') + '"'
+
+
+def _match_excerpt(node):
+    """Bounded excerpt for a matched (mention) touchpoint: the node's body, then
+    commit message, then title — whichever searchable text it carries."""
+    data = (node["data"] if node else {}) or {}
+    for key in ("body", "message", "title"):
+        if data.get(key):
+            return _excerpt(data[key])
+    return ""
+
+
+def text_mining(conn, project, phrase, ts_from=None, ts_to=None):
+    """Every comment / commit message / review / PR-issue body mentioning
+    `phrase`, grouped by the decision train each occurrence belongs to —
+    chronological, each cited. The O(matches) FTS query: only the matched nodes
+    and their trains are hydrated, never the full history.
+
+    FTS5-gated: if the SQLite build lacks FTS5 the store carries no searchable
+    index, so this returns a `fts_unavailable` status (a valid answer, exit 0).
+    Otherwise `fts_search` returns matched node ids; for each we `traverse_spine`
+    to its train, dedupe to origin anchors, and build one `_train` per train
+    where the matched nodes are the focus touchpoints (role "mention", excerpt =
+    bounded match text). No matches -> status "ok" with an empty `delivered`
+    (a valid answer — the phrase simply isn't present), not needs_gather.
+    `--from/--to` filter trains by their key date. focus_kind="grep".
+    Determinism: trains by (key_date, anchor); touchpoints/timeline by (ts,id).
+    """
+    if not graphstore.fts5_available(conn):
+        return {
+            "query": "grep",
+            "focus": phrase,
+            "focus_kind": "grep",
+            "project": project,
+            "status": "fts_unavailable",
+            "scope": _scope(ts_from, ts_to),
+            "guidance": (
+                "FTS5 is unavailable in this SQLite build, so the store carries "
+                "no searchable text index; rebuild with FTS5 to run grep"),
+        }
+
+    matched = graphstore.fts_search(conn, _fts_query(phrase))
+    matched_set = set(matched)
+
+    # group matches by the train each belongs to (seed the spine from each
+    # match, dedupe to origin anchors). O(matches): only matches + their
+    # trains are hydrated.
+    trains_by_anchor = {}  # anchor -> reached set (ids)
+    for mid in matched:
+        reach = graphstore.traverse_spine(conn, [mid])
+        reached = set(reach["reached"])
+        if not reached:
+            reached = {mid}
+        anchor = _reached_anchor(conn, reached)
+        trains_by_anchor.setdefault(anchor, set()).update(reached)
+
+    delivered = []
+    shipped = 0
+    for anchor, reached in trains_by_anchor.items():
+        # the matched nodes that fall in this train are the focus touchpoints,
+        # each role "mention" with a bounded excerpt of its match text.
+        focus_touch_ids = sorted(matched_set & reached)
+        role_of = {}
+        for tid in focus_touch_ids:
+            node = graphstore.get_node(conn, tid)
+            role_of[tid] = {"role": "mention", "excerpt": _match_excerpt(node)}
+        train = _train(conn, anchor, reached, focus_touch_ids, role_of)
+        if (ts_from is not None or ts_to is not None) and not _date_in_range(
+                train["key_date"], ts_from, ts_to):
+            continue
+        if train["outcome"] == "shipped":
+            shipped += 1
+        delivered.append(train)
+
+    summary = {"matches": len(matched), "trains": len(delivered)}
+    return _result(
+        "grep", phrase, "grep", project, _scope(ts_from, ts_to),
+        summary, delivered,
     )
 
 
@@ -835,13 +967,25 @@ def _render_symbol_md(res):
     lines.append("- summary: {} events, outcome {}".format(
         s.get("events", 0), s.get("outcome", "?")))
     lines.append("")
-    lines.append("### identity chain ({})".format(len(res["identity_chain"])))
-    for c in res["identity_chain"]:
+    chain = res["identity_chain"]
+    lines.append("### identity chain ({})".format(len(chain)))
+    for c in chain:
         if c.get("confidence"):
             lines.append("- {} ({} / {})".format(
                 c["id"], c.get("confidence"), c.get("basis")))
         else:
             lines.append("- {}".format(c["id"]))
+    # Mermaid only where it adds signal: a multi-link rename/move chain reads
+    # better as a left-to-right graph than as a flat list.
+    if len(chain) > 1:
+        lines.append("")
+        lines.append("```mermaid")
+        lines.append("graph LR")
+        for i, c in enumerate(chain):
+            lines.append('  n{}["{}"]'.format(i, c["id"]))
+        for i in range(len(chain) - 1):
+            lines.append("  n{} --> n{}".format(i, i + 1))
+        lines.append("```")
     lines.extend(_render_delivered_md(res))
     return "\n".join(lines).rstrip()
 
@@ -875,10 +1019,24 @@ def _render_subsystem_md(res):
     return "\n".join(lines).rstrip()
 
 
+def _render_grep_md(res):
+    if res["status"] == "fts_unavailable":
+        return "## spotlight: grep `{}`\n\n_FTS unavailable:_ {}".format(
+            res["focus"], res.get("guidance", ""))
+    s = res["summary"]
+    lines = ["## spotlight: grep `{}`".format(res["focus"]), ""]
+    lines.append("- scope: {}".format(_scope_label(res["scope"])))
+    lines.append("- summary: {} matches across {} trains".format(
+        s.get("matches", 0), s.get("trains", 0)))
+    lines.extend(_render_delivered_md(res))
+    return "\n".join(lines).rstrip()
+
+
 _RENDERERS = {
     "person": _render_person_md,
     "symbol": _render_symbol_md,
     "subsystem": _render_subsystem_md,
+    "grep": _render_grep_md,
 }
 
 
@@ -932,6 +1090,9 @@ def main(argv=None):
     elif args.query == "subsystem":
         res = subsystem_split(conn, project, args.args[0],
                               ts_from=args.ts_from, ts_to=args.ts_to)
+    elif args.query == "grep":
+        res = text_mining(conn, project, args.args[0],
+                          ts_from=args.ts_from, ts_to=args.ts_to)
     conn.close()
 
     if args.md:

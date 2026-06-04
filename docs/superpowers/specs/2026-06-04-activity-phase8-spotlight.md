@@ -162,8 +162,8 @@ the `O(matches)` FTS query that is a full file scan on the flat JSON.
   comment/review authors+bodies embedded in social node `data`. Without this the
   query has nothing to search. FTS is created only when the SQLite build supports
   FTS5 (`fts5_available`); the query degrades to a clear "FTS unavailable" result
-  otherwise.
-- **Real data:** ✓ after the indexing prerequisite lands.
+  otherwise. **Done (8c)** — the prerequisite landed in 8a; the query ships in 8c.
+- **Real data:** ✓ (smoke runs against the AVM store when FTS5 is available).
 
 ---
 
@@ -240,9 +240,36 @@ returns the expected aggregate with citations; FTS returns matches `O(matches)`"
   identity-chain edges are stored bidirectionally (`replaced_by` src->dst and
   `identity_from` dst->src both on the artifacts), so the walk recovers the same
   chain from either endpoint.
-- **8c — commit-text-mining + focused renders.** FTS query (input hardening,
-  `O(matches)`), plus the markdown renders for all four. *Gate:* FTS golden +
-  render goldens green; real-data smoke.
+- **8c — commit-text-mining + focused renders.** **DONE.** **commit-text-mining**
+  (`grep <phrase>`) ships end-to-end in `spotlight.py`: FTS5-gated (degrades to a
+  `fts_unavailable` status, exit 0, when the build lacks FTS5), input-hardened via
+  `_fts_query` (the raw phrase is wrapped as a single FTS5 quoted-string literal
+  with embedded `"` doubled, so operators `AND/OR/NOT/*/-/:` and unbalanced quotes
+  are searched literally and never raise — a literal phrase match), and `O(matches)`
+  (only the `fts_search` hits and their trains are hydrated, never full history).
+  Matches are grouped by the decision train each belongs to (`traverse_spine` from
+  each match, deduped to the train's **origin** anchor), one `_train` per train
+  with the matched nodes as focus touchpoints (role `"mention"`, bounded `excerpt`),
+  chronological, every row cited; `--from/--to` filter by key date; no matches is a
+  valid `ok` answer with empty `delivered` (not needs_gather). **Focused renders**:
+  all four queries route through `_RENDERERS` — `_render_grep_md` (a cited hit-list:
+  phrase, summary, then per train an outcome badge + the `mention` touchpoints with
+  excerpts + the compact cited timeline), and `_render_symbol_md` now emits a
+  Mermaid `graph LR` identity-chain diagram when the chain has >1 link (Mermaid only
+  where it adds signal); all renders stay thin formatters over the one JSON
+  envelope. Also folded in a **train-headline polish**: a train's anchor is now its
+  ORIGIN — the reached node with the best `(kind_priority, ts, id)` where
+  issue(0) < pr(1) < release(2) < commit(3) < other(4) — so a train collapses to one
+  entry however it is entered and its headline (`title`) reads as the originating
+  issue/PR, never a commit message (`_origin_anchor`/`_reached_anchor` applied in
+  `_train` and the person/subsystem/grep seed-dedup sites). Seeded grep golden
+  (origin-anchored, train-grouped, cited — FTS5-gated), input-sanitization,
+  `O(matches)`, no-match-empty, `--from/--to`, determinism, a grep `--md` render
+  golden, a symbol-chain Mermaid render test, and a real-data grep smoke against the
+  AVM store; person/subsystem goldens updated for the origin anchors.
+  *Gate met:* FTS golden + render goldens green; full suite **572 passed,
+  4 skipped** (additive over 8b's 549+2; the 4 skips are the FTS-unavailable-path
+  tests, which skip cleanly when this build *has* FTS5); store reader-only.
 
 Each slice ships green under the existing trust gate + suite; spotlight never
 mutates the store, so it cannot regress Phase 7's guarantees.

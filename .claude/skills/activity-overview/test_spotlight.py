@@ -155,14 +155,17 @@ class TestPersonImpact(unittest.TestCase):
         issue9 = graphstore.qualify_id("acme", "r1", "issue-9")
         commit = graphstore.qualify_id("acme", "r1", "c0ffee1")
         # the firewall train reaches issue9 <- pr1 <- commit (part_of/closes);
-        # its anchor is the deterministically smallest reached id.
-        fw_anchor = min(pr1, issue9, commit)
+        # its anchor is the train's ORIGIN — the issue (issue beats pr beats
+        # commit), so the headline reads as the originating issue, not a commit.
+        fw_anchor = issue9
         anchors = {t["anchor"] for t in delivered}
         self.assertIn(fw_anchor, anchors)
         self.assertIn(pr2, anchors)
 
         fw = [t for t in delivered if t["anchor"] == fw_anchor][0]
         self.assertEqual(fw["outcome"], "shipped")
+        # the headline is the issue's title, not the commit message
+        self.assertEqual(fw["title"], "Firewall policy missing")
         self.assertIn("title", fw)
         self.assertIn("areas", fw)
         self.assertIn("roles", fw)
@@ -560,8 +563,8 @@ class TestSubsystemSplit(unittest.TestCase):
         pr1 = graphstore.qualify_id("acme", "r1", "pr-1")
         pr2 = graphstore.qualify_id("acme", "r1", "pr-2")
         issue9 = graphstore.qualify_id("acme", "r1", "issue-9")
-        # PR1 train (anchored on the min reached id) shipped; PR2 in_flight
-        pr1_anchor = min(pr1, issue9)
+        # PR1 train (anchored on its ORIGIN issue) shipped; PR2 in_flight
+        pr1_anchor = issue9
         self.assertEqual(outcomes[pr1_anchor], "shipped")
         self.assertEqual(outcomes[pr2], "in_flight")
         # touchpoints = the area-touching nodes in each train (the commits)
@@ -599,6 +602,147 @@ class TestSubsystemSplit(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class TestTextMining(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _crafted_bundle())
+
+    def test_fts_unavailable_status(self):
+        if graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 available — degrade path not exercised here")
+        res = spotlight.text_mining(self.conn, "acme", "firewall")
+        self.assertEqual(res["status"], "fts_unavailable")
+        self.assertEqual(res["query"], "grep")
+        self.assertIn("guidance", res)
+
+    def test_grep_golden(self):
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        res = spotlight.text_mining(self.conn, "acme", "firewall")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["query"], "grep")
+        self.assertEqual(res["focus"], "firewall")
+        self.assertEqual(res["focus_kind"], "grep")
+        self.assertEqual(res["project"], "acme")
+        self.assertEqual(res["scope"], "all-history")
+        # "firewall" appears in PR1 body/title and issue9 title/body — both in
+        # the same firewall train, anchored on the origin issue.
+        issue9 = graphstore.qualify_id("acme", "r1", "issue-9")
+        pr1 = graphstore.qualify_id("acme", "r1", "pr-1")
+        anchors = [t["anchor"] for t in res["delivered"]]
+        self.assertEqual(anchors, [issue9])  # single train, origin-anchored
+        train = res["delivered"][0]
+        # the matched nodes are the focus touchpoints with role "mention"
+        mention_ids = {tp["id"] for tp in train["touchpoints"]}
+        self.assertIn(pr1, mention_ids)
+        self.assertIn(issue9, mention_ids)
+        for tp in train["touchpoints"]:
+            self.assertEqual(tp["role"], "mention")
+            self.assertIn("excerpt", tp)
+        # summary carries match + train counts
+        self.assertEqual(res["summary"]["trains"], 1)
+        self.assertGreaterEqual(res["summary"]["matches"], 2)
+        # full cited spine timeline present and chronological
+        keys = [(r.get("ts") or "", r["id"]) for r in train["timeline"]]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_grep_no_matches_is_ok_empty(self):
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        res = spotlight.text_mining(self.conn, "acme", "zzz_no_such_phrase_zzz")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["delivered"], [])
+        self.assertEqual(res["summary"]["matches"], 0)
+        self.assertEqual(res["summary"]["trains"], 0)
+
+    def test_grep_input_sanitization_never_raises(self):
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        for phrase in ("fix AND bug", 'a "b" c', "foo:bar", "-x",
+                       "OR NOT *", 'unbalanced " quote'):
+            res = spotlight.text_mining(self.conn, "acme", phrase)
+            self.assertEqual(res["status"], "ok", phrase)
+            self.assertEqual(res["query"], "grep")
+
+    def test_grep_o_matches_only_hydrates_matches(self):
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        # count every node in the store, then assert grep hydrates only the
+        # matches + their trains, never the full history.
+        total = self.conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+        calls = {"n": 0}
+        real_get = graphstore.get_node
+
+        def counting_get(conn, nid):
+            calls["n"] += 1
+            return real_get(conn, nid)
+
+        graphstore.get_node = counting_get
+        try:
+            res = spotlight.text_mining(self.conn, "acme", "firewall")
+        finally:
+            graphstore.get_node = real_get
+        self.assertEqual(res["status"], "ok")
+        # the firewall train is small (issue9/pr1/commit); hydration stays well
+        # under a full-history scan even with re-fetches inside _train.
+        self.assertLess(calls["n"], total * 3)
+
+    def test_grep_from_to_filters_trains(self):
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        # the firewall train's key date is the issue creation (2026-01-08…);
+        # an early --to before it drops the train.
+        res = spotlight.text_mining(self.conn, "acme", "firewall",
+                                    ts_from="2026-01-01", ts_to="2026-01-02")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["delivered"], [])
+
+    def test_grep_determinism(self):
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        a = json.dumps(spotlight.text_mining(self.conn, "acme", "firewall"),
+                       sort_keys=True)
+        b = json.dumps(spotlight.text_mining(self.conn, "acme", "firewall"),
+                       sort_keys=True)
+        self.assertEqual(a, b)
+
+
+class TestGrepRender(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _crafted_bundle())
+
+    def test_grep_md_render_golden(self):
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        res = spotlight.text_mining(self.conn, "acme", "firewall")
+        md = spotlight.render_md(res)
+        self.assertIn("spotlight: grep `firewall`", md)
+        self.assertIn("[shipped]", md)
+        self.assertIn("mention", md)
+        # cited timeline + excerpt present
+        self.assertIn("- timeline:", md)
+
+    def test_grep_md_fts_unavailable(self):
+        if graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 available")
+        res = spotlight.text_mining(self.conn, "acme", "firewall")
+        md = spotlight.render_md(res)
+        self.assertIn("FTS unavailable", md)
+
+    def test_symbol_md_has_mermaid_chain(self):
+        # a two-link identity chain should render a graph LR mermaid block
+        gather.fold_bundle(self.conn, _evolution_create_bundle(repo="r2"))
+        gather.fold_bundle(self.conn, _evolution_move_bundle(repo="r2"))
+        src = graphstore.qualify_id("acme", "r2", "old.bicep#bicep:resource:fw")
+        res = spotlight.pattern_evolution(self.conn, "acme", src)
+        md = spotlight.render_md(res)
+        self.assertIn("```mermaid", md)
+        self.assertIn("graph LR", md)
+
+
 @unittest.skipUnless(os.path.exists(REAL_STORE), "real store absent")
 class TestRealDataSmoke(unittest.TestCase):
     def test_person_impact_real(self):
@@ -633,6 +777,22 @@ class TestRealDataSmoke(unittest.TestCase):
         res = spotlight.subsystem_split(conn, "Azure", "avm/res/cache/redis")
         conn.close()
         self.assertIn(res["status"], ("ok", "needs_gather"))
+
+    def test_text_mining_real(self):
+        conn = graphstore.open_store(REAL_STORE)
+        if not graphstore.fts5_available(conn):
+            conn.close()
+            self.skipTest("FTS5 unavailable")
+        # a common substantive word; whatever it matches, the envelope is a
+        # valid ok answer and every delivered train is cited.
+        res = spotlight.text_mining(conn, "Azure", "redis")
+        conn.close()
+        self.assertEqual(res["query"], "grep")
+        self.assertIn(res["status"], ("ok", "fts_unavailable"))
+        if res["status"] == "ok":
+            for t in res["delivered"]:
+                for r in t["timeline"]:
+                    self.assertIn("kind", r)
 
 
 if __name__ == "__main__":
