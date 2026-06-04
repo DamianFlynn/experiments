@@ -121,9 +121,13 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
   nodes, which keep their bare-`<sha>` local id. Idempotent by id.
 - **`symbol_events` ledger.** The symbol-granular lifecycle
   (`gather.parse_symbol_events`) is persisted into the `code_events` table keyed
-  by the SYMBOL artifact id, carrying the rich `before`/`after` fields (file-level
-  rows leave them NULL). A symbol artifact's `lifecycle[]` is
-  `get_code_events(<symbol artifact id>)` in date order.
+  by the SYMBOL artifact id `<path>#<lang>:<subkind>:<name>`, carrying the rich
+  `before`/`after` fields (file-level rows leave them NULL) and the MAPPED `event`
+  (`derive._SYMBOL_CHANGE_TO_EVENT[change]`). A symbol artifact's `lifecycle[]` is
+  `get_code_events(<symbol artifact id>)` in date order. The raw `symbol_events`
+  array round-trips losslessly: `extract` reconstructs it from these rows (see the
+  reader contract below), so a self-sourced bundle re-derives the symbol/comment
+  artifacts exactly — which is what `validate.no_drift` requires.
 - **Symbol-move edges.** Confident window-wide symbol moves
   (`derive.match_symbol_moves`) upsert `replaced_by` (src→dst) and
   `identity_from` (dst→src) artifact→artifact edges carrying
@@ -193,6 +197,19 @@ RAW-only view — it additionally reconstructs:
   sentinel `"*"`, local id `person-<login>`), keyed by login (the redundant stored
   `login` field is dropped). Because fold now persists ALL participants, this
   naturally returns the full set (each record carries `modules`/`areas`/`is_bot`).
+- **`symbol_events`** by splitting the shared `code_events` ledger: the
+  SYMBOL-keyed rows (local id `<path>#<lang>:<subkind>:<name>` — a SECOND `#` past
+  the repo prefix, with `before`/`after`) reconstruct one symbol_event dict each
+  (file-level `<path>` rows stay in the raw `code_events` array and are never
+  double-counted). The id parse strips the `{project}/{repo}#` prefix, splits once
+  on `#` → `path` + `lang:subkind:name`, then `split(":", 2)` → `lang`/`subkind`/
+  `name` (name kept whole). The stored `event` is reversed back to a `change` via
+  the inverse of `derive._SYMBOL_CHANGE_TO_EVENT`; since `build_artifacts` only
+  uses `change` to recompute that same `event`, the artifact lifecycle round-trips
+  exactly. The key is always emitted (empty `[]` when the repo has no symbol rows).
+  This closes the self-sourced `no_drift` gap the live AVM audit found (86 symbol/
+  comment artifacts were "stored but not derivable" because `extract` dropped
+  `symbol_events`); it also un-forces the previously always-empty `symbol_moves`.
 
 extract READS these — it does NOT re-derive via `build_artifacts` /
 `attribute_people_areas`. Correspondingly `link.enrich` removed its

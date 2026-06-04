@@ -73,6 +73,7 @@
   "people": {},
   "prs": [],
   "releases": [],
+  "symbol_events": [],
   "symbol_moves": {
     "by_confidence": {
       "high": 0,

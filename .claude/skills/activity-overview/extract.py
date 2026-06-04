@@ -26,7 +26,13 @@ Materialization approach (slice 7a part 1)
    nodes the window scan legitimately drops (un-dated commits, degenerate
    fixtures), while the window/spine sets above still drive the in_window tagging.
 4. Reconstruct `code_events` from the ledger in insertion (rowid) order via
-   `graphstore.repo_code_events`, which equals the original source order.
+   `graphstore.repo_code_events`, which equals the original source order. The
+   SAME ledger also carries the symbol-granular rows fold persisted (keyed by the
+   symbol artifact id `<path>#<lang>:<subkind>:<name>`, with before/after); those
+   are split OUT of the file-level `code_events` array and reconstructed into
+   `symbol_events` (see `_materialize_symbol_events`) so the self-sourced raw
+   bundle is COMPLETE — `derive.build_artifacts` re-derives the symbol/comment
+   artifacts exactly, and the self-sourced `validate` no_drift passes.
 5. Reconstruct `meta` (owner/repo/from/to, + clone_sha if recorded) so it
    round-trips. `ref_date`/`period` are NOT stored by P6 and are intentionally not
    reconstructed — enrich falls back to meta["to"] and {from,to} deterministically.
@@ -44,24 +50,36 @@ idempotent. extract reconstructs each by reading that node's `data` back, and
 emits the key ONLY when the node exists (extract never fabricates an empty key —
 fold only wrote the node when the source value was present and non-empty).
 
-NOT YET MATERIALIZED (next agent — slice 7b, additive here):
-  - symbol_events    (symbol-granular ledger; richer artifacts). Not exercised by
-    any current golden (bundle_p2/p3b/p3c carry no non-empty symbol_events), so
-    it is deferred to 7b's artifact-node normalization rather than built blind.
-Each slots into a `_materialize_*` helper and `extract`'s assembled dict below;
-extend `_RAW_KEYS` and add a reader. The equivalence-gate harness in
-test_extract.py is reusable as-is for the new goldens.
+symbol_events (slice 7b — the self-sourced no_drift fix)
+--------------------------------------------------------
+`derive.build_artifacts` reads `bundle["symbol_events"]` to produce the
+symbol/comment artifacts (`<path>#<lang>:<subkind>:<name>`). fold_bundle persists
+each symbol_event into the `code_events` ledger keyed by that symbol artifact id
+(non-NULL before/after; the file-level rows are `<path>`). extract now
+reconstructs `symbol_events` from those symbol-keyed rows so the self-sourced raw
+bundle is complete and build_artifacts re-derives the stored symbol artifacts
+exactly. The key is always emitted (an empty `[]` for repos with no symbol rows,
+e.g. the existing goldens). See `_materialize_symbol_events`.
 """
 
 import sys
 
 import graphstore
+import derive
 
 # Keys this reader materializes from the store: the raw substrate plus the two
 # derived projections fold persists into nodes (artifacts, people).
-_RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events",
+_RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
              "code_owners", "label_taxonomy", "artifacts", "people")
+
+# Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
+# (not the raw symbol `change`). build_artifacts only uses `change` to recompute
+# that same event, so any `change` that maps back to the stored `event` round-trips
+# the artifact lifecycle exactly. The forward map is injective today, so this is a
+# clean inverse; if it were ever non-injective, a representative change suffices.
+_EVENT_TO_SYMBOL_CHANGE = {
+    event: change for change, event in derive._SYMBOL_CHANGE_TO_EVENT.items()}
 
 # Per-repo singleton facts: raw bundle key -> well-known structure-node local id.
 _SINGLETON_FACTS = (
@@ -194,7 +212,13 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
         [n["data"] for n in codes if _is_commit_node(n)],
         key=lambda d: str(d.get("sha")))
 
+    # code_events / symbol_events share one ledger: the file-level rows (`<path>`)
+    # reconstruct the raw `code_events` array; the symbol-keyed rows
+    # (`<path>#<lang>:<subkind>:<name>`, before/after) reconstruct `symbol_events`.
+    # Both readers split the ledger by that form so a symbol row is NEVER
+    # double-counted into code_events (and vice-versa).
     bundle["code_events"] = _materialize_code_events(conn, project, repo)
+    bundle["symbol_events"] = _materialize_symbol_events(conn, project, repo)
 
     # artifacts: the per-file lifecycle ledger fold persisted as artifact `code`
     # nodes (the non-commit ones). Read the stored data blobs back into the dict
@@ -326,4 +350,54 @@ def _materialize_code_events(conn, project, repo):
         if ev["event"] in ("rename", "copy") and ev["detail"]:
             rec["old_path"] = ev["detail"]
         out.append(rec)
+    return out
+
+
+def _materialize_symbol_events(conn, project, repo):
+    """Reconstruct the raw `symbol_events` array from the SYMBOL-granular ledger
+    rows fold persisted, in original source order (ledger rowid order).
+
+    fold_bundle wrote one ledger row per symbol_event, keyed by the symbol
+    artifact's local id `<path>#<lang>:<subkind>:<name>` (mirrored from
+    gather.fold_bundle), carrying before/after; file-level rows are `<path>` and
+    are handled by `_materialize_code_events`. We split SYMBOL rows out by that
+    form: the repo-qualified remainder contains a SECOND `#` (the first `#`
+    separates `path` from `lang:subkind:name`). A bare `<path>` remainder (file
+    event) has no second `#` and is skipped here.
+
+    Per-row reconstruction:
+      - strip the `{project}/{repo}#` prefix to recover the local id, then split
+        ONCE on `#` -> `path`, `lang:subkind:name`, then `.split(":", 2)` ->
+        `[lang, subkind, name]` (name kept whole — may contain `:`/parens/commas).
+      - commit/author/date/before/after come straight from the row columns.
+      - `change`: the row stored the MAPPED event (derive._SYMBOL_CHANGE_TO_EVENT);
+        we reverse it (`_EVENT_TO_SYMBOL_CHANGE`) to a change that recomputes the
+        same event in build_artifacts, so the artifact lifecycle round-trips.
+    Returns [] when the repo has no symbol rows (the goldens). Source-ordered."""
+    prefix = "{}/{}#".format(project, repo)
+    out = []
+    for ev in graphstore.repo_code_events(conn, project, repo):
+        aid = ev["artifact_id"]
+        remainder = aid[len(prefix):] if aid.startswith(prefix) else _local(aid)
+        # Symbol rows have a second `#`: `<path>#<lang>:<subkind>:<name>`. A bare
+        # `<path>` file-level row has none and belongs to code_events, not here.
+        if "#" not in remainder:
+            continue
+        path, _, sym = remainder.partition("#")
+        parts = sym.split(":", 2)
+        if len(parts) != 3:
+            continue  # malformed symbol id (defensive; fold never writes these)
+        lang, subkind, name = parts
+        out.append({
+            "path": path,
+            "lang": lang,
+            "subkind": subkind,
+            "name": name,
+            "change": _EVENT_TO_SYMBOL_CHANGE.get(ev["event"], "change"),
+            "commit": ev["commit_sha"],
+            "author": ev["author"],
+            "date": ev["date"],
+            "before": ev["before"],
+            "after": ev["after"],
+        })
     return out

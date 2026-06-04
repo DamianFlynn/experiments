@@ -21,9 +21,11 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import derive  # noqa: E402
 import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
+import validate  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -151,6 +153,176 @@ class ExtractRawShape(unittest.TestCase):
         rename = [e for e in b["code_events"] if e["change"] == "rename"]
         self.assertEqual(len(rename), 1)
         self.assertEqual(rename[0]["old_path"], "examples/basic/main.bicep")
+
+
+def _symbol_bundle():
+    """A small bundle WITH symbol_events: a couple of symbols + a comment, with
+    before/after, across 2 commits. No golden carries symbol_events, so this
+    fixture is crafted inline to exercise the ledger round-trip."""
+    c1 = "a" * 40
+    c2 = "b" * 40
+    return {
+        "meta": {"owner": "o", "repo": "r",
+                 "from": "2026-05-01", "to": "2026-05-31"},
+        "commits": [
+            {"sha": c1, "message": "Add module", "pr": null_safe(),
+             "author": "Alice", "date": "2026-05-03"},
+            {"sha": c2, "message": "Refine module", "pr": null_safe(),
+             "author": "Bob", "date": "2026-05-10"},
+        ],
+        "code_events": [
+            {"commit": c1, "author": "Alice", "date": "2026-05-03",
+             "change": "add", "path": "avm/res/x/main.bicep"},
+            {"commit": c2, "author": "Bob", "date": "2026-05-10",
+             "change": "modify", "path": "avm/res/x/main.bicep"},
+        ],
+        "symbol_events": [
+            # an added param symbol
+            {"path": "avm/res/x/main.bicep", "lang": "bicep",
+             "subkind": "param", "name": "location", "change": "add",
+             "commit": c1, "author": "Alice", "date": "2026-05-03",
+             "before": None, "after": "param location string"},
+            # the same param changed in c2 (before/after carried)
+            {"path": "avm/res/x/main.bicep", "lang": "bicep",
+             "subkind": "param", "name": "location", "change": "change",
+             "commit": c2, "author": "Bob", "date": "2026-05-10",
+             "before": "param location string",
+             "after": "param location string = resourceGroup().location"},
+            # a resource symbol whose name carries colons/parens
+            {"path": "avm/res/x/main.bicep", "lang": "bicep",
+             "subkind": "resource", "name": "rg (Microsoft.Resources/rg:2024)",
+             "change": "add", "commit": c1, "author": "Alice",
+             "date": "2026-05-03", "before": None, "after": "resource rg ..."},
+            # a comment artifact (subkind comment -> kind comment)
+            {"path": "avm/res/x/main.bicep", "lang": "bicep",
+             "subkind": "comment", "name": "// Parameters //",
+             "change": "add", "commit": c1, "author": "Alice",
+             "date": "2026-05-03", "before": None, "after": "// Parameters //"},
+        ],
+        "prs": [], "issues": [], "milestones": [], "releases": [],
+    }
+
+
+def null_safe():
+    return None
+
+
+def _symbol_arts(artifacts):
+    """Restrict a build_artifacts result to its symbol/comment artifacts
+    (those whose id carries a `#`, i.e. NOT the `art:<path>` file artifacts)."""
+    return {aid: a for aid, a in artifacts.items() if "#" in aid}
+
+
+class ExtractSymbolEventsRoundTrip(unittest.TestCase):
+    """extract reconstructs symbol_events from the ledger so the self-sourced raw
+    bundle is COMPLETE and build_artifacts re-derives the symbol/comment artifacts
+    exactly. RED before the fix (extract drops symbol_events -> build_artifacts
+    can't re-derive them), GREEN after."""
+
+    def setUp(self):
+        self.bundle = _symbol_bundle()
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, copy.deepcopy(self.bundle))
+        m = self.bundle["meta"]
+        self.extracted = extract.extract(
+            self.conn, m["owner"], m["repo"], m["from"], m["to"],
+            warn=lambda _m: None)
+
+    def test_extract_emits_symbol_events(self):
+        self.assertIn("symbol_events", self.extracted)
+        self.assertEqual(len(self.extracted["symbol_events"]),
+                         len(self.bundle["symbol_events"]),
+                         "extract must round-trip every symbol_event row")
+
+    def test_build_artifacts_reproduces_symbol_artifacts(self):
+        # The acceptance criterion: build_artifacts on the reconstructed bundle
+        # reproduces the STORED symbol artifacts exactly (same ids + lifecycle).
+        want = _symbol_arts(derive.build_artifacts(self.bundle))
+        got = _symbol_arts(derive.build_artifacts(self.extracted))
+        self.assertTrue(want, "fixture precondition: symbol artifacts exist")
+        self.assertEqual(set(got), set(want), "same symbol artifact ids")
+        for aid in want:
+            self.assertEqual(got[aid]["kind"], want[aid]["kind"], aid)
+            self.assertEqual(got[aid]["status"], want[aid]["status"], aid)
+            # lifecycle: same events in the same order (the lifecycle the live
+            # audit compares against the stored projection).
+            self.assertEqual(
+                [e["event"] for e in got[aid]["lifecycle"]],
+                [e["event"] for e in want[aid]["lifecycle"]], aid)
+            self.assertEqual(
+                [(e["commit"], e["before"], e["after"])
+                 for e in got[aid]["lifecycle"]],
+                [(e["commit"], e["before"], e["after"])
+                 for e in want[aid]["lifecycle"]], aid)
+
+    def test_symbol_rows_not_double_counted_into_code_events(self):
+        # file-level code_events array stays file-only (no `#` paths).
+        for ev in self.extracted["code_events"]:
+            self.assertNotIn("#", ev["path"])
+        self.assertEqual(len(self.extracted["code_events"]),
+                         len(self.bundle["code_events"]))
+
+    def test_self_sourced_validate_no_drift_passes(self):
+        report = validate.validate(self.conn)
+        nd = [c for c in report.checks if c["name"] == "no_drift"][0]
+        self.assertTrue(
+            nd["ok"],
+            "self-sourced no_drift must pass; details: {}".format(nd["details"]))
+
+
+class ExtractSymbolMovesRoundTrip(unittest.TestCase):
+    """Bonus: with symbol_events round-tripped, symbol_moves is no longer FORCED
+    empty by missing symbol_events. A `drop` in one file + `add` in another (the
+    move shape) survives extract — exercising the `remove`->`drop` reverse map —
+    and link_symbol_identity links it on the self-sourced bundle."""
+
+    def _move_bundle(self):
+        c1, c2 = "c" * 40, "d" * 40
+        return {
+            "meta": {"owner": "o", "repo": "r",
+                     "from": "2026-05-01", "to": "2026-05-31"},
+            "commits": [
+                {"sha": c1, "message": "m1", "pr": None,
+                 "author": "Alice", "date": "2026-05-03"},
+                {"sha": c2, "message": "m2", "pr": None,
+                 "author": "Bob", "date": "2026-05-10"},
+            ],
+            "code_events": [
+                {"commit": c1, "author": "Alice", "date": "2026-05-03",
+                 "change": "modify", "path": "avm/res/a/main.bicep"},
+                {"commit": c2, "author": "Bob", "date": "2026-05-10",
+                 "change": "modify", "path": "avm/res/b/main.bicep"},
+            ],
+            "symbol_events": [
+                {"path": "avm/res/a/main.bicep", "lang": "bicep",
+                 "subkind": "resource", "name": "uniqueThing", "change": "drop",
+                 "commit": c1, "author": "Alice", "date": "2026-05-03",
+                 "before": "resource uniqueThing ...", "after": None},
+                {"path": "avm/res/b/main.bicep", "lang": "bicep",
+                 "subkind": "resource", "name": "uniqueThing", "change": "add",
+                 "commit": c2, "author": "Bob", "date": "2026-05-10",
+                 "before": None, "after": "resource uniqueThing ..."},
+            ],
+            "prs": [], "issues": [], "milestones": [], "releases": [],
+        }
+
+    def test_drop_roundtrips_and_move_links(self):
+        bundle = self._move_bundle()
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(bundle))
+        m = bundle["meta"]
+        ex = extract.extract(conn, m["owner"], m["repo"], m["from"], m["to"],
+                             warn=lambda _m: None)
+        # the `drop` change reverse-maps faithfully through the ledger
+        changes = sorted(e["change"] for e in ex["symbol_events"])
+        self.assertEqual(changes, ["add", "drop"])
+        # link_symbol_identity now finds a confident move (no longer forced empty)
+        view = {**ex, "artifacts": derive.build_artifacts(ex)}
+        derive.link_symbol_identity(view)
+        self.assertEqual(len(view["symbol_moves"]["links"]), 1,
+                         "a unique cross-file drop+add must link as a move")
 
 
 if __name__ == "__main__":
