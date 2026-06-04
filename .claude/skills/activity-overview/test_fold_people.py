@@ -151,6 +151,54 @@ class TestFoldPeople(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], n_edges)
 
 
+class TestReviewerMessageResolvedPR(unittest.TestCase):
+    """Regression lock for the 7b-1 write-path bug: a reviewer of a PR whose
+    commits are only MESSAGE-resolvable to that PR (their raw `pr` field is
+    unset) was dropped, because fold derived people BEFORE attach_commit_prs ran
+    (enrich runs it first). The fix derives people from a commit->PR-resolved
+    COPY, so store-derived people == link-derived people.
+
+    Uses the RAW bundle_p3b fixture (NOT the augmented `_people_bundle`, which
+    adds carol as a review COMMENTER and would mask the reviewer-path bug):
+    there carol reviews PR 42, and commit c1's message resolves to PR 42 while
+    c1["pr"] is unset on the raw record.
+    """
+
+    def setUp(self):
+        with open(os.path.join(FIX, "bundle_p3b.json")) as fh:
+            self.bundle = json.load(fh)
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, json.loads(json.dumps(self.bundle)))
+
+    def test_reviewer_person_node_persisted(self):
+        # carol reviews PR 42 only; commit c1 has no `pr` field, its message
+        # resolves to PR 42. carol's person node must be persisted with the
+        # firewall-policy area inherited from the PR's commit.
+        carol = graphstore.get_node(self.conn, _qp("carol"))
+        self.assertIsNotNone(
+            carol, "reviewer carol (message-resolved PR) must be persisted")
+        self.assertIn("avm/res/network/firewall-policy",
+                      carol["data"]["areas"])
+
+    def test_store_people_equal_link_people(self):
+        # The whole point: store-derived people == link-derived people. Folding
+        # the raw fixture and enriching a copy must produce identical person
+        # records (logins + modules + areas).
+        import link  # noqa: E402
+        enriched = link.enrich(json.loads(json.dumps(self.bundle)))
+        link_people = enriched.get("people", {})
+        rows = self.conn.execute(
+            "SELECT data FROM nodes WHERE id LIKE '%#person-%'").fetchall()
+        store_people = {}
+        for (data,) in rows:
+            rec = json.loads(data)
+            login = rec.pop("login")
+            store_people[login] = rec
+        self.assertEqual(store_people, link_people)
+        self.assertEqual(sorted(store_people), ["alice", "carol", "dave"])
+
+
 class TestPeopleNoLeak(unittest.TestCase):
     """extract's raw output must be byte-identical with vs without the people
     nodes + non-spine edges (they live outside the spine and the prefix-keyed

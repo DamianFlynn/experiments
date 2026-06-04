@@ -5,6 +5,7 @@ later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
 import concurrent.futures
+import copy
 import datetime
 import json
 import os
@@ -2056,8 +2057,17 @@ def fold_bundle(conn, bundle):
     # milestone-/release- prefix reconstruction, and every edge below is
     # non-spine, so traverse_spine never follows them).
     area_idx = derive.area_index(bundle.get("code_graph", {}) or {})
-    people = derive.attribute_people_areas(
-        {**bundle, "people": dict(bundle.get("people") or {})}, area_idx)["people"]
+    # People derivation must see commit->PR links the same way enrich does, or a
+    # reviewer whose PR's commits are only MESSAGE-resolvable to that PR (their
+    # `pr` field is unset on the raw record) is silently dropped. enrich runs
+    # attach_commit_prs FIRST; mirror that here. Resolve on a COPY so the stored
+    # commit `code` nodes (built above, line ~1984) stay faithful to the raw
+    # record and extract's commit reconstruction is unchanged.
+    resolved = copy.deepcopy(bundle.get("commits") or [])
+    attach_commit_prs(resolved)
+    people_view = {**bundle, "commits": resolved,
+                   "people": dict(bundle.get("people") or {})}
+    people = derive.attribute_people_areas(people_view, area_idx)["people"]
 
     def qperson(login):
         return graphstore.qualify_person(project, login)
