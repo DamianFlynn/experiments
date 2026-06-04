@@ -1942,11 +1942,14 @@ def fold_bundle(conn, bundle):
     — re-folding an overlapping window mutates nothing already correct. See
     STORE.md for the schema and identity rules.
 
-    P6 scope: social (prs/issues; comments/reviews stay embedded in the parent's
-    data blob), code (commits) + the file-level code_events ledger, structure
-    (milestones/releases/areas), and the spine edges closes/cross_ref/part_of.
-    People & artifact nodes (link-derived), symbol_events, and every non-spine
-    edge land in a later phase.
+    Scope: social (prs/issues; comments/reviews stay embedded in the parent's
+    data blob), code (commits + the artifact substrate) + the file-level and
+    symbol code_events ledgers, structure (milestones/releases/areas + the
+    project-scoped people nodes), the spine edges closes/cross_ref/part_of, and
+    the non-spine contribution / owns / touches / depends_on / in_milestone /
+    symbol-move edges — all derived on the write path via the `derive` leaf.
+    See STORE.md for the full edge/node inventory and what remains (blocks /
+    in_iteration / fts_text).
     """
     meta = bundle.get("meta", {})
     project, repo = meta.get("owner"), meta.get("repo")
@@ -2045,6 +2048,99 @@ def fold_bundle(conn, bundle):
     for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
         local = "area-{}".format(area.get("id") or area.get("name") or area.get("path"))
         nodes.append((qid(local), project, repo, "structure", None, area, fetched))
+
+    # structure: people + contribution / owns / touches / depends_on /
+    # in_milestone edges (Phase 7b-1 step 3). All derived on the write path via
+    # the shared `derive` leaf module; none of these leak into extract (person
+    # nodes are project-scoped `person-<login>` structure nodes ignored by its
+    # milestone-/release- prefix reconstruction, and every edge below is
+    # non-spine, so traverse_spine never follows them).
+    area_idx = derive.area_index(bundle.get("code_graph", {}) or {})
+    people = derive.attribute_people_areas(
+        {**bundle, "people": dict(bundle.get("people") or {})}, area_idx)["people"]
+
+    def qperson(login):
+        return graphstore.qualify_person(project, login)
+
+    # People `structure` nodes (project-scoped). The `repo` column is the
+    # project sentinel "*" so the SAME login folded from another repo in the
+    # project upserts the identical id (idempotency is by the project-scoped id;
+    # the sentinel keeps the row out of any single repo's repo_nodes view, an
+    # extra no-leak guard). NULL ts -> excluded from window scans.
+    for login, rec in people.items():
+        if not login:
+            continue
+        data = {"login": login, **rec}
+        nodes.append((qperson(login), project, "*", "structure", None, data, fetched))
+
+    def contrib(login, dst_local, etype):
+        if login:
+            edges.append((qperson(login), qid(dst_local), etype, None, None))
+
+    # Contribution edges from the RAW records (person -> node). Idempotent by
+    # (src,dst,type); absent logins/fields are skipped cleanly.
+    for pr in bundle.get("prs", []):
+        prlocal = "pr-{}".format(pr["number"])
+        contrib(pr.get("author"), prlocal, "authored")
+        contrib(pr.get("merged_by"), prlocal, "merged")
+        for reviewer in pr.get("reviewers") or []:
+            contrib(reviewer, prlocal, "reviewed")
+        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
+            contrib(c.get("author"), prlocal, "commented")
+    for iss in bundle.get("issues", []):
+        isslocal = "issue-{}".format(iss["number"])
+        contrib(iss.get("author"), isslocal, "reported")
+        for c in iss.get("comments_list") or []:
+            contrib(c.get("author"), isslocal, "commented")
+    for c in bundle.get("commits", []):
+        contrib(c.get("author"), c["sha"], "authored")
+
+    # owns (person -> area): code_owners maps a path-prefix to owner logins; an
+    # owner owns every area whose paths fall under that prefix.
+    owners = bundle.get("code_owners") or {}
+    if owners:
+        areas_by_id = {}
+        for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
+            areas_by_id[area.get("id") or area.get("name") or area.get("path")] = area
+        for prefix, logins in owners.items():
+            for aid, area in areas_by_id.items():
+                if any((p or "").startswith(prefix) for p in area.get("paths") or []):
+                    for login in logins or []:
+                        contrib(login, "area-{}".format(aid), "owns")
+
+    # touches (commit/pr -> area): the distinct areas a commit's files land in.
+    for c in bundle.get("commits", []):
+        touched = derive._commit_areas(c, area_idx)
+        for aid in sorted(touched):
+            edges.append((qid(c["sha"]), qid("area-{}".format(aid)),
+                          "touches", None, None))
+
+    # depends_on (area -> area): the code_graph dependency edges, carrying
+    # {version,transitive,...} on the edge `data`.
+    for e in (bundle.get("code_graph", {}) or {}).get("edges") or []:
+        src, dst = e.get("from"), e.get("to")
+        if src and dst:
+            data = {k: v for k, v in e.items() if k not in ("from", "to")}
+            edges.append((qid("area-{}".format(src)), qid("area-{}".format(dst)),
+                          "depends_on", None, data or None))
+
+    # in_milestone (social -> structure): a PR/issue's milestone title links to
+    # the milestone node (keyed on number when present, else title — matching
+    # the milestone node's own local id form above).
+    ms_local = {}
+    for m in bundle.get("milestones", []):
+        local = "milestone-{}".format(m.get("number") or m.get("title"))
+        if m.get("title") is not None:
+            ms_local[m["title"]] = local
+        if m.get("number") is not None:
+            ms_local.setdefault(m["number"], local)
+    for items, pref in ((bundle.get("prs", []), "pr-"),
+                        (bundle.get("issues", []), "issue-")):
+        for it in items:
+            local = ms_local.get(it.get("milestone"))
+            if local is not None:
+                edges.append((qid("{}{}".format(pref, it["number"])),
+                              qid(local), "in_milestone", None, None))
 
     # structure: per-repo singleton facts (whole dict round-tripped under a
     # well-known local id, NULL ts so window scans skip it, identity-keyed /

@@ -120,11 +120,42 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
   `identity_from` (dst→src) artifact→artifact edges carrying
   `move_confidence`/`move_basis` in the edge `data`. Idempotent by (src,dst,type).
 
-Still written by a later **slice 7b-1 step 3** (lifting the remaining link
-derivations onto the write path — see
-`docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`): the
-**normalized** people nodes (link-derived) and the contribution / non-spine edges
-(`authored`/`reviewed`/`touches`/`owns`/…).
+**Slice 7b-1 (step 3) additionally persists people + the contribution / non-spine
+edges** (all derived on the write path via the shared `derive.py` leaf —
+`derive.attribute_people_areas` / `derive.area_index` / `derive._commit_areas`):
+
+- **Person `structure` nodes (project-scoped).** Each participant
+  `derive.attribute_people_areas` enumerates (commit authors + the reviewers of
+  PRs with mapped commits, each carrying `modules`/`areas`) upserts as a
+  `structure` node id `qualify_person(project, login)` (`{project}#person-{login}`),
+  NULL `ts`, `data` = `{login, modules, areas}`. The `repo` column is the project
+  sentinel `"*"` (people aggregate across a project's repos), so re-folding the
+  same login from another repo upserts the identical id — one node, never a
+  cross-repo duplicate — and the sentinel keeps the row out of any single repo's
+  `repo_nodes` view. Idempotent by id.
+- **Contribution edges (person→node).** From the RAW records, idempotent by
+  (src,dst,type), skipping absent logins: `authored` (person→pr from `pr.author`,
+  person→commit from `commit.author`), `merged` (person→pr from `pr.merged_by`),
+  `reviewed` (person→pr from `pr.reviewers`), `reported` (person→issue from
+  `issue.author`), `commented` (person→pr/issue from `comments_list` +
+  `review_comments` authors). `reacted` is **not** written: reactions are stored
+  as aggregate counts (`summarize_reactions`), with no per-reactor login to key on.
+- **`owns` (person→area)** from `code_owners` — each owner of a path-prefix owns
+  every area whose paths fall under that prefix. **`touches` (commit→area)** from
+  `derive._commit_areas` (a commit's files → the areas they land in). **`depends_on`
+  (area→area)** from `code_graph["edges"]`, carrying `{version,transitive,…}` in
+  the edge `data`. **`in_milestone` (social→structure)** from a PR/issue's
+  `milestone` title → the milestone node (keyed on number when present).
+
+None of these leak into `extract`: person nodes are ignored by its
+`milestone-`/`release-` prefix structure reconstruction, and every edge above is
+non-spine so `traverse_spine` never follows it.
+
+Still NOT on the write path after step 3: `blocks` (issue→issue) and
+`in_iteration` (social→sprint) — skipped for lack of source data in the current
+fixtures/normalizers (no block/sprint signal is gathered) — and the `fts_text`
+FTS5 index (`index_text` is never called on the write path). See
+`docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
 ## Determinism
 

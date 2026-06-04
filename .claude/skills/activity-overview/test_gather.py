@@ -1977,8 +1977,11 @@ class TestFoldBundle(unittest.TestCase):
         # code_graph is round-tripped as a structure node; see fold_bundle).
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 9)
+        # 3 spine edges (closes/cross_ref/part_of) + 2 `authored` person->commit
+        # edges (alice->abc123, bob->def456) from Phase 7b-1 step 3. Re-folding
+        # mutates nothing: still 5.
         self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], 3)
+            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], 5)
 
     def test_code_graph_singleton_node_roundtrip(self):
         # the whole code_graph dict is round-tripped under local id `codegraph`,
