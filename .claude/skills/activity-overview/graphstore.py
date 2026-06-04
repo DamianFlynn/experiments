@@ -238,6 +238,72 @@ def add_code_event(conn, artifact_id, event, commit_sha, author=None, date=None,
     conn.commit()
 
 
+def upsert_nodes(conn, rows):
+    """Batch upsert nodes in one transaction. rows: iterable of
+    (id, project, repo, node_class, ts, data, fetched_at) where `data` is a
+    Python object (JSON-serialized here) and `fetched_at` None -> now. Same
+    immutable-identity / ts-data-fetched_at-refresh semantics as upsert_node."""
+    payload = []
+    for (id, project, repo, node_class, ts, data, fetched_at) in rows:
+        if node_class not in NODE_CLASSES:
+            raise ValueError("unknown node_class: {}".format(node_class))
+        payload.append((
+            id, project, repo, node_class, ts,
+            json.dumps(data, sort_keys=True),
+            now_iso() if fetched_at is None else fetched_at,
+        ))
+    if payload:
+        conn.executemany(
+            "INSERT INTO nodes (id, project, repo, node_class, ts, data, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "ts=excluded.ts, data=excluded.data, fetched_at=excluded.fetched_at",
+            payload,
+        )
+        conn.commit()
+
+
+def upsert_edges(conn, rows):
+    """Batch upsert edges in one transaction. rows: iterable of
+    (src_id, dst_id, edge_type, ts, data). Re-upsert unions (refreshes ts/data),
+    never appends — same semantics as upsert_edge."""
+    payload = [
+        (src, dst, etype, ts,
+         json.dumps(data, sort_keys=True) if data is not None else None)
+        for (src, dst, etype, ts, data) in rows
+    ]
+    if payload:
+        conn.executemany(
+            "INSERT INTO edges (src_id, dst_id, edge_type, ts, data) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(src_id, dst_id, edge_type) DO UPDATE SET "
+            "ts=excluded.ts, data=excluded.data",
+            payload,
+        )
+        conn.commit()
+
+
+def add_code_events(conn, rows):
+    """Batch-append code events (set semantics, INSERT OR IGNORE). rows match
+    add_code_event's positional args: (artifact_id, event, commit_sha, author,
+    date, hunk, ref, before, after, detail). `ref` is JSON-serialized."""
+    payload = []
+    for (artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) in rows:
+        payload.append((
+            artifact_id, event, commit_sha, author, date, hunk,
+            json.dumps(ref, sort_keys=True) if ref is not None else None,
+            before, after, detail,
+        ))
+    if payload:
+        conn.executemany(
+            "INSERT OR IGNORE INTO code_events "
+            "(artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            payload,
+        )
+        conn.commit()
+
+
 def get_code_events(conn, artifact_id):
     """Lifecycle events for an artifact, ordered by date then event."""
     rows = conn.execute(

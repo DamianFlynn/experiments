@@ -84,6 +84,18 @@ folded `{project,repo,from,to}`, deduped — `record_window`/`get_windows`);
 `clone_sha:{project}/{repo}` (the tree a repo was last gathered against, for
 deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`).
 
+## Writer (gather --store)
+
+`gather --store PATH` folds its assembled bundle into the store via
+`gather.fold_bundle(conn, bundle)` — additive to the JSON bundle, idempotent by
+identity (re-folding an overlapping window mutates nothing already correct). P6
+writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
+`data` blob), `code` (commits) + the file-level `code_events` ledger,
+`structure` (milestones/releases/areas), and the **spine** edges `closes`,
+`cross_ref`, and `part_of`. People & artifact nodes (link-derived),
+`symbol_events`, and all non-spine edges (`authored`/`reviewed`/`touches`/
+`owns`/…) are written by a later phase.
+
 ## Determinism
 
 `data` blobs serialize with `sort_keys=True`; `range_query` orders by

@@ -10,6 +10,7 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(__file__))
 import gather  # noqa: E402
+import graphstore  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -1853,6 +1854,170 @@ class TestClassifyPrKind(unittest.TestCase):
             self.assertIsNone(gather.classify_pr_kind({"title": title}),
                               f"expected None for {title!r}")
         self.assertIsNone(gather.classify_pr_kind({}))
+
+
+class TestResolveCommitPr(unittest.TestCase):
+    """Verify gather's commit->PR number extraction for merge and squash commit subjects."""
+
+    def test_squash_subject(self):
+        self.assertEqual(gather.resolve_commit_pr("Add policy param (#42)"), 42)
+
+    def test_merge_subject(self):
+        self.assertEqual(
+            gather.resolve_commit_pr("Merge pull request #42 from feature/policy"), 42)
+
+    def test_none_when_absent(self):
+        self.assertIsNone(gather.resolve_commit_pr("Tidy outputs"))
+
+    def test_attach_sets_pr_field(self):
+        commits = [{"sha": "a", "message": "Fix bug (#7)", "pr": None},
+                   {"sha": "b", "message": "Refactor", "pr": None}]
+        gather.attach_commit_prs(commits)
+        self.assertEqual(commits[0]["pr"], 7)
+        self.assertIsNone(commits[1]["pr"])
+
+
+def _fold_fixture_bundle():
+    return {
+        "meta": {"owner": "acme", "repo": "widget", "from": "2026-01-01",
+                 "to": "2026-01-31", "clone_sha": "deadbeef"},
+        "prs": [{
+            "number": 10, "url": "u/10", "state": "closed", "merged": True,
+            "merged_at": "2026-01-10T00:00:00Z", "created_at": "2026-01-05T00:00:00Z",
+            "closed_at": "2026-01-10T00:00:00Z",
+            "closes": [3], "crossref_issues": [4],
+        }],
+        "issues": [
+            {"number": 3, "url": "u/3", "state": "closed",
+             "closed_at": "2026-01-10T00:00:00Z", "updated_at": "2026-01-10T00:00:00Z"},
+            {"number": 4, "url": "u/4", "state": "open",
+             "updated_at": "2026-01-09T00:00:00Z", "closed_at": None},
+        ],
+        "commits": [
+            {"sha": "abc123", "message": "Add thing (#10)", "author": "alice",
+             "date": "2026-01-09T00:00:00Z", "files": ["a.py"]},
+            {"sha": "def456", "message": "WIP no pr ref", "author": "bob",
+             "date": "2026-01-08T00:00:00Z", "files": ["b.py"]},
+        ],
+        "code_events": [
+            {"commit": "abc123", "author": "alice", "date": "2026-01-09T00:00:00Z",
+             "change": "add", "path": "a.py"},
+            {"commit": "abc123", "author": "alice", "date": "2026-01-09T00:00:00Z",
+             "change": "rename", "path": "c.py", "old_path": "b.py"},
+        ],
+        "milestones": [{"number": 1, "title": "v1.0", "state": "open"}],
+        "releases": [{"tag_name": "v0.9", "published_at": "2026-01-15T00:00:00Z"}],
+        # areas carry id/label/paths/edges (see build_directory_areas); fold_bundle
+        # keys the structure node on the area's id.
+        "code_graph": {"areas": [
+            {"id": "core", "label": "Core", "paths": ["src/core"], "edges": []}]},
+    }
+
+
+class TestFoldBundle(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _fold_fixture_bundle())
+
+    def test_nodes_by_class_and_identity(self):
+        pr = graphstore.get_node(self.conn, "acme/widget#pr-10")
+        self.assertEqual(pr["node_class"], "social")
+        self.assertEqual(pr["ts"], "2026-01-10T00:00:00Z")  # merged_at
+        self.assertEqual(graphstore.get_node(
+            self.conn, "acme/widget#issue-3")["node_class"], "social")
+        self.assertEqual(graphstore.get_node(
+            self.conn, "acme/widget#abc123")["node_class"], "code")
+        ms = graphstore.get_node(self.conn, "acme/widget#milestone-1")
+        self.assertEqual(ms["node_class"], "structure")
+        self.assertIsNone(ms["ts"])  # structure: NULL ts, excluded from window scans
+        self.assertEqual(graphstore.get_node(
+            self.conn, "acme/widget#release-v0.9")["node_class"], "structure")
+        self.assertEqual(graphstore.get_node(
+            self.conn, "acme/widget#area-core")["node_class"], "structure")  # area id
+
+    def test_spine_edges(self):
+        out = graphstore.get_edges(self.conn, "acme/widget#pr-10", direction="out")
+        types = {(e["edge_type"], e["dst_id"]) for e in out}
+        self.assertIn(("closes", "acme/widget#issue-3"), types)
+        self.assertIn(("cross_ref", "acme/widget#issue-4"), types)
+        part = graphstore.get_edges(self.conn, "acme/widget#abc123",
+                                    direction="out", edge_types=["part_of"])
+        self.assertEqual(part[0]["dst_id"], "acme/widget#pr-10")
+        # commit without a PR ref produces no part_of edge
+        self.assertEqual(graphstore.get_edges(
+            self.conn, "acme/widget#def456", edge_types=["part_of"]), [])
+
+    def test_train_reachable_over_spine(self):
+        # issue-3 -> pr-10 (closes) -> abc123 (part_of); issue-4 via cross_ref
+        res = graphstore.traverse_spine(self.conn, ["acme/widget#issue-3"])
+        self.assertIn("acme/widget#pr-10", res["reached"])
+        self.assertIn("acme/widget#abc123", res["reached"])
+        self.assertIn("acme/widget#issue-4", res["reached"])
+
+    def test_code_event_ledger_file_level(self):
+        evs = graphstore.get_code_events(self.conn, "acme/widget#a.py")
+        self.assertEqual([e["event"] for e in evs], ["add"])
+        ren = graphstore.get_code_events(self.conn, "acme/widget#c.py")
+        self.assertEqual(ren[0]["event"], "rename")
+        self.assertEqual(ren[0]["detail"], "b.py")  # old_path -> detail
+
+    def test_window_and_clone_sha_recorded(self):
+        self.assertIn(
+            {"project": "acme", "repo": "widget", "from": "2026-01-01",
+             "to": "2026-01-31"},
+            graphstore.get_windows(self.conn))
+        self.assertEqual(
+            graphstore.get_clone_sha(self.conn, "acme", "widget"), "deadbeef")
+
+    def test_idempotent_refold(self):
+        gather.fold_bundle(self.conn, _fold_fixture_bundle())  # second fold
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 8)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], 3)
+
+    def test_range_query_excludes_structure_with_null_ts(self):
+        social_code = graphstore.range_query(
+            self.conn, "acme", ["widget"], "2026-01-01", "2026-01-31")
+        ids = {n["id"] for n in social_code}
+        self.assertIn("acme/widget#pr-10", ids)
+        self.assertNotIn("acme/widget#milestone-1", ids)  # NULL ts -> excluded
+
+    def test_requires_owner_and_repo(self):
+        with self.assertRaises(ValueError):
+            gather.fold_bundle(self.conn, {"meta": {}})
+
+
+class TestStoreFlag(unittest.TestCase):
+    def _run_main(self, extra_args, out_dir):
+        out_path = os.path.join(out_dir, "bundle.json")
+        orig = gather.acquire
+        gather.acquire = lambda args, env: _fold_fixture_bundle()
+        try:
+            gather.main(["--owner", "acme", "--repo", "widget",
+                         "--from", "2026-01-01", "--to", "2026-01-31",
+                         "--out", out_path] + extra_args)
+        finally:
+            gather.acquire = orig
+        return out_path
+
+    def test_main_folds_into_store_when_flag_set(self):
+        with tempfile.TemporaryDirectory() as d:
+            store_path = os.path.join(d, "store.db")
+            self._run_main(["--store", store_path], d)
+            self.assertTrue(os.path.exists(store_path))
+            conn = graphstore.open_store(store_path)
+            try:
+                self.assertEqual(graphstore.get_node(
+                    conn, "acme/widget#pr-10")["node_class"], "social")
+            finally:
+                conn.close()
+
+    def test_no_store_flag_writes_no_db(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._run_main([], d)
+            self.assertEqual([f for f in os.listdir(d) if f.endswith(".db")], [])
 
 
 if __name__ == "__main__":

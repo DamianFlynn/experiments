@@ -30,6 +30,11 @@ name: activity-overview integration (live smoke test)
 #   ARM and terraform graph: well-formed edge objects, at least one Bicep area with
 #   a resolved immediate edge carrying a version on a busy Bicep window, and the
 #   module_graph entry in the diagrams manifest).
+#   PLUS Phase 6 (journey-graph store: `gather --store` mirrors the bundle into
+#   graphstore — a node per PR/issue/commit/milestone/release/area of the right
+#   class, the spine edges closes/cross_ref/part_of, a populated code_events
+#   ledger, window + clone_sha recorded, range_query excluding NULL-ts structure,
+#   and traverse_spine reaching every PR from the issue it closes/cross-references).
 #
 # SECRET (one-time): add a repo secret named ACTIVITY_TEST_TOKEN
 #   Settings -> Secrets and variables -> Actions -> New repository secret
@@ -151,7 +156,8 @@ jobs:
           python3 gather.py \
             --owner "$OWNER" --repo "$REPO" \
             --from "$FROM" --to "$TO" \
-            --out workspace/bundle.json
+            --out workspace/bundle.json \
+            --store workspace/journey.db
           python3 link.py workspace/bundle.json
           # Diagrams: emit + record the manifest. mmdc (and its headless browser)
           # is not installed on the runner, so skip the compile check here — the
@@ -509,6 +515,102 @@ jobs:
           assert aee["timeout"] + aee["failed"] <= bee["timeout"] + bee["failed"], \
               f"resume increased gaps: {bee} -> {aee}"
           print(f"  phase3c.2 resume smoke OK: {bee} -> {aee}")
+          PY
+
+      - name: Assert the journey-graph store mirrors the bundle (Phase 6)
+        run: |
+          cd .claude/skills/activity-overview
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, ".")
+          import graphstore, gather
+
+          b = json.load(open("workspace/bundle.json"))
+          owner, repo = b["meta"]["owner"], b["meta"]["repo"]
+
+          def qid(local):
+              return graphstore.qualify_id(owner, repo, local)
+
+          conn = graphstore.open_store("workspace/journey.db")
+
+          # 1. Every PR/issue/commit/milestone/release/area is a node of the right class.
+          for p in b["prs"]:
+              n = graphstore.get_node(conn, qid(f"pr-{p['number']}"))
+              assert n and n["node_class"] == "social", f"missing social node pr-{p['number']}"
+          for i in b["issues"]:
+              n = graphstore.get_node(conn, qid(f"issue-{i['number']}"))
+              assert n and n["node_class"] == "social", f"missing social node issue-{i['number']}"
+          for c in b["commits"]:
+              n = graphstore.get_node(conn, qid(c["sha"]))
+              assert n and n["node_class"] == "code", f"missing code node {c['sha']}"
+          for m in b.get("milestones", []):
+              local = "milestone-{}".format(m.get("number") or m.get("title"))
+              assert (graphstore.get_node(conn, qid(local)) or {}).get("node_class") == "structure", \
+                  f"missing structure node {local}"
+          for r in b.get("releases", []):
+              local = "release-{}".format(r.get("tag_name") or r.get("name"))
+              assert (graphstore.get_node(conn, qid(local)) or {}).get("node_class") == "structure", \
+                  f"missing structure node {local}"
+          areas = (b.get("code_graph", {}) or {}).get("areas", []) or []
+          for a in areas:
+              local = "area-{}".format(a.get("id") or a.get("name") or a.get("path"))
+              assert (graphstore.get_node(conn, qid(local)) or {}).get("node_class") == "structure", \
+                  f"missing area node {local}"
+
+          # 2. Spine edges mirror the bundle's PR closing / cross-ref relations.
+          for p in b["prs"]:
+              out = graphstore.get_edges(conn, qid(f"pr-{p['number']}"), direction="out")
+              closes = {e["dst_id"] for e in out if e["edge_type"] == "closes"}
+              xref = {e["dst_id"] for e in out if e["edge_type"] == "cross_ref"}
+              for n in p.get("closes", []):
+                  assert qid(f"issue-{n}") in closes, f"pr-{p['number']} missing closes->{n}"
+              for n in p.get("crossref_issues", []):
+                  assert qid(f"issue-{n}") in xref, f"pr-{p['number']} missing cross_ref->{n}"
+
+          # 3. part_of: each commit whose subject names an in-store PR points at it.
+          part_of = 0
+          for c in b["commits"]:
+              prn = gather.resolve_commit_pr(c.get("message", ""))
+              if prn is None or not graphstore.get_node(conn, qid(f"pr-{prn}")):
+                  continue
+              out = graphstore.get_edges(conn, qid(c["sha"]), direction="out", edge_types=["part_of"])
+              assert any(e["dst_id"] == qid(f"pr-{prn}") for e in out), \
+                  f"commit {c['sha']} missing part_of->pr-{prn}"
+              part_of += 1
+
+          # 4. code_events ledger populated when the bundle carries file-level events.
+          if b.get("code_events"):
+              assert conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0] > 0, \
+                  "bundle has code_events but the ledger is empty"
+
+          # 5. window + clone_sha recorded.
+          assert {"project": owner, "repo": repo, "from": b["meta"]["from"],
+                  "to": b["meta"]["to"]} in graphstore.get_windows(conn), "window not recorded"
+          assert graphstore.get_clone_sha(conn, owner, repo) == b["meta"]["clone_sha"], \
+              "clone_sha mismatch"
+
+          # 6. range_query returns in-window activity, excludes NULL-ts structure.
+          inwin = graphstore.range_query(conn, owner, [repo], b["meta"]["from"], b["meta"]["to"])
+          assert "structure" not in {n["node_class"] for n in inwin}, \
+              "range_query leaked NULL-ts structure nodes"
+
+          # 7. Spine is traversable end-to-end: an issue reaches every PR that
+          #    closes or cross-references it (traverse_spine is the train-assembly
+          #    primitive readers use — this proves the edges we wrote are walkable).
+          spine = 0
+          for p in b["prs"]:
+              pid = qid(f"pr-{p['number']}")
+              for issn in list(p.get("closes", [])) + list(p.get("crossref_issues", [])):
+                  res = graphstore.traverse_spine(conn, [qid(f"issue-{issn}")])
+                  assert pid in res["reached"], \
+                      f"issue-{issn} does not reach linked pr-{p['number']} over spine"
+                  spine += 1
+
+          nc = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+          ec = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+          cec = conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0]
+          print(f"OK store: nodes={nc} edges={ec} code_events={cec} "
+                f"part_of_asserted={part_of} areas={len(areas)} spine_checked={spine}")
           PY
 
       - name: Upload the bundle + diagrams

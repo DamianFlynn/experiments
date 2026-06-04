@@ -454,5 +454,69 @@ class TestScaleSmoke(unittest.TestCase):
         self.assertIn("idx_nodes_window", detail)
 
 
+class TestBatchWrite(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+
+    def test_upsert_nodes_batch_and_idempotent(self):
+        rows = [
+            ("p/r#pr-1", "p", "r", "social", "2026-01-01T00:00:00Z", {"n": 1}, None),
+            ("p/r#issue-1", "p", "r", "social", "2026-01-02T00:00:00Z", {"n": 2}, None),
+        ]
+        graphstore.upsert_nodes(self.conn, rows)
+        graphstore.upsert_nodes(self.conn, rows)  # re-fold: no duplication
+        self.assertEqual(graphstore.get_node(self.conn, "p/r#pr-1")["data"], {"n": 1})
+        count = self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_upsert_nodes_rejects_bad_class(self):
+        with self.assertRaises(ValueError):
+            graphstore.upsert_nodes(
+                self.conn, [("x", "p", "r", "bogus", None, {}, None)])
+
+    def test_upsert_edges_batch_and_union(self):
+        rows = [("p/r#pr-1", "p/r#issue-1", "closes", None, None),
+                ("p/r#c1", "p/r#pr-1", "part_of", None, {"k": "v"})]
+        graphstore.upsert_edges(self.conn, rows)
+        graphstore.upsert_edges(self.conn, rows)  # re-fold: union, not append
+        edges = graphstore.get_edges(self.conn, "p/r#pr-1")
+        self.assertEqual(len(edges), 2)
+
+    def test_upsert_nodes_refreshes_on_conflict(self):
+        graphstore.upsert_nodes(self.conn, [
+            ("p/r#pr-1", "p", "r", "social", "2026-01-01T00:00:00Z", {"v": 1}, None)])
+        graphstore.upsert_nodes(self.conn, [
+            ("p/r#pr-1", "p", "r", "social", "2026-02-02T00:00:00Z", {"v": 2}, None)])
+        node = graphstore.get_node(self.conn, "p/r#pr-1")
+        self.assertEqual(node["data"], {"v": 2})
+        self.assertEqual(node["ts"], "2026-02-02T00:00:00Z")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM nodes").fetchone()[0], 1)
+
+    def test_add_code_events_batch_set_semantics(self):
+        rows = [("p/r#a.py", "add", "c1", "alice", "2026-01-01", None, None,
+                 None, None, None)]
+        graphstore.add_code_events(self.conn, rows)
+        graphstore.add_code_events(self.conn, rows)  # set semantics: no dup
+        evs = graphstore.get_code_events(self.conn, "p/r#a.py")
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["event"], "add")
+
+    def test_add_code_events_ref_round_trips(self):
+        graphstore.add_code_events(self.conn, [
+            ("p/r#a.py", "modify", "c2", "alice", "2026-01-01", None,
+             {"old": "x.py"}, None, None, None)])
+        ev = graphstore.get_code_events(self.conn, "p/r#a.py")[0]
+        self.assertEqual(ev["ref"], {"old": "x.py"})
+
+    def test_empty_batches_are_noops(self):
+        graphstore.upsert_nodes(self.conn, [])
+        graphstore.upsert_edges(self.conn, [])
+        graphstore.add_code_events(self.conn, [])
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

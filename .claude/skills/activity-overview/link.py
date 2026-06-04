@@ -1,28 +1,16 @@
 """Offline link layer: enrich a bundle with trains and buckets. No network."""
 
 import json
-import re
 import sys
 from datetime import datetime, timezone
 
 import gather  # for classify_artifact_path (shared artifact-kind gate)
 
-_PR_RE = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
-
-
-def resolve_commit_pr(message):
-    """Best-effort PR number from a commit subject (merge or squash style)."""
-    m = _PR_RE.search(message or "")
-    if not m:
-        return None
-    return int(m.group(1) or m.group(2))
-
-
-def attach_commit_prs(commits):
-    """Set each commit's `pr` from its message in place."""
-    for c in commits:
-        c["pr"] = resolve_commit_pr(c.get("message", ""))
-    return commits
+# commit->PR resolution lives in gather (shared with the store writer, so trains
+# and the store's part_of edges read the same signal); re-exported here to keep
+# link's public entry points (and its callers/tests) stable.
+resolve_commit_pr = gather.resolve_commit_pr
+attach_commit_prs = gather.attach_commit_prs
 
 
 def ref(type_, id_, url):
