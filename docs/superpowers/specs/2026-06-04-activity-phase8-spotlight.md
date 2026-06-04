@@ -38,26 +38,57 @@ graph (which Phase 7 proved).
 
 ---
 
+## Output contract — the chronological delivery train
+
+Every query returns a **full, chronological "delivery train"**: a time-ordered,
+fully-cited sequence of what the focus delivered — **not aggregate counts**. The AI
+narrates it as a story; the citations are the evidence.
+
+- **Person / subsystem foci group by *decision train*** — the unit of delivery.
+  Each train the focus **touched in any role** appears (authored, reviewed, merged,
+  reported, or even a *single pivotal comment*), ordered chronologically, carrying:
+  the train's `outcome` (`shipped` / `rejected` / `in_flight`), its full spine
+  `timeline` (issue → PR → review → merge → release, each cited) for **context**,
+  and the focus's **own touchpoints** within it (their specific events — incl. a
+  lone comment, with excerpt + ref). **Impact is not volume:** a small number of
+  contributors may have outsized impact, or vice-versa; showing each touchpoint
+  inside the train's full context lets the reader judge *influence*, not tally
+  activity.
+- **Symbol focus is its own chronological train** — the artifact's lifecycle
+  (`code_events`) + identity chain across moves, in time order.
+- **Time scope:** optional `--from/--to` answers *"impact in a timeframe"*; omitted,
+  the train spans the focus's whole history in the store (*"over the project"*). The
+  scope is echoed in the result so the narration stays contextual.
+- **Both delivered and not:** all activity is included, with **shipped outcomes
+  emphasized** (sorted/flagged) so "what landed" is foregrounded while in-flight /
+  rejected work stays visible.
+
+> The 8a interim person-impact shape (grouped counts) is **superseded** by this
+> contract and is realigned as part of Phase 8 (counts survive only as a small
+> summary header; the body is the chronological trains).
+
+---
+
 ## The four queries
 
 Each query: a Python API `spotlight.<name>(conn, project, **params) -> Result` and a
 CLI subcommand. `Result` is a deterministically-ordered, citation-bearing dict
 (JSON-serializable); a miss yields `{"status": "needs_gather", "guidance": ...}`.
 
-### 1. person-impact  `spotlight person <login>`
-**Q:** everything a contributor did across **all repos in the project** (people are
-project-scoped, repo sentinel `*`).
-- **Modules / areas** — from the person `structure` node (`modules`/`areas`).
-- **Authored / reviewed / merged / reported / commented** — counts + the cited
-  nodes, from the contribution edges (`get_edges(person, "out")`).
-- **Symbols authored (+ authored_then_removed)** — `code_events` rows with
-  `author == login` on symbol artifact ids; `authored_then_removed` = a symbol the
-  person `add`ed that later has a `remove` event (by anyone).
-- **Trains anchored** — `traverse_spine` seeded from the person's authored/reported
-  PRs/issues → the decision trains they drove.
-- **Bot-aware:** the `is_bot` flag is surfaced so a renderer can separate automation.
-- *Determinism:* edges ordered by `(edge_type, ts, dst_id)`; symbols by artifact id.
-- **Real data:** ✓ available now.
+### 1. person-impact  `spotlight person <login> [--from --to]`
+**Q:** a contributor's **impact** across all project repos (people are
+project-scoped) — the decision trains they touched, chronologically.
+- **Trains touched** — every train containing a node the login authored / reviewed
+  / merged / reported / **commented** on (seed `traverse_spine` from those nodes,
+  dedupe to anchors). Each carries `outcome`, the full cited spine `timeline`, and
+  the login's **touchpoints** in that train (their events — incl. a single
+  influential comment, with excerpt + ref). Ordered chronologically by the train's
+  key date.
+- **modules / areas / is_bot** — from the person `structure` node (context header).
+- **summary** — per-role counts + trains-touched + shipped, as a small header for
+  scale; the body is the chronological trains, not the counts.
+- *Determinism:* trains by `(key_date, anchor id)`; touchpoints/timeline by date.
+- **Real data ✓.**
 
 ### 2. subsystem-split  `spotlight subsystem <area> [--from --to]`
 **Q:** an area's activity + blast radius over an optional range.
