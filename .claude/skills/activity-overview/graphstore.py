@@ -346,6 +346,36 @@ def fts_search(conn, query):
     return [r[0] for r in rows]
 
 
+def record_window(conn, project, repo, frm, to):
+    """Append a gathered window to the meta ledger, deduped on the exact tuple."""
+    raw = get_meta(conn, "gathered_windows")
+    windows = json.loads(raw) if raw else []
+    entry = {"project": project, "repo": repo, "from": frm, "to": to}
+    if entry not in windows:
+        windows.append(entry)
+        set_meta(conn, "gathered_windows", json.dumps(windows, sort_keys=True))
+
+
+def get_windows(conn):
+    """Return the list of gathered windows recorded in the meta ledger."""
+    raw = get_meta(conn, "gathered_windows")
+    return json.loads(raw) if raw else []
+
+
+def _clone_sha_key(project, repo):
+    return "clone_sha:{}/{}".format(project, repo)
+
+
+def set_clone_sha(conn, project, repo, sha):
+    """Record the tree SHA a repo was last gathered against (per project/repo)."""
+    set_meta(conn, _clone_sha_key(project, repo), sha)
+
+
+def get_clone_sha(conn, project, repo):
+    """Return the recorded clone SHA for project/repo, or None if absent."""
+    return get_meta(conn, _clone_sha_key(project, repo))
+
+
 def init_schema(conn):
     """Create all tables. FTS5 table is created when the build supports it."""
     conn.executescript(_CORE_SCHEMA)

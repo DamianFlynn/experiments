@@ -305,5 +305,24 @@ class TestFts(unittest.TestCase):
         self.assertEqual(graphstore.fts_search(conn, "zzz"), [])
 
 
+class TestMetaProvenance(unittest.TestCase):
+    def test_record_window_dedups_exact_repeat(self):
+        conn = _store()
+        graphstore.record_window(conn, "p", "r", "2026-04-01", "2026-04-30")
+        graphstore.record_window(conn, "p", "r", "2026-04-01", "2026-04-30")
+        graphstore.record_window(conn, "p", "r", "2026-05-01", "2026-05-31")
+        windows = graphstore.get_windows(conn)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0]["from"], "2026-04-01")
+
+    def test_clone_sha_round_trips_per_repo(self):
+        conn = _store()
+        graphstore.set_clone_sha(conn, "p", "r1", "abc123")
+        graphstore.set_clone_sha(conn, "p", "r2", "def456")
+        self.assertEqual(graphstore.get_clone_sha(conn, "p", "r1"), "abc123")
+        self.assertEqual(graphstore.get_clone_sha(conn, "p", "r2"), "def456")
+        self.assertIsNone(graphstore.get_clone_sha(conn, "p", "missing"))
+
+
 if __name__ == "__main__":
     unittest.main()
