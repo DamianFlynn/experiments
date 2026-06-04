@@ -12,9 +12,12 @@ claim in the report resolves to a source ref — never invent facts.
 > SQLite **journey-graph store** — that trustworthy graph is the deliverable. The
 > flat bundle JSON is no longer a produced artifact; it is a **transient view**
 > the reader stage materializes from the store via `extract`. The report vertical
-> (`extract → link → render → report`) is **restored in Phase 8**; steps 2–4
-> below describe that target shape and run once Phase 8 lands. Validate the store
-> with `python3 validate.py workspace/journey.db` (self-contained — no bundle file).
+> (`extract → link → render → report`) **composes from the store** today — each
+> stage reads the materialized view, guarded by the golden-bundle equivalence gate
+> (steps 2–4 below). A single one-shot reader command is not yet wired (compose the
+> stages); that is a minor integration nicety, decoupled from the phase roadmap
+> (Phase 8 is `spotlight`, the analytics reader). Validate the store with
+> `python3 validate.py workspace/journey.db` (self-contained — no bundle file).
 
 ## Procedure
 
@@ -41,14 +44,14 @@ claim in the report resolves to a source ref — never invent facts.
      ```
      `no_drift` / `idempotency` self-source their raw bundle from the store via `extract`; an
      external `--bundle` is an optional cross-check, never required.
-2. **(Phase 8) Materialize + Link.** The reader stage rebuilds the bundle view from the store
+2. **Materialize + Link.** The reader stage rebuilds the bundle view from the store
    (`extract`) and enriches it offline (no network):
    ```bash
    python3 link.py <bundle-view>
    ```
    This adds `trains` and classifies all four `buckets` (`shipped`, `rejected`,
    `in_flight`, `next_candidates`).
-3. **(Phase 8) Render diagrams.** Preflight: `mmdc` must be on PATH
+3. **Render diagrams.** Preflight: `mmdc` must be on PATH
    (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
    `graphify` is **optional** (used only for its supported languages); when it is
    absent — e.g. on Bicep/Terraform repos — the **directory provider** supplies
@@ -62,7 +65,7 @@ claim in the report resolves to a source ref — never invent facts.
    if any diagram does not compile** under `mmdc`.
    The manifest now also includes `content_timeline`, `deltas_bar`,
    `contributor_graph`, and `kind_breakdown`.
-4. **(Phase 8) Write the report.** Read the materialized bundle view and fill
+4. **Write the report.** Read the materialized bundle view and fill
    `report-template.md`, embedding each `bundle.diagrams` file as a ```mermaid block.
    Cite each fact with its `url`. Do not state anything the view does not contain.
 

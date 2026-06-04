@@ -9,7 +9,8 @@ against. All SQL lives in `graphstore.py`; callers use its function API.
 > `gather --store` writes it and nothing else — there is no longer a flat bundle
 > JSON artifact. The bundle is a **transient view** that `extract` materializes
 > from the store on demand. The report vertical (`extract → link → render →
-> report`) is restored in **Phase 8**. The store stands alone, proven by
+> report`) **composes from the store** — each stage reads the materialized view,
+> guarded by the golden-bundle equivalence gate. The store stands alone, proven by
 > `validate.py` (below), which self-sources everything it needs from the store.
 
 ## Identity (qualified ids)

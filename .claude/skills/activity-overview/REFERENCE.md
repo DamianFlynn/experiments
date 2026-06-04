@@ -34,9 +34,10 @@ python3 gather.py --owner OWNER --repo REPO --from 2026-05-01 --to 2026-05-31 \
 python3 validate.py workspace/journey.db
 ```
 
-The report vertical (`extract → link → render → report`) is restored in Phase 8,
-where the bundle is a transient view materialized from the store. Then render
-with the skill (see `SKILL.md`).
+The report vertical (`extract → link → render → report`) **composes from the
+store** — `extract` materializes the bundle as a transient view, then `link`/
+`render` consume it (guarded by the golden-bundle equivalence gate). Render with
+the skill (see `SKILL.md`).
 
 ## Tests
 
