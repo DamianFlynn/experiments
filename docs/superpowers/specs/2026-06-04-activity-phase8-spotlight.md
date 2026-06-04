@@ -69,6 +69,44 @@ narrates it as a story; the citations are the evidence.
 
 ---
 
+## Realigned shapes (the realign target — one contract, all four queries)
+
+A small set of **shared output helpers** shape every query, so there is no
+per-query divergence and the 8c text-mining query + renderers reuse them:
+
+- `_scope(from,to)` → `{"from","to"}` or `"all-history"`, echoed on every Result.
+- `_timeline_row(node)` → a cited chronological row: `{id, kind, event?, ts,
+  number?|sha?, url?, title?, excerpt?}`.
+- `_outcome(train_nodes)` → `shipped` (a PR merged / release present in the
+  train), `rejected` (anchor/PR closed-unmerged), else `in_flight`.
+- `_train(anchor, reached, focus_touch_ids, role_of)` → one decision-train entry:
+  `{anchor, title, outcome, areas[], roles[], touchpoints[ cited focus events;
+  a comment carries its excerpt ], timeline[ _timeline_row…, chronological ]}`.
+- `_result(query, focus, scope, summary, delivered, **context)` → the envelope:
+  `{query, focus, focus_kind, project, status, scope, summary{…}, …context,
+  delivered:[ train entries, chronological by key date; shipped emphasized ]}`.
+
+Per query (data extraction is unchanged — only the output shape moves):
+- **person:** `delivered` = every train the login **touched** (seed spine from
+  authored/reviewed/merged/reported/**commented** dsts; dedupe to anchors);
+  touchpoints = the login's contribution events in that train (a lone comment
+  with its excerpt). context: `is_bot, modules, areas, symbols_authored,
+  authored_then_removed`. summary: per-role counts + `trains_touched` + `shipped`.
+- **subsystem:** `delivered` = trains that touched the area (seed spine from the
+  area's touching commits/PRs); touchpoints = the area-touching nodes in each
+  train. context: `contributors` (owns/touches), `depends_on` blast radius.
+  summary: `trains + shipped + contributors`.
+- **symbol:** `delivered` = a single train — the artifact's lifecycle
+  (`code_events`, chronological, cited); `outcome` = `removed|alive`. context:
+  `identity_chain`. `--from/--to` bound the lifecycle to a timeframe.
+- **text-mining (8c):** `delivered` = occurrences grouped by the train each
+  belongs to, chronological, each cited (file/commit/comment + excerpt).
+
+Determinism is unchanged: trains by `(key_date, anchor)`; timeline/touchpoints by
+`(ts, id)`. Renderers stay thin formatters over this one envelope.
+
+---
+
 ## The four queries
 
 Each query: a Python API `spotlight.<name>(conn, project, **params) -> Result` and a
