@@ -1,7 +1,7 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** Approved design — rev 13 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending)
+**Status:** Approved design — rev 14 (Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending. **Rev 14 re-seats the storage/read seam onto a persistent SQLite graph substrate** — graphstore → gather-as-writer → extract → spotlight — keeping the rev-1–13 fact model verbatim while making full-history chronology, random-access analytics, and durable accumulation tractable; see the new *Architecture (rev 14) — persistent graph substrate* section below and the unified **P1–P14** ledger under *Implementation phasing*. The deferred 4b and the original P5–P8 features are re-sequenced as P10–P14, rebuilt on the store.)
 **Author:** brainstormed via superpowers
 
 ## Purpose
@@ -65,6 +65,197 @@ deterministically in Link.
 
 This keeps token cost bounded (diffs are local; sub-agents are scoped to one train each)
 and report data reproducible.
+
+## Architecture (rev 14) — persistent graph substrate
+
+**Rev 14 changes where facts live and how they are read back — not what a fact is.**
+Through rev 13 the **JSON bundle was the seam**: `gather.py` wrote one
+`activity-{from}-{to}.json` and `link`/`render`/report read it. That is correct for a
+single window but does not compose along the dimension this design itself calls central —
+**continuity**. Three pressures break the flat-file seam:
+
+1. **Full-history chronology.** The product is a *journey* — "deferred in April, shipped in
+   June", a symbol's birth-and-death across months, a person's arc — not a month in
+   isolation. Under the flat file the only correct long view is a **full re-gather**,
+   because JSON has no incremental read path.
+2. **Random-access queries.** A flat bundle is built for one traversal (window → buckets →
+   trains → report). Any other cut — "everything this person touched across all repos",
+   "how did this subsystem's edges evolve", "every comment mentioning `breaking change`" —
+   is a full scan of every bundle, with no index.
+3. **Accumulation without re-fetch.** Overlap-dedup-by-identity is recomputed in memory each
+   run; there is no durable accumulated state.
+
+Rev 14 keeps the rev-1–13 **fact model verbatim** (trains, provenance, people, flow,
+artifacts, feature deltas, diagrams) and swaps the **substrate**: a persistent property
+graph that gather accumulates into **by identity** and that readers query. The bundle does
+not disappear — it becomes a **view materialized out of the graph** for a window,
+byte-compatible with what `link`/`render`/report already consume. Everything described
+below under "the bundle" still holds as the **fact model / materialized view**; only its
+storage and read paths change.
+
+```
+  rev ≤13: Acquire → Bundle (one JSON/window) → Link → Analyze → Synthesize
+                        └─ re-unioned on every long read ─┘
+
+  rev 14:  Acquire → graphstore (persistent property graph, accumulated by identity)
+                       ├─ extract(window)  → Bundle view → Link → Analyze → Synthesize   (downstream unchanged)
+                       └─ spotlight(query) → analytics views (person / subsystem / pattern / text)
+```
+
+`gather` becomes a **writer** (source facts → upsert by stable identity; re-running an
+overlapping window is a durable no-op). `extract` is the **primary reader** (a window is a
+range query plus bounded train-spine traversal, emitting the same bundle shape). `spotlight`
+is a **second reader** (parameterized analytics the flat bundle could never answer without a
+full scan). Claude still does only judgment; the store holds only recorded facts, each still
+carrying its `{type,id,url}` source ref — provenance is a *column*, not an afterthought.
+
+### Decisions (locked)
+
+1. **SQLite property graph.** A single embedded file via stdlib `sqlite3`: zero server, zero
+   network, portable (copy the `.db` like you copied the bundle), transactional upserts, real
+   indexes for range + traversal, **FTS5** for text mining, recursive CTEs for bounded
+   traversal. No new hard dependency. *Rejected:* Neo4j (server + driver dep, breaks
+   portability); staying on JSON (the very thing that doesn't scale); a document store (loses
+   the relational range-scan that *is* the window query).
+2. **Project/repo-qualified identity.** Every node id is namespaced `{project}/{repo}#{local}`
+   (people are `{project}#person-{login}`, project-scoped so one person aggregates across the
+   project's repos). This makes **multi-repo** a first-class store property: a cross-repo
+   train (a PR in repo A closing an issue in repo B) is just an edge between two qualified ids
+   that cannot collide. Single-repo runs are the degenerate one-prefix case.
+3. **Local cache, opt-in sync.** The store lives in the workspace
+   (`workspace/<project>-journey.db`, one per project) as a **rebuildable cache** — git stays
+   source of truth, so a lost `.db` is always reconstructable by re-gathering. Cross-machine
+   sharing is **opt-in** via a configured remote (the manifest `store` block), not automatic.
+   Mirrors the existing stance: re-run is canonical, the `.db` is the cheap path.
+4. **Spotlight is in-scope** for the first substrate release, not a fast-follow — the whole
+   point of the substrate is random-access analytics; shipping the store without a non-window
+   reader would leave its rationale unproven.
+
+### Section 1 — artifact → node mapping (the schema)
+
+The rev-13 bundle is a bag of arrays (`commits`, `prs`, `issues`, `trains`, `artifacts`,
+`feature_deltas`, `people`, `flow`, …). The store **normalizes** that bag into three node
+classes + one typed edge table + ancillary tables; nothing in the fact model is dropped.
+
+Every node carries `id` (qualified, PK), `project`, `repo`, `node_class`, `ts` (primary
+chronological key that window scans use), `data` (the full rev-13 record as a JSON blob, so
+the bundle view round-trips losslessly), and `fetched_at`.
+
+| node_class | rev-13 origin | id form | `ts` is |
+|---|---|---|---|
+| **social** | `prs[]`, `issues[]`, comments, reviews, reactions | `repo#pr-<n>` / `repo#issue-<n>` / `repo#comment-<id>` | merged/closed/created |
+| **code** | `commits[]`, `artifacts[]` (incl. 3d/3e symbols), `symbol_events` | `repo#<sha>` / `repo#<path>#<lang>:<subkind>:<name>` | author/event date |
+| **structure** | `code_graph.areas[]`, `code_owners`, `milestones[]`, `releases[]`, `project`/sprints, `people[]` | `repo#area-<id>` / `{project}#person-<login>` / `repo#milestone-<n>` | point-in-time / NULL |
+
+People are **project-scoped, not repo-scoped** — exactly the cross-repo people view rev 13
+wanted but couldn't express per-bundle.
+
+**Edge table** `edges(src_id, dst_id, edge_type, ts, data)`, indexed both directions, makes
+the rev-13 relationships explicit and queryable: `closes` (pr→issue), `part_of` (commit→pr),
+`cross_ref` (issue↔pr↔commit), `duplicate_of`/`spun_off` (issue→issue), `touches`
+(commit/pr→area), `authored`/`reviewed`/`merged`/`reported`/`commented`/`reacted`
+(person→node), `owns` (person→area), `depends_on` (area→area, carries
+`{version,transitive,provider,resolved}`), `replaced_by`/`identity_from` (artifact→artifact,
+carries `move_confidence`), `blocks` (issue→issue), `in_milestone`/`in_iteration`
+(social→structure).
+
+A **decision train is no longer a stored array** — it is the connected component reachable
+from a root issue over the **spine** edge types (`closes`/`part_of`/`cross_ref`/`spun_off`/
+`duplicate_of`). `train.id` stays the rev-13 stable anchor (`train-issue-<n>`/`train-pr-<n>`),
+now the identity of a *traversal seed* rather than a row. This is what makes a train spanning
+months read as one thread with no roll-up — the edges simply exist in the store.
+
+**Ancillary tables:** `code_events` (the artifact lifecycle ledger, one row per
+`add|change|remove`, set-keyed by `(artifact,commit,event)` → an artifact's `lifecycle[]` is
+a query); `fts_text` (FTS5 over comment/review/commit/body text → `O(matches)` text mining
+instead of a full scan); `meta` (per-repo `clone_sha`, `gathered_windows[]`, schema version).
+
+**Identity & idempotency (durable dedup):** upsert key is the qualified `id`; social/structure
+nodes update mutable fields in place, code lifecycles are sets keyed by `(artifact,commit,
+event)`, edges are keyed by `(src,dst,type)` → unioned never appended. So the rev-13 "overlap
+by a day so nothing falls in the seam" becomes safe *and permanent*: the overlap is the gap
+guarantee, the PK is the dedup guarantee — now **persisted** instead of recomputed per read.
+
+### Section 2 — gather as a writer (+ backfill)
+
+`gather.py`'s Acquire responsibilities are unchanged (clone + REST/GraphQL + code-area
+provider + IaC edges + full-window code-event walk all carry over). What changes is its
+**sink**: instead of assembling one in-memory bundle and serializing JSON, it **upserts each
+fact into the store by identity** inside a transaction per source batch (a crashed gather
+leaves a consistent partial store). It still takes `--from/--to` (bounding the clone + API
+pull exactly as before) but writes land in the *shared* store; `meta.gathered_windows` records
+the fold; `clone_sha` is pinned per repo for deterministic resume/roll-up.
+
+**`backfill(id)` — the single-node bridge (genuinely new).** Because the store is a *graph*, a
+reader traversing a train can hit an edge pointing at a node never gathered (e.g. a windowed PR
+`closes` an issue opened before the window). On a flat bundle that fact is lost. `backfill(id)`
+is a single-node, on-demand fetch (REST for social, local git/`git fetch --depth 1 <sha>` for
+code, graphify for structure) → upsert that one node + its cheap immediate edges; idempotent,
+a no-op if present, called only on a traversal *miss*, bounded by a per-window budget. It is
+the only network call outside the main Acquire pass, so it stays inside `gather.py` (extract
+calls `gather.backfill(id)`; it never fetches itself — the "only gather touches the network"
+invariant holds).
+
+### Section 3 — extract as the primary reader
+
+`extract.py` replaces "open the JSON bundle" with "**materialize a bundle view for a window out
+of the store**", byte-compatible with the rev-13 schema so `link`/`render`/`report` and their
+tests are untouched. The window read is three bounded steps: (1) **range query** —
+`WHERE project=? AND repo IN (…) AND ts BETWEEN ? AND ?` → in-window nodes, each flagged
+`in_window: true`; (2) **seed the trains** — each in-window social node → its train anchor id;
+(3) **bounded spine traversal** — a recursive CTE from each seed over the spine allowlist,
+depth-capped, pulling out-of-window spine nodes as `in_window: false` (context, not activity)
+and `backfill`-ing absent ones under a budget ceiling (warn, don't fetch unboundedly). Activity
+counts/buckets only ever sum `in_window` nodes; the out-of-window spine is there purely so a
+train reads as a complete thread. The view then assembles exactly the rev-13 arrays; from
+`link` onward, nothing knows the substrate changed. **Roll-up and resume** (3c.2) collapse into
+the store — a "6-month view" is a wider range query, no multi-bundle union; structure still
+comes from the latest `clone_sha`, now a `WHERE` instead of a merge.
+
+### Section 4 — spotlight as a second reader
+
+`spotlight.py` is the reader the flat bundle could never support: **parameterized analytics
+queries** orthogonal to the window, each bounded SQL (+ CTE / FTS) returning a
+deterministically-ordered result the model narrates with the same citation discipline. The
+in-scope set: **person impact** (aggregate a `login` across all project repos — modules,
+authored/reviewed, symbols authored + `authored_then_removed`, trains anchored); **subsystem
+split** (an area's contributors / shipped / `depends_on` blast radius / stalled items over a
+range); **pattern evolution** (a symbol's full lifecycle across history via `code_events` +
+identity edges); **commit-text mining** (FTS5 over `fts_text` — every comment/commit/review
+mentioning a phrase, the `O(matches)` query that is a full file scan on JSON). Spotlight does
+not re-fetch — a missing answer is "gather that window first", surfaced as guidance.
+
+### Section 5 — testing strategy (substrate)
+
+Testable layer-by-layer because the layers are isolated; **TDD applies**. Existing fixtures
+(`git_log_*`, `rest_*`/`graphql_*`, golden `bundle_*.json`) are reused as the equivalence
+oracle. Layers: **graphstore unit** (in-memory SQLite); **idempotency/accumulation** (fold
+twice → identical store; overlapping windows union); **determinism** (byte-stable store + view
+via `(ts,id)` sort); **⭐ golden-bundle equivalence** (build store from existing fixtures →
+`extract` a window → assert output matches existing `bundle_*.json` so the existing pipeline +
+all its tests pass unchanged — *the linchpin that guards the whole swap*); **traversal &
+backfill bounds** (spine allowlist, depth cap, budget; backfill only on miss, idempotent);
+**cross-repo identity** (qualified ids don't collide; cross-repo train traverses);
+**multi-commit chronology**; **spotlight queries**; **scale smoke** (~50k synthetic nodes →
+window query under threshold, guarding the JSON-breaks rationale). No substrate phase ships
+without the golden-bundle test green.
+
+### New & changed components (rev 14)
+
+- **`graphstore.py` (new)** — SQLite property graph: schema, upsert-by-id, range query, bounded
+  spine traversal, FTS. Owns *all* SQL; readers/writers call its function API.
+- **`gather.py` (changed)** — Acquire writes upserts into the store; adds `backfill(id)`.
+- **`extract.py` (new)** — window range query + spine traversal → materialized bundle view
+  (rev-13 schema).
+- **`spotlight.py` (new)** — parameterized analytics queries + focused renders.
+- **`link.py` / `render.py` / `report-template.md` (unchanged)** — read the materialized view
+  exactly as before; guarded by golden-bundle equivalence.
+- **`STORE.md` (new)** — graph schema reference (node classes, edge types, ancillary tables,
+  identity rules), the contract later phases and downstream renderers code against. `BUNDLE.md`
+  gains a cross-ref noting the bundle is now a materialized view.
+- **`projects.json` (changed)** — adds `repos[]` (the multi-repo seam; a single-repo project
+  lists one) and a `store` block (`{path, sync:{enabled:false, remote:null}}` — local-cache
+  default). All existing per-project fields carry over.
 
 ## The bundle is the product (fact base for many outputs)
 
@@ -316,7 +507,8 @@ last year). The bundle is therefore a **time-series record**, not a one-shot sna
 - No YouTube network access / transcript auto-fetch. The transcript is **user-provided**
   as a local file.
 - No multi-repo aggregation in v1 (single target repo per run; one optional linked
-  Projects v2 board). **Terraform multi-repo aggregation is deferred to Phase 6.**
+  Projects v2 board). **Multi-repo — including Terraform aggregation — lands as Phase 9** on
+  the rev-14 graph substrate (qualified ids make it a first-class store property).
 - No write actions to GitHub. Read-only.
 - The report is **Markdown with embedded Mermaid** diagrams (timelines, decision-train
   flowcharts, bucket charts) — renders on GitHub and most viewers with **no deps to view**,
@@ -980,24 +1172,63 @@ against GitHub) after each.
   `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`, `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD`, `FORECAST_TIER_POSSIBLE_THRESHOLD`, `FORECAST_OVERDUE_DAYS`.
   *Still pending (4b):* sub-agent per-train narration; gather review/lifecycle slice.
-- **Phase 4 — sub-agent train narratives + train graphs + forecast.**
-  *Analyze:* parallel sub-agent per train → decision narratives. *Link:* emit
-  `diagrams.train_flowcharts`. *Report:* deepened "Decision trains" section with embedded
-  flowcharts + next-release forecast.
-- **Phase 5 — people graph + flow/stall analysis.**
-  *Acquire:* reactions, `author_association`, assignees, issue types. *Link:* `people`/
-  `halls` (internal-vs-community + authored-code churn), `code_owners`, `flow`/`blockers`;
-  emit `contributor_graph` + `blocker_graph` + `kind_breakdown`. *Report:* **Contributors &
-  community** (public) + **Stalled, blocked & pile-ups**; internal shame/blame appendix
-  gated off by default.
-- **Phase 6 — Projects v2 + sprint framing.**
-  *Acquire:* GraphQL board. *Link:* iteration/status resolution. *Report:* previous/current/
-  next sprint + release-train framing, board status on in-flight.
-- **Phase 7 — series continuity.**
-  `series.json` index + `meta.prev_bundle` chaining; carry-over (`first_seen`/`carried_over`/
-  `prior_status`) and the forecast-loop "Since last installment" section.
-- **Phase 8 — transcript, slash command, multi-repo.**
-  Community-call section, `/activity` entrypoint, and **Terraform multi-repo aggregation**.
+- **Phase 4b — sub-agent train narratives (deferred, re-seated as Phase 10).** Originally the
+  narration half of Phase 4. Deferred under the flat-bundle architecture; **rebuilt on the
+  graph substrate as Phase 10** (below) so it is written once, reading a per-train slice over
+  the store rather than the JSON bundle. Its gather review/lifecycle prereq moves with it.
+
+**Rev-14 substrate + re-seated features (the unified ledger continues here).** P1–P4a above
+are shipped under the flat-bundle seam. P5–P9 build the persistent graph substrate; P10–P14
+then rebuild the deferred 4b and the original P5–P8 features **on the store** (several of which
+shrink because the store does their heavy lifting — noted per phase). Each remains a verifiable
+vertical slice; the **golden-bundle equivalence test gates every substrate phase**.
+
+- **Phase 5 — graphstore foundation (substrate).** `graphstore.py`: 3 node classes + typed
+  edge table + `code_events` + FTS5 + `meta`; identity-keyed idempotent upserts; windowed range
+  query; bounded spine traversal; `STORE.md`. Full offline unit + idempotency + determinism +
+  scale tests. *Verifiable:* seed from existing fixtures, round-trip, assert idempotent union.
+  Plan: `docs/superpowers/plans/2026-06-04-activity-overview-phase5-graphstore.md`.
+- **Phase 6 — gather as writer + backfill (substrate).** Repoint `gather.py`'s sink from
+  JSON-assembly to store upserts (per-batch transactions); pin `clone_sha`; record
+  `gathered_windows`. `backfill(id)` single-node on-demand bridge. *Verifiable:* re-gather an
+  overlapping window into a fresh `.db` → no duplication; a backfilled out-of-window node
+  appears exactly once.
+- **Phase 7 — extract → bundle-view equivalence (substrate; the gate).** `extract.py`: range
+  query → train seeds → bounded spine traversal (`in_window` flags + backfill budget) →
+  materialized bundle view in the rev-13 schema. *Gate:* the ⭐ golden-bundle equivalence test —
+  `extract` reproduces existing `bundle_*.json` so `link`/`render`/report and all existing tests
+  pass unchanged. Roll-up/resume collapse into wider range queries.
+- **Phase 8 — spotlight (substrate analytics; absorbs original-P5 people view).** `spotlight.py`:
+  person-impact, subsystem-split, pattern-evolution, commit-text-mining queries + focused
+  renders. *Verifiable:* each query against a seeded multi-window store returns the expected
+  aggregate with citations; the FTS query returns matches `O(matches)`.
+- **Phase 9 — multi-repo (substrate; absorbs original-P8 multi-repo).** Exercise qualified-id
+  namespacing end-to-end: `repos[]` manifest, cross-repo trains (PR in repo A closing an issue
+  in repo B traverses as one thread), project-scoped people aggregating across repos, and
+  **Terraform multi-repo aggregation**. *Verifiable:* cross-repo identity + cross-repo train
+  tests green on real data.
+- **Phase 10 — 4b: sub-agent train narration, rebuilt on the store.** *Analyze:* parallel
+  sub-agent per train reading a slice over `traverse_spine` → decision narratives with an
+  `evidence:[ref]` list. *Gather prereq (lands here):* persist PR review submissions + timeline
+  lifecycle events (already fetched, currently discarded) as `social` nodes + `reviewed`/
+  lifecycle edges → true `review_rounds`/`reopen_count` + review-round texture. *Report:*
+  deepened "Decision trains" section. Built once, on the graph, after extract proves
+  equivalence.
+- **Phase 11 — people & community + flow/stall report views (original-P5 report half).** The
+  data model + aggregation now live in P5 (schema) / P6 (gather) / P8 (spotlight); this phase
+  ships the **report sections** over them: **Contributors & community** (public) and **Stalled,
+  blocked & pile-ups**, the `contributor_graph`/`blocker_graph`/`kind_breakdown` diagrams, and
+  the internal shame/blame appendix gated off by default.
+- **Phase 12 — Projects v2 + sprint framing (original P6).** *Acquire:* GraphQL board →
+  structure nodes + `in_iteration`/`in_milestone` edges. *Link:* iteration/status resolution.
+  *Report:* previous/current/next sprint + release-train framing, board status on in-flight.
+- **Phase 13 — series continuity (original P7; mostly absorbed by the store).** Cross-window
+  state is now a wide range query, so this phase ships the **"Since last installment"** report
+  section + the forecast-loop (predicted-vs-landed) and carry-over (`first_seen`/`carried_over`/
+  `prior_status`). `series.json` becomes a thin convenience index over the store, never an
+  override of a re-gather.
+- **Phase 14 — transcript + slash command (original-P8 remainder).** Community-call section +
+  the `/activity` slash-command entrypoint.
 
 ## Testing strategy
 

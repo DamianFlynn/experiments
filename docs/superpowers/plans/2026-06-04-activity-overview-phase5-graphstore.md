@@ -1,4 +1,4 @@
-# Journey-Graph P5 — graphstore foundation — Implementation Plan
+# activity-overview Phase 5 — graphstore foundation (journey-graph substrate) — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11 stdlib only (`sqlite3`, `json`, `time`); `unittest` tests run under `pytest`. No new external dependencies. FTS5 is used when the bundled SQLite provides it (skip-guarded otherwise, mirroring the existing `mmdc` skip pattern).
 
-**Spec:** `docs/superpowers/specs/2026-06-03-activity-journey-graph-design.md` (Sections 1 and 5; decisions 1–2).
+**Spec:** `docs/superpowers/specs/2026-06-01-activity-overview-design.md` rev 14 — *Architecture (rev 14) — persistent graph substrate*, Sections 1 and 5, decisions 1–2; this is **Phase 5** of the unified P1–P14 ledger.
 
 ---
 
