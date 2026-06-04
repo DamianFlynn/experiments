@@ -30,15 +30,23 @@ Materialization approach (slice 7a part 1)
 Deterministic ordering matches the golden bundles: prs/issues by number, commits
 by sha, milestones by number, releases by tag/name, code_events by source order.
 
-NOT YET MATERIALIZED (next agent — slice 7a part 2, additive here):
-  - workflow_stats   (needs a workflow ledger; bundle_p2)
-  - code_graph       (areas/edges/edge_extraction; bundle_p2/p3b)
-  - code_owners      (CODEOWNERS projection; bundle_p3b)
-  - label_taxonomy   (label facet round-trip; bundle_p2/p3b/p3c)
-  - symbol_events    (symbol-granular ledger; richer artifacts)
-Each slots into `_materialize_*` helpers and `extract`'s assembled dict below;
-extend `_RAW_KEYS` and add a `_materialize_<key>` reader. The equivalence-gate
-harness in test_extract.py is reusable as-is for the new goldens.
+Per-repo singleton facts (slice 7a part 2)
+------------------------------------------
+`workflow_stats`, `code_graph`, `code_owners`, and `label_taxonomy` are per-repo
+singleton dicts (aggregate facts, not arrays). fold_bundle persists each whole
+dict as a `structure` node under a well-known local id (`workflowstats` /
+`codegraph` / `codeowners` / `labeltaxonomy`) with NULL ts, identity-keyed and
+idempotent. extract reconstructs each by reading that node's `data` back, and
+emits the key ONLY when the node exists (extract never fabricates an empty key —
+fold only wrote the node when the source value was present and non-empty).
+
+NOT YET MATERIALIZED (next agent — slice 7b, additive here):
+  - symbol_events    (symbol-granular ledger; richer artifacts). Not exercised by
+    any current golden (bundle_p2/p3b/p3c carry no non-empty symbol_events), so
+    it is deferred to 7b's artifact-node normalization rather than built blind.
+Each slots into a `_materialize_*` helper and `extract`'s assembled dict below;
+extend `_RAW_KEYS` and add a reader. The equivalence-gate harness in
+test_extract.py is reusable as-is for the new goldens.
 """
 
 import sys
@@ -47,7 +55,16 @@ import graphstore
 
 # Raw keys this slice materializes. (See module docstring for the not-yet list.)
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events",
-             "milestones", "releases")
+             "milestones", "releases", "workflow_stats", "code_graph",
+             "code_owners", "label_taxonomy")
+
+# Per-repo singleton facts: raw bundle key -> well-known structure-node local id.
+_SINGLETON_FACTS = (
+    ("workflow_stats", "workflowstats"),
+    ("code_graph", "codegraph"),
+    ("code_owners", "codeowners"),
+    ("label_taxonomy", "labeltaxonomy"),
+)
 
 
 def _local(node_id):
@@ -117,7 +134,22 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None):
 
     bundle["code_events"] = _materialize_code_events(conn, project, repo)
 
+    # Per-repo singleton facts: emit each key only when its node was stored.
+    for key, local in _SINGLETON_FACTS:
+        value = _materialize_singleton(conn, project, repo, local)
+        if value is not None:
+            bundle[key] = value
+
     return bundle
+
+
+def _materialize_singleton(conn, project, repo, local):
+    """Read back a per-repo singleton fact persisted as a structure node under a
+    well-known local id (workflow_stats/code_graph/code_owners/label_taxonomy).
+    Returns the stored dict, or None if the node was never written (so extract
+    does not fabricate an empty key for repos that had no such fact)."""
+    node = graphstore.get_node(conn, graphstore.qualify_id(project, repo, local))
+    return node["data"] if node is not None else None
 
 
 def _by(records, key):

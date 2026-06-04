@@ -2025,6 +2025,18 @@ def fold_bundle(conn, bundle):
         local = "area-{}".format(area.get("id") or area.get("name") or area.get("path"))
         nodes.append((qid(local), project, repo, "structure", None, area, fetched))
 
+    # structure: per-repo singleton facts (whole dict round-tripped under a
+    # well-known local id, NULL ts so window scans skip it, identity-keyed /
+    # idempotent). Only emitted when present and non-empty so extract never
+    # fabricates an empty key. See STORE.md and extract._materialize_singleton.
+    for local, value in (("workflowstats", bundle.get("workflow_stats")),
+                         ("codegraph", bundle.get("code_graph")),
+                         ("codeowners", bundle.get("code_owners")),
+                         ("labeltaxonomy", bundle.get("label_taxonomy"))):
+        if value:
+            nodes.append((qid(local), project, repo, "structure", None,
+                          value, fetched))
+
     graphstore.upsert_nodes(conn, nodes)
     graphstore.upsert_edges(conn, edges)
     graphstore.add_code_events(conn, events)
