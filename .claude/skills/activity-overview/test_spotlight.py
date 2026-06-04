@@ -345,6 +345,29 @@ class TestCLI(unittest.TestCase):
         r = self._run("person", "alice", "--store", self.store)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def _run_offline(self, *args):
+        # --complete with NO token must run offline (honest-only), never reach
+        # the network. Force GITHUB_TOKEN out of the child env.
+        env = dict(os.environ)
+        env.pop("GITHUB_TOKEN", None)
+        return subprocess.run(
+            [sys.executable, os.path.join(HERE, "spotlight.py")] + list(args),
+            capture_output=True, text=True, env=env)
+
+    def test_complete_flag_accepted_offline(self):
+        r = self._run_offline("person", "alice", "--store", self.store,
+                              "--complete", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertTrue(out["delivered"])
+        self.assertIn("complete", out["delivered"][0])
+        self.assertIn("honest-only", r.stderr)  # offline notice emitted
+
+    def test_complete_budget_flag_parses(self):
+        r = self._run_offline("person", "alice", "--store", self.store,
+                              "--complete", "--complete-budget", "5", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
 
 _SYM = lambda path, name, change, commit, author, date, before, after: {
     "path": path, "lang": "bicep", "subkind": "resource", "name": name,

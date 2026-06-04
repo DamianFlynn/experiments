@@ -16,10 +16,12 @@ Stdlib only (sqlite3, argparse, json). Python 3.
 
 import argparse
 import json
+import os
 import sys
 
 import graphstore
 import complete
+import gather
 
 
 def _detect_project(conn, project):
@@ -1139,6 +1141,13 @@ def main(argv=None):
     parser.add_argument("--to", dest="ts_to", default=None,
                         help="bound the delivery train at/before this ts "
                              "(see --from)")
+    parser.add_argument("--complete", action="store_true",
+                        help="fetch missing cross-window spine anchors via the "
+                             "GitHub API (needs GITHUB_TOKEN); default is "
+                             "offline/honest-only")
+    parser.add_argument("--complete-budget", dest="complete_budget", type=int,
+                        default=50,
+                        help="max nodes to backfill per train when --complete")
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true",
                      help="emit raw cited JSON (default)")
@@ -1154,18 +1163,34 @@ def main(argv=None):
     conn = graphstore.open_store(args.store)
     project = _detect_project(conn, args.project)
 
+    # Build the (optional) backfill seam. --complete needs a token; without one
+    # we stay offline/honest-only rather than failing.
+    backfill = None
+    if args.complete:
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            fetch = gather.make_backfill_fetcher(token)
+            backfill = lambda c, mid: gather.backfill(c, mid, fetch=fetch)  # noqa: E731
+        else:
+            sys.stderr.write("spotlight: --complete needs GITHUB_TOKEN; "
+                             "running offline (honest-only)\n")
+    cb = args.complete_budget
+
     if args.query == "person":
         res = person_impact(conn, project, args.args[0],
-                            ts_from=args.ts_from, ts_to=args.ts_to)
+                            ts_from=args.ts_from, ts_to=args.ts_to,
+                            backfill=backfill, complete_budget=cb)
     elif args.query == "symbol":
         res = pattern_evolution(conn, project, args.args[0],
                                 ts_from=args.ts_from, ts_to=args.ts_to)
     elif args.query == "subsystem":
         res = subsystem_split(conn, project, args.args[0],
-                              ts_from=args.ts_from, ts_to=args.ts_to)
+                              ts_from=args.ts_from, ts_to=args.ts_to,
+                              backfill=backfill, complete_budget=cb)
     elif args.query == "grep":
         res = text_mining(conn, project, args.args[0],
-                          ts_from=args.ts_from, ts_to=args.ts_to)
+                          ts_from=args.ts_from, ts_to=args.ts_to,
+                          backfill=backfill, complete_budget=cb)
     conn.close()
 
     if args.md:
