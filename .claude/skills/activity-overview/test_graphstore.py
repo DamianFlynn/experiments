@@ -274,5 +274,36 @@ class TestTraversal(unittest.TestCase):
         self.assertEqual(res, {"reached": {}, "missing": []})
 
 
+def _needs_fts5():
+    conn = _store()
+    return graphstore.fts5_available(conn)
+
+
+@unittest.skipUnless(_needs_fts5(), "SQLite build lacks FTS5")
+class TestFts(unittest.TestCase):
+    def test_index_and_search_matches(self):
+        conn = _store()
+        graphstore.index_text(conn, "p/r#comment-1", "this is a breaking change to the API")
+        graphstore.index_text(conn, "p/r#comment-2", "minor docs tweak")
+        hits = graphstore.fts_search(conn, "breaking change")
+        self.assertEqual(hits, ["p/r#comment-1"])
+
+    def test_reindex_same_node_no_duplicate(self):
+        conn = _store()
+        graphstore.index_text(conn, "p/r#comment-1", "alpha")
+        graphstore.index_text(conn, "p/r#comment-1", "alpha beta")
+        hits_alpha = graphstore.fts_search(conn, "alpha")
+        self.assertEqual(hits_alpha, ["p/r#comment-1"])
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM fts_text WHERE node_id=?", ("p/r#comment-1",)
+        ).fetchone()[0]
+        self.assertEqual(rows, 1)
+
+    def test_search_no_match_returns_empty(self):
+        conn = _store()
+        graphstore.index_text(conn, "p/r#c", "nothing relevant")
+        self.assertEqual(graphstore.fts_search(conn, "zzz"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

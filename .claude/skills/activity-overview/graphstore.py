@@ -16,6 +16,10 @@ NODE_CLASSES = ("social", "code", "structure")
 # Spine edge types: the allowlist a decision-train traversal may follow.
 SPINE_EDGE_TYPES = ("closes", "part_of", "cross_ref", "spun_off", "duplicate_of")
 
+# FTS5 availability is a property of the compiled SQLite library — identical for
+# every connection in the process — so it is probed once and cached here.
+_FTS5_CACHE = None
+
 _CORE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
     id          TEXT PRIMARY KEY,
@@ -95,13 +99,18 @@ def get_meta(conn, key, default=None):
 
 
 def fts5_available(conn):
-    """True if this SQLite build supports FTS5."""
+    """True if this SQLite build supports FTS5. Probed once, then cached
+    (availability is a build property, so it can't change between calls)."""
+    global _FTS5_CACHE
+    if _FTS5_CACHE is not None:
+        return _FTS5_CACHE
     try:
         conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)")
         conn.execute("DROP TABLE IF EXISTS _fts5_probe")
-        return True
+        _FTS5_CACHE = True
     except sqlite3.OperationalError:
-        return False
+        _FTS5_CACHE = False
+    return _FTS5_CACHE
 
 
 def qualify_id(project, repo, local):
@@ -312,6 +321,29 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
         }
     missing = [i for i in reached if i not in present]
     return {"reached": reached, "missing": missing}
+
+
+def index_text(conn, node_id, text):
+    """Index a node's searchable text. Delete-then-insert keeps it idempotent
+    (FTS5 has no UPSERT). Raises if the SQLite build lacks FTS5."""
+    if not fts5_available(conn):
+        raise RuntimeError("FTS5 not available in this SQLite build")
+    conn.execute("DELETE FROM fts_text WHERE node_id=?", (node_id,))
+    conn.execute(
+        "INSERT INTO fts_text (node_id, text) VALUES (?, ?)", (node_id, text)
+    )
+    conn.commit()
+
+
+def fts_search(conn, query):
+    """Node ids whose indexed text matches the FTS5 query, ranked by relevance."""
+    if not fts5_available(conn):
+        raise RuntimeError("FTS5 not available in this SQLite build")
+    rows = conn.execute(
+        "SELECT node_id FROM fts_text WHERE fts_text MATCH ? ORDER BY rank",
+        (query,),
+    )
+    return [r[0] for r in rows]
 
 
 def init_schema(conn):
