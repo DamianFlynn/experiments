@@ -122,5 +122,43 @@ class TestEdges(unittest.TestCase):
         self.assertEqual([e["dst_id"] for e in only], ["b"])
 
 
+class TestCodeEvents(unittest.TestCase):
+    def test_add_and_get_ordered_by_date(self):
+        conn = _store()
+        aid = "p/r#main.bicep#bicep:param:location"
+        graphstore.add_code_event(
+            conn, aid, "change", "sha2", author="bob",
+            date="2026-04-05T00:00:00Z", before="x", after="y", detail="bicep param location",
+        )
+        graphstore.add_code_event(
+            conn, aid, "add", "sha1", author="ann",
+            date="2026-04-01T00:00:00Z", detail="bicep param location",
+        )
+        events = graphstore.get_code_events(conn, aid)
+        self.assertEqual([e["event"] for e in events], ["add", "change"])
+        self.assertEqual(events[0]["author"], "ann")
+        self.assertEqual(events[1]["after"], "y")
+
+    def test_re_add_same_event_is_noop(self):
+        conn = _store()
+        aid = "p/r#main.bicep#bicep:param:x"
+        for _ in range(2):
+            graphstore.add_code_event(
+                conn, aid, "add", "sha1", date="2026-04-01T00:00:00Z"
+            )
+        count = conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_ref_round_trips_as_dict(self):
+        conn = _store()
+        aid = "p/r#main.bicep#bicep:param:x"
+        graphstore.add_code_event(
+            conn, aid, "add", "sha1", date="2026-04-01T00:00:00Z",
+            ref={"type": "commit", "id": "sha1", "url": "https://x/sha1"},
+        )
+        events = graphstore.get_code_events(conn, aid)
+        self.assertEqual(events[0]["ref"]["type"], "commit")
+
+
 if __name__ == "__main__":
     unittest.main()

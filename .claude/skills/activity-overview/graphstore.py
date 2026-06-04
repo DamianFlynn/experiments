@@ -209,6 +209,47 @@ def get_edges(conn, node_id, direction="both", edge_types=None):
     return [_row_to_edge(r) for r in conn.execute(sql, params)]
 
 
+def add_code_event(conn, artifact_id, event, commit_sha, author=None, date=None,
+                   hunk=None, ref=None, before=None, after=None, detail=None):
+    """Append one artifact lifecycle event. Keyed by (artifact, commit, event):
+    re-seeing the same event is a no-op (set semantics), so re-folding a window
+    never duplicates a lifecycle entry."""
+    conn.execute(
+        "INSERT OR IGNORE INTO code_events "
+        "(artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            artifact_id, event, commit_sha, author, date, hunk,
+            json.dumps(ref, sort_keys=True) if ref is not None else None,
+            before, after, detail,
+        ),
+    )
+    conn.commit()
+
+
+def get_code_events(conn, artifact_id):
+    """Lifecycle events for an artifact, ordered by date then event."""
+    rows = conn.execute(
+        "SELECT * FROM code_events WHERE artifact_id=? ORDER BY date, event",
+        (artifact_id,),
+    )
+    out = []
+    for r in rows:
+        out.append({
+            "artifact_id": r["artifact_id"],
+            "event": r["event"],
+            "commit_sha": r["commit_sha"],
+            "author": r["author"],
+            "date": r["date"],
+            "hunk": r["hunk"],
+            "ref": json.loads(r["ref"]) if r["ref"] is not None else None,
+            "before": r["before"],
+            "after": r["after"],
+            "detail": r["detail"],
+        })
+    return out
+
+
 def init_schema(conn):
     """Create all tables. FTS5 table is created when the build supports it."""
     conn.executescript(_CORE_SCHEMA)
