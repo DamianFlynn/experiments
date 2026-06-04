@@ -1,0 +1,489 @@
+{
+  "artifacts": {
+    "art:avm/res/network/firewall-policy/examples/basic/main.bicep": {
+      "code_area": "avm/res/network/firewall-policy",
+      "kind": "example",
+      "lifecycle": [
+        {
+          "author": "alice",
+          "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+          "date": "2026-05-03",
+          "event": "add",
+          "ref": {
+            "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+          }
+        }
+      ],
+      "name": "main.bicep",
+      "path": "avm/res/network/firewall-policy/examples/basic/main.bicep",
+      "replaced_by": null,
+      "status": "live"
+    },
+    "art:docs/firewall.md": {
+      "code_area": "docs",
+      "kind": "doc",
+      "lifecycle": [
+        {
+          "author": "alice",
+          "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+          "date": "2026-05-03",
+          "event": "add",
+          "ref": {
+            "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+          }
+        },
+        {
+          "author": "dave",
+          "commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+          "date": "2026-05-25",
+          "event": "remove",
+          "ref": {
+            "id": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+            "type": "commit",
+            "url": "https://github.com/o/r/commit/c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+          }
+        }
+      ],
+      "name": "firewall.md",
+      "path": "docs/firewall.md",
+      "replaced_by": null,
+      "status": "removed"
+    }
+  },
+  "buckets": {
+    "in_flight": [],
+    "next_candidates": [
+      {
+        "id": 18,
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/18"
+      }
+    ],
+    "rejected": [],
+    "shipped": [
+      {
+        "id": 42,
+        "train": "train-issue-17",
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/42"
+      },
+      {
+        "id": 17,
+        "train": "train-issue-17",
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/17"
+      }
+    ]
+  },
+  "code_events": [
+    {
+      "author": "alice",
+      "change": "add",
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "date": "2026-05-03",
+      "path": "avm/res/network/firewall-policy/examples/basic/main.bicep"
+    },
+    {
+      "author": "alice",
+      "change": "add",
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "date": "2026-05-03",
+      "path": "docs/firewall.md"
+    },
+    {
+      "author": "dave",
+      "change": "delete",
+      "commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+      "date": "2026-05-25",
+      "path": "docs/firewall.md"
+    }
+  ],
+  "code_graph": {
+    "areas": [
+      {
+        "edges": [],
+        "id": "avm/res/network/firewall-policy",
+        "label": "firewall-policy",
+        "paths": [
+          "avm/res/network/firewall-policy/examples/basic/main.bicep",
+          "avm/res/network/firewall-policy/main.bicep"
+        ]
+      },
+      {
+        "edges": [],
+        "id": "docs",
+        "label": "docs",
+        "paths": [
+          "docs/firewall.md"
+        ]
+      }
+    ],
+    "provider": "directory"
+  },
+  "code_owners": {
+    "avm/res/network/": [
+      "alice",
+      "bob"
+    ],
+    "docs/": [
+      "dave"
+    ]
+  },
+  "commits": [
+    {
+      "author": "alice",
+      "files": [
+        "avm/res/network/firewall-policy/examples/basic/main.bicep",
+        "avm/res/network/firewall-policy/main.bicep"
+      ],
+      "message": "Add policy example (#42)",
+      "pr": 42,
+      "sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    },
+    {
+      "author": "dave",
+      "files": [
+        "docs/firewall.md"
+      ],
+      "message": "Drop stale firewall doc",
+      "pr": null,
+      "sha": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+    }
+  ],
+  "feature_deltas": [
+    {
+      "after": null,
+      "area": "avm/res/network/firewall-policy",
+      "artifact": "art:avm/res/network/firewall-policy/examples/basic/main.bicep",
+      "author": "alice",
+      "before": null,
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "detail": null,
+      "kind": "add",
+      "name": "main.bicep",
+      "pr": 42,
+      "subject": "example",
+      "train": "train-issue-17",
+      "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    },
+    {
+      "after": null,
+      "area": "docs",
+      "artifact": "art:docs/firewall.md",
+      "author": "alice",
+      "before": null,
+      "commit": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+      "detail": null,
+      "kind": "add",
+      "name": "firewall.md",
+      "pr": 42,
+      "subject": "doc",
+      "train": "train-issue-17",
+      "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+    },
+    {
+      "after": null,
+      "area": "docs",
+      "artifact": "art:docs/firewall.md",
+      "author": "dave",
+      "before": null,
+      "commit": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+      "detail": null,
+      "kind": "drop",
+      "name": "firewall.md",
+      "pr": null,
+      "subject": "doc",
+      "train": null,
+      "url": "https://github.com/o/r/commit/c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+    }
+  ],
+  "forecast": {
+    "candidates": [
+      {
+        "ref": {
+          "id": 18,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/18"
+        },
+        "score": 6.5,
+        "signals": [
+          "on milestone v1.3.0",
+          "active in window"
+        ],
+        "tier": "likely",
+        "train": null
+      }
+    ],
+    "next_milestone": "v1.3.0"
+  },
+  "issues": [
+    {
+      "closed_at": "2026-05-10T12:00:00Z",
+      "comments_list": [],
+      "facets": {
+        "area": "area: networking",
+        "lifecycle": null,
+        "priority": null,
+        "status": null
+      },
+      "kind": "feature",
+      "labels": [
+        "area: networking",
+        "Type: Feature"
+      ],
+      "milestone": "v1.2.0",
+      "number": 17,
+      "open_high_activity": false,
+      "reactions": {
+        "+1": 0,
+        "-1": 0,
+        "heart": 0,
+        "hooray": 0,
+        "total": 0
+      },
+      "state": "closed",
+      "state_reason": "completed",
+      "title": "Support policy param",
+      "updated_at": "2026-05-10T12:00:00Z",
+      "url": "https://github.com/o/r/issues/17"
+    },
+    {
+      "closed_at": null,
+      "comments_list": [],
+      "facets": {
+        "area": "area: storage",
+        "lifecycle": null,
+        "priority": null,
+        "status": null
+      },
+      "kind": "module-request",
+      "labels": [
+        "area: storage"
+      ],
+      "milestone": "v1.3.0",
+      "number": 18,
+      "open_high_activity": false,
+      "reactions": {
+        "+1": 3,
+        "-1": 0,
+        "heart": 0,
+        "hooray": 0,
+        "total": 3
+      },
+      "state": "open",
+      "state_reason": null,
+      "title": "Add storage module",
+      "updated_at": "2026-05-22T00:00:00Z",
+      "url": "https://github.com/o/r/issues/18"
+    }
+  ],
+  "label_taxonomy": {
+    "area": {
+      "area:": [
+        "area: networking",
+        "area: storage"
+      ]
+    },
+    "kind": {
+      "Type:": [
+        "Type: Bug",
+        "Type: Feature"
+      ]
+    },
+    "source": "auto"
+  },
+  "meta": {
+    "from": "2026-05-01",
+    "owner": "o",
+    "repo": "r",
+    "to": "2026-05-31"
+  },
+  "milestones": [
+    {
+      "due_on": "2026-05-31T00:00:00Z",
+      "number": 4,
+      "state": "open",
+      "title": "v1.2.0"
+    },
+    {
+      "due_on": "2026-06-30T00:00:00Z",
+      "number": 5,
+      "state": "open",
+      "title": "v1.3.0"
+    }
+  ],
+  "modules": {
+    "avm/res/network/firewall-policy": {
+      "commits": 1,
+      "files_changed": 2,
+      "prs": 1
+    },
+    "docs": {
+      "commits": 1,
+      "files_changed": 1,
+      "prs": 0
+    }
+  },
+  "people": {
+    "alice": {
+      "areas": [
+        "avm/res/network/firewall-policy"
+      ],
+      "modules": [
+        "avm/res/network/firewall-policy"
+      ]
+    },
+    "carol": {
+      "areas": [
+        "avm/res/network/firewall-policy"
+      ],
+      "modules": [
+        "avm/res/network/firewall-policy"
+      ]
+    },
+    "dave": {
+      "areas": [
+        "docs"
+      ],
+      "modules": [
+        "docs"
+      ]
+    }
+  },
+  "prs": [
+    {
+      "author": "alice",
+      "closed_at": "2026-05-10T12:00:00Z",
+      "closes": [
+        17
+      ],
+      "comments_list": [],
+      "crossref_issues": [],
+      "facets": {
+        "area": "area: networking",
+        "lifecycle": null,
+        "priority": null,
+        "status": null
+      },
+      "labels": [
+        "area: networking",
+        "Type: Feature"
+      ],
+      "merged": true,
+      "merged_at": "2026-05-10T12:00:00Z",
+      "milestone": "v1.2.0",
+      "number": 42,
+      "review_comments": [],
+      "reviewers": [
+        "carol"
+      ],
+      "state": "closed",
+      "title": "Add policy example",
+      "url": "https://github.com/o/r/pull/42"
+    }
+  ],
+  "releases": [],
+  "symbol_moves": {
+    "by_confidence": {
+      "high": 0,
+      "medium": 0
+    },
+    "links": []
+  },
+  "timeline": [
+    {
+      "actor": "alice",
+      "event": "add",
+      "layer": "code",
+      "ref": {
+        "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+      },
+      "subject": {
+        "kind": "example",
+        "name": "main.bicep",
+        "path": "avm/res/network/firewall-policy/examples/basic/main.bicep"
+      },
+      "ts": "2026-05-03"
+    },
+    {
+      "actor": "alice",
+      "event": "add",
+      "layer": "code",
+      "ref": {
+        "id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+      },
+      "subject": {
+        "kind": "doc",
+        "name": "firewall.md",
+        "path": "docs/firewall.md"
+      },
+      "ts": "2026-05-03"
+    },
+    {
+      "actor": "dave",
+      "event": "remove",
+      "layer": "code",
+      "ref": {
+        "id": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+        "type": "commit",
+        "url": "https://github.com/o/r/commit/c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+      },
+      "subject": {
+        "kind": "doc",
+        "name": "firewall.md",
+        "path": "docs/firewall.md"
+      },
+      "ts": "2026-05-25"
+    }
+  ],
+  "trains": [
+    {
+      "code_areas": [
+        "avm/res/network/firewall-policy"
+      ],
+      "commits": [
+        "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+      ],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 1,
+        "elapsed_days": null,
+        "merged_at": "2026-05-10T12:00:00Z",
+        "opened_at": null,
+        "participants": 2,
+        "review_comments": 0,
+        "reviewers": 1,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 17,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/17"
+        },
+        {
+          "id": 42,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/42"
+        }
+      ],
+      "id": "train-issue-17",
+      "kind": "feature",
+      "outcome": "shipped",
+      "prs": [
+        42
+      ],
+      "root_issue": 17,
+      "significance": 10.0,
+      "tier": "deep"
+    }
+  ]
+}

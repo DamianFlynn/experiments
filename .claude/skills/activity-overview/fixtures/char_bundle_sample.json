@@ -1,0 +1,125 @@
+{
+  "artifacts": {},
+  "buckets": {
+    "in_flight": [],
+    "next_candidates": [],
+    "rejected": [],
+    "shipped": [
+      {
+        "id": 42,
+        "train": "train-issue-17",
+        "type": "pr",
+        "url": "https://github.com/o/r/pull/42"
+      },
+      {
+        "id": 17,
+        "train": "train-issue-17",
+        "type": "issue",
+        "url": "https://github.com/o/r/issues/17"
+      }
+    ]
+  },
+  "code_events": [],
+  "commits": [
+    {
+      "message": "Add policy param (#42)",
+      "pr": 42,
+      "sha": "a"
+    },
+    {
+      "message": "Merge pull request #42 from x",
+      "pr": 42,
+      "sha": "b"
+    },
+    {
+      "message": "Tidy outputs",
+      "pr": null,
+      "sha": "c"
+    }
+  ],
+  "feature_deltas": [],
+  "forecast": {
+    "candidates": [],
+    "next_milestone": null
+  },
+  "issues": [
+    {
+      "kind": "feature",
+      "number": 17,
+      "state": "closed",
+      "state_reason": "completed",
+      "title": "Support policy param",
+      "url": "https://github.com/o/r/issues/17"
+    }
+  ],
+  "meta": {
+    "from": "2026-05-01",
+    "owner": "o",
+    "repo": "r",
+    "to": "2026-05-31"
+  },
+  "milestones": [],
+  "modules": {},
+  "people": {},
+  "prs": [
+    {
+      "closes": [
+        17
+      ],
+      "merged": true,
+      "number": 42,
+      "title": "Add policy param",
+      "url": "https://github.com/o/r/pull/42"
+    }
+  ],
+  "releases": [],
+  "symbol_moves": {
+    "by_confidence": {
+      "high": 0,
+      "medium": 0
+    },
+    "links": []
+  },
+  "timeline": [],
+  "trains": [
+    {
+      "code_areas": [],
+      "commits": [
+        "a",
+        "b"
+      ],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 2,
+        "elapsed_days": null,
+        "merged_at": null,
+        "opened_at": null,
+        "participants": 0,
+        "review_comments": 0,
+        "reviewers": 0,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 17,
+          "type": "issue",
+          "url": "https://github.com/o/r/issues/17"
+        },
+        {
+          "id": 42,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/42"
+        }
+      ],
+      "id": "train-issue-17",
+      "kind": "feature",
+      "outcome": "shipped",
+      "prs": [
+        42
+      ],
+      "root_issue": 17,
+      "significance": 9.0,
+      "tier": "deep"
+    }
+  ]
+}
