@@ -1,5 +1,6 @@
 import os
 import sys
+import time as _time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -403,6 +404,30 @@ class TestDeterminism(unittest.TestCase):
         # tie on ts -> ordered by id; a before b before later c
         self.assertEqual([n["id"] for n in got],
                          ["p/r#a", "p/r#b", "p/r#c"])
+
+
+class TestScaleSmoke(unittest.TestCase):
+    def test_window_query_fast_over_50k_nodes(self):
+        conn = _store()
+        conn.execute("BEGIN")
+        for i in range(50000):
+            # spread across ~3 months; ~1/3 land inside the April window
+            month = 4 + (i % 3)
+            day = 1 + (i % 27)
+            ts = "2026-{:02d}-{:02d}T00:00:00Z".format(month, day)
+            conn.execute(
+                "INSERT INTO nodes (id, project, repo, node_class, ts, data, fetched_at) "
+                "VALUES (?, 'p', 'r', 'social', ?, '{}', '2026-04-04T00:00:00Z')",
+                ("p/r#n{}".format(i), ts),
+            )
+        conn.commit()
+        start = _time.perf_counter()
+        got = graphstore.range_query(
+            conn, "p", ["r"], "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z"
+        )
+        elapsed = _time.perf_counter() - start
+        self.assertGreater(len(got), 10000)
+        self.assertLess(elapsed, 2.0)  # generous ceiling; guards a missing index
 
 
 if __name__ == "__main__":
