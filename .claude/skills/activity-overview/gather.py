@@ -1854,6 +1854,12 @@ def classify_id(qid):
     return {"node_class": node_class, "kind": kind, "local": local}
 
 
+# Returned by a `fetch` seam to mean "this id DEFINITIVELY does not exist" (a
+# 404) — distinct from None ("couldn't reach it / transient"). backfill prunes
+# an ABSENT id by tombstoning it via graphstore.record_dead_ref.
+ABSENT = object()
+
+
 def backfill(conn, id, fetch=None):
     """Fetch and upsert ONE missing spine node + its cheap immediate edges.
 
@@ -1869,7 +1875,8 @@ def backfill(conn, id, fetch=None):
     Returns `{"fetched": bool, "id": id, "edges_added": int}`.
     """
     if graphstore.get_node(conn, id) is not None:
-        return {"fetched": False, "id": id, "edges_added": 0}  # already present
+        return {"fetched": False, "absent": False, "id": id,
+                "edges_added": 0}  # already present
 
     info = classify_id(id)
     parsed = graphstore.parse_id(id)
@@ -1882,8 +1889,12 @@ def backfill(conn, id, fetch=None):
                          "make_backfill_fetcher(token); tests: a fake)")
 
     result = fetch(info["kind"], info["local"], id)
+    if result is ABSENT:
+        graphstore.record_dead_ref(conn, id)  # only gather writes
+        return {"fetched": False, "absent": True, "id": id, "edges_added": 0}
     if not result or not result.get("node"):
-        return {"fetched": False, "id": id, "edges_added": 0}  # unfetchable
+        return {"fetched": False, "absent": False, "id": id,
+                "edges_added": 0}  # unreachable / transient
 
     raw = result["node"]
     fetched_at = graphstore.now_iso()
@@ -1913,7 +1924,7 @@ def backfill(conn, id, fetch=None):
                       edge_type, None, None))
     if edges:
         graphstore.upsert_edges(conn, edges)
-    return {"fetched": True, "id": id, "edges_added": len(edges)}
+    return {"fetched": True, "absent": False, "id": id, "edges_added": len(edges)}
 
 
 def make_backfill_fetcher(token, clone_dir=None):

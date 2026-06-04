@@ -293,3 +293,32 @@ class RollupResumeHardening(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BackfillAbsent(unittest.TestCase):
+    def test_absent_records_dead_ref_and_reports_absent(self):
+        conn = _store()
+        gather.fold_bundle(conn, copy.deepcopy(_cross_window_bundle()))
+        iid = graphstore.qualify_id("acme", "widget", "issue-123")  # never existed
+
+        def fetch(kind, local, qid):
+            return gather.ABSENT
+
+        res = gather.backfill(conn, iid, fetch=fetch)
+        self.assertFalse(res["fetched"])
+        self.assertTrue(res["absent"])
+        self.assertTrue(graphstore.is_dead_ref(conn, iid))  # remembered dead
+        self.assertIsNone(graphstore.get_node(conn, iid))    # not upserted
+
+    def test_unreachable_none_is_not_absent(self):
+        conn = _store()
+        gather.fold_bundle(conn, copy.deepcopy(_cross_window_bundle()))
+        iid = graphstore.qualify_id("acme", "widget", "issue-7")
+
+        def fetch(kind, local, qid):
+            return None  # transient / unreachable, NOT a 404
+
+        res = gather.backfill(conn, iid, fetch=fetch)
+        self.assertFalse(res["fetched"])
+        self.assertFalse(res["absent"])
+        self.assertFalse(graphstore.is_dead_ref(conn, iid))  # NOT tombstoned
