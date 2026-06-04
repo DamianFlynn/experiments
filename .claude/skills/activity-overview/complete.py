@@ -14,14 +14,19 @@ import graphstore
 
 def _in_window(node, window):
     """A node is in-window if there is no window, or its ts falls in [from, to].
-    A node with no ts is treated as out-of-window (cannot prove it's inside)."""
+    A node with no ts is treated as out-of-window (cannot prove it's inside).
+    Either bound may be None (a one-sided window)."""
     if window is None:
         return True
     ts = node.get("ts")
     if ts is None:
         return False
     frm, to = window
-    return frm <= ts <= to
+    if frm is not None and ts < frm:
+        return False
+    if to is not None and ts > to:
+        return False
+    return True
 
 
 def _spine_neighbors(conn, qid, edge_types):

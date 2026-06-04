@@ -505,11 +505,24 @@ def get_clone_sha(conn, project, repo):
     return get_meta(conn, _clone_sha_key(project, repo))
 
 
+_DEAD_REFS_DDL = (
+    "CREATE TABLE IF NOT EXISTS dead_refs ("
+    "id TEXT PRIMARY KEY, project TEXT, reason TEXT, first_seen TEXT)"
+)
+
+
+def _ensure_dead_refs(conn):
+    """Create the dead_refs table if absent. Lets the tombstone helpers work on
+    a store opened directly (not via init_schema) or one that predates 8d."""
+    conn.execute(_DEAD_REFS_DDL)
+
+
 def record_dead_ref(conn, id, reason="absent"):
     """Tombstone a qualified id known not to exist (a 404 phantom). Idempotent:
     re-recording the same id is a no-op (first_seen is preserved). We never
     destructively delete the dangling edge — this just stops traversal from
     re-surfacing it. `project` is recovered from the id's scope when present."""
+    _ensure_dead_refs(conn)
     parsed = parse_id(id)
     project = parsed["scope"].split("/", 1)[0] if parsed["scope"] else None
     conn.execute(
@@ -522,12 +535,14 @@ def record_dead_ref(conn, id, reason="absent"):
 
 def is_dead_ref(conn, id):
     """True if `id` has been tombstoned as a known-absent phantom."""
+    _ensure_dead_refs(conn)
     row = conn.execute("SELECT 1 FROM dead_refs WHERE id=?", (id,)).fetchone()
     return row is not None
 
 
 def get_dead_refs(conn):
     """All tombstoned ids, sorted (deterministic)."""
+    _ensure_dead_refs(conn)
     return [r[0] for r in conn.execute("SELECT id FROM dead_refs ORDER BY id")]
 
 

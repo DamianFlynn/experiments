@@ -19,6 +19,7 @@ import json
 import sys
 
 import graphstore
+import complete
 
 
 def _detect_project(conn, project):
@@ -205,7 +206,8 @@ def _reached_anchor(conn, reached):
     return _origin_anchor(nodes)
 
 
-def _train(conn, anchor, reached, focus_touch_ids, role_of):
+def _train(conn, anchor, reached, focus_touch_ids, role_of,
+           *, window=None, backfill=None, complete_budget=50):
     """Build one decision-train entry routed through the shared contract.
 
     `anchor`           — the train's deterministic anchor id; superseded here by
@@ -282,7 +284,7 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of):
     key_date = timeline[0]["ts"] if timeline else (
         (anchor_node["ts"] if anchor_node else None) or "")
 
-    return {
+    train = {
         "anchor": anchor,
         "key_date": key_date,
         "title": adata.get("title"),
@@ -292,6 +294,17 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of):
         "touchpoints": touchpoints,
         "timeline": timeline,
     }
+    # Honest edge contract: complete the train's causal spine (offline-by-default,
+    # no network) and stamp complete/gaps. `missing` is self-derived from the
+    # reached set so every builder gets the contract uniformly; skip_dead keeps
+    # pruned phantoms out.
+    reach = graphstore.traverse_spine(
+        conn, sorted(reached), edge_types=_CAUSAL_SPINE, skip_dead=True)
+    comp = complete.complete_train(
+        conn, reach["reached"], reach["missing"], window=window,
+        backfill=backfill, budget=complete_budget, edge_types=_CAUSAL_SPINE)
+    complete.annotate(train, comp)
+    return train
 
 
 def _result(query, focus, focus_kind, project, scope, summary, delivered,
@@ -326,7 +339,8 @@ _ROLE_OF_EDGE = {
 }
 
 
-def person_impact(conn, project, login, ts_from=None, ts_to=None):
+def person_impact(conn, project, login, ts_from=None, ts_to=None,
+                  *, backfill=None, complete_budget=50):
     """A contributor's impact across all repos in `project` (people are
     project-scoped), as the chronological delivery trains they TOUCHED in any
     role. Returns the unified citation-bearing envelope; a miss (no person
@@ -431,7 +445,9 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None):
             role_of.setdefault(dst_id, []).append(entry)
             if dst_id not in focus_touch_ids:
                 focus_touch_ids.append(dst_id)
-        train = _train(conn, anchor, reached, focus_touch_ids, role_of)
+        train = _train(conn, anchor, reached, focus_touch_ids, role_of,
+                       window=_completion_window(ts_from, ts_to),
+                       backfill=backfill, complete_budget=complete_budget)
         if (ts_from is not None or ts_to is not None) and not _date_in_range(
                 train["key_date"], ts_from, ts_to):
             continue
@@ -465,6 +481,15 @@ def _as_iso(bound, end_of_day=False):
     if bound is None or "T" in bound:
         return bound
     return bound + ("T23:59:59Z" if end_of_day else "T00:00:00Z")
+
+
+def _completion_window(ts_from, ts_to):
+    """The normalized (lo, hi) ISO bounds for completion's window check, or None
+    when unbounded. Date-only bounds are widened to start/end-of-day so they
+    compare correctly against ISO datetimes (mirrors `_date_in_range`)."""
+    if ts_from is None and ts_to is None:
+        return None
+    return (_as_iso(ts_from), _as_iso(ts_to, end_of_day=True))
 
 
 def _date_in_range(ts, ts_from, ts_to):
@@ -587,6 +612,10 @@ def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
         "roles": [],
         "touchpoints": [],
         "timeline": timeline,
+        # A symbol lifecycle is a code-identity chain, not a causal-spine train,
+        # so it has no spine refs to complete — trivially whole.
+        "complete": True,
+        "gaps": [],
     }
 
     # --- identity_chain: walk replaced_by forward + identity_from backward ---
@@ -662,7 +691,8 @@ def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
     )
 
 
-def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
+def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
+                    *, backfill=None, complete_budget=50):
     """An area's activity + blast radius as the chronological delivery trains
     that TOUCHED the area (optional time range). Returns the unified
     citation-bearing envelope; an unknown area (no `area-<area>` structure node
@@ -768,7 +798,9 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
     for anchor, reached in trains_by_anchor.items():
         focus_touch_ids = sorted(touch_set & reached)
         role_of = {tid: "touches" for tid in focus_touch_ids}
-        train = _train(conn, anchor, reached, focus_touch_ids, role_of)
+        train = _train(conn, anchor, reached, focus_touch_ids, role_of,
+                       window=_completion_window(ts_from, ts_to),
+                       backfill=backfill, complete_budget=complete_budget)
         if (ts_from is not None or ts_to is not None) and not _date_in_range(
                 train["key_date"], ts_from, ts_to):
             continue
@@ -838,7 +870,8 @@ def _match_excerpt(node):
     return ""
 
 
-def text_mining(conn, project, phrase, ts_from=None, ts_to=None):
+def text_mining(conn, project, phrase, ts_from=None, ts_to=None,
+                *, backfill=None, complete_budget=50):
     """Every comment / commit message / review / PR-issue body mentioning
     `phrase`, grouped by the decision train each occurrence belongs to —
     chronological, each cited. The O(matches) FTS query: only the matched nodes
@@ -892,7 +925,9 @@ def text_mining(conn, project, phrase, ts_from=None, ts_to=None):
         for tid in focus_touch_ids:
             node = graphstore.get_node(conn, tid)
             role_of[tid] = {"role": "mention", "excerpt": _match_excerpt(node)}
-        train = _train(conn, anchor, reached, focus_touch_ids, role_of)
+        train = _train(conn, anchor, reached, focus_touch_ids, role_of,
+                       window=_completion_window(ts_from, ts_to),
+                       backfill=backfill, complete_budget=complete_budget)
         if (ts_from is not None or ts_to is not None) and not _date_in_range(
                 train["key_date"], ts_from, ts_to):
             continue

@@ -933,3 +933,26 @@ class TestReviewFixes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHonestContract(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _crafted_bundle())
+
+    def test_every_train_carries_complete_and_gaps(self):
+        res = spotlight.person_impact(self.conn, "acme", "alice")
+        self.assertTrue(res.get("delivered"))
+        for t in res["delivered"]:
+            self.assertIn("complete", t)
+            self.assertIn("gaps", t)
+            self.assertIsInstance(t["gaps"], list)
+
+    def test_offline_default_self_contained_trains_are_complete(self):
+        # No fetcher: trains complete-or-not from the store alone. The crafted
+        # fixture's trains are self-contained, so they are complete:true offline.
+        res = spotlight.person_impact(self.conn, "acme", "alice")
+        for t in res["delivered"]:
+            self.assertTrue(t["complete"])
+            self.assertEqual(t["gaps"], [])
