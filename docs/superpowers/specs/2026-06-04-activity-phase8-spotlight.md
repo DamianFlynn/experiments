@@ -136,10 +136,15 @@ returns the expected aggregate with citations; FTS returns matches `O(matches)`"
 ## Gated slices
 
 - **8a — gather text-indexing prerequisite + spotlight scaffold + person-impact.**
-  `fold_bundle` indexes searchable text into `fts_text` (idempotent; FTS5-gated).
-  Stand up `spotlight.py` (CLI + Result shape + miss/guidance) and ship
-  **person-impact** end-to-end with seeded + real-data tests. *Gate:* person-impact
-  golden green; FTS populated on fold; Phase 7 suites unchanged.
+  **DONE.** `fold_bundle` indexes searchable text into `fts_text` (idempotent;
+  FTS5-gated) — PR/issue titles+bodies + comment/review authors+bodies, and
+  commit messages. `spotlight.py` is stood up (CLI defaulting to raw cited JSON
+  + `--md` render; Result shape with `ok`/`needs_gather`/`fts_unavailable`;
+  project auto-detect), and **person-impact** ships end-to-end (contributions
+  grouped+cited, symbols authored/authored_then_removed, trains anchored) with a
+  seeded golden, cross-repo aggregation, needs_gather, determinism, and a
+  real-data smoke (`test_spotlight.py`). *Gate met:* person-impact golden green;
+  FTS populated on fold; Phase 7 suites unchanged (537 passed, 2 skipped).
 - **8b — pattern-evolution + subsystem-split.** The graph-traversal queries
   (identity-chain lifecycle; area contributors/shipped/`depends_on`). Seeded
   fixtures for subsystem (sparse real data). *Gate:* both query goldens green.

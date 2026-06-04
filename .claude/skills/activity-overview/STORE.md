@@ -79,6 +79,14 @@ index; `fts_search(query)` returns matching node ids ranked by relevance.
 Created only when the SQLite build supports FTS5 (`fts5_available`); the
 text-mining spotlight query depends on it.
 
+**Populated on the fold path (Phase 8a).** `fold_bundle` indexes searchable
+text per owning node id, keyed so a hit hydrates back to the node it came from:
+PR/issue `social` nodes index their title + body + embedded comment/review
+authors+bodies; commit `code` nodes index the commit message. The call is
+FTS5-gated (skipped silently when the build lacks FTS5 — the store stays valid)
+and idempotent (`index_text` is delete-then-insert per node id, so re-folding
+an overlapping window re-indexes cleanly without duplicates).
+
 `fts_search` passes `query` straight to the FTS5 `MATCH` operator, so the
 argument must be a **valid FTS5 query**. Callers searching user-derived terms
 (e.g. the P8 spotlight text-mining query) must quote/escape them — FTS5
@@ -227,8 +235,8 @@ window-projection helpers it still uses: `attribute_code_areas`/`build_modules`/
 
 Still NOT on the write path after step 3: `blocks` (issue→issue) and
 `in_iteration` (social→sprint) — skipped for lack of source data in the current
-fixtures/normalizers (no block/sprint signal is gathered) — and the `fts_text`
-FTS5 index (`index_text` is never called on the write path). See
+fixtures/normalizers (no block/sprint signal is gathered). The `fts_text` FTS5
+index IS now populated on fold (Phase 8a — see *Text index* above). See
 `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
 ## Backfill on a traversal miss (slice 7c)

@@ -1965,6 +1965,19 @@ def make_backfill_fetcher(token, clone_dir=None):
     return fetch
 
 
+def _social_text(item, comments):
+    """The full searchable text for a PR/issue social node: its title + body,
+    then each embedded comment/review author + body. Newline-joined so FTS5
+    tokenizes phrases across the parts. Pure; missing fields are skipped."""
+    parts = [item.get("title") or "", item.get("body") or ""]
+    for c in comments:
+        author = c.get("author") or ""
+        body = c.get("body") or ""
+        if author or body:
+            parts.append("{} {}".format(author, body).strip())
+    return "\n".join(p for p in parts if p)
+
+
 def fold_bundle(conn, bundle):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
@@ -2203,6 +2216,28 @@ def fold_bundle(conn, bundle):
     graphstore.upsert_nodes(conn, nodes)
     graphstore.upsert_edges(conn, edges)
     graphstore.add_code_events(conn, events)
+
+    # fts_text: index the searchable text per owning node id so `spotlight grep`
+    # has something to MATCH (Phase 8a prerequisite). FTS5-gated — when the
+    # SQLite build lacks FTS5 the store stays valid and we skip silently.
+    # index_text is delete-then-insert per node id, so re-folding re-indexes
+    # cleanly (idempotent). Sources (the approved scope, decision 1):
+    #   - PR social nodes: title + body + embedded comment/review authors+bodies
+    #   - issue social nodes: title + body + embedded comment authors+bodies
+    #   - commit code nodes: the commit message
+    if graphstore.fts5_available(conn):
+        for pr in bundle.get("prs", []):
+            text = _social_text(
+                pr,
+                (pr.get("comments_list") or []) + (pr.get("review_comments") or []))
+            graphstore.index_text(conn, qid("pr-{}".format(pr["number"])), text)
+        for iss in bundle.get("issues", []):
+            text = _social_text(iss, iss.get("comments_list") or [])
+            graphstore.index_text(
+                conn, qid("issue-{}".format(iss["number"])), text)
+        for c in bundle.get("commits", []):
+            graphstore.index_text(conn, qid(c["sha"]), c.get("message") or "")
+
     graphstore.record_window(conn, project, repo, meta.get("from"), meta.get("to"))
     if meta.get("clone_sha"):
         graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"])
