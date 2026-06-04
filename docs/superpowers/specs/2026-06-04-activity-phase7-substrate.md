@@ -1,6 +1,15 @@
 # Phase 7 — full graph substrate (extract + persisted derived facts) — design
 
-**Status: PROPOSED.** Detailed design for **Phase 7** of the journey-graph substrate,
+**Status: IMPLEMENTED (slices 7a–7c + trust gate + store-only wrap-up).**
+**Phase 7's deliverable is the trustworthy journey-graph store** — proven by the
+trust gate (`validate.py`) and self-contained on the store alone. The end-to-end
+report vertical (`extract → link → render → report`) is intentionally **broken at
+the close of Phase 7** (the flat-bundle file and its `link`/`render`/`report`
+driver are no longer wired by `gather`) and is **restored in Phase 8** via
+`extract → link → render`, which materializes the bundle view from the store and
+runs the existing (preserved) derivation/render code. See *Wrap-up* below.
+
+Detailed design for **Phase 7** of the journey-graph substrate,
 expanding and superseding the one-line P7 ledger entry in the rev-14 design
 (`2026-06-01-activity-overview-design.md` → *Implementation phasing*). The rev-14 ledger
 split "extract + raw round-trip" (P7) from "the link-derived graph" (folded into P8). This
@@ -206,6 +215,36 @@ live REST/git paths are exercisable only against a real repo — relevant to the
 
 ---
 
+## Wrap-up — store-only deliverable (the Phase 7 close)
+
+After 7a–7c and the trust gate, Phase 7 makes the **store the SOLE deliverable**
+and removes the now-dead flat-bundle code paths. Approved scope: *"Full:
+store-only"*, explicitly accepting that it **breaks the end-to-end report
+vertical** (restored in Phase 8).
+
+- **`gather` → store-only.** `--store` is **required**; `gather` folds the
+  in-memory bundle into the store and writes **no bundle JSON file**. Removed:
+  the `--out` flag and the bundle-file `json.dump` emission; `--resume`
+  (flat-bundle resume) and `--rollup` (multi-bundle union) flags **and their
+  implementations** (`resume_acquire`, `resume_bundle`, `rollup_bundles`,
+  `_period_to`, `ROLLUP_ACTIVITY_KEYS`/`ROLLUP_LATEST_FIELDS`, and the
+  `only_status` resume branch in `extract_iac_edges`). Both are **superseded by
+  the store**: roll-up = a wider `range_query`; resume = a re-fold against the
+  pinned `clone_sha` (idempotent dedup). `build_bundle`/`fold_bundle` are KEPT
+  (the bundle still exists transiently in-memory; only the FILE artifact and the
+  flat resume/rollup paths go).
+- **`validate` → self-sourcing.** `validate STORE.db` (no `--bundle`) now
+  reconstructs the raw bundle FROM THE STORE via `extract` (over the store's full
+  window) and runs `no_drift` + `idempotency` against it, so the trust gate is
+  fully self-contained on a store. `--bundle` remains an optional cross-check but
+  is **unnecessary**. The auditor survives a corrupt store (a re-derive/re-fold
+  that raises becomes a failed ERROR check, not a crash).
+- **Kept (Phase 8 restores the vertical):** `extract`, `derive`, `link`,
+  `render`, `report`, and the `bundle_*.json`/`char_*.json` fixtures are all
+  preserved. Phase 8 wires `extract → link → render` to materialize the bundle
+  view from the store and produce the report — no derivation/render code is
+  rewritten, only re-connected to read from the store.
+
 ## The equivalence gate (invariant across all slices)
 
 > **At every slice, for each golden, `enrich(extract(store)) == enrich(golden_raw)` — i.e.
@@ -234,10 +273,11 @@ any "green" claim.
 | `extract.py` | **new** — window range query + train seeds + bounded spine traversal → materialized rev-13 bundle view. 7a: raw arrays. 7b: also materializes `artifacts[]`/`people[]`/`modules{}` from stored nodes/edges. 7c: calls `gather.backfill(id)` on traversal miss. |
 | `graphstore.py` | additions as needed for symbol_events ledger access, artifact/person node + non-spine edge writers/readers, window-scoped artifact/people queries. Still owns *all* SQL. |
 | shared derive module | **new (7b)** — `build_artifacts` / `match_symbol_moves` / `attribute_people_areas` / `build_modules` + edge derivations lifted from `link.py`, imported by both the write path and `link`. |
-| `gather.py` | 7a: persist remaining raw facts (`symbol_events`, `workflow_stats`, code_graph/owners projections). 7b: invoke shared derivations on the write path to persist artifact/person nodes + non-spine edges. 7c: `backfill(id)` wired as the on-miss bridge. |
-| `link.py` | 7b: **shrinks** — stops calling the lifted derivations; keeps the window projections (trains/buckets/timeline/feature_deltas/significance/effort/areas/forecast). |
-| `STORE.md` | update the *Writer* section: artifact/person nodes, `symbol_events`, and non-spine edges are now written (in 7b), no longer "a later phase." |
-| `render.py` / `report-template.md` | **unchanged** — read the materialized view exactly as before; guarded by the equivalence gate. |
+| `gather.py` | 7a: persist remaining raw facts (`symbol_events`, `workflow_stats`, code_graph/owners projections). 7b: invoke shared derivations on the write path to persist artifact/person nodes + non-spine edges. 7c: `backfill(id)` wired as the on-miss bridge. **Wrap-up: store-only** — `--store` required, no bundle file; `--out`/`--resume`/`--rollup` + their impls removed. |
+| `link.py` | 7b: **shrinks** — stops calling the lifted derivations; keeps the window projections (trains/buckets/timeline/feature_deltas/significance/effort/areas/forecast). **Wrap-up:** drop the dead `derive` re-exports used only by tests (`artifact_id`/`build_artifacts`/`area_index`/`_area_for_path`/`attribute_people_areas`/`match_symbol_moves`); KEPT as a deferred Phase-8 module. |
+| `validate.py` | trust gate (per-invariant store audit). **Wrap-up:** `no_drift`/`idempotency` **self-source** the raw bundle from the store via `extract`; `--bundle` optional. |
+| `STORE.md` | update the *Writer* section: artifact/person nodes, `symbol_events`, and non-spine edges are now written (in 7b), no longer "a later phase." **Wrap-up:** store is the sole deliverable; add the *Trust gate* section. |
+| `render.py` / `report-template.md` | **unchanged and KEPT** — read the materialized view exactly as before; re-wired to the store-sourced view in **Phase 8** (the vertical is intentionally un-driven at the Phase 7 close). |
 
 ---
 

@@ -156,12 +156,18 @@ def test_mutated_person_data_fails_no_drift_with_bundle():
     assert any("carol" in str(d) for d in c["details"]), c["details"]
 
 
-def test_no_drift_skipped_without_bundle():
+def test_no_drift_self_sourced_without_bundle():
+    """Store-only world (Phase 7): with no --bundle, no_drift + idempotency
+    SELF-SOURCE the raw bundle from the store via extract and still run (and
+    pass on a clean store), so the trust gate is self-contained on a store."""
     conn = _clean_store()
     report = validate.validate(conn, project="o", repo="r")
     names = {c["name"] for c in report.checks}
-    assert "no_drift" not in names
-    assert "idempotency" not in names
+    assert "no_drift" in names
+    assert "idempotency" in names
+    assert _check(report, "no_drift")["ok"] is True, _check(report, "no_drift")
+    assert _check(report, "idempotency")["ok"] is True, _check(report, "idempotency")
+    assert report.ok is True, [c for c in report.checks if not c["ok"]]
 
 
 def test_empty_id_node_fails_no_fabrication():

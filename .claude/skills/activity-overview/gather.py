@@ -1344,9 +1344,7 @@ def fetch_until(get_page, first_url, more):
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(description="Acquire an activity-overview bundle.")
-    # Not argparse-required: a --resume run derives these from the prior bundle's
-    # meta. acquire() enforces them for a normal (non-resume) run.
+    p = argparse.ArgumentParser(description="Acquire an activity-overview store.")
     p.add_argument("--owner")
     p.add_argument("--repo")
     p.add_argument("--from", dest="from")
@@ -1362,17 +1360,14 @@ def parse_args(argv):
     p.add_argument("--include-releases", dest="include_releases",
                    action="store_true", default=True)
     p.add_argument("--no-releases", dest="include_releases", action="store_false")
-    p.add_argument("--resume", default=None,
-                   help="Prior bundle JSON: re-resolve only its timeout/failed edges "
-                        "against the pinned meta.clone_sha; reuse everything else.")
-    p.add_argument("--rollup", nargs="+", default=None, metavar="BUNDLE",
-                   help="Merge 2+ monthly bundle JSONs into one multi-period bundle "
-                        "(overlap-safe union by identity; structure from the latest). "
-                        "Re-run link on the result. No clone/token needed.")
-    p.add_argument("--out", default=None)
-    p.add_argument("--store", default=None,
-                   help="also fold the bundle into this SQLite journey-graph "
-                        "store (off by default; additive to the JSON bundle)")
+    # Store-only (Phase 7): the SQLite journey-graph store is THE deliverable.
+    # gather folds the assembled bundle into it and writes no bundle file. The
+    # bundle is a transient view extract materializes from the store (Phase 8
+    # reader stage). Roll-up = a wider range_query; resume = re-fold against the
+    # pinned clone_sha — both store-native, so the flat-bundle flags are gone.
+    p.add_argument("--store", required=True,
+                   help="path to the SQLite journey-graph store to fold into "
+                        "(the sole gather deliverable)")
     return p.parse_args(argv)
 
 
@@ -1403,12 +1398,13 @@ def run_git(args, cwd=None, timeout=None):
 
 
 def clone_head_sha(clone_dir, run=run_git):
-    """Resolve the clone's HEAD commit SHA (provenance for resume + roll-up).
+    """Resolve the clone's HEAD commit SHA — stamped into `meta.clone_sha` as
+    structural provenance.
 
-    Pins the exact tree the code_graph/edges were built against so a `--resume`
-    rebuilds against the identical source (no mixed-SHA graph) and a multi-bundle
-    roll-up can pick the newest structural snapshot deterministically. Returns the
-    40-char SHA, or None when there is no clone (e.g. --no-clone with nothing on disk)."""
+    Pins the exact tree the code_graph/edges were built against. The store-native
+    resume (re-fold against the pinned SHA) keys off it so a refresh rebuilds from
+    the identical source (no mixed-SHA graph). Returns the 40-char SHA, or None
+    when there is no clone (e.g. --no-clone with nothing on disk)."""
     try:
         return run(["git", "-C", clone_dir, "rev-parse", "HEAD"]).strip() or None
     except Exception:
@@ -1462,7 +1458,7 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
                       read_text=_read_text_file, patterns=None,
                       max_workers=IAC_MAX_WORKERS, timeout=IAC_BUILD_TIMEOUT,
-                      retries=IAC_RETRIES, only_status=None):
+                      retries=IAC_RETRIES):
     """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
 
     Each area with a main.bicep (and `bicep` on PATH) or a *.tf (and `terraform` on
@@ -1471,12 +1467,7 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     restore failure, build error, or timeout leaves `edges` as-is ([]) but stamps
     `area["edges_status"]` so the gap is VISIBLE, never a silent empty. An aggregate
     `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
-    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph.
-
-    `only_status` (a set, e.g. {"timeout","failed"}) drives RESUME: only areas whose
-    current `edges_status` is in the set are rebuilt; every other area keeps its prior
-    edges + status untouched. The summary is recomputed across ALL areas so it reflects
-    the merged state. Sound because an area's edges are a pure function of its source."""
+    `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     areas = code_graph.get("areas", [])
     area_ids = {a["id"] for a in areas}
@@ -1484,9 +1475,8 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     have_tf = bool(which("terraform"))
     summary = {"resolved": 0, "timeout": 0, "failed": 0, "skipped": 0}
 
-    # Fresh full run with no toolchain: build-only ⇒ everything skipped. (For a
-    # resume, fall through so retained areas keep their prior resolved edges.)
-    if only_status is None and not (have_bicep or have_tf):
+    # No toolchain: build-only ⇒ everything skipped.
+    if not (have_bicep or have_tf):
         for area in areas:
             area["edges_status"] = "skipped"
         summary["skipped"] = len(areas)
@@ -1494,8 +1484,6 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
         return code_graph
 
     def work(area):
-        if only_status is not None and area.get("edges_status") not in only_status:
-            return area, (None, area.get("edges_status") or "skipped")   # retain
         return area, _extract_area_edges(area, clone_dir, area_ids, patterns,
                                          have_bicep, have_tf, run, read_text,
                                          timeout, retries)
@@ -1509,81 +1497,6 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
 
     code_graph["edge_extraction"] = summary
     return code_graph
-
-
-def resume_bundle(prior_bundle, clone_dir, **extract_kw):
-    """Re-resolve ONLY the unresolved (timeout/failed) edges of a prior bundle, in
-    place, reusing everything else. Cheap way to close a partial edge gap without
-    recomputing the window — correct only when the clone is checked out at the prior
-    `meta.clone_sha` (same source tree). Returns the updated bundle. Mutates it."""
-    code_graph = prior_bundle.get("code_graph") or {}
-    extract_iac_edges(code_graph, clone_dir,
-                      only_status={"timeout", "failed"}, **extract_kw)
-    prior_bundle["code_graph"] = code_graph
-    return prior_bundle
-
-
-# Stable identity keys for overlap-safe roll-up. Monthly runs may overlap by a day
-# or two (a gap guarantee against late merges / clock skew); these immutable keys are
-# the dedup guarantee, so overlap never double-counts. (commit,path,change) keys a
-# code-event; PRs/issues by number; commits by sha; releases by tag; milestones by id.
-ROLLUP_ACTIVITY_KEYS = {
-    "prs": lambda x: x.get("number"),
-    "issues": lambda x: x.get("number"),
-    "commits": lambda x: x.get("sha"),
-    "releases": lambda x: x.get("tag") or x.get("id") or x.get("name"),
-    "milestones": lambda x: x.get("number") or x.get("id") or x.get("title"),
-    "code_events": lambda x: (x.get("commit"), x.get("path"), x.get("change")),
-}
-# Structure/derived fields are a point-in-time snapshot of a moving tree, so the
-# roll-up takes them whole from the LATEST installment rather than merging.
-ROLLUP_LATEST_FIELDS = ("code_graph", "code_owners", "label_taxonomy",
-                        "workflows", "workflow_stats")
-
-
-def _period_to(bundle):
-    m = bundle.get("meta") or {}
-    return (m.get("period") or {}).get("to") or m.get("to") or ""
-
-
-def rollup_bundles(bundles):
-    """Merge monthly installments into one multi-period bundle (the cheap through-line
-    for a long view; a fresh wide-window re-run stays canonical). ACTIVITY (prs/issues/
-    commits/code_events/releases/milestones) is UNIONED by stable identity — overlap
-    never double-counts, and the freshest observation of a mutable item (issue state,
-    open PR) wins (last-write). STRUCTURE (code_graph/owners/taxonomy/workflows) is taken
-    from the latest installment (newest `clone_sha`). `meta.period` spans the union window.
-    Derived link/report fields are intentionally dropped — re-run link on the result."""
-    if not bundles:
-        raise ValueError("rollup_bundles: no bundles given")
-    ordered = sorted(bundles, key=_period_to)
-    latest = ordered[-1]
-    merged = {}
-
-    for field, keyfn in ROLLUP_ACTIVITY_KEYS.items():
-        seen = {}
-        for i, b in enumerate(ordered):
-            for j, item in enumerate(b.get(field) or []):
-                k = keyfn(item)
-                seen[k if k is not None else (i, j)] = item   # last (freshest) wins
-        merged[field] = list(seen.values())
-
-    for field in ROLLUP_LATEST_FIELDS:
-        if field in latest:
-            merged[field] = latest[field]
-
-    metas = [b.get("meta") or {} for b in ordered]
-    froms = [(m.get("period") or {}).get("from") or m.get("from") for m in metas]
-    froms = [f for f in froms if f]
-    tos = [t for t in (_period_to(b) for b in ordered) if t]
-    lm = latest.get("meta") or {}
-    span = {"from": min(froms) if froms else lm.get("from"),
-            "to": max(tos) if tos else lm.get("to")}
-    merged["meta"] = {**lm, "from": span["from"], "to": span["to"],
-                      "period": span, "clone_sha": lm.get("clone_sha"),
-                      "rolled_up_from": [(m.get("period") or {"from": m.get("from"),
-                                          "to": m.get("to")}) for m in metas]}
-    return merged
 
 
 def http_get_json(url, token):
@@ -1674,46 +1587,9 @@ def _runs_page(get_page, api, frm, to):
     return runs
 
 
-def resume_acquire(args):
-    """`--resume` path: load a prior bundle, check the clone out at its pinned
-    `meta.clone_sha`, re-resolve only the timeout/failed edges, reuse everything
-    else. Not unit-tested (git/IO orchestration); the merge core is resume_bundle."""
-    with open(args.resume) as fh:
-        prior = json.load(fh)
-    meta = prior.get("meta") or {}
-    owner, repo = meta.get("owner"), meta.get("repo")
-    clone_dir = args.clone_dir or meta.get("clone_dir") or f"workspace/{repo}-clone"
-    sha = meta.get("clone_sha")
-    if not sha:
-        sys.stderr.write("error: prior bundle has no meta.clone_sha to resume against\n")
-        raise SystemExit(2)
-    if not args.no_clone:
-        os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
-        if not os.path.isdir(os.path.join(clone_dir, ".git")):
-            run_git(["git", "clone", f"https://github.com/{owner}/{repo}.git", clone_dir])
-        # fetch the exact pinned commit (works on a shallow clone) and check it out,
-        # so the rebuild runs against the IDENTICAL tree the prior run resolved.
-        run_git(["git", "-C", clone_dir, "fetch", "--depth", "1", "origin", sha])
-        run_git(["git", "-C", clone_dir, "checkout", "--force", sha])
-    before = dict((prior.get("code_graph") or {}).get("edge_extraction") or {})
-    resume_bundle(prior, clone_dir)
-    after = (prior.get("code_graph") or {}).get("edge_extraction") or {}
-    sys.stderr.write(f"resume: edge_extraction {before} -> {after}\n")
-    return prior
-
-
 def acquire(args, env):
-    if getattr(args, "rollup", None):
-        bundles = []
-        for path in args.rollup:
-            with open(path) as fh:
-                bundles.append(json.load(fh))
-        return rollup_bundles(bundles)
-    if getattr(args, "resume", None):
-        return resume_acquire(args)
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
-        sys.stderr.write("error: --owner --repo --from --to are required "
-                         "(or pass --resume <prior-bundle>)\n")
+        sys.stderr.write("error: --owner --repo --from --to are required\n")
         raise SystemExit(2)
     token = resolve_token(env)
     owner, repo = args.owner, args.repo
@@ -2335,20 +2211,16 @@ def fold_bundle(conn, bundle):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     bundle = acquire(args, os.environ)
-    period = bundle.get("meta", {}).get("period", {})
-    out = (args.out or f"workspace/activity-{getattr(args, 'from', None) or period.get('from')}"
-           f"-{args.to or period.get('to')}.json")
-    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    with open(out, "w") as fh:
-        json.dump(bundle, fh, indent=2)
-    sys.stderr.write(f"wrote {out}\n")
-    if getattr(args, "store", None):
-        conn = graphstore.open_store(args.store)
-        graphstore.init_schema(conn)
-        fold_bundle(conn, bundle)
-        conn.close()
-        sys.stderr.write(f"folded bundle into store {args.store}\n")
-    return out
+    # Store-only (Phase 7): fold the assembled bundle into the journey-graph store
+    # — the sole deliverable. No bundle JSON file is written; the bundle is a
+    # transient view the Phase 8 reader materializes via extract.
+    os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
+    conn = graphstore.open_store(args.store)
+    graphstore.init_schema(conn)
+    fold_bundle(conn, bundle)
+    conn.close()
+    sys.stderr.write(f"folded bundle into store {args.store}\n")
+    return args.store
 
 
 if __name__ == "__main__":

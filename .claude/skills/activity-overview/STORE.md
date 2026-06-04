@@ -5,6 +5,13 @@ identity-keyed substrate that `gather` writes and `extract`/`spotlight` read.
 This file is the contract those phases (and downstream renderer authors) code
 against. All SQL lives in `graphstore.py`; callers use its function API.
 
+> **Phase 7 deliverable (store-only).** This trustworthy graph IS the deliverable.
+> `gather --store` writes it and nothing else — there is no longer a flat bundle
+> JSON artifact. The bundle is a **transient view** that `extract` materializes
+> from the store on demand. The report vertical (`extract → link → render →
+> report`) is restored in **Phase 8**. The store stands alone, proven by
+> `validate.py` (below), which self-sources everything it needs from the store.
+
 ## Identity (qualified ids)
 
 Every node id is namespaced so multi-repo data cannot collide:
@@ -86,9 +93,11 @@ deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`).
 
 ## Writer (gather --store)
 
-`gather --store PATH` folds its assembled bundle into the store via
-`gather.fold_bundle(conn, bundle)` — additive to the JSON bundle, idempotent by
-identity (re-folding an overlapping window mutates nothing already correct). P6
+`gather --store PATH` (required) folds its in-memory assembled bundle into the
+store via `gather.fold_bundle(conn, bundle)` — the store is the **sole output**
+(no bundle file is written), idempotent by identity (re-folding an overlapping
+window mutates nothing already correct, so roll-up = a wider window re-fold and
+resume = a re-fold against the pinned `clone_sha`). P6
 writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
 `data` blob), `code` (commits) + the file-level `code_events` ledger,
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
@@ -254,6 +263,18 @@ overlapping window is byte-stable. Resume/roll-up read structure from the latest
 `clone_sha` (`set_clone_sha`/`get_clone_sha`) and the `gathered_windows` ledger
 (`record_window`/`get_windows`): the structure pin is the newest fold's
 `clone_sha`, a `WHERE`, not a merge.
+
+## Trust gate (validate.py)
+
+`python3 validate.py STORE.db` audits the store for trustworthiness and exits
+non-zero on any ERROR (CI-gateable). It is **self-contained on a store**: the two
+real-data checks — `no_drift` (stored people/artifacts == freshly re-derived) and
+`idempotency` (a re-fold changes no counts) — need a raw bundle to re-derive
+against, and when none is passed they **self-source it from the store** via
+`extract` over the store's full activity window. A `--bundle` argument is an
+optional cross-check, never required. The auditor never mutates the store and
+survives a corrupt one (a re-derive/re-fold that raises becomes a failed ERROR
+check, not a crash). This is what makes the store a stand-alone deliverable.
 
 ## Determinism
 

@@ -13,15 +13,9 @@ import gather  # for resolve_commit_pr / attach_commit_prs (commit->PR resolutio
 # resolving to the names imported from derive (one-way: link -> derive).
 from derive import (
     ref,
-    artifact_id,
-    build_artifacts,
-    area_index,
-    _area_for_path,
     attribute_code_areas,
     _commit_areas,
     build_modules,
-    attribute_people_areas,
-    match_symbol_moves,
     link_symbol_identity,
 )
 

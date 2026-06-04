@@ -1,12 +1,14 @@
 # Bundle Schema
 
-The bundle is a single JSON object produced by the pipeline. The **gather** step
-(`gather.py`) fills `meta`, `commits`, `prs`, `issues`, and — from Phase 2 —
+The bundle is a single JSON object. **Phase 7 is store-only:** the bundle is no
+longer a produced file — `gather` folds its facts into the journey-graph store
+(see `STORE.md`), and the reader stage materializes this bundle shape as a
+**transient view** via `extract`. This document remains the contract for that
+view: the **gather**/fold path supplies `meta`, `commits`, `prs`, `issues`,
 `workflows`, `workflow_stats`, `releases`, `milestones`; the **link** step
-(`link.py`) then fills `trains` and `buckets`; the **render** step (`render.py`)
-fills `diagrams`. Every other top-level key is reserved empty by gather and
-populated in later phases. (See **Phase 2 fields** below for the fields added
-after the walking skeleton.)
+(`link.py`, Phase 8) then fills `trains` and `buckets`; the **render** step
+(`render.py`, Phase 8) fills `diagrams`. (See **Phase 2 fields** below for the
+fields added after the walking skeleton.)
 
 ## Ref convention
 
@@ -26,9 +28,10 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
   from it is a stacked/fork contribution (merged into another branch, not main) — kept in `prs`
   as context but not counted as shipped-to-main (see `commits`/`date` note below and trains).
   Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
-  It pins the exact source tree so `gather.py --resume <prior-bundle>` can re-resolve **only**
-  the `timeout`/`failed` edges against the identical tree (edges are a pure function of source),
-  and a multi-bundle roll-up can pick the newest structural snapshot deterministically.
+  It pins the exact source tree (edges are a pure function of source), which is the basis for
+  the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,
+  idempotent by identity. (Phase 7 is store-only — see `STORE.md`; this bundle shape is the
+  transient view `extract` materializes from the store, not a produced file.)
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
   (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits

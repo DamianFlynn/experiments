@@ -310,6 +310,7 @@ class TestCliAndAuth(unittest.TestCase):
         args = gather.parse_args([
             "--owner", "o", "--repo", "r",
             "--from", "2026-05-01", "--to", "2026-05-31",
+            "--store", "workspace/store.db",
         ])
         self.assertEqual(args.owner, "o")
         self.assertEqual(args.repo, "r")
@@ -317,6 +318,13 @@ class TestCliAndAuth(unittest.TestCase):
         self.assertEqual(args.to, "2026-05-31")
         self.assertEqual(args.branches, "main")
         self.assertFalse(args.no_clone)
+        self.assertEqual(args.store, "workspace/store.db")
+
+    def test_parse_args_store_is_required(self):
+        with self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gather.parse_args(["--owner", "o", "--repo", "r",
+                               "--from", "2026-05-01", "--to", "2026-05-31"])
 
     def test_resolve_token_prefers_github_token(self):
         self.assertEqual(
@@ -1492,148 +1500,6 @@ class TestIacEdgeHardening(unittest.TestCase):
         self.assertEqual(summ["failed"], 0)
 
 
-class TestResumeEdges(unittest.TestCase):
-    """Phase 3c.2: targeted re-resolution rebuilds ONLY the timeout/failed areas
-    and retains the rest, converging to a full run's result."""
-
-    def setUp(self):
-        with open(os.path.join(FIX, "arm_compiled_sample.json")) as fh:
-            self.arm = fh.read()
-        with open(os.path.join(FIX, "bicep_source_sample.bicep")) as fh:
-            self.src = fh.read()
-
-    def _prior(self):
-        # A prior bundle: bar resolved (real edges), baz failed, qux skipped.
-        return {"meta": {"clone_sha": "f" * 40},
-                "code_graph": {"provider": "directory", "areas": [
-                    {"id": "avm/ptn/foo/bar", "label": "bar",
-                     "paths": ["avm/ptn/foo/bar/main.bicep"],
-                     "edges": [{"to": "avm/res/x/y", "kind": "module"}],
-                     "edges_status": "resolved"},
-                    {"id": "avm/ptn/foo/baz", "label": "baz",
-                     "paths": ["avm/ptn/foo/baz/main.bicep"],
-                     "edges": [], "edges_status": "failed"},
-                    {"id": "avm/ptn/foo/qux", "label": "qux",
-                     "paths": ["avm/ptn/foo/qux/readme.md"],
-                     "edges": [], "edges_status": "skipped"},
-                ]}}
-
-    def test_resume_rebuilds_only_failed_and_retains_resolved(self):
-        calls = []
-
-        def run(cmd, **kw):
-            calls.append(cmd[:2])
-            return self.arm if cmd[:2] == ["bicep", "build"] else ""
-        prior = self._prior()
-        resumed = gather.resume_bundle(
-            prior, "clone",
-            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
-            read_text=lambda _p: self.src, run=run)
-        areas = {a["id"]: a for a in resumed["code_graph"]["areas"]}
-        # resolved area untouched — its edges are NOT rebuilt (no build for bar)
-        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
-                         [{"to": "avm/res/x/y", "kind": "module"}])
-        # failed area rebuilt → now resolved with real edges
-        self.assertEqual(areas["avm/ptn/foo/baz"]["edges_status"], "resolved")
-        self.assertTrue(areas["avm/ptn/foo/baz"]["edges"])
-        # only baz triggered a build (bar/qux were retained, no subprocess)
-        built = [c for c in calls if c == ["bicep", "build"]]
-        self.assertEqual(len(built), 1)
-
-    def test_resume_summary_reflects_merged_state(self):
-        prior = self._prior()
-        gather.resume_bundle(
-            prior, "clone",
-            which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
-            read_text=lambda _p: self.src,
-            run=lambda cmd, **kw: self.arm if cmd[:2] == ["bicep", "build"] else "")
-        summ = prior["code_graph"]["edge_extraction"]
-        self.assertEqual(summ["resolved"], 2)   # bar (retained) + baz (rebuilt)
-        self.assertEqual(summ["skipped"], 1)    # qux (retained)
-        self.assertEqual(summ["failed"], 0)
-
-    def test_only_status_does_not_clobber_when_no_toolchain(self):
-        # Resume with no CLI present must NOT wipe prior resolved edges.
-        prior = self._prior()
-        gather.extract_iac_edges(prior["code_graph"], "clone",
-                                 which=lambda _n: None,
-                                 only_status={"timeout", "failed"})
-        areas = {a["id"]: a for a in prior["code_graph"]["areas"]}
-        self.assertEqual(areas["avm/ptn/foo/bar"]["edges_status"], "resolved")
-        self.assertEqual(areas["avm/ptn/foo/bar"]["edges"],
-                         [{"to": "avm/res/x/y", "kind": "module"}])
-
-
-class TestRollupBundles(unittest.TestCase):
-    """Phase 3c.2: overlap-safe roll-up of monthly installments."""
-
-    def _bundle(self, frm, to, sha, prs, issues, cg_label):
-        return {
-            "meta": {"owner": "o", "repo": "r", "from": frm, "to": to,
-                     "clone_sha": sha, "period": {"from": frm, "to": to}},
-            "prs": prs, "issues": issues,
-            "commits": [], "code_events": [], "releases": [], "milestones": [],
-            "code_graph": {"provider": "directory",
-                           "areas": [{"id": "a", "label": cg_label}]},
-        }
-
-    def test_overlap_pr_deduped_by_number(self):
-        # PR #10 merged on the seam appears in both windows → once in the roll-up.
-        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40,
-                            [{"number": 10, "title": "seam"}], [], "apr")
-        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40,
-                            [{"number": 10, "title": "seam"}, {"number": 11}], [], "may")
-        merged = gather.rollup_bundles([apr, may])
-        nums = sorted(p["number"] for p in merged["prs"])
-        self.assertEqual(nums, [10, 11])
-
-    def test_mutable_item_takes_freshest_observation(self):
-        # issue #5 is open in April, closed by June → roll-up keeps the later state.
-        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [],
-                            [{"number": 5, "state": "open"}], "apr")
-        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [],
-                            [{"number": 5, "state": "closed"}], "may")
-        merged = gather.rollup_bundles([apr, may])
-        self.assertEqual(len(merged["issues"]), 1)
-        self.assertEqual(merged["issues"][0]["state"], "closed")
-
-    def test_structure_and_period_from_span_and_latest(self):
-        apr = self._bundle("2026-04-01", "2026-05-02", "a" * 40, [], [], "apr")
-        may = self._bundle("2026-04-29", "2026-06-01", "b" * 40, [], [], "may")
-        # pass out of order to prove it sorts by period
-        merged = gather.rollup_bundles([may, apr])
-        self.assertEqual(merged["meta"]["period"],
-                         {"from": "2026-04-01", "to": "2026-06-01"})
-        self.assertEqual(merged["meta"]["clone_sha"], "b" * 40)        # latest
-        self.assertEqual(merged["code_graph"]["areas"][0]["label"], "may")  # latest
-        self.assertEqual(len(merged["meta"]["rolled_up_from"]), 2)
-
-    def test_empty_raises(self):
-        with self.assertRaises(ValueError):
-            gather.rollup_bundles([])
-
-    def test_rollup_cli_end_to_end(self):
-        # Exercise the --rollup CLI path (acquire dispatch + file IO + out write),
-        # codifying the operational flow so it's covered offline (no clone/token).
-        with tempfile.TemporaryDirectory() as d:
-            f1 = os.path.join(d, "apr.json")
-            f2 = os.path.join(d, "may.json")
-            out = os.path.join(d, "half.json")
-            with open(f1, "w") as fh:
-                json.dump(self._bundle("2026-04-01", "2026-05-02", "a" * 40,
-                                       [{"number": 1}], [], "apr"), fh)
-            with open(f2, "w") as fh:
-                json.dump(self._bundle("2026-04-29", "2026-06-01", "b" * 40,
-                                       [{"number": 1}, {"number": 2}], [], "may"), fh)
-            gather.main(["--rollup", f1, f2, "--out", out])
-            with open(out) as fh:
-                merged = json.load(fh)
-        self.assertEqual(sorted(p["number"] for p in merged["prs"]), [1, 2])  # deduped
-        self.assertEqual(merged["meta"]["period"],
-                         {"from": "2026-04-01", "to": "2026-06-01"})
-        self.assertEqual(merged["code_graph"]["areas"][0]["label"], "may")  # latest
-
-
 class TestAcquireEdgesP3c(unittest.TestCase):
     """Compose the provider + edge seam offline (graphify + bicep absent ->
     directory provider, edges empty; bicep stubbed -> edges populate)."""
@@ -2038,23 +1904,25 @@ class TestFoldBundle(unittest.TestCase):
             gather.fold_bundle(self.conn, {"meta": {}})
 
 
-class TestStoreFlag(unittest.TestCase):
-    def _run_main(self, extra_args, out_dir):
-        out_path = os.path.join(out_dir, "bundle.json")
+class TestStoreOnly(unittest.TestCase):
+    """Phase 7 store-only: `gather --store` is THE deliverable. main folds the
+    in-memory bundle into the journey-graph store and writes NO bundle file
+    (--out is gone); --store is required."""
+
+    def _run_main(self, extra_args):
         orig = gather.acquire
         gather.acquire = lambda args, env: _fold_fixture_bundle()
         try:
-            gather.main(["--owner", "acme", "--repo", "widget",
-                         "--from", "2026-01-01", "--to", "2026-01-31",
-                         "--out", out_path] + extra_args)
+            return gather.main(["--owner", "acme", "--repo", "widget",
+                                "--from", "2026-01-01", "--to", "2026-01-31"]
+                               + extra_args)
         finally:
             gather.acquire = orig
-        return out_path
 
-    def test_main_folds_into_store_when_flag_set(self):
+    def test_main_folds_into_store(self):
         with tempfile.TemporaryDirectory() as d:
             store_path = os.path.join(d, "store.db")
-            self._run_main(["--store", store_path], d)
+            self._run_main(["--store", store_path])
             self.assertTrue(os.path.exists(store_path))
             conn = graphstore.open_store(store_path)
             try:
@@ -2062,11 +1930,12 @@ class TestStoreFlag(unittest.TestCase):
                     conn, "acme/widget#pr-10")["node_class"], "social")
             finally:
                 conn.close()
+            # store-only: NO bundle JSON file is emitted alongside the store.
+            self.assertEqual([f for f in os.listdir(d) if f.endswith(".json")], [])
 
-    def test_no_store_flag_writes_no_db(self):
-        with tempfile.TemporaryDirectory() as d:
-            self._run_main([], d)
-            self.assertEqual([f for f in os.listdir(d) if f.endswith(".db")], [])
+    def test_main_requires_store(self):
+        with self.assertRaises(SystemExit):
+            self._run_main([])
 
 
 def _artifact_fold_bundle():

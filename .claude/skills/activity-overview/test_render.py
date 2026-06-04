@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import derive  # noqa: E402
 import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
@@ -401,10 +402,10 @@ class TestEndToEndOfflineP3(unittest.TestCase):
         arts = bundle["artifacts"]
         doc = next(a for a in arts.values() if a["path"] == "docs/firewall.md")
         self.assertEqual(doc["status"], "removed")
-        old_ex = arts[link.artifact_id("examples/basic/main.bicep")]
+        old_ex = arts[derive.artifact_id("examples/basic/main.bicep")]
         self.assertEqual(old_ex["status"], "replaced")
         self.assertEqual(old_ex["replaced_by"],
-                         link.artifact_id("examples/advanced/main.bicep"))
+                         derive.artifact_id("examples/advanced/main.bicep"))
 
         # timeline: both layers, sorted, well-formed refs
         tl = bundle["timeline"]
@@ -514,11 +515,11 @@ class TestEndToEndOfflineP3b(unittest.TestCase):
 
         # code_area filled on the example artifact (covered by the AVM area)
         ex = bundle["artifacts"][
-            link.artifact_id(
+            derive.artifact_id(
                 "avm/res/network/firewall-policy/examples/basic/main.bicep")]
         self.assertEqual(ex["code_area"], "avm/res/network/firewall-policy")
         # docs artifact -> docs area
-        doc = bundle["artifacts"][link.artifact_id("docs/firewall.md")]
+        doc = bundle["artifacts"][derive.artifact_id("docs/firewall.md")]
         self.assertEqual(doc["code_area"], "docs")
 
         # feature_deltas carry a real area now (no longer all null)

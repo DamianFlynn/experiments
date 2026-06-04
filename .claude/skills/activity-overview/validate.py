@@ -28,9 +28,10 @@ The invariants (each a named check; see the per-function docstrings):
                                     no empty/non-round-tripping id.
     schema_conformance      ERROR  each edge type's endpoints match STORE.md.
     no_drift                ERROR  stored people/artifacts == freshly re-derived
-                                    from the bundle (only with --bundle).
+                                    from the bundle (self-sourced from the store
+                                    via extract; --bundle is an optional cross-check).
     idempotency             ERROR  re-folding the bundle changes no counts
-                                    (only with --bundle).
+                                    (bundle self-sourced from the store).
 """
 
 import argparse
@@ -42,6 +43,7 @@ import sys
 import graphstore
 from graphstore import SPINE_EDGE_TYPES
 import derive
+import extract
 
 try:
     import gather
@@ -624,12 +626,42 @@ def check_idempotency(conn, bundle):
 
 # --- top-level driver ---------------------------------------------------------
 
+def _store_window(conn, project, repo):
+    """The full activity window of a store: (min_ts, max_ts) over project/repo
+    nodes that carry a timestamp (structure nodes are NULL-ts and excluded). The
+    span is used to self-source the raw bundle via extract so the trust gate is
+    fully self-contained on a store (no external bundle file needed)."""
+    row = conn.execute(
+        "SELECT MIN(ts), MAX(ts) FROM nodes "
+        "WHERE project=? AND repo=? AND ts IS NOT NULL",
+        (project, repo)).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def _self_source_bundle(conn, project, repo):
+    """Reconstruct the raw bundle FROM THE STORE via extract, over the store's
+    full activity window. In a store-only world (Phase 7) there is no bundle
+    FILE; the bundle is the transient view extract materializes. Running it here
+    lets no_drift/idempotency audit the store with no external input. Returns
+    None when the store has no in-window activity (nothing to self-source)."""
+    ts_from, ts_to = _store_window(conn, project, repo)
+    if ts_from is None or ts_to is None:
+        return None
+    # extract materializes only RAW keys; that is exactly what no_drift /
+    # idempotency re-derive against (they run derive.* themselves).
+    return extract.extract(conn, project, repo, ts_from, ts_to,
+                           warn=lambda _msg: None)
+
+
 def validate(conn, project=None, repo=None, bundle=None):
     """Audit a populated store; return a Report.
 
     project/repo are derived from the store (`nodes`) when not passed, so this
-    works over a real gathered store. When `bundle` is provided the two
-    real-data checks (no_drift, idempotency) additionally run.
+    works over a real gathered store. The two real-data checks (no_drift,
+    idempotency) need a raw bundle to re-derive against; when `bundle` is not
+    passed they SELF-SOURCE it from the store (via extract over the store's full
+    window) so the gate is self-contained on a store-only deliverable. A passed
+    `bundle` is honored as an optional cross-check but is never required.
     """
     project, repo = _detect_project_repo(conn, project, repo)
     checks = [
@@ -639,10 +671,30 @@ def validate(conn, project=None, repo=None, bundle=None):
         check_no_fabrication(conn),
         check_schema_conformance(conn),
     ]
-    if bundle is not None:
-        checks.append(check_no_drift(conn, project, repo, bundle))
-        checks.append(check_idempotency(conn, bundle))
+    drift_bundle = bundle if bundle is not None \
+        else _self_source_bundle(conn, project, repo)
+    if drift_bundle is not None:
+        # A self-sourced bundle mirrors the store; if the store is corrupt the
+        # re-derive/re-fold can RAISE. The auditor must never crash on a bad
+        # store — surface the failure as an ERROR detail so the gate still fails
+        # loudly (the structural checks above usually name the root cause).
+        checks.append(_guarded(check_no_drift, "no_drift",
+                               conn, project, repo, drift_bundle))
+        checks.append(_guarded(check_idempotency, "idempotency",
+                               conn, drift_bundle))
     return Report(checks)
+
+
+def _guarded(fn, name, *args):
+    """Run a real-data check, converting an exception (corrupt store breaking the
+    re-derive/re-fold) into a failed ERROR check rather than crashing the audit."""
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 - auditor must survive a bad store
+        return _check(name, ERROR, [{
+            "severity": ERROR,
+            "problem": "check could not run on this store",
+            "error": "{}: {}".format(type(exc).__name__, exc)}])
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -680,7 +732,8 @@ def main(argv=None):
     parser.add_argument("--repo", default=None,
                         help="repo (auto-detected from the store if omitted)")
     parser.add_argument("--bundle", default=None,
-                        help="raw bundle JSON to enable no_drift + idempotency")
+                        help="optional raw bundle JSON cross-check for no_drift + "
+                             "idempotency (unnecessary: they self-source from the store)")
     parser.add_argument("--json", action="store_true",
                         help="emit the report as JSON instead of text")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
