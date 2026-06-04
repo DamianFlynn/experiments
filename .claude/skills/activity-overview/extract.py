@@ -94,6 +94,16 @@ def _local(node_id):
     return graphstore.parse_id(node_id)["local"]
 
 
+def _full_local(node_id, project, repo):
+    """The node's local id with ONLY the `{project}/{repo}#` scope prefix stripped.
+    Unlike `_local` (which rpartitions on the LAST `#`, truncating a symbol
+    artifact's `<path>#<lang>:<subkind>:<name>` local id down to
+    `<lang>:<subkind>:<name>`), this preserves any internal `#` — so symbol/comment
+    artifact ids round-trip intact and never collide by key."""
+    prefix = "{}/{}#".format(project, repo)
+    return node_id[len(prefix):] if node_id.startswith(prefix) else _local(node_id)
+
+
 def _is_commit_node(node):
     """True for a real commit `code` node, False for an artifact one. Commits are
     keyed by a bare `<sha>` local id and their record carries `sha`; artifact
@@ -234,7 +244,8 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # each artifact path in the (already source-ordered) code_events — to reproduce
     # the same timeline byte-for-byte. Artifacts with no code_event (none today)
     # fall to the end, ordered by id.
-    arts = {_local(n["id"]): n["data"] for n in codes if _is_artifact_node(n)}
+    arts = {_full_local(n["id"], project, repo): n["data"]
+            for n in codes if _is_artifact_node(n)}
     bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"])
 
     # people: the per-login modules/areas fold persisted as project-scoped person
@@ -329,7 +340,6 @@ def _materialize_code_events(conn, project, repo):
     """Reconstruct the raw `code_events` array from the file-level ledger, in
     original source order (ledger rowid order). rename/copy recover `old_path`
     from the event's `detail` (fold_bundle stored old_path there)."""
-    prefix = "{}/{}#".format(project, repo)
     out = []
     for ev in graphstore.repo_code_events(conn, project, repo):
         aid = ev["artifact_id"]
@@ -337,7 +347,7 @@ def _materialize_code_events(conn, project, repo):
         # for a file event, `<path>#<lang>:<subkind>:<name>` for a symbol one.
         # Skip symbol-granular rows — they are part of the artifact substrate, not
         # this raw file-level `code_events` array (file paths have no `#`).
-        remainder = aid[len(prefix):] if aid.startswith(prefix) else _local(aid)
+        remainder = _full_local(aid, project, repo)
         if "#" in remainder:
             continue
         rec = {
@@ -374,11 +384,10 @@ def _materialize_symbol_events(conn, project, repo):
         we reverse it (`_EVENT_TO_SYMBOL_CHANGE`) to a change that recomputes the
         same event in build_artifacts, so the artifact lifecycle round-trips.
     Returns [] when the repo has no symbol rows (the goldens). Source-ordered."""
-    prefix = "{}/{}#".format(project, repo)
     out = []
     for ev in graphstore.repo_code_events(conn, project, repo):
         aid = ev["artifact_id"]
-        remainder = aid[len(prefix):] if aid.startswith(prefix) else _local(aid)
+        remainder = _full_local(aid, project, repo)
         # Symbol rows have a second `#`: `<path>#<lang>:<subkind>:<name>`. A bare
         # `<path>` file-level row has none and belongs to code_events, not here.
         if "#" not in remainder:

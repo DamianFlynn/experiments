@@ -271,6 +271,55 @@ class ExtractSymbolEventsRoundTrip(unittest.TestCase):
             "self-sourced no_drift must pass; details: {}".format(nd["details"]))
 
 
+class ExtractArtifactsKeyNoCollision(unittest.TestCase):
+    """Regression (Copilot review on #13): extract keyed bundle["artifacts"] via
+    `_local` (parse_id rpartitions the LAST `#`), truncating a symbol artifact's
+    `<path>#<lang>:<subkind>:<name>` id down to `<lang>:<subkind>:<name>`. Two
+    files sharing a symbol of the same lang:subkind:name then collided to one key,
+    silently dropping artifacts from the materialized view. No golden carries
+    symbol artifacts, so no gate caught it — on the real AVM store 27 of 94
+    artifacts were lost. extract must key by the FULL local id."""
+
+    def test_same_symbol_in_two_files_does_not_collide(self):
+        c1 = "c" * 40
+        bundle = {
+            "meta": {"owner": "o", "repo": "r",
+                     "from": "2026-05-01", "to": "2026-05-31"},
+            "commits": [{"sha": c1, "message": "Add", "pr": None,
+                         "author": "Alice", "date": "2026-05-03"}],
+            "code_events": [
+                {"commit": c1, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "avm/res/a/main.bicep"},
+                {"commit": c1, "author": "Alice", "date": "2026-05-03",
+                 "change": "add", "path": "avm/res/b/main.bicep"},
+            ],
+            "symbol_events": [
+                {"path": "avm/res/a/main.bicep", "lang": "bicep",
+                 "subkind": "param", "name": "location", "change": "add",
+                 "commit": c1, "author": "Alice", "date": "2026-05-03",
+                 "before": None, "after": "param location string"},
+                {"path": "avm/res/b/main.bicep", "lang": "bicep",
+                 "subkind": "param", "name": "location", "change": "add",
+                 "commit": c1, "author": "Alice", "date": "2026-05-03",
+                 "before": None, "after": "param location string"},
+            ],
+            "prs": [], "issues": [], "milestones": [], "releases": [],
+        }
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(bundle))
+        m = bundle["meta"]
+        ex = extract.extract(conn, m["owner"], m["repo"], m["from"], m["to"],
+                             warn=lambda _m: None)
+        arts = ex["artifacts"]
+        # Both same-named symbols survive under DISTINCT, full-local keys.
+        self.assertIn("avm/res/a/main.bicep#bicep:param:location", arts)
+        self.assertIn("avm/res/b/main.bicep#bicep:param:location", arts)
+        # And extract's keying matches build_artifacts (the source of truth).
+        self.assertEqual(set(arts), set(derive.build_artifacts(bundle)),
+                         "extract artifacts map must key exactly as build_artifacts")
+
+
 class ExtractSymbolMovesRoundTrip(unittest.TestCase):
     """Bonus: with symbol_events round-tripped, symbol_moves is no longer FORCED
     empty by missing symbol_events. A `drop` in one file + `add` in another (the
