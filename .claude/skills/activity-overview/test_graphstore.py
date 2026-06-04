@@ -55,5 +55,43 @@ class TestIdentity(unittest.TestCase):
         self.assertNotEqual(a, b)
 
 
+class TestNodes(unittest.TestCase):
+    def test_upsert_then_get_round_trips_data(self):
+        conn = _store()
+        nid = graphstore.qualify_id("p", "r", "pr-1")
+        graphstore.upsert_node(
+            conn, id=nid, project="p", repo="r", node_class="social",
+            ts="2026-04-01T00:00:00Z", data={"number": 1, "title": "x"},
+        )
+        node = graphstore.get_node(conn, nid)
+        self.assertEqual(node["id"], nid)
+        self.assertEqual(node["node_class"], "social")
+        self.assertEqual(node["data"], {"number": 1, "title": "x"})
+
+    def test_get_missing_returns_none(self):
+        conn = _store()
+        self.assertIsNone(graphstore.get_node(conn, "nope#x"))
+
+    def test_reupsert_updates_in_place_no_duplicate(self):
+        conn = _store()
+        nid = graphstore.qualify_id("p", "r", "issue-1")
+        graphstore.upsert_node(
+            conn, id=nid, project="p", repo="r", node_class="social",
+            ts="2026-04-01T00:00:00Z", data={"state": "open"},
+            fetched_at="2026-04-01T00:00:00Z",
+        )
+        graphstore.upsert_node(
+            conn, id=nid, project="p", repo="r", node_class="social",
+            ts="2026-04-02T00:00:00Z", data={"state": "closed"},
+            fetched_at="2026-04-02T00:00:00Z",
+        )
+        count = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self.assertEqual(count, 1)
+        node = graphstore.get_node(conn, nid)
+        self.assertEqual(node["data"], {"state": "closed"})
+        self.assertEqual(node["ts"], "2026-04-02T00:00:00Z")
+        self.assertEqual(node["fetched_at"], "2026-04-02T00:00:00Z")
+
+
 if __name__ == "__main__":
     unittest.main()

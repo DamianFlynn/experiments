@@ -124,6 +124,43 @@ def parse_id(qid):
     return {"scope": scope, "local": local}
 
 
+def _row_to_node(row):
+    return {
+        "id": row["id"],
+        "project": row["project"],
+        "repo": row["repo"],
+        "node_class": row["node_class"],
+        "ts": row["ts"],
+        "data": json.loads(row["data"]),
+        "fetched_at": row["fetched_at"],
+    }
+
+
+def upsert_node(conn, id, project, repo, node_class, ts, data, fetched_at=None):
+    """Insert or update a node by id. Identity columns (project/repo/
+    node_class) are immutable; ts/data/fetched_at refresh on conflict."""
+    if node_class not in NODE_CLASSES:
+        raise ValueError("unknown node_class: {}".format(node_class))
+    conn.execute(
+        "INSERT INTO nodes (id, project, repo, node_class, ts, data, fetched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "ts=excluded.ts, data=excluded.data, fetched_at=excluded.fetched_at",
+        (
+            id, project, repo, node_class, ts,
+            json.dumps(data, sort_keys=True),
+            now_iso() if fetched_at is None else fetched_at,
+        ),
+    )
+    conn.commit()
+
+
+def get_node(conn, id):
+    """Return the node dict for id, or None if absent."""
+    row = conn.execute("SELECT * FROM nodes WHERE id=?", (id,)).fetchone()
+    return _row_to_node(row) if row else None
+
+
 def init_schema(conn):
     """Create all tables. FTS5 table is created when the build supports it."""
     conn.executescript(_CORE_SCHEMA)
