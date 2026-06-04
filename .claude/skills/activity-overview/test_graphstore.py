@@ -324,5 +324,55 @@ class TestMetaProvenance(unittest.TestCase):
         self.assertIsNone(graphstore.get_clone_sha(conn, "p", "missing"))
 
 
+def _fold(conn):
+    """Simulate one gather fold: a small train + a code event + edges."""
+    for nid, klass, ts in [
+        ("p/r#issue-1", "social", "2026-04-01T00:00:00Z"),
+        ("p/r#pr-1", "social", "2026-04-03T00:00:00Z"),
+        ("p/r#commit-1", "code", "2026-04-03T00:00:00Z"),
+    ]:
+        graphstore.upsert_node(
+            conn, id=nid, project="p", repo="r", node_class=klass,
+            ts=ts, data={"id": nid}, fetched_at="2026-04-04T00:00:00Z",
+        )
+    graphstore.upsert_edge(conn, "p/r#pr-1", "p/r#issue-1", "closes")
+    graphstore.upsert_edge(conn, "p/r#commit-1", "p/r#pr-1", "part_of")
+    graphstore.add_code_event(
+        conn, "p/r#main.bicep#bicep:param:x", "add", "commit-1",
+        date="2026-04-03T00:00:00Z",
+    )
+    graphstore.record_window(conn, "p", "r", "2026-04-01", "2026-04-30")
+
+
+def _counts(conn):
+    return {
+        t: conn.execute("SELECT COUNT(*) FROM {}".format(t)).fetchone()[0]
+        for t in ("nodes", "edges", "code_events")
+    }
+
+
+class TestIdempotentAccumulation(unittest.TestCase):
+    def test_folding_same_window_twice_is_noop(self):
+        conn = _store()
+        _fold(conn)
+        first = _counts(conn)
+        _fold(conn)  # overlapping re-gather
+        second = _counts(conn)
+        self.assertEqual(first, second)
+        self.assertEqual(len(graphstore.get_windows(conn)), 1)
+
+    def test_overlapping_window_unions_new_node_only(self):
+        conn = _store()
+        _fold(conn)
+        # an overlapping window that adds exactly one new node
+        graphstore.upsert_node(
+            conn, id="p/r#pr-2", project="p", repo="r", node_class="social",
+            ts="2026-04-29T00:00:00Z", data={"id": "p/r#pr-2"},
+        )
+        self.assertEqual(_counts(conn)["nodes"], 4)
+        _fold(conn)  # re-fold the original window; pr-2 must survive, nothing duplicates
+        self.assertEqual(_counts(conn)["nodes"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()
