@@ -999,3 +999,44 @@ class TestHonestContract(unittest.TestCase):
         for t in res["delivered"]:
             self.assertTrue(t["complete"])
             self.assertEqual(t["gaps"], [])
+
+
+class TestWindowedGapWithPhantom(unittest.TestCase):
+    def test_person_query_reports_outside_window_and_prunes_phantom(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        # alice's in-window PR #10 closes out-of-window issue #7 (a real anchor,
+        # provided by the fetcher) AND has a `Fixes #123` phantom (ABSENT).
+        pr = graphstore.qualify_id("acme", "widget", "pr-10")
+        issue = graphstore.qualify_id("acme", "widget", "issue-7")
+        phantom = graphstore.qualify_id("acme", "widget", "issue-123")
+        rfc = graphstore.qualify_id("acme", "widget", "issue-5")
+        person = graphstore.qualify_person("acme", "alice")
+        graphstore.upsert_node(conn, pr, "acme", "widget", "social",
+                               "2026-06-10T00:00:00Z", {"number": 10})
+        graphstore.upsert_node(conn, person, "acme", "*", "structure", None,
+                               {"login": "alice"})
+        graphstore.upsert_edge(conn, person, pr, "authored")
+        graphstore.upsert_edge(conn, pr, issue, "closes")
+        graphstore.upsert_edge(conn, pr, phantom, "closes")
+
+        def fetch(kind, local, qid):
+            if local == "issue-7":
+                return {"node": {"number": 7, "closed_at": "2026-01-01T00:00:00Z",
+                                 "state": "closed"},
+                        "edges": [("issue-5", "spun_off")]}
+            if local == "issue-123":
+                return gather.ABSENT
+            return None
+        backfill = lambda c, mid: gather.backfill(c, mid, fetch=fetch)  # noqa: E731
+
+        res = spotlight.person_impact(conn, "acme", "alice",
+                                      ts_from="2026-06-01", ts_to="2026-06-30",
+                                      backfill=backfill)
+        self.assertTrue(res["delivered"])
+        train = res["delivered"][0]
+        self.assertFalse(train["complete"])
+        gap_ids = {g["id"]: g["reason"] for g in train["gaps"]}
+        self.assertNotIn(phantom, gap_ids)             # phantom pruned, not a gap
+        self.assertTrue(graphstore.is_dead_ref(conn, phantom))
+        self.assertEqual(gap_ids.get(rfc), "outside_window")  # honest pointer
