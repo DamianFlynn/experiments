@@ -234,6 +234,234 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
+_SYM = lambda path, name, change, commit, author, date, before, after: {
+    "path": path, "lang": "bicep", "subkind": "resource", "name": name,
+    "change": change, "commit": commit, "author": author, "date": date,
+    "before": before, "after": after}
+
+
+def _evolution_create_bundle(repo="r1"):
+    """Window 1: the bicep resource symbol `fw` is added in old.bicep and then
+    changed there. (Folded separately from the move window so each fold's
+    drop/add sets stay UNIQUE — match_symbol_moves is window-wide and would
+    otherwise see the creation `add` and the move `add` as an ambiguous pair.)"""
+    return {
+        "meta": {"owner": "acme", "repo": repo,
+                 "from": "2026-01-01", "to": "2026-01-15"},
+        "prs": [], "issues": [],
+        "commits": [
+            {"sha": "aaa1111", "message": "add fw", "author": "alice",
+             "date": "2026-01-05T00:00:00Z",
+             "url": "https://github.com/acme/{}/commit/aaa1111".format(repo)},
+            {"sha": "bbb2222", "message": "tweak fw", "author": "alice",
+             "date": "2026-01-10T00:00:00Z",
+             "url": "https://github.com/acme/{}/commit/bbb2222".format(repo)},
+        ],
+        "symbol_events": [
+            _SYM("old.bicep", "fw", "add", "aaa1111", "alice",
+                 "2026-01-05T00:00:00Z", None, "resource fw v1"),
+            _SYM("old.bicep", "fw", "change", "bbb2222", "alice",
+                 "2026-01-10T00:00:00Z", "resource fw v1", "resource fw v2"),
+        ],
+    }
+
+
+def _evolution_move_bundle(repo="r1"):
+    """Window 2: `fw` is dropped from old.bicep and added in new.bicep — a
+    UNIQUE-name move within this window, so match_symbol_moves links old->new
+    (replaced_by old->new, identity_from new->old). Combined with window 1 the
+    source artifact's lifecycle spans add+change+remove in date order."""
+    return {
+        "meta": {"owner": "acme", "repo": repo,
+                 "from": "2026-01-16", "to": "2026-01-31"},
+        "prs": [], "issues": [],
+        "commits": [
+            {"sha": "ccc3333", "message": "move fw to new.bicep", "author": "bob",
+             "date": "2026-01-20T00:00:00Z",
+             "url": "https://github.com/acme/{}/commit/ccc3333".format(repo)},
+        ],
+        "symbol_events": [
+            _SYM("old.bicep", "fw", "drop", "ccc3333", "bob",
+                 "2026-01-20T00:00:00Z", "resource fw v2", None),
+            _SYM("new.bicep", "fw", "add", "ccc3333", "bob",
+                 "2026-01-20T00:00:00Z", None, "resource fw v2"),
+        ],
+    }
+
+
+class TestPatternEvolution(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _evolution_create_bundle())
+        gather.fold_bundle(self.conn, _evolution_move_bundle())
+        self.src = graphstore.qualify_id(
+            "acme", "r1", "old.bicep#bicep:resource:fw")
+        self.dst = graphstore.qualify_id(
+            "acme", "r1", "new.bicep#bicep:resource:fw")
+
+    def test_golden_lifecycle(self):
+        res = spotlight.pattern_evolution(self.conn, "acme", self.src)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["query"], "symbol")
+        self.assertEqual(res["artifact_id"], self.src)
+        lc = res["lifecycle"]
+        # add -> change -> remove, in (date, commit) order
+        self.assertEqual([e["event"] for e in lc], ["add", "change", "remove"])
+        self.assertEqual([e["commit"] for e in lc],
+                         ["aaa1111", "bbb2222", "ccc3333"])
+        # symbols carry bounded before/after
+        self.assertEqual(lc[0]["before"], None)
+        self.assertEqual(lc[0]["after"], "resource fw v1")
+        self.assertEqual(lc[1]["before"], "resource fw v1")
+        # each cited by commit ref/commit
+        for e in lc:
+            self.assertIn("commit", e)
+            self.assertIn("author", e)
+            self.assertIn("date", e)
+
+    def test_golden_identity_chain(self):
+        res = spotlight.pattern_evolution(self.conn, "acme", self.src)
+        chain = res["identity_chain"]
+        # ordered A -> B across the move
+        self.assertEqual([c["id"] for c in chain], [self.src, self.dst])
+        # the move link carries confidence + basis
+        link = [c for c in chain if c.get("confidence")]
+        self.assertTrue(link)
+        self.assertIn(link[0]["confidence"], ("high", "medium"))
+        self.assertIn("basis", link[0])
+
+    def test_chain_from_dst_same_chain(self):
+        # walking from the destination recovers the same ordered chain
+        res = spotlight.pattern_evolution(self.conn, "acme", self.dst)
+        self.assertEqual([c["id"] for c in res["identity_chain"]],
+                         [self.src, self.dst])
+
+    def test_accepts_local_id(self):
+        res = spotlight.pattern_evolution(
+            self.conn, "acme", "old.bicep#bicep:resource:fw")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["artifact_id"], self.src)
+
+    def test_needs_gather_unknown(self):
+        res = spotlight.pattern_evolution(
+            self.conn, "acme", "nope.bicep#bicep:resource:ghost")
+        self.assertEqual(res["status"], "needs_gather")
+        self.assertIn("guidance", res)
+
+    def test_determinism(self):
+        a = json.dumps(spotlight.pattern_evolution(self.conn, "acme", self.src),
+                       sort_keys=True)
+        b = json.dumps(spotlight.pattern_evolution(self.conn, "acme", self.src),
+                       sort_keys=True)
+        self.assertEqual(a, b)
+
+
+def _subsystem_store(conn):
+    """Seed a store directly (areas/owns/depends_on are sparse via fold, so we
+    craft the graph) with one area that has: a codeowner (owns), two PRs that
+    touch it via their commits (one merged=shipped, one open=stalled), and a
+    depends_on edge in each direction."""
+    P, R = "acme", "r1"
+    qid = lambda local: graphstore.qualify_id(P, R, local)
+    area = "area-avm/res/net/fw"
+    dep_up = "area-avm/res/net/base"   # fw depends_on base (forward / out)
+    dep_dn = "area-avm/res/net/app"    # app depends_on fw (reverse / in)
+    fetched = "2026-01-01T00:00:00Z"
+    nodes = [
+        (qid(area), P, R, "structure", None,
+         {"id": "avm/res/net/fw", "paths": ["avm/res/net/fw"]}, fetched),
+        (qid(dep_up), P, R, "structure", None, {"id": "avm/res/net/base"}, fetched),
+        (qid(dep_dn), P, R, "structure", None, {"id": "avm/res/net/app"}, fetched),
+        (graphstore.qualify_person(P, "owner1"), P, "*", "structure", None,
+         {"login": "owner1"}, fetched),
+        # PR 1 merged (shipped), PR 2 open (stalled)
+        (qid("pr-1"), P, R, "social", "2026-01-10T00:00:00Z",
+         {"number": 1, "title": "ship fw", "state": "closed", "merged": True,
+          "url": "https://github.com/acme/r1/pull/1"}, fetched),
+        (qid("pr-2"), P, R, "social", "2026-01-15T00:00:00Z",
+         {"number": 2, "title": "wip fw", "state": "open", "merged": False,
+          "url": "https://github.com/acme/r1/pull/2"}, fetched),
+        # commits that touch the area, each part_of a PR
+        (qid("sha1"), P, R, "code", "2026-01-09T00:00:00Z",
+         {"sha": "sha1", "author": "carol"}, fetched),
+        (qid("sha2"), P, R, "code", "2026-01-14T00:00:00Z",
+         {"sha": "sha2", "author": "dave"}, fetched),
+    ]
+    graphstore.upsert_nodes(conn, nodes)
+    edges = [
+        (graphstore.qualify_person(P, "owner1"), qid(area), "owns", None, None),
+        (qid("sha1"), qid(area), "touches", None, None),
+        (qid("sha2"), qid(area), "touches", None, None),
+        (qid("sha1"), qid("pr-1"), "part_of", None, None),
+        (qid("sha2"), qid("pr-2"), "part_of", None, None),
+        (qid(area), qid(dep_up), "depends_on", None,
+         {"version": "1.0.0", "transitive": False}),
+        (qid(dep_dn), qid(area), "depends_on", None,
+         {"version": "2.0.0", "transitive": True}),
+    ]
+    graphstore.upsert_edges(conn, edges)
+
+
+class TestSubsystemSplit(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        _subsystem_store(self.conn)
+
+    def test_golden(self):
+        res = spotlight.subsystem_split(self.conn, "acme", "avm/res/net/fw")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["query"], "subsystem")
+        self.assertEqual(res["area"], "avm/res/net/fw")
+
+        # contributors: owner1 (owns) + carol/dave via touching commits
+        relations = {c["login"]: c["relation"] for c in res["contributors"]}
+        self.assertEqual(relations.get("owner1"), "owns")
+        # touching-commit authors surface as touches contributors
+        self.assertIn("carol", relations)
+        self.assertEqual(relations["carol"], "touches")
+        # ordered by login
+        logins = [c["login"] for c in res["contributors"]]
+        self.assertEqual(logins, sorted(logins))
+
+        # shipped (PR1 merged) vs stalled (PR2 open)
+        shipped = [i["number"] for i in res["shipped"]]
+        stalled = [i["number"] for i in res["stalled"]]
+        self.assertEqual(shipped, [1])
+        self.assertEqual(stalled, [2])
+        self.assertEqual(res["shipped"][0]["url"],
+                         "https://github.com/acme/r1/pull/1")
+
+        # blast radius both directions, carrying version/transitive
+        deps_out = res["depends_on"]["out"]
+        deps_in = res["depends_on"]["in"]
+        self.assertEqual([d["area"] for d in deps_out], ["avm/res/net/base"])
+        self.assertEqual(deps_out[0]["version"], "1.0.0")
+        self.assertEqual([d["area"] for d in deps_in], ["avm/res/net/app"])
+        self.assertEqual(deps_in[0]["transitive"], True)
+
+    def test_time_range_filter(self):
+        # PR2 (ts 2026-01-15) excluded by an early --to
+        res = spotlight.subsystem_split(
+            self.conn, "acme", "avm/res/net/fw",
+            ts_from="2026-01-01", ts_to="2026-01-12")
+        nums = [i["number"] for i in res["shipped"] + res["stalled"]]
+        self.assertEqual(nums, [1])
+
+    def test_needs_gather_unknown_area(self):
+        res = spotlight.subsystem_split(self.conn, "acme", "no/such/area")
+        self.assertEqual(res["status"], "needs_gather")
+        self.assertIn("guidance", res)
+
+    def test_determinism(self):
+        a = json.dumps(spotlight.subsystem_split(self.conn, "acme",
+                       "avm/res/net/fw"), sort_keys=True)
+        b = json.dumps(spotlight.subsystem_split(self.conn, "acme",
+                       "avm/res/net/fw"), sort_keys=True)
+        self.assertEqual(a, b)
+
+
 @unittest.skipUnless(os.path.exists(REAL_STORE), "real store absent")
 class TestRealDataSmoke(unittest.TestCase):
     def test_person_impact_real(self):
@@ -249,6 +477,29 @@ class TestRealDataSmoke(unittest.TestCase):
             ("url" in r or "number" in r or "sha" in r)
             for g in res["contributions"].values() for r in g["items"])
         self.assertTrue(any_cite)
+
+    def test_pattern_evolution_real(self):
+        # a real file artifact with a code_event lifecycle (109 events in store)
+        conn = graphstore.open_store(REAL_STORE)
+        aid = ("Azure/bicep-registry-modules#"
+               "avm/res/cache/redis/main.bicep")
+        res = spotlight.pattern_evolution(conn, "Azure", aid)
+        conn.close()
+        self.assertEqual(res["status"], "ok")
+        self.assertGreaterEqual(len(res["lifecycle"]), 1)
+        # each lifecycle row carries its commit citation
+        for e in res["lifecycle"]:
+            self.assertIn("commit", e)
+        # identity_chain is at least the artifact itself (no moves in store)
+        self.assertEqual(res["identity_chain"][0]["id"], aid)
+
+    def test_subsystem_split_real_sparse(self):
+        # owns/depends_on are empty in the short real window; touches has 4.
+        # The query must run cleanly and return ok or needs_gather.
+        conn = graphstore.open_store(REAL_STORE)
+        res = spotlight.subsystem_split(conn, "Azure", "avm/res/cache/redis")
+        conn.close()
+        self.assertIn(res["status"], ("ok", "needs_gather"))
 
 
 if __name__ == "__main__":

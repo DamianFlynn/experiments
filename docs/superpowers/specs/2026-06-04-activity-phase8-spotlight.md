@@ -145,9 +145,32 @@ returns the expected aggregate with citations; FTS returns matches `O(matches)`"
   seeded golden, cross-repo aggregation, needs_gather, determinism, and a
   real-data smoke (`test_spotlight.py`). *Gate met:* person-impact golden green;
   FTS populated on fold; Phase 7 suites unchanged (537 passed, 2 skipped).
-- **8b — pattern-evolution + subsystem-split.** The graph-traversal queries
-  (identity-chain lifecycle; area contributors/shipped/`depends_on`). Seeded
-  fixtures for subsystem (sparse real data). *Gate:* both query goldens green.
+- **8b — pattern-evolution + subsystem-split.** **DONE.** The graph-traversal
+  queries ship end-to-end in `spotlight.py`. **pattern-evolution** (`symbol`):
+  full lifecycle from `get_code_events` ordered by `(date, commit)`, each row
+  cited by its commit ref; **identity_chain** assembled by walking `replaced_by`
+  forward + `identity_from` backward (depth-capped) into an ordered A->B->C
+  chain, each move link carrying `confidence`/`basis` from edge `data`
+  (`move_confidence`/`move_basis`); accepts qualified or local artifact ids;
+  unknown id -> `needs_gather`. **subsystem-split** (`subsystem [--from --to]`):
+  contributors = inverse `owns` (codeowner logins) + the authors of commits/PRs
+  that `touches` the area (`owns` beats `touches`), deduped + ordered by login;
+  shipped/stalled = PRs attributed to the area by following touching commits'
+  `part_of` edges (or a PR that `touches` directly), split merged/closed vs open,
+  optionally `ts`-range filtered; `depends_on` blast radius out (depends on) +
+  in (depended on by) with version/transitive. Seeded goldens (a real
+  rename/move chain folded across two windows so the move set stays unique; an
+  area with a codeowner, mixed-status touching PRs, and a `depends_on` each
+  direction), needs_gather, determinism, and real-data smokes (a real file
+  artifact's lifecycle; subsystem-split runs cleanly on the sparse real store —
+  redis area attributes PR 7120 as shipped via its touching commit, deps empty).
+  *Gate met:* both query goldens green; full suite 549 passed, 2 skipped
+  (additive over 8a's 537+2); store byte-identical after queries (reader-only).
+  *Store-shape note:* PRs attribute to an area transitively (commit `touches`
+  area + commit `part_of` PR), not via a direct PR->area edge in the real store;
+  identity-chain edges are stored bidirectionally (`replaced_by` src->dst and
+  `identity_from` dst->src both on the artifacts), so the walk recovers the same
+  chain from either endpoint.
 - **8c — commit-text-mining + focused renders.** FTS query (input hardening,
   `O(matches)`), plus the markdown renders for all four. *Gate:* FTS golden +
   render goldens green; real-data smoke.

@@ -56,6 +56,9 @@ def _like_prefix(s):
 # Contribution edge types, in the deterministic group order person-impact emits.
 _CONTRIB_TYPES = ("authored", "reviewed", "merged", "reported", "commented")
 
+# Defensive cap on the identity-chain walk (renames/moves should be shallow).
+_CHAIN_DEPTH_CAP = 64
+
 
 def _cite(node_id, data):
     """A citation row for a contribution target: its id plus whichever of
@@ -196,6 +199,301 @@ def person_impact(conn, project, login):
     return result
 
 
+def _normalize_artifact_id(conn, project, artifact_id):
+    """Accept an artifact id in qualified (`{project}/{repo}#{local}`) or local
+    (`{local}`) form and return the qualified id, or None if it can't be
+    resolved. A qualified id is returned as-is. A local id is matched against
+    the project's repos: the first repo for which the qualified id has a node OR
+    a code_events row wins (deterministic by repo order)."""
+    if artifact_id.startswith("{}/".format(project)):
+        return artifact_id  # already project-qualified
+    for repo in _project_repos(conn, project):
+        cand = graphstore.qualify_id(project, repo, artifact_id)
+        if graphstore.get_node(conn, cand) is not None:
+            return cand
+        row = conn.execute(
+            "SELECT 1 FROM code_events WHERE artifact_id=? LIMIT 1",
+            (cand,)).fetchone()
+        if row:
+            return cand
+    return None
+
+
+def pattern_evolution(conn, project, artifact_id):
+    """A symbol/file artifact's FULL lifecycle across all history (not one
+    window). Returns a deterministically-ordered, citation-bearing Result; an
+    unknown id (no node and no code_events) yields a needs_gather result.
+
+    Fields:
+      lifecycle      — get_code_events(artifact_id) in (date, commit) order;
+                       each row {event, commit, author, date, before, after}
+                       cited by its commit ref. File artifacts leave
+                       before/after null; symbols carry bounded before/after.
+      identity_chain — the artifact's true cross-path history assembled by
+                       walking `replaced_by` (src->dst) forward and
+                       `identity_from` (dst->src) backward from the given id.
+                       Ordered A->B->C across renames/moves; each link past the
+                       head carries the move `confidence`/`basis` from edge data.
+    Determinism: lifecycle by (date, commit); chain in link order (depth-capped).
+    """
+    qid = _normalize_artifact_id(conn, project, artifact_id)
+    events = graphstore.get_code_events(conn, qid) if qid else []
+    node = graphstore.get_node(conn, qid) if qid else None
+    if not events and node is None:
+        return {
+            "query": "symbol",
+            "artifact_id": artifact_id,
+            "project": project,
+            "status": "needs_gather",
+            "guidance": (
+                "no node or code_events for {}; gather a window that touches "
+                "this artifact".format(artifact_id)),
+        }
+
+    # --- lifecycle: code_events in (date, commit) order, each cited ---
+    events.sort(key=lambda e: ((e["date"] or ""), e["commit_sha"]))
+    lifecycle = []
+    for e in events:
+        ref = e.get("ref")
+        row = {
+            "event": e["event"],
+            "commit": e["commit_sha"],
+            "author": e["author"],
+            "date": e["date"],
+            "before": e["before"],
+            "after": e["after"],
+        }
+        # cite by the commit ref when present (url/sha), else the bare sha.
+        if isinstance(ref, dict):
+            if ref.get("url") is not None:
+                row["url"] = ref["url"]
+            if ref.get("sha") is not None:
+                row["ref_sha"] = ref["sha"]
+        lifecycle.append(row)
+
+    # --- identity_chain: walk replaced_by forward + identity_from backward ---
+    # Each artifact stores both edges (replaced_by src->dst, identity_from
+    # dst->src, both carrying move_confidence/move_basis). Walk forward via
+    # replaced_by out-edges, backward via identity_from out-edges, to assemble
+    # the ordered chain A->B->C and the move link metadata.
+    forward = []  # ids after qid, in move order
+    backward = []  # ids before qid, in reverse move order
+    link_meta = {}  # id -> {confidence, basis} for the move that PRODUCED it
+
+    if qid:
+        seen = {qid}
+        # forward: qid replaced_by next
+        cur = qid
+        depth = 0
+        while depth < _CHAIN_DEPTH_CAP:
+            edges = graphstore.get_edges(conn, cur, direction="out",
+                                         edge_types=["replaced_by"])
+            if not edges:
+                break
+            e = edges[0]  # deterministic (get_edges orders by dst_id)
+            nxt = e["dst_id"]
+            if nxt in seen:
+                break
+            d = e["data"] or {}
+            link_meta[nxt] = {
+                "confidence": d.get("move_confidence"),
+                "basis": d.get("move_basis"),
+            }
+            forward.append(nxt)
+            seen.add(nxt)
+            cur = nxt
+            depth += 1
+        # backward: qid identity_from prev (i.e. prev replaced_by qid)
+        cur = qid
+        depth = 0
+        while depth < _CHAIN_DEPTH_CAP:
+            edges = graphstore.get_edges(conn, cur, direction="out",
+                                         edge_types=["identity_from"])
+            if not edges:
+                break
+            e = edges[0]
+            prv = e["dst_id"]
+            if prv in seen:
+                break
+            d = e["data"] or {}
+            # this is the move that produced `cur` from `prv`
+            link_meta[cur] = {
+                "confidence": d.get("move_confidence"),
+                "basis": d.get("move_basis"),
+            }
+            backward.append(prv)
+            seen.add(prv)
+            cur = prv
+            depth += 1
+
+    ordered = list(reversed(backward)) + [qid] + forward
+    identity_chain = []
+    for i, aid in enumerate(ordered):
+        c = {"id": aid}
+        meta = link_meta.get(aid)
+        if meta and (meta.get("confidence") or meta.get("basis")):
+            c["confidence"] = meta.get("confidence")
+            c["basis"] = meta.get("basis")
+        identity_chain.append(c)
+
+    return {
+        "query": "symbol",
+        "artifact_id": qid,
+        "project": project,
+        "status": "ok",
+        "lifecycle": lifecycle,
+        "identity_chain": identity_chain,
+    }
+
+
+def subsystem_split(conn, project, area, ts_from=None, ts_to=None):
+    """An area's activity + blast radius (optional time range). Returns a
+    deterministically-ordered, citation-bearing Result; an unknown area (no
+    `area-<area>` structure node in any project repo) yields a needs_gather
+    result.
+
+    Fields:
+      contributors  — codeowners (inverse `owns`, person->area) plus the authors
+                      of commits/PRs that `touches` the area, deduped to logins
+                      with their relation (`owns` wins over `touches`), cited.
+      shipped/stalled — the PRs attributed to the area (a PR is attributed when
+                      one of its `part_of` commits `touches` the area, or the PR
+                      itself `touches` the area), split by status: merged/closed
+                      -> shipped, open -> stalled. Filtered by node `ts` when
+                      --from/--to are given. Cited by number/url.
+      depends_on    — blast radius: `depends_on` edges OUT of the area (what it
+                      depends on) and INTO it (what depends on it), each carrying
+                      version/transitive from edge data.
+    Determinism: contributors by login; items by number then id; deps by area id.
+    """
+    # resolve the area node across the project's repos
+    area_qid = None
+    area_local = "area-{}".format(area)
+    for repo in _project_repos(conn, project):
+        cand = graphstore.qualify_id(project, repo, area_local)
+        if graphstore.get_node(conn, cand) is not None:
+            area_qid = cand
+            break
+    if area_qid is None:
+        return {
+            "query": "subsystem",
+            "area": area,
+            "project": project,
+            "status": "needs_gather",
+            "guidance": (
+                "no area node for {}; gather a window that touches it (areas "
+                "are sparse in short windows)".format(area)),
+        }
+
+    def _in_range(ts):
+        if ts is None:
+            return False
+        if ts_from is not None and ts < ts_from:
+            return False
+        if ts_to is not None and ts > ts_to:
+            return False
+        return True
+
+    def _author_login(node):
+        return (node["data"] or {}).get("author") if node else None
+
+    # --- in-edges to the area: owns (person) + touches (commit/pr) ---
+    in_edges = graphstore.get_edges(conn, area_qid, direction="in",
+                                    edge_types=["owns", "touches"])
+    relations = {}  # login -> relation ('owns' beats 'touches')
+    cite_by_login = {}
+    touching_src_ids = []
+    for e in in_edges:
+        if e["edge_type"] == "owns":
+            # src is a person node; recover the login
+            person = graphstore.get_node(conn, e["src_id"])
+            login = (person["data"] or {}).get("login") if person else None
+            if login is None:
+                login = graphstore.parse_id(e["src_id"])["local"]
+                if login.startswith("person-"):
+                    login = login[len("person-"):]
+            relations[login] = "owns"
+        elif e["edge_type"] == "touches":
+            touching_src_ids.append(e["src_id"])
+
+    # touching commits/PRs -> their authors are touches contributors, and the
+    # PRs they belong to are the area's attributed items.
+    attributed_prs = {}  # pr_id -> pr node
+    for src_id in touching_src_ids:
+        src = graphstore.get_node(conn, src_id)
+        login = _author_login(src)
+        if login is not None and login not in relations:
+            relations[login] = "touches"
+        # if the toucher is itself a PR node, attribute it directly
+        if "#pr-" in src_id and src is not None:
+            attributed_prs[src_id] = src
+        # follow part_of (commit -> pr) to attribute the PR
+        for pe in graphstore.get_edges(conn, src_id, direction="out",
+                                       edge_types=["part_of"]):
+            if "#pr-" in pe["dst_id"]:
+                pr = graphstore.get_node(conn, pe["dst_id"])
+                if pr is not None:
+                    attributed_prs[pe["dst_id"]] = pr
+
+    contributors = [
+        {"login": login, "relation": relations[login]}
+        for login in sorted(relations)
+    ]
+
+    # --- shipped / stalled split over the attributed PRs ---
+    shipped, stalled = [], []
+    for pr_id in sorted(attributed_prs):
+        pr = attributed_prs[pr_id]
+        if (ts_from is not None or ts_to is not None) and not _in_range(pr["ts"]):
+            continue
+        pdata = pr["data"] or {}
+        row = _cite(pr_id, pdata)
+        merged = bool(pdata.get("merged"))
+        state = pdata.get("state")
+        if merged or state == "closed":
+            shipped.append(row)
+        else:
+            stalled.append(row)
+    _item_key = lambda r: (r.get("number") if r.get("number") is not None
+                           else float("inf"), r["id"])
+    shipped.sort(key=_item_key)
+    stalled.sort(key=_item_key)
+
+    # --- depends_on blast radius (out = depends on; in = depended upon by) ---
+    def _dep_row(other_id, data):
+        d = data or {}
+        local = graphstore.parse_id(other_id)["local"]
+        if local.startswith("area-"):
+            local = local[len("area-"):]
+        return {
+            "area": local,
+            "id": other_id,
+            "version": d.get("version"),
+            "transitive": d.get("transitive"),
+        }
+
+    deps_out, deps_in = [], []
+    for e in graphstore.get_edges(conn, area_qid, direction="out",
+                                  edge_types=["depends_on"]):
+        deps_out.append(_dep_row(e["dst_id"], e["data"]))
+    for e in graphstore.get_edges(conn, area_qid, direction="in",
+                                  edge_types=["depends_on"]):
+        deps_in.append(_dep_row(e["src_id"], e["data"]))
+    deps_out.sort(key=lambda d: d["id"])
+    deps_in.sort(key=lambda d: d["id"])
+
+    return {
+        "query": "subsystem",
+        "area": area,
+        "project": project,
+        "status": "ok",
+        "contributors": contributors,
+        "shipped": shipped,
+        "stalled": stalled,
+        "depends_on": {"out": deps_out, "in": deps_in},
+    }
+
+
 # --------------------------------------------------------------------------
 # Markdown render (thin, deterministic formatter over the same JSON).
 # --------------------------------------------------------------------------
@@ -237,7 +535,63 @@ def _render_person_md(res):
     return "\n".join(lines)
 
 
-_RENDERERS = {"person": _render_person_md}
+def _render_symbol_md(res):
+    if res["status"] == "needs_gather":
+        return "## spotlight: symbol `{}`\n\n_needs gather:_ {}".format(
+            res["artifact_id"], res["guidance"])
+    lines = ["## spotlight: symbol `{}`".format(res["artifact_id"]), ""]
+    lines.append("### lifecycle ({})".format(len(res["lifecycle"])))
+    for e in res["lifecycle"]:
+        ref = e.get("url") or e.get("ref_sha") or e["commit"]
+        lines.append("- **{}** by {} on {} — {}".format(
+            e["event"], e.get("author") or "?", e.get("date") or "?", ref))
+    lines.append("")
+    lines.append("### identity chain ({})".format(len(res["identity_chain"])))
+    for c in res["identity_chain"]:
+        if c.get("confidence"):
+            lines.append("- {} ({} / {})".format(
+                c["id"], c.get("confidence"), c.get("basis")))
+        else:
+            lines.append("- {}".format(c["id"]))
+    return "\n".join(lines)
+
+
+def _render_subsystem_md(res):
+    if res["status"] == "needs_gather":
+        return "## spotlight: subsystem `{}`\n\n_needs gather:_ {}".format(
+            res["area"], res["guidance"])
+    lines = ["## spotlight: subsystem `{}`".format(res["area"]), ""]
+    lines.append("### contributors ({})".format(len(res["contributors"])))
+    for c in res["contributors"]:
+        lines.append("- {} ({})".format(c["login"], c["relation"]))
+    lines.append("")
+    lines.append("### shipped ({}) / stalled ({})".format(
+        len(res["shipped"]), len(res["stalled"])))
+    for label, items in (("shipped", res["shipped"]), ("stalled", res["stalled"])):
+        for r in items:
+            ref = r.get("url") or r["id"]
+            label2 = r.get("title") or r.get("id")
+            lines.append("- [{}] {} — {}".format(label, label2, ref))
+    lines.append("")
+    deps = res["depends_on"]
+    lines.append("### depends_on blast radius (out {} / in {})".format(
+        len(deps["out"]), len(deps["in"])))
+    for d in deps["out"]:
+        lines.append("- depends on {} (v{}{})".format(
+            d["area"], d.get("version"),
+            ", transitive" if d.get("transitive") else ""))
+    for d in deps["in"]:
+        lines.append("- depended on by {} (v{}{})".format(
+            d["area"], d.get("version"),
+            ", transitive" if d.get("transitive") else ""))
+    return "\n".join(lines)
+
+
+_RENDERERS = {
+    "person": _render_person_md,
+    "symbol": _render_symbol_md,
+    "subsystem": _render_subsystem_md,
+}
 
 
 def render_md(res):
@@ -259,6 +613,10 @@ def main(argv=None):
     parser.add_argument("--store", required=True, help="path to the store db")
     parser.add_argument("--project", default=None,
                         help="project (auto-detected from the store if omitted)")
+    parser.add_argument("--from", dest="ts_from", default=None,
+                        help="subsystem: filter items at/after this ts")
+    parser.add_argument("--to", dest="ts_to", default=None,
+                        help="subsystem: filter items at/before this ts")
     fmt = parser.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true",
                      help="emit raw cited JSON (default)")
@@ -276,6 +634,11 @@ def main(argv=None):
 
     if args.query == "person":
         res = person_impact(conn, project, args.args[0])
+    elif args.query == "symbol":
+        res = pattern_evolution(conn, project, args.args[0])
+    elif args.query == "subsystem":
+        res = subsystem_split(conn, project, args.args[0],
+                              ts_from=args.ts_from, ts_to=args.ts_to)
     conn.close()
 
     if args.md:
