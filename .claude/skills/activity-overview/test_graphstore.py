@@ -122,6 +122,11 @@ class TestEdges(unittest.TestCase):
         only = graphstore.get_edges(conn, "a", direction="out", edge_types=["closes"])
         self.assertEqual([e["dst_id"] for e in only], ["b"])
 
+    def test_get_edges_rejects_unknown_direction(self):
+        conn = _store()
+        with self.assertRaises(ValueError):
+            graphstore.get_edges(conn, "a", direction="sideways")
+
 
 class TestCodeEvents(unittest.TestCase):
     def test_add_and_get_ordered_by_date(self):

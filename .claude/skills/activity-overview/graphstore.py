@@ -197,6 +197,8 @@ def _row_to_edge(row):
 def get_edges(conn, node_id, direction="both", edge_types=None):
     """Edges touching node_id. direction: 'out' (src=node), 'in' (dst=node),
     or 'both'. Optional edge_types allowlist."""
+    if direction not in ("out", "in", "both"):
+        raise ValueError("unknown direction: {}".format(direction))
     clauses = []
     params = []
     if direction == "out":
@@ -336,11 +338,14 @@ def index_text(conn, node_id, text):
 
 
 def fts_search(conn, query):
-    """Node ids whose indexed text matches the FTS5 query, ranked by relevance."""
+    """Node ids whose indexed text matches the FTS5 query, ranked by relevance.
+
+    Orders by FTS5's built-in `rank` (bm25 score), with `node_id` as a
+    deterministic tie-breaker so equal-scoring matches order stably."""
     if not fts5_available(conn):
         raise RuntimeError("FTS5 not available in this SQLite build")
     rows = conn.execute(
-        "SELECT node_id FROM fts_text WHERE fts_text MATCH ? ORDER BY rank",
+        "SELECT node_id FROM fts_text WHERE fts_text MATCH ? ORDER BY rank, node_id",
         (query,),
     )
     return [r[0] for r in rows]
