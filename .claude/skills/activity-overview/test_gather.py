@@ -1974,9 +1974,14 @@ class TestFoldBundle(unittest.TestCase):
     def test_idempotent_refold(self):
         gather.fold_bundle(self.conn, _fold_fixture_bundle())  # second fold
         # 8 spine/structure nodes + 1 `codegraph` singleton (fixture's non-empty
-        # code_graph is round-tripped as a structure node; see fold_bundle).
+        # code_graph is round-tripped as a structure node; see fold_bundle) + 2
+        # person nodes (alice/bob, the commit authors). Person nodes are now
+        # created for EVERY participant with a contribution edge (the BUG 1 fix:
+        # alice/bob's `authored` edges were previously dangling because their
+        # files map to no code area, so the old attribute_people_areas-only
+        # persistence skipped them).
         self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 9)
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 11)
         # 3 spine edges (closes/cross_ref/part_of) + 2 `authored` person->commit
         # edges (alice->abc123, bob->def456) from Phase 7b-1 step 3. Re-folding
         # mutates nothing: still 5.

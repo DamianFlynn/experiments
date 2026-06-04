@@ -333,6 +333,7 @@
       "areas": [
         "avm/res/network/firewall-policy"
       ],
+      "is_bot": false,
       "modules": [
         "avm/res/network/firewall-policy"
       ]
@@ -341,6 +342,7 @@
       "areas": [
         "avm/res/network/firewall-policy"
       ],
+      "is_bot": false,
       "modules": [
         "avm/res/network/firewall-policy"
       ]
@@ -349,6 +351,7 @@
       "areas": [
         "docs"
       ],
+      "is_bot": false,
       "modules": [
         "docs"
       ]

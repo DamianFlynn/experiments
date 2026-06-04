@@ -182,15 +182,14 @@ class TestReviewerMessageResolvedPR(unittest.TestCase):
                       carol["data"]["areas"])
 
     def test_store_people_equal_link_people(self):
-        # The whole point: store-derived people == link-derived people. The
-        # link-derivation is derive.attribute_people_areas (what enrich used to
-        # call before slice 7b-2 shrank it). It must see commit->PR links, so we
-        # resolve them first exactly as fold's write path does.
+        # The whole point: store-derived people == the shared enumerator's output
+        # (derive.enumerate_participants — the SINGLE source of truth fold and
+        # validate.no_drift both use). It must see commit->PR links, so we resolve
+        # them first exactly as fold's write path does.
         raw = json.loads(json.dumps(self.bundle))
         gather.attach_commit_prs(raw["commits"])
         area_idx = derive.area_index(raw.get("code_graph", {}) or {})
-        link_people = derive.attribute_people_areas(
-            {**raw, "people": {}}, area_idx)["people"]
+        enumerated = derive.enumerate_participants(raw, area_idx)
         rows = self.conn.execute(
             "SELECT data FROM nodes WHERE id LIKE '%#person-%'").fetchall()
         store_people = {}
@@ -198,7 +197,7 @@ class TestReviewerMessageResolvedPR(unittest.TestCase):
             rec = json.loads(data)
             login = rec.pop("login")
             store_people[login] = rec
-        self.assertEqual(store_people, link_people)
+        self.assertEqual(store_people, enumerated)
         self.assertEqual(sorted(store_people), ["alice", "carol", "dave"])
 
 

@@ -185,6 +185,139 @@ def test_schema_conformance_catches_wrong_authored_endpoint():
     assert c["severity"] == "ERROR"
 
 
+# --- BUG 1: person nodes for ALL participants (live-audit regression) ---------
+
+def _participants_bundle():
+    """In-memory bundle exercising the 4 participant classes the OLD write path
+    dropped (person-node creation was driven by attribute_people_areas =
+    commit-authors + reviewers of MAPPED-commit PRs only, while contribution
+    edges were written for EVERY participant -> dangling edges, no person node):
+
+      1. pure commenter      : comments only, never authors/reviews/commits.
+      2. issue reporter      : opens an issue, otherwise no contribution.
+      3. PR author w/ commits OUT OF WINDOW (no commit row in the bundle).
+      4. reviewer of a PR with NO mapped commits (no commit message-resolves it).
+
+    Plus alice, a real contributor (commit author) so the bundle is non-trivial.
+    """
+    return {
+        "meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                 "to": "2026-05-31"},
+        "commits": [
+            # alice's commit message-resolves to PR 1 (she is a real contributor).
+            {"sha": "a" * 40, "author": "alice", "date": "2026-05-02",
+             "message": "feat (#1)", "files": ["avm/res/x/main.bicep"]},
+        ],
+        "prs": [
+            {"number": 1, "author": "alice", "reviewers": ["reviewer-mapped"],
+             "merged": True, "merged_at": "2026-05-03",
+             "comments_list": [{"author": "pure-commenter", "body": "nice"}],
+             "url": "https://x/1"},
+            # PR 2: author's commits are out of window (no commit row here); its
+            # reviewer reviews a PR with NO mapped commits.
+            {"number": 2, "author": "oow-author",
+             "reviewers": ["reviewer-unmapped"],
+             "merged": True, "merged_at": "2026-05-04", "url": "https://x/2"},
+        ],
+        "issues": [
+            {"number": 7, "author": "issue-reporter", "url": "https://x/i7"},
+        ],
+        "code_graph": {"areas": [
+            {"id": "avm/res/x", "paths": ["avm/res/x/main.bicep"]}]},
+    }
+
+
+_DROPPED_LOGINS = ("pure-commenter", "issue-reporter", "oow-author",
+                   "reviewer-unmapped")
+
+
+def _fold_participants():
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    bundle = _participants_bundle()
+    gather.fold_bundle(conn, bundle)
+    return conn, bundle
+
+
+def test_all_participants_get_person_nodes():
+    conn, _ = _fold_participants()
+    for login in _DROPPED_LOGINS:
+        node = graphstore.get_node(conn, graphstore.qualify_person("o", login))
+        assert node is not None, "missing person node for {}".format(login)
+        assert node["data"]["login"] == login
+
+
+def test_participants_validate_clean():
+    conn, bundle = _fold_participants()
+    report = validate.validate(conn, project="o", repo="r", bundle=bundle)
+    # The two checks BUG 1 broke must now pass (no dangling person edges, every
+    # raw login has a person node), and the whole audit is clean.
+    for name in ("participant_completeness", "referential_integrity", "no_drift"):
+        c = _check(report, name)
+        assert c["ok"] is True, (name, c["details"])
+    assert report.ok is True, [c for c in report.checks if not c["ok"]]
+
+
+def test_participants_appear_in_extract_people():
+    import extract
+    conn, _ = _fold_participants()
+    out = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31")
+    for login in _DROPPED_LOGINS:
+        assert login in out["people"], login
+
+
+# --- BUG 2: no_drift symbol-artifact id reconstruction (auditor false positive) -
+
+def _symbol_artifact_bundle():
+    """A bundle with a SYMBOL/comment artifact whose stored id is the double-`#`
+    form `{path}#{lang}:{subkind}:{name}` and whose name carries `:`, parens and
+    commas. `validate._local` (parse_id) rpartitions on the LAST `#`, truncating
+    the local to `{lang}:{subkind}:{name}` — so no_drift used to FALSELY report
+    the artifact "derived but not stored". The graph is fine; only the auditor's
+    id reconstruction was wrong."""
+    return {
+        "meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                 "to": "2026-05-31"},
+        "commits": [
+            {"sha": "a" * 40, "author": "alice", "date": "2026-05-02",
+             "message": "feat (#1)", "files": ["avm/res/x/main.bicep"]},
+        ],
+        "prs": [{"number": 1, "author": "alice", "merged": True,
+                 "merged_at": "2026-05-03", "url": "https://x/1"}],
+        "issues": [],
+        "symbol_events": [
+            # a real symbol whose name is plain.
+            {"commit": "a" * 40, "author": "alice", "date": "2026-05-02",
+             "path": "avm/res/x/main.bicep", "lang": "bicep",
+             "subkind": "param", "name": "location", "change": "add",
+             "before": None, "after": "param location string"},
+            # a comment whose NAME (the comment text) contains : , ( ) — the
+            # adversarial id case.
+            {"commit": "a" * 40, "author": "alice", "date": "2026-05-02",
+             "path": "avm/res/x/main.bicep", "lang": "bicep",
+             "subkind": "comment",
+             "name": "TODO: handle (edge, cases): foo:bar", "change": "add",
+             "before": None, "after": "// TODO: handle (edge, cases): foo:bar"},
+        ],
+        "code_graph": {"areas": [
+            {"id": "avm/res/x", "paths": ["avm/res/x/main.bicep"]}]},
+    }
+
+
+def test_no_drift_no_false_positive_on_symbol_artifact():
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    bundle = _symbol_artifact_bundle()
+    gather.fold_bundle(conn, bundle)
+    report = validate.validate(conn, project="o", repo="r", bundle=bundle)
+    c = _check(report, "no_drift")
+    # No "derived but not stored" (or any) artifact drift for the symbol/comment.
+    bad = [d for d in c["details"]
+           if d.get("kind") == "artifact" and d.get("severity") == "ERROR"]
+    assert bad == [], bad
+    assert c["ok"] is True, c["details"]
+
+
 # --- CLI ----------------------------------------------------------------------
 
 def _write_store(tmp_path, name="bundle_p3b.json"):

@@ -122,17 +122,36 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
 
 **Slice 7b-1 (step 3) additionally persists people + the contribution / non-spine
 edges** (all derived on the write path via the shared `derive.py` leaf —
-`derive.attribute_people_areas` / `derive.area_index` / `derive._commit_areas`):
+`derive.enumerate_participants` / `derive.attribute_people_areas` /
+`derive.area_index` / `derive._commit_areas`):
 
-- **Person `structure` nodes (project-scoped).** Each participant
-  `derive.attribute_people_areas` enumerates (commit authors + the reviewers of
-  PRs with mapped commits, each carrying `modules`/`areas`) upserts as a
-  `structure` node id `qualify_person(project, login)` (`{project}#person-{login}`),
-  NULL `ts`, `data` = `{login, modules, areas}`. The `repo` column is the project
+- **Person `structure` nodes (project-scoped) = ALL participants.** `people` is
+  the FULL participant set: EVERY login that carries any contribution edge gets a
+  person node — `pr.author`, `pr.merged_by`, each `pr.reviewers`, `issue.author`,
+  commit `author`, and comment / review-comment authors. The single source of
+  truth is `derive.enumerate_participants(bundle)` (the **anti-drift enumerator**):
+  the write path (`gather.fold_bundle`) AND the auditor (`validate.no_drift`) both
+  call it, so they can never disagree on "who". Contributors (commit authors +
+  reviewers of PRs with mapped commits) carry the `{modules, areas}` that
+  `attribute_people_areas` derives; pure participants (comment-only, issue
+  reporters, out-of-window PR authors, reviewers of mapped-commit-less PRs) get
+  empty `modules`/`areas`. Every login is **bot-tagged** — `is_bot = True` when it
+  matches `*[bot]`, `github-actions`, `microsoft-github-policy-service`,
+  `*-organizer`, or `copilot-*` (`derive.is_bot_login`); bots are TAGGED, never
+  dropped (dropping = losing data). Each upserts as a `structure` node id
+  `qualify_person(project, login)` (`{project}#person-{login}`), NULL `ts`,
+  `data` = `{login, modules, areas, is_bot}`. The `repo` column is the project
   sentinel `"*"` (people aggregate across a project's repos), so re-folding the
   same login from another repo upserts the identical id — one node, never a
   cross-repo duplicate — and the sentinel keeps the row out of any single repo's
   `repo_nodes` view. Idempotent by id.
+
+  > Before this fix, person-node creation was driven by `attribute_people_areas`
+  > alone (commit authors + reviewers of mapped-commit PRs), while contribution
+  > edges were written for EVERY participant — so a real AVM gather had 222 logins
+  > with contribution edges (commented/reported/authored/reviewed) but NO person
+  > node, leaving thousands of dangling person→node edges. The shared enumerator
+  > closes that gap.
 - **Contribution edges (person→node).** From the RAW records, idempotent by
   (src,dst,type), skipping absent logins: `authored` (person→pr from `pr.author`,
   person→commit from `commit.author`), `merged` (person→pr from `pr.merged_by`),
@@ -163,7 +182,8 @@ RAW-only view — it additionally reconstructs:
   consumers (`build_timeline`'s same-`(ts,url)` tie-break) reproduce byte-for-byte.
 - **`people`** by reading the project-scoped person `structure` nodes (repo
   sentinel `"*"`, local id `person-<login>`), keyed by login (the redundant stored
-  `login` field is dropped).
+  `login` field is dropped). Because fold now persists ALL participants, this
+  naturally returns the full set (each record carries `modules`/`areas`/`is_bot`).
 
 extract READS these — it does NOT re-derive via `build_artifacts` /
 `attribute_people_areas`. Correspondingly `link.enrich` removed its

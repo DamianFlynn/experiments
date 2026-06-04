@@ -253,6 +253,86 @@ def attribute_people_areas(bundle, idx):
     return bundle
 
 
+# Bots are TAGGED (is_bot=True), never dropped — dropping = losing data. A login is
+# a bot when it ends with the GitHub App suffix `[bot]` or matches one of the known
+# automation accounts the AVM org runs. Patterns are matched case-insensitively.
+import re as _re
+
+_BOT_EXACT = {"github-actions", "microsoft-github-policy-service"}
+_BOT_RE = _re.compile(
+    r"""(?ix)
+    ^ (?:
+        .*\[bot\]            # any GitHub App login: foo[bot], copilot-swe-agent[bot]
+      | .*-organizer         # *-organizer automation accounts
+      | copilot-.*           # copilot-* family
+    ) $
+    """
+)
+
+
+def is_bot_login(login):
+    """True when `login` is an automation account (tagged, never dropped). Pure."""
+    if not login:
+        return False
+    low = login.lower()
+    return low in _BOT_EXACT or bool(_BOT_RE.match(login))
+
+
+def enumerate_participants(bundle, idx=None):
+    """The FULL participant set — ONE source of truth for "who" (the anti-drift
+    enumerator).
+
+    Returns {login: {modules, areas, is_bot}} for EVERY login that carries any
+    contribution edge on the write path: `pr.author`, `pr.merged_by`, each
+    `pr.reviewers`, `issue.author`, commit `author`, and comment / review-comment
+    authors (PR conversation + review comments, issue comments).
+
+    Contributors (commit authors + reviewers of PRs with mapped commits) keep the
+    `{modules, areas}` `attribute_people_areas` derives; pure participants get
+    empty `modules`/`areas`. Every login is bot-tagged via `is_bot_login` — tagged,
+    not dropped, so no "who" is ever lost.
+
+    The CALLER must have run `attach_commit_prs` on the bundle's commits first (so
+    commit->PR mapping is present, mirroring enrich / the carol fix); both
+    `gather.fold_bundle` and `validate.no_drift` do exactly that on a copy. Pure.
+    """
+    if idx is None:
+        idx = area_index(bundle.get("code_graph", {}) or {})
+    # contributor modules/areas come from the existing attribution (a fresh copy of
+    # the people map so we never mutate the caller's bundle).
+    attributed = attribute_people_areas(
+        {**bundle, "people": dict(bundle.get("people") or {})}, idx
+    )["people"]
+
+    out = {}
+
+    def add(login):
+        if not login:
+            return
+        if login not in out:
+            rec = attributed.get(login) or {}
+            out[login] = {
+                "modules": sorted(rec.get("modules") or []),
+                "areas": sorted(rec.get("areas") or []),
+                "is_bot": is_bot_login(login),
+            }
+
+    for pr in bundle.get("prs", []):
+        add(pr.get("author"))
+        add(pr.get("merged_by"))
+        for rv in pr.get("reviewers") or []:
+            add(rv)
+        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
+            add(c.get("author"))
+    for iss in bundle.get("issues", []):
+        add(iss.get("author"))
+        for c in iss.get("comments_list") or []:
+            add(c.get("author"))
+    for c in bundle.get("commits", []):
+        add(c.get("author"))
+    return out
+
+
 # Phase 3e: symbol-identity (window-wide moves). Comments are excluded — their text
 # identity already captures evolution and would match noisily.
 _COMMENT_SUBKINDS = {"comment", "todo"}

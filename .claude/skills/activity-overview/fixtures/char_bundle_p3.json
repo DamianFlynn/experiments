@@ -369,7 +369,23 @@
     }
   ],
   "modules": {},
-  "people": {},
+  "people": {
+    "bob": {
+      "areas": [],
+      "is_bot": false,
+      "modules": []
+    },
+    "carol": {
+      "areas": [],
+      "is_bot": false,
+      "modules": []
+    },
+    "dave": {
+      "areas": [],
+      "is_bot": false,
+      "modules": []
+    }
+  },
   "prs": [
     {
       "closed_at": "2026-05-10T12:00:00Z",

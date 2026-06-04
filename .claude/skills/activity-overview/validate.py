@@ -478,14 +478,16 @@ def check_schema_conformance(conn):
 # --- check 6: store-derived == link-derived (no drift) -----------------------
 
 def _derive_people(bundle):
-    """Re-derive the people projection exactly as the write path does: run
-    attach_commit_prs on a COPY first (so reviewers of message-resolved PRs are
-    attributed), then derive.attribute_people_areas."""
+    """Re-derive the people projection exactly as the write path does, via the
+    SAME shared enumerator (derive.enumerate_participants) — so writer and
+    auditor can never diverge. Run attach_commit_prs on a COPY first (so
+    reviewers of message-resolved PRs are attributed), then enumerate the FULL
+    participant set (every login with a contribution edge, bot-tagged)."""
     area_idx = derive.area_index(bundle.get("code_graph", {}) or {})
     resolved = copy.deepcopy(bundle.get("commits") or [])
     gather.attach_commit_prs(resolved)
     view = {**bundle, "commits": resolved, "people": dict(bundle.get("people") or {})}
-    return derive.attribute_people_areas(view, area_idx)["people"]
+    return derive.enumerate_participants(view, area_idx)
 
 
 def _derive_artifacts(bundle):
@@ -519,10 +521,12 @@ def check_no_drift(conn, project, repo, bundle):
             stored_people[login] = {
                 "modules": sorted(d.get("modules") or []),
                 "areas": sorted(d.get("areas") or []),
+                "is_bot": bool(d.get("is_bot")),
             }
     want_norm = {
         login: {"modules": sorted(rec.get("modules") or []),
-                "areas": sorted(rec.get("areas") or [])}
+                "areas": sorted(rec.get("areas") or []),
+                "is_bot": bool(rec.get("is_bot"))}
         for login, rec in want_people.items()
     }
     for login in sorted(set(stored_people) | set(want_norm)):
@@ -539,10 +543,19 @@ def check_no_drift(conn, project, repo, bundle):
                             "expected": want_norm[login]})
 
     # --- artifacts ---
+    # The stored artifact id is `{project}/{repo}#{local}` where the SYMBOL-artifact
+    # local is itself a double-`#` form `{path}#{lang}:{subkind}:{name}`. `_local`
+    # (parse_id) rpartitions on the LAST `#`, which truncates a symbol id to
+    # `{lang}:{subkind}:{name}` — so it would never match the derived `{path}#…`
+    # key and 86 real artifacts were FALSELY reported "derived but not stored". Strip
+    # ONLY the repo prefix to recover the true local id (mirroring how fold_bundle /
+    # extract reconstruct it).
     want_arts = _derive_artifacts(bundle)
     stored_arts = {}
+    repo_prefix = "{}/{}#".format(project, repo)
     for n in graphstore.repo_nodes(conn, project, repo, "code"):
-        local = _local(n["id"])
+        nid = n["id"]
+        local = nid[len(repo_prefix):] if nid.startswith(repo_prefix) else _local(nid)
         if local.startswith("art:") or "#" in local:
             stored_arts[local] = n["data"] or {}
     art_fields = ("kind", "path", "name", "status", "replaced_by", "code_area")

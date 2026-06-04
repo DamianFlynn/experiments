@@ -2213,13 +2213,21 @@ def fold_bundle(conn, bundle):
     # reviewer whose PR's commits are only MESSAGE-resolvable to that PR (their
     # `pr` field is unset on the raw record) is silently dropped. enrich runs
     # attach_commit_prs FIRST; mirror that here. Resolve on a COPY so the stored
-    # commit `code` nodes (built above, line ~1984) stay faithful to the raw
-    # record and extract's commit reconstruction is unchanged.
+    # commit `code` nodes (built above) stay faithful to the raw record and
+    # extract's commit reconstruction is unchanged.
     resolved = copy.deepcopy(bundle.get("commits") or [])
     attach_commit_prs(resolved)
     people_view = {**bundle, "commits": resolved,
                    "people": dict(bundle.get("people") or {})}
-    people = derive.attribute_people_areas(people_view, area_idx)["people"]
+    # ONE shared enumerator: person nodes are created for EVERY participant with
+    # any contribution edge — not just commit-authors + mapped-PR reviewers. This
+    # is the anti-drift fix for the live-audit bug where 222 logins had
+    # contribution edges (commented/reported/authored/reviewed) but NO person
+    # node (dangling edges). Contributors carry their modules/areas; pure
+    # participants get empty ones; bots are tagged (is_bot), never dropped.
+    # validate.no_drift re-derives via the SAME enumerate_participants, so writer
+    # and auditor can never diverge.
+    people = derive.enumerate_participants(people_view, area_idx)
 
     def qperson(login):
         return graphstore.qualify_person(project, login)
