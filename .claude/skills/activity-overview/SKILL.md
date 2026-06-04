@@ -36,6 +36,10 @@ claim in the report resolves to a source ref in the bundle — never invent fact
      ```
      Roll-up emits a *raw* bundle (derived fields dropped), so continue at **Link** then Render.
      (A fresh wide-window re-gather always yields a correct bundle and stays canonical.)
+   - **Persist to the journey-graph store (optional).** Add `--store workspace/journey.db`
+     to also fold the bundle into the SQLite substrate (see `STORE.md`) — additive and
+     idempotent; the JSON bundle is still written and the rest of the procedure is
+     unchanged.
 2. **Link.** Enrich it offline (no network):
    ```bash
    python3 link.py workspace/bundle.json

@@ -15,6 +15,8 @@ import sys
 import urllib.error
 import urllib.request
 
+import graphstore
+
 SCHEMA_VERSION = 1
 RECORD_SEP = "\x1e"
 FIELD_SEP = "\x1f"
@@ -317,6 +319,24 @@ def summarize_reviews(raw_reviews):
         if _REVIEW_RANK[state] > _REVIEW_RANK[decision]:
             decision = state
     return {"reviewers": reviewers, "decision": decision}
+
+
+_PR_RE = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
+
+
+def resolve_commit_pr(message):
+    """Best-effort PR number from a commit subject (merge or squash style)."""
+    m = _PR_RE.search(message or "")
+    if not m:
+        return None
+    return int(m.group(1) or m.group(2))
+
+
+def attach_commit_prs(commits):
+    """Set each commit's `pr` from its message in place."""
+    for c in commits:
+        c["pr"] = resolve_commit_pr(c.get("message", ""))
+    return commits
 
 
 def parse_timeline_crossrefs(raw_timeline):
@@ -1368,6 +1388,9 @@ def parse_args(argv):
                         "(overlap-safe union by identity; structure from the latest). "
                         "Re-run link on the result. No clone/token needed.")
     p.add_argument("--out", default=None)
+    p.add_argument("--store", default=None,
+                   help="also fold the bundle into this SQLite journey-graph "
+                        "store (off by default; additive to the JSON bundle)")
     return p.parse_args(argv)
 
 
@@ -1932,6 +1955,84 @@ def acquire(args, env):
     return bundle
 
 
+def fold_bundle(conn, bundle):
+    """Fold a raw bundle into the journey-graph store by stable identity:
+    upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
+    — re-folding an overlapping window mutates nothing already correct. See
+    STORE.md for the schema and identity rules.
+
+    P6 scope: social (prs/issues; comments/reviews stay embedded in the parent's
+    data blob), code (commits) + the file-level code_events ledger, structure
+    (milestones/releases/areas), and the spine edges closes/cross_ref/part_of.
+    People & artifact nodes (link-derived), symbol_events, and every non-spine
+    edge land in a later phase.
+    """
+    meta = bundle.get("meta", {})
+    project, repo = meta.get("owner"), meta.get("repo")
+    if not project or not repo:
+        raise ValueError("bundle meta needs owner and repo to qualify ids")
+
+    fetched = graphstore.now_iso()
+    nodes, edges, events = [], [], []
+
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+
+    # social: PRs, with closes/cross_ref spine edges to their issues.
+    for pr in bundle.get("prs", []):
+        pid = qid("pr-{}".format(pr["number"]))
+        ts = pr.get("merged_at") or pr.get("closed_at") or pr.get("created_at")
+        nodes.append((pid, project, repo, "social", ts, pr, fetched))
+        for n in pr.get("closes") or []:
+            edges.append((pid, qid("issue-{}".format(n)), "closes", None, None))
+        for n in pr.get("crossref_issues") or []:
+            edges.append((pid, qid("issue-{}".format(n)), "cross_ref", None, None))
+
+    # social: issues.
+    for iss in bundle.get("issues", []):
+        ts = iss.get("closed_at") or iss.get("updated_at")
+        nodes.append((qid("issue-{}".format(iss["number"])), project, repo,
+                      "social", ts, iss, fetched))
+
+    # code: commits, with part_of spine edge to the PR named in the subject.
+    for c in bundle.get("commits", []):
+        cid = qid(c["sha"])
+        nodes.append((cid, project, repo, "code", c.get("date"), c, fetched))
+        prn = resolve_commit_pr(c.get("message", ""))
+        if prn is not None:
+            edges.append((cid, qid("pr-{}".format(prn)), "part_of", None, None))
+
+    # code: file-level code-event ledger (rename/copy source -> detail).
+    for ev in bundle.get("code_events", []):
+        path = ev.get("path")
+        if not path:
+            continue
+        events.append((
+            qid(path), ev.get("change"), ev.get("commit"), ev.get("author"),
+            ev.get("date"), None, None, None, None, ev.get("old_path"),
+        ))
+
+    # structure: milestones & areas (NULL ts -> excluded from window scans),
+    # releases (dated point-in-time).
+    for m in bundle.get("milestones", []):
+        local = "milestone-{}".format(m.get("number") or m.get("title"))
+        nodes.append((qid(local), project, repo, "structure", None, m, fetched))
+    for r in bundle.get("releases", []):
+        local = "release-{}".format(r.get("tag_name") or r.get("name"))
+        nodes.append((qid(local), project, repo, "structure",
+                      r.get("published_at"), r, fetched))
+    for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
+        local = "area-{}".format(area.get("id") or area.get("name") or area.get("path"))
+        nodes.append((qid(local), project, repo, "structure", None, area, fetched))
+
+    graphstore.upsert_nodes(conn, nodes)
+    graphstore.upsert_edges(conn, edges)
+    graphstore.add_code_events(conn, events)
+    graphstore.record_window(conn, project, repo, meta.get("from"), meta.get("to"))
+    if meta.get("clone_sha"):
+        graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"])
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     bundle = acquire(args, os.environ)
@@ -1942,6 +2043,12 @@ def main(argv=None):
     with open(out, "w") as fh:
         json.dump(bundle, fh, indent=2)
     sys.stderr.write(f"wrote {out}\n")
+    if getattr(args, "store", None):
+        conn = graphstore.open_store(args.store)
+        graphstore.init_schema(conn)
+        fold_bundle(conn, bundle)
+        conn.close()
+        sys.stderr.write(f"folded bundle into store {args.store}\n")
     return out
 
 

@@ -32,7 +32,8 @@ jobs:
         run: |
           python -m py_compile \
             .claude/skills/activity-overview/gather.py \
-            .claude/skills/activity-overview/link.py
+            .claude/skills/activity-overview/link.py \
+            .claude/skills/activity-overview/graphstore.py
 
       - name: Run the offline test suite
         run: |
