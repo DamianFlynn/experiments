@@ -160,5 +160,59 @@ class TestCodeEvents(unittest.TestCase):
         self.assertEqual(events[0]["ref"]["type"], "commit")
 
 
+def _seed_window_nodes(conn):
+    rows = [
+        ("pr-1", "r1", "social", "2026-04-02T00:00:00Z"),
+        ("pr-2", "r1", "social", "2026-04-20T00:00:00Z"),
+        ("pr-3", "r1", "social", "2026-05-10T00:00:00Z"),   # out of window
+        ("pr-9", "r2", "social", "2026-04-15T00:00:00Z"),   # other repo
+        ("c-1", "r1", "code", "2026-04-12T00:00:00Z"),
+        ("area-1", "r1", "structure", None),                # structure: no ts
+    ]
+    for local, repo, klass, ts in rows:
+        nid = graphstore.qualify_id("p", repo, local)
+        graphstore.upsert_node(
+            conn, id=nid, project="p", repo=repo, node_class=klass,
+            ts=ts, data={"local": local},
+        )
+
+
+class TestRangeQuery(unittest.TestCase):
+    def test_window_bounds_and_repo_filter(self):
+        conn = _store()
+        _seed_window_nodes(conn)
+        got = graphstore.range_query(
+            conn, "p", ["r1"], "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z"
+        )
+        locals_ = sorted(n["data"]["local"] for n in got)
+        self.assertEqual(locals_, ["c-1", "pr-1", "pr-2"])  # pr-3 out, r2 excluded, area-1 null ts
+
+    def test_node_class_filter(self):
+        conn = _store()
+        _seed_window_nodes(conn)
+        got = graphstore.range_query(
+            conn, "p", ["r1"], "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z",
+            node_class="social",
+        )
+        self.assertEqual(sorted(n["data"]["local"] for n in got), ["pr-1", "pr-2"])
+
+    def test_multi_repo_union(self):
+        conn = _store()
+        _seed_window_nodes(conn)
+        got = graphstore.range_query(
+            conn, "p", ["r1", "r2"], "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z",
+            node_class="social",
+        )
+        self.assertIn("pr-9", [n["data"]["local"] for n in got])
+
+    def test_empty_repos_returns_empty(self):
+        conn = _store()
+        _seed_window_nodes(conn)
+        got = graphstore.range_query(
+            conn, "p", [], "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z"
+        )
+        self.assertEqual(got, [])
+
+
 if __name__ == "__main__":
     unittest.main()

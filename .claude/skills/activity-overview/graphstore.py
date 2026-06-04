@@ -250,6 +250,26 @@ def get_code_events(conn, artifact_id):
     return out
 
 
+def range_query(conn, project, repos, ts_from, ts_to, node_class=None):
+    """In-window nodes: project match, repo in `repos`, ts in [ts_from, ts_to].
+    Nodes with NULL ts (structure) are excluded — they are not activity.
+    Ordered by (ts, id) for deterministic output."""
+    if not repos:
+        return []
+    repo_ph = ",".join("?" for _ in repos)
+    sql = (
+        "SELECT * FROM nodes "
+        "WHERE project=? AND repo IN ({}) "
+        "AND ts IS NOT NULL AND ts BETWEEN ? AND ?".format(repo_ph)
+    )
+    params = [project] + list(repos) + [ts_from, ts_to]
+    if node_class is not None:
+        sql += " AND node_class=?"
+        params.append(node_class)
+    sql += " ORDER BY ts, id"
+    return [_row_to_node(r) for r in conn.execute(sql, params)]
+
+
 def init_schema(conn):
     """Create all tables. FTS5 table is created when the build supports it."""
     conn.executescript(_CORE_SCHEMA)
