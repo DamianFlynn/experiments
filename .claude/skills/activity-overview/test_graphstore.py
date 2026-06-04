@@ -214,5 +214,65 @@ class TestRangeQuery(unittest.TestCase):
         self.assertEqual(got, [])
 
 
+class TestTraversal(unittest.TestCase):
+    def _train(self, conn):
+        # issue-1 <-closes- pr-1 <-part_of- commit-1 ; pr-1 -cross_ref-> issue-2
+        for nid, klass in [
+            ("p/r#issue-1", "social"), ("p/r#pr-1", "social"),
+            ("p/r#commit-1", "code"), ("p/r#issue-2", "social"),
+        ]:
+            graphstore.upsert_node(
+                conn, id=nid, project="p", repo="r", node_class=klass,
+                ts="2026-04-01T00:00:00Z", data={},
+            )
+        graphstore.upsert_edge(conn, "p/r#pr-1", "p/r#issue-1", "closes")
+        graphstore.upsert_edge(conn, "p/r#commit-1", "p/r#pr-1", "part_of")
+        graphstore.upsert_edge(conn, "p/r#pr-1", "p/r#issue-2", "cross_ref")
+
+    def test_reaches_connected_component_both_directions(self):
+        conn = _store()
+        self._train(conn)
+        res = graphstore.traverse_spine(conn, ["p/r#issue-1"], max_depth=6)
+        self.assertEqual(
+            set(res["reached"]),
+            {"p/r#issue-1", "p/r#pr-1", "p/r#commit-1", "p/r#issue-2"},
+        )
+        self.assertEqual(res["reached"]["p/r#issue-1"], 0)
+        self.assertEqual(res["reached"]["p/r#pr-1"], 1)
+
+    def test_depth_cap_limits_reach(self):
+        conn = _store()
+        self._train(conn)
+        res = graphstore.traverse_spine(conn, ["p/r#issue-1"], max_depth=1)
+        self.assertIn("p/r#pr-1", res["reached"])
+        self.assertNotIn("p/r#commit-1", res["reached"])  # depth 2, beyond cap
+
+    def test_non_spine_edges_are_not_followed(self):
+        conn = _store()
+        self._train(conn)
+        graphstore.upsert_node(
+            conn, id="p/r#area-9", project="p", repo="r",
+            node_class="structure", ts=None, data={},
+        )
+        graphstore.upsert_edge(conn, "p/r#pr-1", "p/r#area-9", "touches")
+        res = graphstore.traverse_spine(conn, ["p/r#issue-1"], max_depth=6)
+        self.assertNotIn("p/r#area-9", res["reached"])  # 'touches' not a spine type
+
+    def test_missing_node_reported(self):
+        conn = _store()
+        self._train(conn)
+        # an out-of-window issue referenced but never stored
+        graphstore.upsert_edge(conn, "p/r#pr-1", "p/r#issue-99", "closes")
+        res = graphstore.traverse_spine(conn, ["p/r#issue-1"], max_depth=6)
+        self.assertIn("p/r#issue-99", res["reached"])
+        self.assertIn("p/r#issue-99", res["missing"])
+        self.assertNotIn("p/r#issue-1", res["missing"])
+
+    def test_empty_seeds_returns_empty(self):
+        conn = _store()
+        res = graphstore.traverse_spine(conn, [], max_depth=6)
+        self.assertEqual(res, {"reached": {}, "missing": []})
+
+
 if __name__ == "__main__":
     unittest.main()

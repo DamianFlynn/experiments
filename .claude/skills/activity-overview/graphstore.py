@@ -270,6 +270,50 @@ def range_query(conn, project, repos, ts_from, ts_to, node_class=None):
     return [_row_to_node(r) for r in conn.execute(sql, params)]
 
 
+def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
+    """Undirected reachability over the spine edge allowlist, depth-capped.
+
+    Walks edges in both directions (a train links issue<->pr<->commit
+    regardless of edge direction), following only `edge_types`, stopping at
+    `max_depth` hops. Returns {"reached": {id: min_depth}, "missing": [ids
+    reached but absent from nodes]} — `missing` is what a reader backfills.
+    """
+    seed_ids = list(dict.fromkeys(seed_ids))  # dedup, preserve order
+    if not seed_ids:
+        return {"reached": {}, "missing": []}
+
+    seed_values = ",".join("(?)" for _ in seed_ids)
+    etype_ph = ",".join("?" for _ in edge_types)
+    sql = (
+        "WITH RECURSIVE seeds(id) AS (VALUES {seeds}), "
+        "reach(id, depth) AS ( "
+        "  SELECT id, 0 FROM seeds "
+        "  UNION "
+        "  SELECT CASE WHEN e.src_id = r.id THEN e.dst_id ELSE e.src_id END, "
+        "         r.depth + 1 "
+        "  FROM reach r "
+        "  JOIN edges e ON (e.src_id = r.id OR e.dst_id = r.id) "
+        "  WHERE e.edge_type IN ({etypes}) AND r.depth < ? "
+        ") "
+        "SELECT id, MIN(depth) AS depth FROM reach GROUP BY id"
+    ).format(seeds=seed_values, etypes=etype_ph)
+    params = list(seed_ids) + list(edge_types) + [max_depth]
+
+    reached = {row["id"]: row["depth"] for row in conn.execute(sql, params)}
+
+    present = set()
+    ids = list(reached)
+    if ids:
+        ph = ",".join("?" for _ in ids)
+        present = {
+            r["id"] for r in conn.execute(
+                "SELECT id FROM nodes WHERE id IN ({})".format(ph), ids
+            )
+        }
+    missing = [i for i in reached if i not in present]
+    return {"reached": reached, "missing": missing}
+
+
 def init_schema(conn):
     """Create all tables. FTS5 table is created when the build supports it."""
     conn.executescript(_CORE_SCHEMA)
