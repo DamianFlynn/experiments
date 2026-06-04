@@ -117,11 +117,38 @@ class TestCloneAndWindow(unittest.TestCase):
         self.assertFalse(gather.in_window("2026-06-01", "2026-05-01", "2026-05-31"))
         self.assertFalse(gather.in_window(None, "2026-05-01", "2026-05-31"))
 
+    def test_window_records_filters_by_date_inclusive(self):
+        recs = [{"date": "2026-05-10", "commit": "a"},
+                {"date": "2026-05-25", "commit": "b"},
+                {"date": "2026-06-01", "commit": "c"},
+                {"date": "2026-06-02", "commit": "d"},
+                {"date": "", "commit": "e"}]
+        out = gather.window_records(recs, "2026-05-25", "2026-06-01")
+        self.assertEqual([r["commit"] for r in out], ["b", "c"])
+
+    def test_window_records_preserves_order(self):
+        recs = [{"date": "2026-05-26"}, {"date": "2026-05-25"}, {"date": "2026-05-27"}]
+        self.assertEqual([r["date"] for r in gather.window_records(
+            recs, "2026-05-25", "2026-05-31")],
+            ["2026-05-26", "2026-05-25", "2026-05-27"])
+
 
 class TestPrNormalization(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "rest_sample.json")) as fh:
             self.data = json.load(fh)
+
+    def test_normalize_captures_base_and_head_refs(self):
+        raw = {"number": 5, "base": {"ref": "users/x/feat"},
+               "head": {"ref": "fix-branch"}}
+        pr = gather.normalize_pr(raw)
+        self.assertEqual(pr["base"], "users/x/feat")
+        self.assertEqual(pr["head"], "fix-branch")
+
+    def test_normalize_missing_base_head_is_none(self):
+        pr = gather.normalize_pr({"number": 6})
+        self.assertIsNone(pr["base"])
+        self.assertIsNone(pr["head"])
 
     def test_parse_closing_refs_all_keywords(self):
         self.assertEqual(gather.parse_closing_refs("Fixes #17"), [17])
@@ -1035,6 +1062,14 @@ class TestParseBicepModuleRefs(unittest.TestCase):
         self.assertEqual(gather.parse_bicep_module_refs(""), [])
         self.assertEqual(gather.parse_bicep_module_refs(None), [])
 
+    def test_array_instantiation_marks_many_instances(self):
+        src = "module x 'nat-rule/main.bicep' = [for i in r: { name: i }]"
+        self.assertEqual(gather.parse_bicep_module_refs(src)[0]["instances"], "many")
+
+    def test_single_instantiation_marks_one_instance(self):
+        src = "module x 'child/main.bicep' = { name: 'c' }"
+        self.assertEqual(gather.parse_bicep_module_refs(src)[0]["instances"], "one")
+
 
 class TestResolveModuleRef(unittest.TestCase):
     def test_registry_path_resolves_to_avm_area_id(self):
@@ -1145,6 +1180,32 @@ class TestBuildBicepEdges(unittest.TestCase):
         vault = [e for e in edges if e["to"] == "avm/res/key-vault/vault"]
         self.assertEqual(len(vault), 1)
         self.assertFalse(vault[0]["transitive"])
+
+    def test_local_child_submodule_named_not_self_edge(self):
+        """A local relative ref to a private child module is resolved to the named
+        child node (`<area>/<child>`), not collapsed to a `<area> -> <area>` self
+        edge, and is flagged local + carries instance cardinality."""
+        src = "module child 'nat-rule/main.bicep' = [for x in r: {}]\n"
+        base = "avm/res/network/vpn-gateway/main.bicep"
+        edges = gather.build_bicep_edges(src, {}, base, set(),
+                                         gather.DEFAULT_AREA_PATTERNS)
+        e = next(e for e in edges if e["ref"] == "nat-rule/main.bicep")
+        self.assertEqual(e["to"], "avm/res/network/vpn-gateway/nat-rule")
+        self.assertNotEqual(e["to"], "avm/res/network/vpn-gateway")
+        self.assertTrue(e["local"])
+        self.assertEqual(e["instances"], "many")
+        self.assertTrue(e["resolved"])
+
+    def test_true_self_recursion_stays_self_edge(self):
+        """A module that references its own main.bicep is genuine recursion and
+        stays a self edge (not relabelled as a child)."""
+        src = "module self 'main.bicep' = { name: 'r' }"
+        base = "avm/res/network/vpn-gateway/main.bicep"
+        edges = gather.build_bicep_edges(src, {}, base, set(),
+                                         gather.DEFAULT_AREA_PATTERNS)
+        e = edges[0]
+        self.assertEqual(e["to"], "avm/res/network/vpn-gateway")
+        self.assertNotIn("local", e)
 
     def test_empty_build_inputs_yield_no_edges(self):
         self.assertEqual(
@@ -1766,6 +1827,32 @@ class TestParseSymbolEvents(unittest.TestCase):
 
     def test_empty_input_yields_no_events(self):
         self.assertEqual(gather.parse_symbol_events(""), [])
+
+
+class TestClassifyPrKind(unittest.TestCase):
+    """Conventional-commit PR title -> canonical kind (train fallback)."""
+
+    def test_conventional_prefixes_map_to_kinds(self):
+        self.assertEqual(gather.classify_pr_kind({"title": "feat: add redis cmk"}),
+                         "feature")
+        self.assertEqual(gather.classify_pr_kind({"title": "fix: null deref"}), "bug")
+        self.assertEqual(gather.classify_pr_kind({"title": "docs: clarify readme"}),
+                         "docs")
+
+    def test_scope_breaking_and_case_are_handled(self):
+        self.assertEqual(
+            gather.classify_pr_kind({"title": "feat(avm/res/cache/redis): add"}),
+            "feature")
+        self.assertEqual(gather.classify_pr_kind({"title": "fix!: drop output"}), "bug")
+        self.assertEqual(gather.classify_pr_kind({"title": "Feat: Case Insensitive"}),
+                         "feature")
+
+    def test_unmapped_or_absent_prefix_returns_none(self):
+        for title in ("chore: bump deps", "refactor: tidy", "perf: faster",
+                      "Add policy param", "feat add no colon", ""):
+            self.assertIsNone(gather.classify_pr_kind({"title": title}),
+                              f"expected None for {title!r}")
+        self.assertIsNone(gather.classify_pr_kind({}))
 
 
 if __name__ == "__main__":

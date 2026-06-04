@@ -86,3 +86,28 @@ claim in the report resolves to a source ref in the bundle — never invent fact
 - Phase 3e: when `symbol_moves.links` is non-empty, collapse the matching add/drop
   deltas into a single **"moved"** row (`from_path → to_path`), labelling `confidence`;
   `medium`-confidence moves are heuristic, so present them as likely-not-certain.
+- Phase 4a **Decision trains** — each train in `bundle["trains"]` now carries `significance`,
+  `tier` (`"deep"` or `"mention"`), and an `effort` block. Structure the section as follows:
+  - **DEEP trains** (`tier == "deep"`) get a full sub-section. Embed the train's Mermaid
+    flowchart from `diagrams.train_flowcharts[id]` (a file path; read and inline as a
+    ```mermaid block). Add an **effort line** derived from the `effort` block:
+    - Merged: *"landed in N days · R reviewers · P contributors"*
+      (`elapsed_days`, `reviewers`, `participants`; note `stalled: true` when present).
+    - Open: *"open N days"* (compute from `effort.opened_at` to today; merged_at is null).
+    The per-train narrative is authored in Phase 4b (sub-agent pass) — for now leave a
+    `<!-- narrative: <train-id> -->` placeholder after the effort line.
+  - **MENTION trains** (`tier == "mention"`) collapse to a single line:
+    `- train-id — {title} — {outcome} ({PR count} PR(s))`.
+  - `slice_train(bundle, train_id)` is the bounded, self-contained unit that a Phase 4b
+    sub-agent (or a spotlight) consumes for one train. Call it to scope the context passed
+    to a sub-agent. `render.py --train <id>` produces a spotlight flowchart on demand for
+    any tier.
+- Phase 4a **Next-release forecast** — `bundle["forecast"]` contains a forward-only
+  prediction over `buckets.next_candidates`. Render a **Next-release forecast** section:
+  - Header: *"Next milestone: {forecast.next_milestone}"* (or "none identified").
+  - Group candidates by tier in order: **Likely** (score ≥ 5.0) → **Possible** (≥ 2.0) →
+    **Longshot** (< 2.0). Within each group, list in score-descending order.
+  - Per candidate: the item title + link (from `ref.url`), its `train` id if set, and the
+    `signals` list (e.g. "on milestone v1.2 · high-priority · open PR").
+  - Note: this is a forward-only forecast. The predicted-vs-landed loop (Phase 7) is not
+    yet present — do not describe it as such.

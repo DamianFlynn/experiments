@@ -546,9 +546,403 @@ class TestModuleGraph(unittest.TestCase):
         mmd = render.emit_module_graph(empty)
         self.assertIn("No module dependencies", mmd)
 
+    def test_local_child_edge_is_named_and_marked_multi_instance(self):
+        """A local child-submodule edge renders the named child node and a marker
+        that distinguishes it as a local, multi-instance (array) dependency."""
+        bundle = {"code_graph": {"areas": [
+            {"id": "avm/res/network/vpn-gateway", "edges": [
+                {"to": "avm/res/network/vpn-gateway/nat-rule", "kind": "module",
+                 "ref": "nat-rule/main.bicep", "version": None, "transitive": False,
+                 "local": True, "instances": "many", "resolved": True}]}]}}
+        mmd = render.emit_module_graph(bundle)
+        self.assertIn("nat-rule", mmd)            # child submodule named
+        # local + multi-instance marker, quoted so `[]` doesn't break Mermaid.
+        self.assertIn('|"child[]"|', mmd)
+
     def test_registered_in_render_manifest(self):
         names = set(render.render(self.bundle))
         self.assertIn("module_graph", names)
+
+
+def _train_bundle():
+    """A minimal enriched bundle with one deep (issue-rooted) train and one mention train."""
+    return {
+        "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
+        "issues": [
+            {"number": 17, "title": "Support policy param", "kind": "feature",
+             "url": "https://github.com/o/r/issues/17", "milestone": "v1.2.0"},
+        ],
+        "prs": [
+            {"number": 42, "title": "Add policy param", "merged": True,
+             "milestone": "v1.2.0", "url": "https://github.com/o/r/pull/42"},
+        ],
+        "trains": [
+            {
+                "id": "train-issue-17",
+                "kind": "feature",
+                "root_issue": 17,
+                "prs": [42],
+                "commits": [],
+                "code_areas": ["avm/res/network/firewall-policy"],
+                "outcome": "shipped",
+                "evidence": [],
+                "significance": 10.0,
+                "tier": "deep",
+            },
+            {
+                "id": "train-pr-99",
+                "kind": "other",
+                "root_issue": None,
+                "prs": [99],
+                "commits": [],
+                "code_areas": [],
+                "outcome": "shipped",
+                "evidence": [],
+                "significance": 1.0,
+                "tier": "mention",
+            },
+        ],
+        "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
+        "releases": [],
+        "artifacts": {},
+        "feature_deltas": [],
+        "people": {},
+        "modules": {},
+    }
+
+
+class TestEmitTrainFlowchart(unittest.TestCase):
+    def test_shipped_issue_rooted_has_issue_pr_and_outcome_nodes(self):
+        b = _train_bundle()
+        train = b["trains"][0]
+        mmd = render.emit_train_flowchart(b, train)
+        self.assertTrue(mmd.startswith("flowchart"))
+        # issue node (title text present)
+        self.assertIn("Support policy param", mmd)
+        # PR node
+        self.assertIn("Add policy param", mmd)
+        # outcome node: shipped
+        self.assertIn("Shipped", mmd)
+        # edges present
+        self.assertIn("-->", mmd)
+
+    def test_shipped_issue_rooted_has_issue_to_pr_edge(self):
+        b = _train_bundle()
+        train = b["trains"][0]
+        issue_number = train["root_issue"]   # 17
+        pr_number = train["prs"][0]          # 42
+        mmd = render.emit_train_flowchart(b, train)
+        lines = mmd.splitlines()
+        iss_id = render._node_id("iss", str(issue_number))
+        pr_id = render._node_id("pr", str(pr_number))
+        out_id = render._node_id("out", train["id"])
+        # The specific issue -> PR edge must be present
+        self.assertIn(f"    {iss_id} --> {pr_id}", lines)
+        # The PR -> outcome edge must also be present
+        self.assertIn(f"    {pr_id} --> {out_id}", lines)
+
+    def test_pr_only_train_has_no_issue_node(self):
+        b = _train_bundle()
+        # Build a PR-only train (root_issue=None) with a known PR
+        b["prs"].append({"number": 99, "title": "Standalone fix", "merged": True,
+                         "milestone": None, "url": "https://github.com/o/r/pull/99"})
+        train = b["trains"][1]  # train-pr-99
+        mmd = render.emit_train_flowchart(b, train)
+        self.assertTrue(mmd.startswith("flowchart"))
+        # The only issue is #17 and its title should NOT appear
+        self.assertNotIn("Support policy param", mmd)
+        # PR title should appear
+        self.assertIn("Standalone fix", mmd)
+
+    def test_outcome_rejected_label(self):
+        b = _train_bundle()
+        train = dict(b["trains"][0])
+        train["outcome"] = "rejected"
+        mmd = render.emit_train_flowchart(b, train)
+        self.assertIn("Rejected", mmd)
+        self.assertNotIn("Shipped", mmd)
+        self.assertNotIn("In flight", mmd)
+
+    def test_outcome_open_becomes_in_flight(self):
+        b = _train_bundle()
+        train = dict(b["trains"][0])
+        train["outcome"] = "open"
+        mmd = render.emit_train_flowchart(b, train)
+        self.assertIn("In flight", mmd)
+        self.assertNotIn("Shipped", mmd)
+        self.assertNotIn("Rejected", mmd)
+
+    def test_outcome_unknown_becomes_in_flight(self):
+        b = _train_bundle()
+        train = dict(b["trains"][0])
+        train["outcome"] = "in_flight"
+        mmd = render.emit_train_flowchart(b, train)
+        self.assertIn("In flight", mmd)
+
+    def test_shipped_with_milestone_appended(self):
+        b = _train_bundle()
+        train = b["trains"][0]  # outcome=shipped, PR milestone=v1.2.0
+        mmd = render.emit_train_flowchart(b, train)
+        self.assertIn("v1.2.0", mmd)
+
+    def test_shipped_no_milestone_no_arrow(self):
+        b = _train_bundle()
+        # Remove milestone from PR
+        b["prs"][0]["milestone"] = None
+        train = b["trains"][0]
+        mmd = render.emit_train_flowchart(b, train)
+        # Find the outcome node line (contains the outcome label)
+        outcome_lines = [ln for ln in mmd.splitlines() if "Shipped" in ln]
+        self.assertTrue(outcome_lines, "Expected an outcome node line containing 'Shipped'")
+        outcome_line = outcome_lines[0]
+        # When there is no milestone, the arrow glyph must NOT appear in the outcome node
+        self.assertNotIn("Shipped →", outcome_line)
+
+    def test_shipped_with_milestone_has_arrow_in_outcome_line(self):
+        b = _train_bundle()
+        train = b["trains"][0]  # outcome=shipped, PR milestone=v1.2.0
+        mmd = render.emit_train_flowchart(b, train)
+        # Find the outcome node line
+        outcome_lines = [ln for ln in mmd.splitlines() if "Shipped" in ln]
+        self.assertTrue(outcome_lines, "Expected an outcome node line containing 'Shipped'")
+        outcome_line = outcome_lines[0]
+        # Milestone arrow should appear in the outcome node label
+        self.assertIn("Shipped →", outcome_line)
+        self.assertIn("v1.2.0", outcome_line)
+
+    def test_mode_c_adds_area_nodes(self):
+        """Under the threshold: area nodes are emitted (mode C)."""
+        b = _train_bundle()
+        train = b["trains"][0]  # 1 PR, 1 area — well under defaults
+        mmd = render.emit_train_flowchart(b, train)
+        # area tail of 'avm/res/network/firewall-policy' is 'firewall-policy'
+        self.assertIn("firewall-policy", mmd)
+
+    def test_mode_a_no_area_nodes_when_too_many_prs(self):
+        """Exceeding TRAIN_FLOW_MAX_PRS drops area annotation (mode A)."""
+        b = _train_bundle()
+        max_prs = render.TRAIN_FLOW_MAX_PRS
+        # Build a train with max_prs+1 PRs and a few code areas
+        pr_nums = list(range(100, 100 + max_prs + 1))
+        for n in pr_nums:
+            b["prs"].append({"number": n, "title": f"PR {n}", "merged": True,
+                             "milestone": None, "url": f"u/{n}"})
+        train = {
+            "id": "train-issue-17",
+            "kind": "feature",
+            "root_issue": 17,
+            "prs": pr_nums,
+            "commits": [],
+            "code_areas": ["area/foo", "area/bar"],
+            "outcome": "shipped",
+            "evidence": [],
+        }
+        mmd = render.emit_train_flowchart(b, train)
+        # No area-annotation node declarations: the ("label") rounded-node shape is
+        # unique to area nodes here, so assert those specific lines are absent
+        # (more precise than a bare substring that a PR/issue title could contain).
+        self.assertNotIn('("foo")', mmd)
+        self.assertNotIn('("bar")', mmd)
+
+    def test_mode_a_no_area_nodes_when_too_many_areas(self):
+        """Exceeding TRAIN_FLOW_MAX_AREAS drops area annotation (mode A)."""
+        b = _train_bundle()
+        max_areas = render.TRAIN_FLOW_MAX_AREAS
+        areas = [f"area/area{i}" for i in range(max_areas + 1)]
+        train = {
+            "id": "train-issue-17",
+            "kind": "feature",
+            "root_issue": 17,
+            "prs": [42],
+            "commits": [],
+            "code_areas": areas,
+            "outcome": "shipped",
+            "evidence": [],
+        }
+        mmd = render.emit_train_flowchart(b, train)
+        # area tails should NOT appear (area0, area1,...)
+        self.assertNotIn("area0", mmd)
+
+    def test_mode_c_at_max_threshold_keeps_areas(self):
+        """Exactly at threshold (not over) stays in mode C."""
+        b = _train_bundle()
+        # Exactly TRAIN_FLOW_MAX_PRS PRs and TRAIN_FLOW_MAX_AREAS areas
+        max_prs = render.TRAIN_FLOW_MAX_PRS
+        max_areas = render.TRAIN_FLOW_MAX_AREAS
+        pr_nums = list(range(200, 200 + max_prs))
+        for n in pr_nums:
+            b["prs"].append({"number": n, "title": f"PR {n}", "merged": True,
+                             "milestone": None, "url": f"u/{n}"})
+        areas = [f"area/zone{i}" for i in range(max_areas)]
+        train = {
+            "id": "train-issue-17",
+            "kind": "feature",
+            "root_issue": 17,
+            "prs": pr_nums,
+            "commits": [],
+            "code_areas": areas,
+            "outcome": "shipped",
+            "evidence": [],
+        }
+        mmd = render.emit_train_flowchart(b, train)
+        # In mode C: area node tails present
+        self.assertIn("zone0", mmd)
+
+    def test_duplicate_areas_do_not_force_mode_a(self):
+        """6 code_areas entries with only 2 distinct values should stay in mode C."""
+        b = _train_bundle()
+        max_areas = render.TRAIN_FLOW_MAX_AREAS  # 5
+        # Raw length (6) exceeds max_areas (5) but distinct count (2) does not.
+        areas = ["area/alpha", "area/beta"] * 3  # 6 entries, 2 distinct
+        self.assertGreater(len(areas), max_areas)
+        self.assertLessEqual(len(set(areas)), max_areas)
+        train = {
+            "id": "train-issue-17",
+            "kind": "feature",
+            "root_issue": 17,
+            "prs": [42],
+            "commits": [],
+            "code_areas": areas,
+            "outcome": "shipped",
+            "evidence": [],
+        }
+        mmd = render.emit_train_flowchart(b, train)
+        # Must stay in mode C: area tails are present
+        self.assertIn("alpha", mmd)
+        self.assertIn("beta", mmd)
+        # Only one node per distinct area (node id is deterministic from area name)
+        alpha_id = render._node_id("area", "area/alpha")
+        beta_id = render._node_id("area", "area/beta")
+        # Each distinct area node declaration appears exactly once
+        node_lines = [ln for ln in mmd.splitlines()
+                      if alpha_id in ln and '("' in ln]
+        self.assertEqual(len(node_lines), 1, "alpha area node should appear exactly once")
+        node_lines_b = [ln for ln in mmd.splitlines()
+                        if beta_id in ln and '("' in ln]
+        self.assertEqual(len(node_lines_b), 1, "beta area node should appear exactly once")
+
+
+class TestWriteDiagramsTrainFlowcharts(unittest.TestCase):
+    def test_train_flowcharts_map_registered_for_deep_trains(self):
+        b = _train_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            outdir = os.path.join(d, "diagrams")
+            render.write_diagrams(b, outdir)
+            tf = b["diagrams"].get("train_flowcharts")
+            self.assertIsInstance(tf, dict)
+            # Only the deep train (train-issue-17), not the mention train (train-pr-99)
+            self.assertIn("train-issue-17", tf)
+            self.assertNotIn("train-pr-99", tf)
+
+    def test_train_flowcharts_workspace_relative_paths(self):
+        b = _train_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            outdir = os.path.join(d, "diagrams")
+            render.write_diagrams(b, outdir)
+            tf = b["diagrams"]["train_flowcharts"]
+            path = tf["train-issue-17"]
+            # workspace-relative: should be diagrams/train-issue-17.mmd
+            self.assertTrue(path.endswith("train-issue-17.mmd"))
+            self.assertFalse(os.path.isabs(path))
+
+    def test_train_flowchart_file_written_to_disk(self):
+        b = _train_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            outdir = os.path.join(d, "diagrams")
+            real_paths = render.write_diagrams(b, outdir)
+            # Real path for the deep train should be a key or in return value
+            # It may be returned as a separate key in real_paths or embedded
+            # Check the file exists on disk
+            mmd_path = os.path.join(outdir, "train-issue-17.mmd")
+            self.assertTrue(os.path.exists(mmd_path))
+
+    def test_train_flowchart_real_paths_returned_for_validation(self):
+        b = _train_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            outdir = os.path.join(d, "diagrams")
+            real_paths = render.write_diagrams(b, outdir)
+            # real_paths should contain entries for each deep train flowchart
+            # so mmdc can validate them
+            self.assertIn("train-issue-17", real_paths)
+
+    def test_flat_diagrams_unaffected(self):
+        """The existing flat diagram keys must still be present."""
+        b = _train_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            outdir = os.path.join(d, "diagrams")
+            real_paths = render.write_diagrams(b, outdir)
+            for key in ("buckets_pie", "timeline_gantt"):
+                self.assertIn(key, real_paths)
+                self.assertIn(key, b["diagrams"])
+
+
+class TestTrainSpotlightCLI(unittest.TestCase):
+    def test_parse_args_accepts_train_option(self):
+        args = render.parse_args(["bundle.json", "--train", "train-issue-17"])
+        self.assertEqual(args.train, "train-issue-17")
+
+    def test_parse_args_train_defaults_to_none(self):
+        args = render.parse_args(["bundle.json"])
+        self.assertIsNone(args.train)
+
+    def test_main_train_spotlight_writes_single_train(self):
+        b = _train_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            bundle_path = os.path.join(d, "b.json")
+            with open(bundle_path, "w") as fh:
+                json.dump(b, fh)
+            outdir = os.path.join(d, "diagrams")
+            manifest = render.main([bundle_path, "--diagrams-dir", outdir,
+                                    "--train", "train-issue-17", "--skip-validate"])
+            # Only the single train file was produced in the manifest
+            self.assertIn("train-issue-17", manifest)
+            # Flat diagrams should NOT appear in spotlight-only manifest
+            self.assertNotIn("buckets_pie", manifest)
+
+    def test_main_train_spotlight_works_for_mention_tier(self):
+        """--train can render even a mention-tier train."""
+        b = _train_bundle()
+        # Add a PR for the mention train
+        b["prs"].append({"number": 99, "title": "Mention fix", "merged": True,
+                         "milestone": None, "url": "u/99"})
+        with tempfile.TemporaryDirectory() as d:
+            bundle_path = os.path.join(d, "b.json")
+            with open(bundle_path, "w") as fh:
+                json.dump(b, fh)
+            outdir = os.path.join(d, "diagrams")
+            manifest = render.main([bundle_path, "--diagrams-dir", outdir,
+                                    "--train", "train-pr-99", "--skip-validate"])
+            self.assertIn("train-pr-99", manifest)
+
+    def test_main_train_registers_in_bundle_train_flowcharts_map(self):
+        b = _train_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            bundle_path = os.path.join(d, "b.json")
+            with open(bundle_path, "w") as fh:
+                json.dump(b, fh)
+            outdir = os.path.join(d, "diagrams")
+            render.main([bundle_path, "--diagrams-dir", outdir,
+                         "--train", "train-issue-17", "--skip-validate"])
+            written = json.load(open(bundle_path))
+            tf = written["diagrams"].get("train_flowcharts", {})
+            self.assertIn("train-issue-17", tf)
+
+
+class TestTrainFlowchartMmdc(unittest.TestCase):
+    @unittest.skipUnless(_mmdc_works(), "working mmdc (with browser) not available")
+    def test_train_flowcharts_compile_via_mmdc(self):
+        """Live gate: emitted train flowcharts must actually compile with mmdc."""
+        b = _train_bundle()
+        # Ensure there is at least one deep train
+        b["trains"][0]["tier"] = "deep"
+        with tempfile.TemporaryDirectory() as d:
+            outdir = os.path.join(d, "diagrams")
+            real_paths = render.write_diagrams(b, outdir)
+            # Collect only the train flowchart paths for validation
+            train_paths = [v for k, v in real_paths.items()
+                           if k.startswith("train-")]
+            self.assertTrue(train_paths, "No train flowchart paths to validate")
+            render.validate_with_mmdc(train_paths)  # raises on failure
 
 
 if __name__ == "__main__":

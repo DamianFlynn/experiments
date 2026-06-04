@@ -94,7 +94,7 @@ def parse_git_log(raw):
 # FIELD_SEP header as parse_git_log, but the BODY is `--name-status` lines so each
 # changed path carries its change type (and rename/copy detection via -M -C gives
 # `R###`/`C###` with old+new paths).
-CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%ad%x1f%s"
+CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
 
 _STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
                      "R": "rename", "C": "copy", "T": "modify"}
@@ -204,6 +204,14 @@ def in_window(ts, from_date, to_date):
     return from_date <= day <= to_date
 
 
+def window_records(records, from_date, to_date):
+    """Keep only commits/events whose `date` (committer/landing date) falls in
+    [from,to] inclusive. Pure. Used instead of git's `--since/--until`, which
+    silently prunes valid in-window commits when commit dates are non-monotonic
+    across committer timezones (and excludes the upper boundary day)."""
+    return [r for r in records if in_window(r.get("date"), from_date, to_date)]
+
+
 _CLOSING_RE = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
 )
@@ -239,6 +247,11 @@ def normalize_pr(raw):
         "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
         "state": raw.get("state"),
+        # base/head branch refs: a PR whose base isn't the analyzed branch is a
+        # stacked/fork PR (it merged into another branch, not main) — kept as
+        # context but not counted as shipped-to-main (see link.build_trains).
+        "base": (raw.get("base") or {}).get("ref"),
+        "head": (raw.get("head") or {}).get("ref"),
         "comments": raw.get("comments", 0) or 0,
         "review_comments_count": raw.get("review_comments", 0) or 0,
         "reviewers": [],
@@ -793,18 +806,23 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
 # Phase 3c: IaC dependency-edge extraction (build-only). The edge object is
 # {to, kind, ref, version, transitive, provider, resolved}; see BUNDLE.md.
 
-_BICEP_MODULE_RE = re.compile(r"module\s+\w+\s+'(?P<ref>[^']+)'")
+_BICEP_MODULE_RE = re.compile(
+    r"module\s+\w+\s+'(?P<ref>[^']+)'(?:\s*=\s*(?P<open>[\[{]))?")
 
 
 def parse_bicep_module_refs(source_text):
     """Extract `module <sym> '<ref>'` references from a .bicep source.
 
-    Each result is {ref, registry_path, version, local_path}. Registry refs
-    (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
-    `registry_path` + `version`; everything else is a `local_path`. Pure."""
+    Each result is {ref, registry_path, version, local_path, instances}. Registry
+    refs (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
+    `registry_path` + `version`; everything else is a `local_path`. `instances` is
+    `"many"` when the module is instantiated as an array (`= [for ...]`), `"one"`
+    for a single `= {`, else None. Pure."""
     refs = []
     for m in _BICEP_MODULE_RE.finditer(source_text or ""):
         ref = m.group("ref")
+        open_ch = m.group("open")
+        instances = "many" if open_ch == "[" else "one" if open_ch == "{" else None
         registry_path = version = local_path = None
         if ref.startswith("br/public:") or ref.startswith("br:"):
             body = ref.split(":", 1)[1]              # drop the br/public or br scheme
@@ -818,7 +836,8 @@ def parse_bicep_module_refs(source_text):
         else:
             local_path = ref
         refs.append({"ref": ref, "registry_path": registry_path,
-                     "version": version, "local_path": local_path})
+                     "version": version, "local_path": local_path,
+                     "instances": instances})
     return refs
 
 
@@ -920,18 +939,36 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     patterns = patterns or DEFAULT_AREA_PATTERNS
     edges = []
     seen = set()
+    self_id = classify_code_area(base_path, patterns)
 
     for ri in parse_bicep_module_refs(source_text):
         to = resolve_module_ref(ri, base_path, patterns)
+        local = False
+        # A local relative ref that resolves back to THIS area is a private child
+        # submodule (e.g. `nat-rule/main.bicep`), not a self-dependency. Name the
+        # child node (`<area>/<child>`) so the graph shows which private submodule
+        # is used; a ref to the area's own main.bicep is genuine recursion and is
+        # left as a self edge.
+        if ri.get("local_path") and to is not None and to == self_id:
+            joined = os.path.normpath(
+                os.path.join(os.path.dirname(base_path or ""), ri["local_path"]))
+            child_dir = os.path.dirname(joined)
+            if child_dir != self_id and child_dir.startswith(str(self_id) + "/"):
+                to = child_dir
+                local = True
         key = (to, ri["ref"], False)
         if key in seen:
             continue
         seen.add(key)
-        edges.append({"to": to, "kind": "module", "ref": ri["ref"],
-                      "version": ri["version"], "transitive": False,
-                      "provider": "bicep", "resolved": to is not None})
+        edge = {"to": to, "kind": "module", "ref": ri["ref"],
+                "version": ri["version"], "transitive": False,
+                "provider": "bicep", "resolved": to is not None}
+        if local:
+            edge["local"] = True
+            if ri.get("instances"):
+                edge["instances"] = ri["instances"]
+        edges.append(edge)
 
-    self_id = classify_code_area(base_path, patterns)
     immediate_tos = {e["to"] for e in edges}  # direct deps, already captured above
     for node in walk_arm_deployments(arm_json):
         # depth 1 == the direct module instantiations (already emitted as immediate
@@ -1253,6 +1290,28 @@ def classify_issue_kind(issue, taxonomy, types_present):
     if kind:
         return kind
     return "other"
+
+
+# Conventional-commit type prefix -> canonical kind (only the prefixes that map
+# cleanly onto _VALID_KINDS; everything else falls through to None/"other").
+_CC_TYPE_TO_KIND = {"feat": "feature", "fix": "bug", "docs": "docs"}
+_CC_PREFIX_RE = re.compile(r"^([a-z]+)(?:\([^)]*\))?!?:")
+
+
+def classify_pr_kind(pr):
+    """Kind from a PR's conventional-commit title prefix: feat->feature, fix->bug,
+    docs->docs. Returns None when the title has no recognized prefix, so callers
+    can fall through to 'other'. Pure.
+
+    Used as a fallback for trains with no typed root issue: repos like AVM title
+    PRs conventionally (`feat:`/`fix:`) but rarely close a typed issue, so without
+    this every train's kind would be 'other' and significance could not weight
+    feature vs fix."""
+    title = (pr.get("title") or "").strip().lower()
+    m = _CC_PREFIX_RE.match(title)
+    if not m:
+        return None
+    return _CC_TYPE_TO_KIND.get(m.group(1))
 
 
 def fetch_all(get_page, first_url):
@@ -1665,12 +1724,14 @@ def acquire(args, env):
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
     # Multi-branch commit walking arrives in a later phase.
+    # The shallow clone already bounds history to ~CLONE_MARGIN_DAYS before `frm`;
+    # we walk it fully and window in Python (window_records) rather than with git's
+    # `--since/--until`, which prunes valid in-window commits across timezones.
     raw = run_git([
         "git", "-C", clone_dir, "log",
-        f"--since={frm}", f"--until={to}",
         f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
     ])
-    commits = parse_git_log(raw)
+    commits = window_records(parse_git_log(raw), frm, to)
 
     # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
     # Guarded so --no-clone / missing clone degrades gracefully to empty.
@@ -1680,11 +1741,10 @@ def acquire(args, env):
     if not args.no_clone or os.path.isdir(clone_dir):
         raw_walk = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
-            f"--since={frm}", f"--until={to}",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
             "--name-status", "-M", "-C",
         ])
-        code_events = parse_code_events(raw_walk)
+        code_events = window_records(parse_code_events(raw_walk), frm, to)
 
     # Phase 3d: symbol-granular change attribution via a single `git log -p` walk
     # (diff-local, no per-commit checkout). Same guard/degradation + oldest→newest
@@ -1693,11 +1753,10 @@ def acquire(args, env):
     if not args.no_clone or os.path.isdir(clone_dir):
         raw_patch = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
-            f"--since={frm}", f"--until={to}",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
             "-p", "--unified=3", "-M", "-C",
         ])
-        symbol_events = parse_symbol_events(raw_patch)
+        symbol_events = window_records(parse_symbol_events(raw_patch), frm, to)
 
     # Drop any shallow-boundary commit whose diff is a whole-tree phantom (its parent
     # was grafted away by the bounded clone) — guards both walks against inflation.
@@ -1853,6 +1912,9 @@ def acquire(args, env):
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
         "branches": args.branches.split(","), "clone_dir": clone_dir,
+        # the analyzed mainline branch: PRs merged into other branches are stacked/
+        # fork contributions, not shipped-to-main (link.build_trains keys on this).
+        "base_branch": args.branches.split(",")[0],
         "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
         "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,

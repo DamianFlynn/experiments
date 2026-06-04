@@ -21,19 +21,48 @@ SHAs in `trains[].commits` — wrapped `commit` refs arrive in a later phase.)
 Scope notes mark where Phase 2 widens what Phase 1 collected; field lists below
 are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 
-- `meta` — `owner, repo, from, to, branches, clone_dir, period, prev_bundle, schema_version`,
-  plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
+- `meta` — `owner, repo, from, to, branches, base_branch, clone_dir, period, prev_bundle,
+  schema_version`. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
+  from it is a stacked/fork contribution (merged into another branch, not main) — kept in `prs`
+  as context but not counted as shipped-to-main (see `commits`/`date` note below and trains).
+  Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
   It pins the exact source tree so `gather.py --resume <prior-bundle>` can re-resolve **only**
   the `timeout`/`failed` edges against the identical tree (edges are a pure function of source),
   and a multi-bundle roll-up can pick the newest structural snapshot deterministically.
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
+  `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
+  (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
+  across committer timezones.
 - `prs` — PRs in scope (Phase 1: merged-in-window only; **Phase 2** also includes
   open and closed-unmerged PRs): `{ number, title, body, author, author_association,
-  labels, merged, merged_by, merged_at, closed_at, state, closes:[issue#], url }`.
+  labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
+  `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
 - `issues` — issues in scope (Phase 1: PR-closing issues only; **Phase 2** also
   includes open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
-- `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], outcome, evidence:[ref] }]`.
+- `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
+  contributing_prs:[#], significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at,
+  elapsed_days, reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
+  A train is anchored by its root **issue** (`train-issue-<n>`) or, when no issue is linked
+  (process not followed / a forked PR), by its **PR** (`train-pr-<n>`). One train per anchor, by
+  precedence shipped > in_flight > rejected > abandoned: `"shipped"` (≥1 PR merged to
+  `meta.base_branch`), `"in_flight"` (only OPEN PR(s) targeting it; in progress), `"rejected"`
+  (only CLOSED-unmerged PR(s) targeting it; change dropped), `"abandoned"` (an issue closed
+  `not_planned` with no PR train — an idea that went nowhere). **`contributing_prs`** are
+  PRs merged into another PR's branch (`base == that PR's head`) — stacked/fork contributions to
+  this train's journey-to-main, tracked but not counted as shipped.
+  `kind` derives from the typed root issue; when there is no typed root issue it falls back to
+  the anchor PRs' conventional-commit title prefix (`feat→feature`, `fix→bug`, `docs→docs`), else
+  `other` — so significance still differentiates work on repos that title PRs but rarely type issues.
+  `significance = footprint × kind_weight + breadth` (footprint counts prs + commits + code_areas +
+  contributing_prs); `tier` = `"deep"` for the top-N by significance ∪ any train ≥ the significance
+  floor, else `"mention"` (Phase 4a).
+  `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed
+  `review_comments_count` (int); `participants` = count of distinct authors + reviewers +
+  comment-authors (int);
+  `stalled` = merged but `elapsed_days > TRAIN_STALL_DAYS`. All fields degrade to null/0
+  when data is thin. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
+  `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`.
 - `buckets` — `{ shipped:[ref], in_flight:[ref], rejected:[ref], next_candidates:[ref] }`
   (Phase 1 fills only `shipped`; Phase 2 classifies all four — see below).
 
@@ -56,7 +85,18 @@ docsRefs, release_train, sprints, project, diagrams`.
   `next_candidates` (one bucket per item; precedence shipped > rejected >
   next_candidates > in_flight). Each ref may carry a `train` id.
 - **diagrams{}** maps `buckets_pie` / `timeline_gantt` to their `.mmd` paths,
-  written and mmdc-validated by `render.py`.
+  written and mmdc-validated by `render.py`. **`diagrams.train_flowcharts`** is a nested
+  map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written by `render.py` (one adaptive
+  Mermaid `flowchart` per DEEP train; mode C with code-area annotation nodes when
+  `len(prs) ≤ TRAIN_FLOW_MAX_PRS` and `len(distinct code_areas) ≤ TRAIN_FLOW_MAX_AREAS`, else
+  mode A bare chain). On-demand spotlight render via `render.py --train <id>` (any tier).
+- **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
+  train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
+  — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
+  desc. Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
+  / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
+  `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
+  (≥2.0 → possible), `FORECAST_OVERDUE_DAYS` (Phase 4a).
 
 ## Phase 3a fields (narrative substrate)
 
@@ -134,6 +174,8 @@ docsRefs, release_train, sprints, project, diagrams`.
   | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
   | `version` | pinned version when present, else `null` |
   | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
+  | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge |
+  | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
   | `resolved` | `true` when `to` is non-null |
 
@@ -144,8 +186,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   identified (area-id + version) from source; transitive edges connect to *other areas in the
   repo* (deep external-module internals are not fabricated into edges). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
-  workflow for install). **Deferred:** symbol-granular artifacts (3d), symbol-identity tracking
-  (3e), resource-level `dependsOn` edges.
+  workflow for install). **Deferred:** resource-level `dependsOn` edges.
 
   **Visible gaps (Phase 3c.1).** Per-module builds run in parallel, each bounded by a generous
   per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
@@ -177,5 +218,35 @@ docsRefs, release_train, sprints, project, diagrams`.
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
 - **Phase 3d (shipped):** symbol/comment artifacts + `before`/`after`/`detail` on
   feature_deltas (see `symbol_events` above), diff-local from a `git log -p` walk.
-- **Still deferred:** symbol-identity tracking across renames/moves (3e), resource-level
-  `dependsOn` edges, multi-repo aggregation.
+- **Still deferred:** resource-level `dependsOn` edges, multi-repo aggregation.
+
+## Phase 4a fields (train significance + effort + forecast + per-train slice)
+
+- **trains[]** gain `significance`, `tier`, and `effort` (see top-level `trains` bullet
+  above for the exact shapes and tunables).
+- **forecast** — top-level `forecast` block (see Phase 2 fields above).
+- **diagrams.train_flowcharts** — now LIVE: the per-deep-train `.mmd` map (see Phase 2
+  fields above).
+- **`slice_train(bundle, train_id)`** — a pure, read-only, bounded helper (not a bundle
+  field; called by the report ranker and future sub-agents). Returns a self-contained dict:
+
+  ```
+  {
+    "train":          { id, kind, outcome, significance, tier, effort,
+                        code_areas, evidence },
+    "issue":          { number, title, body*, url, labels, kind,
+                        comments*:[body*], comments_overflow } | None,
+    "prs":            [ { number, title, body*, state, merged, created_at,
+                          merged_at, url, reviewers:[login], review_decision,
+                          review_comments*:[body*], review_comments_overflow,
+                          comments*:[body*], comments_overflow } ],
+    "commits":        [ { sha, message*, author, date } ],
+    "feature_deltas": [ ...this train's deltas only... ],
+    "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ]
+  }
+  ```
+
+  (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
+  chars with a `…[+N chars]` marker; each comment list capped at `SLICE_COMMENTS_KEPT` = 6
+  bodies, overflow count in `<key>_overflow`.) Raises `KeyError` on unknown id. Does not
+  mutate the bundle.
