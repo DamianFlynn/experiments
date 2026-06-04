@@ -1499,12 +1499,16 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     return code_graph
 
 
-def http_get_json(url, token):
+def http_get_json(url, token, allow_404=False):
     """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested.
 
     On an HTTP error, GitHub explains the cause in the response body and a few
     headers (rate limit vs. SAML SSO vs. token scope). urllib discards both by
     default, leaving only a bare "HTTP Error 403", so we surface them ourselves.
+
+    With allow_404=True a 404 returns (None, 404) instead of raising, so the
+    backfill seam can map a definitively-absent ref to ABSENT. All other HTTP
+    errors still raise SystemExit with the diagnostic.
     """
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
@@ -1517,6 +1521,8 @@ def http_get_json(url, token):
             nxt = _next_link(resp.headers.get("Link", ""))
         return body, nxt
     except urllib.error.HTTPError as err:
+        if allow_404 and err.code == 404:
+            return None, 404
         raise SystemExit(_format_http_error(url, err)) from err
 
 
@@ -1944,13 +1950,17 @@ def make_backfill_fetcher(token, clone_dir=None):
         api = f"https://api.github.com/repos/{project}/{repo}"
         if kind == "social" and local.startswith("issue-"):
             num = local[len("issue-"):]
-            raw, _ = http_get_json(f"{api}/issues/{num}", token)
+            raw, nxt = http_get_json(f"{api}/issues/{num}", token, allow_404=True)
+            if raw is None and nxt == 404:
+                return ABSENT
             if raw.get("pull_request"):
                 return None
             return {"node": normalize_issue(raw), "edges": []}
         if kind == "social" and local.startswith("pr-"):
             num = local[len("pr-"):]
-            raw, _ = http_get_json(f"{api}/pulls/{num}", token)
+            raw, nxt = http_get_json(f"{api}/pulls/{num}", token, allow_404=True)
+            if raw is None and nxt == 404:
+                return ABSENT
             pr = normalize_pr(raw)
             edges = [("issue-{}".format(n), "closes") for n in pr.get("closes") or []]
             return {"node": pr, "edges": edges}
