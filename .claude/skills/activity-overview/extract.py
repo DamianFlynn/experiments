@@ -102,12 +102,25 @@ def _train_anchor(node):
     return node["id"]
 
 
-def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None):
+def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
+            backfill=None, backfill_budget=50):
     """Materialize a rev-13 RAW bundle view for project/repo over [ts_from, ts_to].
 
     Returns a bundle dict carrying ONLY raw keys; run `link.enrich` on it to add
     the derived projections. `warn` is an optional callable(str) for the spine
     `missing` notice (defaults to stderr).
+
+    `backfill` is the slice-7c seam: an optional callable `backfill(conn, id)`
+    (production passes `lambda c, i: gather.backfill(c, i, fetch=...)`). When
+    provided and the spine traversal yields `missing` ids, extract asks it to
+    fetch each one — up to `backfill_budget` per call — so a cross-window train
+    (e.g. a windowed PR closing an out-of-window issue) reads COMPLETE: the
+    backfilled node lands in the store and is pulled in below as out-of-window
+    CONTEXT (in_window: false), never counted as in-window activity. Once the
+    budget is exhausted extract WARNS and stops (it never fetches unboundedly).
+    When `backfill` is None (the default) behavior is EXACTLY as before — the
+    `missing` ids are only warned about — so existing callers/characterization
+    are byte-identical.
     """
     if warn is None:
         warn = lambda msg: sys.stderr.write(msg + "\n")  # noqa: E731
@@ -118,16 +131,47 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None):
     in_window_ids = {n["id"] for n in in_window}
 
     # 2. Seed trains from in-window social nodes, then bounded spine traversal to
-    #    surface out-of-window context (in_window: false). Missing => warn only.
+    #    surface out-of-window context (in_window: false).
     seeds = [_train_anchor(n) for n in in_window if n["node_class"] == "social"]
     spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth)
+
+    # 2b. Backfill the `missing` spine ids when a seam is injected (slice 7c).
+    #     Bounded by `backfill_budget`: once exhausted, warn and stop. After a
+    #     successful backfill the node is in the store, so re-traverse — a
+    #     backfilled node may itself reference further missing spine nodes, which
+    #     we keep resolving within the remaining budget. When `backfill` is None
+    #     this whole block is skipped and the original warn-only path runs.
+    if backfill is not None and spine["missing"]:
+        fetched = set()
+        budget_hit = False
+        while spine["missing"]:
+            progressed = False
+            for mid in sorted(spine["missing"]):
+                if mid in fetched:
+                    continue
+                if len(fetched) >= backfill_budget:
+                    budget_hit = True
+                    break
+                fetched.add(mid)
+                res = backfill(conn, mid)
+                if res and res.get("fetched"):
+                    progressed = True
+            if budget_hit or not progressed:
+                break
+            spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth)
+        if budget_hit:
+            warn("extract: backfill budget ({}) exhausted; {} spine context "
+                 "node(s) left un-fetched: {}".format(
+                     backfill_budget, len(spine["missing"]),
+                     ", ".join(sorted(spine["missing"]))))
+
     if spine["missing"]:
-        warn("extract: {} spine context node(s) referenced but not stored "
-             "(backfill is slice 7c): {}".format(
-                 len(spine["missing"]), ", ".join(sorted(spine["missing"]))))
+        warn("extract: {} spine context node(s) referenced but not stored: "
+             "{}".format(len(spine["missing"]),
+                         ", ".join(sorted(spine["missing"]))))
     # context_ids: reached-but-out-of-window nodes (in_window: false). Recorded for
     # completeness / future per-node tagging; the raw arrays below are sourced from
-    # repo_nodes so they already include these.
+    # repo_nodes so they already include these (including any just backfilled).
     _context_ids = set(spine["reached"]) - in_window_ids  # noqa: F841
 
     # 3+4. Materialize raw arrays from the full repo node set + the ledger.

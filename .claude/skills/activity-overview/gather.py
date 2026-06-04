@@ -1937,6 +1937,158 @@ def acquire(args, env):
     return bundle
 
 
+# --- Backfill (slice 7c): on-demand single-node fetch on a traversal MISS -----
+#
+# A reader (extract) traversing a decision train over the spine edges can hit an
+# edge pointing at a node never gathered (e.g. a windowed PR `closes` an issue
+# opened before the window) — a `missing` id. `backfill` fetches THAT ONE node +
+# its cheap immediate spine edges and upserts it. It is the ONLY network call
+# outside the main Acquire pass, so it lives here in gather.
+#
+# The actual fetch is SEAMED behind an injectable `fetch` callable so the test
+# suite never touches the network: tests pass a fixture-backed fake; production
+# passes `make_backfill_fetcher(token)` (REST for social, local/`git fetch
+# --depth 1` for code). `fetch(kind, local, qid)` returns either None (genuinely
+# unfetchable) or `{"node": <raw record dict>, "edges": [(dst_local, edge_type),
+# ...]}`. backfill shapes the result into store node/edge upserts, reusing the
+# same id/edge conventions fold_bundle uses.
+
+def classify_id(qid):
+    """Classify a qualified node id into its node_class + a fetch `kind`, from
+    the LOCAL id form (mirrors fold_bundle's id conventions):
+
+      social: `pr-<n>` / `issue-<n>` / `comment-<id>`
+      code:   a bare `<sha>` commit (artifact ids carry `art:`/`#` and are a
+              substrate detail, never a spine target — classified `code` too)
+      structure: everything else (milestones/releases/areas/singletons/person-)
+
+    Returns {"node_class", "kind", "local"}.
+    """
+    local = graphstore.parse_id(qid)["local"]
+    if local.startswith(("pr-", "issue-", "comment-")):
+        kind = "social"
+    elif local.startswith(("milestone-", "release-", "area-", "person-")) \
+            or local.startswith("art:") or "#" in local \
+            or local in ("workflowstats", "codegraph", "codeowners",
+                         "labeltaxonomy"):
+        kind = "structure"
+    else:
+        kind = "code"  # bare <sha> commit
+    node_class = "structure" if kind == "structure" else kind
+    return {"node_class": node_class, "kind": kind, "local": local}
+
+
+def backfill(conn, id, fetch=None):
+    """Fetch and upsert ONE missing spine node + its cheap immediate edges.
+
+    Idempotent: if `get_node(id)` already returns a node, this is a no-op and
+    NOTHING is fetched. Otherwise it classifies `id`, calls the injected `fetch`
+    seam for that one node, and (when the fetch yields a record) upserts the node
+    plus any immediate spine edges the seam returned.
+
+    `fetch(kind, local, qid)` is the network seam (None == unfetchable; a dict
+    `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched). Tests
+    pass a fixture-backed fake; production passes `make_backfill_fetcher(token)`.
+
+    Returns `{"fetched": bool, "id": id, "edges_added": int}`.
+    """
+    if graphstore.get_node(conn, id) is not None:
+        return {"fetched": False, "id": id, "edges_added": 0}  # already present
+
+    info = classify_id(id)
+    parsed = graphstore.parse_id(id)
+    # The scope is `{project}/{repo}`; recover project/repo so the upsert lands
+    # in the same identity columns fold_bundle uses.
+    project, _, repo = parsed["scope"].partition("/")
+
+    if fetch is None:
+        raise ValueError("backfill needs a `fetch` seam (production: "
+                         "make_backfill_fetcher(token); tests: a fake)")
+
+    result = fetch(info["kind"], info["local"], id)
+    if not result or not result.get("node"):
+        return {"fetched": False, "id": id, "edges_added": 0}  # unfetchable
+
+    raw = result["node"]
+    fetched_at = graphstore.now_iso()
+    # ts mirrors fold_bundle's choice per class: social PR -> merged/closed/
+    # created; social issue -> closed/updated; commit -> date; structure -> NULL.
+    if info["kind"] == "social" and info["local"].startswith("pr-"):
+        ts = raw.get("merged_at") or raw.get("closed_at") or raw.get("created_at")
+    elif info["kind"] == "social" and info["local"].startswith("issue-"):
+        ts = raw.get("closed_at") or raw.get("updated_at")
+    elif info["kind"] == "code":
+        ts = raw.get("date")
+    else:
+        ts = raw.get("published_at")  # release; milestone/area stay None
+
+    graphstore.upsert_node(
+        conn, id, project, repo, info["node_class"], ts, raw, fetched_at)
+
+    # Cheap immediate spine edges the seam surfaced (e.g. issue#7 spun_off #5).
+    # Only spine edge types are honored — backfill closes a TRAVERSAL gap, it does
+    # not re-derive the whole non-spine substrate. Edges to still-absent nodes are
+    # fine (a later traversal surfaces them as `missing` for another backfill).
+    edges = []
+    for dst_local, edge_type in result.get("edges") or []:
+        if edge_type not in graphstore.SPINE_EDGE_TYPES:
+            continue
+        edges.append((id, graphstore.qualify_id(project, repo, dst_local),
+                      edge_type, None, None))
+    if edges:
+        graphstore.upsert_edges(conn, edges)
+    return {"fetched": True, "id": id, "edges_added": len(edges)}
+
+
+def make_backfill_fetcher(token, clone_dir=None):
+    """Production `fetch` seam for `backfill`: resolves one node by REST (social)
+    or local git (code). Returns a `fetch(kind, local, qid)` callable.
+
+    NOT unit-tested (it is the live-network edge); the suite exercises backfill
+    with a fixture-backed fake instead. social -> GitHub REST (normalize_pr /
+    normalize_issue, plus the same `closes` spine edges fold derives); code -> a
+    bounded `git fetch --depth 1 <sha>` into the clone then a one-commit log;
+    structure -> not backfilled on demand (graphify/whole-dict facts come from
+    Acquire), so it returns None and the node stays a warned gap.
+    """
+    def fetch(kind, local, qid):
+        parsed = graphstore.parse_id(qid)
+        project, _, repo = parsed["scope"].partition("/")
+        api = f"https://api.github.com/repos/{project}/{repo}"
+        if kind == "social" and local.startswith("issue-"):
+            num = local[len("issue-"):]
+            raw, _ = http_get_json(f"{api}/issues/{num}", token)
+            if raw.get("pull_request"):
+                return None
+            return {"node": normalize_issue(raw), "edges": []}
+        if kind == "social" and local.startswith("pr-"):
+            num = local[len("pr-"):]
+            raw, _ = http_get_json(f"{api}/pulls/{num}", token)
+            pr = normalize_pr(raw)
+            edges = [("issue-{}".format(n), "closes") for n in pr.get("closes") or []]
+            return {"node": pr, "edges": edges}
+        if kind == "code" and clone_dir:
+            sha = local
+            try:
+                run_git(["git", "-C", clone_dir, "fetch", "--depth", "1",
+                         "origin", sha])
+                raw = run_git(["git", "-C", clone_dir, "log", "-1",
+                               f"--pretty=format:{CODE_LOG_FORMAT}",
+                               "--date=short", "--name-only", sha])
+            except Exception:
+                return None
+            commits = parse_git_log(raw)
+            if not commits:
+                return None
+            c = commits[0]
+            prn = resolve_commit_pr(c.get("message", ""))
+            edges = [("pr-{}".format(prn), "part_of")] if prn is not None else []
+            return {"node": c, "edges": edges}
+        return None  # structure / unfetchable on demand
+
+    return fetch
+
+
 def fold_bundle(conn, bundle):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent

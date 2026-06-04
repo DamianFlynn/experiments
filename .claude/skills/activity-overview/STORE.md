@@ -181,6 +181,60 @@ fixtures/normalizers (no block/sprint signal is gathered) — and the `fts_text`
 FTS5 index (`index_text` is never called on the write path). See
 `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
+## Backfill on a traversal miss (slice 7c)
+
+A reader (`extract`) traversing a decision train over the spine edges can hit a
+`missing` id — a spine edge pointing at a node never gathered (e.g. a windowed PR
+`closes` an issue opened/closed *before* the window). `gather.backfill(conn, id,
+fetch=…)` closes that gap on demand: it fetches THAT ONE node + its cheap
+immediate spine edges and upserts them by identity. It is the **only** network
+call outside the main Acquire pass, so it lives in `gather.py` (`extract` never
+fetches itself — it calls in via an injected `backfill` callable).
+
+- **Idempotent / no-op when present.** `backfill` first checks `get_node(id)`;
+  if the node already exists it returns `{"fetched": False, …}` WITHOUT fetching.
+  The fetched node is **durable** (upserted), so it persists for the next window
+  and a re-run is a no-op — the backfilled node appears exactly once.
+- **Injectable network seam.** The actual fetch goes through a `fetch(kind,
+  local, qid)` callable (`None` == unfetchable; `{"node": raw, "edges":
+  [(dst_local, edge_type), …]}` == fetched). `classify_id` derives `kind`
+  (social `pr-`/`issue-`/`comment-`, code bare-`<sha>`, else structure) from the
+  local id form. Production wires `gather.make_backfill_fetcher(token,
+  clone_dir)` (REST `normalize_pr`/`normalize_issue` for social — re-deriving the
+  same `closes` spine edges fold does; bounded `git fetch --depth 1 <sha>` +
+  one-commit log for code; structure not backfilled on demand). The test suite
+  passes a **fixture-backed fake** — NO network. Only spine edge types from the
+  seam are honored (backfill closes a traversal gap, it does not re-derive the
+  non-spine substrate).
+- **Reader wiring + budget.** `extract.extract(…, backfill=None,
+  backfill_budget=50)`: when `backfill` is injected and traversal yields
+  `missing` ids, extract calls it per id under the per-window budget ceiling, then
+  re-traverses so a backfilled node that itself references further missing spine
+  nodes is resolved within the **remaining** budget. Once the budget is exhausted
+  it WARNS and stops (never unbounded). When `backfill is None` (the default, and
+  what every existing test/characterization uses) the path is byte-identical to
+  before — `missing` ids are only warned about.
+- **Context-only (documented gap).** A backfilled node is pulled into the bundle
+  as out-of-window **context** (it was reached via the spine but is outside the
+  range query), so it does NOT count toward in-window activity. The read pipeline
+  that wires `backfill=gather.backfill` in production is not landed yet (extract
+  is still read only by tests today); `make_backfill_fetcher`'s live REST/git
+  paths are therefore only exercisable against a real repo (relevant to the
+  upcoming trust gate), not by the offline suite.
+
+## Roll-up / resume (slice 7c)
+
+A multi-window "wider view" is a **single wider `range_query`** over the union of
+folded windows — a `WHERE ts BETWEEN …`, NOT a multi-bundle merge. Folding two
+adjacent windows (March, April) then range-querying `[March-start, April-end]`
+returns the union of their in-window nodes; each narrow window still returns only
+its own. Overlapping re-folds are idempotent (identity-keyed nodes/edges, set
+semantics on the ledger, deduped `gathered_windows`), so re-extracting an
+overlapping window is byte-stable. Resume/roll-up read structure from the latest
+`clone_sha` (`set_clone_sha`/`get_clone_sha`) and the `gathered_windows` ledger
+(`record_window`/`get_windows`): the structure pin is the newest fold's
+`clone_sha`, a `WHERE`, not a merge.
+
 ## Determinism
 
 `data` blobs serialize with `sort_keys=True`; `range_query` orders by

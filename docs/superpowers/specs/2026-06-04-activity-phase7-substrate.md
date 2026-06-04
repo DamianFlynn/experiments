@@ -165,25 +165,44 @@ the window-scoped `artifacts[]`/`people[]` views match the legacy arrays.
 person nodes and all contribution edges; **P8 spotlight queries are unblocked** (person impact,
 subsystem split, pattern evolution all have their nodes/edges).
 
-### Slice 7c — backfill on traversal miss + roll-up/resume hardening
+### Slice 7c — backfill on traversal miss + roll-up/resume hardening — IMPLEMENTED
 
 **Goal:** close the train completeness loop and the cross-window story.
 
-- **Wire backfill.** `extract`'s spine traversal calls `gather.backfill(id)` on each `missing`
-  spine node, under a **per-window budget** (warn, don't fetch unboundedly). Backfill is the
-  only network call outside Acquire, stays in `gather.py` (`extract` calls
-  `gather.backfill(id)`; it never fetches itself). The fetched node + its immediate edges are
-  **upserted (durable)** and appear in this projection; idempotent, a no-op if already present.
-- **Roll-up / resume hardening.** A multi-window "6-month view" is one wider range query;
-  resume uses `clone_sha` + `gathered_windows` (the structure is the latest `clone_sha`, a
-  `WHERE`, not a merge).
+- **Backfill wired (`gather.backfill(conn, id, fetch=…)`).** On a traversal MISS, `extract`
+  asks gather (via an injected `backfill` callable) to fetch THAT ONE node + its cheap
+  immediate spine edges and upsert them. Backfill is the only network call outside Acquire and
+  stays in `gather.py` (`extract` never fetches itself — it has no top-level `import gather`;
+  the dependency is injected). It is **idempotent**: `get_node(id)` present ⇒ no-op, NO fetch.
+  Returns `{"fetched", "id", "edges_added"}`. The fetched node is **durable** (upserted) and
+  appears in the projection as out-of-window **context** (`in_window: false`) — a backfilled
+  node does NOT count toward in-window activity (documented gap).
+  - **Network seam (no real network in the suite).** `fetch(kind, local, qid)` is injectable;
+    `gather.classify_id` derives `kind` from the local id (`pr-`/`issue-`/`comment-` social,
+    bare `<sha>` code, else structure). Production wires `gather.make_backfill_fetcher(token,
+    clone_dir)` (REST `normalize_pr`/`normalize_issue` re-deriving fold's `closes` edges; bounded
+    `git fetch --depth 1 <sha>` + one-commit log for code; structure not on-demand). Tests pass
+    a **fixture-backed fake**. Only spine edge types from the seam are honored.
+  - **Budget ceiling.** `extract.extract(…, backfill=None, backfill_budget=50)` calls backfill
+    per `missing` id under the budget, re-traversing so a backfilled node referencing further
+    missing spine nodes resolves within the remaining budget; budget-exhausted ⇒ WARN + stop.
+    `backfill=None` (the default) is byte-identical to the prior warn-only path (characterization
+    untouched).
+- **Roll-up / resume hardening.** A multi-window "wider view" is one wider `range_query` over the
+  union of folded windows (a `WHERE ts BETWEEN …`, NOT a multi-bundle merge); overlapping re-fold
+  is idempotent (proven at the extract level). Resume/roll-up read structure from the latest
+  `clone_sha` (`set_clone_sha`/`get_clone_sha`) + the `gathered_windows` ledger
+  (`record_window`/`get_windows`) — a `WHERE`, not a merge.
 
-**Gate:** a windowed PR closing an **out-of-window** issue traverses as **one complete train**;
-re-running is a no-op (the backfilled node appears exactly once and persists for the next
-window); traversal/backfill respect the spine allowlist, depth cap, and budget ceiling.
+**Gate (met, `test_backfill.py`):** a windowed PR closing an **out-of-window** issue traverses as
+**one complete train** after backfill (`traverse_spine` reaches it with `missing == []`);
+re-running is a no-op (the backfilled node appears exactly once and persists); traversal/backfill
+respect the spine allowlist, depth cap, and budget ceiling.
 
-**Verifiable exit:** cross-thread trains read complete; backfilled facts are durable across
-windows; overlapping re-gather/re-extract never duplicates.
+**Verifiable exit (met):** cross-thread trains read complete; backfilled facts are durable across
+windows; overlapping re-gather/re-extract never duplicates. **Deferred:** no production reader
+wires `backfill=gather.backfill` yet (extract is read only by tests); `make_backfill_fetcher`'s
+live REST/git paths are exercisable only against a real repo — relevant to the upcoming trust gate.
 
 ---
 
