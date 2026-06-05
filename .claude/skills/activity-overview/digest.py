@@ -206,10 +206,11 @@ def build_project_trains(members, components, project):
                 parsed = graphstore.parse_id(nid)
                 scope = parsed["scope"]   # "{project}/{repo}"
                 local = parsed["local"]   # "pr-N" or "issue-N"
-                # scope is "{project}/{owner}/{repo}"; project is slash-free
-                # (enforced by manifest.load_manifest), so the remainder is the
-                # "owner/repo" slug.
-                repo_part = scope.split("/", 1)[1]
+                # scope is "{project}/{owner}/{repo}"; strip the exact "{project}/"
+                # prefix (we hold `project`) so the owner/repo slug is recovered
+                # correctly even if a project name ever contained a slash —
+                # independent of the manifest slash-free guard.
+                repo_part = scope[len(project) + 1:]
                 if local.startswith("issue-"):
                     issues.append(nid)
                     if repo_part not in repos:
@@ -221,7 +222,8 @@ def build_project_trains(members, components, project):
 
         # the project-train id is derived from the merged, fully-qualified
         # reference set -> deterministic and globally unique across repos.
-        assert prs or issues, "project train must reference at least one pr/issue"
+        if not (prs or issues):
+            raise ValueError("project train must reference at least one pr/issue")
         tid = "ptrain-" + min(prs + issues)
         out.append({
             "id": tid,
