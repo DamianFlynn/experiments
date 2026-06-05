@@ -2056,5 +2056,34 @@ class TestFoldArtifacts(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], n_edges)
 
 
+class TestFoldBundleOverride(unittest.TestCase):
+    def test_override_project_and_slug_repo(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, _fold_fixture_bundle(),
+                           project="avm-tf", repo="Azure/widget")
+        # node ids are qualified with the OVERRIDE project + owner/repo slug
+        pr = graphstore.get_node(conn, "avm-tf/Azure/widget#pr-10")
+        self.assertEqual(pr["node_class"], "social")
+        self.assertEqual(pr["project"], "avm-tf")
+        self.assertEqual(pr["repo"], "Azure/widget")
+        # spine edge dst is qualified the same way (parse_id splits scope on first /)
+        out = graphstore.get_edges(conn, "avm-tf/Azure/widget#pr-10", direction="out")
+        self.assertIn(("closes", "avm-tf/Azure/widget#issue-3"),
+                      {(e["edge_type"], e["dst_id"]) for e in out})
+        # window + clone_sha recorded under the override identity
+        self.assertIn({"project": "avm-tf", "repo": "Azure/widget",
+                       "from": "2026-01-01", "to": "2026-01-31"},
+                      graphstore.get_windows(conn))
+        self.assertEqual(graphstore.get_clone_sha(conn, "avm-tf", "Azure/widget"),
+                         "deadbeef")
+
+    def test_default_identity_unchanged(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, _fold_fixture_bundle())  # no override
+        self.assertIsNotNone(graphstore.get_node(conn, "acme/widget#pr-10"))
+
+
 if __name__ == "__main__":
     unittest.main()

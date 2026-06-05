@@ -2023,7 +2023,7 @@ def _social_text(item, comments):
     return "\n".join(p for p in parts if p)
 
 
-def fold_bundle(conn, bundle):
+def fold_bundle(conn, bundle, project=None, repo=None, members=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
     — re-folding an overlapping window mutates nothing already correct. See
@@ -2039,7 +2039,15 @@ def fold_bundle(conn, bundle):
     in_iteration / fts_text).
     """
     meta = bundle.get("meta", {})
-    project, repo = meta.get("owner"), meta.get("repo")
+    # Identity override (Phase 9): a multi-repo run folds each member under one
+    # LOGICAL project (`project`) with `repo` = "owner/repo". Single-repo runs pass
+    # neither and fall back to meta.owner/meta.repo — byte-identical to before.
+    # `members` (a set/dict of "owner/repo" slugs) gates cross-repo edge emission;
+    # None (single-repo) skips it entirely (added in a later task).
+    if project is None:
+        project = meta.get("owner")
+    if repo is None:
+        repo = meta.get("repo")
     if not project or not repo:
         raise ValueError("bundle meta needs owner and repo to qualify ids")
 
