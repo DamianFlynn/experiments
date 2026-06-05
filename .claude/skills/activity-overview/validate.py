@@ -10,6 +10,8 @@ Read-only over the store: `validate` never mutates it. stdlib only.
 
 API
     validate(conn, project=None, repo=None, bundle=None) -> Report
+        validate_repo(conn, project, repo, bundle=None) -> Report
+        validate_project(conn, project, repos) -> dict
         Report.ok      : bool  (False iff any ERROR-severity check failed)
         Report.checks  : [{name, ok, severity, details:[...]}]
 
@@ -724,25 +726,34 @@ def _guarded(fn, name, *args):
 
 # --- CLI ----------------------------------------------------------------------
 
-def _format_report(report, project, repo):
+def _format_checks_lines(checks, indent=""):
+    """Return a list of lines rendering `checks` (a list of check dicts) using
+    the canonical per-check format.  `indent` is prepended to every line so the
+    same helper can be used at top-level (empty indent) or nested (e.g. "  ")."""
     lines = []
-    status = "OK" if report.ok else "FAIL"
-    lines.append("trust audit: {}  (project={} repo={})".format(status, project, repo))
-    lines.append("=" * 60)
-    for c in report.checks:
+    for c in checks:
         mark = "ok  " if c["ok"] else "FAIL"
-        lines.append("[{}] {}  ({})".format(mark, c["name"], c["severity"]))
+        lines.append("{}[{}] {}  ({})".format(indent, mark, c["name"], c["severity"]))
         for d in c["details"]:
             sev = d.get("severity", c["severity"])
             if c["ok"] and sev == INFO:
                 # show only a brief note for passing checks
                 note = d.get("note") or d.get("summary")
                 if note:
-                    lines.append("      - {}".format(note))
+                    lines.append("{}      - {}".format(indent, note))
                 continue
-            lines.append("      - [{}] {}".format(
-                sev, json.dumps({k: v for k, v in d.items()
-                                 if k != "severity"}, sort_keys=True)))
+            lines.append("{}      - [{}] {}".format(
+                indent, sev, json.dumps({k: v for k, v in d.items()
+                                         if k != "severity"}, sort_keys=True)))
+    return lines
+
+
+def _format_report(report, project, repo):
+    lines = []
+    status = "OK" if report.ok else "FAIL"
+    lines.append("trust audit: {}  (project={} repo={})".format(status, project, repo))
+    lines.append("=" * 60)
+    lines.extend(_format_checks_lines(report.checks))
     lines.append("=" * 60)
     lines.append("RESULT: {}".format(status))
     return "\n".join(lines)
@@ -776,6 +787,9 @@ def main(argv=None):
 
     if repo is None:
         # Multi-repo project path: run validate_project over all member repos.
+        if args.bundle:
+            sys.stderr.write("warning: --bundle is ignored in multi-repo "
+                             "project validation (it is single-repo by nature)\n")
         repos = graphstore.project_repos(conn, project)
         agg = validate_project(conn, project, repos)
         conn.close()
@@ -788,10 +802,9 @@ def main(argv=None):
             print("=" * 60)
             for mr in agg["members"]:
                 mstatus = "OK" if mr["ok"] else "FAIL"
-                print("  [{}] {}".format(mstatus, mr["repo"]))
-                for c in mr.get("checks", []):
-                    mark = "ok  " if c["ok"] else "FAIL"
-                    print("      [{}}] {}  ({})".format(mark, c["name"], c["severity"]))
+                print("  repo: {}  [{}]".format(mr["repo"], mstatus))
+                for line in _format_checks_lines(mr.get("checks", []), indent="    "):
+                    print(line)
             print("=" * 60)
             print("RESULT: {}".format(status))
         return 0 if agg["ok"] else 1
