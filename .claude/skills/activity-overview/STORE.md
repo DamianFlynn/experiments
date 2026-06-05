@@ -233,10 +233,19 @@ re-exports them — call `derive.*` directly. (`link` re-exports only the
 window-projection helpers it still uses: `attribute_code_areas`/`build_modules`/
 `link_symbol_identity`/`ref`, plus `resolve_commit_pr`/`attach_commit_prs`.)
 
-Still NOT on the write path after step 3: `blocks` (issue→issue) and
-`in_iteration` (social→sprint) — skipped for lack of source data in the current
-fixtures/normalizers (no block/sprint signal is gathered). The `fts_text` FTS5
-index IS now populated on fold (Phase 8a — see *Text index* above). See
+`blocks` (issue→issue) IS now on the write path: `normalize_issue` parses directed
+dependency phrasing from an issue's title+body (`parse_blocks_refs` — "blocks #N" /
+"blocking #N" → outbound; "blocked by #N" / "depends on #N" → inbound; same-repo
+bare `#N`), and fold emits a `blocks` edge normalized to **blocker → blocked**. To
+keep referential integrity, an edge is emitted ONLY when the target #N is itself a
+gathered issue (a ref to an out-of-window issue is dropped, never left dangling).
+`blocks` is a NON-spine relation (not in `SPINE_EDGE_TYPES`), so `traverse_spine`
+never follows it and decision-train composition is unchanged; its issue→issue shape
+already matched `validate.check_schema_conformance`'s allowlist.
+
+Still NOT on the write path: `in_iteration` (social→sprint) — needs **Projects v2**
+acquisition (the `read:project` scope), which gather does not yet pull. The
+`fts_text` FTS5 index IS populated on fold (Phase 8a — see *Text index* above). See
 `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
 ## Backfill on a traversal miss (slice 7c)
