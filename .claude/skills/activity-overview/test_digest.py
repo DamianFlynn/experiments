@@ -310,5 +310,72 @@ class TestBuildProjectView(unittest.TestCase):
         self.assertEqual(len(view["people"]), 1)
 
 
+class TestProjectViewTicketIntegration(unittest.TestCase):
+    def test_ticket_attached_and_related_work_clustered(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/r1", "Azure/r2"}
+        def _b(repo, pr_n, iss_n):
+            return {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                             "from": "2026-01-01", "to": "2026-01-31",
+                             "base_branch": "main"},
+                    "prs": [{"number": pr_n, "url": "u/{}".format(pr_n),
+                             "state": "closed", "merged": True, "base": "main",
+                             "head": "h{}".format(pr_n),
+                             "merged_at": "2026-01-05T00:00:00Z",
+                             "created_at": "2026-01-02T00:00:00Z",
+                             "closed_at": "2026-01-05T00:00:00Z",
+                             "closes": [iss_n], "crossref_issues": [],
+                             "title": "feat", "body": "Implements ABC-123"}],
+                    "issues": [{"number": iss_n, "url": "u/i{}".format(iss_n),
+                                "state": "closed",
+                                "closed_at": "2026-01-04T00:00:00Z",
+                                "updated_at": "2026-01-04T00:00:00Z"}],
+                    "commits": [], "code_events": [], "milestones": [],
+                    "releases": [], "code_graph": {"areas": []}}
+        gather.fold_bundle(conn, _b("Azure/r1", 1, 2), project="proj",
+                           repo="Azure/r1", members=members)
+        gather.fold_bundle(conn, _b("Azure/r2", 3, 4), project="proj",
+                           repo="Azure/r2", members=members)
+        view = digest.build_project_view(
+            conn, "proj", ["Azure/r1", "Azure/r2"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        # each train carries the ticket parsed from its PR body
+        self.assertTrue(all("ABC-123" in t["tickets"] for t in view["trains"]))
+        self.assertEqual(len(view["trains"]), 2)
+        # related_work clusters the two unlinked trains by the shared ticket
+        self.assertEqual(len(view["related_work"]), 1)
+        self.assertEqual(view["related_work"][0]["ticket"], "ABC-123")
+        self.assertEqual(len(view["related_work"][0]["train_ids"]), 2)
+
+
+class TestMergeHelpers(unittest.TestCase):
+    def test_merge_modules_repo_qualifies_area_keys(self):
+        members = [
+            {"repo": "Azure/a", "bundle": {"modules": {"core": {"commits": 1}}}},
+            {"repo": "Azure/b", "bundle": {"modules": {"core": {"commits": 2}}}},
+        ]
+        mods = digest._merge_modules(members)
+        self.assertEqual(set(mods), {"Azure/a::core", "Azure/b::core"})
+        self.assertEqual(mods["Azure/b::core"], {"commits": 2})
+
+    def test_merge_people_preserves_extra_fields_and_unions(self):
+        members = [
+            {"repo": "Azure/a", "bundle": {"people": {
+                "alice": {"modules": ["m1"], "areas": ["a1"], "is_bot": False,
+                          "display_name": "Alice"}}}},
+            {"repo": "Azure/b", "bundle": {"people": {
+                "alice": {"modules": ["m2"], "areas": ["a1"], "is_bot": False,
+                          "display_name": "Alice"}}}},
+        ]
+        people = digest._merge_people(members)
+        self.assertEqual(set(people), {"alice"})
+        self.assertEqual(people["alice"]["modules"], ["m1", "m2"])
+        self.assertEqual(people["alice"]["areas"], ["a1"])
+        self.assertEqual(people["alice"]["display_name"], "Alice")  # preserved
+        # source records not mutated
+        self.assertEqual(members[0]["bundle"]["people"]["alice"]["modules"], ["m1"])
+
+
 if __name__ == "__main__":
     unittest.main()

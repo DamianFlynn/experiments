@@ -220,9 +220,9 @@ def build_project_trains(members, components, project):
 
 
 def _attach_tickets(members, project_trains, project, ticket_pattern):
-    """Set each project train's `tickets` from the bodies/titles of its member
-    PRs/issues (+ any external_refs). Builds a qualified-id -> record index from
-    the member bundles so a train's qualified refs resolve to their text."""
+    """Set each project train's `tickets` from the titles + bodies of its member
+    PRs/issues. Builds a qualified-id -> record index from the member bundles so
+    a train's qualified refs resolve to their text."""
     rec = {}
     for m in members:
         repo, b = m["repo"], m["bundle"]
@@ -234,9 +234,7 @@ def _attach_tickets(members, project_trains, project, ticket_pattern):
         seen, tickets = set(), []
         for qid in tr["prs"] + tr["issues"]:
             r = rec.get(qid) or {}
-            text = "{}\n{}".format(r.get("title", "") or "", r.get("body") or "")
-            for ext in r.get("external_refs") or []:
-                text += "\n{} {}".format(ext.get("repo", ""), ext.get("number", ""))
+            text = "{}\n{}".format(r.get("title") or "", r.get("body") or "")
             for tk in parse_ticket_refs(text, ticket_pattern):
                 if tk not in seen:
                     seen.add(tk)
@@ -254,16 +252,19 @@ def _merge_shipped(members):
 
 
 def _merge_people(members):
-    """Union member `people` dicts by login (person nodes are project-scoped, so
-    the records are identical across members; union modules/areas, OR is_bot)."""
+    """Union member `people` dicts by login. Person nodes are project-scoped
+    (folded once per project under the "*" sentinel), so the records are identical
+    across members; we seed from the first record seen (preserving any fields) and
+    union modules/areas + OR is_bot across members for safety."""
     people = {}
     for m in members:
         for login, rec in (m["bundle"].get("people", {}) or {}).items():
-            cur = people.setdefault(login, {"modules": [], "areas": [],
-                                            "is_bot": False})
-            cur["modules"] = sorted(set(cur["modules"]) | set(rec.get("modules", [])))
-            cur["areas"] = sorted(set(cur["areas"]) | set(rec.get("areas", [])))
-            cur["is_bot"] = cur["is_bot"] or bool(rec.get("is_bot"))
+            if login not in people:
+                people[login] = dict(rec)  # copy: preserve all fields, don't alias
+            cur = people[login]
+            cur["modules"] = sorted(set(cur.get("modules", [])) | set(rec.get("modules", [])))
+            cur["areas"] = sorted(set(cur.get("areas", [])) | set(rec.get("areas", [])))
+            cur["is_bot"] = bool(cur.get("is_bot")) or bool(rec.get("is_bot"))
     return people
 
 
@@ -281,9 +282,9 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
                        backfill_budget=50, ticket_pattern=_DEFAULT_TICKET_RE):
     """The merged project view consumed by report-template.md's narrative step.
     Keys: meta{project,repos,from,to}, members[{repo,bundle}] (per-member raw +
-    enriched, for collision-prone per-file sections), trains (cross-repo, with
-    tickets), related_work (ticket clusters), shipped (repo-tagged), people
-    (merged by login), modules (repo-qualified)."""
+    enriched, for collision-prone per-file sections), trains (project-wide, each
+    with a `tickets` list), related_work (ticket clusters), shipped (repo-tagged),
+    people (merged by login), modules (repo-qualified)."""
     members = member_bundles(conn, project, repos, ts_from, ts_to,
                              backfill=backfill, backfill_budget=backfill_budget)
     comps = spine_components(conn, project, repos, ts_from, ts_to)
