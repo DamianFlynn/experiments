@@ -1,6 +1,6 @@
 # avm-tf-aiml-lz — Project Activity Digest (2026-03-16 → 2026-03-22)
 
-> **Multi-repo constellation digest.** Source of truth is the journey-graph store (`workspace/journey.db`); this report is materialized from `digest.py`'s project view and validated diagrams. Every claim resolves to a store value or a GitHub URL.
+> **Illustration, not the product.** The product is the JSON bundle (`samples/digest_view.json`) emitted by `digest.py` — the verifiable interface a downstream content agent consumes to write the narrative. This Markdown is a deterministic *structural* rendering of that bundle (tables + validated diagrams + sourced facts, no authored prose). Every value resolves to the bundle or a GitHub URL.
 
 | | |
 |---|---|
@@ -16,17 +16,26 @@ Member repositories:
 - [`Azure/terraform-azurerm-avm-res-network-virtualnetwork`](https://github.com/Azure/terraform-azurerm-avm-res-network-virtualnetwork)
 - [`Azure/terraform-azurerm-avm-res-operationalinsights-workspace`](https://github.com/Azure/terraform-azurerm-avm-res-operationalinsights-workspace)
 
-> ✅ **Completeness.** No in-window commit landed on the shallow-clone boundary (`meta.boundary_dropped_commits` is empty for every member), so the code-level ledgers (feature changes / content lifecycle) are complete across the constellation. Gathered with a widened clone margin (`ACTIVITY_CLONE_MARGIN_DAYS`).
+> ✅ **`meta.boundary_dropped_commits` empty for every member** — feature-change / content-lifecycle ledgers are complete.
 
-## Executive summary
+## Summary
 
-Across the constellation's **3 member repos**, **44 items shipped** this week (4 merged PRs, 40 issues closed) over **21 decision trains**. The three modules form a real dependency constellation — **6 resolved module-dependency edges, 4 of them cross-repo**: the AI/ML landing-zone *pattern* consumes both *resource* modules it sits above.
+| Metric | Value |
+|---|---|
+| Member repos | 3 |
+| Shipped (merged PRs) | 4 |
+| Shipped (issues closed) | 40 |
+| Decision trains | 21 |
+| Cross-repo trains | 0 |
+| `related_work` clusters | 0 |
+| Module-dependency edges | 6 |
+| — cross-repo / intra-repo | 4 / 2 |
+| People (of which bots) | 88 (3) |
+| Modules (repo-qualified areas) | 23 |
 
-The notable structural finding: **the repos are coupled by module dependencies, not by shared work**. There are **0 cross-repo decision trains** and **0 ticket-linked `related_work` clusters** — every train lives entirely within one repo, and no internal ticket spans two. So a change in the vnet or operationalinsights module ripples into the landing zone *structurally* (version-pinned `source` references), even though the teams' issue/PR threads this window never crossed repo boundaries.
+## Cross-repo module dependency graph
 
-## Cross-repo module dependency graph (blast radius)
-
-Resolved `depends_on` edges across the project (Terraform `source` → the member that publishes that registry module). Cross-repo edges are a member module depending on **another member's** published module — the constellation's real coupling.
+`view["module_edges"]` — resolved Terraform `depends_on` (consumer area → the member area it sources). Cross-repo = a member sourcing another member's module.
 
 ```mermaid
 flowchart LR
@@ -52,27 +61,16 @@ flowchart LR
 
 | Consumer (repo · area) | Depends on (repo · area) | Version | Cross-repo | Transitive |
 |---|---|---|---|---|
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `0.16.0` | **yes** | no |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | **yes** | yes |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `=0.16.0` | **yes** | no |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | **yes** | yes |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `0.16.0` | yes | no |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | yes | yes |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `=0.16.0` | yes | no |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | yes | yes |
 | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/peering` | — | no | no |
 | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/subnet` | — | no | no |
 
-**Reading the graph.** 4 cross-repo dependency edge(s) resolved this window — a member module consuming another member's published module:
-
-- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` → `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` (`0.16.0`)
-- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` → `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` (`0.4.2`, transitive)
-- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` → `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` (`=0.16.0`)
-- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` → `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` (`0.4.2`, transitive)
-
-Plus 2 intra-repo sub-module edge(s).
-
-Edges come from a static, whole-tracked-tree parse of every module's `source` references (no `terraform init`), so the graph reflects the repo's full module structure regardless of in-window churn. **Blast radius:** a breaking change to a depended-on resource module's `main.tf` forces a version bump in every consumer above. Compute the precise dependents of any member with `python3 spotlight.py dependents <owner/repo> --store workspace/journey.db --project avm-tf-aiml-lz`.
-
 ## Decision trains
 
-21 project-wide trains, ranked most-substantial first (by PR + commit count, then outcome). Each train is keyed off its qualified spine anchor; refs link to GitHub. Project trains carry no per-train flowchart of their own — for the two headline trains, the owning member's deep-tier flowchart is embedded below.
+`view["trains"]`, ordered by PR+commit count then outcome. Anchor = qualified spine id; refs link to GitHub.
 
 | Train (anchor) | Repo | Kind | Outcome | Refs | Commits |
 |---|---|---|---|---|---|
@@ -98,33 +96,11 @@ Edges come from a static, whole-tracked-tree parse of every module's `source` re
 | `issue-131` — [AVM Module Issue]: RBAC attribute principal_t | terraform-azurerm-avm-res-operationalinsights-workspace | bug | in_flight | [terraform-azurerm-avm-res-operationalinsights-workspace#130](https://github.com/Azure/terraform-azurerm-avm-res-operationalinsights-workspace/pull/130) [terraform-azurerm-avm-res-operationalinsights-workspace#131](https://github.com/Azure/terraform-azurerm-avm-res-operationalinsights-workspace/issues/131) | 0 |
 | `issue-49` — [AVM Module Issue]: Why is azapi used for subn | terraform-azurerm-avm-res-network-virtualnetwork | question | abandoned | [terraform-azurerm-avm-res-network-virtualnetwork#49](https://github.com/Azure/terraform-azurerm-avm-res-network-virtualnetwork/issues/49) | 0 |
 
-### terraform-azurerm-avm-ptn-aiml-landing-zone · `train-pr-80`
-
-**Shipped headline — APIM VNet integration.** [PR #80](https://github.com/Azure/terraform-azurerm-avm-ptn-aiml-landing-zone/pull/80) configures API Management with VNet integration so it reaches internal services. *Significance 28.0 — landed in 7 days · 2 participants · 0 formal reviewers (merged via the maintainer pipeline).* Cut into release `v0.4.1`.
-
-```mermaid
-flowchart LR
-    pr_80["fix: Configure APIM with VNet integratio"]
-    out_train_pr_80(["Shipped"])
-    pr_80 --> out_train_pr_80
-```
-
-### terraform-azurerm-avm-ptn-aiml-landing-zone · `train-pr-84`
-
-**Largest open train — the 7-issue rollup.** [PR #84](https://github.com/Azure/terraform-azurerm-avm-ptn-aiml-landing-zone/pull/84) *“resolve 7 open issues — AppGW routing, APIM zones, VNet peering…”* is still open (opened 2026-04-09, ~57 days as of 2026-06-05 · 3 participants · 1 reviewer). It bundles several in-window bug reports into one fix.
-
-```mermaid
-flowchart LR
-    pr_84["fix: resolve 7 open issues — AppGW routi"]
-    out_train_pr_84(["In flight"])
-    pr_84 --> out_train_pr_84
-```
-
-> **Related work (ticket-linked):** none. No internal ticket reference (Jira/ADO-style) spans two trains this window, so there are no hidden cross-repo deliverables beyond the module-dependency coupling above.
+`related_work` (ticket-linked cross-repo clusters): none
 
 ## Shipped this period
 
-44 items merged/closed, grouped by member repo.
+`view["shipped"]` (repo-tagged), grouped by member.
 
 ### `terraform-azurerm-avm-ptn-aiml-landing-zone` — 7 shipped
 
@@ -187,9 +163,9 @@ flowchart LR
 
 ## Module ownership
 
-CODEOWNERS plus per-area contribution stats (commits / PRs / files touched in window). Area ids are repo-qualified in the store; split on `::` for display. All three repos are owned by the same AVM core team.
+`view["modules"]` (per-area commits/PRs/files) + CODEOWNERS + `view["people"]`. Top 8 areas per repo by files touched.
 
-- **People in window:** 88 logins (3 bots). **2** have module-level attribution: `Copilot`, `azure-verified-modules[bot]` (bot).
+- People in window: 88 logins (3 bots); 2 with module-level attribution: `Copilot`, `azure-verified-modules[bot]` (bot).
 
 | Repo | Module (area) | CODEOWNERS | Commits | PRs | Files |
 |---|---|---|---|---|---|
@@ -212,7 +188,7 @@ CODEOWNERS plus per-area contribution stats (commits / PRs / files touched in wi
 | `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/mcp.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
 | `terraform-azurerm-avm-res-operationalinsights-workspace` | `AGENTS.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
 
-People ↔ code-area edges (landing zone — the only member with in-window code-area attribution after the boundary drop):
+People ↔ code-area edges:
 
 ```mermaid
 flowchart LR
@@ -250,7 +226,7 @@ flowchart LR
 
 ## Per-member detail
 
-Single-repo sections below render once per member from `view["members"][i]["bundle"]`.
+Per-member sections from `view["members"][i]["bundle"]`.
 
 ### `Azure/terraform-azurerm-avm-ptn-aiml-landing-zone`
 
@@ -283,7 +259,7 @@ gantt
 
 #### Releases
 
-- **v0.4.1** (`v0.4.1`) — published 2026-03-21T06:09:58Z. [release](https://github.com/Azure/terraform-azurerm-avm-ptn-aiml-landing-zone/releases/tag/v0.4.1)
+- `v0.4.1` (v0.4.1) — 2026-03-21T06:09:58Z · [release](https://github.com/Azure/terraform-azurerm-avm-ptn-aiml-landing-zone/releases/tag/v0.4.1)
 
 #### CI/CD health
 
@@ -306,9 +282,7 @@ pie showData
     "question" : 3
 ```
 
-#### In flight (47)
-
-6 open PRs, 41 open issues. Open PRs:
+#### In flight — 47 (6 open PRs, 41 open issues)
 
 - [pr#23](https://github.com/Azure/terraform-azurerm-avm-ptn-aiml-landing-zone/pull/23) adding nsg rules to bastion and containerappenvironment subnet — train `train-issue-20`
 - [pr#32](https://github.com/Azure/terraform-azurerm-avm-ptn-aiml-landing-zone/pull/32) appgw_rule01 fix for destination_address_prefixes — train `train-issue-35`
@@ -319,7 +293,8 @@ pie showData
 
 #### Next-release forecast
 
-**Next milestone:** none identified. No open item carried a milestone, high-priority, or open-PR signal strong enough to forecast this window.
+- Next milestone: none identified
+- Candidates: 0
 
 #### Module dependency graph
 
@@ -392,7 +367,7 @@ timeline
     2026-03-20 : changed README.md (readme) by Copilot : changed _header.md (doc) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : built #name = "ai-lz-vnet-default-2" (comment) by Copilot : built #resource_group_name = "ai-lz-rg-default-ivrhi-2" (com : built #resource_group_name = "default-example-rg-ivrh-2" (co : built #resource_group_name = "ai-lz-rg-default-ivrhi-1" (com : built #resource_group_name = "default-example-rg-ivrh-1" (co : changed test (symbol) by Copilot : built #resource_group_name = "ai-lz-rg-default-ivrhi-4" (com : built #resource_group_name = "ai-lz-rg-default-ivrhi-3" (com : built time_sleep.wait_for_kv_rbac (symbol) by Copilot : built time_sleep.wait_for_kv_rbac (symbol) by Copilot
 ```
 
-- **copilot-instructions.md** (doc) — removed.
+- `copilot-instructions.md` (doc) — removed
 
 
 ### `Azure/terraform-azurerm-avm-res-network-virtualnetwork`
@@ -444,9 +419,7 @@ pie showData
     "docs" : 2
 ```
 
-#### In flight (28)
-
-10 open PRs, 18 open issues. Open PRs:
+#### In flight — 28 (10 open PRs, 18 open issues)
 
 - [pr#13](https://github.com/Azure/terraform-azurerm-avm-res-network-virtualnetwork/pull/13) Update variables.tf — train `train-issue-12`
 - [pr#25](https://github.com/Azure/terraform-azurerm-avm-res-network-virtualnetwork/pull/25) Put name as required inputs for module — train `train-issue-123`
@@ -465,7 +438,8 @@ pie showData
 
 #### Next-release forecast
 
-**Next milestone:** none identified. No open item carried a milestone, high-priority, or open-PR signal strong enough to forecast this window.
+- Next milestone: none identified
+- Candidates: 0
 
 #### Module dependency graph
 
@@ -505,7 +479,7 @@ timeline
     2026-03-18 : built AzAPI.md (doc) by azure-verified-modules[bot] : built SKILL.md (doc) by azure-verified-modules[bot] : built terraform-test.md (doc) by azure-verified-modules[bot] : built tfpluginschema.md (doc) by azure-verified-modules[bot] : dropped copilot-instructions.md (doc) by azure-verified-modu : changed AGENTS.md (doc) by azure-verified-modules[bot]
 ```
 
-- **copilot-instructions.md** (doc) — removed.
+- `copilot-instructions.md` (doc) — removed
 
 
 ### `Azure/terraform-azurerm-avm-res-operationalinsights-workspace`
@@ -548,9 +522,7 @@ pie showData
     "question" : 1
 ```
 
-#### In flight (6)
-
-3 open PRs, 3 open issues. Open PRs:
+#### In flight — 6 (3 open PRs, 3 open issues)
 
 - [pr#115](https://github.com/Azure/terraform-azurerm-avm-res-operationalinsights-workspace/pull/115) Update Terraform required_version from ~>1.5 to ~>1.9 across all modules and examples — train `train-issue-112`
 - [pr#129](https://github.com/Azure/terraform-azurerm-avm-res-operationalinsights-workspace/pull/129) fix(outputs): avoid deprecated azurerm provider attribute in resource… — train `train-issue-128`
@@ -558,7 +530,8 @@ pie showData
 
 #### Next-release forecast
 
-**Next milestone:** none identified. No open item carried a milestone, high-priority, or open-PR signal strong enough to forecast this window.
+- Next milestone: none identified
+- Candidates: 0
 
 #### Module dependency graph
 
@@ -594,9 +567,9 @@ timeline
     2026-03-18 : built AzAPI.md (doc) by azure-verified-modules[bot] : built SKILL.md (doc) by azure-verified-modules[bot] : built terraform-test.md (doc) by azure-verified-modules[bot] : built tfpluginschema.md (doc) by azure-verified-modules[bot] : dropped copilot-instructions.md (doc) by azure-verified-modu : changed AGENTS.md (doc) by azure-verified-modules[bot]
 ```
 
-- **copilot-instructions.md** (doc) — removed.
+- `copilot-instructions.md` (doc) — removed
 
 
 ---
 
-*Generated from `digest.py` over `workspace/journey.db`. 41 diagrams rendered and validated with `mmdc`. Re-run: `python3 build_report.py`.*
+*Structural rendering of `digest.py` over the project store; 41 diagrams validated with `mmdc`. The JSON bundle (`digest_view.json`) is the source of truth. Re-run: `python3 samples/build_report.py`.*
