@@ -217,3 +217,86 @@ def build_project_trains(members, components, project):
         })
     out.sort(key=lambda t: t["id"])
     return out
+
+
+def _attach_tickets(members, project_trains, project, ticket_pattern):
+    """Set each project train's `tickets` from the bodies/titles of its member
+    PRs/issues (+ any external_refs). Builds a qualified-id -> record index from
+    the member bundles so a train's qualified refs resolve to their text."""
+    rec = {}
+    for m in members:
+        repo, b = m["repo"], m["bundle"]
+        for p in b.get("prs", []):
+            rec[graphstore.qualify_id(project, repo, "pr-{}".format(p["number"]))] = p
+        for i in b.get("issues", []):
+            rec[graphstore.qualify_id(project, repo, "issue-{}".format(i["number"]))] = i
+    for tr in project_trains:
+        seen, tickets = set(), []
+        for qid in tr["prs"] + tr["issues"]:
+            r = rec.get(qid) or {}
+            text = "{}\n{}".format(r.get("title", "") or "", r.get("body") or "")
+            for ext in r.get("external_refs") or []:
+                text += "\n{} {}".format(ext.get("repo", ""), ext.get("number", ""))
+            for tk in parse_ticket_refs(text, ticket_pattern):
+                if tk not in seen:
+                    seen.add(tk)
+                    tickets.append(tk)
+        tr["tickets"] = tickets
+
+
+def _merge_shipped(members):
+    """Project-wide Shipped: each member's buckets.shipped rows, tagged by repo."""
+    out = []
+    for m in members:
+        for row in (m["bundle"].get("buckets", {}) or {}).get("shipped", []):
+            out.append({**row, "repo": m["repo"]})
+    return out
+
+
+def _merge_people(members):
+    """Union member `people` dicts by login (person nodes are project-scoped, so
+    the records are identical across members; union modules/areas, OR is_bot)."""
+    people = {}
+    for m in members:
+        for login, rec in (m["bundle"].get("people", {}) or {}).items():
+            cur = people.setdefault(login, {"modules": [], "areas": [],
+                                            "is_bot": False})
+            cur["modules"] = sorted(set(cur["modules"]) | set(rec.get("modules", [])))
+            cur["areas"] = sorted(set(cur["areas"]) | set(rec.get("areas", [])))
+            cur["is_bot"] = cur["is_bot"] or bool(rec.get("is_bot"))
+    return people
+
+
+def _merge_modules(members):
+    """Project-wide modules, area ids repo-qualified ("{repo}::{area}") so two
+    members' same-named areas never collide."""
+    mods = {}
+    for m in members:
+        for area, stats in (m["bundle"].get("modules", {}) or {}).items():
+            mods["{}::{}".format(m["repo"], area)] = stats
+    return mods
+
+
+def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
+                       backfill_budget=50, ticket_pattern=_DEFAULT_TICKET_RE):
+    """The merged project view consumed by report-template.md's narrative step.
+    Keys: meta{project,repos,from,to}, members[{repo,bundle}] (per-member raw +
+    enriched, for collision-prone per-file sections), trains (cross-repo, with
+    tickets), related_work (ticket clusters), shipped (repo-tagged), people
+    (merged by login), modules (repo-qualified)."""
+    members = member_bundles(conn, project, repos, ts_from, ts_to,
+                             backfill=backfill, backfill_budget=backfill_budget)
+    comps = spine_components(conn, project, repos, ts_from, ts_to)
+    trains = build_project_trains(members, comps, project)
+    _attach_tickets(members, trains, project, ticket_pattern)
+    related = group_related_work(trains)
+    return {
+        "meta": {"project": project, "repos": list(repos),
+                 "from": ts_from, "to": ts_to},
+        "members": members,
+        "trains": trains,
+        "related_work": related,
+        "shipped": _merge_shipped(members),
+        "people": _merge_people(members),
+        "modules": _merge_modules(members),
+    }

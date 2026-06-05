@@ -268,5 +268,47 @@ class TestTicketGrouping(unittest.TestCase):
                                    "train_ids": ["ptrain-a", "ptrain-b"]}])
 
 
+class TestBuildProjectView(unittest.TestCase):
+    def test_view_spans_members_with_merged_sections(self):
+        conn = graphstore.open_store(":memory:")
+        _seed_two_member_store(conn)
+        view = digest.build_project_view(
+            conn, "proj", ["Azure/mod-a", "Azure/mod-b"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        self.assertEqual(view["meta"]["project"], "proj")
+        self.assertEqual(view["meta"]["repos"], ["Azure/mod-a", "Azure/mod-b"])
+        self.assertEqual(len(view["trains"]), 1)
+        self.assertEqual(set(view["trains"][0]["repos"]),
+                         {"Azure/mod-a", "Azure/mod-b"})
+        shipped_repos = {s["repo"] for s in view["shipped"]}
+        self.assertIn("Azure/mod-a", shipped_repos)
+        self.assertEqual([m["repo"] for m in view["members"]],
+                         ["Azure/mod-a", "Azure/mod-b"])
+
+    def test_contributor_in_both_members_appears_once(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        for repo in ("Azure/x", "Azure/y"):
+            b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                          "from": "2026-01-01", "to": "2026-01-31",
+                          "base_branch": "main"},
+                 "prs": [{"number": 1, "url": "u", "state": "closed",
+                          "merged": True, "base": "main", "head": "h",
+                          "merged_at": "2026-01-05T00:00:00Z",
+                          "created_at": "2026-01-02T00:00:00Z",
+                          "closed_at": "2026-01-05T00:00:00Z",
+                          "closes": [], "crossref_issues": [],
+                          "title": "feat: a", "body": "", "author": "alice"}],
+                 "issues": [], "commits": [], "code_events": [],
+                 "milestones": [], "releases": [], "code_graph": {"areas": []}}
+            gather.fold_bundle(conn, b, project="proj", repo=repo,
+                               members={"Azure/x", "Azure/y"})
+        view = digest.build_project_view(
+            conn, "proj", ["Azure/x", "Azure/y"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        self.assertIn("alice", view["people"])
+        self.assertEqual(len(view["people"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
