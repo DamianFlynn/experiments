@@ -68,3 +68,113 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
         comps.append(frozenset(comp))
     comps.sort(key=lambda c: min(c))
     return comps
+
+
+# outcome precedence when member trains merge into one project train (mirrors
+# link.build_trains' shipped > in_flight > rejected > abandoned).
+_OUTCOME_RANK = {"shipped": 3, "in_flight": 2, "rejected": 1, "abandoned": 0}
+
+
+def _member_train_anchor_qid(project, repo, train):
+    """The qualified spine anchor of a member train: its root issue, else its
+    first PR — exactly link.build_trains' anchor, qualified to `repo`."""
+    if train.get("root_issue") is not None:
+        local = "issue-{}".format(train["root_issue"])
+    else:
+        local = "pr-{}".format(train["prs"][0])
+    return graphstore.qualify_id(project, repo, local)
+
+
+def build_project_trains(members, components, project):
+    """Stitch the per-member trains into project trains along the spine.
+
+    `members` is member_bundles' output; `components` is spine_components' output.
+    Each member train maps to the component containing its anchor; member trains
+    sharing a component merge into ONE project train with qualified, repo-spanning
+    references. Trains whose anchor isn't in any component form their own singleton
+    project train. Deterministic order by project-train id.
+
+    Components may include social nodes (issues/PRs) that have no corresponding
+    member train (e.g. a cross-repo issue that was closed without a local PR).
+    These nodes are folded into the project train that owns the component so that
+    cross-repo references and repos are fully represented."""
+    comp_of = {}
+    for i, comp in enumerate(components):
+        for nid in comp:
+            comp_of[nid] = i
+
+    groups = {}
+    for m in members:
+        repo, bundle = m["repo"], m["bundle"]
+        for tr in bundle.get("trains", []):
+            anchor = _member_train_anchor_qid(project, repo, tr)
+            key = ("comp", comp_of[anchor]) if anchor in comp_of else ("solo", anchor)
+            groups.setdefault(key, []).append((repo, tr))
+
+    out = []
+    for key, items in groups.items():
+        prs, issues, commits, evidence, repos = [], [], [], [], []
+        kind, outcome, root = "other", "abandoned", None
+        best_rank = -1
+        for repo, tr in items:
+            if repo not in repos:
+                repos.append(repo)
+            for n in tr["prs"]:
+                prs.append(graphstore.qualify_id(project, repo, "pr-{}".format(n)))
+            if tr.get("root_issue") is not None:
+                issues.append(graphstore.qualify_id(
+                    project, repo, "issue-{}".format(tr["root_issue"])))
+            for sha in tr.get("commits", []):
+                commits.append(graphstore.qualify_id(project, repo, sha))
+            for ev in tr.get("evidence", []):
+                evidence.append({**ev, "repo": repo})
+            rank = _OUTCOME_RANK.get(tr["outcome"], 0)
+            if rank > best_rank:
+                best_rank, outcome = rank, tr["outcome"]
+            if tr.get("root_issue") is not None and root is None:
+                kind, root = tr["kind"], _member_train_anchor_qid(project, repo, tr)
+        if root is None:  # no root issue anywhere: take the kind of the min anchor
+            repo0, tr0 = min(items, key=lambda rt: _member_train_anchor_qid(
+                project, rt[0], rt[1]))
+            kind = tr0["kind"]
+
+        # Fold in any component nodes that have no member train (e.g. a cross-repo
+        # issue closed without a local PR).  These contribute repos + refs but no
+        # outcome/kind signal — they are already accounted for by the spine edge that
+        # linked them to a train-bearing anchor.
+        if key[0] == "comp":
+            comp_idx = key[1]
+            train_anchors = set(prs) | set(issues)
+            for nid in components[comp_idx]:
+                if nid in train_anchors:
+                    continue
+                parsed = graphstore.parse_id(nid)
+                scope = parsed["scope"]   # "{project}/{repo}"
+                local = parsed["local"]   # "pr-N" or "issue-N"
+                # scope is "{project}/{repo}"; strip the project prefix + "/"
+                repo_part = scope[len(project) + 1:]
+                if local.startswith("issue-"):
+                    issues.append(nid)
+                    if repo_part not in repos:
+                        repos.append(repo_part)
+                elif local.startswith("pr-"):
+                    prs.append(nid)
+                    if repo_part not in repos:
+                        repos.append(repo_part)
+
+        # the project-train id is derived from the merged, fully-qualified
+        # reference set -> deterministic and globally unique across repos.
+        tid = "ptrain-" + min(prs + issues)
+        out.append({
+            "id": tid,
+            "kind": kind,
+            "outcome": outcome,
+            "repos": sorted(repos),
+            "prs": sorted(set(prs)),
+            "issues": sorted(set(issues)),
+            "commits": sorted(set(commits)),
+            "evidence": evidence,
+            "code_areas": [],
+        })
+    out.sort(key=lambda t: t["id"])
+    return out

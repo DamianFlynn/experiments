@@ -153,5 +153,49 @@ class TestSpineComponents(unittest.TestCase):
             frozenset({"proj/Azure/mod#pr-5", "proj/Azure/mod#issue-6"})})
 
 
+class TestBuildProjectTrains(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        _seed_two_member_store(self.conn)
+        self.frm, self.to = "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"
+        self.members = digest.member_bundles(
+            self.conn, "proj", ["Azure/mod-a", "Azure/mod-b"], self.frm, self.to)
+        self.comps = digest.spine_components(
+            self.conn, "proj", ["Azure/mod-a", "Azure/mod-b"], self.frm, self.to)
+
+    def test_cross_repo_train_is_single_and_spans_repos(self):
+        trains = digest.build_project_trains(self.members, self.comps, "proj")
+        self.assertEqual(len(trains), 1)
+        t = trains[0]
+        self.assertEqual(set(t["repos"]), {"Azure/mod-a", "Azure/mod-b"})
+        self.assertIn("proj/Azure/mod-a#pr-10", t["prs"])
+        self.assertIn("proj/Azure/mod-b#issue-3", t["issues"])
+        self.assertEqual(t["outcome"], "shipped")
+
+    def test_single_repo_train_preserved_with_qualified_ids(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        b = {"meta": {"owner": "Azure", "repo": "solo", "from": "2026-01-01",
+                      "to": "2026-01-31", "base_branch": "main"},
+             "prs": [{"number": 7, "url": "u/7", "state": "closed", "merged": True,
+                      "base": "main", "head": "h7",
+                      "merged_at": "2026-01-09T00:00:00Z",
+                      "created_at": "2026-01-02T00:00:00Z",
+                      "closed_at": "2026-01-09T00:00:00Z",
+                      "closes": [], "crossref_issues": [], "title": "fix: x",
+                      "body": ""}],
+             "issues": [], "commits": [], "code_events": [],
+             "milestones": [], "releases": [], "code_graph": {"areas": []}}
+        gather.fold_bundle(conn, b, project="proj", repo="Azure/solo",
+                           members={"Azure/solo"})
+        frm, to = "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"
+        members = digest.member_bundles(conn, "proj", ["Azure/solo"], frm, to)
+        comps = digest.spine_components(conn, "proj", ["Azure/solo"], frm, to)
+        trains = digest.build_project_trains(members, comps, "proj")
+        self.assertEqual(len(trains), 1)
+        self.assertEqual(trains[0]["repos"], ["Azure/solo"])
+        self.assertEqual(trains[0]["prs"], ["proj/Azure/solo#pr-7"])
+
+
 if __name__ == "__main__":
     unittest.main()
