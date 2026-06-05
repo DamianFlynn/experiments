@@ -197,5 +197,56 @@ class TestBuildProjectTrains(unittest.TestCase):
         self.assertEqual(trains[0]["prs"], ["proj/Azure/solo#pr-7"])
 
 
+class TestBuildProjectTrainsUnit(unittest.TestCase):
+    def _train(self, tid, *, root_issue=None, prs=(), commits=(),
+               outcome="shipped", kind="feature", evidence=()):
+        return {"id": tid, "kind": kind, "root_issue": root_issue,
+                "prs": list(prs), "commits": list(commits), "outcome": outcome,
+                "evidence": list(evidence)}
+
+    def test_outcome_precedence_across_members(self):
+        # one component spanning two members; shipped must win over rejected.
+        members = [
+            {"repo": "Azure/a",
+             "bundle": {"trains": [self._train("train-pr-1", prs=[1],
+                                               outcome="rejected", kind="bug")]}},
+            {"repo": "Azure/b",
+             "bundle": {"trains": [self._train("train-pr-2", prs=[2],
+                                               outcome="shipped", kind="feature")]}},
+        ]
+        comps = [frozenset({"proj/Azure/a#pr-1", "proj/Azure/b#pr-2"})]
+        trains = digest.build_project_trains(members, comps, "proj")
+        self.assertEqual(len(trains), 1)
+        self.assertEqual(trains[0]["outcome"], "shipped")
+        self.assertEqual(sorted(trains[0]["repos"]), ["Azure/a", "Azure/b"])
+
+    def test_evidence_is_repo_tagged(self):
+        members = [{"repo": "Azure/a", "bundle": {"trains": [
+            self._train("train-pr-1", prs=[1],
+                        evidence=[{"type": "pr", "id": 1, "url": "u/1"}])]}}]
+        comps = [frozenset({"proj/Azure/a#pr-1"})]
+        trains = digest.build_project_trains(members, comps, "proj")
+        self.assertEqual(trains[0]["evidence"],
+                         [{"type": "pr", "id": 1, "url": "u/1", "repo": "Azure/a"}])
+
+    def test_orphan_component_node_is_folded(self):
+        # component contains a cross-repo issue with NO member train -> it must
+        # still appear in issues + its repo in repos.
+        members = [{"repo": "Azure/a", "bundle": {"trains": [
+            self._train("train-pr-1", prs=[1])]}}]
+        comps = [frozenset({"proj/Azure/a#pr-1", "proj/Azure/b#issue-9"})]
+        trains = digest.build_project_trains(members, comps, "proj")
+        self.assertEqual(len(trains), 1)
+        self.assertIn("proj/Azure/b#issue-9", trains[0]["issues"])
+        self.assertIn("Azure/b", trains[0]["repos"])
+
+    def test_kind_falls_back_to_min_anchor_when_no_root_issue(self):
+        members = [{"repo": "Azure/a", "bundle": {"trains": [
+            self._train("train-pr-1", prs=[1], kind="bug", outcome="shipped")]}}]
+        comps = [frozenset({"proj/Azure/a#pr-1"})]
+        trains = digest.build_project_trains(members, comps, "proj")
+        self.assertEqual(trains[0]["kind"], "bug")
+
+
 if __name__ == "__main__":
     unittest.main()

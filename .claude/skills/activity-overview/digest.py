@@ -97,7 +97,10 @@ def build_project_trains(members, components, project):
     Components may include social nodes (issues/PRs) that have no corresponding
     member train (e.g. a cross-repo issue that was closed without a local PR).
     These nodes are folded into the project train that owns the component so that
-    cross-repo references and repos are fully represented."""
+    cross-repo references and repos are fully represented. A component all of whose
+    social nodes are orphans (no member train maps to it) produces no project train —
+    mirroring single-repo behaviour, where a closed issue with no PR and no
+    `not_planned` reason yields no train."""
     comp_of = {}
     for i, comp in enumerate(components):
         for nid in comp:
@@ -134,7 +137,7 @@ def build_project_trains(members, components, project):
             if tr.get("root_issue") is not None and root is None:
                 kind, root = tr["kind"], _member_train_anchor_qid(project, repo, tr)
         if root is None:  # no root issue anywhere: take the kind of the min anchor
-            repo0, tr0 = min(items, key=lambda rt: _member_train_anchor_qid(
+            _, tr0 = min(items, key=lambda rt: _member_train_anchor_qid(
                 project, rt[0], rt[1]))
             kind = tr0["kind"]
 
@@ -151,8 +154,10 @@ def build_project_trains(members, components, project):
                 parsed = graphstore.parse_id(nid)
                 scope = parsed["scope"]   # "{project}/{repo}"
                 local = parsed["local"]   # "pr-N" or "issue-N"
-                # scope is "{project}/{repo}"; strip the project prefix + "/"
-                repo_part = scope[len(project) + 1:]
+                # scope is "{project}/{owner}/{repo}"; project is slash-free
+                # (enforced by manifest.load_manifest), so the remainder is the
+                # "owner/repo" slug.
+                repo_part = scope.split("/", 1)[1]
                 if local.startswith("issue-"):
                     issues.append(nid)
                     if repo_part not in repos:
@@ -164,6 +169,7 @@ def build_project_trains(members, components, project):
 
         # the project-train id is derived from the merged, fully-qualified
         # reference set -> deterministic and globally unique across repos.
+        assert prs or issues, "project train must reference at least one pr/issue"
         tid = "ptrain-" + min(prs + issues)
         out.append({
             "id": tid,

@@ -81,6 +81,14 @@ class TestLoadManifest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "object"):
                 manifest.load_manifest(path)
 
+    def test_rejects_slash_in_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, {"project": "org/proj",
+                                "window": {"from": "x", "to": "y"},
+                                "repos": [{"owner": "o", "repo": "r"}]})
+            with self.assertRaisesRegex(ValueError, "project"):
+                manifest.load_manifest(path)
+
     def test_rejects_slash_in_owner_or_repo(self):
         for entry in ({"owner": "Az/ure", "repo": "r"},
                       {"owner": "o", "repo": "re/po"}):

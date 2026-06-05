@@ -23,6 +23,8 @@ def load_manifest(path):
     project = raw.get("project")
     if not project:
         raise ValueError("manifest: 'project' is required")
+    if "/" in project:
+        raise ValueError("manifest: 'project' must not contain '/'")
 
     window = raw.get("window")
     if not isinstance(window, dict):
