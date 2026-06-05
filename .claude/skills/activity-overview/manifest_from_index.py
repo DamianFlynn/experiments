@@ -141,7 +141,10 @@ def _read_index(src, opener=urllib.request.urlopen):
     if src == "-":
         return sys.stdin.read()
     if src.startswith(("http://", "https://")):
-        with opener(src) as resp:                     # nosec - operator-supplied URL
+        # Send a User-Agent like the rest of the skill (gather.http_get_json) — some
+        # servers reject UA-less requests.
+        req = urllib.request.Request(src, headers={"User-Agent": "activity-overview"})
+        with opener(req) as resp:                      # nosec - operator-supplied URL
             return resp.read().decode("utf-8-sig")
     with open(src, encoding="utf-8-sig") as fh:
         return fh.read()
@@ -164,7 +167,8 @@ def parse_args(argv):
     p.add_argument("--name-contains", action="append", dest="name_contains",
                    help="keep rows whose module name contains this; repeatable.")
     p.add_argument("--include", action="append", default=[],
-                   help="'owner/repo' to keep regardless of other filters; repeatable.")
+                   help="'owner/repo' (must be present in the index) to keep "
+                        "regardless of kind/status/name filters; repeatable.")
     p.add_argument("--exclude", action="append", default=[],
                    help="'owner/repo' to drop; repeatable.")
     p.add_argument("--limit", type=int, default=None, help="cap member count.")
@@ -186,7 +190,14 @@ def main(argv=None):
         return 2
     rows = []
     for src in sources:
-        rows.extend(parse_index(_read_index(src)))
+        try:
+            rows.extend(parse_index(_read_index(src)))
+        except (OSError, UnicodeError, csv.Error) as exc:
+            # OSError covers file-not-found AND urllib URLError/HTTPError; keep the
+            # CLI's explicit-exit-code contract instead of dumping a traceback.
+            sys.stderr.write("manifest-from-index: failed to read index {!r}: "
+                             "{}\n".format(src, exc))
+            return 2
     manifest = build_manifest(
         rows, args.project, args.frm, args.to,
         kinds=args.kinds, statuses=args.statuses, name_contains=args.name_contains,

@@ -182,6 +182,32 @@ class TestCli(unittest.TestCase):
                        "--from", "f", "--to", "t"])
         self.assertEqual(rc, 2)
 
+    def test_main_read_failure_returns_2(self):
+        # a missing index file is an OSError; the CLI returns 2, not a traceback.
+        rc = mfi.main(["--index", "/no/such/index.csv", "--project", "p",
+                       "--from", "f", "--to", "t"])
+        self.assertEqual(rc, 2)
+
+    def test_read_index_sets_user_agent(self):
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"ModuleName,RepoURL\n"
+
+        def fake(req):
+            captured["req"] = req
+            return _Resp()
+
+        mfi._read_index("https://example.com/x.csv", opener=fake)
+        self.assertEqual(captured["req"].get_header("User-agent"), "activity-overview")
+
 
 if __name__ == "__main__":
     unittest.main()
