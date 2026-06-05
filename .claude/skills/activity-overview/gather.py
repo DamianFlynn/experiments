@@ -2157,7 +2157,7 @@ def parse_registry_source(src):
         return None
     core = src.split("//", 1)[0]                       # drop submodule path
     parts = [p for p in core.split("/") if p]
-    if len(parts) == 4 and "." in parts[0]:            # strip a registry host
+    if len(parts) == 4 and "." in parts[0]:            # strip a registry host: the 4-segment form is exclusively host/namespace/name/provider per the Terraform registry protocol
         parts = parts[1:]
     if len(parts) != 3:
         return None
@@ -2168,9 +2168,9 @@ def resolve_registry_member(src, project, members, registry_by_slug):
     """Resolve a registry source to a member's root-area qualified id, or None.
     Exact (manifest `registry` equals `src`) wins over the HashiCorp naming
     convention (`namespace/name/provider` -> `{namespace}/terraform-{provider}-{name}`).
-    Pure."""
+    Pure. Case-sensitive; the convention assumes a lowercase provider (GitHub slugs are case-sensitive)."""
     for slug in sorted(members):                       # exact, deterministic
-        if registry_by_slug.get(slug) == src:
+        if src and registry_by_slug.get(slug) == src:
             return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
     parsed = parse_registry_source(src)
     if parsed is None:
@@ -2197,7 +2197,7 @@ def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
             if e.get("resolved") and to is not None:
                 dst = q(repo, "area-{}".format(to))
                 data = {k: v for k, v in e.items() if k != "to"}
-            elif (not e.get("resolved") and members and registry_by_slug
+            elif (not e.get("resolved") and members and registry_by_slug is not None
                   and e.get("ref")):
                 dst = resolve_registry_member(e["ref"], project, members,
                                               registry_by_slug)
@@ -2529,12 +2529,15 @@ def main(argv=None):
     graphstore.init_schema(conn)
     if man is not None:
         members = manifest_mod.member_slugs(man)
+        registry_by_slug = {
+            "{}/{}".format(m["owner"], m["repo"]): m.get("registry")
+            for m in man["repos"]}
         for m in man["repos"]:
             member_args = _member_args(args, m, man["from"], man["to"])
             bundle = acquire(member_args, os.environ)
             fold_bundle(conn, bundle, project=man["project"],
                         repo="{}/{}".format(m["owner"], m["repo"]),
-                        members=members)
+                        members=members, registry_by_slug=registry_by_slug)
         sys.stderr.write(
             "folded {} member repo(s) of project '{}' into store {}\n".format(
                 len(man["repos"]), man["project"], args.store))

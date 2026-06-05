@@ -2504,6 +2504,57 @@ class TestRegistryResolution(unittest.TestCase):
         self.assertIsNone(gather.resolve_registry_member(
             "Hashicorp/consul/aws", "p", {"Azure/other"}, {}))
 
+    def test_exact_wins_over_convention_peer(self):
+        members = {"Azure/custom-kv",
+                   "Azure/terraform-azurerm-avm-res-keyvault-vault"}
+        reg = {"Azure/custom-kv": "Azure/avm-res-keyvault-vault/azurerm"}
+        dst = gather.resolve_registry_member(
+            "Azure/avm-res-keyvault-vault/azurerm", "p", members, reg)
+        self.assertEqual(dst, "p/Azure/custom-kv#area-main.tf")  # exact beats convention
+
+
+class TestCrossRepoDependsOn(unittest.TestCase):
+    def _member_a(self):
+        return {"meta": {"owner": "Azure", "repo": "consumer", "from": "2026-01-01",
+                         "to": "2026-01-31", "base_branch": "main"},
+                "prs": [], "issues": [], "commits": [], "code_events": [],
+                "milestones": [], "releases": [],
+                "code_graph": {"provider": "directory", "areas": [
+                    {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                     "edges": [{"to": None, "kind": "module",
+                                "ref": "Azure/avm-res-keyvault-vault/azurerm",
+                                "version": "0.1.0", "transitive": False,
+                                "provider": "terraform", "resolved": False}]}]}}
+
+    def test_fold_emits_cross_repo_depends_on_via_convention(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/consumer",
+                   "Azure/terraform-azurerm-avm-res-keyvault-vault"}
+        gather.fold_bundle(conn, self._member_a(), project="proj",
+                           repo="Azure/consumer", members=members,
+                           registry_by_slug={})
+        deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(len(deps), 1)
+        self.assertEqual(
+            deps[0]["dst_id"],
+            "proj/Azure/terraform-azurerm-avm-res-keyvault-vault#area-main.tf")
+        self.assertEqual(deps[0]["data"].get("cross_repo"), True)
+        self.assertEqual(deps[0]["data"].get("version"), "0.1.0")
+
+    def test_fold_emits_cross_repo_depends_on_via_exact_registry(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/consumer", "Azure/kv"}
+        reg = {"Azure/kv": "Azure/avm-res-keyvault-vault/azurerm"}
+        gather.fold_bundle(conn, self._member_a(), project="proj",
+                           repo="Azure/consumer", members=members,
+                           registry_by_slug=reg)
+        deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(deps[0]["dst_id"], "proj/Azure/kv#area-main.tf")
+
 
 if __name__ == "__main__":
     unittest.main()
