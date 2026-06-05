@@ -113,11 +113,7 @@ def _detect_project_repo(conn, project, repo):
             raise ValueError(
                 "store holds multiple projects {} — pass --project".format(projects))
     if repo is None:
-        repos = sorted({
-            r[0] for r in conn.execute(
-                "SELECT DISTINCT repo FROM nodes WHERE project=? AND repo != '*'",
-                (project,))
-        })
+        repos = graphstore.project_repos(conn, project)
         if len(repos) == 1:
             repo = repos[0]
         elif not repos:
