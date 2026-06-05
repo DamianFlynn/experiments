@@ -964,5 +964,21 @@ class TestTrainFlowchartMmdc(unittest.TestCase):
             render.validate_with_mmdc(train_paths)  # raises on failure
 
 
+class TestProjectModuleGraph(unittest.TestCase):
+    def test_cross_repo_edge_drawn_with_subgraphs(self):
+        edges = [{"src_repo": "Azure/consumer", "src_area": "main.tf",
+                  "dst_repo": "Azure/kv", "dst_area": "main.tf",
+                  "version": "0.1.0", "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertIn("flowchart", mmd)
+        self.assertIn("Azure/consumer", mmd)
+        self.assertIn("Azure/kv", mmd)
+        self.assertIn("0.1.0", mmd)
+
+    def test_empty_edges_placeholder(self):
+        mmd = render.emit_project_module_graph([])
+        self.assertIn("No cross-repo module dependencies", mmd)
+
+
 if __name__ == "__main__":
     unittest.main()

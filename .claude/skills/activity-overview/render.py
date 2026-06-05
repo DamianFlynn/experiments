@@ -358,6 +358,38 @@ def emit_module_graph(bundle):
     return "\n".join(lines) + "\n"
 
 
+def emit_project_module_graph(module_edges):
+    """A Mermaid flowchart of project module dependencies (Slice S4 blast radius).
+    Nodes are grouped into a subgraph per member repo; each edge draws
+    src-area --> dst-area labelled with its version (or 'transitive'). Cross-repo
+    edges are the point of the diagram; intra-repo edges are included for context.
+    Pure; deterministic (inputs are pre-sorted by digest.project_depends_on)."""
+    if not module_edges:
+        return "flowchart LR\n    none[No cross-repo module dependencies]\n"
+    by_repo = {}
+    drawn = []
+    for e in module_edges:
+        src = _node_id("m", "{}::{}".format(e["src_repo"], e["src_area"]))
+        dst = _node_id("m", "{}::{}".format(e["dst_repo"], e["dst_area"]))
+        by_repo.setdefault(e["src_repo"], {})[src] = e["src_area"]
+        by_repo.setdefault(e["dst_repo"], {})[dst] = e["dst_area"]
+        label = e.get("version") or ("transitive" if e.get("transitive") else "")
+        drawn.append((src, dst, label))
+    lines = ["flowchart LR"]
+    for repo in sorted(by_repo):
+        lines.append('    subgraph {}["{}"]'.format(_node_id("r", repo),
+                                                     _flow_label(repo)))
+        for nid, area in sorted(by_repo[repo].items()):
+            lines.append('        {}("{}")'.format(nid, _flow_label(area)))
+        lines.append("    end")
+    for src, dst, label in sorted(set(drawn)):
+        if label:
+            lines.append('    {} -->|"{}"| {}'.format(src, _flow_label(label), dst))
+        else:
+            lines.append("    {} --> {}".format(src, dst))
+    return "\n".join(lines) + "\n"
+
+
 def render(bundle):
     """Name -> Mermaid text for every diagram this phase emits."""
     return {
