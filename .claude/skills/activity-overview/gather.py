@@ -1058,7 +1058,12 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
 _TF_MODULE_HEAD_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{')
 _TF_SOURCE_RE = re.compile(r'source\s*=\s*"(?P<src>[^"]+)"')
 _TF_VERSION_RE = re.compile(r'version\s*=\s*"(?P<ver>[^"]+)"')
-_TF_EDGE_RE = re.compile(r'"\[root\]\s*(?P<a>[^"]+)"\s*->\s*"\[root\]\s*(?P<b>[^"]+)"')
+# Terraform graph DOT edge. The `[root] ` node prefix is OPTIONAL: older
+# `terraform graph` emitted `"[root] module.x..." -> "[root] ..."`, but modern
+# terraform (>=~1.x default graph) emits unprefixed `"module.x..." -> "..."`.
+# Matching both keeps inter-module dependency extraction working across versions.
+_TF_EDGE_RE = re.compile(
+    r'"(?:\[root\]\s*)?(?P<a>[^"]+)"\s*->\s*"(?:\[root\]\s*)?(?P<b>[^"]+)"')
 _TF_MODULE_TOKEN_RE = re.compile(r"module\.([A-Za-z0-9_-]+)")
 
 

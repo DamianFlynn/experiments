@@ -1317,6 +1317,21 @@ class TestTerraformParsers(unittest.TestCase):
         pairs = gather.parse_terraform_graph(self.dot)
         self.assertFalse([p for p in pairs if p[0] == p[1] and p[0] is not None])
 
+    def test_graph_parses_modern_unprefixed_dot(self):
+        # Modern `terraform graph` (>=~1.x) omits the `[root] ` node prefix and
+        # uses fully-qualified resource node names; pairs must still be recovered.
+        dot = (
+            'digraph G {\n'
+            '  "azurerm_resource_group.this" -> "module.vnet.azapi_resource.vnet";\n'
+            '  "module.vnet.azapi_resource.vnet" -> "module.naming.random_string.x";\n'
+            '  "module.vnet.azapi_resource.vnet" -> "module.vnet.random_uuid.t";\n'
+            '}\n'
+        )
+        pairs = gather.parse_terraform_graph(dot)
+        self.assertIn((None, "vnet"), pairs)          # root -> module.vnet
+        self.assertIn(("vnet", "naming"), pairs)       # cross-module edge
+        self.assertNotIn(("vnet", "vnet"), pairs)      # same-module self-edge dropped
+
     def test_empty_inputs(self):
         self.assertEqual(gather.parse_terraform_module_blocks(""), {})
         self.assertEqual(gather.parse_terraform_graph(""), [])
