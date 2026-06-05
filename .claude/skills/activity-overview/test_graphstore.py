@@ -614,5 +614,20 @@ class TestProjectRepos(unittest.TestCase):
         self.assertEqual(graphstore.project_repos(conn, "p"), ["Azure/a"])
 
 
+class TestEdgesByType(unittest.TestCase):
+    def test_returns_project_edges_of_type_sorted(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_edges(conn, [
+            ("p/A/x#area-main.tf", "p/A/y#area-main.tf", "depends_on", None,
+             {"version": "1.0"}),
+            ("q/A/z#area-main.tf", "q/A/w#area-main.tf", "depends_on", None, None),
+        ])
+        rows = graphstore.edges_by_type(conn, "depends_on", "p")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["src_id"], "p/A/x#area-main.tf")
+        self.assertEqual(rows[0]["data"]["version"], "1.0")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -326,7 +326,39 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
         "shipped": _merge_shipped(members),
         "people": _merge_people(members),
         "modules": _merge_modules(members),
+        "module_edges": project_depends_on(conn, project, repos),
     }
+
+
+def _area_of(qid):
+    """('owner/repo', 'area-tail') from a qualified area id
+    '{project}/{owner}/{repo}#area-<tail>'."""
+    parsed = graphstore.parse_id(qid)
+    repo = parsed["scope"].split("/", 1)[1]            # strip leading project/
+    local = parsed["local"]
+    area = local[len("area-"):] if local.startswith("area-") else local
+    return repo, area
+
+
+def project_depends_on(conn, project, repos):
+    """The project's module-dependency edges as render-ready rows:
+    [{src_repo, src_area, dst_repo, dst_area, version, transitive, cross_repo}, ...]
+    sorted by (src_id, dst_id). Reads resolved depends_on edges from the store."""
+    repo_set = set(repos)
+    out = []
+    for e in graphstore.edges_by_type(conn, "depends_on", project):
+        src_repo, src_area = _area_of(e["src_id"])
+        dst_repo, dst_area = _area_of(e["dst_id"])
+        if src_repo not in repo_set:
+            continue
+        d = e["data"] or {}
+        out.append({
+            "src_repo": src_repo, "src_area": src_area,
+            "dst_repo": dst_repo, "dst_area": dst_area,
+            "version": d.get("version"), "transitive": d.get("transitive"),
+            "cross_repo": bool(d.get("cross_repo")) or src_repo != dst_repo,
+        })
+    return out
 
 
 def parse_args(argv):

@@ -549,5 +549,25 @@ class TestProjectDigestIntegration(unittest.TestCase):
         self.assertTrue(validate.validate_project(conn, "proj", repos)["ok"])
 
 
+class TestProjectDependsOn(unittest.TestCase):
+    def test_project_depends_on_lists_cross_repo_edges(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_edges(conn, [
+            ("proj/Azure/consumer#area-main.tf",
+             "proj/Azure/kv#area-main.tf", "depends_on", None,
+             {"version": "0.1.0", "cross_repo": True, "transitive": False}),
+        ])
+        edges = digest.project_depends_on(conn, "proj", ["Azure/consumer", "Azure/kv"])
+        self.assertEqual(len(edges), 1)
+        e = edges[0]
+        self.assertEqual(e["src_repo"], "Azure/consumer")
+        self.assertEqual(e["dst_repo"], "Azure/kv")
+        self.assertEqual(e["src_area"], "main.tf")
+        self.assertEqual(e["dst_area"], "main.tf")
+        self.assertTrue(e["cross_repo"])
+        self.assertEqual(e["version"], "0.1.0")
+
+
 if __name__ == "__main__":
     unittest.main()

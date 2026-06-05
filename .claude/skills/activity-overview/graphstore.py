@@ -227,6 +227,17 @@ def get_edges(conn, node_id, direction="both", edge_types=None):
     return [_row_to_edge(r) for r in conn.execute(sql, params)]
 
 
+def edges_by_type(conn, edge_type, project):
+    """All edges of `edge_type` whose src node belongs to `project`, sorted by
+    (src_id, dst_id). src_id is the qualified '{project}/{repo}#local', so the
+    project filter is a prefix match on '{project}/'."""
+    rows = conn.execute(
+        "SELECT * FROM edges WHERE edge_type=? AND src_id LIKE ? "
+        "ORDER BY src_id, dst_id",
+        (edge_type, project + "/%"))
+    return [_row_to_edge(r) for r in rows]
+
+
 def add_code_event(conn, artifact_id, event, commit_sha, author=None, date=None,
                    hunk=None, ref=None, before=None, after=None, detail=None):
     """Append one artifact lifecycle event. Keyed by (artifact, commit, event):
