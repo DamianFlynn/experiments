@@ -2716,9 +2716,19 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # in `nodes`; a later real fold of that area upserts over the stand-in. extract
     # rebuilds code_graph from the `codegraph` singleton (not area-* nodes), so the
     # stand-in is invisible to every member bundle — purely an edge anchor.
+    # Ensure each NEW depends_on target (one not already staged in `nodes`) exists.
+    # Batch the store existence check into a SINGLE query rather than a get_node per
+    # dst — depends_on fan-out can be large (a bicep repo window has dozens) — then
+    # synthesize only the truly-absent ones.
     _have = {n[0] for n in nodes}
-    for dst in sorted(_dep_dsts):
-        if dst in _have or graphstore.get_node(conn, dst) is not None:
+    _cand = sorted(d for d in _dep_dsts if d not in _have)
+    _existing = set()
+    if _cand:
+        ph = ",".join("?" for _ in _cand)
+        _existing = {r[0] for r in conn.execute(
+            "SELECT id FROM nodes WHERE id IN ({})".format(ph), _cand)}
+    for dst in _cand:
+        if dst in _existing:
             continue
         p = graphstore.parse_id(dst)
         scope = p["scope"]
