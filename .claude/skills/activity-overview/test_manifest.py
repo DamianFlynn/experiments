@@ -91,6 +91,14 @@ class TestLoadManifest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "'/'"):
                     manifest.load_manifest(path)
 
+    def test_rejects_non_string_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, {"project": "p", "window": {"from": "x", "to": "y"},
+                                "repos": [{"owner": "o", "repo": "r",
+                                           "registry": 123}]})
+            with self.assertRaisesRegex(ValueError, "registry"):
+                manifest.load_manifest(path)
+
     def test_member_slugs_empty(self):
         self.assertEqual(manifest.member_slugs({"repos": []}), set())
 

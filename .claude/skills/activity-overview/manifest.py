@@ -47,7 +47,12 @@ def load_manifest(path):
         # backfill path splits back on '/'; a '/' inside either would desync that.
         if "/" in owner or "/" in repo:
             raise ValueError("manifest: 'owner' and 'repo' must not contain '/'")
-        repos.append({"owner": owner, "repo": repo, "registry": r.get("registry")})
+        # registry is optional (Terraform registry path), but if present it must
+        # be a string so downstream dep-resolution can rely on the type.
+        registry = r.get("registry")
+        if registry is not None and not isinstance(registry, str):
+            raise ValueError("manifest: 'registry' must be a string when present")
+        repos.append({"owner": owner, "repo": repo, "registry": registry})
 
     return {"project": project, "from": date_from, "to": date_to, "repos": repos}
 
