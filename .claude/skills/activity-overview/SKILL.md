@@ -44,6 +44,30 @@ claim in the report resolves to a source ref — never invent facts.
      ```
      `no_drift` / `idempotency` self-source their raw bundle from the store via `extract`; an
      external `--bundle` is an optional cross-check, never required.
+   - **Multi-repo project (Phase 9).** To fold several repos under one logical
+     project (e.g. an Azure Verified Modules — Terraform constellation, where each
+     module is its own repo), pass a **manifest** instead of `--owner/--repo`:
+     ```bash
+     python3 gather.py --manifest workspace/manifest.json --store workspace/journey.db
+     ```
+     The manifest is `{project, window:{from,to}, repos:[{owner, repo, registry?}]}`
+     (`registry` optional — an exact Terraform registry path; absent → resolved by
+     the HashiCorp naming convention). gather folds each member under
+     `project=<manifest.project>`, `repo="owner/repo"`. Cross-repo decision-train
+     edges (qualified `owner/repo#N` refs + repo-aware timeline cross-refs) and
+     cross-repo Terraform `depends_on` (registry source → the member that publishes
+     it) form automatically; `examples/`/`tests/` Terraform subtrees are treated as
+     scaffolding (not module dependencies). Validate the whole project with
+     `python3 validate.py workspace/journey.db --project <name>` (adds a
+     project-wide people check). A project digest view (cross-repo trains, merged
+     Shipped/ownership, `related_work` ticket clusters, the project module-dependency
+     graph) comes from `python3 digest.py --store workspace/journey.db --project <name>
+     --from FROM --to TO`; the blast radius for one member is `python3 spotlight.py
+     dependents <owner/repo> --store workspace/journey.db --project <name>`.
+     - **Heavy live runs.** A real AVM pattern module's `terraform init` pulls dozens
+       of registry modules; set a shared `TF_PLUGIN_CACHE_DIR` (gather warms it once,
+       then extracts in parallel) and, if needed, raise `ACTIVITY_IAC_BUILD_TIMEOUT`
+       / tune `ACTIVITY_IAC_MAX_WORKERS` (defaults 300s / 8).
 2. **Materialize + Link.** The reader stage rebuilds the bundle view from the store
    (`extract`) and enriches it offline (no network):
    ```bash
