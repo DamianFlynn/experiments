@@ -24,10 +24,12 @@ _DEFAULT_TICKET_RE = re.compile(r"\b([A-Z]{2,}-\d+)\b")
 
 
 def parse_ticket_refs(text, pattern=_DEFAULT_TICKET_RE):
-    """Ordered, deduped internal-ticket ids in `text`. Pure."""
+    """Ordered, deduped internal-ticket ids in `text`. Pure. Uses capture group 1
+    when the pattern has one AND it participated in the match, else the whole
+    match — so an optional group that didn't fire never yields a `None` token."""
     out, seen = [], set()
     for m in pattern.finditer(text or ""):
-        tok = m.group(1) if m.re.groups else m.group(0)
+        tok = m.group(1) if (m.re.groups and m.group(1) is not None) else m.group(0)
         if tok not in seen:
             seen.add(tok)
             out.append(tok)

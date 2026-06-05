@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -275,6 +276,15 @@ class TestTicketGrouping(unittest.TestCase):
 
     def test_parse_ticket_refs_empty(self):
         self.assertEqual(digest.parse_ticket_refs(None), [])
+
+    def test_parse_ticket_refs_optional_group_falls_back_to_full_match(self):
+        # custom pattern whose group 1 is optional; on a match where it doesn't
+        # participate, m.group(1) is None -> use the whole match, never None.
+        pat = re.compile(r"(PRE-)?ABC-\d+")
+        self.assertEqual(digest.parse_ticket_refs("see ABC-7 here", pat),
+                         ["ABC-7"])
+        self.assertEqual(digest.parse_ticket_refs("see PRE-ABC-8 here", pat),
+                         ["PRE-"])  # group 1 participated -> it is used
 
     def test_related_work_clusters_trains_sharing_a_ticket(self):
         trains = [

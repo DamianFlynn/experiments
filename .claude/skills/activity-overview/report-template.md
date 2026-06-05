@@ -36,34 +36,28 @@
      Single-repo fallback: per-member trains from
      `view["members"][i]["bundle"]["trains"]`. -->
 
-DEEP trains (`tier == "deep"`) get a full sub-section with flowchart + effort line.
-MENTION trains (`tier == "mention"`) are one-liners at the end of the section.
+<!-- Project trains carry NO `tier`/`effort`/`root_issue`/flowchart of their own —
+     those are single-repo projections. Order trains most-substantial first
+     (rank by `len(train["prs"]) + len(train["commits"])`, break ties by
+     `outcome` shipped > in_flight > rejected > abandoned). Lead with the
+     cross-repo trains (`len(train["repos"]) > 1`).
+     For a DEEP per-train flowchart + effort line, drop into the owning member's
+     single-repo bundle: match the project train's local `pr-`/`issue-` ids to a
+     train in `view["members"][i]["bundle"]["trains"]` (which DO carry `tier`,
+     `significance`, `effort`) and that member's rendered
+     `diagrams.train_flowcharts[...]`. -->
 
-### {train.id} — {issue or PR title}  *(DEEP)*
+### {train.id} — {short title}
 
-<!-- spans: {", ".join(train["repos"])} — omit line when only one repo -->
+<!-- spans: {", ".join(train["repos"])} — omit this line when only one repo -->
 
-```mermaid
-{contents of diagrams.train_flowcharts[train.id]}
-```
-
-*Effort: landed in {effort.elapsed_days} days · {effort.reviewers} reviewer(s) · {effort.participants} contributor(s)*
-*(or "open N days" when effort.merged_at is null; append "— stalled" when effort.stalled is true)*
-
-<!-- narrative: {train.id} -->
-
-- **Root issue:** #{root_issue} (or "none — PR-anchored")
-- **PRs:** {train["prs"]} *(qualified ids; strip project prefix for display)*
-- **Commits:** {commit count}
-- **Outcome:** {train["outcome"]}
-- **Tickets:** {train["tickets"] joined with ", " or "—"}
-- **Evidence:** {evidence urls}
-
----
-
-*MENTION trains (one line each):*
-
-- `{train.id}` — {title} — {outcome} ({PR count} PR(s)){ — spans: {repos} when multi-repo}
+- **Repos:** {", ".join(train["repos"])} {"— cross-repo" when len > 1}
+- **Kind / outcome:** {train["kind"]} / {train["outcome"]}
+- **PRs:** {train["prs"]} *(qualified ids; strip the "{project}/" prefix for display)*
+- **Issues:** {train["issues"]}
+- **Commits:** {len(train["commits"])}
+- **Tickets:** {", ".join(train["tickets"]) or "—"}
+- **Evidence:** {e["url"] for e in train["evidence"]}
 
 ## Related work (cross-repo, ticket-linked)
 
