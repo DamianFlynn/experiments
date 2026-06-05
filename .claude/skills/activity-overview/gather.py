@@ -1530,6 +1530,23 @@ IAC_MAX_WORKERS = int(os.environ.get("ACTIVITY_IAC_MAX_WORKERS", "8"))        # 
 IAC_RETRIES = int(os.environ.get("ACTIVITY_IAC_RETRIES", "1"))               # extra attempts on timeout/failure
 
 
+def _list_tf_files(clone_dir, rel_dir):
+    """Every *.tf file (clone-relative path) in a module directory, sorted.
+
+    Terraform treats ALL *.tf in a directory as ONE module, and real modules spread
+    their `module` blocks across files (an AVM consumer puts them in
+    main.networking.tf / main.monitoring.tf / ..., not main.tf). Edge extraction
+    must read the whole directory so `build_terraform_edges` sees every module
+    source — the terraform-graph DOT already spans the whole dir. Returns [] when
+    the dir cannot be listed (the caller falls back to the entrypoint)."""
+    full = os.path.join(clone_dir, rel_dir) if rel_dir else clone_dir
+    try:
+        names = sorted(f for f in os.listdir(full) if f.endswith(".tf"))
+    except OSError:
+        return []
+    return [os.path.join(rel_dir, f) if rel_dir else f for f in names]
+
+
 def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf,
                         run, read_text, timeout, retries):
     """Resolve ONE area's edges. Returns (edges_or_None, status). Never raises.
@@ -1554,8 +1571,13 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
                 arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
                 src = read_text(os.path.join(clone_dir, bp))
                 return build_bicep_edges(src, arm, bp, area_ids, patterns), "resolved"
-            dot = _terraform_graph_dot(run, clone_dir, os.path.dirname(tp), timeout)
-            src = read_text(os.path.join(clone_dir, tp))
+            rel_dir = os.path.dirname(tp)
+            dot = _terraform_graph_dot(run, clone_dir, rel_dir, timeout)
+            # Read EVERY *.tf in the module dir (not just the entrypoint): a module's
+            # `module` blocks span all its files, and terraform graph already spans
+            # the whole dir. Fall back to the entrypoint if the dir can't be listed.
+            tf_files = _list_tf_files(clone_dir, rel_dir) or [tp]
+            src = "\n".join(read_text(os.path.join(clone_dir, f)) for f in tf_files)
             return build_terraform_edges(src, dot, tp, area_ids, patterns), "resolved"
         except subprocess.TimeoutExpired:
             status = "timeout"   # hung build: bounded, retried, then recorded

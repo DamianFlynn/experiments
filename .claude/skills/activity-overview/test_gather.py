@@ -1499,6 +1499,38 @@ class TestExtractIacEdges(unittest.TestCase):
         self.assertTrue(prod["edges"])
         self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
 
+    def test_terraform_module_source_in_sibling_file_resolves(self):
+        # An AVM consumer declares its `module` blocks across main.<topic>.tf files,
+        # not main.tf. Extraction must read the WHOLE dir, so a source in a sibling
+        # file still resolves (the entrypoint-only read missed it -> 0 edges).
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            with open(os.path.join(clone, "main.tf"), "w") as fh:
+                fh.write('terraform { required_version = ">= 1.0" }\n')
+            with open(os.path.join(clone, "main.networking.tf"), "w") as fh:
+                fh.write('module "vnet" {\n'
+                         '  source  = "Azure/avm-res-network-virtualnetwork/azurerm"\n'
+                         '  version = "0.7.1"\n}\n')
+            dot = ('digraph {\n'
+                   '"azurerm_x.a" -> "module.vnet.azurerm_virtual_network.this"\n}\n')
+
+            def run(cmd, **kw):
+                return dot if cmd[-1] == "graph" else ""
+
+            cg = {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf",
+                 "paths": ["main.tf", "main.networking.tf"], "edges": []}]}
+            gather.extract_iac_edges(
+                cg, clone,
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=gather._read_text_file)
+            edges = cg["areas"][0]["edges"]
+            refs = {e["ref"] for e in edges}
+            self.assertIn("Azure/avm-res-network-virtualnetwork/azurerm", refs)
+            vnet = next(e for e in edges
+                        if e["ref"] == "Azure/avm-res-network-virtualnetwork/azurerm")
+            self.assertEqual(vnet["version"], "0.7.1")
+
     def test_terraform_prewarm_runs_once_before_parallel_with_shared_cache(self):
         # With a shared TF_PLUGIN_CACHE_DIR + parallel workers, a single serial
         # warm-up `init` runs BEFORE the per-area builds so the parallel inits are
