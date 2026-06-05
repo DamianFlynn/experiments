@@ -748,6 +748,20 @@ class TestDirectoryCodeAreaProvider(unittest.TestCase):
                                       gather.DEFAULT_AREA_PATTERNS),
             "infra/network")
 
+    def test_repo_root_tf_files_collapse_to_one_main_tf_area(self):
+        # A Terraform root module keeps many root .tf files; they must form ONE
+        # area ("main.tf"), not one area per file (the old fragmentation bug).
+        for f in ("main.tf", "variables.tf", "outputs.tf", "locals.tf", "terraform.tf"):
+            self.assertEqual(
+                gather.classify_code_area(f, gather.DEFAULT_AREA_PATTERNS),
+                "main.tf", f)
+        areas = gather.build_directory_areas(
+            ["main.tf", "variables.tf", "outputs.tf", "locals.tf"],
+            gather.DEFAULT_AREA_PATTERNS)["areas"]
+        self.assertEqual([a["id"] for a in areas], ["main.tf"])
+        self.assertEqual(areas[0]["paths"],
+                         ["locals.tf", "main.tf", "outputs.tf", "variables.tf"])
+
     def test_generic_fallback_is_top_two_segments(self):
         self.assertEqual(
             gather.classify_code_area("src/app/handlers/auth.py",
@@ -1392,6 +1406,30 @@ class TestBuildTerraformEdges(unittest.TestCase):
             gather.build_terraform_edges("", "", self.base, set(),
                                          gather.DEFAULT_AREA_PATTERNS), [])
 
+    def test_local_source_to_repo_root_resolves_to_main_tf(self):
+        # An example at examples/<name>/ with `source = "../.."` points at the repo
+        # ROOT module. It must resolve to the root area id "main.tf" (the same id the
+        # root files classify to) -> NOT a phantom "." area (the dangling-edge bug).
+        tf = 'module "this" { source = "../.." }\n'
+        dot = 'digraph {\n"x" -> "module.this.y"\n}\n'
+        edges = gather.build_terraform_edges(
+            tf, dot, "examples/default/main.tf", set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["to"], "main.tf")
+        self.assertTrue(edges[0]["resolved"])
+
+    def test_local_source_escaping_repo_is_unresolved_not_phantom(self):
+        # A source resolving ABOVE the repo root cannot be a repo area -> to=None,
+        # resolved=False (no dangling phantom), identity kept in ref.
+        tf = 'module "up" { source = "../../.." }\n'
+        dot = 'digraph {\n"x" -> "module.up.y"\n}\n'
+        edges = gather.build_terraform_edges(
+            tf, dot, "examples/default/main.tf", set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(len(edges), 1)
+        self.assertIsNone(edges[0]["to"])
+        self.assertFalse(edges[0]["resolved"])
+        self.assertEqual(edges[0]["ref"], "../../..")
+
 
 class TestExtractIacEdges(unittest.TestCase):
     def _code_graph(self):
@@ -1460,6 +1498,43 @@ class TestExtractIacEdges(unittest.TestCase):
         prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
         self.assertTrue(prod["edges"])
         self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
+
+    def test_scaffold_areas_are_skipped_not_built(self):
+        # examples/ and tests/ areas must NOT be built (no terraform run) — they are
+        # marked skipped, so the heavy AVM example stacks are never init'd.
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+        built_dirs = []
+
+        def run(cmd, **kw):
+            if cmd[-1] == "graph":
+                built_dirs.append(cmd[1])   # the -chdir=... arg
+                return dot
+            built_dirs.append(cmd[1])
+            return ""
+
+        cg = {"provider": "directory", "areas": [
+            {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"], "edges": []},
+            {"id": "examples/default", "label": "default",
+             "paths": ["examples/default/main.tf"], "edges": []},
+            {"id": "tests/e2e", "label": "e2e",
+             "paths": ["tests/e2e/main.tf"], "edges": []},
+        ]}
+        cg = gather.extract_iac_edges(
+            cg, "clone",
+            which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+            run=run, read_text=lambda _p: tf)
+        by_id = {a["id"]: a for a in cg["areas"]}
+        self.assertEqual(by_id["main.tf"]["edges_status"], "resolved")
+        self.assertEqual(by_id["examples/default"]["edges_status"], "skipped")
+        self.assertEqual(by_id["tests/e2e"]["edges_status"], "skipped")
+        self.assertEqual(by_id["examples/default"]["edges"], [])
+        # terraform was invoked ONLY for the root module, never for scaffold dirs
+        self.assertFalse(any("examples/default" in d or "tests/e2e" in d
+                             for d in built_dirs))
+        self.assertEqual(cg["edge_extraction"]["skipped"], 2)
 
 
 class TestIacEdgeHardening(unittest.TestCase):
@@ -2463,6 +2538,62 @@ class TestFoldDependsOnFlatten(unittest.TestCase):
         self.assertEqual(set(by_dst), {"p/Az/r#area-b", "p/Az/r#area-c"})
         self.assertEqual(by_dst["p/Az/r#area-b"]["data"]["transitive"], True)
         self.assertEqual(by_dst["p/Az/r#area-b"]["data"]["version"], "2.0")
+
+    def test_examples_and_tests_areas_are_excluded_from_depends_on(self):
+        # examples/ and tests/ are module test/doc scaffolding: their module blocks
+        # (here: the example referencing the root module, and a test referencing
+        # another registry module) must NOT become stored depends_on edges. The
+        # root module's own edge IS kept.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Az/r", "Az/other"}
+        registry_by_slug = {"Az/other": "Other/avm-res-thing/azurerm"}
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                 "edges": [{"to": "modules/x", "kind": "module", "ref": "./modules/x",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "modules/x", "label": "x", "paths": ["modules/x/main.tf"],
+                 "edges": []},
+                {"id": "examples/default", "label": "default",
+                 "paths": ["examples/default/main.tf"],
+                 "edges": [{"to": "main.tf", "kind": "module", "ref": "../..",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "tests/e2e", "label": "e2e", "paths": ["tests/e2e/main.tf"],
+                 "edges": [{"to": None, "kind": "module",
+                            "ref": "Other/avm-res-thing/azurerm", "version": "1.0",
+                            "transitive": False, "provider": "terraform",
+                            "resolved": False}]},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="proj", repo="Az/r",
+                           members=members, registry_by_slug=registry_by_slug)
+        # the root module's intra-repo edge survives
+        root = graphstore.get_edges(conn, "proj/Az/r#area-main.tf", direction="out",
+                                    edge_types=["depends_on"])
+        self.assertEqual([d["dst_id"] for d in root], ["proj/Az/r#area-modules/x"])
+        # the example's edge to the root module is NOT stored
+        ex = graphstore.get_edges(conn, "proj/Az/r#area-examples/default",
+                                  direction="out", edge_types=["depends_on"])
+        self.assertEqual(ex, [])
+        # the test's cross-repo registry ref is NOT resolved into a member edge
+        te = graphstore.get_edges(conn, "proj/Az/r#area-tests/e2e",
+                                  direction="out", edge_types=["depends_on"])
+        self.assertEqual(te, [])
+
+    def test_is_scaffold_area(self):
+        self.assertTrue(gather._is_scaffold_area("examples/default"))
+        self.assertTrue(gather._is_scaffold_area("tests/e2e"))
+        self.assertTrue(gather._is_scaffold_area("modules/x/examples/foo"))
+        self.assertFalse(gather._is_scaffold_area("main.tf"))
+        self.assertFalse(gather._is_scaffold_area("modules/examples-helper"))
+        self.assertFalse(gather._is_scaffold_area(None))
 
     def test_resolved_true_but_to_none_is_dropped(self):
         conn = graphstore.open_store(":memory:")

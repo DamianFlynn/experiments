@@ -746,9 +746,12 @@ def _terraform_modules_dir(parts):
 
 
 def _tf_dir(parts):
-    # any directory containing a *.tf file -> that directory.
+    # Any directory containing a *.tf file -> that directory. Repo-root .tf files
+    # (no directory component) collapse to a SINGLE "main.tf" root-module area, so a
+    # Terraform root module is one area (like a Bicep main.bicep dir) instead of
+    # fragmenting into one area per root file (main.tf/variables.tf/outputs.tf/...).
     if parts and parts[-1].endswith(".tf"):
-        return "/".join(parts[:-1]) or parts[0]
+        return "/".join(parts[:-1]) or "main.tf"
     return None
 
 
@@ -786,6 +789,17 @@ def classify_code_area(path, patterns):
 def _area_label(area_id):
     """A short, human tail for an area id (the last path segment)."""
     return (area_id or "").rstrip("/").split("/")[-1] or area_id
+
+
+def _is_scaffold_area(area_id):
+    """True for a Terraform `examples/` or `tests/` subtree. These are the module's
+    unit-test / documentation scaffolding: their `module` blocks reference the
+    module-under-test and test fixtures (often via CI-manipulated relative paths, or
+    other registry modules used only to stand up a test), NOT the published module's
+    own dependencies. Such areas are skipped at edge extraction and their depends_on
+    edges are excluded at fold, so they are never built or misattributed as the
+    module's real (incl. cross-repo) dependencies. Pure."""
+    return bool({"examples", "tests"} & set((area_id or "").split("/")))
 
 
 def build_directory_areas(paths, patterns):
@@ -1142,7 +1156,17 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None)
             return None, None, None
         if src.startswith(".") or src.startswith("/"):
             joined = os.path.normpath(os.path.join(base_dir, src))
-            return (classify_code_area(joined + "/main.tf", patterns) or joined), src, None
+            if joined == os.pardir or joined.startswith(os.pardir + os.sep):
+                # escapes the repo (e.g. ../../.. above root): unresolvable to a
+                # repo area -> external (to=None), never a phantom dangling area.
+                return None, src, None
+            # normpath('.') is the repo root; classify it the same way root files
+            # are (-> "main.tf"), so a local source pointing at the root module
+            # resolves to the SAME area id as the root module's own files.
+            rel = "" if joined == os.curdir else joined
+            area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
+                or rel or "main.tf"
+            return area, src, None
         return None, src, version_of(name)        # external: to=None, identity in ref
 
     pairs = parse_terraform_graph(dot_text)
@@ -1568,8 +1592,19 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
                                          have_bicep, have_tf, run, read_text,
                                          timeout, retries)
 
+    # examples/ and tests/ are module scaffolding whose edges are excluded from
+    # depends_on at fold time; don't spend a terraform/bicep build on them (the AVM
+    # pattern examples instantiate the whole stack) — mark skipped, build the rest.
+    build = []
+    for area in areas:
+        if _is_scaffold_area(area.get("id")):
+            area["edges_status"] = "skipped"
+            summary["skipped"] += 1
+        else:
+            build.append(area)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for area, (edges, status) in pool.map(work, areas):
+        for area, (edges, status) in pool.map(work, build):
             if edges is not None:
                 area["edges"] = edges
             area["edges_status"] = status
@@ -1840,8 +1875,11 @@ def acquire(args, env):
         seen.add(issue["number"])
         issues.append(issue)
     for n in sorted(wanted - seen):
-        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
-        if raw_issue.get("pull_request"):
+        # A closed/cross-referenced issue can 404 — deleted, transferred to another
+        # repo, or a cross-ref number that is not an issue in THIS repo. Tolerate it
+        # (skip) rather than aborting the whole gather on one dangling reference.
+        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token, allow_404=True)
+        if raw_issue is None or raw_issue.get("pull_request"):
             continue
         raw_by_num[raw_issue["number"]] = raw_issue
         issues.append(normalize_issue(raw_issue))
@@ -2191,11 +2229,14 @@ def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
     """Yield (src_qid, dst_qid, data) depends_on triples from a bundle's area
     edges. Resolved-local edges -> intra-repo. Unresolved registry edges resolve
     to a member's root area ONLY in multi-repo folds (`members` non-empty and
-    `registry_by_slug` not None); single-repo folds skip them (byte-stable). Pure."""
+    `registry_by_slug` not None); single-repo folds skip them (byte-stable).
+    `examples/`/`tests/` source areas are skipped (scaffolding, not module deps). Pure."""
     def q(slug, local):
         return graphstore.qualify_id(project, slug, local)
     areas = (bundle.get("code_graph", {}) or {}).get("areas") or []
     for area in areas:
+        if _is_scaffold_area(area.get("id")):
+            continue
         src = q(repo, "area-{}".format(area["id"]))
         for e in area.get("edges") or []:
             to = e.get("to")
