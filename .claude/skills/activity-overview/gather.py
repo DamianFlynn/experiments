@@ -1928,8 +1928,9 @@ def acquire(args, env):
         sys.stderr.write(
             f"warning: {len(_boundary_dropped)} in-window commit(s) sit at the shallow "
             f"clone boundary; their whole-tree phantom diffs were dropped (a visible gap "
-            f"in meta.boundary_dropped_commits) — widen CLONE_MARGIN_DAYS to recover: "
-            f"{_boundary_dropped}\n")
+            f"in meta.boundary_dropped_commits) — widen the clone margin "
+            f"(ACTIVITY_CLONE_MARGIN_DAYS, default {CLONE_MARGIN_DAYS}) and re-gather "
+            f"to recover: {_boundary_dropped}\n")
 
     # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
     # from the code-event walk + the commit file lists (local, zero-token).
@@ -2672,11 +2673,17 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # node is invisible to every member bundle — it exists purely as an edge anchor.
     _have = {n[0] for n in nodes}
     for dst in sorted(_dep_dsts):
-        if dst in _have or graphstore.get_node(conn, dst) is not None:
-            continue
         p = graphstore.parse_id(dst)
         scope = p["scope"]
         dst_repo = scope[len(project) + 1:] if scope.startswith(project + "/") else scope
+        # ONLY ensure cross-repo targets. An intra-repo depends_on dst is a local
+        # area that must come from THIS repo's code_graph — synthesizing it would
+        # mask a real referential-integrity bug (a dangling local edge), so leave it
+        # for validate to catch.
+        if dst_repo == repo:
+            continue
+        if dst in _have or graphstore.get_node(conn, dst) is not None:
+            continue
         local = p["local"]
         area_id = local[len("area-"):] if local.startswith("area-") else local
         nodes.append((dst, project, dst_repo, "structure", None,

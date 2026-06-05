@@ -7,6 +7,7 @@ fills report-template.md into a finished Markdown digest. Every fact resolves to
 a store-backed value or a GitHub URL; narrative prose is grounded in those
 values only. Deterministic — re-running over the same view is byte-stable.
 """
+import datetime
 import json
 import os
 import sys
@@ -22,10 +23,11 @@ DIAG = os.path.join(SKILL_ROOT, "workspace/diagrams")
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "avm-tf-aiml-lz-digest.md")
 
-view = json.load(open(VIEW))
+with open(VIEW, encoding="utf-8") as _fh:
+    view = json.load(_fh)
 PROJECT = view["meta"]["project"]
 FROM, TO = view["meta"]["from"], view["meta"]["to"]
-TODAY = "2026-06-05"
+TODAY = datetime.date.today().isoformat()
 
 import graphstore  # noqa: E402  (qualify/parse ids, same as digest.py)
 

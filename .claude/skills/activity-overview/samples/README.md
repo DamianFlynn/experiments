@@ -60,8 +60,11 @@ python3 samples/build_report.py   # → samples/avm-tf-aiml-lz-digest.md
 
 ### mmdc as root
 
-`mmdc` launches headless Chromium, which refuses to run as root without
-`--no-sandbox`. Pass a puppeteer config when validating diagrams:
+Prefer running `mmdc` as a **non-root user**, where Chromium's sandbox works
+normally and no flags are needed. Only when you cannot (e.g. a root-only CI
+container) does Chromium refuse to launch without `--no-sandbox` — disabling the
+sandbox reduces isolation, so scope it to controlled, throwaway environments and
+never point it at untrusted `.mmd` input. In that case pass a puppeteer config:
 
 ```bash
 printf '{"args":["--no-sandbox","--disable-setuid-sandbox"]}' > workspace/puppeteer.json

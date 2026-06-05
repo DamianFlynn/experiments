@@ -2795,6 +2795,30 @@ class TestFoldDependsOnFlatten(unittest.TestCase):
         self.assertEqual(after, real)                   # real producer area preserved
         self.assertNotIn("synthesized", after)
 
+    def test_intra_repo_dangling_target_not_synthesized(self):
+        # Only CROSS-repo targets are ensured. An intra-repo resolved-local edge
+        # whose dst area is absent from code_graph must NOT be synthesized — that
+        # would mask a real referential-integrity bug (left for validate to catch).
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"], "edges": [
+                    {"to": "modules/ghost", "kind": "module", "ref": "./modules/ghost",
+                     "version": None, "transitive": False, "provider": "terraform",
+                     "resolved": True}]}]},  # 'modules/ghost' area is NOT defined
+        }
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
+        deps = graphstore.get_edges(conn, "p/Az/r#area-main.tf", direction="out",
+                                    edge_types=["depends_on"])
+        self.assertEqual([d["dst_id"] for d in deps], ["p/Az/r#area-modules/ghost"])
+        # intra-repo target left dangling (not masked by a synthesized stand-in)
+        self.assertIsNone(graphstore.get_node(conn, "p/Az/r#area-modules/ghost"))
+
 
 class TestStructuralTerraformScan(unittest.TestCase):
     FILES = {
