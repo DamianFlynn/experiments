@@ -2795,10 +2795,11 @@ class TestFoldDependsOnFlatten(unittest.TestCase):
         self.assertEqual(after, real)                   # real producer area preserved
         self.assertNotIn("synthesized", after)
 
-    def test_intra_repo_dangling_target_not_synthesized(self):
-        # Only CROSS-repo targets are ensured. An intra-repo resolved-local edge
-        # whose dst area is absent from code_graph must NOT be synthesized — that
-        # would mask a real referential-integrity bug (left for validate to catch).
+    def test_intra_repo_depends_on_target_is_ensured(self):
+        # An intra-repo depends_on dst is a real module-area path (a sub-module the
+        # window-scoped area provider didn't surface). It IS ensured so the edge is
+        # not dangling — this is the avm/res/*/* bicep sub-module case that left
+        # ~30 dangling depends_on edges on Azure/bicep-registry-modules.
         conn = graphstore.open_store(":memory:")
         graphstore.init_schema(conn)
         bundle = {
@@ -2808,16 +2809,18 @@ class TestFoldDependsOnFlatten(unittest.TestCase):
             "milestones": [], "releases": [],
             "code_graph": {"provider": "directory", "areas": [
                 {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"], "edges": [
-                    {"to": "modules/ghost", "kind": "module", "ref": "./modules/ghost",
+                    {"to": "modules/subnet", "kind": "module", "ref": "./modules/subnet",
                      "version": None, "transitive": False, "provider": "terraform",
-                     "resolved": True}]}]},  # 'modules/ghost' area is NOT defined
+                     "resolved": True}]}]},  # 'modules/subnet' area NOT in code_graph
         }
         gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
         deps = graphstore.get_edges(conn, "p/Az/r#area-main.tf", direction="out",
                                     edge_types=["depends_on"])
-        self.assertEqual([d["dst_id"] for d in deps], ["p/Az/r#area-modules/ghost"])
-        # intra-repo target left dangling (not masked by a synthesized stand-in)
-        self.assertIsNone(graphstore.get_node(conn, "p/Az/r#area-modules/ghost"))
+        self.assertEqual([d["dst_id"] for d in deps], ["p/Az/r#area-modules/subnet"])
+        # intra-repo target ensured (minimal structure stand-in -> not dangling)
+        node = graphstore.get_node(conn, "p/Az/r#area-modules/subnet")
+        self.assertIsNotNone(node)
+        self.assertEqual(node["node_class"], "structure")
 
 
 class TestStructuralTerraformScan(unittest.TestCase):
