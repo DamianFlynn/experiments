@@ -280,7 +280,7 @@ fetches itself — it calls in via an injected `backfill` callable).
   paths are therefore only exercisable against a real repo (relevant to the
   upcoming trust gate), not by the offline suite.
 
-## Train completion + dead-ref memory (Phase 8d — implemented, in review on PR #14)
+## Train completion + dead-ref memory (Phase 8d — shipped, #14)
 
 7c's `backfill` is a *single-node* bridge. **Phase 8d** promotes it into a shared
 **completion orchestrator** (`complete.py`) that closes a train **transitively**

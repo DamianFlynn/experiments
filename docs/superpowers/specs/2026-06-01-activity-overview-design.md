@@ -1,13 +1,10 @@
 # activity-overview skill — design
 
 **Date:** 2026-06-01
-**Status:** rev 15 — design approved; implementation in progress.
+**Status:** rev 15 — shipped.
 
-**Where we are (2026-06-04):**
-- **Shipped to `master`:** Phases 1–4a (the flat-bundle digest) plus the rev-14 substrate phases **5** (graphstore foundation, #11), **6** (gather-as-writer + on-demand `backfill`, #12) and **7** (full graph substrate — `extract` slices 7a/7b/7c, #13). The persistent SQLite graph is the live seam; `extract` reproduces the rev-13 bundle byte-for-byte under the equivalence gate.
-- **In review (both on PR #14, `claude/phase8-spotlight`):**
-  - **Phase 8 — spotlight** (the four substrate-analytics queries + focused renders + CI gate).
-  - **Phase 8d — the train-completion orchestrator** (`complete.py`) — *this rev, now implemented* atop Phase 8: dead-ref tombstone + `gather.ABSENT` seam (8d-1), the transitive window-bounded orchestrator + `extract` refactor (8d-2), and spotlight's honest `complete`/`gaps` contract + `--complete` + gap render (8d-3). The full skill suite + validator gate are green (608 tests). Design: `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`; plan: `docs/superpowers/plans/2026-06-04-activity-phase8d-completion.md`. Deferred: the real-data `--complete` smoke against the AVM store (needs a token + store).
+**Where we are (2026-06-05):**
+- **Shipped to `master`:** Phases 1–4a (the flat-bundle digest); the rev-14 substrate phases **5** (graphstore foundation, #11), **6** (gather-as-writer + on-demand `backfill`, #12) and **7** (full graph substrate — `extract` slices 7a/7b/7c, #13); **Phase 8 — spotlight** (the four substrate-analytics queries + focused renders + CI gate) and **Phase 8d — the train-completion orchestrator** (`complete.py`: dead-ref tombstone + `gather.ABSENT` seam, the transitive window-bounded orchestrator + `extract` refactor, and spotlight's honest `complete`/`gaps` contract + `--complete` + gap render), both via **#14**. The persistent SQLite graph is the live seam; `extract` reproduces the rev-13 bundle byte-for-byte under the equivalence gate. **Verified end-to-end against real AVM data** (gather → `validate` → spotlight → live `--complete`) on both a fixed historical week and a trailing recent week. Design: `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`; plan: `docs/superpowers/plans/2026-06-04-activity-phase8d-completion.md`.
 - **Future:** Phases 9–14 (multi-repo, 4b sub-agent narration, report/community/forecast views) — see the **P1–P14** ledger under *Implementation phasing*.
 
 **Rev history.** (**rev 15 promotes backfill into a shared train-completion orchestrator** — `complete.py` makes train completion *transitive* and *window-bounded* and gives every train an *honest edge contract* (`complete`/`gaps` with reasons; 404 phantoms pruned + remembered dead via a `dead_refs` tombstone), shared by `extract` and `spotlight`; see the new *`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`* and **Phase 8d** in the ledger. Prior — rev 14, Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending. **Rev 14 re-seats the storage/read seam onto a persistent SQLite graph substrate** — graphstore → gather-as-writer → extract → spotlight — keeping the rev-1–13 fact model verbatim while making full-history chronology, random-access analytics, and durable accumulation tractable; see the new *Architecture (rev 14) — persistent graph substrate* section below and the unified **P1–P14** ledger under *Implementation phasing*. The deferred 4b and the original P5–P8 features are re-sequenced as P10–P14, rebuilt on the store.)
@@ -1218,11 +1215,11 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   roll-up/resume hardening. Persistence model: *facts (nodes/edges/ledgers, incl. backfilled
   threads) are durable; only roll-ups are recomputed, from those facts.* Detailed design:
   `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
-- **Phase 8 — spotlight (substrate analytics; absorbs original-P5 people view) (in review — PR #14).** `spotlight.py`:
+- **Phase 8 — spotlight (substrate analytics; absorbs original-P5 people view) (shipped, #14).** `spotlight.py`:
   person-impact, subsystem-split, pattern-evolution, commit-text-mining queries + focused
   renders. *Verifiable:* each query against a seeded multi-window store returns the expected
   aggregate with citations; the FTS query returns matches `O(matches)`.
-- **Phase 8d — train completion (the completion orchestrator) (substrate; rev 15; implemented — in review on PR #14).** Promote
+- **Phase 8d — train completion (the completion orchestrator) (substrate; rev 15; shipped, #14).** Promote
   7c's single-node `backfill` + extract's inline loop into a shared **`complete.py`**: transitive
   spine completion **bounded by the query window** (else closure; level-0 directly-referenced
   anchors always filled), an **honest edge contract** on every train (`complete` + `gaps[{id,
