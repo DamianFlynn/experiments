@@ -248,5 +248,25 @@ class TestBuildProjectTrainsUnit(unittest.TestCase):
         self.assertEqual(trains[0]["kind"], "bug")
 
 
+class TestTicketGrouping(unittest.TestCase):
+    def test_parse_ticket_refs_default_pattern(self):
+        self.assertEqual(
+            digest.parse_ticket_refs("see ABC-1234 and ABC-1234 and XY-7, not A1"),
+            ["ABC-1234", "XY-7"])  # ordered, deduped; needs >=2 letters then -digits
+
+    def test_parse_ticket_refs_empty(self):
+        self.assertEqual(digest.parse_ticket_refs(None), [])
+
+    def test_related_work_clusters_trains_sharing_a_ticket(self):
+        trains = [
+            {"id": "ptrain-a", "tickets": ["ABC-1"]},
+            {"id": "ptrain-b", "tickets": ["ABC-1", "ZZ-9"]},
+            {"id": "ptrain-c", "tickets": ["QQ-2"]},
+        ]
+        groups = digest.group_related_work(trains)
+        self.assertEqual(groups, [{"ticket": "ABC-1",
+                                   "train_ids": ["ptrain-a", "ptrain-b"]}])
+
+
 if __name__ == "__main__":
     unittest.main()

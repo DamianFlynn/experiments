@@ -9,11 +9,44 @@ docs/superpowers/specs/2026-06-05-activity-phase9-multirepo.md (S3).
 """
 import argparse
 import json
+import re
 import sys
 
 import extract as extract_mod
 import graphstore
 import link as link_mod
+
+
+# Internal-ticket reference (Jira/ADO-style): 2+ uppercase letters, hyphen,
+# digits. Conservative so it doesn't swallow enum-like tokens (A1, v2). Override
+# via build_project_view(ticket_pattern=...).
+_DEFAULT_TICKET_RE = re.compile(r"\b([A-Z]{2,}-\d+)\b")
+
+
+def parse_ticket_refs(text, pattern=_DEFAULT_TICKET_RE):
+    """Ordered, deduped internal-ticket ids in `text`. Pure."""
+    out, seen = [], set()
+    for m in pattern.finditer(text or ""):
+        tok = m.group(1)
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return out
+
+
+def group_related_work(trains):
+    """Cluster project trains that share a ticket but are otherwise unlinked.
+    Returns [{"ticket": str, "train_ids": [...]}, ...] for tickets spanning >=2
+    trains, ordered by ticket. Each train carries a `tickets` list (set by
+    build_project_view)."""
+    by_ticket = {}
+    for tr in trains:
+        for tk in tr.get("tickets", []):
+            by_ticket.setdefault(tk, [])
+            if tr["id"] not in by_ticket[tk]:
+                by_ticket[tk].append(tr["id"])
+    return [{"ticket": tk, "train_ids": sorted(ids)}
+            for tk, ids in sorted(by_ticket.items()) if len(ids) >= 2]
 
 
 def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
