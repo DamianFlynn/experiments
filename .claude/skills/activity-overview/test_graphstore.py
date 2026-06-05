@@ -628,6 +628,19 @@ class TestEdgesByType(unittest.TestCase):
         self.assertEqual(rows[0]["src_id"], "p/A/x#area-main.tf")
         self.assertEqual(rows[0]["data"]["version"], "1.0")
 
+    def test_underscore_in_project_is_not_a_like_wildcard(self):
+        # 'infra_prod' must not match 'infraXprod' (the '_' is escaped).
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_edges(conn, [
+            ("infra_prod/A/x#area-main.tf", "infra_prod/A/y#area-main.tf",
+             "depends_on", None, None),
+            ("infraXprod/A/z#area-main.tf", "infraXprod/A/w#area-main.tf",
+             "depends_on", None, None),
+        ])
+        rows = graphstore.edges_by_type(conn, "depends_on", "infra_prod")
+        self.assertEqual([r["src_id"] for r in rows], ["infra_prod/A/x#area-main.tf"])
+
 
 if __name__ == "__main__":
     unittest.main()

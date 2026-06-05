@@ -332,9 +332,13 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
 
 def _area_of(qid):
     """('owner/repo', 'area-tail') from a qualified area id
-    '{project}/{owner}/{repo}#area-<tail>'."""
+    '{project}/{owner}/{repo}#area-<tail>'. Precondition: a repo-qualified id
+    (raises on a project-scoped/person id with no '/' in its scope)."""
     parsed = graphstore.parse_id(qid)
-    repo = parsed["scope"].split("/", 1)[1]            # strip leading project/
+    parts = parsed["scope"].split("/", 1)              # strip leading project/
+    if len(parts) < 2:
+        raise ValueError("_area_of: expected a repo-qualified id, got {!r}".format(qid))
+    repo = parts[1]
     local = parsed["local"]
     area = local[len("area-"):] if local.startswith("area-") else local
     return repo, area

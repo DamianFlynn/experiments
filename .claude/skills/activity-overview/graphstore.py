@@ -230,11 +230,13 @@ def get_edges(conn, node_id, direction="both", edge_types=None):
 def edges_by_type(conn, edge_type, project):
     """All edges of `edge_type` whose src node belongs to `project`, sorted by
     (src_id, dst_id). src_id is the qualified '{project}/{repo}#local', so the
-    project filter is a prefix match on '{project}/'."""
+    filter is a LIKE on the literal prefix '{project}/' (LIKE metacharacters in
+    the project name are escaped, as in repo_code_events)."""
+    pref = project.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     rows = conn.execute(
-        "SELECT * FROM edges WHERE edge_type=? AND src_id LIKE ? "
+        "SELECT * FROM edges WHERE edge_type=? AND src_id LIKE ? ESCAPE '\\' "
         "ORDER BY src_id, dst_id",
-        (edge_type, project + "/%"))
+        (edge_type, pref + "/%"))
     return [_row_to_edge(r) for r in rows]
 
 

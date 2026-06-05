@@ -568,6 +568,23 @@ class TestProjectDependsOn(unittest.TestCase):
         self.assertTrue(e["cross_repo"])
         self.assertEqual(e["version"], "0.1.0")
 
+    def test_intra_repo_edge_is_not_cross_repo_and_src_filter_applies(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_edges(conn, [
+            # intra-repo edge (same repo, no cross_repo flag) -> cross_repo False
+            ("proj/Azure/a#area-modules/app", "proj/Azure/a#area-modules/base",
+             "depends_on", None, {"transitive": True}),
+            # src repo NOT in the requested set -> dropped
+            ("proj/Azure/other#area-main.tf", "proj/Azure/a#area-main.tf",
+             "depends_on", None, None),
+        ])
+        edges = digest.project_depends_on(conn, "proj", ["Azure/a"])
+        self.assertEqual(len(edges), 1)
+        self.assertFalse(edges[0]["cross_repo"])
+        self.assertEqual(edges[0]["transitive"], True)
+        self.assertEqual(edges[0]["src_area"], "modules/app")
+
 
 if __name__ == "__main__":
     unittest.main()
