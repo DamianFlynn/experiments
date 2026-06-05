@@ -199,6 +199,24 @@ Direct dependencies carry pinned versions; cross-module edges show which areas a
 change ripples into. When no edges resolve, `module_graph` renders a
 `No module dependencies` placeholder (the diagram is always present).
 
+## Cross-repo module dependencies (blast radius)
+
+<!-- Source: `view["module_edges"]` (each {src_repo, src_area, dst_repo, dst_area,
+     version, transitive, cross_repo}) and the diagram
+     `render.emit_project_module_graph(view["module_edges"])`. Lead with the
+     cross-repo edges (cross_repo == true): a member's module depending on another
+     member's published module. For "if member X changes, who is affected?", cite
+     `spotlight dependents <owner/repo>` (its `dependents` list). Omit the whole
+     section when `view["module_edges"]` is empty. -->
+
+```mermaid
+{render.emit_project_module_graph(view["module_edges"])}
+```
+
+| Consumer (repo · area) | Depends on (repo · area) | Version | Cross-repo |
+|---|---|---|---|
+| `{src_repo}` · `{src_area}` | `{dst_repo}` · `{dst_area}` | {version or "—"} | {"yes" when cross_repo} |
+
 ## Module ownership
 
 <!-- Multi-repo: source from `view["modules"]` and `view["people"]`.
