@@ -2874,6 +2874,56 @@ class TestStructuralTerraformScan(unittest.TestCase):
                                 "Azure/avm-res-network-virtualnetwork/azurerm"])
 
 
+class TestBlocksEdges(unittest.TestCase):
+    def test_parse_blocks_refs_directions_and_dedup(self):
+        refs = gather.parse_blocks_refs(
+            "This blocks #5 and is blocked by #7. Depends on #7. Blocking #9.")
+        self.assertEqual(refs, [
+            {"number": 5, "direction": "out"},    # blocks #5
+            {"number": 7, "direction": "in"},     # blocked by #7 (depends on #7 dedups)
+            {"number": 9, "direction": "out"},     # blocking #9
+        ])
+
+    def test_parse_blocks_refs_ignores_prose(self):
+        # needs a closing '#N' tied to a dependency keyword; loose prose is ignored
+        self.assertEqual(gather.parse_blocks_refs("this unblocks the path, see #5"), [])
+        self.assertEqual(gather.parse_blocks_refs("blocked yesterday on #5"), [])
+        self.assertEqual(gather.parse_blocks_refs("no refs here"), [])
+
+    def _issues_bundle(self, issues):
+        return {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "commits": [], "code_events": [], "milestones": [],
+            "releases": [], "code_graph": {"provider": "directory", "areas": []},
+            "issues": issues,
+        }
+
+    def test_fold_emits_blocks_between_gathered_issues_only(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        issues = [
+            gather.normalize_issue({"number": 1, "title": "A",
+                                    "body": "blocked by #2", "html_url": "u"}),
+            gather.normalize_issue({"number": 2, "title": "B",
+                                    "body": "blocks #3 and depends on #99",
+                                    "html_url": "u"}),
+            gather.normalize_issue({"number": 3, "title": "C", "body": "",
+                                    "html_url": "u"}),
+        ]
+        gather.fold_bundle(conn, self._issues_bundle(issues), project="p", repo="Az/r")
+        got = {(e["src_id"], e["dst_id"])
+               for e in graphstore.edges_by_type(conn, "blocks", "p")}
+        # #1 blocked-by #2 -> (2 blocks 1); #2 blocks #3 -> (2 blocks 3);
+        # #99 is not a gathered issue -> dropped (no dangling edge).
+        self.assertEqual(got, {("p/Az/r#issue-2", "p/Az/r#issue-1"),
+                               ("p/Az/r#issue-2", "p/Az/r#issue-3")})
+        # blocks is a NON-spine relation: traverse_spine must not follow it.
+        self.assertNotIn("blocks", graphstore.SPINE_EDGE_TYPES)
+        reached = graphstore.traverse_spine(conn, ["p/Az/r#issue-2"])["reached"]
+        self.assertNotIn("p/Az/r#issue-3", reached)
+
+
 class TestRegistryResolution(unittest.TestCase):
     def test_parse_registry_source_plain(self):
         self.assertEqual(

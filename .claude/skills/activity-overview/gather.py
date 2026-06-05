@@ -287,6 +287,33 @@ def parse_closing_refs(text):
     return out
 
 
+# Issue dependency phrasing -> a directed `blocks` relation (issue->issue). "this
+# blocks #N" / "blocking #N" is an OUTbound block (this -> N); "blocked by #N" /
+# "depends on #N" is INbound (N -> this). Conservative keyword set so prose like
+# "this unblocks the path" never trips it. Same-repo bare `#N` only.
+_BLOCKS_RE = re.compile(
+    r"\b(?P<kw>blocked\s+by|depends\s+on|blocking|blocks?)\s+#(?P<num>\d+)",
+    re.IGNORECASE,
+)
+_BLOCKS_INBOUND = ("blocked by", "depends on")
+
+
+def parse_blocks_refs(text):
+    """Directed `blocks` refs in issue text, ordered + deduped. Returns
+    [{number, direction}] where direction is 'out' (this issue blocks #N) or 'in'
+    (this issue is blocked by / depends on #N). Pure."""
+    out, seen = [], set()
+    for m in _BLOCKS_RE.finditer(text or ""):
+        kw = " ".join(m.group("kw").lower().split())
+        num = int(m.group("num"))
+        direction = "in" if kw in _BLOCKS_INBOUND else "out"
+        key = (num, direction)
+        if key not in seen:
+            seen.add(key)
+            out.append({"number": num, "direction": direction})
+    return out
+
+
 def normalize_pr(raw):
     """Map a GitHub REST PR object to the bundle's PR shape."""
     milestone = raw.get("milestone")
@@ -346,6 +373,11 @@ def normalize_issue(raw):
         "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
         "comments": raw.get("comments", 0) or 0,
+        # directed issue->issue dependency refs parsed from title+body (same-repo
+        # bare #N); fold emits `blocks` edges between gathered issues.
+        "blocks": parse_blocks_refs(
+            (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
+        ),
         "url": raw.get("html_url"),
     }
 
@@ -2433,9 +2465,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     symbol code_events ledgers, structure (milestones/releases/areas + the
     project-scoped people nodes), the spine edges closes/cross_ref/part_of, and
     the non-spine contribution / owns / touches / depends_on / in_milestone /
-    symbol-move edges — all derived on the write path via the `derive` leaf.
-    See STORE.md for the full edge/node inventory and what remains (blocks /
-    in_iteration / fts_text).
+    blocks / symbol-move edges — all derived on the write path via the `derive`
+    leaf. See STORE.md for the full edge/node inventory and what remains
+    (in_iteration — needs Projects v2 acquisition).
     """
     meta = bundle.get("meta", {})
     # Identity override (Phase 9): a multi-repo run folds each member under one
@@ -2475,11 +2507,21 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         for n in pr.get("crossref_issues") or []:
             edges.append((pid, qid("issue-{}".format(n)), "cross_ref", None, None))
 
-    # social: issues.
+    # social: issues, with `blocks` (issue->issue) relation edges. A blocks ref to
+    # an issue NOT gathered in this window is dropped rather than left dangling
+    # (referential_integrity): only edges between two gathered issues are emitted.
+    _gathered_issues = {i["number"] for i in bundle.get("issues", [])}
     for iss in bundle.get("issues", []):
         ts = iss.get("closed_at") or iss.get("updated_at")
-        nodes.append((qid("issue-{}".format(iss["number"])), project, repo,
-                      "social", ts, iss, fetched))
+        iid = qid("issue-{}".format(iss["number"]))
+        nodes.append((iid, project, repo, "social", ts, iss, fetched))
+        for b in iss.get("blocks") or []:
+            if b["number"] not in _gathered_issues:
+                continue
+            other = qid("issue-{}".format(b["number"]))
+            # normalize to blocker -> blocked
+            src, dst = (iid, other) if b["direction"] == "out" else (other, iid)
+            edges.append((src, dst, "blocks", None, None))
 
     # code: commits, with part_of spine edge to the PR named in the subject.
     for c in bundle.get("commits", []):
