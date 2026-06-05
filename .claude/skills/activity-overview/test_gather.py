@@ -2135,5 +2135,35 @@ class TestManifestMain(unittest.TestCase):
         self.assertIsNotNone(graphstore.get_node(conn, "proj/Azure/mod-b#pr-10"))
 
 
+class TestParseQualifiedRefs(unittest.TestCase):
+    def test_closing_keyword_owner_repo_hash(self):
+        refs = gather.parse_qualified_refs(
+            "Closes Azure/Azure-Verified-Modules#1234 and more")
+        self.assertEqual(refs, [{"owner": "Azure", "repo": "Azure-Verified-Modules",
+                                 "number": 1234, "kind": "closes", "is_pr": False}])
+
+    def test_full_url_issue_and_pull(self):
+        refs = gather.parse_qualified_refs(
+            "see https://github.com/Azure/mod-b/issues/7 and "
+            "https://github.com/Azure/mod-c/pull/9")
+        self.assertEqual(refs, [
+            {"owner": "Azure", "repo": "mod-b", "number": 7,
+             "kind": "cross_ref", "is_pr": False},
+            {"owner": "Azure", "repo": "mod-c", "number": 9,
+             "kind": "cross_ref", "is_pr": True},
+        ])
+
+    def test_dedup_order_preserving(self):
+        refs = gather.parse_qualified_refs(
+            "Fixes Azure/a#1\nResolves Azure/a#1\nFixes Azure/b#2")
+        self.assertEqual([(r["repo"], r["number"]) for r in refs], [("a", 1), ("b", 2)])
+
+    def test_bare_hash_not_captured(self):
+        self.assertEqual(gather.parse_qualified_refs("Closes #5"), [])
+
+    def test_empty(self):
+        self.assertEqual(gather.parse_qualified_refs(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -221,6 +221,45 @@ _CLOSING_RE = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
 )
 
+# Cross-repo references (Phase 9). A closing keyword qualified with owner/repo
+# (`Closes Azure/repo#12`) -> a `closes` link to that OTHER repo's issue. A bare
+# GitHub URL (`https://github.com/owner/repo/(issues|pull)/N`) -> a `cross_ref`
+# mention (issues -> issue node, pull -> pr node). Bare `#N` stays same-repo
+# (parse_closing_refs). Owners/repos: GitHub names — alnum start, then word/.-.
+_QUALIFIED_CLOSE_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
+    r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)#(?P<num>\d+)",
+    re.IGNORECASE,
+)
+_QUALIFIED_URL_RE = re.compile(
+    r"https?://github\.com/"
+    r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)/"
+    r"(?P<kind>issues|pull)/(?P<num>\d+)",
+)
+
+
+def parse_qualified_refs(text):
+    """Cross-repo refs in PR/issue text, ordered + deduped. Returns a list of
+    {owner, repo, number, kind, is_pr}: closing keywords -> kind 'closes'
+    (is_pr False; closing targets an issue); github.com URLs -> kind 'cross_ref'
+    (is_pr True for /pull/, False for /issues/). Bare `#N` is left to
+    parse_closing_refs (same-repo). Pure."""
+    out, seen = [], set()
+
+    def add(owner, repo, num, kind, is_pr):
+        key = (owner, repo, num)
+        if key not in seen:
+            seen.add(key)
+            out.append({"owner": owner, "repo": repo, "number": num,
+                        "kind": kind, "is_pr": is_pr})
+
+    for m in _QUALIFIED_CLOSE_RE.finditer(text or ""):
+        add(m.group("owner"), m.group("repo"), int(m.group("num")), "closes", False)
+    for m in _QUALIFIED_URL_RE.finditer(text or ""):
+        add(m.group("owner"), m.group("repo"), int(m.group("num")), "cross_ref",
+            m.group("kind") == "pull")
+    return out
+
 
 def parse_closing_refs(text):
     """Extract issue numbers from GitHub closing keywords, de-duplicated,
