@@ -78,7 +78,7 @@ def parse_index(text):
     Each row: {module, kind, status, owner, repo, registry, display, namespace,
     resource_type}."""
     rows = []
-    reader = csv.DictReader(io.StringIO(text.lstrip("﻿")))
+    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
     for raw in reader:
         g = {(k or "").strip().lower(): (v or "").strip()
              for k, v in raw.items() if k}
@@ -174,6 +174,12 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    # Enforce the manifest contract up front (mirrors manifest.load_manifest) so we
+    # never emit a manifest that the loader would reject.
+    if not args.project or "/" in args.project:
+        sys.stderr.write("manifest-from-index: --project must be non-empty and "
+                         "must not contain '/'\n")
+        return 2
     sources = list(args.index) + [AVM_INDEX_URLS[k] for k in args.avm]
     if not sources:
         sys.stderr.write("manifest-from-index: need at least one --index or --avm\n")
@@ -189,7 +195,7 @@ def main(argv=None):
         sys.stderr.write("manifest-from-index: no members matched the filters "
                          "(check --kind/--status/--name-contains/--include)\n")
         return 1
-    text = json.dumps(manifest, indent=2)
+    text = json.dumps(manifest, indent=2, sort_keys=True)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text + "\n")

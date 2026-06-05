@@ -1,4 +1,3 @@
-import io
 import json
 import os
 import sys
@@ -88,7 +87,7 @@ class TestParseIndex(unittest.TestCase):
         self.assertIn("Available", vnet["status"])
 
     def test_tolerates_bom(self):
-        rows = mfi.parse_index("﻿" + FIXTURE)
+        rows = mfi.parse_index("\ufeff" + FIXTURE)
         self.assertEqual(len(rows), 4)
 
 
@@ -176,6 +175,12 @@ class TestCli(unittest.TestCase):
     def test_main_needs_a_source(self):
         self.assertEqual(
             mfi.main(["--project", "p", "--from", "f", "--to", "t"]), 2)
+
+    def test_main_rejects_slash_project(self):
+        # the manifest contract forbids '/' in project; enforce before emitting.
+        rc = mfi.main(["--avm", "res", "--project", "a/b",
+                       "--from", "f", "--to", "t"])
+        self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":
