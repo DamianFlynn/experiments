@@ -2277,5 +2277,60 @@ class TestFoldCrossRepoEdges(unittest.TestCase):
         self.assertNotIn("external_refs", pr["data"])
 
 
+class TestMultiRepoIntegration(unittest.TestCase):
+    def test_two_member_manifest_builds_cross_repo_train(self):
+        import tempfile
+        man = {
+            "project": "avm",
+            "window": {"from": "2026-01-01", "to": "2026-01-31"},
+            "repos": [{"owner": "Azure", "repo": "mod-a"},
+                      {"owner": "Azure", "repo": "mod-b"}],
+        }
+
+        def fake_acquire(args, env):
+            base = {"meta": {"owner": args.owner, "repo": args.repo,
+                             "from": getattr(args, "from"), "to": args.to,
+                             "clone_sha": "sha-" + args.repo},
+                    "issues": [], "commits": [], "code_events": [],
+                    "milestones": [], "releases": [], "code_graph": {"areas": []}}
+            if args.repo == "mod-a":
+                base["prs"] = [{
+                    "number": 10, "url": "u/10", "merged": True,
+                    "merged_at": "2026-01-10T00:00:00Z",
+                    "created_at": "2026-01-05T00:00:00Z",
+                    "closed_at": "2026-01-10T00:00:00Z",
+                    "closes": [], "crossref_issues": [],
+                    "title": "feat", "body": "Closes Azure/mod-b#3"}]
+            else:
+                base["prs"] = []
+                base["issues"] = [{"number": 3, "url": "u/3", "state": "closed",
+                                   "closed_at": "2026-01-08T00:00:00Z",
+                                   "updated_at": "2026-01-08T00:00:00Z"}]
+            return base
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mpath = os.path.join(tmp, "m.json")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                json.dump(man, fh)
+            store = os.path.join(tmp, "j.db")
+            orig = gather.acquire
+            gather.acquire = fake_acquire
+            try:
+                gather.main(["--manifest", mpath, "--store", store])
+            finally:
+                gather.acquire = orig
+            conn = graphstore.open_store(store)
+
+        # both windows recorded under the logical project + owner/repo slugs
+        windows = graphstore.get_windows(conn)
+        self.assertIn({"project": "avm", "repo": "Azure/mod-a",
+                       "from": "2026-01-01", "to": "2026-01-31"}, windows)
+        self.assertIn({"project": "avm", "repo": "Azure/mod-b",
+                       "from": "2026-01-01", "to": "2026-01-31"}, windows)
+        # the cross-repo train: B's issue reaches A's PR over the spine
+        res = graphstore.traverse_spine(conn, ["avm/Azure/mod-b#issue-3"])
+        self.assertIn("avm/Azure/mod-a#pr-10", res["reached"])
+
+
 if __name__ == "__main__":
     unittest.main()
