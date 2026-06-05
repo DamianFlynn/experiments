@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS dead_refs (
+    id         TEXT PRIMARY KEY,
+    project    TEXT,
+    reason     TEXT,
+    first_seen TEXT
+);
 """
 
 
@@ -391,7 +398,8 @@ def repo_code_events(conn, project, repo):
     return out
 
 
-def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
+def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES,
+                   skip_dead=False):
     """Undirected reachability over the spine edge allowlist, depth-capped.
 
     Walks edges in both directions (a train links issue<->pr<->commit
@@ -403,6 +411,17 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
     if not seed_ids:
         return {"reached": {}, "missing": []}
 
+    # When skip_dead, exclude tombstoned phantom ids from the recursive
+    # expansion itself — not just the returned `missing`. Filtering only the
+    # final `missing` list would still let a repeated dead ref (e.g. two PRs
+    # both `Fixes #123`) BRIDGE otherwise-unrelated trains, because the CTE
+    # reaches the dead id from both sides before the filter runs.
+    next_id = "CASE WHEN e.src_id = r.id THEN e.dst_id ELSE e.src_id END"
+    dead_clause = ""
+    if skip_dead:
+        _ensure_dead_refs(conn)
+        dead_clause = " AND ({}) NOT IN (SELECT id FROM dead_refs)".format(next_id)
+
     seed_values = ",".join("(?)" for _ in seed_ids)
     etype_ph = ",".join("?" for _ in edge_types)
     sql = (
@@ -410,14 +429,14 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
         "reach(id, depth) AS ( "
         "  SELECT id, 0 FROM seeds "
         "  UNION "
-        "  SELECT CASE WHEN e.src_id = r.id THEN e.dst_id ELSE e.src_id END, "
+        "  SELECT {next}, "
         "         r.depth + 1 "
         "  FROM reach r "
         "  JOIN edges e ON (e.src_id = r.id OR e.dst_id = r.id) "
-        "  WHERE e.edge_type IN ({etypes}) AND r.depth < ? "
+        "  WHERE e.edge_type IN ({etypes}) AND r.depth < ?{dead} "
         ") "
         "SELECT id, MIN(depth) AS depth FROM reach GROUP BY id"
-    ).format(seeds=seed_values, etypes=etype_ph)
+    ).format(seeds=seed_values, etypes=etype_ph, next=next_id, dead=dead_clause)
     params = list(seed_ids) + list(edge_types) + [max_depth]
 
     reached = {row["id"]: row["depth"] for row in conn.execute(sql, params)}
@@ -432,19 +451,25 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES):
             )
         }
     missing = [i for i in reached if i not in present]
+    if skip_dead and missing:
+        missing = [i for i in missing if not is_dead_ref(conn, i)]
     return {"reached": reached, "missing": missing}
 
 
-def index_text(conn, node_id, text):
+def index_text(conn, node_id, text, commit=True):
     """Index a node's searchable text. Delete-then-insert keeps it idempotent
-    (FTS5 has no UPSERT). Raises if the SQLite build lacks FTS5."""
+    (FTS5 has no UPSERT). Raises if the SQLite build lacks FTS5.
+
+    `commit=False` lets a caller batch many inserts into a single transaction
+    (e.g. folding a whole window) and commit once at the end."""
     if not fts5_available(conn):
         raise RuntimeError("FTS5 not available in this SQLite build")
     conn.execute("DELETE FROM fts_text WHERE node_id=?", (node_id,))
     conn.execute(
         "INSERT INTO fts_text (node_id, text) VALUES (?, ?)", (node_id, text)
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def fts_search(conn, query):
@@ -489,6 +514,47 @@ def set_clone_sha(conn, project, repo, sha):
 def get_clone_sha(conn, project, repo):
     """Return the recorded clone SHA for project/repo, or None if absent."""
     return get_meta(conn, _clone_sha_key(project, repo))
+
+
+_DEAD_REFS_DDL = (
+    "CREATE TABLE IF NOT EXISTS dead_refs ("
+    "id TEXT PRIMARY KEY, project TEXT, reason TEXT, first_seen TEXT)"
+)
+
+
+def _ensure_dead_refs(conn):
+    """Create the dead_refs table if absent. Lets the tombstone helpers work on
+    a store opened directly (not via init_schema) or one that predates 8d."""
+    conn.execute(_DEAD_REFS_DDL)
+
+
+def record_dead_ref(conn, id, reason="absent"):
+    """Tombstone a qualified id known not to exist (a 404 phantom). Idempotent:
+    re-recording the same id is a no-op (first_seen is preserved). We never
+    destructively delete the dangling edge — this just stops traversal from
+    re-surfacing it. `project` is recovered from the id's scope when present."""
+    _ensure_dead_refs(conn)
+    parsed = parse_id(id)
+    project = parsed["scope"].split("/", 1)[0] if parsed["scope"] else None
+    conn.execute(
+        "INSERT INTO dead_refs (id, project, reason, first_seen) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+        (id, project, reason, now_iso()),
+    )
+    conn.commit()
+
+
+def is_dead_ref(conn, id):
+    """True if `id` has been tombstoned as a known-absent phantom."""
+    _ensure_dead_refs(conn)
+    row = conn.execute("SELECT 1 FROM dead_refs WHERE id=?", (id,)).fetchone()
+    return row is not None
+
+
+def get_dead_refs(conn):
+    """All tombstoned ids, sorted (deterministic)."""
+    _ensure_dead_refs(conn)
+    return [r[0] for r in conn.execute("SELECT id FROM dead_refs ORDER BY id")]
 
 
 def init_schema(conn):

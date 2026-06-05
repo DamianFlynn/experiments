@@ -518,5 +518,76 @@ class TestBatchWrite(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 0)
 
 
+class TestDeadRefs(unittest.TestCase):
+    def setUp(self):
+        self.conn = _store()
+
+    def test_record_then_is_dead(self):
+        qid = graphstore.qualify_id("acme", "widget", "issue-123")
+        self.assertFalse(graphstore.is_dead_ref(self.conn, qid))
+        graphstore.record_dead_ref(self.conn, qid)
+        self.assertTrue(graphstore.is_dead_ref(self.conn, qid))
+
+    def test_record_is_idempotent(self):
+        qid = graphstore.qualify_id("acme", "widget", "issue-123")
+        graphstore.record_dead_ref(self.conn, qid)
+        graphstore.record_dead_ref(self.conn, qid)  # second call must not raise
+        self.assertEqual(graphstore.get_dead_refs(self.conn), [qid])
+
+    def test_get_dead_refs_sorted(self):
+        for local in ("issue-9", "issue-1", "issue-5"):
+            graphstore.record_dead_ref(
+                self.conn, graphstore.qualify_id("acme", "widget", local))
+        got = graphstore.get_dead_refs(self.conn)
+        self.assertEqual(got, sorted(got))
+
+    def test_dead_refs_table_created_by_init(self):
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='dead_refs'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_traverse_spine_skip_dead_omits_tombstoned_missing(self):
+        # PR #10 closes issue #7 (absent). Seed PR #10's train.
+        pr = graphstore.qualify_id("acme", "widget", "pr-10")
+        issue = graphstore.qualify_id("acme", "widget", "issue-7")
+        graphstore.upsert_node(self.conn, pr, "acme", "widget", "social",
+                               "2026-03-15T00:00:00Z", {"number": 10})
+        graphstore.upsert_edge(self.conn, pr, issue, "closes")
+
+        # Default: issue #7 is reported missing.
+        m = graphstore.traverse_spine(self.conn, [pr])["missing"]
+        self.assertIn(issue, m)
+
+        # Tombstoned + skip_dead=True: it is omitted from missing.
+        graphstore.record_dead_ref(self.conn, issue)
+        m2 = graphstore.traverse_spine(self.conn, [pr], skip_dead=True)["missing"]
+        self.assertNotIn(issue, m2)
+        # Without skip_dead it is still reported (default unchanged).
+        self.assertIn(issue, graphstore.traverse_spine(self.conn, [pr])["missing"])
+
+    def test_skip_dead_prevents_phantom_bridging(self):
+        # Two unrelated PRs both `Fixes #123` (a phantom). The dead id must NOT
+        # bridge them into one train when skip_dead.
+        pr10 = graphstore.qualify_id("acme", "widget", "pr-10")
+        pr11 = graphstore.qualify_id("acme", "widget", "pr-11")
+        ph = graphstore.qualify_id("acme", "widget", "issue-123")
+        graphstore.upsert_node(self.conn, pr10, "acme", "widget", "social",
+                               "2026-03-10T00:00:00Z", {"number": 10})
+        graphstore.upsert_node(self.conn, pr11, "acme", "widget", "social",
+                               "2026-03-11T00:00:00Z", {"number": 11})
+        graphstore.upsert_edge(self.conn, pr10, ph, "closes")
+        graphstore.upsert_edge(self.conn, pr11, ph, "closes")
+        # Default: the phantom bridges pr10 <-> pr11 into one reach.
+        r = graphstore.traverse_spine(self.conn, [pr10])
+        self.assertIn(pr11, r["reached"])
+        # Tombstoned + skip_dead: the phantom is not expanded through, so the
+        # two PRs stay separate trains.
+        graphstore.record_dead_ref(self.conn, ph)
+        r2 = graphstore.traverse_spine(self.conn, [pr10], skip_dead=True)
+        self.assertNotIn(ph, r2["reached"])
+        self.assertNotIn(pr11, r2["reached"])
+
+
 if __name__ == "__main__":
     unittest.main()

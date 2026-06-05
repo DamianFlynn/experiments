@@ -291,5 +291,58 @@ class RollupResumeHardening(unittest.TestCase):
         self.assertEqual(w1, w2)
 
 
+class BackfillAbsent(unittest.TestCase):
+    def test_absent_records_dead_ref_and_reports_absent(self):
+        conn = _store()
+        gather.fold_bundle(conn, copy.deepcopy(_cross_window_bundle()))
+        iid = graphstore.qualify_id("acme", "widget", "issue-123")  # never existed
+
+        def fetch(kind, local, qid):
+            return gather.ABSENT
+
+        res = gather.backfill(conn, iid, fetch=fetch)
+        self.assertFalse(res["fetched"])
+        self.assertTrue(res["absent"])
+        self.assertTrue(graphstore.is_dead_ref(conn, iid))  # remembered dead
+        self.assertIsNone(graphstore.get_node(conn, iid))    # not upserted
+
+    def test_unreachable_none_is_not_absent(self):
+        conn = _store()
+        gather.fold_bundle(conn, copy.deepcopy(_cross_window_bundle()))
+        iid = graphstore.qualify_id("acme", "widget", "issue-7")
+
+        def fetch(kind, local, qid):
+            return None  # transient / unreachable, NOT a 404
+
+        res = gather.backfill(conn, iid, fetch=fetch)
+        self.assertFalse(res["fetched"])
+        self.assertFalse(res["absent"])
+        self.assertFalse(graphstore.is_dead_ref(conn, iid))  # NOT tombstoned
+
+    def test_production_seam_issue_ref_resolving_to_pr_is_traversed(self):
+        # `Closes #N` where #N is actually a PR (shared number space): GitHub's
+        # issue endpoint returns a PR object (has `pull_request`). The PR is real,
+        # so the seam follows the thread — it resolves /pulls/N and returns the PR
+        # node (carrying the /pull/ url), NOT ABSENT.
+        fetch = gather.make_backfill_fetcher("tok")
+        orig = gather.http_get_json
+
+        def fake(url, token, allow_404=False):
+            if "/issues/" in url:
+                return ({"number": 8, "pull_request": {"url": "u"}}, None)
+            if "/pulls/" in url:
+                return ({"number": 8, "title": "PR 8", "user": {"login": "x"},
+                         "html_url": "https://github.com/acme/widget/pull/8"}, None)
+            return (None, 404)
+        try:
+            gather.http_get_json = fake
+            res = fetch("social", "issue-8", "acme/widget#issue-8")
+            self.assertIsNot(res, gather.ABSENT)
+            self.assertEqual(res["node"]["number"], 8)
+            self.assertIn("/pull/", res["node"]["url"])
+        finally:
+            gather.http_get_json = orig
+
+
 if __name__ == "__main__":
     unittest.main()

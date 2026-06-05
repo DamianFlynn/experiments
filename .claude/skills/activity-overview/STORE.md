@@ -9,7 +9,8 @@ against. All SQL lives in `graphstore.py`; callers use its function API.
 > `gather --store` writes it and nothing else — there is no longer a flat bundle
 > JSON artifact. The bundle is a **transient view** that `extract` materializes
 > from the store on demand. The report vertical (`extract → link → render →
-> report`) is restored in **Phase 8**. The store stands alone, proven by
+> report`) **composes from the store** — each stage reads the materialized view,
+> guarded by the golden-bundle equivalence gate. The store stands alone, proven by
 > `validate.py` (below), which self-sources everything it needs from the store.
 
 ## Identity (qualified ids)
@@ -77,6 +78,14 @@ event)` → set semantics (re-seeing a commit is a no-op). An artifact's
 index; `fts_search(query)` returns matching node ids ranked by relevance.
 Created only when the SQLite build supports FTS5 (`fts5_available`); the
 text-mining spotlight query depends on it.
+
+**Populated on the fold path (Phase 8a).** `fold_bundle` indexes searchable
+text per owning node id, keyed so a hit hydrates back to the node it came from:
+PR/issue `social` nodes index their title + body + embedded comment/review
+authors+bodies; commit `code` nodes index the commit message. The call is
+FTS5-gated (skipped silently when the build lacks FTS5 — the store stays valid)
+and idempotent (`index_text` is delete-then-insert per node id, so re-folding
+an overlapping window re-indexes cleanly without duplicates).
 
 `fts_search` passes `query` straight to the FTS5 `MATCH` operator, so the
 argument must be a **valid FTS5 query**. Callers searching user-derived terms
@@ -226,8 +235,8 @@ window-projection helpers it still uses: `attribute_code_areas`/`build_modules`/
 
 Still NOT on the write path after step 3: `blocks` (issue→issue) and
 `in_iteration` (social→sprint) — skipped for lack of source data in the current
-fixtures/normalizers (no block/sprint signal is gathered) — and the `fts_text`
-FTS5 index (`index_text` is never called on the write path). See
+fixtures/normalizers (no block/sprint signal is gathered). The `fts_text` FTS5
+index IS now populated on fold (Phase 8a — see *Text index* above). See
 `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
 ## Backfill on a traversal miss (slice 7c)
@@ -270,6 +279,37 @@ fetches itself — it calls in via an injected `backfill` callable).
   is still read only by tests today); `make_backfill_fetcher`'s live REST/git
   paths are therefore only exercisable against a real repo (relevant to the
   upcoming trust gate), not by the offline suite.
+
+## Train completion + dead-ref memory (Phase 8d — shipped, #14)
+
+7c's `backfill` is a *single-node* bridge. **Phase 8d** promotes it into a shared
+**completion orchestrator** (`complete.py`) that closes a train **transitively**
+along the causal spine, **bounded by the query's time window** (level-0
+directly-referenced anchors always filled; transitive expansion stops at the
+window edge; closure when no window). Both readers call it — `extract` (refactored
+off its inline loop) and `spotlight` (its four queries gain optional `--complete`).
+`gather.backfill` stays the single-node primitive `complete.py` orchestrates
+through the **injected** fetch seam, so `complete.py` does no I/O and `spotlight`
+stays reader-only.
+
+Every train then carries an **honest edge contract**: `complete: bool` and
+`gaps: [{id, reason}]` with reason `not_gathered` (offline, no fetch attempted) /
+`outside_window` (beyond the query window, not chased) / `unreachable` (a fetch
+was attempted and failed) / `budget` (the per-query fetch ceiling was hit). A
+reference the seam reports **definitively absent** (a 404 phantom — e.g. a
+`Fixes #123` PR-template placeholder) is **pruned**, never a gap, and recorded in
+the `dead_refs` tombstone so no future query re-chases it.
+
+**`dead_refs` table** — `(id PK, project, reason, first_seen)`. Written *only* by
+`gather.backfill` when the seam returns the `ABSENT` outcome (preserving "only
+gather writes"); read via `is_dead_ref`/`get_dead_refs`. `traverse_spine(…,
+skip_dead=True)` drops known-dead ids from `missing` so even the report path stops
+re-surfacing pruned phantoms. The fetch seam grows a third outcome to make this
+possible: `fetched payload` | `ABSENT` (definitive 404 → prune + record dead) |
+`None` (transient/unreachable → an `unreachable` gap). The tombstone is additive,
+ignored by the trust gate, and `first_seen` is excluded from determinism asserts
+(like `fetched_at`). See
+`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`.
 
 ## Roll-up / resume (slice 7c)
 

@@ -6,8 +6,8 @@ longer a produced file — `gather` folds its facts into the journey-graph store
 **transient view** via `extract`. This document remains the contract for that
 view: the **gather**/fold path supplies `meta`, `commits`, `prs`, `issues`,
 `workflows`, `workflow_stats`, `releases`, `milestones`; the **link** step
-(`link.py`, Phase 8) then fills `trains` and `buckets`; the **render** step
-(`render.py`, Phase 8) fills `diagrams`. (See **Phase 2 fields** below for the
+(`link.py`) then fills `trains` and `buckets`; the **render** step
+(`render.py`) fills `diagrams`. (See **Phase 2 fields** below for the
 fields added after the walking skeleton.)
 
 ## Ref convention

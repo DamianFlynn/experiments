@@ -1499,12 +1499,16 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     return code_graph
 
 
-def http_get_json(url, token):
+def http_get_json(url, token, allow_404=False):
     """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested.
 
     On an HTTP error, GitHub explains the cause in the response body and a few
     headers (rate limit vs. SAML SSO vs. token scope). urllib discards both by
     default, leaving only a bare "HTTP Error 403", so we surface them ourselves.
+
+    With allow_404=True a 404 returns (None, 404) instead of raising, so the
+    backfill seam can map a definitively-absent ref to ABSENT. All other HTTP
+    errors still raise SystemExit with the diagnostic.
     """
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
@@ -1517,6 +1521,8 @@ def http_get_json(url, token):
             nxt = _next_link(resp.headers.get("Link", ""))
         return body, nxt
     except urllib.error.HTTPError as err:
+        if allow_404 and err.code == 404:
+            return None, 404
         raise SystemExit(_format_http_error(url, err)) from err
 
 
@@ -1854,6 +1860,12 @@ def classify_id(qid):
     return {"node_class": node_class, "kind": kind, "local": local}
 
 
+# Returned by a `fetch` seam to mean "this id DEFINITIVELY does not exist" (a
+# 404) — distinct from None ("couldn't reach it / transient"). backfill prunes
+# an ABSENT id by tombstoning it via graphstore.record_dead_ref.
+ABSENT = object()
+
+
 def backfill(conn, id, fetch=None):
     """Fetch and upsert ONE missing spine node + its cheap immediate edges.
 
@@ -1862,14 +1874,20 @@ def backfill(conn, id, fetch=None):
     seam for that one node, and (when the fetch yields a record) upserts the node
     plus any immediate spine edges the seam returned.
 
-    `fetch(kind, local, qid)` is the network seam (None == unfetchable; a dict
-    `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched). Tests
-    pass a fixture-backed fake; production passes `make_backfill_fetcher(token)`.
+    `fetch(kind, local, qid)` is the network seam with THREE outcomes:
+      - a dict `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched;
+      - `gather.ABSENT` == the id DEFINITIVELY does not exist (a 404) —
+        `backfill` tombstones it via `graphstore.record_dead_ref` so it is
+        pruned and never re-chased;
+      - `None` == transient/unreachable (could not be resolved this run).
+    Tests pass a fixture-backed fake; production passes `make_backfill_fetcher`.
 
-    Returns `{"fetched": bool, "id": id, "edges_added": int}`.
+    Returns `{"fetched": bool, "absent": bool, "id": id, "edges_added": int}` —
+    `absent=True` only on the ABSENT outcome.
     """
     if graphstore.get_node(conn, id) is not None:
-        return {"fetched": False, "id": id, "edges_added": 0}  # already present
+        return {"fetched": False, "absent": False, "id": id,
+                "edges_added": 0}  # already present
 
     info = classify_id(id)
     parsed = graphstore.parse_id(id)
@@ -1882,8 +1900,12 @@ def backfill(conn, id, fetch=None):
                          "make_backfill_fetcher(token); tests: a fake)")
 
     result = fetch(info["kind"], info["local"], id)
+    if result is ABSENT:
+        graphstore.record_dead_ref(conn, id)  # only gather writes
+        return {"fetched": False, "absent": True, "id": id, "edges_added": 0}
     if not result or not result.get("node"):
-        return {"fetched": False, "id": id, "edges_added": 0}  # unfetchable
+        return {"fetched": False, "absent": False, "id": id,
+                "edges_added": 0}  # unreachable / transient
 
     raw = result["node"]
     fetched_at = graphstore.now_iso()
@@ -1913,7 +1935,7 @@ def backfill(conn, id, fetch=None):
                       edge_type, None, None))
     if edges:
         graphstore.upsert_edges(conn, edges)
-    return {"fetched": True, "id": id, "edges_added": len(edges)}
+    return {"fetched": True, "absent": False, "id": id, "edges_added": len(edges)}
 
 
 def make_backfill_fetcher(token, clone_dir=None):
@@ -1926,6 +1948,11 @@ def make_backfill_fetcher(token, clone_dir=None):
     bounded `git fetch --depth 1 <sha>` into the clone then a one-commit log;
     structure -> not backfilled on demand (graphify/whole-dict facts come from
     Acquire), so it returns None and the node stays a warned gap.
+
+    A `Closes #N` whose #N resolves to a PR (issues + PRs share one number
+    space) is followed to the real PR and returned as a node — the thread is
+    traversed, not dropped. Outcomes: a fetched dict, `ABSENT` (a genuine 404),
+    or `None` (transient / not resolvable this run, e.g. a code sha with no clone).
     """
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
@@ -1933,13 +1960,31 @@ def make_backfill_fetcher(token, clone_dir=None):
         api = f"https://api.github.com/repos/{project}/{repo}"
         if kind == "social" and local.startswith("issue-"):
             num = local[len("issue-"):]
-            raw, _ = http_get_json(f"{api}/issues/{num}", token)
+            raw, nxt = http_get_json(f"{api}/issues/{num}", token, allow_404=True)
+            if raw is None and nxt == 404:
+                return ABSENT
             if raw.get("pull_request"):
-                return None
+                # #N is actually a PR (issues + PRs share one number space). The
+                # parsed `issue-N` is gather's mis-classification, not a phantom:
+                # the PR is real, so follow the thread and resolve it to the PR.
+                # It is returned under the referenced id so the existing `closes`
+                # edge connects; its /pull/ html_url lets the reader label it a PR
+                # and anchor the train's headline to in-window work, so an ancient
+                # cross-ref is traversed as context without hijacking the title.
+                pr_raw, pnxt = http_get_json(f"{api}/pulls/{num}", token,
+                                             allow_404=True)
+                if pr_raw is None and pnxt == 404:
+                    return ABSENT
+                pr = normalize_pr(pr_raw)
+                edges = [("issue-{}".format(n), "closes")
+                         for n in pr.get("closes") or []]
+                return {"node": pr, "edges": edges}
             return {"node": normalize_issue(raw), "edges": []}
         if kind == "social" and local.startswith("pr-"):
             num = local[len("pr-"):]
-            raw, _ = http_get_json(f"{api}/pulls/{num}", token)
+            raw, nxt = http_get_json(f"{api}/pulls/{num}", token, allow_404=True)
+            if raw is None and nxt == 404:
+                return ABSENT
             pr = normalize_pr(raw)
             edges = [("issue-{}".format(n), "closes") for n in pr.get("closes") or []]
             return {"node": pr, "edges": edges}
@@ -1963,6 +2008,19 @@ def make_backfill_fetcher(token, clone_dir=None):
         return None  # structure / unfetchable on demand
 
     return fetch
+
+
+def _social_text(item, comments):
+    """The full searchable text for a PR/issue social node: its title + body,
+    then each embedded comment/review author + body. Newline-joined so FTS5
+    tokenizes phrases across the parts. Pure; missing fields are skipped."""
+    parts = [item.get("title") or "", item.get("body") or ""]
+    for c in comments:
+        author = c.get("author") or ""
+        body = c.get("body") or ""
+        if author or body:
+            parts.append("{} {}".format(author, body).strip())
+    return "\n".join(p for p in parts if p)
 
 
 def fold_bundle(conn, bundle):
@@ -2203,6 +2261,33 @@ def fold_bundle(conn, bundle):
     graphstore.upsert_nodes(conn, nodes)
     graphstore.upsert_edges(conn, edges)
     graphstore.add_code_events(conn, events)
+
+    # fts_text: index the searchable text per owning node id so `spotlight grep`
+    # has something to MATCH (Phase 8a prerequisite). FTS5-gated — when the
+    # SQLite build lacks FTS5 the store stays valid and we skip silently.
+    # index_text is delete-then-insert per node id, so re-folding re-indexes
+    # cleanly (idempotent). Sources (the approved scope, decision 1):
+    #   - PR social nodes: title + body + embedded comment/review authors+bodies
+    #   - issue social nodes: title + body + embedded comment authors+bodies
+    #   - commit code nodes: the commit message
+    if graphstore.fts5_available(conn):
+        # Batch the FTS writes into one transaction (index_text(commit=False) +
+        # a single commit) and skip empty text: many tiny commits over a large
+        # window is wasteful, and empty searchable text indexes nothing useful.
+        def _index(node_local, text):
+            if text:
+                graphstore.index_text(conn, qid(node_local), text, commit=False)
+        for pr in bundle.get("prs", []):
+            _index("pr-{}".format(pr["number"]), _social_text(
+                pr,
+                (pr.get("comments_list") or []) + (pr.get("review_comments") or [])))
+        for iss in bundle.get("issues", []):
+            _index("issue-{}".format(iss["number"]),
+                   _social_text(iss, iss.get("comments_list") or []))
+        for c in bundle.get("commits", []):
+            _index(c["sha"], c.get("message") or "")
+        conn.commit()
+
     graphstore.record_window(conn, project, repo, meta.get("from"), meta.get("to"))
     if meta.get("clone_sha"):
         graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"])

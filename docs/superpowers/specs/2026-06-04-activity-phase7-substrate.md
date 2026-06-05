@@ -2,12 +2,14 @@
 
 **Status: IMPLEMENTED (slices 7a–7c + trust gate + store-only wrap-up).**
 **Phase 7's deliverable is the trustworthy journey-graph store** — proven by the
-trust gate (`validate.py`) and self-contained on the store alone. The end-to-end
-report vertical (`extract → link → render → report`) is intentionally **broken at
-the close of Phase 7** (the flat-bundle file and its `link`/`render`/`report`
-driver are no longer wired by `gather`) and is **restored in Phase 8** via
-`extract → link → render`, which materializes the bundle view from the store and
-runs the existing (preserved) derivation/render code. See *Wrap-up* below.
+trust gate (`validate.py`) and self-contained on the store alone. `gather` writes
+only the store — there is no flat-bundle file. The end-to-end report vertical
+(`extract → link → render → report`) **composes from the store**: `extract`
+materializes the bundle view and the existing (preserved) `link`/`render`/`report`
+code consumes it, guarded by the golden-bundle equivalence gate (and exercised by
+`test_render` via `extract`). Wiring this into a single one-shot reader command is
+a minor, decoupled integration — **not** a roadmap phase (rev-14 Phase 8 is
+`spotlight`). See *Wrap-up* below.
 
 Detailed design for **Phase 7** of the journey-graph substrate,
 expanding and superseding the one-line P7 ledger entry in the rev-14 design
@@ -219,8 +221,10 @@ live REST/git paths are exercisable only against a real repo — relevant to the
 
 After 7a–7c and the trust gate, Phase 7 makes the **store the SOLE deliverable**
 and removes the now-dead flat-bundle code paths. Approved scope: *"Full:
-store-only"*, explicitly accepting that it **breaks the end-to-end report
-vertical** (restored in Phase 8).
+store-only"*: `gather` produces only the store. The report vertical still
+**composes from the store** (`extract → link → render`, equivalence-gated); only
+the flat-bundle *file* and its one-shot driver are gone — re-wiring a single reader
+command is a minor decoupled integration, not a roadmap phase.
 
 - **`gather` → store-only.** `--store` is **required**; `gather` folds the
   in-memory bundle into the store and writes **no bundle JSON file**. Removed:
@@ -239,11 +243,12 @@ vertical** (restored in Phase 8).
   fully self-contained on a store. `--bundle` remains an optional cross-check but
   is **unnecessary**. The auditor survives a corrupt store (a re-derive/re-fold
   that raises becomes a failed ERROR check, not a crash).
-- **Kept (Phase 8 restores the vertical):** `extract`, `derive`, `link`,
+- **Kept (the vertical composes from the store):** `extract`, `derive`, `link`,
   `render`, `report`, and the `bundle_*.json`/`char_*.json` fixtures are all
-  preserved. Phase 8 wires `extract → link → render` to materialize the bundle
-  view from the store and produce the report — no derivation/render code is
-  rewritten, only re-connected to read from the store.
+  preserved. `extract → link → render` materializes the bundle view from the store
+  and produces the report — no derivation/render code is rewritten (the equivalence
+  gate guards this; `test_render` exercises it via `extract`). A one-shot reader
+  command is an optional follow-up integration, decoupled from the roadmap.
 
 ## The equivalence gate (invariant across all slices)
 
@@ -277,7 +282,7 @@ any "green" claim.
 | `link.py` | 7b: **shrinks** — stops calling the lifted derivations; keeps the window projections (trains/buckets/timeline/feature_deltas/significance/effort/areas/forecast). **Wrap-up:** drop the dead `derive` re-exports used only by tests (`artifact_id`/`build_artifacts`/`area_index`/`_area_for_path`/`attribute_people_areas`/`match_symbol_moves`); KEPT as a deferred Phase-8 module. |
 | `validate.py` | trust gate (per-invariant store audit). **Wrap-up:** `no_drift`/`idempotency` **self-source** the raw bundle from the store via `extract`; `--bundle` optional. |
 | `STORE.md` | update the *Writer* section: artifact/person nodes, `symbol_events`, and non-spine edges are now written (in 7b), no longer "a later phase." **Wrap-up:** store is the sole deliverable; add the *Trust gate* section. |
-| `render.py` / `report-template.md` | **unchanged and KEPT** — read the materialized view exactly as before; re-wired to the store-sourced view in **Phase 8** (the vertical is intentionally un-driven at the Phase 7 close). |
+| `render.py` / `report-template.md` | **unchanged and KEPT** — read the materialized view exactly as before; the vertical composes from the store via `extract` (equivalence-gated; exercised by `test_render`). Only the one-shot flat-bundle driver is gone. |
 
 ---
 
