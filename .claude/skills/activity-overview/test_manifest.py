@@ -45,28 +45,31 @@ class TestLoadManifest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(tmp, {"window": {"from": "x", "to": "y"},
                                 "repos": [{"owner": "o", "repo": "r"}]})
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "project"):
                 manifest.load_manifest(path)
 
     def test_rejects_missing_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(tmp, {"project": "p", "repos": [{"owner": "o", "repo": "r"}]})
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "window"):
                 manifest.load_manifest(path)
 
     def test_rejects_empty_repos(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(tmp, {"project": "p",
                                 "window": {"from": "x", "to": "y"}, "repos": []})
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "repos"):
                 manifest.load_manifest(path)
 
     def test_rejects_member_without_owner_or_repo(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write(tmp, {"project": "p", "window": {"from": "x", "to": "y"},
                                 "repos": [{"owner": "o"}]})
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "owner"):
                 manifest.load_manifest(path)
+
+    def test_member_slugs_empty(self):
+        self.assertEqual(manifest.member_slugs({"repos": []}), set())
 
 
 if __name__ == "__main__":

@@ -23,8 +23,8 @@ def load_manifest(path):
         raise ValueError("manifest: 'project' is required")
 
     window = raw.get("window") or {}
-    frm, to = window.get("from"), window.get("to")
-    if not frm or not to:
+    date_from, date_to = window.get("from"), window.get("to")
+    if not date_from or not date_to:
         raise ValueError("manifest: 'window.from' and 'window.to' are required")
 
     raw_repos = raw.get("repos") or []
@@ -38,7 +38,7 @@ def load_manifest(path):
             raise ValueError("manifest: each repo needs 'owner' and 'repo'")
         repos.append({"owner": owner, "repo": repo, "registry": r.get("registry")})
 
-    return {"project": project, "from": frm, "to": to, "repos": repos}
+    return {"project": project, "from": date_from, "to": date_to, "repos": repos}
 
 
 def member_slugs(manifest):
