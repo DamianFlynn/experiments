@@ -38,7 +38,17 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
     nodes across `repos`. Each returned frozenset of qualified node ids is one
     decision train (possibly spanning members — the store's cross-repo
     closes/cross_ref edges join them). Deterministic: components are ordered by
-    their lexicographically smallest member id."""
+    their lexicographically smallest member id.
+
+    Three behaviours to know:
+    - Reachability is capped at `max_depth` hops (matching extract), so a single
+      real train spanning more than `max_depth` spine hops can split into two
+      components.
+    - traverse_spine has no window filter, so a component MAY include out-of-window
+      social anchors reachable from an in-window seed (cross-window train context).
+    - Each frozenset holds only PR/issue SOCIAL anchors; commits/areas traversed
+      bridge the component but are dropped from the returned set (trains are keyed
+      off social anchors)."""
     in_window = graphstore.range_query(conn, project, repos, ts_from, ts_to)
     socials = [n["id"] for n in in_window if n["node_class"] == "social"]
     seen, comps = set(), []
@@ -52,6 +62,8 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
         comp = {nid for nid in reached
                 if graphstore.parse_id(nid)["local"].startswith(("pr-", "issue-"))}
         comp.add(sid)
+        # only social anchors can be seeds (the loop iterates `socials`), so
+        # tracking anchors in `seen` is enough to keep components disjoint.
         seen |= comp
         comps.append(frozenset(comp))
     comps.sort(key=lambda c: min(c))

@@ -83,6 +83,75 @@ class TestSpineComponents(unittest.TestCase):
                          {frozenset({"proj/Azure/a#pr-1"}),
                           frozenset({"proj/Azure/b#pr-9"})})
 
+    def test_three_anchor_chain_is_one_component(self):
+        # PR#1 and PR#3 both close issue#2 -> issue-2 bridges them into ONE
+        # component of three social anchors. Exercises `seen` dedup (issue-2 and
+        # pr-3 are absorbed by pr-1's traversal before they are seen as seeds).
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Azure", "repo": "mod", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [
+                {"number": 1, "url": "u/1", "state": "closed", "merged": True,
+                 "base": "main", "head": "h1", "merged_at": "2026-01-05T00:00:00Z",
+                 "created_at": "2026-01-02T00:00:00Z",
+                 "closed_at": "2026-01-05T00:00:00Z",
+                 "closes": [2], "crossref_issues": [], "title": "feat", "body": ""},
+                {"number": 3, "url": "u/3", "state": "closed", "merged": True,
+                 "base": "main", "head": "h3", "merged_at": "2026-01-06T00:00:00Z",
+                 "created_at": "2026-01-03T00:00:00Z",
+                 "closed_at": "2026-01-06T00:00:00Z",
+                 "closes": [2], "crossref_issues": [], "title": "feat", "body": ""},
+            ],
+            "issues": [{"number": 2, "url": "u/2", "state": "closed",
+                        "closed_at": "2026-01-04T00:00:00Z",
+                        "updated_at": "2026-01-04T00:00:00Z"}],
+            "commits": [], "code_events": [], "milestones": [], "releases": [],
+            "code_graph": {"areas": []},
+        }
+        gather.fold_bundle(conn, bundle, project="proj", repo="Azure/mod",
+                           members={"Azure/mod"})
+        comps = digest.spine_components(
+            conn, "proj", ["Azure/mod"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        self.assertEqual(len(comps), 1)
+        self.assertEqual(comps[0], frozenset({
+            "proj/Azure/mod#pr-1", "proj/Azure/mod#issue-2", "proj/Azure/mod#pr-3"}))
+
+    def test_two_separate_multi_node_components_are_isolated(self):
+        # Two independent PR->issue pairs -> two disjoint 2-node components.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        def _pair(pr_n, iss_n):
+            return {
+                "meta": {"owner": "Azure", "repo": "mod", "from": "2026-01-01",
+                         "to": "2026-01-31", "base_branch": "main"},
+                "prs": [{"number": pr_n, "url": "u/{}".format(pr_n),
+                         "state": "closed", "merged": True, "base": "main",
+                         "head": "h{}".format(pr_n),
+                         "merged_at": "2026-01-05T00:00:00Z",
+                         "created_at": "2026-01-02T00:00:00Z",
+                         "closed_at": "2026-01-05T00:00:00Z",
+                         "closes": [iss_n], "crossref_issues": [],
+                         "title": "feat", "body": ""}],
+                "issues": [{"number": iss_n, "url": "u/i{}".format(iss_n),
+                            "state": "closed", "closed_at": "2026-01-04T00:00:00Z",
+                            "updated_at": "2026-01-04T00:00:00Z"}],
+                "commits": [], "code_events": [], "milestones": [],
+                "releases": [], "code_graph": {"areas": []},
+            }
+        gather.fold_bundle(conn, _pair(1, 2), project="proj", repo="Azure/mod",
+                           members={"Azure/mod"})
+        gather.fold_bundle(conn, _pair(5, 6), project="proj", repo="Azure/mod",
+                           members={"Azure/mod"})
+        comps = digest.spine_components(
+            conn, "proj", ["Azure/mod"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        self.assertEqual({frozenset(c) for c in comps}, {
+            frozenset({"proj/Azure/mod#pr-1", "proj/Azure/mod#issue-2"}),
+            frozenset({"proj/Azure/mod#pr-5", "proj/Azure/mod#issue-6"})})
+
 
 if __name__ == "__main__":
     unittest.main()
