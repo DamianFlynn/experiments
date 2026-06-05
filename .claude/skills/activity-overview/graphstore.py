@@ -354,6 +354,17 @@ def range_query(conn, project, repos, ts_from, ts_to, node_class=None):
     return [_row_to_node(r) for r in conn.execute(sql, params)]
 
 
+def project_repos(conn, project):
+    """The project's distinct MEMBER repos (`owner/repo`), sorted. Excludes the
+    `"*"` person sentinel so people (project-scoped) never count as a repo. This
+    is store-only member discovery: a reader needs just the store + project name."""
+    return sorted(
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT repo FROM nodes WHERE project=? AND repo != '*'",
+            (project,))
+    )
+
+
 def repo_nodes(conn, project, repo, node_class=None):
     """All nodes for one project/repo (optionally one node_class), ordered by
     (ts NULLs last, id). Unlike range_query this is *not* window-filtered: it is
