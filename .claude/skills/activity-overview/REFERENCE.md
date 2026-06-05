@@ -66,6 +66,11 @@ constellation (each `terraform init` pulls many registry modules), set a shared
 defaults when needed: `ACTIVITY_IAC_BUILD_TIMEOUT` (seconds/subprocess, default
 `300`), `ACTIVITY_IAC_MAX_WORKERS` (`8`), `ACTIVITY_IAC_RETRIES` (`1`).
 
+The shallow clone reaches `ACTIVITY_CLONE_MARGIN_DAYS` (default `14`) before the
+window so an in-window commit keeps its real parent. If `meta.boundary_dropped_commits`
+is non-empty (an in-window commit still landed on the shallow boundary, so its
+whole-tree phantom diff was dropped), widen this knob and re-gather to recover it.
+
 ## Tests
 
 ```bash

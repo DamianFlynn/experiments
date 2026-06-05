@@ -369,6 +369,27 @@ under concurrency). The IaC build knobs are env-overridable for heavy runs:
 `ACTIVITY_IAC_BUILD_TIMEOUT` (default 300s), `ACTIVITY_IAC_MAX_WORKERS` (8),
 `ACTIVITY_IAC_RETRIES` (1).
 
+A cross-repo `depends_on` resolves to the producer member's module-root area
+(`area-main.tf`). That root is only created by the producer's own fold when its
+`main.tf` is an in-window code area — usually it is not. The consumer fold
+therefore **ensures the target node exists** (a minimal `structure` stand-in,
+create-if-absent so a producer's real area always wins), keeping the edge from
+dangling. The node is an edge anchor only: `extract` rebuilds `code_graph` from
+the `codegraph` singleton, never from `area-*` nodes, so it is invisible to every
+member bundle. The shallow-clone margin is `ACTIVITY_CLONE_MARGIN_DAYS`
+(default 14); widen it when `meta.boundary_dropped_commits` is non-empty.
+
+The DOT-based extraction (`terraform graph`) only resolves edges for module areas
+the directory provider sees — i.e. in-window-CHANGED dirs — so the dependency graph
+would otherwise track churn rather than structure. On **multi-repo (manifest)**
+gathers, `scan_structural_terraform_areas` additionally parses every module's
+`source` references across the whole tracked tree (static, no `terraform init`) and
+`merge_structural_areas` unions them into `code_graph` (existing areas keep their
+DOT edges + gain missing structural ones; untouched module dirs are appended). The
+blast-radius graph is then the repo's full module structure regardless of in-window
+activity. Gated to manifest folds so single-repo bundles stay byte-stable; `git
+ls-files` lists only tracked `.tf`, excluding vendored `.terraform/` modules.
+
 **People aggregate across members.** Person nodes are project-scoped (`repo="*"`).
 Each per-member fold **unions** a person's `areas`/`modules` (and ORs `is_bot`)
 with the already-stored node — a plain upsert would overwrite, so a member where a
