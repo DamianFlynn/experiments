@@ -385,8 +385,12 @@ def emit_project_module_graph(module_edges):
         drawn.append((src, dst, label))
     lines = ["flowchart LR"]
     for repo in sorted(by_repo):
+        # Use full repo name in the subgraph label (only escape quotes; do NOT
+        # truncate — long repo names like terraform-azurerm-avm-res-keyvault-vault
+        # would be silently clipped by _flow_label's 40-char cap).
+        repo_label = repo.replace('"', "'")
         lines.append('    subgraph {}["{}"]'.format(_node_id("r", repo),
-                                                     _flow_label(repo)))
+                                                     repo_label))
         for nid, area in sorted(by_repo[repo].items()):
             lines.append('        {}("{}")'.format(nid, _flow_label(area)))
         lines.append("    end")
