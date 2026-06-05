@@ -389,6 +389,12 @@ class TestValidateProject(unittest.TestCase):
                          {"Azure/mod-a", "Azure/mod-b"})
         self.assertTrue(all(r["ok"] for r in report["members"]))
 
+    def test_empty_repos_raises_rather_than_vacuous_ok(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        with self.assertRaisesRegex(ValueError, "no repos"):
+            validate.validate_project(conn, "proj", [])
+
 
 class TestValidateProjectAggregation(unittest.TestCase):
     def test_one_failing_member_makes_aggregate_not_ok(self):

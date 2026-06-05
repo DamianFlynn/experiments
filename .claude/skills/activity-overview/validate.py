@@ -703,7 +703,14 @@ def validate(conn, project=None, repo=None, bundle=None):
 def validate_project(conn, project, repos):
     """Run the per-member validation over a project's full member set and
     aggregate. Returns {"ok": all-green, "project": project,
-    "members": [{"repo": r, "ok": bool, ...per-repo report...}, ...]}."""
+    "members": [{"repo": r, "ok": bool, ...per-repo report...}, ...]}.
+
+    Raises ValueError on an empty `repos`: validation ATTESTS trustworthiness,
+    and `all([])` would vacuously report ok=True for zero repos, masking a
+    misconfigured member set. (digest.build_project_view, which only DESCRIBES,
+    tolerates an empty project and returns an empty view.)"""
+    if not repos:
+        raise ValueError("validate_project: no repos to validate")
     member_reports = []
     for repo in repos:
         rep = validate_repo(conn, project, repo)

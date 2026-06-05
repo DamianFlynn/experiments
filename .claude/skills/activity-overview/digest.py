@@ -50,17 +50,22 @@ def group_related_work(trains):
 
 
 def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
-                   backfill_budget=50):
+                   backfill_budget=50, warn=None):
     """Materialize + enrich one bundle per member repo, in `repos` order.
     Each is the single-repo enriched bundle for that member, produced via
     the unmodified extract -> link.enrich path.
+
+    `warn` is an optional callable(str) forwarded to extract for spine
+    backfill-budget / missing-context diagnostics; the default (None) lets
+    extract emit them to stderr, so an incomplete project digest is visible
+    without corrupting the JSON on stdout.
     Returns [{"repo": "owner/repo", "bundle": <enriched dict>}, ...]."""
     out = []
     for repo in repos:
         bundle = extract_mod.extract(
             conn, project, repo, ts_from, ts_to,
             backfill=backfill, backfill_budget=backfill_budget,
-            warn=lambda _m: None)
+            warn=warn)
         bundle = link_mod.enrich(bundle)
         out.append({"repo": repo, "bundle": bundle})
     return out
@@ -291,14 +296,19 @@ def _merge_modules(members):
 
 
 def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
-                       backfill_budget=50, ticket_pattern=_DEFAULT_TICKET_RE):
+                       backfill_budget=50, ticket_pattern=_DEFAULT_TICKET_RE,
+                       warn=None):
     """The merged project view consumed by report-template.md's narrative step.
     Keys: meta{project,repos,from,to}, members[{repo,bundle}] (per-member raw +
     enriched, for collision-prone per-file sections), trains (project-wide, each
     with a `tickets` list), related_work (ticket clusters), shipped (repo-tagged),
-    people (merged by login), modules (repo-qualified)."""
+    people (merged by login), modules (repo-qualified).
+
+    `warn` is forwarded to member_bundles (extract diagnostics); default None
+    lets extract surface incompleteness on stderr."""
     members = member_bundles(conn, project, repos, ts_from, ts_to,
-                             backfill=backfill, backfill_budget=backfill_budget)
+                             backfill=backfill, backfill_budget=backfill_budget,
+                             warn=warn)
     comps = spine_components(conn, project, repos, ts_from, ts_to)
     trains = build_project_trains(members, comps, project)
     _attach_tickets(members, trains, project, ticket_pattern)
@@ -327,7 +337,8 @@ def parse_args(argv):
     p.add_argument("--from", dest="ts_from", required=True)
     p.add_argument("--to", dest="ts_to", required=True)
     p.add_argument("--ticket-pattern", default=None,
-                   help="regex (one capture group) for internal-ticket refs; "
+                   help="regex for internal-ticket refs; the first capture group "
+                        "is used if the pattern has one, else the whole match; "
                         "default matches Jira/ADO-style ABC-1234.")
     return p.parse_args(argv)
 
