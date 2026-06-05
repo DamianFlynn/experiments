@@ -9,6 +9,8 @@ import graphstore  # noqa: E402
 import gather  # noqa: E402
 import digest  # noqa: E402
 import validate  # noqa: E402
+import render  # noqa: E402
+import spotlight  # noqa: E402
 
 
 def _seed_two_member_store(conn):
@@ -588,8 +590,6 @@ class TestProjectDependsOn(unittest.TestCase):
 
 class TestS4Gate(unittest.TestCase):
     def test_cross_repo_depends_on_render_and_blast_radius(self):
-        import render
-        import spotlight
         conn = graphstore.open_store(":memory:")
         graphstore.init_schema(conn)
         members = {"Azure/consumer",
@@ -629,6 +629,8 @@ class TestS4Gate(unittest.TestCase):
         self.assertEqual(xrepo[0]["src_repo"], "Azure/consumer")
         self.assertEqual(xrepo[0]["dst_repo"],
                          "Azure/terraform-azurerm-avm-res-keyvault-vault")
+        self.assertEqual(xrepo[0]["version"], "0.1.0")   # carried through fold
+        self.assertEqual(xrepo[0]["transitive"], False)
 
         mmd = render.emit_project_module_graph(view["module_edges"])
         self.assertIn("Azure/consumer", mmd)
@@ -636,6 +638,7 @@ class TestS4Gate(unittest.TestCase):
 
         res = spotlight.member_dependents(
             conn, "proj", "Azure/terraform-azurerm-avm-res-keyvault-vault")
+        self.assertEqual(res["status"], "ok")
         self.assertEqual(res["dependents"], ["Azure/consumer"])
 
         self.assertTrue(validate.validate_project(conn, "proj", repos)["ok"])

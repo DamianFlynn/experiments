@@ -174,6 +174,15 @@ def _flow_label(text):
     return clean.strip()[:40] or "?"
 
 
+def _subgraph_label(text):
+    """Sanitise a subgraph TITLE. Unlike _flow_label this is UNCAPPED by design:
+    a subgraph title is a repo identity (e.g.
+    'Azure/terraform-azurerm-avm-res-keyvault-vault', 46 chars) and truncating it
+    would hide which member the blast radius points at. Repo slugs carry no
+    newlines, so only quotes need escaping."""
+    return (text or "").replace('"', "'")
+
+
 def emit_contributor_graph(bundle):
     """A Mermaid `flowchart` of people <-> code-area edges.
 
@@ -385,12 +394,10 @@ def emit_project_module_graph(module_edges):
         drawn.append((src, dst, label))
     lines = ["flowchart LR"]
     for repo in sorted(by_repo):
-        # Use full repo name in the subgraph label (only escape quotes; do NOT
-        # truncate — long repo names like terraform-azurerm-avm-res-keyvault-vault
-        # would be silently clipped by _flow_label's 40-char cap).
-        repo_label = repo.replace('"', "'")
+        # Subgraph title uses the UNCAPPED _subgraph_label (repo identity must not
+        # be truncated); node area labels keep _flow_label's 40-char cap.
         lines.append('    subgraph {}["{}"]'.format(_node_id("r", repo),
-                                                     repo_label))
+                                                     _subgraph_label(repo)))
         for nid, area in sorted(by_repo[repo].items()):
             lines.append('        {}("{}")'.format(nid, _flow_label(area)))
         lines.append("    end")

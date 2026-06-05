@@ -979,6 +979,15 @@ class TestProjectModuleGraph(unittest.TestCase):
         mmd = render.emit_project_module_graph([])
         self.assertIn("No cross-repo module dependencies", mmd)
 
+    def test_long_repo_name_not_truncated_in_subgraph_title(self):
+        # _subgraph_label is uncapped: a 46-char AVM repo slug appears in full.
+        long_repo = "Azure/terraform-azurerm-avm-res-keyvault-vault"
+        edges = [{"src_repo": long_repo, "src_area": "main.tf",
+                  "dst_repo": "Azure/x", "dst_area": "main.tf",
+                  "version": None, "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertIn('["{}"]'.format(long_repo), mmd)  # full name, not clipped
+
     def test_same_area_name_in_two_repos_distinct_nodes(self):
         # both repos have a 'main.tf' area -> distinct node ids, two subgraphs.
         edges = [{"src_repo": "Azure/a", "src_area": "main.tf",

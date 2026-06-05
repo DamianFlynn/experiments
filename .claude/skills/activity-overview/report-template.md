@@ -199,7 +199,7 @@ Direct dependencies carry pinned versions; cross-module edges show which areas a
 change ripples into. When no edges resolve, `module_graph` renders a
 `No module dependencies` placeholder (the diagram is always present).
 
-## Cross-repo module dependencies (blast radius)
+## Cross-repo module dependency graph
 
 <!-- Source: `view["module_edges"]` (each {src_repo, src_area, dst_repo, dst_area,
      version, transitive, cross_repo}) and the diagram
