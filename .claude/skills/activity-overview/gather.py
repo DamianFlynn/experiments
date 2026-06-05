@@ -2143,7 +2143,42 @@ def _cross_repo_pr_edges(pr, project, current_repo, members):
     return external, edges
 
 
-def resolve_registry_member(*args, **kwargs):  # replaced in the next task (S4)
+# The member's root module area: a repo-root main.tf classifies to area "main.tf"
+# (DEFAULT_AREA_PATTERNS / _tf_dir), so a cross-repo dep targets this node.
+_ROOT_AREA_LOCAL = "area-{}".format(
+    classify_code_area("main.tf", DEFAULT_AREA_PATTERNS))
+
+
+def parse_registry_source(src):
+    """Parse a Terraform registry module source `[host/]namespace/name/provider`
+    (optional `//submodule` suffix) -> (namespace, name, provider), or None if it
+    is not a registry source (local path, git/http url, or wrong shape). Pure."""
+    if not src or src.startswith((".", "/")) or "://" in src:
+        return None
+    core = src.split("//", 1)[0]                       # drop submodule path
+    parts = [p for p in core.split("/") if p]
+    if len(parts) == 4 and "." in parts[0]:            # strip a registry host
+        parts = parts[1:]
+    if len(parts) != 3:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def resolve_registry_member(src, project, members, registry_by_slug):
+    """Resolve a registry source to a member's root-area qualified id, or None.
+    Exact (manifest `registry` equals `src`) wins over the HashiCorp naming
+    convention (`namespace/name/provider` -> `{namespace}/terraform-{provider}-{name}`).
+    Pure."""
+    for slug in sorted(members):                       # exact, deterministic
+        if registry_by_slug.get(slug) == src:
+            return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+    parsed = parse_registry_source(src)
+    if parsed is None:
+        return None
+    namespace, name, provider = parsed
+    slug = "{}/terraform-{}-{}".format(namespace, provider, name)
+    if slug in members:
+        return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
     return None
 
 
@@ -2162,7 +2197,8 @@ def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
             if e.get("resolved") and to is not None:
                 dst = q(repo, "area-{}".format(to))
                 data = {k: v for k, v in e.items() if k != "to"}
-            elif members and registry_by_slug and e.get("ref"):
+            elif (not e.get("resolved") and members and registry_by_slug
+                  and e.get("ref")):
                 dst = resolve_registry_member(e["ref"], project, members,
                                               registry_by_slug)
                 if dst is None:

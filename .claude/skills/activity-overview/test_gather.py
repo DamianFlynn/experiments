@@ -2421,6 +2421,89 @@ class TestFoldDependsOnFlatten(unittest.TestCase):
                                     direction="out", edge_types=["depends_on"])
         self.assertEqual(deps, [])
 
+    def test_transitive_flag_preserved(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "a", "label": "a", "paths": ["a/main.tf"],
+                 "edges": [{"to": "b", "kind": "module", "ref": "../b",
+                            "version": "2.0", "transitive": True,
+                            "provider": "terraform", "resolved": True},
+                           {"to": "c", "kind": "module", "ref": "../c",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "b", "label": "b", "paths": ["b/main.tf"], "edges": []},
+                {"id": "c", "label": "c", "paths": ["c/main.tf"], "edges": []},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
+        deps = graphstore.get_edges(conn, "p/Az/r#area-a", direction="out",
+                                    edge_types=["depends_on"])
+        by_dst = {d["dst_id"]: d for d in deps}
+        self.assertEqual(set(by_dst), {"p/Az/r#area-b", "p/Az/r#area-c"})
+        self.assertEqual(by_dst["p/Az/r#area-b"]["data"]["transitive"], True)
+        self.assertEqual(by_dst["p/Az/r#area-b"]["data"]["version"], "2.0")
+
+    def test_resolved_true_but_to_none_is_dropped(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "a", "label": "a", "paths": ["a/main.tf"],
+                 "edges": [{"to": None, "kind": "module", "ref": "x",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]}]},
+        }
+        # even WITH members+registry available, a resolved/to=None edge is dropped
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r",
+                           members={"Az/r", "Az/other"}, registry_by_slug={})
+        self.assertEqual(graphstore.get_edges(conn, "p/Az/r#area-a",
+                         direction="out", edge_types=["depends_on"]), [])
+
+
+class TestRegistryResolution(unittest.TestCase):
+    def test_parse_registry_source_plain(self):
+        self.assertEqual(
+            gather.parse_registry_source("Azure/avm-res-keyvault-vault/azurerm"),
+            ("Azure", "avm-res-keyvault-vault", "azurerm"))
+
+    def test_parse_registry_source_with_host_and_submodule(self):
+        self.assertEqual(
+            gather.parse_registry_source(
+                "registry.terraform.io/Azure/avm-res-keyvault-vault/azurerm//sub"),
+            ("Azure", "avm-res-keyvault-vault", "azurerm"))
+
+    def test_parse_registry_source_rejects_non_registry(self):
+        self.assertIsNone(gather.parse_registry_source("./local"))
+        self.assertIsNone(gather.parse_registry_source("two/parts"))
+
+    def test_resolve_exact_registry_match_wins(self):
+        members = {"Azure/kv-repo"}
+        reg = {"Azure/kv-repo": "Azure/avm-res-keyvault-vault/azurerm"}
+        dst = gather.resolve_registry_member(
+            "Azure/avm-res-keyvault-vault/azurerm", "p", members, reg)
+        self.assertEqual(dst, "p/Azure/kv-repo#area-main.tf")
+
+    def test_resolve_convention_match(self):
+        members = {"Azure/terraform-azurerm-avm-res-keyvault-vault"}
+        dst = gather.resolve_registry_member(
+            "Azure/avm-res-keyvault-vault/azurerm", "p", members, {})
+        self.assertEqual(
+            dst, "p/Azure/terraform-azurerm-avm-res-keyvault-vault#area-main.tf")
+
+    def test_resolve_no_match_returns_none(self):
+        self.assertIsNone(gather.resolve_registry_member(
+            "Hashicorp/consul/aws", "p", {"Azure/other"}, {}))
+
 
 if __name__ == "__main__":
     unittest.main()
