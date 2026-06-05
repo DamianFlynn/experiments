@@ -496,45 +496,32 @@ def _derive_people(bundle):
     return derive.enumerate_participants(view, area_idx)
 
 
-def _derive_artifacts(bundle):
-    """Re-derive the artifact projection exactly as the write path does:
-    build_artifacts then link_symbol_identity (on a copy carrying them)."""
-    artifacts = derive.build_artifacts(bundle)
-    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
-    return artifacts
-
-
-def check_no_drift(conn, project, repo, bundle):
-    """Store-derived == link-derived (the carol-check generalized to ANY data).
-
-    Re-derive people and artifacts from the bundle (running attach_commit_prs
-    first, exactly as the write path does) and assert the STORED person/artifact
-    nodes equal the freshly derived set — same ids, same key fields. Any
-    difference = ERROR with the diff. This is the strongest real-data guarantee:
-    it catches a stored projection that has silently drifted from what the data
-    says it should be.
-    """
-    details = []
-
-    # --- people ---
-    want_people = _derive_people(bundle)
-    stored_people = {}
+def _stored_project_people(conn, project):
+    """The stored project-scoped people projection {login: {modules, areas, is_bot}}.
+    People carry the repo sentinel "*", so this reads them once for the project."""
+    out = {}
     for n in graphstore.repo_nodes(conn, project, "*", "structure"):
         local = _local(n["id"])
         if local.startswith("person-"):
             login = local[len("person-"):]
             d = n["data"] or {}
-            stored_people[login] = {
-                "modules": sorted(d.get("modules") or []),
-                "areas": sorted(d.get("areas") or []),
-                "is_bot": bool(d.get("is_bot")),
-            }
-    want_norm = {
-        login: {"modules": sorted(rec.get("modules") or []),
-                "areas": sorted(rec.get("areas") or []),
-                "is_bot": bool(rec.get("is_bot"))}
-        for login, rec in want_people.items()
-    }
+            out[login] = {"modules": sorted(d.get("modules") or []),
+                          "areas": sorted(d.get("areas") or []),
+                          "is_bot": bool(d.get("is_bot"))}
+    return out
+
+
+def _norm_people(people):
+    """Normalize a derived people dict to the stored projection's key fields."""
+    return {login: {"modules": sorted(rec.get("modules") or []),
+                    "areas": sorted(rec.get("areas") or []),
+                    "is_bot": bool(rec.get("is_bot"))}
+            for login, rec in people.items()}
+
+
+def _people_drift_details(stored_people, want_norm):
+    """The ERROR details for any divergence between stored and re-derived people."""
+    details = []
     for login in sorted(set(stored_people) | set(want_norm)):
         if login not in stored_people:
             details.append({"severity": ERROR, "kind": "person", "login": login,
@@ -545,8 +532,76 @@ def check_no_drift(conn, project, repo, bundle):
         elif stored_people[login] != want_norm[login]:
             details.append({"severity": ERROR, "kind": "person", "login": login,
                             "problem": "person drift",
-                            "stored": stored_people[login],
-                            "expected": want_norm[login]})
+                            "stored": stored_people[login], "expected": want_norm[login]})
+    return details
+
+
+def _derive_people_project(conn, project, repos):
+    """Re-derive the PROJECT-WIDE people aggregate: per-member enumerate (exactly as
+    each fold does), unioned across members (areas/modules union, is_bot OR) — the
+    read-side mirror of the union-merge fold_bundle writes."""
+    agg = {}
+    for repo in repos:
+        bundle = _self_source_bundle(conn, project, repo)
+        if bundle is None:
+            continue
+        for login, rec in _derive_people(bundle).items():
+            cur = agg.setdefault(login, {"areas": set(), "modules": set(),
+                                         "is_bot": False})
+            cur["areas"] |= set(rec.get("areas") or [])
+            cur["modules"] |= set(rec.get("modules") or [])
+            cur["is_bot"] = cur["is_bot"] or bool(rec.get("is_bot"))
+    return {login: {"modules": sorted(v["modules"]), "areas": sorted(v["areas"]),
+                    "is_bot": v["is_bot"]} for login, v in agg.items()}
+
+
+def check_no_drift_people(conn, project, repos):
+    """PROJECT-WIDE people no-drift: the stored project-scoped person nodes equal
+    the people re-derived across ALL members and unioned (mirroring fold_bundle's
+    union-merge). People are project-scoped, so this is the correct granularity — a
+    per-member check can never reproduce the cross-member union."""
+    want = _norm_people(_derive_people_project(conn, project, repos))
+    stored = _stored_project_people(conn, project)
+    details = _people_drift_details(stored, want)
+    if not details:
+        details.append({"severity": INFO,
+                        "note": "store matches re-derived project people"})
+    return _check("no_drift_people", ERROR, details)
+
+
+def _derive_artifacts(bundle):
+    """Re-derive the artifact projection exactly as the write path does:
+    build_artifacts then link_symbol_identity (on a copy carrying them)."""
+    artifacts = derive.build_artifacts(bundle)
+    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
+    return artifacts
+
+
+def check_no_drift(conn, project, repo, bundle, check_people=True):
+    """Store-derived == link-derived (the carol-check generalized to ANY data).
+
+    Re-derive people and artifacts from the bundle (running attach_commit_prs
+    first, exactly as the write path does) and assert the STORED person/artifact
+    nodes equal the freshly derived set — same ids, same key fields. Any
+    difference = ERROR with the diff. This is the strongest real-data guarantee:
+    it catches a stored projection that has silently drifted from what the data
+    says it should be.
+
+    `check_people=False` skips the people section: people are PROJECT-scoped (one
+    node per login, areas/modules unioned across all member repos), so in a
+    multi-repo project they are audited ONCE project-wide by
+    check_no_drift_people, not per member (a single member's bundle can never
+    re-derive the cross-member union). Artifacts are repo-scoped and always
+    checked here. Single-repo callers keep the default (repo == whole project)."""
+    details = []
+
+    # --- people (skipped per-member in a project: audited once by
+    #     check_no_drift_people over the cross-member union) ---
+    if check_people:
+        want_people = _derive_people(bundle)
+        stored_people = _stored_project_people(conn, project)
+        want_norm = _norm_people(want_people)
+        details.extend(_people_drift_details(stored_people, want_norm))
 
     # --- artifacts ---
     # The stored artifact id is `{project}/{repo}#{local}` where the SYMBOL-artifact
@@ -657,13 +712,17 @@ def _self_source_bundle(conn, project, repo):
                            warn=lambda _msg: None)
 
 
-def validate_repo(conn, project, repo, bundle=None):
+def validate_repo(conn, project, repo, bundle=None, check_people=True):
     """Run all trustworthiness checks for a single (project, repo) and return a
     Report. The two real-data checks (no_drift, idempotency) need a raw bundle
     to re-derive against; when `bundle` is not passed they SELF-SOURCE it from
     the store (via extract over the store's full window) so the gate is
     self-contained on a store-only deliverable. A passed `bundle` is honored as
     an optional cross-check but is never required.
+
+    `check_people=False` (set by validate_project) drops no_drift's people section
+    here: project-scoped people are audited once project-wide by
+    check_no_drift_people, not per member.
     """
     checks = [
         check_referential_integrity(conn),
@@ -680,7 +739,7 @@ def validate_repo(conn, project, repo, bundle=None):
         # store — surface the failure as an ERROR detail so the gate still fails
         # loudly (the structural checks above usually name the root cause).
         checks.append(_guarded(check_no_drift, "no_drift",
-                               conn, project, repo, drift_bundle))
+                               conn, project, repo, drift_bundle, check_people))
         checks.append(_guarded(check_idempotency, "idempotency",
                                conn, drift_bundle))
     return Report(checks)
@@ -713,10 +772,16 @@ def validate_project(conn, project, repos):
         raise ValueError("validate_project: no repos to validate")
     member_reports = []
     for repo in repos:
-        rep = validate_repo(conn, project, repo)
+        # check_people=False: people are project-scoped; audited once below.
+        rep = validate_repo(conn, project, repo, check_people=False)
         member_reports.append({"repo": repo, **rep.to_dict()})
-    return {"ok": all(r["ok"] for r in member_reports),
-            "project": project, "members": member_reports}
+    # PROJECT-WIDE checks (the ones whose unit is the project, not a member repo):
+    # people drift over the cross-member union.
+    project_checks = [check_no_drift_people(conn, project, repos)]
+    ok = (all(r["ok"] for r in member_reports)
+          and all(c["ok"] for c in project_checks))
+    return {"ok": ok, "project": project, "members": member_reports,
+            "project_checks": project_checks}
 
 
 def _guarded(fn, name, *args):
@@ -811,6 +876,10 @@ def main(argv=None):
                 mstatus = "OK" if mr["ok"] else "FAIL"
                 print("  repo: {}  [{}]".format(mr["repo"], mstatus))
                 for line in _format_checks_lines(mr.get("checks", []), indent="    "):
+                    print(line)
+            if agg.get("project_checks"):
+                print("  project-wide:")
+                for line in _format_checks_lines(agg["project_checks"], indent="    "):
                     print(line)
             print("=" * 60)
             print("RESULT: {}".format(status))

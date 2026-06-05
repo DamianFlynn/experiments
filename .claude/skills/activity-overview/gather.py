@@ -2487,6 +2487,19 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         if not login:
             continue
         data = {"login": login, **rec}
+        # Project-scoped people aggregate across members. A later member's fold must
+        # UNION its attribution with what an earlier member already stored — a plain
+        # upsert would OVERWRITE, so the last member folded (e.g. one where the
+        # person has no area attribution) would erase another member's. Union keeps
+        # the person node the true project-wide aggregate, independent of fold order
+        # and idempotent (re-folding a member unions a subset -> no change).
+        prior = conn.execute("SELECT data FROM nodes WHERE id=?",
+                             (qperson(login),)).fetchone()
+        if prior and prior[0]:
+            pd = json.loads(prior[0])
+            data["areas"] = sorted(set(rec.get("areas") or []) | set(pd.get("areas") or []))
+            data["modules"] = sorted(set(rec.get("modules") or []) | set(pd.get("modules") or []))
+            data["is_bot"] = bool(rec.get("is_bot")) or bool(pd.get("is_bot"))
         nodes.append((qperson(login), project, "*", "structure", None, data, fetched))
 
     def contrib(login, dst_local, etype):
