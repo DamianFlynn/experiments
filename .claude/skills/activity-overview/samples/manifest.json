@@ -1,0 +1,22 @@
+{
+  "project": "avm-tf-aiml-lz",
+  "window": {
+    "from": "2026-03-16",
+    "to": "2026-03-22"
+  },
+  "repos": [
+    {
+      "owner": "Azure",
+      "repo": "terraform-azurerm-avm-ptn-aiml-landing-zone"
+    },
+    {
+      "owner": "Azure",
+      "repo": "terraform-azurerm-avm-res-network-virtualnetwork"
+    },
+    {
+      "owner": "Azure",
+      "repo": "terraform-azurerm-avm-res-operationalinsights-workspace",
+      "registry": "Azure/avm-res-operationalinsights-workspace/azurerm"
+    }
+  ]
+}
