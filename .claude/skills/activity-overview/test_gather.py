@@ -2195,5 +2195,26 @@ class TestParseTimelineXrefs(unittest.TestCase):
         self.assertEqual(gather.parse_timeline_xrefs(None, "o/r"), [])
 
 
+class TestAcquireTimelineXrefs(unittest.TestCase):
+    def test_sets_timeline_xrefs_only_when_cross_repo_present(self):
+        pr_same = {"number": 1, "crossref_issues": []}
+        tl_same = [{"event": "cross-referenced",
+                    "source": {"issue": {"number": 5,
+                                         "repository": {"full_name": "Azure/self"},
+                                         "pull_request": None}}}]
+        gather._attach_timeline_xrefs(pr_same, tl_same, "Azure/self")
+        self.assertNotIn("timeline_xrefs", pr_same)   # same-repo only -> key absent
+
+        pr_cross = {"number": 2, "crossref_issues": []}
+        tl_cross = [{"event": "cross-referenced",
+                     "source": {"issue": {"number": 8,
+                                          "repository": {"full_name": "Azure/other"},
+                                          "pull_request": None}}}]
+        gather._attach_timeline_xrefs(pr_cross, tl_cross, "Azure/self")
+        self.assertEqual(pr_cross["timeline_xrefs"],
+                         [{"owner": "Azure", "repo": "other", "number": 8,
+                           "kind": "cross_ref", "is_pr": False}])
+
+
 if __name__ == "__main__":
     unittest.main()

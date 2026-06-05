@@ -1661,6 +1661,15 @@ def _runs_page(get_page, api, frm, to):
     return runs
 
 
+def _attach_timeline_xrefs(pr, timeline, current_slug):
+    """Set pr['timeline_xrefs'] to the cross-repo timeline refs, but ONLY when
+    there are any (conditional key: a PR with no cross-repo refs keeps its exact
+    prior shape, so single-repo gathers stay byte-identical). Mutates pr."""
+    xrefs = parse_timeline_xrefs(timeline, current_slug)
+    if xrefs:
+        pr["timeline_xrefs"] = xrefs
+
+
 def acquire(args, env):
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
         sys.stderr.write("error: --owner --repo --from --to are required\n")
@@ -1780,6 +1789,7 @@ def acquire(args, env):
         timeline = fetch_all(
             get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
         pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+        _attach_timeline_xrefs(pr, timeline, f"{owner}/{repo}")
         review_comments = fetch_all(
             get_page, f"{api}/pulls/{pr['number']}/comments?per_page=100")
         pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
