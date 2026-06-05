@@ -48,11 +48,7 @@ def _detect_project(conn, project):
 
 def _project_repos(conn, project):
     """The non-sentinel repos for a project (people aggregate across them)."""
-    return sorted({
-        r[0] for r in conn.execute(
-            "SELECT DISTINCT repo FROM nodes WHERE project=? AND repo != '*'",
-            (project,))
-    })
+    return graphstore.project_repos(conn, project)
 
 
 def _like_prefix(s):

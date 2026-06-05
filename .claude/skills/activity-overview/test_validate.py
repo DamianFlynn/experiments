@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import unittest
 
 import graphstore
 import gather
@@ -367,3 +368,101 @@ def test_cli_with_bundle_runs_drift(tmp_path):
                  "--bundle", os.path.join(FIX, "bundle_p3b.json"))
     assert r.returncode == 0, r.stdout + r.stderr
     assert "no_drift" in r.stdout
+
+
+class TestValidateProject(unittest.TestCase):
+    def test_two_member_store_validates_green(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        for repo in ("Azure/mod-a", "Azure/mod-b"):
+            b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                          "from": "2026-01-01", "to": "2026-01-31",
+                          "base_branch": "main"},
+                 "prs": [], "issues": [], "commits": [], "code_events": [],
+                 "milestones": [], "releases": [], "code_graph": {"areas": []}}
+            gather.fold_bundle(conn, b, project="proj", repo=repo,
+                               members={"Azure/mod-a", "Azure/mod-b"})
+        report = validate.validate_project(conn, "proj",
+                                           ["Azure/mod-a", "Azure/mod-b"])
+        self.assertTrue(report["ok"])
+        self.assertEqual({r["repo"] for r in report["members"]},
+                         {"Azure/mod-a", "Azure/mod-b"})
+        self.assertTrue(all(r["ok"] for r in report["members"]))
+
+    def test_empty_repos_raises_rather_than_vacuous_ok(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        with self.assertRaisesRegex(ValueError, "no repos"):
+            validate.validate_project(conn, "proj", [])
+
+
+class TestValidateProjectAggregation(unittest.TestCase):
+    def test_one_failing_member_makes_aggregate_not_ok(self):
+        """Monkeypatch validate_repo so one repo returns a failing Report and
+        assert that validate_project aggregates ok=False correctly."""
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+
+        class _Rep:
+            def __init__(self, ok):
+                self._ok = ok
+
+            @property
+            def ok(self):
+                return self._ok
+
+            def to_dict(self):
+                return {"ok": self._ok, "checks": []}
+
+        import validate as _v
+        orig = _v.validate_repo
+        _v.validate_repo = lambda c, p, r, **kw: _Rep(r != "Azure/bad")
+        try:
+            report = _v.validate_project(conn, "proj",
+                                         ["Azure/good", "Azure/bad"])
+        finally:
+            _v.validate_repo = orig
+
+        self.assertFalse(report["ok"])
+        by_repo = {m["repo"]: m["ok"] for m in report["members"]}
+        self.assertEqual(by_repo, {"Azure/good": True, "Azure/bad": False})
+
+
+def _write_two_member_store(tmp_path):
+    """Write a two-member (Azure/mod-a, Azure/mod-b) store to a temp file and
+    return the db path.  Mirrors _write_store() but for a multi-repo project."""
+    db = os.path.join(str(tmp_path), "multi_store.db")
+    conn = graphstore.open_store(db)
+    graphstore.init_schema(conn)
+    for repo in ("Azure/mod-a", "Azure/mod-b"):
+        b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                      "from": "2026-01-01", "to": "2026-01-31",
+                      "base_branch": "main"},
+             "prs": [], "issues": [], "commits": [], "code_events": [],
+             "milestones": [], "releases": [], "code_graph": {"areas": []}}
+        gather.fold_bundle(conn, b, project="proj", repo=repo,
+                           members={"Azure/mod-a", "Azure/mod-b"})
+    conn.close()
+    return db
+
+
+def test_cli_multi_repo_text_exits_zero(tmp_path):
+    """Regression test for the line-794 format crash: the multi-repo TEXT path
+    must complete without raising and must exit 0 for a clean two-member store."""
+    db = _write_two_member_store(tmp_path)
+    r = _run_cli(db, "--project", "proj")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Azure/mod-a" in r.stdout
+    assert "Azure/mod-b" in r.stdout
+
+
+def test_cli_multi_repo_json_exits_zero_and_has_members(tmp_path):
+    """The multi-repo JSON path exits 0, parses cleanly, and carries both
+    repos in the 'members' list."""
+    db = _write_two_member_store(tmp_path)
+    r = _run_cli(db, "--project", "proj", "--json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = json.loads(r.stdout)
+    assert "members" in data
+    repos = {m["repo"] for m in data["members"]}
+    assert repos == {"Azure/mod-a", "Azure/mod-b"}

@@ -1,42 +1,77 @@
-# {repo} — Activity Digest ({from} → {to})
+# {project} — Activity Digest ({from} → {to})
+
+<!-- Multi-repo digest. All sections below consume the JSON view emitted by
+     `python3 digest.py --store <path> --project <name> --from ... --to ...`.
+     Per-member (single-repo) sections render once per entry in
+     `view["members"][i]["bundle"]`; project-wide sections read the merged keys
+     (trains, shipped, people, modules, related_work). -->
 
 ## Executive summary
+
+<!-- source: len(view["shipped"]) shipped, len(view["trains"]) trains -->
 
 {N} merged PRs across {M} decision trains. {shipped_count} items shipped.
 
 ## Shipped this period
 
-For each ref in `buckets.shipped`, one line: the PR/issue title, number, and link.
+<!-- Multi-repo: source from `view["shipped"]` (each row has a `repo` key added
+     by `_merge_shipped`). Single-repo fallback: per-member
+     `view["members"][i]["bundle"]["buckets"]["shipped"]`. -->
 
-- [{title}]({url}) (#{number})
+| Repo | Title | Number |
+|------|-------|--------|
+| `{view["shipped"][].repo}` | [{title}]({url}) | #{number} |
 
 ## Decision trains
 
-DEEP trains (`tier == "deep"`) get a full sub-section with flowchart + effort line.
-MENTION trains (`tier == "mention"`) are one-liners at the end of the section.
+<!-- Multi-repo: source from `view["trains"]` (project-wide trains keyed off
+     qualified node ids). Each train carries:
+       - `repos`    — list of member repos contributing to this train
+       - `kind`     — "feature" | "bug" | "other"
+       - `outcome`  — "shipped" | "in_flight" | "rejected" | "abandoned"
+       - `prs`      — qualified PR ids, e.g. "proj/Azure/mod-a#pr-10"
+       - `issues`   — qualified issue ids
+       - `tickets`  — internal ticket refs parsed from PR/issue text (may be [])
+     When `len(train["repos"]) > 1`, note "spans: {repo1}, {repo2}" in the header.
+     Single-repo fallback: per-member trains from
+     `view["members"][i]["bundle"]["trains"]`. -->
 
-### {train.id} — {issue or PR title}  *(DEEP)*
+<!-- Project trains carry NO `tier`/`effort`/`root_issue`/flowchart of their own —
+     those are single-repo projections. Order trains most-substantial first
+     (rank by `len(train["prs"]) + len(train["commits"])`, break ties by
+     `outcome` shipped > in_flight > rejected > abandoned). Lead with the
+     cross-repo trains (`len(train["repos"]) > 1`).
+     For a DEEP per-train flowchart + effort line, drop into the owning member's
+     single-repo bundle: match the project train's local `pr-`/`issue-` ids to a
+     train in `view["members"][i]["bundle"]["trains"]` (which DO carry `tier`,
+     `significance`, `effort`) and that member's rendered
+     `diagrams.train_flowcharts[...]`. -->
 
-```mermaid
-{contents of diagrams.train_flowcharts[train.id]}
-```
+### {train.id} — {short title}
 
-*Effort: landed in {effort.elapsed_days} days · {effort.reviewers} reviewer(s) · {effort.participants} contributor(s)*
-*(or "open N days" when effort.merged_at is null; append "— stalled" when effort.stalled is true)*
+<!-- spans: {", ".join(train["repos"])} — omit this line when only one repo -->
 
-<!-- narrative: {train.id} -->
+- **Repos:** {", ".join(train["repos"])} {"— cross-repo" when len > 1}
+- **Kind / outcome:** {train["kind"]} / {train["outcome"]}
+- **PRs:** {train["prs"]} *(qualified ids; strip the "{project}/" prefix for display)*
+- **Issues:** {train["issues"]}
+- **Commits:** {len(train["commits"])}
+- **Tickets:** {", ".join(train["tickets"]) or "—"}
+- **Evidence:** {e["url"] for e in train["evidence"]}
 
-- **Root issue:** #{root_issue} (or "none — PR-anchored")
-- **PRs:** {prs}
-- **Commits:** {commit count}
-- **Outcome:** {outcome}
-- **Evidence:** {evidence urls}
+## Related work (cross-repo, ticket-linked)
 
----
+<!-- Source: `view["related_work"]` — a list of `{ticket, train_ids}` objects.
+     Each entry represents two or more project trains that share an internal
+     ticket reference (Jira/ADO-style, e.g. ABC-1234) but are NOT connected by
+     any GitHub closes/cross_ref edge. They are distinct-repo deliverables whose
+     only shared signal is the internal ticket. This section makes that
+     invisible coupling visible.
+     Omit the section entirely when `view["related_work"]` is empty. -->
 
-*MENTION trains (one line each):*
-
-- `{train.id}` — {title} — {outcome} ({PR count} PR(s))
+| Ticket | Trains |
+|--------|--------|
+| `{related_work[].ticket}` | {related_work[].train_ids joined with ", "} |
 
 ## Activity at a glance
 
@@ -166,12 +201,22 @@ change ripples into. When no edges resolve, `module_graph` renders a
 
 ## Module ownership
 
-From `code_owners` + `people.modules`/`modules`: who owns and who touched each
-module this window.
+<!-- Multi-repo: source from `view["modules"]` and `view["people"]`.
+     `view["modules"]` keys are `"{repo}::{area}"` — split on `::` for display.
+     `view["people"]` logins are merged across all member repos (union by login).
+     Top contributors: people whose `modules` list includes the area id. -->
 
-| Module | Owners (CODEOWNERS) | Top contributors | Commits | PRs | Files |
-|--------|---------------------|------------------|---------|-----|-------|
-| `{area}` | {code_owners[glob]} | {people whose modules include area} | {modules[area].commits} | {modules[area].prs} | {modules[area].files_changed} |
+From `code_owners` + `view["people"]`/`view["modules"]`: who owns and who touched
+each module this window.
+
+| Repo | Module | Owners (CODEOWNERS) | Top contributors | Commits | PRs | Files |
+|------|--------|---------------------|------------------|---------|-----|-------|
+| `{repo}` *(from key split on `::`)* | `{area}` | {code_owners[glob]} | {people whose modules include area} | {modules["{repo}::{area}"].commits} | {modules["{repo}::{area}"].prs} | {modules["{repo}::{area}"].files_changed} |
+
+<!-- Per-file sections (Content lifecycle, Feature changes) render once per
+     member repo from `view["members"][i]["bundle"]`. Activity at a glance,
+     Releases, In flight, Rejected, Content lifecycle, and Feature changes all
+     read from view["members"][i]["bundle"][...] — NOT a top-level view[...] key. -->
 
 Embeds `diagrams.contributor_graph` (people ↔ code-area edges):
 

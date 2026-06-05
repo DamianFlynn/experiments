@@ -589,5 +589,30 @@ class TestDeadRefs(unittest.TestCase):
         self.assertNotIn(pr11, r2["reached"])
 
 
+class TestProjectRepos(unittest.TestCase):
+    def test_distinct_members_excluding_person_sentinel(self):
+        conn = _store()
+        graphstore.upsert_nodes(conn, [
+            ("p/Azure/a#pr-1", "p", "Azure/a", "social", "2026-01-01", {}, None),
+            ("p/Azure/b#pr-1", "p", "Azure/b", "social", "2026-01-02", {}, None),
+            ("p/Azure/a#pr-2", "p", "Azure/a", "social", "2026-01-03", {}, None),
+            ("p#person-x", "p", "*", "structure", None, {"login": "x"}, None),
+        ])
+        self.assertEqual(graphstore.project_repos(conn, "p"),
+                         ["Azure/a", "Azure/b"])
+
+    def test_empty_project(self):
+        conn = _store()
+        self.assertEqual(graphstore.project_repos(conn, "nope"), [])
+
+    def test_excludes_other_projects(self):
+        conn = _store()
+        graphstore.upsert_nodes(conn, [
+            ("p/Azure/a#pr-1", "p", "Azure/a", "social", "2026-01-01", {}, None),
+            ("q/Azure/z#pr-1", "q", "Azure/z", "social", "2026-01-02", {}, None),
+        ])
+        self.assertEqual(graphstore.project_repos(conn, "p"), ["Azure/a"])
+
+
 if __name__ == "__main__":
     unittest.main()
