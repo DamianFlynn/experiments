@@ -369,6 +369,16 @@ under concurrency). The IaC build knobs are env-overridable for heavy runs:
 `ACTIVITY_IAC_BUILD_TIMEOUT` (default 300s), `ACTIVITY_IAC_MAX_WORKERS` (8),
 `ACTIVITY_IAC_RETRIES` (1).
 
+A cross-repo `depends_on` resolves to the producer member's module-root area
+(`area-main.tf`). That root is only created by the producer's own fold when its
+`main.tf` is an in-window code area — usually it is not. The consumer fold
+therefore **ensures the target node exists** (a minimal `structure` stand-in,
+create-if-absent so a producer's real area always wins), keeping the edge from
+dangling. The node is an edge anchor only: `extract` rebuilds `code_graph` from
+the `codegraph` singleton, never from `area-*` nodes, so it is invisible to every
+member bundle. The shallow-clone margin is `ACTIVITY_CLONE_MARGIN_DAYS`
+(default 14); widen it when `meta.boundary_dropped_commits` is non-empty.
+
 **People aggregate across members.** Person nodes are project-scoped (`repo="*"`).
 Each per-member fold **unions** a person's `areas`/`modules` (and ORs `is_bot`)
 with the already-stored node — a plain upsert would overwrite, so a member where a

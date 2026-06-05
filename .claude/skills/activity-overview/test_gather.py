@@ -83,6 +83,23 @@ class TestCloneAndWindow(unittest.TestCase):
         self.assertIn("--no-single-branch", cmd)
         self.assertEqual(cmd[-2:], ["https://github.com/o/r.git", "/tmp/clone"])
 
+    def test_clone_margin_env_override(self):
+        # ACTIVITY_CLONE_MARGIN_DAYS widens the pre-window reach at call time so an
+        # in-window commit's parent is captured (recovering boundary-dropped commits).
+        import unittest.mock as mock
+        with mock.patch.dict(os.environ, {"ACTIVITY_CLONE_MARGIN_DAYS": "90"}):
+            self.assertEqual(gather._clone_margin_days(), 90)
+            cmd = gather.build_clone_cmd("https://github.com/o/r.git",
+                                         "2026-05-01", "/tmp/clone")
+            # 2026-05-01 shifted back 90 days
+            self.assertIn("--shallow-since=2026-01-31", cmd)
+        # absent / non-int -> the CLONE_MARGIN_DAYS default (14)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ACTIVITY_CLONE_MARGIN_DAYS", None)
+            self.assertEqual(gather._clone_margin_days(), gather.CLONE_MARGIN_DAYS)
+        with mock.patch.dict(os.environ, {"ACTIVITY_CLONE_MARGIN_DAYS": "oops"}):
+            self.assertEqual(gather._clone_margin_days(), gather.CLONE_MARGIN_DAYS)
+
     def test_shift_date(self):
         self.assertEqual(gather._shift_date("2026-05-01", -14), "2026-04-17")
         self.assertEqual(gather._shift_date("bad", -14), "bad")  # parse-error fallback
@@ -2706,6 +2723,71 @@ class TestFoldDependsOnFlatten(unittest.TestCase):
                            members={"Az/r", "Az/other"}, registry_by_slug={})
         self.assertEqual(graphstore.get_edges(conn, "p/Az/r#area-a",
                          direction="out", edge_types=["depends_on"]), [])
+
+    def _consumer_bundle(self):
+        # a consumer whose root references a producer registry module (unresolved
+        # -> resolves cross-repo via the naming convention)
+        return {
+            "meta": {"owner": "Az", "repo": "consumer", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                 "edges": [{"to": None, "kind": "module",
+                            "ref": "Az/avm-res-thing/azurerm", "version": "1.2.3",
+                            "transitive": False, "provider": "terraform",
+                            "resolved": False}]}]},
+        }
+
+    def test_cross_repo_target_root_node_is_ensured(self):
+        # A cross-repo depends_on targets the producer's module-root area. The
+        # producer's main.tf is usually NOT an in-window area, so its own fold
+        # creates no area-main.tf node. The consumer fold must ENSURE that target
+        # node exists, or the edge dangles (validate.referential_integrity).
+        # Regression: surfaced when widening the clone margin removed the phantom
+        # whole-tree diffs that used to create the producer root area by accident.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Az/consumer", "Az/terraform-azurerm-avm-res-thing"}
+        # producer is NOT folded -> its area-main.tf node does not pre-exist
+        gather.fold_bundle(conn, self._consumer_bundle(), project="p",
+                           repo="Az/consumer", members=members, registry_by_slug={})
+        dst = "p/Az/terraform-azurerm-avm-res-thing#area-main.tf"
+        deps = graphstore.get_edges(conn, "p/Az/consumer#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual([d["dst_id"] for d in deps], [dst])
+        node = graphstore.get_node(conn, dst)
+        self.assertIsNotNone(node)                      # no dangling edge
+        self.assertEqual(node["node_class"], "structure")
+
+    def test_ensured_root_node_does_not_clobber_real_producer_area(self):
+        # Create-if-ABSENT only: a real producer area-main.tf (folded in any order)
+        # must win over the minimal stand-in.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        dst = "p/Az/terraform-azurerm-avm-res-thing#area-main.tf"
+        producer = {
+            "meta": {"owner": "Az", "repo": "terraform-azurerm-avm-res-thing",
+                     "from": "2026-01-01", "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "root", "paths": ["main.tf"],
+                 "edges": []}]},
+        }
+        gather.fold_bundle(conn, producer, project="p",
+                           repo="Az/terraform-azurerm-avm-res-thing")
+        real = graphstore.get_node(conn, dst)["data"]
+        self.assertNotIn("synthesized", real)
+        # consumer folds AFTER, referencing the producer -> must not overwrite
+        gather.fold_bundle(
+            conn, self._consumer_bundle(), project="p", repo="Az/consumer",
+            members={"Az/consumer", "Az/terraform-azurerm-avm-res-thing"},
+            registry_by_slug={})
+        after = graphstore.get_node(conn, dst)["data"]
+        self.assertEqual(after, real)                   # real producer area preserved
+        self.assertNotIn("synthesized", after)
 
 
 class TestRegistryResolution(unittest.TestCase):

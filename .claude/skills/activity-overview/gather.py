@@ -150,6 +150,18 @@ def parse_code_events(raw):
 CLONE_MARGIN_DAYS = 14
 
 
+def _clone_margin_days():
+    """Effective clone margin in days. `ACTIVITY_CLONE_MARGIN_DAYS` overrides the
+    CLONE_MARGIN_DAYS default at call time (a non-int/empty value falls back to the
+    default) — widen it to pull enough pre-window history that an in-window commit's
+    parent is in the clone, so it is no longer a grafted boundary commit
+    (recovering meta.boundary_dropped_commits)."""
+    try:
+        return int(os.environ.get("ACTIVITY_CLONE_MARGIN_DAYS", CLONE_MARGIN_DAYS))
+    except (ValueError, TypeError):
+        return CLONE_MARGIN_DAYS
+
+
 def _shift_date(date_str, days):
     """YYYY-MM-DD shifted by `days` (negative = earlier); input returned on parse error."""
     try:
@@ -162,12 +174,13 @@ def _shift_date(date_str, days):
 def build_clone_cmd(repo_url, from_date, clone_dir):
     """Construct the bounded, partial clone command (network-free to build).
 
-    `--shallow-since` reaches CLONE_MARGIN_DAYS before `from_date` so the shallow
-    boundary commit (whole-tree phantom diff) sits OUTSIDE the report window."""
+    `--shallow-since` reaches CLONE_MARGIN_DAYS before `from_date` (override with
+    ACTIVITY_CLONE_MARGIN_DAYS) so the shallow boundary commit (whole-tree phantom
+    diff) sits OUTSIDE the report window."""
     return [
         "git", "clone",
         "--filter=blob:none",
-        f"--shallow-since={_shift_date(from_date, -CLONE_MARGIN_DAYS)}",
+        f"--shallow-since={_shift_date(from_date, -_clone_margin_days())}",
         "--no-single-branch",
         repo_url, clone_dir,
     ]
@@ -2550,9 +2563,35 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # top-level edges key. A resolved-local edge -> an intra-repo depends_on; an
     # unresolved registry edge resolves to a cross-repo member only in multi-repo
     # folds (see _fold_depends_on, threaded with members + registry_by_slug).
+    _dep_dsts = set()
     for src, dst, data in _fold_depends_on(bundle, project, repo, members,
                                            registry_by_slug):
         edges.append((src, dst, "depends_on", None, data or None))
+        _dep_dsts.add(dst)
+
+    # A cross-repo depends_on targets a producer member's MODULE-ROOT area
+    # (area-main.tf). That node is created by the producer's OWN fold only if its
+    # main.tf was an in-window code area — which it usually is not (a module's
+    # root is published/depended-on without changing every window). Ensure the
+    # target exists as a minimal structure node so the edge is never dangling
+    # (validate.referential_integrity). Create-if-ABSENT only — never clobber the
+    # producer's real area node, in any fold order: get_node sees prior committed
+    # folds, and this fold's own area nodes are already in `nodes`; if the producer
+    # later folds a real area-main.tf it upserts over this minimal stand-in. extract
+    # rebuilds code_graph from the `codegraph` singleton (not area-* nodes), so this
+    # node is invisible to every member bundle — it exists purely as an edge anchor.
+    _have = {n[0] for n in nodes}
+    for dst in sorted(_dep_dsts):
+        if dst in _have or graphstore.get_node(conn, dst) is not None:
+            continue
+        p = graphstore.parse_id(dst)
+        scope = p["scope"]
+        dst_repo = scope[len(project) + 1:] if scope.startswith(project + "/") else scope
+        local = p["local"]
+        area_id = local[len("area-"):] if local.startswith("area-") else local
+        nodes.append((dst, project, dst_repo, "structure", None,
+                      {"id": area_id, "synthesized": "cross_repo_depends_on_target"},
+                      fetched))
 
     # in_milestone (social -> structure): a PR/issue's milestone title links to
     # the milestone node (keyed on number when present, else title — matching

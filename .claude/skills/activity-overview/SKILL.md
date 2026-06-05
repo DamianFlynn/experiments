@@ -68,6 +68,10 @@ claim in the report resolves to a source ref — never invent facts.
        of registry modules; set a shared `TF_PLUGIN_CACHE_DIR` (gather warms it once,
        then extracts in parallel) and, if needed, raise `ACTIVITY_IAC_BUILD_TIMEOUT`
        / tune `ACTIVITY_IAC_MAX_WORKERS` (defaults 300s / 8).
+     - **Boundary-dropped commits.** If a run warns that in-window commit(s) sit at
+       the shallow-clone boundary (their whole-tree phantom diffs were dropped — see
+       `meta.boundary_dropped_commits`), widen `ACTIVITY_CLONE_MARGIN_DAYS` (default
+       `14`) and re-gather so each in-window commit keeps its real parent.
 2. **Materialize + Link.** The reader stage rebuilds the bundle view from the store
    (`extract`) and enriches it offline (no network):
    ```bash
