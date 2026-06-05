@@ -2702,34 +2702,41 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         edges.append((src, dst, "depends_on", None, data or None))
         _dep_dsts.add(dst)
 
-    # A cross-repo depends_on targets a producer member's MODULE-ROOT area
-    # (area-main.tf). That node is created by the producer's OWN fold only if its
-    # main.tf was an in-window code area — which it usually is not (a module's
-    # root is published/depended-on without changing every window). Ensure the
-    # target exists as a minimal structure node so the edge is never dangling
-    # (validate.referential_integrity). Create-if-ABSENT only — never clobber the
-    # producer's real area node, in any fold order: get_node sees prior committed
-    # folds, and this fold's own area nodes are already in `nodes`; if the producer
-    # later folds a real area-main.tf it upserts over this minimal stand-in. extract
-    # rebuilds code_graph from the `codegraph` singleton (not area-* nodes), so this
-    # node is invisible to every member bundle — it exists purely as an edge anchor.
+    # A depends_on dst is always a real module-area path resolved from a `module`
+    # source reference — an intra-repo SUB-MODULE, or a cross-repo producer's root.
+    # The directory area-provider is WINDOW-SCOPED, so a referenced module that was
+    # not itself changed in-window has no area node, leaving the edge dangling
+    # (validate.referential_integrity). This is a real-data fact, not a bug — bicep
+    # repos like avm/res/*/* reference deep sub-modules every gather; a single-repo
+    # bicep window over Azure/bicep-registry-modules produced ~30 such edges. Ensure
+    # EACH depends_on target (intra- and cross-repo) exists as a minimal `structure`
+    # area node so the dependency graph stays referentially intact and complete.
+    # Create-if-ABSENT only — never clobber a real area node, in any fold order:
+    # get_node sees prior committed folds and this fold's own area nodes are already
+    # in `nodes`; a later real fold of that area upserts over the stand-in. extract
+    # rebuilds code_graph from the `codegraph` singleton (not area-* nodes), so the
+    # stand-in is invisible to every member bundle — purely an edge anchor.
+    # Ensure each NEW depends_on target (one not already staged in `nodes`) exists.
+    # Batch the store existence check into a SINGLE query rather than a get_node per
+    # dst — depends_on fan-out can be large (a bicep repo window has dozens) — then
+    # synthesize only the truly-absent ones.
     _have = {n[0] for n in nodes}
-    for dst in sorted(_dep_dsts):
+    _cand = sorted(d for d in _dep_dsts if d not in _have)
+    _existing = set()
+    if _cand:
+        ph = ",".join("?" for _ in _cand)
+        _existing = {r[0] for r in conn.execute(
+            "SELECT id FROM nodes WHERE id IN ({})".format(ph), _cand)}
+    for dst in _cand:
+        if dst in _existing:
+            continue
         p = graphstore.parse_id(dst)
         scope = p["scope"]
         dst_repo = scope[len(project) + 1:] if scope.startswith(project + "/") else scope
-        # ONLY ensure cross-repo targets. An intra-repo depends_on dst is a local
-        # area that must come from THIS repo's code_graph — synthesizing it would
-        # mask a real referential-integrity bug (a dangling local edge), so leave it
-        # for validate to catch.
-        if dst_repo == repo:
-            continue
-        if dst in _have or graphstore.get_node(conn, dst) is not None:
-            continue
         local = p["local"]
         area_id = local[len("area-"):] if local.startswith("area-") else local
         nodes.append((dst, project, dst_repo, "structure", None,
-                      {"id": area_id, "synthesized": "cross_repo_depends_on_target"},
+                      {"id": area_id, "synthesized": "depends_on_target"},
                       fetched))
 
     # in_milestone (social -> structure): a PR/issue's milestone title links to
