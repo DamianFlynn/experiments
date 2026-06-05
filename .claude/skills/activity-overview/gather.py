@@ -2336,7 +2336,8 @@ def main(argv=None):
             "folded {} member repo(s) of project '{}' into store {}\n".format(
                 len(man["repos"]), man["project"], args.store))
     else:
-        # Store-only single-repo path (Phase 7), unchanged.
+        # Store-only single-repo path (Phase 7). Same acquire->fold->return as
+        # before; the store setup above is now shared with the manifest branch.
         bundle = acquire(args, os.environ)
         fold_bundle(conn, bundle)
         sys.stderr.write("folded bundle into store {}\n".format(args.store))
