@@ -1001,11 +1001,24 @@ def _scope_label(scope):
 def member_dependents(conn, project, member):
     """Blast radius: the project members whose areas transitively depend on
     `member`'s areas, via inbound depends_on edges (A depends_on B => edge A->B,
-    so 'who depends on B' walks in-edges). Returns a cited envelope. Deterministic.
-    `member` is an 'owner/repo' slug."""
+    so 'who depends on B' walks in-edges). `member` is an 'owner/repo' slug.
+
+    Unlike the train-oriented queries this returns a FLAT `dependents` list (no
+    `summary`/`delivered`) and is time-independent (`scope` carries no window). A
+    member with no area nodes (ungathered/unknown slug) yields a needs_gather
+    result, mirroring the sibling queries. Deterministic."""
     seed_areas = [n["id"] for n in graphstore.repo_nodes(
         conn, project, member, "structure")
         if graphstore.parse_id(n["id"])["local"].startswith("area-")]
+    if not seed_areas:
+        return {
+            "query": "dependents", "focus": member, "focus_kind": "member",
+            "project": project, "status": "needs_gather",
+            "scope": _scope(None, None),
+            "guidance": ("no area nodes for member {}; gather it into the project "
+                         "store first (areas are sparse in short windows)".format(
+                             member)),
+        }
     seen, frontier, dependents = set(seed_areas), list(seed_areas), set()
     while frontier:
         nxt = []
@@ -1024,6 +1037,7 @@ def member_dependents(conn, project, member):
     return {
         "query": "dependents", "focus": member, "focus_kind": "member",
         "project": project, "status": "ok",
+        "scope": _scope(None, None),
         "dependents": sorted(dependents),
     }
 
@@ -1181,8 +1195,11 @@ def _render_grep_md(res):
 
 
 def _render_dependents_md(res):
+    if res["status"] == "needs_gather":
+        return "## spotlight: blast radius `{}`\n\n_needs gather:_ {}".format(
+            res["focus"], res["guidance"])
     deps = res.get("dependents") or []
-    head = "# Blast radius — `{}`\n".format(res["focus"])
+    head = "## spotlight: blast radius `{}`\n".format(res["focus"])
     if not deps:
         return head + "\nNothing in the project depends on this member.\n"
     return head + "\nMembers that (transitively) depend on it:\n\n" + "\n".join(
