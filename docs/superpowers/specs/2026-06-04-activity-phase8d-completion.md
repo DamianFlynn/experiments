@@ -282,5 +282,3 @@ Phase 7's guarantees.
 > changing Phase 8 goldens) or only when `--complete` is passed (preserving
 > goldens) — proposed **always**, because an answer that states its own edges
 > every time is the whole point of the honesty contract.
-</content>
-</invoke>

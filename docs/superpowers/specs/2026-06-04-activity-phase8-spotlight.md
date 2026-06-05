@@ -27,10 +27,15 @@ Design rules (rev-14 Section 4):
 - **Citation discipline** — every row carries its source ref (`url` / `sha` /
   `number`), same as the report. Spotlight surfaces facts the model *cites*, never
   prose it invents.
-- **Never re-fetches.** A query whose answer needs un-gathered data returns a
-  structured *"gather that window/repo first"* guidance result, not a partial lie.
-- **Reader only.** `spotlight` imports `graphstore` (+ `derive` for shared shaping);
-  it never writes the store and never calls the network.
+- **Offline by default; honest, never a partial lie.** An unknown focus returns a
+  structured *"gather that window/repo first"* guidance result, and every delivery
+  train carries a `complete`/`gaps` contract (Phase 8d) naming any un-gathered spine
+  anchors. Completion is **opt-in**: with `--complete` (a `backfill` seam injected
+  from a token) spotlight fills missing cross-window anchors via `gather`; without
+  it there is no network and no write.
+- **Reader by default; gather is the only writer/network.** `spotlight` imports
+  `graphstore` (+ `derive` for shared shaping) and writes nothing itself — the
+  optional completion effect is `gather.backfill`'s, never spotlight's.
 
 `spotlight` reuses the **trust gate's** guarantee: it reads the same nodes/edges/
 ledgers `validate.py` audits, so a spotlight answer is exactly as trustworthy as the

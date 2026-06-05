@@ -291,10 +291,6 @@ class RollupResumeHardening(unittest.TestCase):
         self.assertEqual(w1, w2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BackfillAbsent(unittest.TestCase):
     def test_absent_records_dead_ref_and_reports_absent(self):
         conn = _store()
@@ -322,3 +318,7 @@ class BackfillAbsent(unittest.TestCase):
         self.assertFalse(res["fetched"])
         self.assertFalse(res["absent"])
         self.assertFalse(graphstore.is_dead_ref(conn, iid))  # NOT tombstoned
+
+
+if __name__ == "__main__":
+    unittest.main()

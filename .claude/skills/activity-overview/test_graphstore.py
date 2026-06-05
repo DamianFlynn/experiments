@@ -518,10 +518,6 @@ class TestBatchWrite(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestDeadRefs(unittest.TestCase):
     def setUp(self):
         self.conn = _store()
@@ -569,3 +565,7 @@ class TestDeadRefs(unittest.TestCase):
         self.assertNotIn(issue, m2)
         # Without skip_dead it is still reported (default unchanged).
         self.assertIn(issue, graphstore.traverse_spine(self.conn, [pr])["missing"])
+
+
+if __name__ == "__main__":
+    unittest.main()

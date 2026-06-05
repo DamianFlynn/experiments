@@ -1283,5 +1283,3 @@ git commit -m "test(activity): windowed-gap-with-phantom golden + 8d-3 gate (8d-
 - The exact `lines`-list variable name in `_render_train_md` and the precise `_train` return-dict assembly (Tasks 12, 14) — confirm against the live source when editing; the plan cites the call-site line numbers.
 - `http_get_json` return shape **confirmed** `(parsed_json, next_url)` and raises `SystemExit` on 404; Task 4 adds an `allow_404` path rather than assuming a status tuple. No open risk.
 - `get_edges(conn, node_id, direction, edge_types)` **confirmed** to support `direction in {"out","in","both"}` + an `edge_types` allowlist (`graphstore.py:197`), as `complete._spine_neighbors` relies on (Task 5).
-</content>
-</invoke>

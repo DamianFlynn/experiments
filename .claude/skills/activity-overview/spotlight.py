@@ -6,10 +6,14 @@ done across all repos?" and (in later slices) symbol lifecycle, subsystem
 blast radius, and full-text mining. Bounded SQL over the journey-graph store,
 deterministically ordered, every row carrying its source citation.
 
-Reader only: imports `graphstore` (+ `derive` where shared shaping helps); it
-never writes the store and never touches the network. Primary output is raw,
-cited JSON for the AI that builds reports; `--md` is a thin deterministic
-render over the same JSON. See docs/.../activity-phase8-spotlight.md.
+Reader-only by default: imports `graphstore` (+ `derive` where shared shaping
+helps) and, offline, neither writes the store nor touches the network. The one
+exception is opt-in completion (Phase 8d): when a `backfill` seam is injected
+(CLI `--complete`, which wires `gather.make_backfill_fetcher` from a token), the
+honest-edge step may fetch and upsert missing cross-window anchors *through
+gather* — gather stays the only writer/network. Primary output is raw, cited
+JSON for the AI that builds reports; `--md` is a thin deterministic render over
+the same JSON. See docs/.../activity-phase8-spotlight.md.
 
 Stdlib only (sqlite3, argparse, json). Python 3.
 """
@@ -226,8 +230,20 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of,
     Returns {anchor, key_date, title, outcome, areas[], roles[],
              touchpoints[ cited focus events; comment carries excerpt ],
              timeline[ _timeline_row…, chronological by (ts,id) ]}.
-    Determinism: timeline + touchpoints by (ts, id)."""
-    nodes = [graphstore.get_node(conn, nid) for nid in reached]
+    Determinism: timeline + touchpoints by (ts, id).
+
+    Completion runs FIRST (offline-by-default): the body — anchor, timeline,
+    touchpoints — is built from the POST-completion reached set, so `--complete`
+    actually surfaces fetched cross-window anchors instead of leaving the same
+    holes. `missing` is self-derived from `reached`; skip_dead prunes phantoms."""
+    reach = graphstore.traverse_spine(
+        conn, sorted(reached), edge_types=_CAUSAL_SPINE, skip_dead=True)
+    comp = complete.complete_train(
+        conn, reach["reached"], reach["missing"], window=window,
+        backfill=backfill, budget=complete_budget, edge_types=_CAUSAL_SPINE)
+    reached = comp["reached"]  # present, post-completion train nodes
+
+    nodes = [graphstore.get_node(conn, nid) for nid in sorted(reached)]
     nodes = [n for n in nodes if n is not None]
 
     # the anchor is the train's ORIGIN (issue beats pr beats release beats
@@ -282,9 +298,16 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of,
             touchpoints.append(row)
     touchpoints.sort(key=lambda r: (r["ts"], r["id"], r.get("role") or ""))
 
-    # the train's key date = the earliest spine ts (story start), anchor tie-break
-    key_date = timeline[0]["ts"] if timeline else (
-        (anchor_node["ts"] if anchor_node else None) or "")
+    # the train's key date = earliest spine ts (story start). Anchor it to the
+    # train's IN-WINDOW activity so completion's out-of-window CONTEXT (level-0
+    # anchors fetched by --complete) enriches the timeline without shifting the
+    # train's scope/sort position out of the query window. timeline is already
+    # (ts, id)-sorted, so the first in-window row is the earliest.
+    if timeline:
+        in_window_ts = [r["ts"] for r in timeline if _ts_in_window(r["ts"], window)]
+        key_date = in_window_ts[0] if in_window_ts else timeline[0]["ts"]
+    else:
+        key_date = (anchor_node["ts"] if anchor_node else None) or ""
 
     train = {
         "anchor": anchor,
@@ -296,15 +319,7 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of,
         "touchpoints": touchpoints,
         "timeline": timeline,
     }
-    # Honest edge contract: complete the train's causal spine (offline-by-default,
-    # no network) and stamp complete/gaps. `missing` is self-derived from the
-    # reached set so every builder gets the contract uniformly; skip_dead keeps
-    # pruned phantoms out.
-    reach = graphstore.traverse_spine(
-        conn, sorted(reached), edge_types=_CAUSAL_SPINE, skip_dead=True)
-    comp = complete.complete_train(
-        conn, reach["reached"], reach["missing"], window=window,
-        backfill=backfill, budget=complete_budget, edge_types=_CAUSAL_SPINE)
+    # Stamp the honest edge contract (complete/gaps) from the completion above.
     complete.annotate(train, comp)
     return train
 
@@ -492,6 +507,21 @@ def _completion_window(ts_from, ts_to):
     if ts_from is None and ts_to is None:
         return None
     return (_as_iso(ts_from), _as_iso(ts_to, end_of_day=True))
+
+
+def _ts_in_window(ts, window):
+    """True if `ts` falls within a normalized (lo, hi) completion window (either
+    bound may be None). An empty ts cannot be proven in-window -> False."""
+    if window is None:
+        return True
+    if not ts:
+        return False
+    lo, hi = window
+    if lo is not None and ts < lo:
+        return False
+    if hi is not None and ts > hi:
+        return False
+    return True
 
 
 def _date_in_range(ts, ts_from, ts_to):

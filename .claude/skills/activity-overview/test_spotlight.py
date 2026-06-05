@@ -974,10 +974,6 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual(scoped["summary"]["trains_touched"], len(scoped["delivered"]))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestHonestContract(unittest.TestCase):
     def setUp(self):
         self.conn = graphstore.open_store(":memory:")
@@ -1040,3 +1036,7 @@ class TestWindowedGapWithPhantom(unittest.TestCase):
         self.assertNotIn(phantom, gap_ids)             # phantom pruned, not a gap
         self.assertTrue(graphstore.is_dead_ref(conn, phantom))
         self.assertEqual(gap_ids.get(rfc), "outside_window")  # honest pointer
+
+
+if __name__ == "__main__":
+    unittest.main()
