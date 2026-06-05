@@ -1436,7 +1436,14 @@ def parse_args(argv):
                    help="path to a multi-repo project manifest (JSON). Mutually "
                         "exclusive with --owner/--repo; folds every member repo "
                         "into one store under the manifest's logical project name.")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # --manifest carries its own member list + window, so the single-repo flags
+    # are meaningless alongside it. Enforce the documented exclusivity rather than
+    # silently letting the manifest branch win (ambiguous, misleading help text).
+    if args.manifest and (args.owner or args.repo
+                          or getattr(args, "from") or args.to):
+        p.error("--manifest is mutually exclusive with --owner/--repo/--from/--to")
+    return args
 
 
 def resolve_token(env):
@@ -2035,7 +2042,13 @@ def make_backfill_fetcher(token, clone_dir=None):
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
         project, _, repo = parsed["scope"].partition("/")
-        api = f"https://api.github.com/repos/{project}/{repo}"
+        # Multi-repo (Phase 9) ids scope as `{project}/{owner}/{repo}`, so the
+        # repo part is itself an `owner/repo` slug and addresses GitHub directly.
+        # Single-repo ids scope as `{owner}/{repo}` (no inner slash), so fall back
+        # to the legacy owner=project mapping. Without this, a multi-repo backfill
+        # hits repos/{project}/{owner}/{repo} -> false 404s / dead_refs.
+        slug = repo if "/" in repo else "{}/{}".format(project, repo)
+        api = f"https://api.github.com/repos/{slug}"
         if kind == "social" and local.startswith("issue-"):
             num = local[len("issue-"):]
             raw, nxt = http_get_json(f"{api}/issues/{num}", token, allow_404=True)
@@ -2150,7 +2163,7 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None):
     # LOGICAL project (`project`) with `repo` = "owner/repo". Single-repo runs pass
     # neither and fall back to meta.owner/meta.repo — byte-identical to before.
     # `members` (a set/dict of "owner/repo" slugs) gates cross-repo edge emission;
-    # None (single-repo) skips it entirely (added in a later task).
+    # None (single-repo) skips it entirely.
     if project is None:
         project = meta.get("owner")
     if repo is None:

@@ -326,6 +326,24 @@ class TestCliAndAuth(unittest.TestCase):
             gather.parse_args(["--owner", "o", "--repo", "r",
                                "--from", "2026-05-01", "--to", "2026-05-31"])
 
+    def test_parse_args_manifest_alone_is_accepted(self):
+        args = gather.parse_args([
+            "--manifest", "workspace/project.json",
+            "--store", "workspace/store.db",
+        ])
+        self.assertEqual(args.manifest, "workspace/project.json")
+        self.assertIsNone(args.owner)
+        self.assertIsNone(args.repo)
+
+    def test_parse_args_manifest_conflicts_with_single_repo_flags(self):
+        for extra in (["--owner", "o"], ["--repo", "r"],
+                      ["--from", "2026-05-01"], ["--to", "2026-05-31"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(SystemExit), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    gather.parse_args(["--manifest", "workspace/project.json",
+                                       "--store", "workspace/store.db", *extra])
+
     def test_resolve_token_prefers_github_token(self):
         self.assertEqual(
             gather.resolve_token({"GITHUB_TOKEN": "gh", "GH_TOKEN": "alt"}), "gh"
