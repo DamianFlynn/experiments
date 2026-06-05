@@ -27,7 +27,7 @@ def parse_ticket_refs(text, pattern=_DEFAULT_TICKET_RE):
     """Ordered, deduped internal-ticket ids in `text`. Pure."""
     out, seen = [], set()
     for m in pattern.finditer(text or ""):
-        tok = m.group(1)
+        tok = m.group(1) if m.re.groups else m.group(0)
         if tok not in seen:
             seen.add(tok)
             out.append(tok)
@@ -305,7 +305,8 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
 
 def parse_args(argv):
     p = argparse.ArgumentParser(
-        description="Emit a multi-repo project digest view (JSON) from a store.")
+        description="Emit a multi-repo project digest view (JSON) from a store. "
+                    "Output embeds full per-member bundles and can be large for many repos.")
     p.add_argument("--store", required=True, help="path to the journey-graph store")
     p.add_argument("--project", required=True, help="logical project name")
     p.add_argument("--repo", action="append", dest="repos", default=None,
@@ -321,15 +322,24 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.ticket_pattern:
+        try:
+            pattern = re.compile(args.ticket_pattern)
+        except re.error as e:
+            sys.stderr.write("digest: invalid --ticket-pattern: {}\n".format(e))
+            return 2
+    else:
+        pattern = _DEFAULT_TICKET_RE
     conn = graphstore.open_store(args.store)
-    repos = args.repos or graphstore.project_repos(conn, args.project)
-    pattern = (re.compile(args.ticket_pattern) if args.ticket_pattern
-               else _DEFAULT_TICKET_RE)
-    view = build_project_view(conn, args.project, repos, args.ts_from, args.ts_to,
-                              ticket_pattern=pattern)
+    try:
+        repos = args.repos or graphstore.project_repos(conn, args.project)
+        view = build_project_view(conn, args.project, repos,
+                                  args.ts_from, args.ts_to, ticket_pattern=pattern)
+    finally:
+        conn.close()
     sys.stdout.write(json.dumps(view, sort_keys=True, indent=2))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

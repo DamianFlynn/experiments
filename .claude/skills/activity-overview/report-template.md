@@ -8,6 +8,8 @@
 
 ## Executive summary
 
+<!-- source: len(view["shipped"]) shipped, len(view["trains"]) trains -->
+
 {N} merged PRs across {M} decision trains. {shipped_count} items shipped.
 
 ## Shipped this period
@@ -218,7 +220,9 @@ each module this window.
 | `{repo}` *(from key split on `::`)* | `{area}` | {code_owners[glob]} | {people whose modules include area} | {modules["{repo}::{area}"].commits} | {modules["{repo}::{area}"].prs} | {modules["{repo}::{area}"].files_changed} |
 
 <!-- Per-file sections (Content lifecycle, Feature changes) render once per
-     member repo from `view["members"][i]["bundle"]`. -->
+     member repo from `view["members"][i]["bundle"]`. Activity at a glance,
+     Releases, In flight, Rejected, Content lifecycle, and Feature changes all
+     read from view["members"][i]["bundle"][...] — NOT a top-level view[...] key. -->
 
 Embeds `diagrams.contributor_graph` (people ↔ code-area edges):
 

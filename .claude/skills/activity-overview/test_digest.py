@@ -379,6 +379,13 @@ class TestMergeHelpers(unittest.TestCase):
 
 
 class TestDigestCli(unittest.TestCase):
+    def _run(self, args):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = digest.main(args)
+        return rc, buf.getvalue()
+
     def test_main_emits_project_view_json(self):
         import io
         import tempfile
@@ -397,6 +404,60 @@ class TestDigestCli(unittest.TestCase):
         view = json.loads(buf.getvalue())
         self.assertEqual(view["meta"]["project"], "proj")
         self.assertEqual(len(view["trains"]), 1)
+
+    def test_main_repo_subset(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "j.db")
+            disk = graphstore.open_store(store); _seed_two_member_store(disk); disk.close()
+            rc, out = self._run(["--store", store, "--project", "proj",
+                                 "--repo", "Azure/mod-a",
+                                 "--from", "2026-01-01T00:00:00Z",
+                                 "--to", "2026-01-31T23:59:59Z"])
+        self.assertEqual(rc, 0)
+        view = json.loads(out)
+        self.assertEqual(view["meta"]["repos"], ["Azure/mod-a"])
+        self.assertEqual([m["repo"] for m in view["members"]], ["Azure/mod-a"])
+
+    def test_main_unknown_project_is_empty_view(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "j.db")
+            disk = graphstore.open_store(store); _seed_two_member_store(disk); disk.close()
+            rc, out = self._run(["--store", store, "--project", "nope",
+                                 "--from", "2026-01-01T00:00:00Z",
+                                 "--to", "2026-01-31T23:59:59Z"])
+        self.assertEqual(rc, 0)
+        view = json.loads(out)
+        self.assertEqual(view["meta"]["repos"], [])
+        self.assertEqual(view["trains"], [])
+
+    def test_main_custom_ticket_pattern_accepted(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "j.db")
+            disk = graphstore.open_store(store); _seed_two_member_store(disk); disk.close()
+            rc, out = self._run(["--store", store, "--project", "proj",
+                                 "--from", "2026-01-01T00:00:00Z",
+                                 "--to", "2026-01-31T23:59:59Z",
+                                 "--ticket-pattern", r"(TASK-\d+)"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["meta"]["project"], "proj")
+
+    def test_main_invalid_ticket_pattern_exits_2(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "j.db")
+            disk = graphstore.open_store(store); _seed_two_member_store(disk); disk.close()
+            import io, contextlib
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = digest.main(["--store", store, "--project", "proj",
+                                  "--from", "2026-01-01T00:00:00Z",
+                                  "--to", "2026-01-31T23:59:59Z",
+                                  "--ticket-pattern", "((unclosed"])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid --ticket-pattern", err.getvalue())
 
 
 if __name__ == "__main__":
