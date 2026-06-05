@@ -99,6 +99,12 @@ class TestCloneAndWindow(unittest.TestCase):
             self.assertEqual(gather._clone_margin_days(), gather.CLONE_MARGIN_DAYS)
         with mock.patch.dict(os.environ, {"ACTIVITY_CLONE_MARGIN_DAYS": "oops"}):
             self.assertEqual(gather._clone_margin_days(), gather.CLONE_MARGIN_DAYS)
+        # negative -> clamped to 0 (never shifts --shallow-since past from_date)
+        with mock.patch.dict(os.environ, {"ACTIVITY_CLONE_MARGIN_DAYS": "-30"}):
+            self.assertEqual(gather._clone_margin_days(), 0)
+            cmd = gather.build_clone_cmd("https://github.com/o/r.git",
+                                         "2026-05-01", "/tmp/clone")
+            self.assertIn("--shallow-since=2026-05-01", cmd)  # == from_date, not after
 
     def test_shift_date(self):
         self.assertEqual(gather._shift_date("2026-05-01", -14), "2026-04-17")

@@ -88,9 +88,13 @@ def train_refs(t):
         if info:
             out.append("[{}#{}]({})".format(short(info["repo"]), info["num"], info["url"]))
         else:
-            # out-of-window spine anchor: render the bare qualified local id
+            # out-of-window spine anchor (no in-window record to link): render it
+            # repo-qualified, since a bare local id like `issue-123` is ambiguous
+            # across members (two repos can both have issue-123).
             p = graphstore.parse_id(q)
-            out.append("`{}`".format(p["local"]))
+            scope = p["scope"]
+            repo_part = scope[len(PROJECT) + 1:] if scope.startswith(PROJECT + "/") else scope
+            out.append("`{}#{}`".format(short(repo_part), p["local"]))
     return out
 
 

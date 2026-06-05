@@ -155,9 +155,11 @@ def _clone_margin_days():
     CLONE_MARGIN_DAYS default at call time (a non-int/empty value falls back to the
     default) — widen it to pull enough pre-window history that an in-window commit's
     parent is in the clone, so it is no longer a grafted boundary commit
-    (recovering meta.boundary_dropped_commits)."""
+    (recovering meta.boundary_dropped_commits). Clamped to >= 0: a negative override
+    would shift `--shallow-since` AFTER `from_date`, inverting the margin guarantee
+    and silently reintroducing boundary-commit gaps."""
     try:
-        return int(os.environ.get("ACTIVITY_CLONE_MARGIN_DAYS", CLONE_MARGIN_DAYS))
+        return max(0, int(os.environ.get("ACTIVITY_CLONE_MARGIN_DAYS", CLONE_MARGIN_DAYS)))
     except (ValueError, TypeError):
         return CLONE_MARGIN_DAYS
 
