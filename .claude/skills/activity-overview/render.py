@@ -4,6 +4,7 @@ Pure emitters build the diagram text from existing bundle fields; `mmdc` (mermai
 compiles every file so a diagram that would not render fails the run. No network."""
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -164,6 +165,19 @@ def _node_id(prefix, text):
     return f"{prefix}_{safe}"[:60]
 
 
+def _stable_node_id(prefix, text):
+    """A COLLISION-FREE Mermaid node id for arbitrary (possibly long) text.
+
+    Unlike `_node_id` (60-char cap, fine for the short single-repo diagram keys),
+    this keeps a readable sanitized head AND appends a short deterministic hash of
+    the FULL text. Long AVM `{repo}::{area}` keys routinely share a >60-char prefix
+    (e.g. `Azure/terraform-azurerm-avm-res-network-...`), so a plain truncation
+    would collapse distinct nodes into one and mis-wire the edges between them."""
+    safe = "".join(ch if ch.isalnum() else "_" for ch in (text or ""))
+    digest = hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{safe[:40]}_{digest}"
+
+
 def _area_tail(area):
     return (area or "").rstrip("/").split("/")[-1] or area
 
@@ -172,6 +186,15 @@ def _flow_label(text):
     """Sanitise a flowchart label: drop quotes/newlines that would break the node."""
     clean = (text or "").replace('"', "'").replace("\n", " ")
     return clean.strip()[:40] or "?"
+
+
+def _subgraph_label(text):
+    """Sanitise a subgraph TITLE. Unlike _flow_label this is UNCAPPED by design:
+    a subgraph title is a repo identity (e.g.
+    'Azure/terraform-azurerm-avm-res-keyvault-vault', 46 chars) and truncating it
+    would hide which member the blast radius points at. Repo slugs carry no
+    newlines, so only quotes need escaping."""
+    return (text or "").replace('"', "'")
 
 
 def emit_contributor_graph(bundle):
@@ -355,6 +378,50 @@ def emit_module_graph(bundle):
             lines.append(f'    {src_id} -->|"{_flow_label(label)}"| {dst_id}')
         else:
             lines.append(f"    {src_id} --> {dst_id}")
+    return "\n".join(lines) + "\n"
+
+
+def emit_project_module_graph(module_edges):
+    """A Mermaid flowchart of project module dependencies (Slice S4 blast radius).
+    Nodes are grouped into a subgraph per member repo; each edge draws
+    src-area --> dst-area labelled with its version (or 'transitive'). Cross-repo
+    edges are the point of the diagram; intra-repo edges are included for context.
+
+    A PROJECT-level emitter: the digest report flow calls it with
+    `digest.project_depends_on(...)` rows (NOT the single-repo `render()` dict,
+    which is bundle-scoped). Pure; deterministic — it sorts repos, nodes, and
+    edges internally, so input order does not matter."""
+    if not module_edges:
+        return "flowchart LR\n    none[No cross-repo module dependencies]\n"
+    by_repo = {}
+    drawn = []
+    for e in module_edges:
+        # _stable_node_id (not _node_id): long AVM {repo}::{area} keys share a
+        # 60-char prefix and must not collide into one node.
+        src = _stable_node_id("m", "{}::{}".format(e["src_repo"], e["src_area"]))
+        dst = _stable_node_id("m", "{}::{}".format(e["dst_repo"], e["dst_area"]))
+        # Label with the full area path (not _area_tail): two modules in one repo
+        # can both end in `main.tf`; the path disambiguates them in the subgraph.
+        by_repo.setdefault(e["src_repo"], {})[src] = e["src_area"]
+        by_repo.setdefault(e["dst_repo"], {})[dst] = e["dst_area"]
+        # cross_repo intentionally unused here: all edges are drawn uniformly
+        # (visual styling of cross- vs intra-repo edges is future work).
+        label = e.get("version") or ("transitive" if e.get("transitive") else "")
+        drawn.append((src, dst, label))
+    lines = ["flowchart LR"]
+    for repo in sorted(by_repo):
+        # Subgraph title uses the UNCAPPED _subgraph_label (repo identity must not
+        # be truncated); node area labels keep _flow_label's 40-char cap.
+        lines.append('    subgraph {}["{}"]'.format(_stable_node_id("r", repo),
+                                                     _subgraph_label(repo)))
+        for nid, area in sorted(by_repo[repo].items()):
+            lines.append('        {}("{}")'.format(nid, _flow_label(area)))
+        lines.append("    end")
+    for src, dst, label in sorted(set(drawn)):
+        if label:
+            lines.append('    {} -->|"{}"| {}'.format(src, _flow_label(label), dst))
+        else:
+            lines.append("    {} --> {}".format(src, dst))
     return "\n".join(lines) + "\n"
 
 

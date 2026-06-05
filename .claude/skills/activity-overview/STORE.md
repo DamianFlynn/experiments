@@ -311,6 +311,81 @@ ignored by the trust gate, and `first_seen` is excluded from determinism asserts
 (like `fetched_at`). See
 `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`.
 
+## Phase 9 — multi-repo project (the constellation)
+
+A **project can span several repos** folded under one logical name (the lead case
+is Azure Verified Modules — Terraform, where each module is its own repo). The
+producer takes a **manifest** instead of `--owner/--repo`:
+
+```bash
+python3 gather.py --manifest workspace/manifest.json --store workspace/journey.db
+```
+
+```json
+{ "project": "avm-tf-storage",
+  "window": { "from": "2026-03-01", "to": "2026-03-31" },
+  "repos": [
+    { "owner": "Azure", "repo": "terraform-azurerm-avm-res-storage-storageaccount",
+      "registry": "Azure/avm-res-storage-storageaccount/azurerm" },
+    { "owner": "Azure", "repo": "terraform-azurerm-avm-res-keyvault-vault" } ] }
+```
+
+gather loops the members, running the existing acquire→fold path once per member
+into the **same store** under `project = manifest.project`, `repo = "{owner}/{repo}"`.
+The slash in `repo` is benign — every join is on the full string, every split is
+first-`/` (scope) or last-`#` (local). The single-repo `--owner/--repo` path is
+byte-unchanged (`project = owner`, `repo = <name>`).
+
+- **Cross-repo spine edges.** A PR body's **qualified** ref (`owner/repo#N`, full
+  `github.com/.../issues|pull/N` URL) or a repo-aware timeline cross-ref to a
+  **member** repo emits a `closes`/`cross_ref` spine edge across the repo boundary
+  (`traverse_spine` walks it unchanged); a ref to a **non-member** repo is recorded
+  on the node's `external_refs` (honest, not a fetchable gap).
+- **Cross-repo `depends_on` (Terraform).** `build_terraform_edges` keeps a registry
+  source as `to=None, ref=<src>`; `fold_bundle` resolves it to the member that
+  publishes that module — **exact** (a member whose manifest `registry` equals the
+  source) then the **HashiCorp naming convention**
+  (`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`) — and
+  emits an area→area `depends_on` to that member's root area
+  (`#area-main.tf`), `data.cross_repo = True`. A registry source whose first segment
+  is a host (a dot, e.g. `github.com/org/repo`) is VCS shorthand, never resolved.
+  Resolution only runs in a multi-repo fold (`members` + `registry_by_slug` present);
+  single-repo folds emit intra-repo edges only.
+
+**Terraform extraction, corrected for real modules.** A Terraform **root module is
+one area** — repo-root `*.tf` files (`main.tf`/`variables.tf`/`main.<topic>.tf`/…)
+collapse to a single `main.tf` area (not one per file), and edge extraction reads
+**every `*.tf` in the module directory** (a module's `module` blocks span its files;
+`terraform graph` already spans the whole dir). A local source landing on the repo
+root (e.g. an example's `source = "../.."`) resolves to that `main.tf` area; a source
+escaping the repo is unresolved, never a phantom dangling area. **`examples/` and
+`tests/` subtrees are scaffolding** (they reference the module-under-test and test
+fixtures, often other registry modules, via CI-manipulated paths) — they are
+**skipped at extraction and excluded at fold**, so they never become bogus intra-
+or cross-repo dependencies. `terraform graph` runs through the same parallel pool
+as the bicep build; with a shared `TF_PLUGIN_CACHE_DIR` a one-shot serial provider
+warm-up precedes the parallel inits (terraform's plugin cache is not write-safe
+under concurrency). The IaC build knobs are env-overridable for heavy runs:
+`ACTIVITY_IAC_BUILD_TIMEOUT` (default 300s), `ACTIVITY_IAC_MAX_WORKERS` (8),
+`ACTIVITY_IAC_RETRIES` (1).
+
+**People aggregate across members.** Person nodes are project-scoped (`repo="*"`).
+Each per-member fold **unions** a person's `areas`/`modules` (and ORs `is_bot`)
+with the already-stored node — a plain upsert would overwrite, so a member where a
+contributor has no attribution would erase another's. The aggregate is fold-order
+independent and idempotent (re-folding a member unions a subset → no change).
+
+**Readers + validate aggregate the member set.** `digest.py` is the project
+aggregation layer above `extract` (per-member extract+enrich, then merge:
+spine-linked trains stitched across members; trains sharing only an internal ticket
+clustered into `related_work`; Shipped/people/modules merged; cross-repo
+`module_edges` for the project-wide blast-radius graph). `spotlight dependents
+<owner/repo>` answers the reverse-dependency (blast-radius) question. `validate.py
+--project <name>` runs the per-member checks **plus** a project-wide
+`no_drift_people` check that re-derives people across **all** members and unions
+them (the read-side mirror of the fold) — people are project-scoped, so they are
+audited once project-wide, not per member.
+
 ## Roll-up / resume (slice 7c)
 
 A multi-window "wider view" is a **single wider `range_query`** over the union of

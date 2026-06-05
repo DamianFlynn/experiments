@@ -746,9 +746,12 @@ def _terraform_modules_dir(parts):
 
 
 def _tf_dir(parts):
-    # any directory containing a *.tf file -> that directory.
+    # Any directory containing a *.tf file -> that directory. Repo-root .tf files
+    # (no directory component) collapse to a SINGLE "main.tf" root-module area, so a
+    # Terraform root module is one area (like a Bicep main.bicep dir) instead of
+    # fragmenting into one area per root file (main.tf/variables.tf/outputs.tf/...).
     if parts and parts[-1].endswith(".tf"):
-        return "/".join(parts[:-1]) or parts[0]
+        return "/".join(parts[:-1]) or "main.tf"
     return None
 
 
@@ -786,6 +789,17 @@ def classify_code_area(path, patterns):
 def _area_label(area_id):
     """A short, human tail for an area id (the last path segment)."""
     return (area_id or "").rstrip("/").split("/")[-1] or area_id
+
+
+def _is_scaffold_area(area_id):
+    """True for a Terraform `examples/` or `tests/` subtree. These are the module's
+    unit-test / documentation scaffolding: their `module` blocks reference the
+    module-under-test and test fixtures (often via CI-manipulated relative paths, or
+    other registry modules used only to stand up a test), NOT the published module's
+    own dependencies. Such areas are skipped at edge extraction and their depends_on
+    edges are excluded at fold, so they are never built or misattributed as the
+    module's real (incl. cross-repo) dependencies. Pure."""
+    return bool({"examples", "tests"} & set((area_id or "").split("/")))
 
 
 def build_directory_areas(paths, patterns):
@@ -1058,7 +1072,12 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
 _TF_MODULE_HEAD_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{')
 _TF_SOURCE_RE = re.compile(r'source\s*=\s*"(?P<src>[^"]+)"')
 _TF_VERSION_RE = re.compile(r'version\s*=\s*"(?P<ver>[^"]+)"')
-_TF_EDGE_RE = re.compile(r'"\[root\]\s*(?P<a>[^"]+)"\s*->\s*"\[root\]\s*(?P<b>[^"]+)"')
+# Terraform graph DOT edge. The `[root] ` node prefix is OPTIONAL: older
+# `terraform graph` emitted `"[root] module.x..." -> "[root] ..."`, but modern
+# terraform (>=~1.x default graph) emits unprefixed `"module.x..." -> "..."`.
+# Matching both keeps inter-module dependency extraction working across versions.
+_TF_EDGE_RE = re.compile(
+    r'"(?:\[root\]\s*)?(?P<a>[^"]+)"\s*->\s*"(?:\[root\]\s*)?(?P<b>[^"]+)"')
 _TF_MODULE_TOKEN_RE = re.compile(r"module\.([A-Za-z0-9_-]+)")
 
 
@@ -1137,7 +1156,17 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None)
             return None, None, None
         if src.startswith(".") or src.startswith("/"):
             joined = os.path.normpath(os.path.join(base_dir, src))
-            return (classify_code_area(joined + "/main.tf", patterns) or joined), src, None
+            if joined == os.pardir or joined.startswith(os.pardir + os.sep):
+                # escapes the repo (e.g. ../../.. above root): unresolvable to a
+                # repo area -> external (to=None), never a phantom dangling area.
+                return None, src, None
+            # normpath('.') is the repo root; classify it the same way root files
+            # are (-> "main.tf"), so a local source pointing at the root module
+            # resolves to the SAME area id as the root module's own files.
+            rel = "" if joined == os.curdir else joined
+            area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
+                or rel or "main.tf"
+            return area, src, None
         return None, src, version_of(name)        # external: to=None, identity in ref
 
     pairs = parse_terraform_graph(dot_text)
@@ -1491,9 +1520,31 @@ def clone_head_sha(clone_dir, run=run_git):
 # process (never a slow-but-progressing one). Speed comes from bounded concurrency,
 # not a tight timeout. A timed-out/failed build is retried once, then recorded as a
 # VISIBLE gap (edges_status) rather than a silent empty.
-IAC_BUILD_TIMEOUT = 300   # seconds per bicep/terraform subprocess
-IAC_MAX_WORKERS = 8       # parallel per-module builds
-IAC_RETRIES = 1           # extra attempts after the first on timeout/failure
+#
+# Env-overridable for heavy live runs: a real AVM pattern module's `terraform init`
+# pulls dozens of registry modules (raise the timeout), and a shared
+# TF_PLUGIN_CACHE_DIR is not safe under concurrent writes (lower the workers to 1
+# to serialize). The defaults are unchanged for the offline test/CI path.
+IAC_BUILD_TIMEOUT = int(os.environ.get("ACTIVITY_IAC_BUILD_TIMEOUT", "300"))  # seconds per subprocess
+IAC_MAX_WORKERS = int(os.environ.get("ACTIVITY_IAC_MAX_WORKERS", "8"))        # parallel per-module builds
+IAC_RETRIES = int(os.environ.get("ACTIVITY_IAC_RETRIES", "1"))               # extra attempts on timeout/failure
+
+
+def _list_tf_files(clone_dir, rel_dir):
+    """Every *.tf file (clone-relative path) in a module directory, sorted.
+
+    Terraform treats ALL *.tf in a directory as ONE module, and real modules spread
+    their `module` blocks across files (an AVM consumer puts them in
+    main.networking.tf / main.monitoring.tf / ..., not main.tf). Edge extraction
+    must read the whole directory so `build_terraform_edges` sees every module
+    source — the terraform-graph DOT already spans the whole dir. Returns [] when
+    the dir cannot be listed (the caller falls back to the entrypoint)."""
+    full = os.path.join(clone_dir, rel_dir) if rel_dir else clone_dir
+    try:
+        names = sorted(f for f in os.listdir(full) if f.endswith(".tf"))
+    except OSError:
+        return []
+    return [os.path.join(rel_dir, f) if rel_dir else f for f in names]
 
 
 def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf,
@@ -1520,14 +1571,39 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
                 arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
                 src = read_text(os.path.join(clone_dir, bp))
                 return build_bicep_edges(src, arm, bp, area_ids, patterns), "resolved"
-            dot = _terraform_graph_dot(run, clone_dir, os.path.dirname(tp), timeout)
-            src = read_text(os.path.join(clone_dir, tp))
+            rel_dir = os.path.dirname(tp)
+            dot = _terraform_graph_dot(run, clone_dir, rel_dir, timeout)
+            # Read EVERY *.tf in the module dir (not just the entrypoint): a module's
+            # `module` blocks span all its files, and terraform graph already spans
+            # the whole dir. Fall back to the entrypoint if the dir can't be listed.
+            tf_files = _list_tf_files(clone_dir, rel_dir) or [tp]
+            src = "\n".join(read_text(os.path.join(clone_dir, f)) for f in tf_files)
             return build_terraform_edges(src, dot, tp, area_ids, patterns), "resolved"
         except subprocess.TimeoutExpired:
             status = "timeout"   # hung build: bounded, retried, then recorded
         except Exception:
             status = "failed"
     return None, status
+
+
+def _terraform_prewarm(build_areas, clone_dir, run, timeout):
+    """Populate a SHARED TF_PLUGIN_CACHE_DIR once, serially, before the parallel
+    builds. terraform's plugin cache is not safe under concurrent writes, so a cold
+    cache + N parallel `terraform init` would race; one warm-up init (AVM members
+    share the same handful of providers) turns the rest into cache HITS — restoring
+    bicep-like parallel extraction for terraform without the race. Best-effort: any
+    failure is ignored (the parallel builds still run and report their own status)."""
+    for area in build_areas:
+        tp = _tf_entrypoint(area)
+        if not tp:
+            continue
+        full = os.path.join(clone_dir, os.path.dirname(tp) or ".")
+        try:
+            run(["terraform", f"-chdir={full}", "init", "-backend=false",
+                 "-input=false"], timeout=timeout)
+        except Exception:
+            pass
+        return   # one warm-up populates the cache for the shared providers
 
 
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
@@ -1563,8 +1639,25 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
                                          have_bicep, have_tf, run, read_text,
                                          timeout, retries)
 
+    # examples/ and tests/ are module scaffolding whose edges are excluded from
+    # depends_on at fold time; don't spend a terraform/bicep build on them (the AVM
+    # pattern examples instantiate the whole stack) — mark skipped, build the rest.
+    build = []
+    for area in areas:
+        if _is_scaffold_area(area.get("id")):
+            area["edges_status"] = "skipped"
+            summary["skipped"] += 1
+        else:
+            build.append(area)
+
+    # Parallel terraform graph generation, mirroring the parallel bicep build path
+    # (both run through one ThreadPoolExecutor). With a SHARED TF_PLUGIN_CACHE_DIR
+    # the cold-cache parallel inits would race, so warm it once serially first.
+    if have_tf and max_workers > 1 and os.environ.get("TF_PLUGIN_CACHE_DIR"):
+        _terraform_prewarm(build, clone_dir, run, timeout)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for area, (edges, status) in pool.map(work, areas):
+        for area, (edges, status) in pool.map(work, build):
             if edges is not None:
                 area["edges"] = edges
             area["edges_status"] = status
@@ -1835,8 +1928,11 @@ def acquire(args, env):
         seen.add(issue["number"])
         issues.append(issue)
     for n in sorted(wanted - seen):
-        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token)
-        if raw_issue.get("pull_request"):
+        # A closed/cross-referenced issue can 404 — deleted, transferred to another
+        # repo, or a cross-ref number that is not an issue in THIS repo. Tolerate it
+        # (skip) rather than aborting the whole gather on one dangling reference.
+        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token, allow_404=True)
+        if raw_issue is None or raw_issue.get("pull_request"):
             continue
         raw_by_num[raw_issue["number"]] = raw_issue
         issues.append(normalize_issue(raw_issue))
@@ -2143,7 +2239,86 @@ def _cross_repo_pr_edges(pr, project, current_repo, members):
     return external, edges
 
 
-def fold_bundle(conn, bundle, project=None, repo=None, members=None):
+# The member's root module area: a repo-root main.tf classifies to area "main.tf"
+# (DEFAULT_AREA_PATTERNS / _tf_dir), so a cross-repo dep targets this node.
+_ROOT_AREA_LOCAL = "area-{}".format(
+    classify_code_area("main.tf", DEFAULT_AREA_PATTERNS))
+
+
+def parse_registry_source(src):
+    """Parse a Terraform registry module source `[host/]namespace/name/provider`
+    (optional `//submodule` suffix) -> (namespace, name, provider), or None if it
+    is not a registry source (local path, git/http url, or wrong shape). Pure."""
+    if not src or src.startswith((".", "/")) or "://" in src:
+        return None
+    core = src.split("//", 1)[0]                       # drop submodule path
+    parts = [p for p in core.split("/") if p]
+    if len(parts) == 4 and "." in parts[0]:            # strip a registry host (4-seg form: host/ns/name/provider)
+        parts = parts[1:]
+    if len(parts) != 3:
+        return None
+    # A dot in the namespace means the first segment is a HOST, not a namespace —
+    # i.e. VCS shorthand like `github.com/org/repo`, not a registry address. A real
+    # registry namespace never contains a dot, so reject it (don't mis-resolve it
+    # via the naming convention). Registry hosts are only valid in the 4-seg form
+    # handled above.
+    if "." in parts[0]:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def resolve_registry_member(src, project, members, registry_by_slug):
+    """Resolve a registry source to a member's root-area qualified id, or None.
+    Exact (manifest `registry` equals `src`) wins over the HashiCorp naming
+    convention (`namespace/name/provider` -> `{namespace}/terraform-{provider}-{name}`).
+    Pure. Case-sensitive; the convention assumes a lowercase provider (GitHub slugs are case-sensitive)."""
+    for slug in sorted(members):                       # exact, deterministic
+        if src and registry_by_slug.get(slug) == src:
+            return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+    parsed = parse_registry_source(src)
+    if parsed is None:
+        return None
+    namespace, name, provider = parsed
+    slug = "{}/terraform-{}-{}".format(namespace, provider, name)
+    if slug in members:
+        return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+    return None
+
+
+def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
+    """Yield (src_qid, dst_qid, data) depends_on triples from a bundle's area
+    edges. Resolved-local edges -> intra-repo. Unresolved registry edges resolve
+    to a member's root area ONLY in multi-repo folds (`members` non-empty and
+    `registry_by_slug` not None); single-repo folds skip them (byte-stable).
+    `examples/`/`tests/` source areas are skipped (scaffolding, not module deps). Pure."""
+    def q(slug, local):
+        return graphstore.qualify_id(project, slug, local)
+    areas = (bundle.get("code_graph", {}) or {}).get("areas") or []
+    for area in areas:
+        if _is_scaffold_area(area.get("id")):
+            continue
+        src = q(repo, "area-{}".format(area["id"]))
+        for e in area.get("edges") or []:
+            to = e.get("to")
+            if e.get("resolved") and to is not None:
+                dst = q(repo, "area-{}".format(to))
+                data = {k: v for k, v in e.items() if k != "to"}
+            elif (not e.get("resolved") and members and registry_by_slug is not None
+                  and e.get("ref")):
+                dst = resolve_registry_member(e["ref"], project, members,
+                                              registry_by_slug)
+                if dst is None:
+                    continue
+                data = {k: v for k, v in e.items() if k != "to"}
+                data["resolved"] = True
+                data["cross_repo"] = True
+            else:
+                continue
+            yield src, dst, (data or None)
+
+
+def fold_bundle(conn, bundle, project=None, repo=None, members=None,
+                registry_by_slug=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
     — re-folding an overlapping window mutates nothing already correct. See
@@ -2312,6 +2487,19 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None):
         if not login:
             continue
         data = {"login": login, **rec}
+        # Project-scoped people aggregate across members. A later member's fold must
+        # UNION its attribution with what an earlier member already stored — a plain
+        # upsert would OVERWRITE, so the last member folded (e.g. one where the
+        # person has no area attribution) would erase another member's. Union keeps
+        # the person node the true project-wide aggregate, independent of fold order
+        # and idempotent (re-folding a member unions a subset -> no change).
+        prior = conn.execute("SELECT data FROM nodes WHERE id=?",
+                             (qperson(login),)).fetchone()
+        if prior and prior[0]:
+            pd = json.loads(prior[0])
+            data["areas"] = sorted(set(rec.get("areas") or []) | set(pd.get("areas") or []))
+            data["modules"] = sorted(set(rec.get("modules") or []) | set(pd.get("modules") or []))
+            data["is_bot"] = bool(rec.get("is_bot")) or bool(pd.get("is_bot"))
         nodes.append((qperson(login), project, "*", "structure", None, data, fetched))
 
     def contrib(login, dst_local, etype):
@@ -2356,14 +2544,15 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None):
             edges.append((qid(c["sha"]), qid("area-{}".format(aid)),
                           "touches", None, None))
 
-    # depends_on (area -> area): the code_graph dependency edges, carrying
-    # {version,transitive,...} on the edge `data`.
-    for e in (bundle.get("code_graph", {}) or {}).get("edges") or []:
-        src, dst = e.get("from"), e.get("to")
-        if src and dst:
-            data = {k: v for k, v in e.items() if k not in ("from", "to")}
-            edges.append((qid("area-{}".format(src)), qid("area-{}".format(dst)),
-                          "depends_on", None, data or None))
+    # depends_on (area -> area): flatten each area's resolved dependency edges
+    # into store edges, carrying {version,transitive,ref,...} on the edge `data`.
+    # Phase 3c stamps edges per area (code_graph.areas[].edges); there is no
+    # top-level edges key. A resolved-local edge -> an intra-repo depends_on; an
+    # unresolved registry edge resolves to a cross-repo member only in multi-repo
+    # folds (see _fold_depends_on, threaded with members + registry_by_slug).
+    for src, dst, data in _fold_depends_on(bundle, project, repo, members,
+                                           registry_by_slug):
+        edges.append((src, dst, "depends_on", None, data or None))
 
     # in_milestone (social -> structure): a PR/issue's milestone title links to
     # the milestone node (keyed on number when present, else title — matching
@@ -2459,12 +2648,15 @@ def main(argv=None):
     graphstore.init_schema(conn)
     if man is not None:
         members = manifest_mod.member_slugs(man)
+        registry_by_slug = {
+            "{}/{}".format(m["owner"], m["repo"]): m.get("registry")
+            for m in man["repos"]}
         for m in man["repos"]:
             member_args = _member_args(args, m, man["from"], man["to"])
             bundle = acquire(member_args, os.environ)
             fold_bundle(conn, bundle, project=man["project"],
                         repo="{}/{}".format(m["owner"], m["repo"]),
-                        members=members)
+                        members=members, registry_by_slug=registry_by_slug)
         sys.stderr.write(
             "folded {} member repo(s) of project '{}' into store {}\n".format(
                 len(man["repos"]), man["project"], args.store))

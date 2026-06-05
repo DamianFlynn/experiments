@@ -39,6 +39,33 @@ store** — `extract` materializes the bundle as a transient view, then `link`/
 `render` consume it (guarded by the golden-bundle equivalence gate). Render with
 the skill (see `SKILL.md`).
 
+### Multi-repo project (Phase 9)
+
+Fold several repos under one logical project via a manifest, then validate/read the
+whole project:
+
+```bash
+python3 gather.py --manifest workspace/manifest.json --store workspace/journey.db
+python3 validate.py workspace/journey.db --project avm-tf-storage
+python3 digest.py --store workspace/journey.db --project avm-tf-storage \
+    --from 2026-03-01 --to 2026-03-31           # merged project view (JSON)
+python3 spotlight.py dependents Azure/terraform-azurerm-avm-res-keyvault-vault \
+    --store workspace/journey.db --project avm-tf-storage   # blast radius
+```
+
+Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
+"registry"?} ] }` — `registry` is an optional exact Terraform registry path; absent,
+a member is matched by the HashiCorp naming convention
+(`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`).
+
+### IaC build env knobs (heavy live runs)
+
+`terraform`/`bicep` edge extraction runs in parallel. For a real AVM Terraform
+constellation (each `terraform init` pulls many registry modules), set a shared
+`TF_PLUGIN_CACHE_DIR` (gather warms it once before the parallel inits). Override the
+defaults when needed: `ACTIVITY_IAC_BUILD_TIMEOUT` (seconds/subprocess, default
+`300`), `ACTIVITY_IAC_MAX_WORKERS` (`8`), `ACTIVITY_IAC_RETRIES` (`1`).
+
 ## Tests
 
 ```bash

@@ -964,5 +964,87 @@ class TestTrainFlowchartMmdc(unittest.TestCase):
             render.validate_with_mmdc(train_paths)  # raises on failure
 
 
+class TestProjectModuleGraph(unittest.TestCase):
+    def test_cross_repo_edge_drawn_with_subgraphs(self):
+        edges = [{"src_repo": "Azure/consumer", "src_area": "main.tf",
+                  "dst_repo": "Azure/kv", "dst_area": "main.tf",
+                  "version": "0.1.0", "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertIn("flowchart", mmd)
+        self.assertIn("Azure/consumer", mmd)
+        self.assertIn("Azure/kv", mmd)
+        self.assertIn("0.1.0", mmd)
+
+    def test_empty_edges_placeholder(self):
+        mmd = render.emit_project_module_graph([])
+        self.assertIn("No cross-repo module dependencies", mmd)
+
+    def test_long_repo_name_not_truncated_in_subgraph_title(self):
+        # _subgraph_label is uncapped: a 46-char AVM repo slug appears in full.
+        long_repo = "Azure/terraform-azurerm-avm-res-keyvault-vault"
+        edges = [{"src_repo": long_repo, "src_area": "main.tf",
+                  "dst_repo": "Azure/x", "dst_area": "main.tf",
+                  "version": None, "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertIn('["{}"]'.format(long_repo), mmd)  # full name, not clipped
+
+    def test_same_area_name_in_two_repos_distinct_nodes(self):
+        # both repos have a 'main.tf' area -> distinct node ids, two subgraphs.
+        edges = [{"src_repo": "Azure/a", "src_area": "main.tf",
+                  "dst_repo": "Azure/b", "dst_area": "main.tf",
+                  "version": None, "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertEqual(mmd.count("subgraph"), 2)
+        self.assertEqual(mmd.count("end"), 2)
+        # one node defined per repo (the m_ node lines), and exactly one arrow.
+        self.assertEqual(sum(1 for ln in mmd.splitlines()
+                             if ln.strip().startswith("m_") and "(" in ln), 2)
+        self.assertEqual(mmd.count("-->"), 1)
+
+    def test_long_repo_prefixes_do_not_collide_into_one_node(self):
+        # Two AVM repos whose {repo}::{area} keys share a >60-char prefix must become
+        # DISTINCT Mermaid nodes. The OLD 60-char-truncation id (_node_id) collapsed
+        # them into one, mis-wiring the cross-repo edge.
+        a = "Azure/terraform-azurerm-avm-res-network-virtualnetwork-peering-alpha"
+        b = "Azure/terraform-azurerm-avm-res-network-virtualnetwork-peering-bravo"
+        # precondition: the old id WOULD have collided (proves the bug is real)
+        self.assertEqual(render._node_id("m", a + "::main.tf"),
+                         render._node_id("m", b + "::main.tf"))
+        edges = [{"src_repo": a, "src_area": "main.tf",
+                  "dst_repo": b, "dst_area": "main.tf",
+                  "version": "1.0.0", "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        node_ids = [ln.strip().split("(")[0] for ln in mmd.splitlines()
+                    if ln.strip().startswith("m_") and "(" in ln]
+        self.assertEqual(len(node_ids), 2)
+        self.assertEqual(len(set(node_ids)), 2)   # distinct, no collision
+        self.assertEqual(mmd.count("subgraph"), 2)
+        self.assertEqual(mmd.count("-->"), 1)
+
+    def test_transitive_only_edge_labelled_transitive(self):
+        edges = [{"src_repo": "r/a", "src_area": "x", "dst_repo": "r/b",
+                  "dst_area": "y", "version": None, "transitive": True,
+                  "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertIn("transitive", mmd)
+
+    def test_intra_repo_chain_node_defined_once(self):
+        # a/app -> a/base and a/base -> a/core: 'a/base' is both dst and src,
+        # all in one repo -> one subgraph, base defined exactly once.
+        edges = [
+            {"src_repo": "Az/a", "src_area": "app", "dst_repo": "Az/a",
+             "dst_area": "base", "version": None, "transitive": False,
+             "cross_repo": False},
+            {"src_repo": "Az/a", "src_area": "base", "dst_repo": "Az/a",
+             "dst_area": "core", "version": None, "transitive": False,
+             "cross_repo": False},
+        ]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertEqual(mmd.count("subgraph"), 1)
+        base_defs = sum(1 for ln in mmd.splitlines()
+                        if ln.strip().startswith("m_") and ln.strip().endswith('("base")'))
+        self.assertEqual(base_defs, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

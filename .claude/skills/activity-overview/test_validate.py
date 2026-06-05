@@ -395,6 +395,45 @@ class TestValidateProject(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no repos"):
             validate.validate_project(conn, "proj", [])
 
+    def _two_member_store_with_distinct_authors(self):
+        # alice is active only in mod-a, bob only in mod-b. People are PROJECT-scoped
+        # so both person nodes exist for the project; a PER-MEMBER no_drift would
+        # flag the "foreign" author as "stored but not derivable" for the other repo.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/mod-a", "Azure/mod-b"}
+        def pr(n, author):
+            return {"number": n, "url": "u/%d" % n, "state": "closed", "merged": True,
+                    "base": "main", "head": "h%d" % n,
+                    "merged_at": "2026-01-1%dT00:00:00Z" % (n % 10),
+                    "created_at": "2026-01-0%dT00:00:00Z" % (n % 10),
+                    "closed_at": "2026-01-1%dT00:00:00Z" % (n % 10),
+                    "closes": [], "crossref_issues": [], "title": "feat", "body": "",
+                    "author": author}
+        for repo, author, num in (("Azure/mod-a", "alice", 1), ("Azure/mod-b", "bob", 2)):
+            b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                          "from": "2026-01-01", "to": "2026-01-31", "base_branch": "main"},
+                 "prs": [pr(num, author)], "issues": [], "commits": [], "code_events": [],
+                 "milestones": [], "releases": [], "code_graph": {"areas": []}}
+            gather.fold_bundle(conn, b, project="proj", repo=repo, members=members)
+        return conn
+
+    def test_per_member_no_drift_does_not_flag_foreign_authors(self):
+        # The real-data failure: validating mod-b must NOT report alice (a mod-a
+        # author, stored project-wide) as "stored but not derivable".
+        conn = self._two_member_store_with_distinct_authors()
+        report = validate.validate_project(conn, "proj",
+                                           ["Azure/mod-a", "Azure/mod-b"])
+        self.assertTrue(report["ok"], report)
+        self.assertTrue(all(r["ok"] for r in report["members"]))
+        # the project-wide people check is present and green
+        names = {c["name"] for c in report["project_checks"]}
+        self.assertIn("no_drift_people", names)
+        self.assertTrue(all(c["ok"] for c in report["project_checks"]))
+        # both authors are stored as project people
+        people = validate._stored_project_people(conn, "proj")
+        self.assertEqual(set(people), {"alice", "bob"})
+
 
 class TestValidateProjectAggregation(unittest.TestCase):
     def test_one_failing_member_makes_aggregate_not_ok(self):

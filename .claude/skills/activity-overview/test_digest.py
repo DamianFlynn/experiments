@@ -9,6 +9,8 @@ import graphstore  # noqa: E402
 import gather  # noqa: E402
 import digest  # noqa: E402
 import validate  # noqa: E402
+import render  # noqa: E402
+import spotlight  # noqa: E402
 
 
 def _seed_two_member_store(conn):
@@ -546,6 +548,99 @@ class TestProjectDigestIntegration(unittest.TestCase):
         self.assertEqual({s["repo"] for s in view["shipped"]},
                          {"Azure/mod-a", "Azure/mod-c"})
         # validate is green across the member set
+        self.assertTrue(validate.validate_project(conn, "proj", repos)["ok"])
+
+
+class TestProjectDependsOn(unittest.TestCase):
+    def test_project_depends_on_lists_cross_repo_edges(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_edges(conn, [
+            ("proj/Azure/consumer#area-main.tf",
+             "proj/Azure/kv#area-main.tf", "depends_on", None,
+             {"version": "0.1.0", "cross_repo": True, "transitive": False}),
+        ])
+        edges = digest.project_depends_on(conn, "proj", ["Azure/consumer", "Azure/kv"])
+        self.assertEqual(len(edges), 1)
+        e = edges[0]
+        self.assertEqual(e["src_repo"], "Azure/consumer")
+        self.assertEqual(e["dst_repo"], "Azure/kv")
+        self.assertEqual(e["src_area"], "main.tf")
+        self.assertEqual(e["dst_area"], "main.tf")
+        self.assertTrue(e["cross_repo"])
+        self.assertEqual(e["version"], "0.1.0")
+
+    def test_intra_repo_edge_is_not_cross_repo_and_src_filter_applies(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_edges(conn, [
+            # intra-repo edge (same repo, no cross_repo flag) -> cross_repo False
+            ("proj/Azure/a#area-modules/app", "proj/Azure/a#area-modules/base",
+             "depends_on", None, {"transitive": True}),
+            # src repo NOT in the requested set -> dropped
+            ("proj/Azure/other#area-main.tf", "proj/Azure/a#area-main.tf",
+             "depends_on", None, None),
+        ])
+        edges = digest.project_depends_on(conn, "proj", ["Azure/a"])
+        self.assertEqual(len(edges), 1)
+        self.assertFalse(edges[0]["cross_repo"])
+        self.assertEqual(edges[0]["transitive"], True)
+        self.assertEqual(edges[0]["src_area"], "modules/app")
+
+
+class TestS4Gate(unittest.TestCase):
+    def test_cross_repo_depends_on_render_and_blast_radius(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/consumer",
+                   "Azure/terraform-azurerm-avm-res-keyvault-vault"}
+        consumer = {
+            "meta": {"owner": "Azure", "repo": "consumer", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                 "edges": [{"to": None, "kind": "module",
+                            "ref": "Azure/avm-res-keyvault-vault/azurerm",
+                            "version": "0.1.0", "transitive": False,
+                            "provider": "terraform", "resolved": False}]}]}}
+        kv = {"meta": {"owner": "Azure",
+                       "repo": "terraform-azurerm-avm-res-keyvault-vault",
+                       "from": "2026-01-01", "to": "2026-01-31",
+                       "base_branch": "main"},
+              "prs": [], "issues": [], "commits": [], "code_events": [],
+              "milestones": [], "releases": [],
+              "code_graph": {"provider": "directory", "areas": [
+                  {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                   "edges": []}]}}
+        gather.fold_bundle(conn, consumer, project="proj", repo="Azure/consumer",
+                           members=members, registry_by_slug={})
+        gather.fold_bundle(conn, kv, project="proj",
+                           repo="Azure/terraform-azurerm-avm-res-keyvault-vault",
+                           members=members, registry_by_slug={})
+
+        frm, to = "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"
+        repos = graphstore.project_repos(conn, "proj")
+        view = digest.build_project_view(conn, "proj", repos, frm, to)
+
+        xrepo = [e for e in view["module_edges"] if e["cross_repo"]]
+        self.assertEqual(len(xrepo), 1)
+        self.assertEqual(xrepo[0]["src_repo"], "Azure/consumer")
+        self.assertEqual(xrepo[0]["dst_repo"],
+                         "Azure/terraform-azurerm-avm-res-keyvault-vault")
+        self.assertEqual(xrepo[0]["version"], "0.1.0")   # carried through fold
+        self.assertEqual(xrepo[0]["transitive"], False)
+
+        mmd = render.emit_project_module_graph(view["module_edges"])
+        self.assertIn("Azure/consumer", mmd)
+        self.assertIn("terraform-azurerm-avm-res-keyvault-vault", mmd)
+
+        res = spotlight.member_dependents(
+            conn, "proj", "Azure/terraform-azurerm-avm-res-keyvault-vault")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["dependents"], ["Azure/consumer"])
+
         self.assertTrue(validate.validate_project(conn, "proj", repos)["ok"])
 
 

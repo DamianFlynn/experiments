@@ -33,9 +33,15 @@ def _people_bundle():
             pr["comments_list"] = [{"author": "erin", "body": "lgtm"}]
             pr["review_comments"] = [{"author": "carol", "body": "nit"}]
     # a code_graph area dependency edge (firewall-policy depends on docs).
-    b["code_graph"]["edges"] = [
-        {"from": "avm/res/network/firewall-policy", "to": "docs",
-         "version": "1.0.0", "transitive": False}]
+    # Phase 3c format: edges are stamped per area (areas[].edges), not top-level.
+    for area in b["code_graph"]["areas"]:
+        if area["id"] == "avm/res/network/firewall-policy":
+            area["edges"] = [
+                {"to": "docs", "kind": "module", "ref": "./docs",
+                 "version": "1.0.0", "transitive": False,
+                 "provider": "terraform", "resolved": True}]
+        else:
+            area.setdefault("edges", [])
     return b
 
 

@@ -748,6 +748,20 @@ class TestDirectoryCodeAreaProvider(unittest.TestCase):
                                       gather.DEFAULT_AREA_PATTERNS),
             "infra/network")
 
+    def test_repo_root_tf_files_collapse_to_one_main_tf_area(self):
+        # A Terraform root module keeps many root .tf files; they must form ONE
+        # area ("main.tf"), not one area per file (the old fragmentation bug).
+        for f in ("main.tf", "variables.tf", "outputs.tf", "locals.tf", "terraform.tf"):
+            self.assertEqual(
+                gather.classify_code_area(f, gather.DEFAULT_AREA_PATTERNS),
+                "main.tf", f)
+        areas = gather.build_directory_areas(
+            ["main.tf", "variables.tf", "outputs.tf", "locals.tf"],
+            gather.DEFAULT_AREA_PATTERNS)["areas"]
+        self.assertEqual([a["id"] for a in areas], ["main.tf"])
+        self.assertEqual(areas[0]["paths"],
+                         ["locals.tf", "main.tf", "outputs.tf", "variables.tf"])
+
     def test_generic_fallback_is_top_two_segments(self):
         self.assertEqual(
             gather.classify_code_area("src/app/handlers/auth.py",
@@ -1317,6 +1331,21 @@ class TestTerraformParsers(unittest.TestCase):
         pairs = gather.parse_terraform_graph(self.dot)
         self.assertFalse([p for p in pairs if p[0] == p[1] and p[0] is not None])
 
+    def test_graph_parses_modern_unprefixed_dot(self):
+        # Modern `terraform graph` (>=~1.x) omits the `[root] ` node prefix and
+        # uses fully-qualified resource node names; pairs must still be recovered.
+        dot = (
+            'digraph G {\n'
+            '  "azurerm_resource_group.this" -> "module.vnet.azapi_resource.vnet";\n'
+            '  "module.vnet.azapi_resource.vnet" -> "module.naming.random_string.x";\n'
+            '  "module.vnet.azapi_resource.vnet" -> "module.vnet.random_uuid.t";\n'
+            '}\n'
+        )
+        pairs = gather.parse_terraform_graph(dot)
+        self.assertIn((None, "vnet"), pairs)          # root -> module.vnet
+        self.assertIn(("vnet", "naming"), pairs)       # cross-module edge
+        self.assertNotIn(("vnet", "vnet"), pairs)      # same-module self-edge dropped
+
     def test_empty_inputs(self):
         self.assertEqual(gather.parse_terraform_module_blocks(""), {})
         self.assertEqual(gather.parse_terraform_graph(""), [])
@@ -1376,6 +1405,30 @@ class TestBuildTerraformEdges(unittest.TestCase):
         self.assertEqual(
             gather.build_terraform_edges("", "", self.base, set(),
                                          gather.DEFAULT_AREA_PATTERNS), [])
+
+    def test_local_source_to_repo_root_resolves_to_main_tf(self):
+        # An example at examples/<name>/ with `source = "../.."` points at the repo
+        # ROOT module. It must resolve to the root area id "main.tf" (the same id the
+        # root files classify to) -> NOT a phantom "." area (the dangling-edge bug).
+        tf = 'module "this" { source = "../.." }\n'
+        dot = 'digraph {\n"x" -> "module.this.y"\n}\n'
+        edges = gather.build_terraform_edges(
+            tf, dot, "examples/default/main.tf", set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["to"], "main.tf")
+        self.assertTrue(edges[0]["resolved"])
+
+    def test_local_source_escaping_repo_is_unresolved_not_phantom(self):
+        # A source resolving ABOVE the repo root cannot be a repo area -> to=None,
+        # resolved=False (no dangling phantom), identity kept in ref.
+        tf = 'module "up" { source = "../../.." }\n'
+        dot = 'digraph {\n"x" -> "module.up.y"\n}\n'
+        edges = gather.build_terraform_edges(
+            tf, dot, "examples/default/main.tf", set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(len(edges), 1)
+        self.assertIsNone(edges[0]["to"])
+        self.assertFalse(edges[0]["resolved"])
+        self.assertEqual(edges[0]["ref"], "../../..")
 
 
 class TestExtractIacEdges(unittest.TestCase):
@@ -1445,6 +1498,135 @@ class TestExtractIacEdges(unittest.TestCase):
         prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
         self.assertTrue(prod["edges"])
         self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
+
+    def test_terraform_module_source_in_sibling_file_resolves(self):
+        # An AVM consumer declares its `module` blocks across main.<topic>.tf files,
+        # not main.tf. Extraction must read the WHOLE dir, so a source in a sibling
+        # file still resolves (the entrypoint-only read missed it -> 0 edges).
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            with open(os.path.join(clone, "main.tf"), "w") as fh:
+                fh.write('terraform { required_version = ">= 1.0" }\n')
+            with open(os.path.join(clone, "main.networking.tf"), "w") as fh:
+                fh.write('module "vnet" {\n'
+                         '  source  = "Azure/avm-res-network-virtualnetwork/azurerm"\n'
+                         '  version = "0.7.1"\n}\n')
+            dot = ('digraph {\n'
+                   '"azurerm_x.a" -> "module.vnet.azurerm_virtual_network.this"\n}\n')
+
+            def run(cmd, **kw):
+                return dot if cmd[-1] == "graph" else ""
+
+            cg = {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf",
+                 "paths": ["main.tf", "main.networking.tf"], "edges": []}]}
+            gather.extract_iac_edges(
+                cg, clone,
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=gather._read_text_file)
+            edges = cg["areas"][0]["edges"]
+            refs = {e["ref"] for e in edges}
+            self.assertIn("Azure/avm-res-network-virtualnetwork/azurerm", refs)
+            vnet = next(e for e in edges
+                        if e["ref"] == "Azure/avm-res-network-virtualnetwork/azurerm")
+            self.assertEqual(vnet["version"], "0.7.1")
+
+    def test_terraform_prewarm_runs_once_before_parallel_with_shared_cache(self):
+        # With a shared TF_PLUGIN_CACHE_DIR + parallel workers, a single serial
+        # warm-up `init` runs BEFORE the per-area builds so the parallel inits are
+        # cache hits, not a write race.
+        import unittest.mock as mock
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+        calls = []
+        lock = __import__("threading").Lock()
+
+        def run(cmd, **kw):
+            with lock:
+                calls.append(cmd)
+            return dot if cmd[-1] == "graph" else ""
+
+        cg = {"provider": "directory", "areas": [
+            {"id": "modules/a", "label": "a", "paths": ["modules/a/main.tf"],
+             "edges": []},
+            {"id": "modules/b", "label": "b", "paths": ["modules/b/main.tf"],
+             "edges": []},
+        ]}
+        with mock.patch.dict(os.environ, {"TF_PLUGIN_CACHE_DIR": "/tmp/x"}):
+            gather.extract_iac_edges(
+                cg, "clone",
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=lambda _p: tf, max_workers=4)
+        # first recorded call is the serial warm-up init (an `init`, never `graph`)
+        self.assertIn("init", calls[0])
+        self.assertEqual(calls[0][-1], "-input=false")
+        # one extra init beyond the two per-area inits (the warm-up)
+        self.assertEqual(sum(1 for c in calls if "init" in c), 3)
+
+    def test_no_prewarm_without_shared_cache(self):
+        # Without TF_PLUGIN_CACHE_DIR there is no race to avoid -> no warm-up.
+        import unittest.mock as mock
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+        calls = []
+        lock = __import__("threading").Lock()
+
+        def run(cmd, **kw):
+            with lock:
+                calls.append(cmd)
+            return dot if cmd[-1] == "graph" else ""
+
+        cg = {"provider": "directory", "areas": [
+            {"id": "modules/a", "label": "a", "paths": ["modules/a/main.tf"],
+             "edges": []}]}
+        env = {k: v for k, v in os.environ.items() if k != "TF_PLUGIN_CACHE_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            gather.extract_iac_edges(
+                cg, "clone",
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=lambda _p: tf, max_workers=4)
+        self.assertEqual(sum(1 for c in calls if "init" in c), 1)  # one area, no warm-up
+
+    def test_scaffold_areas_are_skipped_not_built(self):
+        # examples/ and tests/ areas must NOT be built (no terraform run) — they are
+        # marked skipped, so the heavy AVM example stacks are never init'd.
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+        built_dirs = []
+
+        def run(cmd, **kw):
+            if cmd[-1] == "graph":
+                built_dirs.append(cmd[1])   # the -chdir=... arg
+                return dot
+            built_dirs.append(cmd[1])
+            return ""
+
+        cg = {"provider": "directory", "areas": [
+            {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"], "edges": []},
+            {"id": "examples/default", "label": "default",
+             "paths": ["examples/default/main.tf"], "edges": []},
+            {"id": "tests/e2e", "label": "e2e",
+             "paths": ["tests/e2e/main.tf"], "edges": []},
+        ]}
+        cg = gather.extract_iac_edges(
+            cg, "clone",
+            which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+            run=run, read_text=lambda _p: tf)
+        by_id = {a["id"]: a for a in cg["areas"]}
+        self.assertEqual(by_id["main.tf"]["edges_status"], "resolved")
+        self.assertEqual(by_id["examples/default"]["edges_status"], "skipped")
+        self.assertEqual(by_id["tests/e2e"]["edges_status"], "skipped")
+        self.assertEqual(by_id["examples/default"]["edges"], [])
+        # terraform was invoked ONLY for the root module, never for scaffold dirs
+        self.assertFalse(any("examples/default" in d or "tests/e2e" in d
+                             for d in built_dirs))
+        self.assertEqual(cg["edge_extraction"]["skipped"], 2)
 
 
 class TestIacEdgeHardening(unittest.TestCase):
@@ -2373,6 +2555,266 @@ class TestMultiRepoIntegration(unittest.TestCase):
         # the cross-repo train: B's issue reaches A's PR over the spine
         res = graphstore.traverse_spine(conn, ["avm/Azure/mod-b#issue-3"])
         self.assertIn("avm/Azure/mod-a#pr-10", res["reached"])
+
+
+class TestFoldDependsOnFlatten(unittest.TestCase):
+    def test_resolved_area_edges_become_store_depends_on(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "modules/app", "label": "app", "paths": ["modules/app/main.tf"],
+                 "edges": [{"to": "modules/base", "kind": "module", "ref": "../base",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "modules/base", "label": "base",
+                 "paths": ["modules/base/main.tf"], "edges": []},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
+        deps = graphstore.get_edges(conn, "p/Az/r#area-modules/app",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(len(deps), 1)
+        self.assertEqual(deps[0]["dst_id"], "p/Az/r#area-modules/base")
+        self.assertEqual(deps[0]["data"].get("transitive"), False)
+
+    def test_unresolved_registry_edge_dropped_in_single_repo(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                 "edges": [{"to": None, "kind": "module",
+                            "ref": "Azure/avm-res-keyvault-vault/azurerm",
+                            "version": "0.1.0", "transitive": False,
+                            "provider": "terraform", "resolved": False}]},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
+        deps = graphstore.get_edges(conn, "p/Az/r#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(deps, [])
+
+    def test_transitive_flag_preserved(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "a", "label": "a", "paths": ["a/main.tf"],
+                 "edges": [{"to": "b", "kind": "module", "ref": "../b",
+                            "version": "2.0", "transitive": True,
+                            "provider": "terraform", "resolved": True},
+                           {"to": "c", "kind": "module", "ref": "../c",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "b", "label": "b", "paths": ["b/main.tf"], "edges": []},
+                {"id": "c", "label": "c", "paths": ["c/main.tf"], "edges": []},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
+        deps = graphstore.get_edges(conn, "p/Az/r#area-a", direction="out",
+                                    edge_types=["depends_on"])
+        by_dst = {d["dst_id"]: d for d in deps}
+        self.assertEqual(set(by_dst), {"p/Az/r#area-b", "p/Az/r#area-c"})
+        self.assertEqual(by_dst["p/Az/r#area-b"]["data"]["transitive"], True)
+        self.assertEqual(by_dst["p/Az/r#area-b"]["data"]["version"], "2.0")
+
+    def test_examples_and_tests_areas_are_excluded_from_depends_on(self):
+        # examples/ and tests/ are module test/doc scaffolding: their module blocks
+        # (here: the example referencing the root module, and a test referencing
+        # another registry module) must NOT become stored depends_on edges. The
+        # root module's own edge IS kept.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Az/r", "Az/other"}
+        registry_by_slug = {"Az/other": "Other/avm-res-thing/azurerm"}
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                 "edges": [{"to": "modules/x", "kind": "module", "ref": "./modules/x",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "modules/x", "label": "x", "paths": ["modules/x/main.tf"],
+                 "edges": []},
+                {"id": "examples/default", "label": "default",
+                 "paths": ["examples/default/main.tf"],
+                 "edges": [{"to": "main.tf", "kind": "module", "ref": "../..",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "tests/e2e", "label": "e2e", "paths": ["tests/e2e/main.tf"],
+                 "edges": [{"to": None, "kind": "module",
+                            "ref": "Other/avm-res-thing/azurerm", "version": "1.0",
+                            "transitive": False, "provider": "terraform",
+                            "resolved": False}]},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="proj", repo="Az/r",
+                           members=members, registry_by_slug=registry_by_slug)
+        # the root module's intra-repo edge survives
+        root = graphstore.get_edges(conn, "proj/Az/r#area-main.tf", direction="out",
+                                    edge_types=["depends_on"])
+        self.assertEqual([d["dst_id"] for d in root], ["proj/Az/r#area-modules/x"])
+        # the example's edge to the root module is NOT stored
+        ex = graphstore.get_edges(conn, "proj/Az/r#area-examples/default",
+                                  direction="out", edge_types=["depends_on"])
+        self.assertEqual(ex, [])
+        # the test's cross-repo registry ref is NOT resolved into a member edge
+        te = graphstore.get_edges(conn, "proj/Az/r#area-tests/e2e",
+                                  direction="out", edge_types=["depends_on"])
+        self.assertEqual(te, [])
+
+    def test_is_scaffold_area(self):
+        self.assertTrue(gather._is_scaffold_area("examples/default"))
+        self.assertTrue(gather._is_scaffold_area("tests/e2e"))
+        self.assertTrue(gather._is_scaffold_area("modules/x/examples/foo"))
+        self.assertFalse(gather._is_scaffold_area("main.tf"))
+        self.assertFalse(gather._is_scaffold_area("modules/examples-helper"))
+        self.assertFalse(gather._is_scaffold_area(None))
+
+    def test_resolved_true_but_to_none_is_dropped(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "a", "label": "a", "paths": ["a/main.tf"],
+                 "edges": [{"to": None, "kind": "module", "ref": "x",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]}]},
+        }
+        # even WITH members+registry available, a resolved/to=None edge is dropped
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r",
+                           members={"Az/r", "Az/other"}, registry_by_slug={})
+        self.assertEqual(graphstore.get_edges(conn, "p/Az/r#area-a",
+                         direction="out", edge_types=["depends_on"]), [])
+
+
+class TestRegistryResolution(unittest.TestCase):
+    def test_parse_registry_source_plain(self):
+        self.assertEqual(
+            gather.parse_registry_source("Azure/avm-res-keyvault-vault/azurerm"),
+            ("Azure", "avm-res-keyvault-vault", "azurerm"))
+
+    def test_parse_registry_source_with_host_and_submodule(self):
+        self.assertEqual(
+            gather.parse_registry_source(
+                "registry.terraform.io/Azure/avm-res-keyvault-vault/azurerm//sub"),
+            ("Azure", "avm-res-keyvault-vault", "azurerm"))
+
+    def test_parse_registry_source_rejects_non_registry(self):
+        self.assertIsNone(gather.parse_registry_source("./local"))
+        self.assertIsNone(gather.parse_registry_source("two/parts"))
+
+    def test_parse_registry_source_rejects_vcs_host_shorthand(self):
+        # A 3-segment source whose first segment is a HOST (contains a dot) is VCS
+        # shorthand (github.com/org/repo), NOT a registry triple -> must be None,
+        # so it is never mis-resolved to a member via the naming convention.
+        self.assertIsNone(gather.parse_registry_source("github.com/Azure/foo"))
+        self.assertIsNone(gather.parse_registry_source("example.com/a/b//sub"))
+        # a real registry namespace has no dot -> still parses
+        self.assertEqual(gather.parse_registry_source("Azure/avm-res-x/azurerm"),
+                         ("Azure", "avm-res-x", "azurerm"))
+
+    def test_resolve_exact_registry_match_wins(self):
+        members = {"Azure/kv-repo"}
+        reg = {"Azure/kv-repo": "Azure/avm-res-keyvault-vault/azurerm"}
+        dst = gather.resolve_registry_member(
+            "Azure/avm-res-keyvault-vault/azurerm", "p", members, reg)
+        self.assertEqual(dst, "p/Azure/kv-repo#area-main.tf")
+
+    def test_resolve_convention_match(self):
+        members = {"Azure/terraform-azurerm-avm-res-keyvault-vault"}
+        dst = gather.resolve_registry_member(
+            "Azure/avm-res-keyvault-vault/azurerm", "p", members, {})
+        self.assertEqual(
+            dst, "p/Azure/terraform-azurerm-avm-res-keyvault-vault#area-main.tf")
+
+    def test_resolve_no_match_returns_none(self):
+        self.assertIsNone(gather.resolve_registry_member(
+            "Hashicorp/consul/aws", "p", {"Azure/other"}, {}))
+
+    def test_exact_wins_over_convention_peer(self):
+        members = {"Azure/custom-kv",
+                   "Azure/terraform-azurerm-avm-res-keyvault-vault"}
+        reg = {"Azure/custom-kv": "Azure/avm-res-keyvault-vault/azurerm"}
+        dst = gather.resolve_registry_member(
+            "Azure/avm-res-keyvault-vault/azurerm", "p", members, reg)
+        self.assertEqual(dst, "p/Azure/custom-kv#area-main.tf")  # exact beats convention
+
+
+class TestCrossRepoDependsOn(unittest.TestCase):
+    def _member_a(self):
+        return {"meta": {"owner": "Azure", "repo": "consumer", "from": "2026-01-01",
+                         "to": "2026-01-31", "base_branch": "main"},
+                "prs": [], "issues": [], "commits": [], "code_events": [],
+                "milestones": [], "releases": [],
+                "code_graph": {"provider": "directory", "areas": [
+                    {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                     "edges": [{"to": None, "kind": "module",
+                                "ref": "Azure/avm-res-keyvault-vault/azurerm",
+                                "version": "0.1.0", "transitive": False,
+                                "provider": "terraform", "resolved": False}]}]}}
+
+    def test_fold_emits_cross_repo_depends_on_via_convention(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/consumer",
+                   "Azure/terraform-azurerm-avm-res-keyvault-vault"}
+        gather.fold_bundle(conn, self._member_a(), project="proj",
+                           repo="Azure/consumer", members=members,
+                           registry_by_slug={})
+        deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(len(deps), 1)
+        self.assertEqual(
+            deps[0]["dst_id"],
+            "proj/Azure/terraform-azurerm-avm-res-keyvault-vault#area-main.tf")
+        self.assertEqual(deps[0]["data"].get("cross_repo"), True)
+        self.assertEqual(deps[0]["data"].get("version"), "0.1.0")
+
+    def test_fold_emits_cross_repo_depends_on_via_exact_registry(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/consumer", "Azure/kv"}
+        reg = {"Azure/kv": "Azure/avm-res-keyvault-vault/azurerm"}
+        gather.fold_bundle(conn, self._member_a(), project="proj",
+                           repo="Azure/consumer", members=members,
+                           registry_by_slug=reg)
+        deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(len(deps), 1)
+        self.assertEqual(deps[0]["dst_id"], "proj/Azure/kv#area-main.tf")
+
+    def test_fold_drops_registry_edge_when_target_not_a_member(self):
+        # the convention target repo is absent from members -> no cross-repo edge.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, self._member_a(), project="proj",
+                           repo="Azure/consumer",
+                           members={"Azure/consumer", "Azure/unrelated"},
+                           registry_by_slug={})
+        deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(deps, [])
 
 
 if __name__ == "__main__":

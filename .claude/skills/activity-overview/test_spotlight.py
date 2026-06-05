@@ -1050,5 +1050,77 @@ class TestWindowedGapWithPhantom(unittest.TestCase):
         self.assertEqual(gap_ids.get(rfc), "outside_window")  # honest pointer
 
 
+class TestMemberDependents(unittest.TestCase):
+    def _seed(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_nodes(conn, [
+            ("proj/Az/B#area-main.tf", "proj", "Az/B", "structure", None,
+             {"id": "area-main.tf"}, None),
+            ("proj/Az/A#area-main.tf", "proj", "Az/A", "structure", None,
+             {"id": "area-main.tf"}, None),
+            ("proj/Az/C#area-main.tf", "proj", "Az/C", "structure", None,
+             {"id": "area-main.tf"}, None),
+        ])
+        graphstore.upsert_edges(conn, [
+            ("proj/Az/A#area-main.tf", "proj/Az/B#area-main.tf", "depends_on",
+             None, {"cross_repo": True}),
+            ("proj/Az/C#area-main.tf", "proj/Az/A#area-main.tf", "depends_on",
+             None, {"cross_repo": True}),
+        ])
+        return conn
+
+    def test_blast_radius_from_b_returns_a_and_c(self):
+        conn = self._seed()
+        res = spotlight.member_dependents(conn, "proj", "Az/B")
+        self.assertEqual(res["focus"], "Az/B")
+        self.assertEqual(set(res["dependents"]), {"Az/A", "Az/C"})  # transitive
+
+    def test_no_dependents(self):
+        conn = self._seed()
+        res = spotlight.member_dependents(conn, "proj", "Az/C")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["dependents"], [])
+
+    def test_unknown_member_is_needs_gather(self):
+        conn = self._seed()
+        res = spotlight.member_dependents(conn, "proj", "Az/nope")
+        self.assertEqual(res["status"], "needs_gather")
+        self.assertIn("guidance", res)
+
+    def test_cycle_terminates_and_excludes_self(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_nodes(conn, [
+            ("proj/Az/A#area-main.tf", "proj", "Az/A", "structure", None,
+             {"id": "area-main.tf"}, None),
+            ("proj/Az/B#area-main.tf", "proj", "Az/B", "structure", None,
+             {"id": "area-main.tf"}, None),
+        ])
+        graphstore.upsert_edges(conn, [   # mutual dependency A<->B
+            ("proj/Az/A#area-main.tf", "proj/Az/B#area-main.tf", "depends_on",
+             None, None),
+            ("proj/Az/B#area-main.tf", "proj/Az/A#area-main.tf", "depends_on",
+             None, None),
+        ])
+        res = spotlight.member_dependents(conn, "proj", "Az/B")
+        self.assertEqual(res["dependents"], ["Az/A"])  # terminates; no self
+
+    def test_intra_repo_dep_does_not_self_report(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_nodes(conn, [
+            ("proj/Az/A#area-app", "proj", "Az/A", "structure", None,
+             {"id": "area-app"}, None),
+            ("proj/Az/A#area-base", "proj", "Az/A", "structure", None,
+             {"id": "area-base"}, None),
+        ])
+        graphstore.upsert_edges(conn, [   # app depends_on base, same repo
+            ("proj/Az/A#area-app", "proj/Az/A#area-base", "depends_on", None, None),
+        ])
+        res = spotlight.member_dependents(conn, "proj", "Az/A")
+        self.assertEqual(res["dependents"], [])  # member never in its own radius
+
+
 if __name__ == "__main__":
     unittest.main()
