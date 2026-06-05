@@ -1050,5 +1050,37 @@ class TestWindowedGapWithPhantom(unittest.TestCase):
         self.assertEqual(gap_ids.get(rfc), "outside_window")  # honest pointer
 
 
+class TestMemberDependents(unittest.TestCase):
+    def _seed(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_nodes(conn, [
+            ("proj/Az/B#area-main.tf", "proj", "Az/B", "structure", None,
+             {"id": "area-main.tf"}, None),
+            ("proj/Az/A#area-main.tf", "proj", "Az/A", "structure", None,
+             {"id": "area-main.tf"}, None),
+            ("proj/Az/C#area-main.tf", "proj", "Az/C", "structure", None,
+             {"id": "area-main.tf"}, None),
+        ])
+        graphstore.upsert_edges(conn, [
+            ("proj/Az/A#area-main.tf", "proj/Az/B#area-main.tf", "depends_on",
+             None, {"cross_repo": True}),
+            ("proj/Az/C#area-main.tf", "proj/Az/A#area-main.tf", "depends_on",
+             None, {"cross_repo": True}),
+        ])
+        return conn
+
+    def test_blast_radius_from_b_returns_a_and_c(self):
+        conn = self._seed()
+        res = spotlight.member_dependents(conn, "proj", "Az/B")
+        self.assertEqual(res["focus"], "Az/B")
+        self.assertEqual(set(res["dependents"]), {"Az/A", "Az/C"})  # transitive
+
+    def test_no_dependents(self):
+        conn = self._seed()
+        res = spotlight.member_dependents(conn, "proj", "Az/C")
+        self.assertEqual(res["dependents"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

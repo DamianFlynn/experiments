@@ -998,6 +998,36 @@ def _scope_label(scope):
     return "{}..{}".format(scope.get("from") or "", scope.get("to") or "")
 
 
+def member_dependents(conn, project, member):
+    """Blast radius: the project members whose areas transitively depend on
+    `member`'s areas, via inbound depends_on edges (A depends_on B => edge A->B,
+    so 'who depends on B' walks in-edges). Returns a cited envelope. Deterministic.
+    `member` is an 'owner/repo' slug."""
+    seed_areas = [n["id"] for n in graphstore.repo_nodes(
+        conn, project, member, "structure")
+        if graphstore.parse_id(n["id"])["local"].startswith("area-")]
+    seen, frontier, dependents = set(seed_areas), list(seed_areas), set()
+    while frontier:
+        nxt = []
+        for nid in frontier:
+            for e in graphstore.get_edges(conn, nid, direction="in",
+                                          edge_types=["depends_on"]):
+                src = e["src_id"]
+                if src in seen:
+                    continue
+                seen.add(src)
+                nxt.append(src)
+                dep_repo = graphstore.parse_id(src)["scope"].split("/", 1)[1]
+                if dep_repo != member:
+                    dependents.add(dep_repo)
+        frontier = nxt
+    return {
+        "query": "dependents", "focus": member, "focus_kind": "member",
+        "project": project, "status": "ok",
+        "dependents": sorted(dependents),
+    }
+
+
 def _render_train_md(t):
     """One delivery train as deterministic markdown: outcome badge + the
     focus's touchpoints, then the cited spine timeline."""
@@ -1150,11 +1180,21 @@ def _render_grep_md(res):
     return "\n".join(lines).rstrip()
 
 
+def _render_dependents_md(res):
+    deps = res.get("dependents") or []
+    head = "# Blast radius — `{}`\n".format(res["focus"])
+    if not deps:
+        return head + "\nNothing in the project depends on this member.\n"
+    return head + "\nMembers that (transitively) depend on it:\n\n" + "\n".join(
+        "- `{}`".format(d) for d in deps) + "\n"
+
+
 _RENDERERS = {
     "person": _render_person_md,
     "symbol": _render_symbol_md,
     "subsystem": _render_subsystem_md,
     "grep": _render_grep_md,
+    "dependents": _render_dependents_md,
 }
 
 
@@ -1234,6 +1274,8 @@ def main(argv=None):
         res = text_mining(conn, project, args.args[0],
                           ts_from=args.ts_from, ts_to=args.ts_to,
                           backfill=backfill, complete_budget=cb)
+    elif args.query == "dependents":
+        res = member_dependents(conn, project, args.args[0])
     conn.close()
 
     if args.md:
