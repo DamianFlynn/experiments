@@ -123,13 +123,27 @@ W("")
 for m in view["members"]:
     W("- [`{}`](https://github.com/{})".format(m["repo"], m["repo"]))
 W("")
-W("> ⚠️ **Known gap.** One in-window commit per member sat at the shallow-clone "
-  "boundary, so its whole-tree phantom diff was dropped (visible in "
-  "`meta.boundary_dropped_commits`). Code-level ledgers (feature changes / "
-  "content lifecycle) are therefore complete only for "
-  "`terraform-azurerm-avm-ptn-aiml-landing-zone`; the two resource modules' "
-  "in-window merges were `pre-commit` chores whose diffs fell on that boundary. "
-  "Widen `CLONE_MARGIN_DAYS` to recover them.")
+# Data-driven completeness note: read each member's meta.boundary_dropped_commits.
+# A wider ACTIVITY_CLONE_MARGIN_DAYS at gather time recovers these; when none
+# remain, the report states the ledgers are complete instead of warning.
+_dropped = {m["repo"]: (m["bundle"].get("meta") or {}).get("boundary_dropped_commits", [])
+            for m in view["members"]}
+_with_gap = {r: d for r, d in _dropped.items() if d}
+if _with_gap:
+    detail = "; ".join("`{}` ({})".format(short(r), ", ".join(c[:9] for c in d))
+                       for r, d in _with_gap.items())
+    W("> ⚠️ **Known gap.** {} in-window commit(s) sat at the shallow-clone "
+      "boundary, so their whole-tree phantom diffs were dropped (visible in "
+      "`meta.boundary_dropped_commits`): {}. Code-level ledgers (feature changes "
+      "/ content lifecycle) are incomplete for those members. Widen the clone "
+      "margin (`ACTIVITY_CLONE_MARGIN_DAYS`) at gather time to recover "
+      "them.".format(sum(len(d) for d in _with_gap.values()), detail))
+else:
+    W("> ✅ **Completeness.** No in-window commit landed on the shallow-clone "
+      "boundary (`meta.boundary_dropped_commits` is empty for every member), so "
+      "the code-level ledgers (feature changes / content lifecycle) are complete "
+      "across the constellation. Gathered with a widened clone margin "
+      "(`ACTIVITY_CLONE_MARGIN_DAYS`).")
 W("")
 
 
