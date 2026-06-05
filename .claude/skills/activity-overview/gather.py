@@ -1144,6 +1144,111 @@ def parse_terraform_graph(dot_text):
     return sorted(pairs, key=lambda p: (p[0] or "", p[1]))
 
 
+def _resolve_tf_module_source(name, sources, bodies, base_dir, patterns):
+    """Resolve one terraform `module "<name>"` block to (to_area|None, ref|None,
+    version). A LOCAL source (`./` or `/`) maps to a repo area id (via
+    classify_code_area, relative to `base_dir`) -> `to`=area; a REGISTRY/external
+    source can't map to a repo area so `to`=None with the source kept in `ref`
+    (+ pinned `version`); `ref`=None means a module block with no source. Pure.
+    Shared by the DOT-driven build_terraform_edges and the static whole-tree scan."""
+    src = sources.get(name)
+    if not src:
+        return None, None, None
+    if src.startswith(".") or src.startswith("/"):
+        joined = os.path.normpath(os.path.join(base_dir, src))
+        if joined == os.pardir or joined.startswith(os.pardir + os.sep):
+            # escapes the repo (e.g. ../../.. above root): unresolvable to a
+            # repo area -> external (to=None), never a phantom dangling area.
+            return None, src, None
+        # normpath('.') is the repo root; classify it the same way root files
+        # are (-> "main.tf"), so a local source pointing at the root module
+        # resolves to the SAME area id as the root module's own files.
+        rel = "" if joined == os.curdir else joined
+        area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
+            or rel or "main.tf"
+        return area, src, None
+    vm = _TF_VERSION_RE.search(bodies.get(name, ""))
+    return None, src, (vm.group("ver") if vm else None)  # external: to=None, ref=src
+
+
+def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
+                                    read_text=None):
+    """Statically discover EVERY terraform module area in the clone tree and its
+    `module {source=}` dependency edges, WITHOUT terraform init (source-parse only).
+
+    The directory provider only sees in-window-CHANGED paths, so the DOT-driven
+    extract_iac_edges resolves edges only for module areas touched in the window —
+    a blast-radius graph that shrinks/grows with churn. This scan reads the whole
+    tracked tree so the module-dependency graph reflects the repo's actual module
+    structure regardless of in-window activity. Every statically-parsed block is a
+    DIRECT edge (no DOT transitivity), shaped exactly like build_terraform_edges'
+    output. Scaffold areas (examples/tests) are skipped. Returns
+    {area_id: {"paths": [...], "edges": [...]}}. `list_files`/`read_text` are
+    injectable for offline tests; defaults list tracked *.tf via git + read disk."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    if list_files is None:
+        def list_files():
+            return run_git(["git", "-C", clone_dir, "ls-files"]).splitlines()
+    if read_text is None:
+        def read_text(rel):
+            return _read_text_file(os.path.join(clone_dir, rel))
+
+    by_area = {}
+    for rel in list_files():
+        if not rel.endswith(".tf"):                # only terraform sources
+            continue
+        aid = classify_code_area(rel, patterns)
+        if aid is None or _is_scaffold_area(aid):
+            continue
+        by_area.setdefault(aid, []).append(rel)
+
+    out = {}
+    for aid, paths in by_area.items():
+        paths = sorted(set(paths))
+        entry = next((p for p in paths if p == "main.tf" or p.endswith("/main.tf")),
+                     paths[0])
+        base_dir = os.path.dirname(entry)
+        text = "\n".join(read_text(p) for p in paths)
+        bodies = _terraform_module_bodies(text)
+        sources = parse_terraform_module_blocks(text)
+        edges, seen = [], set()
+        for name in sources:                       # only blocks WITH a source
+            to, ref, version = _resolve_tf_module_source(name, sources, bodies,
+                                                          base_dir, patterns)
+            if ref is None or (to, ref) in seen:
+                continue
+            seen.add((to, ref))
+            edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
+                          "transitive": False, "provider": "terraform",
+                          "resolved": to is not None})
+        out[aid] = {"paths": paths,
+                    "edges": sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))}
+    return out
+
+
+def merge_structural_areas(code_graph, structural):
+    """Union the static structural terraform areas/edges into `code_graph`
+    (multi-repo blast-radius augmentation). An in-window area keeps its DOT-derived
+    edges and gains any structural edge not already present (dedup by (to, ref));
+    module areas the in-window walk never saw are appended (deterministic by id)
+    with their .tf paths + edges. Mutates and returns code_graph."""
+    areas = code_graph.setdefault("areas", [])
+    by_id = {a["id"]: a for a in areas}
+    for aid, info in sorted(structural.items()):
+        if aid in by_id:
+            a = by_id[aid]
+            edges = a.setdefault("edges", [])
+            have = {(e.get("to"), e.get("ref")) for e in edges}
+            for e in info["edges"]:
+                if (e.get("to"), e.get("ref")) not in have:
+                    edges.append(e)
+                    have.add((e.get("to"), e.get("ref")))
+        else:
+            areas.append({"id": aid, "label": _area_label(aid),
+                          "paths": info["paths"], "edges": info["edges"]})
+    return code_graph
+
+
 def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None):
     """Build inter-area dependency edges for one Terraform area.
 
@@ -1160,36 +1265,12 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None)
     sources = parse_terraform_module_blocks(tf_text)
     base_dir = os.path.dirname(base_path or "")
 
-    def version_of(name):
-        vm = _TF_VERSION_RE.search(bodies.get(name, ""))
-        return vm.group("ver") if vm else None
-
-    def resolve(name):
-        """-> (to_area_or_None, ref_or_None, version). ref None = unknown module."""
-        src = sources.get(name)
-        if not src:
-            return None, None, None
-        if src.startswith(".") or src.startswith("/"):
-            joined = os.path.normpath(os.path.join(base_dir, src))
-            if joined == os.pardir or joined.startswith(os.pardir + os.sep):
-                # escapes the repo (e.g. ../../.. above root): unresolvable to a
-                # repo area -> external (to=None), never a phantom dangling area.
-                return None, src, None
-            # normpath('.') is the repo root; classify it the same way root files
-            # are (-> "main.tf"), so a local source pointing at the root module
-            # resolves to the SAME area id as the root module's own files.
-            rel = "" if joined == os.curdir else joined
-            area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
-                or rel or "main.tf"
-            return area, src, None
-        return None, src, version_of(name)        # external: to=None, identity in ref
-
     pairs = parse_terraform_graph(dot_text)
     direct = {b for a, b in pairs if a is None}    # modules the root depends on
     edges = []
     seen = set()
     for _a, b in pairs:
-        to, ref, version = resolve(b)
+        to, ref, version = _resolve_tf_module_source(b, sources, bodies, base_dir, patterns)
         if ref is None:                            # module block with no source
             continue
         key = (to, ref)
@@ -1863,6 +1944,13 @@ def acquire(args, env):
     # a clone on disk.
     if not args.no_clone or os.path.isdir(clone_dir):
         code_graph = extract_iac_edges(code_graph, clone_dir)
+        # Multi-repo (project) gathers additionally fold the WHOLE module tree's
+        # static `source` deps (no terraform init) so the cross-repo blast-radius
+        # graph is structural, not limited to in-window-changed areas. Gated off the
+        # manifest path: single-repo bundles stay byte-stable (golden-bundle gate).
+        if getattr(args, "structural_iac", False) and os.path.isdir(clone_dir):
+            code_graph = merge_structural_areas(
+                code_graph, scan_structural_terraform_areas(clone_dir))
 
     # CODEOWNERS from the clone (local file; try the conventional locations).
     code_owners = {}
@@ -2675,6 +2763,7 @@ def _member_args(base, member, frm, to):
     ns = argparse.Namespace(**fields)
     setattr(ns, "from", frm)   # 'from' is a Python keyword: set via attribute
     ns.to = to
+    ns.structural_iac = True   # manifest members get the whole-tree module scan
     return ns
 
 

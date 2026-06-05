@@ -2796,6 +2796,60 @@ class TestFoldDependsOnFlatten(unittest.TestCase):
         self.assertNotIn("synthesized", after)
 
 
+class TestStructuralTerraformScan(unittest.TestCase):
+    FILES = {
+        "main.tf": (
+            'module "vnet" { source = "Azure/avm-res-network-virtualnetwork/azurerm"\n'
+            '  version = "0.16.0" }\n'
+            'module "subnet" { source = "./modules/subnet" }\n'),
+        "variables.tf": "variable \"x\" {}\n",
+        "modules/subnet/main.tf": 'resource "azurerm_subnet" "s" {}\n',
+        "examples/default/main.tf": (
+            'module "root" { source = "../.." }\n'),   # scaffold -> skipped
+        "README.md": "not terraform\n",
+    }
+
+    def _scan(self):
+        return gather.scan_structural_terraform_areas(
+            "/clone",
+            list_files=lambda: list(self.FILES),
+            read_text=lambda rel: self.FILES[rel])
+
+    def test_whole_tree_areas_and_edges(self):
+        out = self._scan()
+        # scaffold example area is skipped; module dirs + root are present
+        self.assertEqual(set(out), {"main.tf", "modules/subnet"})
+        root = {(e["to"], e["ref"], e["version"], e["resolved"]) for e in out["main.tf"]["edges"]}
+        self.assertEqual(root, {
+            (None, "Azure/avm-res-network-virtualnetwork/azurerm", "0.16.0", False),
+            ("modules/subnet", "./modules/subnet", None, True)})
+        # every statically-parsed block is a DIRECT edge
+        self.assertTrue(all(e["transitive"] is False for e in out["main.tf"]["edges"]))
+        self.assertEqual(out["modules/subnet"]["edges"], [])  # no module blocks
+
+    def test_skips_non_tf_and_is_offline(self):
+        # README.md never read (only *.tf grouped); no git/terraform invoked
+        out = self._scan()
+        self.assertNotIn(None, out)
+        self.assertTrue(all(p.endswith(".tf") for info in out.values() for p in info["paths"]))
+
+    def test_merge_unions_edges_and_adds_areas(self):
+        code_graph = {"provider": "directory", "areas": [
+            {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"], "edges": [
+                # an in-window DOT edge already present -> preserved, not duplicated
+                {"to": "modules/subnet", "kind": "module", "ref": "./modules/subnet",
+                 "version": None, "transitive": False, "provider": "terraform",
+                 "resolved": True}]}]}
+        gather.merge_structural_areas(code_graph, self._scan())
+        by_id = {a["id"]: a for a in code_graph["areas"]}
+        # new module area appended
+        self.assertIn("modules/subnet", by_id)
+        # main.tf keeps its 1 DOT edge + gains only the registry edge (no dup of subnet)
+        refs = sorted(e["ref"] for e in by_id["main.tf"]["edges"])
+        self.assertEqual(refs, ["./modules/subnet",
+                                "Azure/avm-res-network-virtualnetwork/azurerm"])
+
+
 class TestRegistryResolution(unittest.TestCase):
     def test_parse_registry_source_plain(self):
         self.assertEqual(
