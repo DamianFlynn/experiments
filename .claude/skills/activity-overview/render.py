@@ -363,7 +363,11 @@ def emit_project_module_graph(module_edges):
     Nodes are grouped into a subgraph per member repo; each edge draws
     src-area --> dst-area labelled with its version (or 'transitive'). Cross-repo
     edges are the point of the diagram; intra-repo edges are included for context.
-    Pure; deterministic (inputs are pre-sorted by digest.project_depends_on)."""
+
+    A PROJECT-level emitter: the digest report flow calls it with
+    `digest.project_depends_on(...)` rows (NOT the single-repo `render()` dict,
+    which is bundle-scoped). Pure; deterministic — it sorts repos, nodes, and
+    edges internally, so input order does not matter."""
     if not module_edges:
         return "flowchart LR\n    none[No cross-repo module dependencies]\n"
     by_repo = {}
@@ -371,8 +375,12 @@ def emit_project_module_graph(module_edges):
     for e in module_edges:
         src = _node_id("m", "{}::{}".format(e["src_repo"], e["src_area"]))
         dst = _node_id("m", "{}::{}".format(e["dst_repo"], e["dst_area"]))
+        # Label with the full area path (not _area_tail): two modules in one repo
+        # can both end in `main.tf`; the path disambiguates them in the subgraph.
         by_repo.setdefault(e["src_repo"], {})[src] = e["src_area"]
         by_repo.setdefault(e["dst_repo"], {})[dst] = e["dst_area"]
+        # cross_repo intentionally unused here: all edges are drawn uniformly
+        # (visual styling of cross- vs intra-repo edges is future work).
         label = e.get("version") or ("transitive" if e.get("transitive") else "")
         drawn.append((src, dst, label))
     lines = ["flowchart LR"]

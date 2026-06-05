@@ -979,6 +979,43 @@ class TestProjectModuleGraph(unittest.TestCase):
         mmd = render.emit_project_module_graph([])
         self.assertIn("No cross-repo module dependencies", mmd)
 
+    def test_same_area_name_in_two_repos_distinct_nodes(self):
+        # both repos have a 'main.tf' area -> distinct node ids, two subgraphs.
+        edges = [{"src_repo": "Azure/a", "src_area": "main.tf",
+                  "dst_repo": "Azure/b", "dst_area": "main.tf",
+                  "version": None, "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertEqual(mmd.count("subgraph"), 2)
+        self.assertEqual(mmd.count("end"), 2)
+        # one node defined per repo (the m_ node lines), and exactly one arrow.
+        self.assertEqual(sum(1 for ln in mmd.splitlines()
+                             if ln.strip().startswith("m_") and "(" in ln), 2)
+        self.assertEqual(mmd.count("-->"), 1)
+
+    def test_transitive_only_edge_labelled_transitive(self):
+        edges = [{"src_repo": "r/a", "src_area": "x", "dst_repo": "r/b",
+                  "dst_area": "y", "version": None, "transitive": True,
+                  "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertIn("transitive", mmd)
+
+    def test_intra_repo_chain_node_defined_once(self):
+        # a/app -> a/base and a/base -> a/core: 'a/base' is both dst and src,
+        # all in one repo -> one subgraph, base defined exactly once.
+        edges = [
+            {"src_repo": "Az/a", "src_area": "app", "dst_repo": "Az/a",
+             "dst_area": "base", "version": None, "transitive": False,
+             "cross_repo": False},
+            {"src_repo": "Az/a", "src_area": "base", "dst_repo": "Az/a",
+             "dst_area": "core", "version": None, "transitive": False,
+             "cross_repo": False},
+        ]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertEqual(mmd.count("subgraph"), 1)
+        base_defs = sum(1 for ln in mmd.splitlines()
+                        if ln.strip().startswith("m_") and ln.strip().endswith('("base")'))
+        self.assertEqual(base_defs, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
