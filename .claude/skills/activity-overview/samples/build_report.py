@@ -212,12 +212,13 @@ if _xrepo:
     if _intra:
         W("Plus {} intra-repo sub-module edge(s).".format(len(_intra)))
         W("")
-    W("Resolved edges are extracted from terraform module areas that were built in "
-      "this window, so the graph reflects active dependencies rather than the full "
-      "static module tree. **Blast radius:** a breaking change to a depended-on "
-      "resource module's `main.tf` forces a version bump in every consumer above. "
-      "Compute the precise dependents of any member with `python3 spotlight.py "
-      "dependents <owner/repo> --store workspace/journey.db --project {}`.".format(PROJECT))
+    W("Edges come from a static, whole-tracked-tree parse of every module's "
+      "`source` references (no `terraform init`), so the graph reflects the repo's "
+      "full module structure regardless of in-window churn. **Blast radius:** a "
+      "breaking change to a depended-on resource module's `main.tf` forces a version "
+      "bump in every consumer above. Compute the precise dependents of any member "
+      "with `python3 spotlight.py dependents <owner/repo> --store workspace/journey.db "
+      "--project {}`.".format(PROJECT))
 else:
     W("No cross-repo module dependencies resolved this window.")
 W("")

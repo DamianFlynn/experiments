@@ -20,7 +20,7 @@ Member repositories:
 
 ## Executive summary
 
-Across the constellation's **3 member repos**, **44 items shipped** this week (4 merged PRs, 40 issues closed) over **21 decision trains**. The three modules form a real dependency constellation — **2 resolved module-dependency edges, 2 of them cross-repo**: the AI/ML landing-zone *pattern* consumes both *resource* modules it sits above.
+Across the constellation's **3 member repos**, **44 items shipped** this week (4 merged PRs, 40 issues closed) over **21 decision trains**. The three modules form a real dependency constellation — **6 resolved module-dependency edges, 4 of them cross-repo**: the AI/ML landing-zone *pattern* consumes both *resource* modules it sits above.
 
 The notable structural finding: **the repos are coupled by module dependencies, not by shared work**. There are **0 cross-repo decision trains** and **0 ticket-linked `related_work` clusters** — every train lives entirely within one repo, and no internal ticket spans two. So a change in the vnet or operationalinsights module ripples into the landing zone *structurally* (version-pinned `source` references), even though the teams' issue/PR threads this window never crossed repo boundaries.
 
@@ -32,28 +32,43 @@ Resolved `depends_on` edges across the project (Terraform `source` → the membe
 flowchart LR
     subgraph r_Azure_terraform_azurerm_avm_ptn_aiml_lan_8f5ee345["Azure/terraform-azurerm-avm-ptn-aiml-landing-zone"]
         m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4("modules/example_hub_vnet")
+        m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e("main.tf")
     end
     subgraph r_Azure_terraform_azurerm_avm_res_network__c3bf45c1["Azure/terraform-azurerm-avm-res-network-virtualnetwork"]
+        m_Azure_terraform_azurerm_avm_res_network__8693f704("modules/subnet")
         m_Azure_terraform_azurerm_avm_res_network__9b1b7c02("main.tf")
+        m_Azure_terraform_azurerm_avm_res_network__a691fb80("modules/peering")
     end
     subgraph r_Azure_terraform_azurerm_avm_res_operatio_b3f65f76["Azure/terraform-azurerm-avm-res-operationalinsights-workspace"]
         m_Azure_terraform_azurerm_avm_res_operatio_27a69a94("main.tf")
     end
     m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4 -->|"=0.16.0"| m_Azure_terraform_azurerm_avm_res_network__9b1b7c02
     m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4 -->|"0.4.2"| m_Azure_terraform_azurerm_avm_res_operatio_27a69a94
+    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e -->|"0.16.0"| m_Azure_terraform_azurerm_avm_res_network__9b1b7c02
+    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e -->|"0.4.2"| m_Azure_terraform_azurerm_avm_res_operatio_27a69a94
+    m_Azure_terraform_azurerm_avm_res_network__9b1b7c02 --> m_Azure_terraform_azurerm_avm_res_network__8693f704
+    m_Azure_terraform_azurerm_avm_res_network__9b1b7c02 --> m_Azure_terraform_azurerm_avm_res_network__a691fb80
 ```
 
 | Consumer (repo · area) | Depends on (repo · area) | Version | Cross-repo | Transitive |
 |---|---|---|---|---|
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `0.16.0` | **yes** | no |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | **yes** | yes |
 | `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `=0.16.0` | **yes** | no |
 | `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | **yes** | yes |
+| `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/peering` | — | no | no |
+| `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/subnet` | — | no | no |
 
-**Reading the graph.** 2 cross-repo dependency edge(s) resolved this window — a member module consuming another member's published module:
+**Reading the graph.** 4 cross-repo dependency edge(s) resolved this window — a member module consuming another member's published module:
 
+- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` → `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` (`0.16.0`)
+- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` → `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` (`0.4.2`, transitive)
 - `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` → `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` (`=0.16.0`)
 - `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` → `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` (`0.4.2`, transitive)
 
-Resolved edges are extracted from terraform module areas that were built in this window, so the graph reflects active dependencies rather than the full static module tree. **Blast radius:** a breaking change to a depended-on resource module's `main.tf` forces a version bump in every consumer above. Compute the precise dependents of any member with `python3 spotlight.py dependents <owner/repo> --store workspace/journey.db --project avm-tf-aiml-lz`.
+Plus 2 intra-repo sub-module edge(s).
+
+Edges come from a static, whole-tracked-tree parse of every module's `source` references (no `terraform init`), so the graph reflects the repo's full module structure regardless of in-window churn. **Blast radius:** a breaking change to a depended-on resource module's `main.tf` forces a version bump in every consumer above. Compute the precise dependents of any member with `python3 spotlight.py dependents <owner/repo> --store workspace/journey.db --project avm-tf-aiml-lz`.
 
 ## Decision trains
 
@@ -456,7 +471,11 @@ pie showData
 
 ```mermaid
 flowchart LR
-    none[No module dependencies]
+    m_main_tf("main.tf")
+    m_modules_peering("peering")
+    m_modules_subnet("subnet")
+    m_main_tf --> m_modules_peering
+    m_main_tf --> m_modules_subnet
 ```
 
 #### Feature changes (add / drop / change)

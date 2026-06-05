@@ -379,6 +379,17 @@ the `codegraph` singleton, never from `area-*` nodes, so it is invisible to ever
 member bundle. The shallow-clone margin is `ACTIVITY_CLONE_MARGIN_DAYS`
 (default 14); widen it when `meta.boundary_dropped_commits` is non-empty.
 
+The DOT-based extraction (`terraform graph`) only resolves edges for module areas
+the directory provider sees — i.e. in-window-CHANGED dirs — so the dependency graph
+would otherwise track churn rather than structure. On **multi-repo (manifest)**
+gathers, `scan_structural_terraform_areas` additionally parses every module's
+`source` references across the whole tracked tree (static, no `terraform init`) and
+`merge_structural_areas` unions them into `code_graph` (existing areas keep their
+DOT edges + gain missing structural ones; untouched module dirs are appended). The
+blast-radius graph is then the repo's full module structure regardless of in-window
+activity. Gated to manifest folds so single-repo bundles stay byte-stable; `git
+ls-files` lists only tracked `.tf`, excluding vendored `.terraform/` modules.
+
 **People aggregate across members.** Person nodes are project-scoped (`repo="*"`).
 Each per-member fold **unions** a person's `areas`/`modules` (and ORs `is_bot`)
 with the already-stored node — a plain upsert would overwrite, so a member where a

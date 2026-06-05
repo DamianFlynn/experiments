@@ -22,10 +22,10 @@ This is the proof that the full project vertical composes:
 | `Azure/terraform-azurerm-avm-res-operationalinsights-workspace` | resource module |
 
 The headline finding: the repos are coupled by **module dependencies** (the
-pattern's `modules/example_hub_vnet` pins the vnet module at `=0.16.0` and pulls
-operationalinsights `0.4.2` transitively — 2 cross-repo edges resolved this
-window), but **not by shared work** — zero cross-repo decision trains and zero
-ticket-linked clusters this window.
+pattern's root `main.tf` and its `modules/example_hub_vnet` both pin the vnet
+module at `0.16.0` and pull operationalinsights `0.4.2` transitively — 4 cross-repo
+edges, plus 2 intra-repo vnet sub-module edges), but **not by shared work** — zero
+cross-repo decision trains and zero ticket-linked clusters this window.
 
 ## How it was produced
 
@@ -78,12 +78,19 @@ in-window commit's real parent in the clone, so `boundary_dropped_commits` is
 empty for all three members and the feature-change / content-lifecycle ledgers are
 complete across the constellation (the report renders a ✅ completeness line).
 
-Recovering those diffs also corrected the **module-dependency graph**. At the
-default margin the dropped commits' phantom whole-tree diffs made *every*
-directory look like an in-window code area, so terraform extraction ran over them
-and surfaced extra `depends_on` edges (e.g. from each repo's root `main.tf`). With
-the phantom diffs gone, the graph reflects only the terraform module areas
-genuinely built in-window — fewer edges, but honest. The dependency graph is thus
-window-scoped (active dependencies), not the full static module tree; a fully
-structural blast-radius graph would extract module sources from the whole tree
-regardless of in-window churn (a possible follow-up).
+### Module-dependency graph: structural, not window-scoped
+
+The dependency graph is **structural** — `gather` statically parses every module's
+`source` references across the whole tracked tree (`scan_structural_terraform_areas`,
+no `terraform init`) on multi-repo gathers, so the blast-radius graph reflects the
+repo's actual module structure regardless of which areas changed in-window.
+
+This was a real correction. The DOT-based extraction (`terraform graph`) only ran
+over module areas the directory provider saw, i.e. in-window-CHANGED dirs. At the
+default clone margin, the dropped boundary commits' phantom whole-tree diffs made
+*every* directory look changed, so the graph looked complete **by accident**.
+Closing the boundary gap removed that accident and the graph collapsed to only the
+in-window-built areas (2 edges) — honest but thin. The static whole-tree scan
+restores the full graph (6 edges: 4 cross-repo + 2 intra-repo) **honestly**,
+independent of churn. Single-repo gathers keep the original window-scoped behaviour
+(byte-stable golden bundle); the structural scan is gated to manifest projects.
