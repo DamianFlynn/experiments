@@ -326,6 +326,24 @@ class TestCliAndAuth(unittest.TestCase):
             gather.parse_args(["--owner", "o", "--repo", "r",
                                "--from", "2026-05-01", "--to", "2026-05-31"])
 
+    def test_parse_args_manifest_alone_is_accepted(self):
+        args = gather.parse_args([
+            "--manifest", "workspace/project.json",
+            "--store", "workspace/store.db",
+        ])
+        self.assertEqual(args.manifest, "workspace/project.json")
+        self.assertIsNone(args.owner)
+        self.assertIsNone(args.repo)
+
+    def test_parse_args_manifest_conflicts_with_single_repo_flags(self):
+        for extra in (["--owner", "o"], ["--repo", "r"],
+                      ["--from", "2026-05-01"], ["--to", "2026-05-31"]):
+            with self.subTest(extra=extra):
+                with self.assertRaises(SystemExit), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    gather.parse_args(["--manifest", "workspace/project.json",
+                                       "--store", "workspace/store.db", *extra])
+
     def test_resolve_token_prefers_github_token(self):
         self.assertEqual(
             gather.resolve_token({"GITHUB_TOKEN": "gh", "GH_TOKEN": "alt"}), "gh"
@@ -2054,6 +2072,307 @@ class TestFoldArtifacts(unittest.TestCase):
             self.conn.execute("SELECT COUNT(*) FROM code_events").fetchone()[0], n_events)
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], n_edges)
+
+
+class TestFoldBundleOverride(unittest.TestCase):
+    def test_override_project_and_slug_repo(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, _fold_fixture_bundle(),
+                           project="avm-tf", repo="Azure/widget")
+        # node ids are qualified with the OVERRIDE project + owner/repo slug
+        pr = graphstore.get_node(conn, "avm-tf/Azure/widget#pr-10")
+        self.assertEqual(pr["node_class"], "social")
+        self.assertEqual(pr["project"], "avm-tf")
+        self.assertEqual(pr["repo"], "Azure/widget")
+        # spine edge dst is qualified the same way (parse_id splits scope on first /)
+        out = graphstore.get_edges(conn, "avm-tf/Azure/widget#pr-10", direction="out")
+        self.assertIn(("closes", "avm-tf/Azure/widget#issue-3"),
+                      {(e["edge_type"], e["dst_id"]) for e in out})
+        # window + clone_sha recorded under the override identity
+        self.assertIn({"project": "avm-tf", "repo": "Azure/widget",
+                       "from": "2026-01-01", "to": "2026-01-31"},
+                      graphstore.get_windows(conn))
+        self.assertEqual(graphstore.get_clone_sha(conn, "avm-tf", "Azure/widget"),
+                         "deadbeef")
+
+    def test_default_identity_unchanged(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, _fold_fixture_bundle())  # no override
+        self.assertIsNotNone(graphstore.get_node(conn, "acme/widget#pr-10"))
+
+
+class TestManifestMain(unittest.TestCase):
+    def test_member_args_clones_namespace_with_overrides(self):
+        base = gather.parse_args([
+            "--owner", "x", "--repo", "y", "--from", "a", "--to", "b",
+            "--store", "s.db", "--no-clone"])
+        member = gather._member_args(
+            base, {"owner": "Azure", "repo": "mod-a", "registry": None},
+            "2026-03-01", "2026-03-31")
+        self.assertEqual(member.owner, "Azure")
+        self.assertEqual(member.repo, "mod-a")
+        self.assertEqual(getattr(member, "from"), "2026-03-01")
+        self.assertEqual(member.to, "2026-03-31")
+        # clone_dir is re-derived per member and includes the owner so members
+        # sharing a repo name across owners don't collide on disk.
+        self.assertEqual(member.clone_dir, "workspace/Azure-mod-a-clone")
+        self.assertTrue(member.no_clone)               # other flags carried through
+
+    def test_member_args_clone_dirs_distinct_for_same_repo_name(self):
+        base = gather.parse_args([
+            "--manifest", "m.json", "--store", "s.db", "--no-clone"])
+        a = gather._member_args(
+            base, {"owner": "Azure", "repo": "mod", "registry": None}, "x", "y")
+        b = gather._member_args(
+            base, {"owner": "Contoso", "repo": "mod", "registry": None}, "x", "y")
+        self.assertNotEqual(a.clone_dir, b.clone_dir)
+        self.assertEqual(a.clone_dir, "workspace/Azure-mod-clone")
+        self.assertEqual(b.clone_dir, "workspace/Contoso-mod-clone")
+
+    def test_main_folds_each_member_under_logical_project(self):
+        import tempfile
+        man = {
+            "project": "proj",
+            "window": {"from": "2026-01-01", "to": "2026-01-31"},
+            "repos": [{"owner": "Azure", "repo": "mod-a"},
+                      {"owner": "Azure", "repo": "mod-b"}],
+        }
+        calls = []
+
+        def fake_acquire(args, env):
+            calls.append((args.owner, args.repo))
+            b = _fold_fixture_bundle()
+            b["meta"] = {**b["meta"], "owner": args.owner, "repo": args.repo,
+                         "from": getattr(args, "from"), "to": args.to}
+            return b
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mpath = os.path.join(tmp, "m.json")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                json.dump(man, fh)
+            store = os.path.join(tmp, "j.db")
+            orig = gather.acquire
+            gather.acquire = fake_acquire
+            try:
+                gather.main(["--manifest", mpath, "--store", store])
+            finally:
+                gather.acquire = orig
+            conn = graphstore.open_store(store)
+        # both members acquired, folded under the logical project + owner/repo slug
+        self.assertEqual(set(calls), {("Azure", "mod-a"), ("Azure", "mod-b")})
+        self.assertIsNotNone(graphstore.get_node(conn, "proj/Azure/mod-a#pr-10"))
+        self.assertIsNotNone(graphstore.get_node(conn, "proj/Azure/mod-b#pr-10"))
+
+    def test_main_invalid_manifest_leaves_no_store(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            mpath = os.path.join(tmp, "m.json")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                json.dump({"project": "p"}, fh)   # no window/repos -> invalid
+            store = os.path.join(tmp, "j.db")
+            with self.assertRaises(ValueError):
+                gather.main(["--manifest", mpath, "--store", store])
+            # validation happens before open_store, so no empty DB is left behind
+            self.assertFalse(os.path.exists(store))
+
+
+class TestParseQualifiedRefs(unittest.TestCase):
+    def test_closing_keyword_owner_repo_hash(self):
+        refs = gather.parse_qualified_refs(
+            "Closes Azure/Azure-Verified-Modules#1234 and more")
+        self.assertEqual(refs, [{"owner": "Azure", "repo": "Azure-Verified-Modules",
+                                 "number": 1234, "kind": "closes", "is_pr": False}])
+
+    def test_full_url_issue_and_pull(self):
+        refs = gather.parse_qualified_refs(
+            "see https://github.com/Azure/mod-b/issues/7 and "
+            "https://github.com/Azure/mod-c/pull/9")
+        self.assertEqual(refs, [
+            {"owner": "Azure", "repo": "mod-b", "number": 7,
+             "kind": "cross_ref", "is_pr": False},
+            {"owner": "Azure", "repo": "mod-c", "number": 9,
+             "kind": "cross_ref", "is_pr": True},
+        ])
+
+    def test_dedup_order_preserving(self):
+        refs = gather.parse_qualified_refs(
+            "Fixes Azure/a#1\nResolves Azure/a#1\nFixes Azure/b#2")
+        self.assertEqual([(r["repo"], r["number"]) for r in refs], [("a", 1), ("b", 2)])
+
+    def test_bare_hash_not_captured(self):
+        self.assertEqual(gather.parse_qualified_refs("Closes #5"), [])
+
+    def test_empty(self):
+        self.assertEqual(gather.parse_qualified_refs(None), [])
+
+
+class TestParseTimelineXrefs(unittest.TestCase):
+    def _ev(self, full_name, number, is_pr):
+        src = {"number": number,
+               "repository": {"full_name": full_name},
+               "pull_request": ({} if is_pr else None)}
+        return {"event": "cross-referenced", "source": {"issue": src}}
+
+    def test_keeps_cross_repo_drops_same_repo(self):
+        tl = [self._ev("Azure/other", 7, False),     # cross-repo issue
+              self._ev("Azure/self", 3, False),       # same repo -> dropped
+              self._ev("Azure/other2", 9, True)]      # cross-repo PR
+        out = gather.parse_timeline_xrefs(tl, "Azure/self")
+        self.assertEqual(out, [
+            {"owner": "Azure", "repo": "other", "number": 7,
+             "kind": "cross_ref", "is_pr": False},
+            {"owner": "Azure", "repo": "other2", "number": 9,
+             "kind": "cross_ref", "is_pr": True},
+        ])
+
+    def test_dedup_and_ignores_non_crossref_events(self):
+        tl = [self._ev("Azure/other", 7, False),
+              self._ev("Azure/other", 7, False),
+              {"event": "labeled"}]
+        out = gather.parse_timeline_xrefs(tl, "Azure/self")
+        self.assertEqual(len(out), 1)
+
+    def test_empty(self):
+        self.assertEqual(gather.parse_timeline_xrefs(None, "o/r"), [])
+
+
+class TestAcquireTimelineXrefs(unittest.TestCase):
+    def test_sets_timeline_xrefs_only_when_cross_repo_present(self):
+        pr_same = {"number": 1, "crossref_issues": []}
+        tl_same = [{"event": "cross-referenced",
+                    "source": {"issue": {"number": 5,
+                                         "repository": {"full_name": "Azure/self"},
+                                         "pull_request": None}}}]
+        gather._attach_timeline_xrefs(pr_same, tl_same, "Azure/self")
+        self.assertNotIn("timeline_xrefs", pr_same)   # same-repo only -> key absent
+
+        pr_cross = {"number": 2, "crossref_issues": []}
+        tl_cross = [{"event": "cross-referenced",
+                     "source": {"issue": {"number": 8,
+                                          "repository": {"full_name": "Azure/other"},
+                                          "pull_request": None}}}]
+        gather._attach_timeline_xrefs(pr_cross, tl_cross, "Azure/self")
+        self.assertEqual(pr_cross["timeline_xrefs"],
+                         [{"owner": "Azure", "repo": "other", "number": 8,
+                           "kind": "cross_ref", "is_pr": False}])
+
+
+def _xrepo_fold_bundle():
+    """A PR in member 'Azure/mod-a' that closes an issue in member 'Azure/mod-b'
+    and mentions a NON-member 'Other/ext' via a qualified body ref."""
+    return {
+        "meta": {"owner": "Azure", "repo": "mod-a", "from": "2026-01-01",
+                 "to": "2026-01-31", "clone_sha": "sha-a"},
+        "prs": [{
+            "number": 10, "url": "u/10", "state": "closed", "merged": True,
+            "merged_at": "2026-01-10T00:00:00Z", "created_at": "2026-01-05T00:00:00Z",
+            "closed_at": "2026-01-10T00:00:00Z", "closes": [], "crossref_issues": [],
+            "title": "feat: cross-module",
+            "body": "Closes Azure/mod-b#3\nalso Closes Other/ext#99",
+            "timeline_xrefs": [{"owner": "Azure", "repo": "mod-b", "number": 5,
+                                "kind": "cross_ref", "is_pr": True}],
+        }],
+        "issues": [], "commits": [], "code_events": [],
+        "milestones": [], "releases": [], "code_graph": {"areas": []},
+    }
+
+
+class TestFoldCrossRepoEdges(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        self.members = {"Azure/mod-a", "Azure/mod-b"}
+        gather.fold_bundle(self.conn, _xrepo_fold_bundle(),
+                           project="proj", repo="Azure/mod-a", members=self.members)
+
+    def test_member_close_becomes_cross_repo_edge(self):
+        out = graphstore.get_edges(self.conn, "proj/Azure/mod-a#pr-10",
+                                   direction="out")
+        types = {(e["edge_type"], e["dst_id"]) for e in out}
+        self.assertIn(("closes", "proj/Azure/mod-b#issue-3"), types)
+
+    def test_member_timeline_xref_becomes_cross_repo_pr_edge(self):
+        out = graphstore.get_edges(self.conn, "proj/Azure/mod-a#pr-10",
+                                   direction="out")
+        types = {(e["edge_type"], e["dst_id"]) for e in out}
+        self.assertIn(("cross_ref", "proj/Azure/mod-b#pr-5"), types)  # is_pr -> pr-
+
+    def test_non_member_ref_is_external_not_edge(self):
+        pr = graphstore.get_node(self.conn, "proj/Azure/mod-a#pr-10")
+        self.assertEqual(pr["data"]["external_refs"],
+                         [{"repo": "Other/ext", "number": 99, "kind": "closes"}])
+        out = graphstore.get_edges(self.conn, "proj/Azure/mod-a#pr-10",
+                                   direction="out")
+        dsts = {e["dst_id"] for e in out}
+        self.assertNotIn("proj/Other/ext#issue-99", dsts)
+
+    def test_cross_repo_train_traverses_repo_boundary(self):
+        res = graphstore.traverse_spine(self.conn, ["proj/Azure/mod-b#issue-3"])
+        self.assertIn("proj/Azure/mod-a#pr-10", res["reached"])
+
+    def test_single_repo_path_emits_no_external_refs(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, _fold_fixture_bundle())   # members=None
+        pr = graphstore.get_node(conn, "acme/widget#pr-10")
+        self.assertNotIn("external_refs", pr["data"])
+
+
+class TestMultiRepoIntegration(unittest.TestCase):
+    def test_two_member_manifest_builds_cross_repo_train(self):
+        import tempfile
+        man = {
+            "project": "avm",
+            "window": {"from": "2026-01-01", "to": "2026-01-31"},
+            "repos": [{"owner": "Azure", "repo": "mod-a"},
+                      {"owner": "Azure", "repo": "mod-b"}],
+        }
+
+        def fake_acquire(args, env):
+            base = {"meta": {"owner": args.owner, "repo": args.repo,
+                             "from": getattr(args, "from"), "to": args.to,
+                             "clone_sha": "sha-" + args.repo},
+                    "issues": [], "commits": [], "code_events": [],
+                    "milestones": [], "releases": [], "code_graph": {"areas": []}}
+            if args.repo == "mod-a":
+                base["prs"] = [{
+                    "number": 10, "url": "u/10", "merged": True,
+                    "merged_at": "2026-01-10T00:00:00Z",
+                    "created_at": "2026-01-05T00:00:00Z",
+                    "closed_at": "2026-01-10T00:00:00Z",
+                    "closes": [], "crossref_issues": [],
+                    "title": "feat", "body": "Closes Azure/mod-b#3"}]
+            else:
+                base["prs"] = []
+                base["issues"] = [{"number": 3, "url": "u/3", "state": "closed",
+                                   "closed_at": "2026-01-08T00:00:00Z",
+                                   "updated_at": "2026-01-08T00:00:00Z"}]
+            return base
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mpath = os.path.join(tmp, "m.json")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                json.dump(man, fh)
+            store = os.path.join(tmp, "j.db")
+            orig = gather.acquire
+            gather.acquire = fake_acquire
+            try:
+                gather.main(["--manifest", mpath, "--store", store])
+            finally:
+                gather.acquire = orig
+            conn = graphstore.open_store(store)
+
+        # both windows recorded under the logical project + owner/repo slugs
+        windows = graphstore.get_windows(conn)
+        self.assertIn({"project": "avm", "repo": "Azure/mod-a",
+                       "from": "2026-01-01", "to": "2026-01-31"}, windows)
+        self.assertIn({"project": "avm", "repo": "Azure/mod-b",
+                       "from": "2026-01-01", "to": "2026-01-31"}, windows)
+        # the cross-repo train: B's issue reaches A's PR over the spine
+        res = graphstore.traverse_spine(conn, ["avm/Azure/mod-b#issue-3"])
+        self.assertIn("avm/Azure/mod-a#pr-10", res["reached"])
 
 
 if __name__ == "__main__":

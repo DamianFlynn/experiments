@@ -18,6 +18,7 @@ import urllib.request
 
 import derive
 import graphstore
+import manifest as manifest_mod
 
 SCHEMA_VERSION = 1
 RECORD_SEP = "\x1e"
@@ -220,6 +221,45 @@ _CLOSING_RE = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
 )
 
+# Cross-repo references (Phase 9). A closing keyword qualified with owner/repo
+# (`Closes Azure/repo#12`) -> a `closes` link to that OTHER repo's issue. A bare
+# GitHub URL (`https://github.com/owner/repo/(issues|pull)/N`) -> a `cross_ref`
+# mention (issues -> issue node, pull -> pr node). Bare `#N` stays same-repo
+# (parse_closing_refs). Owners/repos: GitHub names — alnum start, then word/.-.
+_QUALIFIED_CLOSE_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
+    r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)#(?P<num>\d+)",
+    re.IGNORECASE,
+)
+_QUALIFIED_URL_RE = re.compile(
+    r"https?://github\.com/"
+    r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)/"
+    r"(?P<kind>issues|pull)/(?P<num>\d+)",
+)
+
+
+def parse_qualified_refs(text):
+    """Cross-repo refs in PR/issue text, ordered + deduped. Returns a list of
+    {owner, repo, number, kind, is_pr}: closing keywords -> kind 'closes'
+    (is_pr False; closing targets an issue); github.com URLs -> kind 'cross_ref'
+    (is_pr True for /pull/, False for /issues/). Bare `#N` is left to
+    parse_closing_refs (same-repo). Pure."""
+    out, seen = [], set()
+
+    def add(owner, repo, num, kind, is_pr):
+        key = (owner, repo, num)
+        if key not in seen:
+            seen.add(key)
+            out.append({"owner": owner, "repo": repo, "number": num,
+                        "kind": kind, "is_pr": is_pr})
+
+    for m in _QUALIFIED_CLOSE_RE.finditer(text or ""):
+        add(m.group("owner"), m.group("repo"), int(m.group("num")), "closes", False)
+    for m in _QUALIFIED_URL_RE.finditer(text or ""):
+        add(m.group("owner"), m.group("repo"), int(m.group("num")), "cross_ref",
+            m.group("kind") == "pull")
+    return out
+
 
 def parse_closing_refs(text):
     """Extract issue numbers from GitHub closing keywords, de-duplicated,
@@ -358,6 +398,30 @@ def parse_timeline_crossrefs(raw_timeline):
             num = (ev.get("subject") or {}).get("number")
         if num is not None and num not in out:
             out.append(num)
+    return out
+
+
+def parse_timeline_xrefs(raw_timeline, current_slug):
+    """Cross-REPO timeline cross-references (Phase 9): cross-referenced events
+    whose source issue/PR lives in a DIFFERENT repo than `current_slug`
+    ('owner/repo'). Same-repo refs are left to parse_timeline_crossrefs. Returns
+    ordered, deduped [{owner, repo, number, kind='cross_ref', is_pr}]. Pure."""
+    out, seen = [], set()
+    for ev in raw_timeline or []:
+        if ev.get("event") != "cross-referenced":
+            continue
+        src = (ev.get("source") or {}).get("issue") or {}
+        full = ((src.get("repository") or {}).get("full_name")) or ""
+        num = src.get("number")
+        if not full or full == current_slug or num is None:
+            continue
+        key = (full, num)
+        if key in seen:
+            continue
+        seen.add(key)
+        owner, _, repo = full.partition("/")
+        out.append({"owner": owner, "repo": repo, "number": num,
+                    "kind": "cross_ref", "is_pr": src.get("pull_request") is not None})
     return out
 
 
@@ -1368,7 +1432,18 @@ def parse_args(argv):
     p.add_argument("--store", required=True,
                    help="path to the SQLite journey-graph store to fold into "
                         "(the sole gather deliverable)")
-    return p.parse_args(argv)
+    p.add_argument("--manifest",
+                   help="path to a multi-repo project manifest (JSON). Mutually "
+                        "exclusive with --owner/--repo; folds every member repo "
+                        "into one store under the manifest's logical project name.")
+    args = p.parse_args(argv)
+    # --manifest carries its own member list + window, so the single-repo flags
+    # are meaningless alongside it. Enforce the documented exclusivity rather than
+    # silently letting the manifest branch win (ambiguous, misleading help text).
+    if args.manifest and (args.owner or args.repo
+                          or getattr(args, "from") or args.to):
+        p.error("--manifest is mutually exclusive with --owner/--repo/--from/--to")
+    return args
 
 
 def resolve_token(env):
@@ -1593,6 +1668,15 @@ def _runs_page(get_page, api, frm, to):
     return runs
 
 
+def _attach_timeline_xrefs(pr, timeline, current_slug):
+    """Set pr['timeline_xrefs'] to the cross-repo timeline refs, but ONLY when
+    there are any (conditional key: a PR with no cross-repo refs keeps its exact
+    prior shape, so single-repo gathers stay byte-identical). Mutates pr."""
+    xrefs = parse_timeline_xrefs(timeline, current_slug)
+    if xrefs:
+        pr["timeline_xrefs"] = xrefs
+
+
 def acquire(args, env):
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
         sys.stderr.write("error: --owner --repo --from --to are required\n")
@@ -1712,6 +1796,7 @@ def acquire(args, env):
         timeline = fetch_all(
             get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
         pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+        _attach_timeline_xrefs(pr, timeline, f"{owner}/{repo}")
         review_comments = fetch_all(
             get_page, f"{api}/pulls/{pr['number']}/comments?per_page=100")
         pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
@@ -1957,7 +2042,13 @@ def make_backfill_fetcher(token, clone_dir=None):
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
         project, _, repo = parsed["scope"].partition("/")
-        api = f"https://api.github.com/repos/{project}/{repo}"
+        # Multi-repo (Phase 9) ids scope as `{project}/{owner}/{repo}`, so the
+        # repo part is itself an `owner/repo` slug and addresses GitHub directly.
+        # Single-repo ids scope as `{owner}/{repo}` (no inner slash), so fall back
+        # to the legacy owner=project mapping. Without this, a multi-repo backfill
+        # hits repos/{project}/{owner}/{repo} -> false 404s / dead_refs.
+        slug = repo if "/" in repo else "{}/{}".format(project, repo)
+        api = f"https://api.github.com/repos/{slug}"
         if kind == "social" and local.startswith("issue-"):
             num = local[len("issue-"):]
             raw, nxt = http_get_json(f"{api}/issues/{num}", token, allow_404=True)
@@ -2023,7 +2114,36 @@ def _social_text(item, comments):
     return "\n".join(p for p in parts if p)
 
 
-def fold_bundle(conn, bundle):
+def _cross_repo_pr_edges(pr, project, current_repo, members):
+    """Resolve a PR's cross-repo references (qualified body refs +
+    repo-aware timeline xrefs) for a multi-repo project. Returns
+    (external_refs, edges):
+      - a ref to a MEMBER repo -> an edge tuple (src_pid, dst_id, kind, None, None)
+        where kind is 'closes'/'cross_ref' and dst is the target repo's issue/pr;
+      - a ref to a NON-member repo -> an external_refs dict {repo, number, kind}.
+    Same-repo refs are skipped (the bare-#N path already covers them). Pure."""
+    pid = graphstore.qualify_id(project, current_repo, "pr-{}".format(pr["number"]))
+    text = (pr.get("title", "") or "") + "\n" + (pr.get("body") or "")
+    refs = parse_qualified_refs(text) + list(pr.get("timeline_xrefs") or [])
+    edges, external, seen = [], [], set()
+    for r in refs:
+        slug = "{}/{}".format(r["owner"], r["repo"])
+        if slug == current_repo:
+            continue
+        local = ("pr-" if r.get("is_pr") else "issue-") + str(r["number"])
+        key = (slug, local, r["kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if slug in members:
+            edges.append((pid, graphstore.qualify_id(project, slug, local),
+                          r["kind"], None, None))
+        else:
+            external.append({"repo": slug, "number": r["number"], "kind": r["kind"]})
+    return external, edges
+
+
+def fold_bundle(conn, bundle, project=None, repo=None, members=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
     — re-folding an overlapping window mutates nothing already correct. See
@@ -2039,7 +2159,15 @@ def fold_bundle(conn, bundle):
     in_iteration / fts_text).
     """
     meta = bundle.get("meta", {})
-    project, repo = meta.get("owner"), meta.get("repo")
+    # Identity override (Phase 9): a multi-repo run folds each member under one
+    # LOGICAL project (`project`) with `repo` = "owner/repo". Single-repo runs pass
+    # neither and fall back to meta.owner/meta.repo — byte-identical to before.
+    # `members` (a set/dict of "owner/repo" slugs) gates cross-repo edge emission;
+    # None (single-repo) skips it entirely.
+    if project is None:
+        project = meta.get("owner")
+    if repo is None:
+        repo = meta.get("repo")
     if not project or not repo:
         raise ValueError("bundle meta needs owner and repo to qualify ids")
 
@@ -2049,10 +2177,19 @@ def fold_bundle(conn, bundle):
     def qid(local):
         return graphstore.qualify_id(project, repo, local)
 
-    # social: PRs, with closes/cross_ref spine edges to their issues.
+    # social: PRs, with closes/cross_ref spine edges to their issues. In a
+    # multi-repo project (members given) a PR's qualified refs + repo-aware
+    # timeline xrefs also yield CROSS-repo spine edges (to member repos) or
+    # honest external_refs (to non-members) — see _cross_repo_pr_edges. Gated on
+    # `members is not None` so single-repo folds are byte-identical.
     for pr in bundle.get("prs", []):
         pid = qid("pr-{}".format(pr["number"]))
         ts = pr.get("merged_at") or pr.get("closed_at") or pr.get("created_at")
+        if members is not None:
+            external, xedges = _cross_repo_pr_edges(pr, project, repo, members)
+            if external:
+                pr = {**pr, "external_refs": external}
+            edges.extend(xedges)
         nodes.append((pid, project, repo, "social", ts, pr, fetched))
         for n in pr.get("closes") or []:
             edges.append((pid, qid("issue-{}".format(n)), "closes", None, None))
@@ -2293,18 +2430,51 @@ def fold_bundle(conn, bundle):
         graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"])
 
 
+def _member_args(base, member, frm, to):
+    """Clone the CLI args for one manifest member: same flags, but owner/repo and
+    the window come from the manifest, and clone_dir is re-derived PER MEMBER as
+    `{base}/{owner}-{repo}-clone`. Including the owner (not just the repo, which is
+    acquire's single-repo default) keeps two members that share a repo name under
+    different owners from colliding on the same checkout. A `--clone-dir` on the
+    base args is treated as the parent directory; otherwise it defaults to
+    `workspace`."""
+    base_dir = (base.clone_dir or "workspace").rstrip("/")
+    clone_dir = "{}/{}-{}-clone".format(base_dir, member["owner"], member["repo"])
+    fields = {**vars(base), "owner": member["owner"], "repo": member["repo"],
+              "clone_dir": clone_dir}
+    ns = argparse.Namespace(**fields)
+    setattr(ns, "from", frm)   # 'from' is a Python keyword: set via attribute
+    ns.to = to
+    return ns
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    bundle = acquire(args, os.environ)
-    # Store-only (Phase 7): fold the assembled bundle into the journey-graph store
-    # — the sole deliverable. No bundle JSON file is written; the bundle is a
-    # transient view the Phase 8 reader materializes via extract.
+    # Load + validate the manifest BEFORE touching the store, so a bad/missing
+    # manifest fails fast instead of leaving an empty DB behind.
+    man = manifest_mod.load_manifest(args.manifest) if getattr(
+        args, "manifest", None) else None
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
     graphstore.init_schema(conn)
-    fold_bundle(conn, bundle)
+    if man is not None:
+        members = manifest_mod.member_slugs(man)
+        for m in man["repos"]:
+            member_args = _member_args(args, m, man["from"], man["to"])
+            bundle = acquire(member_args, os.environ)
+            fold_bundle(conn, bundle, project=man["project"],
+                        repo="{}/{}".format(m["owner"], m["repo"]),
+                        members=members)
+        sys.stderr.write(
+            "folded {} member repo(s) of project '{}' into store {}\n".format(
+                len(man["repos"]), man["project"], args.store))
+    else:
+        # Store-only single-repo path (Phase 7). Same acquire->fold->return as
+        # before; the store setup above is now shared with the manifest branch.
+        bundle = acquire(args, os.environ)
+        fold_bundle(conn, bundle)
+        sys.stderr.write("folded bundle into store {}\n".format(args.store))
     conn.close()
-    sys.stderr.write(f"folded bundle into store {args.store}\n")
     return args.store
 
 
