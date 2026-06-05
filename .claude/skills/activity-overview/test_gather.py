@@ -2375,5 +2375,52 @@ class TestMultiRepoIntegration(unittest.TestCase):
         self.assertIn("avm/Azure/mod-a#pr-10", res["reached"])
 
 
+class TestFoldDependsOnFlatten(unittest.TestCase):
+    def test_resolved_area_edges_become_store_depends_on(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "modules/app", "label": "app", "paths": ["modules/app/main.tf"],
+                 "edges": [{"to": "modules/base", "kind": "module", "ref": "../base",
+                            "version": None, "transitive": False,
+                            "provider": "terraform", "resolved": True}]},
+                {"id": "modules/base", "label": "base",
+                 "paths": ["modules/base/main.tf"], "edges": []},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
+        deps = graphstore.get_edges(conn, "p/Az/r#area-modules/app",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(len(deps), 1)
+        self.assertEqual(deps[0]["dst_id"], "p/Az/r#area-modules/base")
+        self.assertEqual(deps[0]["data"].get("transitive"), False)
+
+    def test_unresolved_registry_edge_dropped_in_single_repo(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Az", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [], "issues": [], "commits": [], "code_events": [],
+            "milestones": [], "releases": [],
+            "code_graph": {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"],
+                 "edges": [{"to": None, "kind": "module",
+                            "ref": "Azure/avm-res-keyvault-vault/azurerm",
+                            "version": "0.1.0", "transitive": False,
+                            "provider": "terraform", "resolved": False}]},
+            ]},
+        }
+        gather.fold_bundle(conn, bundle, project="p", repo="Az/r")
+        deps = graphstore.get_edges(conn, "p/Az/r#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(deps, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2143,7 +2143,40 @@ def _cross_repo_pr_edges(pr, project, current_repo, members):
     return external, edges
 
 
-def fold_bundle(conn, bundle, project=None, repo=None, members=None):
+def resolve_registry_member(*args, **kwargs):  # replaced in the next task (S4)
+    return None
+
+
+def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
+    """Yield (src_qid, dst_qid, data) depends_on triples from a bundle's area
+    edges. Resolved-local edges -> intra-repo. Unresolved registry edges resolve
+    to a member's root area ONLY when members + registry_by_slug are supplied
+    (multi-repo); single-repo folds skip them (byte-stable). Pure."""
+    def q(slug, local):
+        return graphstore.qualify_id(project, slug, local)
+    areas = (bundle.get("code_graph", {}) or {}).get("areas") or []
+    for area in areas:
+        src = q(repo, "area-{}".format(area["id"]))
+        for e in area.get("edges") or []:
+            to = e.get("to")
+            if e.get("resolved") and to is not None:
+                dst = q(repo, "area-{}".format(to))
+                data = {k: v for k, v in e.items() if k != "to"}
+            elif members and registry_by_slug and e.get("ref"):
+                dst = resolve_registry_member(e["ref"], project, members,
+                                              registry_by_slug)
+                if dst is None:
+                    continue
+                data = {k: v for k, v in e.items() if k != "to"}
+                data["resolved"] = True
+                data["cross_repo"] = True
+            else:
+                continue
+            yield src, dst, (data or None)
+
+
+def fold_bundle(conn, bundle, project=None, repo=None, members=None,
+                registry_by_slug=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
     — re-folding an overlapping window mutates nothing already correct. See
@@ -2356,14 +2389,15 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None):
             edges.append((qid(c["sha"]), qid("area-{}".format(aid)),
                           "touches", None, None))
 
-    # depends_on (area -> area): the code_graph dependency edges, carrying
-    # {version,transitive,...} on the edge `data`.
-    for e in (bundle.get("code_graph", {}) or {}).get("edges") or []:
-        src, dst = e.get("from"), e.get("to")
-        if src and dst:
-            data = {k: v for k, v in e.items() if k not in ("from", "to")}
-            edges.append((qid("area-{}".format(src)), qid("area-{}".format(dst)),
-                          "depends_on", None, data or None))
+    # depends_on (area -> area): flatten each area's resolved dependency edges
+    # into store edges, carrying {version,transitive,ref,...} on the edge `data`.
+    # Phase 3c stamps edges per area (code_graph.areas[].edges); there is no
+    # top-level edges key. A resolved-local edge -> an intra-repo depends_on; an
+    # unresolved registry edge resolves to a cross-repo member only in multi-repo
+    # folds (see _fold_depends_on, threaded with members + registry_by_slug).
+    for src, dst, data in _fold_depends_on(bundle, project, repo, members,
+                                           registry_by_slug):
+        edges.append((src, dst, "depends_on", None, data or None))
 
     # in_milestone (social -> structure): a PR/issue's milestone title links to
     # the milestone node (keyed on number when present, else title — matching
