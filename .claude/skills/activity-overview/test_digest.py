@@ -56,5 +56,33 @@ class TestMemberBundles(unittest.TestCase):
         self.assertEqual(members[1]["bundle"]["prs"], [])
 
 
+class TestSpineComponents(unittest.TestCase):
+    def test_cross_repo_edge_unifies_two_members(self):
+        conn = graphstore.open_store(":memory:")
+        _seed_two_member_store(conn)
+        comps = digest.spine_components(
+            conn, "proj", ["Azure/mod-a", "Azure/mod-b"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        # exactly one component, containing A's PR and B's issue
+        self.assertEqual(len(comps), 1)
+        self.assertEqual(comps[0],
+                         frozenset({"proj/Azure/mod-a#pr-10",
+                                    "proj/Azure/mod-b#issue-3"}))
+
+    def test_unconnected_socials_are_separate_components(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_nodes(conn, [
+            ("proj/Azure/a#pr-1", "proj", "Azure/a", "social", "2026-01-01T00:00:00Z", {}, None),
+            ("proj/Azure/b#pr-9", "proj", "Azure/b", "social", "2026-01-02T00:00:00Z", {}, None),
+        ])
+        comps = digest.spine_components(
+            conn, "proj", ["Azure/a", "Azure/b"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        self.assertEqual({frozenset(c) for c in comps},
+                         {frozenset({"proj/Azure/a#pr-1"}),
+                          frozenset({"proj/Azure/b#pr-9"})})
+
+
 if __name__ == "__main__":
     unittest.main()
