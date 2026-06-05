@@ -102,7 +102,7 @@ W = lines.append
 W("# {} — Project Activity Digest ({} → {})".format(PROJECT, FROM, TO))
 W("")
 W("> **Multi-repo constellation digest.** Source of truth is the journey-graph "
-  "store (`workspace/journey_live.db`); this report is materialized from "
+  "store (`workspace/journey.db`); this report is materialized from "
   "`digest.py`'s project view and validated diagrams. Every claim resolves to a "
   "store value or a GitHub URL.")
 W("")
@@ -193,17 +193,29 @@ for e in view["module_edges"]:
         "**yes**" if e["cross_repo"] else "no",
         "yes" if e["transitive"] else "no"))
 W("")
-W("**Reading the graph.** The pattern module "
-  "`terraform-azurerm-avm-ptn-aiml-landing-zone` pins "
-  "`avm-res-network-virtualnetwork` at `0.16.0` (both from its root `main.tf` and "
-  "its `modules/example_hub_vnet` sub-module) and pulls "
-  "`avm-res-operationalinsights-workspace` `0.4.2` transitively. Within the vnet "
-  "module, `main.tf` fans out to its own `modules/subnet` (transitive) and "
-  "`modules/peering` sub-modules. **Blast radius:** a breaking change to either "
-  "resource module's `main.tf` forces a version bump in the landing zone. Compute "
-  "the precise dependents of any member with "
-  "`python3 spotlight.py dependents <owner/repo> --store workspace/journey_live.db "
-  "--project {}`.".format(PROJECT))
+_xrepo = [e for e in view["module_edges"] if e["cross_repo"]]
+_intra = [e for e in view["module_edges"] if not e["cross_repo"]]
+if _xrepo:
+    W("**Reading the graph.** {} cross-repo dependency edge(s) resolved this "
+      "window — a member module consuming another member's published "
+      "module:".format(len(_xrepo)))
+    W("")
+    for e in _xrepo:
+        W("- `{}` · `{}` → `{}` · `{}` (`{}`{})".format(
+            short(e["src_repo"]), e["src_area"], short(e["dst_repo"]), e["dst_area"],
+            e["version"] or "unpinned", ", transitive" if e["transitive"] else ""))
+    W("")
+    if _intra:
+        W("Plus {} intra-repo sub-module edge(s).".format(len(_intra)))
+        W("")
+    W("Resolved edges are extracted from terraform module areas that were built in "
+      "this window, so the graph reflects active dependencies rather than the full "
+      "static module tree. **Blast radius:** a breaking change to a depended-on "
+      "resource module's `main.tf` forces a version bump in every consumer above. "
+      "Compute the precise dependents of any member with `python3 spotlight.py "
+      "dependents <owner/repo> --store workspace/journey.db --project {}`.".format(PROJECT))
+else:
+    W("No cross-repo module dependencies resolved this window.")
 W("")
 
 
@@ -477,7 +489,7 @@ for m in view["members"]:
 
 W("---")
 W("")
-W("*Generated from `digest.py` over `workspace/journey_live.db`. {} diagrams "
+W("*Generated from `digest.py` over `workspace/journey.db`. {} diagrams "
   "rendered and validated with `mmdc`. Re-run: "
   "`python3 build_report.py`.*".format(
       sum(len(os.listdir(os.path.join(DIAG, slug(m["repo"])))) for m in view["members"]) + 1))

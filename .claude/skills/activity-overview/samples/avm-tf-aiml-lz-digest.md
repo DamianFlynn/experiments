@@ -1,6 +1,6 @@
 # avm-tf-aiml-lz — Project Activity Digest (2026-03-16 → 2026-03-22)
 
-> **Multi-repo constellation digest.** Source of truth is the journey-graph store (`workspace/journey_live.db`); this report is materialized from `digest.py`'s project view and validated diagrams. Every claim resolves to a store value or a GitHub URL.
+> **Multi-repo constellation digest.** Source of truth is the journey-graph store (`workspace/journey.db`); this report is materialized from `digest.py`'s project view and validated diagrams. Every claim resolves to a store value or a GitHub URL.
 
 | | |
 |---|---|
@@ -16,11 +16,11 @@ Member repositories:
 - [`Azure/terraform-azurerm-avm-res-network-virtualnetwork`](https://github.com/Azure/terraform-azurerm-avm-res-network-virtualnetwork)
 - [`Azure/terraform-azurerm-avm-res-operationalinsights-workspace`](https://github.com/Azure/terraform-azurerm-avm-res-operationalinsights-workspace)
 
-> ⚠️ **Known gap.** One in-window commit per member sat at the shallow-clone boundary, so its whole-tree phantom diff was dropped (visible in `meta.boundary_dropped_commits`). Code-level ledgers (feature changes / content lifecycle) are therefore complete only for `terraform-azurerm-avm-ptn-aiml-landing-zone`; the two resource modules' in-window merges were `pre-commit` chores whose diffs fell on that boundary. Widen `CLONE_MARGIN_DAYS` to recover them.
+> ✅ **Completeness.** No in-window commit landed on the shallow-clone boundary (`meta.boundary_dropped_commits` is empty for every member), so the code-level ledgers (feature changes / content lifecycle) are complete across the constellation. Gathered with a widened clone margin (`ACTIVITY_CLONE_MARGIN_DAYS`).
 
 ## Executive summary
 
-Across the constellation's **3 member repos**, **44 items shipped** this week (4 merged PRs, 40 issues closed) over **21 decision trains**. The three modules form a real dependency constellation — **6 resolved module-dependency edges, 4 of them cross-repo**: the AI/ML landing-zone *pattern* consumes both *resource* modules it sits above.
+Across the constellation's **3 member repos**, **44 items shipped** this week (4 merged PRs, 40 issues closed) over **21 decision trains**. The three modules form a real dependency constellation — **2 resolved module-dependency edges, 2 of them cross-repo**: the AI/ML landing-zone *pattern* consumes both *resource* modules it sits above.
 
 The notable structural finding: **the repos are coupled by module dependencies, not by shared work**. There are **0 cross-repo decision trains** and **0 ticket-linked `related_work` clusters** — every train lives entirely within one repo, and no internal ticket spans two. So a change in the vnet or operationalinsights module ripples into the landing zone *structurally* (version-pinned `source` references), even though the teams' issue/PR threads this window never crossed repo boundaries.
 
@@ -32,34 +32,28 @@ Resolved `depends_on` edges across the project (Terraform `source` → the membe
 flowchart LR
     subgraph r_Azure_terraform_azurerm_avm_ptn_aiml_lan_8f5ee345["Azure/terraform-azurerm-avm-ptn-aiml-landing-zone"]
         m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4("modules/example_hub_vnet")
-        m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e("main.tf")
     end
     subgraph r_Azure_terraform_azurerm_avm_res_network__c3bf45c1["Azure/terraform-azurerm-avm-res-network-virtualnetwork"]
-        m_Azure_terraform_azurerm_avm_res_network__8693f704("modules/subnet")
         m_Azure_terraform_azurerm_avm_res_network__9b1b7c02("main.tf")
-        m_Azure_terraform_azurerm_avm_res_network__a691fb80("modules/peering")
     end
     subgraph r_Azure_terraform_azurerm_avm_res_operatio_b3f65f76["Azure/terraform-azurerm-avm-res-operationalinsights-workspace"]
         m_Azure_terraform_azurerm_avm_res_operatio_27a69a94("main.tf")
     end
     m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4 -->|"=0.16.0"| m_Azure_terraform_azurerm_avm_res_network__9b1b7c02
     m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4 -->|"0.4.2"| m_Azure_terraform_azurerm_avm_res_operatio_27a69a94
-    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e -->|"0.16.0"| m_Azure_terraform_azurerm_avm_res_network__9b1b7c02
-    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e -->|"0.4.2"| m_Azure_terraform_azurerm_avm_res_operatio_27a69a94
-    m_Azure_terraform_azurerm_avm_res_network__9b1b7c02 -->|"transitive"| m_Azure_terraform_azurerm_avm_res_network__8693f704
-    m_Azure_terraform_azurerm_avm_res_network__9b1b7c02 --> m_Azure_terraform_azurerm_avm_res_network__a691fb80
 ```
 
 | Consumer (repo · area) | Depends on (repo · area) | Version | Cross-repo | Transitive |
 |---|---|---|---|---|
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `0.16.0` | **yes** | no |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | **yes** | yes |
 | `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `=0.16.0` | **yes** | no |
 | `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | **yes** | yes |
-| `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/peering` | — | no | no |
-| `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/subnet` | — | no | yes |
 
-**Reading the graph.** The pattern module `terraform-azurerm-avm-ptn-aiml-landing-zone` pins `avm-res-network-virtualnetwork` at `0.16.0` (both from its root `main.tf` and its `modules/example_hub_vnet` sub-module) and pulls `avm-res-operationalinsights-workspace` `0.4.2` transitively. Within the vnet module, `main.tf` fans out to its own `modules/subnet` (transitive) and `modules/peering` sub-modules. **Blast radius:** a breaking change to either resource module's `main.tf` forces a version bump in the landing zone. Compute the precise dependents of any member with `python3 spotlight.py dependents <owner/repo> --store workspace/journey_live.db --project avm-tf-aiml-lz`.
+**Reading the graph.** 2 cross-repo dependency edge(s) resolved this window — a member module consuming another member's published module:
+
+- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` → `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` (`=0.16.0`)
+- `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` → `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` (`0.4.2`, transitive)
+
+Resolved edges are extracted from terraform module areas that were built in this window, so the graph reflects active dependencies rather than the full static module tree. **Blast radius:** a breaking change to a depended-on resource module's `main.tf` forces a version bump in every consumer above. Compute the precise dependents of any member with `python3 spotlight.py dependents <owner/repo> --store workspace/journey.db --project avm-tf-aiml-lz`.
 
 ## Decision trains
 
@@ -184,30 +178,24 @@ CODEOWNERS plus per-area contribution stats (commits / PRs / files touched in wi
 
 | Repo | Module (area) | CODEOWNERS | Commits | PRs | Files |
 |---|---|---|---|---|---|
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `main.tf` | `Azure/avm-core-team-technical-terraform` | 2 | 2 | 38 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `modules/example_hub_vnet` | `Azure/avm-core-team-technical-terraform` | 2 | 2 | 8 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default` | `Azure/avm-core-team-technical-terraform` | 2 | 2 | 7 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default-byo-vnet` | `Azure/avm-core-team-technical-terraform` | 2 | 2 | 7 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone` | `Azure/avm-core-team-technical-terraform` | 2 | 2 | 7 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone-byo-vnet` | `Azure/avm-core-team-technical-terraform` | 2 | 2 | 7 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `main.tf` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 8 |
 | `terraform-azurerm-avm-ptn-aiml-landing-zone` | `.agents/skills` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 5 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `.github/actions` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 5 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `main.tf` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 9 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `modules/subnet` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 9 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `modules/peering` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 8 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `examples/complete` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 7 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `examples/peer_only_specified_subnets` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 7 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `examples/existing_vnet_ipam_subnets` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 6 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `examples/existing_vnet_peering_sync_address_space` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 6 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `examples/ipam_basic` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 6 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `main.tf` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 14 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `modules/log_analytics_solution` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 7 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `modules/query_packs` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 7 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `examples/default` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 6 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `examples/deploy_network_isolation` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 6 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `examples/deploy_query_packs` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 6 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `examples/deploy_security_insights` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 6 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `modules/example_hub_vnet` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 3 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default-byo-vnet` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone-byo-vnet` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `.github/copilot-instructions.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.agents/skills` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 5 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.github/copilot-instructions.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.vscode/extensions.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.vscode/mcp.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `AGENTS.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
 | `terraform-azurerm-avm-res-operationalinsights-workspace` | `.agents/skills` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 5 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.github/copilot-instructions.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/extensions.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/mcp.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `AGENTS.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
 
 People ↔ code-area edges (landing zone — the only member with in-window code-area attribution after the boundary drop):
 
@@ -216,71 +204,18 @@ flowchart LR
     p_Copilot["Copilot"]
     p_azure_verified_modules_bot_["azure-verified-modules[bot]"]
     a_AGENTS_md("AGENTS.md")
-    a_CODE_OF_CONDUCT_md("CODE_OF_CONDUCT.md")
-    a_CONTRIBUTING_md("CONTRIBUTING.md")
-    a_LICENSE("LICENSE")
-    a_Makefile("Makefile")
     a_README_md("README.md")
-    a_SECURITY_md("SECURITY.md")
-    a_SUPPORT_md("SUPPORT.md")
-    a__DS_Store(".DS_Store")
     a__agents_skills("skills")
-    a__devcontainer_devcontainer_json("devcontainer.json")
-    a__editorconfig(".editorconfig")
-    a__footer_md("_footer.md")
-    a__gitattributes(".gitattributes")
-    a__github_CODEOWNERS("CODEOWNERS")
-    a__github_ISSUE_TEMPLATE("ISSUE_TEMPLATE")
-    a__github_PULL_REQUEST_TEMPLATE_md("PULL_REQUEST_TEMPLATE.md")
-    a__github_actions("actions")
-    a__github_dependabot_yml("dependabot.yml")
-    a__github_policies("policies")
-    a__github_workflows("workflows")
-    a__gitignore(".gitignore")
+    a__github_copilot_instructions_md("copilot-instructions.md")
     a__header_md("_header.md")
-    a__terraform_docs_yml(".terraform-docs.yml")
-    a__terraform_registry(".terraform-registry")
-    a__tflint_hcl(".tflint.hcl")
     a__vscode_extensions_json("extensions.json")
-    a__vscode_settings_json("settings.json")
-    a_avm("avm")
-    a_avm_bat("avm.bat")
-    a_avm_ps1("avm.ps1")
-    a_avmmakefile("avmmakefile")
-    a_examples_README_md("README.md")
-    a_examples__DS_Store(".DS_Store")
-    a_examples__terraform_docs_yml(".terraform-docs.yml")
-    a_examples_complete("complete")
+    a__vscode_mcp_json("mcp.json")
     a_examples_default("default")
     a_examples_default_byo_vnet("default-byo-vnet")
-    a_examples_deploy_network_isolation("deploy_network_isolation")
-    a_examples_deploy_query_packs("deploy_query_packs")
-    a_examples_deploy_security_insights("deploy_security_insights")
-    a_examples_existing_vnet_ipam_subnets("existing_vnet_ipam_subnets")
-    a_examples_existing_vnet_peering("existing_vnet_peering")
-    a_examples_existing_vnet_peering_sync_address_space("existing_vnet_peering_sync_address_space")
-    a_examples_existing_vnet_subnets("existing_vnet_subnets")
-    a_examples_ipam_basic("ipam_basic")
-    a_examples_ipam_vnet_only("ipam_vnet_only")
-    a_examples_legacy_address_prefix("legacy_address_prefix")
-    a_examples_new_route("new_route")
-    a_examples_new_security_rule("new_security_rule")
-    a_examples_peer_only_specified_address_spaces("peer_only_specified_address_spaces")
-    a_examples_peer_only_specified_subnets("peer_only_specified_subnets")
-    a_examples_service_endpoints_with_locations("service_endpoints_with_locations")
     a_examples_standalone("standalone")
     a_examples_standalone_byo_vnet("standalone-byo-vnet")
-    a_examples_with_network_interface("with_network_interface")
     a_main_tf("main.tf")
-    a_modules_README_md("README.md")
-    a_modules__terraform_docs_yml(".terraform-docs.yml")
     a_modules_example_hub_vnet("example_hub_vnet")
-    a_modules_log_analytics_solution("log_analytics_solution")
-    a_modules_peering("peering")
-    a_modules_query_packs("query_packs")
-    a_modules_subnet("subnet")
-    a_tests_README_md("README.md")
-    a_tests_unit("unit")
     p_Copilot --> a_README_md
     p_Copilot --> a__header_md
     p_Copilot --> a_examples_default
@@ -290,71 +225,10 @@ flowchart LR
     p_Copilot --> a_main_tf
     p_Copilot --> a_modules_example_hub_vnet
     p_azure_verified_modules_bot_ --> a_AGENTS_md
-    p_azure_verified_modules_bot_ --> a_CODE_OF_CONDUCT_md
-    p_azure_verified_modules_bot_ --> a_CONTRIBUTING_md
-    p_azure_verified_modules_bot_ --> a_LICENSE
-    p_azure_verified_modules_bot_ --> a_Makefile
-    p_azure_verified_modules_bot_ --> a_README_md
-    p_azure_verified_modules_bot_ --> a_SECURITY_md
-    p_azure_verified_modules_bot_ --> a_SUPPORT_md
-    p_azure_verified_modules_bot_ --> a__DS_Store
     p_azure_verified_modules_bot_ --> a__agents_skills
-    p_azure_verified_modules_bot_ --> a__devcontainer_devcontainer_json
-    p_azure_verified_modules_bot_ --> a__editorconfig
-    p_azure_verified_modules_bot_ --> a__footer_md
-    p_azure_verified_modules_bot_ --> a__gitattributes
-    p_azure_verified_modules_bot_ --> a__github_CODEOWNERS
-    p_azure_verified_modules_bot_ --> a__github_ISSUE_TEMPLATE
-    p_azure_verified_modules_bot_ --> a__github_PULL_REQUEST_TEMPLATE_md
-    p_azure_verified_modules_bot_ --> a__github_actions
-    p_azure_verified_modules_bot_ --> a__github_dependabot_yml
-    p_azure_verified_modules_bot_ --> a__github_policies
-    p_azure_verified_modules_bot_ --> a__github_workflows
-    p_azure_verified_modules_bot_ --> a__gitignore
-    p_azure_verified_modules_bot_ --> a__header_md
-    p_azure_verified_modules_bot_ --> a__terraform_docs_yml
-    p_azure_verified_modules_bot_ --> a__terraform_registry
-    p_azure_verified_modules_bot_ --> a__tflint_hcl
+    p_azure_verified_modules_bot_ --> a__github_copilot_instructions_md
     p_azure_verified_modules_bot_ --> a__vscode_extensions_json
-    p_azure_verified_modules_bot_ --> a__vscode_settings_json
-    p_azure_verified_modules_bot_ --> a_avm
-    p_azure_verified_modules_bot_ --> a_avm_bat
-    p_azure_verified_modules_bot_ --> a_avm_ps1
-    p_azure_verified_modules_bot_ --> a_avmmakefile
-    p_azure_verified_modules_bot_ --> a_examples_README_md
-    p_azure_verified_modules_bot_ --> a_examples__DS_Store
-    p_azure_verified_modules_bot_ --> a_examples__terraform_docs_yml
-    p_azure_verified_modules_bot_ --> a_examples_complete
-    p_azure_verified_modules_bot_ --> a_examples_default
-    p_azure_verified_modules_bot_ --> a_examples_default_byo_vnet
-    p_azure_verified_modules_bot_ --> a_examples_deploy_network_isolation
-    p_azure_verified_modules_bot_ --> a_examples_deploy_query_packs
-    p_azure_verified_modules_bot_ --> a_examples_deploy_security_insights
-    p_azure_verified_modules_bot_ --> a_examples_existing_vnet_ipam_subnets
-    p_azure_verified_modules_bot_ --> a_examples_existing_vnet_peering
-    p_azure_verified_modules_bot_ --> a_examples_existing_vnet_peering_sync_address_space
-    p_azure_verified_modules_bot_ --> a_examples_existing_vnet_subnets
-    p_azure_verified_modules_bot_ --> a_examples_ipam_basic
-    p_azure_verified_modules_bot_ --> a_examples_ipam_vnet_only
-    p_azure_verified_modules_bot_ --> a_examples_legacy_address_prefix
-    p_azure_verified_modules_bot_ --> a_examples_new_route
-    p_azure_verified_modules_bot_ --> a_examples_new_security_rule
-    p_azure_verified_modules_bot_ --> a_examples_peer_only_specified_address_spaces
-    p_azure_verified_modules_bot_ --> a_examples_peer_only_specified_subnets
-    p_azure_verified_modules_bot_ --> a_examples_service_endpoints_with_locations
-    p_azure_verified_modules_bot_ --> a_examples_standalone
-    p_azure_verified_modules_bot_ --> a_examples_standalone_byo_vnet
-    p_azure_verified_modules_bot_ --> a_examples_with_network_interface
-    p_azure_verified_modules_bot_ --> a_main_tf
-    p_azure_verified_modules_bot_ --> a_modules_README_md
-    p_azure_verified_modules_bot_ --> a_modules__terraform_docs_yml
-    p_azure_verified_modules_bot_ --> a_modules_example_hub_vnet
-    p_azure_verified_modules_bot_ --> a_modules_log_analytics_solution
-    p_azure_verified_modules_bot_ --> a_modules_peering
-    p_azure_verified_modules_bot_ --> a_modules_query_packs
-    p_azure_verified_modules_bot_ --> a_modules_subnet
-    p_azure_verified_modules_bot_ --> a_tests_README_md
-    p_azure_verified_modules_bot_ --> a_tests_unit
+    p_azure_verified_modules_bot_ --> a__vscode_mcp_json
 ```
 
 ---
@@ -445,12 +319,18 @@ flowchart LR
 xychart-beta
     title "Feature changes by kind"
     x-axis [add, drop, change]
-    y-axis "Count" 0 --> 12
-    bar [9, 0, 12]
+    y-axis "Count" 0 --> 13
+    bar [13, 1, 13]
 ```
 
 | Kind | Subject | Detail / Name | Author | PR |
 |---|---|---|---|---|
+| add | doc | AzAPI.md | azure-verified-modules[bot] | #81 |
+| add | doc | SKILL.md | azure-verified-modules[bot] | #81 |
+| add | doc | terraform-test.md | azure-verified-modules[bot] | #81 |
+| add | doc | tfpluginschema.md | azure-verified-modules[bot] | #81 |
+| drop | doc | copilot-instructions.md | azure-verified-modules[bot] | #81 |
+| change | doc | AGENTS.md | azure-verified-modules[bot] | #81 |
 | change | readme | README.md | Copilot | #80 |
 | change | doc | _header.md | Copilot | #80 |
 | change | readme | README.md | Copilot | #80 |
@@ -493,10 +373,11 @@ xychart-beta
 ```mermaid
 timeline
     title Content lifecycle (2026-03-16 - 2026-03-22)
+    2026-03-18 : built AzAPI.md (doc) by azure-verified-modules[bot] : built SKILL.md (doc) by azure-verified-modules[bot] : built terraform-test.md (doc) by azure-verified-modules[bot] : built tfpluginschema.md (doc) by azure-verified-modules[bot] : dropped copilot-instructions.md (doc) by azure-verified-modu : changed AGENTS.md (doc) by azure-verified-modules[bot]
     2026-03-20 : changed README.md (readme) by Copilot : changed _header.md (doc) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : built #name = "ai-lz-vnet-default-2" (comment) by Copilot : built #resource_group_name = "ai-lz-rg-default-ivrhi-2" (com : built #resource_group_name = "default-example-rg-ivrh-2" (co : built #resource_group_name = "ai-lz-rg-default-ivrhi-1" (com : built #resource_group_name = "default-example-rg-ivrh-1" (co : changed test (symbol) by Copilot : built #resource_group_name = "ai-lz-rg-default-ivrhi-4" (com : built #resource_group_name = "ai-lz-rg-default-ivrhi-3" (com : built time_sleep.wait_for_kv_rbac (symbol) by Copilot : built time_sleep.wait_for_kv_rbac (symbol) by Copilot
 ```
 
-All 21 tracked artifacts are `live` (examples, READMEs, docs revised in window — none removed or replaced).
+- **copilot-instructions.md** (doc) — removed.
 
 
 ### `Azure/terraform-azurerm-avm-res-network-virtualnetwork`
@@ -575,12 +456,37 @@ pie showData
 
 ```mermaid
 flowchart LR
-    m_main_tf("main.tf")
-    m_modules_peering("peering")
-    m_modules_subnet("subnet")
-    m_main_tf --> m_modules_peering
-    m_main_tf -->|"transitive"| m_modules_subnet
+    none[No module dependencies]
 ```
+
+#### Feature changes (add / drop / change)
+
+```mermaid
+xychart-beta
+    title "Feature changes by kind"
+    x-axis [add, drop, change]
+    y-axis "Count" 0 --> 4
+    bar [4, 1, 1]
+```
+
+| Kind | Subject | Detail / Name | Author | PR |
+|---|---|---|---|---|
+| add | doc | AzAPI.md | azure-verified-modules[bot] | #59 |
+| add | doc | SKILL.md | azure-verified-modules[bot] | #59 |
+| add | doc | terraform-test.md | azure-verified-modules[bot] | #59 |
+| add | doc | tfpluginschema.md | azure-verified-modules[bot] | #59 |
+| drop | doc | copilot-instructions.md | azure-verified-modules[bot] | #59 |
+| change | doc | AGENTS.md | azure-verified-modules[bot] | #59 |
+
+#### Content lifecycle (built / changed / dropped)
+
+```mermaid
+timeline
+    title Content lifecycle (2026-03-16 - 2026-03-22)
+    2026-03-18 : built AzAPI.md (doc) by azure-verified-modules[bot] : built SKILL.md (doc) by azure-verified-modules[bot] : built terraform-test.md (doc) by azure-verified-modules[bot] : built tfpluginschema.md (doc) by azure-verified-modules[bot] : dropped copilot-instructions.md (doc) by azure-verified-modu : changed AGENTS.md (doc) by azure-verified-modules[bot]
+```
+
+- **copilot-instructions.md** (doc) — removed.
 
 
 ### `Azure/terraform-azurerm-avm-res-operationalinsights-workspace`
@@ -642,7 +548,36 @@ flowchart LR
     none[No module dependencies]
 ```
 
+#### Feature changes (add / drop / change)
+
+```mermaid
+xychart-beta
+    title "Feature changes by kind"
+    x-axis [add, drop, change]
+    y-axis "Count" 0 --> 4
+    bar [4, 1, 1]
+```
+
+| Kind | Subject | Detail / Name | Author | PR |
+|---|---|---|---|---|
+| add | doc | AzAPI.md | azure-verified-modules[bot] | #127 |
+| add | doc | SKILL.md | azure-verified-modules[bot] | #127 |
+| add | doc | terraform-test.md | azure-verified-modules[bot] | #127 |
+| add | doc | tfpluginschema.md | azure-verified-modules[bot] | #127 |
+| drop | doc | copilot-instructions.md | azure-verified-modules[bot] | #127 |
+| change | doc | AGENTS.md | azure-verified-modules[bot] | #127 |
+
+#### Content lifecycle (built / changed / dropped)
+
+```mermaid
+timeline
+    title Content lifecycle (2026-03-16 - 2026-03-22)
+    2026-03-18 : built AzAPI.md (doc) by azure-verified-modules[bot] : built SKILL.md (doc) by azure-verified-modules[bot] : built terraform-test.md (doc) by azure-verified-modules[bot] : built tfpluginschema.md (doc) by azure-verified-modules[bot] : dropped copilot-instructions.md (doc) by azure-verified-modu : changed AGENTS.md (doc) by azure-verified-modules[bot]
+```
+
+- **copilot-instructions.md** (doc) — removed.
+
 
 ---
 
-*Generated from `digest.py` over `workspace/journey_live.db`. 41 diagrams rendered and validated with `mmdc`. Re-run: `python3 build_report.py`.*
+*Generated from `digest.py` over `workspace/journey.db`. 41 diagrams rendered and validated with `mmdc`. Re-run: `python3 build_report.py`.*
