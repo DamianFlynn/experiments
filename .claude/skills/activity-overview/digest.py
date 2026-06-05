@@ -301,3 +301,35 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
         "people": _merge_people(members),
         "modules": _merge_modules(members),
     }
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="Emit a multi-repo project digest view (JSON) from a store.")
+    p.add_argument("--store", required=True, help="path to the journey-graph store")
+    p.add_argument("--project", required=True, help="logical project name")
+    p.add_argument("--repo", action="append", dest="repos", default=None,
+                   help="member repo 'owner/repo'; repeatable. Default: all "
+                        "members discovered in the store for the project.")
+    p.add_argument("--from", dest="ts_from", required=True)
+    p.add_argument("--to", dest="ts_to", required=True)
+    p.add_argument("--ticket-pattern", default=None,
+                   help="regex (one capture group) for internal-ticket refs; "
+                        "default matches Jira/ADO-style ABC-1234.")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    conn = graphstore.open_store(args.store)
+    repos = args.repos or graphstore.project_repos(conn, args.project)
+    pattern = (re.compile(args.ticket_pattern) if args.ticket_pattern
+               else _DEFAULT_TICKET_RE)
+    view = build_project_view(conn, args.project, repos, args.ts_from, args.ts_to,
+                              ticket_pattern=pattern)
+    sys.stdout.write(json.dumps(view, sort_keys=True, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

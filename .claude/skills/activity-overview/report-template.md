@@ -1,4 +1,10 @@
-# {repo} — Activity Digest ({from} → {to})
+# {project} — Activity Digest ({from} → {to})
+
+<!-- Multi-repo digest. All sections below consume the JSON view emitted by
+     `python3 digest.py --store <path> --project <name> --from ... --to ...`.
+     Per-member (single-repo) sections render once per entry in
+     `view["members"][i]["bundle"]`; project-wide sections read the merged keys
+     (trains, shipped, people, modules, related_work). -->
 
 ## Executive summary
 
@@ -6,16 +12,34 @@
 
 ## Shipped this period
 
-For each ref in `buckets.shipped`, one line: the PR/issue title, number, and link.
+<!-- Multi-repo: source from `view["shipped"]` (each row has a `repo` key added
+     by `_merge_shipped`). Single-repo fallback: per-member
+     `view["members"][i]["bundle"]["buckets"]["shipped"]`. -->
 
-- [{title}]({url}) (#{number})
+| Repo | Title | Number |
+|------|-------|--------|
+| `{view["shipped"][].repo}` | [{title}]({url}) | #{number} |
 
 ## Decision trains
+
+<!-- Multi-repo: source from `view["trains"]` (project-wide trains keyed off
+     qualified node ids). Each train carries:
+       - `repos`    — list of member repos contributing to this train
+       - `kind`     — "feature" | "bug" | "other"
+       - `outcome`  — "shipped" | "in_flight" | "rejected" | "abandoned"
+       - `prs`      — qualified PR ids, e.g. "proj/Azure/mod-a#pr-10"
+       - `issues`   — qualified issue ids
+       - `tickets`  — internal ticket refs parsed from PR/issue text (may be [])
+     When `len(train["repos"]) > 1`, note "spans: {repo1}, {repo2}" in the header.
+     Single-repo fallback: per-member trains from
+     `view["members"][i]["bundle"]["trains"]`. -->
 
 DEEP trains (`tier == "deep"`) get a full sub-section with flowchart + effort line.
 MENTION trains (`tier == "mention"`) are one-liners at the end of the section.
 
 ### {train.id} — {issue or PR title}  *(DEEP)*
+
+<!-- spans: {", ".join(train["repos"])} — omit line when only one repo -->
 
 ```mermaid
 {contents of diagrams.train_flowcharts[train.id]}
@@ -27,16 +51,31 @@ MENTION trains (`tier == "mention"`) are one-liners at the end of the section.
 <!-- narrative: {train.id} -->
 
 - **Root issue:** #{root_issue} (or "none — PR-anchored")
-- **PRs:** {prs}
+- **PRs:** {train["prs"]} *(qualified ids; strip project prefix for display)*
 - **Commits:** {commit count}
-- **Outcome:** {outcome}
+- **Outcome:** {train["outcome"]}
+- **Tickets:** {train["tickets"] joined with ", " or "—"}
 - **Evidence:** {evidence urls}
 
 ---
 
 *MENTION trains (one line each):*
 
-- `{train.id}` — {title} — {outcome} ({PR count} PR(s))
+- `{train.id}` — {title} — {outcome} ({PR count} PR(s)){ — spans: {repos} when multi-repo}
+
+## Related work (cross-repo, ticket-linked)
+
+<!-- Source: `view["related_work"]` — a list of `{ticket, train_ids}` objects.
+     Each entry represents two or more project trains that share an internal
+     ticket reference (Jira/ADO-style, e.g. ABC-1234) but are NOT connected by
+     any GitHub closes/cross_ref edge. They are distinct-repo deliverables whose
+     only shared signal is the internal ticket. This section makes that
+     invisible coupling visible.
+     Omit the section entirely when `view["related_work"]` is empty. -->
+
+| Ticket | Trains |
+|--------|--------|
+| `{related_work[].ticket}` | {related_work[].train_ids joined with ", "} |
 
 ## Activity at a glance
 
@@ -166,12 +205,20 @@ change ripples into. When no edges resolve, `module_graph` renders a
 
 ## Module ownership
 
-From `code_owners` + `people.modules`/`modules`: who owns and who touched each
-module this window.
+<!-- Multi-repo: source from `view["modules"]` and `view["people"]`.
+     `view["modules"]` keys are `"{repo}::{area}"` — split on `::` for display.
+     `view["people"]` logins are merged across all member repos (union by login).
+     Top contributors: people whose `modules` list includes the area id. -->
 
-| Module | Owners (CODEOWNERS) | Top contributors | Commits | PRs | Files |
-|--------|---------------------|------------------|---------|-----|-------|
-| `{area}` | {code_owners[glob]} | {people whose modules include area} | {modules[area].commits} | {modules[area].prs} | {modules[area].files_changed} |
+From `code_owners` + `view["people"]`/`view["modules"]`: who owns and who touched
+each module this window.
+
+| Repo | Module | Owners (CODEOWNERS) | Top contributors | Commits | PRs | Files |
+|------|--------|---------------------|------------------|---------|-----|-------|
+| `{repo}` *(from key split on `::`)* | `{area}` | {code_owners[glob]} | {people whose modules include area} | {modules["{repo}::{area}"].commits} | {modules["{repo}::{area}"].prs} | {modules["{repo}::{area}"].files_changed} |
+
+<!-- Per-file sections (Content lifecycle, Feature changes) render once per
+     member repo from `view["members"][i]["bundle"]`. -->
 
 Embeds `diagrams.contributor_graph` (people ↔ code-area edges):
 

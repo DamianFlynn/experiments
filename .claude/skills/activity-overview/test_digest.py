@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -375,6 +376,27 @@ class TestMergeHelpers(unittest.TestCase):
         self.assertEqual(people["alice"]["display_name"], "Alice")  # preserved
         # source records not mutated
         self.assertEqual(members[0]["bundle"]["people"]["alice"]["modules"], ["m1"])
+
+
+class TestDigestCli(unittest.TestCase):
+    def test_main_emits_project_view_json(self):
+        import io
+        import tempfile
+        import contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "j.db")
+            disk = graphstore.open_store(store)
+            _seed_two_member_store(disk)
+            disk.close()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = digest.main(["--store", store, "--project", "proj",
+                                  "--from", "2026-01-01T00:00:00Z",
+                                  "--to", "2026-01-31T23:59:59Z"])
+        self.assertEqual(rc, 0)
+        view = json.loads(buf.getvalue())
+        self.assertEqual(view["meta"]["project"], "proj")
+        self.assertEqual(len(view["trains"]), 1)
 
 
 if __name__ == "__main__":
