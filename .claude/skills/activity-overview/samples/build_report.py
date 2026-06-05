@@ -1,8 +1,10 @@
 """Structural renderer for a digest.py project view (illustration only).
 
 **The JSON bundle is the product.** `gather → store → digest.py` emits the
-verifiable project view (`samples/digest_view.json`): the trustworthy, fully
-sourced interface a downstream content agent consumes to author a narrative.
+verifiable project view — the trustworthy, fully sourced interface a downstream
+content agent consumes to author a narrative. The committed snapshot of that
+product is `samples/digest_view.json`; this script reads the freshly generated
+copy that `digest.py` writes to `workspace/digest_view.json`.
 
 This script does NOT author narrative. It deterministically renders the bundle
 into a Markdown *skeleton* — metadata, summary counts, tables, and the validated
@@ -279,13 +281,14 @@ for m in view["members"]:
             short(repo), area, owner, s.get("commits", 0),
             s.get("prs", 0), s.get("files_changed", 0)))
 W("")
-cg = os.path.join(DIAG, slug("Azure/terraform-azurerm-avm-ptn-aiml-landing-zone"),
-                  "contributor_graph.mmd")
-if os.path.exists(cg):
-    W("People ↔ code-area edges:")
-    W("")
-    W(mmd(cg))
-    W("")
+# People ↔ code-area graph per member that has one (discovered, not hardcoded).
+for m in view["members"]:
+    cg = os.path.join(DIAG, slug(m["repo"]), "contributor_graph.mmd")
+    if os.path.exists(cg):
+        W("People ↔ code-area edges — `{}`:".format(short(m["repo"])))
+        W("")
+        W(mmd(cg))
+        W("")
 
 
 # ============================ per-member appendices ==========================

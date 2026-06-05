@@ -188,7 +188,75 @@ flowchart LR
 | `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/mcp.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
 | `terraform-azurerm-avm-res-operationalinsights-workspace` | `AGENTS.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
 
-People ↔ code-area edges:
+People ↔ code-area edges — `terraform-azurerm-avm-ptn-aiml-landing-zone`:
+
+```mermaid
+flowchart LR
+    p_Copilot["Copilot"]
+    p_azure_verified_modules_bot_["azure-verified-modules[bot]"]
+    a_AGENTS_md("AGENTS.md")
+    a_README_md("README.md")
+    a__agents_skills("skills")
+    a__github_copilot_instructions_md("copilot-instructions.md")
+    a__header_md("_header.md")
+    a__vscode_extensions_json("extensions.json")
+    a__vscode_mcp_json("mcp.json")
+    a_examples_default("default")
+    a_examples_default_byo_vnet("default-byo-vnet")
+    a_examples_standalone("standalone")
+    a_examples_standalone_byo_vnet("standalone-byo-vnet")
+    a_main_tf("main.tf")
+    a_modules_example_hub_vnet("example_hub_vnet")
+    p_Copilot --> a_README_md
+    p_Copilot --> a__header_md
+    p_Copilot --> a_examples_default
+    p_Copilot --> a_examples_default_byo_vnet
+    p_Copilot --> a_examples_standalone
+    p_Copilot --> a_examples_standalone_byo_vnet
+    p_Copilot --> a_main_tf
+    p_Copilot --> a_modules_example_hub_vnet
+    p_azure_verified_modules_bot_ --> a_AGENTS_md
+    p_azure_verified_modules_bot_ --> a__agents_skills
+    p_azure_verified_modules_bot_ --> a__github_copilot_instructions_md
+    p_azure_verified_modules_bot_ --> a__vscode_extensions_json
+    p_azure_verified_modules_bot_ --> a__vscode_mcp_json
+```
+
+People ↔ code-area edges — `terraform-azurerm-avm-res-network-virtualnetwork`:
+
+```mermaid
+flowchart LR
+    p_Copilot["Copilot"]
+    p_azure_verified_modules_bot_["azure-verified-modules[bot]"]
+    a_AGENTS_md("AGENTS.md")
+    a_README_md("README.md")
+    a__agents_skills("skills")
+    a__github_copilot_instructions_md("copilot-instructions.md")
+    a__header_md("_header.md")
+    a__vscode_extensions_json("extensions.json")
+    a__vscode_mcp_json("mcp.json")
+    a_examples_default("default")
+    a_examples_default_byo_vnet("default-byo-vnet")
+    a_examples_standalone("standalone")
+    a_examples_standalone_byo_vnet("standalone-byo-vnet")
+    a_main_tf("main.tf")
+    a_modules_example_hub_vnet("example_hub_vnet")
+    p_Copilot --> a_README_md
+    p_Copilot --> a__header_md
+    p_Copilot --> a_examples_default
+    p_Copilot --> a_examples_default_byo_vnet
+    p_Copilot --> a_examples_standalone
+    p_Copilot --> a_examples_standalone_byo_vnet
+    p_Copilot --> a_main_tf
+    p_Copilot --> a_modules_example_hub_vnet
+    p_azure_verified_modules_bot_ --> a_AGENTS_md
+    p_azure_verified_modules_bot_ --> a__agents_skills
+    p_azure_verified_modules_bot_ --> a__github_copilot_instructions_md
+    p_azure_verified_modules_bot_ --> a__vscode_extensions_json
+    p_azure_verified_modules_bot_ --> a__vscode_mcp_json
+```
+
+People ↔ code-area edges — `terraform-azurerm-avm-res-operationalinsights-workspace`:
 
 ```mermaid
 flowchart LR
