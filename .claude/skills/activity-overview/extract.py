@@ -172,9 +172,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     #     (every missing id becomes a not_gathered gap and is warned, nothing is
     #     fetched). After fetches, re-read the spine so the materialization below
     #     sees the backfilled nodes.
+    # warn=None: extract emits its own budget/context warnings from result["gaps"]
+    # below, so letting complete_train also warn would duplicate them.
     result = complete.complete_train(
         conn, spine["reached"], spine["missing"], window=None,
-        backfill=backfill, budget=backfill_budget, warn=warn)
+        backfill=backfill, budget=backfill_budget)
     if backfill is not None:
         spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth,
                                           skip_dead=True)

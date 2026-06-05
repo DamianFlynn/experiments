@@ -1874,11 +1874,16 @@ def backfill(conn, id, fetch=None):
     seam for that one node, and (when the fetch yields a record) upserts the node
     plus any immediate spine edges the seam returned.
 
-    `fetch(kind, local, qid)` is the network seam (None == unfetchable; a dict
-    `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched). Tests
-    pass a fixture-backed fake; production passes `make_backfill_fetcher(token)`.
+    `fetch(kind, local, qid)` is the network seam with THREE outcomes:
+      - a dict `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched;
+      - `gather.ABSENT` == the id DEFINITIVELY does not exist (a 404, or an
+        `issue-N` ref that resolves to a PR) — `backfill` tombstones it via
+        `graphstore.record_dead_ref` so it is pruned and never re-chased;
+      - `None` == transient/unreachable (could not be resolved this run).
+    Tests pass a fixture-backed fake; production passes `make_backfill_fetcher`.
 
-    Returns `{"fetched": bool, "id": id, "edges_added": int}`.
+    Returns `{"fetched": bool, "absent": bool, "id": id, "edges_added": int}` —
+    `absent=True` only on the ABSENT outcome.
     """
     if graphstore.get_node(conn, id) is not None:
         return {"fetched": False, "absent": False, "id": id,
@@ -1943,6 +1948,10 @@ def make_backfill_fetcher(token, clone_dir=None):
     bounded `git fetch --depth 1 <sha>` into the clone then a one-commit log;
     structure -> not backfilled on demand (graphify/whole-dict facts come from
     Acquire), so it returns None and the node stays a warned gap.
+
+    Outcomes per the `backfill` contract: a fetched dict, `ABSENT` (a 404, or an
+    `issue-N` ref that GitHub resolves to a PR — so no such issue exists), or
+    `None` (transient / not resolvable this run, e.g. a code sha with no clone).
     """
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
@@ -1954,7 +1963,14 @@ def make_backfill_fetcher(token, clone_dir=None):
             if raw is None and nxt == 404:
                 return ABSENT
             if raw.get("pull_request"):
-                return None
+                # #N exists but is a PR, so there is NO issue #N: the parsed
+                # `issue-N` reference is a phantom (a `Closes #N` that points at a
+                # PR — `Closes` only auto-closes issues). Treat it as ABSENT so it
+                # is pruned + tombstoned, never fabricated into the train and never
+                # re-chased. (Returning the PR here would pull an unrelated, often
+                # ancient PR in as the train's context — the exact mis-link the
+                # honest contract avoids.)
+                return ABSENT
             return {"node": normalize_issue(raw), "edges": []}
         if kind == "social" and local.startswith("pr-"):
             num = local[len("pr-"):]

@@ -64,6 +64,7 @@ jobs:
             .claude/skills/activity-overview/graphstore.py \
             .claude/skills/activity-overview/extract.py \
             .claude/skills/activity-overview/derive.py \
+            .claude/skills/activity-overview/complete.py \
             .claude/skills/activity-overview/validate.py \
             .claude/skills/activity-overview/spotlight.py \
             .claude/skills/activity-overview/ci_spotlight_integration.py

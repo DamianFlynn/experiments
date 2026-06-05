@@ -319,6 +319,20 @@ class BackfillAbsent(unittest.TestCase):
         self.assertFalse(res["absent"])
         self.assertFalse(graphstore.is_dead_ref(conn, iid))  # NOT tombstoned
 
+    def test_production_seam_issue_ref_resolving_to_pr_is_absent(self):
+        # `Closes #N` where #N is actually a PR: GitHub's issue endpoint returns
+        # a PR object (has `pull_request`). There is no issue #N, so the seam
+        # must report ABSENT (-> pruned + tombstoned), not fetch the PR.
+        fetch = gather.make_backfill_fetcher("tok")
+        orig = gather.http_get_json
+        try:
+            gather.http_get_json = lambda url, token, allow_404=False: (
+                {"number": 8, "pull_request": {"url": "u"}}, None)
+            res = fetch("social", "issue-8", "acme/widget#issue-8")
+            self.assertIs(res, gather.ABSENT)
+        finally:
+            gather.http_get_json = orig
+
 
 if __name__ == "__main__":
     unittest.main()

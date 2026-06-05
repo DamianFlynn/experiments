@@ -411,6 +411,17 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES,
     if not seed_ids:
         return {"reached": {}, "missing": []}
 
+    # When skip_dead, exclude tombstoned phantom ids from the recursive
+    # expansion itself — not just the returned `missing`. Filtering only the
+    # final `missing` list would still let a repeated dead ref (e.g. two PRs
+    # both `Fixes #123`) BRIDGE otherwise-unrelated trains, because the CTE
+    # reaches the dead id from both sides before the filter runs.
+    next_id = "CASE WHEN e.src_id = r.id THEN e.dst_id ELSE e.src_id END"
+    dead_clause = ""
+    if skip_dead:
+        _ensure_dead_refs(conn)
+        dead_clause = " AND ({}) NOT IN (SELECT id FROM dead_refs)".format(next_id)
+
     seed_values = ",".join("(?)" for _ in seed_ids)
     etype_ph = ",".join("?" for _ in edge_types)
     sql = (
@@ -418,14 +429,14 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES,
         "reach(id, depth) AS ( "
         "  SELECT id, 0 FROM seeds "
         "  UNION "
-        "  SELECT CASE WHEN e.src_id = r.id THEN e.dst_id ELSE e.src_id END, "
+        "  SELECT {next}, "
         "         r.depth + 1 "
         "  FROM reach r "
         "  JOIN edges e ON (e.src_id = r.id OR e.dst_id = r.id) "
-        "  WHERE e.edge_type IN ({etypes}) AND r.depth < ? "
+        "  WHERE e.edge_type IN ({etypes}) AND r.depth < ?{dead} "
         ") "
         "SELECT id, MIN(depth) AS depth FROM reach GROUP BY id"
-    ).format(seeds=seed_values, etypes=etype_ph)
+    ).format(seeds=seed_values, etypes=etype_ph, next=next_id, dead=dead_clause)
     params = list(seed_ids) + list(edge_types) + [max_depth]
 
     reached = {row["id"]: row["depth"] for row in conn.execute(sql, params)}

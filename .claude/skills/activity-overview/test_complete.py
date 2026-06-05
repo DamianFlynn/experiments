@@ -59,6 +59,25 @@ class CompleteOffline(unittest.TestCase):
         ids = [g["id"] for g in res["gaps"]]
         self.assertEqual(ids, sorted(ids))
 
+    def test_offline_with_window_is_not_gathered_never_outside_window(self):
+        # Offline (no fetcher) must NOT emit window-derived reasons: we never
+        # looked, so an out-of-window-referrer ref is still `not_gathered`.
+        conn = _store()
+        pr = graphstore.qualify_id("acme", "widget", "pr-10")
+        i7 = graphstore.qualify_id("acme", "widget", "issue-7")   # present, OOW
+        i5 = graphstore.qualify_id("acme", "widget", "issue-5")   # missing
+        graphstore.upsert_node(conn, pr, "acme", "widget", "social",
+                               "2026-06-10T00:00:00Z", {"number": 10})
+        graphstore.upsert_node(conn, i7, "acme", "widget", "social",
+                               "2026-01-01T00:00:00Z", {"number": 7})
+        graphstore.upsert_edge(conn, pr, i7, "closes")
+        graphstore.upsert_edge(conn, i7, i5, "spun_off")  # i5's referrer is OOW
+        reach = graphstore.traverse_spine(conn, [pr])
+        res = complete.complete_train(
+            conn, reach["reached"], reach["missing"],
+            window=("2026-06-01", "2026-06-30"), backfill=None)
+        self.assertEqual(res["gaps"], [{"id": i5, "reason": "not_gathered"}])
+
 
 class CompleteTransitive(unittest.TestCase):
     def _three_deep(self, conn):

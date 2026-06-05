@@ -566,6 +566,28 @@ class TestDeadRefs(unittest.TestCase):
         # Without skip_dead it is still reported (default unchanged).
         self.assertIn(issue, graphstore.traverse_spine(self.conn, [pr])["missing"])
 
+    def test_skip_dead_prevents_phantom_bridging(self):
+        # Two unrelated PRs both `Fixes #123` (a phantom). The dead id must NOT
+        # bridge them into one train when skip_dead.
+        pr10 = graphstore.qualify_id("acme", "widget", "pr-10")
+        pr11 = graphstore.qualify_id("acme", "widget", "pr-11")
+        ph = graphstore.qualify_id("acme", "widget", "issue-123")
+        graphstore.upsert_node(self.conn, pr10, "acme", "widget", "social",
+                               "2026-03-10T00:00:00Z", {"number": 10})
+        graphstore.upsert_node(self.conn, pr11, "acme", "widget", "social",
+                               "2026-03-11T00:00:00Z", {"number": 11})
+        graphstore.upsert_edge(self.conn, pr10, ph, "closes")
+        graphstore.upsert_edge(self.conn, pr11, ph, "closes")
+        # Default: the phantom bridges pr10 <-> pr11 into one reach.
+        r = graphstore.traverse_spine(self.conn, [pr10])
+        self.assertIn(pr11, r["reached"])
+        # Tombstoned + skip_dead: the phantom is not expanded through, so the
+        # two PRs stay separate trains.
+        graphstore.record_dead_ref(self.conn, ph)
+        r2 = graphstore.traverse_spine(self.conn, [pr10], skip_dead=True)
+        self.assertNotIn(ph, r2["reached"])
+        self.assertNotIn(pr11, r2["reached"])
+
 
 if __name__ == "__main__":
     unittest.main()

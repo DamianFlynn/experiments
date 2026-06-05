@@ -76,11 +76,14 @@ def complete_train(conn, reached, missing, *, window=None, backfill=None,
             work.remove(mid)
             if graphstore.is_dead_ref(conn, mid):
                 continue                              # phantom: pruned, no gap
+            if backfill is None:
+                # Offline: no completion policy ran, so we cannot claim a ref is
+                # "outside the window" — we simply haven't looked. Every live
+                # (non-dead) missing id is honestly `not_gathered`.
+                gaps[mid] = "not_gathered"
+                continue
             if not referrer_in_window(mid):
                 gaps[mid] = "outside_window"
-                continue
-            if backfill is None:
-                gaps[mid] = "not_gathered"
                 continue
             if fetched >= budget:
                 gaps[mid] = "budget"

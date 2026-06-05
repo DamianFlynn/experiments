@@ -435,7 +435,8 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None,
     # First map each seed to its train's reached set + anchor.
     trains_by_anchor = {}  # anchor -> reached set (ids)
     for seed in sorted(set(seed_ids)):
-        reach = graphstore.traverse_spine(conn, [seed], edge_types=_CAUSAL_SPINE)
+        reach = graphstore.traverse_spine(conn, [seed], edge_types=_CAUSAL_SPINE,
+                                          skip_dead=True)
         reached = set(reach["reached"])
         if not reached:
             continue
@@ -816,7 +817,8 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
     seed_ids = set(touching_src_ids) | set(attributed_prs)
     trains_by_anchor = {}  # anchor -> reached set (ids)
     for seed in sorted(seed_ids):
-        reach = graphstore.traverse_spine(conn, [seed], edge_types=_CAUSAL_SPINE)
+        reach = graphstore.traverse_spine(conn, [seed], edge_types=_CAUSAL_SPINE,
+                                          skip_dead=True)
         reached = set(reach["reached"])
         if not reached:
             # a lone toucher with no spine still forms a single-node train
@@ -940,7 +942,8 @@ def text_mining(conn, project, phrase, ts_from=None, ts_to=None,
     # trains are hydrated.
     trains_by_anchor = {}  # anchor -> reached set (ids)
     for mid in matched:
-        reach = graphstore.traverse_spine(conn, [mid], edge_types=_CAUSAL_SPINE)
+        reach = graphstore.traverse_spine(conn, [mid], edge_types=_CAUSAL_SPINE,
+                                          skip_dead=True)
         reached = set(reach["reached"])
         if not reached:
             reached = {mid}
