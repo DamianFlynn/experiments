@@ -18,6 +18,7 @@ import urllib.request
 
 import derive
 import graphstore
+import manifest as manifest_mod
 
 SCHEMA_VERSION = 1
 RECORD_SEP = "\x1e"
@@ -1368,6 +1369,10 @@ def parse_args(argv):
     p.add_argument("--store", required=True,
                    help="path to the SQLite journey-graph store to fold into "
                         "(the sole gather deliverable)")
+    p.add_argument("--manifest",
+                   help="path to a multi-repo project manifest (JSON). Mutually "
+                        "exclusive with --owner/--repo; folds every member repo "
+                        "into one store under the manifest's logical project name.")
     return p.parse_args(argv)
 
 
@@ -2301,18 +2306,41 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None):
         graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"])
 
 
+def _member_args(base, member, frm, to):
+    """Clone the CLI args for one manifest member: same flags, but owner/repo and
+    the window come from the manifest, and clone_dir is re-derived per member
+    (acquire defaults it to workspace/{repo}-clone)."""
+    fields = {**vars(base), "owner": member["owner"], "repo": member["repo"],
+              "clone_dir": None}
+    ns = argparse.Namespace(**fields)
+    setattr(ns, "from", frm)   # 'from' is a Python keyword: set via attribute
+    ns.to = to
+    return ns
+
+
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    bundle = acquire(args, os.environ)
-    # Store-only (Phase 7): fold the assembled bundle into the journey-graph store
-    # — the sole deliverable. No bundle JSON file is written; the bundle is a
-    # transient view the Phase 8 reader materializes via extract.
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
     graphstore.init_schema(conn)
-    fold_bundle(conn, bundle)
+    if getattr(args, "manifest", None):
+        man = manifest_mod.load_manifest(args.manifest)
+        members = manifest_mod.member_slugs(man)
+        for m in man["repos"]:
+            member_args = _member_args(args, m, man["from"], man["to"])
+            bundle = acquire(member_args, os.environ)
+            fold_bundle(conn, bundle, project=man["project"],
+                        repo="{}/{}".format(m["owner"], m["repo"]),
+                        members=members)
+        sys.stderr.write(
+            "folded {} member repo(s) of project '{}' into store {}\n".format(
+                len(man["repos"]), man["project"], args.store))
+    else:
+        # Store-only single-repo path (Phase 7), unchanged.
+        bundle = acquire(args, os.environ)
+        fold_bundle(conn, bundle)
+        sys.stderr.write("folded bundle into store {}\n".format(args.store))
     conn.close()
-    sys.stderr.write(f"folded bundle into store {args.store}\n")
     return args.store
 
 

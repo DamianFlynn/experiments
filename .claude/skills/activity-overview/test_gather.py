@@ -2085,5 +2085,55 @@ class TestFoldBundleOverride(unittest.TestCase):
         self.assertIsNotNone(graphstore.get_node(conn, "acme/widget#pr-10"))
 
 
+class TestManifestMain(unittest.TestCase):
+    def test_member_args_clones_namespace_with_overrides(self):
+        base = gather.parse_args([
+            "--owner", "x", "--repo", "y", "--from", "a", "--to", "b",
+            "--store", "s.db", "--no-clone"])
+        member = gather._member_args(
+            base, {"owner": "Azure", "repo": "mod-a", "registry": None},
+            "2026-03-01", "2026-03-31")
+        self.assertEqual(member.owner, "Azure")
+        self.assertEqual(member.repo, "mod-a")
+        self.assertEqual(getattr(member, "from"), "2026-03-01")
+        self.assertEqual(member.to, "2026-03-31")
+        self.assertIsNone(member.clone_dir)            # re-derived per member
+        self.assertTrue(member.no_clone)               # other flags carried through
+
+    def test_main_folds_each_member_under_logical_project(self):
+        import tempfile
+        man = {
+            "project": "proj",
+            "window": {"from": "2026-01-01", "to": "2026-01-31"},
+            "repos": [{"owner": "Azure", "repo": "mod-a"},
+                      {"owner": "Azure", "repo": "mod-b"}],
+        }
+        calls = []
+
+        def fake_acquire(args, env):
+            calls.append((args.owner, args.repo))
+            b = _fold_fixture_bundle()
+            b["meta"] = {**b["meta"], "owner": args.owner, "repo": args.repo,
+                         "from": getattr(args, "from"), "to": args.to}
+            return b
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mpath = os.path.join(tmp, "m.json")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                json.dump(man, fh)
+            store = os.path.join(tmp, "j.db")
+            orig = gather.acquire
+            gather.acquire = fake_acquire
+            try:
+                gather.main(["--manifest", mpath, "--store", store])
+            finally:
+                gather.acquire = orig
+            conn = graphstore.open_store(store)
+        # both members acquired, folded under the logical project + owner/repo slug
+        self.assertEqual(set(calls), {("Azure", "mod-a"), ("Azure", "mod-b")})
+        self.assertIsNotNone(graphstore.get_node(conn, "proj/Azure/mod-a#pr-10"))
+        self.assertIsNotNone(graphstore.get_node(conn, "proj/Azure/mod-b#pr-10"))
+
+
 if __name__ == "__main__":
     unittest.main()
