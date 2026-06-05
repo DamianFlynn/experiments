@@ -2553,7 +2553,20 @@ class TestCrossRepoDependsOn(unittest.TestCase):
                            registry_by_slug=reg)
         deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
                                     direction="out", edge_types=["depends_on"])
+        self.assertEqual(len(deps), 1)
         self.assertEqual(deps[0]["dst_id"], "proj/Azure/kv#area-main.tf")
+
+    def test_fold_drops_registry_edge_when_target_not_a_member(self):
+        # the convention target repo is absent from members -> no cross-repo edge.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, self._member_a(), project="proj",
+                           repo="Azure/consumer",
+                           members={"Azure/consumer", "Azure/unrelated"},
+                           registry_by_slug={})
+        deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
+                                    direction="out", edge_types=["depends_on"])
+        self.assertEqual(deps, [])
 
 
 if __name__ == "__main__":

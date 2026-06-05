@@ -2157,7 +2157,7 @@ def parse_registry_source(src):
         return None
     core = src.split("//", 1)[0]                       # drop submodule path
     parts = [p for p in core.split("/") if p]
-    if len(parts) == 4 and "." in parts[0]:            # strip a registry host: the 4-segment form is exclusively host/namespace/name/provider per the Terraform registry protocol
+    if len(parts) == 4 and "." in parts[0]:            # strip a registry host (4-seg form: host/ns/name/provider)
         parts = parts[1:]
     if len(parts) != 3:
         return None
@@ -2185,8 +2185,8 @@ def resolve_registry_member(src, project, members, registry_by_slug):
 def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
     """Yield (src_qid, dst_qid, data) depends_on triples from a bundle's area
     edges. Resolved-local edges -> intra-repo. Unresolved registry edges resolve
-    to a member's root area ONLY when members + registry_by_slug are supplied
-    (multi-repo); single-repo folds skip them (byte-stable). Pure."""
+    to a member's root area ONLY in multi-repo folds (`members` non-empty and
+    `registry_by_slug` not None); single-repo folds skip them (byte-stable). Pure."""
     def q(slug, local):
         return graphstore.qualify_id(project, slug, local)
     areas = (bundle.get("code_graph", {}) or {}).get("areas") or []
