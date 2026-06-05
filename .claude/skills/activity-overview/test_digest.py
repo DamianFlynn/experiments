@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import graphstore  # noqa: E402
 import gather  # noqa: E402
 import digest  # noqa: E402
+import validate  # noqa: E402
 
 
 def _seed_two_member_store(conn):
@@ -458,6 +459,67 @@ class TestDigestCli(unittest.TestCase):
                                   "--ticket-pattern", "((unclosed"])
             self.assertEqual(rc, 2)
             self.assertIn("invalid --ticket-pattern", err.getvalue())
+
+
+class TestProjectDigestIntegration(unittest.TestCase):
+    def test_gate_cross_repo_train_ticket_cluster_and_validate(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/mod-a", "Azure/mod-b", "Azure/mod-c"}
+        # A closes B#3 (spine cross-repo train). C mentions the same ticket as A
+        # but has NO spine link -> related_work cluster, not a merged train.
+        a = {"meta": {"owner": "Azure", "repo": "mod-a", "from": "2026-01-01",
+                      "to": "2026-01-31", "base_branch": "main"},
+             "prs": [{"number": 10, "url": "uA/10", "state": "closed",
+                      "merged": True, "base": "main", "head": "hA",
+                      "merged_at": "2026-01-10T00:00:00Z",
+                      "created_at": "2026-01-05T00:00:00Z",
+                      "closed_at": "2026-01-10T00:00:00Z",
+                      "closes": [], "crossref_issues": [],
+                      "title": "feat: x", "body": "Closes Azure/mod-b#3\nADO-555"}],
+             "issues": [], "commits": [], "code_events": [],
+             "milestones": [], "releases": [], "code_graph": {"areas": []}}
+        b = {"meta": {"owner": "Azure", "repo": "mod-b", "from": "2026-01-01",
+                      "to": "2026-01-31", "base_branch": "main"},
+             "prs": [], "issues": [{"number": 3, "url": "uB/3", "state": "closed",
+                                    "closed_at": "2026-01-08T00:00:00Z",
+                                    "updated_at": "2026-01-08T00:00:00Z"}],
+             "commits": [], "code_events": [], "milestones": [], "releases": [],
+             "code_graph": {"areas": []}}
+        c = {"meta": {"owner": "Azure", "repo": "mod-c", "from": "2026-01-01",
+                      "to": "2026-01-31", "base_branch": "main"},
+             "prs": [{"number": 20, "url": "uC/20", "state": "closed",
+                      "merged": True, "base": "main", "head": "hC",
+                      "merged_at": "2026-01-12T00:00:00Z",
+                      "created_at": "2026-01-06T00:00:00Z",
+                      "closed_at": "2026-01-12T00:00:00Z",
+                      "closes": [], "crossref_issues": [],
+                      "title": "feat: y", "body": "part of ADO-555"}],
+             "issues": [], "commits": [], "code_events": [],
+             "milestones": [], "releases": [], "code_graph": {"areas": []}}
+        for bundle, repo in ((a, "Azure/mod-a"), (b, "Azure/mod-b"),
+                             (c, "Azure/mod-c")):
+            gather.fold_bundle(conn, bundle, project="proj", repo=repo,
+                               members=members)
+
+        frm, to = "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"
+        repos = graphstore.project_repos(conn, "proj")
+        view = digest.build_project_view(conn, "proj", repos, frm, to)
+
+        # one cross-repo train (A+B) and one standalone train (C)
+        spanning = [t for t in view["trains"] if len(t["repos"]) > 1]
+        self.assertEqual(len(spanning), 1)
+        self.assertEqual(set(spanning[0]["repos"]), {"Azure/mod-a", "Azure/mod-b"})
+        # ADO-555 glues A's train and C's train (different repos, no spine link)
+        tickets = {g["ticket"] for g in view["related_work"]}
+        self.assertIn("ADO-555", tickets)
+        glued = next(g for g in view["related_work"] if g["ticket"] == "ADO-555")
+        self.assertEqual(len(glued["train_ids"]), 2)
+        # Shipped spans the project
+        self.assertEqual({s["repo"] for s in view["shipped"]},
+                         {"Azure/mod-a", "Azure/mod-c"})
+        # validate is green across the member set
+        self.assertTrue(validate.validate_project(conn, "proj", repos)["ok"])
 
 
 if __name__ == "__main__":
