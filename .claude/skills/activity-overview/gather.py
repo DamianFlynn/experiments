@@ -1520,9 +1520,14 @@ def clone_head_sha(clone_dir, run=run_git):
 # process (never a slow-but-progressing one). Speed comes from bounded concurrency,
 # not a tight timeout. A timed-out/failed build is retried once, then recorded as a
 # VISIBLE gap (edges_status) rather than a silent empty.
-IAC_BUILD_TIMEOUT = 300   # seconds per bicep/terraform subprocess
-IAC_MAX_WORKERS = 8       # parallel per-module builds
-IAC_RETRIES = 1           # extra attempts after the first on timeout/failure
+#
+# Env-overridable for heavy live runs: a real AVM pattern module's `terraform init`
+# pulls dozens of registry modules (raise the timeout), and a shared
+# TF_PLUGIN_CACHE_DIR is not safe under concurrent writes (lower the workers to 1
+# to serialize). The defaults are unchanged for the offline test/CI path.
+IAC_BUILD_TIMEOUT = int(os.environ.get("ACTIVITY_IAC_BUILD_TIMEOUT", "300"))  # seconds per subprocess
+IAC_MAX_WORKERS = int(os.environ.get("ACTIVITY_IAC_MAX_WORKERS", "8"))        # parallel per-module builds
+IAC_RETRIES = int(os.environ.get("ACTIVITY_IAC_RETRIES", "1"))               # extra attempts on timeout/failure
 
 
 def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf,
@@ -1557,6 +1562,26 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
         except Exception:
             status = "failed"
     return None, status
+
+
+def _terraform_prewarm(build_areas, clone_dir, run, timeout):
+    """Populate a SHARED TF_PLUGIN_CACHE_DIR once, serially, before the parallel
+    builds. terraform's plugin cache is not safe under concurrent writes, so a cold
+    cache + N parallel `terraform init` would race; one warm-up init (AVM members
+    share the same handful of providers) turns the rest into cache HITS — restoring
+    bicep-like parallel extraction for terraform without the race. Best-effort: any
+    failure is ignored (the parallel builds still run and report their own status)."""
+    for area in build_areas:
+        tp = _tf_entrypoint(area)
+        if not tp:
+            continue
+        full = os.path.join(clone_dir, os.path.dirname(tp) or ".")
+        try:
+            run(["terraform", f"-chdir={full}", "init", "-backend=false",
+                 "-input=false"], timeout=timeout)
+        except Exception:
+            pass
+        return   # one warm-up populates the cache for the shared providers
 
 
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
@@ -1602,6 +1627,12 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
             summary["skipped"] += 1
         else:
             build.append(area)
+
+    # Parallel terraform graph generation, mirroring the parallel bicep build path
+    # (both run through one ThreadPoolExecutor). With a SHARED TF_PLUGIN_CACHE_DIR
+    # the cold-cache parallel inits would race, so warm it once serially first.
+    if have_tf and max_workers > 1 and os.environ.get("TF_PLUGIN_CACHE_DIR"):
+        _terraform_prewarm(build, clone_dir, run, timeout)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         for area, (edges, status) in pool.map(work, build):
@@ -2203,6 +2234,13 @@ def parse_registry_source(src):
     if len(parts) == 4 and "." in parts[0]:            # strip a registry host (4-seg form: host/ns/name/provider)
         parts = parts[1:]
     if len(parts) != 3:
+        return None
+    # A dot in the namespace means the first segment is a HOST, not a namespace —
+    # i.e. VCS shorthand like `github.com/org/repo`, not a registry address. A real
+    # registry namespace never contains a dot, so reject it (don't mis-resolve it
+    # via the naming convention). Registry hosts are only valid in the 4-seg form
+    # handled above.
+    if "." in parts[0]:
         return None
     return parts[0], parts[1], parts[2]
 

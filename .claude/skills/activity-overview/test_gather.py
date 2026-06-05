@@ -1499,6 +1499,66 @@ class TestExtractIacEdges(unittest.TestCase):
         self.assertTrue(prod["edges"])
         self.assertTrue(all(e["provider"] == "terraform" for e in prod["edges"]))
 
+    def test_terraform_prewarm_runs_once_before_parallel_with_shared_cache(self):
+        # With a shared TF_PLUGIN_CACHE_DIR + parallel workers, a single serial
+        # warm-up `init` runs BEFORE the per-area builds so the parallel inits are
+        # cache hits, not a write race.
+        import unittest.mock as mock
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+        calls = []
+        lock = __import__("threading").Lock()
+
+        def run(cmd, **kw):
+            with lock:
+                calls.append(cmd)
+            return dot if cmd[-1] == "graph" else ""
+
+        cg = {"provider": "directory", "areas": [
+            {"id": "modules/a", "label": "a", "paths": ["modules/a/main.tf"],
+             "edges": []},
+            {"id": "modules/b", "label": "b", "paths": ["modules/b/main.tf"],
+             "edges": []},
+        ]}
+        with mock.patch.dict(os.environ, {"TF_PLUGIN_CACHE_DIR": "/tmp/x"}):
+            gather.extract_iac_edges(
+                cg, "clone",
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=lambda _p: tf, max_workers=4)
+        # first recorded call is the serial warm-up init (an `init`, never `graph`)
+        self.assertIn("init", calls[0])
+        self.assertEqual(calls[0][-1], "-input=false")
+        # one extra init beyond the two per-area inits (the warm-up)
+        self.assertEqual(sum(1 for c in calls if "init" in c), 3)
+
+    def test_no_prewarm_without_shared_cache(self):
+        # Without TF_PLUGIN_CACHE_DIR there is no race to avoid -> no warm-up.
+        import unittest.mock as mock
+        with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
+            dot = fh.read()
+        with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
+            tf = fh.read()
+        calls = []
+        lock = __import__("threading").Lock()
+
+        def run(cmd, **kw):
+            with lock:
+                calls.append(cmd)
+            return dot if cmd[-1] == "graph" else ""
+
+        cg = {"provider": "directory", "areas": [
+            {"id": "modules/a", "label": "a", "paths": ["modules/a/main.tf"],
+             "edges": []}]}
+        env = {k: v for k, v in os.environ.items() if k != "TF_PLUGIN_CACHE_DIR"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            gather.extract_iac_edges(
+                cg, "clone",
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=lambda _p: tf, max_workers=4)
+        self.assertEqual(sum(1 for c in calls if "init" in c), 1)  # one area, no warm-up
+
     def test_scaffold_areas_are_skipped_not_built(self):
         # examples/ and tests/ areas must NOT be built (no terraform run) — they are
         # marked skipped, so the heavy AVM example stacks are never init'd.
@@ -2631,6 +2691,16 @@ class TestRegistryResolution(unittest.TestCase):
     def test_parse_registry_source_rejects_non_registry(self):
         self.assertIsNone(gather.parse_registry_source("./local"))
         self.assertIsNone(gather.parse_registry_source("two/parts"))
+
+    def test_parse_registry_source_rejects_vcs_host_shorthand(self):
+        # A 3-segment source whose first segment is a HOST (contains a dot) is VCS
+        # shorthand (github.com/org/repo), NOT a registry triple -> must be None,
+        # so it is never mis-resolved to a member via the naming convention.
+        self.assertIsNone(gather.parse_registry_source("github.com/Azure/foo"))
+        self.assertIsNone(gather.parse_registry_source("example.com/a/b//sub"))
+        # a real registry namespace has no dot -> still parses
+        self.assertEqual(gather.parse_registry_source("Azure/avm-res-x/azurerm"),
+                         ("Azure", "avm-res-x", "azurerm"))
 
     def test_resolve_exact_registry_match_wins(self):
         members = {"Azure/kv-repo"}

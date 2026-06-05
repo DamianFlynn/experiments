@@ -4,6 +4,7 @@ Pure emitters build the diagram text from existing bundle fields; `mmdc` (mermai
 compiles every file so a diagram that would not render fails the run. No network."""
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -162,6 +163,19 @@ def _node_id(prefix, text):
     """A safe Mermaid node id from arbitrary text (alnum + underscore)."""
     safe = "".join(ch if ch.isalnum() else "_" for ch in (text or ""))
     return f"{prefix}_{safe}"[:60]
+
+
+def _stable_node_id(prefix, text):
+    """A COLLISION-FREE Mermaid node id for arbitrary (possibly long) text.
+
+    Unlike `_node_id` (60-char cap, fine for the short single-repo diagram keys),
+    this keeps a readable sanitized head AND appends a short deterministic hash of
+    the FULL text. Long AVM `{repo}::{area}` keys routinely share a >60-char prefix
+    (e.g. `Azure/terraform-azurerm-avm-res-network-...`), so a plain truncation
+    would collapse distinct nodes into one and mis-wire the edges between them."""
+    safe = "".join(ch if ch.isalnum() else "_" for ch in (text or ""))
+    digest = hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{safe[:40]}_{digest}"
 
 
 def _area_tail(area):
@@ -382,8 +396,10 @@ def emit_project_module_graph(module_edges):
     by_repo = {}
     drawn = []
     for e in module_edges:
-        src = _node_id("m", "{}::{}".format(e["src_repo"], e["src_area"]))
-        dst = _node_id("m", "{}::{}".format(e["dst_repo"], e["dst_area"]))
+        # _stable_node_id (not _node_id): long AVM {repo}::{area} keys share a
+        # 60-char prefix and must not collide into one node.
+        src = _stable_node_id("m", "{}::{}".format(e["src_repo"], e["src_area"]))
+        dst = _stable_node_id("m", "{}::{}".format(e["dst_repo"], e["dst_area"]))
         # Label with the full area path (not _area_tail): two modules in one repo
         # can both end in `main.tf`; the path disambiguates them in the subgraph.
         by_repo.setdefault(e["src_repo"], {})[src] = e["src_area"]
@@ -396,7 +412,7 @@ def emit_project_module_graph(module_edges):
     for repo in sorted(by_repo):
         # Subgraph title uses the UNCAPPED _subgraph_label (repo identity must not
         # be truncated); node area labels keep _flow_label's 40-char cap.
-        lines.append('    subgraph {}["{}"]'.format(_node_id("r", repo),
+        lines.append('    subgraph {}["{}"]'.format(_stable_node_id("r", repo),
                                                      _subgraph_label(repo)))
         for nid, area in sorted(by_repo[repo].items()):
             lines.append('        {}("{}")'.format(nid, _flow_label(area)))

@@ -1001,6 +1001,26 @@ class TestProjectModuleGraph(unittest.TestCase):
                              if ln.strip().startswith("m_") and "(" in ln), 2)
         self.assertEqual(mmd.count("-->"), 1)
 
+    def test_long_repo_prefixes_do_not_collide_into_one_node(self):
+        # Two AVM repos whose {repo}::{area} keys share a >60-char prefix must become
+        # DISTINCT Mermaid nodes. The OLD 60-char-truncation id (_node_id) collapsed
+        # them into one, mis-wiring the cross-repo edge.
+        a = "Azure/terraform-azurerm-avm-res-network-virtualnetwork-peering-alpha"
+        b = "Azure/terraform-azurerm-avm-res-network-virtualnetwork-peering-bravo"
+        # precondition: the old id WOULD have collided (proves the bug is real)
+        self.assertEqual(render._node_id("m", a + "::main.tf"),
+                         render._node_id("m", b + "::main.tf"))
+        edges = [{"src_repo": a, "src_area": "main.tf",
+                  "dst_repo": b, "dst_area": "main.tf",
+                  "version": "1.0.0", "transitive": False, "cross_repo": True}]
+        mmd = render.emit_project_module_graph(edges)
+        node_ids = [ln.strip().split("(")[0] for ln in mmd.splitlines()
+                    if ln.strip().startswith("m_") and "(" in ln]
+        self.assertEqual(len(node_ids), 2)
+        self.assertEqual(len(set(node_ids)), 2)   # distinct, no collision
+        self.assertEqual(mmd.count("subgraph"), 2)
+        self.assertEqual(mmd.count("-->"), 1)
+
     def test_transitive_only_edge_labelled_transitive(self):
         edges = [{"src_repo": "r/a", "src_area": "x", "dst_repo": "r/b",
                   "dst_area": "y", "version": None, "transitive": True,
