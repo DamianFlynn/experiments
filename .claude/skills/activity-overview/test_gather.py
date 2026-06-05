@@ -2216,5 +2216,66 @@ class TestAcquireTimelineXrefs(unittest.TestCase):
                            "kind": "cross_ref", "is_pr": False}])
 
 
+def _xrepo_fold_bundle():
+    """A PR in member 'Azure/mod-a' that closes an issue in member 'Azure/mod-b'
+    and mentions a NON-member 'Other/ext' via a qualified body ref."""
+    return {
+        "meta": {"owner": "Azure", "repo": "mod-a", "from": "2026-01-01",
+                 "to": "2026-01-31", "clone_sha": "sha-a"},
+        "prs": [{
+            "number": 10, "url": "u/10", "state": "closed", "merged": True,
+            "merged_at": "2026-01-10T00:00:00Z", "created_at": "2026-01-05T00:00:00Z",
+            "closed_at": "2026-01-10T00:00:00Z", "closes": [], "crossref_issues": [],
+            "title": "feat: cross-module",
+            "body": "Closes Azure/mod-b#3\nalso Closes Other/ext#99",
+            "timeline_xrefs": [{"owner": "Azure", "repo": "mod-b", "number": 5,
+                                "kind": "cross_ref", "is_pr": True}],
+        }],
+        "issues": [], "commits": [], "code_events": [],
+        "milestones": [], "releases": [], "code_graph": {"areas": []},
+    }
+
+
+class TestFoldCrossRepoEdges(unittest.TestCase):
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        self.members = {"Azure/mod-a", "Azure/mod-b"}
+        gather.fold_bundle(self.conn, _xrepo_fold_bundle(),
+                           project="proj", repo="Azure/mod-a", members=self.members)
+
+    def test_member_close_becomes_cross_repo_edge(self):
+        out = graphstore.get_edges(self.conn, "proj/Azure/mod-a#pr-10",
+                                   direction="out")
+        types = {(e["edge_type"], e["dst_id"]) for e in out}
+        self.assertIn(("closes", "proj/Azure/mod-b#issue-3"), types)
+
+    def test_member_timeline_xref_becomes_cross_repo_pr_edge(self):
+        out = graphstore.get_edges(self.conn, "proj/Azure/mod-a#pr-10",
+                                   direction="out")
+        types = {(e["edge_type"], e["dst_id"]) for e in out}
+        self.assertIn(("cross_ref", "proj/Azure/mod-b#pr-5"), types)  # is_pr -> pr-
+
+    def test_non_member_ref_is_external_not_edge(self):
+        pr = graphstore.get_node(self.conn, "proj/Azure/mod-a#pr-10")
+        self.assertEqual(pr["data"]["external_refs"],
+                         [{"repo": "Other/ext", "number": 99, "kind": "closes"}])
+        out = graphstore.get_edges(self.conn, "proj/Azure/mod-a#pr-10",
+                                   direction="out")
+        dsts = {e["dst_id"] for e in out}
+        self.assertNotIn("proj/Other/ext#issue-99", dsts)
+
+    def test_cross_repo_train_traverses_repo_boundary(self):
+        res = graphstore.traverse_spine(self.conn, ["proj/Azure/mod-b#issue-3"])
+        self.assertIn("proj/Azure/mod-a#pr-10", res["reached"])
+
+    def test_single_repo_path_emits_no_external_refs(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, _fold_fixture_bundle())   # members=None
+        pr = graphstore.get_node(conn, "acme/widget#pr-10")
+        self.assertNotIn("external_refs", pr["data"])
+
+
 if __name__ == "__main__":
     unittest.main()

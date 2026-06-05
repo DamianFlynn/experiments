@@ -2101,6 +2101,35 @@ def _social_text(item, comments):
     return "\n".join(p for p in parts if p)
 
 
+def _cross_repo_pr_edges(pr, project, current_repo, members):
+    """Resolve a PR's cross-repo references (qualified body refs +
+    repo-aware timeline xrefs) for a multi-repo project. Returns
+    (external_refs, edges):
+      - a ref to a MEMBER repo -> an edge tuple (src_pid, dst_id, kind, None, None)
+        where kind is 'closes'/'cross_ref' and dst is the target repo's issue/pr;
+      - a ref to a NON-member repo -> an external_refs dict {repo, number, kind}.
+    Same-repo refs are skipped (the bare-#N path already covers them). Pure."""
+    pid = graphstore.qualify_id(project, current_repo, "pr-{}".format(pr["number"]))
+    text = (pr.get("title", "") or "") + "\n" + (pr.get("body") or "")
+    refs = parse_qualified_refs(text) + list(pr.get("timeline_xrefs") or [])
+    edges, external, seen = [], [], set()
+    for r in refs:
+        slug = "{}/{}".format(r["owner"], r["repo"])
+        if slug == current_repo:
+            continue
+        local = ("pr-" if r.get("is_pr") else "issue-") + str(r["number"])
+        key = (slug, local, r["kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if slug in members:
+            edges.append((pid, graphstore.qualify_id(project, slug, local),
+                          r["kind"], None, None))
+        else:
+            external.append({"repo": slug, "number": r["number"], "kind": r["kind"]})
+    return external, edges
+
+
 def fold_bundle(conn, bundle, project=None, repo=None, members=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
@@ -2135,10 +2164,19 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None):
     def qid(local):
         return graphstore.qualify_id(project, repo, local)
 
-    # social: PRs, with closes/cross_ref spine edges to their issues.
+    # social: PRs, with closes/cross_ref spine edges to their issues. In a
+    # multi-repo project (members given) a PR's qualified refs + repo-aware
+    # timeline xrefs also yield CROSS-repo spine edges (to member repos) or
+    # honest external_refs (to non-members) — see _cross_repo_pr_edges. Gated on
+    # `members is not None` so single-repo folds are byte-identical.
     for pr in bundle.get("prs", []):
         pid = qid("pr-{}".format(pr["number"]))
         ts = pr.get("merged_at") or pr.get("closed_at") or pr.get("created_at")
+        if members is not None:
+            external, xedges = _cross_repo_pr_edges(pr, project, repo, members)
+            if external:
+                pr = {**pr, "external_refs": external}
+            edges.extend(xedges)
         nodes.append((pid, project, repo, "social", ts, pr, fetched))
         for n in pr.get("closes") or []:
             edges.append((pid, qid("issue-{}".format(n)), "closes", None, None))
