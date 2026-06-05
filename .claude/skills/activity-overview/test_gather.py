@@ -2165,5 +2165,35 @@ class TestParseQualifiedRefs(unittest.TestCase):
         self.assertEqual(gather.parse_qualified_refs(None), [])
 
 
+class TestParseTimelineXrefs(unittest.TestCase):
+    def _ev(self, full_name, number, is_pr):
+        src = {"number": number,
+               "repository": {"full_name": full_name},
+               "pull_request": ({} if is_pr else None)}
+        return {"event": "cross-referenced", "source": {"issue": src}}
+
+    def test_keeps_cross_repo_drops_same_repo(self):
+        tl = [self._ev("Azure/other", 7, False),     # cross-repo issue
+              self._ev("Azure/self", 3, False),       # same repo -> dropped
+              self._ev("Azure/other2", 9, True)]      # cross-repo PR
+        out = gather.parse_timeline_xrefs(tl, "Azure/self")
+        self.assertEqual(out, [
+            {"owner": "Azure", "repo": "other", "number": 7,
+             "kind": "cross_ref", "is_pr": False},
+            {"owner": "Azure", "repo": "other2", "number": 9,
+             "kind": "cross_ref", "is_pr": True},
+        ])
+
+    def test_dedup_and_ignores_non_crossref_events(self):
+        tl = [self._ev("Azure/other", 7, False),
+              self._ev("Azure/other", 7, False),
+              {"event": "labeled"}]
+        out = gather.parse_timeline_xrefs(tl, "Azure/self")
+        self.assertEqual(len(out), 1)
+
+    def test_empty(self):
+        self.assertEqual(gather.parse_timeline_xrefs(None, "o/r"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

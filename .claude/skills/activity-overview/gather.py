@@ -401,6 +401,30 @@ def parse_timeline_crossrefs(raw_timeline):
     return out
 
 
+def parse_timeline_xrefs(raw_timeline, current_slug):
+    """Cross-REPO timeline cross-references (Phase 9): cross-referenced events
+    whose source issue/PR lives in a DIFFERENT repo than `current_slug`
+    ('owner/repo'). Same-repo refs are left to parse_timeline_crossrefs. Returns
+    ordered, deduped [{owner, repo, number, kind='cross_ref', is_pr}]. Pure."""
+    out, seen = [], set()
+    for ev in raw_timeline or []:
+        if ev.get("event") != "cross-referenced":
+            continue
+        src = (ev.get("source") or {}).get("issue") or {}
+        full = ((src.get("repository") or {}).get("full_name")) or ""
+        num = src.get("number")
+        if not full or full == current_slug or num is None:
+            continue
+        key = (full, num)
+        if key in seen:
+            continue
+        seen.add(key)
+        owner, _, repo = full.partition("/")
+        out.append({"owner": owner, "repo": repo, "number": num,
+                    "kind": "cross_ref", "is_pr": src.get("pull_request") is not None})
+    return out
+
+
 def normalize_workflow(raw):
     """Map a GitHub Actions run object to the bundle's workflow shape."""
     return {
