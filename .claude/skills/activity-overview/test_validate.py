@@ -367,3 +367,26 @@ def test_cli_with_bundle_runs_drift(tmp_path):
                  "--bundle", os.path.join(FIX, "bundle_p3b.json"))
     assert r.returncode == 0, r.stdout + r.stderr
     assert "no_drift" in r.stdout
+
+
+import unittest
+
+
+class TestValidateProject(unittest.TestCase):
+    def test_two_member_store_validates_green(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        for repo in ("Azure/mod-a", "Azure/mod-b"):
+            b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                          "from": "2026-01-01", "to": "2026-01-31",
+                          "base_branch": "main"},
+                 "prs": [], "issues": [], "commits": [], "code_events": [],
+                 "milestones": [], "releases": [], "code_graph": {"areas": []}}
+            gather.fold_bundle(conn, b, project="proj", repo=repo,
+                               members={"Azure/mod-a", "Azure/mod-b"})
+        report = validate.validate_project(conn, "proj",
+                                           ["Azure/mod-a", "Azure/mod-b"])
+        self.assertTrue(report["ok"])
+        self.assertEqual({r["repo"] for r in report["members"]},
+                         {"Azure/mod-a", "Azure/mod-b"})
+        self.assertTrue(all(r["ok"] for r in report["members"]))

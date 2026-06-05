@@ -92,13 +92,16 @@ def _all_edges(conn):
     return [graphstore._row_to_edge(r) for r in conn.execute("SELECT * FROM edges")]
 
 
-def _detect_project_repo(conn, project, repo):
+def _detect_project_repo(conn, project, repo, allow_multi=False):
     """Derive (project, repo) from the store when not passed.
 
     project: the single non-sentinel project in `nodes` (people use repo "*").
     repo:    the single non-sentinel repo for that project. Works over a real
     gathered store; raises if the store holds >1 project/repo and the caller
     did not disambiguate.
+
+    When allow_multi=True and there are multiple repos, repo is returned as
+    None (so the caller can use the project path instead of raising).
     """
     if project is None:
         projects = sorted({
@@ -118,6 +121,8 @@ def _detect_project_repo(conn, project, repo):
             repo = repos[0]
         elif not repos:
             raise ValueError("project {} has no repo to validate".format(project))
+        elif allow_multi:
+            repo = None  # caller will use validate_project
         else:
             raise ValueError(
                 "project {} holds multiple repos {} — pass --repo".format(project, repos))
@@ -650,17 +655,14 @@ def _self_source_bundle(conn, project, repo):
                            warn=lambda _msg: None)
 
 
-def validate(conn, project=None, repo=None, bundle=None):
-    """Audit a populated store; return a Report.
-
-    project/repo are derived from the store (`nodes`) when not passed, so this
-    works over a real gathered store. The two real-data checks (no_drift,
-    idempotency) need a raw bundle to re-derive against; when `bundle` is not
-    passed they SELF-SOURCE it from the store (via extract over the store's full
-    window) so the gate is self-contained on a store-only deliverable. A passed
-    `bundle` is honored as an optional cross-check but is never required.
+def validate_repo(conn, project, repo, bundle=None):
+    """Run all trustworthiness checks for a single (project, repo) and return a
+    Report. The two real-data checks (no_drift, idempotency) need a raw bundle
+    to re-derive against; when `bundle` is not passed they SELF-SOURCE it from
+    the store (via extract over the store's full window) so the gate is
+    self-contained on a store-only deliverable. A passed `bundle` is honored as
+    an optional cross-check but is never required.
     """
-    project, repo = _detect_project_repo(conn, project, repo)
     checks = [
         check_referential_integrity(conn),
         check_participant_completeness(conn, project, repo, bundle),
@@ -680,6 +682,32 @@ def validate(conn, project=None, repo=None, bundle=None):
         checks.append(_guarded(check_idempotency, "idempotency",
                                conn, drift_bundle))
     return Report(checks)
+
+
+def validate(conn, project=None, repo=None, bundle=None):
+    """Audit a populated store; return a Report.
+
+    project/repo are derived from the store (`nodes`) when not passed, so this
+    works over a real gathered store. The two real-data checks (no_drift,
+    idempotency) need a raw bundle to re-derive against; when `bundle` is not
+    passed they SELF-SOURCE it from the store (via extract over the store's full
+    window) so the gate is self-contained on a store-only deliverable. A passed
+    `bundle` is honored as an optional cross-check but is never required.
+    """
+    project, repo = _detect_project_repo(conn, project, repo)
+    return validate_repo(conn, project, repo, bundle)
+
+
+def validate_project(conn, project, repos):
+    """Run the per-member validation over a project's full member set and
+    aggregate. Returns {"ok": all-green, "project": project,
+    "members": [{"repo": r, "ok": bool, ...per-repo report...}, ...]}."""
+    member_reports = []
+    for repo in repos:
+        rep = validate_repo(conn, project, repo)
+        member_reports.append({"repo": repo, **rep.to_dict()})
+    return {"ok": all(r["ok"] for r in member_reports),
+            "project": project, "members": member_reports}
 
 
 def _guarded(fn, name, *args):
@@ -740,15 +768,42 @@ def main(argv=None):
     if args.bundle:
         with open(args.bundle) as fh:
             bundle = json.load(fh)
-    report = validate(conn, project=args.project, repo=args.repo, bundle=bundle)
-    project, repo = _detect_project_repo(conn, args.project, args.repo)
-    conn.close()
 
-    if args.json:
-        print(json.dumps(report.to_dict(), sort_keys=True, indent=2))
+    # Detect project/repo; allow_multi=True so multi-repo stores don't raise
+    # when --repo is omitted — the project path handles them.
+    project, repo = _detect_project_repo(conn, args.project, args.repo,
+                                          allow_multi=True)
+
+    if repo is None:
+        # Multi-repo project path: run validate_project over all member repos.
+        repos = graphstore.project_repos(conn, project)
+        agg = validate_project(conn, project, repos)
+        conn.close()
+        if args.json:
+            print(json.dumps(agg, sort_keys=True, indent=2))
+        else:
+            status = "OK" if agg["ok"] else "FAIL"
+            print("trust audit (project): {}  (project={} repos={})".format(
+                status, project, repos))
+            print("=" * 60)
+            for mr in agg["members"]:
+                mstatus = "OK" if mr["ok"] else "FAIL"
+                print("  [{}] {}".format(mstatus, mr["repo"]))
+                for c in mr.get("checks", []):
+                    mark = "ok  " if c["ok"] else "FAIL"
+                    print("      [{}}] {}  ({})".format(mark, c["name"], c["severity"]))
+            print("=" * 60)
+            print("RESULT: {}".format(status))
+        return 0 if agg["ok"] else 1
     else:
-        print(_format_report(report, project, repo))
-    return 0 if report.ok else 1
+        # Single-repo path: identical to the original behaviour.
+        report = validate_repo(conn, project, repo, bundle)
+        conn.close()
+        if args.json:
+            print(json.dumps(report.to_dict(), sort_keys=True, indent=2))
+        else:
+            print(_format_report(report, project, repo))
+        return 0 if report.ok else 1
 
 
 if __name__ == "__main__":
