@@ -67,6 +67,9 @@ jobs:
             .claude/skills/activity-overview/complete.py \
             .claude/skills/activity-overview/validate.py \
             .claude/skills/activity-overview/spotlight.py \
+            .claude/skills/activity-overview/manifest.py \
+            .claude/skills/activity-overview/manifest_from_index.py \
+            .claude/skills/activity-overview/digest.py \
             .claude/skills/activity-overview/ci_spotlight_integration.py
 
       - name: Run the offline test suite

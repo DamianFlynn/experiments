@@ -41,10 +41,17 @@ the skill (see `SKILL.md`).
 
 ### Multi-repo project (Phase 9)
 
-Fold several repos under one logical project via a manifest, then validate/read the
-whole project:
+Generate the manifest from the AVM module index (or hand-author it), then fold the
+members under one logical project and validate/read the whole project:
 
 ```bash
+# Generate a manifest from the canonical AVM index CSV(s). --avm res|ptn|utl pulls
+# the published index; filter with --kind/--status/--name-contains/--include/
+# --exclude/--limit. (--index FILE|URL|- reads a local/remote/stdin CSV instead.)
+python3 manifest_from_index.py --avm res --avm ptn \
+    --project avm-tf-storage --from 2026-03-01 --to 2026-03-31 \
+    --name-contains storage --status Available > workspace/manifest.json
+
 python3 gather.py --manifest workspace/manifest.json --store workspace/journey.db
 python3 validate.py workspace/journey.db --project avm-tf-storage
 python3 digest.py --store workspace/journey.db --project avm-tf-storage \
