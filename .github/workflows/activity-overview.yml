@@ -253,10 +253,12 @@ jobs:
     # index slice (manifest_from_index.py), gather both members into ONE project
     # store, prove the project graph is trustworthy (validate --project), and assert
     # the digest resolves a CROSS-REPO module-dependency edge (the pattern sourcing
-    # the resource module). The cross-repo edge comes from the static whole-tree
-    # source scan — no `terraform init` here, so the gate stays fast. Pinned
-    # historical window -> reproducible. Heavy (2 clones + API) + needs the token,
-    # so gated like live/spotlight: on demand, on schedule, or on a default-branch
+    # the resource module). Terraform is installed so the real `terraform init` +
+    # `terraform graph` DOT extraction runs on real modules (parity with the bicep
+    # live/spotlight gates); the static whole-tree source scan still backstops the
+    # cross-repo edge if a heavy `init` times out. Pinned historical window ->
+    # reproducible. Heavy (2 clones + API + terraform init) + needs the token, so
+    # gated like live/spotlight: on demand, on schedule, or on a default-branch
     # push — never on a feature/fork PR.
     needs: tests
     if: >-
@@ -276,6 +278,23 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Install Terraform
+        env:
+          # Pinned so the gate is reproducible and a new terraform release cannot
+          # silently change graph output. Bump deliberately. Raw binary (no wrapper)
+          # so `terraform graph` DOT reaches the extractor unmodified.
+          TERRAFORM_VERSION: 1.15.5
+        run: |
+          curl -sSLo tf.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          unzip -o tf.zip terraform
+          sudo mv terraform /usr/local/bin/terraform
+          installed="$(terraform version | head -1)"
+          echo "$installed"
+          case "$installed" in
+            *"${TERRAFORM_VERSION}"*) ;;
+            *) echo "::error::terraform version mismatch: wanted ${TERRAFORM_VERSION}, got '$installed'"; exit 1 ;;
+          esac
 
       - name: Verify the integration secret is present
         env:
@@ -300,8 +319,15 @@ jobs:
       - name: Gather the constellation into one project store
         env:
           GITHUB_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
+          # terraform init for an AVM pattern pulls many registry modules: warm a
+          # shared plugin cache and give each init room. A heavy init that still
+          # times out degrades gracefully — edge_extraction records timeout/failed
+          # and the static whole-tree source scan still backstops the cross-repo edge.
+          TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.claude/skills/activity-overview/workspace/.tfcache
+          ACTIVITY_IAC_BUILD_TIMEOUT: "600"
         run: |
           cd .claude/skills/activity-overview
+          mkdir -p workspace/.tfcache
           python gather.py --manifest workspace/manifest.json \
             --store workspace/journey.db
 
