@@ -2115,8 +2115,21 @@ class TestManifestMain(unittest.TestCase):
         self.assertEqual(member.repo, "mod-a")
         self.assertEqual(getattr(member, "from"), "2026-03-01")
         self.assertEqual(member.to, "2026-03-31")
-        self.assertIsNone(member.clone_dir)            # re-derived per member
+        # clone_dir is re-derived per member and includes the owner so members
+        # sharing a repo name across owners don't collide on disk.
+        self.assertEqual(member.clone_dir, "workspace/Azure-mod-a-clone")
         self.assertTrue(member.no_clone)               # other flags carried through
+
+    def test_member_args_clone_dirs_distinct_for_same_repo_name(self):
+        base = gather.parse_args([
+            "--manifest", "m.json", "--store", "s.db", "--no-clone"])
+        a = gather._member_args(
+            base, {"owner": "Azure", "repo": "mod", "registry": None}, "x", "y")
+        b = gather._member_args(
+            base, {"owner": "Contoso", "repo": "mod", "registry": None}, "x", "y")
+        self.assertNotEqual(a.clone_dir, b.clone_dir)
+        self.assertEqual(a.clone_dir, "workspace/Azure-mod-clone")
+        self.assertEqual(b.clone_dir, "workspace/Contoso-mod-clone")
 
     def test_main_folds_each_member_under_logical_project(self):
         import tempfile
@@ -2151,6 +2164,18 @@ class TestManifestMain(unittest.TestCase):
         self.assertEqual(set(calls), {("Azure", "mod-a"), ("Azure", "mod-b")})
         self.assertIsNotNone(graphstore.get_node(conn, "proj/Azure/mod-a#pr-10"))
         self.assertIsNotNone(graphstore.get_node(conn, "proj/Azure/mod-b#pr-10"))
+
+    def test_main_invalid_manifest_leaves_no_store(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            mpath = os.path.join(tmp, "m.json")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                json.dump({"project": "p"}, fh)   # no window/repos -> invalid
+            store = os.path.join(tmp, "j.db")
+            with self.assertRaises(ValueError):
+                gather.main(["--manifest", mpath, "--store", store])
+            # validation happens before open_store, so no empty DB is left behind
+            self.assertFalse(os.path.exists(store))
 
 
 class TestParseQualifiedRefs(unittest.TestCase):

@@ -17,25 +17,36 @@ def load_manifest(path):
     Raises ValueError on any missing/empty required field."""
     with open(path, encoding="utf-8") as fh:
         raw = json.load(fh)
+    if not isinstance(raw, dict):
+        raise ValueError("manifest: top-level value must be a JSON object")
 
     project = raw.get("project")
     if not project:
         raise ValueError("manifest: 'project' is required")
 
-    window = raw.get("window") or {}
+    window = raw.get("window")
+    if not isinstance(window, dict):
+        window = {}
     date_from, date_to = window.get("from"), window.get("to")
     if not date_from or not date_to:
         raise ValueError("manifest: 'window.from' and 'window.to' are required")
 
     raw_repos = raw.get("repos") or []
-    if not raw_repos:
+    if not isinstance(raw_repos, list) or not raw_repos:
         raise ValueError("manifest: 'repos' must list at least one member")
 
     repos = []
     for r in raw_repos:
+        if not isinstance(r, dict):
+            raise ValueError("manifest: each repo must be an object with "
+                             "'owner' and 'repo'")
         owner, repo = r.get("owner"), r.get("repo")
         if not owner or not repo:
             raise ValueError("manifest: each repo needs 'owner' and 'repo'")
+        # owner/repo flow into '{project}/{owner}/{repo}#...' node ids, which the
+        # backfill path splits back on '/'; a '/' inside either would desync that.
+        if "/" in owner or "/" in repo:
+            raise ValueError("manifest: 'owner' and 'repo' must not contain '/'")
         repos.append({"owner": owner, "repo": repo, "registry": r.get("registry")})
 
     return {"project": project, "from": date_from, "to": date_to, "repos": repos}

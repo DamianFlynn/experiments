@@ -68,6 +68,29 @@ class TestLoadManifest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "owner"):
                 manifest.load_manifest(path)
 
+    def test_rejects_non_object_toplevel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, [{"project": "p"}])  # top-level array
+            with self.assertRaisesRegex(ValueError, "object"):
+                manifest.load_manifest(path)
+
+    def test_rejects_non_object_repo_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(tmp, {"project": "p", "window": {"from": "x", "to": "y"},
+                                "repos": ["Azure/a"]})  # string, not object
+            with self.assertRaisesRegex(ValueError, "object"):
+                manifest.load_manifest(path)
+
+    def test_rejects_slash_in_owner_or_repo(self):
+        for entry in ({"owner": "Az/ure", "repo": "r"},
+                      {"owner": "o", "repo": "re/po"}):
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as tmp:
+                path = _write(tmp, {"project": "p",
+                                    "window": {"from": "x", "to": "y"},
+                                    "repos": [entry]})
+                with self.assertRaisesRegex(ValueError, "'/'"):
+                    manifest.load_manifest(path)
+
     def test_member_slugs_empty(self):
         self.assertEqual(manifest.member_slugs({"repos": []}), set())
 

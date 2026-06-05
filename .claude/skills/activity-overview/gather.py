@@ -2432,10 +2432,16 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None):
 
 def _member_args(base, member, frm, to):
     """Clone the CLI args for one manifest member: same flags, but owner/repo and
-    the window come from the manifest, and clone_dir is re-derived per member
-    (acquire defaults it to workspace/{repo}-clone)."""
+    the window come from the manifest, and clone_dir is re-derived PER MEMBER as
+    `{base}/{owner}-{repo}-clone`. Including the owner (not just the repo, which is
+    acquire's single-repo default) keeps two members that share a repo name under
+    different owners from colliding on the same checkout. A `--clone-dir` on the
+    base args is treated as the parent directory; otherwise it defaults to
+    `workspace`."""
+    base_dir = (base.clone_dir or "workspace").rstrip("/")
+    clone_dir = "{}/{}-{}-clone".format(base_dir, member["owner"], member["repo"])
     fields = {**vars(base), "owner": member["owner"], "repo": member["repo"],
-              "clone_dir": None}
+              "clone_dir": clone_dir}
     ns = argparse.Namespace(**fields)
     setattr(ns, "from", frm)   # 'from' is a Python keyword: set via attribute
     ns.to = to
@@ -2444,11 +2450,14 @@ def _member_args(base, member, frm, to):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    # Load + validate the manifest BEFORE touching the store, so a bad/missing
+    # manifest fails fast instead of leaving an empty DB behind.
+    man = manifest_mod.load_manifest(args.manifest) if getattr(
+        args, "manifest", None) else None
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
     graphstore.init_schema(conn)
-    if getattr(args, "manifest", None):
-        man = manifest_mod.load_manifest(args.manifest)
+    if man is not None:
         members = manifest_mod.member_slugs(man)
         for m in man["repos"]:
             member_args = _member_args(args, m, man["from"], man["to"])
