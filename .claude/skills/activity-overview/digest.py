@@ -133,7 +133,18 @@ def build_project_trains(members, components, project):
     cross-repo references and repos are fully represented. A component all of whose
     social nodes are orphans (no member train maps to it) produces no project train —
     mirroring single-repo behaviour, where a closed issue with no PR and no
-    `not_planned` reason yields no train."""
+    `not_planned` reason yields no train.
+
+    Two consequences of the orphan fold worth knowing:
+    - Because `spine_components` caps reachability at `max_depth`, a single real
+      train spanning more than that many spine hops can split into two components;
+      an intermediate anchor shared by both may then surface in two project trains
+      (once as a member-train ref, once orphan-folded). Rare (needs a >max_depth
+      chain) and inherited from `extract`'s single-repo cap.
+    - A project train's `repos`/refs reflect its whole component, so when the caller
+      restricts `members`/`repos` to a subset, a spine edge reaching a member
+      OUTSIDE the requested subset still pulls that member's node in (the edge is
+      real). The emitted `repos` can thus exceed the requested set."""
     comp_of = {}
     for i, comp in enumerate(components):
         for nid in comp:
@@ -150,7 +161,7 @@ def build_project_trains(members, components, project):
     out = []
     for key, items in groups.items():
         prs, issues, commits, evidence, repos = [], [], [], [], []
-        kind, outcome, root = "other", "abandoned", None
+        outcome = "abandoned"
         best_rank = -1
         for repo, tr in items:
             if repo not in repos:
@@ -167,12 +178,13 @@ def build_project_trains(members, components, project):
             rank = _OUTCOME_RANK.get(tr["outcome"], 0)
             if rank > best_rank:
                 best_rank, outcome = rank, tr["outcome"]
-            if tr.get("root_issue") is not None and root is None:
-                kind, root = tr["kind"], _member_train_anchor_qid(project, repo, tr)
-        if root is None:  # no root issue anywhere: take the kind of the min anchor
-            _, tr0 = min(items, key=lambda rt: _member_train_anchor_qid(
-                project, rt[0], rt[1]))
-            kind = tr0["kind"]
+        # kind: prefer a typed root-issue train; among candidates pick the one with
+        # the min anchor — consistent with the train-id derivation and the outcome
+        # ordering (vs. first-by-repo-order, which depended on member iteration).
+        root_items = [(r, tr) for r, tr in items if tr.get("root_issue") is not None]
+        _, kpick = min(root_items or items,
+                       key=lambda rt: _member_train_anchor_qid(project, rt[0], rt[1]))
+        kind = kpick["kind"]
 
         # Fold in any component nodes that have no member train (e.g. a cross-repo
         # issue closed without a local PR).  These contribute repos + refs but no

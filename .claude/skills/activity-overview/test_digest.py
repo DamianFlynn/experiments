@@ -222,6 +222,23 @@ class TestBuildProjectTrainsUnit(unittest.TestCase):
         self.assertEqual(trains[0]["outcome"], "shipped")
         self.assertEqual(sorted(trains[0]["repos"]), ["Azure/a", "Azure/b"])
 
+    def test_kind_picks_min_anchor_among_root_issue_trains(self):
+        # two root-issue member trains in one component; kind comes from the
+        # MIN-anchor train (Azure/a#issue-5 < Azure/b#issue-2 lexicographically),
+        # not from member iteration order.
+        members = [
+            {"repo": "Azure/b",
+             "bundle": {"trains": [self._train("train-issue-2", root_issue=2,
+                                               prs=[2], kind="feature")]}},
+            {"repo": "Azure/a",
+             "bundle": {"trains": [self._train("train-issue-5", root_issue=5,
+                                               prs=[5], kind="bug")]}},
+        ]
+        comps = [frozenset({"proj/Azure/a#issue-5", "proj/Azure/b#issue-2"})]
+        trains = digest.build_project_trains(members, comps, "proj")
+        self.assertEqual(len(trains), 1)
+        self.assertEqual(trains[0]["kind"], "bug")  # Azure/a#issue-5 is the min
+
     def test_evidence_is_repo_tagged(self):
         members = [{"repo": "Azure/a", "bundle": {"trains": [
             self._train("train-pr-1", prs=[1],
