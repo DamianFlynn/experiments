@@ -112,7 +112,9 @@ def _node_kind(node_id, data):
     pr / issue / commit / release / comment / symbol / file, else the node's
     structural prefix. Deterministic."""
     local = graphstore.parse_id(node_id)["local"]
-    if local.startswith("pr-"):
+    # A backfilled `Closes #N` whose #N turned out to be a PR is stored under the
+    # referenced `issue-N` id but carries the PR's /pull/ url — label it a PR.
+    if local.startswith("pr-") or "/pull/" in ((data or {}).get("url") or ""):
         return "pr"
     if local.startswith("issue-"):
         return "issue"
@@ -248,9 +250,13 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of,
 
     # the anchor is the train's ORIGIN (issue beats pr beats release beats
     # commit), so the headline reads as the originating issue/PR title — not a
-    # commit message. Falls back to the passed anchor if nothing hydrated.
+    # commit message. Anchor it to the train's IN-WINDOW work so pulled-in
+    # out-of-window context (e.g. an ancient cross-referenced PR) is traversed
+    # but cannot hijack the headline. Falls back to all nodes (then the passed
+    # anchor) if nothing hydrated / nothing is in-window.
     if nodes:
-        anchor = _origin_anchor(nodes)
+        in_window_nodes = [n for n in nodes if _ts_in_window(n.get("ts"), window)]
+        anchor = _origin_anchor(in_window_nodes or nodes)
     anchor_node = graphstore.get_node(conn, anchor)
     adata = (anchor_node["data"] if anchor_node else {}) or {}
 

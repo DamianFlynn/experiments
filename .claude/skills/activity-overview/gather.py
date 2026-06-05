@@ -1876,9 +1876,9 @@ def backfill(conn, id, fetch=None):
 
     `fetch(kind, local, qid)` is the network seam with THREE outcomes:
       - a dict `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched;
-      - `gather.ABSENT` == the id DEFINITIVELY does not exist (a 404, or an
-        `issue-N` ref that resolves to a PR) — `backfill` tombstones it via
-        `graphstore.record_dead_ref` so it is pruned and never re-chased;
+      - `gather.ABSENT` == the id DEFINITIVELY does not exist (a 404) —
+        `backfill` tombstones it via `graphstore.record_dead_ref` so it is
+        pruned and never re-chased;
       - `None` == transient/unreachable (could not be resolved this run).
     Tests pass a fixture-backed fake; production passes `make_backfill_fetcher`.
 
@@ -1949,9 +1949,10 @@ def make_backfill_fetcher(token, clone_dir=None):
     structure -> not backfilled on demand (graphify/whole-dict facts come from
     Acquire), so it returns None and the node stays a warned gap.
 
-    Outcomes per the `backfill` contract: a fetched dict, `ABSENT` (a 404, or an
-    `issue-N` ref that GitHub resolves to a PR — so no such issue exists), or
-    `None` (transient / not resolvable this run, e.g. a code sha with no clone).
+    A `Closes #N` whose #N resolves to a PR (issues + PRs share one number
+    space) is followed to the real PR and returned as a node — the thread is
+    traversed, not dropped. Outcomes: a fetched dict, `ABSENT` (a genuine 404),
+    or `None` (transient / not resolvable this run, e.g. a code sha with no clone).
     """
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
@@ -1963,14 +1964,21 @@ def make_backfill_fetcher(token, clone_dir=None):
             if raw is None and nxt == 404:
                 return ABSENT
             if raw.get("pull_request"):
-                # #N exists but is a PR, so there is NO issue #N: the parsed
-                # `issue-N` reference is a phantom (a `Closes #N` that points at a
-                # PR — `Closes` only auto-closes issues). Treat it as ABSENT so it
-                # is pruned + tombstoned, never fabricated into the train and never
-                # re-chased. (Returning the PR here would pull an unrelated, often
-                # ancient PR in as the train's context — the exact mis-link the
-                # honest contract avoids.)
-                return ABSENT
+                # #N is actually a PR (issues + PRs share one number space). The
+                # parsed `issue-N` is gather's mis-classification, not a phantom:
+                # the PR is real, so follow the thread and resolve it to the PR.
+                # It is returned under the referenced id so the existing `closes`
+                # edge connects; its /pull/ html_url lets the reader label it a PR
+                # and anchor the train's headline to in-window work, so an ancient
+                # cross-ref is traversed as context without hijacking the title.
+                pr_raw, pnxt = http_get_json(f"{api}/pulls/{num}", token,
+                                             allow_404=True)
+                if pr_raw is None and pnxt == 404:
+                    return ABSENT
+                pr = normalize_pr(pr_raw)
+                edges = [("issue-{}".format(n), "closes")
+                         for n in pr.get("closes") or []]
+                return {"node": pr, "edges": edges}
             return {"node": normalize_issue(raw), "edges": []}
         if kind == "social" and local.startswith("pr-"):
             num = local[len("pr-"):]

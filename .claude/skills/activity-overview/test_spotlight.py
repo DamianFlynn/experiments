@@ -783,6 +783,18 @@ class TestGapRender(unittest.TestCase):
         self.assertIn("outside-window", md)
         self.assertIn("not-gathered", md)
 
+    def test_node_kind_labels_pr_stored_under_issue_id_by_pull_url(self):
+        # A backfilled `Closes #N` whose #N was a PR is stored under issue-N but
+        # carries the PR's /pull/ url -> it must render as a PR, not an issue.
+        nid = graphstore.qualify_id("acme", "widget", "issue-8")
+        data = {"number": 8, "url": "https://github.com/acme/widget/pull/8"}
+        self.assertEqual(spotlight._node_kind(nid, data), "pr")
+        # a genuine issue (issues/ url) stays an issue
+        idata = {"number": 9, "url": "https://github.com/acme/widget/issues/9"}
+        self.assertEqual(
+            spotlight._node_kind(graphstore.qualify_id("acme", "widget", "issue-9"),
+                                 idata), "issue")
+
 
 class TestGrepRender(unittest.TestCase):
     def setUp(self):
