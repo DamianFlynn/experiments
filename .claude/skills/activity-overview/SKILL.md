@@ -52,12 +52,28 @@ claim in the report resolves to a source ref — never invent facts.
      ```
      The manifest is `{project, window:{from,to}, repos:[{owner, repo, registry?}]}`
      (`registry` optional — an exact Terraform registry path; absent → resolved by
-     the HashiCorp naming convention). gather folds each member under
-     `project=<manifest.project>`, `repo="owner/repo"`. Cross-repo decision-train
-     edges (qualified `owner/repo#N` refs + repo-aware timeline cross-refs) and
-     cross-repo Terraform `depends_on` (registry source → the member that publishes
-     it) form automatically; `examples/`/`tests/` Terraform subtrees are treated as
-     scaffolding (not module dependencies). Validate the whole project with
+     the HashiCorp naming convention).
+     - **Generate/refresh the manifest from the AVM index first** (recommended), so
+       it tracks the current module set. The published AVM index is the source of
+       truth for which member repos and registry paths exist, so regenerating before
+       a gather avoids drift as modules are added, renamed, or promoted — don't rely
+       on a stale hand-curated list:
+       ```bash
+       python3 manifest_from_index.py --avm res --avm ptn \
+         --project avm-tf-aiml-lz --from FROM --to TO \
+         --name-contains aiml-landing-zone --status Available > workspace/manifest.json
+       ```
+       `--avm res|ptn|utl` pulls the canonical AVM index CSV(s) (or `--index FILE|URL|-`
+       for a local/pinned copy); filter with `--kind`/`--status`/`--name-contains`/
+       `--include`/`--exclude`/`--limit`. The output is exactly the contract
+       `gather --manifest` folds; hand-authoring is the fallback for a fixed set.
+
+     gather folds each
+     member under `project=<manifest.project>`, `repo="owner/repo"`. Cross-repo
+     decision-train edges (qualified `owner/repo#N` refs + repo-aware timeline
+     cross-refs) and cross-repo Terraform `depends_on` (registry source → the member
+     that publishes it) form automatically; `examples/`/`tests/` Terraform subtrees
+     are treated as scaffolding (not module dependencies). Validate the whole project with
      `python3 validate.py workspace/journey.db --project <name>` (adds a
      project-wide people check). A project digest view (cross-repo trains, merged
      Shipped/ownership, `related_work` ticket clusters, the project module-dependency
