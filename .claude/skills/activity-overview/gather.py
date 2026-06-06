@@ -1650,9 +1650,11 @@ def clone_head_sha(clone_dir, run=run_git):
 # VISIBLE gap (edges_status) rather than a silent empty.
 #
 # Env-overridable for heavy live runs: a real AVM pattern module's `terraform init`
-# pulls dozens of registry modules (raise the timeout), and a shared
-# TF_PLUGIN_CACHE_DIR is not safe under concurrent writes (lower the workers to 1
-# to serialize). The defaults are unchanged for the offline test/CI path.
+# pulls dozens of registry modules (raise the timeout). A shared TF_PLUGIN_CACHE_DIR
+# is not safe under concurrent writes, but `_terraform_prewarm` warms every area's
+# providers serially first so the parallel inits are cache HITS (no race) — keeping
+# parallel extraction safe without lowering the workers. The defaults are unchanged
+# for the offline test/CI path.
 IAC_BUILD_TIMEOUT = int(os.environ.get("ACTIVITY_IAC_BUILD_TIMEOUT", "300"))  # seconds per subprocess
 IAC_MAX_WORKERS = int(os.environ.get("ACTIVITY_IAC_MAX_WORKERS", "8"))        # parallel per-module builds
 IAC_RETRIES = int(os.environ.get("ACTIVITY_IAC_RETRIES", "1"))               # extra attempts on timeout/failure
@@ -1715,12 +1717,13 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
 
 
 def _terraform_prewarm(build_areas, clone_dir, run, timeout):
-    """Populate a SHARED TF_PLUGIN_CACHE_DIR once, serially, before the parallel
-    builds. terraform's plugin cache is not safe under concurrent writes, so a cold
-    cache + N parallel `terraform init` would race; one warm-up init (AVM members
-    share the same handful of providers) turns the rest into cache HITS — restoring
-    bicep-like parallel extraction for terraform without the race. Best-effort: any
-    failure is ignored (the parallel builds still run and report their own status)."""
+    """Populate a SHARED TF_PLUGIN_CACHE_DIR before the parallel builds. terraform's
+    plugin cache is not safe under concurrent writes, so a cold cache + N parallel
+    `terraform init` would race on provider downloads. Warm EVERY build area's
+    providers serially up front; the subsequent parallel inits are then pure cache
+    HITS (read-only) — race-free for ANY provider mix, not just members that happen
+    to share the same providers. Best-effort: a single warm-up failing is ignored
+    (that area's parallel build still runs and reports its own status)."""
     for area in build_areas:
         tp = _tf_entrypoint(area)
         if not tp:
@@ -1731,7 +1734,6 @@ def _terraform_prewarm(build_areas, clone_dir, run, timeout):
                  "-input=false"], timeout=timeout)
         except Exception:
             pass
-        return   # one warm-up populates the cache for the shared providers
 
 
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
