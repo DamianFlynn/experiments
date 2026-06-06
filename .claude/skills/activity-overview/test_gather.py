@@ -3431,14 +3431,14 @@ class TestParseProjectBoard(unittest.TestCase):
         self.assertIsNone(self.items[("acme/widget", 4)]["sprint_id"])
 
     def test_iterations_unioned_with_end_dates(self):
-        # iterations + completedIterations across boards; end = start + duration days.
+        # iterations + completedIterations; end = inclusive last day = start+(dur-1).
         self.assertIn("IT_current", self.sprints)
         self.assertIn("IT_done", self.sprints)
         cur = self.sprints["IT_current"]
         self.assertEqual(cur["title"], "Sprint 5")
         self.assertEqual(cur["start"], "2026-01-12")
-        self.assertEqual(cur["end"], "2026-01-26")  # +14 days
-        self.assertEqual(self.sprints["IT_done"]["end"], "2026-01-12")  # 2025-12-29 +14
+        self.assertEqual(cur["end"], "2026-01-25")  # inclusive: 2026-01-12 + (14-1)
+        self.assertEqual(self.sprints["IT_done"]["end"], "2026-01-11")  # 2025-12-29 +13
 
     def test_iteration_value_on_item(self):
         self.assertEqual(self.items[("acme/widget", 7)]["sprint_id"], "IT_current")
@@ -3470,6 +3470,29 @@ class TestParseProjectBoard(unittest.TestCase):
         ])
         self.assertEqual(sprints, {})
         self.assertEqual(items, {})
+
+    def test_item_on_two_boards_merges_status_and_sprint(self):
+        # the SAME issue on two boards: one supplies Status, the other a sprint —
+        # they MERGE (not clobber). (Finder finding 1.)
+        def board(num, item_fvs, fields=None):
+            return {"id": "B%d" % num, "number": num, "title": "b%d" % num,
+                    "fields": {"nodes": fields or []},
+                    "items": {"nodes": [{
+                        "content": {"__typename": "Issue", "number": 3,
+                                    "repository": {"nameWithOwner": "a/r"}},
+                        "fieldValues": {"nodes": item_fvs}}]}}
+        status_board = board(1, [{"__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                  "name": "Todo", "field": {"name": "Status"}}])
+        sprint_board = board(2, [{"__typename": "ProjectV2ItemFieldIterationValue",
+                                  "title": "S1", "iterationId": "IT1"}],
+                             fields=[{"__typename": "ProjectV2IterationField",
+                                      "name": "Sprint", "configuration": {
+                                          "iterations": [{"id": "IT1", "title": "S1",
+                                                          "startDate": "2026-01-01",
+                                                          "duration": 14}],
+                                          "completedIterations": []}}])
+        sprints, items = gather.parse_project_board([status_board, sprint_board])
+        self.assertEqual(items[("a/r", 3)], {"status": "Todo", "sprint_id": "IT1"})
 
 
 def _project_fold_bundle():
@@ -3559,6 +3582,7 @@ class TestFetchProjectBoard(unittest.TestCase):
         # first page returns one board with hasNextPage=True; second page closes it.
         page1 = copy.deepcopy(_project_board_data())
         b0 = page1["repository"]["projectsV2"]["nodes"][0]
+        b0["id"] = "BOARD1"
         b0["items"]["pageInfo"] = {"hasNextPage": True, "endCursor": "C1"}
         first_item = b0["items"]["nodes"][:1]
         rest_items = b0["items"]["nodes"][1:]
@@ -3570,15 +3594,14 @@ class TestFetchProjectBoard(unittest.TestCase):
 
         def fake_graphql(query, variables=None):
             calls.append(variables)
-            # discovery / first page (no cursor) -> page1 (board, hasNextPage)
-            if not variables or variables.get("cursor") is None:
-                return copy.deepcopy(page1)
-            # subsequent page request -> the rest of the items, no more pages
-            data = copy.deepcopy(page1)
-            data["repository"]["projectsV2"]["nodes"][0]["items"] = {
-                "pageInfo": {"hasNextPage": False, "endCursor": None},
-                "nodes": copy.deepcopy(rest_items)}
-            return data
+            # board-scoped pagination (PROJECT_BOARD_ITEMS_QUERY: node(id)) -> the rest
+            if variables and variables.get("id") is not None:
+                self.assertEqual(variables["cursor"], "C1")  # primary's own cursor
+                return {"node": {"items": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": copy.deepcopy(rest_items)}}}
+            # discovery / first page -> page1 (board, hasNextPage)
+            return copy.deepcopy(page1)
 
         sprints, items = gather.fetch_project_board(fake_graphql, "acme", "widget")
         self.assertEqual(sprints, {})
@@ -3611,20 +3634,44 @@ class TestFetchProjectBoard(unittest.TestCase):
 
     def test_item_cap_is_defensive(self):
         # a board that always claims another page must terminate at the cap.
+        def _item(n):
+            return {"content": {"__typename": "Issue", "number": n,
+                                "repository": {"nameWithOwner": "acme/widget"}},
+                    "fieldValues": {"nodes": []}}
+        runaway_page = {"pageInfo": {"hasNextPage": True, "endCursor": "C"},
+                        "nodes": [_item(1)]}
+
         def runaway(query, variables=None):
+            if variables and variables.get("id") is not None:   # node-scoped paging
+                return {"node": {"items": dict(runaway_page,
+                                               nodes=[_item(variables["cursor"] and 2)])}}
             return {"repository": {"projectsV2": {"nodes": [{
                 "id": "B", "number": 1, "title": "x", "fields": {"nodes": []},
-                "items": {"pageInfo": {"hasNextPage": True, "endCursor": "C"},
-                          "nodes": [
-                              {"content": {"__typename": "Issue", "number": 1,
-                                           "repository": {"nameWithOwner": "acme/widget"}},
-                               "fieldValues": {"nodes": []}}]}}]}}}
+                "items": runaway_page}]}}}
 
         sprints, items = gather.fetch_project_board(
             runaway, "acme", "widget", max_items=5)
         self.assertEqual(sprints, {})
-        # terminated rather than looping forever
-        self.assertTrue(len(items) <= 5)
+        self.assertTrue(len(items) <= 5)  # terminated rather than looping forever
+
+    def test_multiple_boards_ingests_only_primary(self):
+        # a repo linking >1 board ingests only the lowest-numbered (primary) one.
+        def board(num, item_number, status):
+            return {"id": "B%d" % num, "number": num, "title": "b%d" % num,
+                    "fields": {"nodes": []},
+                    "items": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                              "nodes": [{
+                                  "content": {"__typename": "Issue", "number": item_number,
+                                              "repository": {"nameWithOwner": "acme/widget"}},
+                                  "fieldValues": {"nodes": [
+                                      {"__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                       "name": status, "field": {"name": "Status"}}]}}]}}
+        data = {"repository": {"projectsV2": {"nodes": [
+            board(5, 50, "Done"), board(2, 20, "Todo")]}}}  # primary = #2
+        sprints, items = gather.fetch_project_board(
+            lambda q, v=None: copy.deepcopy(data), "acme", "widget")
+        self.assertIn(("acme/widget", 20), items)         # primary board #2
+        self.assertNotIn(("acme/widget", 50), items)      # #5 ignored
 
 
 if __name__ == "__main__":

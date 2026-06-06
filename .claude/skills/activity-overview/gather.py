@@ -2082,6 +2082,39 @@ query($owner:String!, $repo:String!, $cursor:String) {
 """.strip()
 
 
+# Board-scoped item pagination: paginate ONE board's items by its node id (so a
+# cursor always belongs to that board's connection — unlike the discovery query,
+# whose shared $cursor can't correctly paginate multiple boards at once).
+PROJECT_BOARD_ITEMS_QUERY = """
+query($id:ID!, $cursor:String) {
+  node(id:$id) {
+    ... on ProjectV2 {
+      items(first:100, after:$cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          content {
+            __typename
+            ... on Issue { number repository { nameWithOwner } }
+            ... on PullRequest { number repository { nameWithOwner } }
+          }
+          fieldValues(first:30) {
+            nodes {
+              __typename
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+                field { ... on ProjectV2FieldCommon { name } }
+              }
+              ... on ProjectV2ItemFieldIterationValue { title iterationId }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+
 def graphql_post(token, query, variables=None):
     """POST a GraphQL query to GitHub's `/graphql`, returning the parsed `data`.
     Not unit-tested (like http_get_json). Surfaces HTTP errors via the same
@@ -2108,14 +2141,16 @@ def graphql_post(token, query, variables=None):
 
 
 def _iter_end(start, duration):
-    """end-date = startDate + duration days (ISO YYYY-MM-DD). None-safe."""
+    """Inclusive last day of the iteration = startDate + (duration - 1) days (ISO
+    YYYY-MM-DD). Inclusive (not the next iteration's start) so it matches the
+    inclusive [from,to] window-overlap test. None-safe."""
     if not start or duration is None:
         return None
     try:
         d = datetime.date.fromisoformat(start[:10])
     except (TypeError, ValueError):
         return None
-    return (d + datetime.timedelta(days=int(duration))).isoformat()
+    return (d + datetime.timedelta(days=max(0, int(duration) - 1))).isoformat()
 
 
 def parse_project_board(board_nodes):
@@ -2172,16 +2207,28 @@ def parse_project_board(board_nodes):
                         status = fv.get("name")
                 elif tn == "ProjectV2ItemFieldIterationValue":
                     sprint_id = fv.get("iterationId")
-            items_by_ref[(repo_slug, number)] = {
-                "status": status, "sprint_id": sprint_id}
+            # MERGE across boards (an item can be on several boards): keep the first
+            # non-None status/sprint_id seen (boards arrive in deterministic order),
+            # so one board's status + another's sprint combine instead of clobbering.
+            cur = items_by_ref.get((repo_slug, number))
+            if cur is None:
+                items_by_ref[(repo_slug, number)] = {
+                    "status": status, "sprint_id": sprint_id}
+            else:
+                if cur.get("status") is None:
+                    cur["status"] = status
+                if cur.get("sprint_id") is None:
+                    cur["sprint_id"] = sprint_id
     return sprints, items_by_ref
 
 
 def fetch_project_board(graphql, owner, repo, max_items=2000):
-    """Auto-discover + fetch the repo's Projects v2 board(s) via the injected
+    """Auto-discover + fetch the repo's PRIMARY Projects v2 board via the injected
     `graphql(query, variables)` callable, returning `(sprints, items_by_ref)`
-    (see parse_project_board). Paginates the first board's items by
-    pageInfo.hasNextPage/endCursor, capping total items defensively at `max_items`.
+    (see parse_project_board). A repo may link several boards; we ingest only the
+    lowest-numbered one (spec: one board per repo for now) and warn about the rest,
+    rather than half-fetch them. Its items are paginated by NODE ID (so each cursor
+    belongs to that board's connection), capped defensively at `max_items`.
 
     Degrades CLEANLY to ({}, {}) on any error (a GraphQL `errors` SystemExit, a
     network failure, a null repository, or no linked board) — a board fetch must
@@ -2191,11 +2238,7 @@ def fetch_project_board(graphql, owner, repo, max_items=2000):
     try:
         data = graphql(PROJECT_BOARD_QUERY,
                        {"owner": owner, "repo": repo, "cursor": None})
-    except SystemExit as err:
-        sys.stderr.write(
-            f"warning: skipping Projects v2 board for {owner}/{repo}: {err}\n")
-        return {}, {}
-    except Exception as err:  # noqa: BLE001 — degrade, never hard-fail
+    except (SystemExit, Exception) as err:  # noqa: BLE001 — degrade, never hard-fail
         sys.stderr.write(
             f"warning: skipping Projects v2 board for {owner}/{repo}: {err}\n")
         return {}, {}
@@ -2207,48 +2250,45 @@ def fetch_project_board(graphql, owner, repo, max_items=2000):
     if not boards:
         return {}, {}
 
-    # Determinism: ingest boards by number then id.
+    # Determinism: pick the lowest-numbered board as primary; ignore the rest.
     boards = sorted(
         boards, key=lambda b: (b.get("number") is None, b.get("number") or 0,
                                b.get("id") or ""))
-
-    # Paginate the FIRST board's items (the common single-board case). Each page
-    # returns the same fields block, so we accumulate item pages onto a copy of the
-    # first board and parse the whole set once.
     primary = boards[0]
-    pages = [primary]
-    info = (primary.get("items") or {}).get("pageInfo") or {}
+    if len(boards) > 1:
+        sys.stderr.write(
+            "warning: {}/{} links {} Projects v2 boards; ingesting only #{} "
+            "({}), ignoring the rest.\n".format(
+                owner, repo, len(boards), primary.get("number"),
+                primary.get("title")))
+
+    # Paginate the PRIMARY board's items by its node id (correct per-board cursors).
     nodes = list(((primary.get("items") or {}).get("nodes") or []))
-    cursor = info.get("endCursor")
-    has_next = info.get("hasNextPage")
-    guard = 0
-    while has_next and len(nodes) < max_items and guard < 100:
+    info = (primary.get("items") or {}).get("pageInfo") or {}
+    cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
+    board_id, guard = primary.get("id"), 0
+    while has_next and board_id and len(nodes) < max_items and guard < 100:
         guard += 1
         try:
-            page = graphql(PROJECT_BOARD_QUERY,
-                           {"owner": owner, "repo": repo, "cursor": cursor})
+            page = graphql(PROJECT_BOARD_ITEMS_QUERY,
+                           {"id": board_id, "cursor": cursor})
         except Exception as err:  # noqa: BLE001
             sys.stderr.write(
                 f"warning: partial Projects v2 board for {owner}/{repo}: {err}\n")
             break
-        nb = (((page or {}).get("repository") or {}).get("projectsV2") or {}).get("nodes") or []
-        if not nb:
+        items = ((page or {}).get("node") or {}).get("items") or {}
+        page_nodes = items.get("nodes") or []
+        if not page_nodes:
             break
-        items = nb[0].get("items") or {}
-        nodes.extend(items.get("nodes") or [])
+        nodes.extend(page_nodes)
         info = items.get("pageInfo") or {}
-        cursor = info.get("endCursor")
-        has_next = info.get("hasNextPage")
+        cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
     nodes = nodes[:max_items]
 
-    # Reassemble: the primary board with its accumulated items + every OTHER board
-    # (taken as their single first page — multi-board repos are rare and namespaced
-    # by iteration id, so this is a deterministic best-effort union).
     primary_full = dict(primary)
     primary_full["items"] = {"pageInfo": {"hasNextPage": False, "endCursor": None},
                              "nodes": nodes}
-    pages = [primary_full] + list(boards[1:])
-    return parse_project_board(pages)
+    return parse_project_board([primary_full])
 
 
 def _next_link(link_header):
@@ -2558,10 +2598,11 @@ def acquire(args, env):
         # kept (can't exclude it). Drop the iteration stamp on items whose sprint
         # was windowed out so fold leaves no dangling in_iteration edge.
         kept = {}
+        to10, frm10 = (to or "")[:10], (frm or "")[:10]
         for sid, s in sprints.items():
             start, end = s.get("start"), s.get("end")
-            overlaps = ((start is None or start[:10] <= to)
-                        and (end is None or end[:10] >= frm))
+            overlaps = ((start is None or start[:10] <= to10)
+                        and (end is None or end[:10] >= frm10))
             if overlaps:
                 kept[sid] = s
         sprints = kept
