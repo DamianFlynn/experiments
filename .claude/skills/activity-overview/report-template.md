@@ -178,18 +178,19 @@ not planned.
 
 Where flow is stuck this period. **Flow signals, not blame** — the public digest
 never attributes a stall/blocker to a person (that is the gated internal appendix).
-Omit the whole section when there is no stalled / blocked / pile-up data.
+Omit the whole section when `flow`/`blockers` are empty and there are no stalled trains.
 
-**Stalled trains** — deep trains with `train.effort.stalled` true, longest
-`effort.elapsed_days` first:
+**Flow pathologies** — the per-issue classification in `bundle["flow"]` (deterministic;
+each entry already carries its `state`, `age_days`, `reactions`, `blocked_by`, and
+`signals`). Group by `state` in this order — **blocked → upvoted_but_ignored →
+traction_then_abandoned → hung** — each issue cited:
 
-- train `{train.id}` — {short title} — stalled {train.effort.elapsed_days}d (cite the
-  train's root issue / PR url)
+- [{title}]({url}) (#{number}) — *{state}* — {", ".join(flow_entry.signals)}
 
-**Blocked issues** — issues carrying `blocked_by` (and/or `blocking`), each cited:
+**Top blockers** — issues ranked by how many others they block, from
+`bundle["blockers"]` (highest `blocks_count` first) — the ones to unblock first:
 
-- [{title}]({url}) (#{number}) — blocked by {blocked_by joined with ", " as #N}{; blocks
-  {blocking joined as #N, …}}
+- [{title}]({url}) (#{number}) — blocks {blocks_count}: {blocks joined as #N, …}
 
 {Embed the dependency graph when `diagrams.blocker_graph` is present:}
 
@@ -197,10 +198,11 @@ Omit the whole section when there is no stalled / blocked / pile-up data.
 {diagrams.blocker_graph}
 ```
 
-**Pile-ups** — open, high-activity issues (`issue["open_high_activity"]` true), each
-cited:
+**Stalled trains** — deep trains with `train.effort.stalled` true (train-level, distinct
+from the issue-level flow above), longest `effort.elapsed_days` first:
 
-- [{title}]({url}) (#{number})
+- train `{train.id}` — {short title} — stalled {train.effort.elapsed_days}d (cite the
+  train's root issue / PR url)
 
 ## Next-release forecast
 
