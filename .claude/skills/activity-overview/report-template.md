@@ -39,6 +39,22 @@
 - **Landed:** `forecast_loop.landed` — predicted (tier `{tier}`) and shipped this window: [{title}]({url}) (#{id}).
 - **Not yet:** `forecast_loop.not_yet` — predicted (tier `{tier}`) but still not shipped: [{title}]({url}) (#{id}).
 
+## Community call highlights
+
+<!-- Phase 14. OMIT this whole section when NO transcript was provided. When one
+     was, the skill ran `python3 transcript.py <path>` to get clean text; author
+     this section ONLY from that text (it is the source — there are no PR/issue
+     urls, so GROUND every specific claim with a short verbatim quote from the
+     transcript). Cover: topics discussed, decisions made, asks / requests, and
+     follow-ups / action items. Do not attribute anything to the call that the
+     transcript does not say. Call context may also inform the Executive summary
+     and Decision trains — clearly as call context, never as a code fact. -->
+
+- **Topics:** {what was discussed}
+- **Decisions:** {what was decided} — *"{verbatim quote}"*
+- **Asks:** {requests raised}
+- **Follow-ups:** {action items / who owns what}
+
 ## Shipped this period
 
 <!-- Multi-repo: source from `view["shipped"]` (each row has a `repo` key added

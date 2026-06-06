@@ -78,6 +78,42 @@ window so an in-window commit keeps its real parent. If `meta.boundary_dropped_c
 is non-empty (an in-window commit still landed on the shallow boundary, so its
 whole-tree phantom diff was dropped), widen this knob and re-gather to recover it.
 
+### Projects v2 board knobs
+
+When a repo links Projects v2 boards, gather ingests **every maintained** board it
+links (merging items; per-repo `(slug, number)` keying, so no foreign-repo status
+leaks) and skips **closed/stale** ones. Override the defaults when needed:
+`ACTIVITY_BOARD_STALE_DAYS` (a board untouched longer than this before the window's
+ref date is treated as deprecated, default `365`) and `ACTIVITY_BOARD_MAX_ITEMS`
+(per-board item cap, default `5000`; a truncated board warns). `--no-project-board`
+skips the layer entirely (e.g. a token without `read:project`).
+
+### Community-call transcript (Phase 14)
+
+To fold a community call into the report, pass a **local** transcript file (no
+network) and normalize it to clean prose:
+
+```bash
+python3 transcript.py workspace/<name>-call-2026-05.vtt   # .vtt/.srt/.txt/.md
+```
+
+The skill reads that output and authors the **Community call highlights** section,
+grounded in (and quoting) the transcript. No transcript ⇒ the section is omitted.
+
+### Slash command
+
+The skill ships a thin `/activity` entrypoint at `commands/activity.md`. Claude Code
+discovers slash commands under `.claude/commands/` (project) or `~/.claude/commands/`
+(user), so install it by copying/symlinking that file there:
+
+```bash
+ln -s ../skills/activity-overview/commands/activity.md .claude/commands/activity.md
+```
+
+Then: `/activity <owner/repo|project> <from> <to> [--transcript PATH] [--series PATH]
+[options]` — it parses the args and defers to `SKILL.md` (gather → link → render →
+report).
+
 ## Tests
 
 ```bash

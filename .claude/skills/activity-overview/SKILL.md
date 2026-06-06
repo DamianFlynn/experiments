@@ -120,7 +120,19 @@ claim in the report resolves to a source ref — never invent facts.
    if any diagram does not compile** under `mmdc`.
    The manifest now also includes `content_timeline`, `deltas_bar`,
    `contributor_graph`, and `kind_breakdown`.
-4. **Write the report.** Read the materialized bundle view and fill
+4. **Community-call transcript (optional, Phase 14).** If the user provides a
+   community-call transcript (a local file passed explicitly, or a `transcript`
+   path in `projects.json`) — no network, user-provided only — normalize it to
+   clean prose first:
+   ```bash
+   python3 transcript.py path/to/call.vtt
+   ```
+   `transcript.py` strips WebVTT/SRT structure (headers, NOTE/STYLE blocks, cue
+   timings, SRT indices, inline tags) and collapses rolling-caption duplicates;
+   plain `.txt`/`.md` passes through. Read its stdout and author the **Community
+   call highlights** section grounded ONLY in that text (see the report rules
+   below). No transcript ⇒ skip this step and omit the section.
+5. **Write the report.** Read the materialized bundle view and fill
    `report-template.md`, embedding each `bundle.diagrams` file as a ```mermaid block.
    Cite each fact with its `url`. Do not state anything the view does not contain.
 
@@ -305,3 +317,11 @@ claim in the report resolves to a source ref — never invent facts.
   **Forecast loop** (`forecast_loop.landed` vs `not_yet` — last installment's predictions
   matched against this window's shipped). Membership is deterministic and every item cites
   its ref; the continuity narrative is the agent's. Omit on the first installment.
+- Phase 14 **Community call highlights** (public) — present ONLY when a transcript was
+  provided (step 4). Author it from the normalized `transcript.py` output and NOTHING else:
+  summarize topics / decisions / asks / follow-ups, and ground each specific claim with a
+  short **verbatim quote** from the transcript (the transcript is the source — there are no
+  urls to cite). Never attribute to the call anything the transcript doesn't say. Same
+  grounded-narrator discipline as the per-train analyses (Phase 4b): read the bounded
+  source, summarize, quote. Call context may inform the executive summary / decision-train
+  framing, clearly flagged as call context — never as a code fact. Omit when no transcript.

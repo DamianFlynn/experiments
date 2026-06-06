@@ -1296,8 +1296,15 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   (`installment_snapshot` / `compute_series`) wired through `link.py --series series.json`.
   `series.json` is a thin **append-only** convenience index over the store, never an override
   of a re-gather; without `--series` the digest is byte-identical (no `series` key).
-- **Phase 14 — transcript + slash command (original-P8 remainder).** Community-call section +
-  the `/activity` slash-command entrypoint.
+- **Phase 14 — transcript + slash command (original-P8 remainder).** SHIPPED (slice 1).
+  A pure `transcript.py` normalizes a user-provided community-call transcript
+  (WebVTT/SRT/plain, no network) into clean prose; the report grows a gated
+  **Community call highlights** section authored by the grounded narrator (quote the
+  transcript, Phase 4b discipline) and woven into the framing. The `/activity` slash
+  command (`commands/activity.md`) is the thin entrypoint
+  (`/activity <owner/repo|project> <from> <to> [--transcript …] [--series …] [options]`),
+  deferring all logic to `SKILL.md`. No pipeline change ⇒ goldens byte-identical. Spec:
+  `docs/superpowers/specs/2026-06-06-activity-phase14-transcript-command.md`.
 
 ## Testing strategy
 
