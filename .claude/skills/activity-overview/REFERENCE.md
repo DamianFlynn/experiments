@@ -4,8 +4,10 @@
 
 Copy `.claude/skills/activity-overview/` into your repo (or `~/.claude/skills/`).
 Requirements: Python 3 (stdlib only), `git` on PATH, and a `GITHUB_TOKEN`
-(or `GH_TOKEN`) with `repo` scope (read access). `read:project` is only required
-once Projects v2 support lands in a later phase.
+(or `GH_TOKEN`) with `repo` scope (read access). Add **`read:project`** to ingest
+Projects v2 boards (gather auto-discovers them); without it — or with
+`--no-project-board` — the board layer cleanly degrades to empty and everything
+else is unaffected.
 
 ### Token notes
 
@@ -33,6 +35,12 @@ python3 gather.py --owner OWNER --repo REPO --from 2026-05-01 --to 2026-05-31 \
     --store workspace/journey.db
 python3 validate.py workspace/journey.db
 ```
+
+**The store persists and grows.** `--store workspace/journey.db` is a normal SQLite
+file on disk — reuse the **same path** across windows/repos and gather folds into it
+**idempotently** (re-running an overlapping window never double-counts), so the
+journey graph accretes over time. It's a local, rebuildable cache; delete the file to
+start fresh, or re-gather to refresh against the pinned clone SHA (see `STORE.md`).
 
 The report vertical (`extract → link → render → report`) **composes from the
 store** — `extract` materializes the bundle as a transient view, then `link`/
