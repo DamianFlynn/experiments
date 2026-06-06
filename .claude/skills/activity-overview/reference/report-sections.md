@@ -36,7 +36,7 @@ Merged PRs + completed issues from `buckets.shipped`. **Group by code area** (`c
 Each train in `bundle["trains"]` carries `significance`, `tier` (`"deep"`/`"mention"`), and an
 `effort` block.
 - **DEEP trains** (`tier == "deep"`) get a full sub-section. Embed the train's flowchart from
-  `diagrams.train_flowcharts[id]` (a file path — read and inline as a ```mermaid block). Add an
+  `diagrams.train_flowcharts[id]` (a file path — read and inline as a fenced mermaid block). Add an
   **effort line** from `effort`:
   - Merged: *"landed in N days · R reviewers · P contributors"* (`elapsed_days`, `reviewers`,
     `participants`; note `stalled: true` when present).

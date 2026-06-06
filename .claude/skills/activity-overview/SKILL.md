@@ -25,12 +25,15 @@ All scripts referenced below ship inside this skill directory
 For deeper detail: **`reference/report-sections.md`** (how to author each report
 section), **`BUNDLE.md`** (the structured view / output contract for downstream
 formatters), **`STORE.md`** (the graph schema), **`REFERENCE.md`** (install, env knobs,
-the `/activity` command, transcript flow), and **`examples/`** (worked inputs/outputs).
+the `/activity` command, transcript flow), and **`samples/`** (a worked end-to-end
+example — the structured view + a rendered digest).
 
 ## Procedure
 
 1. **Acquire → store.** Run the gather CLI (requires `GITHUB_TOKEN` with `repo` scope and
-   `git` on PATH; `read:project` is only needed once later phases enable Projects v2). The
+   `git` on PATH). gather auto-discovers and ingests the repo's Projects v2 board(s) when
+   the token also has `read:project`; without that scope (or with `--no-project-board`) the
+   board layer cleanly degrades to empty and the rest of the run is unaffected. The
    **store is the sole output** — gather writes no bundle file:
    ```bash
    python3 gather.py --owner OWNER --repo REPO --from FROM --to TO --store workspace/journey.db
@@ -141,7 +144,7 @@ the `/activity` command, transcript flow), and **`examples/`** (worked inputs/ou
    call highlights** section grounded ONLY in that text (see the report rules
    below). No transcript ⇒ skip this step and omit the section.
 5. **Write the report.** Read the materialized bundle view and fill
-   `report-template.md`, embedding each `bundle.diagrams` file as a ```mermaid block.
+   `report-template.md`, embedding each `bundle.diagrams` file as a fenced mermaid block.
    Cite each fact with its `url`. Do not state anything the view does not contain.
 
 ## Report rules
