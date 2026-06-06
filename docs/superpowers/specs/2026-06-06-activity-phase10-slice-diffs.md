@@ -37,7 +37,7 @@ Two seams already exist:
    `f["hunks"]` — a new pure helper `bounded_file_diff(hunks, cap)` that emits the
    `+`/`-`/context lines (with `@@` markers) up to `FILE_DIFF_CAP` chars/lines, then a
    `…[+N lines]` marker. Produce a `{(commit, path): diff}` lookup, surfaced as a new
-   bundle field or merged onto `code_events[].diff` in `acquire` (keyed by `(commit,
+   bundle field or merged onto `code_events[].hunk` in `acquire` (keyed by `(commit,
    path)`). **Omit when empty** (merge commits / no patch / binary).
    The fold writes it to the existing `hunk` column for the file artifact's lifecycle
    row (no schema change); `repo_code_events`/`extract` already return `hunk`.
@@ -93,5 +93,5 @@ Two seams already exist:
   previously absent — without a clone at narration time.
 
 ## Not in scope
-- Full-file or multi-hunk un-bounded diffs (the cap is deliberate — the slice is a
+- Full-file or multi-hunk unbounded diffs (the cap is deliberate — the slice is a
   bounded context unit, not a patch archive).
