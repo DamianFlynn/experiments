@@ -2692,11 +2692,14 @@ class TestCapTrainDiffs(unittest.TestCase):
     def test_keeps_within_budget_strips_beyond_without_mutating_bundle(self):
         half = link.SLICE_DIFF_CAP // 2 + 100  # two of these exceed the budget
         big = "x" * half
+        # The budget is checked BEFORE adding each diff, so the delta that *spends* the
+        # remaining budget is kept (cumulative `used` can end up over cap); the NEXT
+        # delta is the one stripped.
         deltas = [
-            {"name": "a", "diff": big},   # used 0      -> kept
-            {"name": "b", "diff": big},   # used ~half  -> kept (still < cap)
-            {"name": "c", "diff": big},   # used >cap   -> diff stripped
-            {"name": "d"},                # no diff     -> untouched
+            {"name": "a", "diff": big},   # used 0 (< cap)     -> kept; used -> ~half
+            {"name": "b", "diff": big},   # used ~half (< cap) -> kept; used -> >cap
+            {"name": "c", "diff": big},   # used >cap          -> diff stripped
+            {"name": "d"},                # no diff            -> untouched
         ]
         original = copy.deepcopy(deltas)
         out, dropped = link._cap_train_diffs(deltas)

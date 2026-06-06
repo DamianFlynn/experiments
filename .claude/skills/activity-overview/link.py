@@ -672,7 +672,7 @@ def _cap_lifecycle(event_objs):
 
 
 def _cap_train_diffs(deltas):
-    """Bound the TOTAL `diff` bytes across a train's feature_deltas. Pure.
+    """Bound the TOTAL `diff` chars across a train's feature_deltas. Pure.
 
     Keeps each delta's `diff` until SLICE_DIFF_CAP chars are used, then strips `diff`
     from the remaining deltas (copying only those, so the bundle is never mutated —
@@ -721,7 +721,9 @@ def slice_train(bundle, train_id):
                          lifecycle_overflow, reopen_count } ],
           "commits": [ { sha, message*, author, date } ],
           "feature_deltas": [ ... only this train's deltas; file-level deltas may carry
-                               a bounded `diff`, capped in TOTAL to SLICE_DIFF_CAP ... ],
+                               a bounded `diff`. The combined diff chars are capped to
+                               SLICE_DIFF_CAP: once spent, later deltas have `diff`
+                               OMITTED (the delta is still listed) ... ],
           "feature_deltas_diff_overflow": <# deltas whose diff was omitted for the cap>,
           "symbol_moves":   [ ... only moves whose from/to artifact id is
                                referenced by this train's feature_deltas ... ]
@@ -839,7 +841,7 @@ def slice_train(bundle, train_id):
         if lnk.get("from") in own_artifact_ids or lnk.get("to") in own_artifact_ids
     ]
 
-    # Phase 10 slice-diffs: bound the combined file-diff bytes carried for this train.
+    # Phase 10 slice-diffs: bound the combined file-diff chars carried for this train.
     own_deltas, diff_overflow = _cap_train_diffs(own_deltas)
 
     return {
