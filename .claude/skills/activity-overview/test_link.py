@@ -1488,6 +1488,16 @@ class TestSliceTrain(unittest.TestCase):
             "comments_list": [
                 {"author": "alice", "body": f"comment {i}"} for i in range(8)
             ],  # 8 comments -> overflow with cap=6
+            # 8 lifecycle events -> overflow with cap=6; 2 reopened
+            "lifecycle": [
+                {"id": f"ev{i}", "actor": "alice",
+                 "event": "reopened" if i < 2 else "closed",
+                 "created_at": f"2026-05-0{i+1}T00:00:00Z",
+                 "label": None,
+                 "url": f"https://github.com/o/r/issues/10#event-{i}"}
+                for i in range(8)
+            ],
+            "reopen_count": 2,
         }
         issue_2 = {
             "number": 11,
@@ -1517,6 +1527,30 @@ class TestSliceTrain(unittest.TestCase):
                 {"author": "dave", "body": f"conv {i}"} for i in range(3)
             ],  # 3 < 6 -> no overflow
             "closes": [10],
+            # review submissions: 7 -> overflow with cap=6; body[3] is long
+            "reviews": [
+                {"id": f"rv{i}", "author": "carol",
+                 "state": "CHANGES_REQUESTED" if i % 2 else "APPROVED",
+                 "submitted_at": f"2026-05-0{i+1}T00:00:00Z",
+                 "body": ("w" * 2000) if i == 3 else f"review body {i}",
+                 "url": f"https://github.com/o/r/pull/100#pullrequestreview-{i}"}
+                for i in range(7)
+            ],
+            "review_rounds": {"count": 7,
+                              "states": ["APPROVED", "CHANGES_REQUESTED",
+                                         "APPROVED", "CHANGES_REQUESTED",
+                                         "APPROVED", "CHANGES_REQUESTED",
+                                         "APPROVED"]},
+            # 8 lifecycle events -> overflow with cap=6; 1 reopened
+            "lifecycle": [
+                {"id": f"pev{i}", "actor": "bob",
+                 "event": "reopened" if i == 0 else "ready_for_review",
+                 "created_at": f"2026-05-0{i+1}T00:00:00Z",
+                 "label": None,
+                 "url": f"https://github.com/o/r/pull/100#event-{i}"}
+                for i in range(8)
+            ],
+            "reopen_count": 1,
         }
         pr_2 = {
             "number": 101,
@@ -1784,6 +1818,105 @@ class TestSliceTrain(unittest.TestCase):
         # fixture has 3 conv comments; cap is 6 -> no overflow
         self.assertEqual(len(pr_100["comments"]), 3)
         self.assertEqual(pr_100["comments_overflow"], 0)
+
+    # ------------------------------------------------------------------
+    # Phase 10 slice 2: review/lifecycle texture on the slice
+    # ------------------------------------------------------------------
+
+    def test_pr_block_has_review_lifecycle_keys(self):
+        """Every PR block carries the new texture keys (stable shape)."""
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        for pr in s["prs"]:
+            for field in ("review_rounds", "reviews", "reviews_overflow",
+                          "lifecycle", "lifecycle_overflow", "reopen_count"):
+                self.assertIn(field, pr, f"PR block missing field '{field}'")
+
+    def test_pr_review_rounds_copied(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        rr = pr_100["review_rounds"]
+        self.assertEqual(rr["count"], 7)
+        self.assertEqual(rr["states"][0], "APPROVED")
+        self.assertEqual(rr["states"][1], "CHANGES_REQUESTED")
+
+    def test_pr_reviews_capped_and_shaped(self):
+        bundle = self._bundle()
+        cap = link.SLICE_COMMENTS_KEPT
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        # 7 reviews -> keep cap, overflow = 1
+        self.assertEqual(len(pr_100["reviews"]), cap)
+        self.assertEqual(pr_100["reviews_overflow"], 7 - cap)
+        for rv in pr_100["reviews"]:
+            self.assertEqual(set(rv.keys()),
+                             {"author", "state", "submitted_at", "body"})
+        # review body[3] is long -> text-capped with marker (2000 - 1500 = 500)
+        long_rv = pr_100["reviews"][3]
+        self.assertTrue(long_rv["body"].endswith("…[+500 chars]"),
+                        f"expected '…[+500 chars]', got: {long_rv['body'][-30:]!r}")
+
+    def test_pr_lifecycle_capped_and_shaped(self):
+        bundle = self._bundle()
+        cap = link.SLICE_COMMENTS_KEPT
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        # 8 events -> keep cap, overflow = 2
+        self.assertEqual(len(pr_100["lifecycle"]), cap)
+        self.assertEqual(pr_100["lifecycle_overflow"], 8 - cap)
+        for ev in pr_100["lifecycle"]:
+            self.assertEqual(set(ev.keys()),
+                             {"event", "actor", "created_at", "label"})
+        self.assertEqual(pr_100["reopen_count"], 1)
+
+    def test_pr_with_no_texture_defaults(self):
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        # pr_2 (101) has no reviews/review_rounds/lifecycle/reopen_count
+        pr_101 = next(p for p in s["prs"] if p["number"] == 101)
+        self.assertIsNone(pr_101["review_rounds"])
+        self.assertEqual(pr_101["reviews"], [])
+        self.assertEqual(pr_101["reviews_overflow"], 0)
+        self.assertEqual(pr_101["lifecycle"], [])
+        self.assertEqual(pr_101["lifecycle_overflow"], 0)
+        self.assertEqual(pr_101["reopen_count"], 0)
+
+    def test_issue_block_has_lifecycle_keys(self):
+        bundle = self._bundle()
+        cap = link.SLICE_COMMENTS_KEPT
+        s = link.slice_train(bundle, "train-issue-10")
+        issue = s["issue"]
+        for field in ("lifecycle", "lifecycle_overflow", "reopen_count"):
+            self.assertIn(field, issue, f"issue block missing '{field}'")
+        # 8 events -> keep cap, overflow = 2
+        self.assertEqual(len(issue["lifecycle"]), cap)
+        self.assertEqual(issue["lifecycle_overflow"], 8 - cap)
+        for ev in issue["lifecycle"]:
+            self.assertEqual(set(ev.keys()),
+                             {"event", "actor", "created_at", "label"})
+        self.assertEqual(issue["reopen_count"], 2)
+
+    def test_issue_with_no_lifecycle_defaults(self):
+        bundle = self._bundle()
+        # train-issue-11's issue 11 has no lifecycle/reopen_count
+        s = link.slice_train(bundle, "train-issue-11")
+        issue = s["issue"]
+        self.assertEqual(issue["lifecycle"], [])
+        self.assertEqual(issue["lifecycle_overflow"], 0)
+        self.assertEqual(issue["reopen_count"], 0)
+
+    def test_slice_does_not_mutate_bundle(self):
+        """The slice copies lists/dicts; mutating the slice leaves bundle intact."""
+        bundle = self._bundle()
+        s = link.slice_train(bundle, "train-issue-10")
+        pr_100 = next(p for p in s["prs"] if p["number"] == 100)
+        pr_100["reviews"].append({"junk": True})
+        pr_100["lifecycle"].clear()
+        # original bundle untouched
+        raw_pr = next(p for p in bundle["prs"] if p["number"] == 100)
+        self.assertEqual(len(raw_pr["reviews"]), 7)
+        self.assertEqual(len(raw_pr["lifecycle"]), 8)
 
     def test_comment_bodies_are_strings_not_dicts(self):
         """Comment lists emit just the body text, not the full comment object."""
