@@ -717,7 +717,7 @@ class ExtractProjectBoardRoundTrip(unittest.TestCase):
             "commits": [], "milestones": [], "releases": [],
             "sprints": {
                 "IT_current": {"title": "Sprint 5", "start": "2026-01-12",
-                               "end": "2026-01-26"},
+                               "end": "2026-01-25"},
             },
         }
 
@@ -732,7 +732,7 @@ class ExtractProjectBoardRoundTrip(unittest.TestCase):
         ex = self._extract()
         self.assertEqual(ex["sprints"], {
             "IT_current": {"title": "Sprint 5", "start": "2026-01-12",
-                           "end": "2026-01-26"}})
+                           "end": "2026-01-25"}})
 
     def test_board_status_and_iteration_surface(self):
         ex = self._extract()

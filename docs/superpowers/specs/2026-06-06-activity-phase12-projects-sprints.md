@@ -38,9 +38,9 @@ issue/PR payload), and an iteration carries a **date range** (start + duration) 
 ### Source the board (auto-discover)
 gather **auto-discovers** the board from the repo it's gathering: a GraphQL query for
 `repository(owner, name).projectsV2(first: N)` → the linked Projects v2 board(s). When a
-repo links **multiple** boards, take them in a deterministic order (by number) and ingest
-each (sprints are namespaced by board id, so they don't collide); when it links **none**,
-the sprint layer is simply empty and every existing output is unchanged. No new required
+repo links **multiple** boards, ingest only the **primary** (lowest-numbered) one and
+warn about + ignore the rest (one board per repo for now — see "Not in scope"); when it
+links **none**, the sprint layer is simply empty and every existing output is unchanged. No new required
 flag — it rides the existing `--owner/--repo` (and each manifest member). An optional
 `--no-project-board` escape hatch skips the query (e.g. when the token lacks
 `read:project` scope, so a run never hard-fails on a permissions error — degrade to empty).
@@ -101,4 +101,5 @@ flag — it rides the existing `--owner/--repo` (and each manifest member). An o
 
 ## Not in scope
 - Status automation / writing to the board (read-only).
-- Multiple boards per project (one board per project for now).
+- Ingesting more than ONE board per repo — when a repo links several, only the primary
+  (lowest-numbered) board is ingested; the rest are warned about and ignored for now.

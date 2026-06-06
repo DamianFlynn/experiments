@@ -3501,7 +3501,7 @@ def _project_fold_bundle():
     job; here we emulate it so fold's behavior is what's under test)."""
     b = _fold_fixture_bundle()
     b["sprints"] = {
-        "IT_current": {"title": "Sprint 5", "start": "2026-01-12", "end": "2026-01-26"},
+        "IT_current": {"title": "Sprint 5", "start": "2026-01-12", "end": "2026-01-25"},
     }
     # PR 10 -> in-progress + current sprint; issue 3 -> a status, no sprint.
     b["prs"][0]["board_status"] = "In Progress"
@@ -3524,7 +3524,7 @@ class TestFoldProjectBoard(unittest.TestCase):
         self.assertEqual(n["node_class"], "structure")
         self.assertEqual(n["ts"], "2026-01-12")  # ts = start
         self.assertEqual(n["data"], {"title": "Sprint 5", "start": "2026-01-12",
-                                     "end": "2026-01-26"})
+                                     "end": "2026-01-25"})
 
     def test_in_iteration_edge(self):
         out = graphstore.get_edges(self.conn, "acme/widget#pr-10",
