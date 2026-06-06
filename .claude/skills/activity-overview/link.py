@@ -70,6 +70,36 @@ def select_milestones(milestones, ref_date):
     return current, nxt
 
 
+def select_sprints(sprints, ref_date):
+    """(previous, current, next) iterations relative to `ref_date` (Phase 12).
+
+    `sprints` is the `{iteration_id: {title, start, end}}` map. Returns three
+    `{id, title, start, end}` dicts (or None): `current` is the iteration whose
+    inclusive [start, end] contains `ref_date`; if none does, the latest iteration
+    that started on/before `ref_date` (else the earliest). `previous`/`next` are the
+    iterations adjacent to `current` by start date. Empty map -> (None, None, None).
+    Pure — dormant until a board defines an iteration field (status-only boards yield
+    no sprints), but ready for sprint framing when one does."""
+    ordered = sorted(
+        ({"id": sid, **(s or {})} for sid, s in (sprints or {}).items()),
+        key=lambda s: ((s.get("start") or "9999-12-31")[:10], s["id"]))
+    if not ordered:
+        return None, None, None
+    ref = (ref_date or "")[:10]
+    current = next(
+        (s for s in ordered
+         if (s.get("start") or "")[:10] <= ref <= (s.get("end") or "9999-12-31")[:10]
+         and s.get("start")),
+        None)
+    if current is None:
+        started = [s for s in ordered if (s.get("start") or "")[:10] <= ref]
+        current = started[-1] if started else ordered[0]
+    idx = ordered.index(current)
+    prev = ordered[idx - 1] if idx > 0 else None
+    nxt = ordered[idx + 1] if idx + 1 < len(ordered) else None
+    return prev, current, nxt
+
+
 def train_index(trains):
     """Map ('pr'|'issue', number) -> train id, for cross-linking bucket refs."""
     idx = {}

@@ -273,3 +273,17 @@ claim in the report resolves to a source ref — never invent facts.
      **Module biography** report section (below) — prose `summary` + the surface-change
      timeline, each line cited. Stays grounded in the slice's sourced facts (the
      deterministic CRUD); the prose is the model's judgment over it.
+- Phase 12 **Board status & sprint framing** — when the repo links a Projects v2 board
+  (gather auto-discovers it), PRs/issues carry `board_status` (e.g. Todo / In Progress /
+  Done / Blocked) and, on iteration boards, an `iteration` (sprint id); `bundle["sprints"]`
+  holds `{id: {title, start, end}}`. Render:
+  - **Board status on In-flight** — annotate each `buckets.in_flight` item with its
+    `board_status` when present, and add a one-line **status breakdown** (count of the
+    in-flight — or all gathered — items by `board_status`). This is the universal layer
+    (works on status-only boards like the common case). Omit when no item carries a status.
+  - **Sprints (release-train framing)** — ONLY when `bundle["sprints"]` is non-empty (the
+    board defines an iteration field). Resolve previous / current / next via
+    `link.select_sprints(bundle["sprints"], ref_date)` and, per sprint, list the items
+    whose `iteration` is that sprint id (shipped vs in-flight). Omit the whole sprint
+    subsection for status-only boards (no iterations) — most boards, so this is usually
+    absent. All deterministic data; the framing prose is the agent's.

@@ -1,7 +1,8 @@
 # activity-overview — Phase 12: Projects v2 + sprint framing
 
 **Date:** 2026-06-06
-**Status:** in progress (spec / scoping).
+**Status:** shipped — slice 1 (#34, board ingest: status + optional sprints) and slice 2
+(this PR: `select_sprints` resolver + board-status / sprint-framing report sections).
 **Depends on:** the store's structure-node + edge model; the existing `in_milestone`
 sibling (pr/issue → `milestone-<n>` structure node) as the pattern to mirror.
 
@@ -79,12 +80,16 @@ flag — it rides the existing `--owner/--repo` (and each manifest member). An o
   on the In-flight section.
 
 ## Slices (TDD)
-1. **Acquire + store.** `graphql_post`; the board query + `parse_project_board` (pure,
-   tested from a crafted GraphQL response fixture); `--project-board` flag; fold sprint
-   nodes + `in_iteration` edges + `board_status`; `extract` surfaces them. Offline tests;
-   omit-when-empty keeps goldens byte-identical; `validate` green.
-2. **Resolution + report.** `select_sprints` (previous/current/next by date); SKILL.md +
-   `report-template.md` sprint-framing section + in-flight board status.
+1. **Acquire + store (shipped, #34).** `graphql_post`; board auto-discovery +
+   `parse_project_board` (pure, tested from crafted GraphQL fixtures);
+   `--project-board`/`--no-project-board`; fold sprint nodes + `in_iteration` edges +
+   `board_status`; `extract` surfaces them. Goldens byte-identical; `validate` green.
+   Verified live on Azure/bicep #115.
+2. **Resolution + report (this slice).** `link.select_sprints` (previous/current/next by
+   date, offline-tested — dormant until an iteration board exists); SKILL.md +
+   `report-template.md` **board-status** framing (status on in-flight + breakdown,
+   universal) and a **Sprints** section (release-train framing, only when the board has
+   iterations).
 
 ## Testing & verification (read this)
 - **Offline TDD:** `parse_project_board` + the fold + resolution are pure and tested from

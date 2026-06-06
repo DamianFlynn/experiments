@@ -404,6 +404,30 @@ class TestSelectMilestonesAndBuckets(unittest.TestCase):
         self.assertEqual(current["title"], "v1.2.0")
         self.assertEqual(nxt["title"], "v1.3.0")
 
+    def test_select_sprints_prev_current_next(self):
+        sprints = {
+            "IT_done": {"title": "S4", "start": "2025-12-29", "end": "2026-01-11"},
+            "IT_cur": {"title": "S5", "start": "2026-01-12", "end": "2026-01-25"},
+            "IT_next": {"title": "S6", "start": "2026-01-26", "end": "2026-02-08"},
+        }
+        prev, cur, nxt = link.select_sprints(sprints, "2026-01-20")  # inside S5
+        self.assertEqual((prev["id"], cur["id"], nxt["id"]),
+                         ("IT_done", "IT_cur", "IT_next"))
+
+    def test_select_sprints_ref_in_gap_falls_back_to_latest_started(self):
+        sprints = {
+            "IT_a": {"title": "A", "start": "2026-01-01", "end": "2026-01-07"},
+            "IT_b": {"title": "B", "start": "2026-02-01", "end": "2026-02-07"},
+        }
+        # ref between the two sprints (no iteration contains it) -> latest started
+        prev, cur, nxt = link.select_sprints(sprints, "2026-01-20")
+        self.assertEqual(cur["id"], "IT_a")
+        self.assertIsNone(prev)
+        self.assertEqual(nxt["id"], "IT_b")
+
+    def test_select_sprints_empty(self):
+        self.assertEqual(link.select_sprints({}, "2026-01-20"), (None, None, None))
+
     def test_buckets_classify_each_item_once(self):
         b = self._p2_bundle()["buckets"]
         def nums(key):
