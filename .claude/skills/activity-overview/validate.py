@@ -410,6 +410,8 @@ def _id_kind(conn, qid, node_cache):
         return "milestone"
     if local.startswith("release-"):
         return "release"
+    if local.startswith("sprint-"):
+        return "sprint"
     # Phase 10 slice 1: review/event social nodes (checked before pr-/issue- so a
     # review/event id is never misread as its bare-number parent kind).
     if local.startswith("review-"):

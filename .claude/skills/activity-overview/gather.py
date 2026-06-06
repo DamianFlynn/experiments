@@ -1739,6 +1739,14 @@ def parse_args(argv):
     p.add_argument("--include-releases", dest="include_releases",
                    action="store_true", default=True)
     p.add_argument("--no-releases", dest="include_releases", action="store_false")
+    # Phase 12: auto-discover + ingest the repo's Projects v2 board (its single-
+    # select Status, plus sprint/iteration nodes when the board defines them). On
+    # by default; degrades to empty on any error (no board / missing read:project
+    # scope). --no-project-board skips the GraphQL query entirely.
+    p.add_argument("--project-board", dest="project_board",
+                   action="store_true", default=True)
+    p.add_argument("--no-project-board", dest="project_board",
+                   action="store_false")
     # Store-only (Phase 7): the SQLite journey-graph store is THE deliverable.
     # gather folds the assembled bundle into it and writes no bundle file. The
     # bundle is a transient view extract materializes from the store (Phase 8
@@ -2013,6 +2021,274 @@ def _format_http_error(url, err):
             "= authorize the PAT for the org's SAML SSO; otherwise check token scope."
         )
     return "\n".join(lines)
+
+
+# --- Projects v2 (Phase 12): GraphQL board ingest ----------------------------
+#
+# gather is REST-only everywhere else; this is its single GraphQL call. The
+# helper is kept THIN (like http_get_json) and is NOT unit-tested — the
+# normalization (parse_project_board) and the fetch driver (fetch_project_board)
+# ARE, against crafted fixtures.
+
+GRAPHQL_URL = "https://api.github.com/graphql"
+
+# Auto-discover the repo's board(s) and pull a page of items. `$cursor` paginates
+# the (first board's) items; fields/iterations are stable across pages so we read
+# them from the first response. The shapes are confirmed against the live API.
+PROJECT_BOARD_QUERY = """
+query($owner:String!, $repo:String!, $cursor:String) {
+  repository(owner:$owner, name:$repo) {
+    projectsV2(first:10) {
+      nodes {
+        id
+        number
+        title
+        fields(first:50) {
+          nodes {
+            __typename
+            ... on ProjectV2IterationField {
+              name
+              configuration {
+                iterations { id title startDate duration }
+                completedIterations { id title startDate duration }
+              }
+            }
+          }
+        }
+        items(first:100, after:$cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            content {
+              __typename
+              ... on Issue { number repository { nameWithOwner } }
+              ... on PullRequest { number repository { nameWithOwner } }
+            }
+            fieldValues(first:30) {
+              nodes {
+                __typename
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                  name
+                  field { ... on ProjectV2FieldCommon { name } }
+                }
+                ... on ProjectV2ItemFieldIterationValue { title iterationId }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+
+# Board-scoped item pagination: paginate ONE board's items by its node id (so a
+# cursor always belongs to that board's connection — unlike the discovery query,
+# whose shared $cursor can't correctly paginate multiple boards at once).
+PROJECT_BOARD_ITEMS_QUERY = """
+query($id:ID!, $cursor:String) {
+  node(id:$id) {
+    ... on ProjectV2 {
+      items(first:100, after:$cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          content {
+            __typename
+            ... on Issue { number repository { nameWithOwner } }
+            ... on PullRequest { number repository { nameWithOwner } }
+          }
+          fieldValues(first:30) {
+            nodes {
+              __typename
+              ... on ProjectV2ItemFieldSingleSelectValue {
+                name
+                field { ... on ProjectV2FieldCommon { name } }
+              }
+              ... on ProjectV2ItemFieldIterationValue { title iterationId }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def graphql_post(token, query, variables=None):
+    """POST a GraphQL query to GitHub's `/graphql`, returning the parsed `data`.
+    Not unit-tested (like http_get_json). Surfaces HTTP errors via the same
+    diagnostic as http_get_json, and surfaces GraphQL `errors` (200-with-errors,
+    e.g. a missing `read:project` scope) as a SystemExit so the caller can degrade.
+    """
+    payload = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(GRAPHQL_URL, data=payload, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "activity-overview",
+    })
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as err:
+        raise SystemExit(_format_http_error(GRAPHQL_URL, err)) from err
+    if body.get("errors"):
+        msgs = "; ".join(
+            e.get("message", "") for e in body["errors"] if isinstance(e, dict))
+        raise SystemExit(f"error: GraphQL {GRAPHQL_URL} returned errors: {msgs}")
+    return body.get("data") or {}
+
+
+def _iter_end(start, duration):
+    """Inclusive last day of the iteration = startDate + (duration - 1) days (ISO
+    YYYY-MM-DD). Inclusive (not the next iteration's start) so it matches the
+    inclusive [from,to] window-overlap test. None-safe."""
+    if not start or duration is None:
+        return None
+    try:
+        d = datetime.date.fromisoformat(start[:10])
+    except (TypeError, ValueError):
+        return None
+    return (d + datetime.timedelta(days=max(0, int(duration) - 1))).isoformat()
+
+
+def parse_project_board(board_nodes):
+    """Pure normalization of `repository.projectsV2.nodes` into
+    `(sprints, items_by_ref)`:
+
+      sprints      = {iteration_id: {"title", "start", "end"}} — the union of every
+                     board's iterations + completedIterations (end = start+duration
+                     days). EMPTY for status-only boards (no ProjectV2IterationField).
+      items_by_ref = {(repo_nameWithOwner, number): {"status": <name|None>,
+                     "sprint_id": <iterationId|None>}} — `status` is the
+                     ProjectV2ItemFieldSingleSelectValue whose field.name == "Status";
+                     `sprint_id` is the ProjectV2ItemFieldIterationValue's iterationId.
+
+    Deterministic; tolerant of missing/None field values, content, and fields.
+    """
+    sprints = {}
+    items_by_ref = {}
+    for board in board_nodes or []:
+        if not isinstance(board, dict):
+            continue
+        # iterations (+ completed) from the (optional) ProjectV2IterationField
+        for f in ((board.get("fields") or {}).get("nodes") or []):
+            if not isinstance(f, dict):
+                continue
+            if f.get("__typename") != "ProjectV2IterationField":
+                continue
+            cfg = f.get("configuration") or {}
+            for key in ("iterations", "completedIterations"):
+                for it in (cfg.get(key) or []):
+                    if not isinstance(it, dict) or not it.get("id"):
+                        continue
+                    sprints[it["id"]] = {
+                        "title": it.get("title"),
+                        "start": it.get("startDate"),
+                        "end": _iter_end(it.get("startDate"), it.get("duration")),
+                    }
+        # items -> (repo, number) -> {status, sprint_id}
+        for item in ((board.get("items") or {}).get("nodes") or []):
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content") or {}
+            number = content.get("number")
+            repo_slug = (content.get("repository") or {}).get("nameWithOwner")
+            if number is None or not repo_slug:
+                continue
+            status, sprint_id = None, None
+            for fv in ((item.get("fieldValues") or {}).get("nodes") or []):
+                if not isinstance(fv, dict):
+                    continue
+                tn = fv.get("__typename")
+                if tn == "ProjectV2ItemFieldSingleSelectValue":
+                    if (fv.get("field") or {}).get("name") == "Status":
+                        status = fv.get("name")
+                elif tn == "ProjectV2ItemFieldIterationValue":
+                    sprint_id = fv.get("iterationId")
+            # MERGE across boards (an item can be on several boards): keep the first
+            # non-None status/sprint_id seen (boards arrive in deterministic order),
+            # so one board's status + another's sprint combine instead of clobbering.
+            cur = items_by_ref.get((repo_slug, number))
+            if cur is None:
+                items_by_ref[(repo_slug, number)] = {
+                    "status": status, "sprint_id": sprint_id}
+            else:
+                if cur.get("status") is None:
+                    cur["status"] = status
+                if cur.get("sprint_id") is None:
+                    cur["sprint_id"] = sprint_id
+    return sprints, items_by_ref
+
+
+def fetch_project_board(graphql, owner, repo, max_items=2000):
+    """Auto-discover + fetch the repo's PRIMARY Projects v2 board via the injected
+    `graphql(query, variables)` callable, returning `(sprints, items_by_ref)`
+    (see parse_project_board). A repo may link several boards; we ingest only the
+    lowest-numbered one (spec: one board per repo for now) and warn about the rest,
+    rather than half-fetch them. Its items are paginated by NODE ID (so each cursor
+    belongs to that board's connection), capped defensively at `max_items`.
+
+    Degrades CLEANLY to ({}, {}) on any error (a GraphQL `errors` SystemExit, a
+    network failure, a null repository, or no linked board) — a board fetch must
+    NEVER hard-fail the run. `graphql` is injectable so the suite tests this
+    driver against fixtures with no network.
+    """
+    try:
+        data = graphql(PROJECT_BOARD_QUERY,
+                       {"owner": owner, "repo": repo, "cursor": None})
+    except (SystemExit, Exception) as err:  # noqa: BLE001 — degrade, never hard-fail
+        sys.stderr.write(
+            f"warning: skipping Projects v2 board for {owner}/{repo}: {err}\n")
+        return {}, {}
+
+    repo_obj = (data or {}).get("repository")
+    if not repo_obj:
+        return {}, {}
+    boards = (repo_obj.get("projectsV2") or {}).get("nodes") or []
+    if not boards:
+        return {}, {}
+
+    # Determinism: pick the lowest-numbered board as primary; ignore the rest.
+    boards = sorted(
+        boards, key=lambda b: (b.get("number") is None, b.get("number") or 0,
+                               b.get("id") or ""))
+    primary = boards[0]
+    if len(boards) > 1:
+        sys.stderr.write(
+            "warning: {}/{} links {} Projects v2 boards; ingesting only #{} "
+            "({}), ignoring the rest.\n".format(
+                owner, repo, len(boards), primary.get("number"),
+                primary.get("title")))
+
+    # Paginate the PRIMARY board's items by its node id (correct per-board cursors).
+    nodes = list(((primary.get("items") or {}).get("nodes") or []))
+    info = (primary.get("items") or {}).get("pageInfo") or {}
+    cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
+    board_id, guard = primary.get("id"), 0
+    while has_next and board_id and len(nodes) < max_items and guard < 100:
+        guard += 1
+        try:
+            page = graphql(PROJECT_BOARD_ITEMS_QUERY,
+                           {"id": board_id, "cursor": cursor})
+        except Exception as err:  # noqa: BLE001
+            sys.stderr.write(
+                f"warning: partial Projects v2 board for {owner}/{repo}: {err}\n")
+            break
+        items = ((page or {}).get("node") or {}).get("items") or {}
+        page_nodes = items.get("nodes") or []
+        if not page_nodes:
+            break
+        nodes.extend(page_nodes)
+        info = items.get("pageInfo") or {}
+        cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
+    nodes = nodes[:max_items]
+
+    primary_full = dict(primary)
+    primary_full["items"] = {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                             "nodes": nodes}
+    return parse_project_board([primary_full])
 
 
 def _next_link(link_header):
@@ -2307,6 +2583,40 @@ def acquire(args, env):
     raw_milestones = fetch_all(get_page, f"{api}/milestones?state=all&per_page=100")
     milestones = [normalize_milestone(m) for m in raw_milestones]
 
+    # Phase 12: Projects v2 board. Auto-discover via GraphQL (the only GraphQL call
+    # in gather), stamp each gathered pr/issue with its board_status + iteration,
+    # and surface the (date-windowed) sprints. Degrades to empty on any error so a
+    # missing read:project scope NEVER hard-fails the run; --no-project-board skips
+    # the query entirely.
+    sprints = {}
+    if getattr(args, "project_board", True):
+        def _graphql(query, variables=None):
+            return graphql_post(token, query, variables)
+        sprints, items_by_ref = fetch_project_board(_graphql, owner, repo)
+        # Window-bound iterations to [frm, to] by date: keep a sprint that overlaps
+        # the window at all (start <= to and end >= frm). A sprint with no dates is
+        # kept (can't exclude it). Drop the iteration stamp on items whose sprint
+        # was windowed out so fold leaves no dangling in_iteration edge.
+        kept = {}
+        to10, frm10 = (to or "")[:10], (frm or "")[:10]
+        for sid, s in sprints.items():
+            start, end = s.get("start"), s.get("end")
+            overlaps = ((start is None or start[:10] <= to10)
+                        and (end is None or end[:10] >= frm10))
+            if overlaps:
+                kept[sid] = s
+        sprints = kept
+        slug = f"{owner}/{repo}"
+        for it in prs + issues:
+            facts = items_by_ref.get((slug, it.get("number")))
+            if not facts:
+                continue
+            if facts.get("status") is not None:
+                it["board_status"] = facts["status"]
+            sid = facts.get("sprint_id")
+            if sid is not None and sid in sprints:
+                it["iteration"] = sid
+
     ref_date = getattr(args, "ref_date", None) or to
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
@@ -2328,6 +2638,7 @@ def acquire(args, env):
     bundle["code_graph"] = code_graph
     bundle["code_owners"] = code_owners
     bundle["label_taxonomy"] = label_taxonomy
+    bundle["sprints"] = sprints
     return bundle
 
 
@@ -2361,7 +2672,8 @@ def classify_id(qid):
     local = graphstore.parse_id(qid)["local"]
     if local.startswith(("pr-", "issue-", "comment-")):
         kind = "social"
-    elif local.startswith(("milestone-", "release-", "area-", "person-")) \
+    elif local.startswith(("milestone-", "release-", "area-", "person-",
+                           "sprint-")) \
             or local.startswith("art:") or "#" in local \
             or local in ("workflowstats", "codegraph", "codeowners",
                          "labeltaxonomy"):
@@ -2811,6 +3123,13 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
         local = "area-{}".format(area.get("id") or area.get("name") or area.get("path"))
         nodes.append((qid(local), project, repo, "structure", None, area, fetched))
+    # structure: sprints (Phase 12 — Projects v2 iterations). `sprint-<id>`
+    # structure node, ts = start (dated point-in-time so window scans can find the
+    # current/next sprint), data = {title, start, end}. Empty for status-only
+    # boards (the common case) -> nothing emitted -> goldens byte-identical.
+    for sid, s in (bundle.get("sprints") or {}).items():
+        nodes.append((qid("sprint-{}".format(sid)), project, repo, "structure",
+                      s.get("start"), s, fetched))
 
     # structure: people + contribution / owns / touches / depends_on /
     # in_milestone edges (Phase 7b-1 step 3). All derived on the write path via
@@ -3013,6 +3332,22 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             if local is not None:
                 edges.append((qid("{}{}".format(pref, it["number"])),
                               qid(local), "in_milestone", None, None))
+
+    # in_iteration (social -> structure): a PR/issue's board iteration links to its
+    # `sprint-<id>` node — the sprint sibling of in_milestone. Only emitted when the
+    # sprint was folded (a windowed-out iteration leaves no dangling edge). The
+    # item's `board_status` rides the pr/issue node data blob (stamped in acquire),
+    # so it round-trips through extract for free — no separate edge/node. Empty
+    # `sprints` (status-only / no board) emits nothing -> goldens byte-identical.
+    _sprint_ids = set(bundle.get("sprints") or {})
+    for items, pref in ((bundle.get("prs", []), "pr-"),
+                        (bundle.get("issues", []), "issue-")):
+        for it in items:
+            sid = it.get("iteration")
+            if sid is not None and sid in _sprint_ids:
+                edges.append((qid("{}{}".format(pref, it["number"])),
+                              qid("sprint-{}".format(sid)), "in_iteration",
+                              None, None))
 
     # structure: per-repo singleton facts (whole dict round-tripped under a
     # well-known local id, NULL ts so window scans skip it, identity-keyed /
