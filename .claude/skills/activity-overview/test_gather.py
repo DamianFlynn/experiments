@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import email.message
 import io
 import json
@@ -3305,6 +3306,325 @@ class TestCrossRepoDependsOn(unittest.TestCase):
         deps = graphstore.get_edges(conn, "proj/Azure/consumer#area-main.tf",
                                     direction="out", edge_types=["depends_on"])
         self.assertEqual(deps, [])
+
+
+# --- Phase 12 slice 1: Projects v2 board ingest -----------------------------
+
+def _project_board_data():
+    """A crafted GraphQL `data` response with TWO boards under one repo:
+      - board #1: status-only (a `Status` single-select, NO iteration field).
+      - board #2: an iteration board (Status + a ProjectV2IterationField with one
+        live + one completed iteration, and an item carrying an iteration value).
+    Mirrors the live shapes in the spec. `parse_project_board` consumes the
+    `repository.projectsV2.nodes` array (one or many boards)."""
+    return {
+        "repository": {
+            "projectsV2": {
+                "nodes": [
+                    {
+                        "id": "BOARD_status_only",
+                        "number": 115,
+                        "title": "Bicep",
+                        "fields": {"nodes": [
+                            {"__typename": "ProjectV2FieldCommon"},
+                            {"__typename": "ProjectV2SingleSelectField",
+                             "name": "Status"},
+                        ]},
+                        "items": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "content": {"__typename": "Issue", "number": 3,
+                                                "repository": {"nameWithOwner": "acme/widget"}},
+                                    "fieldValues": {"nodes": [
+                                        {"__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                         "name": "Todo",
+                                         "field": {"name": "Status"}},
+                                    ]},
+                                },
+                                {
+                                    "content": {"__typename": "PullRequest", "number": 10,
+                                                "repository": {"nameWithOwner": "acme/widget"}},
+                                    "fieldValues": {"nodes": [
+                                        # a non-Status single-select must NOT be read as status
+                                        {"__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                         "name": "P1",
+                                         "field": {"name": "Priority"}},
+                                        {"__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                         "name": "In Progress",
+                                         "field": {"name": "Status"}},
+                                    ]},
+                                },
+                                {
+                                    # an item with no Status value -> status None
+                                    "content": {"__typename": "Issue", "number": 4,
+                                                "repository": {"nameWithOwner": "acme/widget"}},
+                                    "fieldValues": {"nodes": []},
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "id": "BOARD_iter",
+                        "number": 200,
+                        "title": "Sprints",
+                        "fields": {"nodes": [
+                            {"__typename": "ProjectV2SingleSelectField",
+                             "name": "Status"},
+                            {"__typename": "ProjectV2IterationField",
+                             "name": "Sprint",
+                             "configuration": {
+                                 "iterations": [
+                                     {"id": "IT_current", "title": "Sprint 5",
+                                      "startDate": "2026-01-12", "duration": 14},
+                                 ],
+                                 "completedIterations": [
+                                     {"id": "IT_done", "title": "Sprint 4",
+                                      "startDate": "2025-12-29", "duration": 14},
+                                 ],
+                             }},
+                        ]},
+                        "items": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "content": {"__typename": "Issue", "number": 7,
+                                                "repository": {"nameWithOwner": "acme/widget"}},
+                                    "fieldValues": {"nodes": [
+                                        {"__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                         "name": "In Progress",
+                                         "field": {"name": "Status"}},
+                                        {"__typename": "ProjectV2ItemFieldIterationValue",
+                                         "title": "Sprint 5",
+                                         "iterationId": "IT_current"},
+                                    ]},
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+        },
+    }
+
+
+class TestParseProjectBoard(unittest.TestCase):
+    """Pure normalization of the GraphQL board response into (sprints, items)."""
+
+    def setUp(self):
+        nodes = _project_board_data()["repository"]["projectsV2"]["nodes"]
+        self.sprints, self.items = gather.parse_project_board(nodes)
+
+    def test_status_only_board_items(self):
+        self.assertEqual(self.items[("acme/widget", 3)]["status"], "Todo")
+        self.assertEqual(self.items[("acme/widget", 10)]["status"], "In Progress")
+        # status-only board items carry no sprint
+        self.assertIsNone(self.items[("acme/widget", 10)]["sprint_id"])
+
+    def test_status_field_name_match(self):
+        # PR 10 had a non-Status single-select (Priority=P1) before its Status
+        # value; only the field.name=="Status" one wins.
+        self.assertEqual(self.items[("acme/widget", 10)]["status"], "In Progress")
+
+    def test_missing_status_value_is_none(self):
+        self.assertIsNone(self.items[("acme/widget", 4)]["status"])
+        self.assertIsNone(self.items[("acme/widget", 4)]["sprint_id"])
+
+    def test_iterations_unioned_with_end_dates(self):
+        # iterations + completedIterations across boards; end = start + duration days.
+        self.assertIn("IT_current", self.sprints)
+        self.assertIn("IT_done", self.sprints)
+        cur = self.sprints["IT_current"]
+        self.assertEqual(cur["title"], "Sprint 5")
+        self.assertEqual(cur["start"], "2026-01-12")
+        self.assertEqual(cur["end"], "2026-01-26")  # +14 days
+        self.assertEqual(self.sprints["IT_done"]["end"], "2026-01-12")  # 2025-12-29 +14
+
+    def test_iteration_value_on_item(self):
+        self.assertEqual(self.items[("acme/widget", 7)]["sprint_id"], "IT_current")
+        self.assertEqual(self.items[("acme/widget", 7)]["status"], "In Progress")
+
+    def test_status_only_board_yields_no_sprints_alone(self):
+        # the status-only board (#115) on its own produces an empty sprints dict.
+        only = [n for n in
+                _project_board_data()["repository"]["projectsV2"]["nodes"]
+                if n["id"] == "BOARD_status_only"]
+        sprints, items = gather.parse_project_board(only)
+        self.assertEqual(sprints, {})
+        self.assertEqual(items[("acme/widget", 3)]["status"], "Todo")
+
+    def test_deterministic(self):
+        a = gather.parse_project_board(
+            _project_board_data()["repository"]["projectsV2"]["nodes"])
+        b = gather.parse_project_board(
+            _project_board_data()["repository"]["projectsV2"]["nodes"])
+        self.assertEqual(a, b)
+
+    def test_tolerates_none_and_missing(self):
+        # a node with no fields/items/content must not crash.
+        sprints, items = gather.parse_project_board([
+            {"id": "B", "number": 1, "title": None,
+             "fields": {"nodes": []},
+             "items": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                       "nodes": [{"content": None, "fieldValues": {"nodes": []}}]}},
+        ])
+        self.assertEqual(sprints, {})
+        self.assertEqual(items, {})
+
+
+def _project_fold_bundle():
+    """The base fold fixture + a parsed project board: sprints + per-item
+    board_status/iteration already stamped onto the pr/issue records (acquire's
+    job; here we emulate it so fold's behavior is what's under test)."""
+    b = _fold_fixture_bundle()
+    b["sprints"] = {
+        "IT_current": {"title": "Sprint 5", "start": "2026-01-12", "end": "2026-01-26"},
+    }
+    # PR 10 -> in-progress + current sprint; issue 3 -> a status, no sprint.
+    b["prs"][0]["board_status"] = "In Progress"
+    b["prs"][0]["iteration"] = "IT_current"
+    b["issues"][0]["board_status"] = "Todo"
+    return b
+
+
+class TestFoldProjectBoard(unittest.TestCase):
+    """Phase 12 slice 1: sprint structure nodes, in_iteration edges, board_status."""
+
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _project_fold_bundle())
+
+    def test_sprint_structure_node(self):
+        n = graphstore.get_node(self.conn, "acme/widget#sprint-IT_current")
+        self.assertIsNotNone(n)
+        self.assertEqual(n["node_class"], "structure")
+        self.assertEqual(n["ts"], "2026-01-12")  # ts = start
+        self.assertEqual(n["data"], {"title": "Sprint 5", "start": "2026-01-12",
+                                     "end": "2026-01-26"})
+
+    def test_in_iteration_edge(self):
+        out = graphstore.get_edges(self.conn, "acme/widget#pr-10",
+                                   direction="out", edge_types=["in_iteration"])
+        self.assertEqual([e["dst_id"] for e in out],
+                         ["acme/widget#sprint-IT_current"])
+        # issue with a status but no iteration -> no in_iteration edge
+        self.assertEqual(graphstore.get_edges(
+            self.conn, "acme/widget#issue-3", edge_types=["in_iteration"]), [])
+
+    def test_board_status_stamped_on_node(self):
+        pr = graphstore.get_node(self.conn, "acme/widget#pr-10")
+        self.assertEqual(pr["data"].get("board_status"), "In Progress")
+        iss = graphstore.get_node(self.conn, "acme/widget#issue-3")
+        self.assertEqual(iss["data"].get("board_status"), "Todo")
+
+    def test_omit_when_empty(self):
+        # the base fixture has no project board -> NO sprint nodes / in_iteration.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, _fold_fixture_bundle())
+        rows = conn.execute(
+            "SELECT id FROM nodes WHERE id LIKE '%#sprint-%'").fetchall()
+        self.assertEqual(rows, [])
+        rows = conn.execute(
+            "SELECT * FROM edges WHERE edge_type='in_iteration'").fetchall()
+        self.assertEqual(rows, [])
+
+    def test_idempotent_refold(self):
+        before = self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        before_e = self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        gather.fold_bundle(self.conn, _project_fold_bundle())
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], before)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], before_e)
+
+    def test_in_iteration_edge_dropped_when_sprint_absent(self):
+        # an item iteration whose sprint_id is not in bundle["sprints"] (e.g.
+        # windowed out) must NOT leave a dangling edge.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        b = _project_fold_bundle()
+        b["prs"][0]["iteration"] = "IT_unknown"
+        gather.fold_bundle(conn, b)
+        self.assertEqual(graphstore.get_edges(
+            conn, "acme/widget#pr-10", edge_types=["in_iteration"]), [])
+
+
+class TestFetchProjectBoard(unittest.TestCase):
+    """The acquire-level board fetch seam: auto-discovery + pagination via an
+    injected graphql callable, degrading cleanly on errors / no board."""
+
+    def test_happy_path_parses_and_paginates(self):
+        # first page returns one board with hasNextPage=True; second page closes it.
+        page1 = copy.deepcopy(_project_board_data())
+        b0 = page1["repository"]["projectsV2"]["nodes"][0]
+        b0["items"]["pageInfo"] = {"hasNextPage": True, "endCursor": "C1"}
+        first_item = b0["items"]["nodes"][:1]
+        rest_items = b0["items"]["nodes"][1:]
+        b0["items"]["nodes"] = first_item
+        # only keep board #1 (status-only) for the pagination case to keep it simple
+        page1["repository"]["projectsV2"]["nodes"] = [b0]
+
+        calls = []
+
+        def fake_graphql(query, variables=None):
+            calls.append(variables)
+            # discovery / first page (no cursor) -> page1 (board, hasNextPage)
+            if not variables or variables.get("cursor") is None:
+                return copy.deepcopy(page1)
+            # subsequent page request -> the rest of the items, no more pages
+            data = copy.deepcopy(page1)
+            data["repository"]["projectsV2"]["nodes"][0]["items"] = {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": copy.deepcopy(rest_items)}
+            return data
+
+        sprints, items = gather.fetch_project_board(fake_graphql, "acme", "widget")
+        self.assertEqual(sprints, {})
+        self.assertEqual(items[("acme/widget", 3)]["status"], "Todo")
+        self.assertEqual(items[("acme/widget", 4)]["status"], None)
+        self.assertGreaterEqual(len(calls), 2)  # paginated
+
+    def test_degrades_on_graphql_errors(self):
+        def boom(query, variables=None):
+            raise SystemExit("error: GraphQL errors: missing read:project scope")
+
+        sprints, items = gather.fetch_project_board(boom, "acme", "widget")
+        self.assertEqual(sprints, {})
+        self.assertEqual(items, {})
+
+    def test_degrades_when_no_board(self):
+        def none_board(query, variables=None):
+            return {"repository": {"projectsV2": {"nodes": []}}}
+
+        sprints, items = gather.fetch_project_board(none_board, "acme", "widget")
+        self.assertEqual(sprints, {})
+        self.assertEqual(items, {})
+
+    def test_degrades_on_null_repository(self):
+        def null_repo(query, variables=None):
+            return {"repository": None}
+
+        sprints, items = gather.fetch_project_board(null_repo, "acme", "widget")
+        self.assertEqual((sprints, items), ({}, {}))
+
+    def test_item_cap_is_defensive(self):
+        # a board that always claims another page must terminate at the cap.
+        def runaway(query, variables=None):
+            return {"repository": {"projectsV2": {"nodes": [{
+                "id": "B", "number": 1, "title": "x", "fields": {"nodes": []},
+                "items": {"pageInfo": {"hasNextPage": True, "endCursor": "C"},
+                          "nodes": [
+                              {"content": {"__typename": "Issue", "number": 1,
+                                           "repository": {"nameWithOwner": "acme/widget"}},
+                               "fieldValues": {"nodes": []}}]}}]}}}
+
+        sprints, items = gather.fetch_project_board(
+            runaway, "acme", "widget", max_items=5)
+        self.assertEqual(sprints, {})
+        # terminated rather than looping forever
+        self.assertTrue(len(items) <= 5)
 
 
 if __name__ == "__main__":

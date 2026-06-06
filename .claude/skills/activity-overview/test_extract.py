@@ -693,5 +693,69 @@ class ExtractBlocks(unittest.TestCase):
                 self.assertNotIn("blocked_by", iss, name)
 
 
+class ExtractProjectBoardRoundTrip(unittest.TestCase):
+    """Phase 12 slice 1: sprints materialize from sprint-<id> structure nodes;
+    each pr/issue surfaces its board_status + iteration. Omit-when-empty."""
+
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r", "from": "2026-01-01",
+                     "to": "2026-01-31"},
+            "prs": [{
+                "number": 10, "url": "https://gh/o/r/pull/10", "state": "closed",
+                "merged": True, "merged_at": "2026-01-10T00:00:00Z",
+                "created_at": "2026-01-05T00:00:00Z",
+                "closed_at": "2026-01-10T00:00:00Z", "closes": [],
+                "crossref_issues": [],
+                "board_status": "In Progress", "iteration": "IT_current",
+            }],
+            "issues": [{
+                "number": 3, "url": "https://gh/o/r/issues/3", "state": "open",
+                "updated_at": "2026-01-09T00:00:00Z", "closed_at": None,
+                "board_status": "Todo",
+            }],
+            "commits": [], "milestones": [], "releases": [],
+            "sprints": {
+                "IT_current": {"title": "Sprint 5", "start": "2026-01-12",
+                               "end": "2026-01-26"},
+            },
+        }
+
+    def _extract(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(self._bundle()))
+        return extract.extract(conn, "o", "r", "2026-01-01", "2026-01-31",
+                               warn=lambda _m: None)
+
+    def test_sprints_materialize(self):
+        ex = self._extract()
+        self.assertEqual(ex["sprints"], {
+            "IT_current": {"title": "Sprint 5", "start": "2026-01-12",
+                           "end": "2026-01-26"}})
+
+    def test_board_status_and_iteration_surface(self):
+        ex = self._extract()
+        pr = ex["prs"][0]
+        self.assertEqual(pr.get("board_status"), "In Progress")
+        self.assertEqual(pr.get("iteration"), "IT_current")
+        self.assertEqual(ex["issues"][0].get("board_status"), "Todo")
+        self.assertNotIn("iteration", ex["issues"][0])  # none -> omitted
+
+    def test_omit_when_empty(self):
+        # a golden with no project board has no sprints key and clean records.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(_load_golden("bundle_p3b.json")))
+        ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
+                             warn=lambda _m: None)
+        self.assertNotIn("sprints", ex)
+        for pr in ex["prs"]:
+            self.assertNotIn("board_status", pr)
+            self.assertNotIn("iteration", pr)
+        for iss in ex["issues"]:
+            self.assertNotIn("board_status", iss)
+
+
 if __name__ == "__main__":
     unittest.main()

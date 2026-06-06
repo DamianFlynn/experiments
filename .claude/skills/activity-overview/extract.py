@@ -275,6 +275,16 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
          if _local(n["id"]).startswith("release-")],
         key=lambda d: d.get("tag_name") or d.get("name") or "")
 
+    # Phase 12 slice 1: sprints materialize from the `sprint-<id>` structure nodes
+    # keyed by iteration id (the inverse of fold's emission), mirroring milestones.
+    # The pr/issue `board_status` + `iteration` ride the social node data blob, so
+    # they round-trip with the prs/issues arrays above — no extra work. Omit the
+    # `sprints` key entirely when no board was folded (byte-identical to before).
+    sprints = {_local(n["id"])[len("sprint-"):]: n["data"] for n in structure
+               if _local(n["id"]).startswith("sprint-")}
+    if sprints:
+        bundle["sprints"] = sprints
+
     # Per-repo singleton facts: emit each key only when its node was stored.
     for key, local in _SINGLETON_FACTS:
         value = _materialize_singleton(conn, project, repo, local)
