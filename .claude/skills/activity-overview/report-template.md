@@ -304,6 +304,33 @@ whole section when there is no `people` data.
 The people ↔ code-area relationships are shown by `diagrams.contributor_graph`, embedded
 once under **Module ownership** above (do not repeat the Mermaid block here).
 
+## Module biography
+
+<!-- ON-DEMAND deep-dive: render only when a module/area is in focus (the request asks
+     for a module's history, or a module is notably active). Source: the narrator pass
+     over `python3 spotlight.py module <area> --store <db> --project <name> --json`
+     (see SKILL.md "Module biography").
+     Full-history, NOT window-bounded. Omit from the standard windowed digest. -->
+
+### `{area}` — {one-line what-this-module-is}
+
+_{summary: 1–2 sentences on how the module's surface has moved over `{time_range.first}` →
+`{time_range.last}`}_
+
+**Surface changes** (parameter / symbol CRUD, from each symbol's lifecycle):
+
+- `{symbol.name}` ({subkind}) — {added v… → default changed → removed}, each change
+  citing its driving PR/commit ([#{pr}]({url}))
+
+**Notable revisions** — the changes that shifted the contract (new required input, a
+default flip, a breaking rename):
+
+- {change} — [{ref}]({url})
+
+**Removed** — symbols whose last lifecycle event is `remove`:
+
+- `{symbol.name}` — dropped in [#{pr}]({url})
+
 ## Internal appendix — stall & blocker attribution
 
 <!-- GATED: render this section ONLY when the operator explicitly requests an *internal*

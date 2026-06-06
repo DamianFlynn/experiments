@@ -1260,11 +1260,11 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   in `slice_train` — so `.tf`/`.bicep` *logic* changes carry their real diff in-slice
   (durable in the graph; no clone needed at narration time). Spec:
   `docs/superpowers/specs/2026-06-06-activity-phase10-slice-diffs.md`. **Follow-on —
-  module evolution ("module biography") — v1 slice 1 shipped (#30):** a store-backed
+  module evolution ("module biography") — v1 shipped (#30 + slice 2):** a store-backed
   `slice_module` (`spotlight module <area>`) over an area's full artifact lifecycle (CRUD
   + diffs across all history, rename chains folded) → the bounded biography slice a
-  skill-side narrator turns into grounded prose (slice 2, pending; v2 = a structured IaC
-  param-CRUD extractor, good-to-have). Spec:
+  skill-side narrator turns into grounded prose + a Module biography report section
+  (v2 = a structured IaC param-CRUD extractor, good-to-have). Spec:
   `docs/superpowers/specs/2026-06-06-activity-module-evolution.md`.
 - **Phase 11 — people & community + flow/stall report views (original-P5 report half) —
   shipped (#31 + slice 2).** The data model + aggregation live in P5 (schema) / P6 (gather) /
