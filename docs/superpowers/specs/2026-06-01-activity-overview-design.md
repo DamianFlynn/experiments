@@ -1260,14 +1260,18 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   in `slice_train` — so `.tf`/`.bicep` *logic* changes carry their real diff in-slice
   (durable in the graph; no clone needed at narration time). Spec:
   `docs/superpowers/specs/2026-06-06-activity-phase10-slice-diffs.md`. **Follow-on —
-  module evolution ("module biography"):** a store-backed `slice_module` over an area's
-  full artifact lifecycle (CRUD + diffs across all history) → a grounded module-evolution
-  narrative; spec: `docs/superpowers/specs/2026-06-06-activity-module-evolution.md`.
-- **Phase 11 — people & community + flow/stall report views (original-P5 report half).** The
-  data model + aggregation now live in P5 (schema) / P6 (gather) / P8 (spotlight); this phase
-  ships the **report sections** over them: **Contributors & community** (public) and **Stalled,
-  blocked & pile-ups**, the `contributor_graph`/`blocker_graph`/`kind_breakdown` diagrams, and
-  the internal shame/blame appendix gated off by default.
+  module evolution ("module biography") — v1 slice 1 shipped (#30):** a store-backed
+  `slice_module` (`spotlight module <area>`) over an area's full artifact lifecycle (CRUD
+  + diffs across all history, rename chains folded) → the bounded biography slice a
+  skill-side narrator turns into grounded prose (slice 2, pending; v2 = a structured IaC
+  param-CRUD extractor, good-to-have). Spec:
+  `docs/superpowers/specs/2026-06-06-activity-module-evolution.md`.
+- **Phase 11 — people & community + flow/stall report views (original-P5 report half) — in
+  progress.** The data model + aggregation now live in P5 (schema) / P6 (gather) / P8
+  (spotlight); this phase ships the **report sections** over them: **Contributors & community**
+  (public) and **Stalled, blocked & pile-ups**, the `contributor_graph`/`blocker_graph`/
+  `kind_breakdown` diagrams, and the internal shame/blame appendix gated off by default. Spec:
+  `docs/superpowers/specs/2026-06-06-activity-phase11-people-community.md`.
 - **Phase 12 — Projects v2 + sprint framing (original P6).** *Acquire:* GraphQL board →
   structure nodes + `in_iteration`/`in_milestone` edges. *Link:* iteration/status resolution.
   *Report:* previous/current/next sprint + release-train framing, board status on in-flight.

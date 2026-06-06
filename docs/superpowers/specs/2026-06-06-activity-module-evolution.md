@@ -1,7 +1,9 @@
 # activity-overview — Module evolution (the "module biography")
 
 **Date:** 2026-06-06
-**Status:** in progress (v1).
+**Status:** v1 slice 1 **shipped (#30)** (`slice_module` + `spotlight module <area>`);
+slice 2 (skill-side biography narrator + report section) pending; v2 (structured IaC
+param·output·variable extractor → API-surface changelog) is a good-to-have, future.
 **Depends on:** the durable journey-graph store; the artifact lifecycle ledger
 (`code_events`, now carrying `hunk`/`before`/`after` — Phase 10 + the in-slice diffs
 enhancement #28/#29); `area_index` (path→area); the Phase 10 narrator pattern.
@@ -75,13 +77,18 @@ with prose on top. Bigger (new gather capability + schema), sequenced separately
 
 ## Slices (TDD)
 
-1. **`slice_module` + CLI (this slice).** The store-backed slice above + a
+1. **`slice_module` + CLI (shipped, #30).** The store-backed slice above + a
    `spotlight.py module <area>` subcommand that emits the bounded slice JSON (and a
-   plain render). Offline tests from a crafted store (artifacts with multi-event
-   lifecycles + a rename); bounded; deterministic ordering.
-2. **Biography narrator + report.** The Phase 10-style narrator protocol in `SKILL.md`
-   over `slice_module`, and a **Module biography** report section (`report-template.md`).
-3. **(v2, later)** the structured IaC param extractor + API-surface changelog table.
+   markdown render). Connected-component rename folding; bounded; deterministic.
+   Verified on real AVM data.
+2. **Biography narrator + report (pending).** The narrator is the **skill's (agent's)
+   job, never pipeline code** — a `SKILL.md` protocol (mirroring Phase 4b) where the
+   lead reads a `slice_module` slice and emits a grounded, sourced narrative
+   (`{summary, surface_changes, notable_revisions, removed, evidence:[ref]}`, every ref
+   verbatim from the slice; lead verifies), then renders a **Module biography** section
+   in `report-template.md`. The pipeline stays deterministic; the prose is the model's.
+3. **(v2, good-to-have, future)** the structured IaC param·output·variable extractor +
+   a deterministic API-surface changelog table (`param | CRUD | when | PR`).
 
 ## Testing
 - Unit (offline, crafted store): area→artifact resolution; full-history lifecycle
