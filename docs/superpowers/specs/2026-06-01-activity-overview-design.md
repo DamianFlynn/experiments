@@ -4,7 +4,7 @@
 **Status:** rev 15 — shipped.
 
 **Where we are (2026-06-05):**
-- **Shipped to `master`:** Phases 1–4a (the flat-bundle digest); the rev-14 substrate phases **5** (graphstore foundation, #11), **6** (gather-as-writer + on-demand `backfill`, #12) and **7** (full graph substrate — `extract` slices 7a/7b/7c, #13); **Phase 8 — spotlight** (the four substrate-analytics queries + focused renders + CI gate) and **Phase 8d — the train-completion orchestrator** (`complete.py`: dead-ref tombstone + `gather.ABSENT` seam, the transitive window-bounded orchestrator + `extract` refactor, and spotlight's honest `complete`/`gaps` contract + `--complete` + gap render), both via **#14**; and **Phase 9 — multi-repo** (qualified-id namespacing, cross-repo trains, project-scoped people, and **Terraform multi-repo aggregation** — the AVM-TF constellation; #15–#18, #20–#23), with a multi-repo **constellation CI gate** running real `terraform init`/`graph`. The persistent SQLite graph is the live seam; `extract` reproduces the rev-13 bundle byte-for-byte under the equivalence gate. **Verified end-to-end against real AVM data** (gather → `validate` → spotlight → live `--complete`) on both a fixed historical week and a trailing recent week, across both Bicep and Terraform toolchains. Design: `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`; plan: `docs/superpowers/plans/2026-06-04-activity-phase8d-completion.md`. **In progress — Phase 10** (4b sub-agent train narration on the store; spec: `docs/superpowers/specs/2026-06-06-activity-phase10-narration.md`).
+- **Shipped to `master`:** Phases 1–4a (the flat-bundle digest); the rev-14 substrate phases **5** (graphstore foundation, #11), **6** (gather-as-writer + on-demand `backfill`, #12) and **7** (full graph substrate — `extract` slices 7a/7b/7c, #13); **Phase 8 — spotlight** (the four substrate-analytics queries + focused renders + CI gate) and **Phase 8d — the train-completion orchestrator** (`complete.py`: dead-ref tombstone + `gather.ABSENT` seam, the transitive window-bounded orchestrator + `extract` refactor, and spotlight's honest `complete`/`gaps` contract + `--complete` + gap render), both via **#14**; and **Phase 9 — multi-repo** (qualified-id namespacing, cross-repo trains, project-scoped people, and **Terraform multi-repo aggregation** — the AVM-TF constellation; #15–#18, #20–#23), with a multi-repo **constellation CI gate** running real `terraform init`/`graph`. The persistent SQLite graph is the live seam; `extract` reproduces the rev-13 bundle byte-for-byte under the equivalence gate. **Verified end-to-end against real AVM data** (gather → `validate` → spotlight → live `--complete`) on both a fixed historical week and a trailing recent week, across both Bicep and Terraform toolchains. Design: `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`; plan: `docs/superpowers/plans/2026-06-04-activity-phase8d-completion.md`. **Phase 10 — 4b sub-agent train narration** (review/lifecycle graph nodes → bounded `slice_train` texture → parallel grounded narrator sub-agents over `link.py --slice`; #24–#26; spec: `docs/superpowers/specs/2026-06-06-activity-phase10-narration.md`).
 - **Future:** Phases 9–14 (multi-repo, 4b sub-agent narration, report/community/forecast views) — see the **P1–P14** ledger under *Implementation phasing*.
 
 **Rev history.** (**rev 15 promotes backfill into a shared train-completion orchestrator** — `complete.py` makes train completion *transitive* and *window-bounded* and gives every train an *honest edge contract* (`complete`/`gaps` with reasons; 404 phantoms pruned + remembered dead via a `dead_refs` tombstone), shared by `extract` and `spotlight`; see the new *`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`* and **Phase 8d** in the ledger. Prior — rev 14, Phases 1/2/3a/3b/3c/3c.1/3c.2 shipped; + Phase 3d symbol-granular artifacts shipped — diff-local `git log -p` walk → `symbol_events` folded into `kind:symbol|comment` artifacts + `feature_deltas` with bounded `before`/`after`/`detail`, for Bicep/Terraform with graphify-language symbols best-effort; + Phase 3e symbol-identity tracking shipped — window-wide symbol MOVES with precision-over-recall guards + confidence, in `symbol_moves` + artifact `replaced_by`/`identity_from`; + Phase 4a significance+tier scoring, per-train `effort` block, `slice_train` bounded helper, `forecast` scaffold, and `train_flowcharts` live — 4b sub-agent narration + gather review/lifecycle slice still pending. **Rev 14 re-seats the storage/read seam onto a persistent SQLite graph substrate** — graphstore → gather-as-writer → extract → spotlight — keeping the rev-1–13 fact model verbatim while making full-history chronology, random-access analytics, and durable accumulation tractable; see the new *Architecture (rev 14) — persistent graph substrate* section below and the unified **P1–P14** ledger under *Implementation phasing*. The deferred 4b and the original P5–P8 features are re-sequenced as P10–P14, rebuilt on the store.)
@@ -1240,18 +1240,23 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   bicep trust gate (#22), and a multi-repo **constellation CI gate** running real `terraform
   init`/`graph` over real modules (#20, #23). *Verified:* cross-repo identity + cross-repo train
   tests green on real AVM-Bicep + AVM-Terraform data.
-- **Phase 10 — 4b: sub-agent train narration, rebuilt on the store — in progress** (spec:
-  `docs/superpowers/specs/2026-06-06-activity-phase10-narration.md`). **Slices 1 (#24) + 2 (#25)
-  shipped:** PR review submissions + timeline lifecycle events (already fetched, previously
-  discarded) persist as `social` nodes attached to their PR/issue via **`part_of`** (spine, so the
-  rounds ride inside the train slice; train identity unchanged) → true `review_rounds`/`reopen_count`
-  + review-round texture, folded into the bounded `slice_train`. **Slice 3 (narration) in progress:**
-  `link.py --slice <id>` emits one train's enriched slice as JSON; the lead dispatches a parallel
-  narrator sub-agent per deep train that reads ONLY its slice → a `{summary, proposed, changed,
-  rejected, shipped, evidence:[ref]}` narrative, every ref copied verbatim from the slice (lead
-  verifies + composes into the `<!-- narrative: <id> -->` slot). *Report:* deepened "Decision trains"
-  section (narrative + review-rounds/reopen texture). Built once, on the graph, after extract proves
-  equivalence.
+- **Phase 10 — 4b: sub-agent train narration, rebuilt on the store — shipped (#24–#26)** (spec:
+  `docs/superpowers/specs/2026-06-06-activity-phase10-narration.md`). **Slice 1 (#24):** PR review
+  submissions + timeline lifecycle events (already fetched, previously discarded) persist as `social`
+  nodes attached to their PR/issue via **`part_of`** (spine, so the rounds ride inside the train
+  slice; train identity unchanged) → true `review_rounds`/`reopen_count` + review-round texture.
+  **Slice 2 (#25):** that texture folded into the bounded `slice_train`. **Slice 3 (#26):** `link.py
+  --slice <id>` emits one train's enriched slice as JSON; the lead dispatches a parallel narrator
+  sub-agent per deep train that reads ONLY its slice → a `{summary, proposed, changed, rejected,
+  shipped, evidence:[ref]}` narrative (code layer — PR body/commits/`feature_deltas` — as primary
+  source; reviews/lifecycle for the decision arc), every ref copied verbatim from the slice (lead
+  verifies + composes into the `<!-- narrative: <id> -->` slot, with an optional lead-driven
+  `git show` diff handle); the report's deep-train effort line surfaces the review-rounds/reopen
+  texture. **Verified end-to-end against real AVM data** (Azure/terraform-azurerm-avm-res-network-
+  virtualnetwork: review-round arcs + reopen counts persisted, slice carries the decision thread).
+  **Future enhancement (sequenced separately):** language-agnostic bounded unified-diff capture in
+  the gather code-walk, so `.tf`/`.bicep` *logic* changes carry their real `before`/`after` in-slice
+  (today only graphify symbols + comments do).
 - **Phase 11 — people & community + flow/stall report views (original-P5 report half).** The
   data model + aggregation now live in P5 (schema) / P6 (gather) / P8 (spotlight); this phase
   ships the **report sections** over them: **Contributors & community** (public) and **Stalled,
