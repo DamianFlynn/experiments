@@ -428,6 +428,16 @@ class TestSelectMilestonesAndBuckets(unittest.TestCase):
     def test_select_sprints_empty(self):
         self.assertEqual(link.select_sprints({}, "2026-01-20"), (None, None, None))
 
+    def test_select_sprints_ignores_startless_sprint_in_fallback(self):
+        # a start-less iteration (possible from GraphQL) must NOT become `current`
+        # in a ref-date gap just because it sorts last.
+        sprints = {
+            "IT_real": {"title": "R", "start": "2026-01-01", "end": "2026-01-07"},
+            "IT_nostart": {"title": "N", "start": None, "end": None},
+        }
+        _prev, cur, _nxt = link.select_sprints(sprints, "2026-03-01")  # gap after R
+        self.assertEqual(cur["id"], "IT_real")
+
     def test_buckets_classify_each_item_once(self):
         b = self._p2_bundle()["buckets"]
         def nums(key):

@@ -92,7 +92,10 @@ def select_sprints(sprints, ref_date):
          and s.get("start")),
         None)
     if current is None:
-        started = [s for s in ordered if (s.get("start") or "")[:10] <= ref]
+        # latest iteration with a REAL start on/before ref (a start-less sprint must
+        # never win the fallback — it sorts last but has no date to compare).
+        started = [s for s in ordered
+                   if s.get("start") and s["start"][:10] <= ref]
         current = started[-1] if started else ordered[0]
     idx = ordered.index(current)
     prev = ordered[idx - 1] if idx > 0 else None
