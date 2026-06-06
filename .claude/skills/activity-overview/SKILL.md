@@ -25,8 +25,10 @@ All scripts referenced below ship inside this skill directory
 For deeper detail: **`reference/report-sections.md`** (how to author each report
 section), **`BUNDLE.md`** (the structured view / output contract for downstream
 formatters), **`STORE.md`** (the graph schema), **`REFERENCE.md`** (install, env knobs,
-the `/activity` command, transcript flow), and **`samples/`** (a worked end-to-end
-example — the structured view + a rendered digest).
+the `/activity` command, transcript flow), **`samples/`** (a worked end-to-end
+example — the structured view + a rendered digest), and **`examples/`** (input
+examples: a transcript, manifest, series index, plus a second formatter consuming
+the structured view).
 
 ## Procedure
 

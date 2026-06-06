@@ -10,6 +10,30 @@ view: the **gather**/fold path supplies `meta`, `commits`, `prs`, `issues`,
 (`render.py`) fills `diagrams`. (See **Phase 2 fields** below for the
 fields added after the walking skeleton.)
 
+## Output contract (for downstream formatters)
+
+The pipeline's **product is this structured view**, not the Markdown report — the
+report is just one renderer over it, and other formatters (changelog, social,
+video-script, dashboards) consume the same view. The contract:
+
+- **Versioned.** `meta.schema_version` (currently `1`) identifies the shape; a
+  formatter should read it and refuse a version it doesn't understand. Bumps are
+  recorded here.
+- **Two entry points, same shape family.** Single-repo: the enriched bundle view
+  (`extract` → `link.py`) — keys documented below. Multi-repo project: `python3
+  digest.py --store <db> --project <name> --from … --to …` emits the merged
+  **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
+  modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
+  canonical JSON (`sort_keys`), so output is diff-stable.
+- **Every fact carries a ref** (see *Ref convention* below), so any consumer can
+  cite/fact-check without re-fetching. Narrative is NOT in the view — it's the
+  model's job, authored from the view.
+- **Stability.** Top-level keys are append-only within a `schema_version`;
+  omit-when-empty containers keep the shape diff-stable across windows.
+- **Reference formatters.** `samples/build_report.py` (structural Markdown skeleton)
+  and `examples/formatters/shipped_changelog.py` (a compact per-repo "shipped"
+  changelog) both consume the view unchanged — copy either as a starting point.
+
 ## Ref convention
 
 Every provenance reference is `{ "type": "pr|issue|commit", "id": <number|sha>,

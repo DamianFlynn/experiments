@@ -1,0 +1,30 @@
+WEBVTT
+Kind: captions
+Language: en
+
+NOTE Example community-call transcript for the activity-overview skill.
+Pass it with `python3 transcript.py examples/community-call.vtt` (or via a
+projects.json `transcript` path) to fold a "Community call highlights" section
+into the digest. User-provided, local file — no network.
+
+00:00:01.000 --> 00:00:05.000
+<v Maria>Welcome everyone to the monthly AVM community call.</v>
+
+00:00:05.000 --> 00:00:11.000
+<v Maria>Headline this month: the storage-account module shipped its 1.0, and we
+cut a release on Friday.</v>
+
+00:00:11.000 --> 00:00:18.000
+<v Tom>Decision: we're standardising the diagnostic-settings interface across all
+resource modules. Owners please migrate before the next call.</v>
+
+00:00:18.000 --> 00:00:24.000
+<v Priya>Ask from the community: can we get clearer guidance on the breaking-change
+policy? A few folks were surprised by the v1 rename.</v>
+
+00:00:24.000 --> 00:00:30.000
+<v Maria>Follow-up: Tom to draft the breaking-change policy doc; Priya to review.
+We'll track it as an issue and revisit next month.</v>
+
+00:00:30.000 --> 00:00:34.000
+<v Maria>That's it — thanks all, see you in four weeks.</v>

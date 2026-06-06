@@ -1,0 +1,34 @@
+[
+  {
+    "from": "2026-04-01",
+    "to": "2026-04-30",
+    "ref_date": "2026-04-30",
+    "shipped": [
+      {"type": "pr", "id": 101},
+      {"type": "issue", "id": 88}
+    ],
+    "in_flight": [
+      {"type": "pr", "id": 110, "board_status": "In Progress"},
+      {"type": "issue", "id": 95, "board_status": "Blocked"}
+    ],
+    "forecast": [
+      {"type": "pr", "id": 110, "tier": "likely"},
+      {"type": "issue", "id": 95, "tier": "possible"}
+    ]
+  },
+  {
+    "from": "2026-05-01",
+    "to": "2026-05-31",
+    "ref_date": "2026-05-31",
+    "shipped": [
+      {"type": "pr", "id": 110},
+      {"type": "pr", "id": 121}
+    ],
+    "in_flight": [
+      {"type": "issue", "id": 95, "board_status": "In Review"}
+    ],
+    "forecast": [
+      {"type": "issue", "id": 95, "tier": "likely"}
+    ]
+  }
+]
