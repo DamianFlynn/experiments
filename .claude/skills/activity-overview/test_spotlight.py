@@ -1412,6 +1412,108 @@ class TestSliceModule(unittest.TestCase):
         self.assertIn("guidance", res)
 
 
+class TestSliceModuleFolding(unittest.TestCase):
+    """Rename folding via connected components — robust to diamonds, cycles, and a
+    chain whose in-area terminal was replaced by an OUT-of-area successor (the cases
+    the old root-only forward walk fragmented)."""
+
+    P, R, AREA = "acme", "r1", "m"
+
+    def _q(self, local):
+        return graphstore.qualify_id(self.P, self.R, local)
+
+    def _store(self, syms, repl_edges, events):
+        """syms: [(path, local)] in-area unless path is outside area `m`;
+        repl_edges: [(src_local, dst_local)] replaced_by; events: [(local, date)]."""
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        f = "2026-01-01T00:00:00Z"
+        in_area_paths = sorted({p for p, _ in syms if p.startswith(self.AREA + "/")})
+        graphstore.upsert_nodes(conn, [
+            (self._q("codegraph"), self.P, self.R, "structure", None,
+             {"areas": [{"id": self.AREA, "name": self.AREA,
+                         "paths": in_area_paths}]}, f)])
+        graphstore.upsert_nodes(conn, [
+            (self._q(local), self.P, self.R, "code", f,
+             {"kind": "symbol", "path": path, "name": local,
+              "subkind": "resource", "lang": "bicep", "status": "live"}, f)
+            for path, local in syms])
+        graphstore.upsert_edges(conn, [
+            (self._q(s), self._q(d), "replaced_by", None, None)
+            for s, d in repl_edges])
+        # unique commit_sha per row — the ledger PK is (artifact_id, commit_sha,
+        # event), so reusing a sha for the same artifact+event would dedupe rows.
+        graphstore.add_code_events(conn, [
+            (self._q(local), "add", "sha{}".format(i), "a", date, None,
+             {"type": "commit", "id": "sha{}".format(i)}, None, "v", None)
+            for i, (local, date) in enumerate(events)])
+        return conn
+
+    def test_diamond_folds_into_one_symbol(self):
+        # A and B both replaced_by C -> ONE folded symbol carrying all three events.
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x"),
+             ("m/b.bicep", "m/b.bicep#bicep:resource:x"),
+             ("m/c.bicep", "m/c.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "m/c.bicep#bicep:resource:x"),
+             ("m/b.bicep#bicep:resource:x", "m/c.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "2026-01-01"),
+             ("m/b.bicep#bicep:resource:x", "2026-01-02"),
+             ("m/c.bicep#bicep:resource:x", "2026-01-03")])
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(len(res["symbols"]), 1)
+        self.assertEqual(len(res["symbols"][0]["lifecycle"]), 3)
+        # representative is the current artifact (the terminal C)
+        self.assertTrue(res["symbols"][0]["id"].endswith("c.bicep#bicep:resource:x"))
+
+    def test_cycle_folds_into_one_symbol(self):
+        # A <-> B mutual replaced_by -> one component, not two fragments, no hang.
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x"),
+             ("m/b.bicep", "m/b.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "m/b.bicep#bicep:resource:x"),
+             ("m/b.bicep#bicep:resource:x", "m/a.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "2026-01-01"),
+             ("m/b.bicep#bicep:resource:x", "2026-01-02")])
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(len(res["symbols"]), 1)
+        self.assertEqual(len(res["symbols"][0]["lifecycle"]), 2)
+
+    def test_in_area_chain_with_out_of_area_terminal_still_folds(self):
+        # A -> B (both in area), B -> OUT (outside area). A+B must fold into ONE
+        # symbol; OUT is excluded. (The old walk left A and B as two fragments.)
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x"),
+             ("m/b.bicep", "m/b.bicep#bicep:resource:x"),
+             ("other/z.bicep", "other/z.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "m/b.bicep#bicep:resource:x"),
+             ("m/b.bicep#bicep:resource:x", "other/z.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "2026-01-01"),
+             ("m/b.bicep#bicep:resource:x", "2026-01-02"),
+             ("other/z.bicep#bicep:resource:x", "2026-01-03")])
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(len(res["symbols"]), 1)              # A+B folded
+        self.assertEqual(len(res["symbols"][0]["lifecycle"]), 2)  # OUT excluded
+        self.assertNotIn("other/z.bicep",
+                         res["symbols"][0]["id"])
+
+    def test_time_range_uses_full_history_not_capped_rows(self):
+        # An artifact with > _MODULE_LIFECYCLE_CAP events: time_range.last must be the
+        # TRUE latest date, not the last KEPT (oldest-N) row.
+        n = spotlight._MODULE_LIFECYCLE_CAP + 5
+        events = [("m/a.bicep#bicep:resource:x", "2026-{:02d}-01".format(i + 1))
+                  for i in range(min(n, 12))]
+        # pad beyond the cap with later same-month days to exceed the row cap
+        events += [("m/a.bicep#bicep:resource:x", "2027-01-{:02d}".format(i + 1))
+                   for i in range(n - len(events))]
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x")], [], events)
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(res["symbols"][0]["lifecycle_overflow"],
+                         n - spotlight._MODULE_LIFECYCLE_CAP)
+        self.assertEqual(res["time_range"]["last"], max(d for _, d in events))
+
+
 class TestSliceModuleCLI(unittest.TestCase):
     def setUp(self):
         import tempfile

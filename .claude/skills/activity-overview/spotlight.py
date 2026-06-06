@@ -961,15 +961,18 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
     """
     repos = _project_repos(conn, project)
 
-    # --- resolve the area's path set from the stored codegraph singleton ---
-    area_idx = {}
+    # --- resolve the area per repo (NEVER merge indexes: a path string can map to
+    #     different areas in different repos, so match each artifact against ITS OWN
+    #     repo's codegraph) ---
+    area_idx_by_repo = {}
     for repo in repos:
         cg = graphstore.get_node(
             conn, graphstore.qualify_id(project, repo, "codegraph"))
         if cg is not None:
-            area_idx.update(derive.area_index(cg["data"] or {}))
-    area_paths = {p for p, a in area_idx.items() if a == area}
-    if not area_paths:
+            area_idx_by_repo[repo] = derive.area_index(cg["data"] or {})
+    has_area = any(a == area for idx in area_idx_by_repo.values()
+                   for a in idx.values())
+    if not has_area:
         return {
             "query": "module",
             "focus": area,
@@ -983,10 +986,9 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
         }
 
     # --- collect the area's artifact code nodes (file + symbol/comment) ---
-    # `replaced_by` source artifacts fold into their successor, so a rename reads
-    # as one symbol history — track the set of ids that are superseded.
     artifacts = {}  # qid -> node
     for repo in repos:
+        idx = area_idx_by_repo.get(repo, {})
         for node in graphstore.repo_nodes(conn, project, repo, node_class="code"):
             data = node["data"] or {}
             # artifact `code` nodes are the non-commit ones: a commit carries a
@@ -995,49 +997,40 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
             if "sha" in data:
                 continue
             path = data.get("path")
-            if path is None or derive._area_for_path(path, area_idx) != area:
+            if path is None or derive._area_for_path(path, idx) != area:
                 continue
             artifacts[node["id"]] = node
 
-    # rename folding: a `replaced_by` edge means src's history continues in dst.
-    # Pick the chain's terminal node as the representative; gather all the chain's
-    # ids so their events merge into one lifecycle.
-    superseded = set()      # ids that are NOT the chain representative
-    chain_of = {}           # representative id -> ordered [member ids]
+    # --- rename folding via CONNECTED COMPONENTS over in-area replaced_by edges ---
+    # A renamed/moved symbol's history spans several artifact ids linked by
+    # `replaced_by`. Grouping by connected component (over in-area replaced_by edges,
+    # either direction) folds the whole identity into ONE entry — robust to diamonds
+    # (two ids replaced by one), cycles, and a chain whose in-area terminal was
+    # replaced by an OUT-of-area successor (that successor isn't in `artifacts`, so
+    # the in-area members still group together). Each component is one symbol/file.
+    adj = {aid: set() for aid in artifacts}
+    succ = {aid: set() for aid in artifacts}   # directed in-area replaced_by targets
     for aid in artifacts:
-        edges = graphstore.get_edges(conn, aid, direction="out",
-                                     edge_types=["replaced_by"])
-        if edges:
-            superseded.add(aid)
+        for e in graphstore.get_edges(conn, aid, direction="out",
+                                      edge_types=["replaced_by"]):
+            dst = e["dst_id"]
+            if dst in adj:                 # only fold links between in-area artifacts
+                adj[aid].add(dst)
+                adj[dst].add(aid)
+                succ[aid].add(dst)
+    components, comp_of = [], {}
     for aid in sorted(artifacts):
-        if aid in superseded:
+        if aid in comp_of:
             continue
-        # walk forward to gather the full chain rooted here
-        members = [aid]
-        seen = {aid}
-        cur = aid
-        depth = 0
-        while depth < _CHAIN_DEPTH_CAP:
-            edges = graphstore.get_edges(conn, cur, direction="in",
-                                         edge_types=["replaced_by"])
-            edges = [e for e in edges if e["src_id"] not in seen]
-            if not edges:
-                break
-            prev = edges[0]["src_id"]
-            members.append(prev)
-            seen.add(prev)
-            cur = prev
-            depth += 1
-        chain_of[aid] = members
-
-    # representatives: a non-superseded node, or a superseded one whose successor
-    # is outside the area (so its history would otherwise be lost). The chain
-    # walk above roots at non-superseded nodes; any superseded id not folded into
-    # one of those chains stands alone.
-    folded = {m for members in chain_of.values() for m in members}
-    for aid in sorted(artifacts):
-        if aid not in folded:
-            chain_of[aid] = [aid]
+        comp, stack = [], [aid]
+        while stack:
+            x = stack.pop()
+            if x in comp_of:
+                continue
+            comp_of[x] = len(components)
+            comp.append(x)
+            stack.extend(y for y in adj[x] if y not in comp_of)
+        components.append(sorted(comp))    # rep = comp[0] (deterministic)
 
     # --- pre-fetch the commit->PR map over every sha in the slice's events ---
     # The file-level ledger is keyed by the BARE-path qid, but a file artifact
@@ -1058,17 +1051,16 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
         all_shas.update(e["commit_sha"] for e in evs)
     pr_of = _commit_pr_map(conn, all_shas, project, repos)
 
-    def _lifecycle(rep, members):
-        """The folded, ordered, bounded lifecycle for a chain (its members'
-        events merged), plus the overflow count beyond the row cap."""
+    def _lifecycle(members):
+        """The folded, ordered, bounded lifecycle for a component (its members'
+        events merged). Returns (rows, overflow, ordered) — `ordered` is the FULL
+        windowed event list (pre row-cap) so time_range can be computed from it."""
         merged = []
         for m in members:
             merged.extend(events_by_member.get(m, []))
         ordered = _ordered_lifecycle(merged, ts_from, ts_to)
-        total = len(ordered)
-        kept = ordered[:_MODULE_LIFECYCLE_CAP]
         rows = []
-        for e in kept:
+        for e in ordered[:_MODULE_LIFECYCLE_CAP]:
             row = {
                 "event": e["event"],
                 "date": e["date"] or "",
@@ -1082,14 +1074,22 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
             if e["hunk"] is not None:
                 row["diff"] = _slice_cap_text(e["hunk"])
             rows.append(row)
-        return rows, max(0, total - _MODULE_LIFECYCLE_CAP)
+        return rows, max(0, len(ordered) - _MODULE_LIFECYCLE_CAP), ordered
 
     symbols, files = [], []
-    for rep in sorted(chain_of):
-        members = chain_of[rep]
+    all_dates = []  # ALL windowed event dates (pre row-cap AND pre artifact-cap)
+    for comp in components:
+        members = comp
+        # representative = the chain's CURRENT artifact (a terminal with no in-area
+        # replaced_by successor), so a folded rename shows the present name; fall back
+        # to the min id for a cycle (every node has a successor). Deterministic.
+        comp_set = set(comp)
+        terminals = sorted(a for a in comp if not (succ[a] & comp_set))
+        rep = terminals[0] if terminals else comp[0]
         node = artifacts[rep]
         data = node["data"] or {}
-        lifecycle, overflow = _lifecycle(rep, members)
+        lifecycle, overflow, ordered = _lifecycle(members)
+        all_dates.extend(e["date"] for e in ordered if e["date"])
         # symbol/comment artifacts vs file artifacts. The id form is the tell:
         # a symbol's local id is `<path>#<lang>:<subkind>:<name>` (a `#` after the
         # repo scope), a file's is `art:<path>` / a bare path. Strip the
@@ -1123,9 +1123,9 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
     symbols = symbols[:_MODULE_ARTIFACT_CAP]
     files = files[:_MODULE_ARTIFACT_CAP]
 
-    # --- time range over the kept lifecycle dates ---
-    all_dates = [r["date"] for grp in (symbols, files) for a in grp
-                 for r in a["lifecycle"] if r["date"]]
+    # --- time range over ALL windowed lifecycle dates (collected pre row-cap and
+    #     pre artifact-cap above), so an overflowing artifact never under-reports the
+    #     module's true first/last activity ---
     time_range = {
         "first": min(all_dates) if all_dates else None,
         "last": max(all_dates) if all_dates else None,
