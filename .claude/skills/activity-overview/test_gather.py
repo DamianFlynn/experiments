@@ -2073,6 +2073,14 @@ class TestParseFileDiffs(unittest.TestCase):
         self.assertEqual(
             gather.parse_file_diffs(gather.RECORD_SEP + header + "\n"), [])
 
+    def test_parse_patch_events_single_pass_matches_separate(self):
+        # acquire walks the patch ONCE via parse_patch_events; it must produce exactly
+        # what the two separate parsers do (no double-parse, no behaviour change).
+        raw = self._raw(BICEP_DIFF, TF_DIFF)
+        sym, diffs = gather.parse_patch_events(raw)
+        self.assertEqual(sym, gather.parse_symbol_events(raw))
+        self.assertEqual(diffs, gather.parse_file_diffs(raw))
+
 
 class TestClassifyPrKind(unittest.TestCase):
     """Conventional-commit PR title -> canonical kind (train fallback)."""

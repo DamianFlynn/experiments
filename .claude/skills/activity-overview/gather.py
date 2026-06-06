@@ -801,10 +801,13 @@ def bounded_file_diff(hunks, cap=FILE_DIFF_CAP, line_cap=FILE_DIFF_LINE_CAP):
     """Render a file's parsed `hunks` as a bounded unified-diff snippet. Pure.
 
     Emits an `@@ +<new_start> @@` marker per hunk followed by its sign-prefixed
-    lines (`+`/`-`/` `), capped to `cap` chars OR `line_cap` lines (whichever is hit
-    first). When truncated, appends a `…[+N lines]` marker counting the dropped diff
-    lines (hunk markers are not counted). Returns None when there are no hunks (or no
-    lines) so the field is omit-when-empty for byte-stability."""
+    lines (`+`/`-`/` `). The BODY is held to roughly `cap` chars OR `line_cap` lines
+    (whichever is hit first), appending a `…[+N lines]` marker for the dropped diff
+    lines (hunk markers are not counted toward `line_cap`). The result is
+    *approximately* bounded, not strict: it may exceed `cap` by a small margin — it
+    always keeps at least the first body line (truncated to `cap` + `…` if huge) plus
+    its `@@` marker, and may add the overflow marker. Returns None when there are no
+    hunks (or no lines) so the field is omit-when-empty for byte-stability."""
     if not hunks:
         return None
     # Flatten into the ordered output lines: a marker per hunk, then its body lines.
@@ -845,38 +848,12 @@ def bounded_file_diff(hunks, cap=FILE_DIFF_CAP, line_cap=FILE_DIFF_LINE_CAP):
     return "\n".join(rendered)
 
 
-def parse_file_diffs(raw):
-    """Parse `git log -p` output into per-(commit, path) bounded file diffs. Pure.
-
-    Mirrors parse_symbol_events' chunk/parse_unified_diff loop, but emits ONE bounded
-    unified-diff snippet per changed file (every language, not just symbol_lang ones):
-    `[{commit, path, hunk}]`. Files whose hunks render empty are omitted. Merge commits
-    (no patch) yield nothing. Keyed by the NEW path (rename target)."""
-    out = []
-    for chunk in (raw or "").split(RECORD_SEP):
-        if not chunk.strip():
-            continue
-        lines = chunk.split("\n")
-        fields = lines[0].split(FIELD_SEP)
-        if len(fields) < 5:
-            continue
-        sha = fields[0].strip()
-        body = "\n".join(lines[1:])
-        for f in parse_unified_diff(body):
-            path = f["path"] or f["old_path"]
-            diff = bounded_file_diff(f["hunks"])
-            if path and diff:
-                out.append({"commit": sha, "path": path, "hunk": diff})
-    return out
-
-
-def parse_symbol_events(raw):
-    """Parse `git log -p` output into symbol-level change events. Pure.
-
-    Each event: {commit, author, date, path, lang, subkind, name, change, before, after}.
-    Only tracked source files (symbol_lang) contribute; file-level lifecycle still comes
-    from parse_code_events. Merge commits show no patch and yield nothing."""
-    events = []
+def _iter_patch_files(raw):
+    """Yield (sha, author, date, file) for every changed file in each commit chunk
+    of a `git log -p` walk — a SINGLE parse of the patch text. `file` is a
+    parse_unified_diff entry ({path, old_path, hunks}). Merge commits (no patch)
+    yield nothing. Pure; the shared walk behind the parsers below + parse_patch_events
+    (so acquire can extract both symbol events and file diffs in one pass)."""
     for chunk in (raw or "").split(RECORD_SEP):
         if not chunk.strip():
             continue
@@ -887,14 +864,65 @@ def parse_symbol_events(raw):
         sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
         body = "\n".join(lines[1:])
         for f in parse_unified_diff(body):
-            path = f["path"] or f["old_path"]
-            for d in build_symbol_deltas(path, f["hunks"]):
-                events.append({
-                    "commit": sha, "author": author, "date": date, "path": d["path"],
-                    "lang": d["lang"], "subkind": d["subkind"], "name": d["name"],
-                    "change": d["change"], "before": d["before"], "after": d["after"],
-                })
+            yield sha, author, date, f
+
+
+def _symbol_events_for(sha, author, date, f):
+    """Symbol-level change events for one patched file. Pure."""
+    path = f["path"] or f["old_path"]
+    return [{
+        "commit": sha, "author": author, "date": date, "path": d["path"],
+        "lang": d["lang"], "subkind": d["subkind"], "name": d["name"],
+        "change": d["change"], "before": d["before"], "after": d["after"],
+    } for d in build_symbol_deltas(path, f["hunks"])]
+
+
+def _file_diff_for(sha, f):
+    """The bounded {commit, path, hunk} record for one patched file, or None. Pure."""
+    path = f["path"] or f["old_path"]
+    diff = bounded_file_diff(f["hunks"])
+    return {"commit": sha, "path": path, "hunk": diff} if path and diff else None
+
+
+def parse_file_diffs(raw):
+    """Parse `git log -p` output into per-(commit, path) bounded file diffs. Pure.
+
+    Emits ONE bounded unified-diff snippet per changed file (every language, not just
+    symbol_lang ones): `[{commit, path, hunk}]`, keyed by the NEW path (rename target).
+    Files whose hunks render empty are omitted; merge commits yield nothing."""
+    out = []
+    for sha, _author, _date, f in _iter_patch_files(raw):
+        rec = _file_diff_for(sha, f)
+        if rec:
+            out.append(rec)
+    return out
+
+
+def parse_symbol_events(raw):
+    """Parse `git log -p` output into symbol-level change events. Pure.
+
+    Each event: {commit, author, date, path, lang, subkind, name, change, before, after}.
+    Only tracked source files (symbol_lang) contribute; file-level lifecycle still comes
+    from parse_code_events. Merge commits show no patch and yield nothing."""
+    events = []
+    for sha, author, date, f in _iter_patch_files(raw):
+        events.extend(_symbol_events_for(sha, author, date, f))
     return events
+
+
+def parse_patch_events(raw):
+    """Single pass over a `git log -p` walk → (symbol_events, file_diffs). Pure.
+
+    Same outputs as `parse_symbol_events(raw)` and `parse_file_diffs(raw)` but parses
+    the (potentially large) patch text ONCE — acquire uses this so the walk isn't
+    re-parsed per consumer."""
+    sym, diffs = [], []
+    for sha, author, date, f in _iter_patch_files(raw):
+        sym.extend(_symbol_events_for(sha, author, date, f))
+        rec = _file_diff_for(sha, f)
+        if rec:
+            diffs.append(rec)
+    return sym, diffs
 
 
 # Ordered code-area patterns for the directory provider (primary, zero-dep).
@@ -2080,14 +2108,15 @@ def acquire(args, env):
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
             "-p", "--unified=3", "-M", "-C",
         ])
-        symbol_events = window_records(parse_symbol_events(raw_patch), frm, to)
-        # Phase 10 slice-diffs: a bounded, language-agnostic unified-diff hunk per
-        # changed (commit, path) from the SAME `git log -p` walk (no extra git/
-        # network). Attach it onto the matching file-level code_event so it rides
-        # code_events -> file artifact -> feature_deltas and persists in the ledger.
-        # Omit-when-empty (only set the key when a hunk exists) for byte-stability.
-        diff_by_key = {(d["commit"], d["path"]): d["hunk"]
-                       for d in parse_file_diffs(raw_patch)}
+        # Single pass over the patch text yields BOTH symbol events and the
+        # Phase 10 slice-diffs hunks (no double-parse). The bounded, language-agnostic
+        # unified-diff per changed (commit, path) comes from the SAME `git log -p`
+        # walk (no extra git/network); attach it onto the matching file-level
+        # code_event so it rides code_events -> file artifact -> feature_deltas and
+        # persists in the ledger. Omit-when-empty for byte-stability.
+        raw_symbol_events, file_diffs = parse_patch_events(raw_patch)
+        symbol_events = window_records(raw_symbol_events, frm, to)
+        diff_by_key = {(d["commit"], d["path"]): d["hunk"] for d in file_diffs}
         if diff_by_key:
             for ev in code_events:
                 hunk = diff_by_key.get((ev.get("commit"), ev.get("path")))
