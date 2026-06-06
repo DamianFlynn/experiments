@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import json
 import os
@@ -1723,7 +1724,8 @@ class TestSliceTrain(unittest.TestCase):
     def test_slice_returns_all_top_level_keys(self):
         bundle = self._bundle()
         s = link.slice_train(bundle, "train-issue-10")
-        for key in ("train", "issue", "prs", "commits", "feature_deltas", "symbol_moves"):
+        for key in ("train", "issue", "prs", "commits", "feature_deltas",
+                    "feature_deltas_diff_overflow", "symbol_moves"):
             self.assertIn(key, s, f"missing top-level key '{key}'")
 
     def test_train_block_carries_phase4a_fields(self):
@@ -2682,6 +2684,34 @@ class TestSliceCLI(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             link.main([path, "--slice", "train-does-not-exist"])
         self.assertEqual(cm.exception.code, 2)
+
+
+class TestCapTrainDiffs(unittest.TestCase):
+    """Phase 10 slice-diffs slice 2: the per-train TOTAL diff budget."""
+
+    def test_keeps_within_budget_strips_beyond_without_mutating_bundle(self):
+        half = link.SLICE_DIFF_CAP // 2 + 100  # two of these exceed the budget
+        big = "x" * half
+        deltas = [
+            {"name": "a", "diff": big},   # used 0      -> kept
+            {"name": "b", "diff": big},   # used ~half  -> kept (still < cap)
+            {"name": "c", "diff": big},   # used >cap   -> diff stripped
+            {"name": "d"},                # no diff     -> untouched
+        ]
+        original = copy.deepcopy(deltas)
+        out, dropped = link._cap_train_diffs(deltas)
+        self.assertEqual(dropped, 1)
+        self.assertIn("diff", out[0])
+        self.assertIn("diff", out[1])
+        self.assertNotIn("diff", out[2])      # stripped for the budget
+        self.assertEqual(out[3], {"name": "d"})
+        # the bundle's deltas are NOT mutated (slice is read-only by contract)
+        self.assertEqual(deltas, original)
+
+    def test_no_diffs_is_zero_overflow(self):
+        out, dropped = link._cap_train_diffs([{"name": "a"}, {"name": "b"}])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(out), 2)
 
 
 if __name__ == "__main__":

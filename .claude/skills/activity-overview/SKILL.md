@@ -162,17 +162,17 @@ claim in the report resolves to a source ref — never invent facts.
      train's self-contained JSON slice (the `slice_train` shape: train / issue / prs /
      commits + `review_rounds`, capped `reviews`/`lifecycle`, `reopen_count`,
      `feature_deltas`). Read-only — it does NOT rewrite the bundle.
-  1b. **Deepen the slice with the real diff (optional, lead-only).** The slice already
-     names *what* changed (`feature_deltas` paths/areas) and carries each commit's `sha`,
-     but for languages with no symbol-level `before`/`after` (Terraform/Bicep land only
-     file/comment-granular hunks) the actual logic change isn't in the slice. When the
-     gather clone is still on disk (`workspace/<repo>-clone`), the **lead** MAY fetch it —
-     `git -C workspace/<repo>-clone show <slice.commits[].sha> -- <feature_delta path>` —
-     and fold a **bounded** excerpt into that train's slice JSON before dispatch (cap it,
-     e.g. ~40 lines/file, prefer the module path over `examples/*` churn). Do this in the
-     LEAD, never in the narrator: the narrator must stay slice-only so its evidence stays
-     verifiable. Best-effort — skip silently if the clone is gone; the PR body + commit
-     messages already carry the prose story.
+  1b. **Real diffs are already in the slice — deepen only if needed (lead-only).**
+     File-level `feature_deltas` now carry a bounded `diff` for EVERY language (not just
+     graphify symbols/comments), so the narrator reads the actual change *from the slice*.
+     Only when `feature_deltas_diff_overflow > 0` (a churny train dropped some diffs for
+     the per-train cap) or a truncated file genuinely matters, the **lead** MAY fetch more
+     from the gather clone if it's still on disk (`workspace/<repo>-clone`):
+     `git -C workspace/<repo>-clone show <slice.commits[].sha> -- <feature_delta path>`,
+     folding a **bounded** excerpt into the slice before dispatch (prefer the module path
+     over `examples/*` churn). Do this in the LEAD, never the narrator — the narrator
+     stays slice-only so its evidence stays verifiable. Best-effort; skip if the clone is
+     gone (the in-slice diffs + PR body + commit messages still tell the story).
   2. **Dispatch one narrator sub-agent per deep train, IN PARALLEL** (one Task each, sent
      together). Hand it the (optionally deepened) slice JSON and this contract:
      > You are a release narrator. Using ONLY the supplied train slice — never outside
