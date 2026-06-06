@@ -1,8 +1,8 @@
 # activity-overview — Phase 11: people & community + flow/stall report views
 
 **Date:** 2026-06-06
-**Status:** slice 1 shipped (#31); slice 2 (this PR) — Contributors & community section
-+ gated shame/blame appendix.
+**Status:** slice 1 shipped (#31); slice 2 (this PR) adds the Contributors & community
+section and the gated shame/blame appendix.
 **Depends on:** the data model already in the store — `people` (P5 schema / P6 gather /
 P8 spotlight, extract-materialized), the `stalled` train flag + `effort` (Phase 4a),
 `open_high_activity` on issues (Phase 3a), and the `blocks` issue→issue edges (Phase 9

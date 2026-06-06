@@ -287,33 +287,36 @@ template → heuristic.
 Who moved the project this period (public — recognition, not blame). Rank contributors
 by a footprint counted from the bundle: PRs authored (`prs[].author`), PRs reviewed
 (`prs[].reviewers`), commits authored (`commits[].author`); most-active first. Show each
-person's areas from `people[login].modules`. Omit the whole section when there is no
-`people` data.
+person's areas from `people[login].modules`. **Cite** each contributor's work — link a
+representative authored/reviewed PR (`prs[].url`) so the footprint is grounded. Omit the
+whole section when there is no `people` data.
 
-| Contributor | Authored | Reviewed | Commits | Areas |
-|-------------|----------|----------|---------|-------|
-| `{login}` | {authored} | {reviewed} | {commits} | {", ".join(people[login].modules)} |
+| Contributor | Authored | Reviewed | Commits | Areas | Evidence |
+|-------------|----------|----------|---------|-------|----------|
+| `{login}` | {authored} | {reviewed} | {commits} | {", ".join(people[login].modules)} | [#{pr.number}]({pr.url}), … |
 
-<!-- Automation: list `people[login]` where `is_bot` is true under this subhead, so the
-     human view above isn't skewed by dependabot/CI bots. -->
+<!-- Automation: when any `people[login]` has `is_bot` true, list them under this subhead
+     so the human view above isn't skewed by dependabot/CI bots. OMIT the subhead entirely
+     when there are no bot contributors (no empty "Automation:" stanza). -->
 
 **Automation:** {", ".join(bot logins)}
 
-The people ↔ code-area relationships:
-
-```mermaid
-{contents of diagrams.contributor_graph}
-```
+The people ↔ code-area relationships are shown by `diagrams.contributor_graph`, embedded
+once under **Module ownership** above (do not repeat the Mermaid block here).
 
 ## Internal appendix — stall & blocker attribution
 
 <!-- GATED: render this section ONLY when the operator explicitly requests an *internal*
      report (e.g. the request says "internal" / "with attribution"). The DEFAULT public
      digest OMITS this section entirely. It attributes the flow signals (from the
-     "Stalled, blocked & pile-ups" section) to people, using existing bundle data only —
-     stalled trains → effort.participants/reviewers + the owning PR/issue authors;
-     blocked issues → the blocker/blocked issue authors. Factual association, never
-     judgmental. Each line cites its url. -->
+     "Stalled, blocked & pile-ups" section) to people, using existing bundle data only.
+     Factual association, never judgmental. EACH line cites its own url. -->
 
-- {login} — associated with stalled train `{train.id}` ({effort.elapsed_days}d) / blocked
-  issue #{number} ([link]({url}))
+**Stalled trains** — attribute to `effort.participants` / reviewers + the owning PR/issue
+authors:
+
+- {login} — stalled train `{train.id}` ({effort.elapsed_days}d) — [{ref}]({train root issue/PR url})
+
+**Blocked issues** — attribute to the blocker/blocked issue authors:
+
+- {login} — blocked issue #{number} — [link]({issue.url})
