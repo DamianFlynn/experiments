@@ -1981,6 +1981,107 @@ class TestParseSymbolEvents(unittest.TestCase):
         self.assertEqual(gather.parse_symbol_events(""), [])
 
 
+class TestBoundedFileDiff(unittest.TestCase):
+    def test_renders_marker_and_sign_lines(self):
+        f = gather.parse_unified_diff(TF_DIFF)[0]
+        out = gather.bounded_file_diff(f["hunks"])
+        self.assertTrue(out.startswith("@@ +1 @@"))
+        self.assertIn('-  name = "old"', out)
+        self.assertIn('+  name = "new"', out)
+        self.assertIn(' resource "azurerm_resource_group" "this" {', out)
+        # un-truncated short diff carries no overflow marker
+        self.assertNotIn("…[+", out)
+
+    def test_no_hunks_is_none(self):
+        self.assertIsNone(gather.bounded_file_diff([]))
+        self.assertIsNone(gather.bounded_file_diff([{"new_start": 1, "lines": []}]))
+
+    def test_char_cap_truncates_with_overflow_marker(self):
+        lines = [(" ", "x" * 50) for _ in range(40)]
+        hunks = [{"new_start": 1, "lines": lines}]
+        out = gather.bounded_file_diff(hunks, cap=200, line_cap=999)
+        self.assertLessEqual(len(out.split("…[+")[0]), 260)  # body under ~cap
+        self.assertRegex(out, r"…\[\+\d+ lines\]")
+        # the dropped count is total - kept
+        kept = sum(1 for ln in out.split("\n") if ln and not ln.startswith(("@@", "…")))
+        dropped = int(out.split("…[+")[1].split(" ")[0])
+        self.assertEqual(kept + dropped, 40)
+
+    def test_line_cap_truncates_with_overflow_marker(self):
+        lines = [(" ", "ln{}".format(i)) for i in range(50)]
+        hunks = [{"new_start": 1, "lines": lines}]
+        out = gather.bounded_file_diff(hunks, cap=99999, line_cap=10)
+        body = [ln for ln in out.split("\n") if not ln.startswith(("@@", "…"))]
+        self.assertEqual(len(body), 10)
+        self.assertIn("…[+40 lines]", out)
+
+    def test_multi_hunk_markers(self):
+        hunks = [{"new_start": 1, "lines": [("+", "a")]},
+                 {"new_start": 9, "lines": [("-", "b")]}]
+        out = gather.bounded_file_diff(hunks)
+        self.assertEqual(out, "@@ +1 @@\n+a\n@@ +9 @@\n-b")
+
+    def test_huge_first_line_kept_truncated_not_dropped(self):
+        # a single body line longer than cap (minified/lockfile) must still yield a
+        # (truncated) diff, not silently vanish to None.
+        hunks = [{"new_start": 1, "lines": [("+", "z" * 5000)]}]
+        out = gather.bounded_file_diff(hunks, cap=200)
+        self.assertIsNotNone(out)
+        self.assertIn("@@ +1 @@", out)
+        self.assertTrue(out.rstrip().endswith("…"))
+        self.assertLessEqual(len(out), 200 + 40)  # cap + marker/ellipsis slack
+
+    def test_markers_counted_toward_cap(self):
+        # many single-line hunks: marker bytes are bounded too, so the result can't
+        # overshoot `cap` on markers alone.
+        hunks = [{"new_start": i, "lines": [("+", "x")]} for i in range(100)]
+        out = gather.bounded_file_diff(hunks, cap=50, line_cap=999)
+        self.assertLessEqual(len(out.split("…[+")[0]), 50 + 20)
+
+    def test_hunk_without_lines_key_does_not_crash(self):
+        self.assertIsNone(gather.bounded_file_diff([{"new_start": 1}]))
+
+
+class TestParseFileDiffs(unittest.TestCase):
+    def _raw(self, *diffs, sha="a" * 40):
+        header = gather.FIELD_SEP.join([sha, "p", "Alice", "2026-05-03", "subj"])
+        return gather.RECORD_SEP + header + "\n" + "".join(diffs)
+
+    def test_one_bounded_diff_per_changed_file(self):
+        out = gather.parse_file_diffs(self._raw(BICEP_DIFF, TF_DIFF))
+        by_path = {d["path"]: d for d in out}
+        self.assertEqual(set(by_path), {"avm/res/foo/main.bicep", "live/prod/main.tf"})
+        self.assertTrue(all(d["commit"] == "a" * 40 for d in out))
+        self.assertIn("+  name = \"new\"", by_path["live/prod/main.tf"]["hunk"])
+
+    def test_language_agnostic_non_source_file_included(self):
+        # README.md yields NO symbol events but DOES get a bounded file diff.
+        md = ("diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+              "@@ -1 +1 @@\n-old\n+new\n")
+        out = gather.parse_file_diffs(self._raw(md))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["path"], "README.md")
+        self.assertIn("+new", out[0]["hunk"])
+        # ...while the symbol walk stays empty for it (unchanged behaviour)
+        self.assertEqual(gather.parse_symbol_events(self._raw(md)), [])
+
+    def test_empty_input_yields_nothing(self):
+        self.assertEqual(gather.parse_file_diffs(""), [])
+
+    def test_merge_commit_no_patch_yields_nothing(self):
+        header = gather.FIELD_SEP.join(["b" * 40, "p1 p2", "Bob", "2026-05-04", "merge"])
+        self.assertEqual(
+            gather.parse_file_diffs(gather.RECORD_SEP + header + "\n"), [])
+
+    def test_parse_patch_events_single_pass_matches_separate(self):
+        # acquire walks the patch ONCE via parse_patch_events; it must produce exactly
+        # what the two separate parsers do (no double-parse, no behaviour change).
+        raw = self._raw(BICEP_DIFF, TF_DIFF)
+        sym, diffs = gather.parse_patch_events(raw)
+        self.assertEqual(sym, gather.parse_symbol_events(raw))
+        self.assertEqual(diffs, gather.parse_file_diffs(raw))
+
+
 class TestClassifyPrKind(unittest.TestCase):
     """Conventional-commit PR title -> canonical kind (train fallback)."""
 
