@@ -16,9 +16,10 @@ The pipeline's **product is this structured view**, not the Markdown report — 
 report is just one renderer over it, and other formatters (changelog, social,
 video-script, dashboards) consume the same view. The contract:
 
-- **Versioned.** `meta.schema_version` (currently `1`) identifies the shape; a
-  formatter should read it and refuse a version it doesn't understand. Bumps are
-  recorded here.
+- **Versioned.** `meta.schema_version` (currently `1`) identifies the shape on
+  BOTH entry points — the single-repo bundle and the multi-repo project view (and
+  each `members[].bundle.meta`). A formatter should read it and refuse a version it
+  doesn't understand. Bumps are recorded here.
 - **Two entry points, same shape family.** Single-repo: the enriched bundle view
   (`extract` → `link.py`) — keys documented below. Multi-repo project: `python3
   digest.py --store <db> --project <name> --from … --to …` emits the merged

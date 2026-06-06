@@ -15,10 +15,20 @@ import json
 import sys
 from collections import defaultdict
 
-# Top-level keys this formatter relies on (a subset of the contract). It checks
-# the view's schema so a future breaking change surfaces loudly rather than
-# silently mis-rendering.
-CONSUMED_KEYS = ("meta", "shipped")
+# The view must carry `meta` and shipped refs — either a project view's top-level
+# `shipped` or a single-repo bundle's `buckets.shipped`. Checked up front so a
+# non-view (or a future breaking change) surfaces loudly rather than mis-rendering.
+def _is_view(view):
+    return isinstance(view, dict) and "meta" in view and (
+        "shipped" in view or "shipped" in (view.get("buckets") or {}))
+
+
+def _shipped(view):
+    """Shipped refs from either entry point: a multi-repo project view's top-level
+    `shipped`, or a single-repo enriched bundle's `buckets.shipped`."""
+    if "shipped" in view:
+        return view["shipped"]
+    return (view.get("buckets") or {}).get("shipped", [])
 
 
 def render(view):
@@ -27,7 +37,7 @@ def render(view):
     lines = [f"# {title} — shipped {meta.get('from','?')} → {meta.get('to','?')}", ""]
 
     by_repo = defaultdict(list)
-    for item in view.get("shipped", []):
+    for item in _shipped(view):
         # single-repo views may omit `repo`; fall back to meta.
         repo = item.get("repo") or f'{meta.get("owner","")}/{meta.get("repo","")}'.strip("/")
         by_repo[repo].append(item)
@@ -55,11 +65,10 @@ def main(argv=None):
         raise SystemExit(2)
     with open(argv[0], encoding="utf-8") as fh:
         view = json.load(fh)
-    missing = [k for k in CONSUMED_KEYS if k not in view]
-    if missing:
+    if not _is_view(view):
         sys.stderr.write(
-            f"error: {argv[0]} is not a digest view (missing {missing}); "
-            "see BUNDLE.md for the contract\n")
+            f"error: {argv[0]} is not a digest view (need `meta` + `shipped` or "
+            "`buckets.shipped`); see BUNDLE.md for the contract\n")
         raise SystemExit(2)
     sys.stdout.write(render(view))
 

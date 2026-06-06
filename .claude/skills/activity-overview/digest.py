@@ -324,7 +324,8 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     related = group_related_work(trains)
     return {
         "meta": {"project": project, "repos": list(repos),
-                 "from": ts_from, "to": ts_to},
+                 "from": ts_from, "to": ts_to,
+                 "schema_version": graphstore.SCHEMA_VERSION},
         "members": members,
         "trains": trains,
         "related_work": related,

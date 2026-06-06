@@ -33,6 +33,24 @@ class TestShippedChangelogFormatter(unittest.TestCase):
         out = shipped_changelog.render({"meta": {"owner": "o", "repo": "r"}, "shipped": []})
         self.assertIn("Nothing shipped", out)
 
+    def test_single_repo_buckets_shipped_fallback(self):
+        # single-repo enriched bundle: shipped lives under buckets.shipped.
+        view = {
+            "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
+            "buckets": {"shipped": [{"type": "pr", "id": 7, "url": "u7"}]},
+        }
+        out = shipped_changelog.render(view)
+        self.assertIn("## o/r", out)
+        self.assertIn("[#7](u7)", out)
+        # and the CLI guard accepts it
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        with open(path, "w") as fh:
+            json.dump(view, fh)
+        shipped_changelog.main([path])  # no SystemExit
+
     def test_cli_rejects_non_view(self):
         import tempfile
         fd, path = tempfile.mkstemp(suffix=".json")
