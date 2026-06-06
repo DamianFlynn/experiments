@@ -363,6 +363,19 @@ Engagement is a product goal for these repos, so **people are first-class entiti
 just names on a PR. The intersection of *people × code areas × time* is what lets us draw
 who is contributing, reviewing, blocking, and maintaining — and feature them.
 
+> **Shipped (2026-06-06 — gap closure, PRs #40/#41).** The rich `people` profile below
+> (`prs_authored`/`prs_merged`/`merge_rate`, `prs_reviewed`, `commits_authored`,
+> `issues_opened`, `review_latency_days`, `first_seen`/`last_active`,
+> `examples_authored`/`docs_authored`/`symbols_authored`, `authored_then_removed`,
+> `stale_owned`) is built by `derive.annotate_people_profile`, and `halls.fame` by
+> `derive.build_halls` — both enrich-time projections (siblings of `forecast`/`modules`).
+> **`halls.internal.{shame,blame}` is intentionally NOT built (descoped — recognition only).**
+> The `flow` pathology classifier + `blockers` ranking (below) ship as
+> `derive.build_flow`/`build_blockers`. `internal:bool` per person is not computed (the
+> internal appendix is a prompt-time request, not a stored flag). **The bullets below are
+> the original target model (kept for history) — this note is the as-shipped contract where
+> they differ.**
+
 - **Per-train participants:** each train records `participants: [{ login, role,
   author_association }]` with roles **reporter / author / reviewer / merger / commenter /
   blocker / reactor**. This is the edge list of the contribution graph.
@@ -565,18 +578,22 @@ transcript (Analyze input) nor the report prose (Synthesize output).
 - **CLI:**
   ```
   python gather.py --owner OWNER --repo REPO \
-      --from YYYY-MM-DD --to YYYY-MM-DD \
+      --from YYYY-MM-DD --to YYYY-MM-DD --store workspace/journey.db \
       [--branches main,develop] [--clone-dir PATH] [--no-clone] \
-      [--include-docs] [--include-workflows] [--include-releases] [--include-internal] \
-      [--include-projects] [--project-number N] [--project-owner-type org|user] \
-      [--status-field Status] [--iteration-field Sprint] \
-      [--milestone "vX.Y"] [--ref-date YYYY-MM-DD] [--out PATH]
+      [--no-workflows] [--no-releases] [--no-project-board] \
+      [--ref-date YYYY-MM-DD] [--manifest PATH]
   ```
-  (`--include-workflows`/`--include-releases` default **on**; **graphify always runs**
-  (required — preflight fails fast if absent). `--include-internal` opts the
-  shame/blame appendix into the output (off by default). `--include-projects` activates
-  when a project number is provided. When a project config is used, `SKILL.md` resolves
-  these from config — see component 6.)
+  > **As-shipped CLI (reconciled).** The store-native rev retired several originally-spec'd
+  > flags: the bundle-file `--out` is gone (the store is the sole output); `--milestone` was
+  > dropped (milestone framing is resolved from `ref-date`); `--include-docs`/
+  > `--include-internal` are gone (docs are always gathered; the internal appendix is a
+  > prompt-time request, not a gather flag). Projects v2 is **auto-discovered** — the
+  > explicit `--include-projects`/`--project-number`/`--project-owner-type`/`--status-field`/
+  > `--iteration-field` flags were replaced by `--project-board` (default on) /
+  > `--no-project-board`, and gather ingests every maintained linked board. Workflow and
+  > release collection stay default-on (toggle off with `--no-workflows` / `--no-releases`).
+  > **graphify is now optional** (directory provider is primary). Multi-repo uses
+  > `--manifest` (mutually exclusive with `--owner/--repo`).
 
 - **Clone + local git (the commit/diff layer, network-free after clone):**
   - `git clone --filter=blob:none --shallow-since=<from> --no-single-branch <repo> <clone-dir>`
@@ -979,6 +996,17 @@ index is the cheap through-line, never an override.
   `projects.json`. If none found or `--project` not given, fall back to explicit args.
 - **Distribution:** ships `projects.example.json` (placeholders). User fills a real
   `projects.json` (commit-or-local is their choice).
+- **As-shipped (reconciled — the full schema above is historical/superseded).**
+  `projects.json` is an **agent-read** convenience config (no Python parses it); the shipped
+  `projects.example.json` carries the keys that are actually acted on —
+  `owner`/`repo`/`branches`/`clone_dir`/`transcript`. The richer keys in the schema block
+  above were superseded by the store-native evolution and are NOT separate config anymore:
+  `project_v2` → Projects v2 is **auto-discovered** (every maintained linked board), tuned by
+  the `ACTIVITY_BOARD_*` env knobs; `label_taxonomy` → **auto-detected** (`detect_label_taxonomy`);
+  `internal` → the internal appendix is a **prompt-time request**, not stored config; multi-repo
+  → a **manifest** (`--manifest`, see `examples/manifest.json`), not `repos[]`/`project_v2` here;
+  `include_docs` → docs are always gathered. The store-sync block was never implemented (the
+  store is a local, rebuildable cache).
 
 ### 7. `commands/activity.md` (slash-command entrypoint)
 
@@ -1010,9 +1038,11 @@ index is the cheap through-line, never an override.
 
 ### 8b. Live integration smoke test (per-phase gate)
 
-`.github/workflows/activity-overview-integration.yml` runs the **real** gather → link →
-render pipeline against a live repo (default `Azure/bicep-registry-modules`) and asserts the
-resulting bundle against the **current** contract. It runs automatically **twice a month**
+`.github/workflows/activity-overview.yml` (the `live` + `constellation` jobs) runs the
+**real** gather against a live repo (default `Azure/bicep-registry-modules`), folds the
+journey-graph store, and asserts trust with `validate.py` (the live job intentionally stops
+at the trust gate — the offline `extract → link → render` vertical is covered by the test
+suite and needs mmdc/graphify, so it is not re-run live). It runs automatically **twice a month**
 (1st & 15th, trailing-14-day window) and **on demand** (`workflow_dispatch`, with an optional
 owner/repo/window), authenticated by the `ACTIVITY_TEST_TOKEN` secret — a classic PAT with
 `public_repo`; Microsoft-enterprise targets (e.g. `Azure/*`) cap PAT lifetime at ≤90 days, so
@@ -1273,6 +1303,14 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   the `contributor_graph`/`blocker_graph`/`kind_breakdown` diagrams, and the internal
   shame/blame appendix **gated off by default** (slice 2). Spec:
   `docs/superpowers/specs/2026-06-06-activity-phase11-people-community.md`.
+  **Completion (2026-06-06, #40/#41).** A validation pass found the report sections were
+  rendering people/flow agent-side rather than from first-class data; closed by building the
+  data layer as enrich-time projections: `derive.annotate_people_profile` (the rich profile),
+  `derive.build_halls` (`halls.fame`, recognition-only — **`halls.internal` descoped**),
+  `derive.build_flow` (the hung / upvoted-but-ignored / traction-then-abandoned / blocked
+  classifier), and `derive.build_blockers` (issues ranked by how many they block). The
+  Contributors / Stalled-blocked sections now read these. Spec:
+  `docs/superpowers/specs/2026-06-06-activity-phase11-people-flow.md`.
 - **Phase 12 — Projects v2 + sprint framing (original P6) — shipped (#34 + slice 2).**
   gather's first GraphQL call auto-discovers the repo's board → `board_status` on PRs/issues
   + `sprint-<id>` structure nodes + `in_iteration` edges when the board has an iteration
