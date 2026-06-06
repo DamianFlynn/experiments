@@ -1,8 +1,10 @@
 # activity-overview — Phase 10: sub-agent train narration (4b), on the store
 
 **Date:** 2026-06-06
-**Status:** draft — scoping.
-**Depends on:** Phase 9 (multi-repo) shipped to master; the journey-graph store + `traverse_spine`/`slice_train`.
+**Status:** active — slice 1 (gather prereq) in progress. Edge model **confirmed:
+`part_of`/spine**.
+**Depends on:** Phase 9 (multi-repo) shipped to master (#15–#18, #20–#23); the
+journey-graph store + `traverse_spine`/`slice_train`.
 
 ## Goal
 
@@ -71,12 +73,14 @@ traverse them and a sub-agent slice carries them. New local-id forms and edges:
 - `no_drift`/`idempotency`: review/event nodes are folded by stable id from the raw
   records (idempotent); they are not people/artifacts, so `no_drift` is unaffected.
 
-**Spine note (call out for review):** making reviews/events `part_of` pulls them
+**Spine note (confirmed `part_of`):** making reviews/events `part_of` pulls them
 into `traverse_spine`, so trains gain review/event members. `extract` keys trains on
 PR/issue **social anchors**, so train *identity* is unchanged, but the per-train
 **slice** grows to include the rounds/lifecycle — which is the point (the sub-agent
-needs them). Alternative if we want them out of the spine: a dedicated non-spine
-edge (`on`) instead of `part_of`. Flagged as the one decision to confirm.
+needs them, with no extra plumbing in `slice_train`). Review/event nodes are spine
+**leaves** (no onward spine edges), so they can't bridge a train to unrelated nodes.
+The non-spine `on`-edge alternative was rejected (it would force `slice_train` to
+re-gather the texture out of band).
 
 ## Slices (TDD, task-by-task, each its own PR)
 
