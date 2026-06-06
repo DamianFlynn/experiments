@@ -1554,10 +1554,10 @@ class TestExtractIacEdges(unittest.TestCase):
                         if e["ref"] == "Azure/avm-res-network-virtualnetwork/azurerm")
             self.assertEqual(vnet["version"], "0.7.1")
 
-    def test_terraform_prewarm_runs_once_before_parallel_with_shared_cache(self):
-        # With a shared TF_PLUGIN_CACHE_DIR + parallel workers, a single serial
-        # warm-up `init` runs BEFORE the per-area builds so the parallel inits are
-        # cache hits, not a write race.
+    def test_terraform_prewarm_warms_all_areas_before_parallel(self):
+        # With a shared TF_PLUGIN_CACHE_DIR + parallel workers, EVERY build area is
+        # warmed serially BEFORE the per-area builds, so the parallel inits are cache
+        # hits — race-free for any provider mix (not just shared-provider members).
         import unittest.mock as mock
         with open(os.path.join(FIX, "terraform_graph_sample.dot")) as fh:
             dot = fh.read()
@@ -1582,11 +1582,12 @@ class TestExtractIacEdges(unittest.TestCase):
                 cg, "clone",
                 which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
                 run=run, read_text=lambda _p: tf, max_workers=4)
-        # first recorded call is the serial warm-up init (an `init`, never `graph`)
-        self.assertIn("init", calls[0])
-        self.assertEqual(calls[0][-1], "-input=false")
-        # one extra init beyond the two per-area inits (the warm-up)
-        self.assertEqual(sum(1 for c in calls if "init" in c), 3)
+        # both warm-up inits run before ANY graph (the whole prewarm precedes the pool)
+        first_graph = next(i for i, c in enumerate(calls) if c[-1] == "graph")
+        self.assertGreaterEqual(first_graph, 2)
+        self.assertTrue(all(c[-1] == "-input=false" for c in calls[:2]))  # 2 warm-ups
+        # 2 warm-up inits + 2 per-area build inits (every area warmed, not just one)
+        self.assertEqual(sum(1 for c in calls if "init" in c), 4)
 
     def test_no_prewarm_without_shared_cache(self):
         # Without TF_PLUGIN_CACHE_DIR there is no race to avoid -> no warm-up.

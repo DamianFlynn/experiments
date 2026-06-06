@@ -327,13 +327,12 @@ jobs:
           # plugin cache avoids re-downloading providers, and each init gets room. A
           # heavy init that still times out degrades gracefully — edge_extraction
           # records timeout/failed and the static whole-tree source scan still
-          # backstops the cross-repo edge.
+          # backstops the cross-repo edge. Parallel extraction stays safe because
+          # gather's prewarm populates the cache for EVERY area serially before the
+          # parallel inits (cache hits, no write race) — so we keep the default
+          # workers rather than serializing.
           TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.claude/skills/activity-overview/workspace/.tfcache
           ACTIVITY_IAC_BUILD_TIMEOUT: "600"
-          # The terraform plugin cache is NOT write-safe under concurrency; serialize
-          # the IaC builds (workers=1) so a module pulling an un-prewarmed provider
-          # can't race the cache and flake the gate.
-          ACTIVITY_IAC_MAX_WORKERS: "1"
         run: |
           cd .claude/skills/activity-overview
           mkdir -p workspace/.tfcache
