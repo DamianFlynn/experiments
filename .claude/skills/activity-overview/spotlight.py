@@ -948,7 +948,8 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
     yields the shared `needs_gather` envelope.
 
     For each kept artifact, `get_code_events` gives its full lifecycle; a renamed
-    symbol's history is folded into ONE chain (walk `replaced_by` forward) so the
+    symbol's history is folded into ONE entry via CONNECTED COMPONENTS over in-area
+    `replaced_by` edges (robust to diamonds/cycles/out-of-area terminals) so the
     move's events read as one symbol. Each lifecycle row is bounded (text-capped
     before/after/diff, where diff = the row's `hunk`) and attributed to its PR via
     the commit->PR `part_of` map when cheap. Artifacts split into `symbols` (id
@@ -1157,18 +1158,19 @@ def _module_trains(conn, project, area, repos, ts_from, ts_to):
     area-node resolution + `touches`-edge logic. Returns a list of train dicts
     (anchor/key_date/title/outcome/…), ordered by (key_date, anchor). An absent
     area node simply yields no trains (the artifact lifecycles still stand)."""
+    # Union the `touches` edges from the area node in EVERY repo that has one — the
+    # same area can live in multiple repos (matches slice_module's per-repo handling).
     area_local = "area-{}".format(area)
-    area_qid = None
+    touching_src_ids = []
     for repo in repos:
-        cand = graphstore.qualify_id(project, repo, area_local)
-        if graphstore.get_node(conn, cand) is not None:
-            area_qid = cand
-            break
-    if area_qid is None:
+        area_qid = graphstore.qualify_id(project, repo, area_local)
+        if graphstore.get_node(conn, area_qid) is None:
+            continue
+        touching_src_ids.extend(
+            e["src_id"] for e in graphstore.get_edges(
+                conn, area_qid, direction="in", edge_types=["touches"]))
+    if not touching_src_ids:
         return []
-    in_edges = graphstore.get_edges(conn, area_qid, direction="in",
-                                    edge_types=["touches"])
-    touching_src_ids = [e["src_id"] for e in in_edges]
     seed_ids = set(touching_src_ids)
     for src_id in touching_src_ids:
         if "#pr-" in src_id:
