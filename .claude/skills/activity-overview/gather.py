@@ -49,7 +49,7 @@ def build_bundle(meta, commits, prs, issues):
         "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
         "people": {},
         "halls": {},
-        "flow": {},
+        "flow": [],
         "blockers": [],
         "code_owners": {},
         "code_graph": {},

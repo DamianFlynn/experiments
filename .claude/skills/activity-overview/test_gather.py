@@ -30,10 +30,10 @@ class TestBuildBundle(unittest.TestCase):
         self.assertEqual(bundle["issues"], [{"number": 17}])
 
         # later-phase fields are reserved but empty
-        for key in ["timeline", "feature_deltas", "trains", "blockers",
+        for key in ["timeline", "feature_deltas", "trains", "blockers", "flow",
                     "releases", "milestones", "docsRefs", "workflows"]:
             self.assertEqual(bundle[key], [], f"{key} should be reserved empty list")
-        for key in ["artifacts", "people", "modules", "code_owners", "flow",
+        for key in ["artifacts", "people", "modules", "code_owners",
                     "label_taxonomy", "diagrams", "workflow_stats", "halls",
                     "code_graph", "release_train", "sprints", "project"]:
             self.assertEqual(bundle[key], {}, f"{key} should be reserved empty dict")

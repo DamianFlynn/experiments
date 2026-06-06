@@ -107,6 +107,7 @@
       "status": "replaced"
     }
   },
+  "blockers": [],
   "buckets": {
     "in_flight": [],
     "next_candidates": [
@@ -274,6 +275,7 @@
       "url": "https://github.com/o/r/commit/c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
     }
   ],
+  "flow": [],
   "forecast": {
     "candidates": [
       {

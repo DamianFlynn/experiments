@@ -466,5 +466,183 @@ class TestPeopleProfile(unittest.TestCase):
         self.assertEqual(bundle["halls"]["fame"], [])
 
 
+def _issue(number, **kw):
+    """Build an open issue with sensible defaults; override via kwargs."""
+    base = {
+        "number": number,
+        "url": f"https://github.com/o/r/issues/{number}",
+        "state": "open",
+        "created_at": None,
+        "updated_at": None,
+        "reactions": {},
+        "comments_list": [],
+    }
+    base.update(kw)
+    return base
+
+
+# A reference date; staleness/age computed relative to this.
+_META = {"ref_date": "2026-06-06"}
+
+
+def _one(flow):
+    """Single flow entry helper."""
+    assert len(flow) == 1, flow
+    return flow[0]
+
+
+class TestFlow(unittest.TestCase):
+    def test_blocked_fires(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(1, blocked_by=[2, 3])]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "blocked")
+        self.assertEqual(e["blocked_by"], [2, 3])
+        self.assertIn("blocked by 2 issue(s)", e["signals"])
+
+    def test_upvoted_but_ignored_fires(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-05-01", updated_at="2026-04-01",
+                   reactions={"+1": 7, "total": 9})]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "upvoted_but_ignored")
+        self.assertEqual(e["reactions"], 9)
+        self.assertIn("9 reactions", e["signals"])
+
+    def test_traction_then_abandoned_fires(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-05-01", updated_at="2026-04-01",
+                   comments_list=[{}] * 6)]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "traction_then_abandoned")
+        self.assertIn("6 comments", e["signals"])
+
+    def test_hung_fires(self):
+        # old (>=60d) but not stale-by-upvotes / traction.
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-01-01", updated_at="2026-06-05")]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "hung")
+        self.assertGreaterEqual(e["age_days"], 60)
+        self.assertIn(f"open {e['age_days']}d", e["signals"])
+
+    def test_precedence_blocked_beats_upvoted(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(1, blocked_by=[9], created_at="2026-05-01",
+                   updated_at="2026-04-01", reactions={"+1": 7, "total": 7})]}
+        derive.build_flow(bundle)
+        self.assertEqual(_one(bundle["flow"])["state"], "blocked")
+
+    def test_open_linked_pr_exempts_from_starved_pathologies(self):
+        # would be upvoted_but_ignored, but has an OPEN linked PR -> healthy/omitted.
+        bundle = {"meta": _META,
+                  "prs": [{"number": 50, "state": "open", "merged": False,
+                           "closes": [1], "crossref_issues": []}],
+                  "issues": [
+                      _issue(1, created_at="2026-05-01", updated_at="2026-04-01",
+                             reactions={"+1": 7, "total": 7},
+                             comments_list=[{}] * 6)]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+    def test_open_linked_pr_via_crossref_exempts_hung(self):
+        bundle = {"meta": _META,
+                  "prs": [{"number": 50, "state": "open", "merged": False,
+                           "closes": [], "crossref_issues": [1]}],
+                  "issues": [
+                      _issue(1, created_at="2026-01-01", updated_at="2026-06-05")]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+    def test_merged_or_closed_pr_does_not_exempt(self):
+        # a merged PR is not "in flight" -> issue still classified.
+        bundle = {"meta": _META,
+                  "prs": [{"number": 50, "state": "closed", "merged": True,
+                           "closes": [1], "crossref_issues": []}],
+                  "issues": [
+                      _issue(1, created_at="2026-05-01", updated_at="2026-04-01",
+                             reactions={"+1": 7, "total": 7})]}
+        derive.build_flow(bundle)
+        self.assertEqual(_one(bundle["flow"])["state"], "upvoted_but_ignored")
+
+    def test_healthy_is_omitted(self):
+        # recent, no blockers, low reactions/comments, young.
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-06-01", updated_at="2026-06-05")]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+    def test_closed_issues_ignored(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(1, state="closed", blocked_by=[2])]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+    def test_age_days_none_when_no_created_at(self):
+        # blocked (so it emits) but no created_at -> age_days None, no "open Nd".
+        bundle = {"meta": _META, "issues": [
+            _issue(1, blocked_by=[2], created_at=None)]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertIsNone(e["age_days"])
+        self.assertFalse(any(s.startswith("open ") for s in e["signals"]))
+
+    def test_meta_to_fallback(self):
+        bundle = {"meta": {"to": "2026-06-06"}, "issues": [
+            _issue(1, created_at="2026-01-01", updated_at="2026-06-05")]}
+        derive.build_flow(bundle)
+        self.assertEqual(_one(bundle["flow"])["state"], "hung")
+
+    def test_sorted_by_number(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(3, blocked_by=[1]),
+            _issue(1, blocked_by=[1]),
+            _issue(2, blocked_by=[1])]}
+        derive.build_flow(bundle)
+        self.assertEqual([e["number"] for e in bundle["flow"]], [1, 2, 3])
+
+    def test_not_stale_upvoted_is_healthy(self):
+        # high upvotes but recently updated -> not stale -> not a pathology.
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-06-01", updated_at="2026-06-05",
+                   reactions={"+1": 9, "total": 9})]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+
+class TestBlockers(unittest.TestCase):
+    def test_in_degree_ranking_and_sort(self):
+        bundle = {"issues": [
+            {"number": 1, "url": "u1", "blocking": [10, 11]},
+            {"number": 2, "url": "u2", "blocking": [20, 21, 22]},
+            {"number": 3, "url": "u3", "blocking": [30]},
+            {"number": 4, "url": "u4", "blocking": [40, 41]},
+            {"number": 5, "url": "u5"},
+        ]}
+        derive.build_blockers(bundle)
+        out = bundle["blockers"]
+        # sort: blocks_count desc, then number asc -> 2(3), 1(2), 4(2), 3(1)
+        self.assertEqual([(e["number"], e["blocks_count"]) for e in out],
+                         [(2, 3), (1, 2), (4, 2), (3, 1)])
+        self.assertEqual(out[0]["blocks"], [20, 21, 22])
+
+    def test_dedup_blocks(self):
+        bundle = {"issues": [
+            {"number": 1, "url": "u1", "blocking": [10, 10, 11]}]}
+        derive.build_blockers(bundle)
+        e = bundle["blockers"][0]
+        self.assertEqual(e["blocks"], [10, 11])
+        self.assertEqual(e["blocks_count"], 2)
+
+    def test_empty_when_no_blocking(self):
+        bundle = {"issues": [{"number": 1, "url": "u1"}]}
+        derive.build_blockers(bundle)
+        self.assertEqual(bundle["blockers"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
