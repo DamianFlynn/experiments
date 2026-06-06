@@ -714,12 +714,14 @@ def build_flow(bundle):
 
 
 def build_blockers(bundle):
-    """Rank issues by in-degree over the resolved `blocks` relation.
+    """Rank issues by how many other issues each one blocks (`blocks_count`).
 
-    For each issue with a non-empty `blocking` list, emit `{number, url,
-    blocks_count, blocks}` where `blocks` is the sorted unique set it blocks.
-    Sorted by `blocks_count` desc then number. Empty when no blocking. Pure
-    (sets `bundle["blockers"]`); returns bundle."""
+    `issue["blocking"]` lists the issues this one blocks (the blocker→blocked
+    direction set by `extract._attach_blocks`), so this ranks by that out-degree —
+    the issues to unblock first. For each issue with a non-empty `blocking` list,
+    emit `{number, url, blocks_count, blocks}` where `blocks` is the sorted unique
+    set it blocks. Sorted by `blocks_count` desc then number. Empty when no
+    blocking. Pure (sets `bundle["blockers"]`); returns bundle."""
     entries = []
     for issue in bundle.get("issues", []):
         blocking = issue.get("blocking") or []

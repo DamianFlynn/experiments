@@ -306,7 +306,8 @@ data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
   `meta.ref_date` (fallback `meta.to`). Sorted by `number`. Empty `[]` when all
   open issues are healthy.
 - **blockers** `[ { number, url, blocks_count, blocks:[num] } ]`
-  (`build_blockers`) — issues ranked by **in-degree** over the resolved `blocks`
-  relation (`issue["blocking"]`). One entry per issue with a non-empty `blocking`
-  list; `blocks` is the sorted unique set it blocks. Sorted by `blocks_count`
-  desc then `number`. Empty `[]` when nothing blocks.
+  (`build_blockers`) — issues ranked by **how many other issues each one blocks**
+  (`blocks_count`, i.e. out-degree in the blocker→blocked graph established by
+  `extract._attach_blocks`, read off `issue["blocking"]`). One entry per issue with
+  a non-empty `blocking` list; `blocks` is the sorted unique set it blocks. Sorted
+  by `blocks_count` desc then `number`. Empty `[]` when nothing blocks.

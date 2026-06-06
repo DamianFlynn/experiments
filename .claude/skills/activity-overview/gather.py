@@ -370,6 +370,7 @@ def normalize_issue(raw):
         "milestone": milestone.get("title") if milestone else None,
         "state": raw.get("state"),
         "state_reason": raw.get("state_reason"),
+        "created_at": raw.get("created_at"),
         "updated_at": raw.get("updated_at"),
         "closed_at": raw.get("closed_at"),
         "comments": raw.get("comments", 0) or 0,

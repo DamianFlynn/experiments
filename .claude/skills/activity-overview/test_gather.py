@@ -264,6 +264,7 @@ class TestIssueAndFetch(unittest.TestCase):
         raw = {
             "number": 18, "title": "Open feature", "body": "",
             "state": "open", "state_reason": None,
+            "created_at": "2026-05-10T00:00:00Z",
             "updated_at": "2026-05-22T00:00:00Z",
             "user": {"login": "carol"}, "author_association": "CONTRIBUTOR",
             "labels": [{"name": "priority/high"}],
@@ -274,6 +275,7 @@ class TestIssueAndFetch(unittest.TestCase):
         }
         issue = gather.normalize_issue(raw)
         self.assertEqual(issue["milestone"], "v1.3.0")
+        self.assertEqual(issue["created_at"], "2026-05-10T00:00:00Z")
         self.assertEqual(issue["updated_at"], "2026-05-22T00:00:00Z")
         self.assertEqual(issue["comments"], 7)
         self.assertEqual(issue["state"], "open")
