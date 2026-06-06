@@ -1043,6 +1043,10 @@ def enrich(bundle):
     # over the materialized bundle; need people/prs/commits/artifacts/trains above).
     derive.annotate_people_profile(bundle)
     derive.build_halls(bundle)
+    # Phase 11 slice 2: flow pathology classifier + blockers in-degree (read-side
+    # projections over issues/prs; placed after halls).
+    derive.build_flow(bundle)
+    derive.build_blockers(bundle)
     return bundle
 
 

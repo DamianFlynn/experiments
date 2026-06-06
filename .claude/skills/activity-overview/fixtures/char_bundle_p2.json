@@ -1,5 +1,6 @@
 {
   "artifacts": {},
+  "blockers": [],
   "buckets": {
     "in_flight": [
       {
@@ -54,6 +55,7 @@
   "code_events": [],
   "commits": [],
   "feature_deltas": [],
+  "flow": [],
   "forecast": {
     "candidates": [
       {

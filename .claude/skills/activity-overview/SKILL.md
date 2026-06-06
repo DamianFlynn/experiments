@@ -235,21 +235,24 @@ claim in the report resolves to a source ref — never invent facts.
     `signals` list (e.g. "on milestone v1.2 · high-priority · open PR").
   - Note: this is a forward-only forecast. The predicted-vs-landed loop (Phase 7) is not
     yet present — do not describe it as such.
-- Phase 11 **Stalled, blocked & pile-ups** — render a flow-health section over data that
-  already exists in the bundle. It surfaces where work is stuck this period, from three
-  sources, each item CITING its url:
-  - **Stalled trains** — deep trains whose `train.effort.stalled` is true; report the
-    train + its `effort.elapsed_days` (longest-stalled first), citing the train's root
-    issue / PR url.
-  - **Blocked issues** — issues carrying `issue["blocked_by"]` (numbers blocking it)
-    and/or `issue["blocking"]` (numbers it blocks); list each with its `url`, and embed the
-    `diagrams.blocker_graph` Mermaid flowchart (blocker → blocked) when present.
-  - **Pile-ups** — open, high-activity issues (`issue["open_high_activity"]` true), each
-    cited.
+- Phase 11 **Stalled, blocked & pile-ups** — render a flow-health section from the
+  **deterministic** `flow` + `blockers` projections (plus train-level stall), each item
+  CITING its url:
+  - **Flow pathologies** — `bundle["flow"]` is the per-OPEN-issue classification
+    (`blocked` / `upvoted_but_ignored` / `traction_then_abandoned` / `hung`; healthy issues
+    are omitted). Each entry carries `state`, `age_days`, `reactions`, `blocked_by`, and a
+    ready `signals` list — group by `state` (blocked → upvoted_but_ignored →
+    traction_then_abandoned → hung) and render the signals; no agent-side classifying.
+  - **Top blockers** — `bundle["blockers"]` ranks issues by `blocks_count` (how many they
+    block, highest first) — the ones to unblock first. Embed the `diagrams.blocker_graph`
+    Mermaid flowchart (blocker → blocked) when present.
+  - **Stalled trains** — deep trains whose `train.effort.stalled` is true (train-level,
+    distinct from the issue-level flow); report the train + `effort.elapsed_days`
+    (longest-stalled first), citing the train's root issue / PR url.
   - **Frame as flow signals, not blame.** The public digest NEVER attributes a stall or
     blocker to a person — per-person stall/blocker attribution is the gated internal
-    appendix (below), off by default. Omit the whole section when there is no
-    stalled / blocked / pile-up data.
+    appendix (below), off by default. Omit the whole section when `flow`/`blockers` are
+    empty and there are no stalled trains.
 - Phase 11 **Contributors & community** (public) — who moved the project this period,
   rendered from the **deterministic** `people` profile + `halls.fame`, each contributor
   CITED to their work:

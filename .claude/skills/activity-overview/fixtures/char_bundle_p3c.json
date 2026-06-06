@@ -1,5 +1,6 @@
 {
   "artifacts": {},
+  "blockers": [],
   "buckets": {
     "in_flight": [],
     "next_candidates": [],
@@ -57,6 +58,7 @@
   },
   "commits": [],
   "feature_deltas": [],
+  "flow": [],
   "forecast": {
     "candidates": [],
     "next_milestone": null

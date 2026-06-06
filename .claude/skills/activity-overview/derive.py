@@ -627,3 +627,112 @@ def build_halls(bundle):
     fame.sort(key=lambda e: (-e["score"], e["login"]))
     bundle["halls"] = {"fame": fame[:10]}
     return bundle
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 slice 2: flow pathology classifier + blockers in-degree
+# ---------------------------------------------------------------------------
+
+FLOW_STALE_DAYS = 30
+FLOW_UPVOTE_MIN = 5
+FLOW_TRACTION_MIN = 5
+FLOW_HUNG_DAYS = 60
+
+
+def build_flow(bundle):
+    """Classify each OPEN issue into ONE flow pathology; emit only non-healthy.
+
+    Read-side projection (sibling of forecast/modules). For each `state=="open"`
+    issue, classify in precedence order (first match wins): `blocked` >
+    `upvoted_but_ignored` > `traction_then_abandoned` > `hung` > healthy
+    (healthy is NOT emitted, to stay lean). Staleness/age use `meta.ref_date`
+    (fallback `meta.to`). Issues with an OPEN linked PR (via PR `closes`/
+    `crossref_issues`) are exempt from the activity-starved pathologies
+    (upvoted/traction/hung) — there IS work in flight. Deterministic; sorted by
+    number. Pure (sets `bundle["flow"]`); returns bundle."""
+    meta = bundle.get("meta") or {}
+    ref = _iso_date(meta.get("ref_date") or meta.get("to"))
+
+    # open issues with at least one open (unmerged) linked PR -> work in flight.
+    open_pr_issues = set()
+    for pr in bundle.get("prs", []):
+        if pr.get("state") == "open" and not pr.get("merged"):
+            for num in (pr.get("closes") or []) + (pr.get("crossref_issues") or []):
+                open_pr_issues.add(num)
+
+    entries = []
+    for issue in bundle.get("issues", []):
+        if issue.get("state") != "open":
+            continue
+        has_open_pr = issue.get("number") in open_pr_issues
+        created = _iso_date(issue.get("created_at"))
+        age_days = (ref - created).days if (ref and created) else None
+        updated = _iso_date(issue.get("updated_at"))
+        stale_days = (ref - updated).days if (ref and updated) else None
+        stale = stale_days is not None and stale_days >= FLOW_STALE_DAYS
+        reactions = issue.get("reactions") or {}
+        upvotes = reactions.get("+1", 0)
+        reactions_total = reactions.get("total", 0)
+        blocked_by = issue.get("blocked_by") or []
+        comments = len(issue.get("comments_list") or [])
+
+        if blocked_by:
+            pathology = "blocked"
+        elif upvotes >= FLOW_UPVOTE_MIN and stale and not has_open_pr:
+            pathology = "upvoted_but_ignored"
+        elif comments >= FLOW_TRACTION_MIN and stale and not has_open_pr:
+            pathology = "traction_then_abandoned"
+        elif age_days is not None and age_days >= FLOW_HUNG_DAYS and not has_open_pr:
+            pathology = "hung"
+        else:
+            continue  # healthy -> not emitted
+
+        signals = []
+        if blocked_by:
+            signals.append(f"blocked by {len(blocked_by)} issue(s)")
+        if reactions_total > 0:
+            signals.append(f"{reactions_total} reactions")
+        if stale:
+            signals.append(f"stale {stale_days}d")
+        if comments > 0:
+            signals.append(f"{comments} comments")
+        if age_days is not None:
+            signals.append(f"open {age_days}d")
+
+        entries.append({
+            "number": issue.get("number"),
+            "url": issue.get("url"),
+            "state": pathology,
+            "age_days": age_days,
+            "reactions": reactions_total,
+            "blocked_by": blocked_by,
+            "signals": signals,
+        })
+
+    bundle["flow"] = sorted(entries, key=lambda e: e["number"])
+    return bundle
+
+
+def build_blockers(bundle):
+    """Rank issues by how many other issues each one blocks (`blocks_count`).
+
+    `issue["blocking"]` lists the issues this one blocks (the blocker→blocked
+    direction set by `extract._attach_blocks`), so this ranks by that out-degree —
+    the issues to unblock first. For each issue with a non-empty `blocking` list,
+    emit `{number, url, blocks_count, blocks}` where `blocks` is the sorted unique
+    set it blocks. Sorted by `blocks_count` desc then number. Empty when no
+    blocking. Pure (sets `bundle["blockers"]`); returns bundle."""
+    entries = []
+    for issue in bundle.get("issues", []):
+        blocking = issue.get("blocking") or []
+        if not blocking:
+            continue
+        blocks = sorted(set(blocking))
+        entries.append({
+            "number": issue.get("number"),
+            "url": issue.get("url"),
+            "blocks_count": len(blocks),
+            "blocks": blocks,
+        })
+    bundle["blockers"] = sorted(entries, key=lambda e: (-e["blocks_count"], e["number"]))
+    return bundle

@@ -71,7 +71,7 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 
 ## Reserved (empty in Phase 1)
 
-`timeline, artifacts, feature_deltas, flow, blockers, code_owners,
+`timeline, artifacts, feature_deltas, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, workflows, releases, milestones,
 docsRefs, release_train, sprints, project, diagrams`.
 
@@ -287,4 +287,27 @@ data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
   commits_authored`, keeps `score > 0`, sorts by `(-score, login)`, takes the top
   10 (else `[]`). **`halls.internal`/`shame`/`blame` are intentionally NOT built**
   — per the "recognition, not blame" stance.
-- `flow` and `blockers` remain reserved (slice 2).
+- **flow** `[ { number, url, state, age_days, reactions, blocked_by:[num],
+  signals:[str] } ]` (`build_flow`) — one entry per OPEN issue classified into a
+  non-healthy **pathology** (healthy issues are omitted to stay lean). `state` is
+  the pathology, in precedence order (first match wins):
+  - `blocked` — `blocked_by` non-empty.
+  - `upvoted_but_ignored` — `+1` reactions `≥ FLOW_UPVOTE_MIN` (5) AND stale
+    (`updated_at` `≥ FLOW_STALE_DAYS` = 30 days before `ref_date`) AND no open
+    linked PR.
+  - `traction_then_abandoned` — `≥ FLOW_TRACTION_MIN` (5) comments AND stale AND
+    no open linked PR.
+  - `hung` — `age_days ≥ FLOW_HUNG_DAYS` (60) AND no open linked PR.
+  An issue with an OPEN (unmerged) linked PR (via PR `closes`/`crossref_issues`)
+  is exempt from the activity-starved pathologies (work is in flight). `age_days`
+  is `null` when the issue has no `created_at`. `signals` is a human-readable
+  list (`"blocked by N issue(s)"`, `"N reactions"`, `"stale Nd"`, `"N comments"`,
+  `"open Nd"`), each included only when relevant. `age_days`/staleness use
+  `meta.ref_date` (fallback `meta.to`). Sorted by `number`. Empty `[]` when all
+  open issues are healthy.
+- **blockers** `[ { number, url, blocks_count, blocks:[num] } ]`
+  (`build_blockers`) — issues ranked by **how many other issues each one blocks**
+  (`blocks_count`, i.e. out-degree in the blocker→blocked graph established by
+  `extract._attach_blocks`, read off `issue["blocking"]`). One entry per issue with
+  a non-empty `blocking` list; `blocks` is the sorted unique set it blocks. Sorted
+  by `blocks_count` desc then `number`. Empty `[]` when nothing blocks.

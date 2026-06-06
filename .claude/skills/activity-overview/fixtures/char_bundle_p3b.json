@@ -54,6 +54,7 @@
       "status": "removed"
     }
   },
+  "blockers": [],
   "buckets": {
     "in_flight": [],
     "next_candidates": [
@@ -201,6 +202,7 @@
       "url": "https://github.com/o/r/commit/c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
     }
   ],
+  "flow": [],
   "forecast": {
     "candidates": [
       {
