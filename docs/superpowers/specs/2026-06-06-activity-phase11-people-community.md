@@ -1,7 +1,8 @@
 # activity-overview — Phase 11: people & community + flow/stall report views
 
 **Date:** 2026-06-06
-**Status:** in progress.
+**Status:** slice 1 shipped (#31); slice 2 (this PR) adds the Contributors & community
+section and the gated shame/blame appendix.
 **Depends on:** the data model already in the store — `people` (P5 schema / P6 gather /
 P8 spotlight, extract-materialized), the `stalled` train flag + `effort` (Phase 4a),
 `open_high_activity` on issues (Phase 3a), and the `blocks` issue→issue edges (Phase 9
@@ -67,12 +68,11 @@ diagram emitters). Bounded (cap edges with an overflow note).
 
 ## Slices (TDD)
 
-1. **Flow data + blocker_graph + the "Stalled, blocked & pile-ups" section.** Surface
-   resolved `blocking`/`blocked_by` onto issues in `extract` (omit-when-empty, raw
-   `blocks` untouched); `emit_blocker_graph` (render);
-   SKILL.md + `report-template.md` section over stalled trains / blocked issues /
-   pile-ups. Goldens stay byte-identical; `validate` green.
-2. **"Contributors & community" section + gated shame/blame appendix.** SKILL.md +
+1. **Flow data + blocker_graph + the "Stalled, blocked & pile-ups" section (shipped, #31).**
+   Surface resolved `blocking`/`blocked_by` onto issues in `extract` (omit-when-empty, raw
+   `blocks` untouched); `emit_blocker_graph` (render); SKILL.md + `report-template.md`
+   section over stalled trains / blocked issues / pile-ups. Goldens byte-identical.
+2. **"Contributors & community" section + gated shame/blame appendix (this slice).** SKILL.md +
    `report-template.md` over `people` + `contributor_graph`; the appendix behind an
    explicit internal opt-in, OFF by default.
 
