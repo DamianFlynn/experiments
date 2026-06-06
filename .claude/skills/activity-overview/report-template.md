@@ -281,3 +281,39 @@ template → heuristic.
 ```mermaid
 {contents of diagrams.kind_breakdown}
 ```
+
+## Contributors & community
+
+Who moved the project this period (public — recognition, not blame). Rank contributors
+by a footprint counted from the bundle: PRs authored (`prs[].author`), PRs reviewed
+(`prs[].reviewers`), commits authored (`commits[].author`); most-active first. Show each
+person's areas from `people[login].modules`. Omit the whole section when there is no
+`people` data.
+
+| Contributor | Authored | Reviewed | Commits | Areas |
+|-------------|----------|----------|---------|-------|
+| `{login}` | {authored} | {reviewed} | {commits} | {", ".join(people[login].modules)} |
+
+<!-- Automation: list `people[login]` where `is_bot` is true under this subhead, so the
+     human view above isn't skewed by dependabot/CI bots. -->
+
+**Automation:** {", ".join(bot logins)}
+
+The people ↔ code-area relationships:
+
+```mermaid
+{contents of diagrams.contributor_graph}
+```
+
+## Internal appendix — stall & blocker attribution
+
+<!-- GATED: render this section ONLY when the operator explicitly requests an *internal*
+     report (e.g. the request says "internal" / "with attribution"). The DEFAULT public
+     digest OMITS this section entirely. It attributes the flow signals (from the
+     "Stalled, blocked & pile-ups" section) to people, using existing bundle data only —
+     stalled trains → effort.participants/reviewers + the owning PR/issue authors;
+     blocked issues → the blocker/blocked issue authors. Factual association, never
+     judgmental. Each line cites its url. -->
+
+- {login} — associated with stalled train `{train.id}` ({effort.elapsed_days}d) / blocked
+  issue #{number} ([link]({url}))

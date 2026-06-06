@@ -225,5 +225,28 @@ claim in the report resolves to a source ref — never invent facts.
     cited.
   - **Frame as flow signals, not blame.** The public digest NEVER attributes a stall or
     blocker to a person — per-person stall/blocker attribution is the gated internal
-    appendix (slice 2), off by default. Omit the whole section when there is no
+    appendix (below), off by default. Omit the whole section when there is no
     stalled / blocked / pile-up data.
+- Phase 11 **Contributors & community** (public) — who moved the project this period,
+  rendered from `people` + the bundle's `prs`/`commits`, each contributor CITED to their
+  work:
+  - **Footprint ranking:** rank contributors by a footprint counted from the bundle — PRs
+    authored (`prs[].author`), PRs reviewed (`prs[].reviewers`), commits authored
+    (`commits[].author`) — most-active first, and show their `people[login].modules`/
+    `areas`. (The same agent-side counting the executive summary already does over the
+    bundle; the underlying contribution facts are the deterministic `people`/`prs`/
+    `commits` data.)
+  - **Humans vs automation:** `people[login].is_bot` tags bots — list them under a
+    separate "Automation" subhead so the human contributor view isn't skewed by
+    dependabot/CI.
+  - Embed `diagrams.contributor_graph` (the people ↔ code-area relationships) here.
+  - **Recognition, not blame.** This section names who contributed and where; it NEVER
+    attributes stalls/blockers. Omit when there is no `people` data.
+- Phase 11 **Internal appendix — stall & blocker attribution (GATED; off by default).**
+  Render this ONLY when the operator explicitly requests an *internal* report (the
+  request says e.g. "internal" / "with attribution"); the DEFAULT public digest NEVER
+  includes it. It attributes the flow signals to people from existing bundle data —
+  stalled trains → their `effort.participants` / reviewers + the owning PR/issue authors;
+  blocked issues → the blocker/blocked issue authors — each line cited. Keep it factual
+  (who is associated with a stalled/blocked item), never judgmental. When not explicitly
+  opted in, omit the appendix entirely.
