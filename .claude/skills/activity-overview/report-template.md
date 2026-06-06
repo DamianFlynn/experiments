@@ -102,9 +102,27 @@ For each workflow in `workflow_stats`: total runs and success/failure split.
 
 ## In flight
 
-For each ref in `buckets.in_flight`: title, number, link, and train id if present.
+For each ref in `buckets.in_flight`: title, number, link, train id if present, and its
+Projects v2 **board status** (`board_status`) when present (Phase 12).
 
-- [{title}]({url}) (#{number}){ — train `{train}`}
+- [{title}]({url}) (#{number}){ — train `{train}`}{ — _{board_status}_}
+
+<!-- Board status breakdown (Phase 12): when any item carries `board_status`, add a
+     one-line count by status. Omit when no board is linked (no item has board_status). -->
+
+**Board status:** {Todo N · In Progress N · In Review N · Blocked N · Done N — from the
+in-flight items' `board_status`}
+
+## Sprints
+
+<!-- Phase 12 — ONLY when `bundle["sprints"]` is non-empty (an iteration board). Most
+     boards are status-only (no iterations) -> OMIT this whole section. Resolve via
+     `link.select_sprints(bundle["sprints"], ref_date)`; per sprint, list the items whose
+     `iteration` == that sprint id. -->
+
+- **Current sprint:** {current.title} ({current.start} → {current.end}) — {N items: shipped/in-flight}
+- **Previous:** {previous.title} — {what shipped}
+- **Next:** {next.title} — {committed items}
 
 ## Rejected / abandoned
 

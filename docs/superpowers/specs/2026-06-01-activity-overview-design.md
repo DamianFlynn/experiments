@@ -1273,9 +1273,14 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   the `contributor_graph`/`blocker_graph`/`kind_breakdown` diagrams, and the internal
   shame/blame appendix **gated off by default** (slice 2). Spec:
   `docs/superpowers/specs/2026-06-06-activity-phase11-people-community.md`.
-- **Phase 12 — Projects v2 + sprint framing (original P6).** *Acquire:* GraphQL board →
-  structure nodes + `in_iteration`/`in_milestone` edges. *Link:* iteration/status resolution.
-  *Report:* previous/current/next sprint + release-train framing, board status on in-flight.
+- **Phase 12 — Projects v2 + sprint framing (original P6) — shipped (#34 + slice 2).**
+  gather's first GraphQL call auto-discovers the repo's board → `board_status` on PRs/issues
+  + `sprint-<id>` structure nodes + `in_iteration` edges when the board has an iteration
+  field (mirrors `in_milestone`); `link.select_sprints` resolves previous/current/next; the
+  report frames **board status** (status on in-flight + breakdown, universal) and **sprints**
+  (release-train framing, only on iteration boards). Verified live on Azure/bicep #115 (a
+  status-only board: 799 items with statuses, no sprints). Spec:
+  `docs/superpowers/specs/2026-06-06-activity-phase12-projects-sprints.md`.
 - **Phase 13 — series continuity (original P7; mostly absorbed by the store).** Cross-window
   state is now a wide range query, so this phase ships the **"Since last installment"** report
   section + the forecast-loop (predicted-vs-landed) and carry-over (`first_seen`/`carried_over`/
