@@ -250,3 +250,26 @@ claim in the report resolves to a source ref — never invent facts.
   blocked issues → the blocker/blocked issue authors — each line cited. Keep it factual
   (who is associated with a stalled/blocked item), never judgmental. When not explicitly
   opted in, omit the appendix entirely.
+- **Module biography (on-demand, via `spotlight module`).** For a *module-centric* view —
+  how one module/area has **evolved over time** (parameter/symbol CRUD across ALL gathered
+  history, not one window) — produce a grounded biography. This is a narrator pass (the
+  skill's job, mirroring Phase 4b), not pipeline prose:
+  1. **Get the slice:** `python3 spotlight.py module <area> --store <db> --project <name>
+     --json` emits a bounded, full-history `slice_module` envelope: `time_range`, `symbols`
+     / `files` each with a `lifecycle` of `{event, date, commit, pr?, before?, after?,
+     diff?}` (rename chains folded), and the `trains` that touched the area. Read-only.
+  2. **Narrate from ONLY that slice** → a grounded object
+     `{summary, surface_changes, notable_revisions, removed, evidence:[ref]}`:
+     - `summary`: 1–2 sentences — what this module is and how its surface has moved.
+     - `surface_changes`: the **parameter/symbol CRUD** — read "param/output/resource X
+       added → default/type changed → removed" straight off each symbol's `lifecycle` +
+       `before`/`after`/`diff`. Group by symbol; note the driving `pr` per change.
+     - `notable_revisions`: the handful of changes that actually shifted the contract
+       (new required input, a default flip, a breaking rename via the folded chain).
+     - `removed`: symbols whose last lifecycle event is `remove` (dropped surface).
+     - `evidence`: commit/PR/issue refs **copied verbatim from the slice** backing the
+       above; every claim traces to one.
+  3. **Verify + render.** Drop any evidence ref not present in the slice. Render the
+     **Module biography** report section (below) — prose `summary` + the surface-change
+     timeline, each line cited. Stays grounded in the slice's sourced facts (the
+     deterministic CRUD); the prose is the model's judgment over it.

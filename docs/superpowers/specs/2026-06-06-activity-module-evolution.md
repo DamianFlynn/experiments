@@ -1,9 +1,10 @@
 # activity-overview — Module evolution (the "module biography")
 
 **Date:** 2026-06-06
-**Status:** v1 slice 1 **shipped (#30)** (`slice_module` + `spotlight module <area>`);
-slice 2 (skill-side biography narrator + report section) pending; v2 (structured IaC
-param·output·variable extractor → API-surface changelog) is a good-to-have, future.
+**Status:** v1 **shipped** — slice 1 (#30, `slice_module` + `spotlight module <area>`)
+and slice 2 (this PR, skill-side biography narrator + Module biography report section);
+v2 (structured IaC param·output·variable extractor → API-surface changelog) is a
+good-to-have, future.
 **Depends on:** the durable journey-graph store; the artifact lifecycle ledger
 (`code_events`, now carrying `hunk`/`before`/`after` — Phase 10 + the in-slice diffs
 enhancement #28/#29); `area_index` (path→area); the Phase 10 narrator pattern.
@@ -81,7 +82,7 @@ with prose on top. Bigger (new gather capability + schema), sequenced separately
    `spotlight.py module <area>` subcommand that emits the bounded slice JSON (and a
    markdown render). Connected-component rename folding; bounded; deterministic.
    Verified on real AVM data.
-2. **Biography narrator + report (pending).** The narrator is the **skill's (agent's)
+2. **Biography narrator + report (this PR).** The narrator is the **skill's (agent's)
    job, never pipeline code** — a `SKILL.md` protocol (mirroring Phase 4b) where the
    lead reads a `slice_module` slice and emits a grounded, sourced narrative
    (`{summary, surface_changes, notable_revisions, removed, evidence:[ref]}`, every ref
