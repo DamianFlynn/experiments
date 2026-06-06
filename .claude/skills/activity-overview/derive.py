@@ -440,3 +440,190 @@ def link_symbol_identity(bundle):
             linked.append({**m, "from": src, "to": dst})
     bundle["symbol_moves"] = {"links": linked, "by_confidence": summary}
     return bundle
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 slice 1: people profile + recognition halls
+# ---------------------------------------------------------------------------
+
+import datetime as _dt
+import statistics as _stats
+
+_REMOVED_STATUSES = {"removed", "dropped", "replaced"}
+
+
+def _iso_date(ts):
+    """Parse the leading "YYYY-MM-DD" of an ISO timestamp to a date, or None.
+    Guards both unparseable strings and non-string inputs. Pure."""
+    try:
+        return _dt.date.fromisoformat((ts or "")[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def annotate_people_profile(bundle):
+    """Enrich each `bundle["people"][login]` in place with window-derived metrics.
+
+    Keeps the existing `modules`/`areas`/`is_bot` keys and MERGES the profile
+    fields (counts always present as ints; merge_rate/review_latency_days/
+    first_seen/last_active present as null when N/A). Deterministic; reads only
+    bundle facts (prs/commits/issues/artifacts/code_owners/trains). Pure (in
+    place); returns bundle for convenience."""
+    people = bundle.get("people") or {}
+    if not people:
+        return bundle
+    prs = bundle.get("prs", [])
+    commits = bundle.get("commits", [])
+    issues = bundle.get("issues", [])
+    artifacts = bundle.get("artifacts", {})
+    code_owners = bundle.get("code_owners", {})
+    trains = bundle.get("trains", [])
+
+    # Single pass per collection (O(P+N), not O(P*N)): accumulate per-login counters
+    # / dates / review-latencies keyed by login, then assign. Only logins already in
+    # `people` (the participant enumeration) are tracked — every author/reviewer/
+    # commenter/commit-author is in there, so nobody is missed.
+    acc = {login: {"prs_authored": 0, "prs_merged": 0, "prs_reviewed": 0,
+                   "commits_authored": 0, "issues_opened": 0,
+                   "examples_authored": 0, "docs_authored": 0,
+                   "symbols_authored": 0, "authored_then_removed": 0,
+                   "latencies": [], "dates": []}
+           for login in people}
+
+    def add_date(login, ts):
+        if login in acc:
+            d = _iso_date(ts)
+            if d:
+                acc[login]["dates"].append(d)
+
+    for pr in prs:
+        author = pr.get("author")
+        if author in acc:
+            acc[author]["prs_authored"] += 1
+            if pr.get("merged"):
+                acc[author]["prs_merged"] += 1
+            add_date(author, pr.get("created_at"))
+        if pr.get("merged") and pr.get("merged_by") in acc:
+            # the merge is the merger's activity (an author's own merge is counted
+            # only when they merged it themselves, i.e. merged_by == author).
+            add_date(pr.get("merged_by"), pr.get("merged_at"))
+        created = _iso_date(pr.get("created_at"))
+        reviews = pr.get("reviews") or []
+        for rv in pr.get("reviewers") or []:
+            if rv not in acc:
+                continue
+            acc[rv]["prs_reviewed"] += 1
+            own = sorted((r for r in reviews
+                          if r.get("author") == rv and r.get("submitted_at")),
+                         key=lambda r: r["submitted_at"])
+            if own:
+                sub = _iso_date(own[0].get("submitted_at"))
+                if sub:
+                    acc[rv]["dates"].append(sub)
+                    if created and (sub - created).days >= 0:
+                        acc[rv]["latencies"].append((sub - created).days)
+        # comment activity (PR conversation + review comments) counts toward
+        # first_seen/last_active so a commenter isn't under-reported.
+        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
+            add_date(c.get("author"), c.get("created_at"))
+
+    for c in commits:
+        au = c.get("author")
+        if au in acc:
+            acc[au]["commits_authored"] += 1
+            add_date(au, c.get("date"))
+
+    for iss in issues:
+        au = iss.get("author")
+        if au in acc:
+            acc[au]["issues_opened"] += 1
+            add_date(au, iss.get("created_at"))
+        for c in iss.get("comments_list") or []:
+            add_date(c.get("author"), c.get("created_at"))
+
+    # artifacts: each distinct artifact with an "add" event by a login counts toward
+    # that login's authored-by-kind tally (+ authored_then_removed when removed).
+    for art in artifacts.values():
+        kind = art.get("kind")
+        removed = art.get("status") in _REMOVED_STATUSES
+        adders = {ev.get("author") for ev in (art.get("lifecycle") or [])
+                  if ev.get("event") == "add"}
+        for login in adders:
+            if login not in acc:
+                continue
+            if kind == "example":
+                acc[login]["examples_authored"] += 1
+            elif kind in ("doc", "readme"):
+                acc[login]["docs_authored"] += 1
+            elif kind == "symbol":
+                acc[login]["symbols_authored"] += 1
+            if removed:
+                acc[login]["authored_then_removed"] += 1
+
+    # stale_owned: owned code_owners prefixes that contain a stalled train.
+    stalled_areas = []
+    for t in trains:
+        if (t.get("effort") or {}).get("stalled"):
+            stalled_areas.extend(t.get("code_areas") or [])
+
+    def _stale_owned(login):
+        return sum(1 for prefix, owners in code_owners.items()
+                   if login in (owners or [])
+                   and any(a.startswith(prefix) for a in stalled_areas))
+
+    for login, profile in people.items():
+        a = acc[login]
+        prs_authored = a["prs_authored"]
+        dates = a["dates"]
+        profile.update({
+            "prs_authored": prs_authored,
+            "prs_merged": a["prs_merged"],
+            "merge_rate": (round(a["prs_merged"] / prs_authored, 3)
+                           if prs_authored else None),
+            "prs_reviewed": a["prs_reviewed"],
+            "commits_authored": a["commits_authored"],
+            "issues_opened": a["issues_opened"],
+            "review_latency_days": (round(_stats.median(a["latencies"]), 1)
+                                    if a["latencies"] else None),
+            "first_seen": min(dates).isoformat() if dates else None,
+            "last_active": max(dates).isoformat() if dates else None,
+            "examples_authored": a["examples_authored"],
+            "docs_authored": a["docs_authored"],
+            "symbols_authored": a["symbols_authored"],
+            "authored_then_removed": a["authored_then_removed"],
+            "stale_owned": _stale_owned(login),
+        })
+
+    return bundle
+
+
+def build_halls(bundle):
+    """Build `bundle["halls"] = {"fame": [...]}` — recognition only.
+
+    Run AFTER annotate_people_profile (reads its counts). For each NON-bot login,
+    score = prs_merged*2 + prs_reviewed + commits_authored; keep score>0, sort by
+    (-score, login), take top 10. `halls.internal`/`shame`/`blame` are
+    intentionally NOT built (recognition, not blame). Pure (sets halls); returns
+    bundle."""
+    people = bundle.get("people") or {}
+    fame = []
+    for login, profile in people.items():
+        if profile.get("is_bot"):
+            continue
+        prs_merged = profile.get("prs_merged", 0)
+        prs_reviewed = profile.get("prs_reviewed", 0)
+        commits_authored = profile.get("commits_authored", 0)
+        score = prs_merged * 2 + prs_reviewed + commits_authored
+        if score <= 0:
+            continue
+        fame.append({
+            "login": login,
+            "score": score,
+            "prs_merged": prs_merged,
+            "prs_reviewed": prs_reviewed,
+            "commits_authored": commits_authored,
+            "areas": profile.get("areas", []),
+        })
+    fame.sort(key=lambda e: (-e["score"], e["login"]))
+    bundle["halls"] = {"fame": fame[:10]}
+    return bundle

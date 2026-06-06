@@ -90,6 +90,9 @@
     ],
     "next_milestone": "v1.3.0"
   },
+  "halls": {
+    "fame": []
+  },
   "issues": [
     {
       "closed_at": "2026-05-10T12:00:00Z",

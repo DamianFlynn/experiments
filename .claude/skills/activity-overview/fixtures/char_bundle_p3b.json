@@ -220,6 +220,40 @@
     ],
     "next_milestone": "v1.3.0"
   },
+  "halls": {
+    "fame": [
+      {
+        "areas": [
+          "avm/res/network/firewall-policy"
+        ],
+        "commits_authored": 1,
+        "login": "alice",
+        "prs_merged": 1,
+        "prs_reviewed": 0,
+        "score": 3
+      },
+      {
+        "areas": [
+          "avm/res/network/firewall-policy"
+        ],
+        "commits_authored": 0,
+        "login": "carol",
+        "prs_merged": 0,
+        "prs_reviewed": 1,
+        "score": 1
+      },
+      {
+        "areas": [
+          "docs"
+        ],
+        "commits_authored": 1,
+        "login": "dave",
+        "prs_merged": 0,
+        "prs_reviewed": 0,
+        "score": 1
+      }
+    ]
+  },
   "issues": [
     {
       "closed_at": "2026-05-10T12:00:00Z",
@@ -333,28 +367,70 @@
       "areas": [
         "avm/res/network/firewall-policy"
       ],
+      "authored_then_removed": 1,
+      "commits_authored": 1,
+      "docs_authored": 1,
+      "examples_authored": 1,
+      "first_seen": null,
       "is_bot": false,
+      "issues_opened": 0,
+      "last_active": null,
+      "merge_rate": 1.0,
       "modules": [
         "avm/res/network/firewall-policy"
-      ]
+      ],
+      "prs_authored": 1,
+      "prs_merged": 1,
+      "prs_reviewed": 0,
+      "review_latency_days": null,
+      "stale_owned": 0,
+      "symbols_authored": 0
     },
     "carol": {
       "areas": [
         "avm/res/network/firewall-policy"
       ],
+      "authored_then_removed": 0,
+      "commits_authored": 0,
+      "docs_authored": 0,
+      "examples_authored": 0,
+      "first_seen": null,
       "is_bot": false,
+      "issues_opened": 0,
+      "last_active": null,
+      "merge_rate": null,
       "modules": [
         "avm/res/network/firewall-policy"
-      ]
+      ],
+      "prs_authored": 0,
+      "prs_merged": 0,
+      "prs_reviewed": 1,
+      "review_latency_days": null,
+      "stale_owned": 0,
+      "symbols_authored": 0
     },
     "dave": {
       "areas": [
         "docs"
       ],
+      "authored_then_removed": 0,
+      "commits_authored": 1,
+      "docs_authored": 0,
+      "examples_authored": 0,
+      "first_seen": null,
       "is_bot": false,
+      "issues_opened": 0,
+      "last_active": null,
+      "merge_rate": null,
       "modules": [
         "docs"
-      ]
+      ],
+      "prs_authored": 0,
+      "prs_merged": 0,
+      "prs_reviewed": 0,
+      "review_latency_days": null,
+      "stale_owned": 0,
+      "symbols_authored": 0
     }
   },
   "prs": [

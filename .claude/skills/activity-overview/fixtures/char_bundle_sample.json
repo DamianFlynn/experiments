@@ -42,6 +42,9 @@
     "candidates": [],
     "next_milestone": null
   },
+  "halls": {
+    "fame": []
+  },
   "issues": [
     {
       "kind": "feature",

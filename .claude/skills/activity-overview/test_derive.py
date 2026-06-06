@@ -253,5 +253,218 @@ class ReviewRoundsAndReopenCount(unittest.TestCase):
         self.assertNotIn("reopen_count", bundle["issues"][2])
 
 
+class TestPeopleProfile(unittest.TestCase):
+    def _people(self):
+        return {
+            "alice": {"modules": [], "areas": ["avm/res/network"], "is_bot": False},
+            "bob": {"modules": [], "areas": ["avm/res/storage"], "is_bot": False},
+            "ci[bot]": {"modules": [], "areas": [], "is_bot": True},
+        }
+
+    def test_counts_and_merge_rate(self):
+        bundle = {
+            "people": self._people(),
+            "prs": [
+                {"number": 1, "author": "alice", "merged": True,
+                 "created_at": "2026-01-01", "merged_at": "2026-01-02",
+                 "merged_by": "bob", "reviewers": ["bob"], "reviews": []},
+                {"number": 2, "author": "alice", "merged": False,
+                 "created_at": "2026-01-03", "reviewers": []},
+            ],
+            "commits": [
+                {"sha": "c1", "author": "alice", "date": "2026-01-01"},
+                {"sha": "c2", "author": "alice", "date": "2026-01-02"},
+            ],
+            "issues": [{"number": 9, "author": "alice", "created_at": "2026-01-04"}],
+        }
+        derive.annotate_people_profile(bundle)
+        a = bundle["people"]["alice"]
+        self.assertEqual(a["prs_authored"], 2)
+        self.assertEqual(a["prs_merged"], 1)
+        self.assertEqual(a["merge_rate"], 0.5)
+        self.assertEqual(a["commits_authored"], 2)
+        self.assertEqual(a["issues_opened"], 1)
+        # bob reviewed PR 1, merged PR 1
+        b = bundle["people"]["bob"]
+        self.assertEqual(b["prs_reviewed"], 1)
+        self.assertEqual(b["prs_authored"], 0)
+        # existing keys preserved
+        self.assertEqual(a["areas"], ["avm/res/network"])
+        self.assertFalse(a["is_bot"])
+
+    def test_merge_rate_none_when_no_authored(self):
+        bundle = {"people": self._people(), "prs": [], "commits": [], "issues": []}
+        derive.annotate_people_profile(bundle)
+        self.assertIsNone(bundle["people"]["alice"]["merge_rate"])
+        self.assertEqual(bundle["people"]["alice"]["prs_authored"], 0)
+
+    def test_review_latency_median(self):
+        # alice reviews two PRs: 2-day and 4-day latency -> median 3.0
+        bundle = {
+            "people": self._people(),
+            "prs": [
+                {"number": 1, "author": "bob", "created_at": "2026-01-01",
+                 "reviewers": ["alice"],
+                 "reviews": [{"author": "alice", "state": "approved",
+                              "submitted_at": "2026-01-03"}]},
+                {"number": 2, "author": "bob", "created_at": "2026-01-01",
+                 "reviewers": ["alice"],
+                 "reviews": [{"author": "alice", "state": "approved",
+                              "submitted_at": "2026-01-05"}]},
+            ],
+            "commits": [], "issues": [],
+        }
+        derive.annotate_people_profile(bundle)
+        self.assertEqual(bundle["people"]["alice"]["review_latency_days"], 3.0)
+
+    def test_review_latency_none_when_no_samples(self):
+        bundle = {
+            "people": self._people(),
+            "prs": [{"number": 1, "author": "bob", "created_at": "2026-01-01",
+                     "reviewers": ["alice"], "reviews": []}],
+            "commits": [], "issues": [],
+        }
+        derive.annotate_people_profile(bundle)
+        self.assertIsNone(bundle["people"]["alice"]["review_latency_days"])
+        self.assertEqual(bundle["people"]["alice"]["prs_reviewed"], 1)
+
+    def test_first_seen_last_active(self):
+        bundle = {
+            "people": self._people(),
+            "prs": [{"number": 1, "author": "alice", "merged": False,
+                     "created_at": "2026-03-15", "reviewers": []}],
+            "commits": [{"sha": "c1", "author": "alice", "date": "2026-01-05"}],
+            "issues": [{"number": 9, "author": "alice",
+                        "created_at": "2026-06-01T12:00:00Z"}],
+        }
+        derive.annotate_people_profile(bundle)
+        a = bundle["people"]["alice"]
+        self.assertEqual(a["first_seen"], "2026-01-05")
+        self.assertEqual(a["last_active"], "2026-06-01")
+
+    def test_first_seen_none_when_no_dates(self):
+        bundle = {"people": self._people(), "prs": [], "commits": [], "issues": []}
+        derive.annotate_people_profile(bundle)
+        self.assertIsNone(bundle["people"]["alice"]["first_seen"])
+        self.assertIsNone(bundle["people"]["alice"]["last_active"])
+
+    def test_comment_timestamps_feed_first_last_active(self):
+        # A login who ONLY commented (PR conversation, PR review comment, or issue
+        # comment) still gets first_seen/last_active from those timestamps.
+        bundle = {
+            "people": self._people(),
+            "prs": [{"number": 1, "author": "alice", "merged": False,
+                     "created_at": "2026-02-01", "reviewers": [],
+                     "comments_list": [{"author": "bob", "created_at": "2026-02-02"}],
+                     "review_comments": [{"author": "bob", "created_at": "2026-02-05"}]}],
+            "issues": [{"number": 9, "author": "alice", "created_at": "2026-02-01",
+                        "comments_list": [{"author": "bob",
+                                           "created_at": "2026-01-20"}]}],
+            "commits": [],
+        }
+        derive.annotate_people_profile(bundle)
+        bob = bundle["people"]["bob"]
+        self.assertEqual(bob["prs_authored"], 0)        # bob only commented
+        self.assertEqual(bob["first_seen"], "2026-01-20")
+        self.assertEqual(bob["last_active"], "2026-02-05")
+
+    def test_authored_by_kind(self):
+        bundle = {
+            "people": self._people(),
+            "prs": [], "commits": [], "issues": [],
+            "artifacts": {
+                "art:examples/e.bicep": {"kind": "example", "status": "live",
+                    "lifecycle": [{"author": "alice", "event": "add"}]},
+                "art:docs/d.md": {"kind": "doc", "status": "live",
+                    "lifecycle": [{"author": "alice", "event": "add"}]},
+                "art:README.md": {"kind": "readme", "status": "live",
+                    "lifecycle": [{"author": "alice", "event": "add"}]},
+                "sym1": {"kind": "symbol", "status": "live",
+                    "lifecycle": [{"author": "alice", "event": "add"}]},
+                # bob added, not alice -> not counted for alice
+                "art:examples/f.bicep": {"kind": "example", "status": "live",
+                    "lifecycle": [{"author": "bob", "event": "add"}]},
+                # alice only CHANGED, not added -> not counted
+                "sym2": {"kind": "symbol", "status": "live",
+                    "lifecycle": [{"author": "alice", "event": "change"}]},
+            },
+        }
+        derive.annotate_people_profile(bundle)
+        a = bundle["people"]["alice"]
+        self.assertEqual(a["examples_authored"], 1)
+        self.assertEqual(a["docs_authored"], 2)  # doc + readme
+        self.assertEqual(a["symbols_authored"], 1)
+        self.assertEqual(bundle["people"]["bob"]["examples_authored"], 1)
+
+    def test_authored_then_removed(self):
+        bundle = {
+            "people": self._people(),
+            "prs": [], "commits": [], "issues": [],
+            "artifacts": {
+                "art:examples/e.bicep": {"kind": "example", "status": "replaced",
+                    "lifecycle": [{"author": "alice", "event": "add"}]},
+                "art:docs/d.md": {"kind": "doc", "status": "removed",
+                    "lifecycle": [{"author": "alice", "event": "add"}]},
+                "art:docs/keep.md": {"kind": "doc", "status": "live",
+                    "lifecycle": [{"author": "alice", "event": "add"}]},
+            },
+        }
+        derive.annotate_people_profile(bundle)
+        self.assertEqual(bundle["people"]["alice"]["authored_then_removed"], 2)
+
+    def test_stale_owned(self):
+        bundle = {
+            "people": self._people(),
+            "prs": [], "commits": [], "issues": [],
+            "code_owners": {
+                "avm/res/network/": ["alice", "bob"],
+                "avm/res/storage/": ["bob"],
+            },
+            "trains": [
+                {"id": "t1", "code_areas": ["avm/res/network/foo"],
+                 "effort": {"stalled": True}},
+                {"id": "t2", "code_areas": ["avm/res/storage/bar"],
+                 "effort": {"stalled": False}},
+            ],
+        }
+        derive.annotate_people_profile(bundle)
+        # alice owns network prefix which has a stalled train
+        self.assertEqual(bundle["people"]["alice"]["stale_owned"], 1)
+        # bob owns network (stalled) + storage (not stalled) -> 1
+        self.assertEqual(bundle["people"]["bob"]["stale_owned"], 1)
+
+    def test_build_halls_ranking_and_bot_exclusion(self):
+        bundle = {"people": {
+            "alice": {"areas": ["avm/res/network"], "is_bot": False,
+                      "prs_merged": 3, "prs_reviewed": 2, "commits_authored": 5},
+            "bob": {"areas": ["avm/res/storage"], "is_bot": False,
+                    "prs_merged": 1, "prs_reviewed": 0, "commits_authored": 1},
+            "ci[bot]": {"areas": [], "is_bot": True,
+                        "prs_merged": 10, "prs_reviewed": 10,
+                        "commits_authored": 10},
+        }}
+        derive.build_halls(bundle)
+        fame = bundle["halls"]["fame"]
+        self.assertEqual([e["login"] for e in fame], ["alice", "bob"])
+        # alice: 3*2 + 2 + 5 = 13
+        self.assertEqual(fame[0]["score"], 13)
+        self.assertEqual(fame[0]["areas"], ["avm/res/network"])
+        # bob: 1*2 + 0 + 1 = 3
+        self.assertEqual(fame[1]["score"], 3)
+        self.assertEqual(fame[1]["prs_merged"], 1)
+        # bot excluded despite top score
+        self.assertNotIn("ci[bot]", [e["login"] for e in fame])
+        # halls.internal/shame/blame intentionally omitted
+        self.assertEqual(set(bundle["halls"]), {"fame"})
+
+    def test_build_halls_empty_when_no_score(self):
+        bundle = {"people": {
+            "alice": {"areas": [], "is_bot": False, "prs_merged": 0,
+                      "prs_reviewed": 0, "commits_authored": 0},
+        }}
+        derive.build_halls(bundle)
+        self.assertEqual(bundle["halls"]["fame"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
