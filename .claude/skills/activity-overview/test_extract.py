@@ -272,6 +272,81 @@ class ExtractSymbolEventsRoundTrip(unittest.TestCase):
             "self-sourced no_drift must pass; details: {}".format(nd["details"]))
 
 
+def _file_diff_bundle():
+    """A small bundle whose FILE-level code_events carry a bounded `hunk` (the
+    Phase 10 slice-diff). No golden carries a patch, so this fixture is crafted
+    inline to exercise the file-diff ledger round-trip."""
+    c1 = "c" * 40
+    hunk = "@@ +1 @@\n-old line\n+new line\n context"
+    return {
+        "meta": {"owner": "o", "repo": "r",
+                 "from": "2026-05-01", "to": "2026-05-31"},
+        "commits": [
+            {"sha": c1, "message": "Edit guide", "pr": None,
+             "author": "Alice", "date": "2026-05-03"},
+        ],
+        "code_events": [
+            # a doc file artifact carrying the bounded diff
+            {"commit": c1, "author": "Alice", "date": "2026-05-03",
+             "change": "modify", "path": "docs/guide.md", "hunk": hunk},
+        ],
+        "symbol_events": [],
+        "prs": [], "issues": [], "milestones": [], "releases": [],
+        "_expected_hunk": hunk,
+    }
+
+
+class ExtractFileDiffRoundTrip(unittest.TestCase):
+    """The bounded file `hunk` rides code_events -> file artifact lifecycle ->
+    ledger -> extract -> re-derived artifact. RED before the fix (hunk dropped on
+    fold/extract), GREEN after. Mirrors ExtractSymbolEventsRoundTrip."""
+
+    def setUp(self):
+        self.bundle = _file_diff_bundle()
+        self.hunk = self.bundle.pop("_expected_hunk")
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, copy.deepcopy(self.bundle))
+        m = self.bundle["meta"]
+        self.extracted = extract.extract(
+            self.conn, m["owner"], m["repo"], m["from"], m["to"],
+            warn=lambda _m: None)
+
+    def test_ledger_persists_hunk_on_file_event(self):
+        rows = graphstore.repo_code_events(self.conn, "o", "r")
+        # file-level rows are `<project>/<repo>#<path>` (one `#`); symbol rows have
+        # a second `#`. Restrict to file rows via extract's local-id stripper.
+        file_rows = [r for r in rows
+                     if "#" not in extract._full_local(r["artifact_id"], "o", "r")]
+        self.assertTrue(file_rows)
+        self.assertEqual(file_rows[0]["hunk"], self.hunk)
+
+    def test_extract_carries_hunk_back_onto_code_events(self):
+        ce = [e for e in self.extracted["code_events"]
+              if e["path"] == "docs/guide.md"]
+        self.assertEqual(len(ce), 1)
+        self.assertEqual(ce[0]["hunk"], self.hunk)
+
+    def test_build_artifacts_reproduces_file_lifecycle_hunk(self):
+        want = derive.build_artifacts(self.bundle)
+        got = derive.build_artifacts(self.extracted)
+        aid = next(a for a in want if want[a]["path"] == "docs/guide.md")
+        self.assertEqual(want[aid]["lifecycle"][0].get("hunk"), self.hunk)
+        self.assertEqual(got[aid]["lifecycle"][0].get("hunk"), self.hunk)
+
+    def test_feature_deltas_surface_diff(self):
+        enriched = link.enrich(copy.deepcopy(self.extracted))
+        fd = [d for d in enriched["feature_deltas"]
+              if d.get("name") == "guide.md"]
+        self.assertTrue(fd)
+        self.assertEqual(fd[0].get("diff"), self.hunk)
+
+    def test_self_sourced_no_drift_passes(self):
+        report = validate.validate(self.conn)
+        nd = [c for c in report.checks if c["name"] == "no_drift"][0]
+        self.assertTrue(nd["ok"], nd["details"])
+
+
 class ExtractArtifactsKeyNoCollision(unittest.TestCase):
     """Regression (Copilot review on #13): extract keyed bundle["artifacts"] via
     `_local` (parse_id rpartitions the LAST `#`), truncating a symbol artifact's

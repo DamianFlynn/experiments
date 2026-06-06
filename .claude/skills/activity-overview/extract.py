@@ -423,6 +423,11 @@ def _materialize_code_events(conn, project, repo):
         }
         if ev["event"] in ("rename", "copy") and ev["detail"]:
             rec["old_path"] = ev["detail"]
+        # Phase 10 slice-diffs: carry the bounded file diff back onto the
+        # reconstructed code_event so a re-derived build_artifacts reproduces the same
+        # lifecycle (and feature_deltas `diff`). Omit-when-empty for byte stability.
+        if ev["hunk"]:
+            rec["hunk"] = ev["hunk"]
         out.append(rec)
     return out
 

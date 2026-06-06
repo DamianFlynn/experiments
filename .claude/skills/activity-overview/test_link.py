@@ -879,6 +879,34 @@ class TestSymbolArtifacts(unittest.TestCase):
         self.assertEqual(vault["after"], "name: 'new'")
         self.assertEqual(vault["detail"], "bicep resource vault")
 
+    def test_file_level_delta_surfaces_diff_symbol_delta_does_not(self):
+        # Phase 10 slice-diffs: file-level deltas carry `diff` (the bounded hunk);
+        # symbol/comment deltas keep before/after and get NO `diff`. Omit-when-empty:
+        # a file event without a hunk leaves the key absent.
+        hunk = "@@ +1 @@\n-old\n+new"
+        b = {"meta": {"owner": "o", "repo": "r"}, "commits": [], "prs": [],
+             "issues": [], "trains": [],
+             "code_events": [
+                 {"path": "docs/guide.md", "change": "modify", "commit": "a" * 40,
+                  "author": "A", "date": "2026-05-03", "hunk": hunk},
+                 {"path": "README.md", "change": "add", "commit": "a" * 40,
+                  "author": "A", "date": "2026-05-03"},  # no hunk
+             ],
+             "symbol_events": [
+                 {"commit": "a" * 40, "author": "A", "date": "2026-05-03",
+                  "path": "m.bicep", "lang": "bicep", "subkind": "param",
+                  "name": "p", "change": "add", "before": None,
+                  "after": "param p string"}]}
+        b["artifacts"] = derive.build_artifacts(b)
+        deltas = link.compute_feature_deltas(b)
+        guide = next(d for d in deltas if d["name"] == "guide.md")
+        self.assertEqual(guide["diff"], hunk)
+        readme = next(d for d in deltas if d["name"] == "README.md")
+        self.assertNotIn("diff", readme)  # omit-when-empty
+        sym = next(d for d in deltas if d["name"] == "p")
+        self.assertNotIn("diff", sym)  # symbol deltas keep before/after only
+        self.assertEqual(sym["after"], "param p string")
+
     def test_symbol_artifacts_get_code_area(self):
         b = self._bundle()
         b["code_graph"] = {"areas": [{"id": "avm/res/foo",

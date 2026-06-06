@@ -788,6 +788,80 @@ def build_symbol_deltas(path, hunks):
     return sorted(deltas, key=lambda d: (str(d["subkind"]), str(d["name"]), d["change"]))
 
 
+# Per-file diff cap (Phase 10 slice-diffs). A bounded unified-diff snippet rides the
+# stored ledger so the slice is self-contained for EVERY language (not just graphify
+# ones) — deliberately small (the slice is a bounded context unit, not a patch
+# archive). Whichever of chars/lines is hit first truncates; mirrors _cap_snippet's
+# "keep it small" style.
+FILE_DIFF_CAP = 800
+FILE_DIFF_LINE_CAP = 30
+
+
+def bounded_file_diff(hunks, cap=FILE_DIFF_CAP, line_cap=FILE_DIFF_LINE_CAP):
+    """Render a file's parsed `hunks` as a bounded unified-diff snippet. Pure.
+
+    Emits an `@@ +<new_start> @@` marker per hunk followed by its sign-prefixed
+    lines (`+`/`-`/` `), capped to `cap` chars OR `line_cap` lines (whichever is hit
+    first). When truncated, appends a `…[+N lines]` marker counting the dropped diff
+    lines (hunk markers are not counted). Returns None when there are no hunks (or no
+    lines) so the field is omit-when-empty for byte-stability."""
+    if not hunks:
+        return None
+    # Flatten into the ordered output lines: a marker per hunk, then its body lines.
+    out, total_body, kept_body = [], 0, 0
+    for hunk in hunks:
+        out.append(("@@", "@@ +{} @@".format(hunk.get("new_start", 0))))
+        for sign, text in hunk["lines"]:
+            total_body += 1
+            out.append((sign, sign + text))
+    if total_body == 0:
+        return None
+    rendered, used = [], 0
+    for kind, line in out:
+        if kind != "@@":
+            # Stop before exceeding either cap; +1 accounts for the joining newline.
+            projected = used + len(line) + (1 if rendered else 0)
+            if kept_body >= line_cap or (rendered and projected > cap):
+                break
+            kept_body += 1
+        rendered.append(line)
+        used += len(line) + (1 if len(rendered) > 1 else 0)
+    # Drop a trailing hunk marker with no body lines under it (cap hit right after it).
+    while rendered and rendered[-1].startswith("@@"):
+        rendered.pop()
+    if not rendered:
+        return None
+    dropped = total_body - kept_body
+    if dropped > 0:
+        rendered.append("…[+{} lines]".format(dropped))
+    return "\n".join(rendered)
+
+
+def parse_file_diffs(raw):
+    """Parse `git log -p` output into per-(commit, path) bounded file diffs. Pure.
+
+    Mirrors parse_symbol_events' chunk/parse_unified_diff loop, but emits ONE bounded
+    unified-diff snippet per changed file (every language, not just symbol_lang ones):
+    `[{commit, path, hunk}]`. Files whose hunks render empty are omitted. Merge commits
+    (no patch) yield nothing. Keyed by the NEW path (rename target)."""
+    out = []
+    for chunk in (raw or "").split(RECORD_SEP):
+        if not chunk.strip():
+            continue
+        lines = chunk.split("\n")
+        fields = lines[0].split(FIELD_SEP)
+        if len(fields) < 5:
+            continue
+        sha = fields[0].strip()
+        body = "\n".join(lines[1:])
+        for f in parse_unified_diff(body):
+            path = f["path"] or f["old_path"]
+            diff = bounded_file_diff(f["hunks"])
+            if path and diff:
+                out.append({"commit": sha, "path": path, "hunk": diff})
+    return out
+
+
 def parse_symbol_events(raw):
     """Parse `git log -p` output into symbol-level change events. Pure.
 
@@ -1999,6 +2073,22 @@ def acquire(args, env):
             "-p", "--unified=3", "-M", "-C",
         ])
         symbol_events = window_records(parse_symbol_events(raw_patch), frm, to)
+        # Phase 10 slice-diffs: a bounded, language-agnostic unified-diff hunk per
+        # changed (commit, path) from the SAME `git log -p` walk (no extra git/
+        # network). Attach it onto the matching file-level code_event so it rides
+        # code_events -> file artifact -> feature_deltas and persists in the ledger.
+        # Omit-when-empty (only set the key when a hunk exists) for byte-stability.
+        diff_by_key = {(d["commit"], d["path"]): d["hunk"]
+                       for d in parse_file_diffs(raw_patch)}
+        if diff_by_key:
+            for ev in code_events:
+                hunk = diff_by_key.get((ev.get("commit"), ev.get("path")))
+                # rename/copy: the patch keys by the NEW path (ev["path"]); fall back
+                # to old_path for the rare case the diff names only the source.
+                if hunk is None and ev.get("old_path"):
+                    hunk = diff_by_key.get((ev.get("commit"), ev.get("old_path")))
+                if hunk:
+                    ev["hunk"] = hunk
 
     # Drop any shallow-boundary commit whose diff is a whole-tree phantom (its parent
     # was grafted away by the bounded clone) — guards both walks against inflation.
@@ -2629,7 +2719,7 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             continue
         events.append((
             qid(path), ev.get("change"), ev.get("commit"), ev.get("author"),
-            ev.get("date"), None, None, None, None, ev.get("old_path"),
+            ev.get("date"), ev.get("hunk"), None, None, None, ev.get("old_path"),
         ))
 
     # code: artifact substrate (Phase 7b-1 step 2). Derive the per-artifact

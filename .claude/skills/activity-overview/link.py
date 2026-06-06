@@ -168,7 +168,7 @@ def compute_feature_deltas(bundle):
             is_symbol = art["kind"] in ("symbol", "comment")
             detail = (f'{art.get("lang", "")} {art.get("subkind", "")} '
                       f'{art["name"]}').strip() if is_symbol else None
-            deltas.append({
+            delta = {
                 "area": None,
                 "kind": kind,
                 "subject": art["kind"],
@@ -182,7 +182,13 @@ def compute_feature_deltas(bundle):
                 "pr": pr,
                 "commit": ev["commit"],
                 "url": ev["ref"]["url"],
-            })
+            }
+            # Phase 10 slice-diffs: surface the bounded file diff on FILE-level deltas
+            # (the language-agnostic "what changed"); symbol/comment deltas keep their
+            # before/after unchanged. Omit-when-empty for byte stability.
+            if not is_symbol and ev.get("hunk"):
+                delta["diff"] = ev["hunk"]
+            deltas.append(delta)
     return deltas
 
 

@@ -85,12 +85,19 @@ def build_artifacts(bundle):
         return aid
 
     def append_event(aid, event, ev):
-        artifacts[aid]["lifecycle"].append({
+        entry = {
             "event": event, "commit": ev["commit"], "author": ev["author"],
             "date": ev["date"],
             "ref": {"type": "commit", "id": ev["commit"],
                     "url": _commit_url(bundle, ev["commit"])},
-        })
+        }
+        # Phase 10 slice-diffs: carry the bounded file diff onto the file artifact's
+        # lifecycle entry so it lives on the STORED artifact (durable in the graph).
+        # Omit-when-empty: synthetic/no-patch bundles carry no `hunk`, so the key is
+        # absent and the goldens stay byte-identical.
+        if ev.get("hunk"):
+            entry["hunk"] = ev["hunk"]
+        artifacts[aid]["lifecycle"].append(entry)
 
     for ev in bundle.get("code_events", []):
         change = ev["change"]

@@ -55,6 +55,20 @@ class BuildArtifacts(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(derive.build_artifacts({"code_events": []}), {})
 
+    def test_file_lifecycle_carries_hunk_when_present(self):
+        # Phase 10 slice-diffs: a code_event's bounded `hunk` rides onto the file
+        # artifact's lifecycle entry (omit-when-empty otherwise).
+        hunk = "@@ +1 @@\n-old\n+new"
+        bundle = {"code_events": [
+            {"path": "docs/x.md", "change": "modify", "commit": "c1",
+             "author": "a", "date": "2026-01-01", "hunk": hunk},
+            {"path": "README.md", "change": "add", "commit": "c2",
+             "author": "a", "date": "2026-01-02"},  # no hunk -> key absent
+        ]}
+        arts = derive.build_artifacts(bundle)
+        self.assertEqual(arts["art:docs/x.md"]["lifecycle"][0]["hunk"], hunk)
+        self.assertNotIn("hunk", arts["art:README.md"]["lifecycle"][0])
+
 
 class AreaIndexAndAttribution(unittest.TestCase):
     def test_area_index_and_lookup(self):
