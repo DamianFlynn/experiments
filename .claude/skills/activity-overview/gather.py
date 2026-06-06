@@ -1781,8 +1781,10 @@ def resolve_token(env):
 
 
 def run_git(args, cwd=None, timeout=None):
-    """Thin wrapper around git (not unit-tested). Surfaces git's own stderr
-    on failure so errors like "not a git repository" reach the user. An optional
+    """Thin wrapper around git. Its live git interaction is integration-only,
+    but the non-UTF-8 decode path below is covered by TestRunGitDecoding.
+    Surfaces git's own stderr on failure so errors like "not a git repository"
+    reach the user. An optional
     `timeout` (seconds) bounds the call — used by the IaC edge build so a hung
     `bicep`/`terraform` cannot stall the run (TimeoutExpired propagates).
 
