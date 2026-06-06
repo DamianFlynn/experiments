@@ -1,7 +1,7 @@
 # activity-overview — Phase 10 enhancement: language-agnostic in-slice file diffs
 
 **Date:** 2026-06-06
-**Status:** slice 1 shipped (#28); slice 2 in progress.
+**Status:** shipped — slice 1 (#28), slice 2 (#29).
 **Depends on:** Phase 10 slices 1–3 (#24–#26) shipped to master.
 
 ## Goal

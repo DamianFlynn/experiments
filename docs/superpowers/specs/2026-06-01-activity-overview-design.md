@@ -1254,9 +1254,15 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   `git show` diff handle); the report's deep-train effort line surfaces the review-rounds/reopen
   texture. **Verified end-to-end against real AVM data** (Azure/terraform-azurerm-avm-res-network-
   virtualnetwork: review-round arcs + reopen counts persisted, slice carries the decision thread).
-  **Future enhancement (sequenced separately):** language-agnostic bounded unified-diff capture in
-  the gather code-walk, so `.tf`/`.bicep` *logic* changes carry their real `before`/`after` in-slice
-  (today only graphify symbols + comments do).
+  **In-slice diffs enhancement — shipped (#28–#29):** a bounded, language-agnostic
+  unified-diff hunk per changed file is captured in the gather code-walk (the existing
+  `code_events.hunk` column), surfaced as `feature_deltas[].diff`, and bounded per train
+  in `slice_train` — so `.tf`/`.bicep` *logic* changes carry their real diff in-slice
+  (durable in the graph; no clone needed at narration time). Spec:
+  `docs/superpowers/specs/2026-06-06-activity-phase10-slice-diffs.md`. **Follow-on —
+  module evolution ("module biography"):** a store-backed `slice_module` over an area's
+  full artifact lifecycle (CRUD + diffs across all history) → a grounded module-evolution
+  narrative; spec: `docs/superpowers/specs/2026-06-06-activity-module-evolution.md`.
 - **Phase 11 — people & community + flow/stall report views (original-P5 report half).** The
   data model + aggregation now live in P5 (schema) / P6 (gather) / P8 (spotlight); this phase
   ships the **report sections** over them: **Contributors & community** (public) and **Stalled,

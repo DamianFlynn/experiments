@@ -1134,5 +1134,426 @@ class TestMemberDependents(unittest.TestCase):
         self.assertEqual(res["dependents"], [])  # member never in its own radius
 
 
+def _module_store(conn):
+    """Seed a store directly for slice_module: a `codegraph` singleton defining
+    one area (`avm/res/net/fw`, paths covering two files), file + symbol artifact
+    `code` nodes (one symbol renamed across paths), multi-event `code_events`
+    lifecycles (add->change->remove with hunk + before/after), commits part_of
+    PRs (so events attribute to a PR), and an `area-` node touched by the trains.
+    One artifact lives OUTSIDE the area to verify area filtering."""
+    P, R = "acme", "r1"
+    qid = lambda local: graphstore.qualify_id(P, R, local)
+    fetched = "2026-01-01T00:00:00Z"
+
+    # paths under the area
+    main_bicep = "avm/res/net/fw/main.bicep"
+    readme = "avm/res/net/fw/README.md"
+    old_bicep = "avm/res/net/fw/old.bicep"   # renamed -> main.bicep symbol
+    outside = "avm/res/other/main.bicep"     # NOT in the area
+
+    code_graph = {
+        "provider": "directory",
+        "areas": [
+            {"id": "avm/res/net/fw", "label": "fw",
+             "paths": [main_bicep, readme, old_bicep], "edges": []},
+            {"id": "avm/res/other", "label": "other",
+             "paths": [outside], "edges": []},
+        ],
+    }
+
+    # symbol artifact ids
+    sym_main = "{}#bicep:resource:fw".format(main_bicep)   # rename target
+    sym_old = "{}#bicep:resource:fw".format(old_bicep)     # rename source
+    sym_out = "{}#bicep:resource:fw".format(outside)       # outside the area
+    file_readme = "art:{}".format(readme)
+
+    nodes = [
+        (qid("codegraph"), P, R, "structure", None, code_graph, fetched),
+        (qid("area-avm/res/net/fw"), P, R, "structure", None,
+         {"id": "avm/res/net/fw", "paths": [main_bicep, readme, old_bicep]},
+         fetched),
+        # artifact code nodes (data carries path/kind/subkind/name/status)
+        (qid(sym_old), P, R, "code", "2026-01-20T00:00:00Z",
+         {"kind": "symbol", "path": old_bicep, "name": "fw",
+          "subkind": "resource", "lang": "bicep", "status": "replaced"}, fetched),
+        (qid(sym_main), P, R, "code", "2026-01-25T00:00:00Z",
+         {"kind": "symbol", "path": main_bicep, "name": "fw",
+          "subkind": "resource", "lang": "bicep", "status": "removed"}, fetched),
+        (qid(file_readme), P, R, "code", "2026-01-10T00:00:00Z",
+         {"kind": "doc", "path": readme, "name": "README.md",
+          "status": "live"}, fetched),
+        (qid(sym_out), P, R, "code", "2026-01-12T00:00:00Z",
+         {"kind": "symbol", "path": outside, "name": "fw",
+          "subkind": "resource", "lang": "bicep", "status": "live"}, fetched),
+        # commits (part_of PRs) and the PRs/issue forming the trains
+        (qid("sha1"), P, R, "code", "2026-01-05T00:00:00Z",
+         {"sha": "sha1", "author": "alice"}, fetched),
+        (qid("sha2"), P, R, "code", "2026-01-20T00:00:00Z",
+         {"sha": "sha2", "author": "bob"}, fetched),
+        (qid("pr-1"), P, R, "social", "2026-01-08T00:00:00Z",
+         {"number": 1, "title": "add fw", "state": "closed", "merged": True,
+          "url": "https://github.com/acme/r1/pull/1"}, fetched),
+        (qid("pr-2"), P, R, "social", "2026-01-22T00:00:00Z",
+         {"number": 2, "title": "move fw", "state": "closed", "merged": True,
+          "url": "https://github.com/acme/r1/pull/2"}, fetched),
+    ]
+    graphstore.upsert_nodes(conn, nodes)
+
+    edges = [
+        # rename chain: old replaced_by main; main identity_from old
+        (qid(sym_old), qid(sym_main), "replaced_by", None,
+         {"move_confidence": "high", "move_basis": "unique-name"}),
+        (qid(sym_main), qid(sym_old), "identity_from", None,
+         {"move_confidence": "high", "move_basis": "unique-name"}),
+        # commits part_of PRs (the commit->PR attribution map)
+        (qid("sha1"), qid("pr-1"), "part_of", None, None),
+        (qid("sha2"), qid("pr-2"), "part_of", None, None),
+        # commits touch the area -> the trains that touched it
+        (qid("sha1"), qid("area-avm/res/net/fw"), "touches", None, None),
+        (qid("sha2"), qid("area-avm/res/net/fw"), "touches", None, None),
+    ]
+    graphstore.upsert_edges(conn, edges)
+
+    # code_events lifecycles. README: add->change (file diff hunks). old.bicep
+    # symbol: add->change then removed on the rename; main.bicep symbol:
+    # add (rename target) -> remove. Outside symbol: add (must be excluded).
+    H = lambda n: "@@ hunk {} @@\n+line\n".format(n)
+    rows = [
+        # file artifact README lifecycle (bare path id, file diff hunk)
+        (qid(readme), "add", "sha1", "alice", "2026-01-05T00:00:00Z",
+         H("readme-add"), {"type": "commit", "id": "sha1"}, None, None, None),
+        (qid(readme), "change", "sha2", "bob", "2026-01-20T00:00:00Z",
+         H("readme-change"), {"type": "commit", "id": "sha2"}, None, None, None),
+        # old.bicep symbol: add then change then remove (rename out)
+        (qid(sym_old), "add", "sha1", "alice", "2026-01-05T00:00:00Z",
+         None, {"type": "commit", "id": "sha1"}, None, "resource fw v1", None),
+        (qid(sym_old), "change", "sha1", "alice", "2026-01-06T00:00:00Z",
+         None, {"type": "commit", "id": "sha1"}, "resource fw v1",
+         "resource fw v2", None),
+        (qid(sym_old), "remove", "sha2", "bob", "2026-01-20T00:00:00Z",
+         None, {"type": "commit", "id": "sha2"}, "resource fw v2", None, None),
+        # main.bicep symbol (rename target): add then later remove
+        (qid(sym_main), "add", "sha2", "bob", "2026-01-20T00:00:00Z",
+         None, {"type": "commit", "id": "sha2"}, None, "resource fw v2", None),
+        (qid(sym_main), "remove", "sha2", "bob", "2026-01-25T00:00:00Z",
+         None, {"type": "commit", "id": "sha2"}, "resource fw v2", None, None),
+        # outside the area — must not appear
+        (qid(sym_out), "add", "sha1", "alice", "2026-01-12T00:00:00Z",
+         None, {"type": "commit", "id": "sha1"}, None, "resource fw out", None),
+    ]
+    graphstore.add_code_events(conn, rows)
+
+
+class TestSliceModule(unittest.TestCase):
+    P = "acme"
+    AREA = "avm/res/net/fw"
+
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        _module_store(self.conn)
+        self.qid = lambda local: graphstore.qualify_id("acme", "r1", local)
+
+    def _slice(self, **kw):
+        return spotlight.slice_module(self.conn, self.P, self.AREA, **kw)
+
+    def test_envelope(self):
+        res = self._slice()
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["query"], "module")
+        self.assertEqual(res["focus"], self.AREA)
+        self.assertEqual(res["focus_kind"], "module")
+        self.assertEqual(res["project"], self.P)
+        self.assertEqual(res["scope"], "all-history")
+        for key in ("symbols", "files", "trains", "time_range", "repos"):
+            self.assertIn(key, res)
+
+    def test_area_resolution_filters_artifacts(self):
+        res = self._slice()
+        sym_ids = {s["id"] for s in res["symbols"]}
+        file_paths = {f["path"] for f in res["files"]}
+        # in-area symbol (folded rename chain -> one entry) + README file
+        self.assertIn(self.qid("avm/res/net/fw/main.bicep#bicep:resource:fw"),
+                      sym_ids)
+        self.assertIn("avm/res/net/fw/README.md", file_paths)
+        # the OUTSIDE symbol must be excluded
+        self.assertNotIn(self.qid("avm/res/other/main.bicep#bicep:resource:fw"),
+                         sym_ids)
+
+    def test_symbol_lifecycle_full_history_ordered_with_diff(self):
+        res = self._slice()
+        sym = [s for s in res["symbols"]
+               if s["id"].endswith("main.bicep#bicep:resource:fw")][0]
+        # rename chain folds: old.bicep's add/change/remove + main.bicep's
+        # add/remove all read as ONE symbol history, ordered by (date, commit)
+        dates = [r["date"] for r in sym["lifecycle"]]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual([r["event"] for r in sym["lifecycle"]],
+                         ["add", "change", "add", "remove", "remove"])
+        # before/after carried on symbol rows (omitted when None)
+        self.assertNotIn("before", sym["lifecycle"][0])  # add: before is None
+        self.assertEqual(sym["lifecycle"][0]["after"], "resource fw v1")
+        self.assertEqual(sym["lifecycle"][1]["before"], "resource fw v1")
+        # commit present on every row
+        for r in sym["lifecycle"]:
+            self.assertIn("commit", r)
+
+    def test_file_lifecycle_carries_diff_hunk(self):
+        res = self._slice()
+        readme = [f for f in res["files"]
+                  if f["path"].endswith("README.md")][0]
+        events = [r["event"] for r in readme["lifecycle"]]
+        self.assertEqual(events, ["add", "change"])
+        # the file diff (hunk) is the key detail on each file lifecycle row
+        self.assertIn("readme-add", readme["lifecycle"][0]["diff"])
+        self.assertIn("readme-change", readme["lifecycle"][1]["diff"])
+
+    def test_pr_attribution(self):
+        res = self._slice()
+        readme = [f for f in res["files"]
+                  if f["path"].endswith("README.md")][0]
+        # sha1 is part_of pr-1, sha2 part_of pr-2
+        prs = {r["pr"] for r in readme["lifecycle"]}
+        self.assertIn(self.qid("pr-1"), prs)
+        self.assertIn(self.qid("pr-2"), prs)
+
+    def test_trains_touching_area(self):
+        res = self._slice()
+        anchors = {t["anchor"] for t in res["trains"]}
+        self.assertIn(self.qid("pr-1"), anchors)
+        self.assertIn(self.qid("pr-2"), anchors)
+
+    def test_time_range(self):
+        res = self._slice()
+        self.assertEqual(res["time_range"]["first"], "2026-01-05T00:00:00Z")
+        self.assertEqual(res["time_range"]["last"], "2026-01-25T00:00:00Z")
+
+    def test_bounding_text_caps(self):
+        # craft a fresh store with one oversize hunk + before/after
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        P, R = "acme", "r1"
+        qid = lambda local: graphstore.qualify_id(P, R, local)
+        path = "avm/res/net/fw/big.md"
+        cg = {"areas": [{"id": "avm/res/net/fw", "paths": [path]}]}
+        graphstore.upsert_nodes(conn, [
+            (qid("codegraph"), P, R, "structure", None, cg, None),
+            (qid("art:" + path), P, R, "code", "2026-01-01T00:00:00Z",
+             {"kind": "doc", "path": path, "status": "live"}, None),
+        ])
+        big = "x" * 5000
+        graphstore.add_code_events(conn, [
+            (qid(path), "add", "s1", "a", "2026-01-01T00:00:00Z", big,
+             {"type": "commit", "id": "s1"}, big, big, None),
+        ])
+        res = spotlight.slice_module(conn, P, "avm/res/net/fw")
+        row = res["files"][0]["lifecycle"][0]
+        # capped to the text budget + a short overflow marker (not the full 5000)
+        self.assertLess(len(row["diff"]), spotlight._SLICE_TEXT_CAP + 40)
+        self.assertIn("chars]", row["diff"])
+        self.assertTrue(row["before"].startswith("x" * spotlight._SLICE_TEXT_CAP))
+
+    def test_bounding_lifecycle_and_artifact_caps(self):
+        # many events on one artifact -> capped with overflow count
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        P, R = "acme", "r1"
+        qid = lambda local: graphstore.qualify_id(P, R, local)
+        path = "avm/res/net/fw/many.md"
+        cg = {"areas": [{"id": "avm/res/net/fw", "paths": [path]}]}
+        graphstore.upsert_nodes(conn, [
+            (qid("codegraph"), P, R, "structure", None, cg, None),
+            (qid("art:" + path), P, R, "code", "2026-01-01T00:00:00Z",
+             {"kind": "doc", "path": path, "status": "live"}, None),
+        ])
+        n = spotlight._MODULE_LIFECYCLE_CAP + 5
+        rows = [
+            (qid(path), "change", "s{:03d}".format(i), "a",
+             "2026-01-{:02d}T00:00:00Z".format((i % 27) + 1), None,
+             {"type": "commit", "id": "s{:03d}".format(i)}, None, None, None)
+            for i in range(n)
+        ]
+        graphstore.add_code_events(conn, rows)
+        res = spotlight.slice_module(conn, P, "avm/res/net/fw")
+        f = res["files"][0]
+        self.assertEqual(len(f["lifecycle"]), spotlight._MODULE_LIFECYCLE_CAP)
+        self.assertEqual(f["lifecycle_overflow"], 5)
+
+    def test_artifact_cap_overflow(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        P, R = "acme", "r1"
+        qid = lambda local: graphstore.qualify_id(P, R, local)
+        n = spotlight._MODULE_ARTIFACT_CAP + 3
+        paths = ["avm/res/net/fw/f{:03d}.md".format(i) for i in range(n)]
+        cg = {"areas": [{"id": "avm/res/net/fw", "paths": paths}]}
+        nodes = [(qid("codegraph"), P, R, "structure", None, cg, None)]
+        rows = []
+        for p in paths:
+            nodes.append((qid("art:" + p), P, R, "code",
+                          "2026-01-01T00:00:00Z",
+                          {"kind": "doc", "path": p, "status": "live"}, None))
+            rows.append((qid(p), "add", "s1", "a", "2026-01-01T00:00:00Z",
+                         None, {"type": "commit", "id": "s1"}, None, None, None))
+        graphstore.upsert_nodes(conn, nodes)
+        graphstore.add_code_events(conn, rows)
+        res = spotlight.slice_module(conn, P, "avm/res/net/fw")
+        self.assertEqual(len(res["files"]), spotlight._MODULE_ARTIFACT_CAP)
+        self.assertEqual(res["files_overflow"], 3)
+
+    def test_deterministic(self):
+        a = json.dumps(self._slice(), sort_keys=True)
+        b = json.dumps(self._slice(), sort_keys=True)
+        self.assertEqual(a, b)
+
+    def test_needs_gather_unknown_area(self):
+        res = spotlight.slice_module(self.conn, self.P, "no/such/area")
+        self.assertEqual(res["status"], "needs_gather")
+        self.assertIn("guidance", res)
+
+
+class TestSliceModuleFolding(unittest.TestCase):
+    """Rename folding via connected components — robust to diamonds, cycles, and a
+    chain whose in-area terminal was replaced by an OUT-of-area successor (the cases
+    the old root-only forward walk fragmented)."""
+
+    P, R, AREA = "acme", "r1", "m"
+
+    def _q(self, local):
+        return graphstore.qualify_id(self.P, self.R, local)
+
+    def _store(self, syms, repl_edges, events):
+        """syms: [(path, local)] in-area unless path is outside area `m`;
+        repl_edges: [(src_local, dst_local)] replaced_by; events: [(local, date)]."""
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        f = "2026-01-01T00:00:00Z"
+        in_area_paths = sorted({p for p, _ in syms if p.startswith(self.AREA + "/")})
+        graphstore.upsert_nodes(conn, [
+            (self._q("codegraph"), self.P, self.R, "structure", None,
+             {"areas": [{"id": self.AREA, "name": self.AREA,
+                         "paths": in_area_paths}]}, f)])
+        graphstore.upsert_nodes(conn, [
+            (self._q(local), self.P, self.R, "code", f,
+             {"kind": "symbol", "path": path, "name": local,
+              "subkind": "resource", "lang": "bicep", "status": "live"}, f)
+            for path, local in syms])
+        graphstore.upsert_edges(conn, [
+            (self._q(s), self._q(d), "replaced_by", None, None)
+            for s, d in repl_edges])
+        # unique commit_sha per row — the ledger PK is (artifact_id, commit_sha,
+        # event), so reusing a sha for the same artifact+event would dedupe rows.
+        graphstore.add_code_events(conn, [
+            (self._q(local), "add", "sha{}".format(i), "a", date, None,
+             {"type": "commit", "id": "sha{}".format(i)}, None, "v", None)
+            for i, (local, date) in enumerate(events)])
+        return conn
+
+    def test_diamond_folds_into_one_symbol(self):
+        # A and B both replaced_by C -> ONE folded symbol carrying all three events.
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x"),
+             ("m/b.bicep", "m/b.bicep#bicep:resource:x"),
+             ("m/c.bicep", "m/c.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "m/c.bicep#bicep:resource:x"),
+             ("m/b.bicep#bicep:resource:x", "m/c.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "2026-01-01"),
+             ("m/b.bicep#bicep:resource:x", "2026-01-02"),
+             ("m/c.bicep#bicep:resource:x", "2026-01-03")])
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(len(res["symbols"]), 1)
+        self.assertEqual(len(res["symbols"][0]["lifecycle"]), 3)
+        # representative is the current artifact (the terminal C)
+        self.assertTrue(res["symbols"][0]["id"].endswith("c.bicep#bicep:resource:x"))
+
+    def test_cycle_folds_into_one_symbol(self):
+        # A <-> B mutual replaced_by -> one component, not two fragments, no hang.
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x"),
+             ("m/b.bicep", "m/b.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "m/b.bicep#bicep:resource:x"),
+             ("m/b.bicep#bicep:resource:x", "m/a.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "2026-01-01"),
+             ("m/b.bicep#bicep:resource:x", "2026-01-02")])
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(len(res["symbols"]), 1)
+        self.assertEqual(len(res["symbols"][0]["lifecycle"]), 2)
+
+    def test_in_area_chain_with_out_of_area_terminal_still_folds(self):
+        # A -> B (both in area), B -> OUT (outside area). A+B must fold into ONE
+        # symbol; OUT is excluded. (The old walk left A and B as two fragments.)
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x"),
+             ("m/b.bicep", "m/b.bicep#bicep:resource:x"),
+             ("other/z.bicep", "other/z.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "m/b.bicep#bicep:resource:x"),
+             ("m/b.bicep#bicep:resource:x", "other/z.bicep#bicep:resource:x")],
+            [("m/a.bicep#bicep:resource:x", "2026-01-01"),
+             ("m/b.bicep#bicep:resource:x", "2026-01-02"),
+             ("other/z.bicep#bicep:resource:x", "2026-01-03")])
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(len(res["symbols"]), 1)              # A+B folded
+        self.assertEqual(len(res["symbols"][0]["lifecycle"]), 2)  # OUT excluded
+        self.assertNotIn("other/z.bicep",
+                         res["symbols"][0]["id"])
+
+    def test_time_range_uses_full_history_not_capped_rows(self):
+        # An artifact with > _MODULE_LIFECYCLE_CAP events: time_range.last must be the
+        # TRUE latest date, not the last KEPT (oldest-N) row.
+        n = spotlight._MODULE_LIFECYCLE_CAP + 5
+        events = [("m/a.bicep#bicep:resource:x", "2026-{:02d}-01".format(i + 1))
+                  for i in range(min(n, 12))]
+        # pad beyond the cap with later same-month days to exceed the row cap
+        events += [("m/a.bicep#bicep:resource:x", "2027-01-{:02d}".format(i + 1))
+                   for i in range(n - len(events))]
+        conn = self._store(
+            [("m/a.bicep", "m/a.bicep#bicep:resource:x")], [], events)
+        res = spotlight.slice_module(conn, self.P, self.AREA)
+        self.assertEqual(res["symbols"][0]["lifecycle_overflow"],
+                         n - spotlight._MODULE_LIFECYCLE_CAP)
+        self.assertEqual(res["time_range"]["last"], max(d for _, d in events))
+
+
+class TestSliceModuleCLI(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.store = os.path.join(self.tmp, "journey.db")
+        conn = graphstore.open_store(self.store)
+        graphstore.init_schema(conn)
+        _module_store(conn)
+        conn.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, os.path.join(HERE, "spotlight.py")] + list(args),
+            capture_output=True, text=True)
+
+    def test_cli_json(self):
+        r = self._run("module", "avm/res/net/fw", "--store", self.store,
+                      "--project", "acme", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["query"], "module")
+        self.assertEqual(out["focus"], "avm/res/net/fw")
+        self.assertTrue(out["symbols"])
+        self.assertTrue(out["files"])
+
+    def test_cli_md(self):
+        r = self._run("module", "avm/res/net/fw", "--store", self.store,
+                      "--project", "acme", "--md")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("module", r.stdout)
+
+    def test_cli_in_process_json(self):
+        rc = spotlight.main(["module", "avm/res/net/fw", "--store", self.store,
+                             "--project", "acme", "--json"])
+        self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
