@@ -8,12 +8,17 @@ sibling (pr/issue → `milestone-<n>` structure node) as the pattern to mirror.
 ## Goal
 
 Bring **GitHub Projects v2** (the org/user "board") into the graph so the digest can
-frame work in **sprints/iterations**, not just calendar windows:
-- **Acquire:** a GraphQL fetch of the project board → **sprint (iteration)** structure
-  nodes + `in_iteration` edges (pr/issue → sprint) + each item's board **status**.
-- **Link:** iteration/status resolution — previous / current / next sprint by date.
-- **Report:** a sprint / release-train framing section, and board **status** on the
-  in-flight items.
+frame work by **board status** and, when a board defines them, **sprints/iterations** —
+not just calendar windows. Real boards are commonly **status-only** (e.g. the verified
+target, Azure org #115 "Bicep" — a `Status` single-select, no iteration field), so
+status is the universal layer and iterations are the conditional one:
+- **Acquire:** a GraphQL fetch of the auto-discovered board → each item's board
+  **`status`** (the `Status` single-select), PLUS **sprint (iteration)** structure nodes
+  + `in_iteration` edges (pr/issue → sprint) **when the board has an iteration field**.
+- **Link:** status surfacing; iteration resolution (prev/current/next sprint by date)
+  when sprints exist.
+- **Report:** board **status** on the in-flight items (+ a status breakdown); a sprint /
+  release-train framing section when the board defines iterations.
 
 The substrate is half-built: `in_iteration` (pr/issue → sprint) is already a reserved
 edge type in `validate._EDGE_SCHEMA`, and `bundle["sprints"]` is a reserved key — but
@@ -42,13 +47,18 @@ flag — it rides the existing `--owner/--repo` (and each manifest member). An o
 
 ### Acquire (gather — first GraphQL call)
 - Add a minimal `graphql_post(token, query, variables)` helper (POST `/graphql`,
-  same auth/error-surfacing as `http_get_json`).
-- Query the board's **iteration field** (its `configuration.iterations[]` →
-  `{id, title, startDate, duration}`) and the board **items** → each item's content
-  (issue/PR `number` + repo) + its **iteration** field value + **status** field value.
-- Normalize to: `sprints = {sprint_id: {title, start, end}}` and, per item,
-  `(repo, number) → {sprint_id, status}`. Scope: window-bounded by the iteration dates
-  intersecting `[from, to]` (so a multi-year board doesn't flood the slice).
+  Bearer auth, same error-surfacing as `http_get_json`).
+- Auto-discover the repo's board(s) (`repository.projectsV2`), then per board query:
+  - its **fields** → the `Status` single-select (universal) and, IF present, the
+    `ProjectV2IterationField`'s `configuration.iterations[] = {id, title, startDate,
+    duration}` (boards without one simply yield no sprints);
+  - its **items** (paginated) → each item's content (`Issue`/`PullRequest` `number` +
+    `repository.nameWithOwner`) and `fieldValues`: the
+    `ProjectV2ItemFieldSingleSelectValue` whose `field.name == "Status"` → status, and
+    the `ProjectV2ItemFieldIterationValue` → `{title, iterationId}`.
+- Normalize (pure `parse_project_board`) to: `sprints = {sprint_id: {title, start,
+  end}}` (empty for status-only boards) and, per item, `(repo, number) → {status,
+  sprint_id?}`. Iteration scope is window-bounded by date intersecting `[from, to]`.
 
 ### Store (fold)
 - **Sprint node:** `sprint-<id>` (`structure`), `ts = start`, `data = {title, start, end}`.
@@ -79,11 +89,15 @@ flag — it rides the existing `--owner/--repo` (and each manifest member). An o
 ## Testing & verification (read this)
 - **Offline TDD:** `parse_project_board` + the fold + resolution are pure and tested from
   crafted GraphQL response fixtures (no network) — the same discipline as the rest.
-- **Live verification:** against a real repo whose linked Projects v2 board the operator
-  points to, using a `read:project`-scoped token — confirm auto-discovery finds the board,
-  the iterations/items parse, and the sprint nodes + `in_iteration` edges + `board_status`
-  fold + surface. The fold/parse degrade cleanly to empty when the token lacks scope or the
-  repo links no board (never hard-fail), so the default AVM runs (no board) stay unchanged.
+- **Live verification (status):** gather **`Azure/bicep`** (which links org board #115
+  "Bicep") with the `read:project`-scoped token — confirm auto-discovery finds #115, items
+  parse, and `board_status` folds + surfaces (#115 is a `Status`-only board, so sprints are
+  legitimately empty). Bound the window so the bicep clone/fetch stays tractable.
+- **Iteration path:** tested **offline** from a crafted GraphQL fixture that DOES define an
+  iteration field (no live iteration board is available yet); live confirmation deferred.
+- **Degrade cleanly:** a missing `read:project` scope, no linked board, or a board with no
+  iteration field all yield an empty layer (never hard-fail), so the default AVM runs
+  (no board) stay byte-identical.
 
 ## Not in scope
 - Status automation / writing to the board (read-only).
