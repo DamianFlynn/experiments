@@ -981,7 +981,7 @@ def main(argv=None):
     else:
         sys.stderr.write("usage: link.py BUNDLE.json [--slice TRAIN_ID]\n")
         raise SystemExit(2)
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         bundle = json.load(fh)
     enrich(bundle)
     if slice_id is not None:
@@ -995,7 +995,7 @@ def main(argv=None):
         json.dump(sliced, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return slice_id
-    with open(path, "w") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(bundle, fh, indent=2)
     sys.stderr.write(
         f"linked {len(bundle['trains'])} trains, "

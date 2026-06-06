@@ -2625,15 +2625,17 @@ class TestSliceCLI(unittest.TestCase):
 
     def _write(self):
         fd, path = tempfile.mkstemp(suffix=".json")
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(self._raw(), fh)
+        # self-cleaning even if a later assertion fails.
+        self.addCleanup(os.unlink, path)
         return path
 
     def test_slice_cli_emits_train_slice_json(self):
         train_id = link.enrich(self._raw())["trains"][0]["id"]
         expected = link.slice_train(link.enrich(self._raw()), train_id)
         path = self._write()
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             before = fh.read()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -2644,16 +2646,14 @@ class TestSliceCLI(unittest.TestCase):
         self.assertEqual(got["prs"][0]["review_rounds"]["count"], 1)
         self.assertEqual(got["issue"]["reopen_count"], 1)
         # read-only: the bundle file is NOT rewritten
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), before)
-        os.unlink(path)
 
     def test_slice_cli_unknown_train_exits_2(self):
         path = self._write()
         with self.assertRaises(SystemExit) as cm:
             link.main([path, "--slice", "train-does-not-exist"])
         self.assertEqual(cm.exception.code, 2)
-        os.unlink(path)
 
 
 if __name__ == "__main__":
