@@ -372,7 +372,9 @@ who is contributing, reviewing, blocking, and maintaining — and feature them.
 > **`halls.internal.{shame,blame}` is intentionally NOT built (descoped — recognition only).**
 > The `flow` pathology classifier + `blockers` ranking (below) ship as
 > `derive.build_flow`/`build_blockers`. `internal:bool` per person is not computed (the
-> internal appendix is a prompt-time request, not a stored flag).
+> internal appendix is a prompt-time request, not a stored flag). **The bullets below are
+> the original target model (kept for history) — this note is the as-shipped contract where
+> they differ.**
 
 - **Per-train participants:** each train records `participants: [{ login, role,
   author_association }]` with roles **reporter / author / reviewer / merger / commenter /
@@ -588,10 +590,10 @@ transcript (Analyze input) nor the report prose (Synthesize output).
   > prompt-time request, not a gather flag). Projects v2 is **auto-discovered** — the
   > explicit `--include-projects`/`--project-number`/`--project-owner-type`/`--status-field`/
   > `--iteration-field` flags were replaced by `--project-board` (default on) /
-  > `--no-project-board`, and gather ingests every maintained linked board. `--include-
-  > workflows`/`--include-releases` are still default-on (toggle off with `--no-workflows`/
-  > `--no-releases`). **graphify is now optional** (directory provider is primary). Multi-repo
-  > uses `--manifest` (mutually exclusive with `--owner/--repo`).
+  > `--no-project-board`, and gather ingests every maintained linked board. Workflow and
+  > release collection stay default-on (toggle off with `--no-workflows` / `--no-releases`).
+  > **graphify is now optional** (directory provider is primary). Multi-repo uses
+  > `--manifest` (mutually exclusive with `--owner/--repo`).
 
 - **Clone + local git (the commit/diff layer, network-free after clone):**
   - `git clone --filter=blob:none --shallow-since=<from> --no-single-branch <repo> <clone-dir>`
@@ -994,10 +996,11 @@ index is the cheap through-line, never an override.
   `projects.json`. If none found or `--project` not given, fall back to explicit args.
 - **Distribution:** ships `projects.example.json` (placeholders). User fills a real
   `projects.json` (commit-or-local is their choice).
-- **As-shipped (reconciled).** `projects.json` is an **agent-read** convenience config (no
-  Python parses it); the shipped `projects.example.json` carries the keys that are actually
-  acted on — `owner`/`repo`/`branches`/`clone_dir`/`transcript`. The richer keys above were
-  superseded by the store-native evolution and are NOT separate config anymore:
+- **As-shipped (reconciled — the full schema above is historical/superseded).**
+  `projects.json` is an **agent-read** convenience config (no Python parses it); the shipped
+  `projects.example.json` carries the keys that are actually acted on —
+  `owner`/`repo`/`branches`/`clone_dir`/`transcript`. The richer keys in the schema block
+  above were superseded by the store-native evolution and are NOT separate config anymore:
   `project_v2` → Projects v2 is **auto-discovered** (every maintained linked board), tuned by
   the `ACTIVITY_BOARD_*` env knobs; `label_taxonomy` → **auto-detected** (`detect_label_taxonomy`);
   `internal` → the internal appendix is a **prompt-time request**, not stored config; multi-repo
