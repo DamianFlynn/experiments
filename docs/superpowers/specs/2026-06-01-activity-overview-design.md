@@ -1281,6 +1281,14 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   (release-train framing, only on iteration boards). Verified live on Azure/bicep #115 (a
   status-only board: 799 items with statuses, no sprints). Spec:
   `docs/superpowers/specs/2026-06-06-activity-phase12-projects-sprints.md`.
+  **Follow-up (2026-06-06, this PR):** the smoke tests (Bicep / AVM-Terraform / AVM-Bicep)
+  showed the "lowest-numbered board = primary" heuristic loses coverage on multi-board repos
+  (`bicep-registry-modules` links #115/#538/#566; #115 has 0 BRM items). gather now ingests
+  EVERY *maintained* board (skipping closed/stale via `board_is_maintained`) and merges their
+  items — verified live: BRM's own items went from 0 → 3,063 statuses, still truthful
+  (per-repo `(slug, number)` keying). Spec:
+  `docs/superpowers/specs/2026-06-06-activity-phase12-all-boards.md`. (Also fixed `run_git`
+  to decode non-UTF-8 git output, surfaced gathering Azure/bicep, #37.)
 - **Phase 13 — series continuity (original P7; mostly absorbed by the store).** SHIPPED
   (slice 1, this PR). Cross-window state is now a wide range query, so this phase ships the
   **"Since last installment"** report section + the forecast-loop (predicted-vs-landed) and

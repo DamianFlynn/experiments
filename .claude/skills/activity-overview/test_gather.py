@@ -3586,6 +3586,64 @@ class TestFoldProjectBoard(unittest.TestCase):
             conn, "acme/widget#pr-10", edge_types=["in_iteration"]), [])
 
 
+class TestBoardIsMaintained(unittest.TestCase):
+    """Pure maintenance filter: closed/stale boards are deprecated; others kept."""
+
+    def test_open_recent_board_is_kept(self):
+        self.assertTrue(gather.board_is_maintained(
+            {"closed": False, "updatedAt": "2026-06-01T00:00:00Z"},
+            ref_date="2026-06-06"))
+
+    def test_closed_board_is_dropped(self):
+        self.assertFalse(gather.board_is_maintained(
+            {"closed": True, "updatedAt": "2026-06-06T00:00:00Z"},
+            ref_date="2026-06-06"))
+
+    def test_stale_board_is_dropped(self):
+        self.assertFalse(gather.board_is_maintained(
+            {"closed": False, "updatedAt": "2020-01-01T00:00:00Z"},
+            ref_date="2026-06-06", stale_days=365))
+
+    def test_boundary_exactly_at_cutoff_is_kept(self):
+        # updatedAt exactly stale_days before ref_date is still kept (>= cutoff).
+        self.assertTrue(gather.board_is_maintained(
+            {"closed": False, "updatedAt": "2025-06-06T12:00:00Z"},
+            ref_date="2026-06-06", stale_days=365))
+
+    def test_missing_updatedAt_is_kept(self):
+        self.assertTrue(gather.board_is_maintained(
+            {"closed": False}, ref_date="2026-06-06"))
+
+    def test_unparseable_updatedAt_is_kept(self):
+        # a malformed updatedAt can't prove staleness -> keep (no raw-string compare).
+        self.assertTrue(gather.board_is_maintained(
+            {"closed": False, "updatedAt": "not-a-date"}, ref_date="2026-06-06"))
+
+    def test_board_max_items_env_override(self):
+        import unittest.mock as mock
+        with mock.patch.dict(os.environ, {"ACTIVITY_BOARD_MAX_ITEMS": "42"}):
+            self.assertEqual(gather._board_max_items(), 42)
+        with mock.patch.dict(os.environ, {"ACTIVITY_BOARD_MAX_ITEMS": "oops"}):
+            self.assertEqual(gather._board_max_items(), gather.BOARD_MAX_ITEMS)
+
+    def test_none_ref_date_keeps_board(self):
+        # without a reference point we can't prove staleness -> keep.
+        self.assertTrue(gather.board_is_maintained(
+            {"closed": False, "updatedAt": "2000-01-01T00:00:00Z"}, ref_date=None))
+
+    def test_non_dict_is_dropped(self):
+        self.assertFalse(gather.board_is_maintained(None))
+
+    def test_env_override_threshold(self):
+        import unittest.mock as mock
+        board = {"closed": False, "updatedAt": "2026-05-01T00:00:00Z"}
+        with mock.patch.dict(os.environ, {"ACTIVITY_BOARD_STALE_DAYS": "10"}):
+            # 36 days old > 10-day threshold -> stale.
+            self.assertFalse(gather.board_is_maintained(board, ref_date="2026-06-06"))
+        with mock.patch.dict(os.environ, {"ACTIVITY_BOARD_STALE_DAYS": "60"}):
+            self.assertTrue(gather.board_is_maintained(board, ref_date="2026-06-06"))
+
+
 class TestFetchProjectBoard(unittest.TestCase):
     """The acquire-level board fetch seam: auto-discovery + pagination via an
     injected graphql callable, degrading cleanly on errors / no board."""
@@ -3666,24 +3724,57 @@ class TestFetchProjectBoard(unittest.TestCase):
         self.assertEqual(sprints, {})
         self.assertTrue(len(items) <= 5)  # terminated rather than looping forever
 
-    def test_multiple_boards_ingests_only_primary(self):
-        # a repo linking >1 board ingests only the lowest-numbered (primary) one.
-        def board(num, item_number, status):
-            return {"id": "B%d" % num, "number": num, "title": "b%d" % num,
-                    "fields": {"nodes": []},
-                    "items": {"pageInfo": {"hasNextPage": False, "endCursor": None},
-                              "nodes": [{
-                                  "content": {"__typename": "Issue", "number": item_number,
-                                              "repository": {"nameWithOwner": "acme/widget"}},
-                                  "fieldValues": {"nodes": [
-                                      {"__typename": "ProjectV2ItemFieldSingleSelectValue",
-                                       "name": status, "field": {"name": "Status"}}]}}]}}
+    @staticmethod
+    def _board(num, item_number, status, closed=False, updated=None):
+        return {"id": "B%d" % num, "number": num, "title": "b%d" % num,
+                "closed": closed, "updatedAt": updated,
+                "fields": {"nodes": []},
+                "items": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                          "nodes": [{
+                              "content": {"__typename": "Issue", "number": item_number,
+                                          "repository": {"nameWithOwner": "acme/widget"}},
+                              "fieldValues": {"nodes": [
+                                  {"__typename": "ProjectV2ItemFieldSingleSelectValue",
+                                   "name": status, "field": {"name": "Status"}}]}}]}}
+
+    def test_multiple_boards_ingests_all_maintained(self):
+        # a repo linking >1 (open) board now ingests EVERY maintained board and
+        # merges their items (the coverage fix; was lowest-numbered-only).
         data = {"repository": {"projectsV2": {"nodes": [
-            board(5, 50, "Done"), board(2, 20, "Todo")]}}}  # primary = #2
+            self._board(5, 50, "Done"), self._board(2, 20, "Todo")]}}}
         sprints, items = gather.fetch_project_board(
             lambda q, v=None: copy.deepcopy(data), "acme", "widget")
-        self.assertIn(("acme/widget", 20), items)         # primary board #2
-        self.assertNotIn(("acme/widget", 50), items)      # #5 ignored
+        self.assertEqual(items[("acme/widget", 20)]["status"], "Todo")   # board #2
+        self.assertEqual(items[("acme/widget", 50)]["status"], "Done")   # board #5
+
+    def test_closed_board_is_skipped(self):
+        # a closed (archived) board is dropped; the open one is still ingested.
+        data = {"repository": {"projectsV2": {"nodes": [
+            self._board(2, 20, "Todo", closed=True),
+            self._board(5, 50, "Done")]}}}
+        sprints, items = gather.fetch_project_board(
+            lambda q, v=None: copy.deepcopy(data), "acme", "widget")
+        self.assertNotIn(("acme/widget", 20), items)   # closed -> skipped
+        self.assertIn(("acme/widget", 50), items)
+
+    def test_stale_board_is_skipped(self):
+        # an open but long-untouched board (updatedAt older than the threshold
+        # before ref_date) is dropped; a freshly-updated one is kept.
+        data = {"repository": {"projectsV2": {"nodes": [
+            self._board(2, 20, "Todo", updated="2019-01-01T00:00:00Z"),
+            self._board(5, 50, "Done", updated="2026-06-01T00:00:00Z")]}}}
+        sprints, items = gather.fetch_project_board(
+            lambda q, v=None: copy.deepcopy(data), "acme", "widget",
+            ref_date="2026-06-06", max_items=5000)
+        self.assertNotIn(("acme/widget", 20), items)   # stale -> skipped
+        self.assertIn(("acme/widget", 50), items)
+
+    def test_all_boards_filtered_degrades_empty(self):
+        data = {"repository": {"projectsV2": {"nodes": [
+            self._board(2, 20, "Todo", closed=True)]}}}
+        sprints, items = gather.fetch_project_board(
+            lambda q, v=None: copy.deepcopy(data), "acme", "widget")
+        self.assertEqual((sprints, items), ({}, {}))
 
 
 if __name__ == "__main__":
