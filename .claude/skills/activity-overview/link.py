@@ -12,6 +12,7 @@ import series  # Phase 13: series continuity (installment_snapshot / compute_ser
 # link dependency. They are re-imported here so link's public API and `enrich`
 # are byte-identical to before — `link.enrich` calls the same functions, now
 # resolving to the names imported from derive (one-way: link -> derive).
+import derive
 from derive import (
     ref,
     attribute_code_areas,
@@ -1038,6 +1039,10 @@ def enrich(bundle):
     # facts live here with forecast/modules — NOT in extract (which stays raw).
     annotate_review_rounds(bundle)
     annotate_reopen_count(bundle)
+    # Phase 11 slice 1: people profile + recognition halls (read-side projections
+    # over the materialized bundle; need people/prs/commits/artifacts/trains above).
+    derive.annotate_people_profile(bundle)
+    derive.build_halls(bundle)
     return bundle
 
 

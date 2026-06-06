@@ -440,3 +440,186 @@ def link_symbol_identity(bundle):
             linked.append({**m, "from": src, "to": dst})
     bundle["symbol_moves"] = {"links": linked, "by_confidence": summary}
     return bundle
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 slice 1: people profile + recognition halls
+# ---------------------------------------------------------------------------
+
+import datetime as _dt
+import statistics as _stats
+
+_REMOVED_STATUSES = {"removed", "dropped", "replaced"}
+
+
+def _iso_date(ts):
+    """Parse the leading "YYYY-MM-DD" of an ISO timestamp to a date, or None.
+    Guards both unparseable strings and non-string inputs. Pure."""
+    try:
+        return _dt.date.fromisoformat((ts or "")[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def annotate_people_profile(bundle):
+    """Enrich each `bundle["people"][login]` in place with window-derived metrics.
+
+    Keeps the existing `modules`/`areas`/`is_bot` keys and MERGES the profile
+    fields (counts always present as ints; merge_rate/review_latency_days/
+    first_seen/last_active present as null when N/A). Deterministic; reads only
+    bundle facts (prs/commits/issues/artifacts/code_owners/trains). Pure (in
+    place); returns bundle for convenience."""
+    people = bundle.get("people") or {}
+    prs = bundle.get("prs", [])
+    commits = bundle.get("commits", [])
+    issues = bundle.get("issues", [])
+    artifacts = bundle.get("artifacts", {})
+    code_owners = bundle.get("code_owners", {})
+    trains = bundle.get("trains", [])
+
+    # Pre-compute the set of area-prefixes that contain a stalled train: a prefix
+    # "contains a stalled train" when any stalled train has a code_areas entry that
+    # startswith the raw prefix string.
+    stalled_areas = []
+    for t in trains:
+        if (t.get("effort") or {}).get("stalled"):
+            stalled_areas.extend(t.get("code_areas") or [])
+
+    def _prefix_has_stalled(prefix):
+        return any(area.startswith(prefix) for area in stalled_areas)
+
+    for login, profile in people.items():
+        prs_authored = 0
+        prs_merged = 0
+        prs_reviewed = 0
+        review_latencies = []
+        dates = []
+
+        for pr in prs:
+            if pr.get("author") == login:
+                prs_authored += 1
+                d = _iso_date(pr.get("created_at"))
+                if d:
+                    dates.append(d)
+                if pr.get("merged"):
+                    prs_merged += 1
+            if pr.get("merged_by") == login and pr.get("merged"):
+                d = _iso_date(pr.get("merged_at"))
+                if d:
+                    dates.append(d)
+            if login in (pr.get("reviewers") or []):
+                prs_reviewed += 1
+                # this login's earliest timestamped review on this PR
+                own = [r for r in (pr.get("reviews") or [])
+                       if r.get("author") == login and r.get("submitted_at")]
+                own.sort(key=lambda r: r["submitted_at"])
+                if own:
+                    sub = _iso_date(own[0].get("submitted_at"))
+                    created = _iso_date(pr.get("created_at"))
+                    if sub:
+                        dates.append(sub)
+                    if sub and created:
+                        latency = (sub - created).days
+                        if latency >= 0:
+                            review_latencies.append(latency)
+
+        commits_authored = 0
+        for c in commits:
+            if c.get("author") == login:
+                commits_authored += 1
+                d = _iso_date(c.get("date"))
+                if d:
+                    dates.append(d)
+
+        issues_opened = 0
+        for iss in issues:
+            if iss.get("author") == login:
+                issues_opened += 1
+                d = _iso_date(iss.get("created_at"))
+                if d:
+                    dates.append(d)
+
+        # artifacts authored (distinct, by an "add" lifecycle event by this login),
+        # bucketed by kind; plus authored-then-removed.
+        examples_authored = 0
+        docs_authored = 0
+        symbols_authored = 0
+        authored_then_removed = 0
+        for art in artifacts.values():
+            added = any(ev.get("author") == login and ev.get("event") == "add"
+                        for ev in art.get("lifecycle") or [])
+            if not added:
+                continue
+            kind = art.get("kind")
+            if kind == "example":
+                examples_authored += 1
+            elif kind in ("doc", "readme"):
+                docs_authored += 1
+            elif kind == "symbol":
+                symbols_authored += 1
+            if art.get("status") in _REMOVED_STATUSES:
+                authored_then_removed += 1
+
+        # stale_owned: distinct owned prefixes (code_owners key whose owner list
+        # includes login) that contain a stalled train.
+        stale_owned = 0
+        for prefix, owners in code_owners.items():
+            if login in (owners or []) and _prefix_has_stalled(prefix):
+                stale_owned += 1
+
+        merge_rate = round(prs_merged / prs_authored, 3) if prs_authored else None
+        review_latency_days = (round(_stats.median(review_latencies), 1)
+                               if review_latencies else None)
+        first_seen = min(dates).isoformat() if dates else None
+        last_active = max(dates).isoformat() if dates else None
+
+        profile.update({
+            "prs_authored": prs_authored,
+            "prs_merged": prs_merged,
+            "merge_rate": merge_rate,
+            "prs_reviewed": prs_reviewed,
+            "commits_authored": commits_authored,
+            "issues_opened": issues_opened,
+            "review_latency_days": review_latency_days,
+            "first_seen": first_seen,
+            "last_active": last_active,
+            "examples_authored": examples_authored,
+            "docs_authored": docs_authored,
+            "symbols_authored": symbols_authored,
+            "authored_then_removed": authored_then_removed,
+            "stale_owned": stale_owned,
+        })
+
+    return bundle
+
+
+def build_halls(bundle):
+    """Build `bundle["halls"] = {"fame": [...]}` — recognition only.
+
+    Run AFTER annotate_people_profile (reads its counts). For each NON-bot login,
+    score = prs_merged*2 + prs_reviewed + commits_authored; keep score>0, sort by
+    (-score, login), take top 10. `halls.internal`/`shame`/`blame` are
+    intentionally NOT built (recognition, not blame). Pure (sets halls); returns
+    bundle."""
+    people = bundle.get("people") or {}
+    fame = []
+    for login, profile in people.items():
+        if profile.get("is_bot"):
+            continue
+        prs_merged = profile.get("prs_merged", 0)
+        prs_reviewed = profile.get("prs_reviewed", 0)
+        commits_authored = profile.get("commits_authored", 0)
+        score = prs_merged * 2 + prs_reviewed + commits_authored
+        if score <= 0:
+            continue
+        fame.append({
+            "login": login,
+            "score": score,
+            "prs_merged": prs_merged,
+            "prs_reviewed": prs_reviewed,
+            "commits_authored": commits_authored,
+            "areas": profile.get("areas", []),
+        })
+    fame.sort(key=lambda e: (-e["score"], e["login"]))
+    bundle["halls"] = {"fame": fame[:10]}
+    return bundle

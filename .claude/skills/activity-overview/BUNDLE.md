@@ -71,7 +71,7 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
 
 ## Reserved (empty in Phase 1)
 
-`timeline, artifacts, feature_deltas, people, halls, flow, blockers, code_owners,
+`timeline, artifacts, feature_deltas, flow, blockers, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, workflows, releases, milestones,
 docsRefs, release_train, sprints, project, diagrams`.
 
@@ -253,3 +253,38 @@ docsRefs, release_train, sprints, project, diagrams`.
   chars with a `…[+N chars]` marker; each comment list capped at `SLICE_COMMENTS_KEPT` = 6
   bodies, overflow count in `<key>_overflow`.) Raises `KeyError` on unknown id. Does not
   mutate the bundle.
+
+## Phase 11 fields (people profile + recognition halls)
+
+These are **enrich-time projections** computed by `link.enrich` over the
+materialized bundle (siblings of `forecast`/`modules`) — not stored person-node
+data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
+`enrich` MERGES the profile fields onto it.
+
+- **people[]** — each `{login: {...}}` entry, in addition to its stored
+  `modules`/`areas`/`is_bot`, gains a window-derived profile
+  (`annotate_people_profile`):
+
+  | field | meaning |
+  |-------|---------|
+  | `prs_authored` | PRs with `author == login` (int) |
+  | `prs_merged` | of those, PRs with truthy `merged` (int) |
+  | `merge_rate` | `round(prs_merged/prs_authored, 3)`, `null` when 0 authored |
+  | `prs_reviewed` | PRs where login is in `reviewers` (int) |
+  | `commits_authored` | commits with `author == login` (int) |
+  | `issues_opened` | issues with `author == login` (int) |
+  | `review_latency_days` | median, over reviewed PRs, of (login's earliest `reviews[].submitted_at` − `pr.created_at`) in days; `null` when no timestamped review |
+  | `first_seen` / `last_active` | min / max ISO date (`YYYY-MM-DD`) across the login's activity (PRs authored/merged-by, commits, issues, reviews); `null` when none |
+  | `examples_authored` / `docs_authored` / `symbols_authored` | distinct artifacts with an `add` lifecycle event by this login, bucketed by `kind` (example; doc+readme; symbol) (int) |
+  | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
+  | `stale_owned` | distinct owned `code_owners` prefixes (owner list includes login) that contain a stalled train (a stalled train's `code_areas` entry `startswith` the prefix) (int) |
+
+  Counts are always present (ints, may be 0); `merge_rate`/`review_latency_days`/
+  `first_seen`/`last_active` are present as `null` when N/A. Deterministic.
+- **halls** `{ "fame": [ { login, score, prs_merged, prs_reviewed,
+  commits_authored, areas } ] }` (`build_halls`) — **recognition only.** `fame`
+  ranks NON-bot logins by footprint `score = prs_merged*2 + prs_reviewed +
+  commits_authored`, keeps `score > 0`, sorts by `(-score, login)`, takes the top
+  10 (else `[]`). **`halls.internal`/`shame`/`blame` are intentionally NOT built**
+  — per the "recognition, not blame" stance.
+- `flow` and `blockers` remain reserved (slice 2).

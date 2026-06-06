@@ -36,7 +36,9 @@ in place with window-derived metrics (keeps existing `modules`/`areas`/`is_bot`)
 - `authored_then_removed` — count of artifacts this login added whose current
   `status` is `removed`/`dropped`/`replaced`.
 - `stale_owned` — count of areas this login owns (`code_owners`) that contain a
-  stalled train or an `open_high_activity` issue.
+  **stalled train** (a train with `effort.stalled`, matched by `code_areas` prefix).
+  (Open high-activity issues carry no area mapping in the bundle, so they're surfaced
+  as *pile-ups* in the flow section — slice 2 — not double-counted here.)
 
 **`build_halls(bundle)`** → `bundle["halls"] = {"fame": [...]}` — recognition only.
 `fame` ranks non-bot contributors by a footprint score

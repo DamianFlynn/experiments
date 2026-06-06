@@ -348,20 +348,27 @@ template → heuristic.
 
 ## Contributors & community
 
-Who moved the project this period (public — recognition, not blame). Rank contributors
-by a footprint counted from the bundle: PRs authored (`prs[].author`), PRs reviewed
-(`prs[].reviewers`), commits authored (`commits[].author`); most-active first. Show each
-person's areas from `people[login].modules`. **Cite** each contributor's work — link a
-representative authored/reviewed PR (`prs[].url`) so the footprint is grounded. Omit the
-whole section when there is no `people` data.
+Who moved the project this period (public — recognition, not blame). The ranking is now
+**deterministic** — read it straight off `halls.fame` (footprint score
+`prs_merged*2 + prs_reviewed + commits_authored`, highest first), and pull each person's
+detail from their `people[login]` profile (`prs_authored`, `prs_merged`, `merge_rate`,
+`prs_reviewed`, `commits_authored`, `issues_opened`, `review_latency_days`, `first_seen`/
+`last_active`, `examples_authored`/`docs_authored`/`symbols_authored`, `areas`). **Cite**
+each contributor's work — link a representative authored/reviewed PR (`prs[].url`) so the
+footprint is grounded. Omit the whole section when `people` is empty.
 
-| Contributor | Authored | Reviewed | Commits | Areas | Evidence |
-|-------------|----------|----------|---------|-------|----------|
-| `{login}` | {authored} | {reviewed} | {commits} | {", ".join(people[login].modules)} | [#{pr.number}]({pr.url}), … |
+| Contributor | Authored | Merged | Reviewed | Commits | Areas | Evidence |
+|-------------|----------|--------|----------|---------|-------|----------|
+| `{halls.fame[].login}` | {people[login].prs_authored} | {people[login].prs_merged} | {people[login].prs_reviewed} | {people[login].commits_authored} | {", ".join(people[login].areas)} | [#{pr.number}]({pr.url}), … |
+
+Optionally note responsiveness/tenure where it adds signal — e.g. *"median review
+latency {review_latency_days}d · active {first_seen} → {last_active}"* — only when those
+fields are non-null.
 
 <!-- Automation: when any `people[login]` has `is_bot` true, list them under this subhead
      so the human view above isn't skewed by dependabot/CI bots. OMIT the subhead entirely
-     when there are no bot contributors (no empty "Automation:" stanza). -->
+     when there are no bot contributors (no empty "Automation:" stanza). Bots are excluded
+     from `halls.fame` already. -->
 
 **Automation:** {", ".join(bot logins)}
 

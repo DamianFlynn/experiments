@@ -251,17 +251,19 @@ claim in the report resolves to a source ref — never invent facts.
     appendix (below), off by default. Omit the whole section when there is no
     stalled / blocked / pile-up data.
 - Phase 11 **Contributors & community** (public) — who moved the project this period,
-  rendered from `people` + the bundle's `prs`/`commits`, each contributor CITED to their
-  work:
-  - **Footprint ranking:** rank contributors by a footprint counted from the bundle — PRs
-    authored (`prs[].author`), PRs reviewed (`prs[].reviewers`), commits authored
-    (`commits[].author`) — most-active first, and show their `people[login].modules`/
-    `areas`. (The same agent-side counting the executive summary already does over the
-    bundle; the underlying contribution facts are the deterministic `people`/`prs`/
-    `commits` data.)
+  rendered from the **deterministic** `people` profile + `halls.fame`, each contributor
+  CITED to their work:
+  - **Footprint ranking:** read it off `halls.fame` (score
+    `prs_merged*2 + prs_reviewed + commits_authored`, bots already excluded, highest
+    first) — no agent-side counting. Per contributor, pull detail from their
+    `people[login]` profile: `prs_authored`/`prs_merged`/`merge_rate`, `prs_reviewed`,
+    `commits_authored`, `issues_opened`, `review_latency_days`, `first_seen`/`last_active`,
+    `examples_authored`/`docs_authored`/`symbols_authored`, and `areas`. Note
+    responsiveness/tenure (review_latency, first→last active) only where non-null.
   - **Humans vs automation:** `people[login].is_bot` tags bots — list them under a
     separate "Automation" subhead so the human contributor view isn't skewed by
-    dependabot/CI.
+    dependabot/CI. (`halls.internal`/shame/blame is intentionally NOT built — recognition
+    only.)
   - Embed `diagrams.contributor_graph` (the people ↔ code-area relationships) here.
   - **Recognition, not blame.** This section names who contributed and where; it NEVER
     attributes stalls/blockers. Omit when there is no `people` data.
