@@ -25,6 +25,7 @@ import sys
 
 import graphstore
 import complete
+import derive
 import gather
 
 
@@ -64,6 +65,14 @@ _CHAIN_DEPTH_CAP = 64
 
 # Bounded excerpt for a comment body carried on a touchpoint / timeline row.
 _EXCERPT_CAP = 200
+
+# slice_module bounds — a module biography is a CONTEXT UNIT, not an archive.
+# Per-text cap for a lifecycle row's before/after/diff; per-artifact lifecycle
+# row cap; total artifact cap. Overflow beyond each is reported as a *_overflow
+# count rather than silently dropped.
+_SLICE_TEXT_CAP = 800
+_MODULE_LIFECYCLE_CAP = 40
+_MODULE_ARTIFACT_CAP = 60
 
 # Causal spine edges for spotlight's decision-train grouping: graphstore's
 # SPINE_EDGE_TYPES minus `cross_ref`. A cross-reference is a casual mention
@@ -587,6 +596,18 @@ def _normalize_artifact_id(conn, project, artifact_id):
     return None
 
 
+def _ordered_lifecycle(events, ts_from=None, ts_to=None):
+    """An artifact's `code_events` rows in (date, commit) order, optionally
+    bounded by [ts_from, ts_to]. The single ordering+filter contract both the
+    per-artifact symbol query and the area-level module slice route through, so a
+    lifecycle reads the same chronological way wherever it is assembled."""
+    rows = sorted(events, key=lambda e: ((e["date"] or ""), e["commit_sha"]))
+    if ts_from is not None or ts_to is not None:
+        rows = [e for e in rows
+                if _date_in_range(e["date"] or "", ts_from, ts_to)]
+    return rows
+
+
 def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
     """A symbol/file artifact's FULL lifecycle across all history (not one
     window), as a SINGLE chronological delivery train. Returns the unified
@@ -618,10 +639,7 @@ def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
         }
 
     # --- timeline: code_events in (date, commit) order, each cited ---
-    events.sort(key=lambda e: ((e["date"] or ""), e["commit_sha"]))
-    if ts_from is not None or ts_to is not None:
-        events = [e for e in events
-                  if _date_in_range(e["date"] or "", ts_from, ts_to)]
+    events = _ordered_lifecycle(events, ts_from, ts_to)
     timeline = []
     for e in events:
         ref = e.get("ref")
@@ -886,6 +904,299 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
         contributors=contributors,
         depends_on={"out": deps_out, "in": deps_in},
     )
+
+
+def _slice_cap_text(s):
+    """Bound a lifecycle row's before/after/diff text to _SLICE_TEXT_CAP chars,
+    appending an overflow marker when cut (mirrors link._cap_text). Pure."""
+    if not s or len(s) <= _SLICE_TEXT_CAP:
+        return s
+    return s[:_SLICE_TEXT_CAP] + "…[+{} chars]".format(len(s) - _SLICE_TEXT_CAP)
+
+
+def _commit_pr_map(conn, shas, project, repos):
+    """Map each commit sha -> its PR node id (the `part_of` dst that is a PR),
+    for cheap event->PR attribution. Built once over the slice's shas; a sha with
+    no part_of PR (or no commit node) is simply absent. Deterministic."""
+    out = {}
+    for sha in sorted({s for s in shas if s}):
+        cid = None
+        for repo in repos:
+            cand = graphstore.qualify_id(project, repo, sha)
+            if graphstore.get_node(conn, cand) is not None:
+                cid = cand
+                break
+        if cid is None:
+            continue
+        for e in graphstore.get_edges(conn, cid, direction="out",
+                                      edge_types=["part_of"]):
+            if "#pr-" in e["dst_id"]:
+                out[sha] = e["dst_id"]
+                break
+    return out
+
+
+def slice_module(conn, project, area, ts_from=None, ts_to=None):
+    """A store-backed, FULL-HISTORY slice of one module (an `area`): every
+    artifact under the area + each artifact's complete lifecycle (CRUD across all
+    gathered windows, with the change detail), plus the trains that touched it —
+    a bounded "module biography". Reads the store only; never writes/networks.
+
+    Resolution: read the stored `codegraph` singleton (`area_index`/
+    `_area_for_path`) and keep `code` artifact nodes whose `path` maps to the
+    requested area. An unknown/empty area (no matching codegraph area in any repo)
+    yields the shared `needs_gather` envelope.
+
+    For each kept artifact, `get_code_events` gives its full lifecycle; a renamed
+    symbol's history is folded into ONE chain (walk `replaced_by` forward) so the
+    move's events read as one symbol. Each lifecycle row is bounded (text-capped
+    before/after/diff, where diff = the row's `hunk`) and attributed to its PR via
+    the commit->PR `part_of` map when cheap. Artifacts split into `symbols` (id
+    has `#`) and `files` (`art:`/bare path).
+
+    Bounding (a context unit, not an archive): per-artifact lifecycle rows capped
+    at _MODULE_LIFECYCLE_CAP (with `lifecycle_overflow`), total artifacts capped
+    at _MODULE_ARTIFACT_CAP per group (with `*_overflow`). Deterministic ordering:
+    symbols by id, files by path, lifecycle by (date, commit).
+    """
+    repos = _project_repos(conn, project)
+
+    # --- resolve the area's path set from the stored codegraph singleton ---
+    area_idx = {}
+    for repo in repos:
+        cg = graphstore.get_node(
+            conn, graphstore.qualify_id(project, repo, "codegraph"))
+        if cg is not None:
+            area_idx.update(derive.area_index(cg["data"] or {}))
+    area_paths = {p for p, a in area_idx.items() if a == area}
+    if not area_paths:
+        return {
+            "query": "module",
+            "focus": area,
+            "focus_kind": "module",
+            "project": project,
+            "status": "needs_gather",
+            "scope": _scope(ts_from, ts_to),
+            "guidance": (
+                "no codegraph area covering {} in any project repo; gather a "
+                "window that touches the module".format(area)),
+        }
+
+    # --- collect the area's artifact code nodes (file + symbol/comment) ---
+    # `replaced_by` source artifacts fold into their successor, so a rename reads
+    # as one symbol history — track the set of ids that are superseded.
+    artifacts = {}  # qid -> node
+    for repo in repos:
+        for node in graphstore.repo_nodes(conn, project, repo, node_class="code"):
+            data = node["data"] or {}
+            # artifact `code` nodes are the non-commit ones: a commit carries a
+            # `sha` and a bare `<sha>` id; artifacts use `art:<path>` / `<path>#…`
+            # and have no `sha` (mirrors extract._is_commit_node).
+            if "sha" in data:
+                continue
+            path = data.get("path")
+            if path is None or derive._area_for_path(path, area_idx) != area:
+                continue
+            artifacts[node["id"]] = node
+
+    # rename folding: a `replaced_by` edge means src's history continues in dst.
+    # Pick the chain's terminal node as the representative; gather all the chain's
+    # ids so their events merge into one lifecycle.
+    superseded = set()      # ids that are NOT the chain representative
+    chain_of = {}           # representative id -> ordered [member ids]
+    for aid in artifacts:
+        edges = graphstore.get_edges(conn, aid, direction="out",
+                                     edge_types=["replaced_by"])
+        if edges:
+            superseded.add(aid)
+    for aid in sorted(artifacts):
+        if aid in superseded:
+            continue
+        # walk forward to gather the full chain rooted here
+        members = [aid]
+        seen = {aid}
+        cur = aid
+        depth = 0
+        while depth < _CHAIN_DEPTH_CAP:
+            edges = graphstore.get_edges(conn, cur, direction="in",
+                                         edge_types=["replaced_by"])
+            edges = [e for e in edges if e["src_id"] not in seen]
+            if not edges:
+                break
+            prev = edges[0]["src_id"]
+            members.append(prev)
+            seen.add(prev)
+            cur = prev
+            depth += 1
+        chain_of[aid] = members
+
+    # representatives: a non-superseded node, or a superseded one whose successor
+    # is outside the area (so its history would otherwise be lost). The chain
+    # walk above roots at non-superseded nodes; any superseded id not folded into
+    # one of those chains stands alone.
+    folded = {m for members in chain_of.values() for m in members}
+    for aid in sorted(artifacts):
+        if aid not in folded:
+            chain_of[aid] = [aid]
+
+    # --- pre-fetch the commit->PR map over every sha in the slice's events ---
+    # The file-level ledger is keyed by the BARE-path qid, but a file artifact
+    # NODE is `art:<path>` (gather folds them under different keys). Resolve the
+    # ledger key per artifact: a `art:<path>` node's events live under `<path>`.
+    def _event_key(aid, node):
+        prefix = "{}/{}#".format(node["project"], node["repo"])
+        local = aid[len(prefix):] if aid.startswith(prefix) else aid
+        if local.startswith("art:"):
+            return prefix + local[len("art:"):]
+        return aid
+
+    all_shas = set()
+    events_by_member = {}
+    for aid, node in artifacts.items():
+        evs = graphstore.get_code_events(conn, _event_key(aid, node))
+        events_by_member[aid] = evs
+        all_shas.update(e["commit_sha"] for e in evs)
+    pr_of = _commit_pr_map(conn, all_shas, project, repos)
+
+    def _lifecycle(rep, members):
+        """The folded, ordered, bounded lifecycle for a chain (its members'
+        events merged), plus the overflow count beyond the row cap."""
+        merged = []
+        for m in members:
+            merged.extend(events_by_member.get(m, []))
+        ordered = _ordered_lifecycle(merged, ts_from, ts_to)
+        total = len(ordered)
+        kept = ordered[:_MODULE_LIFECYCLE_CAP]
+        rows = []
+        for e in kept:
+            row = {
+                "event": e["event"],
+                "date": e["date"] or "",
+                "commit": e["commit_sha"],
+                "pr": pr_of.get(e["commit_sha"]),
+            }
+            if e["before"] is not None:
+                row["before"] = _slice_cap_text(e["before"])
+            if e["after"] is not None:
+                row["after"] = _slice_cap_text(e["after"])
+            if e["hunk"] is not None:
+                row["diff"] = _slice_cap_text(e["hunk"])
+            rows.append(row)
+        return rows, max(0, total - _MODULE_LIFECYCLE_CAP)
+
+    symbols, files = [], []
+    for rep in sorted(chain_of):
+        members = chain_of[rep]
+        node = artifacts[rep]
+        data = node["data"] or {}
+        lifecycle, overflow = _lifecycle(rep, members)
+        # symbol/comment artifacts vs file artifacts. The id form is the tell:
+        # a symbol's local id is `<path>#<lang>:<subkind>:<name>` (a `#` after the
+        # repo scope), a file's is `art:<path>` / a bare path. Strip the
+        # `{project}/{repo}#` qualifier so the symbol `#` isn't masked by the
+        # scope separator (parse_id splits on the LAST `#`).
+        prefix = "{}/{}#".format(node["project"], node["repo"])
+        art_local = rep[len(prefix):] if rep.startswith(prefix) else rep
+        if "#" in art_local:
+            entry = {
+                "id": rep,
+                "kind": data.get("kind"),
+                "subkind": data.get("subkind"),
+                "name": data.get("name"),
+                "status": data.get("status"),
+                "lifecycle": lifecycle,
+                "lifecycle_overflow": overflow,
+            }
+            symbols.append(entry)
+        else:
+            entry = {
+                "path": data.get("path"),
+                "lifecycle": lifecycle,
+                "lifecycle_overflow": overflow,
+            }
+            files.append(entry)
+
+    symbols.sort(key=lambda s: s["id"])
+    files.sort(key=lambda f: f["path"] or "")
+    symbols_overflow = max(0, len(symbols) - _MODULE_ARTIFACT_CAP)
+    files_overflow = max(0, len(files) - _MODULE_ARTIFACT_CAP)
+    symbols = symbols[:_MODULE_ARTIFACT_CAP]
+    files = files[:_MODULE_ARTIFACT_CAP]
+
+    # --- time range over the kept lifecycle dates ---
+    all_dates = [r["date"] for grp in (symbols, files) for a in grp
+                 for r in a["lifecycle"] if r["date"]]
+    time_range = {
+        "first": min(all_dates) if all_dates else None,
+        "last": max(all_dates) if all_dates else None,
+    }
+
+    # --- trains that touched the area (reuse subsystem's area resolution) ---
+    trains = _module_trains(conn, project, area, repos, ts_from, ts_to)
+
+    summary = {
+        "symbols": len(symbols),
+        "files": len(files),
+        "trains": len(trains),
+    }
+    return _result(
+        "module", area, "module", project, _scope(ts_from, ts_to),
+        summary, [],
+        time_range=time_range,
+        repos=repos,
+        symbols=symbols,
+        symbols_overflow=symbols_overflow,
+        files=files,
+        files_overflow=files_overflow,
+        trains=trains,
+    )
+
+
+def _module_trains(conn, project, area, repos, ts_from, ts_to):
+    """The decision trains that TOUCHED the area, reusing subsystem_split's
+    area-node resolution + `touches`-edge logic. Returns a list of train dicts
+    (anchor/key_date/title/outcome/…), ordered by (key_date, anchor). An absent
+    area node simply yields no trains (the artifact lifecycles still stand)."""
+    area_local = "area-{}".format(area)
+    area_qid = None
+    for repo in repos:
+        cand = graphstore.qualify_id(project, repo, area_local)
+        if graphstore.get_node(conn, cand) is not None:
+            area_qid = cand
+            break
+    if area_qid is None:
+        return []
+    in_edges = graphstore.get_edges(conn, area_qid, direction="in",
+                                    edge_types=["touches"])
+    touching_src_ids = [e["src_id"] for e in in_edges]
+    seed_ids = set(touching_src_ids)
+    for src_id in touching_src_ids:
+        if "#pr-" in src_id:
+            seed_ids.add(src_id)
+        for pe in graphstore.get_edges(conn, src_id, direction="out",
+                                       edge_types=["part_of"]):
+            if "#pr-" in pe["dst_id"]:
+                seed_ids.add(pe["dst_id"])
+    trains_by_anchor = {}
+    for seed in sorted(seed_ids):
+        reach = graphstore.traverse_spine(conn, [seed], edge_types=_CAUSAL_SPINE,
+                                          skip_dead=True)
+        reached = set(reach["reached"]) or {seed}
+        anchor = _reached_anchor(conn, reached)
+        trains_by_anchor.setdefault(anchor, set()).update(reached)
+    touch_set = set(touching_src_ids)
+    trains = []
+    for anchor, reached in trains_by_anchor.items():
+        focus_touch_ids = sorted(touch_set & reached)
+        role_of = {tid: "touches" for tid in focus_touch_ids}
+        train = _train(conn, anchor, reached, focus_touch_ids, role_of,
+                       window=_completion_window(ts_from, ts_to))
+        if (ts_from is not None or ts_to is not None) and not _date_in_range(
+                train["key_date"], ts_from, ts_to):
+            continue
+        trains.append(train)
+    trains.sort(key=lambda t: (t.get("key_date") or "", t["anchor"]))
+    return trains
 
 
 def _fts_query(phrase):
@@ -1214,12 +1525,67 @@ def _render_dependents_md(res):
         "- `{}`".format(d) for d in deps) + "\n"
 
 
+def _render_module_md(res):
+    if res["status"] == "needs_gather":
+        return "## spotlight: module `{}`\n\n_needs gather:_ {}".format(
+            res["focus"], res["guidance"])
+    s = res["summary"]
+    tr = res["time_range"]
+    lines = ["## spotlight: module `{}`".format(res["focus"]), ""]
+    lines.append("- scope: {}".format(_scope_label(res["scope"])))
+    lines.append("- time range: {} → {}".format(
+        tr.get("first") or "—", tr.get("last") or "—"))
+    lines.append("- summary: {} symbols, {} files, {} trains".format(
+        s.get("symbols", 0), s.get("files", 0), s.get("trains", 0)))
+
+    def _ev_suffix(r):
+        bits = []
+        if r.get("pr"):
+            bits.append(r["pr"])
+        return " ({})".format(", ".join(bits)) if bits else ""
+
+    lines.append("")
+    lines.append("### symbols ({}{})".format(
+        len(res["symbols"]),
+        ", +{} more".format(res["symbols_overflow"])
+        if res["symbols_overflow"] else ""))
+    for sym in res["symbols"]:
+        lines.append("- `{}` [{}]".format(sym["id"], sym.get("status") or "?"))
+        for r in sym["lifecycle"]:
+            lines.append("  - {} {} {}{}".format(
+                r["date"], r["event"], r["commit"], _ev_suffix(r)))
+        if sym["lifecycle_overflow"]:
+            lines.append("  - …(+{} more events)".format(
+                sym["lifecycle_overflow"]))
+
+    lines.append("")
+    lines.append("### files ({}{})".format(
+        len(res["files"]),
+        ", +{} more".format(res["files_overflow"])
+        if res["files_overflow"] else ""))
+    for f in res["files"]:
+        lines.append("- `{}`".format(f["path"]))
+        for r in f["lifecycle"]:
+            lines.append("  - {} {} {}{}".format(
+                r["date"], r["event"], r["commit"], _ev_suffix(r)))
+        if f["lifecycle_overflow"]:
+            lines.append("  - …(+{} more events)".format(f["lifecycle_overflow"]))
+
+    lines.append("")
+    lines.append("### trains touched ({})".format(len(res["trains"])))
+    for t in res["trains"]:
+        lines.append(_render_train_md(t))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 _RENDERERS = {
     "person": _render_person_md,
     "symbol": _render_symbol_md,
     "subsystem": _render_subsystem_md,
     "grep": _render_grep_md,
     "dependents": _render_dependents_md,
+    "module": _render_module_md,
 }
 
 
@@ -1299,6 +1665,9 @@ def main(argv=None):
         res = text_mining(conn, project, args.args[0],
                           ts_from=args.ts_from, ts_to=args.ts_to,
                           backfill=backfill, complete_budget=cb)
+    elif args.query == "module":
+        res = slice_module(conn, project, args.args[0],
+                           ts_from=args.ts_from, ts_to=args.ts_to)
     elif args.query == "dependents":
         res = member_dependents(conn, project, args.args[0])
     conn.close()
