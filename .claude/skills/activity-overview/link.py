@@ -970,17 +970,17 @@ def enrich(bundle):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
+    # Accept ONLY the documented shapes: `BUNDLE` or `BUNDLE --slice TRAIN_ID`.
+    # `--slice` is recognized strictly as the second positional, and any other
+    # argv shape is rejected (no flag-anywhere / unknown-arg surprises).
+    slice_id = None
+    if len(argv) == 1:
+        path = argv[0]
+    elif len(argv) == 3 and argv[1] == "--slice":
+        path, slice_id = argv[0], argv[2]
+    else:
         sys.stderr.write("usage: link.py BUNDLE.json [--slice TRAIN_ID]\n")
         raise SystemExit(2)
-    path = argv[0]
-    slice_id = None
-    if "--slice" in argv:
-        i = argv.index("--slice")
-        if i + 1 >= len(argv):
-            sys.stderr.write("link.py: --slice requires a TRAIN_ID\n")
-            raise SystemExit(2)
-        slice_id = argv[i + 1]
     with open(path) as fh:
         bundle = json.load(fh)
     enrich(bundle)

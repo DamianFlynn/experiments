@@ -2633,7 +2633,8 @@ class TestSliceCLI(unittest.TestCase):
         train_id = link.enrich(self._raw())["trains"][0]["id"]
         expected = link.slice_train(link.enrich(self._raw()), train_id)
         path = self._write()
-        before = open(path).read()
+        with open(path) as fh:
+            before = fh.read()
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             link.main([path, "--slice", train_id])
@@ -2643,7 +2644,8 @@ class TestSliceCLI(unittest.TestCase):
         self.assertEqual(got["prs"][0]["review_rounds"]["count"], 1)
         self.assertEqual(got["issue"]["reopen_count"], 1)
         # read-only: the bundle file is NOT rewritten
-        self.assertEqual(open(path).read(), before)
+        with open(path) as fh:
+            self.assertEqual(fh.read(), before)
         os.unlink(path)
 
     def test_slice_cli_unknown_train_exits_2(self):
