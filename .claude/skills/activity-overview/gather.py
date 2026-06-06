@@ -2771,9 +2771,17 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         prlocal = "pr-{}".format(pr["number"])
         prid = qid(prlocal)
         for rv in pr.get("reviews") or []:
-            local = "review-{}-{}".format(pr["number"], rv.get("id"))
+            rid = rv.get("id")
+            local = "review-{}-{}".format(pr["number"], rid)
+            # Provenance: reviews normally carry an html_url, but synthesize a
+            # stable `<pr url>#pullrequestreview-<id>` ref if one is absent (same
+            # contract as lifecycle events) so check_provenance never fails.
+            data = rv
+            if not rv.get("url"):
+                base = pr.get("url") or prlocal
+                data = {**rv, "url": "{}#pullrequestreview-{}".format(base, rid)}
             nodes.append((qid(local), project, repo, "social",
-                          rv.get("submitted_at"), rv, fetched))
+                          rv.get("submitted_at"), data, fetched))
             edges.append((qid(local), prid, "part_of", None, None))
         for ev in pr.get("lifecycle") or []:
             data = _lifecycle_event_data(ev, pr.get("url"), prlocal)

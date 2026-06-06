@@ -2266,6 +2266,19 @@ class TestFoldReviewsAndLifecycle(unittest.TestCase):
         n = graphstore.get_node(self.conn, "acme/widget#event-issue-3-300")
         self.assertEqual(n["data"]["url"], "u/3#event-300")
 
+    def test_review_without_url_gets_synthesized_provenance(self):
+        # a review missing its html_url still gets a citable ref (parity with
+        # lifecycle events): "<pr url>#pullrequestreview-<id>".
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        b = _fold_fixture_bundle()  # prs[0] url == "u/10"
+        b["prs"][0]["reviews"] = [
+            {"id": 555, "author": "carol", "state": "approved",
+             "submitted_at": "2026-01-06T00:00:00Z", "body": None, "url": None}]
+        gather.fold_bundle(conn, b)
+        n = graphstore.get_node(conn, "acme/widget#review-10-555")
+        self.assertEqual(n["data"]["url"], "u/10#pullrequestreview-555")
+
     def test_review_and_events_reachable_over_spine(self):
         # spine pulls reviews/events into the PR/issue train (they are leaves).
         res = graphstore.traverse_spine(self.conn, ["acme/widget#pr-10"])

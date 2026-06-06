@@ -90,7 +90,12 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
       bridge the component but are dropped from the returned set (trains are keyed
       off social anchors)."""
     in_window = graphstore.range_query(conn, project, repos, ts_from, ts_to)
-    socials = [n["id"] for n in in_window if n["node_class"] == "social"]
+    # Only pr/issue ANCHORS seed components. Phase 10's review/event social leaves
+    # are train members reached from their parent anchor, not seeds — seeding from
+    # them would leak a review/event id into a component (or orphan one whose
+    # parent is out of window), which build_project_trains can't key off.
+    socials = [n["id"] for n in in_window if n["node_class"] == "social"
+               and graphstore.parse_id(n["id"])["local"].startswith(("pr-", "issue-"))]
     seen, comps = set(), []
     for sid in socials:
         if sid in seen:

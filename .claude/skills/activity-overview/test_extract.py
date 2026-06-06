@@ -25,6 +25,7 @@ import derive  # noqa: E402
 import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
+import link  # noqa: E402
 import validate  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -471,8 +472,14 @@ class ExtractReviewsAndLifecycle(unittest.TestCase):
         self.assertEqual(ex["issues"][0]["lifecycle"][0]["url"],
                          "https://gh/o/r/issues/3#event-300")
 
-    def test_derived_counts_present(self):
+    def test_derived_counts_are_enrich_only(self):
+        # review_rounds/reopen_count are enrich-derived (with forecast/modules),
+        # so extract emits only the RAW reviews/lifecycle, not the counts.
         ex = self._extract()
+        self.assertNotIn("review_rounds", ex["prs"][0])
+        self.assertNotIn("reopen_count", ex["issues"][0])
+        # enrich (the read-side derive) turns the resurfaced raw data into counts.
+        link.enrich(ex)
         self.assertEqual(ex["prs"][0]["review_rounds"],
                          {"count": 2, "states": ["changes_requested", "approved"]})
         self.assertEqual(ex["issues"][0]["reopen_count"], 1)

@@ -795,6 +795,18 @@ class TestGapRender(unittest.TestCase):
             spotlight._node_kind(graphstore.qualify_id("acme", "widget", "issue-9"),
                                  idata), "issue")
 
+    def test_node_kind_review_and_event_not_pr(self):
+        # Phase 10: review/event social leaves carry the parent PR's /pull/ url,
+        # but must classify by their own prefix BEFORE the /pull/ heuristic, else
+        # they double-count as phantom PR rows in the spine timeline.
+        rid = graphstore.qualify_id("acme", "widget", "review-8-100")
+        rdata = {"url": "https://github.com/acme/widget/pull/8#pullrequestreview-100"}
+        self.assertEqual(spotlight._node_kind(rid, rdata), "review")
+        eid = graphstore.qualify_id("acme", "widget", "event-pr-8-200")
+        edata = {"event": "reopened",
+                 "url": "https://github.com/acme/widget/pull/8#event-200"}
+        self.assertEqual(spotlight._node_kind(eid, edata), "event")
+
 
 class TestGrepRender(unittest.TestCase):
     def setUp(self):

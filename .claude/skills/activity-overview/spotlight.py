@@ -108,6 +108,14 @@ def _node_kind(node_id, data):
     pr / issue / commit / release / comment / symbol / file, else the node's
     structural prefix. Deterministic."""
     local = graphstore.parse_id(node_id)["local"]
+    # Phase 10: review submissions / lifecycle events are social leaves on the
+    # PR/issue spine. Classify by their own prefix BEFORE the /pull/ url heuristic
+    # below — their url carries the parent PR's /pull/ path and would otherwise be
+    # misread as a PR (phantom PR rows / double counting in the timeline).
+    if local.startswith("review-"):
+        return "review"
+    if local.startswith("event-"):
+        return "event"
     # A backfilled `Closes #N` whose #N turned out to be a PR is stored under the
     # referenced `issue-N` id but carries the PR's /pull/ url — label it a PR.
     if local.startswith("pr-") or "/pull/" in ((data or {}).get("url") or ""):

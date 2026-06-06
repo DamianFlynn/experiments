@@ -159,9 +159,13 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     in_window = graphstore.range_query(conn, project, [repo], ts_from, ts_to)
     in_window_ids = {n["id"] for n in in_window}
 
-    # 2. Seed trains from in-window social nodes, then bounded spine traversal to
-    #    surface out-of-window context (in_window: false).
-    seeds = [_train_anchor(n) for n in in_window if n["node_class"] == "social"]
+    # 2. Seed trains from in-window social ANCHORS (pr/issue), then bounded spine
+    #    traversal to surface out-of-window context (in_window: false). Phase 10's
+    #    review/event social leaves are reached FROM their parent anchor — they
+    #    must not seed, or a late in-window review on an out-of-window PR would
+    #    pull that PR in (a behaviour change + backfill-budget cost vs pre-P10).
+    seeds = [_train_anchor(n) for n in in_window if n["node_class"] == "social"
+             and _local(n["id"]).startswith(("pr-", "issue-"))]
     spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth,
                                       skip_dead=True)
 
@@ -207,12 +211,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
         key=lambda d: d.get("number"))
 
     # Phase 10 slice 1: re-attach the review/lifecycle social nodes onto their
-    # parent pr/issue records (the inverse of fold's first-class node emission),
-    # then re-derive review_rounds/reopen_count. Done ONLY when such nodes exist
-    # so PRs/issues with no reviews/events stay byte-identical (no new keys).
+    # parent pr/issue records (the inverse of fold's first-class node emission) —
+    # the RAW substrate. The derived review_rounds/reopen_count are computed in
+    # link.enrich (with forecast/modules), not here, so extract stays raw-only.
+    # Done ONLY when such nodes exist so PRs/issues with none stay byte-identical.
     _attach_reviews_and_lifecycle(socials, bundle["prs"], bundle["issues"])
-    derive.annotate_review_rounds(bundle)
-    derive.annotate_reopen_count(bundle)
 
     # `code` holds both commits (local id = bare <sha>) and artifact nodes
     # (local id `art:<path>` for files, `<path>#<lang>:<subkind>:<name>` for
