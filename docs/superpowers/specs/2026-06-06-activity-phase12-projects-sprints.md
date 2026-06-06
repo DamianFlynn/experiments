@@ -30,13 +30,15 @@ issue/PR payload), and an iteration carries a **date range** (start + duration) 
 
 ## Design
 
-### Source the board
-A new gather input names the board (Projects v2 is an **org/user-level** entity, not a
-repo one): `--project-board <owner>/<number>` (owner = org or user login; number = the
-project's board number). Optional — when absent, the sprint layer is simply empty
-(every existing output unchanged). For a manifest run, the board is named once at the
-manifest/project level. **Decision to confirm:** explicit flag vs. auto-discovering the
-repo's linked project(s) via `repository.projectsV2`.
+### Source the board (auto-discover)
+gather **auto-discovers** the board from the repo it's gathering: a GraphQL query for
+`repository(owner, name).projectsV2(first: N)` → the linked Projects v2 board(s). When a
+repo links **multiple** boards, take them in a deterministic order (by number) and ingest
+each (sprints are namespaced by board id, so they don't collide); when it links **none**,
+the sprint layer is simply empty and every existing output is unchanged. No new required
+flag — it rides the existing `--owner/--repo` (and each manifest member). An optional
+`--no-project-board` escape hatch skips the query (e.g. when the token lacks
+`read:project` scope, so a run never hard-fails on a permissions error — degrade to empty).
 
 ### Acquire (gather — first GraphQL call)
 - Add a minimal `graphql_post(token, query, variables)` helper (POST `/graphql`,
@@ -77,11 +79,11 @@ repo's linked project(s) via `repository.projectsV2`.
 ## Testing & verification (read this)
 - **Offline TDD:** `parse_project_board` + the fold + resolution are pure and tested from
   crafted GraphQL response fixtures (no network) — the same discipline as the rest.
-- **Live verification is conditional:** Projects v2 requires a token with `read:project`
-  scope **and** an actual board on the target org/user. If neither is available (e.g. the
-  AVM repos expose no Projects v2 board / the PAT lacks `project` scope), slice 1 ships
-  **offline-verified only**, and live vertical confirmation is deferred until a board is
-  available. This is called out so the "verified on real data" bar is set honestly.
+- **Live verification:** against a real repo whose linked Projects v2 board the operator
+  points to, using a `read:project`-scoped token — confirm auto-discovery finds the board,
+  the iterations/items parse, and the sprint nodes + `in_iteration` edges + `board_status`
+  fold + surface. The fold/parse degrade cleanly to empty when the token lacks scope or the
+  repo links no board (never hard-fail), so the default AVM runs (no board) stay unchanged.
 
 ## Not in scope
 - Status automation / writing to the board (read-only).
