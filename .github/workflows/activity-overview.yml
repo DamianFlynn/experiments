@@ -286,7 +286,11 @@ jobs:
           # so `terraform graph` DOT reaches the extractor unmodified.
           TERRAFORM_VERSION: 1.15.5
         run: |
-          curl -sSLo tf.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"
+          curl -sSLo tf.zip "${base}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          curl -sSLo tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+          # Verify the official checksum before unpacking (supply-chain integrity).
+          grep " terraform_${TERRAFORM_VERSION}_linux_amd64.zip$" tf.sums | sha256sum -c -
           unzip -o tf.zip terraform
           sudo mv terraform /usr/local/bin/terraform
           installed="$(terraform version | head -1)"
@@ -319,12 +323,17 @@ jobs:
       - name: Gather the constellation into one project store
         env:
           GITHUB_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
-          # terraform init for an AVM pattern pulls many registry modules: warm a
-          # shared plugin cache and give each init room. A heavy init that still
-          # times out degrades gracefully — edge_extraction records timeout/failed
-          # and the static whole-tree source scan still backstops the cross-repo edge.
+          # terraform init for an AVM pattern pulls many registry modules: a shared
+          # plugin cache avoids re-downloading providers, and each init gets room. A
+          # heavy init that still times out degrades gracefully — edge_extraction
+          # records timeout/failed and the static whole-tree source scan still
+          # backstops the cross-repo edge.
           TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.claude/skills/activity-overview/workspace/.tfcache
           ACTIVITY_IAC_BUILD_TIMEOUT: "600"
+          # The terraform plugin cache is NOT write-safe under concurrency; serialize
+          # the IaC builds (workers=1) so a module pulling an un-prewarmed provider
+          # can't race the cache and flake the gate.
+          ACTIVITY_IAC_MAX_WORKERS: "1"
         run: |
           cd .claude/skills/activity-overview
           mkdir -p workspace/.tfcache
