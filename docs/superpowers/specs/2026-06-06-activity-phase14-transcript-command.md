@@ -1,7 +1,8 @@
 # activity-overview — Phase 14: community-call transcript + `/activity` slash command
 
 **Date:** 2026-06-06
-**Status:** in progress — slice 1 (this PR).
+**Status:** shipped — slice 1 (this PR): `transcript.py` + Community call highlights
+section + `/activity` command.
 **Depends on:** the agent-authored report (Phase 4b narrator protocol) — the call
 summary is the model's judgment grounded in a bounded source, exactly like the
 per-train narratives; the pipeline stays deterministic.
