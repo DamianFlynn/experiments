@@ -84,7 +84,7 @@ def build_artifacts(bundle):
             }
         return aid
 
-    def append_event(aid, event, ev):
+    def append_event(aid, event, ev, hunk=None):
         entry = {
             "event": event, "commit": ev["commit"], "author": ev["author"],
             "date": ev["date"],
@@ -93,10 +93,12 @@ def build_artifacts(bundle):
         }
         # Phase 10 slice-diffs: carry the bounded file diff onto the file artifact's
         # lifecycle entry so it lives on the STORED artifact (durable in the graph).
-        # Omit-when-empty: synthetic/no-patch bundles carry no `hunk`, so the key is
-        # absent and the goldens stay byte-identical.
-        if ev.get("hunk"):
-            entry["hunk"] = ev["hunk"]
+        # The hunk is passed EXPLICITLY (not read off `ev`): a rename reuses one `ev`
+        # for both sides and its diff is the NEW file's content, so it attaches to the
+        # new-path `add` only — never the old-path `remove`. Omit-when-empty: no-patch
+        # bundles carry no hunk, so the key is absent and the goldens stay identical.
+        if hunk:
+            entry["hunk"] = hunk
         artifacts[aid]["lifecycle"].append(entry)
 
     for ev in bundle.get("code_events", []):
@@ -104,10 +106,12 @@ def build_artifacts(bundle):
         if change in ("rename", "copy") and ev.get("old_path"):
             new_aid = ensure(ev["path"])
             if new_aid is not None:
-                append_event(new_aid, "add", ev)
+                append_event(new_aid, "add", ev, hunk=ev.get("hunk"))
             if change == "rename":
                 old_aid = ensure(ev["old_path"])
                 if old_aid is not None:
+                    # No hunk on the old-path removal — `ev["hunk"]` is the NEW file's
+                    # diff (the patch keys by the rename target), not the old file's.
                     append_event(old_aid, "remove", ev)
                     artifacts[old_aid]["status"] = "replaced"
                     # replaced_by is the direct successor; consumers walk the chain for terminal paths (A->B->C).
@@ -116,7 +120,7 @@ def build_artifacts(bundle):
         aid = ensure(ev["path"])
         if aid is None:
             continue
-        append_event(aid, _CHANGE_TO_EVENT.get(change, "change"), ev)
+        append_event(aid, _CHANGE_TO_EVENT.get(change, "change"), ev, hunk=ev.get("hunk"))
 
     # Phase 3d: fold symbol-granular events into kind:symbol/comment artifacts.
     # Each carries a bounded before/after on its lifecycle entry (file-level entries

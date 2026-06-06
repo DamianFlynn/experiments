@@ -2021,6 +2021,26 @@ class TestBoundedFileDiff(unittest.TestCase):
         out = gather.bounded_file_diff(hunks)
         self.assertEqual(out, "@@ +1 @@\n+a\n@@ +9 @@\n-b")
 
+    def test_huge_first_line_kept_truncated_not_dropped(self):
+        # a single body line longer than cap (minified/lockfile) must still yield a
+        # (truncated) diff, not silently vanish to None.
+        hunks = [{"new_start": 1, "lines": [("+", "z" * 5000)]}]
+        out = gather.bounded_file_diff(hunks, cap=200)
+        self.assertIsNotNone(out)
+        self.assertIn("@@ +1 @@", out)
+        self.assertTrue(out.rstrip().endswith("…"))
+        self.assertLessEqual(len(out), 200 + 40)  # cap + marker/ellipsis slack
+
+    def test_markers_counted_toward_cap(self):
+        # many single-line hunks: marker bytes are bounded too, so the result can't
+        # overshoot `cap` on markers alone.
+        hunks = [{"new_start": i, "lines": [("+", "x")]} for i in range(100)]
+        out = gather.bounded_file_diff(hunks, cap=50, line_cap=999)
+        self.assertLessEqual(len(out.split("…[+")[0]), 50 + 20)
+
+    def test_hunk_without_lines_key_does_not_crash(self):
+        self.assertIsNone(gather.bounded_file_diff([{"new_start": 1}]))
+
 
 class TestParseFileDiffs(unittest.TestCase):
     def _raw(self, *diffs, sha="a" * 40):

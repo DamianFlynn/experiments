@@ -808,24 +808,32 @@ def bounded_file_diff(hunks, cap=FILE_DIFF_CAP, line_cap=FILE_DIFF_LINE_CAP):
     if not hunks:
         return None
     # Flatten into the ordered output lines: a marker per hunk, then its body lines.
-    out, total_body, kept_body = [], 0, 0
+    out, total_body = [], 0
     for hunk in hunks:
         out.append(("@@", "@@ +{} @@".format(hunk.get("new_start", 0))))
-        for sign, text in hunk["lines"]:
+        for sign, text in hunk.get("lines", []):
             total_body += 1
             out.append((sign, sign + text))
     if total_body == 0:
         return None
-    rendered, used = [], 0
+    rendered, used, kept_body = [], 0, 0
     for kind, line in out:
-        if kind != "@@":
-            # Stop before exceeding either cap; +1 accounts for the joining newline.
-            projected = used + len(line) + (1 if rendered else 0)
-            if kept_body >= line_cap or (rendered and projected > cap):
-                break
-            kept_body += 1
+        is_body = kind != "@@"
+        # Always keep the FIRST body line (truncated to `cap`) so a genuinely-changed
+        # file never renders to None just because its first line is huge.
+        first_body = is_body and kept_body == 0
+        if first_body and len(line) > cap:
+            line = line[:cap] + "…"
+        projected = used + len(line) + (1 if rendered else 0)
+        # Stop before exceeding either cap — checked for markers too, so many small
+        # hunks can't overshoot `cap` on marker bytes alone.
+        if not first_body and ((is_body and kept_body >= line_cap)
+                               or (rendered and projected > cap)):
+            break
         rendered.append(line)
-        used += len(line) + (1 if len(rendered) > 1 else 0)
+        used = projected
+        if is_body:
+            kept_body += 1
     # Drop a trailing hunk marker with no body lines under it (cap hit right after it).
     while rendered and rendered[-1].startswith("@@"):
         rendered.pop()

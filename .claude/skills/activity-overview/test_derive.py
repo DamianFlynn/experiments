@@ -69,6 +69,18 @@ class BuildArtifacts(unittest.TestCase):
         self.assertEqual(arts["art:docs/x.md"]["lifecycle"][0]["hunk"], hunk)
         self.assertNotIn("hunk", arts["art:README.md"]["lifecycle"][0])
 
+    def test_rename_hunk_only_on_new_path_not_old(self):
+        # A rename reuses one code_event for both sides; its `hunk` is the NEW file's
+        # diff, so it must land on the new-path `add` ONLY, never the old-path remove.
+        hunk = "@@ +1 @@\n+new content"
+        bundle = {"code_events": [
+            {"path": "docs/new.md", "old_path": "docs/old.md", "change": "rename",
+             "commit": "c1", "author": "a", "date": "2026-01-01", "hunk": hunk},
+        ]}
+        arts = derive.build_artifacts(bundle)
+        self.assertEqual(arts["art:docs/new.md"]["lifecycle"][0]["hunk"], hunk)
+        self.assertNotIn("hunk", arts["art:docs/old.md"]["lifecycle"][0])
+
 
 class AreaIndexAndAttribution(unittest.TestCase):
     def test_area_index_and_lookup(self):
