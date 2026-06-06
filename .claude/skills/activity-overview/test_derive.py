@@ -348,6 +348,26 @@ class TestPeopleProfile(unittest.TestCase):
         self.assertIsNone(bundle["people"]["alice"]["first_seen"])
         self.assertIsNone(bundle["people"]["alice"]["last_active"])
 
+    def test_comment_timestamps_feed_first_last_active(self):
+        # A login who ONLY commented (PR conversation, PR review comment, or issue
+        # comment) still gets first_seen/last_active from those timestamps.
+        bundle = {
+            "people": self._people(),
+            "prs": [{"number": 1, "author": "alice", "merged": False,
+                     "created_at": "2026-02-01", "reviewers": [],
+                     "comments_list": [{"author": "bob", "created_at": "2026-02-02"}],
+                     "review_comments": [{"author": "bob", "created_at": "2026-02-05"}]}],
+            "issues": [{"number": 9, "author": "alice", "created_at": "2026-02-01",
+                        "comments_list": [{"author": "bob",
+                                           "created_at": "2026-01-20"}]}],
+            "commits": [],
+        }
+        derive.annotate_people_profile(bundle)
+        bob = bundle["people"]["bob"]
+        self.assertEqual(bob["prs_authored"], 0)        # bob only commented
+        self.assertEqual(bob["first_seen"], "2026-01-20")
+        self.assertEqual(bob["last_active"], "2026-02-05")
+
     def test_authored_by_kind(self):
         bundle = {
             "people": self._people(),

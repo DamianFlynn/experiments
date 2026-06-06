@@ -470,6 +470,8 @@ def annotate_people_profile(bundle):
     bundle facts (prs/commits/issues/artifacts/code_owners/trains). Pure (in
     place); returns bundle for convenience."""
     people = bundle.get("people") or {}
+    if not people:
+        return bundle
     prs = bundle.get("prs", [])
     commits = bundle.get("commits", [])
     issues = bundle.get("issues", [])
@@ -477,117 +479,119 @@ def annotate_people_profile(bundle):
     code_owners = bundle.get("code_owners", {})
     trains = bundle.get("trains", [])
 
-    # Pre-compute the set of area-prefixes that contain a stalled train: a prefix
-    # "contains a stalled train" when any stalled train has a code_areas entry that
-    # startswith the raw prefix string.
+    # Single pass per collection (O(P+N), not O(P*N)): accumulate per-login counters
+    # / dates / review-latencies keyed by login, then assign. Only logins already in
+    # `people` (the participant enumeration) are tracked — every author/reviewer/
+    # commenter/commit-author is in there, so nobody is missed.
+    acc = {login: {"prs_authored": 0, "prs_merged": 0, "prs_reviewed": 0,
+                   "commits_authored": 0, "issues_opened": 0,
+                   "examples_authored": 0, "docs_authored": 0,
+                   "symbols_authored": 0, "authored_then_removed": 0,
+                   "latencies": [], "dates": []}
+           for login in people}
+
+    def add_date(login, ts):
+        if login in acc:
+            d = _iso_date(ts)
+            if d:
+                acc[login]["dates"].append(d)
+
+    for pr in prs:
+        author = pr.get("author")
+        if author in acc:
+            acc[author]["prs_authored"] += 1
+            if pr.get("merged"):
+                acc[author]["prs_merged"] += 1
+            add_date(author, pr.get("created_at"))
+        if pr.get("merged") and pr.get("merged_by") in acc:
+            # the merge is the merger's activity (an author's own merge is counted
+            # only when they merged it themselves, i.e. merged_by == author).
+            add_date(pr.get("merged_by"), pr.get("merged_at"))
+        created = _iso_date(pr.get("created_at"))
+        reviews = pr.get("reviews") or []
+        for rv in pr.get("reviewers") or []:
+            if rv not in acc:
+                continue
+            acc[rv]["prs_reviewed"] += 1
+            own = sorted((r for r in reviews
+                          if r.get("author") == rv and r.get("submitted_at")),
+                         key=lambda r: r["submitted_at"])
+            if own:
+                sub = _iso_date(own[0].get("submitted_at"))
+                if sub:
+                    acc[rv]["dates"].append(sub)
+                    if created and (sub - created).days >= 0:
+                        acc[rv]["latencies"].append((sub - created).days)
+        # comment activity (PR conversation + review comments) counts toward
+        # first_seen/last_active so a commenter isn't under-reported.
+        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
+            add_date(c.get("author"), c.get("created_at"))
+
+    for c in commits:
+        au = c.get("author")
+        if au in acc:
+            acc[au]["commits_authored"] += 1
+            add_date(au, c.get("date"))
+
+    for iss in issues:
+        au = iss.get("author")
+        if au in acc:
+            acc[au]["issues_opened"] += 1
+            add_date(au, iss.get("created_at"))
+        for c in iss.get("comments_list") or []:
+            add_date(c.get("author"), c.get("created_at"))
+
+    # artifacts: each distinct artifact with an "add" event by a login counts toward
+    # that login's authored-by-kind tally (+ authored_then_removed when removed).
+    for art in artifacts.values():
+        kind = art.get("kind")
+        removed = art.get("status") in _REMOVED_STATUSES
+        adders = {ev.get("author") for ev in (art.get("lifecycle") or [])
+                  if ev.get("event") == "add"}
+        for login in adders:
+            if login not in acc:
+                continue
+            if kind == "example":
+                acc[login]["examples_authored"] += 1
+            elif kind in ("doc", "readme"):
+                acc[login]["docs_authored"] += 1
+            elif kind == "symbol":
+                acc[login]["symbols_authored"] += 1
+            if removed:
+                acc[login]["authored_then_removed"] += 1
+
+    # stale_owned: owned code_owners prefixes that contain a stalled train.
     stalled_areas = []
     for t in trains:
         if (t.get("effort") or {}).get("stalled"):
             stalled_areas.extend(t.get("code_areas") or [])
 
-    def _prefix_has_stalled(prefix):
-        return any(area.startswith(prefix) for area in stalled_areas)
+    def _stale_owned(login):
+        return sum(1 for prefix, owners in code_owners.items()
+                   if login in (owners or [])
+                   and any(a.startswith(prefix) for a in stalled_areas))
 
     for login, profile in people.items():
-        prs_authored = 0
-        prs_merged = 0
-        prs_reviewed = 0
-        review_latencies = []
-        dates = []
-
-        for pr in prs:
-            if pr.get("author") == login:
-                prs_authored += 1
-                d = _iso_date(pr.get("created_at"))
-                if d:
-                    dates.append(d)
-                if pr.get("merged"):
-                    prs_merged += 1
-            if pr.get("merged_by") == login and pr.get("merged"):
-                d = _iso_date(pr.get("merged_at"))
-                if d:
-                    dates.append(d)
-            if login in (pr.get("reviewers") or []):
-                prs_reviewed += 1
-                # this login's earliest timestamped review on this PR
-                own = [r for r in (pr.get("reviews") or [])
-                       if r.get("author") == login and r.get("submitted_at")]
-                own.sort(key=lambda r: r["submitted_at"])
-                if own:
-                    sub = _iso_date(own[0].get("submitted_at"))
-                    created = _iso_date(pr.get("created_at"))
-                    if sub:
-                        dates.append(sub)
-                    if sub and created:
-                        latency = (sub - created).days
-                        if latency >= 0:
-                            review_latencies.append(latency)
-
-        commits_authored = 0
-        for c in commits:
-            if c.get("author") == login:
-                commits_authored += 1
-                d = _iso_date(c.get("date"))
-                if d:
-                    dates.append(d)
-
-        issues_opened = 0
-        for iss in issues:
-            if iss.get("author") == login:
-                issues_opened += 1
-                d = _iso_date(iss.get("created_at"))
-                if d:
-                    dates.append(d)
-
-        # artifacts authored (distinct, by an "add" lifecycle event by this login),
-        # bucketed by kind; plus authored-then-removed.
-        examples_authored = 0
-        docs_authored = 0
-        symbols_authored = 0
-        authored_then_removed = 0
-        for art in artifacts.values():
-            added = any(ev.get("author") == login and ev.get("event") == "add"
-                        for ev in art.get("lifecycle") or [])
-            if not added:
-                continue
-            kind = art.get("kind")
-            if kind == "example":
-                examples_authored += 1
-            elif kind in ("doc", "readme"):
-                docs_authored += 1
-            elif kind == "symbol":
-                symbols_authored += 1
-            if art.get("status") in _REMOVED_STATUSES:
-                authored_then_removed += 1
-
-        # stale_owned: distinct owned prefixes (code_owners key whose owner list
-        # includes login) that contain a stalled train.
-        stale_owned = 0
-        for prefix, owners in code_owners.items():
-            if login in (owners or []) and _prefix_has_stalled(prefix):
-                stale_owned += 1
-
-        merge_rate = round(prs_merged / prs_authored, 3) if prs_authored else None
-        review_latency_days = (round(_stats.median(review_latencies), 1)
-                               if review_latencies else None)
-        first_seen = min(dates).isoformat() if dates else None
-        last_active = max(dates).isoformat() if dates else None
-
+        a = acc[login]
+        prs_authored = a["prs_authored"]
+        dates = a["dates"]
         profile.update({
             "prs_authored": prs_authored,
-            "prs_merged": prs_merged,
-            "merge_rate": merge_rate,
-            "prs_reviewed": prs_reviewed,
-            "commits_authored": commits_authored,
-            "issues_opened": issues_opened,
-            "review_latency_days": review_latency_days,
-            "first_seen": first_seen,
-            "last_active": last_active,
-            "examples_authored": examples_authored,
-            "docs_authored": docs_authored,
-            "symbols_authored": symbols_authored,
-            "authored_then_removed": authored_then_removed,
-            "stale_owned": stale_owned,
+            "prs_merged": a["prs_merged"],
+            "merge_rate": (round(a["prs_merged"] / prs_authored, 3)
+                           if prs_authored else None),
+            "prs_reviewed": a["prs_reviewed"],
+            "commits_authored": a["commits_authored"],
+            "issues_opened": a["issues_opened"],
+            "review_latency_days": (round(_stats.median(a["latencies"]), 1)
+                                    if a["latencies"] else None),
+            "first_seen": min(dates).isoformat() if dates else None,
+            "last_active": max(dates).isoformat() if dates else None,
+            "examples_authored": a["examples_authored"],
+            "docs_authored": a["docs_authored"],
+            "symbols_authored": a["symbols_authored"],
+            "authored_then_removed": a["authored_then_removed"],
+            "stale_owned": _stale_owned(login),
         })
 
     return bundle
