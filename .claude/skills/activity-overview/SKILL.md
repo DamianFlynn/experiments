@@ -162,28 +162,43 @@ claim in the report resolves to a source ref — never invent facts.
      train's self-contained JSON slice (the `slice_train` shape: train / issue / prs /
      commits + `review_rounds`, capped `reviews`/`lifecycle`, `reopen_count`,
      `feature_deltas`). Read-only — it does NOT rewrite the bundle.
+  1b. **Deepen the slice with the real diff (optional, lead-only).** The slice already
+     names *what* changed (`feature_deltas` paths/areas) and carries each commit's `sha`,
+     but for languages with no symbol-level `before`/`after` (Terraform/Bicep land only
+     file/comment-granular hunks) the actual logic change isn't in the slice. When the
+     gather clone is still on disk (`workspace/<repo>-clone`), the **lead** MAY fetch it —
+     `git -C workspace/<repo>-clone show <slice.commits[].sha> -- <feature_delta path>` —
+     and fold a **bounded** excerpt into that train's slice JSON before dispatch (cap it,
+     e.g. ~40 lines/file, prefer the module path over `examples/*` churn). Do this in the
+     LEAD, never in the narrator: the narrator must stay slice-only so its evidence stays
+     verifiable. Best-effort — skip silently if the clone is gone; the PR body + commit
+     messages already carry the prose story.
   2. **Dispatch one narrator sub-agent per deep train, IN PARALLEL** (one Task each, sent
-     together). Hand it the slice JSON and this contract:
+     together). Hand it the (optionally deepened) slice JSON and this contract:
      > You are a release narrator. Using ONLY the supplied train slice — never outside
      > knowledge, never invented facts or URLs — return a JSON object
-     > `{summary, proposed, changed, rejected, shipped, evidence:[ref]}`:
+     > `{summary, proposed, changed, rejected, shipped, evidence:[ref]}`. The **code layer
+     > is your primary source** — mine the PR **title/body** (root cause + solution are
+     > usually spelled out there), the **commit messages**, the `feature_deltas` paths +
+     > any folded diff excerpt — and use the review/lifecycle layer for the *decision arc*:
      > - `summary`: 1–2 sentences — what the train set out to do and how it ended.
-     > - `proposed`: what the opening issue/PR asked for (from the issue/PR bodies).
-     > - `changed`: how the approach shifted across review rounds / reopen events
-     >   (use `review_rounds.states`, the `reviews` bodies, and `lifecycle`).
+     > - `proposed`: the problem + asked-for change (from the issue + PR body).
+     > - `changed`: the actual fix/approach — which module/path/symbol changed and how
+     >   (PR body, commit messages, `feature_deltas`/diff) — *and* how it shifted across
+     >   review rounds / reopens (`review_rounds.states`, `reviews` bodies, `lifecycle`).
      > - `rejected`: anything explicitly dropped/declined (a changes-requested that was
      >   removed, an abandoned alternative) — `null` if the slice shows none.
-     > - `shipped`: what actually merged (from merged PRs + `feature_deltas`).
+     > - `shipped`: what actually merged (merged PRs + `feature_deltas` + the diff).
      > - `evidence`: refs (pr/issue/commit/review URLs) **copied verbatim from the slice**
      >   that back the above; every claim must trace to one of them.
      > Ground every statement in the slice. If a field has no support in the slice, set it
      > to `null`/`[]` rather than guessing.
   3. **Verify, then compose.** Drop any `evidence` ref whose URL is not present in the slice
-     (the sub-agent must introduce no new refs). Render the narrative under the train's
-     effort line: the prose `summary`, then **Proposed / Changed / Rejected / Shipped**
-     bullets (omit empty ones), each carrying its evidence link(s). This is the analysis
-     layer — the model's judgment over the slice — and MUST stay grounded in the slice's
-     sourced facts.
+     (the sub-agent must introduce no new refs; a commit `sha`/url it cites must be one from
+     `slice.commits`). Render the narrative under the train's effort line: the prose
+     `summary`, then **Proposed / Changed / Rejected / Shipped** bullets (omit empty ones),
+     each carrying its evidence link(s). This is the analysis layer — the model's judgment
+     over the slice — and MUST stay grounded in the slice's sourced facts.
   - `slice_train(bundle, train_id)` (in-process) / `link.py --slice <train-id>` (CLI) is the
     bounded, self-contained unit a Phase 4b narrator sub-agent — or a spotlight — consumes
     for one train. `render.py --train <id>` produces a spotlight flowchart on demand for any

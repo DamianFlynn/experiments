@@ -107,8 +107,24 @@ re-gather the texture out of band).
    slot. Protocol authored in `SKILL.md` ("Phase 4b"); `report-template.md` points the
    project view at it. The narration is the *model's judgment over the slice* — gather
    stays deterministic; the prose is never pipeline-written.
+   - **Code layer is the narrator's primary source.** The review *comments* are often
+     thin ("LGTM"); the story lives in the PR **title/body** (root cause + solution), the
+     **commit messages**, and `feature_deltas` (changed module/path, with `before`/`after`
+     where the language has symbol extraction). The narrator mines those for
+     `proposed`/`changed`/`shipped` and uses reviews/lifecycle for the *decision arc*.
+   - **Optional diff handle (lead-only).** The slice already carries each commit `sha` and
+     the changed paths. For languages with no symbol-level hunk (Terraform/Bicep), the
+     **lead** MAY `git show <sha> -- <path>` against the gather clone and fold a bounded
+     excerpt into the slice before dispatch — keeping the narrator slice-only (so evidence
+     stays verifiable) while giving it the real diff. Best-effort; skip if the clone is gone.
 4. **Report.** Deepen the "Decision trains" section: narrative + `review_rounds` /
    `reopen_count` / effort texture per deep train.
+
+**Future enhancement (not this phase).** Capture a bounded, language-agnostic unified-diff
+hunk per changed file in the gather code-walk, so `.tf`/`.bicep` *logic* changes carry
+their real `before`/`after` in-slice (today only graphify symbols + comments do) — making
+the slice fully self-contained without needing the clone. Touches the gather hot path, so
+it is sequenced separately.
 
 ## Testing
 - Unit (offline): `normalize_review` / lifecycle-event parse (direction, allowlist,
