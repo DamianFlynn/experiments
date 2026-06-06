@@ -404,6 +404,10 @@ def attribute_train_areas(bundle, idx):
 SLICE_TEXT_CAP = 1500
 # For each comment list, keep at most this many bodies and record the overflow.
 SLICE_COMMENTS_KEPT = 6
+# Per-train budget (chars) for the TOTAL of feature_delta `diff` snippets carried in
+# one slice. Each file diff is already per-file bounded (gather.FILE_DIFF_CAP); this
+# caps a churny train's combined diffs so they can't dominate the narrator's context.
+SLICE_DIFF_CAP = 6000
 
 # Per-kind multiplier on the raw footprint.  feature/module-request represent
 # the heaviest intentional work; bug is medium; idea captures light exploration;
@@ -667,6 +671,27 @@ def _cap_lifecycle(event_objs):
     return kept, max(0, len(event_objs or []) - len(kept))
 
 
+def _cap_train_diffs(deltas):
+    """Bound the TOTAL `diff` chars across a train's feature_deltas. Pure.
+
+    Keeps each delta's `diff` until SLICE_DIFF_CAP chars are used, then strips `diff`
+    from the remaining deltas (copying only those, so the bundle is never mutated —
+    the slice is read-only by contract). Returns (deltas_out, dropped_count) where
+    dropped_count is how many deltas had their diff omitted for the budget."""
+    out, used, dropped = [], 0, 0
+    for d in deltas:
+        diff = d.get("diff")
+        if diff and used < SLICE_DIFF_CAP:
+            out.append(d)            # within budget: keep as-is (by reference)
+            used += len(diff)
+        elif diff:
+            out.append({k: v for k, v in d.items() if k != "diff"})  # copy w/o diff
+            dropped += 1
+        else:
+            out.append(d)
+    return out, dropped
+
+
 def slice_train(bundle, train_id):
     """Return a bounded, self-contained dict describing one train.
 
@@ -695,7 +720,11 @@ def slice_train(bundle, train_id):
                          lifecycle*:[{event, actor, created_at, label}],
                          lifecycle_overflow, reopen_count } ],
           "commits": [ { sha, message*, author, date } ],
-          "feature_deltas": [ ... only this train's deltas ... ],
+          "feature_deltas": [ ... only this train's deltas; file-level deltas may carry
+                               a bounded `diff`. The combined diff chars are capped to
+                               SLICE_DIFF_CAP: once spent, later deltas have `diff`
+                               OMITTED (the delta is still listed) ... ],
+          "feature_deltas_diff_overflow": <# deltas whose diff was omitted for the cap>,
           "symbol_moves":   [ ... only moves whose from/to artifact id is
                                referenced by this train's feature_deltas ... ]
         }
@@ -812,12 +841,16 @@ def slice_train(bundle, train_id):
         if lnk.get("from") in own_artifact_ids or lnk.get("to") in own_artifact_ids
     ]
 
+    # Phase 10 slice-diffs: bound the combined file-diff chars carried for this train.
+    own_deltas, diff_overflow = _cap_train_diffs(own_deltas)
+
     return {
         "train":          train_block,
         "issue":          issue_block,
         "prs":            pr_blocks,
         "commits":        commit_blocks,
         "feature_deltas": own_deltas,
+        "feature_deltas_diff_overflow": diff_overflow,
         "symbol_moves":   own_moves,
     }
 

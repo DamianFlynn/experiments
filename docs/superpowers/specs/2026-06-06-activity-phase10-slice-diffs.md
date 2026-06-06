@@ -1,7 +1,7 @@
 # activity-overview — Phase 10 enhancement: language-agnostic in-slice file diffs
 
 **Date:** 2026-06-06
-**Status:** in progress.
+**Status:** slice 1 shipped (#28); slice 2 in progress.
 **Depends on:** Phase 10 slices 1–3 (#24–#26) shipped to master.
 
 ## Goal
@@ -76,13 +76,16 @@ Two seams already exist:
 
 ## Slices (TDD)
 
-1. **Capture + store + surface.** `bounded_file_diff` helper; attach `diff` to
-   `code_events`; `build_artifacts` carries it onto the file artifact lifecycle;
-   `compute_feature_deltas` emits it; extract round-trips it. Offline tests from a
-   crafted patch fixture; goldens stay byte-identical; `validate` green.
-2. **Slice cap + narrator.** `slice_train` caps the per-train diff total (overflow
-   marker); SKILL.md "Phase 4b" uses in-slice `feature_deltas[].diff` as the primary
-   "what changed" for non-graphify langs, with the lead `git show` as the fallback.
+1. **Capture + store + surface (shipped, #28).** `bounded_file_diff` helper; attach
+   `hunk` to `code_events`; `build_artifacts` carries it onto the file artifact
+   lifecycle; `compute_feature_deltas` emits `feature_deltas[].diff`; extract
+   round-trips it. Goldens byte-identical; `validate` green.
+2. **Slice cap + narrator (this slice).** `slice_train` caps the per-train diff total
+   (`SLICE_DIFF_CAP`; strips `diff` from deltas beyond budget, copying so the bundle is
+   never mutated, and reports `feature_deltas_diff_overflow`); SKILL.md "Phase 4b" uses
+   the in-slice `feature_deltas[].diff` as the primary "what changed" for ALL languages,
+   demoting the lead `git show` to a fallback (used when `feature_deltas_diff_overflow`
+   > 0 or a truncated file matters).
 
 ## Testing
 - Unit: `bounded_file_diff` (cap + `@@`/sign lines + overflow marker); `code_events`
