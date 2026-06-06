@@ -85,22 +85,46 @@ re-gather the texture out of band).
 
 ## Slices (TDD, task-by-task, each its own PR)
 
-1. **Gather prereq (this slice).** Persist review submissions + lifecycle events as
+**Status:** slices 1 (#24) + 2 (#25) shipped; slice 3 in progress.
+
+1. **Gather prereq (shipped, #24).** Persist review submissions + lifecycle events as
    the nodes/edges above; derive `review_rounds`/`reopen_count`. Offline-testable
    from fixtures. Network: PR reviews and the PR timeline are already fetched; this
    slice adds **one** new call — the issue `/timeline` (issues did not fetch it
    before) — to capture issue lifecycle (`reopen_count`). Validate stays green.
    **Byte-stability:** single-repo extract gains the new keys only when the data
    exists — gate the golden-bundle equivalence accordingly.
-2. **`slice_train` enrichment.** Fold the review/lifecycle texture into the bounded
-   per-train slice `slice_train(bundle, id)` so a sub-agent gets the full thread.
-3. **Sub-agent train narration.** One parallel sub-agent per deep-tier train reads
-   its slice → a structured narrative `{summary, proposed, changed, rejected,
-   shipped, evidence:[ref]}`, grounded only in the slice (never invents). Lead agent
-   composes; `report-template.md` gains the per-train narrative block (the Phase 4a
-   `<!-- narrative: <id> -->` placeholder is filled here).
+2. **`slice_train` enrichment (shipped, #25).** Fold the review/lifecycle texture into
+   the bounded per-train slice `slice_train(bundle, id)` so a sub-agent gets the full
+   thread (`review_rounds`, capped `reviews`/`lifecycle`, `reopen_count`).
+3. **Sub-agent train narration (this slice).** Mechanism: `link.py <bundle> --slice
+   <train-id>` emits one train's enriched slice as JSON (read-only). The lead agent runs
+   it per deep train and dispatches **one narrator sub-agent per deep train, in parallel**;
+   each reads ONLY its slice → a structured narrative `{summary, proposed, changed,
+   rejected, shipped, evidence:[ref]}`, every claim traced to a ref copied verbatim from
+   the slice (never invents). The lead **verifies** (drops any evidence ref not in the
+   slice), then composes the narrative into the deep train's `<!-- narrative: <id> -->`
+   slot. Protocol authored in `SKILL.md` ("Phase 4b"); `report-template.md` points the
+   project view at it. The narration is the *model's judgment over the slice* — gather
+   stays deterministic; the prose is never pipeline-written.
+   - **Code layer is the narrator's primary source.** The review *comments* are often
+     thin ("LGTM"); the story lives in the PR **title/body** (root cause + solution), the
+     **commit messages**, and `feature_deltas` (changed module/path, with `before`/`after`
+     where the language has symbol extraction). The narrator mines those for
+     `proposed`/`changed`/`shipped` and uses reviews/lifecycle for the *decision arc*.
+   - **Optional diff handle (lead-only).** The slice already carries each commit `sha` and
+     the changed paths. For languages with no symbol-level hunk (Terraform/Bicep), the
+     **lead** MAY `git show <sha> -- <path>` against the gather clone and fold a bounded
+     excerpt into the slice before dispatch — keeping the narrator slice-only (so evidence
+     stays verifiable) while giving it the real diff. Best-effort; skip if the clone is gone.
 4. **Report.** Deepen the "Decision trains" section: narrative + `review_rounds` /
    `reopen_count` / effort texture per deep train.
+
+**Future enhancement (not this phase).** Capture a bounded, language-agnostic unified-diff
+hunk per changed file in the gather code-walk, so `.tf`/`.bicep` *logic* changes carry
+their real `before`/`after` in-slice (today only graphify symbols + comments do) — making
+the slice fully self-contained without needing the clone. Touches the gather hot path, so
+it is sequenced separately.
 
 ## Testing
 - Unit (offline): `normalize_review` / lifecycle-event parse (direction, allowlist,

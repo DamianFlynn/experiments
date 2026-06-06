@@ -1,6 +1,9 @@
+import contextlib
+import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -2579,6 +2582,78 @@ class TestBuildForecast(unittest.TestCase):
         )
         link.build_forecast(b3)
         self.assertIn("open PR", b3["forecast"]["candidates"][0]["signals"])
+
+
+class TestSliceCLI(unittest.TestCase):
+    """`link.py BUNDLE --slice TRAIN_ID` emits one train's enriched, bounded slice
+    as JSON on stdout (read-only) — the unit a Phase 4b narrator sub-agent reads."""
+
+    def _raw(self):
+        # A minimal enrich-complete raw bundle: PR 100 closes issue 10 (-> one
+        # train), with review/lifecycle texture so the slice carries it.
+        return {
+            "meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                     "to": "2026-05-31", "base_branch": "main"},
+            "prs": [{"number": 100, "url": "https://gh/o/r/pull/100",
+                     "title": "feat A", "body": "b", "state": "closed",
+                     "merged": True, "base": "main", "head": "h",
+                     "created_at": "2026-05-01T00:00:00Z",
+                     "merged_at": "2026-05-10T00:00:00Z",
+                     "closed_at": "2026-05-10T00:00:00Z",
+                     "closes": [10], "crossref_issues": [],
+                     "reviewers": ["carol"], "review_decision": "approved",
+                     "reviews": [{"id": 1, "author": "carol", "state": "approved",
+                                  "submitted_at": "2026-05-03T00:00:00Z",
+                                  "body": "lgtm",
+                                  "url": "https://gh/o/r/pull/100#r1"}],
+                     "lifecycle": [{"id": 2, "actor": "carol",
+                                    "event": "ready_for_review",
+                                    "created_at": "2026-05-02T00:00:00Z",
+                                    "label": None, "url": "u2"}]}],
+            "issues": [{"number": 10, "url": "https://gh/o/r/issues/10",
+                        "title": "A", "state": "closed",
+                        "closed_at": "2026-05-10T00:00:00Z",
+                        "updated_at": "2026-05-10T00:00:00Z",
+                        "lifecycle": [{"id": 3, "actor": "alice",
+                                       "event": "reopened",
+                                       "created_at": "2026-05-04T00:00:00Z",
+                                       "label": None, "url": None}],
+                        "reopen_count": 1}],
+            "commits": [], "code_events": [], "milestones": [],
+            "releases": [], "code_graph": {"areas": []},
+        }
+
+    def _write(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(self._raw(), fh)
+        # self-cleaning even if a later assertion fails.
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_slice_cli_emits_train_slice_json(self):
+        train_id = link.enrich(self._raw())["trains"][0]["id"]
+        expected = link.slice_train(link.enrich(self._raw()), train_id)
+        path = self._write()
+        with open(path, encoding="utf-8") as fh:
+            before = fh.read()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            link.main([path, "--slice", train_id])
+        got = json.loads(buf.getvalue())
+        self.assertEqual(got, expected)
+        # the slice carries the Phase 10 texture
+        self.assertEqual(got["prs"][0]["review_rounds"]["count"], 1)
+        self.assertEqual(got["issue"]["reopen_count"], 1)
+        # read-only: the bundle file is NOT rewritten
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_slice_cli_unknown_train_exits_2(self):
+        path = self._write()
+        with self.assertRaises(SystemExit) as cm:
+            link.main([path, "--slice", "train-does-not-exist"])
+        self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

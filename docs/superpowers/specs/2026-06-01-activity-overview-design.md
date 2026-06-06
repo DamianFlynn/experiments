@@ -1241,13 +1241,16 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   init`/`graph` over real modules (#20, #23). *Verified:* cross-repo identity + cross-repo train
   tests green on real AVM-Bicep + AVM-Terraform data.
 - **Phase 10 — 4b: sub-agent train narration, rebuilt on the store — in progress** (spec:
-  `docs/superpowers/specs/2026-06-06-activity-phase10-narration.md`). *Analyze:* parallel
-  sub-agent per train reading a slice over `traverse_spine` → decision narratives with an
-  `evidence:[ref]` list. *Gather prereq (slice 1, underway):* persist PR review submissions +
-  timeline lifecycle events (already fetched, currently discarded) as `social` nodes attached to
-  their PR/issue via **`part_of`** (confirmed spine, so the review rounds ride inside the train
-  slice; train identity unchanged) → true `review_rounds`/`reopen_count` + review-round texture.
-  *Report:* deepened "Decision trains" section. Built once, on the graph, after extract proves
+  `docs/superpowers/specs/2026-06-06-activity-phase10-narration.md`). **Slices 1 (#24) + 2 (#25)
+  shipped:** PR review submissions + timeline lifecycle events (already fetched, previously
+  discarded) persist as `social` nodes attached to their PR/issue via **`part_of`** (spine, so the
+  rounds ride inside the train slice; train identity unchanged) → true `review_rounds`/`reopen_count`
+  + review-round texture, folded into the bounded `slice_train`. **Slice 3 (narration) in progress:**
+  `link.py --slice <id>` emits one train's enriched slice as JSON; the lead dispatches a parallel
+  narrator sub-agent per deep train that reads ONLY its slice → a `{summary, proposed, changed,
+  rejected, shipped, evidence:[ref]}` narrative, every ref copied verbatim from the slice (lead
+  verifies + composes into the `<!-- narrative: <id> -->` slot). *Report:* deepened "Decision trains"
+  section (narrative + review-rounds/reopen texture). Built once, on the graph, after extract proves
   equivalence.
 - **Phase 11 — people & community + flow/stall report views (original-P5 report half).** The
   data model + aggregation now live in P5 (schema) / P6 (gather) / P8 (spotlight); this phase

@@ -970,14 +970,32 @@ def enrich(bundle):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
-        sys.stderr.write("usage: link.py BUNDLE.json\n")
+    # Accept ONLY the documented shapes: `BUNDLE` or `BUNDLE --slice TRAIN_ID`.
+    # `--slice` is recognized strictly as the second positional, and any other
+    # argv shape is rejected (no flag-anywhere / unknown-arg surprises).
+    slice_id = None
+    if len(argv) == 1:
+        path = argv[0]
+    elif len(argv) == 3 and argv[1] == "--slice":
+        path, slice_id = argv[0], argv[2]
+    else:
+        sys.stderr.write("usage: link.py BUNDLE.json [--slice TRAIN_ID]\n")
         raise SystemExit(2)
-    path = argv[0]
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         bundle = json.load(fh)
     enrich(bundle)
-    with open(path, "w") as fh:
+    if slice_id is not None:
+        # Phase 4b: emit ONE train's bounded, self-contained slice as JSON for a
+        # narrator sub-agent. Read-only — the bundle file is NOT rewritten.
+        try:
+            sliced = slice_train(bundle, slice_id)
+        except KeyError:
+            sys.stderr.write(f"link.py --slice: train {slice_id!r} not found\n")
+            raise SystemExit(2)
+        json.dump(sliced, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return slice_id
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(bundle, fh, indent=2)
     sys.stderr.write(
         f"linked {len(bundle['trains'])} trains, "
