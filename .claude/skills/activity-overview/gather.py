@@ -416,8 +416,9 @@ def normalize_review(raw):
     Phase 10 slice 1: `summarize_reviews` reduces reviews to {reviewers,
     decision} and DISCARDS the individual submissions; this KEEPS each one so
     the fold can persist it as a `review` social node (the review-rounds
-    texture). Reviews always carry an `html_url`, surfaced as `url` for
-    provenance."""
+    texture). A review's `html_url` is surfaced as `url` for provenance; when
+    absent, the fold synthesizes a stable `<pr url>#pullrequestreview-<id>`
+    ref (so check_provenance never fails)."""
     return {
         "id": raw.get("id"),
         "author": (raw.get("user") or {}).get("login"),

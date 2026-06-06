@@ -39,7 +39,8 @@ traverse them and a sub-agent slice carries them. New local-id forms and edges:
 ### Review submission
 - **Node** `review-<pr>-<review_id>` (`social`), `ts = submitted_at`,
   `data = {author, state, submitted_at, body}`. **Provenance:** the review's
-  `html_url` (reviews always carry one).
+  `html_url` when present, else a synthesized `<pr url>#pullrequestreview-<id>`
+  ref (same fallback contract as lifecycle events).
 - **Edge** `review-<pr>-<review_id>` —`part_of`→ `pr-<pr>`. We **reuse `part_of`**
   (a review is part of the PR thread, like a commit is): this keeps reviews inside
   the train when `traverse_spine` walks it, so a sub-agent reading the train slice
@@ -86,9 +87,11 @@ re-gather the texture out of band).
 
 1. **Gather prereq (this slice).** Persist review submissions + lifecycle events as
    the nodes/edges above; derive `review_rounds`/`reopen_count`. Offline-testable
-   from fixtures (the raw reviews/timeline are already fetched); no new network.
-   Validate stays green. **Byte-stability:** single-repo extract gains the new keys
-   only when the data exists — gate the golden-bundle equivalence accordingly.
+   from fixtures. Network: PR reviews and the PR timeline are already fetched; this
+   slice adds **one** new call — the issue `/timeline` (issues did not fetch it
+   before) — to capture issue lifecycle (`reopen_count`). Validate stays green.
+   **Byte-stability:** single-repo extract gains the new keys only when the data
+   exists — gate the golden-bundle equivalence accordingly.
 2. **`slice_train` enrichment.** Fold the review/lifecycle texture into the bounded
    per-train slice `slice_train(bundle, id)` so a sub-agent gets the full thread.
 3. **Sub-agent train narration.** One parallel sub-agent per deep-tier train reads
