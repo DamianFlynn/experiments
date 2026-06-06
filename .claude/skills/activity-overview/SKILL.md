@@ -148,14 +148,46 @@ claim in the report resolves to a source ref — never invent facts.
     - Merged: *"landed in N days · R reviewers · P contributors"*
       (`elapsed_days`, `reviewers`, `participants`; note `stalled: true` when present).
     - Open: *"open N days"* (compute from `effort.opened_at` to today; merged_at is null).
-    The per-train narrative is authored in Phase 4b (sub-agent pass) — for now leave a
-    `<!-- narrative: <train-id> -->` placeholder after the effort line.
+    Append **review/lifecycle texture** when present (Phase 10): *"· K review rounds"*
+    (sum of `review_rounds.count` over the train's PRs) and *"· reopened M×"* (sum of
+    `reopen_count` across the train's issue + PRs). Omit each when zero/absent.
+    Then fill the `<!-- narrative: <train-id> -->` slot (after the effort line) with a
+    **Phase 4b per-train narrative** authored by a narrator sub-agent — see below.
   - **MENTION trains** (`tier == "mention"`) collapse to a single line:
     `- train-id — {title} — {outcome} ({PR count} PR(s))`.
-  - `slice_train(bundle, train_id)` is the bounded, self-contained unit that a Phase 4b
-    sub-agent (or a spotlight) consumes for one train. Call it to scope the context passed
-    to a sub-agent. `render.py --train <id>` produces a spotlight flowchart on demand for
-    any tier.
+- Phase 4b **Per-train narration (sub-agent pass).** For EACH deep train, fill its
+  `<!-- narrative: <train-id> -->` slot with a sourced narrative produced by a narrator
+  sub-agent that reads ONLY that train's bounded slice:
+  1. **Get the slice:** `python3 link.py <bundle-view> --slice <train-id>` prints the
+     train's self-contained JSON slice (the `slice_train` shape: train / issue / prs /
+     commits + `review_rounds`, capped `reviews`/`lifecycle`, `reopen_count`,
+     `feature_deltas`). Read-only — it does NOT rewrite the bundle.
+  2. **Dispatch one narrator sub-agent per deep train, IN PARALLEL** (one Task each, sent
+     together). Hand it the slice JSON and this contract:
+     > You are a release narrator. Using ONLY the supplied train slice — never outside
+     > knowledge, never invented facts or URLs — return a JSON object
+     > `{summary, proposed, changed, rejected, shipped, evidence:[ref]}`:
+     > - `summary`: 1–2 sentences — what the train set out to do and how it ended.
+     > - `proposed`: what the opening issue/PR asked for (from the issue/PR bodies).
+     > - `changed`: how the approach shifted across review rounds / reopen events
+     >   (use `review_rounds.states`, the `reviews` bodies, and `lifecycle`).
+     > - `rejected`: anything explicitly dropped/declined (a changes-requested that was
+     >   removed, an abandoned alternative) — `null` if the slice shows none.
+     > - `shipped`: what actually merged (from merged PRs + `feature_deltas`).
+     > - `evidence`: refs (pr/issue/commit/review URLs) **copied verbatim from the slice**
+     >   that back the above; every claim must trace to one of them.
+     > Ground every statement in the slice. If a field has no support in the slice, set it
+     > to `null`/`[]` rather than guessing.
+  3. **Verify, then compose.** Drop any `evidence` ref whose URL is not present in the slice
+     (the sub-agent must introduce no new refs). Render the narrative under the train's
+     effort line: the prose `summary`, then **Proposed / Changed / Rejected / Shipped**
+     bullets (omit empty ones), each carrying its evidence link(s). This is the analysis
+     layer — the model's judgment over the slice — and MUST stay grounded in the slice's
+     sourced facts.
+  - `slice_train(bundle, train_id)` (in-process) / `link.py --slice <train-id>` (CLI) is the
+    bounded, self-contained unit a Phase 4b narrator sub-agent — or a spotlight — consumes
+    for one train. `render.py --train <id>` produces a spotlight flowchart on demand for any
+    tier.
 - Phase 4a **Next-release forecast** — `bundle["forecast"]` contains a forward-only
   prediction over `buckets.next_candidates`. Render a **Next-release forecast** section:
   - Header: *"Next milestone: {forecast.next_milestone}"* (or "none identified").

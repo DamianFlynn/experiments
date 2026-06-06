@@ -971,12 +971,30 @@ def enrich(bundle):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
-        sys.stderr.write("usage: link.py BUNDLE.json\n")
+        sys.stderr.write("usage: link.py BUNDLE.json [--slice TRAIN_ID]\n")
         raise SystemExit(2)
     path = argv[0]
+    slice_id = None
+    if "--slice" in argv:
+        i = argv.index("--slice")
+        if i + 1 >= len(argv):
+            sys.stderr.write("link.py: --slice requires a TRAIN_ID\n")
+            raise SystemExit(2)
+        slice_id = argv[i + 1]
     with open(path) as fh:
         bundle = json.load(fh)
     enrich(bundle)
+    if slice_id is not None:
+        # Phase 4b: emit ONE train's bounded, self-contained slice as JSON for a
+        # narrator sub-agent. Read-only — the bundle file is NOT rewritten.
+        try:
+            sliced = slice_train(bundle, slice_id)
+        except KeyError:
+            sys.stderr.write(f"link.py --slice: train {slice_id!r} not found\n")
+            raise SystemExit(2)
+        json.dump(sliced, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return slice_id
     with open(path, "w") as fh:
         json.dump(bundle, fh, indent=2)
     sys.stderr.write(

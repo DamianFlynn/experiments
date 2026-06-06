@@ -41,11 +41,13 @@
      (rank by `len(train["prs"]) + len(train["commits"])`, break ties by
      `outcome` shipped > in_flight > rejected > abandoned). Lead with the
      cross-repo trains (`len(train["repos"]) > 1`).
-     For a DEEP per-train flowchart + effort line, drop into the owning member's
-     single-repo bundle: match the project train's local `pr-`/`issue-` ids to a
-     train in `view["members"][i]["bundle"]["trains"]` (which DO carry `tier`,
+     For a DEEP per-train flowchart + effort line + Phase 4b narrative, drop into the
+     owning member's single-repo bundle: match the project train's local `pr-`/`issue-`
+     ids to a train in `view["members"][i]["bundle"]["trains"]` (which DO carry `tier`,
      `significance`, `effort`) and that member's rendered
-     `diagrams.train_flowcharts[...]`. -->
+     `diagrams.train_flowcharts[...]`. The per-train narrative (summary + Proposed /
+     Changed / Rejected / Shipped, each sourced) is authored by a narrator sub-agent over
+     `link.py <member-bundle> --slice <train-id>` — see SKILL.md "Phase 4b". -->
 
 ### {train.id} — {short title}
 
