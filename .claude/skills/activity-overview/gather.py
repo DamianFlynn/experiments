@@ -2039,9 +2039,11 @@ def _format_http_error(url, err):
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 
-# Auto-discover the repo's board(s) and pull a page of items. `$cursor` paginates
-# the (first board's) items; fields/iterations are stable across pages so we read
-# them from the first response. The shapes are confirmed against the live API.
+# Auto-discover the repo's board(s) and pull each board's first page of items.
+# `closed`/`updatedAt` drive the maintenance filter (skip deprecated boards). The
+# shared `$cursor` is only used for this discovery page; every kept board's
+# remaining items are paginated by NODE ID afterward (PROJECT_BOARD_ITEMS_QUERY),
+# so a per-board cursor is never confused with another board's. Confirmed live.
 PROJECT_BOARD_QUERY = """
 query($owner:String!, $repo:String!, $cursor:String) {
   repository(owner:$owner, name:$repo) {
@@ -2050,6 +2052,8 @@ query($owner:String!, $repo:String!, $cursor:String) {
         id
         number
         title
+        closed
+        updatedAt
         fields(first:50) {
           nodes {
             __typename
@@ -2229,18 +2233,92 @@ def parse_project_board(board_nodes):
     return sprints, items_by_ref
 
 
-def fetch_project_board(graphql, owner, repo, max_items=2000):
-    """Auto-discover + fetch the repo's PRIMARY Projects v2 board via the injected
-    `graphql(query, variables)` callable, returning `(sprints, items_by_ref)`
-    (see parse_project_board). A repo may link several boards; we ingest only the
-    lowest-numbered one (spec: one board per repo for now) and warn about the rest,
-    rather than half-fetch them. Its items are paginated by NODE ID (so each cursor
-    belongs to that board's connection), capped defensively at `max_items`.
+# A linked Projects v2 board left untouched for this long is treated as
+# deprecated-but-not-removed and skipped (overridable via the env var).
+BOARD_STALE_DAYS = 365
+
+
+def _board_stale_days():
+    """Effective board-staleness threshold in days. `ACTIVITY_BOARD_STALE_DAYS`
+    overrides BOARD_STALE_DAYS at call time (a non-int/empty value falls back)."""
+    try:
+        return max(0, int(os.environ.get("ACTIVITY_BOARD_STALE_DAYS",
+                                         BOARD_STALE_DAYS)))
+    except (TypeError, ValueError):
+        return BOARD_STALE_DAYS
+
+
+def board_is_maintained(board, ref_date=None, stale_days=None):
+    """Whether a linked board is worth ingesting. A board is DROPPED when it is
+    `closed` (archived — the clean "deprecated" signal) or its `updatedAt` is
+    older than `stale_days` before `ref_date` (abandoned but never closed). A
+    board with no `updatedAt`, or when `ref_date` is None/unparseable, is KEPT
+    (we can't prove it stale). Pure; date-only comparison for determinism."""
+    if not isinstance(board, dict):
+        return False
+    if board.get("closed"):
+        return False
+    updated = board.get("updatedAt")
+    if not updated or not ref_date:
+        return True
+    if stale_days is None:
+        stale_days = _board_stale_days()
+    try:
+        ref_d = datetime.date.fromisoformat(str(ref_date)[:10])
+    except (TypeError, ValueError):
+        return True
+    cutoff = ref_d - datetime.timedelta(days=max(0, int(stale_days)))
+    return str(updated)[:10] >= cutoff.isoformat()
+
+
+def _paginate_board_items(graphql, board, owner, repo, max_items):
+    """Collect ONE board's item nodes: seed from the discovery page, then page the
+    rest by NODE ID (PROJECT_BOARD_ITEMS_QUERY — a cursor that belongs to this
+    board's connection), capped at `max_items`. Warns on truncation so lost
+    coverage is visible. Returns the (capped) list of item nodes."""
+    nodes = list(((board.get("items") or {}).get("nodes") or []))
+    info = (board.get("items") or {}).get("pageInfo") or {}
+    cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
+    board_id, guard = board.get("id"), 0
+    while has_next and board_id and len(nodes) < max_items and guard < 200:
+        guard += 1
+        try:
+            page = graphql(PROJECT_BOARD_ITEMS_QUERY,
+                           {"id": board_id, "cursor": cursor})
+        except Exception as err:  # noqa: BLE001
+            sys.stderr.write(
+                "warning: partial Projects v2 board #{} for {}/{}: {}\n".format(
+                    board.get("number"), owner, repo, err))
+            break
+        items = ((page or {}).get("node") or {}).get("items") or {}
+        page_nodes = items.get("nodes") or []
+        if not page_nodes:
+            break
+        nodes.extend(page_nodes)
+        info = items.get("pageInfo") or {}
+        cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
+    if has_next and len(nodes) >= max_items:
+        sys.stderr.write(
+            "warning: Projects v2 board #{} for {}/{} truncated at {} items "
+            "(raise ACTIVITY board cap for full coverage).\n".format(
+                board.get("number"), owner, repo, max_items))
+    return nodes[:max_items]
+
+
+def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
+    """Auto-discover + fetch EVERY maintained Projects v2 board the repo links, via
+    the injected `graphql(query, variables)` callable, returning
+    `(sprints, items_by_ref)` (see parse_project_board, which merges items across
+    boards). Boards that are closed or stale (see `board_is_maintained`) are
+    skipped with a warning so a deprecated-but-not-removed board can't pollute the
+    result. Each kept board's items are paginated by NODE ID and capped per board
+    at `max_items`. `ref_date` (the window's ref/`to` date) anchors the staleness
+    check.
 
     Degrades CLEANLY to ({}, {}) on any error (a GraphQL `errors` SystemExit, a
-    network failure, a null repository, or no linked board) — a board fetch must
-    NEVER hard-fail the run. `graphql` is injectable so the suite tests this
-    driver against fixtures with no network.
+    network failure, a null repository, or no linked/maintained board) — a board
+    fetch must NEVER hard-fail the run. `graphql` is injectable so the suite tests
+    this driver against fixtures with no network.
     """
     try:
         data = graphql(PROJECT_BOARD_QUERY,
@@ -2257,45 +2335,33 @@ def fetch_project_board(graphql, owner, repo, max_items=2000):
     if not boards:
         return {}, {}
 
-    # Determinism: pick the lowest-numbered board as primary; ignore the rest.
+    # Deterministic merge order: ascending board number (then id). Drop closed /
+    # stale boards (warning each) so deprecated-but-not-removed boards are ignored.
     boards = sorted(
         boards, key=lambda b: (b.get("number") is None, b.get("number") or 0,
                                b.get("id") or ""))
-    primary = boards[0]
-    if len(boards) > 1:
-        sys.stderr.write(
-            "warning: {}/{} links {} Projects v2 boards; ingesting only #{} "
-            "({}), ignoring the rest.\n".format(
-                owner, repo, len(boards), primary.get("number"),
-                primary.get("title")))
-
-    # Paginate the PRIMARY board's items by its node id (correct per-board cursors).
-    nodes = list(((primary.get("items") or {}).get("nodes") or []))
-    info = (primary.get("items") or {}).get("pageInfo") or {}
-    cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
-    board_id, guard = primary.get("id"), 0
-    while has_next and board_id and len(nodes) < max_items and guard < 100:
-        guard += 1
-        try:
-            page = graphql(PROJECT_BOARD_ITEMS_QUERY,
-                           {"id": board_id, "cursor": cursor})
-        except Exception as err:  # noqa: BLE001
+    kept = []
+    for b in boards:
+        if board_is_maintained(b, ref_date):
+            kept.append(b)
+        else:
+            reason = "closed" if b.get("closed") else "stale (updatedAt {})".format(
+                b.get("updatedAt"))
             sys.stderr.write(
-                f"warning: partial Projects v2 board for {owner}/{repo}: {err}\n")
-            break
-        items = ((page or {}).get("node") or {}).get("items") or {}
-        page_nodes = items.get("nodes") or []
-        if not page_nodes:
-            break
-        nodes.extend(page_nodes)
-        info = items.get("pageInfo") or {}
-        cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
-    nodes = nodes[:max_items]
+                "warning: skipping {} Projects v2 board #{} ({}) for {}/{}.\n".format(
+                    reason, b.get("number"), b.get("title"), owner, repo))
+    if not kept:
+        return {}, {}
 
-    primary_full = dict(primary)
-    primary_full["items"] = {"pageInfo": {"hasNextPage": False, "endCursor": None},
-                             "nodes": nodes}
-    return parse_project_board([primary_full])
+    # Fetch each maintained board fully (per-board node-id pagination), then merge.
+    full_boards = []
+    for b in kept:
+        nodes = _paginate_board_items(graphql, b, owner, repo, max_items)
+        fb = dict(b)
+        fb["items"] = {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                       "nodes": nodes}
+        full_boards.append(fb)
+    return parse_project_board(full_boards)
 
 
 def _next_link(link_header):
@@ -2599,7 +2665,11 @@ def acquire(args, env):
     if getattr(args, "project_board", True):
         def _graphql(query, variables=None):
             return graphql_post(token, query, variables)
-        sprints, items_by_ref = fetch_project_board(_graphql, owner, repo)
+        # ref_date (the window's reference point) anchors the board staleness
+        # check; it is finalized below but resolves to the same value here.
+        sprints, items_by_ref = fetch_project_board(
+            _graphql, owner, repo,
+            ref_date=getattr(args, "ref_date", None) or to)
         # Window-bound iterations to [frm, to] by date: keep a sprint that overlaps
         # the window at all (start <= to and end >= frm). A sprint with no dates is
         # kept (can't exclude it). Drop the iteration stamp on items whose sprint

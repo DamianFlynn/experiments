@@ -1,7 +1,9 @@
 # activity-overview — Phase 12 follow-up: ingest ALL maintained boards
 
 **Date:** 2026-06-06
-**Status:** in progress — slice 1 (this PR).
+**Status:** shipped — slice 1 (this PR). Verified live on `bicep-registry-modules`:
+0 → 3,063 of its own items now carry board status (merged from #538 + #566; #115 kept
+but contributes 0 BRM items), all three boards currently open + fresh so none filtered.
 **Depends on:** Phase 12 slice 1 (board ingest) — `parse_project_board` already
 merges items across multiple board nodes; only `fetch_project_board` restricted
 the fetch to a single (lowest-numbered) board.
@@ -55,6 +57,9 @@ A board is **dropped** (with a one-line `warning:` naming it + the reason) when:
   guard bounds a pathological board.
 - Pass the LIST of full board nodes to `parse_project_board` (union of iterations;
   per-item `(slug, number)` merge — first non-None status/sprint in board order).
+  **Conflict rule:** boards are passed in ascending `number` order, so when the
+  same item carries a status on more than one board, the **lowest-numbered board
+  wins** (deterministic). Recording which board a status came from is out of scope.
 - Degrade cleanly to `({}, {})` on any error, exactly as today. A repo that links
   **no** board still yields the empty layer (AVM-Terraform stays byte-identical).
 

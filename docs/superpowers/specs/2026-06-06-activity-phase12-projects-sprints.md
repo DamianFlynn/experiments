@@ -106,5 +106,8 @@ flag — it rides the existing `--owner/--repo` (and each manifest member). An o
 
 ## Not in scope
 - Status automation / writing to the board (read-only).
-- Ingesting more than ONE board per repo — when a repo links several, only the primary
-  (lowest-numbered) board is ingested; the rest are warned about and ignored for now.
+- ~~Ingesting more than ONE board per repo~~ — SUPERSEDED by the 2026-06-06 follow-up
+  (`2026-06-06-activity-phase12-all-boards.md`): gather now ingests EVERY maintained
+  board a repo links (skipping closed/stale ones) and merges their items, after the
+  smoke tests showed the lowest-numbered heuristic picked the wrong board (zero
+  coverage) for `bicep-registry-modules`.
