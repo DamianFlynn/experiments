@@ -5,6 +5,7 @@ import sys
 from datetime import datetime, timezone
 
 import gather  # for resolve_commit_pr / attach_commit_prs (commit->PR resolution)
+import series  # Phase 13: series continuity (installment_snapshot / compute_series)
 
 # Phase 7b-1: the pure derivations now live in `derive` (a leaf module that does
 # NOT import link or gather), so the store write-path can derive these without a
@@ -1042,20 +1043,46 @@ def enrich(bundle):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    # Accept ONLY the documented shapes: `BUNDLE` or `BUNDLE --slice TRAIN_ID`.
-    # `--slice` is recognized strictly as the second positional, and any other
-    # argv shape is rejected (no flag-anywhere / unknown-arg surprises).
+    # Accept ONLY the documented shapes: `BUNDLE`, `BUNDLE --slice TRAIN_ID`, or
+    # `BUNDLE --series series.json`. The flag is recognized strictly as the
+    # second positional, and any other argv shape is rejected (no flag-anywhere
+    # / unknown-arg surprises). `--slice` and `--series` are mutually exclusive.
     slice_id = None
+    series_path = None
     if len(argv) == 1:
         path = argv[0]
     elif len(argv) == 3 and argv[1] == "--slice":
         path, slice_id = argv[0], argv[2]
+    elif len(argv) == 3 and argv[1] == "--series":
+        path, series_path = argv[0], argv[2]
     else:
-        sys.stderr.write("usage: link.py BUNDLE.json [--slice TRAIN_ID]\n")
+        sys.stderr.write(
+            "usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json]\n")
         raise SystemExit(2)
     with open(path, encoding="utf-8") as fh:
         bundle = json.load(fh)
     enrich(bundle)
+    if series_path is not None:
+        # Phase 13: series continuity. Load the append-only index (absent/empty
+        # ⇒ first installment), compute the `series` block against the last
+        # recorded installment, then append THIS installment's snapshot and write
+        # the index back. Without `--series` no `series` key is added, so the
+        # standard digest stays byte-identical.
+        try:
+            with open(series_path, encoding="utf-8") as fh:
+                raw = fh.read()
+            # Absent OR empty/whitespace-only (e.g. a freshly `touch`ed or
+            # truncated file) ⇒ first installment. A non-empty but malformed
+            # index still raises, surfacing a clear error rather than silently
+            # discarding a corrupt-but-present index.
+            installments = json.loads(raw) if raw.strip() else []
+        except FileNotFoundError:
+            installments = []
+        prior = installments[-1] if installments else None
+        bundle["series"] = series.compute_series(bundle, prior)
+        installments.append(series.installment_snapshot(bundle))
+        with open(series_path, "w", encoding="utf-8") as fh:
+            json.dump(installments, fh, indent=2)
     if slice_id is not None:
         # Phase 4b: emit ONE train's bounded, self-contained slice as JSON for a
         # narrator sub-agent. Read-only — the bundle file is NOT rewritten.
