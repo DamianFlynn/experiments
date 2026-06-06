@@ -4,8 +4,10 @@ name: activity-overview
 #   tests (offline, every push/PR)  ->  live (real gather -> journey-graph
 #   store -> trust audit, on demand / scheduled / on a push to the default
 #   branch). The journey-graph store is the deliverable; `validate.py` is the
-#   gate that proves the graph is trustworthy before any report is built from
-#   it. The report vertical (extract -> link -> render) lands in Phase 8.
+#   gate that proves the graph is trustworthy. The live job intentionally stops
+#   at the trust gate (gather -> validate); the offline report vertical
+#   (extract -> link -> render) is covered by the test suite and needs
+#   mmdc/graphify, so it is not re-run live here.
 
 on:
   push:
