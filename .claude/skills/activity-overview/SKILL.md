@@ -95,6 +95,17 @@ claim in the report resolves to a source ref — never invent facts.
    ```
    This adds `trains` and classifies all four `buckets` (`shipped`, `rejected`,
    `in_flight`, `next_candidates`).
+
+   **Series continuity (optional).** For a recurring digest, pass an append-only
+   index so this installment is framed against the last one:
+   ```bash
+   python3 link.py <bundle-view> --series series.json
+   ```
+   This adds `bundle["series"]` (`new` / `carried_over` / `forecast_loop`) and
+   appends this installment's snapshot to `series.json`. The file is a thin
+   convenience index over the store — never an override; delete it to start a
+   fresh series (the next run is then a "first installment"). Without `--series`
+   the digest is byte-identical to before.
 3. **Render diagrams.** Preflight: `mmdc` must be on PATH
    (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
    `graphify` is **optional** (used only for its supported languages); when it is
@@ -287,3 +298,10 @@ claim in the report resolves to a source ref — never invent facts.
     whose `iteration` is that sprint id (shipped vs in-flight). Omit the whole sprint
     subsection for status-only boards (no iterations) — most boards, so this is usually
     absent. All deterministic data; the framing prose is the agent's.
+- Phase 13 **Series continuity ("Since last installment")** — present ONLY when the run
+  was linked with `--series` and `bundle["series"].first_installment` is false. From
+  `bundle["series"]`: render **New this installment** (`new`), **Carried over**
+  (`carried_over`, each citing its `prior_status` and whether it has now shipped), and the
+  **Forecast loop** (`forecast_loop.landed` vs `not_yet` — last installment's predictions
+  matched against this window's shipped). Membership is deterministic and every item cites
+  its ref; the continuity narrative is the agent's. Omit on the first installment.

@@ -1281,11 +1281,13 @@ vertical slice; the **golden-bundle equivalence test gates every substrate phase
   (release-train framing, only on iteration boards). Verified live on Azure/bicep #115 (a
   status-only board: 799 items with statuses, no sprints). Spec:
   `docs/superpowers/specs/2026-06-06-activity-phase12-projects-sprints.md`.
-- **Phase 13 — series continuity (original P7; mostly absorbed by the store).** Cross-window
-  state is now a wide range query, so this phase ships the **"Since last installment"** report
-  section + the forecast-loop (predicted-vs-landed) and carry-over (`first_seen`/`carried_over`/
-  `prior_status`). `series.json` becomes a thin convenience index over the store, never an
-  override of a re-gather.
+- **Phase 13 — series continuity (original P7; mostly absorbed by the store).** SHIPPED
+  (slice 1, this PR). Cross-window state is now a wide range query, so this phase ships the
+  **"Since last installment"** report section + the forecast-loop (predicted-vs-landed) and
+  carry-over (`new`/`carried_over`/`prior_status`) via a pure `series.py`
+  (`installment_snapshot` / `compute_series`) wired through `link.py --series series.json`.
+  `series.json` is a thin **append-only** convenience index over the store, never an override
+  of a re-gather; without `--series` the digest is byte-identical (no `series` key).
 - **Phase 14 — transcript + slash command (original-P8 remainder).** Community-call section +
   the `/activity` slash-command entrypoint.
 

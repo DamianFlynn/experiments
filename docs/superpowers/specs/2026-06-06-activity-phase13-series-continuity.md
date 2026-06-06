@@ -1,7 +1,7 @@
 # activity-overview — Phase 13: series continuity ("Since last installment")
 
 **Date:** 2026-06-06
-**Status:** in progress.
+**Status:** shipped — slice 1 (this PR): `series.py` + `link.py --series` + report section.
 **Depends on:** the durable store (cross-window state is a wide `range_query`); the
 enriched bundle's `buckets` (shipped / in_flight / rejected / next_candidates) +
 `forecast` + (Phase 12) `board_status`.

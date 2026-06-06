@@ -12,6 +12,30 @@
 
 {N} merged PRs across {M} decision trains. {shipped_count} items shipped.
 
+## Since last installment
+
+<!-- Phase 13 (series continuity). OMIT this whole section when `bundle["series"]`
+     is absent (no `--series` index) or `series.first_installment` is true — the
+     first digest of a project has no prior to compare against. Source:
+     `bundle["series"]` = {new, carried_over, forecast_loop}. Framing prose is the
+     agent's; the membership is deterministic and every item cites its ref. -->
+
+**New this installment:** items in `series.new` (first seen this window).
+
+- [{title}]({url}) (#{id})
+
+**Carried over:** items that were in flight last installment and are still here
+(`series.carried_over`), each annotated with where it stood last time
+(`prior_status`).
+
+- [{title}]({url}) (#{id}) — *was {prior_status}*{ — now shipped (when `bucket == "shipped"`)}
+
+**Forecast loop** (last installment's predictions vs. what landed) — from
+`series.forecast_loop`:
+
+- **Landed:** `forecast_loop.landed` — predicted (tier `{tier}`) and shipped this window: [{title}]({url}) (#{id}).
+- **Not yet:** `forecast_loop.not_yet` — predicted (tier `{tier}`) but still not shipped: [{title}]({url}) (#{id}).
+
 ## Shipped this period
 
 <!-- Multi-repo: source from `view["shipped"]` (each row has a `repo` key added
@@ -161,7 +185,8 @@ cited:
 
 ## Next-release forecast
 
-From `bundle["forecast"]` (forward-only; predicted-vs-landed loop is Phase 7).
+From `bundle["forecast"]` (forward-only). The predicted-vs-landed loop is the
+"Since last installment" section above (Phase 13), driven by `bundle["series"]`.
 
 **Next milestone:** {forecast.next_milestone} *(or "none identified")*
 
