@@ -192,6 +192,84 @@ def test_schema_conformance_catches_wrong_authored_endpoint():
     assert c["severity"] == "ERROR"
 
 
+# --- Phase 10 slice 1: review/event social nodes + part_of spine -------------
+
+def _lifecycle_bundle():
+    return {
+        "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
+        "prs": [{
+            "number": 7, "url": "https://gh/o/r/pull/7", "state": "closed",
+            "merged": True, "merged_at": "2026-05-10T00:00:00Z",
+            "created_at": "2026-05-02T00:00:00Z", "closed_at": "2026-05-10T00:00:00Z",
+            "closes": [], "crossref_issues": [],
+            "reviews": [{"id": 100, "author": "carol", "state": "approved",
+                         "submitted_at": "2026-05-03T00:00:00Z", "body": None,
+                         "url": "https://gh/o/r/pull/7#r100"}],
+            "lifecycle": [{"id": 200, "actor": "dan", "event": "ready_for_review",
+                           "created_at": "2026-05-03T06:00:00Z", "label": None,
+                           "url": None}],
+        }],
+        "issues": [{
+            "number": 3, "url": "https://gh/o/r/issues/3", "state": "open",
+            "updated_at": "2026-05-09T00:00:00Z", "closed_at": None,
+            "lifecycle": [{"id": 300, "actor": "alice", "event": "reopened",
+                           "created_at": "2026-05-08T00:00:00Z", "label": None,
+                           "url": None}],
+        }],
+        "commits": [], "milestones": [], "releases": [],
+    }
+
+
+def _lifecycle_store():
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    gather.fold_bundle(conn, _lifecycle_bundle())
+    return conn
+
+
+def test_review_event_id_kinds_classified():
+    conn = _lifecycle_store()
+    cache = {}
+    assert validate._id_kind(conn, "o/r#review-7-100", cache) == "review"
+    assert validate._id_kind(conn, "o/r#event-pr-7-200", cache) == "event"
+    assert validate._id_kind(conn, "o/r#event-issue-3-300", cache) == "event"
+
+
+def test_review_event_part_of_schema_conforms():
+    conn = _lifecycle_store()
+    report = validate.validate(conn, project="o", repo="r")
+    c = _check(report, "schema_conformance")
+    assert c["ok"] is True, c["details"]
+
+
+def test_review_event_nodes_are_sourced():
+    conn = _lifecycle_store()
+    report = validate.validate(conn, project="o", repo="r")
+    c = _check(report, "provenance")
+    assert c["ok"] is True, c["details"]
+
+
+def test_lifecycle_store_validates_green():
+    conn = _lifecycle_store()
+    report = validate.validate(conn, project="o", repo="r")
+    assert report.ok is True, [c for c in report.checks if not c["ok"]]
+
+
+def test_review_with_orphan_parent_is_info_not_error():
+    # a review whose parent PR is out of window: part_of is spine -> INFO.
+    conn = _lifecycle_store()
+    graphstore.upsert_node(conn, "o/r#review-99-1", "o", "r", "social",
+                           "2026-05-03T00:00:00Z",
+                           {"author": "x", "state": "approved",
+                            "url": "https://gh/o/r/pull/99#r1"})
+    graphstore.upsert_edge(conn, "o/r#review-99-1", "o/r#pr-99", "part_of")
+    report = validate.validate(conn, project="o", repo="r")
+    c = _check(report, "referential_integrity")
+    assert c["ok"] is True, c["details"]
+    assert any(d.get("severity") == "INFO" and "pr-99" in str(d)
+               for d in c["details"]), c["details"]
+
+
 # --- BUG 1: person nodes for ALL participants (live-audit regression) ---------
 
 def _participants_bundle():

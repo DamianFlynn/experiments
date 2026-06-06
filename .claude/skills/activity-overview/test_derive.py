@@ -182,5 +182,50 @@ class SymbolMoves(unittest.TestCase):
             bundle["artifacts"]["a.bicep#bicep:resource:foo"]["status"], "replaced")
 
 
+class ReviewRoundsAndReopenCount(unittest.TestCase):
+    """Phase 10 slice 1: derived read-side counts from the review/lifecycle
+    submissions persisted on the bundle (pure, like build_modules)."""
+
+    def test_review_rounds_counts_and_state_sequence(self):
+        bundle = {"prs": [
+            {"number": 7, "reviews": [
+                {"state": "changes_requested", "submitted_at": "2026-01-01"},
+                {"state": "approved", "submitted_at": "2026-01-02"},
+            ]},
+            {"number": 8},  # no reviews -> absent from the map
+        ]}
+        derive.annotate_review_rounds(bundle)
+        self.assertEqual(bundle["prs"][0]["review_rounds"],
+                         {"count": 2, "states": ["changes_requested", "approved"]})
+        self.assertNotIn("review_rounds", bundle["prs"][1])
+
+    def test_review_rounds_orders_by_submitted_at(self):
+        bundle = {"prs": [{"number": 1, "reviews": [
+            {"state": "approved", "submitted_at": "2026-01-05"},
+            {"state": "commented", "submitted_at": "2026-01-02"},
+        ]}]}
+        derive.annotate_review_rounds(bundle)
+        self.assertEqual(bundle["prs"][0]["review_rounds"]["states"],
+                         ["commented", "approved"])
+
+    def test_reopen_count_on_pr_and_issue(self):
+        bundle = {
+            "prs": [{"number": 7, "lifecycle": [
+                {"event": "reopened"}, {"event": "ready_for_review"},
+                {"event": "reopened"}]}],
+            "issues": [
+                {"number": 3, "lifecycle": [{"event": "reopened"}]},
+                {"number": 4, "lifecycle": [{"event": "closed"}]},
+                {"number": 5},  # no lifecycle
+            ],
+        }
+        derive.annotate_reopen_count(bundle)
+        self.assertEqual(bundle["prs"][0]["reopen_count"], 2)
+        self.assertEqual(bundle["issues"][0]["reopen_count"], 1)
+        # zero reopens -> key omitted (no fabricated zero).
+        self.assertNotIn("reopen_count", bundle["issues"][1])
+        self.assertNotIn("reopen_count", bundle["issues"][2])
+
+
 if __name__ == "__main__":
     unittest.main()

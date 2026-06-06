@@ -410,6 +410,53 @@ def summarize_reviews(raw_reviews):
     return {"reviewers": reviewers, "decision": decision}
 
 
+def normalize_review(raw):
+    """Map a raw PR review submission to the bundle's review shape. Pure.
+
+    Phase 10 slice 1: `summarize_reviews` reduces reviews to {reviewers,
+    decision} and DISCARDS the individual submissions; this KEEPS each one so
+    the fold can persist it as a `review` social node (the review-rounds
+    texture). Reviews always carry an `html_url`, surfaced as `url` for
+    provenance."""
+    return {
+        "id": raw.get("id"),
+        "author": (raw.get("user") or {}).get("login"),
+        "state": (raw.get("state") or "").lower() or None,
+        "submitted_at": raw.get("submitted_at"),
+        "body": raw.get("body"),
+        "url": raw.get("html_url"),
+    }
+
+
+# Lifecycle events we persist as first-class `event` social nodes. Conservative
+# allowlist (the spec's decision): `cross-referenced` stays on its existing
+# crossref/xref path and is NOT duplicated here.
+_LIFECYCLE_EVENTS = ("reopened", "closed", "ready_for_review")
+
+
+def parse_timeline_lifecycle(raw_timeline):
+    """Normalize the allowlisted timeline lifecycle events. Pure.
+
+    Keeps only `reopened`/`closed`/`ready_for_review` (order-preserving), each as
+    {id, actor, event, created_at, label, url}. `url` is None when the raw event
+    carries none — the fold synthesizes a stable `<parent html_url>#event-<id>`
+    provenance ref in that case (so check_provenance passes)."""
+    out = []
+    for ev in raw_timeline or []:
+        event = ev.get("event")
+        if event not in _LIFECYCLE_EVENTS:
+            continue
+        out.append({
+            "id": ev.get("id"),
+            "actor": (ev.get("actor") or {}).get("login"),
+            "event": event,
+            "created_at": ev.get("created_at"),
+            "label": (ev.get("label") or {}).get("name"),
+            "url": ev.get("url"),
+        })
+    return out
+
+
 _PR_RE = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
 
 
@@ -2024,10 +2071,21 @@ def acquire(args, env):
         summary = summarize_reviews(reviews)
         pr["reviewers"] = summary["reviewers"]
         pr["review_decision"] = summary["decision"]
+        # Phase 10 slice 1: KEEP the individual review submissions (fold persists
+        # them as `review` social nodes). Only set the key when non-empty so the
+        # bundle/extract stay byte-stable for PRs with no reviews.
+        submissions = [normalize_review(r) for r in reviews]
+        if submissions:
+            pr["reviews"] = submissions
         timeline = fetch_all(
             get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
         pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
         _attach_timeline_xrefs(pr, timeline, f"{owner}/{repo}")
+        # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
+        # ready_for_review). Omit-when-empty for byte stability.
+        lifecycle = parse_timeline_lifecycle(timeline)
+        if lifecycle:
+            pr["lifecycle"] = lifecycle
         review_comments = fetch_all(
             get_page, f"{api}/pulls/{pr['number']}/comments?per_page=100")
         pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
@@ -2079,6 +2137,13 @@ def acquire(args, env):
         n = issue["number"]
         conv = fetch_all(get_page, f"{api}/issues/{n}/comments?per_page=100")
         issue["comments_list"] = [normalize_comment(c) for c in conv]
+        # Phase 10 slice 1: allowlisted lifecycle events for issues (reopened in
+        # particular drives reopen_count). Omit-when-empty for byte stability.
+        issue_timeline = fetch_all(
+            get_page, f"{api}/issues/{n}/timeline?per_page=100")
+        issue_lifecycle = parse_timeline_lifecycle(issue_timeline)
+        if issue_lifecycle:
+            issue["lifecycle"] = issue_lifecycle
         issue["reactions"] = summarize_reactions(raw_by_num.get(n, {}).get("reactions"))
         issue["open_high_activity"] = derive_open_high_activity(issue)
         issue["issue_type"] = (raw_by_num.get(n, {}).get("type") or {}).get("name") \
@@ -2455,6 +2520,29 @@ def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
             yield src, dst, (data or None)
 
 
+def _lifecycle_event_data(ev, parent_url, parent_local):
+    """Build a lifecycle-event node's `data` blob, ensuring a citable `url`.
+
+    Provenance (spec): the event's own `url` when present, else a stable
+    synthesized `<parent html_url>#event-<id>` (falling back to the parent's
+    local id when the parent carries no url) so check_provenance always passes.
+    The stored blob carries {actor, event, created_at, label, url}."""
+    url = ev.get("url")
+    if not url:
+        base = parent_url or parent_local
+        url = "{}#event-{}".format(base, ev.get("id"))
+    # `id` is kept in the blob so extract round-trips it and a re-fold rebuilds the
+    # SAME `event-<parent>-<id>` node id (idempotency).
+    return {
+        "id": ev.get("id"),
+        "actor": ev.get("actor"),
+        "event": ev.get("event"),
+        "created_at": ev.get("created_at"),
+        "label": ev.get("label"),
+        "url": url,
+    }
+
+
 def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                 registry_by_slug=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
@@ -2671,6 +2759,37 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             contrib(c.get("author"), isslocal, "commented")
     for c in bundle.get("commits", []):
         contrib(c.get("author"), c["sha"], "authored")
+
+    # Phase 10 slice 1: PR review submissions + lifecycle events as first-class
+    # `social` nodes with a `part_of` spine edge to their parent. Folded by stable
+    # id from the raw records (idempotent); review/event nodes are spine LEAVES
+    # (no onward spine edge), so they ride into the PR/issue train when
+    # traverse_spine walks it but can't bridge it to anything unrelated. Emitted
+    # only when the data is present, so a bundle with no reviews/events stays
+    # byte-identical (no fabricated nodes/edges).
+    for pr in bundle.get("prs", []):
+        prlocal = "pr-{}".format(pr["number"])
+        prid = qid(prlocal)
+        for rv in pr.get("reviews") or []:
+            local = "review-{}-{}".format(pr["number"], rv.get("id"))
+            nodes.append((qid(local), project, repo, "social",
+                          rv.get("submitted_at"), rv, fetched))
+            edges.append((qid(local), prid, "part_of", None, None))
+        for ev in pr.get("lifecycle") or []:
+            data = _lifecycle_event_data(ev, pr.get("url"), prlocal)
+            local = "event-{}-{}".format(prlocal, ev.get("id"))
+            nodes.append((qid(local), project, repo, "social",
+                          ev.get("created_at"), data, fetched))
+            edges.append((qid(local), prid, "part_of", None, None))
+    for iss in bundle.get("issues", []):
+        isslocal = "issue-{}".format(iss["number"])
+        issid = qid(isslocal)
+        for ev in iss.get("lifecycle") or []:
+            data = _lifecycle_event_data(ev, iss.get("url"), isslocal)
+            local = "event-{}-{}".format(isslocal, ev.get("id"))
+            nodes.append((qid(local), project, repo, "social",
+                          ev.get("created_at"), data, fetched))
+            edges.append((qid(local), issid, "part_of", None, None))
 
     # owns (person -> area): code_owners maps a path-prefix to owner logins; an
     # owner owns every area whose paths fall under that prefix.

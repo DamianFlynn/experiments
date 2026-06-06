@@ -410,6 +410,12 @@ def _id_kind(conn, qid, node_cache):
         return "milestone"
     if local.startswith("release-"):
         return "release"
+    # Phase 10 slice 1: review/event social nodes (checked before pr-/issue- so a
+    # review/event id is never misread as its bare-number parent kind).
+    if local.startswith("review-"):
+        return "review"
+    if local.startswith("event-"):
+        return "event"
     if local.startswith("pr-"):
         return "pr"
     if local.startswith("issue-"):
@@ -443,7 +449,7 @@ _EDGE_SCHEMA = {
     "in_milestone": ({"pr", "issue"}, {"milestone"}),
     "in_iteration": ({"pr", "issue"}, {"sprint"}),
     "closes":       ({"pr"}, {"issue"}),
-    "part_of":      ({"commit"}, {"pr"}),
+    "part_of":      ({"commit", "review", "event"}, {"pr", "issue"}),
     "blocks":       ({"issue"}, {"issue"}),
     "replaced_by":  ({"artifact"}, {"artifact"}),
     "identity_from": ({"artifact"}, {"artifact"}),

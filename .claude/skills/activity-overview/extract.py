@@ -206,6 +206,14 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
         [n["data"] for n in socials if _local(n["id"]).startswith("issue-")],
         key=lambda d: d.get("number"))
 
+    # Phase 10 slice 1: re-attach the review/lifecycle social nodes onto their
+    # parent pr/issue records (the inverse of fold's first-class node emission),
+    # then re-derive review_rounds/reopen_count. Done ONLY when such nodes exist
+    # so PRs/issues with no reviews/events stay byte-identical (no new keys).
+    _attach_reviews_and_lifecycle(socials, bundle["prs"], bundle["issues"])
+    derive.annotate_review_rounds(bundle)
+    derive.annotate_reopen_count(bundle)
+
     # `code` holds both commits (local id = bare <sha>) and artifact nodes
     # (local id `art:<path>` for files, `<path>#<lang>:<subkind>:<name>` for
     # symbols). Commits reconstruct the raw `commits` array; the artifact nodes
@@ -266,6 +274,54 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
             bundle[key] = value
 
     return bundle
+
+
+def _attach_reviews_and_lifecycle(socials, prs, issues):
+    """Re-attach `review`/`event` social nodes onto their parent pr/issue records.
+
+    The inverse of `gather.fold_bundle`'s first-class node emission: a review
+    node `review-<pr>-<id>` belongs on PR `<pr>`'s `reviews` list; an event node
+    `event-pr-<n>-<id>` / `event-issue-<n>-<id>` belongs on that pr/issue's
+    `lifecycle` list. Both lists are ordered by the node's natural timestamp
+    (submitted_at / created_at) then id, so a re-extract is byte-stable. Mutates
+    the pr/issue dicts in place; only sets a key when >=1 child node exists (so
+    records with none stay byte-identical). The node data blobs already carry the
+    exact normalized shape fold persisted, so they round-trip as-is."""
+    pr_by_num = {p.get("number"): p for p in prs}
+    issue_by_num = {i.get("number"): i for i in issues}
+    reviews_by_pr = {}        # pr number -> [review data]
+    lifecycle_by_parent = {}  # ("pr"|"issue", number) -> [event data]
+    for n in socials:
+        local = _local(n["id"])
+        if local.startswith("review-"):
+            rest = local[len("review-"):]
+            prnum, _, _eid = rest.rpartition("-")
+            try:
+                key = int(prnum)
+            except ValueError:
+                continue
+            reviews_by_pr.setdefault(key, []).append(n["data"])
+        elif local.startswith("event-pr-") or local.startswith("event-issue-"):
+            kind = "pr" if local.startswith("event-pr-") else "issue"
+            rest = local[len("event-{}-".format(kind)):]
+            num, _, _eid = rest.rpartition("-")
+            try:
+                key = int(num)
+            except ValueError:
+                continue
+            lifecycle_by_parent.setdefault((kind, key), []).append(n["data"])
+
+    def _sorted(items, ts_key):
+        return sorted(items, key=lambda d: (d.get(ts_key) or "", d.get("id") or 0))
+
+    for prnum, revs in reviews_by_pr.items():
+        pr = pr_by_num.get(prnum)
+        if pr is not None:
+            pr["reviews"] = _sorted(revs, "submitted_at")
+    for (kind, num), evs in lifecycle_by_parent.items():
+        parent = (pr_by_num if kind == "pr" else issue_by_num).get(num)
+        if parent is not None:
+            parent["lifecycle"] = _sorted(evs, "created_at")
 
 
 def _order_artifacts(arts, code_events):
