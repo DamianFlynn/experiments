@@ -583,6 +583,64 @@ class TestModuleGraph(unittest.TestCase):
         self.assertIn("module_graph", names)
 
 
+class TestBlockerGraph(unittest.TestCase):
+    """Phase 11 slice 1: emit_blocker_graph renders a Mermaid flowchart over the
+    issues' surfaced `blocks` edges (blocker --> blocked)."""
+
+    def _bundle(self, issues):
+        return {"meta": {"owner": "o", "repo": "r"}, "issues": issues}
+
+    def test_flowchart_edges_from_blocks(self):
+        # #3 blocks #4; #4 blocks #5 -> two directed edges.
+        bundle = self._bundle([
+            {"number": 3, "blocks": [4]},
+            {"number": 4, "blocks": [5], "blocked_by": [3]},
+            {"number": 5, "blocked_by": [4]},
+        ])
+        mmd = render.emit_blocker_graph(bundle)
+        self.assertTrue(mmd.startswith("flowchart"))
+        self.assertEqual(mmd.count("-->"), 2)
+        # labels are the issue numbers.
+        self.assertIn("#3", mmd)
+        self.assertIn("#5", mmd)
+
+    def test_only_participating_issues_get_nodes(self):
+        bundle = self._bundle([
+            {"number": 3, "blocks": [4]},
+            {"number": 4, "blocked_by": [3]},
+            {"number": 6},  # no blocks edge -> no node
+        ])
+        mmd = render.emit_blocker_graph(bundle)
+        self.assertNotIn("#6", mmd)
+
+    def test_placeholder_when_no_blocks(self):
+        mmd = render.emit_blocker_graph(self._bundle([{"number": 1}, {"number": 2}]))
+        self.assertIn("No blocked issues", mmd)
+
+    def test_placeholder_when_no_issues(self):
+        self.assertIn("No blocked issues", render.emit_blocker_graph({}))
+
+    def test_deterministic(self):
+        bundle = self._bundle([
+            {"number": 5, "blocks": [3]},
+            {"number": 3, "blocked_by": [5]},
+            {"number": 8, "blocks": [3]},
+        ])
+        self.assertEqual(render.emit_blocker_graph(bundle),
+                         render.emit_blocker_graph(bundle))
+
+    def test_bounded_with_overflow_note(self):
+        # many distinct edges -> capped node/edge count plus an overflow note.
+        issues = [{"number": n, "blocks": [n + 1000]} for n in range(100)]
+        mmd = render.emit_blocker_graph(self._bundle(issues))
+        self.assertLessEqual(mmd.count("-->"), 40)
+        self.assertIn("more", mmd.lower())
+
+    def test_registered_in_render_manifest(self):
+        names = set(render.render(self._bundle([])))
+        self.assertIn("blocker_graph", names)
+
+
 def _train_bundle():
     """A minimal enriched bundle with one deep (issue-rooted) train and one mention train."""
     return {

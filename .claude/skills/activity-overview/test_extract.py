@@ -582,5 +582,99 @@ class ExtractReviewsAndLifecycle(unittest.TestCase):
         self.assertTrue(report.ok, [c for c in report.checks if not c["ok"]])
 
 
+class ExtractBlocks(unittest.TestCase):
+    """Phase 11 slice 1: extract surfaces the store `blocks` issue->issue edges
+    (normalized blocker->blocked by fold) back onto the issue records as
+    `issue["blocks"]` (numbers this issue blocks, outbound) and
+    `issue["blocked_by"]` (numbers blocking this one, inbound). Omit-when-empty so
+    issues with no dependency edges stay byte-identical."""
+
+    def _bundle(self):
+        # `blocks` is the parsed directed-ref list normalize_issue produces.
+        # #3 blocks #4 (out: 3->4); #5 is blocked by #4 (in: 4->5, so #4 blocks
+        # #5). #4 is therefore blocked by #3 and blocks #5. #6 is unrelated.
+        def iss(num, blocks):
+            return {
+                "number": num, "url": "https://gh/o/r/issues/{}".format(num),
+                "state": "open", "updated_at": "2026-05-09T00:00:00Z",
+                "closed_at": None, "title": "i{}".format(num), "body": "",
+                "blocks": blocks,
+            }
+        return {
+            "meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                     "to": "2026-05-31"},
+            "prs": [],
+            "issues": [
+                iss(3, [{"number": 4, "direction": "out"}]),
+                iss(4, []),
+                iss(5, [{"number": 4, "direction": "in"}]),
+                iss(6, []),
+            ],
+            "commits": [], "milestones": [], "releases": [],
+        }
+
+    def _extract(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(self._bundle()))
+        return extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
+                               warn=lambda _m: None)
+
+    def _by_num(self, ex):
+        return {i["number"]: i for i in ex["issues"]}
+
+    def test_outbound_blocks_surface_as_numbers(self):
+        issues = self._by_num(self._extract())
+        self.assertEqual(issues[3]["blocks"], [4])
+        self.assertEqual(issues[4]["blocks"], [5])
+
+    def test_inbound_surfaces_as_blocked_by(self):
+        issues = self._by_num(self._extract())
+        self.assertEqual(issues[4]["blocked_by"], [3])
+        self.assertEqual(issues[5]["blocked_by"], [4])
+
+    def test_numbers_are_sorted_lists(self):
+        # craft an issue that blocks several others, out of numeric order.
+        bundle = self._bundle()
+        bundle["issues"].append({
+            "number": 9, "url": "https://gh/o/r/issues/9", "state": "open",
+            "updated_at": "2026-05-09T00:00:00Z", "closed_at": None,
+            "title": "i9", "body": "",
+            "blocks": [{"number": 6, "direction": "out"},
+                       {"number": 4, "direction": "out"},
+                       {"number": 5, "direction": "out"}],
+        })
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(bundle))
+        ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
+                             warn=lambda _m: None)
+        nine = next(i for i in ex["issues"] if i["number"] == 9)
+        self.assertEqual(nine["blocks"], [4, 5, 6])
+
+    def test_omit_when_empty(self):
+        # #6 participates in no blocks edge -> neither key is set.
+        issues = self._by_num(self._extract())
+        self.assertNotIn("blocks", issues[6])
+        self.assertNotIn("blocked_by", issues[6])
+        # #3 only blocks (no inbound) -> no blocked_by key.
+        self.assertNotIn("blocked_by", issues[3])
+        # #5 is only blocked (no outbound) -> no blocks key.
+        self.assertNotIn("blocks", issues[5])
+
+    def test_goldens_carry_no_blocks(self):
+        # the committed goldens have no blocks edges; omit-when-empty must keep
+        # every issue free of both keys (the byte-stability contract).
+        for name in ("bundle_p3.json", "bundle_p3b.json", "bundle_p3c.json"):
+            conn = graphstore.open_store(":memory:")
+            graphstore.init_schema(conn)
+            gather.fold_bundle(conn, copy.deepcopy(_load_golden(name)))
+            ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
+                                 warn=lambda _m: None)
+            for iss in ex["issues"]:
+                self.assertNotIn("blocks", iss, name)
+                self.assertNotIn("blocked_by", iss, name)
+
+
 if __name__ == "__main__":
     unittest.main()

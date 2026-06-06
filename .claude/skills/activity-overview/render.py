@@ -381,6 +381,44 @@ def emit_module_graph(bundle):
     return "\n".join(lines) + "\n"
 
 
+def emit_blocker_graph(bundle, max_edges=40):
+    """A Mermaid `flowchart` over the issues' surfaced `blocks` edges (Phase 11).
+
+    Each issue that participates in a dependency becomes a node labelled `#<n>`;
+    every `blocks` relation draws blocker --> blocked (fold normalized the edge
+    direction, and extract surfaces it as `issue["blocks"]` = the issues this one
+    blocks). Emits a `No blocked issues` placeholder when no `blocks` edges exist.
+    Bounded: at most `max_edges` edges are drawn (deterministic order), with an
+    overflow note when more exist. Derived solely from existing bundle fields."""
+    issues = bundle.get("issues") or []
+    # Collect blocker->blocked pairs from the outbound `blocks` lists; sorted +
+    # deduped so the diagram is deterministic regardless of issue/edge order.
+    edges = sorted({
+        (iss["number"], blocked)
+        for iss in issues
+        if iss.get("number") is not None
+        for blocked in (iss.get("blocks") or [])
+    })
+    lines = ["flowchart LR"]
+    if not edges:
+        lines.append("    none[No blocked issues]")
+        return "\n".join(lines) + "\n"
+    overflow = len(edges) - max_edges
+    drawn = edges[:max_edges]
+    nodes = {}
+    for blocker, blocked in drawn:
+        for n in (blocker, blocked):
+            nodes[_node_id("i", str(n))] = "#{}".format(n)
+    for nid, label in sorted(nodes.items()):
+        lines.append(f'    {nid}("{_flow_label(label)}")')
+    for blocker, blocked in drawn:
+        lines.append(f"    {_node_id('i', str(blocker))} --> "
+                     f"{_node_id('i', str(blocked))}")
+    if overflow > 0:
+        lines.append(f"    more[+{overflow} more blocked]")
+    return "\n".join(lines) + "\n"
+
+
 def emit_project_module_graph(module_edges):
     """A Mermaid flowchart of project module dependencies (Slice S4 blast radius).
     Nodes are grouped into a subgraph per member repo; each edge draws
@@ -435,6 +473,7 @@ def render(bundle):
         "contributor_graph": emit_contributor_graph(bundle),
         "kind_breakdown": emit_kind_breakdown(bundle),
         "module_graph": emit_module_graph(bundle),
+        "blocker_graph": emit_blocker_graph(bundle),
     }
 
 

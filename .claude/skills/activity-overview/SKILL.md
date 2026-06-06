@@ -212,3 +212,18 @@ claim in the report resolves to a source ref — never invent facts.
     `signals` list (e.g. "on milestone v1.2 · high-priority · open PR").
   - Note: this is a forward-only forecast. The predicted-vs-landed loop (Phase 7) is not
     yet present — do not describe it as such.
+- Phase 11 **Stalled, blocked & pile-ups** — render a flow-health section over data that
+  already exists in the bundle. It surfaces where work is stuck this period, from three
+  sources, each item CITING its url:
+  - **Stalled trains** — deep trains whose `train.effort.stalled` is true; report the
+    train + its `effort.elapsed_days` (longest-stalled first), citing the train's root
+    issue / PR url.
+  - **Blocked issues** — issues carrying `issue["blocked_by"]` (numbers blocking it)
+    and/or `issue["blocks"]` (numbers it blocks); list each with its `url`, and embed the
+    `diagrams.blocker_graph` Mermaid flowchart (blocker → blocked) when present.
+  - **Pile-ups** — open, high-activity issues (`issue["open_high_activity"]` true), each
+    cited.
+  - **Frame as flow signals, not blame.** The public digest NEVER attributes a stall or
+    blocker to a person — per-person stall/blocker attribution is the gated internal
+    appendix (slice 2), off by default. Omit the whole section when there is no
+    stalled / blocked / pile-up data.

@@ -113,6 +113,34 @@ not planned.
 
 - [{title}]({url}) (#{number})
 
+## Stalled, blocked & pile-ups
+
+Where flow is stuck this period. **Flow signals, not blame** — the public digest
+never attributes a stall/blocker to a person (that is the gated internal appendix).
+Omit the whole section when there is no stalled / blocked / pile-up data.
+
+**Stalled trains** — deep trains with `train.effort.stalled` true, longest
+`effort.elapsed_days` first:
+
+- train `{train.id}` — {short title} — stalled {train.effort.elapsed_days}d (cite the
+  train's root issue / PR url)
+
+**Blocked issues** — issues carrying `blocked_by` (and/or `blocks`), each cited:
+
+- [{title}]({url}) (#{number}) — blocked by {blocked_by joined with ", " as #N}{; blocks
+  #N, …}
+
+{Embed the dependency graph when `diagrams.blocker_graph` is present:}
+
+```mermaid
+{diagrams.blocker_graph}
+```
+
+**Pile-ups** — open, high-activity issues (`issue["open_high_activity"]` true), each
+cited:
+
+- [{title}]({url}) (#{number})
+
 ## Next-release forecast
 
 From `bundle["forecast"]` (forward-only; predicted-vs-landed loop is Phase 7).
