@@ -125,10 +125,10 @@ Omit the whole section when there is no stalled / blocked / pile-up data.
 - train `{train.id}` — {short title} — stalled {train.effort.elapsed_days}d (cite the
   train's root issue / PR url)
 
-**Blocked issues** — issues carrying `blocked_by` (and/or `blocks`), each cited:
+**Blocked issues** — issues carrying `blocked_by` (and/or `blocking`), each cited:
 
 - [{title}]({url}) (#{number}) — blocked by {blocked_by joined with ", " as #N}{; blocks
-  #N, …}
+  {blocking joined as #N, …}}
 
 {Embed the dependency graph when `diagrams.blocker_graph` is present:}
 

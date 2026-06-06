@@ -219,7 +219,7 @@ claim in the report resolves to a source ref — never invent facts.
     train + its `effort.elapsed_days` (longest-stalled first), citing the train's root
     issue / PR url.
   - **Blocked issues** — issues carrying `issue["blocked_by"]` (numbers blocking it)
-    and/or `issue["blocks"]` (numbers it blocks); list each with its `url`, and embed the
+    and/or `issue["blocking"]` (numbers it blocks); list each with its `url`, and embed the
     `diagrams.blocker_graph` Mermaid flowchart (blocker → blocked) when present.
   - **Pile-ups** — open, high-activity issues (`issue["open_high_activity"]` true), each
     cited.

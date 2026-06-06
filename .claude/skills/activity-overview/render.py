@@ -386,18 +386,18 @@ def emit_blocker_graph(bundle, max_edges=40):
 
     Each issue that participates in a dependency becomes a node labelled `#<n>`;
     every `blocks` relation draws blocker --> blocked (fold normalized the edge
-    direction, and extract surfaces it as `issue["blocks"]` = the issues this one
+    direction, and extract surfaces it as `issue["blocking"]` = the issues this one
     blocks). Emits a `No blocked issues` placeholder when no `blocks` edges exist.
     Bounded: at most `max_edges` edges are drawn (deterministic order), with an
     overflow note when more exist. Derived solely from existing bundle fields."""
     issues = bundle.get("issues") or []
-    # Collect blocker->blocked pairs from the outbound `blocks` lists; sorted +
+    # Collect blocker->blocked pairs from the resolved `blocking` lists; sorted +
     # deduped so the diagram is deterministic regardless of issue/edge order.
     edges = sorted({
         (iss["number"], blocked)
         for iss in issues
         if iss.get("number") is not None
-        for blocked in (iss.get("blocks") or [])
+        for blocked in (iss.get("blocking") or [])
     })
     lines = ["flowchart LR"]
     if not edges:

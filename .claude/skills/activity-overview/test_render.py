@@ -593,8 +593,8 @@ class TestBlockerGraph(unittest.TestCase):
     def test_flowchart_edges_from_blocks(self):
         # #3 blocks #4; #4 blocks #5 -> two directed edges.
         bundle = self._bundle([
-            {"number": 3, "blocks": [4]},
-            {"number": 4, "blocks": [5], "blocked_by": [3]},
+            {"number": 3, "blocking": [4]},
+            {"number": 4, "blocking": [5], "blocked_by": [3]},
             {"number": 5, "blocked_by": [4]},
         ])
         mmd = render.emit_blocker_graph(bundle)
@@ -606,7 +606,7 @@ class TestBlockerGraph(unittest.TestCase):
 
     def test_only_participating_issues_get_nodes(self):
         bundle = self._bundle([
-            {"number": 3, "blocks": [4]},
+            {"number": 3, "blocking": [4]},
             {"number": 4, "blocked_by": [3]},
             {"number": 6},  # no blocks edge -> no node
         ])
@@ -622,16 +622,16 @@ class TestBlockerGraph(unittest.TestCase):
 
     def test_deterministic(self):
         bundle = self._bundle([
-            {"number": 5, "blocks": [3]},
+            {"number": 5, "blocking": [3]},
             {"number": 3, "blocked_by": [5]},
-            {"number": 8, "blocks": [3]},
+            {"number": 8, "blocking": [3]},
         ])
         self.assertEqual(render.emit_blocker_graph(bundle),
                          render.emit_blocker_graph(bundle))
 
     def test_bounded_with_overflow_note(self):
         # many distinct edges -> capped node/edge count plus an overflow note.
-        issues = [{"number": n, "blocks": [n + 1000]} for n in range(100)]
+        issues = [{"number": n, "blocking": [n + 1000]} for n in range(100)]
         mmd = render.emit_blocker_graph(self._bundle(issues))
         self.assertLessEqual(mmd.count("-->"), 40)
         self.assertIn("more", mmd.lower())

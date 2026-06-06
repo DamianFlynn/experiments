@@ -584,10 +584,11 @@ class ExtractReviewsAndLifecycle(unittest.TestCase):
 
 class ExtractBlocks(unittest.TestCase):
     """Phase 11 slice 1: extract surfaces the store `blocks` issue->issue edges
-    (normalized blocker->blocked by fold) back onto the issue records as
-    `issue["blocks"]` (numbers this issue blocks, outbound) and
-    `issue["blocked_by"]` (numbers blocking this one, inbound). Omit-when-empty so
-    issues with no dependency edges stay byte-identical."""
+    (normalized blocker->blocked by fold) onto the issue records as RESOLVED numbers
+    `issue["blocking"]` (numbers this issue blocks, outbound) and
+    `issue["blocked_by"]` (numbers blocking this one, inbound). The raw `blocks`
+    ref-list is left UNTOUCHED (fold re-reads it). Omit-when-empty for the resolved
+    keys so issues with no dependency edges stay byte-identical."""
 
     def _bundle(self):
         # `blocks` is the parsed directed-ref list normalize_issue produces.
@@ -623,17 +624,17 @@ class ExtractBlocks(unittest.TestCase):
     def _by_num(self, ex):
         return {i["number"]: i for i in ex["issues"]}
 
-    def test_outbound_blocks_surface_as_numbers(self):
+    def test_outbound_blocks_surface_as_blocking_numbers(self):
         issues = self._by_num(self._extract())
-        self.assertEqual(issues[3]["blocks"], [4])
-        self.assertEqual(issues[4]["blocks"], [5])
+        self.assertEqual(issues[3]["blocking"], [4])
+        self.assertEqual(issues[4]["blocking"], [5])
 
     def test_inbound_surfaces_as_blocked_by(self):
         issues = self._by_num(self._extract())
         self.assertEqual(issues[4]["blocked_by"], [3])
         self.assertEqual(issues[5]["blocked_by"], [4])
 
-    def test_numbers_are_sorted_lists(self):
+    def test_blocking_numbers_are_sorted_lists(self):
         # craft an issue that blocks several others, out of numeric order.
         bundle = self._bundle()
         bundle["issues"].append({
@@ -650,21 +651,37 @@ class ExtractBlocks(unittest.TestCase):
         ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
                              warn=lambda _m: None)
         nine = next(i for i in ex["issues"] if i["number"] == 9)
-        self.assertEqual(nine["blocks"], [4, 5, 6])
+        self.assertEqual(nine["blocking"], [4, 5, 6])
 
-    def test_omit_when_empty(self):
-        # #6 participates in no blocks edge -> neither key is set.
+    def test_omit_resolved_keys_when_empty(self):
+        # the RESOLVED keys are omit-when-empty (the raw `blocks` ref-list stays).
         issues = self._by_num(self._extract())
-        self.assertNotIn("blocks", issues[6])
+        self.assertNotIn("blocking", issues[6])     # #6 in no blocks edge
         self.assertNotIn("blocked_by", issues[6])
-        # #3 only blocks (no inbound) -> no blocked_by key.
-        self.assertNotIn("blocked_by", issues[3])
-        # #5 is only blocked (no outbound) -> no blocks key.
-        self.assertNotIn("blocks", issues[5])
+        self.assertNotIn("blocked_by", issues[3])   # #3 only blocks
+        self.assertNotIn("blocking", issues[5])      # #5 only blocked
 
-    def test_goldens_carry_no_blocks(self):
+    def test_raw_blocks_left_untouched_for_refold(self):
+        # extract must NOT overwrite the raw `blocks` ref-list — fold re-reads it.
+        issues = self._by_num(self._extract())
+        self.assertEqual(issues[3]["blocks"], [{"number": 4, "direction": "out"}])
+
+    def test_validate_idempotent_with_block_edge(self):
+        # Regression: validate's idempotency gate re-folds the extracted bundle, and
+        # gather.fold reads `blocks` as [{number, direction}]. Surfacing resolved ints
+        # under the SAME key crashed it ('int' object is not subscriptable); the
+        # resolved view lives under `blocking`/`blocked_by` so re-fold stays clean.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(self._bundle()))
+        report = validate.validate(conn)
+        idem = [c for c in report.checks if c["name"] == "idempotency"][0]
+        self.assertTrue(idem["ok"], idem.get("details"))
+        self.assertTrue(report.ok, [c for c in report.checks if not c["ok"]])
+
+    def test_goldens_carry_no_blocking(self):
         # the committed goldens have no blocks edges; omit-when-empty must keep
-        # every issue free of both keys (the byte-stability contract).
+        # every issue free of the resolved keys (the byte-stability contract).
         for name in ("bundle_p3.json", "bundle_p3b.json", "bundle_p3c.json"):
             conn = graphstore.open_store(":memory:")
             graphstore.init_schema(conn)
@@ -672,7 +689,7 @@ class ExtractBlocks(unittest.TestCase):
             ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
                                  warn=lambda _m: None)
             for iss in ex["issues"]:
-                self.assertNotIn("blocks", iss, name)
+                self.assertNotIn("blocking", iss, name)
                 self.assertNotIn("blocked_by", iss, name)
 
 

@@ -217,9 +217,9 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # Done ONLY when such nodes exist so PRs/issues with none stay byte-identical.
     _attach_reviews_and_lifecycle(socials, bundle["prs"], bundle["issues"])
 
-    # Phase 11 slice 1: surface the store's `blocks` issue->issue edges onto the
-    # issue records (issue["blocks"] / issue["blocked_by"]) for the report +
-    # blocker_graph. Omit-when-empty keeps blocks-free goldens byte-identical.
+    # Phase 11 slice 1: surface the store's `blocks` issue->issue edges as resolved
+    # numbers (issue["blocking"] / issue["blocked_by"]) for the report + blocker_graph.
+    # The raw `blocks` ref-list (fold-consumed) is left intact. Omit-when-empty.
     _attach_blocks(conn, project, repo, bundle["issues"])
 
     # `code` holds both commits (local id = bare <sha>) and artifact nodes
@@ -365,16 +365,20 @@ def _order_artifacts(arts, code_events):
 
 
 def _attach_blocks(conn, project, repo, issues):
-    """Surface the store's `blocks` issue->issue edges (Phase 9 #21) back onto
-    the issue records. fold normalized every edge to blocker->blocked, so for an
-    issue's qualified id: OUTbound edges (this is the blocker) name the issues it
-    blocks -> `issue["blocks"]`; INbound edges (this is blocked) name the issues
-    blocking it -> `issue["blocked_by"]`. Both are sorted lists of issue NUMBERS.
+    """Surface the store's `blocks` issue->issue edges (Phase 9 #21) onto the issue
+    records as RESOLVED gathered-issue numbers, for the report + blocker_graph. fold
+    normalized every edge to blocker->blocked, so for an issue's qualified id:
+    OUTbound edges (this is the blocker) name the issues it blocks -> `issue["blocking"]`;
+    INbound edges (this is blocked) name the issues blocking it -> `issue["blocked_by"]`.
+    Both are sorted lists of issue NUMBERS, omit-when-empty.
 
-    Mirrors `_attach_reviews_and_lifecycle`: a post-attach over the already-built
-    `issues`, reading the store directly so the report + blocker_graph never have
-    to. Only sets a key when non-empty so issues with no dependency edges (every
-    committed golden) stay byte-identical."""
+    NOTE: we do NOT touch the issue's raw `blocks` field — that is the parsed
+    directed-ref list ([{number, direction}]) `normalize_issue` wrote, and
+    `gather.fold_bundle` re-reads it (e.g. validate's idempotency gate re-folds this
+    very extracted bundle). Overwriting it would break re-fold, so the resolved view
+    lives under the separate `blocking`/`blocked_by` keys. Mirrors
+    `_attach_reviews_and_lifecycle`: a post-attach reading the store directly. Only
+    sets a key when non-empty so issues with no dependency edges stay byte-identical."""
     def _num(node_id):
         local = graphstore.parse_id(node_id)["local"]
         if not local.startswith("issue-"):
@@ -388,20 +392,13 @@ def _attach_blocks(conn, project, repo, issues):
         number = iss.get("number")
         if number is None:
             continue
-        # The stored raw issue blob carries `blocks` as the parsed directed-ref
-        # list ([{number, direction}]) normalize_issue wrote. We REPLACE it with
-        # the resolved blocker/blocked NUMBERS from the store edges (and drop it
-        # entirely when this issue participates in none), so the surfaced key has
-        # one meaning and omit-when-empty holds regardless of the raw blob.
-        iss.pop("blocks", None)
-        iss.pop("blocked_by", None)
         qid = graphstore.qualify_id(project, repo, "issue-{}".format(number))
         out = graphstore.get_edges(conn, qid, direction="out",
                                    edge_types=["blocks"])
-        blocks = sorted({n for n in (_num(e["dst_id"]) for e in out)
-                         if n is not None})
-        if blocks:
-            iss["blocks"] = blocks
+        blocking = sorted({n for n in (_num(e["dst_id"]) for e in out)
+                           if n is not None})
+        if blocking:
+            iss["blocking"] = blocking
         inn = graphstore.get_edges(conn, qid, direction="in",
                                    edge_types=["blocks"])
         blocked_by = sorted({n for n in (_num(e["src_id"]) for e in inn)
