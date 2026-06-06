@@ -208,6 +208,38 @@ def build_modules(bundle, idx):
     return bundle
 
 
+def annotate_review_rounds(bundle):
+    """Set `review_rounds` on each PR that has review submissions (Phase 10).
+
+    `review_rounds = {count, states}` where `states` is the per-submission state
+    ordered by `submitted_at` (the approve->changes-requested->re-review
+    texture). PRs with no `reviews` are left untouched (no fabricated key). Pure
+    (in place); returns bundle for convenience."""
+    for pr in bundle.get("prs", []):
+        reviews = pr.get("reviews")
+        if not reviews:
+            continue
+        ordered = sorted(reviews, key=lambda r: (r.get("submitted_at") or "",
+                                                 r.get("id") or 0))
+        pr["review_rounds"] = {
+            "count": len(ordered),
+            "states": [r.get("state") for r in ordered],
+        }
+    return bundle
+
+
+def annotate_reopen_count(bundle):
+    """Set `reopen_count` on each PR/issue with >=1 `reopened` lifecycle event
+    (Phase 10). The key is omitted when the count is zero (no fabricated zero).
+    Pure (in place); returns bundle for convenience."""
+    for item in list(bundle.get("prs", [])) + list(bundle.get("issues", [])):
+        reopens = sum(1 for ev in item.get("lifecycle") or []
+                      if ev.get("event") == "reopened")
+        if reopens:
+            item["reopen_count"] = reopens
+    return bundle
+
+
 def attribute_people_areas(bundle, idx):
     """Give each authoring/reviewing person their modules + areas.
 

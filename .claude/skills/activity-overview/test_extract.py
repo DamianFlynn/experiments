@@ -25,6 +25,7 @@ import derive  # noqa: E402
 import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
+import link  # noqa: E402
 import validate  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -405,6 +406,105 @@ class ExtractSymbolMovesRoundTrip(unittest.TestCase):
         derive.link_symbol_identity(view)
         self.assertEqual(len(view["symbol_moves"]["links"]), 1,
                          "a unique cross-file drop+add must link as a move")
+
+
+class ExtractReviewsAndLifecycle(unittest.TestCase):
+    """Phase 10 slice 1: extract surfaces the review/lifecycle social nodes back
+    onto their parent pr/issue records, and re-attaches the derived counts, so
+    the read side (and a train slice) sees the rounds/lifecycle texture."""
+
+    def _bundle(self):
+        return {
+            "meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                     "to": "2026-05-31"},
+            "prs": [{
+                "number": 7, "url": "https://gh/o/r/pull/7", "state": "closed",
+                "merged": True, "merged_at": "2026-05-10T00:00:00Z",
+                "created_at": "2026-05-02T00:00:00Z",
+                "closed_at": "2026-05-10T00:00:00Z", "closes": [], "crossref_issues": [],
+                "reviews": [
+                    {"id": 100, "author": "carol", "state": "changes_requested",
+                     "submitted_at": "2026-05-03T00:00:00Z", "body": "x",
+                     "url": "https://gh/o/r/pull/7#r100"},
+                    {"id": 101, "author": "carol", "state": "approved",
+                     "submitted_at": "2026-05-04T00:00:00Z", "body": None,
+                     "url": "https://gh/o/r/pull/7#r101"},
+                ],
+                "lifecycle": [
+                    {"id": 200, "actor": "dan", "event": "ready_for_review",
+                     "created_at": "2026-05-03T06:00:00Z", "label": None,
+                     "url": "u200"},
+                ],
+            }],
+            "issues": [{
+                "number": 3, "url": "https://gh/o/r/issues/3", "state": "open",
+                "updated_at": "2026-05-09T00:00:00Z", "closed_at": None,
+                "lifecycle": [
+                    {"id": 300, "actor": "alice", "event": "reopened",
+                     "created_at": "2026-05-08T00:00:00Z", "label": None,
+                     "url": None},
+                ],
+            }],
+            "commits": [], "milestones": [], "releases": [],
+        }
+
+    def _extract(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(self._bundle()))
+        return extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
+                               warn=lambda _m: None)
+
+    def test_reviews_resurface_on_pr_in_order(self):
+        ex = self._extract()
+        pr = ex["prs"][0]
+        self.assertEqual([r["id"] for r in pr["reviews"]], [100, 101])
+        self.assertEqual([r["state"] for r in pr["reviews"]],
+                         ["changes_requested", "approved"])
+
+    def test_lifecycle_resurfaces_on_pr_and_issue(self):
+        ex = self._extract()
+        self.assertEqual([e["event"] for e in ex["prs"][0]["lifecycle"]],
+                         ["ready_for_review"])
+        self.assertEqual([e["event"] for e in ex["issues"][0]["lifecycle"]],
+                         ["reopened"])
+        # synthesized provenance for the url-less issue event round-trips.
+        self.assertEqual(ex["issues"][0]["lifecycle"][0]["url"],
+                         "https://gh/o/r/issues/3#event-300")
+
+    def test_derived_counts_are_enrich_only(self):
+        # review_rounds/reopen_count are enrich-derived (with forecast/modules),
+        # so extract emits only the RAW reviews/lifecycle, not the counts.
+        ex = self._extract()
+        self.assertNotIn("review_rounds", ex["prs"][0])
+        self.assertNotIn("reopen_count", ex["issues"][0])
+        # enrich (the read-side derive) turns the resurfaced raw data into counts.
+        link.enrich(ex)
+        self.assertEqual(ex["prs"][0]["review_rounds"],
+                         {"count": 2, "states": ["changes_requested", "approved"]})
+        self.assertEqual(ex["issues"][0]["reopen_count"], 1)
+
+    def test_keys_absent_when_no_review_or_lifecycle_data(self):
+        # a golden with no reviews/events keeps the pr/issue records clean.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(_load_golden("bundle_p3b.json")))
+        ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
+                             warn=lambda _m: None)
+        for pr in ex["prs"]:
+            self.assertNotIn("reviews", pr)
+            self.assertNotIn("lifecycle", pr)
+            self.assertNotIn("review_rounds", pr)
+        for iss in ex["issues"]:
+            self.assertNotIn("lifecycle", iss)
+            self.assertNotIn("reopen_count", iss)
+
+    def test_clean_store_validates_green(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(self._bundle()))
+        report = validate.validate(conn, project="o", repo="r")
+        self.assertTrue(report.ok, [c for c in report.checks if not c["ok"]])
 
 
 if __name__ == "__main__":

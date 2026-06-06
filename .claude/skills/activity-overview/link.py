@@ -17,6 +17,8 @@ from derive import (
     _commit_areas,
     build_modules,
     link_symbol_identity,
+    annotate_review_rounds,
+    annotate_reopen_count,
 )
 
 # commit->PR resolution lives in gather (shared with the store writer, so trains
@@ -896,6 +898,11 @@ def enrich(bundle):
     # Phase 4a: next-release forecast (needs buckets + milestones, placed after both).
     build_forecast(bundle)
     build_modules(bundle, idx)
+    # Phase 10 slice 1: review-round / reopen texture, derived from the
+    # reviews/lifecycle that gather set (or extract resurfaces). Read-side derived
+    # facts live here with forecast/modules — NOT in extract (which stays raw).
+    annotate_review_rounds(bundle)
+    annotate_reopen_count(bundle)
     return bundle
 
 

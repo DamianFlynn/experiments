@@ -427,6 +427,66 @@ class TestReviewsAndTimeline(unittest.TestCase):
         ]
         self.assertEqual(gather.parse_timeline_crossrefs(raw), [5])
 
+    # --- Phase 10 slice 1: normalize_review (keep the submissions) -----------
+    def test_normalize_review_maps_fields(self):
+        raw = {"id": 555, "user": {"login": "bob"}, "state": "CHANGES_REQUESTED",
+               "submitted_at": "2026-05-09T10:00:00Z", "body": "needs work",
+               "html_url": "https://gh/x/pull/7#pullrequestreview-555"}
+        out = gather.normalize_review(raw)
+        self.assertEqual(out, {
+            "id": 555, "author": "bob", "state": "changes_requested",
+            "submitted_at": "2026-05-09T10:00:00Z", "body": "needs work",
+            "url": "https://gh/x/pull/7#pullrequestreview-555"})
+
+    def test_normalize_review_handles_missing_user_and_body(self):
+        raw = {"id": 1, "state": "APPROVED",
+               "submitted_at": "2026-05-10T10:00:00Z", "html_url": "u"}
+        out = gather.normalize_review(raw)
+        self.assertIsNone(out["author"])
+        self.assertIsNone(out["body"])
+        self.assertEqual(out["state"], "approved")
+
+    def test_summarize_reviews_output_unchanged_when_normalizing(self):
+        # normalize_review must NOT change summarize_reviews' contract.
+        raw = [{"id": 1, "user": {"login": "bob"}, "state": "APPROVED",
+                "submitted_at": "2026-05-10T10:00:00Z", "html_url": "u"}]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["bob"], "decision": "approved"})
+
+    # --- Phase 10 slice 1: parse_timeline_lifecycle (allowlist) -------------
+    def test_parse_timeline_lifecycle_allowlist_only(self):
+        raw = [
+            {"id": 1, "event": "reopened", "actor": {"login": "bob"},
+             "created_at": "2026-05-01T00:00:00Z", "url": "u1"},
+            {"id": 2, "event": "closed", "actor": {"login": "carol"},
+             "created_at": "2026-05-02T00:00:00Z", "url": "u2"},
+            {"id": 3, "event": "ready_for_review", "actor": {"login": "dan"},
+             "created_at": "2026-05-03T00:00:00Z"},
+            # NOT in the allowlist -> dropped here (cross-referenced stays on its
+            # own path; labeled/assigned/etc are ignored).
+            {"id": 4, "event": "cross-referenced",
+             "created_at": "2026-05-04T00:00:00Z"},
+            {"id": 5, "event": "labeled", "created_at": "2026-05-05T00:00:00Z"},
+        ]
+        out = gather.parse_timeline_lifecycle(raw)
+        self.assertEqual([e["event"] for e in out],
+                         ["reopened", "closed", "ready_for_review"])
+        self.assertEqual(out[0], {
+            "id": 1, "actor": "bob", "event": "reopened",
+            "created_at": "2026-05-01T00:00:00Z", "label": None, "url": "u1"})
+
+    def test_parse_timeline_lifecycle_captures_label(self):
+        raw = [{"id": 9, "event": "reopened", "actor": {"login": "x"},
+                "created_at": "2026-05-01T00:00:00Z",
+                "label": {"name": "bug"}}]
+        out = gather.parse_timeline_lifecycle(raw)
+        self.assertEqual(out[0]["label"], "bug")
+        self.assertIsNone(out[0]["url"])  # no url -> synthesized later by fold
+
+    def test_parse_timeline_lifecycle_empty(self):
+        self.assertEqual(gather.parse_timeline_lifecycle([]), [])
+        self.assertEqual(gather.parse_timeline_lifecycle(None), [])
+
 
 class TestWorkflowsReleasesMilestones(unittest.TestCase):
     def test_normalize_workflow_maps_fields(self):
@@ -2126,6 +2186,115 @@ class TestFoldBundle(unittest.TestCase):
     def test_requires_owner_and_repo(self):
         with self.assertRaises(ValueError):
             gather.fold_bundle(self.conn, {"meta": {}})
+
+    def test_no_review_or_event_nodes_without_data(self):
+        # the base fixture carries no reviews/lifecycle -> no review-/event- nodes.
+        rows = self.conn.execute(
+            "SELECT id FROM nodes WHERE id LIKE '%#review-%' OR id LIKE '%#event-%'"
+        ).fetchall()
+        self.assertEqual(rows, [])
+
+
+def _fold_lifecycle_bundle():
+    """The base fold fixture, extended with PR review submissions and lifecycle
+    events on both a PR and an issue (Phase 10 slice 1)."""
+    b = _fold_fixture_bundle()
+    b["prs"][0]["reviews"] = [
+        {"id": 100, "author": "carol", "state": "changes_requested",
+         "submitted_at": "2026-01-06T00:00:00Z", "body": "tweak",
+         "url": "https://gh/acme/widget/pull/10#r100"},
+        {"id": 101, "author": "carol", "state": "approved",
+         "submitted_at": "2026-01-07T00:00:00Z", "body": None,
+         "url": "https://gh/acme/widget/pull/10#r101"},
+    ]
+    b["prs"][0]["lifecycle"] = [
+        {"id": 200, "actor": "bob", "event": "ready_for_review",
+         "created_at": "2026-01-06T12:00:00Z", "label": None, "url": "u200"},
+    ]
+    # an issue lifecycle event with NO url -> fold synthesizes a provenance ref.
+    b["issues"][0]["lifecycle"] = [
+        {"id": 300, "actor": "alice", "event": "reopened",
+         "created_at": "2026-01-08T00:00:00Z", "label": None, "url": None},
+        {"id": 301, "actor": "alice", "event": "reopened",
+         "created_at": "2026-01-09T00:00:00Z", "label": None, "url": None},
+    ]
+    return b
+
+
+class TestFoldReviewsAndLifecycle(unittest.TestCase):
+    """Phase 10 slice 1: review submissions + lifecycle events as first-class
+    social nodes with `part_of` spine edges to their parent pr/issue."""
+
+    def setUp(self):
+        self.conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(self.conn)
+        gather.fold_bundle(self.conn, _fold_lifecycle_bundle())
+
+    def test_review_nodes_are_social_with_ts_and_data(self):
+        n = graphstore.get_node(self.conn, "acme/widget#review-10-100")
+        self.assertEqual(n["node_class"], "social")
+        self.assertEqual(n["ts"], "2026-01-06T00:00:00Z")  # submitted_at
+        self.assertEqual(n["data"]["author"], "carol")
+        self.assertEqual(n["data"]["state"], "changes_requested")
+        self.assertEqual(n["data"]["url"],
+                         "https://gh/acme/widget/pull/10#r100")
+
+    def test_review_part_of_edge_to_pr(self):
+        out = graphstore.get_edges(self.conn, "acme/widget#review-10-101",
+                                   direction="out", edge_types=["part_of"])
+        self.assertEqual(out[0]["dst_id"], "acme/widget#pr-10")
+
+    def test_pr_lifecycle_event_node_and_edge(self):
+        n = graphstore.get_node(self.conn, "acme/widget#event-pr-10-200")
+        self.assertEqual(n["node_class"], "social")
+        self.assertEqual(n["ts"], "2026-01-06T12:00:00Z")  # created_at
+        self.assertEqual(n["data"]["event"], "ready_for_review")
+        out = graphstore.get_edges(self.conn, "acme/widget#event-pr-10-200",
+                                   direction="out", edge_types=["part_of"])
+        self.assertEqual(out[0]["dst_id"], "acme/widget#pr-10")
+
+    def test_issue_lifecycle_event_node_and_edge(self):
+        n = graphstore.get_node(self.conn, "acme/widget#event-issue-3-300")
+        self.assertEqual(n["node_class"], "social")
+        self.assertEqual(n["data"]["event"], "reopened")
+        out = graphstore.get_edges(self.conn, "acme/widget#event-issue-3-300",
+                                   direction="out", edge_types=["part_of"])
+        self.assertEqual(out[0]["dst_id"], "acme/widget#issue-3")
+
+    def test_event_without_url_gets_synthesized_provenance(self):
+        # parent issue url is "u/3"; synthesized ref = "<parent>#event-<id>".
+        n = graphstore.get_node(self.conn, "acme/widget#event-issue-3-300")
+        self.assertEqual(n["data"]["url"], "u/3#event-300")
+
+    def test_review_without_url_gets_synthesized_provenance(self):
+        # a review missing its html_url still gets a citable ref (parity with
+        # lifecycle events): "<pr url>#pullrequestreview-<id>".
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        b = _fold_fixture_bundle()  # prs[0] url == "u/10"
+        b["prs"][0]["reviews"] = [
+            {"id": 555, "author": "carol", "state": "approved",
+             "submitted_at": "2026-01-06T00:00:00Z", "body": None, "url": None}]
+        gather.fold_bundle(conn, b)
+        n = graphstore.get_node(conn, "acme/widget#review-10-555")
+        self.assertEqual(n["data"]["url"], "u/10#pullrequestreview-555")
+
+    def test_review_and_events_reachable_over_spine(self):
+        # spine pulls reviews/events into the PR/issue train (they are leaves).
+        res = graphstore.traverse_spine(self.conn, ["acme/widget#pr-10"])
+        self.assertIn("acme/widget#review-10-100", res["reached"])
+        self.assertIn("acme/widget#event-pr-10-200", res["reached"])
+        res2 = graphstore.traverse_spine(self.conn, ["acme/widget#issue-3"])
+        self.assertIn("acme/widget#event-issue-3-300", res2["reached"])
+
+    def test_idempotent_refold(self):
+        before_n = self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        before_e = self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        gather.fold_bundle(self.conn, _fold_lifecycle_bundle())
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0], before_n)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], before_e)
 
 
 class TestStoreOnly(unittest.TestCase):

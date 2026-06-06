@@ -124,6 +124,39 @@ class TestSpineComponents(unittest.TestCase):
         self.assertEqual(comps[0], frozenset({
             "proj/Azure/mod#pr-1", "proj/Azure/mod#issue-2", "proj/Azure/mod#pr-3"}))
 
+    def test_review_event_leaves_do_not_seed_spurious_components(self):
+        # Phase 10: review/event social nodes are part_of LEAVES on the PR spine.
+        # They must not seed their own component — pre-fix each in-window leaf was
+        # iterated as a seed, producing duplicate/overlapping components that leak
+        # the review/event id. Only pr/issue anchors may seed.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = {
+            "meta": {"owner": "Azure", "repo": "mod", "from": "2026-01-01",
+                     "to": "2026-01-31", "base_branch": "main"},
+            "prs": [{"number": 1, "url": "u/1", "state": "closed", "merged": True,
+                     "base": "main", "head": "h1", "merged_at": "2026-01-05T00:00:00Z",
+                     "created_at": "2026-01-02T00:00:00Z",
+                     "closed_at": "2026-01-05T00:00:00Z", "closes": [],
+                     "crossref_issues": [], "title": "feat", "body": "",
+                     "reviews": [{"id": 100, "author": "carol", "state": "approved",
+                                  "submitted_at": "2026-01-04T00:00:00Z",
+                                  "body": None, "url": "u/1#r100"}],
+                     "lifecycle": [{"id": 200, "actor": "bob",
+                                    "event": "ready_for_review",
+                                    "created_at": "2026-01-03T00:00:00Z",
+                                    "label": None, "url": "u200"}]}],
+            "issues": [], "commits": [], "code_events": [], "milestones": [],
+            "releases": [], "code_graph": {"areas": []},
+        }
+        gather.fold_bundle(conn, bundle, project="proj", repo="Azure/mod",
+                           members={"Azure/mod"})
+        comps = digest.spine_components(
+            conn, "proj", ["Azure/mod"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        # exactly ONE component — the PR anchor only, no review/event leakage.
+        self.assertEqual(comps, [frozenset({"proj/Azure/mod#pr-1"})])
+
     def test_two_separate_multi_node_components_are_isolated(self):
         # Two independent PR->issue pairs -> two disjoint 2-node components.
         conn = graphstore.open_store(":memory:")
