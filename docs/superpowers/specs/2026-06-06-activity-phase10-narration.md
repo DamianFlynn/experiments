@@ -85,7 +85,8 @@ re-gather the texture out of band).
 
 ## Slices (TDD, task-by-task, each its own PR)
 
-**Status:** slices 1 (#24) + 2 (#25) shipped; slice 3 in progress.
+**Status:** shipped — slices 1 (#24), 2 (#25), 3 (#26). Future: language-agnostic
+in-slice diff capture (see slice 3 note).
 
 1. **Gather prereq (shipped, #24).** Persist review submissions + lifecycle events as
    the nodes/edges above; derive `review_rounds`/`reopen_count`. Offline-testable
