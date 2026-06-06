@@ -41,21 +41,25 @@ are agent-rendered over the bundle, like every other report section.
 ## Design
 
 ### Surface `blocks` into the bundle (extract)
-`fold` already writes `blocks` (issue→issue) edges; `extract` must materialize them
-onto issues so the report + diagram can read them without touching the store:
-`issue["blocks"]` (issue ids this one blocks) and `issue["blocked_by"]` (inbound).
-Omit-when-empty (byte-stability; goldens carry none).
+`fold` already writes `blocks` (issue→issue) edges; `extract` materializes them onto
+issues as RESOLVED issue numbers so the report + diagram read them without touching the
+store: `issue["blocking"]` (numbers this issue blocks, outbound) and `issue["blocked_by"]`
+(inbound). The issue's **raw `blocks`** field (the `[{number, direction}]` ref-list
+`normalize_issue` wrote) is left UNTOUCHED — `gather.fold` re-reads it (validate's
+idempotency gate re-folds the extracted bundle), so the resolved view uses separate keys.
+Omit-when-empty for the resolved keys (byte-stability; goldens carry none).
 
 ### `blocker_graph` diagram (render.py)
-`emit_blocker_graph(bundle)` — a Mermaid graph over the `blocks` edges among in-window
-issues (node = issue #, edge = "blocks"), mirroring `emit_module_graph`'s style; emitted
-into `diagrams` only when non-empty. Bounded (cap nodes/edges with an overflow note).
+`emit_blocker_graph(bundle)` — a Mermaid graph over the issues' `blocking` edges (node =
+issue #, edge = blocker → blocked), mirroring `emit_module_graph`'s style; **always
+emitted, with a `No blocked issues` placeholder when empty** (consistent with the other
+diagram emitters). Bounded (cap edges with an overflow note).
 
 ### Report sections (SKILL.md + report-template.md)
 - **Contributors & community:** rank contributors by footprint (authored/reviewed/
   areas), embed `contributor_graph`, cite people→PR/area refs. Public-safe (no blame).
 - **Stalled, blocked & pile-ups:** stalled deep trains (`effort.stalled`,
-  elapsed/opened days), blocked issues (`blocked_by`/`blocks`, embed `blocker_graph`),
+  elapsed/opened days), blocked issues (`blocked_by`/`blocking`, embed `blocker_graph`),
   pile-ups (`open_high_activity`), each cited. Frame as flow signals, not blame.
 - **Shame/blame appendix (gated):** per-person stalled/blocking attribution — rendered
   ONLY when an explicit opt-in is set (a `--internal`/config flag the agent passes);
@@ -64,7 +68,8 @@ into `diagrams` only when non-empty. Bounded (cap nodes/edges with an overflow n
 ## Slices (TDD)
 
 1. **Flow data + blocker_graph + the "Stalled, blocked & pile-ups" section.** Surface
-   `blocks` onto issues in `extract` (omit-when-empty); `emit_blocker_graph` (render);
+   resolved `blocking`/`blocked_by` onto issues in `extract` (omit-when-empty, raw
+   `blocks` untouched); `emit_blocker_graph` (render);
    SKILL.md + `report-template.md` section over stalled trains / blocked issues /
    pile-ups. Goldens stay byte-identical; `validate` green.
 2. **"Contributors & community" section + gated shame/blame appendix.** SKILL.md +
@@ -72,8 +77,9 @@ into `diagrams` only when non-empty. Bounded (cap nodes/edges with an overflow n
    explicit internal opt-in, OFF by default.
 
 ## Testing
-- Unit (offline): `extract` surfaces `blocks`/`blocked_by` (omit-when-empty, goldens
-  byte-identical); `emit_blocker_graph` (nodes/edges, empty→omitted, bounding);
+- Unit (offline): `extract` surfaces resolved `blocking`/`blocked_by` (omit-when-empty,
+  raw `blocks` untouched, goldens byte-identical, validate idempotency green on a real
+  block edge); `emit_blocker_graph` (nodes/edges, empty→placeholder, bounding);
   deterministic ordering. `validate`/characterization green.
 - Vertical: re-gather a real repo window with blocked issues / stalled trains and
   confirm the sections + `blocker_graph` populate and cite real refs.

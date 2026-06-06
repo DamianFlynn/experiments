@@ -379,8 +379,15 @@ def _attach_blocks(conn, project, repo, issues):
     lives under the separate `blocking`/`blocked_by` keys. Mirrors
     `_attach_reviews_and_lifecycle`: a post-attach reading the store directly. Only
     sets a key when non-empty so issues with no dependency edges stay byte-identical."""
+    # One query for all of the project's `blocks` edges, then build per-issue maps —
+    # O(E+N) instead of two SQL lookups per issue. `blocks` edges are same-repo
+    # (gather only parses bare `#N`), so we key on numbers scoped to THIS repo.
+    prefix = "{}/{}#".format(project, repo)
+
     def _num(node_id):
-        local = graphstore.parse_id(node_id)["local"]
+        if not node_id.startswith(prefix):
+            return None
+        local = node_id[len(prefix):]
         if not local.startswith("issue-"):
             return None
         try:
@@ -388,23 +395,21 @@ def _attach_blocks(conn, project, repo, issues):
         except ValueError:
             return None
 
+    blocking, blocked_by = {}, {}  # number -> set(numbers)
+    for e in graphstore.edges_by_type(conn, "blocks", project):
+        s, d = _num(e["src_id"]), _num(e["dst_id"])
+        if s is None or d is None:
+            continue
+        blocking.setdefault(s, set()).add(d)     # s blocks d
+        blocked_by.setdefault(d, set()).add(s)
     for iss in issues:
         number = iss.get("number")
         if number is None:
             continue
-        qid = graphstore.qualify_id(project, repo, "issue-{}".format(number))
-        out = graphstore.get_edges(conn, qid, direction="out",
-                                   edge_types=["blocks"])
-        blocking = sorted({n for n in (_num(e["dst_id"]) for e in out)
-                           if n is not None})
-        if blocking:
-            iss["blocking"] = blocking
-        inn = graphstore.get_edges(conn, qid, direction="in",
-                                   edge_types=["blocks"])
-        blocked_by = sorted({n for n in (_num(e["src_id"]) for e in inn)
-                             if n is not None})
-        if blocked_by:
-            iss["blocked_by"] = blocked_by
+        if blocking.get(number):
+            iss["blocking"] = sorted(blocking[number])
+        if blocked_by.get(number):
+            iss["blocked_by"] = sorted(blocked_by[number])
 
 
 def _materialize_people(conn, project):
