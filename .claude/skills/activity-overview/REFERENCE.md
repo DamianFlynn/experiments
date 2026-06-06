@@ -37,10 +37,14 @@ python3 validate.py workspace/journey.db
 ```
 
 **The store persists and grows.** `--store workspace/journey.db` is a normal SQLite
-file on disk — reuse the **same path** across windows/repos and gather folds into it
-**idempotently** (re-running an overlapping window never double-counts), so the
-journey graph accretes over time. It's a local, rebuildable cache; delete the file to
-start fresh, or re-gather to refresh against the pinned clone SHA (see `STORE.md`).
+file on disk — reuse the **same path** for a project across windows (and across its
+member repos) and gather folds into it **idempotently** (re-running an overlapping
+window never double-counts), so the journey graph accretes over time. It's a local,
+rebuildable cache; delete the file to start fresh, or re-gather to refresh against the
+pinned clone SHA (see `STORE.md`). A single store *can* hold **multiple** projects/repos,
+but then the readers need to be told which: `validate.py` (and `digest.py`/`spotlight.py`)
+error asking for `--project` (and `--repo` when a project spans several) — the bare
+`validate.py workspace/journey.db` example above assumes a single-project store.
 
 The report vertical (`extract → link → render → report`) **composes from the
 store** — `extract` materializes the bundle as a transient view, then `link`/
