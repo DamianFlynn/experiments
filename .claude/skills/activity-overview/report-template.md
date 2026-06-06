@@ -14,11 +14,14 @@
 
 ## Since last installment
 
-<!-- Phase 13 (series continuity). OMIT this whole section when `bundle["series"]`
-     is absent (no `--series` index) or `series.first_installment` is true — the
-     first digest of a project has no prior to compare against. Source:
-     `bundle["series"]` = {new, carried_over, forecast_loop}. Framing prose is the
-     agent's; the membership is deterministic and every item cites its ref. -->
+<!-- Phase 13 (series continuity). This is a BUNDLE-scoped section, like Board
+     status / Sprints: `series` is set by `link.py --series` on each member's
+     bundle, so render it per member from `view["members"][i]["bundle"]["series"]`
+     (there is no project-wide `series` on `view`). OMIT a member's block when its
+     `bundle["series"]` is absent (no `--series` index) or `series.first_installment`
+     is true — the first digest of a project has no prior to compare against.
+     Source per member: `series` = {new, carried_over, forecast_loop}. Framing prose
+     is the agent's; the membership is deterministic and every item cites its ref. -->
 
 **New this installment:** items in `series.new` (first seen this window).
 
@@ -185,8 +188,10 @@ cited:
 
 ## Next-release forecast
 
-From `bundle["forecast"]` (forward-only). The predicted-vs-landed loop is the
-"Since last installment" section above (Phase 13), driven by `bundle["series"]`.
+From `bundle["forecast"]` (forward-only). The predicted-vs-landed loop is NOT
+here — it lives in the "Since last installment" section above (Phase 13), and
+only when that section is present (i.e. the run was linked with `--series` and
+this is not the first installment); otherwise there is no loop to show.
 
 **Next milestone:** {forecast.next_milestone} *(or "none identified")*
 

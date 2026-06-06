@@ -1070,7 +1070,12 @@ def main(argv=None):
         # standard digest stays byte-identical.
         try:
             with open(series_path, encoding="utf-8") as fh:
-                installments = json.load(fh)
+                raw = fh.read()
+            # Absent OR empty/whitespace-only (e.g. a freshly `touch`ed or
+            # truncated file) ⇒ first installment. A non-empty but malformed
+            # index still raises, surfacing a clear error rather than silently
+            # discarding a corrupt-but-present index.
+            installments = json.loads(raw) if raw.strip() else []
         except FileNotFoundError:
             installments = []
         prior = installments[-1] if installments else None

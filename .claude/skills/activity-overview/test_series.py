@@ -178,6 +178,24 @@ class TestSeriesWiring(unittest.TestCase):
         for p in (p1, p2, series_path):
             os.unlink(p)
 
+    def test_empty_or_whitespace_index_is_first_installment(self):
+        # A zero-byte / whitespace-only file (touched-but-unwritten or truncated)
+        # must be treated as the first installment, not crash on JSONDecodeError.
+        for contents in ("", "   \n"):
+            series_fd, series_path = tempfile.mkstemp(suffix=".json")
+            os.close(series_fd)
+            with open(series_path, "w") as fh:
+                fh.write(contents)
+            p = self._write(_min_enrichable())
+            link.main([p, "--series", series_path])
+            with open(p) as fh:
+                out = json.load(fh)
+            self.assertTrue(out["series"]["first_installment"])
+            with open(series_path) as fh:
+                self.assertEqual(len(json.load(fh)), 1)
+            os.unlink(p)
+            os.unlink(series_path)
+
 
 def _min_enrichable():
     """A minimal raw bundle that link.enrich accepts without KeyErrors."""
