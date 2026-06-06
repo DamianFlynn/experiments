@@ -44,6 +44,18 @@ class TestBuildBundle(unittest.TestCase):
         self.assertEqual(bundle["meta"]["schema_version"], 1)
 
 
+class TestRunGitDecoding(unittest.TestCase):
+    def test_non_utf8_output_is_replaced_not_crashing(self):
+        # A real commit patch can carry non-UTF-8 bytes (latin-1 source, binary
+        # hunks). run_git must decode with errors="replace" rather than crash the
+        # whole gather on a single bad byte. Drive the current Python interpreter
+        # (hermetic/portable — no reliance on a shell `printf`) to emit a lone
+        # 0xa1 byte (the exact byte that crashed gathering Azure/bicep).
+        out = gather.run_git(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'\\xa1')"])
+        self.assertIn("�", out)  # decoded to the replacement char, no raise
+
+
 class TestParseGitLog(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "git_log_sample.txt")) as fh:

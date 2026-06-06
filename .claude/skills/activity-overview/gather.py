@@ -1781,12 +1781,19 @@ def resolve_token(env):
 
 
 def run_git(args, cwd=None, timeout=None):
-    """Thin wrapper around git (not unit-tested). Surfaces git's own stderr
-    on failure so errors like "not a git repository" reach the user. An optional
+    """Thin wrapper around git. Its live git interaction is integration-only,
+    but the non-UTF-8 decode path below is covered by TestRunGitDecoding.
+    Surfaces git's own stderr on failure so errors like "not a git repository"
+    reach the user. An optional
     `timeout` (seconds) bounds the call — used by the IaC edge build so a hung
-    `bicep`/`terraform` cannot stall the run (TimeoutExpired propagates)."""
+    `bicep`/`terraform` cannot stall the run (TimeoutExpired propagates).
+
+    Decodes git's output as UTF-8 with `errors="replace"`: real-world patches
+    can carry non-UTF-8 bytes (latin-1 source, binary hunks), and a strict
+    decode would hard-crash the whole run on a single bad byte. Replacing keeps
+    the diff/log walks robust on large repos (e.g. Azure/bicep)."""
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                          timeout=timeout)
+                          encoding="utf-8", errors="replace", timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(
             f"command failed (exit {proc.returncode}): {' '.join(args)}\n"
