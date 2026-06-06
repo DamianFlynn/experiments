@@ -308,7 +308,8 @@ once under **Module ownership** above (do not repeat the Mermaid block here).
 
 <!-- ON-DEMAND deep-dive: render only when a module/area is in focus (the request asks
      for a module's history, or a module is notably active). Source: the narrator pass
-     over `python3 spotlight.py module <area> --json` (see SKILL.md "Module biography").
+     over `python3 spotlight.py module <area> --store <db> --project <name> --json`
+     (see SKILL.md "Module biography").
      Full-history, NOT window-bounded. Omit from the standard windowed digest. -->
 
 ### `{area}` — {one-line what-this-module-is}
