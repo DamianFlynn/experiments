@@ -622,6 +622,45 @@ def _cap_comments(comment_objs):
     return kept, max(0, len(bodies) - len(kept))
 
 
+def _cap_reviews(review_objs):
+    """Return (kept_reviews, overflow_count) from a list of review-submission dicts.
+
+    Keeps up to SLICE_COMMENTS_KEPT submissions, each projected to
+    {author, state, submitted_at, body} with body run through _cap_text;
+    overflow_count is the number of submissions dropped beyond the cap.
+    Mirrors _cap_comments but yields objects (not bare strings).
+    """
+    kept = [
+        {
+            "author":       r.get("author"),
+            "state":        r.get("state"),
+            "submitted_at": r.get("submitted_at"),
+            "body":         _cap_text(r.get("body")),
+        }
+        for r in (review_objs or [])[:SLICE_COMMENTS_KEPT]
+    ]
+    return kept, max(0, len(review_objs or []) - len(kept))
+
+
+def _cap_lifecycle(event_objs):
+    """Return (kept_events, overflow_count) from a list of lifecycle-event dicts.
+
+    Keeps up to SLICE_COMMENTS_KEPT events, each projected to
+    {event, actor, created_at, label} (drops id/url); overflow_count is the
+    number of events dropped beyond the cap.
+    """
+    kept = [
+        {
+            "event":      e.get("event"),
+            "actor":      e.get("actor"),
+            "created_at": e.get("created_at"),
+            "label":      e.get("label"),
+        }
+        for e in (event_objs or [])[:SLICE_COMMENTS_KEPT]
+    ]
+    return kept, max(0, len(event_objs or []) - len(kept))
+
+
 def slice_train(bundle, train_id):
     """Return a bounded, self-contained dict describing one train.
 
@@ -637,11 +676,18 @@ def slice_train(bundle, train_id):
           "train":   { id, kind, outcome, significance, tier, effort,
                        code_areas, evidence },
           "issue":   { number, title, body*, url, labels, kind,
-                       comments*:[body*], comments_overflow } | None,
+                       comments*:[body*], comments_overflow,
+                       lifecycle*:[{event, actor, created_at, label}],
+                       lifecycle_overflow, reopen_count } | None,
           "prs":     [ { number, title, body*, state, merged, created_at,
                          merged_at, url, reviewers:[login], review_decision,
                          review_comments*:[body*], review_comments_overflow,
-                         comments*:[body*], comments_overflow } ],
+                         comments*:[body*], comments_overflow,
+                         review_rounds:{count, states} | None,
+                         reviews*:[{author, state, submitted_at, body*}],
+                         reviews_overflow,
+                         lifecycle*:[{event, actor, created_at, label}],
+                         lifecycle_overflow, reopen_count } ],
           "commits": [ { sha, message*, author, date } ],
           "feature_deltas": [ ... only this train's deltas ... ],
           "symbol_moves":   [ ... only moves whose from/to artifact id is
@@ -679,6 +725,7 @@ def slice_train(bundle, train_id):
         issue_block = None
     else:
         comments, comments_overflow = _cap_comments(raw_issue.get("comments_list", []))
+        issue_lifecycle, issue_lifecycle_overflow = _cap_lifecycle(raw_issue.get("lifecycle", []))
         issue_block = {
             "number":           raw_issue.get("number"),
             "title":            raw_issue.get("title"),
@@ -688,6 +735,9 @@ def slice_train(bundle, train_id):
             "kind":             raw_issue.get("kind"),
             "comments":         comments,
             "comments_overflow": comments_overflow,
+            "lifecycle":        issue_lifecycle,
+            "lifecycle_overflow": issue_lifecycle_overflow,
+            "reopen_count":     raw_issue.get("reopen_count", 0),
         }
 
     # --- resolve PRs --------------------------------------------------------
@@ -699,6 +749,12 @@ def slice_train(bundle, train_id):
             continue
         rev_comments, rev_overflow = _cap_comments(raw_pr.get("review_comments", []))
         conv_comments, conv_overflow = _cap_comments(raw_pr.get("comments_list", []))
+        reviews, reviews_overflow = _cap_reviews(raw_pr.get("reviews", []))
+        pr_lifecycle, pr_lifecycle_overflow = _cap_lifecycle(raw_pr.get("lifecycle", []))
+        raw_rounds = raw_pr.get("review_rounds")
+        review_rounds = dict(raw_rounds) if raw_rounds else None
+        if review_rounds is not None and "states" in review_rounds:
+            review_rounds["states"] = list(review_rounds["states"])
         pr_blocks.append({
             "number":                 raw_pr.get("number"),
             "title":                  raw_pr.get("title"),
@@ -714,6 +770,12 @@ def slice_train(bundle, train_id):
             "review_comments_overflow": rev_overflow,
             "comments":               conv_comments,
             "comments_overflow":      conv_overflow,
+            "review_rounds":          review_rounds,
+            "reviews":                reviews,
+            "reviews_overflow":       reviews_overflow,
+            "lifecycle":              pr_lifecycle,
+            "lifecycle_overflow":     pr_lifecycle_overflow,
+            "reopen_count":           raw_pr.get("reopen_count", 0),
         })
 
     # --- resolve commits ----------------------------------------------------
