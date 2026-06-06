@@ -12,6 +12,9 @@ store or the graph.
 import re
 import sys
 
+# UTF-8 byte-order mark — written as an explicit escape (the literal char is
+# invisible in editors and easy to mangle).
+_BOM = "\ufeff"
 # A cue-timing line, in either VTT (00:00:01.000) or SRT (00:00:01,000) form;
 # the `-->` arrow is the reliable marker, with optional VTT cue settings after.
 _TIMING_RE = re.compile(r"-->")
@@ -25,7 +28,7 @@ _META_BLOCK_RE = re.compile(r"^(NOTE|STYLE|REGION)(\s|$)")
 def _looks_like_subtitles(text):
     """Content detection (not extension-bound): subtitle formats carry `-->` cue
     timing and/or a WEBVTT header. Plain .txt/.md have neither."""
-    head = text.lstrip("﻿").lstrip()
+    head = text.lstrip(_BOM).lstrip()
     return head.startswith("WEBVTT") or _TIMING_RE.search(text) is not None
 
 
@@ -43,7 +46,7 @@ def normalize_transcript(text):
     cues/lines is de-duplicated (so a genuine immediate repeat collapses to one)."""
     if not text:
         return ""
-    text = text.lstrip("﻿")
+    text = text.lstrip(_BOM)
 
     if not _looks_like_subtitles(text):
         # Plain .txt / .md: trim trailing whitespace per line, squeeze blank runs.

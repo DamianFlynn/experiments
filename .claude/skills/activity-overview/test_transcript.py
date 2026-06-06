@@ -93,7 +93,7 @@ class TestNormalizeTranscript(unittest.TestCase):
 
     def test_bom_is_stripped(self):
         self.assertEqual(
-            transcript.normalize_transcript("﻿WEBVTT\n\n"
+            transcript.normalize_transcript("\ufeffWEBVTT\n\n"
                                             "00:00:01.000 --> 00:00:02.000\nhi"),
             "hi")
 
@@ -119,6 +119,7 @@ class TestTranscriptCli(unittest.TestCase):
         import contextlib
         fd, path = tempfile.mkstemp(suffix=".vtt")
         os.close(fd)
+        self.addCleanup(os.unlink, path)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(VTT)
         buf = io.StringIO()
@@ -126,7 +127,6 @@ class TestTranscriptCli(unittest.TestCase):
             transcript.main([path])
         self.assertIn("Welcome everyone to the monthly call.", buf.getvalue())
         self.assertNotIn("-->", buf.getvalue())
-        os.unlink(path)
 
     def test_cli_missing_file_exits_2(self):
         with self.assertRaises(SystemExit) as cm:

@@ -4,7 +4,8 @@
       "owner": "OWNER",
       "repo": "REPO",
       "branches": ["main"],
-      "clone_dir": "workspace/example-clone"
+      "clone_dir": "workspace/example-clone",
+      "transcript": "workspace/example-call.vtt"
     }
   }
 }
