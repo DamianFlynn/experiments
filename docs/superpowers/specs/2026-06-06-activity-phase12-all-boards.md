@@ -52,9 +52,11 @@ A board is **dropped** (with a one-line `warning:` naming it + the reason) when:
   deterministic merge order), instead of only the lowest-numbered.
 - For EACH kept board: seed from the discovery page's `items.nodes`, then paginate
   the rest **by node id** (`PROJECT_BOARD_ITEMS_QUERY`, so each cursor belongs to
-  that board's connection). Cap **per board** at `max_items`; warn when a board is
-  truncated (so lost coverage is visible — truth). The existing 100→ raise page
-  guard bounds a pathological board.
+  that board's connection). Cap **per board** at `max_items` (the env knob
+  `ACTIVITY_BOARD_MAX_ITEMS`, default 5000); warn when a board is truncated (so
+  lost coverage is visible — truth, and the warning names the env knob to raise).
+  A page guard bounds a pathological board. Discovery requests `projectsV2(first:100)`
+  (the API max) so all linked boards are seen.
 - Pass the LIST of full board nodes to `parse_project_board` (union of iterations;
   per-item `(slug, number)` merge — first non-None status/sprint in board order).
   **Conflict rule:** boards are passed in ascending `number` order, so when the

@@ -2047,7 +2047,7 @@ GRAPHQL_URL = "https://api.github.com/graphql"
 PROJECT_BOARD_QUERY = """
 query($owner:String!, $repo:String!, $cursor:String) {
   repository(owner:$owner, name:$repo) {
-    projectsV2(first:10) {
+    projectsV2(first:100) {
       nodes {
         id
         number
@@ -2237,6 +2237,10 @@ def parse_project_board(board_nodes):
 # deprecated-but-not-removed and skipped (overridable via the env var).
 BOARD_STALE_DAYS = 365
 
+# Per-board item cap (defensive bound on a huge board). Raise via the env var
+# when a board legitimately holds more items than this and is truncated.
+BOARD_MAX_ITEMS = 5000
+
 
 def _board_stale_days():
     """Effective board-staleness threshold in days. `ACTIVITY_BOARD_STALE_DAYS`
@@ -2246,6 +2250,16 @@ def _board_stale_days():
                                          BOARD_STALE_DAYS)))
     except (TypeError, ValueError):
         return BOARD_STALE_DAYS
+
+
+def _board_max_items():
+    """Effective per-board item cap. `ACTIVITY_BOARD_MAX_ITEMS` overrides
+    BOARD_MAX_ITEMS at call time (a non-int/empty value falls back)."""
+    try:
+        return max(1, int(os.environ.get("ACTIVITY_BOARD_MAX_ITEMS",
+                                         BOARD_MAX_ITEMS)))
+    except (TypeError, ValueError):
+        return BOARD_MAX_ITEMS
 
 
 def board_is_maintained(board, ref_date=None, stale_days=None):
@@ -2263,12 +2277,15 @@ def board_is_maintained(board, ref_date=None, stale_days=None):
         return True
     if stale_days is None:
         stale_days = _board_stale_days()
+    # Parse BOTH dates; an unparseable ref_date OR updatedAt means we can't prove
+    # the board stale, so we keep it (matches the "can't prove it stale" intent).
     try:
         ref_d = datetime.date.fromisoformat(str(ref_date)[:10])
+        upd_d = datetime.date.fromisoformat(str(updated)[:10])
     except (TypeError, ValueError):
         return True
     cutoff = ref_d - datetime.timedelta(days=max(0, int(stale_days)))
-    return str(updated)[:10] >= cutoff.isoformat()
+    return upd_d >= cutoff
 
 
 def _paginate_board_items(graphql, board, owner, repo, max_items):
@@ -2300,7 +2317,7 @@ def _paginate_board_items(graphql, board, owner, repo, max_items):
     if has_next and len(nodes) >= max_items:
         sys.stderr.write(
             "warning: Projects v2 board #{} for {}/{} truncated at {} items "
-            "(raise ACTIVITY board cap for full coverage).\n".format(
+            "(raise ACTIVITY_BOARD_MAX_ITEMS for full coverage).\n".format(
                 board.get("number"), owner, repo, max_items))
     return nodes[:max_items]
 
@@ -2668,7 +2685,7 @@ def acquire(args, env):
         # ref_date (the window's reference point) anchors the board staleness
         # check; it is finalized below but resolves to the same value here.
         sprints, items_by_ref = fetch_project_board(
-            _graphql, owner, repo,
+            _graphql, owner, repo, max_items=_board_max_items(),
             ref_date=getattr(args, "ref_date", None) or to)
         # Window-bound iterations to [frm, to] by date: keep a sprint that overlaps
         # the window at all (start <= to and end >= frm). A sprint with no dates is

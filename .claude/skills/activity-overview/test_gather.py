@@ -3614,6 +3614,18 @@ class TestBoardIsMaintained(unittest.TestCase):
         self.assertTrue(gather.board_is_maintained(
             {"closed": False}, ref_date="2026-06-06"))
 
+    def test_unparseable_updatedAt_is_kept(self):
+        # a malformed updatedAt can't prove staleness -> keep (no raw-string compare).
+        self.assertTrue(gather.board_is_maintained(
+            {"closed": False, "updatedAt": "not-a-date"}, ref_date="2026-06-06"))
+
+    def test_board_max_items_env_override(self):
+        import unittest.mock as mock
+        with mock.patch.dict(os.environ, {"ACTIVITY_BOARD_MAX_ITEMS": "42"}):
+            self.assertEqual(gather._board_max_items(), 42)
+        with mock.patch.dict(os.environ, {"ACTIVITY_BOARD_MAX_ITEMS": "oops"}):
+            self.assertEqual(gather._board_max_items(), gather.BOARD_MAX_ITEMS)
+
     def test_none_ref_date_keeps_board(self):
         # without a reference point we can't prove staleness -> keep.
         self.assertTrue(gather.board_is_maintained(
