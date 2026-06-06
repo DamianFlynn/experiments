@@ -635,7 +635,7 @@ def _cap_reviews(review_objs):
             "author":       r.get("author"),
             "state":        r.get("state"),
             "submitted_at": r.get("submitted_at"),
-            "body":         _cap_text(r.get("body") or ""),
+            "body":         _cap_text(r.get("body")),
         }
         for r in (review_objs or [])[:SLICE_COMMENTS_KEPT]
     ]
@@ -677,16 +677,16 @@ def slice_train(bundle, train_id):
                        code_areas, evidence },
           "issue":   { number, title, body*, url, labels, kind,
                        comments*:[body*], comments_overflow,
-                       lifecycle:[{event, actor, created_at, label}],
+                       lifecycle*:[{event, actor, created_at, label}],
                        lifecycle_overflow, reopen_count } | None,
           "prs":     [ { number, title, body*, state, merged, created_at,
                          merged_at, url, reviewers:[login], review_decision,
                          review_comments*:[body*], review_comments_overflow,
                          comments*:[body*], comments_overflow,
                          review_rounds:{count, states} | None,
-                         reviews:[{author, state, submitted_at, body*}],
+                         reviews*:[{author, state, submitted_at, body*}],
                          reviews_overflow,
-                         lifecycle:[{event, actor, created_at, label}],
+                         lifecycle*:[{event, actor, created_at, label}],
                          lifecycle_overflow, reopen_count } ],
           "commits": [ { sha, message*, author, date } ],
           "feature_deltas": [ ... only this train's deltas ... ],

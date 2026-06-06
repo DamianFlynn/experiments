@@ -1907,7 +1907,9 @@ class TestSliceTrain(unittest.TestCase):
         self.assertEqual(issue["reopen_count"], 0)
 
     def test_slice_does_not_mutate_bundle(self):
-        """The slice copies lists/dicts; mutating the slice leaves bundle intact."""
+        """The slice copies the review/lifecycle lists + the review_rounds dict;
+        mutating those in the slice leaves the bundle intact. (Some other slice
+        fields are intentionally by-reference per slice_train's docstring.)"""
         bundle = self._bundle()
         s = link.slice_train(bundle, "train-issue-10")
         pr_100 = next(p for p in s["prs"] if p["number"] == 100)
