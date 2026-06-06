@@ -217,6 +217,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # Done ONLY when such nodes exist so PRs/issues with none stay byte-identical.
     _attach_reviews_and_lifecycle(socials, bundle["prs"], bundle["issues"])
 
+    # Phase 11 slice 1: surface the store's `blocks` issue->issue edges as resolved
+    # numbers (issue["blocking"] / issue["blocked_by"]) for the report + blocker_graph.
+    # The raw `blocks` ref-list (fold-consumed) is left intact. Omit-when-empty.
+    _attach_blocks(conn, project, repo, bundle["issues"])
+
     # `code` holds both commits (local id = bare <sha>) and artifact nodes
     # (local id `art:<path>` for files, `<path>#<lang>:<subkind>:<name>` for
     # symbols). Commits reconstruct the raw `commits` array; the artifact nodes
@@ -357,6 +362,54 @@ def _order_artifacts(arts, code_events):
         return (order.get(aid, fallback), aid)
 
     return {aid: arts[aid] for aid in sorted(arts, key=rank)}
+
+
+def _attach_blocks(conn, project, repo, issues):
+    """Surface the store's `blocks` issue->issue edges (Phase 9 #21) onto the issue
+    records as RESOLVED gathered-issue numbers, for the report + blocker_graph. fold
+    normalized every edge to blocker->blocked, so for an issue's qualified id:
+    OUTbound edges (this is the blocker) name the issues it blocks -> `issue["blocking"]`;
+    INbound edges (this is blocked) name the issues blocking it -> `issue["blocked_by"]`.
+    Both are sorted lists of issue NUMBERS, omit-when-empty.
+
+    NOTE: we do NOT touch the issue's raw `blocks` field — that is the parsed
+    directed-ref list ([{number, direction}]) `normalize_issue` wrote, and
+    `gather.fold_bundle` re-reads it (e.g. validate's idempotency gate re-folds this
+    very extracted bundle). Overwriting it would break re-fold, so the resolved view
+    lives under the separate `blocking`/`blocked_by` keys. Mirrors
+    `_attach_reviews_and_lifecycle`: a post-attach reading the store directly. Only
+    sets a key when non-empty so issues with no dependency edges stay byte-identical."""
+    # One query for all of the project's `blocks` edges, then build per-issue maps —
+    # O(E+N) instead of two SQL lookups per issue. `blocks` edges are same-repo
+    # (gather only parses bare `#N`), so we key on numbers scoped to THIS repo.
+    prefix = "{}/{}#".format(project, repo)
+
+    def _num(node_id):
+        if not node_id.startswith(prefix):
+            return None
+        local = node_id[len(prefix):]
+        if not local.startswith("issue-"):
+            return None
+        try:
+            return int(local[len("issue-"):])
+        except ValueError:
+            return None
+
+    blocking, blocked_by = {}, {}  # number -> set(numbers)
+    for e in graphstore.edges_by_type(conn, "blocks", project):
+        s, d = _num(e["src_id"]), _num(e["dst_id"])
+        if s is None or d is None:
+            continue
+        blocking.setdefault(s, set()).add(d)     # s blocks d
+        blocked_by.setdefault(d, set()).add(s)
+    for iss in issues:
+        number = iss.get("number")
+        if number is None:
+            continue
+        if blocking.get(number):
+            iss["blocking"] = sorted(blocking[number])
+        if blocked_by.get(number):
+            iss["blocked_by"] = sorted(blocked_by[number])
 
 
 def _materialize_people(conn, project):
