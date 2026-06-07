@@ -1,6 +1,6 @@
 # Sample: AVM-TF constellation project digest
 
-A worked, end-to-end **multi-repo (Phase 9) project digest** over a real Azure
+A worked, end-to-end **multi-repo project digest** over a real Azure
 Verified Modules — Terraform constellation. It exercises the deterministic
 vertical: `gather (manifest) → store → validate → digest`.
 

@@ -2,10 +2,11 @@
 
 `graphstore.py` is a stdlib-only SQLite property graph: the durable,
 identity-keyed substrate that `gather` writes and `extract`/`spotlight` read.
-This file is the contract those phases (and downstream renderer authors) code
-against. All SQL lives in `graphstore.py`; callers use its function API.
+This file is the contract the reader/writer code (and downstream renderer
+authors) code against. `graphstore.py` owns the schema and the core read/write
+API; callers use that API (a couple of readers also run their own read-only queries).
 
-> **Phase 7 deliverable (store-only).** This trustworthy graph IS the deliverable.
+> **Store-only.** This trustworthy graph IS the deliverable.
 > `gather --store` writes it and nothing else — there is no longer a flat bundle
 > JSON artifact. The bundle is a **transient view** that `extract` materializes
 > from the store on demand. The report vertical (`extract → link → render →
@@ -79,7 +80,7 @@ index; `fts_search(query)` returns matching node ids ranked by relevance.
 Created only when the SQLite build supports FTS5 (`fts5_available`); the
 text-mining spotlight query depends on it.
 
-**Populated on the fold path (Phase 8a).** `fold_bundle` indexes searchable
+**Populated on the fold path.** `fold_bundle` indexes searchable
 text per owning node id, keyed so a hit hydrates back to the node it came from:
 PR/issue `social` nodes index their title + body + embedded comment/review
 authors+bodies; commit `code` nodes index the commit message. The call is
@@ -245,7 +246,7 @@ already matched `validate.check_schema_conformance`'s allowlist.
 
 Still NOT on the write path: `in_iteration` (social→sprint) — needs **Projects v2**
 acquisition (the `read:project` scope), which gather does not yet pull. The
-`fts_text` FTS5 index IS populated on fold (Phase 8a — see *Text index* above). See
+`fts_text` FTS5 index IS populated on fold (see *Text index* above). See
 `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
 ## Backfill on a traversal miss (slice 7c)
@@ -289,9 +290,9 @@ fetches itself — it calls in via an injected `backfill` callable).
   paths are therefore only exercisable against a real repo (relevant to the
   upcoming trust gate), not by the offline suite.
 
-## Train completion + dead-ref memory (Phase 8d — shipped, #14)
+## Train completion + dead-ref memory
 
-7c's `backfill` is a *single-node* bridge. **Phase 8d** promotes it into a shared
+The single-node `backfill` bridge is promoted into a shared
 **completion orchestrator** (`complete.py`) that closes a train **transitively**
 along the causal spine, **bounded by the query's time window** (level-0
 directly-referenced anchors always filled; transitive expansion stops at the
@@ -320,7 +321,7 @@ ignored by the trust gate, and `first_seen` is excluded from determinism asserts
 (like `fetched_at`). See
 `docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`.
 
-## Phase 9 — multi-repo project (the constellation)
+## Multi-repo project (the constellation)
 
 A **project can span several repos** folded under one logical name (the lead case
 is Azure Verified Modules — Terraform, where each module is its own repo). The

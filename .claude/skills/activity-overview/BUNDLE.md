@@ -1,14 +1,14 @@
 # Bundle Schema
 
-The bundle is a single JSON object. **Phase 7 is store-only:** the bundle is no
+The bundle is a single JSON object. **The skill is store-only:** the bundle is no
 longer a produced file — `gather` folds its facts into the journey-graph store
 (see `STORE.md`), and the reader stage materializes this bundle shape as a
 **transient view** via `extract`. This document remains the contract for that
 view: the **gather**/fold path supplies `meta`, `commits`, `prs`, `issues`,
 `workflows`, `workflow_stats`, `releases`, `milestones`; the **link** step
 (`link.py`) then fills `trains` and `buckets`; the **render** step
-(`render.py`) fills `diagrams`. (See **Phase 2 fields** below for the
-fields added after the walking skeleton.)
+(`render.py`) fills `diagrams`. (The grouped sections below document everything
+beyond the core keys.)
 
 ## Output contract (for downstream formatters)
 
@@ -40,13 +40,13 @@ video-script, dashboards) consume the same view. The contract:
 Every provenance reference is `{ "type": "pr|issue|commit", "id": <number|sha>,
 "url": "https://..." }`. Every narrative-bearing fact (a train, a bucket entry)
 resolves to at least one such ref. To fact-check any claim in a report, follow its
-ref `url` to GitHub. (Phase 1 emits `pr` and `issue` refs; commits appear as bare
-SHAs in `trains[].commits` — wrapped `commit` refs arrive in a later phase.)
+ref `url` to GitHub. (`pr` and `issue` refs are emitted directly; commits appear
+as bare SHAs in `trains[].commits`.)
 
 ## Top-level keys
 
-Scope notes mark where Phase 2 widens what Phase 1 collected; field lists below
-are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
+Field lists below are the core shapes; the grouped sections further down document
+the rest (engagement, code areas, trains, people/flow).
 
 - `meta` — `owner, repo, from, to, branches, base_branch, clone_dir, period, prev_bundle,
   schema_version`. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
@@ -55,18 +55,16 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
   Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
   It pins the exact source tree (edges are a pure function of source), which is the basis for
   the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,
-  idempotent by identity. (Phase 7 is store-only — see `STORE.md`; this bundle shape is the
+  idempotent by identity. (Store-only — see `STORE.md`; this bundle shape is the
   transient view `extract` materializes from the store, not a produced file.)
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
   (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
   across committer timezones.
-- `prs` — PRs in scope (Phase 1: merged-in-window only; **Phase 2** also includes
-  open and closed-unmerged PRs): `{ number, title, body, author, author_association,
+- `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
-- `issues` — issues in scope (Phase 1: PR-closing issues only; **Phase 2** also
-  includes open and not-planned-closed issues): `{ number, title, body, kind, author,
+- `issues` — issues in scope (PR-closing, plus open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
 - `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
   contributing_prs:[#], significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at,
@@ -84,7 +82,7 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
   `other` — so significance still differentiates work on repos that title PRs but rarely type issues.
   `significance = footprint × kind_weight + breadth` (footprint counts prs + commits + code_areas +
   contributing_prs); `tier` = `"deep"` for the top-N by significance ∪ any train ≥ the significance
-  floor, else `"mention"` (Phase 4a).
+  floor, else `"mention"`.
   `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed
   `review_comments_count` (int); `participants` = count of distinct authors + reviewers +
   comment-authors (int);
@@ -92,15 +90,15 @@ are the Phase 1 baseline shapes, extended by **Phase 2 fields**.
   when data is thin. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
   `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`.
 - `buckets` — `{ shipped:[ref], in_flight:[ref], rejected:[ref], next_candidates:[ref] }`
-  (Phase 1 fills only `shipped`; Phase 2 classifies all four — see below).
+  (all four buckets are classified — see below).
 
-## Reserved (empty in Phase 1)
+## Reserved (empty) keys
 
 `timeline, artifacts, feature_deltas, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, workflows, releases, milestones,
 docsRefs, release_train, sprints, project, diagrams`.
 
-## Phase 2 fields
+## Engagement, buckets, diagrams & forecast fields
 
 - **prs[]** gain `created_at`, `updated_at`, `milestone`, `comments`,
   `review_comments_count`, `reviewers`, `review_decision`
@@ -124,22 +122,22 @@ docsRefs, release_train, sprints, project, diagrams`.
   desc. Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
   / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
-  (≥2.0 → possible), `FORECAST_OVERDUE_DAYS` (Phase 4a).
+  (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
 
-## Phase 3a fields (narrative substrate)
+## Narrative-substrate fields
 
 - **prs[]** gain `review_comments: [{author, author_association, body, url, id, created_at}]`
   (inline diff comments) and `comments_list: [{...same shape}]` (conversation
-  comments). The Phase 2 integer count stays under `comments` /
-  `review_comments_count` — the spec's `comments` *body-array* name was already
-  taken by the Phase 2 count, so bodies live under `comments_list`.
+  comments). The integer count stays under `comments` / `review_comments_count`;
+  the body arrays live under `comments_list` (the `comments` name was already taken
+  by the count).
 - **issues[]** gain `comments_list: [{...}]`, `reactions: {"+1","-1","heart",
   "hooray","total"}`, and `open_high_activity: bool` (open issue with notable
   comments/upvotes).
 - **code_events** (gather) — raw file-level events from the full-window
   `git log --name-status -M -C` walk: `[{commit, author, date, change:
   add|modify|delete|rename|copy, path, old_path?}]`. The raw material Link folds.
-- **symbol_events** (gather, Phase 3d) — symbol-granular change events from a single
+- **symbol_events** (gather) — symbol-granular change events from a single
   full-window `git log -p --unified=3` walk, attributed **diff-locally**: `[{commit,
   author, date, path, lang:"bicep|terraform", subkind:"param|var|output|resource|
   module|variable|comment|todo", name, change:"add|drop|change", before, after}]`.
@@ -155,9 +153,9 @@ docsRefs, release_train, sprints, project, diagrams`.
   "add|change|remove", commit, author, date, ref[, before, after]}] } }`. File-level
   ids are `art:<path>` (via `artifact_id`); **symbol/comment** ids are
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
-  joins back to these keys. `code_area` is filled in Phase 3b. Symbol lifecycle entries
+  joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
   carry the bounded `before`/`after`.
-- **symbol_moves** (link, Phase 3e) — window-wide symbol-identity links: `{ links:[{subkind,
+- **symbol_moves** (link) — window-wide symbol-identity links: `{ links:[{subkind,
   name, from_path, to_path, from:<src aid>, to:<dst aid>, confidence:"high|medium", basis:
   "file_rename|unique_name"}], by_confidence:{high,medium} }`. Each link object also carries
   `lang`. A move = the same `(lang, subkind, name)`
@@ -174,14 +172,14 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **feature_deltas** `[{ area, kind:"add|drop|change", subject, name, before,
   after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
   }]` — a projection over `artifacts` (add→add, remove→drop, change→change). For
-  **symbol/comment** subjects (Phase 3d) `before`/`after` carry the bounded hunk
+  **symbol/comment** subjects `before`/`after` carry the bounded hunk
   snippet and `detail` is `"<lang> <subkind> <name>"`; file-level deltas leave them
   null. `area` is filled by area attribution. `pr`/`train` resolve best-effort via
   the commit→PR map.
 - **diagrams{}** now also maps `content_timeline` (Mermaid `timeline`) and
   `deltas_bar` (Mermaid `xychart-beta` bar).
 
-## Phase 3b fields (code areas + label facets)
+## Code-area & label-facet fields
 
 - **code_graph** `{ "provider": "directory|graphify", "areas": [{ "id", "label",
   "paths": [...], "edges": [] }] }`. The **directory provider** (primary,
@@ -193,12 +191,12 @@ docsRefs, release_train, sprints, project, diagrams`.
   integer `community` + `source_file`; **no** top-level `communities` list; edges
   live under `links`) and groups nodes by `community` into `community:<n>` areas.
   graphify does NOT parse Bicep/HCL, so on those repos the directory provider runs.
-  **`code_graph.areas[].edges` (Phase 3c) — inter-area dependency edges.** Each edge:
+  **`code_graph.areas[].edges` — inter-area dependency edges.** Each edge:
 
   | field | meaning |
   |-------|---------|
   | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable (e.g. a registry module — its identity is in `ref`) |
-  | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred to 3d) |
+  | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred) |
   | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
   | `version` | pinned version when present, else `null` |
   | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
@@ -216,7 +214,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 
-  **Visible gaps (Phase 3c.1).** Per-module builds run in parallel, each bounded by a generous
+  **Visible gaps.** Per-module builds run in parallel, each bounded by a generous
   per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
   genuinely hung process) and retried once. Each area carries `edges_status` ∈
   `{resolved, timeout, failed, skipped}` and `code_graph.edge_extraction` carries the aggregate
@@ -235,8 +233,8 @@ docsRefs, release_train, sprints, project, diagrams`.
   (each the first matching label or null). **issues[]** gain **kind** ∈
   `feature|module-request|bug|idea|question|docs|other` (native issue type →
   label kind facet → template filename → title/body heuristic → other).
-- **artifacts[].code_area** and **feature_deltas[].area** are now **populated**
-  (were null in Phase 3a) when the path resolves to a `code_graph` area; null otherwise.
+- **artifacts[].code_area** and **feature_deltas[].area** are **populated** when the
+  path resolves to a `code_graph` area; null otherwise.
 - **trains[].code_areas** — the distinct areas of a train's commits' files.
 - **modules** `{ "<area>": { "commits", "prs", "files_changed" } }` — per-area
   activity counts across the window's commits.
@@ -244,17 +242,16 @@ docsRefs, release_train, sprints, project, diagrams`.
   commits' files) or reviewed (their reviewed PRs' areas).
 - **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
-- **Phase 3d (shipped):** symbol/comment artifacts + `before`/`after`/`detail` on
-  feature_deltas (see `symbol_events` above), diff-local from a `git log -p` walk.
-- **Still deferred:** resource-level `dependsOn` edges, multi-repo aggregation.
+- **Symbol/comment artifacts** carry `before`/`after`/`detail` on feature_deltas
+  (see `symbol_events` above), diff-local from a `git log -p` walk.
+- **Deferred:** resource-level `dependsOn` edges.
 
-## Phase 4a fields (train significance + effort + forecast + per-train slice)
+## Train significance, effort & the per-train slice
 
-- **trains[]** gain `significance`, `tier`, and `effort` (see top-level `trains` bullet
-  above for the exact shapes and tunables).
-- **forecast** — top-level `forecast` block (see Phase 2 fields above).
-- **diagrams.train_flowcharts** — now LIVE: the per-deep-train `.mmd` map (see Phase 2
-  fields above).
+- **trains[]** carry `significance`, `tier`, and `effort` (see the top-level `trains`
+  bullet above for the exact shapes and tunables).
+- **forecast** — top-level `forecast` block (see the engagement/forecast fields above).
+- **diagrams.train_flowcharts** — the per-deep-train `.mmd` map (see the diagrams note above).
 - **`slice_train(bundle, train_id)`** — a pure, read-only, bounded helper (not a bundle
   field; called by the report ranker and future sub-agents). Returns a self-contained dict:
 
@@ -279,7 +276,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   bodies, overflow count in `<key>_overflow`.) Raises `KeyError` on unknown id. Does not
   mutate the bundle.
 
-## Phase 11 fields (people profile + recognition halls)
+## People profile, recognition halls, flow & blockers
 
 These are **enrich-time projections** computed by `link.enrich` over the
 materialized bundle (siblings of `forecast`/`modules`) — not stored person-node

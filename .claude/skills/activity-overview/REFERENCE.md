@@ -26,7 +26,7 @@ is named rather than guessed):
 
 ## Usage
 
-Phase 7 is **store-only**: `gather` folds facts into the SQLite journey-graph
+The skill is **store-only**: `gather` folds facts into the SQLite journey-graph
 store (the sole deliverable; see `STORE.md`) and writes no bundle file. Audit the
 store with `validate.py` (self-contained — no bundle needed):
 
@@ -51,7 +51,7 @@ store** — `extract` materializes the bundle as a transient view, then `link`/
 `render` consume it (guarded by the golden-bundle equivalence gate). Render with
 the skill (see `SKILL.md`).
 
-### Multi-repo project (Phase 9)
+### Multi-repo project
 
 Generate the manifest from the AVM module index (or hand-author it), then fold the
 members under one logical project and validate/read the whole project:
@@ -100,7 +100,7 @@ ref date is treated as deprecated, default `365`) and `ACTIVITY_BOARD_MAX_ITEMS`
 (per-board item cap, default `5000`; a truncated board warns). `--no-project-board`
 skips the layer entirely (e.g. a token without `read:project`).
 
-### Community-call transcript (Phase 14)
+### Community-call transcript
 
 To fold a community call into the report, pass a **local** transcript file (no
 network) and normalize it to clean prose:
