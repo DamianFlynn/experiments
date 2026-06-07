@@ -92,7 +92,13 @@ the rest (engagement, code areas, trains, people/flow).
 - `buckets` — `{ shipped:[ref], in_flight:[ref], rejected:[ref], next_candidates:[ref] }`
   (all four buckets are classified — see below).
 
-## Reserved (empty) keys
+## Optional (omit-when-empty) keys
+
+These keys are reserved in the bundle skeleton and **filled when the data exists** —
+by the later pipeline steps (`link`/`render`) or when the repo actually has them (a
+linked board, releases, CODEOWNERS, …). They are empty/absent when there is nothing to
+report (the omit-when-empty rule that keeps the shape diff-stable), **not** permanently
+empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, workflows, releases, milestones,

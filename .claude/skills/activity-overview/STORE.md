@@ -2,9 +2,9 @@
 
 `graphstore.py` is a stdlib-only SQLite property graph: the durable,
 identity-keyed substrate that `gather` writes and `extract`/`spotlight` read.
-This file is the contract the reader/writer code (and downstream renderer
-authors) code against. `graphstore.py` owns the schema and the core read/write
-API; callers use that API (a couple of readers also run their own read-only queries).
+Readers, writers, and downstream renderer authors rely on this file as the
+contract. `graphstore.py` owns the schema and the core read/write API; callers
+use that API (a couple of readers also run their own read-only queries).
 
 > **Store-only.** This trustworthy graph IS the deliverable.
 > `gather --store` writes it and nothing else — there is no longer a flat bundle
