@@ -44,7 +44,7 @@ the structured view).
    ```
    This folds a schema-complete graph into the SQLite substrate (see `STORE.md`); the fold is
    idempotent, so re-running over an overlapping window never double-counts.
-   - **IaC dependency edges (Phase 3c):** if `bicep` and/or `terraform` are on `PATH`, gather
+   - **IaC dependency edges:** if `bicep` and/or `terraform` are on `PATH`, gather
      resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges` and records
      `code_graph.edge_extraction` (`resolved`/`timeout`/`failed`/`skipped`); absent the CLIs (or
      the module registry), edges are left empty and the rest of the run is unaffected.
@@ -53,13 +53,13 @@ the structured view).
      `meta.clone_sha` (idempotent dedup keeps it overlap-safe). The flat-bundle `--rollup` /
      `--resume` / `--out` flags were retired with the bundle file.
    - **Validate the store (trust gate).** Audit the graph for trustworthiness; this is the
-     Phase 7 deliverable's acceptance check and is fully self-contained on a store:
+     store's acceptance check and is fully self-contained on a store:
      ```bash
      python3 validate.py workspace/journey.db
      ```
      `no_drift` / `idempotency` self-source their raw bundle from the store via `extract`; an
      external `--bundle` is an optional cross-check, never required.
-   - **Multi-repo project (Phase 9).** To fold several repos under one logical
+   - **Multi-repo project.** To fold several repos under one logical
      project (e.g. an Azure Verified Modules — Terraform constellation, where each
      module is its own repo), pass a **manifest** instead of `--owner/--repo`:
      ```bash
@@ -135,7 +135,7 @@ the structured view).
    if any diagram does not compile** under `mmdc`.
    The manifest now also includes `content_timeline`, `deltas_bar`,
    `contributor_graph`, and `kind_breakdown`.
-4. **Community-call transcript (optional, Phase 14).** If the user provides a
+4. **Community-call transcript (optional).** If the user provides a
    community-call transcript (a local file passed explicitly, or a `transcript`
    path in `projects.json`) — no network, user-provided only — normalize it to
    clean prose first:

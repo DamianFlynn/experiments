@@ -14,7 +14,7 @@
 
 ## Since last installment
 
-<!-- Phase 13 (series continuity). This is a BUNDLE-scoped section, like Board
+<!-- Series continuity. This is a BUNDLE-scoped section, like Board
      status / Sprints: `series` is set by `link.py --series` on each member's
      bundle, so render it per member from `view["members"][i]["bundle"]["series"]`
      (there is no project-wide `series` on `view`). OMIT a member's block when its
@@ -41,7 +41,7 @@
 
 ## Community call highlights
 
-<!-- Phase 14. OMIT this whole section when NO transcript was provided. When one
+<!-- Community call. OMIT this whole section when NO transcript was provided. When one
      was, the skill ran `python3 transcript.py <path>` to get clean text; author
      this section ONLY from that text (it is the source — there are no PR/issue
      urls, so GROUND every specific claim with a short verbatim quote from the
@@ -84,13 +84,14 @@
      (rank by `len(train["prs"]) + len(train["commits"])`, break ties by
      `outcome` shipped > in_flight > rejected > abandoned). Lead with the
      cross-repo trains (`len(train["repos"]) > 1`).
-     For a DEEP per-train flowchart + effort line + Phase 4b narrative, drop into the
+     For a DEEP per-train flowchart + effort line + the per-train narrative, drop into the
      owning member's single-repo bundle: match the project train's local `pr-`/`issue-`
      ids to a train in `view["members"][i]["bundle"]["trains"]` (which DO carry `tier`,
      `significance`, `effort`) and that member's rendered
      `diagrams.train_flowcharts[...]`. The per-train narrative (summary + Proposed /
      Changed / Rejected / Shipped, each sourced) is authored by a narrator sub-agent over
-     `link.py <member-bundle> --slice <train-id>` — see SKILL.md "Phase 4b". -->
+     `link.py <member-bundle> --slice <train-id>` — see the per-train narration in
+     `reference/report-sections.md`. -->
 
 ### {train.id} — {short title}
 
@@ -146,11 +147,11 @@ For each workflow in `workflow_stats`: total runs and success/failure split.
 ## In flight
 
 For each ref in `buckets.in_flight`: title, number, link, train id if present, and its
-Projects v2 **board status** (`board_status`) when present (Phase 12).
+Projects v2 **board status** (`board_status`) when present.
 
 - [{title}]({url}) (#{number}){ — train `{train}`}{ — _{board_status}_}
 
-<!-- Board status breakdown (Phase 12): when any item carries `board_status`, add a
+<!-- Board status breakdown: when any item carries `board_status`, add a
      one-line count by status. Omit when no board is linked (no item has board_status). -->
 
 **Board status:** {Todo N · In Progress N · In Review N · Blocked N · Done N — from the
@@ -158,7 +159,7 @@ in-flight items' `board_status`}
 
 ## Sprints
 
-<!-- Phase 12 — ONLY when `bundle["sprints"]` is non-empty (an iteration board). Most
+<!-- Sprints — ONLY when `bundle["sprints"]` is non-empty (an iteration board). Most
      boards are status-only (no iterations) -> OMIT this whole section. Resolve via
      `link.select_sprints(bundle["sprints"], ref_date)`; per sprint, list the items whose
      `iteration` == that sprint id. -->
@@ -207,7 +208,7 @@ from the issue-level flow above), longest `effort.elapsed_days` first:
 ## Next-release forecast
 
 From `bundle["forecast"]` (forward-only). The predicted-vs-landed loop is NOT
-here — it lives in the "Since last installment" section above (Phase 13), and
+here — it lives in the "Since last installment" section above, and
 only when that section is present (i.e. the run was linked with `--series` and
 this is not the first installment); otherwise there is no loop to show.
 
@@ -245,7 +246,7 @@ path resolves to a code area (no longer null when a `code_graph` area covers it)
 |------|---------|------|--------|----|--------|
 | {kind} | {subject} | {name} | {author} | {pr or "—"} | [{commit:7}]({url}) |
 
-### Symbol-level changes (Phase 3d)
+### Symbol-level changes
 
 For `feature_deltas` with `subject` of `symbol`/`comment`, show the actual change using
 the bounded `before`/`after` and `detail` (`<lang> <subkind> <name>`). Omit when no
