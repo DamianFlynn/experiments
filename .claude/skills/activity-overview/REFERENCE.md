@@ -1,5 +1,9 @@
 # activity-overview — Reference
 
+> Design and operations docs: [`docs/HLD.md`](docs/HLD.md) (high-level design + scenarios),
+> [`docs/LLD.md`](docs/LLD.md) (L400 low-level design), [`docs/USAGE.md`](docs/USAGE.md)
+> (operator runbook: monthly progressive updates, forecasting, per-estate playbooks).
+
 ## Install
 
 Copy `.claude/skills/activity-overview/` into your repo (or `~/.claude/skills/`).
