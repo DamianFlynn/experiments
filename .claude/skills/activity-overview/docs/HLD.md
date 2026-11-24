@@ -1,0 +1,442 @@
+# activity-overview — High-Level Design
+
+> **Audience:** architects, maintainers, and the operator who will run monthly digests
+> across the Bicep, AVM-Bicep, AVM-Terraform and enterprise landing-zone (AI, hub/ALZ)
+> estates. **Companions:** [`LLD.md`](LLD.md) (L400 low-level design),
+> [`USAGE.md`](USAGE.md) (operator runbook), [`../ARCHITECTURE.md`](../ARCHITECTURE.md)
+> (narrative tour), [`../STORE.md`](../STORE.md) / [`../BUNDLE.md`](../BUNDLE.md) (contracts).
+>
+> Every capability described here exists on `master`. Where a capability has a limit, the
+> limit is stated in [§10](#10-constraints-and-known-limitations) — nothing here is aspirational
+> unless it sits under [§11](#11-extension-points-and-roadmap).
+
+---
+
+## 1. Purpose
+
+Maintainers of busy repositories are repeatedly asked *"what happened this month, what's
+coming next, and why should I believe you?"*. Answering by hand is slow; answering with an
+LLM from memory produces confident fiction.
+
+**activity-overview** is a Claude Code *skill* that answers those questions with a report in
+which **every claim links to the GitHub record that proves it**. It does that by splitting
+the work in two:
+
+> ⭐ **Core principle — gather is deterministic and decoupled; analysis is the model's judgment.**
+> Python programs collect and structure the facts (same input → same output, every time).
+> The model only writes prose, only from those facts, and must cite them.
+
+The deliverable is not the Markdown report. It is a **persistent, auditable fact base** — a
+SQLite *journey graph* — plus a **versioned structured view** of it. The report is one
+renderer over that view; changelogs, dashboards or slide decks are others.
+
+## 2. Capabilities at a glance
+
+| Capability | Question it answers | Primary tool(s) |
+|---|---|---|
+| Window digest | What shipped / was rejected / is in flight in `[from, to]`? | `gather` → `link` → `render` → report |
+| Decision trains | How did an idea become a change? (issue → PR → commits → follow-ups) | `link.build_trains`, `link --slice` |
+| Next-release forecast | What is likely to land next, and on what evidence? | `link.build_forecast` |
+| Progressive series | What's new vs carried over since last month? Did last month's forecast land? | `link --series` (`series.py`) |
+| Flow health | What is blocked, hung, upvoted-but-ignored? Who/what blocks the most? | `derive.build_flow` / `build_blockers` |
+| Recognition | Who moved the project (no blame board, by design)? | `derive.annotate_people_profile` / `build_halls` |
+| Feature ledger | Which params/outputs/resources/docs were added, changed, removed? | `code_events` + `feature_deltas` |
+| Module biography | How has one module's surface evolved across all history? | `spotlight module` |
+| Blast radius | If this module changes, which modules/repos consume it? | `spotlight dependents`, `digest.module_edges` |
+| Multi-repo project | One view across a constellation of repos | `gather --manifest`, `digest` |
+| Trust gate | Is the fact base complete, sourced and drift-free? | `validate` |
+| Community call | What did the team discuss/decide (grounded in a transcript)? | `transcript` |
+
+## 3. System context
+
+```mermaid
+flowchart LR
+  op([Operator<br/>Claude Code on a laptop or CI])
+  subgraph skill["activity-overview skill"]
+    pipe["Deterministic pipeline<br/>Python 3, stdlib only"]
+    db[("journey.db<br/>SQLite journey graph")]
+    narr["Narrator<br/>Claude, grounded and cited"]
+  end
+  gh["GitHub REST + GraphQL<br/>PRs, issues, reviews, releases,<br/>milestones, Projects v2 boards"]
+  git["git<br/>bounded shallow clone"]
+  iac["bicep / terraform CLIs<br/>optional: module dependency edges"]
+  mmdc["mermaid-cli mmdc<br/>optional: diagram compile check"]
+  reader([Reader of the digest])
+
+  op -->|"/activity owner/repo from to"| pipe
+  pipe -->|read-only HTTPS, token| gh
+  pipe -->|clone, log, show| git
+  pipe -->|build / graph| iac
+  pipe -->|fold, idempotent| db
+  db -->|structured view| narr
+  pipe -->|render| mmdc
+  narr -->|sourced Markdown report| reader
+  reader -.->|clicks any citation to verify| gh
+```
+
+**External dependencies.** `git` and a GitHub token are required. `bicep`/`terraform`
+(module dependency edges), `mmdc` (diagram validation) and `graphify` (symbol-level code areas
+for general-purpose languages) are optional and degrade cleanly when absent.
+
+**Trust boundary.** The pipeline only *reads* GitHub; nothing is ever written back. The
+token needs read scopes only (`repo` or `public_repo`, plus `read:project` for boards).
+
+## 4. Logical architecture
+
+Six layers, each with a single responsibility. Only the **Acquire** layer touches the
+network; everything downstream is offline and reproducible.
+
+```mermaid
+flowchart TB
+  subgraph L1["1 · Acquire (network)"]
+    G["gather.py<br/>clone + REST + GraphQL + IaC build"]
+  end
+  subgraph L2["2 · Persist"]
+    S[("journey.db<br/>graphstore.py")]
+  end
+  subgraph L3["3 · Trust"]
+    V["validate.py<br/>8 audits"]
+  end
+  subgraph L4["4 · Read and enrich (offline)"]
+    X["extract.py<br/>materialize a window view"]
+    D["derive.py<br/>pure projections"]
+    K["link.py<br/>trains, buckets, forecast,<br/>series, slices"]
+    DG["digest.py<br/>multi-repo merge"]
+    SP["spotlight.py<br/>cross-window queries"]
+  end
+  subgraph L5["5 · Present"]
+    R["render.py<br/>Mermaid, mmdc-checked"]
+  end
+  subgraph L6["6 · Narrate"]
+    N["Claude + report-template.md<br/>per-train narrator sub-agents"]
+  end
+  G -->|fold_bundle| S
+  S --> V
+  S --> X --> D --> K
+  X --> DG
+  K --> DG
+  S --> SP
+  K --> R
+  K --> N
+  DG --> N
+  SP --> N
+  R --> N
+```
+
+| Layer | Owns | Never does |
+|---|---|---|
+| Acquire | All network + git I/O; normalization; the only writer of the store | Interpretation, scoring, prose |
+| Persist | Identity-keyed nodes/edges, code-event ledger, FTS index, provenance meta | Business logic |
+| Trust | Proving the store is complete, sourced, conformant, drift-free, idempotent | Mutating the store |
+| Read & enrich | Deterministic projections over a window or across all history | Network (except opt-in backfill via `gather`) |
+| Present | Diagrams that are proven to compile | Facts not in the view |
+| Narrate | Judgment: what matters, how to say it — **cited** | Inventing facts, refs or URLs |
+
+## 5. Key concepts
+
+### 5.1 Journey graph
+
+Every PR, issue, commit, review, person, code area, milestone, release and sprint is a
+**node**; relationships (`authored`, `closes`, `part_of`, `touches`, `depends_on`, `blocks`,
+`in_milestone`, …) are typed **edges**. Ids are qualified (`project/repo#pr-123`), so writes
+are **idempotent**: re-gathering an overlapping window changes nothing that is already
+correct. The store therefore **accretes** — each month adds to the same file and history
+deepens over time.
+
+### 5.2 Decision train
+
+A *decision train* is the connected chain of work joined by the **spine** edges
+(`closes`, `part_of`, `cross_ref`, `spun_off`, `duplicate_of`). It is computed on demand
+(never stored), so it always matches the facts.
+
+```mermaid
+flowchart LR
+  I1["issue #17<br/>feature request"] -->|closes| P1["PR #42<br/>first attempt"]
+  I1 -->|closes| P2["PR #51<br/>reworked"]
+  P1 -.->|cross_ref| P2
+  C1["commit a1b2"] -->|part_of| P2
+  C2["commit c3d4"] -->|part_of| P2
+  I1 -->|spun_off| I2["issue #58<br/>follow-up"]
+  P2 --> OUT{{"outcome: shipped<br/>PR #42 = rejected attempt"}}
+```
+
+Each train gets an **outcome** (shipped / in_flight / rejected / abandoned), a
+**significance** score and a **tier** (`deep` → full narrative, `mention` → one line).
+
+### 5.3 Buckets
+
+Every PR/issue in scope lands in exactly one bucket, with precedence
+**shipped > rejected > next_candidates > in_flight**:
+
+| Bucket | Membership rule (summarized; exact rules in LLD §6.5) |
+|---|---|
+| `shipped` | PR merged to the mainline in-window, or issue closed *completed* in-window |
+| `rejected` | PR closed unmerged in-window, or issue closed *not planned* in-window |
+| `next_candidates` | Open, and on the **next** milestone or carrying a high-priority label |
+| `in_flight` | Open, and on the **current** milestone or updated in-window |
+
+### 5.4 Forecast
+
+A transparent, rule-based score over `next_candidates` (not machine learning). Signals and
+weights: on next milestone **5.0**, high-priority **3.0**, in motion (open PR / train)
+**2.0**, active in window **1.5**, long-open ≥ 200 days **1.0**. Tiers: **likely ≥ 5**,
+**possible ≥ 2**, else **longshot**. Every candidate lists the signals that produced its score.
+
+### 5.5 Series (progressive installments)
+
+A tiny append-only `series.json` records each installment's shipped / in-flight / forecast
+refs. The next installment is compared against the last: **new**, **carried over** (with its
+prior status) and the **forecast loop** (last month's predictions → *landed* vs *not yet*).
+This is what turns isolated monthly reports into a *progressive* story.
+
+### 5.6 Slice
+
+A bounded, self-contained bundle of one train's evidence (issue, PRs, commits, reviews,
+capped diffs). Narrator sub-agents see **only** the slice, and the lead drops any citation
+not present in it — the last line of defence against invented facts.
+
+### 5.7 Project / constellation and blast radius
+
+A **manifest** folds N repos under one logical project. Cross-repo spine edges come from
+qualified refs (`owner/repo#N`, full URLs, repo-aware timeline cross-refs). For Terraform,
+a registry `source` resolves to the member repo that publishes it, giving a project-wide
+**module dependency graph**; `spotlight dependents` reads it backwards as the
+**blast radius**.
+
+## 6. End-to-end flow
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Op as Operator
+  participant C as Claude Code
+  participant G as gather.py
+  participant S as journey.db
+  participant V as validate.py
+  participant DG as digest.py
+  participant L as link.py
+  participant R as render.py
+  participant N as Narrator sub-agents
+  Op->>C: /activity owner/repo 2026-11-01 2026-11-30 --series series.json
+  C->>G: gather --from --to --store
+  G->>G: shallow clone, git walks, REST, GraphQL, IaC build
+  G->>S: fold_bundle (idempotent upserts)
+  C->>V: validate journey.db
+  V-->>C: RESULT OK (or ERROR, then stop)
+  C->>DG: digest --store --project --from --to
+  DG->>S: extract + enrich per member
+  DG-->>C: structured view (JSON)
+  C->>L: link bundle --series series.json
+  L-->>C: trains, buckets, forecast, series block
+  C->>R: render bundle
+  R-->>C: diagrams (compiled by mmdc)
+  loop each deep train, in parallel
+    C->>L: link bundle --slice train-id
+    C->>N: narrate ONLY this slice
+    N-->>C: summary / proposed / changed / rejected / shipped + evidence
+    C->>C: drop any ref not in the slice
+  end
+  C-->>Op: sourced Markdown report + store path
+```
+
+## 7. Deployment views
+
+```mermaid
+flowchart LR
+  subgraph laptop["Operator laptop"]
+    cc["Claude Code<br/>skill: ~/.claude/skills/activity-overview<br/>command: /activity"]
+    py["python3 + git"]
+    opt["optional: bicep, terraform, mmdc"]
+    ws[("~/activity/stream/<br/>journey.db, series.json,<br/>reports/YYYY-MM.md")]
+    cc --> py --> ws
+    py --> opt
+  end
+  subgraph ci["GitHub Actions: activity-overview.yml"]
+    t["tests job<br/>offline suite, py 3.11-3.13"]
+    lv["live job<br/>gather then validate<br/>schedule: 1st and 15th"]
+  end
+  gh[("GitHub")]
+  py -->|read-only token| gh
+  lv -->|ACTIVITY_TEST_TOKEN| gh
+```
+
+- **Laptop (primary).** Claude Code runs the pipeline and writes the narrative. Stores are
+  ordinary files; keep one workspace per *report stream*.
+- **CI (assurance).** The bundled workflow runs the offline test suite on every change and a
+  scheduled **live** trust-gate run (gather → validate, default target
+  `Azure/bicep-registry-modules`, trailing 14 days). CI stops at the trust gate; it does not
+  author narrative.
+
+## 8. Usage scenarios
+
+### 8.1 Scenario A — progressive monthly update (the core loop)
+
+**Goal:** a monthly installment per stream that builds on the previous one: what shipped,
+what's new vs carried over, whether last month's forecast landed, and the next forecast.
+
+```mermaid
+flowchart LR
+  subgraph M1["September installment"]
+    g1["gather 09-01..09-30"] --> s1[("journey.db")]
+    s1 --> l1["link --series"]
+    l1 --> f1["forecast F1<br/>series: first installment"]
+  end
+  subgraph M2["October installment"]
+    g2["gather 10-01..10-31"] --> s1
+    s1 --> l2["link --series"]
+    l2 --> f2["new / carried over<br/>F1 landed vs not yet<br/>forecast F2"]
+  end
+  subgraph M3["November installment"]
+    g3["gather 11-01..11-30"] --> s1
+    s1 --> l3["link --series"]
+    l3 --> f3["new / carried over<br/>F2 landed vs not yet<br/>forecast F3"]
+  end
+  f1 -. snapshot .-> idx[("series.json<br/>append-only")]
+  f2 -. snapshot .-> idx
+  f3 -. snapshot .-> idx
+  idx -. prior installment .-> l2
+  idx -. prior installment .-> l3
+```
+
+**What each installment contains:** executive summary; *Since last installment* (new,
+carried-over with prior board status, forecast loop); shipped by code area; deep decision
+trains with grounded narratives; next-release forecast (likely / possible / longshot with
+signals); feature changes; flow health; contributors; releases and CI health.
+
+**Why it compounds:** the store keeps every month, so quarter or year views are just a
+wider window over the same file (no re-gather needed), and `spotlight` queries span all
+gathered history.
+
+### 8.2 Scenario B — forecasting from in-flight work
+
+**Goal:** a defensible "what's likely next" built from open issues and PRs, then *checked*
+the following month.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Open
+  Open --> InFlight: updated in window,<br/>or on current milestone
+  Open --> NextCandidate: on next milestone,<br/>or high-priority label
+  NextCandidate --> Likely: score >= 5
+  NextCandidate --> Possible: 2 <= score < 5
+  NextCandidate --> Longshot: score < 2
+  Likely --> Landed: shipped next month
+  Possible --> Landed
+  Longshot --> Landed
+  Likely --> NotYet: still open next month
+  Possible --> NotYet
+  Longshot --> NotYet
+  Landed --> [*]
+  NotYet --> NextCandidate: re-scored next installment
+```
+
+**Operating notes.** The forecast is only as good as the repo's planning signals. It is
+strongest where maintainers use **milestones** and **priority labels**; where they don't,
+candidates come only from high-priority labels and may be few. The forecast loop makes
+accuracy *measurable* month over month (landed ÷ forecast per tier). See USAGE §6 for
+making forecasts meaningful on each target.
+
+### 8.3 Scenario C — the portfolio
+
+| Target | Shape | How it is gathered | What you get |
+|---|---|---|---|
+| **Bicep** (`Azure/bicep`) | One product repo (the Bicep compiler and tooling, .NET) | Single repo | Shipped/trains/forecast/flow/people. Code areas by directory (`src/<project>`); no IaC edges (not an IaC repo). |
+| **AVM Bicep** (`Azure/bicep-registry-modules`) | One monorepo, 500+ resource and ~50 pattern modules | Single repo | Areas per module (`avm/res/<svc>/<mod>`, `avm/ptn/<group>/<mod>`); `br/public:` references resolve to in-repo module areas; per-module biographies. |
+| **AVM Terraform** | One repo per module | Manifest (generated from the AVM Terraform index) | Cross-repo trains; structural cross-repo `depends_on`; blast radius per module. |
+| **AI landing zone** | TF pattern constellation + Bicep pattern module in BRM + docs/portal hub repo | TF: manifest. Bicep: the BRM store, scoped to `avm/ptn/ai-ml/landing-zone`. Hub repo: manifest member (social layer) | End-to-end view of the AI LZ: code, dependencies and community discussion. |
+| **Hub / platform LZ (ALZ)** | TF ALZ + connectivity pattern repos; Bicep `avm/ptn/alz`, `avm/ptn/network/hub-networking`; docs hub; ALZ-Bicep classic (archival scheduled) | TF: manifest. Bicep: BRM store scoped to those areas | Platform-LZ change tracking, blast radius of networking modules, deprecation tracking. |
+
+```mermaid
+flowchart TB
+  subgraph stores["One store per report stream"]
+    sb[("bicep.db")]
+    sbrm[("avm-bicep.db")]
+    stf[("avm-tf-family.db")]
+    sai[("ai-lz.db")]
+    shub[("hub-lz.db")]
+  end
+  bicep["Azure/bicep"] --> sb
+  brm["Azure/bicep-registry-modules"] --> sbrm
+  idx["AVM Terraform index CSV"] --> man1["manifest per family"] --> stf
+  aitf["TF: avm-ptn-aiml-landing-zone<br/>+ ai-foundry + resource modules"] --> sai
+  aidocs["Azure/AI-Landing-Zones<br/>docs and portal"] --> sai
+  hubtf["TF: avm-ptn-alz, alz-connectivity-*,<br/>avm-ptn-hubnetworking"] --> shub
+  alzdocs["Azure/Azure-Landing-Zones<br/>docs"] --> shub
+  sbrm -. "spotlight module<br/>avm/ptn/ai-ml/landing-zone" .-> rai["AI LZ report"]
+  sai --> rai
+  sbrm -. "spotlight module<br/>avm/ptn/network/hub-networking, avm/ptn/alz" .-> rhub["Hub LZ report"]
+  shub --> rhub
+```
+
+### 8.4 Scenario D — blast radius before a breaking change (Terraform)
+
+Before bumping a major version of, say, `avm-res-network-virtualnetwork`, run
+`spotlight dependents Azure/terraform-azurerm-avm-res-network-virtualnetwork` against the
+constellation store: it lists every member module that depends on it (with pinned versions
+in `digest.module_edges`). The structural scan means this reflects the repo's real module
+structure, not just this month's churn.
+
+### 8.5 Scenario E — module biography for release notes
+
+`spotlight module avm/res/network/virtual-network` (Bicep) or a TF module area returns the
+full-history lifecycle of every parameter/output/resource symbol (added → changed → removed,
+with before/after snippets and the driving PR). The narrator turns it into a cited
+"how this module evolved" section.
+
+### 8.6 Scenario F — community call fold-in
+
+Pass a `.vtt`/`.srt`/`.txt` transcript; `transcript.py` normalizes it and the report gains
+*Community call highlights* grounded in verbatim quotes, clearly separated from code facts.
+
+### 8.7 Scenario G — flow and contributor health
+
+The deterministic `flow` classifier (blocked / upvoted-but-ignored / traction-then-abandoned
+/ hung) and `blockers` ranking show where work is stuck; `halls.fame` recognizes
+contributors. Attribution of stalls to people exists only in an **opt-in internal appendix**
+— the public digest never blames individuals.
+
+## 9. Quality attributes
+
+| Attribute | How the design delivers it |
+|---|---|
+| **Verifiability** | Every fact carries a `{type, id, url}` ref; narrator citations are filtered to the slice. |
+| **Determinism** | Sorted JSON, ordered range queries, pure projections; same store → byte-identical view. |
+| **Idempotency** | Identity-keyed upserts and set-semantics ledger; re-folds are no-ops. Proven by `validate.idempotency`. |
+| **Trust** | `validate.py` gates every report: provenance, referential integrity, schema conformance, no fabrication, participant completeness, no drift, idempotency (+ project-wide people). |
+| **Graceful degradation** | Missing CLIs, scopes, boards or FTS5 produce empty or clearly-flagged sections, not failures; IaC gaps are counted (`edge_extraction`). |
+| **Offline readers** | Only `gather` (and opt-in `--complete` backfill) touch the network; everything else replays from the store. |
+| **Security** | Read-only token; no write-back; secrets only in the environment; recognition-not-blame by default. |
+| **Portability** | Python 3 stdlib only; the store is one SQLite file. |
+
+## 10. Constraints and known limitations
+
+These are real, current limits — plan around them:
+
+1. **Cross-repo `depends_on` is Terraform-only.** Bicep `br/public:` references resolve to
+   areas *inside the same repo* — perfect for the BRM monorepo, but a Bicep reference from
+   another repo into BRM is not resolved across repos.
+2. **Bicep module graph is window-scoped.** Bicep edges are built only for areas changed
+   in the window; the whole-tree structural scan exists for **Terraform manifest** gathers only.
+3. **Forecast depends on planning hygiene.** Candidates require a next milestone or one of the
+   recognized priority labels (`priority/high`, `priority/critical`, `p0`, `p1`,
+   `high-priority`, `critical`). Repos with different label names need the constant extended.
+4. **Default branch only.** `--branches` is recorded as provenance; the commit walk covers the
+   checked-out default branch.
+5. **Open items are fetched every run.** All open PRs/issues are pulled regardless of window
+   (they feed in-flight/forecast), each with per-item review/timeline/comment calls. On very
+   busy repos (e.g. BRM) a gather is API-heavy; there is no automatic rate-limit back-off —
+   a 403 is reported with GitHub's headers so the cause is explicit.
+6. **No standalone `extract` CLI.** The on-disk bundle view is obtained via `digest.py`
+   (which works for single repos too); see USAGE §4.
+7. **Narrative is not in CI.** The live CI job stops at the trust gate.
+
+## 11. Extension points and roadmap
+
+| Extension | Where |
+|---|---|
+| New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
+| New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
+| Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
+| Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
+| Cross-repo Bicep dependencies | Would mirror `resolve_registry_member` for `br/public:` paths (not implemented) |
+| New spotlight lens | Add a query + renderer in `spotlight.py` |

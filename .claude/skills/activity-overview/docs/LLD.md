@@ -1,0 +1,792 @@
+# activity-overview — Low-Level Design (L400)
+
+> **Audience:** engineers who maintain, extend or debug the skill. **Prerequisite:**
+> [`HLD.md`](HLD.md). **Contracts referenced:** [`../STORE.md`](../STORE.md) (store schema),
+> [`../BUNDLE.md`](../BUNDLE.md) (view schema). **Operator guide:** [`USAGE.md`](USAGE.md).
+>
+> Every function name, flag, constant and threshold in this document is taken from the code
+> on `master`. Line-level detail lives in the source; this document explains *how the parts
+> work and why*, at the level needed to change them safely.
+
+## Contents
+
+1. [Conventions](#1-conventions)
+2. [Code map and dependency graph](#2-code-map-and-dependency-graph)
+3. [Runtime model](#3-runtime-model)
+4. [Acquire — `gather.py`](#4-acquire--gatherpy)
+5. [Persist — `graphstore.py`](#5-persist--graphstorepy)
+6. [Read and enrich — `extract`, `complete`, `link`, `derive`, `series`](#6-read-and-enrich)
+7. [Present — `render.py`](#7-present--renderpy)
+8. [Trust — `validate.py`](#8-trust--validatepy)
+9. [Cross-window reader — `spotlight.py`](#9-cross-window-reader--spotlightpy)
+10. [Multi-repo aggregation — `digest.py`](#10-multi-repo-aggregation--digestpy)
+11. [Supporting tools](#11-supporting-tools)
+12. [Data contracts](#12-data-contracts)
+13. [Configuration and tunables](#13-configuration-and-tunables)
+14. [Cross-cutting concerns](#14-cross-cutting-concerns)
+15. [Testing and CI](#15-testing-and-ci)
+16. [Extension guide](#16-extension-guide)
+
+---
+
+## 1. Conventions
+
+- **Python 3, standard library only.** No third-party packages; `sqlite3`, `urllib`,
+  `subprocess`, `concurrent.futures`, `json`, `re`, `csv`.
+- **Pure vs effectful.** Functions documented as *pure* take inputs and return outputs with
+  no I/O. All network and git I/O is in `gather.py`; the store write path is
+  `gather.fold_bundle` (and `gather.backfill`).
+- **Window.** `[from, to]` are inclusive `YYYY-MM-DD` dates. Windowing of commits is done in
+  Python on the committer date (`window_records`), not with git `--since/--until`.
+- **Ref convention.** `{type: "pr"|"issue"|"commit", id, url}` on every narrative-bearing fact.
+- **Determinism.** JSON is written with `sort_keys=True`; collections are sorted before
+  emission; ties are broken by id.
+
+## 2. Code map and dependency graph
+
+| Module | LOC | Role | Network | Writes store |
+|---|---:|---|:---:|:---:|
+| `gather.py` | 3,547 | CLI; clone, git walks, REST/GraphQL, IaC build, normalization, `fold_bundle`, `backfill` | ✅ | ✅ |
+| `graphstore.py` | 594 | SQLite property-graph schema + read/write API | — | (API) |
+| `extract.py` | 544 | Materialize a raw bundle *view* for one repo + window | (via injected backfill) | — |
+| `complete.py` | 138 | Train-completion policy over the spine (honest gaps) | (via injected backfill) | — |
+| `derive.py` | 738 | Pure projections shared by write and read paths (artifacts, people, flow, halls) | — | — |
+| `link.py` | 1,116 | `enrich`: trains, buckets, timeline, deltas, areas, significance, effort, forecast; `--slice`, `--series` | — | — |
+| `series.py` | 132 | Pure installment snapshot + comparison | — | — |
+| `render.py` | 610 | Mermaid emitters + `mmdc` validation | — | — |
+| `validate.py` | 907 | Trust gate (audits) | — | — |
+| `spotlight.py` | 1,685 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
+| `digest.py` | 414 | Multi-repo project view | — | — |
+| `manifest.py` / `manifest_from_index.py` | — / 221 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
+| `transcript.py` | 116 | VTT/SRT/TXT normalization | — | — |
+
+```mermaid
+flowchart LR
+  gather --> graphstore
+  gather --> derive
+  gather --> manifest
+  extract --> graphstore
+  extract --> derive
+  extract --> complete
+  complete --> graphstore
+  link --> derive
+  link --> gather
+  link --> series
+  validate --> graphstore
+  validate --> extract
+  validate --> derive
+  validate --> gather
+  spotlight --> graphstore
+  spotlight --> complete
+  spotlight --> derive
+  spotlight --> gather
+  digest --> extract
+  digest --> link
+  digest --> graphstore
+```
+
+`derive.py` is a deliberate **leaf** (imports none of the others): both the write path
+(`fold_bundle`) and the read path (`extract` + `link.enrich`) call the same functions, which is
+what makes the `no_drift` audit meaningful. `link` imports `gather` only for pure helpers
+(e.g. `classify_pr_kind`); `validate`/`spotlight` import it for `fold_bundle` (re-fold in a
+scratch store) and `backfill` respectively.
+
+## 3. Runtime model
+
+- Every tool is a short-lived CLI process. There are no daemons, servers or caches beyond the
+  SQLite file, the git clone directory and (optionally) terraform's plugin cache.
+- **Files on disk:** `--store` (SQLite), `--clone-dir` (default `workspace/<repo>-clone`),
+  the bundle view JSON you materialize, `series.json`, `workspace/diagrams/*.mmd`.
+- **Concurrency:** only IaC edge extraction runs in parallel (thread pool,
+  `ACTIVITY_IAC_MAX_WORKERS`). Everything else is single-threaded and ordered.
+- **Failure model:** network/auth failures in `gather` abort with GitHub's message and
+  headers printed; optional tools missing → the dependent layer is empty; readers never
+  mutate the store.
+
+## 4. Acquire — `gather.py`
+
+### 4.1 CLI contract
+
+`main()` → `parse_args()`. Single-repo and manifest modes are mutually exclusive.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--owner`, `--repo` | — | Single-repo target |
+| `--manifest PATH` | — | Multi-repo project (validated by `manifest.load_manifest` **before** the store is touched) |
+| `--from`, `--to` | — | Window (`YYYY-MM-DD`) |
+| `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing |
+| `--branches` | `main` | Recorded in `meta`; first is `base_branch` (walk uses the checked-out default branch) |
+| `--clone-dir` | `workspace/<repo>-clone` | Clone location |
+| `--no-clone` | off | Reuse an existing clone |
+| `--include-workflows` / `--no-workflows` | on | CI run stats |
+| `--include-releases` / `--no-releases` | on | Releases in window |
+| `--project-board` / `--no-project-board` | on | Projects v2 ingest |
+| `--store PATH` | **required** | SQLite store |
+
+Single-repo folds use `project = owner`, `repo = <name>`. Manifest folds use
+`project = manifest.project`, `repo = "owner/repo"`, and pass `members` +
+`registry_by_slug` to `fold_bundle` for cross-repo resolution.
+
+### 4.2 `acquire(args, env)` sequence
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant A as acquire
+  participant Git as git
+  participant IaC as bicep / terraform
+  participant REST as GitHub REST
+  participant GQL as GitHub GraphQL
+  A->>Git: clone --shallow-since=(from - margin)
+  A->>Git: log (commits, full walk) then window_records
+  A->>Git: log --name-status -M -C --reverse (file code_events)
+  A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
+  A->>A: drop shallow-boundary phantom commits
+  A->>A: select_code_area_provider (directory or graphify)
+  A->>IaC: extract_iac_edges (parallel restore+build / init+graph)
+  opt manifest gather
+    A->>A: scan_structural_terraform_areas + merge_structural_areas
+  end
+  A->>A: parse_codeowners
+  A->>REST: closed PRs (until updated < from) + all open PRs
+  loop each kept PR
+    A->>REST: reviews, timeline, review comments, issue comments
+  end
+  A->>REST: issues updated since from + all open issues + referenced issues
+  loop each issue
+    A->>REST: comments, timeline
+  end
+  A->>A: detect_label_taxonomy, apply_facets, classify_issue_kind
+  A->>REST: workflow runs, releases, milestones
+  opt token has read:project
+    A->>GQL: Projects v2 boards (maintained only), items, iterations
+  end
+  A->>A: build_bundle (in memory, never written to disk)
+```
+
+### 4.3 Clone and windowing
+
+- `build_clone_cmd` clones with `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS`
+  (default 14). The margin keeps each in-window commit's real parent in the clone.
+- `shallow_boundary_shas` + `drop_boundary_events` remove events from a commit whose parent
+  was grafted away (its diff would be a whole-tree phantom). Any **in-window** commit dropped
+  this way is recorded in `meta.boundary_dropped_commits` and a warning is printed — widen the
+  margin and re-gather to recover it.
+- Commit dates use the committer date; filtering is `window_records` in Python to avoid git's
+  timezone-sensitive pruning.
+
+### 4.4 Code-event and symbol extraction
+
+- **File level** (`parse_code_events`): `add|modify|delete|rename|copy` per path per commit,
+  oldest → newest.
+- **Symbol level** (`parse_patch_events` → `parse_symbol_events`): a single `git log -p` walk;
+  `detect_symbol_decl` recognizes Bicep (`param|var|output|resource|module`) and Terraform
+  (`variable|output|resource|module`) declarations plus comments. Comments are identified by
+  their text (so a rewritten decision comment is drop + add); `TODO|FIXME|HACK|XXX|BUG`
+  comments get subkind `todo`; banner comments are ignored. `before`/`after` snippets are
+  capped at 200 chars (`_cap_snippet`).
+- **Bounded file diffs** (`bounded_file_diff`, `FILE_DIFF_CAP`/`FILE_DIFF_LINE_CAP`) ride the
+  file-level code event so narrators read real changes without a clone.
+
+### 4.5 Code areas
+
+`select_code_area_provider(paths, clone_dir)` is directory-first: it uses **graphify** only when
+`graphify` is on PATH **and** `graphify update <clone>` yields a `graph.json` with nodes and
+non-empty communities; any absence or failure falls back to the **directory provider**
+(`build_directory_areas`), which maps each path with `classify_code_area`, trying patterns in
+order (graphify does not parse Bicep/HCL, so IaC repos always land here):
+
+| Order | Pattern | Maps | Example |
+|---:|---|---|---|
+| 1 | `avm` (`_avm_area`) | `avm/{res,ptn,utl}/<a>/<b>/…` → 4-segment module subtree | `avm/ptn/ai-ml/landing-zone` |
+| 2 | `main_bicep` | any dir containing `main.bicep` → that dir | `infra/hub/main.bicep` → `infra/hub` |
+| 3 | `terraform_modules` | `modules/<name>/…` | `modules/subnet` |
+| 4 | `tf_dir` | any `*.tf` dir; **repo-root `*.tf` collapse to one `main.tf` area** | `main.networking.tf` → `main.tf` |
+| 5 | `topn` | fallback: top 2 path segments | `src/Bicep.Core` |
+
+`_is_scaffold_area` marks Terraform `examples/` and `tests/` subtrees as scaffolding: their
+edges are **skipped at extraction and excluded at fold**, because those trees reference the
+module under test through CI-manipulated relative paths and test-only registry modules.
+
+### 4.6 IaC dependency edges (`extract_iac_edges`)
+
+```mermaid
+flowchart TB
+  A["code_graph.areas"] --> B{"scaffold area?"}
+  B -- yes --> SK["edges_status = skipped"]
+  B -- no --> C{"entrypoint?"}
+  C -- "main.bicep and bicep on PATH" --> BI["bicep restore + bicep build<br/>to ARM JSON"]
+  C -- "*.tf and terraform on PATH" --> TF["terraform init -backend=false<br/>+ terraform graph (DOT)"]
+  C -- none --> SK
+  BI --> BE["build_bicep_edges<br/>source refs + walk_arm_deployments"]
+  TF --> TE["build_terraform_edges<br/>parse_terraform_graph + module blocks"]
+  BE --> R["edges with to, ref, version,<br/>transitive, local, instances"]
+  TE --> R
+  BI -. "timeout / failure, retried IAC_RETRIES" .-> F["edges_status = timeout / failed"]
+  TF -.-> F
+  R --> OK["edges_status = resolved"]
+  OK --> AGG["code_graph.edge_extraction<br/>resolved / timeout / failed / skipped counts"]
+  F --> AGG
+  SK --> AGG
+```
+
+- **Build-only:** edges come only from a successful build; static guessing is never emitted.
+  A `resolved` area with no edges genuinely has no inter-area dependencies; `timeout`/`failed`
+  are **counted gaps**.
+- **Bicep:** `parse_bicep_module_refs` splits `br/public:<path>:<ver>` / `br:<host>/bicep/<path>:<ver>`
+  into `registry_path` + `version`; `resolve_module_ref` classifies `<path>/main.bicep`, so in
+  the BRM monorepo `br/public:avm/res/network/virtual-network:0.x` resolves to the **in-repo**
+  area `avm/res/network/virtual-network`. Transitive edges come from walking nested
+  deployments in the compiled ARM (`walk_arm_deployments`).
+- **Terraform:** `_tf_entrypoint` reads **every `*.tf` in the module dir**; `parse_terraform_graph`
+  accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
+  first `module.<name>` token gives its owning module. Local sources resolve to repo areas
+  (`../..` from a submodule → the root `main.tf` area); registry sources keep `to=None,
+  ref=<source>, version`.
+- **Concurrency:** a thread pool of `ACTIVITY_IAC_MAX_WORKERS` (8), per-subprocess timeout
+  `ACTIVITY_IAC_BUILD_TIMEOUT` (300 s), `ACTIVITY_IAC_RETRIES` (1). With `TF_PLUGIN_CACHE_DIR`
+  set, `_terraform_prewarm` runs one serial init first because terraform's plugin cache is not
+  safe under concurrent writes.
+- **Structural scan (manifest gathers only):** `scan_structural_terraform_areas` statically parses
+  every tracked module's `source` references (`git ls-files`, no `terraform init`) and
+  `merge_structural_areas` unions them, so the dependency graph reflects structure rather than
+  in-window churn. Single-repo gathers skip this to keep golden bundles byte-stable.
+
+### 4.7 GitHub REST acquisition
+
+| Data | Endpoint(s) | Bounding |
+|---|---|---|
+| Closed PRs | `pulls?state=closed&sort=updated` | `fetch_until` stops when a page's last `updated_at` < `from` |
+| Open PRs | `pulls?state=open` | all |
+| Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
+| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | referenced 404s tolerated (`allow_404`) |
+| Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
+| Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state |
+
+Kept PRs = merged in-window, closed-unmerged in-window, or open. `http_get_json` surfaces
+GitHub's message plus the deciding headers (`x-ratelimit-*`, `x-github-sso`,
+`x-accepted-oauth-scopes`) on any HTTP error; there is no automatic back-off.
+
+### 4.8 Projects v2 boards
+
+`fetch_project_board` (GraphQL) auto-discovers the boards a repo links, keeps those
+`board_is_maintained` (open, touched within `ACTIVITY_BOARD_STALE_DAYS` = 365 of the ref date),
+paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 (warns when truncated) and
+`parse_project_board` yields per-item `status` and `iteration`. Items are keyed per repo
+`(slug, number)` so a foreign repo's status never leaks. Gathered PRs/issues are stamped with
+`board_status` / `iteration`; iterations become `sprint-<id>` structure nodes with
+`in_iteration` edges. Without `read:project` (or with `--no-project-board`) the layer is empty.
+
+### 4.9 Classification
+
+- `detect_label_taxonomy` auto-detects structured label namespaces → facets
+  `area|priority|status|lifecycle|kind`; `apply_facets` stamps the first match per facet.
+- `classify_issue_kind` → `feature|module-request|bug|idea|question|docs|other`, in precedence:
+  native issue type → label kind facet → issue-template filename → title/body heuristic → other.
+- `classify_pr_kind` reads conventional-commit prefixes (`feat→feature`, `fix→bug`, `docs→docs`).
+- `normalize_issue` parses `parse_blocks_refs` ("blocks/blocking #N" outbound, "blocked by /
+  depends on #N" inbound); `derive_open_high_activity` flags open issues with ≥ 5 comments or
+  ≥ 5 👍.
+
+### 4.10 `fold_bundle(conn, bundle, project=None, repo=None, members=None, registry_by_slug=None)`
+
+Writes in this order (all idempotent upserts keyed by qualified id; edges by `(src,dst,type)`;
+code events by `(artifact, commit, event)`):
+
+```mermaid
+flowchart TB
+  s1["1 · social PRs<br/>+ closes / cross_ref spine edges<br/>+ cross-repo spine edges or external_refs (manifest)"]
+  s2["2 · social issues<br/>+ blocks edges (only between gathered issues)"]
+  s3["3 · code commits + part_of edges"]
+  s4["4 · file-level code_events ledger"]
+  s5["5 · artifact code nodes (derive.build_artifacts)<br/>+ symbol code_events + replaced_by / identity_from"]
+  s6["6 · structure: milestones, areas, releases, sprints"]
+  s7["7 · people (derive.enumerate_participants, repo = *)<br/>union across members, bots tagged"]
+  s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; owns; touches; in_milestone; in_iteration"]
+  s9["9 · depends_on (_fold_depends_on)<br/>+ cross-repo registry resolution"]
+  s10["10 · singletons: workflowstats, codegraph, codeowners, labeltaxonomy<br/>+ gathered_windows, clone_sha meta"]
+  s1 --> s2 --> s3 --> s4 --> s5 --> s6 --> s7 --> s8 --> s9 --> s10
+```
+
+(The exact statement order inside the function differs slightly; the grouping above is the
+logical sequence. FTS text is indexed as PR/issue/commit nodes are written (FTS5-gated).)
+
+### 4.11 Cross-repo `depends_on` resolution (Terraform)
+
+```mermaid
+flowchart TB
+  e["area edge: to = None, ref = source"] --> m{"multi-repo fold?<br/>members and registry_by_slug"}
+  m -- no --> drop1["intra-repo edges only"]
+  m -- yes --> p["parse_registry_source"]
+  p --> v{"first segment has a dot?<br/>(VCS shorthand, e.g. github.com/...)"}
+  v -- yes --> drop2["not resolved"]
+  v -- no --> ex{"exact: a member whose<br/>manifest registry == source"}
+  ex -- yes --> hit["target member"]
+  ex -- no --> cv{"convention:<br/>ns/name/provider to<br/>ns/terraform-provider-name<br/>is a member?"}
+  cv -- yes --> hit
+  cv -- no --> drop3["non-member: no edge"]
+  hit --> anchor["ensure target #area-main.tf exists<br/>(structure stand-in, create-if-absent)"]
+  anchor --> out["depends_on src area to member root area<br/>data: version, transitive, cross_repo = true"]
+```
+
+### 4.12 Backfill seam
+
+`gather.backfill(conn, id, fetch)` fetches one missing spine node plus its immediate spine
+edges. `fetch(kind, local, qid)` returns a payload, `ABSENT` (definitive 404 → recorded in
+`dead_refs`, pruned forever) or `None` (transient → reported as an `unreachable` gap).
+Production wiring: `make_backfill_fetcher(token, clone_dir)`. Only `gather` writes, so readers
+receive backfill as an **injected callable**.
+
+## 5. Persist — `graphstore.py`
+
+### 5.1 Schema
+
+```mermaid
+erDiagram
+  nodes {
+    TEXT id PK
+    TEXT project
+    TEXT repo
+    TEXT node_class
+    TEXT ts
+    TEXT data
+    TEXT fetched_at
+  }
+  edges {
+    TEXT src_id PK
+    TEXT dst_id PK
+    TEXT edge_type PK
+    TEXT ts
+    TEXT data
+  }
+  code_events {
+    TEXT artifact_id PK
+    TEXT event PK
+    TEXT commit_sha PK
+    TEXT author
+    TEXT date
+    TEXT hunk
+    TEXT ref
+    TEXT before
+    TEXT after
+    TEXT detail
+  }
+  meta {
+    TEXT key PK
+    TEXT value
+  }
+  dead_refs {
+    TEXT id PK
+    TEXT project
+    TEXT reason
+    TEXT first_seen
+  }
+  nodes ||--o{ edges : "src / dst"
+  nodes ||--o{ code_events : "artifact"
+```
+
+Plus `fts_text` (FTS5 virtual table) when `fts5_available(conn)`.
+
+### 5.2 Identity grammar
+
+| Form | Example | Helper |
+|---|---|---|
+| Repo-scoped | `{project}/{repo}#{local}` | `qualify_id` |
+| Person (project-scoped, `repo = "*"`) | `{project}#person-{login}` | `qualify_person` |
+| Locals | `pr-N`, `issue-N`, `<sha>`, `art:<path>`, `<path>#<lang>:<subkind>:<name>`, `area-<id>`, `milestone-N`, `release-<tag>`, `sprint-<id>`, singletons `codegraph` … | — |
+
+`parse_id` splits scope on the first `/` and local on the last `#`, so `repo = "owner/repo"`
+(manifest mode) is safe.
+
+### 5.3 API
+
+| Group | Functions |
+|---|---|
+| Lifecycle | `open_store`, `init_schema`, `set_meta`, `get_meta`, `now_iso` |
+| Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` |
+| Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)` |
+| Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
+| Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
+| Text | `index_text` (delete-then-insert), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
+| Provenance | `record_window`/`get_windows`, `set_clone_sha`/`get_clone_sha` |
+| Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
+
+**Semantics.** Identity columns are immutable; `ts`/`data`/`fetched_at` refresh on re-upsert.
+Edges union. `range_query` orders by `(ts, id)` and excludes NULL-`ts` structure nodes.
+`traverse_spine` walks spine edges **undirected**, depth-capped; `missing` lists referenced but
+unstored spine ids (minus known-dead when `skip_dead`).
+
+## 6. Read and enrich
+
+### 6.1 `extract.extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None, backfill=None, backfill_budget=50)`
+
+1. `range_query` the window for in-window nodes.
+2. Seed trains from in-window **anchors** (PR/issue; reviews/events never seed), then
+   `traverse_spine` to pull out-of-window context (`in_window: false`).
+3. `complete.complete_train` (see 6.2) — with `backfill=None` this is warn-only.
+4. Materialize the raw arrays (`commits`, `prs`, `issues`, `milestones`, `releases`, `sprints`,
+   `code_events`, `symbol_events`) from the repo's nodes + ledger; re-attach reviews/lifecycle
+   onto parents; surface `blocks` as `blocking`/`blocked_by`.
+5. Read back `artifacts` and `people` (the write path already derived them) and the singleton
+   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`).
+
+The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
+
+### 6.2 Completion and honest gaps (`complete.py`)
+
+Level-0 anchors are always filled; transitive expansion follows the causal spine and stops at
+the query window. Every train carries `complete: bool` and `gaps: [{id, reason}]`:
+
+| Reason | Meaning |
+|---|---|
+| `not_gathered` | Offline; no fetch attempted |
+| `outside_window` | Beyond the query window; intentionally not chased |
+| `unreachable` | Fetch attempted and failed (transient) |
+| `budget` | Per-query fetch ceiling reached |
+
+A definitive 404 (e.g. a `Fixes #123` template placeholder) is **pruned** and tombstoned in
+`dead_refs`, never reported as a gap.
+
+### 6.3 `link.enrich(bundle)` pipeline
+
+```mermaid
+flowchart TB
+  a["attach_commit_prs"] --> b["build_trains"] --> c["compute_buckets"]
+  c --> d["link_symbol_identity"] --> e["build_timeline"] --> f["compute_feature_deltas"]
+  f --> g["attribute_code_areas + attribute_train_areas"] --> h["score_train_significance"]
+  h --> i["annotate_train_effort"] --> j["build_forecast"] --> k["build_modules"]
+  k --> l["annotate_review_rounds + annotate_reopen_count"]
+  l --> m["derive.annotate_people_profile + derive.build_halls"]
+  m --> n["derive.build_flow + derive.build_blockers"]
+```
+
+Order matters: significance needs code areas; forecast needs buckets and milestones; people
+profiles need trains and artifacts. `artifacts`/`people` are **consumed**, not recomputed.
+
+### 6.4 Decision trains — `build_trains`
+
+```mermaid
+flowchart TB
+  pr["PR"] --> sb{"base == another PR's head?"}
+  sb -- yes --> cp["contributing_prs on the parent PR's train"]
+  sb -- no --> an{"closes / cross-refs an issue?"}
+  an -- yes --> ti["anchor train-issue-N"]
+  an -- no --> tp["anchor train-pr-N"]
+  ti --> oc
+  tp --> oc
+  oc{"outcome precedence"} --> o1["shipped: any PR merged to base_branch"]
+  oc --> o2["in_flight: only open PRs to base_branch"]
+  oc --> o3["rejected: only closed-unmerged PRs"]
+  ni["issue closed not_planned, no PR"] --> o4["abandoned train"]
+```
+
+`kind` comes from the root issue's `kind`; when absent/`other`, from the lowest-numbered PR's
+conventional-commit prefix. Each train records `prs`, `commits`, `code_areas`,
+`contributing_prs`, `evidence` refs.
+
+### 6.5 Buckets — `compute_buckets`
+
+Evaluated per PR then per issue; first matching rule wins:
+
+```mermaid
+flowchart TB
+  x["item"] --> s1{"PR merged to base_branch,<br/>merged_at in window?"}
+  s1 -- yes --> SH["shipped"]
+  s1 -- no --> s2{"issue closed completed,<br/>closed_at in window?"}
+  s2 -- yes --> SH
+  s2 -- no --> r1{"PR closed unmerged,<br/>closed_at in window?"}
+  r1 -- yes --> RJ["rejected"]
+  r1 -- no --> r2{"issue closed not_planned,<br/>closed_at in window?"}
+  r2 -- yes --> RJ
+  r2 -- no --> o{"state open?"}
+  o -- no --> NB["no bucket"]
+  o -- yes --> n1{"on NEXT milestone,<br/>or high-priority label?"}
+  n1 -- yes --> NC["next_candidates"]
+  n1 -- no --> i1{"on CURRENT milestone,<br/>or updated_at in window?"}
+  i1 -- yes --> IF["in_flight"]
+  i1 -- no --> NB
+```
+
+`select_milestones(milestones, ref_date)`: open milestones sorted by `(due_on or 9999-12-31,
+number)`; **current** = earliest due on/after `ref_date` (else earliest open); **next** = the
+one after it. `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`,
+`high-priority`, `critical` (case-insensitive exact match).
+
+### 6.6 Significance and effort
+
+```
+footprint    = |prs| + |commits| + |code_areas| + |contributing_prs|
+significance = footprint × TRAIN_KIND_WEIGHTS[kind] + |code_areas|
+tier         = "deep" if rank ≤ TRAIN_SIGNIFICANCE_TOP_N (8) or significance ≥ TRAIN_SIGNIFICANCE_FLOOR (20.0)
+               else "mention"
+```
+
+Kind weights: feature 3.0, module-request 3.0, bug 2.0, idea 1.5, docs/chore/other 1.0.
+Outcome is deliberately ignored (a rejected train's story still matters).
+
+`effort`: `opened_at`, `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
+(sum), `commits`, `participants` (distinct authors + reviewers + commenters), `stalled`
+(merged and `elapsed_days > TRAIN_STALL_DAYS` = 21). Review rounds and reopen counts are added
+by `annotate_review_rounds` / `annotate_reopen_count`.
+
+### 6.7 Forecast — `build_forecast`
+
+For each `next_candidates` ref:
+
+| Signal | Weight | Fires when |
+|---|---:|---|
+| `on_next_milestone` | 5.0 | item milestone == next milestone title |
+| `high_priority` | 3.0 | label in `HIGH_PRIORITY_LABELS` |
+| `in_motion` | 2.0 | it is an open PR; or an open PR `closes`/cross-refs it; or it belongs to a train |
+| `recent_activity` | 1.5 | `updated_at` in window |
+| `overdue` | 1.0 | `ref_date − created_at ≥ FORECAST_OVERDUE_DAYS` (200) |
+
+`tier` = likely (≥ 5.0) / possible (≥ 2.0) / longshot. Candidates sorted by `(−score, id)`.
+Output: `{next_milestone, candidates:[{ref, train, score, tier, signals}]}`. Forward-only —
+verification happens in the next installment's series block.
+
+### 6.8 Slice — `slice_train(bundle, train_id)`
+
+Pure, read-only, raises `KeyError` on an unknown id. Returns `{train, issue, prs, commits,
+feature_deltas, symbol_moves}` plus review rounds, capped reviews/lifecycle and reopen counts.
+Caps: text `SLICE_TEXT_CAP` = 1500 chars (with `…[+N chars]`), `SLICE_COMMENTS_KEPT` = 6 per list
+(overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars
+(`feature_deltas_diff_overflow` counts dropped diffs).
+
+### 6.9 Series — `series.py` via `link.py BUNDLE --series series.json`
+
+```mermaid
+flowchart TB
+  load["read series.json<br/>absent or blank = []"] --> prior{"installments non-empty?"}
+  prior -- no --> first["series.first_installment = true"]
+  prior -- yes --> cmp["compute_series(bundle, installments[-1])"]
+  cmp --> new["new: shipped or in_flight refs<br/>not in prior shipped or in_flight"]
+  cmp --> car["carried_over: refs in prior in_flight,<br/>present now (+ prior_status)"]
+  cmp --> loop["forecast_loop: prior forecast refs<br/>landed (now shipped) / not_yet"]
+  first --> snap
+  new --> snap
+  car --> snap
+  loop --> snap["append installment_snapshot(bundle)<br/>write series.json"]
+```
+
+Identity is `(type, id)`; URLs are excluded. `installment_snapshot` =
+`{from, to, ref_date, shipped:[{type,id}], in_flight:[{type,id,board_status?}],
+forecast:[{type,id,tier}]}`. A malformed non-empty index raises rather than being discarded.
+**Every invocation appends** — run it exactly once per installment.
+
+### 6.10 `derive.py` projections
+
+| Function | Output | Rule highlights |
+|---|---|---|
+| `build_artifacts` | `artifacts{}` | lifecycle per file/symbol; status from newest event |
+| `match_symbol_moves` / `link_symbol_identity` | `symbol_moves` | same `(lang, subkind, name)` dropped in one file, added in one other; `high` when git also flags a rename |
+| `enumerate_participants` | all logins | the single source of truth for "who" (write path and auditor) |
+| `attribute_people_areas` | `people[].modules/areas` | commit files + reviewed PRs' areas |
+| `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*` |
+| `annotate_people_profile` | per-login metrics | prs authored/merged/reviewed, merge rate, review latency (median), first/last active, examples/docs/symbols authored |
+| `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored`, top 10; **no shame/blame** |
+| `build_flow` | `flow[]` | open issues: `blocked` → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d, no open PR) |
+| `build_blockers` | `blockers[]` | out-degree in blocker → blocked graph, sorted desc |
+
+## 7. Present — `render.py`
+
+`render.py BUNDLE [--diagrams-dir workspace/diagrams] [--export svg|png] [--skip-validate] [--train ID]`.
+
+| Diagram key | Emitter | Mermaid type |
+|---|---|---|
+| `buckets_pie` | `emit_buckets_pie` | pie |
+| `timeline_gantt` | `emit_timeline_gantt` | gantt |
+| `content_timeline` | `emit_content_timeline` | timeline |
+| `deltas_bar` | `emit_deltas_bar` | xychart-beta |
+| `contributor_graph` | `emit_contributor_graph` | flowchart |
+| `kind_breakdown` | `emit_kind_breakdown` | pie |
+| `module_graph` | `emit_module_graph` | flowchart |
+| `blocker_graph` | `emit_blocker_graph` (≤ 40 edges) | flowchart |
+| `train_flowcharts{id}` | `emit_train_flowchart` (deep trains) | flowchart; mode C with area nodes when ≤ `TRAIN_FLOW_MAX_PRS` (4) PRs and ≤ `TRAIN_FLOW_MAX_AREAS` (5) areas, else mode A chain |
+| project module graph | `emit_project_module_graph(module_edges)` | flowchart (used by digest reports) |
+
+Every emitted file is compiled with `mmdc` unless `--skip-validate`; a non-compiling diagram
+fails the run. Paths are recorded in `bundle.diagrams`.
+
+## 8. Trust — `validate.py`
+
+`validate.py STORE [--project P] [--repo R] [--bundle FILE] [--json]` → exit 0 when no ERROR, 1
+otherwise. When the store (or `--project`) spans several repos and no `--repo` is given, it runs
+`validate_project` over every member plus the project-wide checks.
+
+| Check | Asserts |
+|---|---|
+| `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR |
+| `participant_completeness` | every login in any raw record has a person node |
+| `provenance` | every social/code node carries a source identifier (url and/or sha) |
+| `no_fabrication` | no invented entities, no historyless artifacts, no malformed ids |
+| `schema_conformance` | each edge type's endpoint classes match STORE.md |
+| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle |
+| `idempotency` | re-folding into a scratch copy changes no counts |
+| `no_drift_people` (project) | project-scoped people == union re-derived across all members |
+
+The auditor never mutates the store; a check that raises is reported as a failed ERROR, not a
+crash. `no_drift`/`idempotency` self-source their bundle via `extract` over the store's
+gathered windows; `--bundle` is an optional cross-check.
+
+## 9. Cross-window reader — `spotlight.py`
+
+`spotlight.py QUERY ARG --store S [--project P] [--from F] [--to T] [--json|--md] [--complete [--complete-budget N]]`
+
+| Query | Function | Answers |
+|---|---|---|
+| `person <login>` | `person_impact` | one contributor's footprint across trains/areas |
+| `symbol <artifact-id>` | `pattern_evolution` | one symbol's lifecycle |
+| `subsystem <area>` | `subsystem_split` | activity split within an area |
+| `grep <phrase>` | `text_mining` | FTS5 search over PR/issue/commit text (needs FTS5) |
+| `module <area>` | `slice_module` | full-history module biography envelope |
+| `dependents <owner/repo>` | `member_dependents` | reverse `depends_on` BFS — blast radius |
+
+Results share an envelope `{query, focus, focus_kind, project, status, scope, …}`.
+`status` may be `needs_gather` or `fts_unavailable` — valid answers, exit 0. `--complete`
+wires `gather.backfill` with a token (the only network path in a reader).
+
+## 10. Multi-repo aggregation — `digest.py`
+
+`digest.py --store S --project P [--repo R …] --from F --to T [--ticket-pattern RE]`
+(repos default to `project_repos`). Works for single-repo stores too
+(`--project <owner> --repo <name>`).
+
+```mermaid
+flowchart TB
+  mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>connected components across repos"]
+  sc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
+  bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (default [A-Z]{2,}-digits)<br/>cluster into related_work"]
+  mb --> mg["_merge_shipped / _merge_people / _merge_modules"]
+  pd["project_depends_on: edges_by_type depends_on"] --> me["module_edges<br/>src_repo, src_area, dst_repo, dst_area,<br/>version, transitive, cross_repo"]
+  tk --> view
+  mg --> view
+  me --> view["project view<br/>meta, members[].bundle, trains, related_work,<br/>shipped, people, modules, module_edges"]
+```
+
+Caveat (documented in code): a train spanning more than `max_depth` spine hops can split
+into two components; and restricting `--repo` cannot hide a real spine edge into another
+member, so emitted `repos` may exceed the requested set.
+
+## 11. Supporting tools
+
+- **`manifest.py`** — `load_manifest` validates `{project (no "/"), window{from,to}, repos[≥1]{owner, repo, registry?}}`; `member_slugs`.
+- **`manifest_from_index.py`** — reads the AVM **Terraform** index CSVs
+  (`Terraform{Resource,Pattern,Utility}Modules.csv` in `Azure/Azure-Verified-Modules`) via
+  `--avm res|ptn|utl` or `--index FILE|URL|-`; filters `--kind/--status/--name-contains/
+  --include/--exclude/--limit`; writes the manifest (`--out` or stdout), deriving `registry`
+  from `PublicRegistryReference`.
+- **`transcript.py PATH`** — strips WebVTT/SRT headers, NOTE/STYLE blocks, cue timings,
+  indices and inline tags; collapses rolling-caption duplicates; `.txt`/`.md` pass through;
+  missing file → exit 2.
+
+## 12. Data contracts
+
+| Artifact | Contract | Producer → consumer |
+|---|---|---|
+| `journey.db` | `STORE.md` (`meta.schema_version`) | gather → everything |
+| Bundle view | `BUNDLE.md` (`meta.schema_version` = 1) | extract/link/digest → render, narrator, formatters |
+| Project view | `BUNDLE.md` § output contract | digest → narrator, formatters |
+| `series.json` | list of `installment_snapshot` (6.9) | link `--series` → link `--series` |
+| Slice | `slice_train` shape (6.8) | link `--slice` → narrator sub-agent |
+| Spotlight envelope | §9 | spotlight → narrator |
+| Manifest | §11 | manifest_from_index / hand-authored → gather |
+
+Top-level view keys are append-only within a schema version; omit-when-empty keeps shapes
+diff-stable.
+
+## 13. Configuration and tunables
+
+**Environment variables**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GITHUB_TOKEN` / `GH_TOKEN` | — | Auth (read scopes) |
+| `ACTIVITY_CLONE_MARGIN_DAYS` | 14 | Clone reaches this far before `from` |
+| `ACTIVITY_IAC_BUILD_TIMEOUT` | 300 | Seconds per IaC subprocess |
+| `ACTIVITY_IAC_MAX_WORKERS` | 8 | Parallel IaC builds |
+| `ACTIVITY_IAC_RETRIES` | 1 | Extra attempts on timeout/failure |
+| `TF_PLUGIN_CACHE_DIR` | unset | Shared terraform provider cache (enables serial pre-warm) |
+| `ACTIVITY_BOARD_STALE_DAYS` | 365 | Board treated as deprecated beyond this |
+| `ACTIVITY_BOARD_MAX_ITEMS` | 5000 | Per-board item cap |
+
+**Code constants** (change deliberately; tests pin many of them)
+
+| Constant | Value | Module |
+|---|---|---|
+| `TRAIN_KIND_WEIGHTS` | feature 3, module-request 3, bug 2, idea 1.5, else 1 | link |
+| `TRAIN_SIGNIFICANCE_TOP_N` / `_FLOOR` | 8 / 20.0 | link |
+| `TRAIN_STALL_DAYS` | 21 | link |
+| `FORECAST_WEIGHTS` | 5.0 / 3.0 / 2.0 / 1.5 / 1.0 | link |
+| `FORECAST_TIER_LIKELY_THRESHOLD` / `_POSSIBLE_` | 5.0 / 2.0 | link |
+| `FORECAST_OVERDUE_DAYS` | 200 | link |
+| `HIGH_PRIORITY_LABELS` | see §6.5 | link |
+| `SLICE_TEXT_CAP` / `SLICE_COMMENTS_KEPT` / `SLICE_DIFF_CAP` | 1500 / 6 / 6000 | link |
+| Flow thresholds | stale 30 d, upvotes 5, comments 5, hung 60 d | derive |
+| `TRAIN_FLOW_MAX_PRS` / `_AREAS` | 4 / 5 | render |
+| `DEFAULT_AREA_PATTERNS` | §4.5 | gather |
+
+## 14. Cross-cutting concerns
+
+### 14.1 Determinism and idempotency
+
+- Identity-keyed upserts + set-semantics ledger + deduped `gathered_windows` → re-folding is a
+  no-op (`validate.idempotency` proves it on every audit).
+- `range_query` orders by `(ts, id)`; JSON `sort_keys`; collections sorted; tie-breaks by id.
+- The only non-deterministic fields are `fetched_at` and `dead_refs.first_seen`, both excluded
+  from determinism assertions.
+
+### 14.2 Degradation matrix
+
+| Missing | Effect | Signal |
+|---|---|---|
+| `bicep` / `terraform` | no IaC edges | `edge_extraction` counts `skipped` |
+| registry unreachable / slow init | some areas unresolved | `timeout` / `failed` counts |
+| `read:project` scope | no board status / sprints | empty board layer |
+| `mmdc` | render fails (or use `--skip-validate`) | error |
+| `graphify` | directory provider used | `code_graph.provider = directory` |
+| FTS5 | `spotlight grep` unavailable | `status: fts_unavailable` |
+| out-of-window spine node | context gap | train `gaps[]` |
+
+### 14.3 Performance and API budget
+
+Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open PRs) + 4 × kept PRs
++ pages(issues since from) + pages(open issues) + 2 × issues + referenced issues + workflow/
+release/milestone pages`. Because **all open PRs and issues** are included every run, busy
+repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
+dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
+`--no-workflows`, `--no-releases`, reusing the clone (`--clone-dir` + `--no-clone`),
+`TF_PLUGIN_CACHE_DIR`, and running heavy gathers off-hours.
+
+### 14.4 Security
+
+- Read-only token; nothing is written to GitHub; the token is read from the environment only.
+- Clones and stores contain repository content — treat workspaces as you would a clone.
+- `mmdc` as root requires `--no-sandbox`; restrict that to throwaway environments.
+- Recognition-not-blame: `halls` has no shame list; people attribution of stalls is an opt-in
+  report appendix.
+
+## 15. Testing and CI
+
+- 18 `test_*.py` modules (stdlib `unittest`), fixture-driven and fully offline (fake fetch
+  seams; no network). Notable: `test_characterization.py` (store-derived == link-derived golden
+  equivalence), `test_validate.py` (each audit), `test_gather.py` (parsers, fold, IaC parsing
+  incl. modern/legacy DOT), `test_digest.py` (cross-repo trains, module edges), `test_series.py`.
+- Run: `python3 -m unittest discover -s .claude/skills/activity-overview -p 'test_*.py' -v`.
+- CI (`.github/workflows/activity-overview.yml`): `tests` on every relevant push/PR (Python 3.11,
+  3.12, 3.13, byte-compile + suite); `live` on dispatch, schedule (07:00 UTC on the 1st and
+  15th) or default-branch push — real gather into a store (pinned bicep CLI) then
+  `validate.py`, using the `ACTIVITY_TEST_TOKEN` secret.
+
+## 16. Extension guide
+
+| Change | Where | Watch out for |
+|---|---|---|
+| New repo layout → areas | add `(name, fn)` to `DEFAULT_AREA_PATTERNS` (order matters) | area ids appear in stored nodes; re-gather after changing |
+| Org priority labels | `link.HIGH_PRIORITY_LABELS` | lower-case exact match |
+| Forecast / significance tuning | constants in `link.py` | tests pin thresholds; update tests + BUNDLE.md |
+| New view field | compute in `link.enrich` or `derive` (pure) | append-only; document in BUNDLE.md; omit when empty |
+| New stored fact | `fold_bundle` + `extract` reader + `validate` conformance | must keep `no_drift` and characterization green |
+| New spotlight query | function + `_RENDERERS` entry + dispatch in `main` | envelope shape; exit 0 for "no data" statuses |
+| New formatter | consume the view (see `examples/formatters/`) | read `meta.schema_version` |
+| Cross-repo Bicep deps | mirror `resolve_registry_member` for `br/public:` paths in `_fold_depends_on` | gate on manifest folds to keep single-repo goldens stable |

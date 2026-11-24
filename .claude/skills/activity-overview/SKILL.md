@@ -22,7 +22,9 @@ pipeline's).
 
 All scripts referenced below ship inside this skill directory
 (`${CLAUDE_SKILL_DIR}`); run them with `python3` from the skill dir (stdlib only).
-For deeper detail: **`ARCHITECTURE.md`** (the L400 deep dive — every tool's parameters
+For deeper detail: **`docs/HLD.md`** (high-level design + usage scenarios), **`docs/LLD.md`**
+(L400 low-level design), **`docs/USAGE.md`** (operator runbook: monthly series, forecasting,
+per-estate playbooks), **`ARCHITECTURE.md`** (the L400 deep dive — every tool's parameters
 + internals, the C4/data-model diagrams, end-to-end scenarios, and a diagnostics
 matrix), **`reference/report-sections.md`** (how to author each report
 section), **`BUNDLE.md`** (the structured view / output contract for downstream
