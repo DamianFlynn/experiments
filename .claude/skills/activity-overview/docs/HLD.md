@@ -140,8 +140,10 @@ Every PR, issue, commit, review, person, code area, milestone, release and sprin
 **node**; relationships (`authored`, `closes`, `part_of`, `touches`, `depends_on`, `blocks`,
 `in_milestone`, …) are typed **edges**. Ids are qualified (`project/repo#pr-123`), so writes
 are **idempotent**: re-gathering an overlapping window changes nothing that is already
-correct. The store therefore **accretes** — each month adds to the same file and history
-deepens over time.
+correct. The storage layer can therefore hold many windows. Today, however, the *readers*
+assume one window per store (see [§10](#10-constraints-and-known-limitations)), so the
+recommended operating model is **one single-window store per installment**, with continuity
+carried by the series file (§5.5).
 
 ### 5.2 Decision train
 
@@ -247,7 +249,7 @@ flowchart LR
     cc["Claude Code<br/>skill: ~/.claude/skills/activity-overview<br/>command: /activity"]
     py["python3 + git"]
     opt["optional: bicep, terraform, mmdc"]
-    ws[("~/activity/stream/<br/>journey.db, series.json,<br/>reports/YYYY-MM.md")]
+    ws[("~/activity/stream/<br/>stores/YYYY-MM.db, series.json,<br/>views/, reports/YYYY-MM.md")]
     cc --> py --> ws
     py --> opt
   end
@@ -277,18 +279,18 @@ what's new vs carried over, whether last month's forecast landed, and the next f
 ```mermaid
 flowchart LR
   subgraph M1["September installment"]
-    g1["gather 09-01..09-30"] --> s1[("journey.db")]
-    s1 --> l1["link --series"]
+    g1["gather 09-01..09-30"] --> s1[("stores/2026-09.db")]
+    s1 --> l1["validate, digest,<br/>link --series"]
     l1 --> f1["forecast F1<br/>series: first installment"]
   end
   subgraph M2["October installment"]
-    g2["gather 10-01..10-31"] --> s1
-    s1 --> l2["link --series"]
+    g2["gather 10-01..10-31"] --> s2[("stores/2026-10.db")]
+    s2 --> l2["validate, digest,<br/>link --series"]
     l2 --> f2["new / carried over<br/>F1 landed vs not yet<br/>forecast F2"]
   end
   subgraph M3["November installment"]
-    g3["gather 11-01..11-30"] --> s1
-    s1 --> l3["link --series"]
+    g3["gather 11-01..11-30"] --> s3[("stores/2026-11.db")]
+    s3 --> l3["validate, digest,<br/>link --series"]
     l3 --> f3["new / carried over<br/>F2 landed vs not yet<br/>forecast F3"]
   end
   f1 -. snapshot .-> idx[("series.json<br/>append-only")]
@@ -303,9 +305,13 @@ carried-over with prior board status, forecast loop); shipped by code area; deep
 trains with grounded narratives; next-release forecast (likely / possible / longshot with
 signals); feature changes; flow health; contributors; releases and CI health.
 
-**Why it compounds:** the store keeps every month, so quarter or year views are just a
-wider window over the same file (no re-gather needed), and `spotlight` queries span all
-gathered history.
+**Why it compounds:** continuity comes from `series.json`, which chains each installment to
+the last — new vs carried over, and whether each forecast landed — so the monthly reports read
+as one progressing story. Each monthly store stays small and independently auditable. Two
+rules keep the chain honest: capture each installment **at month-end** (open work, milestones
+and board status are read as they are at gather time, so a past month cannot be re-created
+later), and gather a quarter or year as **its own window** when you need a roll-up (CI
+statistics and other per-repo facts describe only the window they were gathered for).
 
 ### 8.2 Scenario B — forecasting from in-flight work
 
@@ -348,7 +354,7 @@ making forecasts meaningful on each target.
 
 ```mermaid
 flowchart TB
-  subgraph stores["One store per report stream"]
+  subgraph stores["Stores per report stream, one per installment"]
     sb[("bicep.db")]
     sbrm[("avm-bicep.db")]
     stf[("avm-tf-family.db")]
@@ -373,8 +379,10 @@ flowchart TB
 Before bumping a major version of, say, `avm-res-network-virtualnetwork`, run
 `spotlight dependents Azure/terraform-azurerm-avm-res-network-virtualnetwork` against the
 constellation store: it lists every member module that depends on it (with pinned versions
-in `digest.module_edges`). The structural scan means this reflects the repo's real module
-structure, not just this month's churn.
+in `digest.module_edges`). On a fresh store, the structural scan means this reflects the
+module structure of the checkout gathered for that window, not just that month's churn. A
+store never retracts a `depends_on` edge, so in a store folded from several gathers the
+result is *recorded* dependencies — use a fresh store when you need the current structure.
 
 ### 8.5 Scenario E — module biography for release notes
 
@@ -429,6 +437,29 @@ These are real, current limits — plan around them:
 6. **No standalone `extract` CLI.** The on-disk bundle view is obtained via `digest.py`
    (which works for single repos too); see USAGE §4.
 7. **Narrative is not in CI.** The live CI job stops at the trust gate.
+8. **Views assume a single-window store.** `extract` does not emit `meta.period`, and it
+   materializes the repo's *whole* stored node set, so a view built from a store holding
+   several windows counts every stored merge as shipped (buckets fall back to "in window" when
+   `period` is absent) and its trains/commits include all stored history. This affects both
+   member bundles and the project view.
+9. **Repeated folds of overlapping files fail the trust gate.** On re-fold, an artifact node's
+   lifecycle is replaced by the incoming window's while the change ledger keeps every window,
+   so `validate.no_drift` reports lifecycle drift once a second window touches the same files.
+   (Module biographies are unaffected — `spotlight module` reads the ledger.)
+10. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
+    `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
+    latest gathered window only.
+11. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
+    `depends_on` edge in an existing store.
+12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
+    status as they are *now*; re-gathering a past month reproduces its delivery history, not
+    what was open or forecastable at the time.
+13. **Fresh clone per gather.** `gather` always runs `git clone` into `--clone-dir` (which must
+    not exist); `--no-clone` reuses a clone without fetching.
+
+Items 8–9 are why USAGE recommends one store per installment; they are candidates for code
+fixes (set `meta.period` and window the materialized arrays in `extract`; make artifact
+folding cumulative), tracked in [§11](#11-extension-points-and-roadmap).
 
 ## 11. Extension points and roadmap
 
@@ -437,6 +468,7 @@ These are real, current limits — plan around them:
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
 | Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
+| Multi-window stores (limitations 8–9) | `extract._materialize_meta` (+ windowed arrays) and cumulative artifact folding in `fold_bundle` — not implemented |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies | Would mirror `resolve_registry_member` for `br/public:` paths (not implemented) |
 | New spotlight lens | Add a query + renderer in `spotlight.py` |
