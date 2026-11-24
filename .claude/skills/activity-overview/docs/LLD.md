@@ -166,8 +166,12 @@ sequenceDiagram
 
 ### 4.3 Clone and windowing
 
-- `build_clone_cmd` clones with `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS`
-  (default 14). The margin keeps each in-window commit's real parent in the clone.
+- Unless `--no-clone`, `acquire` always runs `git clone` (`build_clone_cmd`) into `--clone-dir`
+  (default `workspace/<repo>-clone`; for manifests `--clone-dir` is the parent of per-member
+  `<owner>-<repo>-clone` dirs), so the directory must not already exist. `--no-clone` walks an
+  existing clone **without fetching** — only correct if that clone was refreshed beforehand.
+- The clone uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
+  margin keeps each in-window commit's real parent in the clone.
 - `shallow_boundary_shas` + `drop_boundary_events` remove events from a commit whose parent
   was grafted away (its diff would be a whole-tree phantom). Any **in-window** commit dropped
   this way is recorded in `meta.boundary_dropped_commits` and a warning is printed — widen the
@@ -432,6 +436,13 @@ unstored spine ids (minus known-dead when `skip_dead`).
 
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
+> **Single-window assumption.** `_materialize_meta` emits `owner, repo, from, to` (+
+> `clone_sha`) — no `period` or `ref_date` — and steps 4–5 read the repo's *whole* stored node
+> set, not just the window. On a store gathered for one window this is exact (and is what the
+> golden-equivalence tests pin). On a store holding several windows, the view includes every
+> stored PR/issue/commit/train, and `compute_buckets` (which treats a missing `period` as
+> "in window") counts every stored merge as shipped. See HLD §10 items 8–9 and §14.4.
+
 ### 6.2 Completion and honest gaps (`complete.py`)
 
 Level-0 anchors are always filled; transitive expansion follows the causal spine and stops at
@@ -486,7 +497,9 @@ conventional-commit prefix. Each train records `prs`, `commits`, `code_areas`,
 
 ### 6.5 Buckets — `compute_buckets`
 
-Evaluated per PR then per issue; first matching rule wins:
+Evaluated per PR then per issue; first matching rule wins. "In window" uses `meta.period`;
+when `period` is absent (as in an `extract` view) `_in_window` returns true for every
+timestamp:
 
 ```mermaid
 flowchart TB
@@ -572,7 +585,10 @@ flowchart TB
 Identity is `(type, id)`; URLs are excluded. `installment_snapshot` =
 `{from, to, ref_date, shipped:[{type,id}], in_flight:[{type,id,board_status?}],
 forecast:[{type,id,tier}]}`. A malformed non-empty index raises rather than being discarded.
-**Every invocation appends** — run it exactly once per installment.
+**Every invocation appends** — run it exactly once per installment. Recovery from a double
+run: remove *every* snapshot whose `from`/`to` is the duplicated month (removing only the last
+leaves the month compared with itself), plus any later snapshots, then replay the saved
+bundles in chronological order.
 
 ### 6.10 `derive.py` projections
 
@@ -735,6 +751,8 @@ diff-stable.
 - `range_query` orders by `(ts, id)`; JSON `sort_keys`; collections sorted; tie-breaks by id.
 - The only non-deterministic fields are `fetched_at` and `dead_refs.first_seen`, both excluded
   from determinism assertions.
+- Idempotency is per window: re-folding the **same** window is a no-op. Folding **different**
+  overlapping windows is not fully cumulative — see §14.4.
 
 ### 14.2 Degradation matrix
 
@@ -755,8 +773,9 @@ Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open 
 release/milestone pages`. Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
-`--no-workflows`, `--no-releases`, reusing the clone (`--clone-dir` + `--no-clone`),
-`TF_PLUGIN_CACHE_DIR`, and running heavy gathers off-hours.
+`--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
+off-hours. (`--no-clone` saves the clone only if you refresh the existing clone yourself —
+gather does not fetch.)
 
 ### 14.4 Security
 
@@ -765,6 +784,19 @@ dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigati
 - `mmdc` as root requires `--no-sandbox`; restrict that to throwaway environments.
 - Recognition-not-blame: `halls` has no shame list; people attribution of stalls is an opt-in
   report appendix.
+
+### 14.4 Known issues (verified, not yet fixed)
+
+| Issue | Mechanism | Effect | Candidate fix |
+|---|---|---|---|
+| View not window-scoped on multi-window stores | `extract._materialize_meta` omits `period`; arrays come from `repo_nodes` | prior windows' merges counted as shipped; trains/commits span all stored history (member and project views) | emit `meta.period`/`ref_date` from `ts_from/ts_to`; window the materialized arrays to in-window + spine context |
+| Trust gate fails after a second overlapping fold | `fold_bundle` upserts artifact nodes with the incoming window's lifecycle; `code_events` keeps all windows | `validate.no_drift` "lifecycle length drift" | rebuild artifact lifecycle from the full ledger on fold (or merge with the stored one) |
+| Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
+| No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
+| Clone dir reuse | `git clone` into an existing dir fails; `--no-clone` does not fetch | repeated runs need a fresh dir | fetch/deepen an existing clone |
+
+The operating guidance in USAGE (one single-window store per installment, series file for
+continuity, wide single gathers for history stores) avoids the first two in practice.
 
 ## 15. Testing and CI
 
