@@ -342,27 +342,48 @@ data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
   commits_authored`, keeps `score > 0`, sorts by `(-score, login)`, takes the top
   10 (else `[]`). **`halls.internal`/`shame`/`blame` are intentionally NOT built**
   — per the "recognition, not blame" stance.
+- **Blocker state.** `issue["blocking"]` / `issue["blocked_by"]` (set by
+  `extract._attach_blocks`) are the **raw stored relation**, whatever the state of
+  the issues at either end; `diagrams.blocker_graph` draws that raw relation. `flow`
+  and `blockers` apply an **open-only** filter on top, using the `state` of the
+  bundle's own issues: an issue at the other end counts only when it is in the
+  bundle with `state == "open"`. A number **absent from the bundle** has **unknown**
+  state; it never counts as open (gather pulls every open issue of the repo, so an
+  issue it did not gather was not open at gather time, or is not an issue of this
+  repo), and `flow` lists such blockers separately in `blocked_by_unknown` rather
+  than dropping them silently.
 - **flow** `[ { number, url, state, age_days, reactions, blocked_by:[num],
-  signals:[str] } ]` (`build_flow`) — one entry per OPEN issue classified into a
-  non-healthy **pathology** (healthy issues are omitted to stay lean). `state` is
-  the pathology, in precedence order (first match wins):
-  - `blocked` — `blocked_by` non-empty.
+  blocked_by_unknown:[num], signals:[str] } ]` (`build_flow`) — one entry per OPEN
+  issue classified into a non-healthy **pathology** (healthy issues are omitted to
+  stay lean). `blocked_by` holds only the issue's **open** blockers (sorted,
+  unique); closed blockers are dropped; `blocked_by_unknown` holds blockers absent
+  from the bundle (always present, `[]` when none). `state` is the pathology, in
+  precedence order (first match wins):
+  - `blocked` — at least one **open** blocker (`blocked_by` non-empty). An issue
+    whose blockers are all closed or unknown is not `blocked` and is classified
+    by its own signals below.
   - `upvoted_but_ignored` — `+1` reactions `≥ FLOW_UPVOTE_MIN` (5) AND stale
     (`updated_at` `≥ FLOW_STALE_DAYS` = 30 days before `ref_date`) AND no open
     linked PR.
   - `traction_then_abandoned` — `≥ FLOW_TRACTION_MIN` (5) comments AND stale AND
     no open linked PR.
-  - `hung` — `age_days ≥ FLOW_HUNG_DAYS` (60) AND no open linked PR.
+  - `hung` — `age_days ≥ FLOW_HUNG_DAYS` (60) AND stale AND no open linked PR. An
+    old issue with recent activity (updated < 30 days before `ref_date`) is not
+    `hung`; neither is one without `updated_at` (recency unknown, so not stale).
   An issue with an OPEN (unmerged) linked PR (via PR `closes`/`crossref_issues`)
   is exempt from the activity-starved pathologies (work is in flight). `age_days`
   is `null` when the issue has no `created_at`. `signals` is a human-readable
-  list (`"blocked by N issue(s)"`, `"N reactions"`, `"stale Nd"`, `"N comments"`,
-  `"open Nd"`), each included only when relevant. `age_days`/staleness use
-  `meta.ref_date` (fallback `meta.to`). Sorted by `number`. Empty `[]` when all
-  open issues are healthy.
+  list (`"blocked by N issue(s)"` counting open blockers only, `"N blocker(s) of
+  unknown state"`, `"N reactions"`, `"stale Nd"`, `"N comments"`, `"open Nd"`),
+  each included only when relevant. `age_days`/staleness use `meta.ref_date`
+  (fallback `meta.to`). Sorted by `number`. Empty `[]` when all open issues are
+  healthy.
 - **blockers** `[ { number, url, blocks_count, blocks:[num] } ]`
-  (`build_blockers`) — issues ranked by **how many other issues each one blocks**
-  (`blocks_count`, i.e. out-degree in the blocker→blocked graph established by
-  `extract._attach_blocks`, read off `issue["blocking"]`). One entry per issue with
-  a non-empty `blocking` list; `blocks` is the sorted unique set it blocks. Sorted
-  by `blocks_count` desc then `number`. Empty `[]` when nothing blocks.
+  (`build_blockers`) — **open** issues ranked by **how many other open issues each
+  one blocks** (`blocks_count`, i.e. out-degree in the blocker→blocked graph read
+  off `issue["blocking"]`, restricted to open issues). A closed blocker is not
+  listed; `blocks` is the sorted unique set of blocked issues that are in the
+  bundle with `state == "open"` (closed and unknown-state dependants are not
+  counted); a blocker left with no open dependant is omitted. Sorted by
+  `blocks_count` desc then `number`. Empty `[]` when nothing open blocks anything
+  open.

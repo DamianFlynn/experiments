@@ -661,6 +661,31 @@ class ExtractBlocks(unittest.TestCase):
         self.assertNotIn("blocked_by", issues[3])   # #3 only blocks
         self.assertNotIn("blocking", issues[5])      # #5 only blocked
 
+    def test_closed_blocker_kept_raw_in_extract_filtered_in_derive(self):
+        # #60: extract surfaces the stored relation as-is (a CLOSED blocker is still
+        # listed); the open-only filter is applied by derive.build_flow/build_blockers.
+        bundle = self._bundle()
+        bundle["issues"][0]["state"] = "closed"          # #3 (blocks #4) is closed
+        bundle["issues"][0]["closed_at"] = "2026-05-09T00:00:00Z"
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, copy.deepcopy(bundle))
+        ex = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31",
+                             warn=lambda _m: None)
+        issues = self._by_num(ex)
+        self.assertEqual(issues[3]["state"], "closed")
+        self.assertEqual(issues[4]["blocked_by"], [3])   # raw relation kept
+        self.assertEqual(issues[3]["blocking"], [4])
+        derive.build_flow(ex)
+        derive.build_blockers(ex)
+        self.assertNotIn(4, [e["number"] for e in ex["flow"]
+                             if e["state"] == "blocked"])
+        # #5 is still blocked by the OPEN #4; #4 still ranks; closed #3 does not.
+        five = next(e for e in ex["flow"] if e["number"] == 5)
+        self.assertEqual((five["state"], five["blocked_by"]), ("blocked", [4]))
+        self.assertEqual([(b["number"], b["blocks"]) for b in ex["blockers"]],
+                         [(4, [5])])
+
     def test_raw_blocks_left_untouched_for_refold(self):
         # extract must NOT overwrite the raw `blocks` ref-list — fold re-reads it.
         issues = self._by_num(self._extract())

@@ -493,12 +493,14 @@ def _one(flow):
 
 class TestFlow(unittest.TestCase):
     def test_blocked_fires(self):
+        # #60: only OPEN blockers block, so the blockers must be in the bundle and open.
         bundle = {"meta": _META, "issues": [
-            _issue(1, blocked_by=[2, 3])]}
+            _issue(1, blocked_by=[2, 3]), _issue(2), _issue(3)]}
         derive.build_flow(bundle)
         e = _one(bundle["flow"])
         self.assertEqual(e["state"], "blocked")
         self.assertEqual(e["blocked_by"], [2, 3])
+        self.assertEqual(e["blocked_by_unknown"], [])
         self.assertIn("blocked by 2 issue(s)", e["signals"])
 
     def test_upvoted_but_ignored_fires(self):
@@ -521,9 +523,9 @@ class TestFlow(unittest.TestCase):
         self.assertIn("6 comments", e["signals"])
 
     def test_hung_fires(self):
-        # old (>=60d) but not stale-by-upvotes / traction.
+        # old (>=60d) AND stale (>=30d since update, #60), not upvoted / traction.
         bundle = {"meta": _META, "issues": [
-            _issue(1, created_at="2026-01-01", updated_at="2026-06-05")]}
+            _issue(1, created_at="2026-01-01", updated_at="2026-05-01")]}
         derive.build_flow(bundle)
         e = _one(bundle["flow"])
         self.assertEqual(e["state"], "hung")
@@ -533,7 +535,8 @@ class TestFlow(unittest.TestCase):
     def test_precedence_blocked_beats_upvoted(self):
         bundle = {"meta": _META, "issues": [
             _issue(1, blocked_by=[9], created_at="2026-05-01",
-                   updated_at="2026-04-01", reactions={"+1": 7, "total": 7})]}
+                   updated_at="2026-04-01", reactions={"+1": 7, "total": 7}),
+            _issue(9)]}  # the open blocker (healthy itself -> not emitted)
         derive.build_flow(bundle)
         self.assertEqual(_one(bundle["flow"])["state"], "blocked")
 
@@ -554,7 +557,7 @@ class TestFlow(unittest.TestCase):
                   "prs": [{"number": 50, "state": "open", "merged": False,
                            "closes": [], "crossref_issues": [1]}],
                   "issues": [
-                      _issue(1, created_at="2026-01-01", updated_at="2026-06-05")]}
+                      _issue(1, created_at="2026-01-01", updated_at="2026-05-01")]}
         derive.build_flow(bundle)
         self.assertEqual(bundle["flow"], [])
 
@@ -585,7 +588,7 @@ class TestFlow(unittest.TestCase):
     def test_age_days_none_when_no_created_at(self):
         # blocked (so it emits) but no created_at -> age_days None, no "open Nd".
         bundle = {"meta": _META, "issues": [
-            _issue(1, blocked_by=[2], created_at=None)]}
+            _issue(1, blocked_by=[2], created_at=None), _issue(2)]}
         derive.build_flow(bundle)
         e = _one(bundle["flow"])
         self.assertIsNone(e["age_days"])
@@ -593,15 +596,16 @@ class TestFlow(unittest.TestCase):
 
     def test_meta_to_fallback(self):
         bundle = {"meta": {"to": "2026-06-06"}, "issues": [
-            _issue(1, created_at="2026-01-01", updated_at="2026-06-05")]}
+            _issue(1, created_at="2026-01-01", updated_at="2026-05-01")]}
         derive.build_flow(bundle)
         self.assertEqual(_one(bundle["flow"])["state"], "hung")
 
     def test_sorted_by_number(self):
         bundle = {"meta": _META, "issues": [
-            _issue(3, blocked_by=[1]),
-            _issue(1, blocked_by=[1]),
-            _issue(2, blocked_by=[1])]}
+            _issue(3, blocked_by=[9]),
+            _issue(1, blocked_by=[9]),
+            _issue(2, blocked_by=[9]),
+            _issue(9)]}  # the open blocker (healthy itself -> not emitted)
         derive.build_flow(bundle)
         self.assertEqual([e["number"] for e in bundle["flow"]], [1, 2, 3])
 
@@ -613,16 +617,111 @@ class TestFlow(unittest.TestCase):
         derive.build_flow(bundle)
         self.assertEqual(bundle["flow"], [])
 
+    # -- #60: blocker state + hung recency ------------------------------------
+
+    def test_closed_blocker_does_not_block_falls_through(self):
+        # #7 "blocked by #8", #8 closed completed -> not blocked; classified by its
+        # own signals (here upvoted_but_ignored, which `blocked` used to mask).
+        bundle = {"meta": _META, "issues": [
+            _issue(7, blocked_by=[8], created_at="2026-05-01",
+                   updated_at="2026-04-01", reactions={"+1": 7, "total": 7}),
+            _issue(8, state="closed")]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "upvoted_but_ignored")
+        self.assertEqual(e["blocked_by"], [])
+        self.assertEqual(e["blocked_by_unknown"], [])
+        self.assertFalse(any(s.startswith("blocked by") for s in e["signals"]))
+
+    def test_closed_blocker_only_and_otherwise_healthy_is_omitted(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(7, blocked_by=[8], created_at="2026-06-01",
+                   updated_at="2026-06-05"),
+            _issue(8, state="closed")]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+    def test_closed_blocker_no_longer_masks_hung(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(7, blocked_by=[8], created_at="2026-01-01",
+                   updated_at="2026-04-01"),
+            _issue(8, state="closed")]}
+        derive.build_flow(bundle)
+        self.assertEqual(_one(bundle["flow"])["state"], "hung")
+
+    def test_mixed_open_and_closed_blockers_counts_only_open(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(1, blocked_by=[2, 3]), _issue(2), _issue(3, state="closed")]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "blocked")
+        self.assertEqual(e["blocked_by"], [2])
+        self.assertIn("blocked by 1 issue(s)", e["signals"])
+
+    def test_blocker_absent_from_bundle_is_unknown_not_blocking(self):
+        # #9 is not a gathered issue: its state is unknown. It does not make #1
+        # `blocked`, but it is reported (never silently dropped) on an emitted entry.
+        bundle = {"meta": _META, "issues": [
+            _issue(1, blocked_by=[9], created_at="2026-01-01",
+                   updated_at="2026-04-01")]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "hung")
+        self.assertEqual(e["blocked_by"], [])
+        self.assertEqual(e["blocked_by_unknown"], [9])
+        self.assertIn("1 blocker(s) of unknown state", e["signals"])
+
+    def test_unknown_blocker_alongside_open_blocker(self):
+        bundle = {"meta": _META, "issues": [
+            _issue(1, blocked_by=[2, 9]), _issue(2)]}
+        derive.build_flow(bundle)
+        e = _one(bundle["flow"])
+        self.assertEqual(e["state"], "blocked")
+        self.assertEqual(e["blocked_by"], [2])
+        self.assertEqual(e["blocked_by_unknown"], [9])
+        self.assertIn("blocked by 1 issue(s)", e["signals"])
+        self.assertIn("1 blocker(s) of unknown state", e["signals"])
+
+    def test_hung_requires_staleness(self):
+        # open ~150 days, updated (commented) yesterday -> not hung (#60).
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-01-07", updated_at="2026-06-05",
+                   comments_list=[{}])]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+    def test_hung_needs_known_recency(self):
+        # no updated_at -> recency unknown -> not stale -> not hung.
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-01-01", updated_at=None)]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
+    def test_hung_staleness_boundary(self):
+        # updated exactly FLOW_STALE_DAYS (30) before ref -> stale -> hung; 29 -> not.
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-01-01", updated_at="2026-05-07")]}
+        derive.build_flow(bundle)
+        self.assertEqual(_one(bundle["flow"])["state"], "hung")
+        bundle = {"meta": _META, "issues": [
+            _issue(1, created_at="2026-01-01", updated_at="2026-05-08")]}
+        derive.build_flow(bundle)
+        self.assertEqual(bundle["flow"], [])
+
 
 class TestBlockers(unittest.TestCase):
     def test_in_degree_ranking_and_sort(self):
+        # #60: only open blockers, counting only open blocked issues -> every issue
+        # here (blockers and dependants) is open and present in the bundle.
+        dependants = [{"number": n, "url": "u%d" % n, "state": "open"}
+                      for n in (10, 11, 20, 21, 22, 30, 40, 41)]
         bundle = {"issues": [
-            {"number": 1, "url": "u1", "blocking": [10, 11]},
-            {"number": 2, "url": "u2", "blocking": [20, 21, 22]},
-            {"number": 3, "url": "u3", "blocking": [30]},
-            {"number": 4, "url": "u4", "blocking": [40, 41]},
-            {"number": 5, "url": "u5"},
-        ]}
+            {"number": 1, "url": "u1", "state": "open", "blocking": [10, 11]},
+            {"number": 2, "url": "u2", "state": "open", "blocking": [20, 21, 22]},
+            {"number": 3, "url": "u3", "state": "open", "blocking": [30]},
+            {"number": 4, "url": "u4", "state": "open", "blocking": [40, 41]},
+            {"number": 5, "url": "u5", "state": "open"},
+        ] + dependants}
         derive.build_blockers(bundle)
         out = bundle["blockers"]
         # sort: blocks_count desc, then number asc -> 2(3), 1(2), 4(2), 3(1)
@@ -632,7 +731,9 @@ class TestBlockers(unittest.TestCase):
 
     def test_dedup_blocks(self):
         bundle = {"issues": [
-            {"number": 1, "url": "u1", "blocking": [10, 10, 11]}]}
+            {"number": 1, "url": "u1", "state": "open", "blocking": [10, 10, 11]},
+            {"number": 10, "url": "u10", "state": "open"},
+            {"number": 11, "url": "u11", "state": "open"}]}
         derive.build_blockers(bundle)
         e = bundle["blockers"][0]
         self.assertEqual(e["blocks"], [10, 11])
@@ -640,6 +741,32 @@ class TestBlockers(unittest.TestCase):
 
     def test_empty_when_no_blocking(self):
         bundle = {"issues": [{"number": 1, "url": "u1"}]}
+        derive.build_blockers(bundle)
+        self.assertEqual(bundle["blockers"], [])
+
+    # -- #60 -----------------------------------------------------------------
+
+    def test_closed_blocker_excluded(self):
+        bundle = {"issues": [
+            {"number": 8, "url": "u8", "state": "closed", "blocking": [7]},
+            {"number": 7, "url": "u7", "state": "open"}]}
+        derive.build_blockers(bundle)
+        self.assertEqual(bundle["blockers"], [])
+
+    def test_closed_and_unknown_dependants_not_counted(self):
+        bundle = {"issues": [
+            {"number": 1, "url": "u1", "state": "open", "blocking": [2, 3, 4]},
+            {"number": 2, "url": "u2", "state": "open"},
+            {"number": 3, "url": "u3", "state": "closed"}]}  # #4 not in bundle
+        derive.build_blockers(bundle)
+        e = bundle["blockers"][0]
+        self.assertEqual(e["blocks"], [2])
+        self.assertEqual(e["blocks_count"], 1)
+
+    def test_blocker_with_no_open_dependants_omitted(self):
+        bundle = {"issues": [
+            {"number": 1, "url": "u1", "state": "open", "blocking": [3, 4]},
+            {"number": 3, "url": "u3", "state": "closed"}]}
         derive.build_blockers(bundle)
         self.assertEqual(bundle["blockers"], [])
 

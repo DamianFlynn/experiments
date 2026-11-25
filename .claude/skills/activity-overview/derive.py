@@ -639,6 +639,13 @@ FLOW_TRACTION_MIN = 5
 FLOW_HUNG_DAYS = 60
 
 
+def _issue_states(bundle):
+    """{issue number: state} for the bundle's issues. A number absent from this map
+    is an issue that was not gathered: its state is UNKNOWN (see `build_flow`)."""
+    return {iss.get("number"): iss.get("state")
+            for iss in bundle.get("issues", []) if iss.get("number") is not None}
+
+
 def build_flow(bundle):
     """Classify each OPEN issue into ONE flow pathology; emit only non-healthy.
 
@@ -649,9 +656,20 @@ def build_flow(bundle):
     (fallback `meta.to`). Issues with an OPEN linked PR (via PR `closes`/
     `crossref_issues`) are exempt from the activity-starved pathologies
     (upvoted/traction/hung) — there IS work in flight. Deterministic; sorted by
-    number. Pure (sets `bundle["flow"]`); returns bundle."""
+    number. Pure (sets `bundle["flow"]`); returns bundle.
+
+    Blocker state (#60): `issue["blocked_by"]` is the raw stored relation (extract
+    does not filter it). Only blockers that are bundle issues with `state=="open"`
+    count: they form the entry's `blocked_by` and drive `blocked`. A closed blocker
+    no longer blocks, so the issue falls through to its own pathology. A blocker
+    absent from the bundle has UNKNOWN state: it does not make the issue `blocked`
+    (gather pulls every open issue of the repo, so an un-gathered blocker was not
+    open when gathered), but it is listed in `blocked_by_unknown` and a signal.
+    `hung` requires staleness as well as age, so a long-lived issue with recent
+    activity is not `hung`."""
     meta = bundle.get("meta") or {}
     ref = _iso_date(meta.get("ref_date") or meta.get("to"))
+    states = _issue_states(bundle)
 
     # open issues with at least one open (unmerged) linked PR -> work in flight.
     open_pr_issues = set()
@@ -673,7 +691,9 @@ def build_flow(bundle):
         reactions = issue.get("reactions") or {}
         upvotes = reactions.get("+1", 0)
         reactions_total = reactions.get("total", 0)
-        blocked_by = issue.get("blocked_by") or []
+        raw_blockers = sorted(set(issue.get("blocked_by") or []))
+        blocked_by = [n for n in raw_blockers if states.get(n) == "open"]
+        blocked_by_unknown = [n for n in raw_blockers if n not in states]
         comments = len(issue.get("comments_list") or [])
 
         if blocked_by:
@@ -682,7 +702,8 @@ def build_flow(bundle):
             pathology = "upvoted_but_ignored"
         elif comments >= FLOW_TRACTION_MIN and stale and not has_open_pr:
             pathology = "traction_then_abandoned"
-        elif age_days is not None and age_days >= FLOW_HUNG_DAYS and not has_open_pr:
+        elif (age_days is not None and age_days >= FLOW_HUNG_DAYS and stale
+              and not has_open_pr):
             pathology = "hung"
         else:
             continue  # healthy -> not emitted
@@ -690,6 +711,8 @@ def build_flow(bundle):
         signals = []
         if blocked_by:
             signals.append(f"blocked by {len(blocked_by)} issue(s)")
+        if blocked_by_unknown:
+            signals.append(f"{len(blocked_by_unknown)} blocker(s) of unknown state")
         if reactions_total > 0:
             signals.append(f"{reactions_total} reactions")
         if stale:
@@ -706,6 +729,7 @@ def build_flow(bundle):
             "age_days": age_days,
             "reactions": reactions_total,
             "blocked_by": blocked_by,
+            "blocked_by_unknown": blocked_by_unknown,
             "signals": signals,
         })
 
@@ -721,13 +745,22 @@ def build_blockers(bundle):
     the issues to unblock first. For each issue with a non-empty `blocking` list,
     emit `{number, url, blocks_count, blocks}` where `blocks` is the sorted unique
     set it blocks. Sorted by `blocks_count` desc then number. Empty when no
-    blocking. Pure (sets `bundle["blockers"]`); returns bundle."""
+    blocking. Pure (sets `bundle["blockers"]`); returns bundle.
+
+    Open only (#60): `issue["blocking"]` is the raw stored relation. A blocker is
+    ranked only when it is itself `state=="open"`, and `blocks` keeps only the
+    blocked issues that are bundle issues with `state=="open"` — closed dependants
+    and dependants absent from the bundle (state unknown) are not counted. A blocker
+    left with no open dependant is omitted."""
+    states = _issue_states(bundle)
     entries = []
     for issue in bundle.get("issues", []):
-        blocking = issue.get("blocking") or []
-        if not blocking:
+        if issue.get("state") != "open":
             continue
-        blocks = sorted(set(blocking))
+        blocks = sorted(n for n in set(issue.get("blocking") or [])
+                        if states.get(n) == "open")
+        if not blocks:
+            continue
         entries.append({
             "number": issue.get("number"),
             "url": issue.get("url"),

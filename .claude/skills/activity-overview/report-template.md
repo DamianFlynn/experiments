@@ -195,18 +195,22 @@ never attributes a stall/blocker to a person (that is the gated internal appendi
 Omit the whole section when `flow`/`blockers` are empty and there are no stalled trains.
 
 **Flow pathologies** — the per-issue classification in `bundle["flow"]` (deterministic;
-each entry already carries its `state`, `age_days`, `reactions`, `blocked_by`, and
-`signals`). Group by `state` in this order — **blocked → upvoted_but_ignored →
+each entry already carries its `state`, `age_days`, `reactions`, `blocked_by` (open
+blockers only), `blocked_by_unknown`, and `signals`). `blocked` means at least one
+**open** blocker; a closed blocker no longer blocks; `hung` means old **and** stale (no
+update for 30 days). Group by `state` in this order — **blocked → upvoted_but_ignored →
 traction_then_abandoned → hung** — each issue cited:
 
 - [{title}]({url}) (#{number}) — *{state}* — {", ".join(flow_entry.signals)}
 
-**Top blockers** — issues ranked by how many others they block, from
+**Top blockers** — open issues ranked by how many other open issues they block, from
 `bundle["blockers"]` (highest `blocks_count` first) — the ones to unblock first:
 
 - [{title}]({url}) (#{number}) — blocks {blocks_count}: {blocks joined as #N, …}
 
-{Embed the dependency graph when `diagrams.blocker_graph` is present:}
+{Embed the dependency graph when `diagrams.blocker_graph` is present. It draws every stored
+`blocks` relation, including ones whose blocker is already closed, so it can show more
+than the open-only lists above:}
 
 ```mermaid
 {diagrams.blocker_graph}

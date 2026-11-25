@@ -462,13 +462,13 @@ people-and-flow features worth calling out:
 
 ```mermaid
 flowchart TB
-  open[open issue] --> b{blocked_by?}
+  open[open issue] --> b{blocked by an<br/>OPEN issue?}
   b -- yes --> BL[blocked]
   b -- no --> u{👍 ≥ 5 AND stale<br/>AND no open PR?}
   u -- yes --> UP[upvoted_but_ignored]
   u -- no --> t{≥ 5 comments AND stale<br/>AND no open PR?}
   t -- yes --> TR[traction_then_abandoned]
-  t -- no --> h{age ≥ 60d AND no open PR?}
+  t -- no --> h{age ≥ 60d AND stale<br/>AND no open PR?}
   h -- yes --> HU[hung]
   h -- no --> HE[healthy → omitted]
 ```
