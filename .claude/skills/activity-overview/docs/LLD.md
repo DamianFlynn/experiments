@@ -273,7 +273,12 @@ flowchart TB
   accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
   first `module.<name>` token gives its owning module. Local sources resolve to repo areas
   (`../..` from a submodule → the root `main.tf` area); registry sources keep `to=None,
-  ref=<source>, version`.
+  ref=<source>, version`. Module blocks are parsed on an HCL mask (`_hcl_mask`: `#`, `//`,
+  `/* */` comments, string contents incl. `${…}` interpolation, and heredocs blanked), so a
+  commented-out or heredoc'd `module "x" {` is never a block; only file-top-level blocks
+  count, and `source`/`version` are the block's own **top-level** arguments
+  (`_tf_top_level_attr`: line-anchored, bracket depth 0), so `kubernetes_version`,
+  `custom_source` or a `version` key inside a nested map/list is ignored.
 - **Concurrency:** a thread pool of `ACTIVITY_IAC_MAX_WORKERS` (8), per-subprocess timeout
   `ACTIVITY_IAC_BUILD_TIMEOUT` (300 s), `ACTIVITY_IAC_RETRIES` (1). With `TF_PLUGIN_CACHE_DIR`
   set, `_terraform_prewarm` runs one serial init first because terraform's plugin cache is not

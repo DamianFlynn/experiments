@@ -1522,9 +1522,140 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     return sorted(edges, key=lambda e: (e["transitive"], str(e["to"]), str(e["ref"])))
 
 
-_TF_MODULE_HEAD_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{')
-_TF_SOURCE_RE = re.compile(r'source\s*=\s*"(?P<src>[^"]+)"')
-_TF_VERSION_RE = re.compile(r'version\s*=\s*"(?P<ver>[^"]+)"')
+# Module-block parsing runs on an HCL "mask" of the text (see _hcl_mask): comments,
+# string contents and heredocs are blanked to spaces at the SAME offsets, so these
+# patterns only ever see real HCL structure and values are sliced from the
+# original text. A module head must start its line (after optional whitespace);
+# its label may be quoted or a bare identifier.
+_TF_MODULE_HEAD_RE = re.compile(
+    r'(?m)^[ \t]*module[ \t]+(?:"(?P<name>[^"\n]+)"|(?P<ident>[A-Za-z_][\w-]*))[ \t]*\{')
+# A top-level `source`/`version` ARGUMENT: anchored at line start (so
+# `kubernetes_version`/`custom_source` never match), `=` but not `==`, and a
+# plain quoted string value. Depth-0 (not inside a nested block/map/list) is
+# checked separately by _tf_top_level_attr.
+_TF_ATTR_RE = {
+    key: re.compile(r'(?m)^[ \t]*%s[ \t]*=(?!=)[ \t]*"(?P<val>[^"\n]*)"' % key)
+    for key in ("source", "version")}
+_TF_HEREDOC_RE = re.compile(r'<<-?(?P<id>[A-Za-z_][\w-]*)[ \t]*\r?\n')
+_HCL_OPEN, _HCL_CLOSE = "{[(", "}])"
+
+
+def _hcl_mask(text):
+    """Return `text` with HCL comments, string-literal contents and heredoc
+    bodies replaced by spaces (newlines kept), so offsets are unchanged.
+
+    Handles `#` / `//` line comments, `/* */` block comments, double-quoted
+    strings with `\\` escapes, `${...}` / `%{...}` template interpolation (with
+    nested braces and nested strings) and `$${` / `%%{` literal escapes, and
+    `<<ID` / `<<-ID` heredocs closed by a line holding only `ID`. The quote
+    characters of a top-level string are kept so a value's span can be located.
+    An unterminated quoted string ends at the newline (HCL forbids newlines in
+    quoted strings outside interpolation); an unterminated block comment or
+    heredoc runs to the end. Internal helper. Pure."""
+    out = list(text)
+    n = len(text)
+
+    def blank(a, b):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    stack = []          # "str" | [interp_brace_depth]; empty = code context
+    i = 0
+    while i < n:
+        c = text[i]
+        if stack and stack[-1] == "str":
+            if c == "\\":
+                blank(i, min(i + 2, n))
+                i += 2
+            elif c in "$%" and text.startswith(c + c + "{", i):   # literal $${
+                blank(i, i + 3)
+                i += 3
+            elif c in "$%" and text.startswith(c + "{", i):
+                blank(i, i + 2)
+                stack.append([0])
+                i += 2
+            elif c == '"' or (c == "\n" and len(stack) == 1):
+                stack.pop()
+                if stack and c == '"':
+                    blank(i, i + 1)                     # nested string's quote
+                i += 1
+            else:
+                blank(i, i + 1)
+                i += 1
+            continue
+        if stack:                                       # inside an interpolation
+            top = stack[-1]
+            if c == '"':
+                stack.append("str")
+            elif c == "{":
+                top[0] += 1
+            elif c == "}":
+                if top[0]:
+                    top[0] -= 1
+                else:
+                    stack.pop()
+            blank(i, i + 1)
+            i += 1
+            continue
+        # code context
+        if c == "#" or text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif c == '"':
+            stack.append("str")
+            i += 1
+        elif c == "<" and text.startswith("<<", i):
+            m = _TF_HEREDOC_RE.match(text, i)
+            if not m:
+                i += 1
+                continue
+            end = re.compile(r'(?m)^[ \t]*%s[ \t]*\r?$' % re.escape(m.group("id")))
+            em = end.search(text, m.end())
+            j = n if em is None else em.end()
+            blank(i, j)
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _hcl_depths(masked):
+    """Bracket depth ({, [, ( combined) BEFORE each offset of a masked text, as a
+    list of len(masked)+1. Internal helper. Pure."""
+    depths, d = [0], 0
+    for ch in masked:
+        if ch in _HCL_OPEN:
+            d += 1
+        elif ch in _HCL_CLOSE:
+            d = max(d - 1, 0)
+        depths.append(d)
+    return depths
+
+
+def _tf_top_level_attr(body, key):
+    """Value of the module body's own top-level `key = "..."` argument, or None.
+
+    Ignores the key inside comments, strings, heredocs and nested blocks/maps/
+    lists (e.g. `providers = {...}`, an object input with a `version` field) and
+    longer names ending in the key (`kubernetes_version`). First match wins
+    (HCL rejects a duplicate argument). Internal helper. Pure."""
+    body = body or ""
+    masked = _hcl_mask(body)
+    depths = None
+    for m in _TF_ATTR_RE[key].finditer(masked):
+        if depths is None:
+            depths = _hcl_depths(masked)
+        if depths[m.start()] == 0:
+            return body[m.start("val"):m.end("val")]
+    return None
 # Terraform graph DOT edge. The `[root] ` node prefix is OPTIONAL: older
 # `terraform graph` emitted `"[root] module.x..." -> "[root] ..."`, but modern
 # terraform (>=~1.x default graph) emits unprefixed `"module.x..." -> "..."`.
@@ -1539,27 +1670,37 @@ def _terraform_module_bodies(tf_text):
 
     Non-greedy regexes break on nested blocks (`tags { ... }`, `dynamic`), so the
     body is scanned from the opening `{` to its matching close, counting depth.
-    Internal helper. Pure."""
+    Scanning runs on the HCL mask (_hcl_mask), so a `module "x" {` inside a
+    comment, string or heredoc is not a block and braces in those never count;
+    only modules at file top level (depth 0) are returned. The body is the
+    ORIGINAL text. An unclosed block runs to end of text. Internal helper. Pure."""
     text = tf_text or ""
+    masked = _hcl_mask(text)
+    depths = _hcl_depths(masked)
     out = {}
-    for m in _TF_MODULE_HEAD_RE.finditer(text):
-        depth, i = 1, m.end()
-        while i < len(text) and depth:
-            depth += (text[i] == "{") - (text[i] == "}")
+    for m in _TF_MODULE_HEAD_RE.finditer(masked):
+        brace = m.end() - 1                         # offset of the opening `{`
+        if depths[brace] != 0:
+            continue
+        g = "name" if m.group("name") is not None else "ident"
+        name = text[m.start(g):m.end(g)]
+        i = m.end()
+        while i < len(masked) and depths[i + 1] > 0:
             i += 1
-        out[m.group("name")] = text[m.end():i - 1]
+        out[name] = text[m.end():i]
     return out
 
 
 def parse_terraform_module_blocks(tf_text):
     """Map each `module "<name>" { source = "..." }` to its source string. Pure.
 
-    Brace-balanced so a `source` after a nested block is still found."""
+    Brace-balanced so a `source` after a nested block is still found; only the
+    block's own top-level `source` argument counts (_tf_top_level_attr)."""
     out = {}
     for name, body in _terraform_module_bodies(tf_text).items():
-        sm = _TF_SOURCE_RE.search(body)
-        if sm:
-            out[name] = sm.group("src")
+        src = _tf_top_level_attr(body, "source")
+        if src:
+            out[name] = src
     return out
 
 
@@ -1605,8 +1746,8 @@ def _resolve_tf_module_source(name, sources, bodies, base_dir, patterns):
         area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
             or rel or "main.tf"
         return area, src, None
-    vm = _TF_VERSION_RE.search(bodies.get(name, ""))
-    return None, src, (vm.group("ver") if vm else None)  # external: to=None, ref=src
+    version = _tf_top_level_attr(bodies.get(name, ""), "version") or None
+    return None, src, version                          # external: to=None, ref=src
 
 
 def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,

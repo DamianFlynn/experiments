@@ -1734,6 +1734,169 @@ class TestTerraformParsers(unittest.TestCase):
         self.assertEqual(gather.parse_terraform_module_blocks(None), {})
 
 
+class TestTerraformModuleAttributeParsing(unittest.TestCase):
+    """#67: `source`/`version` are the module block's own TOP-LEVEL arguments;
+    comments, strings, heredocs and nested blocks/maps must not leak into them."""
+
+    BASE = "live/prod/main.tf"
+
+    def _edge(self, tf, name="m"):
+        dot = 'digraph {\n"x" -> "module.%s.y"\n}\n' % name
+        edges = gather.build_terraform_edges(
+            tf, dot, self.BASE, set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(len(edges), 1, edges)
+        return edges[0]
+
+    def _scan(self, files):
+        return gather.scan_structural_terraform_areas(
+            "clone", gather.DEFAULT_AREA_PATTERNS,
+            list_files=lambda: sorted(files), read_text=lambda rel: files[rel])
+
+    # --- the four confirmed cases ------------------------------------------
+    def test_kubernetes_version_is_not_the_module_version(self):
+        tf = ('module "m" {\n'
+              '  source             = "git::https://example.com/aks.git?ref=v1"\n'
+              '  kubernetes_version = "1.29"\n'
+              '}\n')
+        self.assertIsNone(self._edge(tf)["version"])
+
+    def test_min_tls_version_is_not_the_module_version(self):
+        tf = ('module "m" {\n'
+              '  source          = "Azure/storage/azurerm"\n'
+              '  min_tls_version = "TLS1_2"\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual(e["ref"], "Azure/storage/azurerm")
+        self.assertIsNone(e["version"])
+
+    def test_custom_source_before_source_is_ignored(self):
+        tf = ('module "m" {\n'
+              '  custom_source = "x"\n'
+              '  source        = "../../modules/real"\n'
+              '}\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {"m": "../../modules/real"})
+
+    def test_hash_commented_module_is_not_an_edge(self):
+        tf = ('# module "old" { source = "./modules/old" }\n'
+              'module "m" { source = "./modules/new" }\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {"m": "./modules/new"})
+        got = self._scan({"main.tf": tf})
+        tos = {e["to"] for a in got.values() for e in a["edges"]}
+        self.assertNotIn("modules/old", tos)
+        self.assertIn("modules/new", tos)
+
+    def test_slash_commented_module_is_not_an_edge(self):
+        tf = '// module "old" { source = "./modules/old" }\n'
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {})
+
+    def test_commented_source_line_inside_module_is_ignored(self):
+        tf = ('module "m" {\n'
+              '  # source = "./modules/old"\n'
+              '  // version = "9.9.9"\n'
+              '  source  = "Azure/naming/azurerm"\n'
+              '  version = "0.4.0" # pinned\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual((e["ref"], e["version"]), ("Azure/naming/azurerm", "0.4.0"))
+
+    # --- additional acceptance cases ----------------------------------------
+    def test_version_inside_nested_map_is_ignored(self):
+        tf = ('module "m" {\n'
+              '  source = "Azure/aks/azurerm"\n'
+              '  settings = {\n'
+              '    version = "x"\n'
+              '    source  = "y"\n'
+              '  }\n'
+              '  node_pools = [\n'
+              '    { version = "z" },\n'
+              '  ]\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual(e["ref"], "Azure/aks/azurerm")
+        self.assertIsNone(e["version"])
+
+    def test_source_and_version_after_nested_block_are_found(self):
+        tf = ('module "m" {\n'
+              '  providers = {\n'
+              '    azurerm = azurerm.alt\n'
+              '  }\n'
+              '  tags = { version = "nope" }\n'
+              '  source  = "Azure/naming/azurerm"\n'
+              '  version = "0.4.0"\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual((e["ref"], e["version"]), ("Azure/naming/azurerm", "0.4.0"))
+
+    def test_module_inside_block_comment_is_ignored(self):
+        tf = ('/*\n'
+              'module "old" {\n'
+              '  source = "./modules/old"\n'
+              '}\n'
+              '*/\n'
+              'module "m" { source = "./modules/new" } /* trailing */\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {"m": "./modules/new"})
+
+    def test_hash_inside_string_is_not_a_comment(self):
+        tf = ('module "m" {\n'
+              '  label   = "a # b { c"\n'
+              '  source  = "git::https://example.com/x.git?ref=v1#frag"\n'
+              '  version = "1.0.0"\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual(e["ref"], "git::https://example.com/x.git?ref=v1#frag")
+        self.assertEqual(e["version"], "1.0.0")
+
+    def test_string_with_escapes_and_interpolation_does_not_break_parsing(self):
+        tf = ('module "m" {\n'
+              '  name   = "say \\"hi\\" ${lookup(var.m, "}", "x")} {"\n'
+              '  source = "./modules/a"\n'
+              '}\n'
+              'module "n" { source = "./modules/b" }\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf),
+                         {"m": "./modules/a", "n": "./modules/b"})
+
+    def test_heredoc_containing_module_text_is_ignored(self):
+        tf = ('locals {\n'
+              '  doc = <<EOT\n'
+              'module "x" {\n'
+              '  source = "./modules/x"\n'
+              '# not a comment }\n'
+              'EOT\n'
+              '}\n'
+              'module "m" {\n'
+              '  policy = <<-JSON\n'
+              '    { "version": "2012", "source = \\"no\\"": 1 }\n'
+              '    version = "bad"\n'
+              '  JSON\n'
+              '  source = "Azure/naming/azurerm"\n'
+              '}\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf),
+                         {"m": "Azure/naming/azurerm"})
+        self.assertIsNone(self._edge(tf)["version"])
+
+    def test_two_modules_on_consecutive_lines(self):
+        tf = ('module "a" { source = "./modules/a" }\n'
+              'module "b" { source = "./modules/b" }\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf),
+                         {"a": "./modules/a", "b": "./modules/b"})
+
+    def test_module_nested_in_another_block_is_not_top_level(self):
+        tf = ('locals {\n'
+              '  x = { module "fake" { source = "./modules/fake" } }\n'
+              '}\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {})
+
+    def test_static_scan_ignores_comment_and_nested_version(self):
+        files = {"main.tf": ('/* module "old" { source = "./modules/old" } */\n'
+                             'module "aks" {\n'
+                             '  source             = "Azure/aks/azurerm"\n'
+                             '  kubernetes_version = "1.29"\n'
+                             '}\n')}
+        edges = [e for a in self._scan(files).values() for e in a["edges"]]
+        self.assertEqual([(e["to"], e["ref"], e["version"]) for e in edges],
+                         [(None, "Azure/aks/azurerm", None)])
+
+
 class TestBuildTerraformEdges(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
