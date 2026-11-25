@@ -7,13 +7,16 @@ import argparse
 import concurrent.futures
 import copy
 import datetime
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import derive
@@ -2026,9 +2029,41 @@ def clone_head_sha(clone_dir, run=run_git):
 # providers serially first so the parallel inits are cache HITS (no race) — keeping
 # parallel extraction safe without lowering the workers. The defaults are unchanged
 # for the offline test/CI path.
-IAC_BUILD_TIMEOUT = int(os.environ.get("ACTIVITY_IAC_BUILD_TIMEOUT", "300"))  # seconds per subprocess
-IAC_MAX_WORKERS = int(os.environ.get("ACTIVITY_IAC_MAX_WORKERS", "8"))        # parallel per-module builds
-IAC_RETRIES = int(os.environ.get("ACTIVITY_IAC_RETRIES", "1"))               # extra attempts on timeout/failure
+#
+# These are the DEFAULTS. The env overrides are read at CALL time (_iac_settings)
+# through `_env_int`, never at import: a non-integer is a clear error naming the
+# variable, and an out-of-range value (e.g. ACTIVITY_IAC_MAX_WORKERS=0, which
+# ThreadPoolExecutor rejects) is clamped to its minimum with a warning.
+IAC_BUILD_TIMEOUT = 300  # seconds per subprocess   (ACTIVITY_IAC_BUILD_TIMEOUT, min 1)
+IAC_MAX_WORKERS = 8      # parallel per-module builds (ACTIVITY_IAC_MAX_WORKERS, min 1)
+IAC_RETRIES = 1          # extra attempts on timeout/failure (ACTIVITY_IAC_RETRIES, min 0)
+
+
+def _env_int(name, default, minimum, env=None):
+    """Read an integer env knob. Unset/blank -> `default`. A non-integer raises
+    SystemExit with a message naming the variable and the bad value. A value
+    below `minimum` is clamped to `minimum` with a stderr warning."""
+    env = os.environ if env is None else env
+    raw = env.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        raise SystemExit(
+            "error: {} must be an integer (got {!r})".format(name, raw)) from None
+    if value < minimum:
+        sys.stderr.write("warning: {}={} is below the minimum {}; using {}\n".format(
+            name, value, minimum, minimum))
+        return minimum
+    return value
+
+
+def _iac_settings(env=None):
+    """(timeout, max_workers, retries) for the IaC edge build, from env at call time."""
+    return (_env_int("ACTIVITY_IAC_BUILD_TIMEOUT", IAC_BUILD_TIMEOUT, 1, env),
+            _env_int("ACTIVITY_IAC_MAX_WORKERS", IAC_MAX_WORKERS, 1, env),
+            _env_int("ACTIVITY_IAC_RETRIES", IAC_RETRIES, 0, env))
 
 
 def _list_tf_files(clone_dir, rel_dir):
@@ -2111,8 +2146,7 @@ def _terraform_prewarm(build_areas, clone_dir, run, timeout):
 
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
                       read_text=_read_text_file, patterns=None,
-                      max_workers=IAC_MAX_WORKERS, timeout=IAC_BUILD_TIMEOUT,
-                      retries=IAC_RETRIES):
+                      max_workers=None, timeout=None, retries=None):
     """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
 
     Each area with a main.bicep (and `bicep` on PATH) or a *.tf (and `terraform` on
@@ -2123,6 +2157,12 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
     `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
+    # None -> the env-overridable defaults (read now, not at import). An explicit
+    # max_workers is still clamped so ThreadPoolExecutor never sees a value < 1.
+    env_timeout, env_workers, env_retries = _iac_settings()
+    timeout = env_timeout if timeout is None else timeout
+    max_workers = env_workers if max_workers is None else max(1, max_workers)
+    retries = env_retries if retries is None else retries
     areas = code_graph.get("areas", [])
     area_ids = {a["id"] for a in areas}
     have_bicep = bool(which("bicep"))
@@ -2170,31 +2210,246 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     return code_graph
 
 
-def http_get_json(url, token, allow_404=False):
-    """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested.
+# --- GitHub HTTP layer (#56) ---------------------------------------------------
+#
+# Every REST and GraphQL call goes through `_github_open`, which adds:
+#   * a timeout on every request (ACTIVITY_HTTP_TIMEOUT, default 60 s), so one
+#     stalled connection cannot hang the run;
+#   * bounded retries with exponential back-off on timeouts, connection errors
+#     and 5xx (ACTIVITY_HTTP_RETRIES, default 3 extra attempts);
+#   * rate-limit back-off per GitHub's documented rules: a 403/429 with
+#     `x-ratelimit-remaining: 0` (primary) waits until `x-ratelimit-reset`; one
+#     with `Retry-After` waits that long; a secondary-limit message with neither
+#     header waits 60 s, doubling on repeats. Every wait is announced on stderr
+#     (how long, until when), is capped by ACTIVITY_RATE_LIMIT_MAX_WAIT (default
+#     3600 s, 0 = never wait) and at most RATE_LIMIT_MAX_WAITS waits are made per
+#     request. Any other 403 (SAML SSO, token scope) fails fast with the existing
+#     diagnostic;
+#   * a redirect handler that drops `Authorization` when a 3xx leaves
+#     https://api.github.com (urllib's default handler would re-send it), and the
+#     token is only ever attached to https://api.github.com URLs in the first place.
+# `opener`, `sleep` and `clock` are injectable so the suite never sleeps or
+# touches the network. The token never appears in a log line or error message:
+# only URLs (which carry no credentials) and GitHub's response headers are shown.
 
-    On an HTTP error, GitHub explains the cause in the response body and a few
-    headers (rate limit vs. SAML SSO vs. token scope). urllib discards both by
-    default, leaving only a bare "HTTP Error 403", so we surface them ourselves.
+GITHUB_API_HOST = "api.github.com"
+HTTP_TIMEOUT = 60                  # seconds per request   (ACTIVITY_HTTP_TIMEOUT, min 1)
+HTTP_RETRIES = 3                   # extra attempts on timeout/5xx (ACTIVITY_HTTP_RETRIES, min 0)
+RATE_LIMIT_MAX_WAIT = 3600         # longest single wait, s (ACTIVITY_RATE_LIMIT_MAX_WAIT, min 0)
+RATE_LIMIT_MAX_WAITS = 5           # rate-limit waits per request before giving up
+SECONDARY_RATE_LIMIT_WAIT = 60     # GitHub: "wait at least one minute" with no header
+_RETRYABLE_STATUS = (500, 502, 503, 504)
+_BACKOFF_CAP = 60
+
+
+class GitHubAPIError(Exception):
+    """A GitHub API failure (HTTP error, exhausted retries, GraphQL errors with no
+    data). A normal Exception, so best-effort layers (the Projects v2 board) can
+    catch it and degrade. REST `http_get_json` re-raises it as SystemExit to keep
+    its fail-fast contract."""
+
+
+def _http_settings(env=None):
+    """(timeout, retries, max_wait) from env at call time (validated)."""
+    return (_env_int("ACTIVITY_HTTP_TIMEOUT", HTTP_TIMEOUT, 1, env),
+            _env_int("ACTIVITY_HTTP_RETRIES", HTTP_RETRIES, 0, env),
+            _env_int("ACTIVITY_RATE_LIMIT_MAX_WAIT", RATE_LIMIT_MAX_WAIT, 0, env))
+
+
+def validate_env_knobs(env=None):
+    """Parse every integer env knob once, up front, so a bad value fails before
+    any clone or API call (SystemExit naming the variable)."""
+    _http_settings(env)
+    _iac_settings(env)
+
+
+def _auth_allowed(url):
+    """The token is only ever sent to https://api.github.com."""
+    parts = urllib.parse.urlsplit(url or "")
+    return parts.scheme == "https" and (parts.hostname or "").lower() == GITHUB_API_HOST
+
+
+class _GitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but strip `Authorization` when the target is not
+    https://api.github.com (e.g. a signed blob-storage URL for logs/artifacts)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and not _auth_allowed(newurl):
+            for store in (new.headers, new.unredirected_hdrs):
+                for key in [k for k in store if k.lower() == "authorization"]:
+                    del store[key]
+        return new
+
+
+def _default_opener():
+    return urllib.request.build_opener(_GitHubRedirectHandler)
+
+
+def _github_headers(url, token, extra=None):
+    headers = {"Accept": "application/vnd.github+json",
+               "User-Agent": "activity-overview"}
+    if token and _auth_allowed(url):
+        headers["Authorization"] = f"Bearer {token}"
+    headers.update(extra or {})
+    return headers
+
+
+def _header_int(headers, name):
+    value = headers.get(name) if headers is not None else None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _error_message(body):
+    try:
+        return json.loads((body or b"").decode()).get("message", "") or ""
+    except Exception:
+        return ""
+
+
+def _rate_limit_wait(code, headers, message, clock, secondary_seen=0):
+    """Classify a refusal. Returns (kind, seconds) with kind 'primary' or
+    'secondary', or (None, 0) for a response that is NOT a rate limit (a genuine
+    403 for SSO/scope must fail fast). Follows GitHub's documented rules: honour
+    Retry-After; with x-ratelimit-remaining 0 wait until x-ratelimit-reset; a
+    secondary limit with neither header waits a minute, growing on repeats."""
+    if code not in (403, 429):
+        return None, 0
+    remaining = str(headers.get("x-ratelimit-remaining") or "").strip()
+    retry_after = _header_int(headers, "Retry-After")
+    text = (message or "").lower()
+    secondary_msg = "secondary rate limit" in text or "abuse" in text
+    if retry_after is not None:
+        return ("primary" if remaining == "0" and not secondary_msg
+                else "secondary"), max(1, retry_after)
+    if remaining == "0":
+        reset = _header_int(headers, "x-ratelimit-reset")
+        wait = SECONDARY_RATE_LIMIT_WAIT if reset is None else int(reset - clock()) + 1
+        return ("secondary" if secondary_msg else "primary"), max(1, wait)
+    if secondary_msg or code == 429:
+        return "secondary", SECONDARY_RATE_LIMIT_WAIT * (2 ** secondary_seen)
+    return None, 0
+
+
+def _utc(ts):
+    return datetime.datetime.fromtimestamp(
+        ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _wait_for_rate_limit(kind, wait, url, waits, max_wait, sleep, clock, diagnostic):
+    """Sleep out one rate-limit window (bounded + announced on stderr) or raise."""
+    if waits > RATE_LIMIT_MAX_WAITS:
+        raise GitHubAPIError(
+            f"{diagnostic}\n  rate limit: still limited after "
+            f"{RATE_LIMIT_MAX_WAITS} waits; giving up.")
+    if wait > max_wait:
+        raise GitHubAPIError(
+            f"{diagnostic}\n  rate limit: {kind} limit resets in {wait}s (at "
+            f"{_utc(clock() + wait)}), longer than ACTIVITY_RATE_LIMIT_MAX_WAIT="
+            f"{max_wait}s; not waiting. Re-run later or raise the cap.")
+    sys.stderr.write(
+        f"warning: GitHub {kind} rate limit hit on {url}; waiting {wait}s "
+        f"(until {_utc(clock() + wait)}) [wait {waits}/{RATE_LIMIT_MAX_WAITS}]\n")
+    sleep(wait)
+
+
+def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
+                 rate_limited=None):
+    """Send `req` with timeout, retries and rate-limit back-off. Returns
+    (headers, body_bytes), or (None, 404) for a 404 when allow_404. Raises
+    GitHubAPIError on any other failure.
+
+    `rate_limited(headers, body)` optionally reports a rate limit signalled in a
+    200 body (GraphQL `RATE_LIMITED`); it returns True to trigger a wait."""
+    opener = opener or _default_opener()
+    sleep = sleep or time.sleep
+    clock = clock or time.time
+    timeout, retries, max_wait = _http_settings()
+    attempt, waits, secondary = 0, 0, 0
+
+    def backoff(reason):
+        nonlocal attempt
+        attempt += 1
+        delay = min(_BACKOFF_CAP, 2 ** (attempt - 1))
+        sys.stderr.write(
+            f"warning: GitHub API {reason} for {url}; retrying in {delay}s "
+            f"(attempt {attempt + 1}/{retries + 1})\n")
+        sleep(delay)
+
+    while True:
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                headers, body = resp.headers, resp.read()
+        except urllib.error.HTTPError as err:
+            if allow_404 and err.code == 404:
+                return None, 404
+            try:
+                body = err.read()
+            except Exception:
+                body = b""
+            diagnostic = _format_http_error(url, err, body)
+            kind, wait = _rate_limit_wait(err.code, err.headers,
+                                          _error_message(body), clock, secondary)
+            if kind:
+                waits += 1
+                secondary += kind == "secondary"
+                _wait_for_rate_limit(kind, wait, url, waits, max_wait, sleep,
+                                     clock, diagnostic)
+                continue
+            if err.code in _RETRYABLE_STATUS and attempt < retries:
+                backoff(f"{err.code}")
+                continue
+            if err.code in _RETRYABLE_STATUS:
+                diagnostic += f"\n  gave up after {attempt + 1} attempt(s)."
+            raise GitHubAPIError(diagnostic) from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+            # URLError (DNS, refused, wrapped timeout), TimeoutError/socket.timeout
+            # and ConnectionError (resets) are OSError subclasses; HTTPException
+            # covers RemoteDisconnected / IncompleteRead mid-body.
+            reason = getattr(err, "reason", None) or err
+            if attempt < retries:
+                backoff(f"request failed ({type(err).__name__}: {reason})")
+                continue
+            raise GitHubAPIError(
+                f"error: GitHub API request to {url} failed after {attempt + 1} "
+                f"attempt(s): {type(err).__name__}: {reason} "
+                f"(timeout {timeout}s; ACTIVITY_HTTP_TIMEOUT / "
+                f"ACTIVITY_HTTP_RETRIES tune this)") from None
+        if rate_limited is not None and rate_limited(headers, body):
+            waits += 1
+            reset = _header_int(headers, "x-ratelimit-reset")
+            wait = (SECONDARY_RATE_LIMIT_WAIT if reset is None
+                    else max(1, int(reset - clock()) + 1))
+            _wait_for_rate_limit("primary", wait, url, waits, max_wait, sleep,
+                                 clock, f"error: GitHub API rate limited for {url}")
+            continue
+        return headers, body
+
+
+def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=None):
+    """GET a GitHub API URL → (parsed_json, next_url).
+
+    Timeouts, retries, rate-limit back-off and redirect auth-stripping come from
+    `_github_open` (see the section comment above). On an HTTP error, GitHub
+    explains the cause in the response body and a few headers (rate limit vs.
+    SAML SSO vs. token scope); `_format_http_error` surfaces both.
 
     With allow_404=True a 404 returns (None, 404) instead of raising, so the
-    backfill seam can map a definitively-absent ref to ABSENT. All other HTTP
-    errors still raise SystemExit with the diagnostic.
+    backfill seam can map a definitively-absent ref to ABSENT. All other
+    failures raise SystemExit with the diagnostic (fail fast).
     """
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "activity-overview",
-    })
+    req = urllib.request.Request(url, headers=_github_headers(url, token))
     try:
-        with urllib.request.urlopen(req) as resp:
-            body = json.loads(resp.read().decode())
-            nxt = _next_link(resp.headers.get("Link", ""))
-        return body, nxt
-    except urllib.error.HTTPError as err:
-        if allow_404 and err.code == 404:
-            return None, 404
-        raise SystemExit(_format_http_error(url, err)) from err
+        headers, body = _github_open(req, url, allow_404=allow_404, opener=opener,
+                                     sleep=sleep, clock=clock)
+    except GitHubAPIError as err:
+        raise SystemExit(str(err)) from None
+    if headers is None and body == 404:
+        return None, 404
+    return json.loads(body.decode()), _next_link(headers.get("Link", ""))
 
 
 # Headers GitHub uses to explain a refusal; surfaced verbatim on error so the
@@ -2202,24 +2457,28 @@ def http_get_json(url, token, allow_404=False):
 _DIAGNOSTIC_HEADERS = (
     "x-ratelimit-remaining",
     "x-ratelimit-reset",
+    "retry-after",
     "x-github-sso",
     "x-accepted-oauth-scopes",
     "x-oauth-scopes",
 )
 
 
-def _format_http_error(url, err):
+def _format_http_error(url, err, body=None):
     """Build a one-screen diagnostic from an HTTPError: status, GitHub's message,
-    and the headers that disambiguate a 403."""
-    try:
-        detail = json.loads(err.read().decode()).get("message", "")
-    except Exception:
-        detail = ""
+    and the headers that disambiguate a 403. `body` is the already-read response
+    body (an HTTPError body can only be read once); None reads it here."""
+    if body is None:
+        try:
+            body = err.read()
+        except Exception:
+            body = b""
+    detail = _error_message(body)
     lines = [f"error: GitHub API {err.code} for {url}"]
     if detail:
         lines.append(f"  message: {detail}")
     for name in _DIAGNOSTIC_HEADERS:
-        value = err.headers.get(name)
+        value = err.headers.get(name) if err.headers is not None else None
         if value:
             lines.append(f"  {name}: {value}")
     if err.code == 403:
@@ -2233,9 +2492,9 @@ def _format_http_error(url, err):
 # --- Projects v2 (Phase 12): GraphQL board ingest ----------------------------
 #
 # gather is REST-only everywhere else; this is its single GraphQL call. The
-# helper is kept THIN (like http_get_json) and is NOT unit-tested — the
-# normalization (parse_project_board) and the fetch driver (fetch_project_board)
-# ARE, against crafted fixtures.
+# helper is kept THIN (like http_get_json); it is tested through an injected
+# opener (test_github_api.py), and the normalization (parse_project_board) and
+# the fetch driver (fetch_project_board) against crafted fixtures.
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 
@@ -2326,29 +2585,49 @@ query($id:ID!, $cursor:String) {
 """.strip()
 
 
-def graphql_post(token, query, variables=None):
+def _graphql_rate_limited(headers, body):
+    """True when a 200 GraphQL response reports a RATE_LIMITED error."""
+    try:
+        errors = json.loads(body.decode()).get("errors") or []
+    except Exception:
+        return False
+    return any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
+               for e in errors)
+
+
+def graphql_post(token, query, variables=None, opener=None, sleep=None, clock=None):
     """POST a GraphQL query to GitHub's `/graphql`, returning the parsed `data`.
-    Not unit-tested (like http_get_json). Surfaces HTTP errors via the same
-    diagnostic as http_get_json, and surfaces GraphQL `errors` (200-with-errors,
-    e.g. a missing `read:project` scope) as a SystemExit so the caller can degrade.
+
+    Shares `_github_open` with http_get_json (timeout, retries, rate-limit
+    back-off incl. a 200 carrying a `RATE_LIMITED` error, redirect auth-strip).
+    Failures raise `GitHubAPIError` — a normal Exception, so the board layer's
+    "never hard-fail" contract can catch it. When the response carries `errors`
+    AND non-empty `data` (e.g. one inaccessible board among several), the partial
+    `data` is KEPT and the errors are warned on stderr; only errors with no data
+    raise.
     """
     payload = json.dumps({"query": query, "variables": variables or {}}).encode()
-    req = urllib.request.Request(GRAPHQL_URL, data=payload, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "activity-overview",
-    })
+    req = urllib.request.Request(GRAPHQL_URL, data=payload, headers=_github_headers(
+        GRAPHQL_URL, token, {"Content-Type": "application/json"}))
+    _, raw = _github_open(req, GRAPHQL_URL, opener=opener, sleep=sleep, clock=clock,
+                          rate_limited=_graphql_rate_limited)
     try:
-        with urllib.request.urlopen(req) as resp:
-            body = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as err:
-        raise SystemExit(_format_http_error(GRAPHQL_URL, err)) from err
-    if body.get("errors"):
+        body = json.loads(raw.decode())
+    except ValueError as err:
+        raise GitHubAPIError(
+            f"error: GraphQL {GRAPHQL_URL} returned non-JSON: {err}") from None
+    data = body.get("data") if isinstance(body, dict) else None
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if errors:
         msgs = "; ".join(
-            e.get("message", "") for e in body["errors"] if isinstance(e, dict))
-        raise SystemExit(f"error: GraphQL {GRAPHQL_URL} returned errors: {msgs}")
-    return body.get("data") or {}
+            e.get("message", "") for e in errors if isinstance(e, dict))
+        if not data:
+            raise GitHubAPIError(
+                f"error: GraphQL {GRAPHQL_URL} returned errors: {msgs}")
+        sys.stderr.write(
+            f"warning: GraphQL {GRAPHQL_URL} returned partial data with errors "
+            f"(keeping the data): {msgs}\n")
+    return data or {}
 
 
 def _iter_end(start, duration):
@@ -2502,7 +2781,10 @@ def _paginate_board_items(graphql, board, owner, repo, max_items):
         try:
             page = graphql(PROJECT_BOARD_ITEMS_QUERY,
                            {"id": board_id, "cursor": cursor})
-        except Exception as err:  # noqa: BLE001
+        except (SystemExit, Exception) as err:  # noqa: BLE001 — degrade, never hard-fail
+            # SystemExit too: an injected/legacy graphql callable may signal an
+            # HTTP error that way, and it is a BaseException `except Exception`
+            # would miss (a 502 on page 2 used to escape fetch_project_board).
             sys.stderr.write(
                 "warning: partial Projects v2 board #{} for {}/{}: {}\n".format(
                     board.get("number"), owner, repo, err))
@@ -2532,7 +2814,7 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     at `max_items`. `ref_date` (the window's ref/`to` date) anchors the staleness
     check.
 
-    Degrades CLEANLY to ({}, {}) on any error (a GraphQL `errors` SystemExit, a
+    Degrades CLEANLY to ({}, {}) on any error (a GitHubAPIError / SystemExit, a
     network failure, a null repository, or no linked/maintained board) — a board
     fetch must NEVER hard-fail the run. `graphql` is injectable so the suite tests
     this driver against fixtures with no network.
@@ -2549,6 +2831,14 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     if not repo_obj:
         return {}, {}
     boards = (repo_obj.get("projectsV2") or {}).get("nodes") or []
+    # Partial GraphQL data (graphql_post keeps `data` alongside `errors`) leaves a
+    # null node for a board this token cannot read: drop it, keep the others.
+    unreadable = sum(1 for b in boards if not isinstance(b, dict))
+    if unreadable:
+        sys.stderr.write(
+            "warning: {} Projects v2 board(s) for {}/{} could not be read; "
+            "ingesting the rest.\n".format(unreadable, owner, repo))
+        boards = [b for b in boards if isinstance(b, dict)]
     if not boards:
         return {}, {}
 
@@ -2600,19 +2890,113 @@ def _paginated(token):
     return get_page
 
 
-def _runs_page(get_page, api, frm, to):
-    """Walk actions/runs, whose pages wrap the list under `workflow_runs`."""
-    runs = []
-    url = f"{api}/actions/runs?created={frm}..{to}&per_page=100"
-    # The `created=` query param bounds the window server-side; the per-page
-    # `< frm` check below is a defensive early-exit guard.
-    while url:
+# GitHub documents that `actions/runs` "will return up to 1,000 results for each
+# search" when filtered by `created` (also actor/branch/event/status/...). A busy
+# repo can exceed that in one month, so a capped range is split by day and each
+# half re-queried; only a SINGLE day still over the cap is left truncated, and
+# then it is VISIBLE: a stderr warning plus a marker in workflow_stats.
+WORKFLOW_RUNS_SEARCH_CAP = 1000
+# Reserved key in the name-keyed workflow_stats map (no real workflow is named
+# this); present ONLY when the runs were truncated, so normal stats are unchanged.
+WORKFLOW_STATS_TRUNCATED_KEY = "_truncated"
+
+
+def _split_created_range(lo, hi):
+    """Split an inclusive created=lo..hi range into two halves by day, or None
+    when it is a single day (or the dates do not parse). Keeps the original
+    outer bounds; inner bounds use the same form (date or UTC timestamp)."""
+    try:
+        lo_d = datetime.date.fromisoformat(str(lo)[:10])
+        hi_d = datetime.date.fromisoformat(str(hi)[:10])
+    except (TypeError, ValueError):
+        return None
+    if lo_d >= hi_d:
+        return None
+    mid = lo_d + datetime.timedelta(days=(hi_d - lo_d).days // 2)
+    nxt = mid + datetime.timedelta(days=1)
+    iso = "T" in str(lo) or "T" in str(hi)
+    left_hi = f"{mid.isoformat()}T23:59:59Z" if iso else mid.isoformat()
+    right_lo = f"{nxt.isoformat()}T00:00:00Z" if iso else nxt.isoformat()
+    return (lo, left_hi), (right_lo, hi)
+
+
+def fetch_workflow_runs(get_page, api, frm, to, cap=WORKFLOW_RUNS_SEARCH_CAP):
+    """Walk actions/runs for created=frm..to without silently hitting GitHub's
+    per-search result cap. Returns (runs, truncation) where truncation is None
+    when complete, else {"truncated": True, "cap", "fetched", "total_count",
+    "ranges"} (also warned on stderr).
+
+    The first page's `total_count` decides: at/over the cap and spanning more
+    than one day, the range is split by day (newest half first, matching the
+    API's created-desc order) WITHOUT paging further. A leaf range is flagged
+    when it fetched fewer runs than its `total_count`, or reached the cap (a
+    `total_count` that is itself capped cannot prove completeness)."""
+    capped, top_total = [], []
+
+    def walk(lo, hi):
+        url = f"{api}/actions/runs?created={lo}..{hi}&per_page=100"
         payload, url = get_page(url)
-        page = payload.get("workflow_runs", []) if isinstance(payload, dict) else payload
-        runs.extend(page)
-        if page and page[-1].get("created_at", "")[:10] < frm[:10]:
-            break
-    return runs
+        total = payload.get("total_count") if isinstance(payload, dict) else None
+        total = total if isinstance(total, int) else None
+        if not top_total:
+            top_total.append(total)
+        if total is not None and total >= cap:
+            halves = _split_created_range(lo, hi)
+            if halves:
+                (l_lo, l_hi), (r_lo, r_hi) = halves
+                return walk(r_lo, r_hi) + walk(l_lo, l_hi)
+        runs = []
+        while True:
+            page = (payload.get("workflow_runs", []) if isinstance(payload, dict)
+                    else payload) or []
+            runs.extend(page)
+            # The `created=` filter bounds the range server-side; this per-page
+            # `< lo` check is a defensive early-exit guard.
+            if not url or (page and page[-1].get("created_at", "")[:10] < str(lo)[:10]):
+                break
+            payload, url = get_page(url)
+        if len(runs) >= cap or (total is not None and len(runs) < total):
+            capped.append({"range": f"{lo}..{hi}", "fetched": len(runs),
+                           "total_count": total})
+        return runs
+
+    raw = walk(frm, to)
+    seen, runs = set(), []
+    for r in raw:
+        rid = r.get("id") if isinstance(r, dict) else None
+        if rid is not None:
+            if rid in seen:
+                continue
+            seen.add(rid)
+        runs.append(r)
+    if not capped:
+        return runs, None
+    truncation = {"truncated": True, "cap": cap, "fetched": len(runs),
+                  "total_count": top_total[0] if top_total else None,
+                  "ranges": [c["range"] for c in capped]}
+    sys.stderr.write(
+        "warning: workflow runs for {}..{} are TRUNCATED: GitHub returns at most "
+        "{} runs per search and {} still hit that cap after splitting by day "
+        "(fetched {} of {} reported). workflow_stats is marked {!r}.\n".format(
+            frm, to, cap, ", ".join(truncation["ranges"]), len(runs),
+            truncation["total_count"] if truncation["total_count"] is not None
+            else "unknown", WORKFLOW_STATS_TRUNCATED_KEY))
+    return runs, truncation
+
+
+def mark_workflow_stats_truncated(stats, truncation):
+    """Return workflow_stats with the truncation marker added (if any)."""
+    if not truncation:
+        return stats
+    out = dict(stats or {})
+    out[WORKFLOW_STATS_TRUNCATED_KEY] = dict(truncation)
+    return out
+
+
+def _runs_page(get_page, api, frm, to):
+    """Walk actions/runs (pages wrap the list under `workflow_runs`). Thin
+    wrapper over fetch_workflow_runs that drops the truncation record."""
+    return fetch_workflow_runs(get_page, api, frm, to)[0]
 
 
 def _attach_timeline_xrefs(pr, timeline, current_slug):
@@ -2894,9 +3278,10 @@ def acquire(args, env):
     workflows = []
     workflow_stats = {}
     if getattr(args, "include_workflows", True):
-        raw_runs = _runs_page(get_page, api, frm, to)
+        raw_runs, runs_truncation = fetch_workflow_runs(get_page, api, frm, to)
         workflows = [normalize_workflow(r) for r in raw_runs]
-        workflow_stats = aggregate_workflow_stats(workflows)
+        workflow_stats = mark_workflow_stats_truncated(
+            aggregate_workflow_stats(workflows), runs_truncation)
 
     releases = []
     if getattr(args, "include_releases", True):
@@ -3759,6 +4144,8 @@ def _member_args(base, member, frm, to):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    # A non-integer ACTIVITY_* knob fails here, before any clone or API call.
+    validate_env_knobs()
     # Load + validate the manifest BEFORE touching the store, so a bad/missing
     # manifest fails fast instead of leaving an empty DB behind.
     man = manifest_mod.load_manifest(args.manifest) if getattr(

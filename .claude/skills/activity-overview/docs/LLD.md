@@ -282,11 +282,36 @@ flowchart TB
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
 | Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | referenced 404s tolerated (`allow_404`) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
-| Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state |
+| Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
 
-Kept PRs = merged in-window, closed-unmerged in-window, or open. `http_get_json` surfaces
-GitHub's message plus the deciding headers (`x-ratelimit-*`, `x-github-sso`,
-`x-accepted-oauth-scopes`) on any HTTP error; there is no automatic back-off.
+Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
+goes through `_github_open` (injectable `opener`/`sleep`/`clock`, so tests never sleep or touch
+the network):
+
+- **Timeouts and retries.** Each request carries `timeout=ACTIVITY_HTTP_TIMEOUT` (60 s).
+  Timeouts, connection errors and 500/502/503/504 are retried up to `ACTIVITY_HTTP_RETRIES` (3)
+  extra times with back-off 1, 2, 4 … s (cap 60 s), then fail with a message naming the URL and
+  the attempt count.
+- **Rate limits** (GitHub's documented rules). A 403/429 with `Retry-After` waits that long; with
+  `x-ratelimit-remaining: 0` (primary) waits until `x-ratelimit-reset`; a secondary-limit
+  message with neither header waits 60 s, doubling on repeats. A GraphQL 200 carrying a
+  `RATE_LIMITED` error waits for the reset too. Each wait is announced on stderr (seconds and
+  the UTC time it ends), is refused when longer than `ACTIVITY_RATE_LIMIT_MAX_WAIT` (3600 s;
+  `0` = never wait), and at most `RATE_LIMIT_MAX_WAITS` (5) are made per request. Any other 403
+  (SAML SSO, token scope) fails fast with the diagnostic: GitHub's message plus the deciding
+  headers (`x-ratelimit-*`, `retry-after`, `x-github-sso`, `x-accepted-oauth-scopes`).
+- **Auth on redirects.** The token is attached only to `https://api.github.com` URLs, and the
+  redirect handler drops `Authorization` when a 3xx leaves that host (urllib's default handler
+  re-sends it).
+- **Errors.** `http_get_json` raises `SystemExit` (fail fast). `graphql_post` raises
+  `GitHubAPIError` (a normal `Exception`); when GraphQL returns `errors` alongside non-empty
+  `data` it keeps the data and warns. The board layer catches both, so a failed page degrades
+  to the items already fetched.
+- **Workflow runs.** `actions/runs?created=` returns at most 1,000 results per search (GitHub
+  docs). `fetch_workflow_runs` reads the first page's `total_count`; at or over the cap the
+  range is split by day and re-queried. A single day still at the cap is left truncated: a
+  stderr warning, and `workflow_stats._truncated = {truncated, cap, fetched, total_count,
+  ranges}` (a reserved key, present only then).
 
 ### 4.8 Projects v2 boards
 
@@ -809,10 +834,18 @@ diff-stable.
 | `ACTIVITY_IAC_BUILD_TIMEOUT` | 300 | Seconds per IaC subprocess |
 | `ACTIVITY_IAC_MAX_WORKERS` | 8 | Parallel IaC builds |
 | `ACTIVITY_IAC_RETRIES` | 1 | Extra attempts on timeout/failure |
+| `ACTIVITY_HTTP_TIMEOUT` | 60 | Seconds per GitHub API request |
+| `ACTIVITY_HTTP_RETRIES` | 3 | Extra attempts on timeout / connection error / 5xx |
+| `ACTIVITY_RATE_LIMIT_MAX_WAIT` | 3600 | Longest single rate-limit wait in seconds (`0` = fail instead of waiting) |
 | `TF_PLUGIN_CACHE_DIR` | unset | Shared terraform provider cache (enables serial pre-warm) |
 | `ACTIVITY_BOARD_STALE_DAYS` | 365 | Board treated as deprecated beyond this |
 | `ACTIVITY_BOARD_MAX_ITEMS` | 5000 | Per-board item cap |
 | `ACTIVITY_MMDC_PUPPETEER_CONFIG` | unset | Puppeteer config file passed to `mmdc -p` (as root without it: generated `--no-sandbox` config) |
+
+Integer knobs `ACTIVITY_HTTP_*`, `ACTIVITY_RATE_LIMIT_MAX_WAIT` and `ACTIVITY_IAC_*` are read
+at call time (not at import) and checked by `validate_env_knobs()` at the start of `main`: a
+non-integer value exits with an error naming the variable; a value below its minimum (1 for
+timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 
 **Code constants** (change deliberately; tests pin many of them)
 
@@ -868,7 +901,9 @@ release/milestone pages`. Because **all open PRs and issues** are included every
 repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
-off-hours. (`--no-clone` saves the clone only if you refresh the existing clone yourself —
+off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
+`ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
+A window with more than 1,000 workflow runs costs a few extra requests for the day-splits. (`--no-clone` saves the clone only if you refresh the existing clone yourself —
 gather does not fetch.)
 
 ### 14.4 Security

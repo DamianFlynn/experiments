@@ -119,6 +119,22 @@ window so an in-window commit keeps its real parent. If `meta.boundary_dropped_c
 is non-empty (an in-window commit still landed on the shallow boundary, so its
 whole-tree phantom diff was dropped), widen this knob and re-gather to recover it.
 
+### GitHub API knobs
+
+Every GitHub request has a timeout and is retried with back-off on timeouts and 5xx;
+on a rate limit gather waits for the reset (it prints how long and until when) and
+continues. Override the defaults when needed: `ACTIVITY_HTTP_TIMEOUT` (seconds per
+request, default `60`), `ACTIVITY_HTTP_RETRIES` (extra attempts, `3`) and
+`ACTIVITY_RATE_LIMIT_MAX_WAIT` (longest single rate-limit wait in seconds, `3600`;
+`0` fails instead of waiting). A 403 that is not a rate limit (SAML SSO, scope)
+still fails at once. A non-integer value for an `ACTIVITY_HTTP_*`,
+`ACTIVITY_RATE_LIMIT_MAX_WAIT` or `ACTIVITY_IAC_*` knob is an error; a value below
+its minimum is clamped with a warning.
+
+If a window has more than 1,000 workflow runs (GitHub's per-search cap) gather
+splits the query by day; a single day still over the cap is reported on stderr and
+marked in `workflow_stats._truncated`.
+
 ### Projects v2 board knobs
 
 When a repo links Projects v2 boards, gather ingests **every maintained** board it

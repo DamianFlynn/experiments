@@ -116,7 +116,10 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **issues[]** gain `milestone`, `updated_at`, `comments`. Open and
   not-planned-closed issues are now included, not just PR-closing issues.
 - **workflows[]**, **workflow_stats{}**, **releases[]**, **milestones[]** are
-  populated (see the schema block in the design spec).
+  populated (see the schema block in the design spec). `workflow_stats` is keyed by
+  workflow name, plus the reserved key `_truncated` ONLY when GitHub's 1,000-run
+  search cap could not be split away: `{truncated, cap, fetched, total_count,
+  ranges}`. Consumers listing workflows skip keys starting with `_`.
 - **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
   `next_candidates` (one bucket per item; precedence shipped > rejected >
   next_candidates > in_flight). Each ref may carry a `train` id. The current/next

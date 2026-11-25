@@ -678,7 +678,9 @@ Queries: `person` · `symbol` · `subsystem` · `grep` · `module` · `dependent
 **Environment variables:** `GITHUB_TOKEN`/`GH_TOKEN` (auth) · `ACTIVITY_CLONE_MARGIN_DAYS`
 (14) · `ACTIVITY_BOARD_STALE_DAYS` (365) · `ACTIVITY_BOARD_MAX_ITEMS` (5000) ·
 `ACTIVITY_IAC_BUILD_TIMEOUT` (300s) · `ACTIVITY_IAC_MAX_WORKERS` (8) ·
-`ACTIVITY_IAC_RETRIES` (1) · `TF_PLUGIN_CACHE_DIR` (shared terraform cache).
+`ACTIVITY_IAC_RETRIES` (1) · `ACTIVITY_HTTP_TIMEOUT` (60s) · `ACTIVITY_HTTP_RETRIES` (3) ·
+`ACTIVITY_RATE_LIMIT_MAX_WAIT` (3600s) · `TF_PLUGIN_CACHE_DIR` (shared terraform cache).
+A non-integer value for an integer knob is an error; one below its minimum is clamped.
 
 **Tunable constants (in code):** trains — top-N=8, significance floor=20.0, stall=21 days;
 forecast — likely ≥5.0, possible ≥2.0, overdue=200 days; slices — text cap 1500, comments

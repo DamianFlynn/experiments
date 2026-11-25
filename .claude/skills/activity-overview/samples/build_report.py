@@ -328,6 +328,8 @@ for m in view["members"]:
         W("| Workflow | Success | Failure | Cancelled | Total |")
         W("|---|---|---|---|---|")
         for name, s in sorted(ws.items()):
+            if name.startswith("_"):   # reserved marker, e.g. _truncated
+                continue
             W("| {} | {} | {} | {} | {} |".format(
                 esc(name), s.get("success", 0), s.get("failure", 0),
                 s.get("cancelled", 0), s.get("total", 0)))

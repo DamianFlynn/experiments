@@ -432,8 +432,9 @@ These are real, current limits — plan around them:
    checked-out default branch.
 5. **Open items are fetched every run.** All open PRs/issues are pulled regardless of window
    (they feed in-flight/forecast), each with per-item review/timeline/comment calls. On very
-   busy repos (e.g. BRM) a gather is API-heavy; there is no automatic rate-limit back-off —
-   a 403 is reported with GitHub's headers so the cause is explicit.
+   busy repos (e.g. BRM) a gather is API-heavy. On a rate limit, gather waits for the reset
+   (announced on stderr, at most `ACTIVITY_RATE_LIMIT_MAX_WAIT`, default one hour) and
+   continues; any other 403 (SSO, scope) still fails fast with GitHub's headers.
 6. **No standalone `extract` CLI.** The on-disk bundle view is obtained via `digest.py`
    (which works for single repos too); see USAGE §4.
 7. **Narrative is not in CI.** The live CI job stops at the trust gate.

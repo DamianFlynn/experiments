@@ -154,6 +154,8 @@ For each release in `releases` (newest first): tag, name, date, and link.
 ## CI/CD health
 
 For each workflow in `workflow_stats`: total runs and success/failure split.
+Skip the reserved `_truncated` key; when it is present, say the counts are partial
+(GitHub's 1,000-run search cap).
 
 - **{workflow}** — {success}/{total} succeeded ({failure} failed, {cancelled} cancelled).
 
