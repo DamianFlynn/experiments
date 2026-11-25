@@ -52,7 +52,7 @@
 | `complete.py` | 138 | Train-completion policy over the spine (honest gaps) | (via injected backfill) | — |
 | `derive.py` | 738 | Pure projections shared by write and read paths (artifacts, people, flow, halls) | — | — |
 | `link.py` | 1,116 | `enrich`: trains, buckets, timeline, deltas, areas, significance, effort, forecast; `--slice`, `--series` | — | — |
-| `series.py` | 132 | Pure installment snapshot + comparison | — | — |
+| `series.py` | 236 | Pure installment snapshot, comparison and window-ordered index | — | — |
 | `render.py` | 1,010 | Mermaid emitters (size-capped) + `mmdc` validation | — | — |
 | `validate.py` | 907 | Trust gate (audits) | — | — |
 | `spotlight.py` | 1,875 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
@@ -758,29 +758,57 @@ test (`test_link_small_fixes.py`) compares it with `slice_train`'s output.
 
 ```mermaid
 flowchart TB
-  load["read series.json<br/>absent or blank = []"] --> prior{"installments non-empty?"}
+  load["read series.json (v2 object or legacy list)<br/>absent or blank = []"] --> chk{"bundle has a window?<br/>index of the same repo?"}
+  chk -- no --> refuse["exit 2, nothing written"]
+  chk -- yes --> prior{"installment for a window<br/>before this one?"}
   prior -- no --> first["series.first_installment = true"]
-  prior -- yes --> cmp["compute_series(bundle, installments[-1])"]
-  cmp --> new["new: shipped or in_flight refs<br/>not in prior shipped or in_flight"]
-  cmp --> car["carried_over: refs in prior in_flight,<br/>present now (+ prior_status)"]
-  cmp --> loop["forecast_loop: prior forecast refs<br/>landed (now shipped) / not_yet"]
+  prior -- yes --> cmp["compute_series(bundle, predecessor)"]
+  cmp --> new["new: shipped or in_flight refs<br/>unknown to the prior snapshot"]
+  cmp --> car["carried_over: prior in_flight refs<br/>in any bucket now (+ bucket, prior_status)"]
+  cmp --> loop["forecast_loop: prior forecast refs<br/>landed / dropped / not_yet"]
   first --> snap
   new --> snap
   car --> snap
-  loop --> snap["append installment_snapshot(bundle)<br/>write series.json"]
+  loop --> snap["place installment_snapshot(bundle)<br/>under its window (replace same window)<br/>write {version: 2, installments}"]
 ```
 
-Identity is `(type, id)`; URLs are excluded. `installment_snapshot` =
-`{from, to, ref_date, shipped:[{type,id}], in_flight:[{type,id,board_status?}],
-forecast:[{type,id,tier}]}`. The index is read and shape-checked before enrich: a non-empty
-index that is not a JSON list of objects exits 2 with `link.py --series: series index <path> …`
-and nothing is written (it is never silently discarded). The bundle is written first and the
-index second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves
-the previous file intact, and a run that cannot write its bundle appends no installment.
-**Every invocation appends** — run it exactly once per installment. Recovery from a double
-run: remove *every* snapshot whose `from`/`to` is the duplicated month (removing only the last
-leaves the month compared with itself), plus any later snapshots, then replay the saved
-bundles in chronological order.
+**Idempotent by window (#86).** An installment is identified by its window `(from, to)`
+(`series.bundle_window`: `meta.period`, else `meta.from`/`meta.to`). `link.main`:
+
+- compares against `series.predecessor` — the installment whose window sorts immediately
+  before this one by `(from, to)` (plain string order, so use the same date form throughout);
+- records the new snapshot with `series.place_installment`: an entry for the same window is
+  **replaced**, and the index is kept in window order. Running the same window twice
+  therefore leaves one entry and produces the same `series` block; re-running an earlier
+  window replaces that entry and compares it with *its* predecessor; running windows out of
+  order inserts each in window order;
+- stamps the snapshot `captured: "backfill"` when the index already holds a later window
+  (open work and forecast are then as of the run, not the window's end), else
+  `"in_order"`, and warns on stderr naming the later installments, whose `series` blocks were
+  computed without this record (re-run them oldest first to refresh them; nothing
+  recomputes them automatically).
+
+`series.normalize_installments` collapses a window recorded more than once (a pre-#86 double
+run) to the entry recorded last; entries without `from`/`to` keep their order ahead of every
+window. Identity of items is `(type, id)`; URLs are excluded. `installment_snapshot` =
+`{owner, repo, from, to, ref_date, captured, shipped:[{type,id}],
+in_flight:[{type,id,board_status?}], next_candidates:[{type,id}], rejected:[{type,id}],
+forecast:[{type,id,tier}]}`. `compute_series`: `new` = this window's shipped/in_flight refs in
+none of the prior's lists (pre-#86 snapshots have no `next_candidates`/`rejected`, which
+then count as empty); `carried_over` = prior in_flight refs found in any of the four current
+buckets, each with `bucket` and `prior_status`; `forecast_loop` = prior forecast refs now in
+`shipped` (`landed`), in `rejected` (`dropped`) or neither (`not_yet`); `prior` =
+`{from, to, captured}` of the predecessor.
+
+The index file is `{"version": 2, "installments": [...]}`; the older bare list is still read
+and is rewritten as version 2 on the next run (an older `link.py` cannot read version 2). It
+is read and shape-checked before enrich: invalid JSON, an object without `version`, another
+version, an entry that is not an object, a reference list that is not a list of objects, or a
+non-string `from`/`to` exits 2 with `link.py --series: series index <path> …`, as do a
+bundle with no window and an index whose entries name another `owner`/`repo`; nothing is
+written (the index is never silently discarded). The bundle is written first and the index
+second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves the
+previous file intact, and a run that cannot write its bundle records no installment.
 
 ### 6.10 `derive.py` projections
 
@@ -993,7 +1021,7 @@ member, so emitted `repos` may exceed the requested set.
 | `journey.db` | `STORE.md` (`meta.schema_version`) | gather → everything |
 | Bundle view | `BUNDLE.md` (`meta.schema_version` = 1) | extract/link/digest → render, narrator, formatters |
 | Project view | `BUNDLE.md` § output contract | digest → narrator, formatters |
-| `series.json` | list of `installment_snapshot` (6.9) | link `--series` → link `--series` |
+| `series.json` | `{"version": 2, "installments": [installment_snapshot]}`, one per window, in window order; legacy bare list read (6.9) | link `--series` → link `--series` |
 | Slice | `slice_train` shape (6.8) | link `--slice` → narrator sub-agent |
 | Spotlight envelope | §9 | spotlight → narrator |
 | Manifest | §11 | manifest_from_index / hand-authored → gather |
@@ -1116,6 +1144,8 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
 | Any open PR counts as in motion | since #87 `in_motion` needs an open PR or an `in_flight` train, but it does not look at the PR's age, draft state or base branch | an open PR untouched for a year, or a draft, still scores `open PR` (+2.0) for the issue it references | weigh PR recency (e.g. `updated_at` in window) if stale open PRs prove common |
 | Spotlight CI gate covers four queries | `ci_spotlight_integration.py` runs `person` / `subsystem` / `symbol` / `grep` only | `module` and `dependents` are exercised by the unit suite but not against the live store | add discovered-argument checks for both (a single-repo store has no cross-repo `depends_on`, so `dependents` belongs on the constellation store) |
+| Series compares bucket membership only | `series.compute_series` (#86) matches the prior snapshot against this window's four buckets | an item in flight last time that is still open but neither updated in the window nor on the current milestone (no bucket) leaves `carried_over` silently; a forecast item that shipped or was closed in a month missing from the index is `not_yet`; refreshing an earlier window does not recompute the later bundles' `series` blocks (stderr names them) | report "went quiet" items from the open item records; recompute later installments on request |
+| No series for a project view | `link.py --series` keys installments per bundle and items by `(type, id)` | a multi-repo constellation keeps one series per member bundle (USAGE §5.4) | key items by `repo` + type + id and accept the digest view |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for

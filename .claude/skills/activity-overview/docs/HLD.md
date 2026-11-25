@@ -188,10 +188,12 @@ notes such as "previous attempt rejected".
 
 ### 5.5 Series (progressive installments)
 
-A tiny append-only `series.json` records each installment's shipped / in-flight / forecast
-refs. The next installment is compared against the last: **new**, **carried over** (with its
-prior status) and the **forecast loop** (last month's predictions → *landed* vs *not yet*).
-This is what turns isolated monthly reports into a *progressive* story.
+A tiny `series.json` records each installment's bucket and forecast refs, one entry per
+window (re-running a month replaces its entry). Each installment is compared against the one
+for the window just before it: **new**, **carried over** (with its prior status and where it
+is now — shipped, still in flight, re-planned or rejected) and the **forecast loop** (last
+month's predictions → *landed*, *not yet* or *dropped*). This is what turns isolated monthly
+reports into a *progressive* story.
 
 ### 5.6 Slice
 
@@ -295,7 +297,7 @@ flowchart LR
     s3 --> l3["validate, digest,<br/>link --series"]
     l3 --> f3["new / carried over<br/>F2 landed vs not yet<br/>forecast F3"]
   end
-  f1 -. snapshot .-> idx[("series.json<br/>append-only")]
+  f1 -. snapshot .-> idx[("series.json<br/>one entry per month")]
   f2 -. snapshot .-> idx
   f3 -. snapshot .-> idx
   idx -. prior installment .-> l2
@@ -303,13 +305,14 @@ flowchart LR
 ```
 
 **What each installment contains:** executive summary; *Since last installment* (new,
-carried-over with prior board status, forecast loop); shipped by code area; deep decision
+carried-over with prior board status and current bucket, forecast loop); shipped by code area; deep decision
 trains with grounded narratives; next-release forecast (likely / possible / longshot with
 signals); feature changes; flow health; contributors; releases and CI health.
 
 **Why it compounds:** continuity comes from `series.json`, which chains each installment to
-the last — new vs carried over, and whether each forecast landed — so the monthly reports read
-as one progressing story. Each monthly store stays small and independently auditable. Two
+the month before it — new vs carried over, and whether each forecast landed or was dropped
+— so the monthly reports read as one progressing story. Re-running a month replaces its entry
+instead of adding a second one. Each monthly store stays small and independently auditable. Two
 rules keep the chain honest: capture each installment **at month-end** (open work, milestones
 and board status are read as they are at gather time, so a past month cannot be re-created
 later), and gather a quarter or year as **its own window** when you need a roll-up (CI
@@ -334,7 +337,11 @@ stateDiagram-v2
   Likely --> NotYet: still open next month
   Possible --> NotYet
   Longshot --> NotYet
+  Likely --> Dropped: closed unshipped next month
+  Possible --> Dropped
+  Longshot --> Dropped
   Landed --> [*]
+  Dropped --> [*]
   NotYet --> NextCandidate: re-scored next installment
 ```
 
@@ -488,6 +495,13 @@ These are real, current limits — plan around them:
     orders code events by the commit's full committer timestamp, so a commit at 09:00 sorts
     after a comment at 08:00 the same day. Commits folded before that change (and backfilled
     commits) only have a day, so their events still sort before that day's comments.
+16. **Series continuity is per bundle and by bucket.** `series.json` keeps one entry per
+    window and compares each installment with the window before it (#86), but it is kept per
+    single-repo bundle (no project-view series), it only sees items that are in one of this
+    window's buckets (in-flight work that went quiet drops out of *carried over*), and
+    refreshing an earlier month does not recompute the later months' already-written series
+    blocks (`link` names them on stderr). A month recorded after a later one is marked
+    `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
 
 Item 8 is why USAGE recommends one store per installment; it is a candidate for a code fix
 (window the materialized arrays in `extract`), tracked in

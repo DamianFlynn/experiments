@@ -3058,4 +3058,4 @@ class TestSeriesDirectoryIsCreated(unittest.TestCase):
                 link.main([bpath, "--series", spath])
             self.assertTrue(os.path.isfile(spath))
             with open(spath) as fh:
-                self.assertEqual(len(json.load(fh)), 1)
+                self.assertEqual(len(json.load(fh)["installments"]), 1)

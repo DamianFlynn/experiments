@@ -207,6 +207,24 @@ docsRefs, release_train, sprints, project, diagrams`.
   `shipped`). Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
+- **series** (only with `link.py BUNDLE --series INDEX`; absent otherwise) —
+  `{ first_installment:bool, prior:{from,to,captured}|None, new:[row],
+  carried_over:[row], forecast_loop:{ landed:[loop], not_yet:[loop], dropped:[loop] } }`.
+  The comparison is against the installment recorded for the window **immediately before**
+  this bundle's window (`meta.period`, else `meta.from`/`meta.to`) in the index — not the
+  last one appended. A `row` is `{type, id, url, bucket}` (`bucket` = this window's bucket);
+  carried rows add `prior_status` (the prior board status, else `"in_flight"`). `new` = this
+  window's `shipped` / `in_flight` items the prior installment did not know at all (in none
+  of its buckets nor its forecast). `carried_over` = items in the prior's `in_flight` that
+  are in **any** of this window's four buckets (so in-flight work that was rejected or
+  moved to `next_candidates` is reported, with that `bucket`). A `loop` row is
+  `{type, id, tier}` for each prior forecast candidate: `landed` = now in `shipped`,
+  `dropped` = now in `rejected` (PR closed unmerged, issue closed not planned), `not_yet`
+  otherwise. `prior.captured` is `"backfill"` when that installment was recorded after a
+  later window (its open work and forecast are as of that run, so leave its loop out of
+  hit-rate statistics), `"in_order"` otherwise, `None` for an entry written before #86.
+  Rows sort by `(type, id)`. The index file itself (`{"version": 2, "installments": [...]}`,
+  one entry per window) is described in `docs/LLD.md` §6.9.
 
 ### Review decision & rounds
 

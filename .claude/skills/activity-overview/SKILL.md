@@ -137,8 +137,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    use that file in steps 4–6. Keep members apart in every later step too: give each member its own bundle, series and diagrams paths — `workspace/view/<owner>__<repo>.json`, `workspace/series/<owner>__<repo>.json` (`link.py` creates the directory), `--diagrams-dir workspace/diagrams/<owner>__<repo>` — so one member never overwrites another's files or is compared with a different repo in the series; each member's `bundle.diagrams` paths resolve against the parent of ITS diagrams dir. It writes the **raw** view only (no trains/buckets yet) and
    exits 2 with a message when the scope is ambiguous, unknown or empty.
 4. **Link** (enriches the bundle view **in place**, offline). For a recurring digest pass
-   the append-only series index so this installment is framed against the last one —
-   **exactly once per installment** (each run appends):
+   the series index so this installment is framed against the previous month's — it
+   keeps one entry per window, so re-running the same window replaces that entry:
    ```bash
    python3 link.py workspace/view/bundle.json --series workspace/series.json
    ```

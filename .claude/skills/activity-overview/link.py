@@ -1141,10 +1141,12 @@ def enrich(bundle):
 
 def _installment_problem(installments):
     """Why the reference lists series.compute_series reads from an installment
-    (`shipped`, `in_flight`, `forecast`) cannot be used, or None. Each must be a
-    list of objects when present."""
+    (`shipped`, `in_flight`, `next_candidates`, `rejected`, `forecast`) or its
+    window cannot be used, or None. Each list must be a list of objects when
+    present; `from` / `to` must be strings when present (they order the index)."""
     for n, inst in enumerate(installments):
-        for key in ("shipped", "in_flight", "forecast"):
+        for key in ("shipped", "in_flight", "next_candidates", "rejected",
+                    "forecast"):
             if key not in inst:
                 continue
             refs = inst[key]
@@ -1152,16 +1154,23 @@ def _installment_problem(installments):
                     or not all(isinstance(r, dict) for r in refs):
                 return ("installment {} has a `{}` that is not a list of "
                         "reference objects".format(n, key))
+        for key in ("from", "to"):
+            if inst.get(key) is not None and not isinstance(inst[key], str):
+                return ("installment {} has a `{}` that is not a date "
+                        "string".format(n, key))
     return None
 
 
 def _load_series_index(series_path):
-    """Read the append-only series index: a JSON list of installment objects.
-    Absent, empty or whitespace-only (a freshly `touch`ed or truncated file) is
-    the first installment ([]). Anything else that is not a list of objects
-    (invalid JSON, an object, a list holding a non-object) exits 2 with a message
-    naming the file, rather than a traceback or a crash at `installments[-1]`
-    (#82); a corrupt-but-present index is never silently discarded."""
+    """Read the series index and return its list of installment objects. The
+    file is `{"version": 2, "installments": [...]}` (#86) or the older bare
+    JSON list of installments, which is still read (and rewritten as version 2
+    by the next `--series` run). Absent, empty or whitespace-only (a freshly
+    `touch`ed or truncated file) is the first installment ([]). Anything else
+    (invalid JSON, another object or version, a list holding a non-object, a
+    malformed installment) exits 2 with a message naming the file, rather than
+    a traceback (#82); a corrupt-but-present index is never silently
+    discarded."""
     try:
         with open(series_path, encoding="utf-8") as fh:
             raw = fh.read()
@@ -1170,22 +1179,56 @@ def _load_series_index(series_path):
     if not raw.strip():
         return []
     try:
-        installments = json.loads(raw)
+        doc = json.loads(raw)
     except ValueError as exc:
         problem = "is not valid JSON ({})".format(exc)
     else:
-        if not isinstance(installments, list):
+        installments, problem = doc, None
+        if isinstance(doc, dict):
+            if "version" not in doc:
+                problem = "is a JSON object without a `version`, not a series index"
+            elif doc["version"] != series.INDEX_VERSION:
+                problem = ("has version {!r}; this link.py reads version {} (or "
+                           "the older bare list)".format(doc["version"],
+                                                         series.INDEX_VERSION))
+            else:
+                installments = doc.get("installments")
+                if not isinstance(installments, list):
+                    problem = "has no `installments` list"
+        elif not isinstance(doc, list):
             problem = "is a JSON {}, not a list of installments".format(
-                type(installments).__name__)
-        elif not all(isinstance(i, dict) for i in installments):
-            problem = "holds an entry that is not an installment object"
-        else:
-            problem = _installment_problem(installments)
-            if problem is None:
-                return installments
+                type(doc).__name__)
+        if problem is None:
+            if not all(isinstance(i, dict) for i in installments):
+                problem = "holds an entry that is not an installment object"
+            else:
+                problem = _installment_problem(installments)
+                if problem is None:
+                    return installments
+    _series_refusal(series_path, problem)
+
+
+def _series_refusal(series_path, problem):
     sys.stderr.write("link.py --series: series index {} {}; fix or remove it\n"
                      .format(series_path, problem))
     raise SystemExit(2)
+
+
+def _series_bundle_problem(meta, installments):
+    """Why this bundle cannot be recorded in this index, or None (#86): it
+    needs a window (installments are identified by it), and an index whose
+    entries name a different owner/repo is another repo's series."""
+    frm, to = series.bundle_window(meta)
+    if frm is None or to is None:
+        return ("cannot record this bundle: it has no window (meta.period or "
+                "meta.from/meta.to), and installments are identified by it")
+    mine = (meta.get("owner"), meta.get("repo"))
+    for inst in installments:
+        theirs = (inst.get("owner"), inst.get("repo"))
+        if None not in theirs and None not in mine and theirs != mine:
+            return ("belongs to {}/{}, not {}/{} (keep one series file per "
+                    "repo)".format(theirs[0], theirs[1], mine[0], mine[1]))
+    return None
 
 
 def _write_json_atomic(path, obj):
@@ -1228,17 +1271,28 @@ def main(argv=None):
         bundle = json.load(fh)
     # Load (and shape-check) the series index BEFORE any work, so a malformed
     # index stops the run with rc 2 and nothing is written.
-    installments = _load_series_index(series_path) if series_path is not None else None
+    installments = None
+    if series_path is not None:
+        installments = _load_series_index(series_path)
+        problem = _series_bundle_problem(bundle.get("meta", {}), installments)
+        if problem is not None:
+            _series_refusal(series_path, problem)
     enrich(bundle)
     if series_path is not None:
-        # Phase 13: series continuity. Compute the `series` block against the
-        # last recorded installment and append THIS installment's snapshot.
-        # Without `--series` no `series` key is added, so the standard digest
-        # stays byte-identical. The index is written AFTER the bundle (below): a
-        # run that cannot write its bundle records no installment (#82).
-        prior = installments[-1] if installments else None
-        bundle["series"] = series.compute_series(bundle, prior)
-        installments.append(series.installment_snapshot(bundle))
+        # Phase 13: series continuity, idempotent by window (#86). Compare
+        # against the installment immediately BEFORE this window and record
+        # this installment under its window, replacing an earlier run of the
+        # same window. Without `--series` no `series` key is added, so the
+        # standard digest stays byte-identical. The index is written AFTER the
+        # bundle (below): a run that cannot write its bundle records no
+        # installment (#82).
+        window = series.bundle_window(bundle.get("meta", {}))
+        later = series.later_installments(installments, window)
+        bundle["series"] = series.compute_series(
+            bundle, series.predecessor(installments, window))
+        installments = series.place_installment(
+            installments, series.installment_snapshot(
+                bundle, captured="backfill" if later else "in_order"))
     if slice_id is not None:
         # Phase 4b: emit ONE train's bounded, self-contained slice as JSON for a
         # narrator sub-agent. Read-only — the bundle file is NOT rewritten.
@@ -1253,7 +1307,16 @@ def main(argv=None):
     _write_json_atomic(path, bundle)
     if series_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(series_path)), exist_ok=True)
-        _write_json_atomic(series_path, installments)
+        _write_json_atomic(series_path, series.index_document(installments))
+        if later:
+            sys.stderr.write(
+                "link.py --series: recorded {} to {} before later installment(s) "
+                "{} (captured: backfill); their series blocks do not reflect "
+                "this record: re-run link.py --series on their bundles, oldest "
+                "first, to refresh them\n"
+                .format(window[0], window[1],
+                        ", ".join("{} to {}".format(i["from"], i["to"])
+                                  for i in later)))
     sys.stderr.write(
         f"linked {len(bundle['trains'])} trains, "
         f"{len(bundle['buckets']['shipped'])} shipped into {path}\n"

@@ -648,7 +648,7 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 
 ### `link.py` — enrich (offline)
 `link.py BUNDLE.json` (enrich in place) · `--slice TRAIN_ID` (emit one train's slice) ·
-`--series series.json` (append + frame "since last installment").
+`--series series.json` (record this window + frame "since last installment").
 
 ### `render.py` — diagrams (needs mmdc)
 `render.py BUNDLE` · `--diagrams-dir` (`workspace/diagrams`) · `--export svg|png` ·

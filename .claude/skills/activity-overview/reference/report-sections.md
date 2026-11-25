@@ -24,10 +24,15 @@ Counts come from the data (shipped refs by `ref.type`, trains by `ptrain.outcome
 ## Since last installment
 Present ONLY when the run was linked with `--series` and `bundle["series"]` (the member's own
 bundle view file — digest's embedded member copy has no `series`) has `first_installment`
-false. **New this installment** (`series.new`), **Carried over** (`series.carried_over`,
-each citing its `ref.prior_status` and whether it has now shipped, `ref.bucket`), and the
-**Forecast loop** (`series.forecast_loop.landed` vs `series.forecast_loop.not_yet` — last
-installment's predictions matched against this window's shipped). Every row is a ref
+false. The comparison is with the installment recorded for the window just before this one.
+**New this installment** (`series.new`: shipped or in-flight items the prior installment did
+not know at all), **Carried over** (`series.carried_over`: last installment's in-flight items,
+each citing its `ref.prior_status` and its current `ref.bucket` — shipped, still in flight,
+re-planned as a next candidate, or rejected), and the **Forecast loop**
+(`series.forecast_loop.landed` / `series.forecast_loop.not_yet` /
+`series.forecast_loop.dropped` — last installment's predictions matched against this
+window's shipped and rejected; when `series.prior.captured` is "backfill" those predictions
+were recorded late, so keep them out of any hit rate). Every row is a ref
 without a title; forecast-loop rows (`{type, id, tier}`) have no `url` either — take both
 from `item`. Membership is deterministic and every item cites its ref; the continuity
 narrative is the agent's. Omit on the first installment.

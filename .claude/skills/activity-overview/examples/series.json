@@ -1,34 +1,48 @@
-[
-  {
-    "from": "2026-04-01",
-    "to": "2026-04-30",
-    "ref_date": "2026-04-30",
-    "shipped": [
-      {"type": "pr", "id": 101},
-      {"type": "issue", "id": 88}
-    ],
-    "in_flight": [
-      {"type": "pr", "id": 110, "board_status": "In Progress"},
-      {"type": "issue", "id": 95, "board_status": "Blocked"}
-    ],
-    "forecast": [
-      {"type": "pr", "id": 110, "tier": "likely"},
-      {"type": "issue", "id": 95, "tier": "possible"}
-    ]
-  },
-  {
-    "from": "2026-05-01",
-    "to": "2026-05-31",
-    "ref_date": "2026-05-31",
-    "shipped": [
-      {"type": "pr", "id": 110},
-      {"type": "pr", "id": 121}
-    ],
-    "in_flight": [
-      {"type": "issue", "id": 95, "board_status": "In Review"}
-    ],
-    "forecast": [
-      {"type": "issue", "id": 95, "tier": "likely"}
-    ]
-  }
-]
+{
+  "version": 2,
+  "installments": [
+    {
+      "from": "2026-04-01",
+      "to": "2026-04-30",
+      "ref_date": "2026-04-30",
+      "captured": "in_order",
+      "shipped": [
+        {"type": "issue", "id": 88},
+        {"type": "pr", "id": 101}
+      ],
+      "in_flight": [
+        {"type": "issue", "id": 97, "board_status": "Blocked"},
+        {"type": "pr", "id": 110, "board_status": "In Progress"}
+      ],
+      "next_candidates": [
+        {"type": "issue", "id": 95}
+      ],
+      "rejected": [],
+      "forecast": [
+        {"type": "issue", "id": 95, "tier": "possible"}
+      ]
+    },
+    {
+      "from": "2026-05-01",
+      "to": "2026-05-31",
+      "ref_date": "2026-05-31",
+      "captured": "in_order",
+      "shipped": [
+        {"type": "pr", "id": 110},
+        {"type": "pr", "id": 121}
+      ],
+      "in_flight": [
+        {"type": "issue", "id": 97, "board_status": "In Review"}
+      ],
+      "next_candidates": [
+        {"type": "issue", "id": 95}
+      ],
+      "rejected": [
+        {"type": "pr", "id": 119}
+      ],
+      "forecast": [
+        {"type": "issue", "id": 95, "tier": "likely"}
+      ]
+    }
+  ]
+}

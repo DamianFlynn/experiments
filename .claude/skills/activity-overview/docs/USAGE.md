@@ -140,7 +140,7 @@ B=$S/views/$M/bundle.json
 python3 $AO/view.py --store $DB --project Azure --repo bicep-registry-modules \
   --from $FROM --to $TO --out $B
 
-# 4 · Link with series continuity (ONCE per installment — it appends to series.json)
+# 4 · Link with series continuity (records this month in series.json; a re-run replaces it)
 python3 $AO/link.py $B --series $S/series.json
 
 # 5 · Diagrams (mmdc validates each; add --skip-validate if mmdc is unavailable).
@@ -152,8 +152,8 @@ python3 $AO/link.py $B --slice train-issue-1234 > $S/views/$M/train-issue-1234.s
 ```
 
 `view.py` writes the **raw** bundle view (`extract`); `link.py` enriches it in place and
-`render.py` adds `diagrams`, so keep `$B` — it is what you replay if the series ever needs
-rebuilding. `view.py` exits 2 with a message when `--project`/`--repo` are ambiguous, unknown, or
+`render.py` adds `diagrams`, so keep `$B` — it is what you re-link if a month's series entry
+needs refreshing. `view.py` exits 2 with a message when `--project`/`--repo` are ambiguous, unknown, or
 have no data in the store.
 
 Then ask Claude to write the report from `$B` (+ slices + diagrams) following
@@ -180,7 +180,7 @@ flowchart TB
   b --> c{"3 · validate OK?"}
   c -- no --> fix["fix cause (see §11), re-gather<br/>into the same monthly store"] --> b
   c -- yes --> d["4 · view.py to views/YYYY-MM/bundle.json<br/>keep the bundle"]
-  d --> e["5 · link --series (exactly once)<br/>compares with last month's snapshot"]
+  d --> e["5 · link --series<br/>compares with the previous month's entry,<br/>records (or replaces) this month's"]
   e --> f["6 · render diagrams"]
   f --> g["7 · Claude authors report<br/>reports/YYYY-MM.md"]
   g --> h["8 · review citations, publish"]
@@ -204,37 +204,50 @@ flowchart TB
    (`fresh`, `fetched`, `depth1-fallback`, `none`).
 3. **Validate.** Never publish from a store that is not `RESULT: OK`.
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
-   they are what you replay if the series ever needs rebuilding.
-5. **Series.** `link --series series.json` compares with the *last entry* in the file and then
-   appends this installment. Each entry carries its `from`/`to`, so you can see which month it
-   belongs to. If you run it twice for the same month, the file ends with two entries for that
-   month: delete **every** entry for that month (deleting only the last leaves the month
-   compared with itself), then run `--series` once. If later months were already appended,
-   delete that suffix too and replay the saved bundles oldest → newest. `link` writes the
-   bundle and then the series file, each atomically, so an interrupted run leaves both as they
-   were (or only the bundle updated — re-run `--series` once). A series file that is not a JSON
-   list of entries stops `link` with exit code 2 and a message naming the file; nothing is
-   written until you fix or remove it.
+   they are what you re-link if a month's series entry needs refreshing.
+5. **Series.** `link --series series.json` keeps **one entry per window** (`from`/`to`) in
+   window order. It compares this month with the entry for the window just *before* it, then
+   records this month, replacing any entry already there for the same window:
+   - **Same month twice** — safe: the second run replaces the first entry and produces the
+     same `series` block (nothing to clean up).
+   - **An earlier month re-run** (e.g. October again after November is recorded) — October's
+     entry is replaced and compared with September; the entry is marked
+     `captured: "backfill"`, and `link` warns that November's bundle was linked against the
+     old October entry. Re-link the later months' saved bundles, oldest first, if their
+     *Since last installment* should reflect the refresh.
+   - **Months out of order** (e.g. September added after October) — September is inserted
+     before October and compared with August (or is the first installment), with the same
+     `backfill` mark and warning.
+
+   `link` writes the bundle and then the series file, each atomically, so an interrupted run
+   leaves both as they were (or only the bundle updated — just re-run it). The file is
+   `{"version": 2, "installments": [...]}`; an older bare-list file is read and rewritten in
+   that form (a month it holds twice collapses to the entry recorded last). A series file
+   `link` cannot use (invalid JSON, an unknown version, a malformed entry, entries for another
+   repo), or a bundle without a window, stops `link` with exit code 2 and a message naming the
+   file; nothing is written until you fix or remove it.
 6. **Render**, then **author**: the report's *Since last installment* section uses
-   `bundle.series` — new items, carried-over items (with prior board status) and the forecast
-   loop (last month's predictions landed / not yet).
+   `bundle.series` — new items, carried-over items (with prior board status and where each is
+   now: shipped, in flight, re-planned or rejected) and the forecast loop (last month's
+   predictions landed / not yet / dropped).
 
 ### 5.3 First installment, catching up, and roll-ups
 
 | Situation | What to do |
 |---|---|
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
-| Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end. |
+| Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end (a month recorded after a later one is marked `captured: "backfill"`, but a first month captured late cannot be detected). |
 | Missed a month | Gather it for delivery history; its in-flight/forecast are "as of now" (above). Keep it out of the series chain, or note in the report that the comparison spans two months. |
 | Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that. A wider `digest` window over a monthly store adds nothing, and singletons such as `workflow_stats` (CI health) only describe the window they were gathered for. Keep quarterly installments in a separate series file. |
-| Refresh a month after late merges | Re-gather the same window into that month's store, then re-materialize. Don't re-run `--series` unless you first remove that month's entry (and replay any later ones). |
+| Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
 
 ### 5.4 Multi-repo streams and series
 
 `--series` works on a single bundle. For a constellation, either keep a series per key member
 (`series/<owner__repo>.json`, e.g. the pattern module) or track continuity at project level
 in the narrative from the merged `shipped`/`trains`. The project view itself has no series
-block.
+block. A series file belongs to one repo: `link` refuses (exit 2) a file whose entries name
+another `owner`/`repo`, since entries are keyed by window alone.
 
 ## 6. Forecasting — reading it and making it useful
 
@@ -263,8 +276,10 @@ open PR still counts, however old or draft it is.
 ### 6.2 Verifying it next month
 
 The following installment's `series.forecast_loop` lists each previous candidate as **landed**
-(it is now in `shipped`) or **not yet**. Track a simple hit-rate per tier over time
-(landed ÷ forecast) to calibrate how much weight readers should put on each tier.
+(it is now in `shipped`), **dropped** (now in `rejected`: PR closed unmerged, issue closed not
+planned) or **not yet**. Track a simple hit-rate per tier over time (landed ÷ forecast) to
+calibrate how much weight readers should put on each tier; skip installments whose
+`series.prior.captured` is `"backfill"` (that forecast was recorded after the fact).
 
 ### 6.3 Making it meaningful on your repos
 
@@ -489,8 +504,9 @@ One store per stream keeps commands simple and failures isolated.
 - **Monthly stores** (`stores/YYYY-MM.db`) are small, single-window and independently
   auditable. Keep them with the month's `views/` and report — together they are the evidence
   behind a published installment.
-- **`series.json`** is the continuity record; back it up with the stores. It is a plain JSON
-  list of installment snapshots (each with `from`/`to`).
+- **`series.json`** is the continuity record; back it up with the stores. It is a JSON
+  object `{"version": 2, "installments": [...]}` holding one snapshot per window (each with
+  `from`/`to`), in window order.
 - **History store (optional).** For cross-window `spotlight` questions (module biography,
   person, grep across many months), build `history.db` from **one wide-window gather**
   (e.g. `--from 2026-01-01 --to 2026-11-30`) into a fresh file, and rebuild it — rather than
@@ -582,7 +598,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
 | Empty board/sprint sections | token lacks `read:project`, or no maintained board | add scope or accept |
 | `render.py` fails | `mmdc` missing, or Chromium sandbox as root | install mmdc; as root use a puppeteer `--no-sandbox` config (throwaway environments only) or `--skip-validate` |
-| `link.py --series` appended twice | ran twice for one month | delete **all** entries for that month (and any later ones), then run once / replay saved bundles in order |
+| `link.py --series` warns about later installments | a month was (re-)recorded after a later one | expected; re-link the named later months' saved bundles oldest first if their comparison should reflect the change |
 | `spotlight grep` → `fts_unavailable` | SQLite built without FTS5 | use a Python with FTS5 (most do) |
 | `spotlight` → `needs_gather` | nothing stored for that focus yet | gather more windows |
 

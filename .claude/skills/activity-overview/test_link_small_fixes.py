@@ -450,14 +450,19 @@ class TestAtomicWrites(_Disk):
     def test_interrupted_series_write_keeps_previous_index(self):
         self._main("--series", self.series_path)
         before = self._get(self.series_path)
-        self.assertEqual(len(json.loads(before)), 1)
+        self.assertEqual(len(json.loads(before)["installments"]), 1)
         real_dump = json.dump
 
         def dump(obj, fh, **kw):
-            if isinstance(obj, list):        # the series index
+            if "installments" in obj:        # the series index (version 2, #86)
                 return _failing_dump(obj, fh, **kw)
             return real_dump(obj, fh, **kw)
 
+        # The next month, so a completed write WOULD change the index (a
+        # same-window re-run rewrites identical bytes since #86).
+        b = _min_enrichable()
+        b["meta"].update({"from": "2026-02-01", "to": "2026-02-28"})
+        self._put(self.bundle_path, json.dumps(b))
         with mock.patch.object(link.json, "dump", dump):
             with self.assertRaises(OSError):
                 self._main("--series", self.series_path)
@@ -469,6 +474,9 @@ class TestAtomicWrites(_Disk):
         # leaves the series index untouched (no installment without a bundle).
         self._main("--series", self.series_path)
         before = self._get(self.series_path)
+        b = _min_enrichable()                 # the next month (see above)
+        b["meta"].update({"from": "2026-02-01", "to": "2026-02-28"})
+        self._put(self.bundle_path, json.dumps(b))
         with mock.patch.object(link.json, "dump", _failing_dump):
             with self.assertRaises(OSError):
                 self._main("--series", self.series_path)
@@ -501,7 +509,8 @@ class TestMalformedSeriesIndex(_Disk):
     def test_valid_index_still_appends(self):
         self._put(self.series_path, "[]")
         self._main("--series", self.series_path)
-        self.assertEqual(len(json.loads(self._get(self.series_path))), 1)
+        self.assertEqual(
+            len(json.loads(self._get(self.series_path))["installments"]), 1)
 
 
 if __name__ == "__main__":

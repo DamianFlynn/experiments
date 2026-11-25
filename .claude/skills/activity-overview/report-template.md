@@ -42,7 +42,7 @@ PLACEHOLDER RULES — read before filling anything below.
   - `item` — the PR or issue a ref or number points at (LOOKUP RULE below).
   - `pr` / `issue` / `commit` — a row of bundle["prs"] / bundle["issues"] /
     bundle["commits"].
-  - `loop` — a `series.forecast_loop.landed` / `not_yet` row `{type, id, tier}`;
+  - `loop` — a `series.forecast_loop.landed` / `not_yet` / `dropped` row `{type, id, tier}`;
     it has no `url` — cite `item.url`.
   - `train` — a single-repo train, bundle["trains"][] (`id`, `kind`, `outcome`,
     `root_issue`, `prs`, `commits`, `code_areas`, `tier`, `significance`,
@@ -122,17 +122,22 @@ placeholder-rules:end -->
 
 - [{item.title}]({ref.url}) ({ref.type} #{ref.id})
 
-**Carried over:** rows of `series.carried_over` — in flight last installment and still
-here, each with where it stood last time (`ref.prior_status`); add "now shipped" when
-`ref.bucket` is "shipped".
+**Carried over:** rows of `series.carried_over` — in flight last installment and in a
+bucket this window, each with where it stood last time (`ref.prior_status`) and where it
+is now (`ref.bucket`: "shipped", "in_flight", "next_candidates" — re-planned — or
+"rejected" — closed without shipping).
 
-- [{item.title}]({ref.url}) ({ref.type} #{ref.id}) — *was {ref.prior_status}*
+- [{item.title}]({ref.url}) ({ref.type} #{ref.id}) — *was {ref.prior_status}, now {ref.bucket}*
 
 **Forecast loop** (last installment's predictions vs. what landed) — rows of
-`series.forecast_loop.landed` and `series.forecast_loop.not_yet`:
+`series.forecast_loop.landed`, `series.forecast_loop.not_yet` and
+`series.forecast_loop.dropped`. When `series.prior.captured` is "backfill" the prior
+installment was recorded after a later month, so say its predictions were made late and
+keep them out of any hit rate:
 
 - **Landed:** predicted (tier `{loop.tier}`) and shipped this window: [{item.title}]({item.url}) ({loop.type} #{loop.id}).
 - **Not yet:** predicted (tier `{loop.tier}`) but still not shipped: [{item.title}]({item.url}) ({loop.type} #{loop.id}).
+- **Dropped:** predicted (tier `{loop.tier}`) but closed without shipping this window: [{item.title}]({item.url}) ({loop.type} #{loop.id}).
 
 ## Community call highlights
 
