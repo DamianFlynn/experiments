@@ -315,18 +315,30 @@ review's state to `DISMISSED`.
   | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred) |
   | `ref` | the raw reference (`br/public:…:<ver>`, `br:<host>/…:<tag>`, `ts:…`, a local path, or a TF `source`), kept verbatim |
   | `version` | pinned version when present, else `null` |
-  | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
+  | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree. Terraform (#80): every `module {}` block in the area's own `*.tf` is `false`, consumed or not; `true` only for a **nested** call (`module.a.module.b`) found in the `terraform graph` DOT |
+  | `address` | Terraform nested edges only: the call's module address, e.g. `module.a.module.b` |
+  | `via` | Terraform nested edges only: the parent call it is reached through, e.g. `module.a`; its first segment is one of the area's own `module "<name>"` blocks |
   | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge. Child edges come from building the **parent**: a child module is never the area's entrypoint |
   | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
   | `resolved` | `true` when `to` is non-null (`to: null` ⇔ `resolved: false`; `version` still carries the ref's tag) |
 
-  **Build-only.** Edges are populated *only* from a successful `bicep restore`+`bicep build`
+  **Build-only (per area).** An area's edges are populated *only* from a successful `bicep restore`+`bicep build`
   (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned
-  working tree. When the CLI or registry is unavailable, or a build fails, `edges` stays `[]` —
-  the skill never emits static, unvalidated edges. Immediate (`transitive:false`) edges are fully
-  identified (area-id + version) from source; transitive edges connect to *other areas in the
-  repo* (deep external-module internals are not fabricated into edges). The `bicep` and
+  working tree. When the CLI or registry is unavailable, or a build fails, that area's `edges`
+  stays `[]`. Immediate (`transitive:false`) edges are fully identified (area-id + version) from
+  source. Bicep transitive edges connect to *other areas in the repo* (deep external-module
+  internals are not fabricated into edges). **Terraform (#80):** the direct edges are the area's
+  own `module {}` blocks, parsed from source, so a module nobody consumes still has its edge. The
+  build only adds nested calls. Each nested call is `transitive:true` with `address`/`via`, and
+  its target (`to`/`ref`/`version`) comes from the `.terraform/modules/modules.json` that the same
+  `terraform init` wrote. A call inside a downloaded package is attributed to that package's
+  module. Without the manifest, `to` and `ref` are `null`. A nested target that is already an
+  edge (same area, or the same registry module ignoring `//submodule`) is not repeated: direct
+  wins. **Static edges on manifest gathers:** a multi-repo (manifest) gather also adds the
+  whole-tree structural scan. It emits the same direct edges, without `terraform`, for every
+  module dir in the clone (see STORE.md). Single-repo gathers do not run that scan and stay
+  build-gated. The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 

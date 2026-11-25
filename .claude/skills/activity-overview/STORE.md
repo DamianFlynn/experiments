@@ -561,6 +561,19 @@ blast-radius graph is then the repo's full module structure regardless of in-win
 activity. Gated to manifest folds so single-repo bundles stay byte-stable; `git
 ls-files` lists only tracked `.tf`, excluding vendored `.terraform/` modules.
 
+**Terraform direct vs transitive (#80).** The build path and the structural scan
+use one rule for direct edges: every `module {}` block in the area dir's own
+`*.tf` is a `transitive: false` edge, consumed or not. So a structural edge never
+contradicts a built one, and the merge dedups on `(to, ref)`. `terraform graph`
+only adds **nested** calls (`module.a.module.b`, both DOT layouts) as
+`transitive: true` edges carrying `address`/`via`. Their targets are read from
+init's `.terraform/modules/modules.json`. A nested target already reached by an
+edge is dropped: the same area, or the same registry module ignoring host case
+and `//submodule`, which is exactly what `_fold_depends_on` resolves to one
+member. So a transitive duplicate cannot overwrite a direct `depends_on`, which
+is keyed `(src, dst, depends_on)`. A nested edge with no known target (no
+manifest) has `to = ref = null` and is never folded.
+
 **People aggregate across members.** Person nodes are project-scoped (`repo="*"`).
 Each per-member fold **unions** a person's `areas`/`modules` (and ORs `is_bot`)
 with the already-stored node — a plain upsert would overwrite, so a member where a

@@ -455,7 +455,14 @@ These are real, current limits — plan around them:
     latest gathered window only.
 11. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
     `depends_on` edge in an existing store.
-12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
+12. **Terraform transitive edges come from the build.** Every `module {}` block an area
+    declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
+    (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:
+    calls whose module tree holds no resources are not in the graph, and without init's
+    `modules.json` a nested call's target is unknown and is not folded. Single-repo gathers emit
+    no Terraform edges at all without `terraform` (no structural scan); manifest gathers still
+    get the static direct edges for every module dir.
+13. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
 13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each

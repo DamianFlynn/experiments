@@ -2034,13 +2034,13 @@ def _tf_top_level_attr(body, key):
         if depths[m.start()] == 0:
             return body[m.start("val"):m.end("val")]
     return None
-# Terraform graph DOT edge. The `[root] ` node prefix is OPTIONAL: older
-# `terraform graph` emitted `"[root] module.x..." -> "[root] ..."`, but modern
-# terraform (>=~1.x default graph) emits unprefixed `"module.x..." -> "..."`.
-# Matching both keeps inter-module dependency extraction working across versions.
-_TF_EDGE_RE = re.compile(
-    r'"(?:\[root\]\s*)?(?P<a>[^"]+)"\s*->\s*"(?:\[root\]\s*)?(?P<b>[^"]+)"')
-_TF_MODULE_TOKEN_RE = re.compile(r"module\.([A-Za-z0-9_-]+)")
+# Terraform graph DOT: every quoted string is a candidate node address. The
+# `[root] ` node prefix is OPTIONAL: older `terraform graph` emitted
+# `"[root] module.x..."`, modern terraform (>= 1.7) emits unprefixed `"module.x..."`.
+# A node's module CALL chain is its leading `module.<name>` segments (an instance
+# key `[0]` / `["k"]` may follow each name): `module.a.module.b.res.x` -> (a, b).
+_TF_DOT_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_TF_MODULE_STEP_RE = re.compile(r'module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?(?:\.|(?=\s)|$)')
 
 
 def _terraform_module_bodies(tf_text):
@@ -2082,23 +2082,55 @@ def parse_terraform_module_blocks(tf_text):
     return out
 
 
-def _first_tf_module(node):
-    m = _TF_MODULE_TOKEN_RE.search(node or "")
-    return m.group(1) if m else None
+def _tf_module_chain(node):
+    """The module call chain a DOT node address lives in: `module.a.module.b.res`
+    -> ("a", "b"); a root-module node -> (). Instance keys are dropped. Pure."""
+    node = node.replace('\\"', '"')
+    if node.startswith("[root]"):
+        node = node[len("[root]"):].lstrip()
+    chain, pos = [], 0
+    while True:
+        m = _TF_MODULE_STEP_RE.match(node, pos)
+        if not m:
+            return tuple(chain)
+        chain.append(m.group(1))
+        pos = m.end()
 
 
-def parse_terraform_graph(dot_text):
-    """Extract (from_module|None, to_module) dependency pairs from terraform graph DOT.
-
-    A node's first `module.<name>` token is its owning module (None = root). An edge
-    A->B becomes (module(A), module(B)) when B is in a module and differs from A.
+def parse_terraform_module_chains(dot_text):
+    """Every module call chain the terraform graph DOT shows, with all its
+    prefixes: a node in `module.a.module.b` yields ("a",) and ("a", "b"). Read
+    from every quoted node address (edges and node declarations), so it works on
+    the legacy `[root] `-prefixed and the modern resource-only layout alike. The
+    DOT says WHICH module calls exist below the root, not who depends on whom.
     Deterministic (sorted, deduped). Pure."""
-    pairs = set()
-    for m in _TF_EDGE_RE.finditer(dot_text or ""):
-        a, b = _first_tf_module(m.group("a")), _first_tf_module(m.group("b"))
-        if b and a != b:
-            pairs.add((a, b))
-    return sorted(pairs, key=lambda p: (p[0] or "", p[1]))
+    chains = set()
+    for m in _TF_DOT_STRING_RE.finditer(dot_text or ""):
+        chain = _tf_module_chain(m.group(1))
+        for i in range(1, len(chain) + 1):
+            chains.add(chain[:i])
+    return sorted(chains)
+
+
+def parse_terraform_modules_manifest(text):
+    """Parse terraform's own record of the installed module tree,
+    `.terraform/modules/modules.json` (written by `terraform init`), into
+    {call chain: {"source", "version", "dir"}}; the root entry (Key "") is
+    dropped. Malformed input or entries are ignored ({} / skipped). Pure."""
+    try:
+        doc = json.loads(text or "")
+    except ValueError:
+        return {}
+    mods = doc.get("Modules") if isinstance(doc, dict) else None
+    out = {}
+    for e in mods if isinstance(mods, list) else ():
+        if not isinstance(e, dict) or not isinstance(e.get("Key"), str) or not e["Key"]:
+            continue
+        out[tuple(e["Key"].split("."))] = {
+            "source": e.get("Source") if isinstance(e.get("Source"), str) else None,
+            "version": e.get("Version") if isinstance(e.get("Version"), str) else None,
+            "dir": e.get("Dir") if isinstance(e.get("Dir"), str) else None}
+    return out
 
 
 def _resolve_tf_module_source(name, sources, bodies, base_dir, patterns):
@@ -2112,20 +2144,84 @@ def _resolve_tf_module_source(name, sources, bodies, base_dir, patterns):
     if not src:
         return None, None, None
     if src.startswith(".") or src.startswith("/"):
-        joined = os.path.normpath(os.path.join(base_dir, src))
-        if joined == os.pardir or joined.startswith(os.pardir + os.sep):
-            # escapes the repo (e.g. ../../.. above root): unresolvable to a
-            # repo area -> external (to=None), never a phantom dangling area.
-            return None, src, None
-        # normpath('.') is the repo root; classify it the same way root files
-        # are (-> "main.tf"), so a local source pointing at the root module
-        # resolves to the SAME area id as the root module's own files.
-        rel = "" if joined == os.curdir else joined
-        area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
-            or rel or "main.tf"
-        return area, src, None
+        return _tf_local_area(base_dir, src, patterns), src, None
     version = _tf_top_level_attr(bodies.get(name, ""), "version") or None
     return None, src, version                          # external: to=None, ref=src
+
+
+def _tf_local_area(base_dir, path, patterns):
+    """The repo area id of a local module dir `path` (relative to `base_dir`), or
+    None when it escapes the repo. Pure."""
+    joined = os.path.normpath(os.path.join(base_dir, path))
+    if joined == os.pardir or joined.startswith(os.pardir + os.sep):
+        # escapes the repo (e.g. ../../.. above root): unresolvable to a
+        # repo area -> external (to=None), never a phantom dangling area.
+        return None
+    # normpath('.') is the repo root; classify it the same way root files
+    # are (-> "main.tf"), so a local source pointing at the root module
+    # resolves to the SAME area id as the root module's own files.
+    rel = "" if joined == os.curdir else joined
+    return classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
+        or rel or "main.tf"
+
+
+def _tf_direct_edges(tf_text, base_dir, patterns):
+    """The DIRECT edges of one Terraform module: one per top-level `module {}`
+    block with a `source` in `tf_text` (the module dir's whole *.tf set), consumed
+    or not, all `transitive: false`; deduped on (to, ref), sorted. Shared by the
+    build path (build_terraform_edges) and the static whole-tree scan, so both
+    report the same direct set. Pure."""
+    bodies = _terraform_module_bodies(tf_text)
+    sources = parse_terraform_module_blocks(tf_text)
+    edges, seen = [], set()
+    for name in sources:                           # only blocks WITH a source
+        to, ref, version = _resolve_tf_module_source(name, sources, bodies,
+                                                      base_dir, patterns)
+        if ref is None or (to, ref) in seen:
+            continue
+        seen.add((to, ref))
+        edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
+                      "transitive": False, "provider": "terraform",
+                      "resolved": to is not None})
+    return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
+
+
+def _resolve_tf_nested(chain, manifest, base_dir, patterns):
+    """Resolve a NESTED module call chain via the init module manifest
+    (parse_terraform_modules_manifest) to (to|None, ref|None, version).
+
+    A module installed in the working tree (its `Dir` outside `.terraform/`) is a
+    repo dir -> its area, with the recorded `Source` as `ref`. One installed under
+    `.terraform/modules/` belongs to a downloaded package: it is attributed to the
+    nearest call in its chain (itself first) with a remote source, e.g. a
+    registry module's internal `./modules/x` is that registry module. Unknown
+    (no manifest entry, no remote ancestor) -> (None, None, None). Pure."""
+    entry = manifest.get(chain)
+    d = os.path.normpath(entry["dir"]) if entry and entry["dir"] else None
+    if d is None:
+        return None, None, None
+    if not (os.path.isabs(d) or d == ".terraform"
+            or d.startswith(".terraform" + os.sep)):
+        return _tf_local_area(base_dir, d, patterns), entry["source"], None
+    for i in range(len(chain), 0, -1):
+        anc = manifest.get(chain[:i]) or {}
+        src = anc.get("source")
+        if src and not src.startswith((".", "/")):
+            return None, src, anc.get("version")
+    return None, None, None
+
+
+def _tf_target_identity(to, ref):
+    """What a module edge points at, for 'direct wins' dedup: a repo area, else the
+    registry module (manifest.registry_identity: host-defaulted, case-folded,
+    `//submodule` dropped — exactly what a multi-repo fold resolves to one member),
+    else the raw ref. None when unknown. Pure."""
+    if to is not None:
+        return ("area", to)
+    if ref is None:
+        return None
+    reg = manifest_mod.registry_identity(ref)
+    return ("registry",) + reg if reg else ("ref", ref)
 
 
 def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
@@ -2168,22 +2264,8 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
         # module); a nested dir is only used when the area dir itself has no *.tf.
         mod_dir = _tf_module_dir(aid, paths)
         own = [p for p in paths if os.path.dirname(p) == mod_dir]
-        base_dir = mod_dir
         text = "\n".join(read_text(p) for p in own)
-        bodies = _terraform_module_bodies(text)
-        sources = parse_terraform_module_blocks(text)
-        edges, seen = [], set()
-        for name in sources:                       # only blocks WITH a source
-            to, ref, version = _resolve_tf_module_source(name, sources, bodies,
-                                                          base_dir, patterns)
-            if ref is None or (to, ref) in seen:
-                continue
-            seen.add((to, ref))
-            edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
-                          "transitive": False, "provider": "terraform",
-                          "resolved": to is not None})
-        out[aid] = {"paths": paths,
-                    "edges": sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))}
+        out[aid] = {"paths": paths, "edges": _tf_direct_edges(text, mod_dir, patterns)}
     return out
 
 
@@ -2210,38 +2292,49 @@ def merge_structural_areas(code_graph, structural):
     return code_graph
 
 
-def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None):
-    """Build inter-area dependency edges for one Terraform area.
+def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None,
+                          modules_json=None):
+    """Build inter-area dependency edges for one Terraform area (#80).
 
-    Joins terraform-graph module pairs with the `module {source=}` blocks. A LOCAL
-    source resolves to a repo area-id (via classify_code_area, relative to base_path)
-    → `to`=area, `resolved`=True. A REGISTRY/external source cannot map to a repo area,
-    so — like the Bicep path and the schema (`to`: area-id|null) — `to`=None,
-    `resolved`=False, with the source kept in `ref` (+ pinned `version`). The DOT graph
-    is transitive: a module the root depends on directly is `transitive`=False; one
-    reached ONLY through another module is `transitive`=True (and direct wins if both).
-    Pure; deterministic."""
+    DIRECT edges are the area's own `module {}` blocks (`tf_text` = the module
+    dir's whole *.tf set): every block with a `source` is `transitive`=False,
+    whether or not anything consumes it (_tf_direct_edges, the same rule as the
+    static whole-tree scan). A LOCAL source resolves to a repo area-id (via
+    classify_code_area, relative to base_path) → `to`=area, `resolved`=True. A
+    REGISTRY/external source cannot map to a repo area, so — like the Bicep path
+    and the schema (`to`: area-id|null) — `to`=None, `resolved`=False, with the
+    source kept in `ref` (+ pinned `version`).
+
+    The terraform graph DOT is used ONLY for NESTED module calls
+    (`module.a.module.b`, parse_terraform_module_chains): each is a
+    `transitive`=True edge carrying its `address` and the parent call it is
+    reached `via`. Its target comes from `modules_json` (the
+    `.terraform/modules/modules.json` the same `terraform init` wrote;
+    _resolve_tf_nested); without it the target is unknown (`to`/`ref` None) but
+    the edge is still recorded. Direct wins: a nested call whose target is
+    already a direct edge (or an earlier nested one) is not repeated
+    (_tf_target_identity). Pure; deterministic."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
-    bodies = _terraform_module_bodies(tf_text)
-    sources = parse_terraform_module_blocks(tf_text)
     base_dir = os.path.dirname(base_path or "")
-
-    pairs = parse_terraform_graph(dot_text)
-    direct = {b for a, b in pairs if a is None}    # modules the root depends on
-    edges = []
-    seen = set()
-    for _a, b in pairs:
-        to, ref, version = _resolve_tf_module_source(b, sources, bodies, base_dir, patterns)
-        if ref is None:                            # module block with no source
+    edges = _tf_direct_edges(tf_text, base_dir, patterns)
+    seen = {_tf_target_identity(e["to"], e["ref"]) for e in edges}
+    manifest = parse_terraform_modules_manifest(modules_json) if modules_json else {}
+    nested = []
+    for chain in parse_terraform_module_chains(dot_text):
+        if len(chain) < 2:                         # a root call: direct, from source
             continue
-        key = (to, ref)
+        to, ref, version = _resolve_tf_nested(chain, manifest, base_dir, patterns)
+        address = ".".join("module." + n for n in chain)
+        key = _tf_target_identity(to, ref) or ("address", address)
         if key in seen:
             continue
         seen.add(key)
-        edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
-                      "transitive": b not in direct, "provider": "terraform",
-                      "resolved": to is not None})
-    return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
+        nested.append({"to": to, "kind": "module", "ref": ref, "version": version,
+                       "transitive": True, "provider": "terraform",
+                       "resolved": to is not None, "address": address,
+                       "via": address.rsplit(".module.", 1)[0]})
+    return sorted(edges + nested,
+                  key=lambda e: (str(e["to"]), str(e["ref"]), e.get("address", "")))
 
 
 def _read_text_file(path):
@@ -2862,6 +2955,18 @@ def _list_tf_files(clone_dir, rel_dir):
     return [os.path.join(rel_dir, f) if rel_dir else f for f in names]
 
 
+def _read_tf_modules_json(read_text, clone_dir, rel_dir):
+    """The `.terraform/modules/modules.json` that `terraform init` just wrote in the
+    module dir (its record of the installed module tree, used to name NESTED
+    module calls), or None when it is absent or unreadable — the nested edges then
+    keep an unknown target; the build itself still counts as resolved."""
+    try:
+        return read_text(os.path.join(clone_dir, rel_dir, ".terraform", "modules",
+                                      "modules.json"))
+    except Exception:
+        return None
+
+
 def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf,
                         run, read_text, timeout, retries):
     """Resolve ONE area's edges. Returns (edges_or_None, status). Never raises.
@@ -2897,7 +3002,9 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
             # the whole dir. Fall back to the entrypoint if the dir can't be listed.
             tf_files = _list_tf_files(clone_dir, rel_dir) or [tp]
             src = "\n".join(read_text(os.path.join(clone_dir, f)) for f in tf_files)
-            return build_terraform_edges(src, dot, tp, area_ids, patterns), "resolved"
+            mods = _read_tf_modules_json(read_text, clone_dir, rel_dir)
+            return build_terraform_edges(src, dot, tp, area_ids, patterns,
+                                         modules_json=mods), "resolved"
         except subprocess.TimeoutExpired:
             status = "timeout"   # hung build: bounded, retried, then recorded
         except Exception:

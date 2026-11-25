@@ -252,7 +252,7 @@ flowchart TB
   C -- "*.tf and terraform on PATH" --> TF["terraform init -backend=false<br/>+ terraform graph (DOT)"]
   C -- none --> SK
   BI --> BE["build_bicep_edges<br/>source refs + walk_arm_deployments"]
-  TF --> TE["build_terraform_edges<br/>parse_terraform_graph + module blocks"]
+  TF --> TE["build_terraform_edges<br/>module blocks (direct) + DOT nested calls<br/>+ .terraform/modules/modules.json"]
   BE --> R["edges with to, ref, version,<br/>transitive, local, instances"]
   TE --> R
   BI -. "timeout / failure, retried IAC_RETRIES" .-> F["edges_status = timeout / failed"]
@@ -273,9 +273,11 @@ flowchart TB
   files under nested `examples/`/`tests/` are never chosen, so an AVM child module
   (`avm/res/key-vault/vault/access-policy/main.bicep`) is never built in place of its parent.
   With no clone directory on disk (offline callers) the same rule runs over `paths` alone.
-- **Build-only:** edges come only from a successful build; static guessing is never emitted.
-  A `resolved` area with no edges genuinely has no inter-area dependencies; `timeout`/`failed`
-  are **counted gaps**.
+- **Build-only:** this path emits an area's edges only after a successful build. A `resolved`
+  area with no edges genuinely has no inter-area dependencies; `timeout`/`failed` are
+  **counted gaps**. (For Terraform the direct edges themselves are source-parsed, and manifest
+  gathers add static edges for every module dir through the structural scan below. Single-repo
+  gathers keep the build gate: no `terraform` means no Terraform edges. Decided in #80.)
 - **Bicep:** `parse_bicep_module_refs` splits a **public**-registry ref (`br/public:<path>:<ver>` /
   `br:mcr.microsoft.com/bicep/<path>:<ver>`) into `registry_path` + `version`; private-registry
   (`br:<other-host>/…`), template-spec (`ts:…`, `ts/<alias>:…`) and user-alias (`br/<alias>:…`)
@@ -287,9 +289,22 @@ flowchart TB
   `avm/res/network/virtual-network` whether or not it changed in the window; anything else is
   `to=None, resolved=False` (#73). Transitive edges come from walking nested
   deployments in the compiled ARM (`walk_arm_deployments`).
-- **Terraform:** extraction reads **every `*.tf` in the entrypoint's module dir**; `parse_terraform_graph`
-  accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
-  first `module.<name>` token gives its owning module. Local sources resolve to repo areas
+- **Terraform (#80):** extraction reads **every `*.tf` in the entrypoint's module dir**. The
+  **direct** set is that dir's own `module {}` blocks (`_tf_direct_edges`): every block with a
+  `source` is an edge with `transitive=false`, whether or not anything consumes its outputs.
+  This is the same function the structural scan uses. The DOT is used only for **nested** calls:
+  `parse_terraform_module_chains` reads every quoted node address, with or without the legacy
+  `[root] ` prefix and with instance keys dropped, and takes its leading `module.<name>` segments
+  as a call chain (`module.a.module.b.res` → `(a, b)`). Each chain of length ≥ 2 is a
+  `transitive=true` edge carrying `address` (`module.a.module.b`) and `via` (`module.a`). Its
+  target comes from the `.terraform/modules/modules.json` that the same `terraform init` wrote
+  (`_resolve_tf_nested`). A `Dir` in the working tree is a repo area, with `ref` set to the
+  recorded `Source`. A `Dir` under `.terraform/modules/` belongs to a downloaded package and is
+  attributed to the nearest call in its chain with a remote source, with that call's `Source`
+  and `Version`. With no manifest, the target is unknown (`to=ref=null`). Direct wins: a nested
+  target that is already an edge is not repeated (`_tf_target_identity`: the area, else the
+  registry identity without `//submodule`, else the raw ref). The DOT shows only calls that
+  contain resources, either directly or deeper down. Local sources resolve to repo areas
   (`../..` from a submodule → the root `main.tf` area); registry sources keep `to=None,
   ref=<source>, version`. Module blocks are parsed on an HCL mask (`_hcl_mask`: `#`, `//`,
   `/* */` comments, string contents incl. `${…}` interpolation, and heredocs blanked), so a
@@ -305,7 +320,9 @@ flowchart TB
   every tracked module's `source` references (`git ls-files`, no `terraform init`; per area
   only the area dir's own `*.tf`, nested `examples/`/`tests/` files excluded) and
   `merge_structural_areas` unions them, so the dependency graph reflects structure rather than
-  in-window churn. Single-repo gathers skip this to keep golden bundles byte-stable.
+  in-window churn. Its direct edges match those of a built area (`_tf_direct_edges`), so the
+  merge adds untouched module dirs and never contradicts a built area's direct set. Single-repo
+  gathers skip this to keep golden bundles byte-stable.
 
 ### 4.7 GitHub REST acquisition
 
@@ -967,7 +984,8 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 
 | Missing | Effect | Signal |
 |---|---|---|
-| `bicep` / `terraform` | no IaC edges | `edge_extraction` counts `skipped` |
+| `bicep` / `terraform` | no IaC edges (manifest gathers keep the static Terraform direct edges) | `edge_extraction` counts `skipped` |
+| `.terraform/modules/modules.json` | nested Terraform edges have no target (`to=ref=null`) | edge has `address`/`via` but no `ref` |
 | registry unreachable / slow init | some areas unresolved | `timeout` / `failed` counts |
 | `read:project` scope | no board status / sprints | empty board layer |
 | `mmdc` | render fails (or use `--skip-validate`) | error |
@@ -1006,6 +1024,8 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
+| Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
+| Terraform edges are build-gated on single-repo gathers | no structural scan without a manifest (#80 decision) | without `terraform` (or with a failed init), a single-repo bundle has no Terraform edges, even though its direct edges are source-parsed | opt-in static fallback with its own `edges_status` |
 | `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
 | Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |

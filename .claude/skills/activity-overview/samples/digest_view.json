@@ -1256,7 +1256,7 @@
                   "ref": "Azure/avm-res-network-applicationgatewaywebapplicationfirewallpolicy/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.2.0"
                 },
                 {
@@ -1265,7 +1265,7 @@
                   "ref": "Azure/avm-res-network-azurefirewall/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.4.0"
                 },
                 {
@@ -1274,7 +1274,7 @@
                   "ref": "Azure/avm-res-network-firewallpolicy/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.3.3"
                 },
                 {
@@ -1283,7 +1283,7 @@
                   "ref": "Azure/avm-res-network-networksecuritygroup/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.5.0"
                 },
                 {
@@ -1292,7 +1292,7 @@
                   "ref": "Azure/avm-res-network-privatednszone/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.4.2"
                 },
                 {
@@ -1301,7 +1301,7 @@
                   "ref": "Azure/avm-res-network-publicipaddress/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.2.0"
                 },
                 {
@@ -1310,7 +1310,7 @@
                   "ref": "Azure/avm-res-network-routetable/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.4.1"
                 },
                 {
@@ -1328,7 +1328,7 @@
                   "ref": "Azure/avm-res-network-virtualnetwork/azurerm//modules/peering",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.16.0"
                 },
                 {
@@ -1346,7 +1346,7 @@
                   "ref": "Azure/avm-res-operationalinsights-workspace/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.4.2"
                 },
                 {
@@ -1480,7 +1480,7 @@
                   "ref": "Azure/avm-res-network-firewallpolicy/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.3.3"
                 },
                 {
@@ -1489,7 +1489,7 @@
                   "ref": "Azure/avm-res-network-natgateway/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.2.1"
                 },
                 {
@@ -1516,7 +1516,7 @@
                   "ref": "Azure/avm-res-operationalinsights-workspace/azurerm",
                   "resolved": false,
                   "to": null,
-                  "transitive": true,
+                  "transitive": false,
                   "version": "0.4.2"
                 },
                 {
@@ -19532,7 +19532,7 @@
       "dst_repo": "Azure/terraform-azurerm-avm-res-operationalinsights-workspace",
       "src_area": "main.tf",
       "src_repo": "Azure/terraform-azurerm-avm-ptn-aiml-landing-zone",
-      "transitive": true,
+      "transitive": false,
       "version": "0.4.2"
     },
     {
@@ -19550,7 +19550,7 @@
       "dst_repo": "Azure/terraform-azurerm-avm-res-operationalinsights-workspace",
       "src_area": "modules/example_hub_vnet",
       "src_repo": "Azure/terraform-azurerm-avm-ptn-aiml-landing-zone",
-      "transitive": true,
+      "transitive": false,
       "version": "0.4.2"
     },
     {
