@@ -183,10 +183,17 @@ class TestManifestValidation(unittest.TestCase):
     def test_rejects_dotdot_owner(self):
         self.assertRejects(_man([{"owner": "..", "repo": "r"}]), r"'owner'")
 
-    def test_rejects_owner_with_double_hyphen_underscore_or_dot(self):
-        for owner in ("a--b", "a_b", "a.b"):
+    def test_rejects_owner_with_dot_or_unsafe_characters(self):
+        for owner in ("a.b", "a b", "a?b", "a#b", "a%2Fb"):
             with self.subTest(owner=owner):
                 self.assertRejects(_man([{"owner": owner, "repo": "r"}]), r"'owner'")
+
+    def test_accepts_legacy_and_enterprise_owner_names(self):
+        # Real GitHub names the sign-up rule no longer allows: legacy accounts
+        # with "--", Enterprise Managed User logins with "_".
+        for owner in ("a--b", "name_corp", "trailing-"):
+            with self.subTest(owner=owner):
+                self.assertEqual(manifest.check_owner(owner), owner)
 
     def test_rejects_integer_owner_with_value_error(self):
         self.assertRejects(_man([{"owner": 123, "repo": "r"}]),

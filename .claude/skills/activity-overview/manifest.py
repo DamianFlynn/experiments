@@ -20,7 +20,11 @@ import re
 
 # GitHub user/org names: alphanumerics and single hyphens, not starting with a
 # hyphen, at most 39 characters.
-_OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+# Owner (user/org) names. Deliberately a little looser than GitHub's current sign-up
+# rule so legitimate existing names are not rejected: legacy accounts may contain
+# "--", and Enterprise Managed User logins contain "_" (name_shortcode). What matters
+# here is that the value is safe to place in a URL path segment and an id.
+_OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _OWNER_MAX = 39
 # GitHub repo names: alphanumerics, '-', '_', '.'; '.' and '..' are reserved.
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -46,11 +50,10 @@ def check_owner(value, what="'owner'"):
     _require_str(value, what)
     if "/" in value:
         raise ValueError("{} must not contain '/', got {!r}".format(what, value))
-    if (not _OWNER_RE.match(value) or "--" in value
-            or len(value) > _OWNER_MAX):
+    if not _OWNER_RE.match(value) or len(value) > _OWNER_MAX:
         raise ValueError(
-            "{} must be a GitHub owner name (letters, digits and single "
-            "hyphens, not starting with '-', at most {} characters), got "
+            "{} must be a GitHub owner name (letters, digits, '-' and '_', "
+            "not starting with '-', at most {} characters), got "
             "{!r}".format(what, _OWNER_MAX, value))
     return value
 
