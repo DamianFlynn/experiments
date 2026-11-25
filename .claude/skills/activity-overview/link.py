@@ -4,6 +4,7 @@ import json
 import sys
 from datetime import datetime, timezone
 
+import graphstore
 import gather  # for resolve_commit_pr / attach_commit_prs (commit->PR resolution)
 import series  # Phase 13: series continuity (installment_snapshot / compute_series)
 
@@ -40,9 +41,9 @@ def _in_window(ts, period):
     so dateless fixtures (and pre-window-free bundles) classify as in-window."""
     if not period or not ts:
         return True
-    frm, to = period.get("from"), period.get("to")
-    day = ts[:10]
-    return (not frm or day >= frm) and (not to or day <= to)
+    # Granularity-safe (issue #52): an ISO `from`/`to` no longer drops the
+    # first day; a date-only ts or bound covers its whole day.
+    return graphstore.ts_in_window(ts, period.get("from"), period.get("to"))
 
 
 def _high_priority(item):

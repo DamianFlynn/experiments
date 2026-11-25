@@ -44,6 +44,18 @@ nothing already correct — the dedup guarantee is durable, not recomputed.
 `structure` nodes typically carry NULL `ts` and are excluded from window
 range scans (they are not activity).
 
+**`ts` granularity and window bounds.** `ts` is mixed: commits and artifacts
+store a date-only `YYYY-MM-DD`; PRs, issues, reviews and events store an ISO
+datetime. Window bounds may also be either form (`--to 2026-05-31` or
+`2026-05-31T23:59:59Z`). Every window check — `range_query`'s SQL and the
+Python predicate `graphstore.ts_in_window(ts, from, to)` that `complete`,
+`spotlight`, `gather.in_window` and `link._in_window` delegate to — applies one
+rule: each bound is compared at the **coarser** granularity of the pair, so a
+date-only `ts` or bound covers its whole day; only datetime-vs-datetime is
+compared exactly. Both ends are inclusive, either bound may be None. So a PR
+merged `2026-05-31T15:00:00Z` is inside `--to 2026-05-31`, and a commit dated
+`2026-03-01` is inside `from=2026-03-01T00:00:00Z`.
+
 ## Edges (`edges` table)
 
 `(src_id, dst_id, edge_type, ts, data)`, PK `(src,dst,type)`. Re-upsert
@@ -445,4 +457,6 @@ check, not a crash). This is what makes the store a stand-alone deliverable.
 ## Determinism
 
 `data` blobs serialize with `sort_keys=True`; `range_query` orders by
-`(ts, id)`. Given fixed inputs the store is byte-stable (modulo `fetched_at`).
+`(ts, id)` and applies the granularity-safe window rule above (`ts_in_window`),
+so the same window gives the same node set whether its bounds are written as
+dates or as start/end-of-day datetimes. Given fixed inputs the store is byte-stable (modulo `fetched_at`).

@@ -511,54 +511,33 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None,
     )
 
 
-def _as_iso(bound, end_of_day=False):
-    """Normalize a date-only value (`YYYY-MM-DD`) to a full ISO datetime so
-    lexicographic comparison stays correct against ISO datetimes. A value that
-    already carries a time (`T...`) — or None — is returned unchanged."""
-    if bound is None or "T" in bound:
-        return bound
-    return bound + ("T23:59:59Z" if end_of_day else "T00:00:00Z")
-
-
 def _completion_window(ts_from, ts_to):
-    """The normalized (lo, hi) ISO bounds for completion's window check, or None
-    when unbounded. Date-only bounds are widened to start/end-of-day so they
-    compare correctly against ISO datetimes (mirrors `_date_in_range`)."""
+    """The (lo, hi) bounds for completion's window check, or None when
+    unbounded. Bounds are passed through as given (date-only or ISO): the
+    granularity rule — a date-only ts or bound covers its whole day — lives in
+    `graphstore.ts_in_window`, which both `_ts_in_window` and
+    `complete._in_window` delegate to (issue #52)."""
     if ts_from is None and ts_to is None:
         return None
-    return (_as_iso(ts_from), _as_iso(ts_to, end_of_day=True))
+    return (ts_from, ts_to)
 
 
 def _ts_in_window(ts, window):
-    """True if `ts` falls within a normalized (lo, hi) completion window (either
-    bound may be None). An empty ts cannot be proven in-window -> False."""
+    """True if `ts` falls within a (lo, hi) completion window (either bound may
+    be None). An empty ts cannot be proven in-window -> False."""
     if window is None:
         return True
-    if not ts:
-        return False
     lo, hi = window
-    if lo is not None and ts < lo:
-        return False
-    if hi is not None and ts > hi:
-        return False
-    return True
+    return graphstore.ts_in_window(ts, lo, hi)
 
 
 def _date_in_range(ts, ts_from, ts_to):
     """A train/event date filter. An empty ts is excluded once a bound is set.
-    Date-only bounds are normalized to the start/end of day, so an inclusive
-    `--to` of `2026-01-12` still matches a same-day ISO datetime like
-    `2026-01-12T14:00:00Z` (a raw string `>` would otherwise exclude it)."""
-    if not ts:
-        return False
-    t = _as_iso(ts)
-    lo = _as_iso(ts_from)
-    hi = _as_iso(ts_to, end_of_day=True)
-    if lo is not None and t < lo:
-        return False
-    if hi is not None and t > hi:
-        return False
-    return True
+    Granularity-safe via `graphstore.ts_in_window`: an inclusive `--to` of
+    `2026-01-12` still matches a same-day ISO datetime like
+    `2026-01-12T14:00:00Z`, and a date-only ts (a commit day) matches an ISO
+    bound on that same day."""
+    return graphstore.ts_in_window(ts, ts_from, ts_to)
 
 
 def _person_comment_excerpt(conn, dst_id, login):

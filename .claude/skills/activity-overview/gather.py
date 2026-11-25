@@ -217,11 +217,10 @@ def in_window_boundary_commits(boundary, commits):
 
 def in_window(ts, from_date, to_date):
     """True if ISO date/datetime string `ts` falls within [from_date, to_date]
-    inclusive, comparing on the date prefix. None/empty is never in window."""
-    if not ts:
-        return False
-    day = ts[:10]
-    return from_date <= day <= to_date
+    inclusive. None/empty is never in window. Bounds may be date-only or ISO;
+    the granularity-safe rule is `graphstore.ts_in_window` (a date-only value
+    covers its whole day, so an ISO `from` no longer drops the first day)."""
+    return graphstore.ts_in_window(ts, from_date, to_date)
 
 
 def window_records(records, from_date, to_date):
@@ -2451,7 +2450,7 @@ def _runs_page(get_page, api, frm, to):
         payload, url = get_page(url)
         page = payload.get("workflow_runs", []) if isinstance(payload, dict) else payload
         runs.extend(page)
-        if page and page[-1].get("created_at", "")[:10] < frm:
+        if page and page[-1].get("created_at", "")[:10] < frm[:10]:
             break
     return runs
 
@@ -2584,7 +2583,7 @@ def acquire(args, env):
     raw_closed = fetch_until(
         get_page,
         f"{api}/pulls?state=closed&sort=updated&direction=desc&per_page=100",
-        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
+        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm[:10],
     )
     # ...plus all currently-open PRs (these feed in_flight / next_candidates).
     raw_open = fetch_all(
@@ -2638,7 +2637,7 @@ def acquire(args, env):
     raw_repo_issues = fetch_until(
         get_page,
         f"{api}/issues?state=all&sort=updated&direction=desc&per_page=100",
-        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
+        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm[:10],
     )
     # Open issues untouched during the window are still relevant to the in_flight
     # / next_candidates buckets (e.g. milestone-scoped work that hasn't moved), so

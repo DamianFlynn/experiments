@@ -5,6 +5,7 @@ gather writes and extract/spotlight read. All SQL lives here; callers use
 the function API below. See STORE.md for the schema and identity rules.
 """
 
+import datetime
 import json
 import sqlite3
 import time
@@ -347,23 +348,116 @@ def get_code_events(conn, artifact_id):
     return out
 
 
-def range_query(conn, project, repos, ts_from, ts_to, node_class=None):
-    """In-window nodes: project match, repo in `repos`, ts in [ts_from, ts_to].
-    Nodes with NULL ts (structure) are excluded — they are not activity.
-    Ordered by (ts, id) for deterministic output."""
-    if not repos:
-        return []
+def _is_date_only(value):
+    """A `ts`/bound with no time part (`YYYY-MM-DD`, no `T`) covers its whole day."""
+    return "T" not in value
+
+
+def ts_in_window(ts, ts_from, ts_to):
+    """THE window predicate (issue #52): is `ts` within [ts_from, ts_to]?
+
+    `ts` and the bounds may each be date-only (`YYYY-MM-DD`) or an ISO datetime
+    (`YYYY-MM-DDTHH:MM:SSZ`). Each bound is compared at the COARSER granularity
+    of the pair: when either side is date-only the comparison is on the date
+    prefix (`[:10]`), so a date-only value counts as its whole day; only when
+    both are datetimes is the full ISO string compared. Consequences:
+
+    - date-only bounds keep ISO-ts nodes on the first and last day
+      (`2026-05-31T15:00:00Z` is inside `--to 2026-05-31`);
+    - ISO bounds keep date-only-ts nodes (commits) on the first and last day
+      (`2026-03-01` is inside `from=2026-03-01T00:00:00Z`).
+
+    Inclusive at both ends; either bound may be None (one-sided / unbounded).
+    An empty/None `ts` cannot be proven in-window -> False. `range_query`'s SQL
+    implements exactly this rule; every other window check delegates here."""
+    if not ts:
+        return False
+    if ts_from:
+        if _is_date_only(ts_from) or _is_date_only(ts):
+            if ts[:10] < ts_from[:10]:
+                return False
+        elif ts < ts_from:
+            return False
+    if ts_to:
+        if _is_date_only(ts_to) or _is_date_only(ts):
+            if ts[:10] > ts_to[:10]:
+                return False
+        elif ts > ts_to:
+            return False
+    return True
+
+
+def _next_day(day):
+    """`YYYY-MM-DD` + 1 day, or None if `day` is not a parseable date."""
+    try:
+        d = datetime.date.fromisoformat(day)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return (d + datetime.timedelta(days=1)).isoformat()
+    except OverflowError:
+        return None
+
+
+def _window_sql(ts_from, ts_to):
+    """(sql_fragment, params) implementing `ts_in_window` over `nodes.ts`.
+
+    A plain `ts >= day` / `ts < next_day` range prefilter keeps the window scan
+    on the `ts` index; the extra terms add the granularity rule (a date-only ts
+    — no `T` — is compared on its day against an ISO bound)."""
+    clauses, params = [], []
+    if ts_from:
+        day = ts_from[:10]
+        # ts >= 'YYYY-MM-DD' is exactly "date prefix >= day" for any ts.
+        clauses.append("ts >= ?")
+        params.append(day)
+        if not _is_date_only(ts_from):
+            # ISO bound: an ISO ts compares precisely; a date-only ts on/after
+            # the bound's day already passed the prefix test above.
+            clauses.append("(ts >= ? OR instr(ts, 'T') = 0)")
+            params.append(ts_from)
+    if ts_to:
+        day = ts_to[:10]
+        nxt = _next_day(day)
+        if nxt is not None:
+            clauses.append("ts < ?")             # index-friendly prefilter
+            params.append(nxt)
+        clauses.append("substr(ts, 1, 10) <= ?")
+        params.append(day)
+        if not _is_date_only(ts_to):
+            clauses.append("(ts <= ? OR instr(ts, 'T') = 0)")
+            params.append(ts_to)
+    return " AND ".join(clauses), params
+
+
+def _range_query_sql(project, repos, ts_from, ts_to, node_class):
     repo_ph = ",".join("?" for _ in repos)
     sql = (
         "SELECT * FROM nodes "
         "WHERE project=? AND repo IN ({}) "
-        "AND ts IS NOT NULL AND ts BETWEEN ? AND ?".format(repo_ph)
+        "AND ts IS NOT NULL AND ts != ''".format(repo_ph)
     )
-    params = [project] + list(repos) + [ts_from, ts_to]
+    params = [project] + list(repos)
+    wsql, wparams = _window_sql(ts_from, ts_to)
+    if wsql:
+        sql += " AND " + wsql
+        params += wparams
     if node_class is not None:
         sql += " AND node_class=?"
         params.append(node_class)
     sql += " ORDER BY ts, id"
+    return sql, params
+
+
+def range_query(conn, project, repos, ts_from, ts_to, node_class=None):
+    """In-window nodes: project match, repo in `repos`, ts in [ts_from, ts_to]
+    under the granularity-safe rule of `ts_in_window` (bounds and ts may each
+    be date-only or ISO; a date-only value covers its whole day; inclusive).
+    Either bound may be None. Nodes with NULL ts (structure) are excluded —
+    they are not activity. Ordered by (ts, id) for deterministic output."""
+    if not repos:
+        return []
+    sql, params = _range_query_sql(project, repos, ts_from, ts_to, node_class)
     return [_row_to_node(r) for r in conn.execute(sql, params)]
 
 

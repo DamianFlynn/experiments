@@ -423,6 +423,12 @@ Plus `fts_text` (FTS5 virtual table) when `fts5_available(conn)`.
 
 **Semantics.** Identity columns are immutable; `ts`/`data`/`fetched_at` refresh on re-upsert.
 Edges union. `range_query` orders by `(ts, id)` and excludes NULL-`ts` structure nodes.
+Window bounds are granularity-safe: node `ts` mixes date-only (commits, artifacts) and ISO
+datetimes (PRs, issues, reviews, events), and bounds may be either. `range_query` and the
+shared predicate `ts_in_window(ts, ts_from, ts_to)` compare each bound at the coarser
+granularity of the pair (a date-only value covers its whole day; datetime-vs-datetime is
+exact), inclusive, either bound optional. `complete._in_window`, `spotlight` window checks,
+`gather.in_window` and `link._in_window` delegate to `ts_in_window`; no caller pads bounds.
 `traverse_spine` walks spine edges **undirected**, depth-capped; `missing` lists referenced but
 unstored spine ids (minus known-dead when `skip_dead`).
 
