@@ -1533,12 +1533,17 @@ def parse_codeowners(text):
 
 # Conventional label namespace -> facet (auto-detect). AVM uses `Class:`/`Type:`/
 # `Needs:`; most repos use `area`/`priority`/`status`/`lifecycle` with `:` or `/`.
+# AVM's `Class:` (Resource/Pattern/Utility Module) says what *scope* an issue is
+# about, not what kind of issue it is — nearly every AVM issue carries one — so
+# it is its own `class` facet (recorded in the taxonomy, never a kind source, and
+# not stamped by `apply_facets`). Only `type`/`kind` namespaces feed the kind facet.
 _AUTO_FACET_NAMESPACES = {
     "area": "area", "component": "area",
     "priority": "priority", "p": "priority",
     "status": "status", "needs": "status",
     "lifecycle": "lifecycle",
-    "type": "kind", "kind": "kind", "class": "kind",
+    "type": "kind", "kind": "kind",
+    "class": "class",
 }
 
 
@@ -1602,24 +1607,51 @@ def detect_label_taxonomy(labels, config=None):
 
 _FACET_KEYS = ("area", "priority", "status", "lifecycle")
 
-# Native issue-type / label-value tokens -> canonical kind.
-_KIND_TOKENS = {
-    "feature": "feature", "enhancement": "feature",
-    "module": "module-request", "module-request": "module-request",
-    "module request": "module-request",
-    "bug": "bug", "defect": "bug",
-    "idea": "idea", "proposal": "idea",
-    "question": "question", "support": "question",
-    "doc": "docs", "docs": "docs", "documentation": "docs",
-}
+# Native issue-type / label-value / template / title word sequences -> canonical
+# kind, in match priority order (the specific multi-word module phrases first).
+# Matched on whole words only: a bare "module" (e.g. AVM's "[AVM Module Issue]"
+# bug titles, `avm_module_issue.yml`) is NOT a module request, "debugger" is not
+# "bug" and "supported" is not "support".
+_KIND_PHRASES = (
+    (("module", "request"), "module-request"),
+    (("module", "proposal"), "module-request"),
+    (("feature", "request"), "feature"),
+    (("feature",), "feature"), (("enhancement",), "feature"),
+    (("bug",), "bug"), (("defect",), "bug"),
+    (("idea",), "idea"), (("proposal",), "idea"),
+    (("question",), "question"), (("support",), "question"),
+    (("doc",), "docs"), (("docs",), "docs"), (("documentation",), "docs"),
+)
 _VALID_KINDS = {"feature", "module-request", "bug", "idea", "question", "docs", "other"}
+_KIND_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _kind_words(text):
+    """Lowercase ASCII-alphanumeric words of `text` (punctuation, `_`, `-`, `/`
+    and emoji are separators)."""
+    return tuple(_KIND_WORD_RE.findall((text or "").lower()))
 
 
 def _kind_from_token(text):
-    """Map a free token (issue-type name, label value, template stem) to a kind."""
-    low = (text or "").strip().lower()
-    for token, kind in _KIND_TOKENS.items():
-        if token in low:
+    """Map free text (issue-type name, label value, template stem, title) to a
+    kind: the first `_KIND_PHRASES` entry occurring as a whole-word sequence."""
+    words = _kind_words(text)
+    for phrase, kind in _KIND_PHRASES:
+        n = len(phrase)
+        if any(words[i:i + n] == phrase for i in range(len(words) - n + 1)):
+            return kind
+    return None
+
+
+def _kind_from_bare_label(label):
+    """Kind of an un-namespaced label that is *exactly* a kind phrase (`bug`,
+    `enhancement`, `documentation`, `Bug 🐛`), else None. A label that merely
+    contains a kind word (`good first issue`, `bug-bash`) is not a kind label."""
+    if _namespace_of(label):
+        return None
+    words = _kind_words(label)
+    for phrase, kind in _KIND_PHRASES:
+        if words == phrase:
             return kind
     return None
 
@@ -1647,28 +1679,36 @@ def apply_facets(item, taxonomy):
 def classify_issue_kind(issue, taxonomy, types_present):
     """Classify an issue into one of feature/module-request/bug/idea/question/docs/other.
 
-    Priority: native GitHub issue type (when present) -> label `kind` facet ->
-    issue-template filename -> title/body heuristic -> other. Pure."""
+    Priority: native GitHub issue type (when present) -> label kind (the
+    `type:`/`kind:` facet labels, then a bare label that is exactly a kind word
+    such as `bug`/`enhancement`) -> issue-template filename -> title heuristic
+    -> other. `Class:` labels never decide kind, and the free-text heuristic
+    reads the title only (whole words), never the body. Pure."""
     # 1. native issue type
     if types_present:
         kind = _kind_from_token(issue.get("issue_type"))
         if kind:
             return kind
-    # 2. label kind facet (the values carried under the taxonomy's `kind` facet)
+    # 2a. label kind facet (the values carried under the taxonomy's `kind` facet)
     for lbl in _labels_in_taxonomy(issue, taxonomy, "kind"):
         value = lbl.split(":", 1)[-1] if ":" in lbl else lbl.split("/", 1)[-1]
         kind = _kind_from_token(value)
         if kind:
             return kind
+    # 2b. bare kind labels (GitHub defaults: bug, enhancement, documentation, ...)
+    for lbl in issue.get("labels") or []:
+        kind = _kind_from_bare_label(lbl)
+        if kind:
+            return kind
     # 3. issue-template filename (e.g. module_request.md, bug_report.yml)
-    kind = _kind_from_token((issue.get("template") or "").replace("_", " "))
+    kind = _kind_from_token(issue.get("template"))
     if kind:
         return kind
-    # 4. title/body heuristic
-    text = f"{issue.get('title','')} {issue.get('body','')}"
-    if "?" in (issue.get("title") or ""):
+    # 4. title heuristic (title only: bodies mention modules, bugs, "support" ...)
+    title = issue.get("title") or ""
+    if "?" in title:
         return "question"
-    kind = _kind_from_token(text)
+    kind = _kind_from_token(title)
     if kind:
         return kind
     return "other"

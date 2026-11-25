@@ -238,12 +238,17 @@ docsRefs, release_train, sprints, project, diagrams`.
   CODEOWNERS (`.github/`/root/`docs/`); `@org/team` and `@user` kept as logins.
 - **label_taxonomy** `{ "<facet>": { "<namespace>": ["label", ...] }, "source":
   "auto|config|merged" }` — auto-detected structured label namespaces mapped to
-  facets (`area`/`priority`/`status`/`lifecycle`/`kind`), with optional config
-  override/extend. Degrades to `{ "source": "auto" }` (no facets) on unstructured labels.
+  facets (`area`/`priority`/`status`/`lifecycle`/`kind`/`class`), with optional config
+  override/extend. Only `type:`/`kind:` namespaces form the `kind` facet; AVM's
+  `Class:` (Resource/Pattern/Utility Module) is a scope facet `class`, recorded but never
+  used for kind. Degrades to `{ "source": "auto" }` (no facets) on unstructured labels.
 - **issues[]/prs[]** gain **facets** `{ area, priority, status, lifecycle }`
   (each the first matching label or null). **issues[]** gain **kind** ∈
   `feature|module-request|bug|idea|question|docs|other` (native issue type →
-  label kind facet → template filename → title/body heuristic → other).
+  label kind (`type:`/`kind:` facet labels, then a bare label that is exactly a kind word,
+  e.g. `bug`/`enhancement`/`documentation`) → template filename → **title** heuristic → other).
+  Matching is on whole words, never substrings; a bare "module" is not a module request
+  (only "module request"/"module proposal" are); issue bodies are never read.
 - **artifacts[].code_area** and **feature_deltas[].area** are **populated** when the
   path resolves to a `code_graph` area; null otherwise.
 - **trains[].code_areas** — the distinct areas of a train's commits' files.

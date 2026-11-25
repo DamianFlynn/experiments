@@ -284,9 +284,15 @@ paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 (warns when truncated) a
 ### 4.9 Classification
 
 - `detect_label_taxonomy` auto-detects structured label namespaces → facets
-  `area|priority|status|lifecycle|kind`; `apply_facets` stamps the first match per facet.
+  `area|priority|status|lifecycle|kind|class` (`type`/`kind` → `kind`; AVM `Class:` → `class`, a
+  scope facet that is never a kind source); `apply_facets` stamps the first match per facet
+  (`area|priority|status|lifecycle` only).
 - `classify_issue_kind` → `feature|module-request|bug|idea|question|docs|other`, in precedence:
-  native issue type → label kind facet → issue-template filename → title/body heuristic → other.
+  native issue type → label kind (`kind` facet labels, then a bare label that is exactly a kind
+  word such as `bug`/`enhancement`) → issue-template filename → title heuristic → other. All
+  steps match whole words via `_KIND_PHRASES` (module phrases first; a bare "module" maps to
+  nothing); the body is never read, so "the module breaks" or "not supported" in a body does not
+  change kind (#58).
 - `classify_pr_kind` reads conventional-commit prefixes (`feat→feature`, `fix→bug`, `docs→docs`).
 - `normalize_issue` parses `parse_blocks_refs` ("blocks/blocking #N" outbound, "blocked by /
   depends on #N" inbound); `derive_open_high_activity` flags open issues with ≥ 5 comments or

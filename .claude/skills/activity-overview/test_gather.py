@@ -1108,6 +1108,128 @@ class TestFacetsAndKind(unittest.TestCase):
             "other")
 
 
+class TestIssueKindLabelSchemes(unittest.TestCase):
+    """#58: kind from real label schemes, with the taxonomy auto-detected from
+    the item's own labels (as `acquire` does over all repo labels)."""
+
+    def _kind(self, labels, title="x", body="", template=None,
+              issue_type=None, types_present=False):
+        issue = {"labels": labels, "title": title, "body": body}
+        if template is not None:
+            issue["template"] = template
+        if issue_type is not None:
+            issue["issue_type"] = issue_type
+        tax = gather.detect_label_taxonomy(labels)
+        return gather.classify_issue_kind(issue, tax, types_present)
+
+    # --- AVM (`Type:` + `Class:` + `Needs:`) ---------------------------------
+    def test_avm_bug_with_class_module_label_is_bug(self):
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Bug 🐛", "Needs: Triage 🔍"],
+            title="x fails"), "bug")
+
+    def test_avm_feature_request_with_class_module_label_is_feature(self):
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Feature Request ✨"]), "feature")
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Feature Request ➕"]), "feature")
+
+    def test_avm_question_and_docs_types(self):
+        self.assertEqual(self._kind(
+            ["Class: Utility Module 📦", "Type: Question/Feedback 🙋"]), "question")
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Documentation 📄",
+             "Status: In PR 👉", "Language: Bicep 💪"]), "docs")
+
+    def test_avm_type_avm_with_module_proposal_template_is_module_request(self):
+        self.assertEqual(self._kind(
+            ["Type: AVM 🅰️ ✌️ Ⓜ️", "Class: Pattern Module 📦"],
+            template="module_proposal.yml"), "module-request")
+
+    def test_class_label_alone_never_decides_kind(self):
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Language: Terraform 🌐"],
+            title="deploy fails"), "other")
+
+    def test_class_namespace_is_not_a_kind_facet(self):
+        tax = gather.detect_label_taxonomy(
+            ["Class: Resource Module 📦", "Type: Bug 🐛"])
+        self.assertEqual(list(tax["kind"]), ["Type:"])
+        self.assertEqual(tax["class"], {"Class:": ["Class: Resource Module 📦"]})
+        # `class` is not one of the stamped facets
+        f = gather.apply_facets({"labels": ["Class: Resource Module 📦"]}, tax)
+        self.assertEqual(set(f), {"area", "priority", "status", "lifecycle"})
+        self.assertTrue(all(v is None for v in f.values()))
+
+    def test_avm_module_issue_title_is_not_module_request(self):
+        # AVM's bug template titles issues "[AVM Module Issue]: ..."; a bare
+        # "module" word is not a module request.
+        self.assertEqual(self._kind(["Class: Resource Module 📦"],
+                                    title="[AVM Module Issue]: deploy fails"),
+                         "other")
+
+    def test_module_proposal_title_is_module_request(self):
+        self.assertEqual(self._kind([], title="[Module Proposal]: avm/res/foo"),
+                         "module-request")
+
+    # --- conventional label schemes (must keep working) ----------------------
+    def test_namespaced_kind_and_type_labels(self):
+        self.assertEqual(self._kind(["kind/bug"]), "bug")
+        self.assertEqual(self._kind(["kind/feature", "area/networking"]), "feature")
+        self.assertEqual(self._kind(["type: feature"]), "feature")
+        self.assertEqual(self._kind(["Type: Bug"]), "bug")
+        self.assertEqual(self._kind(["type: docs"]), "docs")
+
+    def test_bare_kind_labels(self):
+        self.assertEqual(self._kind(["bug"]), "bug")
+        self.assertEqual(self._kind(["enhancement"]), "feature")
+        self.assertEqual(self._kind(["documentation"]), "docs")
+        self.assertEqual(self._kind(["question", "help wanted"]), "question")
+        self.assertEqual(self._kind(["Bug 🐛"]), "bug")
+        # a bare label that merely contains a kind word is not a kind label
+        self.assertEqual(self._kind(["good first issue"], title="misc"), "other")
+        self.assertEqual(self._kind(["bug-bash"], title="misc"), "other")
+
+    def test_namespaced_type_label_beats_bare_label(self):
+        self.assertEqual(self._kind(["enhancement", "Type: Bug 🐛"]), "bug")
+
+    def test_native_issue_type_still_wins(self):
+        self.assertEqual(self._kind(["Type: Bug 🐛"], issue_type="Feature",
+                                    types_present=True), "feature")
+
+    def test_label_beats_template(self):
+        self.assertEqual(self._kind(["Type: Bug 🐛"], template="feature_request.md"),
+                         "bug")
+
+    # --- free-text heuristic: title only, whole words -------------------------
+    def test_bug_label_with_module_in_body_is_bug(self):
+        self.assertEqual(self._kind(["bug"], title="x fails",
+                                    body="the storage module breaks"), "bug")
+
+    def test_body_text_is_not_classified(self):
+        self.assertEqual(self._kind([], title="x fails",
+                                    body="not supported in docker"), "other")
+        self.assertEqual(self._kind([], title="x fails",
+                                    body="new feature, a bug, docs"), "other")
+
+    def test_title_matches_whole_words_not_substrings(self):
+        self.assertEqual(self._kind([], title="debugger crashes"), "other")
+        self.assertEqual(self._kind([], title="not supported in docker"), "other")
+        self.assertEqual(self._kind([], title="Feature request: add cmk"), "feature")
+        self.assertEqual(self._kind([], title="Fix bug in output"), "bug")
+        self.assertEqual(self._kind([], title="How do I configure this?"),
+                         "question")
+
+    def test_template_filenames(self):
+        self.assertEqual(self._kind([], template="bug_report.yml"), "bug")
+        self.assertEqual(self._kind([], template="feature_request.md"), "feature")
+        self.assertEqual(self._kind([], template="module_request.md"),
+                         "module-request")
+        self.assertEqual(self._kind([], template="module-proposal.yml"),
+                         "module-request")
+        self.assertEqual(self._kind([], template="avm_module_issue.yml"), "other")
+
+
 class TestAcquireAssemblyP3b(unittest.TestCase):
     """Compose the Phase 3b helpers over recorded inputs, offline."""
 
