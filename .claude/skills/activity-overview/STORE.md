@@ -136,7 +136,11 @@ request #N`, then the last `(#N)`.
 One row per artifact lifecycle event: `(artifact_id, event, commit_sha,
 author, date, hunk, ref, before, after, detail)`, PK `(artifact, commit,
 event)` → set semantics (re-seeing a commit is a no-op). An artifact's
-`lifecycle[]` is `get_code_events(artifact_id)` ordered by date.
+`lifecycle[]` is `get_code_events(artifact_id)` ordered by date. File-level rows are
+keyed by the bare `<path>` (not the `art:<path>` node id) and keep git's change verb
+(`add`/`modify`/`delete`/`rename`/`copy`); symbol rows carry the mapped event
+(`add`/`change`/`remove`). A reader maps `art:<path>` to `<path>` before reading the
+ledger and treats both `delete` and `remove` as the artifact's end (`spotlight symbol`).
 
 ## Text index (`fts_text`, FTS5)
 
@@ -425,7 +429,8 @@ The single-node `backfill` bridge is promoted into a shared
 along the causal spine, **bounded by the query's time window** (level-0
 directly-referenced anchors always filled; transitive expansion stops at the
 window edge; closure when no window). Both readers call it — `extract` (refactored
-off its inline loop) and `spotlight` (its four queries gain optional `--complete`).
+off its inline loop) and `spotlight` (its train queries — `person`, `subsystem`,
+`grep`, `module` — take optional `--complete`).
 `gather.backfill` stays the single-node primitive `complete.py` orchestrates
 through the **injected** fetch seam, so `complete.py` does no I/O and `spotlight`
 stays reader-only.

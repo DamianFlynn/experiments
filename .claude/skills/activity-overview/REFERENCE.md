@@ -54,7 +54,9 @@ window never double-counts), so the journey graph accretes over time. It's a loc
 rebuildable cache; delete the file to start fresh, or re-gather to refresh against the
 pinned clone SHA (see `STORE.md`). A single store *can* hold **multiple** projects/repos,
 but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
-`spotlight.py`) error asking for `--project` (and `--repo` when a project spans several) —
+`spotlight.py`) error asking for `--project` (and `--repo` when a project spans several;
+`spotlight.py` instead unions an area across members unless `--repo` or `owner/repo::area`
+names one) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 `validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage

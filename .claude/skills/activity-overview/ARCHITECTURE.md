@@ -658,7 +658,7 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 `validate.py STORE` · `--project` · `--repo` · `--bundle` (optional cross-check) · `--json`.
 
 ### `spotlight.py` — analytics (offline)
-`spotlight.py <query> <arg> --store STORE [--project] [--from] [--to] [--json|--md] [--complete]`.
+`spotlight.py <query> <arg> --store STORE [--project] [--repo] [--from] [--to] [--json|--md] [--complete]`.
 Queries: `person` · `symbol` · `subsystem` · `grep` · `module` · `dependents`.
 
 ### `digest.py` — project view (offline)

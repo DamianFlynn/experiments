@@ -21,28 +21,35 @@ Stdlib only (sqlite3, argparse, json). Python 3.
 import argparse
 import json
 import os
+import sqlite3
 import sys
 
 import graphstore
 import complete
+import manifest
 import derive
 import gather
 
 
 def _detect_project(conn, project):
     """Derive the project from the store when not passed (mirrors validate):
-    the single non-sentinel project in `nodes`. Raises on an empty store or an
-    ambiguous multi-project store so the caller disambiguates with --project."""
-    if project is not None:
-        return project
+    the single non-sentinel project in `nodes`. Raises ValueError on an empty
+    store, an ambiguous multi-project store, or a `project` the store does not
+    hold — each message lists the store's projects (the CLI turns it into a
+    usage error, exit 2)."""
     projects = sorted({
         r[0] for r in conn.execute(
             "SELECT DISTINCT project FROM nodes WHERE project IS NOT NULL")
     })
-    if len(projects) == 1:
-        return projects[0]
     if not projects:
         raise ValueError("empty store: no project to query")
+    if project is not None:
+        if project not in projects:
+            raise ValueError("project {!r} is not in the store (projects: "
+                             "{})".format(project, projects))
+        return project
+    if len(projects) == 1:
+        return projects[0]
     raise ValueError(
         "store holds multiple projects {} — pass --project".format(projects))
 
@@ -52,9 +59,41 @@ def _project_repos(conn, project):
     return graphstore.project_repos(conn, project)
 
 
-def _like_prefix(s):
-    """Escape a LIKE prefix (mirrors graphstore.repo_code_events)."""
-    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+# Separator of a repo-qualified area argument: `owner/repo::area`. An area id
+# is a path and may contain '/', so the repo cannot be split off on '/'.
+_AREA_REPO_SEP = "::"
+
+
+def _split_area_arg(area):
+    """(repo or None, area) for an area argument; `owner/repo::area` names the
+    member repo. Only a head with exactly one '/' counts as a repo."""
+    head, sep, tail = area.partition(_AREA_REPO_SEP)
+    if sep and head.count("/") == 1 and tail:
+        return head, tail
+    return None, area
+
+
+def _area_scope(conn, project, area, repo=None):
+    """Resolve an area argument to (repos, area). `area` may be qualified as
+    `owner/repo::area`; `repo` (CLI `--repo`) narrows the same way. Both name a
+    member in any case (resolved via graphstore.resolve_repo). Unqualified, the
+    area is looked up in EVERY project repo and the results are unioned — the
+    same area id (a root area such as `main.tf`, `docs`) is common across the
+    members of a multi-repo project. An unknown repo yields `[]` (the caller
+    answers needs_gather); a `repo` that disagrees with the qualifier raises
+    ValueError."""
+    qual, area = _split_area_arg(area)
+    if qual is not None:
+        if repo is not None and (graphstore.resolve_repo(conn, project, repo)
+                                 != graphstore.resolve_repo(conn, project, qual)):
+            raise ValueError("--repo {} disagrees with the area qualifier "
+                             "{}".format(repo, qual))
+        repo = qual
+    repos = _project_repos(conn, project)
+    if repo is not None:
+        stored = graphstore.resolve_repo(conn, project, repo)
+        repos = [stored] if stored in repos else []
+    return repos, area
 
 
 # Contribution edge types, in the deterministic group order person-impact emits.
@@ -176,26 +215,52 @@ def _timeline_row(node):
     return row
 
 
+# Issue close reasons that mean "not done" (GitHub `state_reason`).
+_ISSUE_DROPPED = ("not_planned", "duplicate")
+
+
 def _outcome(reached_nodes):
-    """Deterministic train outcome over its reached spine nodes:
-      shipped   — a merged PR or a release node is present;
-      rejected  — the train's anchor/PR is closed-but-unmerged (no merge);
-      in_flight — otherwise (still open / unresolved).
+    """Deterministic train outcome over its reached spine nodes, in the
+    vocabulary and precedence of `link.build_trains` (shipped > in_flight >
+    rejected > abandoned), plus `direct_push` for work that landed without a PR:
+      shipped     — a release, a merged PR, or (no PR) an issue closed as
+                    completed (a closed issue without a `state_reason` reads as
+                    completed, GitHub's default close reason);
+      in_flight   — an open PR, or (no PR) an open issue;
+      rejected    — PR(s) present, all closed unmerged;
+      direct_push — no PR and no open/completed issue, but commits: code that
+                    reached the branch without a PR;
+      abandoned   — only issue(s) closed `not_planned` / `duplicate`;
+      in_flight   — anything else (nothing that resolves the train).
     `reached_nodes` is an iterable of node dicts."""
-    nodes = [n for n in reached_nodes if n is not None]
-    has_closed_unmerged = False
-    for n in nodes:
-        kind = _node_kind(n["id"], n.get("data") or {})
+    prs, issues, has_commit = [], [], False
+    for n in reached_nodes:
+        if n is None:
+            continue
         data = n.get("data") or {}
+        kind = _node_kind(n["id"], data)
         if kind == "release":
             return "shipped"
         if kind == "pr":
-            if data.get("merged"):
-                return "shipped"
-            if data.get("state") == "closed":
-                has_closed_unmerged = True
-    if has_closed_unmerged:
-        return "rejected"
+            prs.append(data)
+        elif kind == "issue":
+            issues.append(data)
+        elif kind == "commit":
+            has_commit = True
+    if any(p.get("merged") for p in prs):
+        return "shipped"
+    if prs:
+        if all(p.get("state") == "closed" for p in prs):
+            return "rejected"
+        return "in_flight"
+    if any(i.get("state") != "closed" for i in issues):
+        return "in_flight"
+    if any(i.get("state_reason") not in _ISSUE_DROPPED for i in issues):
+        return "shipped"
+    if has_commit:
+        return "direct_push"
+    if issues:
+        return "abandoned"
     return "in_flight"
 
 
@@ -337,6 +402,10 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of,
         "key_date": key_date,
         "title": adata.get("title"),
         "outcome": _outcome(nodes),
+        # the member repos the train's nodes live in (a cross-repo train spans
+        # several); person nodes carry the "*" sentinel and are not a repo.
+        "repos": sorted({n["repo"] for n in nodes
+                         if n.get("repo") and n["repo"] != "*"}),
         "areas": sorted(areas),
         "roles": sorted(r for r in roles if r),
         "touchpoints": touchpoints,
@@ -434,12 +503,14 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None,
     symbols_authored = []
     removed = []
     for repo in _project_repos(conn, project):
-        prefix = "{}/{}#".format(project, repo)
-        like = _like_prefix(prefix) + "%"
+        # the exact, case-sensitive `{project}/{repo}#` prefix as an index
+        # range (LIKE is case-insensitive and cannot use the index)
+        lo, hi = graphstore._prefix_range(graphstore.qualify_id(project, repo, ""))
         rows = conn.execute(
             "SELECT DISTINCT artifact_id FROM code_events "
-            "WHERE author=? AND event='add' AND artifact_id LIKE ? ESCAPE '\\'",
-            (login, like)).fetchall()
+            "WHERE artifact_id >= ? AND artifact_id < ? AND author=? "
+            "AND event='add' ORDER BY artifact_id",
+            (lo, hi, login)).fetchall()
         for (aid,) in rows:
             local = graphstore.local_id(aid, project, repo)
             if not graphstore.is_symbol_local(local):
@@ -577,12 +648,28 @@ def _normalize_artifact_id(conn, project, artifact_id):
             return cand
         row = conn.execute(
             "SELECT 1 FROM code_events WHERE artifact_id=? LIMIT 1",
-            (cand,)).fetchone()
+            (_ledger_key(cand),)).fetchone()
         if row:
             return cand
     if artifact_id.startswith("{}/".format(project)):
         return artifact_id  # qualified for a repo not (yet) stored: keep as given
     return None
+
+
+def _ledger_key(aid):
+    """The `code_events` key for an artifact id. The file-level ledger is keyed
+    by the BARE path (`{project}/{repo}#<path>`) while a file artifact NODE is
+    `{project}/{repo}#art:<path>` (gather folds them under different keys), so
+    an `art:` id maps to its bare-path row key; every other id is its own key."""
+    parts = graphstore.parse_id(aid)
+    if parts["local"].startswith("art:"):
+        return "{}#{}".format(parts["scope"], parts["local"][len("art:"):])
+    return aid
+
+
+# Ledger events that end an artifact: a symbol's mapped `remove`, a file's raw
+# git `delete` (the file-level ledger stores git's change verb).
+_REMOVAL_EVENTS = ("remove", "delete")
 
 
 def _ordered_lifecycle(events, ts_from=None, ts_to=None):
@@ -606,13 +693,16 @@ def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
     `delivered`: one train whose `timeline` is the artifact's `code_events` in
     (date, commit) order, each row cited via the shared `_timeline_row` shape
     ({id=artifact, kind, event, ts=date, sha, url?, before?, after?}); the
-    train's `outcome` is "removed" if the last event is a remove, else "alive".
+    train's `outcome` is "removed" if the last event is a removal (`remove`
+    for a symbol, `delete` for a file), else "alive". A file artifact may be
+    named by its node id (`art:<path>`) or its bare path; both read the
+    bare-path ledger (`_ledger_key`).
     Context: `identity_chain` — the cross-path history walked over
     replaced_by/identity_from. `--from/--to` bound the lifecycle window.
     Determinism: timeline by (date, commit); chain in link order (depth-capped).
     """
     qid = _normalize_artifact_id(conn, project, artifact_id)
-    events = graphstore.get_code_events(conn, qid) if qid else []
+    events = graphstore.get_code_events(conn, _ledger_key(qid)) if qid else []
     node = graphstore.get_node(conn, qid) if qid else None
     if not events and node is None:
         return {
@@ -647,7 +737,7 @@ def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
             row["url"] = ref["url"]
         timeline.append(row)
 
-    outcome = "removed" if (timeline and timeline[-1]["event"] == "remove") \
+    outcome = "removed" if (timeline and timeline[-1]["event"] in _REMOVAL_EVENTS) \
         else "alive"
     anchor_node = node
     title = (anchor_node["data"].get("title") if anchor_node else None) \
@@ -742,11 +832,16 @@ def pattern_evolution(conn, project, artifact_id, ts_from=None, ts_to=None):
 
 
 def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
-                    *, backfill=None, complete_budget=50):
+                    *, repo=None, backfill=None, complete_budget=50):
     """An area's activity + blast radius as the chronological delivery trains
     that TOUCHED the area (optional time range). Returns the unified
     citation-bearing envelope; an unknown area (no `area-<area>` structure node
     in any project repo) yields a needs_gather result.
+
+    Repo scope: the area is looked up in EVERY project repo and the repos that
+    have it are unioned (the same area id is common across multi-repo members);
+    `owner/repo::area` or `repo=` (any case) narrows it to one member. `repos`
+    lists the members whose area node answered.
 
     `delivered`: one `_train` per train that touched the area (seed the spine
     from the area's touching commits/PRs); each train's `touchpoints` are the
@@ -754,22 +849,24 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
     Context blocks:
       contributors  — codeowners (inverse `owns`) plus the authors of commits/
                       PRs that `touches` the area, deduped (`owns` beats
-                      `touches`), ordered by login.
+                      `touches`), ordered by login; `repos` = where.
       depends_on    — blast radius: `depends_on` edges OUT (what it depends on)
                       and IN (what depends on it), each carrying version/
-                      transitive.
+                      transitive and the `repo` of the area node it hangs off.
     `--from/--to` filter trains by their key date.
-    Determinism: trains by (key_date, anchor); contributors by login; deps by id.
+    Determinism: trains by (key_date, anchor); contributors by login; deps by
+    (id, repo).
     """
-    # resolve the area node across the project's repos
-    area_qid = None
+    # resolve the area node in every project repo that has it (or the one repo
+    # named by `owner/repo::area` / `repo`), and union them
+    repos, area = _area_scope(conn, project, area, repo)
     area_local = "area-{}".format(area)
-    for repo in _project_repos(conn, project):
-        cand = graphstore.qualify_id(project, repo, area_local)
+    area_qids = []  # (repo, area node id), in repo order
+    for r in repos:
+        cand = graphstore.qualify_id(project, r, area_local)
         if graphstore.get_node(conn, cand) is not None:
-            area_qid = cand
-            break
-    if area_qid is None:
+            area_qids.append((r, cand))
+    if not area_qids:
         return {
             "query": "subsystem",
             "focus": area,
@@ -778,30 +875,34 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
             "status": "needs_gather",
             "scope": _scope(ts_from, ts_to),
             "guidance": (
-                "no area node for {}; gather a window that touches it (areas "
-                "are sparse in short windows)".format(area)),
+                "no area node for {} in {}; gather a window that touches it "
+                "(areas are sparse in short windows)".format(
+                    area, ", ".join(repos) or "the named repo")),
         }
 
     def _author_login(node):
         return (node["data"] or {}).get("author") if node else None
 
-    # --- in-edges to the area: owns (person) + touches (commit/pr) ---
-    in_edges = graphstore.get_edges(conn, area_qid, direction="in",
-                                    edge_types=["owns", "touches"])
+    # --- in-edges to each area node: owns (person) + touches (commit/pr) ---
     relations = {}  # login -> relation ('owns' beats 'touches')
-    touching_src_ids = []
-    for e in in_edges:
-        if e["edge_type"] == "owns":
-            # src is a person node; recover the login
-            person = graphstore.get_node(conn, e["src_id"])
-            login = (person["data"] or {}).get("login") if person else None
-            if login is None:
-                login = graphstore.parse_id(e["src_id"])["local"]
-                if login.startswith("person-"):
-                    login = login[len("person-"):]
-            relations[login] = "owns"
-        elif e["edge_type"] == "touches":
-            touching_src_ids.append(e["src_id"])
+    login_repos = {}  # login -> repos of the area nodes they own/touch
+    touching = {}  # touching src id -> repo of the area node it touches
+    for r, area_qid in area_qids:
+        for e in graphstore.get_edges(conn, area_qid, direction="in",
+                                      edge_types=["owns", "touches"]):
+            if e["edge_type"] == "owns":
+                # src is a person node; recover the login
+                person = graphstore.get_node(conn, e["src_id"])
+                login = (person["data"] or {}).get("login") if person else None
+                if login is None:
+                    login = graphstore.parse_id(e["src_id"])["local"]
+                    if login.startswith("person-"):
+                        login = login[len("person-"):]
+                relations[login] = "owns"
+                login_repos.setdefault(login, set()).add(r)
+            elif e["edge_type"] == "touches":
+                touching.setdefault(e["src_id"], r)
+    touching_src_ids = sorted(touching)
 
     # touching commits/PRs -> their authors are touches contributors, and the
     # PRs they belong to are the area's attributed items.
@@ -809,8 +910,9 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
     for src_id in touching_src_ids:
         src = graphstore.get_node(conn, src_id)
         login = _author_login(src)
-        if login is not None and login not in relations:
-            relations[login] = "touches"
+        if login is not None:
+            relations.setdefault(login, "touches")
+            login_repos.setdefault(login, set()).add(touching[src_id])
         # if the toucher is itself a PR node, attribute it directly
         if "#pr-" in src_id and src is not None:
             attributed_prs[src_id] = src
@@ -823,7 +925,8 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
                     attributed_prs[pe["dst_id"]] = pr
 
     contributors = [
-        {"login": login, "relation": relations[login]}
+        {"login": login, "relation": relations[login],
+         "repos": sorted(login_repos.get(login, ()))}
         for login in sorted(relations)
     ]
 
@@ -860,7 +963,8 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
         delivered.append(train)
 
     # --- depends_on blast radius (out = depends on; in = depended upon by) ---
-    def _dep_row(other_id, data):
+    # `repo` on each row is the member whose area node the edge hangs off.
+    def _dep_row(other_id, data, r):
         d = data or {}
         local = graphstore.parse_id(other_id)["local"]
         if local.startswith("area-"):
@@ -868,19 +972,21 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
         return {
             "area": local,
             "id": other_id,
+            "repo": r,
             "version": d.get("version"),
             "transitive": d.get("transitive"),
         }
 
     deps_out, deps_in = [], []
-    for e in graphstore.get_edges(conn, area_qid, direction="out",
-                                  edge_types=["depends_on"]):
-        deps_out.append(_dep_row(e["dst_id"], e["data"]))
-    for e in graphstore.get_edges(conn, area_qid, direction="in",
-                                  edge_types=["depends_on"]):
-        deps_in.append(_dep_row(e["src_id"], e["data"]))
-    deps_out.sort(key=lambda d: d["id"])
-    deps_in.sort(key=lambda d: d["id"])
+    for r, area_qid in area_qids:
+        for e in graphstore.get_edges(conn, area_qid, direction="out",
+                                      edge_types=["depends_on"]):
+            deps_out.append(_dep_row(e["dst_id"], e["data"], r))
+        for e in graphstore.get_edges(conn, area_qid, direction="in",
+                                      edge_types=["depends_on"]):
+            deps_in.append(_dep_row(e["src_id"], e["data"], r))
+    deps_out.sort(key=lambda d: (d["id"], d["repo"]))
+    deps_in.sort(key=lambda d: (d["id"], d["repo"]))
 
     summary = {
         "trains": len(delivered),
@@ -890,6 +996,7 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
     return _result(
         "subsystem", area, "subsystem", project, _scope(ts_from, ts_to),
         summary, delivered,
+        repos=[r for r, _ in area_qids],
         contributors=contributors,
         depends_on={"out": deps_out, "in": deps_in},
     )
@@ -925,7 +1032,8 @@ def _commit_pr_map(conn, shas, project, repos):
     return out
 
 
-def slice_module(conn, project, area, ts_from=None, ts_to=None):
+def slice_module(conn, project, area, ts_from=None, ts_to=None,
+                 *, repo=None, backfill=None, complete_budget=50):
     """A store-backed, FULL-HISTORY slice of one module (an `area`): every
     artifact under the area + each artifact's complete lifecycle (CRUD across all
     gathered windows, with the change detail), plus the trains that touched it —
@@ -934,7 +1042,10 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
     Resolution: read the stored `codegraph` singleton (`area_index`/
     `_area_for_path`) and keep `code` artifact nodes whose `path` maps to the
     requested area. An unknown/empty area (no matching codegraph area in any repo)
-    yields the shared `needs_gather` envelope.
+    yields the shared `needs_gather` envelope. Repo scope as in subsystem_split:
+    union across every repo whose codegraph has the area (listed in `repos`),
+    or one member via `owner/repo::area` / `repo=`. Every symbol and file row
+    carries its `repo` (the same path in two members is two rows).
 
     For each kept artifact, `get_code_events` gives its full lifecycle; a renamed
     symbol's history is folded into ONE entry via CONNECTED COMPONENTS over in-area
@@ -947,22 +1058,23 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
     Bounding (a context unit, not an archive): per-artifact lifecycle rows capped
     at _MODULE_LIFECYCLE_CAP (with `lifecycle_overflow`), total artifacts capped
     at _MODULE_ARTIFACT_CAP per group (with `*_overflow`). Deterministic ordering:
-    symbols by id, files by path, lifecycle by (date, commit).
+    symbols by id, files by (path, repo), lifecycle by (date, commit).
+    `backfill`/`complete_budget` feed the trains' opt-in completion (`--complete`).
     """
-    repos = _project_repos(conn, project)
+    repos, area = _area_scope(conn, project, area, repo)
 
     # --- resolve the area per repo (NEVER merge indexes: a path string can map to
     #     different areas in different repos, so match each artifact against ITS OWN
     #     repo's codegraph) ---
     area_idx_by_repo = {}
-    for repo in repos:
+    for r in repos:
         cg = graphstore.get_node(
-            conn, graphstore.qualify_id(project, repo, "codegraph"))
+            conn, graphstore.qualify_id(project, r, "codegraph"))
         if cg is not None:
-            area_idx_by_repo[repo] = derive.area_index(cg["data"] or {})
-    has_area = any(a == area for idx in area_idx_by_repo.values()
-                   for a in idx.values())
-    if not has_area:
+            area_idx_by_repo[r] = derive.area_index(cg["data"] or {})
+    area_repos = [r for r in repos
+                  if area in area_idx_by_repo.get(r, {}).values()]
+    if not area_repos:
         return {
             "query": "module",
             "focus": area,
@@ -971,15 +1083,16 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
             "status": "needs_gather",
             "scope": _scope(ts_from, ts_to),
             "guidance": (
-                "no codegraph area covering {} in any project repo; gather a "
-                "window that touches the module".format(area)),
+                "no codegraph area covering {} in {}; gather a window that "
+                "touches the module".format(
+                    area, ", ".join(repos) or "the named repo")),
         }
 
     # --- collect the area's artifact code nodes (file + symbol/comment) ---
     artifacts = {}  # qid -> node
-    for repo in repos:
-        idx = area_idx_by_repo.get(repo, {})
-        for node in graphstore.repo_nodes(conn, project, repo, node_class="code"):
+    for r in area_repos:
+        idx = area_idx_by_repo[r]
+        for node in graphstore.repo_nodes(conn, project, r, node_class="code"):
             data = node["data"] or {}
             # artifact `code` nodes are the non-commit ones: a commit carries a
             # `sha` and a bare `<sha>` id; artifacts use `art:<path>` / `<path>#…`
@@ -1024,19 +1137,12 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
 
     # --- pre-fetch the commit->PR map over every sha in the slice's events ---
     # The file-level ledger is keyed by the BARE-path qid, but a file artifact
-    # NODE is `art:<path>` (gather folds them under different keys). Resolve the
-    # ledger key per artifact: a `art:<path>` node's events live under `<path>`.
-    def _event_key(aid, node):
-        prefix = "{}/{}#".format(node["project"], node["repo"])
-        local = aid[len(prefix):] if aid.startswith(prefix) else aid
-        if local.startswith("art:"):
-            return prefix + local[len("art:"):]
-        return aid
-
+    # NODE is `art:<path>` (gather folds them under different keys); see
+    # `_ledger_key`.
     all_shas = set()
     events_by_member = {}
-    for aid, node in artifacts.items():
-        evs = graphstore.get_code_events(conn, _event_key(aid, node))
+    for aid in artifacts:
+        evs = graphstore.get_code_events(conn, _ledger_key(aid))
         events_by_member[aid] = evs
         all_shas.update(e["commit_sha"] for e in evs)
     pr_of = _commit_pr_map(conn, all_shas, project, repos)
@@ -1088,6 +1194,7 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
         if graphstore.is_symbol_local(art_local):
             entry = {
                 "id": rep,
+                "repo": node["repo"],
                 "kind": data.get("kind"),
                 "subkind": data.get("subkind"),
                 "name": data.get("name"),
@@ -1099,13 +1206,14 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
         else:
             entry = {
                 "path": data.get("path"),
+                "repo": node["repo"],
                 "lifecycle": lifecycle,
                 "lifecycle_overflow": overflow,
             }
             files.append(entry)
 
     symbols.sort(key=lambda s: s["id"])
-    files.sort(key=lambda f: f["path"] or "")
+    files.sort(key=lambda f: (f["path"] or "", f["repo"]))
     symbols_overflow = max(0, len(symbols) - _MODULE_ARTIFACT_CAP)
     files_overflow = max(0, len(files) - _MODULE_ARTIFACT_CAP)
     symbols = symbols[:_MODULE_ARTIFACT_CAP]
@@ -1120,7 +1228,8 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
     }
 
     # --- trains that touched the area (reuse subsystem's area resolution) ---
-    trains = _module_trains(conn, project, area, repos, ts_from, ts_to)
+    trains = _module_trains(conn, project, area, area_repos, ts_from, ts_to,
+                            backfill=backfill, complete_budget=complete_budget)
 
     summary = {
         "symbols": len(symbols),
@@ -1131,7 +1240,7 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
         "module", area, "module", project, _scope(ts_from, ts_to),
         summary, [],
         time_range=time_range,
-        repos=repos,
+        repos=area_repos,
         symbols=symbols,
         symbols_overflow=symbols_overflow,
         files=files,
@@ -1140,7 +1249,8 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
     )
 
 
-def _module_trains(conn, project, area, repos, ts_from, ts_to):
+def _module_trains(conn, project, area, repos, ts_from, ts_to,
+                   *, backfill=None, complete_budget=50):
     """The decision trains that TOUCHED the area, reusing subsystem_split's
     area-node resolution + `touches`-edge logic. Returns a list of train dicts
     (anchor/key_date/title/outcome/…), ordered by (key_date, anchor). An absent
@@ -1149,8 +1259,8 @@ def _module_trains(conn, project, area, repos, ts_from, ts_to):
     # same area can live in multiple repos (matches slice_module's per-repo handling).
     area_local = "area-{}".format(area)
     touching_src_ids = []
-    for repo in repos:
-        area_qid = graphstore.qualify_id(project, repo, area_local)
+    for r in repos:
+        area_qid = graphstore.qualify_id(project, r, area_local)
         if graphstore.get_node(conn, area_qid) is None:
             continue
         touching_src_ids.extend(
@@ -1179,7 +1289,8 @@ def _module_trains(conn, project, area, repos, ts_from, ts_to):
         focus_touch_ids = sorted(touch_set & reached)
         role_of = {tid: "touches" for tid in focus_touch_ids}
         train = _train(conn, anchor, reached, focus_touch_ids, role_of,
-                       window=_completion_window(ts_from, ts_to))
+                       window=_completion_window(ts_from, ts_to),
+                       backfill=backfill, complete_budget=complete_budget)
         if (ts_from is not None or ts_to is not None) and not _date_in_range(
                 train["key_date"], ts_from, ts_to):
             continue
@@ -1198,7 +1309,9 @@ def _fts_query(phrase):
     raises a syntax error and is searched as the words the user typed. An empty
     or whitespace-only phrase becomes `""` (matches nothing) rather than raising.
     """
-    cleaned = str(phrase or "").strip()
+    # A NUL byte ends the string for SQLite's FTS5 parser ("unterminated
+    # string"); it can never be in indexed text, so treat it as a space.
+    cleaned = str(phrase or "").replace("\x00", " ").strip()
     if not cleaned:
         return '""'
     return '"' + cleaned.replace('"', '""') + '"'
@@ -1228,7 +1341,9 @@ def text_mining(conn, project, phrase, ts_from=None, ts_to=None,
     where the matched nodes are the focus touchpoints (role "mention", excerpt =
     bounded match text). No matches -> status "ok" with an empty `delivered`
     (a valid answer — the phrase simply isn't present), not needs_gather.
-    `--from/--to` filter trains by their key date. focus_kind="grep".
+    The index is store-wide, so matches outside `project` are dropped first.
+    `--from/--to` filter trains by their key date; `summary.matches` counts the
+    matches inside the trains that survive that filter. focus_kind="grep".
     Determinism: trains by (key_date, anchor); touchpoints/timeline by (ts,id).
     """
     if not graphstore.fts5_available(conn):
@@ -1244,7 +1359,11 @@ def text_mining(conn, project, phrase, ts_from=None, ts_to=None,
                 "no searchable text index; rebuild with FTS5 to run grep"),
         }
 
-    matched = graphstore.fts_search(conn, _fts_query(phrase))
+    # fts_text is store-wide: keep only this project's ids (repo-scoped
+    # `{project}/…` and project-scoped `{project}#…`).
+    prefixes = ("{}/".format(project), "{}#".format(project))
+    matched = [m for m in graphstore.fts_search(conn, _fts_query(phrase))
+               if m.startswith(prefixes)]
     matched_set = set(matched)
 
     # group matches by the train each belongs to (seed the spine from each
@@ -1262,6 +1381,7 @@ def text_mining(conn, project, phrase, ts_from=None, ts_to=None,
 
     delivered = []
     shipped = 0
+    counted = set()  # matches inside a train that survived the scope filter
     for anchor, reached in trains_by_anchor.items():
         # the matched nodes that fall in this train are the focus touchpoints,
         # each role "mention" with a bounded excerpt of its match text.
@@ -1278,9 +1398,10 @@ def text_mining(conn, project, phrase, ts_from=None, ts_to=None,
             continue
         if train["outcome"] == "shipped":
             shipped += 1
+        counted.update(focus_touch_ids)
         delivered.append(train)
 
-    summary = {"matches": len(matched), "trains": len(delivered)}
+    summary = {"matches": len(counted), "trains": len(delivered)}
     return _result(
         "grep", phrase, "grep", project, _scope(ts_from, ts_to),
         summary, delivered,
@@ -1295,6 +1416,8 @@ _OUTCOME_BADGE = {
     "shipped": "[shipped]",
     "rejected": "[rejected]",
     "in_flight": "[in-flight]",
+    "abandoned": "[abandoned]",
+    "direct_push": "[direct-push]",
     "removed": "[removed]",
     "alive": "[alive]",
 }
@@ -1363,6 +1486,8 @@ def _render_train_md(t):
     if t.get("roles"):
         head += " ({})".format(", ".join(t["roles"]))
     lines.append(head)
+    if t.get("repos"):
+        lines.append("- repos: {}".format(", ".join(t["repos"])))
     if t.get("areas"):
         lines.append("- areas: {}".format(", ".join(t["areas"])))
     if t["touchpoints"]:
@@ -1467,12 +1592,15 @@ def _render_subsystem_md(res):
     s = res["summary"]
     lines = ["## spotlight: subsystem `{}`".format(res["focus"]), ""]
     lines.append("- scope: {}".format(_scope_label(res["scope"])))
+    if res.get("repos"):
+        lines.append("- repos: {}".format(", ".join(res["repos"])))
     lines.append("- summary: {} trains, {} shipped, {} contributors".format(
         s.get("trains", 0), s.get("shipped", 0), s.get("contributors", 0)))
     lines.append("")
     lines.append("### contributors ({})".format(len(res["contributors"])))
     for c in res["contributors"]:
-        lines.append("- {} ({})".format(c["login"], c["relation"]))
+        where = "; {}".format(", ".join(c["repos"])) if c.get("repos") else ""
+        lines.append("- {} ({}{})".format(c["login"], c["relation"], where))
     lines.append("")
     deps = res["depends_on"]
     lines.append("### depends_on blast radius (out {} / in {})".format(
@@ -1484,10 +1612,22 @@ def _render_subsystem_md(res):
         if d.get("transitive"):
             bits.append("transitive")
         return " ({})".format(", ".join(bits)) if bits else ""
+    def _dep_repo(d):
+        return "[{}] ".format(d["repo"]) if d.get("repo") else ""
+
+    def _dep_target(d):
+        # name the other end's repo when it is not the row's own repo
+        scope = graphstore.parse_id(d.get("id") or "")["scope"]
+        other = scope.split("/", 1)[1] if "/" in scope else None
+        if d.get("repo") and other and other != d["repo"]:
+            return "{} in {}".format(d["area"], other)
+        return d["area"]
     for d in deps["out"]:
-        lines.append("- depends on {}{}".format(d["area"], _dep_suffix(d)))
+        lines.append("- {}depends on {}{}".format(
+            _dep_repo(d), _dep_target(d), _dep_suffix(d)))
     for d in deps["in"]:
-        lines.append("- depended on by {}{}".format(d["area"], _dep_suffix(d)))
+        lines.append("- {}depended on by {}{}".format(
+            _dep_repo(d), _dep_target(d), _dep_suffix(d)))
     lines.extend(_render_delivered_md(res))
     return "\n".join(lines).rstrip()
 
@@ -1556,7 +1696,7 @@ def _render_module_md(res):
         ", +{} more".format(res["files_overflow"])
         if res["files_overflow"] else ""))
     for f in res["files"]:
-        lines.append("- `{}`".format(f["path"]))
+        lines.append("- `{}` ({})".format(f["path"], f["repo"]))
         for r in f["lifecycle"]:
             lines.append("  - {} {} {}{}".format(
                 r["date"], r["event"], r["commit"], _ev_suffix(r)))
@@ -1591,15 +1731,31 @@ def render_md(res):
 # CLI
 # --------------------------------------------------------------------------
 
+# Queries that build delivery trains (and so can complete them with --complete),
+# and the ones whose argument is an area (and so take --repo).
+_TRAIN_QUERIES = ("person", "subsystem", "grep", "module")
+_AREA_QUERIES = ("subsystem", "module")
+
+
 def main(argv=None):
+    """Exit codes: 0 a result on stdout (`needs_gather` / `fts_unavailable` are
+    valid answers); 2 usage error — unknown query, not exactly one query
+    argument, a flag the query does not take, bad --from/--to, a missing or
+    unreadable store, an empty store, an unknown or (with several in the store)
+    unnamed --project, an unknown --repo. Nothing is written to stdout on 2."""
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(
         description="spotlight — cross-cutting analytics over a journey store.")
-    parser.add_argument("query", help="query subcommand (e.g. 'person')")
-    parser.add_argument("args", nargs="*", help="query arguments")
+    parser.add_argument("query", help="query: {}".format(", ".join(_RENDERERS)))
+    parser.add_argument("args", nargs="*",
+                        help="the query's one argument (quote a multi-word grep "
+                             "phrase)")
     parser.add_argument("--store", required=True, help="path to the store db")
     parser.add_argument("--project", default=None,
-                        help="project (auto-detected from the store if omitted)")
+                        help="project (auto-detected when the store holds one)")
+    parser.add_argument("--repo", default=None,
+                        help="subsystem/module: only this member (owner/repo, "
+                             "any case); same as the argument owner/repo::area")
     parser.add_argument("--from", dest="ts_from", default=None,
                         help="bound the delivery train at/after this ts "
                              "(person: train key date; symbol: lifecycle "
@@ -1610,7 +1766,8 @@ def main(argv=None):
     parser.add_argument("--complete", action="store_true",
                         help="fetch missing cross-window spine anchors via the "
                              "GitHub API (needs GITHUB_TOKEN); default is "
-                             "offline/honest-only")
+                             "offline/honest-only. Train queries only: "
+                             + ", ".join(_TRAIN_QUERIES))
     parser.add_argument("--complete-budget", dest="complete_budget", type=int,
                         default=50,
                         help="max nodes to backfill per train when --complete")
@@ -1622,12 +1779,52 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.query not in _RENDERERS:
-        parser.error("unknown query: {}".format(args.query))
-    if not args.args:
-        parser.error("query '{}' needs an argument".format(args.query))
+        parser.error("unknown query: {} (choose from {})".format(
+            args.query, ", ".join(_RENDERERS)))
+    if len(args.args) != 1:
+        parser.error("query '{}' takes exactly one argument, got {}{}".format(
+            args.query, len(args.args),
+            " (quote a multi-word phrase)" if args.query == "grep" else ""))
+    arg = args.args[0]
+    if args.complete and args.query not in _TRAIN_QUERIES:
+        parser.error("--complete does not apply to '{}' (train queries: "
+                     "{})".format(args.query, ", ".join(_TRAIN_QUERIES)))
+    if args.repo is not None and args.query not in _AREA_QUERIES:
+        parser.error("--repo does not apply to '{}' (area queries: {})".format(
+            args.query, ", ".join(_AREA_QUERIES)))
+    if args.query == "dependents" and (args.ts_from or args.ts_to):
+        parser.error("--from/--to do not apply to 'dependents' "
+                     "(it is time-independent)")
+    try:
+        if args.ts_from is not None:
+            manifest.check_reader_window(args.ts_from, args.ts_to or args.ts_from)
+        if args.ts_to is not None:
+            manifest.check_reader_window(args.ts_from or args.ts_to, args.ts_to)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    conn = graphstore.open_store(args.store)
-    project = _detect_project(conn, args.project)
+    # sqlite3.connect would silently CREATE a missing file; refuse instead.
+    if not os.path.isfile(args.store):
+        parser.error("store {!r} does not exist (run gather.py first)".format(
+            args.store))
+    try:
+        conn = graphstore.open_store(args.store)
+        project = _detect_project(conn, args.project)
+        if args.query in _AREA_QUERIES:
+            qual = _split_area_arg(arg)[0]
+            for name, value in (("--repo", args.repo), ("area qualifier", qual)):
+                if value is None:
+                    continue
+                known = _project_repos(conn, project)
+                if graphstore.resolve_repo(conn, project, value) not in known:
+                    raise ValueError("{} {!r} has no nodes in project {!r} "
+                                     "(repos: {})".format(name, value, project,
+                                                          known))
+            _area_scope(conn, project, arg, args.repo)  # --repo vs qualifier
+    except sqlite3.DatabaseError as exc:
+        parser.error("cannot read store {!r}: {}".format(args.store, exc))
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Build the (optional) backfill seam. --complete needs a token; without one
     # we stay offline/honest-only rather than failing.
@@ -1643,25 +1840,28 @@ def main(argv=None):
     cb = args.complete_budget
 
     if args.query == "person":
-        res = person_impact(conn, project, args.args[0],
+        res = person_impact(conn, project, arg,
                             ts_from=args.ts_from, ts_to=args.ts_to,
                             backfill=backfill, complete_budget=cb)
     elif args.query == "symbol":
-        res = pattern_evolution(conn, project, args.args[0],
+        res = pattern_evolution(conn, project, arg,
                                 ts_from=args.ts_from, ts_to=args.ts_to)
     elif args.query == "subsystem":
-        res = subsystem_split(conn, project, args.args[0],
+        res = subsystem_split(conn, project, arg,
                               ts_from=args.ts_from, ts_to=args.ts_to,
+                              repo=args.repo,
                               backfill=backfill, complete_budget=cb)
     elif args.query == "grep":
-        res = text_mining(conn, project, args.args[0],
+        res = text_mining(conn, project, arg,
                           ts_from=args.ts_from, ts_to=args.ts_to,
                           backfill=backfill, complete_budget=cb)
     elif args.query == "module":
-        res = slice_module(conn, project, args.args[0],
-                           ts_from=args.ts_from, ts_to=args.ts_to)
+        res = slice_module(conn, project, arg,
+                           ts_from=args.ts_from, ts_to=args.ts_to,
+                           repo=args.repo,
+                           backfill=backfill, complete_budget=cb)
     elif args.query == "dependents":
-        res = member_dependents(conn, project, args.args[0])
+        res = member_dependents(conn, project, arg)
     conn.close()
 
     if args.md:

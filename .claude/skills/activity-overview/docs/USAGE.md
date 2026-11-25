@@ -494,13 +494,20 @@ One store per stream keeps commands simple and failures isolated.
 |---|---|
 | Contributor across all history | `spotlight.py person <login> --store S --project P --md` |
 | Module biography | `spotlight.py module <area> --store S --project P --md` (or `--json` for the narrator) |
-| One symbol's lifecycle | `spotlight.py symbol <artifact-id> --store S --project P` |
+| One member's copy of an area | `spotlight.py module owner/repo::<area> …` or `… module <area> --repo owner/repo` (same for `subsystem`); without it an area present in several members (e.g. `main.tf`) is unioned and every row names its repo |
+| One symbol's or file's lifecycle | `spotlight.py symbol <artifact-id> --store S --project P` (a file as `art:<path>` or `<path>`; a deleted file reads `removed`) |
 | Activity inside an area | `spotlight.py subsystem <area> --store S --project P --from F --to T` |
-| Full-text search | `spotlight.py grep '"breaking change"' --store S --project P` (FTS5 syntax — quote phrases) |
+| Full-text search | `spotlight.py grep 'breaking change' --store S --project P` (one argument: quote a multi-word phrase; it is matched literally, within `P` only) |
 | Blast radius (TF constellations) | `spotlight.py dependents <owner/repo> --store S --project P` |
 | Project view for a formatter | `digest.py --store S --project P --from F --to T` (schema: `BUNDLE.md`) |
 | Ticket-linked related work | `digest.py … --manifest M` with `"ticket_prefixes": ["ABC"]` in the manifest, or `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (off by default: `related_work` is `[]`) |
-| Complete out-of-window threads | add `--complete` to `person/subsystem/grep` (uses the token; bounded) |
+| Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`) |
+
+`spotlight.py` exits 2 with usage for a wrong argument count, a flag the query does not take,
+a bad `--from/--to`, a missing or empty store, a store with several projects and no
+`--project` (the error lists them) and an unknown `--repo`. Train outcomes are `shipped`,
+`in_flight`, `rejected`, `abandoned` (an issue closed not-planned/duplicate) and
+`direct_push` (commits with no PR) — see LLD §9.
 
 Reference formatters that consume the view: `samples/build_report.py` (structural Markdown
 skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.

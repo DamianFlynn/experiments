@@ -55,7 +55,7 @@
 | `series.py` | 132 | Pure installment snapshot + comparison | — | — |
 | `render.py` | 1,010 | Mermaid emitters (size-capped) + `mmdc` validation | — | — |
 | `validate.py` | 907 | Trust gate (audits) | — | — |
-| `spotlight.py` | 1,685 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
+| `spotlight.py` | 1,875 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
 | `digest.py` | 414 | Multi-repo project view | — | — |
 | `manifest.py` / `manifest_from_index.py` | 195 / 278 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
 | `transcript.py` | 116 | VTT/SRT/TXT normalization | — | — |
@@ -545,7 +545,7 @@ exact), inclusive, either bound optional. `complete._in_window`, `spotlight` win
 `gather.in_window` and `link._in_window` delegate to `ts_in_window`; no caller pads bounds.
 `traverse_spine` walks spine edges **undirected**, depth-capped; `missing` lists referenced but
 unstored spine ids (minus known-dead when `skip_dead`).
-`edges_by_type` / `repo_code_events` filter on the literal `{project}/` / `{project}/{repo}#`
+`edges_by_type` / `repo_code_events` (and `spotlight`'s person scan) filter on the literal `{project}/` / `{project}/{repo}#`
 id prefix **case-sensitively** as an index range (`>= prefix AND < prefix-successor`), not
 `LIKE`. Batch writers and the meta setters take `commit=False`; `gather.fold_bundle` uses it
 to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clone_sha`) in
@@ -839,20 +839,51 @@ missing `dead_refs` table as empty instead of creating it; only `record_dead_ref
 
 ## 9. Cross-window reader — `spotlight.py`
 
-`spotlight.py QUERY ARG --store S [--project P] [--from F] [--to T] [--json|--md] [--complete [--complete-budget N]]`
+`spotlight.py QUERY ARG --store S [--project P] [--repo R] [--from F] [--to T] [--json|--md] [--complete [--complete-budget N]]`
 
 | Query | Function | Answers |
 |---|---|---|
 | `person <login>` | `person_impact` | one contributor's footprint across trains/areas |
-| `symbol <artifact-id>` | `pattern_evolution` | one symbol's lifecycle |
-| `subsystem <area>` | `subsystem_split` | activity split within an area |
+| `symbol <artifact-id>` | `pattern_evolution` | one symbol's or file's lifecycle |
+| `subsystem [owner/repo::]<area>` | `subsystem_split` | activity split within an area |
 | `grep <phrase>` | `text_mining` | FTS5 search over PR/issue/commit text (needs FTS5) |
-| `module <area>` | `slice_module` | full-history module biography envelope |
+| `module [owner/repo::]<area>` | `slice_module` | full-history module biography envelope |
 | `dependents <owner/repo>` | `member_dependents` | reverse `depends_on` BFS — blast radius |
 
 Results share an envelope `{query, focus, focus_kind, project, status, scope, …}`.
 `status` may be `needs_gather` or `fts_unavailable` — valid answers, exit 0. `--complete`
 wires `gather.backfill` with a token (the only network path in a reader).
+
+Rules (issue #81):
+
+- **Project scope.** `fts_text` is store-wide, so `grep` keeps only ids starting
+  `{project}/` or `{project}#`; `summary.matches` counts the matches inside the trains
+  that survive `--from/--to` (not every raw hit). `person`'s authored-symbol scan uses the
+  case-sensitive `{project}/{repo}#` index range (`graphstore._prefix_range`), not `LIKE`.
+  A NUL byte in a phrase is read as a space.
+- **Areas across repos.** `subsystem`/`module` look the area up in **every** project repo
+  and union the results (the same area id — `main.tf`, `docs` — is common across members);
+  `owner/repo::area` or `--repo` (any case, `graphstore.resolve_repo`) narrows to one
+  member. Every row names its repo: envelope `repos` (members whose area answered),
+  contributor `repos`, depends_on `repo` (the member whose area node the edge hangs off),
+  module symbol/file `repo` (files sort by `(path, repo)`), and every train's `repos`.
+- **Symbol query and file artifacts.** The file-level ledger is keyed by the bare path;
+  `art:<path>` (the node id) and `<path>` both read it (`_ledger_key`, shared with
+  `slice_module`). A lifecycle ending in `remove` (symbol) or `delete` (file, git's verb)
+  is `removed`. A local id is qualified only against known `{project}/{repo}#` prefixes,
+  so a path that starts with the project name (`avm/res/…`) still resolves.
+- **Train outcome** (`_outcome`, the `link.build_trains` vocabulary and precedence):
+  `shipped` (release, merged PR, or — no PR — an issue closed as completed; a closed issue
+  without `state_reason` counts as completed) > `in_flight` (open PR, or — no PR — open
+  issue) > `rejected` (PRs, all closed unmerged) > `direct_push` (no PR, no open/completed
+  issue, but commits) > `abandoned` (only issues closed `not_planned`/`duplicate`);
+  anything else `in_flight`. Rendered badges: `[direct-push]`, `[abandoned]`.
+- **CLI.** Exactly one query argument; `--complete` only for the train queries
+  (`person`, `subsystem`, `grep`, `module`); `--repo` only for `subsystem`/`module`;
+  `--from/--to` not for `dependents` and validated by `manifest.check_reader_window`. A
+  missing (never created) or unreadable store, an empty store, an unknown `--project` or,
+  with several projects, no `--project` (the message lists the store's projects), and an
+  unknown `--repo`/qualifier (lists the project's repos) all exit 2 with usage.
 
 ## 10. Multi-repo aggregation — `digest.py`
 
@@ -1026,7 +1057,6 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
 | Terraform edges are build-gated on single-repo gathers | no structural scan without a manifest (#80 decision) | without `terraform` (or with a failed init), a single-repo bundle has no Terraform edges, even though its direct edges are source-parsed | opt-in static fallback with its own `edges_status` |
-| `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
 | Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
 | Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |

@@ -465,13 +465,19 @@ These are real, current limits — plan around them:
 13. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
-13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
+14. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
     commit's git author to the login PR/issue/review records use (GitHub's commits listing per
     SHA, then a `users.noreply.github.com` email), so a PR author and their commits are one
     person. A commit whose email GitHub links to no account and that has no noreply email
     stays a separate person keyed by its git name and flagged `login_resolved: false` — never
     merged with a login on a guess. Stores folded before this change key commit authors by git
     name: re-gather them into a fresh store rather than folding new windows on top.
+15. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the causal
+    spine and judges the outcome from the nodes it reached (same vocabulary as `link`, plus
+    `direct_push` for commits that landed with no PR). A closed issue without a close reason
+    counts as completed, and a file renamed away keeps its old path `alive` (the ledger records
+    the rename under the new path). An area shared by several members is unioned unless the
+    query names one (`owner/repo::area` or `--repo`).
 
 Items 8–9 are why USAGE recommends one store per installment; they are candidates for code
 fixes (window the materialized arrays in `extract`; make artifact folding cumulative),
