@@ -1099,6 +1099,44 @@ class TestDirectoryCodeAreaProvider(unittest.TestCase):
         self.assertEqual(fp["label"], "firewall-policy")
         self.assertEqual(fp["edges"], [])
 
+    def test_file_directly_under_avm_group_is_not_a_module_area(self):
+        # #73: avm/{res,ptn,utl}/<group>/<file> is not a module (modules are
+        # avm/<kind>/<group>/<module>/...); such a file belongs to its group.
+        P = gather.DEFAULT_AREA_PATTERNS
+        for kind in ("res", "ptn", "utl"):
+            self.assertEqual(
+                gather.classify_code_area(f"avm/{kind}/network/README.md", P),
+                f"avm/{kind}/network")
+        # a real module file is still its 4-segment module area
+        self.assertEqual(
+            gather.classify_code_area("avm/res/network/vnet/README.md", P),
+            "avm/res/network/vnet")
+        cg = gather.build_directory_areas(
+            ["avm/res/network/README.md", "avm/res/network/vnet/main.bicep"], P)
+        self.assertEqual([a["id"] for a in cg["areas"]],
+                         ["avm/res/network", "avm/res/network/vnet"])
+
+    def test_file_directly_under_modules_is_not_a_module_area(self):
+        # #73: modules/<file> is not a module (modules are modules/<name>/...).
+        self.assertEqual(
+            gather.classify_code_area("modules/README.md",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "modules")
+        self.assertEqual(
+            gather.classify_code_area("modules/vnet/README.md",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "modules/vnet")
+
+    def test_generic_fallback_never_makes_a_nested_file_its_own_area(self):
+        # #73: a two-segment file path (dir/file) falls back to its directory,
+        # not to an area named after the file itself.
+        P = gather.DEFAULT_AREA_PATTERNS
+        self.assertEqual(gather.classify_code_area("docs/README.md", P), "docs")
+        self.assertEqual(
+            gather.classify_code_area(".github/CODEOWNERS", P), ".github")
+        cg = gather.build_directory_areas(["docs/a.md", "docs/b.md"], P)
+        self.assertEqual([a["id"] for a in cg["areas"]], ["docs"])
+
     def test_empty_paths_yield_empty_provider(self):
         cg = gather.build_directory_areas([], gather.DEFAULT_AREA_PATTERNS)
         self.assertEqual(cg, {"provider": "directory", "areas": []})
@@ -1563,7 +1601,8 @@ class TestResolveModuleRef(unittest.TestCase):
               "version": "0.9.0", "local_path": None}
         self.assertEqual(
             gather.resolve_module_ref(ri, "avm/ptn/foo/bar/main.bicep",
-                                      gather.DEFAULT_AREA_PATTERNS),
+                                      gather.DEFAULT_AREA_PATTERNS,
+                                      {"avm/res/storage/storage-account"}),
             "avm/res/storage/storage-account")
 
     def test_local_ref_resolves_relative_to_base(self):
@@ -1575,12 +1614,17 @@ class TestResolveModuleRef(unittest.TestCase):
                                       gather.DEFAULT_AREA_PATTERNS),
             "avm/utl/types/avm-common-types")
 
-    def test_unrecognised_registry_path_falls_back_to_the_path(self):
+    def test_registry_path_not_in_repo_area_set_is_unresolved(self):
+        # #73: was "falls back to the path" — a registry path names a module in the
+        # REGISTRY; it is an in-repo area only when that area exists in the repo's
+        # area set. Otherwise None (the edge keeps the raw ref), never a phantom id.
         ri = {"registry_path": "some/custom/thing", "version": "1.0.0",
               "local_path": None}
+        P = gather.DEFAULT_AREA_PATTERNS
+        self.assertIsNone(gather.resolve_module_ref(ri, "x/main.bicep", P, set()))
+        self.assertIsNone(gather.resolve_module_ref(ri, "x/main.bicep", P))
         self.assertEqual(
-            gather.resolve_module_ref(ri, "x/main.bicep",
-                                      gather.DEFAULT_AREA_PATTERNS),
+            gather.resolve_module_ref(ri, "x/main.bicep", P, {"some/custom/thing"}),
             "some/custom/thing")
 
     def test_empty_ref_resolves_to_none(self):
@@ -1588,6 +1632,123 @@ class TestResolveModuleRef(unittest.TestCase):
             gather.resolve_module_ref({"registry_path": None, "version": None,
                                        "local_path": None}, "x/main.bicep",
                                       gather.DEFAULT_AREA_PATTERNS))
+
+
+class TestBicepReferenceForms(unittest.TestCase):
+    """#73: only the PUBLIC Bicep registry maps to this repo's module areas, and
+    only when the classified area exists in the repo's area set. Private registry
+    (`br:<host>/...`), template-spec (`ts:` / `ts/<alias>:`) and user-alias
+    (`br/<alias>:`) refs are `to: null`, `resolved: false`, raw ref kept."""
+
+    P = gather.DEFAULT_AREA_PATTERNS
+    BASE = "infra/main.bicep"
+    AREAS = {"infra", "avm/res/x/y", "avm/res/network",
+             "avm/res/network/vnet", "bicep/avm/res/x/y"}
+
+    def _parse(self, ref):
+        refs = gather.parse_bicep_module_refs(f"module m '{ref}' = {{}}")
+        self.assertEqual(len(refs), 1)
+        return refs[0]
+
+    def _edge(self, ref, area_ids=None):
+        edges = gather.build_bicep_edges(
+            f"module m '{ref}' = {{}}", {}, self.BASE,
+            self.AREAS if area_ids is None else area_ids, self.P)
+        self.assertEqual(len(edges), 1)
+        return edges[0]
+
+    def assertUnresolved(self, ref, version):
+        e = self._edge(ref)
+        self.assertIsNone(e["to"], ref)
+        self.assertFalse(e["resolved"], ref)
+        self.assertEqual(e["ref"], ref)
+        self.assertEqual(e["version"], version)
+        self.assertNotIn("local", e)
+
+    # --- parse ---------------------------------------------------------------
+    def test_public_alias_parses_registry_path(self):
+        r = self._parse("br/public:avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         ("avm/res/x/y", "1.0", None))
+
+    def test_explicit_public_registry_host_parses_registry_path(self):
+        r = self._parse("br:mcr.microsoft.com/bicep/avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         ("avm/res/x/y", "1.0", None))
+
+    def test_private_registry_is_neither_registry_path_nor_local(self):
+        r = self._parse("br:myacr.azurecr.io/bicep/avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         (None, "1.0", None))
+
+    def test_template_specs_are_neither_registry_path_nor_local(self):
+        for ref, ver in (
+                ("ts:00000000-0000-0000-0000-000000000000/rg/spec:2.0", "2.0"),
+                ("ts/corp:spec:2.0", "2.0")):
+            r = self._parse(ref)
+            self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                             (None, ver, None), ref)
+
+    def test_user_alias_is_neither_registry_path_nor_local(self):
+        r = self._parse("br/corp:avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         (None, "1.0", None))
+
+    def test_local_path_still_local(self):
+        r = self._parse("modules/vnet/main.bicep")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         (None, None, "modules/vnet/main.bicep"))
+
+    # --- edges ---------------------------------------------------------------
+    def test_public_ref_resolves_only_when_area_exists(self):
+        e = self._edge("br/public:avm/res/x/y:1.0")
+        self.assertEqual((e["to"], e["resolved"], e["version"]),
+                         ("avm/res/x/y", True, "1.0"))
+        e = self._edge("br/public:avm/res/x/y:1.0", area_ids={"infra"})
+        self.assertEqual((e["to"], e["resolved"], e["ref"], e["version"]),
+                         (None, False, "br/public:avm/res/x/y:1.0", "1.0"))
+
+    def test_explicit_public_host_resolves_only_when_area_exists(self):
+        e = self._edge("br:mcr.microsoft.com/bicep/avm/res/x/y:1.0")
+        self.assertEqual((e["to"], e["resolved"]), ("avm/res/x/y", True))
+        e = self._edge("br:MCR.microsoft.com/bicep/avm/res/x/y:1.0")
+        self.assertEqual((e["to"], e["resolved"]), ("avm/res/x/y", True))
+        self.assertIsNone(self._edge("br:mcr.microsoft.com/bicep/avm/res/x/y:1.0",
+                                     area_ids=set())["to"])
+
+    def test_private_registry_ref_is_unresolved_even_if_path_matches_an_area(self):
+        self.assertUnresolved("br:myacr.azurecr.io/bicep/avm/res/x/y:1.0", "1.0")
+        self.assertUnresolved("br:myacr.azurecr.io/avm/res/x/y:1.0", "1.0")
+        self.assertUnresolved("br:myacr.azurecr.io/bicep/modules/vnet:v3", "v3")
+
+    def test_template_spec_refs_are_unresolved_no_phantom_area(self):
+        self.assertUnresolved(
+            "ts:00000000-0000-0000-0000-000000000000/rg/spec:2.0", "2.0")
+        self.assertUnresolved("ts/corp:spec:2.0", "2.0")
+
+    def test_user_alias_ref_is_unresolved(self):
+        self.assertUnresolved("br/corp:avm/res/x/y:1.0", "1.0")
+        self.assertUnresolved("br/corp:modules/vnet", None)
+
+    def test_public_ref_to_an_avm_group_is_not_a_module(self):
+        # avm/res/network is a group-level (README) area, never a module target.
+        e = self._edge("br/public:avm/res/network:1.0")
+        self.assertIsNone(e["to"])
+        self.assertFalse(e["resolved"])
+
+    def test_transitive_match_skips_avm_group_areas(self):
+        # A nested deployment named like a group must not hang a transitive edge
+        # on the group-level (README) area.
+        arm = {"resources": [{
+            "type": "Microsoft.Resources/deployments", "name": "outer",
+            "properties": {"template": {"metadata": {"name": "outer"},
+                "resources": [{
+                    "type": "Microsoft.Resources/deployments", "name": "inner",
+                    "properties": {"template": {"metadata": {"name": "network"},
+                                                "resources": []}}}]}}}]}
+        edges = gather.build_bicep_edges("", arm, self.BASE,
+                                         {"infra", "avm/res/network"}, self.P)
+        self.assertEqual(edges, [])
 
 
 class TestWalkArmDeployments(unittest.TestCase):
@@ -1638,10 +1799,16 @@ class TestBuildBicepEdges(unittest.TestCase):
         edges = gather.build_bicep_edges(self.src, self.arm, self.base,
                                          self.area_ids, gather.DEFAULT_AREA_PATTERNS)
         imm = {e["to"]: e for e in edges if not e["transitive"]}
-        self.assertEqual(imm["avm/res/storage/storage-account"]["version"], "0.9.0")
-        self.assertEqual(imm["avm/res/storage/storage-account"]["provider"], "bicep")
-        self.assertTrue(imm["avm/res/storage/storage-account"]["resolved"])
+        # key-vault/vault is in the repo's area set -> resolved to its area-id.
         self.assertEqual(imm["avm/res/key-vault/vault"]["version"], "0.6.1")
+        self.assertEqual(imm["avm/res/key-vault/vault"]["provider"], "bicep")
+        self.assertTrue(imm["avm/res/key-vault/vault"]["resolved"])
+        # storage-account is NOT in the area set -> unresolved, raw ref kept (#73).
+        self.assertNotIn("avm/res/storage/storage-account", imm)
+        self.assertEqual(imm[None]["ref"],
+                         "br/public:avm/res/storage/storage-account:0.9.0")
+        self.assertEqual(imm[None]["version"], "0.9.0")
+        self.assertFalse(imm[None]["resolved"])
         # the local ref resolved to its utl area
         self.assertIn("avm/utl/types/avm-common-types", imm)
 
@@ -2073,8 +2240,12 @@ class TestExtractIacEdges(unittest.TestCase):
             which=which, run=run, read_text=lambda _p: bicep_src)
         bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
         tos = {e["to"] for e in bar["edges"]}
-        self.assertIn("avm/res/storage/storage-account", tos)
-        self.assertTrue(any(e["version"] == "0.9.0" for e in bar["edges"]))
+        # key-vault/vault is in the area set -> resolved; storage-account is not
+        # -> unresolved, raw ref + version kept (#73).
+        self.assertIn("avm/res/key-vault/vault", tos)
+        self.assertNotIn("avm/res/storage/storage-account", tos)
+        self.assertTrue(any(e["version"] == "0.9.0" and e["to"] is None
+                            for e in bar["edges"]))
         # terraform area stays empty (terraform absent)
         prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
         self.assertEqual(prod["edges"], [])
@@ -2301,10 +2472,11 @@ class TestIacEntrypoint(unittest.TestCase):
             self.assertEqual(build[2], os.path.join(clone, self.KV, "main.bicep"))
             self.assertEqual(area["edges_status"], "resolved")
             by_ref = {e["ref"]: e for e in area["edges"]}
-            # the parent's registry ref is read (it was never read before)...
-            self.assertEqual(
-                by_ref["br/public:avm/res/network/private-endpoint:0.11.0"]["to"],
-                "avm/res/network/private-endpoint")
+            # the parent's registry ref is read (it was never read before)... it is
+            # unresolved (#73): private-endpoint is not in this repo's area set.
+            pe = by_ref["br/public:avm/res/network/private-endpoint:0.11.0"]
+            self.assertEqual((pe["to"], pe["resolved"], pe["version"]),
+                             (None, False, "0.11.0"))
             # ...and the child keeps the existing local <area>/<child> edge shape
             child = by_ref["key/main.bicep"]
             self.assertEqual(child["to"], self.KV + "/key")
@@ -2516,7 +2688,12 @@ class TestAcquireEdgesP3c(unittest.TestCase):
             read_text=lambda _p: src)
         bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
         self.assertTrue(bar["edges"])
-        self.assertTrue(any(e["to"] == "avm/res/storage/storage-account"
+        # key-vault/vault is an area of this repo -> resolved; storage-account is
+        # not in the area set -> unresolved with the raw ref kept (#73).
+        self.assertTrue(any(e["to"] == "avm/res/key-vault/vault" and e["resolved"]
+                            for e in bar["edges"]))
+        self.assertTrue(any(e["to"] is None and not e["resolved"]
+                            and e["ref"] == "br/public:avm/res/storage/storage-account:0.9.0"
                             for e in bar["edges"]))
 
 

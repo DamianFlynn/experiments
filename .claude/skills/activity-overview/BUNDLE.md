@@ -255,7 +255,9 @@ review's state to `DISMISSED`.
   "paths": [...], "edges": [] }] }`. The **directory provider** (primary,
   zero-dep, offline) maps each tracked file to its module directory (AVM
   `avm/res/<svc>/<module>/`, any `main.bicep` dir, Terraform `modules/<name>/` or
-  any `*.tf` dir, else a top-2-segment fallback); the area `id` is that directory.
+  any `*.tf` dir, else the top 2 segments of the file's directory — a repo-root file
+  keeps its own name); the area `id` is that directory. A file directly under an AVM
+  group (`avm/res/<svc>/README.md`) is not a module: it maps to the group area `avm/res/<svc>`.
   **graphify** is an OPTIONAL provider for its ~25 tree-sitter languages — it reads
   graphify's real `graph.json` (top keys `nodes`/`links`; each node carries an
   integer `community` + `source_file`; **no** top-level `communities` list; edges
@@ -265,15 +267,15 @@ review's state to `DISMISSED`.
 
   | field | meaning |
   |-------|---------|
-  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable (e.g. a registry module — its identity is in `ref`) |
+  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable — its identity is then in `ref`. A Bicep registry ref maps to an area **only** when it is the public registry (`br/public:<path>:<tag>` or `br:mcr.microsoft.com/bicep/<path>:<tag>`) **and** the classified area (`<path>`) is in this repo's area set; a private registry (`br:<other-host>/…`), template spec (`ts:<sub>/<rg>/<name>:<ver>`, `ts/<alias>:…`), user alias (`br/<alias>:…`) or a public module this repo's area set lacks is `null` |
   | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred) |
-  | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
+  | `ref` | the raw reference (`br/public:…:<ver>`, `br:<host>/…:<tag>`, `ts:…`, a local path, or a TF `source`), kept verbatim |
   | `version` | pinned version when present, else `null` |
   | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
   | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge. Child edges come from building the **parent**: a child module is never the area's entrypoint |
   | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
-  | `resolved` | `true` when `to` is non-null |
+  | `resolved` | `true` when `to` is non-null (`to: null` ⇔ `resolved: false`; `version` still carries the ref's tag) |
 
   **Build-only.** Edges are populated *only* from a successful `bicep restore`+`bicep build`
   (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned

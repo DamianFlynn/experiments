@@ -1370,11 +1370,24 @@ def attach_file_diffs(code_events, file_diffs):
 # Each entry is (name, predicate(parts) -> area_id_or_None) tried in order; the
 # first match wins. `parts` is path.split("/"). Patterns are directory-first and
 # match how IaC repos define a module. The generic fallback is last.
+_AVM_KINDS = ("res", "ptn", "utl")
+
+
 def _avm_area(parts):
-    # avm/res/<service>/<module>/...  -> the 4-segment module subtree.
-    if len(parts) >= 4 and parts[0] == "avm" and parts[1] in ("res", "ptn", "utl"):
-        return "/".join(parts[:4])
+    # avm/{res,ptn,utl}/<group>/<module>/...  -> the 4-segment module subtree. The
+    # module segment must be a DIRECTORY (a file under it follows, >= 5 parts): a
+    # file directly under the group (avm/res/network/README.md) is not a module and
+    # belongs to the group-level area avm/res/<group>.
+    if len(parts) >= 4 and parts[0] == "avm" and parts[1] in _AVM_KINDS:
+        return "/".join(parts[:4] if len(parts) >= 5 else parts[:3])
     return None
+
+
+def _is_avm_group_area(area_id):
+    """True for an AVM group-level area id `avm/{res,ptn,utl}/<group>` (the home of
+    files directly under a group, e.g. its README) — never a module. Pure."""
+    parts = (area_id or "").split("/")
+    return len(parts) == 3 and parts[0] == "avm" and parts[1] in _AVM_KINDS
 
 
 def _main_bicep_dir(parts):
@@ -1385,8 +1398,9 @@ def _main_bicep_dir(parts):
 
 
 def _terraform_modules_dir(parts):
-    # modules/<name>/... -> modules/<name>.
-    if len(parts) >= 2 and parts[0] == "modules":
+    # modules/<name>/... -> modules/<name>. <name> must be a directory: a file
+    # directly under modules/ (modules/README.md) is not a module and falls through.
+    if len(parts) >= 3 and parts[0] == "modules":
         return "/".join(parts[:2])
     return None
 
@@ -1402,10 +1416,12 @@ def _tf_dir(parts):
 
 
 def _topn_dir(parts, n=2):
-    # generic fallback: the first N path segments (or the file itself if shallower).
+    # generic fallback: the first N segments of the file's DIRECTORY, so a shallow
+    # file (docs/README.md) lands in its directory (docs), never an area named after
+    # the file. A repo-root file has no directory to name and keeps its own name.
     if not parts:
         return None
-    return "/".join(parts[:n])
+    return "/".join(parts[:-1][:n]) or parts[-1]
 
 
 DEFAULT_AREA_PATTERNS = [
@@ -1421,7 +1437,8 @@ def classify_code_area(path, patterns):
     """Map a tracked file path to a single area id (a directory path), or None.
 
     Tries the ordered `patterns` (AVM module subtree, any main.bicep dir, Terraform
-    modules/<name>, any *.tf dir, else a top-2-segment fallback). Pure."""
+    modules/<name>, any *.tf dir, else the top 2 segments of the file's directory;
+    a repo-root file keeps its own name). Pure."""
     if not path:
         return None
     parts = path.split("/")
@@ -1546,29 +1563,50 @@ _BICEP_MODULE_RE = re.compile(
     r"module\s+\w+\s+'(?P<ref>[^']+)'(?:\s*=\s*(?P<open>[\[{]))?")
 
 
+# A non-local Bicep reference scheme: `br:` / `ts:` or an alias `br/<a>:` / `ts/<a>:`.
+_BICEP_SCHEME_RE = re.compile(r"^(?P<scheme>br|ts)(?:/(?P<alias>[^:/]+))?:(?P<body>.*)$")
+# The public Bicep registry (what the built-in `br/public` alias points at).
+_BICEP_PUBLIC_REGISTRY = "mcr.microsoft.com/bicep/"
+
+
+def _split_ref_tag(body):
+    """`<path>:<tag>` / `<path>@<digest>` -> (path, tag-or-None)."""
+    if "@" in body:
+        return tuple(body.split("@", 1))
+    if ":" in body:
+        return tuple(body.rsplit(":", 1))
+    return body, None
+
+
 def parse_bicep_module_refs(source_text):
     """Extract `module <sym> '<ref>'` references from a .bicep source.
 
-    Each result is {ref, registry_path, version, local_path, instances}. Registry
-    refs (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
-    `registry_path` + `version`; everything else is a `local_path`. `instances` is
-    `"many"` when the module is instantiated as an array (`= [for ...]`), `"one"`
-    for a single `= {`, else None. Pure."""
+    Each result is {ref, registry_path, version, local_path, instances}. Only a
+    PUBLIC Bicep registry ref (`br/public:<path>:<ver>`, or the same registry named
+    explicitly, `br:mcr.microsoft.com/bicep/<path>:<ver>`) sets `registry_path` (the
+    module path in the public registry). A private registry (`br:<other-host>/...`),
+    a template spec (`ts:<sub>/<rg>/<name>:<ver>`, `ts/<alias>:<name>:<ver>`) or a
+    user alias (`br/<alias>:...`) sets neither `registry_path` nor `local_path`:
+    its path says nothing about this repo, so only the raw `ref` (+ `version`) is
+    kept. A ref with no scheme is a `local_path`. `instances` is `"many"` when the
+    module is instantiated as an array (`= [for ...]`), `"one"` for a single
+    `= {`, else None. Pure."""
     refs = []
     for m in _BICEP_MODULE_RE.finditer(source_text or ""):
         ref = m.group("ref")
         open_ch = m.group("open")
         instances = "many" if open_ch == "[" else "one" if open_ch == "{" else None
         registry_path = version = local_path = None
-        if ref.startswith("br/public:") or ref.startswith("br:"):
-            body = ref.split(":", 1)[1]              # drop the br/public or br scheme
-            if ":" in body:
-                path_part, version = body.rsplit(":", 1)
-            else:
-                path_part = body
-            if "/bicep/" in path_part:               # strip an explicit registry host
-                path_part = path_part.split("/bicep/", 1)[1]
-            registry_path = path_part
+        sm = _BICEP_SCHEME_RE.match(ref)
+        if sm:
+            path_part, version = _split_ref_tag(sm.group("body"))
+            alias = sm.group("alias")
+            if sm.group("scheme") == "br" and alias == "public":
+                registry_path = path_part
+            elif (sm.group("scheme") == "br" and alias is None
+                  and path_part.lower().startswith(_BICEP_PUBLIC_REGISTRY)):
+                registry_path = path_part[len(_BICEP_PUBLIC_REGISTRY):]
+            # else: private registry / template spec / user alias -> raw ref only
         else:
             local_path = ref
         refs.append({"ref": ref, "registry_path": registry_path,
@@ -1577,17 +1615,23 @@ def parse_bicep_module_refs(source_text):
     return refs
 
 
-def resolve_module_ref(ref_info, base_path, patterns=None):
+def resolve_module_ref(ref_info, base_path, patterns=None, area_ids=None):
     """Map a parsed bicep/tf ref to a canonical area-id (reusing classify_code_area).
 
-    Registry refs classify their `<path>/main.bicep`; local refs are normalised
-    relative to `base_path`'s directory then classified. Returns the area-id, or
-    the raw path when classification declines, or None when nothing is set. Pure."""
+    A public-registry ref (`registry_path`) classifies its `<path>/main.bicep` and
+    maps to that area ONLY when the area is in `area_ids` (this repo's area set)
+    and is a module (not an AVM group-level area); otherwise None — never a
+    phantom id for a module that is not in this repo (`area_ids` None => no set
+    => None). Local refs are normalised relative to `base_path`'s directory then
+    classified (the raw dir when classification declines). None when nothing
+    resolvable is set (private registry / template spec / alias refs). Pure."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     rp = ref_info.get("registry_path")
     if rp:
-        probe = rp.rstrip("/") + "/main.bicep"
-        return classify_code_area(probe, patterns) or rp
+        area = classify_code_area(rp.strip("/") + "/main.bicep", patterns)
+        if area and area in (area_ids or ()) and not _is_avm_group_area(area):
+            return area
+        return None
     lp = ref_info.get("local_path")
     if lp:
         base_dir = os.path.dirname(base_path or "")
@@ -1678,7 +1722,7 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     self_id = classify_code_area(base_path, patterns)
 
     for ri in parse_bicep_module_refs(source_text):
-        to = resolve_module_ref(ri, base_path, patterns)
+        to = resolve_module_ref(ri, base_path, patterns, area_ids)
         local = False
         # A local relative ref that resolves back to THIS area is a private child
         # submodule (e.g. `nat-rule/main.bicep`), not a self-dependency. Name the
@@ -1706,12 +1750,15 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
         edges.append(edge)
 
     immediate_tos = {e["to"] for e in edges}  # direct deps, already captured above
+    # Only module areas are transitive targets: an AVM group-level area (a group's
+    # README home) would otherwise substring-match nested names like `network`.
+    module_area_ids = [a for a in (area_ids or ()) if not _is_avm_group_area(a)]
     for node in walk_arm_deployments(arm_json):
         # depth 1 == the direct module instantiations (already emitted as immediate
         # source refs); only genuinely-nested deployments are transitive.
         if node["depth"] < 2:
             continue
-        to = _match_repo_area(node.get("metadata_name"), area_ids)
+        to = _match_repo_area(node.get("metadata_name"), module_area_ids)
         if to is None or to == self_id or to in immediate_tos:
             continue
         key = (to, node.get("name"), True)

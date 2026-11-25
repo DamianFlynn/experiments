@@ -221,11 +221,11 @@ order (graphify does not parse Bicep/HCL, so IaC repos always land here):
 
 | Order | Pattern | Maps | Example |
 |---:|---|---|---|
-| 1 | `avm` (`_avm_area`) | `avm/{res,ptn,utl}/<a>/<b>/…` → 4-segment module subtree | `avm/ptn/ai-ml/landing-zone` |
+| 1 | `avm` (`_avm_area`) | `avm/{res,ptn,utl}/<a>/<b>/…` → 4-segment module subtree; a file directly under the group (`avm/res/<a>/README.md`) → group area `avm/res/<a>` (not a module) | `avm/ptn/ai-ml/landing-zone` |
 | 2 | `main_bicep` | any dir containing `main.bicep` → that dir | `infra/hub/main.bicep` → `infra/hub` |
-| 3 | `terraform_modules` | `modules/<name>/…` | `modules/subnet` |
+| 3 | `terraform_modules` | `modules/<name>/…` (`<name>` a dir; `modules/README.md` falls through) | `modules/subnet` |
 | 4 | `tf_dir` | any `*.tf` dir; **repo-root `*.tf` collapse to one `main.tf` area** | `main.networking.tf` → `main.tf` |
-| 5 | `topn` | fallback: top 2 path segments | `src/Bicep.Core` |
+| 5 | `topn` | fallback: top 2 segments of the file's **directory** (`docs/README.md` → `docs`); a repo-root file keeps its own name | `src/Bicep.Core` |
 
 `_is_scaffold_area` marks Terraform `examples/` and `tests/` subtrees as scaffolding: their
 edges are **skipped at extraction and excluded at fold**, because those trees reference the
@@ -272,10 +272,15 @@ flowchart TB
 - **Build-only:** edges come only from a successful build; static guessing is never emitted.
   A `resolved` area with no edges genuinely has no inter-area dependencies; `timeout`/`failed`
   are **counted gaps**.
-- **Bicep:** `parse_bicep_module_refs` splits `br/public:<path>:<ver>` / `br:<host>/bicep/<path>:<ver>`
-  into `registry_path` + `version`; `resolve_module_ref` classifies `<path>/main.bicep`, so in
-  the BRM monorepo `br/public:avm/res/network/virtual-network:0.x` resolves to the **in-repo**
-  area `avm/res/network/virtual-network`. Transitive edges come from walking nested
+- **Bicep:** `parse_bicep_module_refs` splits a **public**-registry ref (`br/public:<path>:<ver>` /
+  `br:mcr.microsoft.com/bicep/<path>:<ver>`) into `registry_path` + `version`; private-registry
+  (`br:<other-host>/…`), template-spec (`ts:…`, `ts/<alias>:…`) and user-alias (`br/<alias>:…`)
+  refs keep only the raw `ref` + `version`. `resolve_module_ref` classifies `<path>/main.bicep`
+  and returns that area **only when it is in the repo's area set** (and is not an AVM group
+  area), so in the BRM monorepo `br/public:avm/res/network/virtual-network:0.x` resolves to the
+  **in-repo** area `avm/res/network/virtual-network` when that area is present; anything else is
+  `to=None, resolved=False` (#73). Note the area set is the window's (in-window-changed paths),
+  so a public ref to an untouched module is unresolved. Transitive edges come from walking nested
   deployments in the compiled ARM (`walk_arm_deployments`).
 - **Terraform:** extraction reads **every `*.tf` in the entrypoint's module dir**; `parse_terraform_graph`
   accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
