@@ -1,13 +1,13 @@
 # avm-tf-aiml-lz — Project Activity Digest (2026-03-16 → 2026-03-22)
 
-> **Illustration, not the product.** The product is the JSON bundle (`samples/digest_view.json`) emitted by `digest.py` — the verifiable interface a downstream content agent consumes to write the narrative. This Markdown is a deterministic *structural* rendering of that bundle (tables + validated diagrams + sourced facts, no authored prose). Every value resolves to the bundle or a GitHub URL.
+> **Illustration, not the product.** The product is the JSON bundle (`samples/digest_view.json`) emitted by `digest.py` — the verifiable interface a downstream content agent consumes to write the narrative. This Markdown is a deterministic *structural* rendering of that bundle (tables + `render.py` diagrams + sourced facts, no authored prose). Every value resolves to the bundle or a GitHub URL.
 
 | | |
 |---|---|
 | **Project** | `avm-tf-aiml-lz` |
 | **Window** | 2026-03-16 → 2026-03-22 |
+| **Reference date** | 2026-03-22 |
 | **Members** | 3 repos |
-| **Generated** | 2026-06-05 |
 | **Pinned clones** | `terraform-azurerm-avm-ptn-aiml-landing-zone`@`364f58182`; `terraform-azurerm-avm-res-network-virtualnetwork`@`a0bbf6176`; `terraform-azurerm-avm-res-operationalinsights-workspace`@`b796b1e5a` |
 
 Member repositories:
@@ -15,8 +15,6 @@ Member repositories:
 - [`Azure/terraform-azurerm-avm-ptn-aiml-landing-zone`](https://github.com/Azure/terraform-azurerm-avm-ptn-aiml-landing-zone)
 - [`Azure/terraform-azurerm-avm-res-network-virtualnetwork`](https://github.com/Azure/terraform-azurerm-avm-res-network-virtualnetwork)
 - [`Azure/terraform-azurerm-avm-res-operationalinsights-workspace`](https://github.com/Azure/terraform-azurerm-avm-res-operationalinsights-workspace)
-
-> ✅ **`meta.boundary_dropped_commits` empty for every member** — feature-change / content-lifecycle ledgers are complete.
 
 ## Summary
 
@@ -39,24 +37,24 @@ Member repositories:
 
 ```mermaid
 flowchart LR
-    subgraph r_Azure_terraform_azurerm_avm_ptn_aiml_lan_8f5ee345["Azure/terraform-azurerm-avm-ptn-aiml-landing-zone"]
-        m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4("modules/example_hub_vnet")
-        m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e("main.tf")
+    subgraph r_Azure_terraform_azurerm__8f5ee345["Azure/terraform-azurerm-avm-ptn-aiml-landing-zone"]
+        m_Azure_terraform_azurerm__444d58f4("modules/example_hub_vnet")
+        m_Azure_terraform_azurerm__5fb4253e("main.tf")
     end
-    subgraph r_Azure_terraform_azurerm_avm_res_network__c3bf45c1["Azure/terraform-azurerm-avm-res-network-virtualnetwork"]
-        m_Azure_terraform_azurerm_avm_res_network__8693f704("modules/subnet")
-        m_Azure_terraform_azurerm_avm_res_network__9b1b7c02("main.tf")
-        m_Azure_terraform_azurerm_avm_res_network__a691fb80("modules/peering")
+    subgraph r_Azure_terraform_azurerm__c3bf45c1["Azure/terraform-azurerm-avm-res-network-virtualnetwork"]
+        m_Azure_terraform_azurerm__8693f704("modules/subnet")
+        m_Azure_terraform_azurerm__9b1b7c02("main.tf")
+        m_Azure_terraform_azurerm__a691fb80("modules/peering")
     end
-    subgraph r_Azure_terraform_azurerm_avm_res_operatio_b3f65f76["Azure/terraform-azurerm-avm-res-operationalinsights-workspace"]
-        m_Azure_terraform_azurerm_avm_res_operatio_27a69a94("main.tf")
+    subgraph r_Azure_terraform_azurerm__b3f65f76["Azure/terraform-azurerm-avm-res-operationalinsights-workspace"]
+        m_Azure_terraform_azurerm__27a69a94("main.tf")
     end
-    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4 -->|"=0.16.0"| m_Azure_terraform_azurerm_avm_res_network__9b1b7c02
-    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_444d58f4 -->|"0.4.2"| m_Azure_terraform_azurerm_avm_res_operatio_27a69a94
-    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e -->|"0.16.0"| m_Azure_terraform_azurerm_avm_res_network__9b1b7c02
-    m_Azure_terraform_azurerm_avm_ptn_aiml_lan_5fb4253e -->|"0.4.2"| m_Azure_terraform_azurerm_avm_res_operatio_27a69a94
-    m_Azure_terraform_azurerm_avm_res_network__9b1b7c02 --> m_Azure_terraform_azurerm_avm_res_network__8693f704
-    m_Azure_terraform_azurerm_avm_res_network__9b1b7c02 --> m_Azure_terraform_azurerm_avm_res_network__a691fb80
+    m_Azure_terraform_azurerm__444d58f4 -->|"0.4.2"| m_Azure_terraform_azurerm__27a69a94
+    m_Azure_terraform_azurerm__444d58f4 -->|"=0.16.0"| m_Azure_terraform_azurerm__9b1b7c02
+    m_Azure_terraform_azurerm__5fb4253e -->|"0.4.2"| m_Azure_terraform_azurerm__27a69a94
+    m_Azure_terraform_azurerm__5fb4253e -->|"0.16.0"| m_Azure_terraform_azurerm__9b1b7c02
+    m_Azure_terraform_azurerm__9b1b7c02 --> m_Azure_terraform_azurerm__8693f704
+    m_Azure_terraform_azurerm__9b1b7c02 --> m_Azure_terraform_azurerm__a691fb80
 ```
 
 | Consumer (repo · area) | Depends on (repo · area) | Version | Cross-repo | Transitive |
@@ -163,63 +161,63 @@ flowchart LR
 
 ## Module ownership
 
-`view["modules"]` (per-area commits/PRs/files) + CODEOWNERS + `view["people"]`. Top 8 areas per repo by files touched.
+`view["modules"]` (per-area commits/PRs/files) + CODEOWNERS (last matching rule per area) + `view["people"]`. Top 8 areas per repo by files touched.
 
 - People in window: 88 logins (3 bots); 2 with module-level attribution: `Copilot`, `azure-verified-modules[bot]` (bot).
 
 | Repo | Module (area) | CODEOWNERS | Commits | PRs | Files |
 |---|---|---|---|---|---|
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `main.tf` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 8 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `.agents/skills` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 5 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `modules/example_hub_vnet` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 3 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default-byo-vnet` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone-byo-vnet` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 2 |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `.github/copilot-instructions.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `.agents/skills` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 5 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `.github/copilot-instructions.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `.vscode/extensions.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `.vscode/mcp.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-network-virtualnetwork` | `AGENTS.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.agents/skills` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 5 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.github/copilot-instructions.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/extensions.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/mcp.json` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
-| `terraform-azurerm-avm-res-operationalinsights-workspace` | `AGENTS.md` | `Azure/avm-core-team-technical-terraform` | 1 | 1 | 1 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `main.tf` | — | 1 | 1 | 8 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `.agents/skills` | — | 1 | 1 | 5 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `modules/example_hub_vnet` | — | 1 | 1 | 3 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default` | — | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/default-byo-vnet` | — | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone` | — | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `examples/standalone-byo-vnet` | — | 1 | 1 | 2 |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` | `.github/copilot-instructions.md` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.agents/skills` | — | 1 | 1 | 5 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.github/copilot-instructions.md` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.vscode/extensions.json` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `.vscode/mcp.json` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-network-virtualnetwork` | `AGENTS.md` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.agents/skills` | — | 1 | 1 | 5 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.github/copilot-instructions.md` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/extensions.json` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `.vscode/mcp.json` | — | 1 | 1 | 1 |
+| `terraform-azurerm-avm-res-operationalinsights-workspace` | `AGENTS.md` | — | 1 | 1 | 1 |
 
 People ↔ code-area edges — `terraform-azurerm-avm-ptn-aiml-landing-zone`:
 
 ```mermaid
 flowchart LR
     p_Copilot["Copilot"]
-    p_azure_verified_modules_bot_["azure-verified-modules[bot]"]
-    a_AGENTS_md("AGENTS.md")
-    a_README_md("README.md")
-    a__agents_skills("skills")
-    a__github_copilot_instructions_md("copilot-instructions.md")
-    a__header_md("_header.md")
-    a__vscode_extensions_json("extensions.json")
-    a__vscode_mcp_json("mcp.json")
-    a_examples_default("default")
-    a_examples_default_byo_vnet("default-byo-vnet")
-    a_examples_standalone("standalone")
-    a_examples_standalone_byo_vnet("standalone-byo-vnet")
-    a_main_tf("main.tf")
-    a_modules_example_hub_vnet("example_hub_vnet")
-    p_Copilot --> a_README_md
-    p_Copilot --> a__header_md
-    p_Copilot --> a_examples_default
-    p_Copilot --> a_examples_default_byo_vnet
-    p_Copilot --> a_examples_standalone
-    p_Copilot --> a_examples_standalone_byo_vnet
-    p_Copilot --> a_main_tf
-    p_Copilot --> a_modules_example_hub_vnet
-    p_azure_verified_modules_bot_ --> a_AGENTS_md
-    p_azure_verified_modules_bot_ --> a__agents_skills
-    p_azure_verified_modules_bot_ --> a__github_copilot_instructions_md
-    p_azure_verified_modules_bot_ --> a__vscode_extensions_json
-    p_azure_verified_modules_bot_ --> a__vscode_mcp_json
+    p_azure_verified_modules_b_deaa9f02["azure-verified-modules[bot]"]
+    a_AGENTS_md_37dd6836("AGENTS.md")
+    a_README_md_8ec9a00b("README.md")
+    a__agents_skills_bb9e901a("skills")
+    a__github_copilot_instruct_0f01752a("copilot-instructions.md")
+    a__header_md_e25e4d9b("_header.md")
+    a__vscode_extensions_json_7cf89ab2("extensions.json")
+    a__vscode_mcp_json_4f05a578("mcp.json")
+    a_examples_default_8f0fd64d("default")
+    a_examples_default_byo_vne_b95b420c("default-byo-vnet")
+    a_examples_standalone_a1c63d96("standalone")
+    a_examples_standalone_byo__fafdbe4c("standalone-byo-vnet")
+    a_main_tf_5bd615df("main.tf")
+    a_modules_example_hub_vnet_9ca82eca("example_hub_vnet")
+    p_Copilot --> a_README_md_8ec9a00b
+    p_Copilot --> a__header_md_e25e4d9b
+    p_Copilot --> a_examples_default_8f0fd64d
+    p_Copilot --> a_examples_default_byo_vne_b95b420c
+    p_Copilot --> a_examples_standalone_a1c63d96
+    p_Copilot --> a_examples_standalone_byo__fafdbe4c
+    p_Copilot --> a_main_tf_5bd615df
+    p_Copilot --> a_modules_example_hub_vnet_9ca82eca
+    p_azure_verified_modules_b_deaa9f02 --> a_AGENTS_md_37dd6836
+    p_azure_verified_modules_b_deaa9f02 --> a__agents_skills_bb9e901a
+    p_azure_verified_modules_b_deaa9f02 --> a__github_copilot_instruct_0f01752a
+    p_azure_verified_modules_b_deaa9f02 --> a__vscode_extensions_json_7cf89ab2
+    p_azure_verified_modules_b_deaa9f02 --> a__vscode_mcp_json_4f05a578
 ```
 
 People ↔ code-area edges — `terraform-azurerm-avm-res-network-virtualnetwork`:
@@ -227,33 +225,33 @@ People ↔ code-area edges — `terraform-azurerm-avm-res-network-virtualnetwork
 ```mermaid
 flowchart LR
     p_Copilot["Copilot"]
-    p_azure_verified_modules_bot_["azure-verified-modules[bot]"]
-    a_AGENTS_md("AGENTS.md")
-    a_README_md("README.md")
-    a__agents_skills("skills")
-    a__github_copilot_instructions_md("copilot-instructions.md")
-    a__header_md("_header.md")
-    a__vscode_extensions_json("extensions.json")
-    a__vscode_mcp_json("mcp.json")
-    a_examples_default("default")
-    a_examples_default_byo_vnet("default-byo-vnet")
-    a_examples_standalone("standalone")
-    a_examples_standalone_byo_vnet("standalone-byo-vnet")
-    a_main_tf("main.tf")
-    a_modules_example_hub_vnet("example_hub_vnet")
-    p_Copilot --> a_README_md
-    p_Copilot --> a__header_md
-    p_Copilot --> a_examples_default
-    p_Copilot --> a_examples_default_byo_vnet
-    p_Copilot --> a_examples_standalone
-    p_Copilot --> a_examples_standalone_byo_vnet
-    p_Copilot --> a_main_tf
-    p_Copilot --> a_modules_example_hub_vnet
-    p_azure_verified_modules_bot_ --> a_AGENTS_md
-    p_azure_verified_modules_bot_ --> a__agents_skills
-    p_azure_verified_modules_bot_ --> a__github_copilot_instructions_md
-    p_azure_verified_modules_bot_ --> a__vscode_extensions_json
-    p_azure_verified_modules_bot_ --> a__vscode_mcp_json
+    p_azure_verified_modules_b_deaa9f02["azure-verified-modules[bot]"]
+    a_AGENTS_md_37dd6836("AGENTS.md")
+    a_README_md_8ec9a00b("README.md")
+    a__agents_skills_bb9e901a("skills")
+    a__github_copilot_instruct_0f01752a("copilot-instructions.md")
+    a__header_md_e25e4d9b("_header.md")
+    a__vscode_extensions_json_7cf89ab2("extensions.json")
+    a__vscode_mcp_json_4f05a578("mcp.json")
+    a_examples_default_8f0fd64d("default")
+    a_examples_default_byo_vne_b95b420c("default-byo-vnet")
+    a_examples_standalone_a1c63d96("standalone")
+    a_examples_standalone_byo__fafdbe4c("standalone-byo-vnet")
+    a_main_tf_5bd615df("main.tf")
+    a_modules_example_hub_vnet_9ca82eca("example_hub_vnet")
+    p_Copilot --> a_README_md_8ec9a00b
+    p_Copilot --> a__header_md_e25e4d9b
+    p_Copilot --> a_examples_default_8f0fd64d
+    p_Copilot --> a_examples_default_byo_vne_b95b420c
+    p_Copilot --> a_examples_standalone_a1c63d96
+    p_Copilot --> a_examples_standalone_byo__fafdbe4c
+    p_Copilot --> a_main_tf_5bd615df
+    p_Copilot --> a_modules_example_hub_vnet_9ca82eca
+    p_azure_verified_modules_b_deaa9f02 --> a_AGENTS_md_37dd6836
+    p_azure_verified_modules_b_deaa9f02 --> a__agents_skills_bb9e901a
+    p_azure_verified_modules_b_deaa9f02 --> a__github_copilot_instruct_0f01752a
+    p_azure_verified_modules_b_deaa9f02 --> a__vscode_extensions_json_7cf89ab2
+    p_azure_verified_modules_b_deaa9f02 --> a__vscode_mcp_json_4f05a578
 ```
 
 People ↔ code-area edges — `terraform-azurerm-avm-res-operationalinsights-workspace`:
@@ -261,33 +259,33 @@ People ↔ code-area edges — `terraform-azurerm-avm-res-operationalinsights-wo
 ```mermaid
 flowchart LR
     p_Copilot["Copilot"]
-    p_azure_verified_modules_bot_["azure-verified-modules[bot]"]
-    a_AGENTS_md("AGENTS.md")
-    a_README_md("README.md")
-    a__agents_skills("skills")
-    a__github_copilot_instructions_md("copilot-instructions.md")
-    a__header_md("_header.md")
-    a__vscode_extensions_json("extensions.json")
-    a__vscode_mcp_json("mcp.json")
-    a_examples_default("default")
-    a_examples_default_byo_vnet("default-byo-vnet")
-    a_examples_standalone("standalone")
-    a_examples_standalone_byo_vnet("standalone-byo-vnet")
-    a_main_tf("main.tf")
-    a_modules_example_hub_vnet("example_hub_vnet")
-    p_Copilot --> a_README_md
-    p_Copilot --> a__header_md
-    p_Copilot --> a_examples_default
-    p_Copilot --> a_examples_default_byo_vnet
-    p_Copilot --> a_examples_standalone
-    p_Copilot --> a_examples_standalone_byo_vnet
-    p_Copilot --> a_main_tf
-    p_Copilot --> a_modules_example_hub_vnet
-    p_azure_verified_modules_bot_ --> a_AGENTS_md
-    p_azure_verified_modules_bot_ --> a__agents_skills
-    p_azure_verified_modules_bot_ --> a__github_copilot_instructions_md
-    p_azure_verified_modules_bot_ --> a__vscode_extensions_json
-    p_azure_verified_modules_bot_ --> a__vscode_mcp_json
+    p_azure_verified_modules_b_deaa9f02["azure-verified-modules[bot]"]
+    a_AGENTS_md_37dd6836("AGENTS.md")
+    a_README_md_8ec9a00b("README.md")
+    a__agents_skills_bb9e901a("skills")
+    a__github_copilot_instruct_0f01752a("copilot-instructions.md")
+    a__header_md_e25e4d9b("_header.md")
+    a__vscode_extensions_json_7cf89ab2("extensions.json")
+    a__vscode_mcp_json_4f05a578("mcp.json")
+    a_examples_default_8f0fd64d("default")
+    a_examples_default_byo_vne_b95b420c("default-byo-vnet")
+    a_examples_standalone_a1c63d96("standalone")
+    a_examples_standalone_byo__fafdbe4c("standalone-byo-vnet")
+    a_main_tf_5bd615df("main.tf")
+    a_modules_example_hub_vnet_9ca82eca("example_hub_vnet")
+    p_Copilot --> a_README_md_8ec9a00b
+    p_Copilot --> a__header_md_e25e4d9b
+    p_Copilot --> a_examples_default_8f0fd64d
+    p_Copilot --> a_examples_default_byo_vne_b95b420c
+    p_Copilot --> a_examples_standalone_a1c63d96
+    p_Copilot --> a_examples_standalone_byo__fafdbe4c
+    p_Copilot --> a_main_tf_5bd615df
+    p_Copilot --> a_modules_example_hub_vnet_9ca82eca
+    p_azure_verified_modules_b_deaa9f02 --> a_AGENTS_md_37dd6836
+    p_azure_verified_modules_b_deaa9f02 --> a__agents_skills_bb9e901a
+    p_azure_verified_modules_b_deaa9f02 --> a__github_copilot_instruct_0f01752a
+    p_azure_verified_modules_b_deaa9f02 --> a__vscode_extensions_json_7cf89ab2
+    p_azure_verified_modules_b_deaa9f02 --> a__vscode_mcp_json_4f05a578
 ```
 
 ---
@@ -432,8 +430,10 @@ xychart-beta
 timeline
     title Content lifecycle (2026-03-16 - 2026-03-22)
     2026-03-18 : built AzAPI.md (doc) by azure-verified-modules[bot] : built SKILL.md (doc) by azure-verified-modules[bot] : built terraform-test.md (doc) by azure-verified-modules[bot] : built tfpluginschema.md (doc) by azure-verified-modules[bot] : dropped copilot-instructions.md (doc) by azure-verified-modu : changed AGENTS.md (doc) by azure-verified-modules[bot]
-    2026-03-20 : changed README.md (readme) by Copilot : changed _header.md (doc) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : built #name = "ai-lz-vnet-default-2" (comment) by Copilot : built #resource_group_name = "ai-lz-rg-default-ivrhi-2" (com : built #resource_group_name = "default-example-rg-ivrh-2" (co : built #resource_group_name = "ai-lz-rg-default-ivrhi-1" (com : built #resource_group_name = "default-example-rg-ivrh-1" (co : changed test (symbol) by Copilot : built #resource_group_name = "ai-lz-rg-default-ivrhi-4" (com : built #resource_group_name = "ai-lz-rg-default-ivrhi-3" (com : built time_sleep.wait_for_kv_rbac (symbol) by Copilot : built time_sleep.wait_for_kv_rbac (symbol) by Copilot
+    2026-03-20 : changed README.md (readme) by Copilot : changed _header.md (doc) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : changed README.md (readme) by Copilot : changed main.tf (example) by Copilot : +13 more events
 ```
+
+_Showing 14 of 27 events._
 
 - `copilot-instructions.md` (doc) — removed
 
@@ -513,11 +513,11 @@ pie showData
 
 ```mermaid
 flowchart LR
-    m_main_tf("main.tf")
-    m_modules_peering("peering")
-    m_modules_subnet("subnet")
-    m_main_tf --> m_modules_peering
-    m_main_tf --> m_modules_subnet
+    m_main_tf_5bd615df("main.tf")
+    m_modules_peering_8ca91a0e("peering")
+    m_modules_subnet_8a667945("subnet")
+    m_main_tf_5bd615df --> m_modules_peering_8ca91a0e
+    m_main_tf_5bd615df --> m_modules_subnet_8a667945
 ```
 
 #### Feature changes (add / drop / change)
@@ -640,4 +640,4 @@ timeline
 
 ---
 
-*Structural rendering of `digest.py` over the project store; 41 diagrams validated with `mmdc`. The JSON bundle (`digest_view.json`) is the source of truth. Re-run: `python3 samples/build_report.py`.*
+*Structural rendering of a `digest.py` project view; 44 diagrams rendered by `render.py` (checked with `mmdc` unless `--skip-validate`). The JSON bundle (`digest_view.json`) is the source of truth. Re-run: `python3 samples/build_report.py --view VIEW.json --out REPORT.md`.*
