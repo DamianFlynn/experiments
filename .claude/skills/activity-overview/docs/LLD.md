@@ -412,7 +412,12 @@ erDiagram
   nodes ||--o{ code_events : "artifact"
 ```
 
-Plus `fts_text` (FTS5 virtual table) when `fts5_available(conn)`.
+Plus `fts_text` (FTS5 virtual table) and its `fts_map(node_id PK, fts_rowid)` side table
+when `fts5_available(conn)`. Indexes beyond the primary keys: `nodes (project, repo,
+node_class, ts)`, `nodes (ts)`, `edges (src_id, edge_type)`, `edges (dst_id, edge_type)`,
+`edges (edge_type, src_id, dst_id)`, `code_events (artifact_id, date)`. Store
+`schema_version` is 2; `init_schema` migrates a v1 store in place (adds the edges index,
+creates and back-fills `fts_map`) — see STORE.md "Schema version and migration".
 
 ### 5.2 Identity grammar
 
@@ -437,7 +442,7 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 | Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)` |
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
 | Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
-| Text | `index_text` (delete-then-insert), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
+| Text | `index_text` / `index_texts` (replace by node id via `fts_map`, no table scan), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
 | Provenance | `record_window`/`get_windows`, `set_clone_sha`/`get_clone_sha` |
 | Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
 
@@ -451,6 +456,11 @@ exact), inclusive, either bound optional. `complete._in_window`, `spotlight` win
 `gather.in_window` and `link._in_window` delegate to `ts_in_window`; no caller pads bounds.
 `traverse_spine` walks spine edges **undirected**, depth-capped; `missing` lists referenced but
 unstored spine ids (minus known-dead when `skip_dead`).
+`edges_by_type` / `repo_code_events` filter on the literal `{project}/` / `{project}/{repo}#`
+id prefix **case-sensitively** as an index range (`>= prefix AND < prefix-successor`), not
+`LIKE`. Batch writers and the meta setters take `commit=False`; `gather.fold_bundle` uses it
+to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clone_sha`) in
+**one transaction** — an exception mid-fold leaves the store unchanged.
 
 ## 6. Read and enrich
 
@@ -879,6 +889,8 @@ gather does not fetch.)
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | Clone dir reuse | `git clone` into an existing dir fails; `--no-clone` does not fetch | repeated runs need a fresh dir | fetch/deepen an existing clone |
+| `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
+| Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for
 continuity, wide single gathers for history stores) avoids the first two in practice.

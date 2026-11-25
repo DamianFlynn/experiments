@@ -719,4 +719,5 @@ whether a train gets a full write-up · **slice** = one train's bounded, self-co
 evidence for the narrator · **flow** = an open issue's stuck-ness pathology ·
 **halls.fame** = the recognition ranking · **blast radius** = the set of repos that depend
 on a given one · **idempotent** = re-running changes nothing · **provenance** = the source
-link attached to every fact · **schema_version** = `1` (stamped on every view and the store).
+link attached to every fact · **schema_version** = `1` on the bundle view; the store's `meta.schema_version` is `2`
+(STORE.md).

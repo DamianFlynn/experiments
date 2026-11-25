@@ -101,6 +101,14 @@ unions, never appends. Edge types:
 `data`), `replaced_by`/`identity_from` (artifact→artifact), `blocks`
 (issue→issue), `in_milestone`/`in_iteration` (social→structure).
 
+`edges_by_type(edge_type, project)` selects the edges whose `src_id` starts
+with `{project}/` — **case-sensitively** (`Azure` and `azure` are different
+projects) and as an index range (`src_id >= '{project}/' AND src_id <
+'{project}0'` on `idx_edges_type_src (edge_type, src_id, dst_id)`), never a
+`LIKE` (case-insensitive in SQLite, so it cannot use an index and mixed
+projects that differ only in case). `repo_code_events(project, repo)` filters
+`code_events.artifact_id` on the `{project}/{repo}#` prefix the same way.
+
 ### Spine edges and decision trains
 
 A decision train is **not stored** — it is the connected component reachable
@@ -120,18 +128,28 @@ event)` → set semantics (re-seeing a commit is a no-op). An artifact's
 
 ## Text index (`fts_text`, FTS5)
 
-`index_text(node_id, text)` (delete-then-insert; idempotent) feeds an FTS5
-index; `fts_search(query)` returns matching node ids ranked by relevance.
-Created only when the SQLite build supports FTS5 (`fts5_available`); the
-text-mining spotlight query depends on it.
+`index_text(node_id, text)` / `index_texts([(node_id, text), ...])` (replace
+any text already indexed for the node; idempotent) feed an FTS5 index;
+`fts_search(query)` returns matching node ids ranked by relevance. Created only
+when the SQLite build supports FTS5 (`fts5_available`); the text-mining
+spotlight query depends on it.
+
+`fts_text(node_id UNINDEXED, text)` cannot look a row up by `node_id` without
+scanning the whole virtual table, so (schema v2) the side table
+`fts_map(node_id PK, fts_rowid)` records which `fts_text` rowid holds each
+node's text. Re-indexing is a primary-key lookup in `fts_map` plus a rowid
+delete/insert in `fts_text` (same rowid reused), so a fold's FTS cost is linear
+in the fold, not in the store. `fts_map` is created and back-filled by
+`init_schema`, and lazily by `index_text(s)` on a store that skipped
+`init_schema` (e.g. `validate`'s in-memory idempotency copy).
 
 **Populated on the fold path.** `fold_bundle` indexes searchable
 text per owning node id, keyed so a hit hydrates back to the node it came from:
 PR/issue `social` nodes index their title + body + embedded comment/review
 authors+bodies; commit `code` nodes index the commit message. The call is
 FTS5-gated (skipped silently when the build lacks FTS5 — the store stays valid)
-and idempotent (`index_text` is delete-then-insert per node id, so re-folding
-an overlapping window re-indexes cleanly without duplicates).
+and idempotent (re-indexing a node id replaces its text, so re-folding an
+overlapping window re-indexes cleanly without duplicates).
 
 `fts_search` passes `query` straight to the FTS5 `MATCH` operator, so the
 argument must be a **valid FTS5 query**. Callers searching user-derived terms
@@ -141,10 +159,35 @@ significant and otherwise raise `OperationalError`.
 
 ## Meta (`meta` table)
 
-Key/value provenance: `schema_version`; `gathered_windows` (JSON list of
+Key/value provenance: `schema_version` (see below); `gathered_windows` (JSON list of
 folded `{project,repo,from,to}`, deduped — `record_window`/`get_windows`);
 `clone_sha:{project}/{repo}` (the tree a repo was last gathered against, for
 deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`).
+
+### Schema version and migration
+
+`graphstore.SCHEMA_VERSION` is **2**. `init_schema` creates a new store at the
+current version and migrates an older one **in place**; every step is additive
+and idempotent, and the stored version is raised, never lowered.
+
+| Version | Change | Migration from the previous version |
+|---|---|---|
+| 1 | initial schema | — |
+| 2 | `fts_map` side table; `idx_edges_type_src` index (issue #55) | create the index; create `fts_map`, collapse any duplicate `fts_text` rows per node (newest kept) and back-fill the map from `fts_text` |
+
+Code older than v2 writing into a v2 store would add `fts_text` rows without
+`fts_map` entries (duplicate text on re-index); do not mix versions on one store.
+
+## Transactions (atomic folds)
+
+`fold_bundle` writes a fold as **one transaction** (`with conn:`): nodes,
+edges, code events, the FTS index, `gathered_windows` and `clone_sha` commit
+together, and any exception rolls all of them back, so readers never see a
+half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
+`add_code_events`, `index_text(s)`, `set_meta`, `record_window`,
+`set_clone_sha`) take `commit=True` by default and `commit=False` to join the
+caller's open transaction. A caller's own uncommitted writes on the same
+connection are committed (or rolled back) with the fold.
 
 ## Writer (gather --store)
 

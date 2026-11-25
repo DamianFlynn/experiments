@@ -11,7 +11,13 @@ import re
 import sqlite3
 import time
 
-SCHEMA_VERSION = 1
+# Store schema version (meta `schema_version`). History:
+#   1 - initial schema.
+#   2 - issue #55: `fts_map` (node_id -> fts_text rowid) so re-indexing deletes
+#       by rowid instead of scanning fts_text; `idx_edges_type_src` so
+#       `edges_by_type` is an index range scan. `init_schema` migrates a v1 store
+#       in place (additive: new index + new table back-filled from fts_text).
+SCHEMA_VERSION = 2
 
 NODE_CLASSES = ("social", "code", "structure")
 
@@ -46,6 +52,8 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges (src_id, edge_type);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges (dst_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_type_src
+    ON edges (edge_type, src_id, dst_id);
 
 CREATE TABLE IF NOT EXISTS code_events (
     artifact_id TEXT NOT NULL,
@@ -91,14 +99,16 @@ def open_store(path=":memory:"):
     return conn
 
 
-def set_meta(conn, key, value):
-    """Upsert a key/value pair in the meta table (value is stored as str)."""
+def set_meta(conn, key, value, commit=True):
+    """Upsert a key/value pair in the meta table (value is stored as str).
+    `commit=False` leaves the write in the caller's open transaction."""
     conn.execute(
         "INSERT INTO meta (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, str(value)),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def get_meta(conn, key, default=None):
@@ -290,17 +300,34 @@ def get_edges(conn, node_id, direction="both", edge_types=None):
     return [_row_to_edge(r) for r in conn.execute(sql, params)]
 
 
+def _prefix_range(prefix):
+    """(lo, hi) such that `col >= lo AND col < hi` selects exactly the TEXT
+    values starting with `prefix`, compared case-sensitively (BINARY collation).
+
+    Replaces `LIKE 'prefix%'`, which is case-insensitive by default (so
+    `Azure/` also matched `azure/`) and therefore cannot use an index. `hi` is
+    `prefix` with its last character incremented; BINARY compares UTF-8 bytes,
+    whose order equals code-point order, so every string with the prefix sorts
+    in [lo, hi) and nothing else does. Callers always pass a prefix ending in a
+    fixed ASCII separator ('/' or '#'), so the increment cannot overflow."""
+    if not prefix:
+        raise ValueError("empty prefix")
+    return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
+def _edges_by_type_sql(edge_type, project):
+    lo, hi = _prefix_range(project + "/")
+    return ("SELECT * FROM edges WHERE edge_type=? AND src_id >= ? AND src_id < ? "
+            "ORDER BY src_id, dst_id", (edge_type, lo, hi))
+
+
 def edges_by_type(conn, edge_type, project):
     """All edges of `edge_type` whose src node belongs to `project`, sorted by
     (src_id, dst_id). src_id is the qualified '{project}/{repo}#local', so the
-    filter is a LIKE on the literal prefix '{project}/' (LIKE metacharacters in
-    the project name are escaped, as in repo_code_events)."""
-    pref = project.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    rows = conn.execute(
-        "SELECT * FROM edges WHERE edge_type=? AND src_id LIKE ? ESCAPE '\\' "
-        "ORDER BY src_id, dst_id",
-        (edge_type, pref + "/%"))
-    return [_row_to_edge(r) for r in rows]
+    filter is the literal, case-sensitive prefix '{project}/' expressed as an
+    index range (`idx_edges_type_src`); see _prefix_range."""
+    sql, params = _edges_by_type_sql(edge_type, project)
+    return [_row_to_edge(r) for r in conn.execute(sql, params)]
 
 
 def add_code_event(conn, artifact_id, event, commit_sha, author=None, date=None,
@@ -321,11 +348,13 @@ def add_code_event(conn, artifact_id, event, commit_sha, author=None, date=None,
     conn.commit()
 
 
-def upsert_nodes(conn, rows):
+def upsert_nodes(conn, rows, commit=True):
     """Batch upsert nodes in one transaction. rows: iterable of
     (id, project, repo, node_class, ts, data, fetched_at) where `data` is a
     Python object (JSON-serialized here) and `fetched_at` None -> now. Same
-    immutable-identity / ts-data-fetched_at-refresh semantics as upsert_node."""
+    immutable-identity / ts-data-fetched_at-refresh semantics as upsert_node.
+    `commit=False` leaves the writes in the caller's open transaction (a fold
+    commits everything once, at the end)."""
     payload = []
     for (id, project, repo, node_class, ts, data, fetched_at) in rows:
         if node_class not in NODE_CLASSES:
@@ -343,13 +372,15 @@ def upsert_nodes(conn, rows):
             "ts=excluded.ts, data=excluded.data, fetched_at=excluded.fetched_at",
             payload,
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
 
-def upsert_edges(conn, rows):
+def upsert_edges(conn, rows, commit=True):
     """Batch upsert edges in one transaction. rows: iterable of
     (src_id, dst_id, edge_type, ts, data). Re-upsert unions (refreshes ts/data),
-    never appends — same semantics as upsert_edge."""
+    never appends — same semantics as upsert_edge. `commit=False`: see
+    upsert_nodes."""
     payload = [
         (src, dst, etype, ts,
          json.dumps(data, sort_keys=True) if data is not None else None)
@@ -363,13 +394,15 @@ def upsert_edges(conn, rows):
             "ts=excluded.ts, data=excluded.data",
             payload,
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
 
-def add_code_events(conn, rows):
+def add_code_events(conn, rows, commit=True):
     """Batch-append code events (set semantics, INSERT OR IGNORE). rows match
     add_code_event's positional args: (artifact_id, event, commit_sha, author,
-    date, hunk, ref, before, after, detail). `ref` is JSON-serialized."""
+    date, hunk, ref, before, after, detail). `ref` is JSON-serialized.
+    `commit=False`: see upsert_nodes."""
     payload = []
     for (artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) in rows:
         payload.append((
@@ -384,7 +417,8 @@ def add_code_events(conn, rows):
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             payload,
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
 
 def get_code_events(conn, artifact_id):
@@ -549,18 +583,22 @@ def repo_nodes(conn, project, repo, node_class=None):
     return [_row_to_node(r) for r in conn.execute(sql, params)]
 
 
+def _repo_code_events_sql(project, repo):
+    lo, hi = _prefix_range(qualify_id(project, repo, ""))
+    return ("SELECT * FROM code_events WHERE artifact_id >= ? AND artifact_id < ? "
+            "ORDER BY rowid", (lo, hi))
+
+
 def repo_code_events(conn, project, repo):
     """Code-event ledger rows for one project/repo, in insertion (rowid) order.
 
     rowid order == the order fold_bundle inserted them == the original bundle's
     `code_events` source order, so a reader can reconstruct that array exactly
     (the per-artifact get_code_events orders by date/event and cannot recover
-    cross-artifact source order)."""
-    pref = "{}/{}#".format(project, repo)
-    rows = conn.execute(
-        "SELECT * FROM code_events WHERE artifact_id LIKE ? ESCAPE '\\' ORDER BY rowid",
-        (pref.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",),
-    )
+    cross-artifact source order). The `{project}/{repo}#` filter is a
+    case-sensitive index range on artifact_id (see _prefix_range)."""
+    sql, params = _repo_code_events_sql(project, repo)
+    rows = conn.execute(sql, params)
     out = []
     for r in rows:
         out.append({
@@ -636,18 +674,79 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES,
     return {"reached": reached, "missing": missing}
 
 
+_FTS_TABLE_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS fts_text "
+    "USING fts5(node_id UNINDEXED, text)"
+)
+
+# node_id -> the fts_text rowid holding its text (schema v2). `node_id` is an
+# UNINDEXED FTS5 column, so `DELETE FROM fts_text WHERE node_id=?` scans the
+# whole virtual table — once per indexed node, which made a fold quadratic in
+# store size. With this map a re-index is a primary-key lookup plus a rowid
+# delete/insert on fts_text.
+_FTS_MAP_DDL = (
+    "CREATE TABLE IF NOT EXISTS fts_map ("
+    "node_id TEXT PRIMARY KEY, fts_rowid INTEGER NOT NULL)"
+)
+
+
+def _ensure_fts_map(conn):
+    """Create and back-fill `fts_map` when it is absent (an FTS-bearing store
+    from schema v1). Runs inside the caller's transaction, if any.
+
+    Back-fill: a v1 store keeps one fts_text row per node (index_text was
+    delete-then-insert), but any stray duplicates are collapsed first, keeping
+    the newest (highest rowid) row, so the map is one-to-one. Used by
+    init_schema (the migration) and lazily by index_text(s), because a reader
+    such as validate's idempotency probe may fold into a copy of a store that
+    was never passed through init_schema."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='fts_map'").fetchone():
+        return
+    conn.execute(_FTS_TABLE_DDL)
+    conn.execute(_FTS_MAP_DDL)
+    conn.execute(
+        "DELETE FROM fts_text WHERE rowid NOT IN "
+        "(SELECT MAX(rowid) FROM fts_text GROUP BY node_id)")
+    conn.execute(
+        "INSERT INTO fts_map (node_id, fts_rowid) "
+        "SELECT node_id, rowid FROM fts_text")
+
+
+def _index_one(conn, node_id, text):
+    row = conn.execute("SELECT fts_rowid FROM fts_map WHERE node_id=?",
+                       (node_id,)).fetchone()
+    if row is not None:
+        # Re-index in place: same rowid, so the map row never changes.
+        conn.execute("DELETE FROM fts_text WHERE rowid=?", (row[0],))
+        conn.execute("INSERT INTO fts_text (rowid, node_id, text) VALUES (?, ?, ?)",
+                     (row[0], node_id, text))
+    else:
+        cur = conn.execute("INSERT INTO fts_text (node_id, text) VALUES (?, ?)",
+                           (node_id, text))
+        conn.execute("INSERT INTO fts_map (node_id, fts_rowid) VALUES (?, ?)",
+                     (node_id, cur.lastrowid))
+
+
 def index_text(conn, node_id, text, commit=True):
-    """Index a node's searchable text. Delete-then-insert keeps it idempotent
-    (FTS5 has no UPSERT). Raises if the SQLite build lacks FTS5.
+    """Index a node's searchable text. Replaces any text already indexed for
+    `node_id` (FTS5 has no UPSERT), so it is idempotent. Raises if the SQLite
+    build lacks FTS5. The old row is found through `fts_map` and deleted by
+    rowid — no fts_text scan.
 
     `commit=False` lets a caller batch many inserts into a single transaction
     (e.g. folding a whole window) and commit once at the end."""
+    index_texts(conn, [(node_id, text)], commit=commit)
+
+
+def index_texts(conn, items, commit=True):
+    """Batch form of index_text: items is an iterable of (node_id, text).
+    Checks the fts_map migration once per call rather than once per node."""
     if not fts5_available(conn):
         raise RuntimeError("FTS5 not available in this SQLite build")
-    conn.execute("DELETE FROM fts_text WHERE node_id=?", (node_id,))
-    conn.execute(
-        "INSERT INTO fts_text (node_id, text) VALUES (?, ?)", (node_id, text)
-    )
+    _ensure_fts_map(conn)
+    for node_id, text in items:
+        _index_one(conn, node_id, text)
     if commit:
         conn.commit()
 
@@ -666,14 +765,16 @@ def fts_search(conn, query):
     return [r[0] for r in rows]
 
 
-def record_window(conn, project, repo, frm, to):
-    """Append a gathered window to the meta ledger, deduped on the exact tuple."""
+def record_window(conn, project, repo, frm, to, commit=True):
+    """Append a gathered window to the meta ledger, deduped on the exact tuple.
+    `commit=False` leaves the write in the caller's open transaction."""
     raw = get_meta(conn, "gathered_windows")
     windows = json.loads(raw) if raw else []
     entry = {"project": project, "repo": repo, "from": frm, "to": to}
     if entry not in windows:
         windows.append(entry)
-        set_meta(conn, "gathered_windows", json.dumps(windows, sort_keys=True))
+        set_meta(conn, "gathered_windows", json.dumps(windows, sort_keys=True),
+                 commit=commit)
 
 
 def get_windows(conn):
@@ -686,9 +787,10 @@ def _clone_sha_key(project, repo):
     return "clone_sha:{}/{}".format(project, repo)
 
 
-def set_clone_sha(conn, project, repo, sha):
-    """Record the tree SHA a repo was last gathered against (per project/repo)."""
-    set_meta(conn, _clone_sha_key(project, repo), sha)
+def set_clone_sha(conn, project, repo, sha, commit=True):
+    """Record the tree SHA a repo was last gathered against (per project/repo).
+    `commit=False` leaves the write in the caller's open transaction."""
+    set_meta(conn, _clone_sha_key(project, repo), sha, commit=commit)
 
 
 def get_clone_sha(conn, project, repo):
@@ -738,13 +840,23 @@ def get_dead_refs(conn):
 
 
 def init_schema(conn):
-    """Create all tables. FTS5 table is created when the build supports it."""
+    """Create all tables (FTS5 ones when the build supports it) and migrate an
+    older store in place to SCHEMA_VERSION.
+
+    Every schema step is additive and idempotent (`IF NOT EXISTS`, back-fill
+    only when the table is new), so running init_schema on a v1 store, a
+    current store or an empty file all converge on the same schema. v1 -> v2
+    adds `idx_edges_type_src` and `fts_map` (back-filled from fts_text). The
+    stored `schema_version` is raised to SCHEMA_VERSION, never lowered."""
     conn.executescript(_CORE_SCHEMA)
-    if fts5_available(conn):
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_text "
-            "USING fts5(node_id UNINDEXED, text)"
-        )
-    conn.commit()
-    if get_meta(conn, "schema_version") is None:
-        set_meta(conn, "schema_version", SCHEMA_VERSION)
+    with conn:
+        if fts5_available(conn):
+            conn.execute(_FTS_TABLE_DDL)
+            _ensure_fts_map(conn)
+        stored = get_meta(conn, "schema_version")
+        try:
+            stored_n = int(stored) if stored is not None else None
+        except ValueError:
+            stored_n = None
+        if stored_n is None or stored_n < SCHEMA_VERSION:
+            set_meta(conn, "schema_version", SCHEMA_VERSION, commit=False)

@@ -3696,39 +3696,46 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             nodes.append((qid(local), project, repo, "structure", None,
                           value, fetched))
 
-    graphstore.upsert_nodes(conn, nodes)
-    graphstore.upsert_edges(conn, edges)
-    graphstore.add_code_events(conn, events)
+    # One fold = ONE transaction (issue #55): nodes, edges, code events, the FTS
+    # index and the window/clone_sha provenance commit together or not at all.
+    # `with conn:` commits on success and rolls back on any exception, so a crash
+    # mid-fold never leaves a half-folded store for readers to serve. (A caller's
+    # own uncommitted writes on this connection join the same transaction.)
+    with conn:
+        graphstore.upsert_nodes(conn, nodes, commit=False)
+        graphstore.upsert_edges(conn, edges, commit=False)
+        graphstore.add_code_events(conn, events, commit=False)
 
-    # fts_text: index the searchable text per owning node id so `spotlight grep`
-    # has something to MATCH (Phase 8a prerequisite). FTS5-gated — when the
-    # SQLite build lacks FTS5 the store stays valid and we skip silently.
-    # index_text is delete-then-insert per node id, so re-folding re-indexes
-    # cleanly (idempotent). Sources (the approved scope, decision 1):
-    #   - PR social nodes: title + body + embedded comment/review authors+bodies
-    #   - issue social nodes: title + body + embedded comment authors+bodies
-    #   - commit code nodes: the commit message
-    if graphstore.fts5_available(conn):
-        # Batch the FTS writes into one transaction (index_text(commit=False) +
-        # a single commit) and skip empty text: many tiny commits over a large
-        # window is wasteful, and empty searchable text indexes nothing useful.
-        def _index(node_local, text):
-            if text:
-                graphstore.index_text(conn, qid(node_local), text, commit=False)
-        for pr in bundle.get("prs", []):
-            _index("pr-{}".format(pr["number"]), _social_text(
-                pr,
-                (pr.get("comments_list") or []) + (pr.get("review_comments") or [])))
-        for iss in bundle.get("issues", []):
-            _index("issue-{}".format(iss["number"]),
-                   _social_text(iss, iss.get("comments_list") or []))
-        for c in bundle.get("commits", []):
-            _index(c["sha"], c.get("message") or "")
-        conn.commit()
+        # fts_text: index the searchable text per owning node id so `spotlight
+        # grep` has something to MATCH (Phase 8a prerequisite). FTS5-gated —
+        # when the SQLite build lacks FTS5 the store stays valid and we skip
+        # silently. Re-indexing a node id replaces its text (via fts_map, no
+        # table scan), so re-folding re-indexes cleanly (idempotent). Sources
+        # (the approved scope, decision 1):
+        #   - PR social nodes: title + body + embedded comment/review authors+bodies
+        #   - issue social nodes: title + body + embedded comment authors+bodies
+        #   - commit code nodes: the commit message
+        # Empty text is skipped: it indexes nothing useful.
+        if graphstore.fts5_available(conn):
+            texts = []
+            for pr in bundle.get("prs", []):
+                texts.append(("pr-{}".format(pr["number"]), _social_text(
+                    pr,
+                    (pr.get("comments_list") or []) + (pr.get("review_comments") or []))))
+            for iss in bundle.get("issues", []):
+                texts.append(("issue-{}".format(iss["number"]),
+                              _social_text(iss, iss.get("comments_list") or [])))
+            for c in bundle.get("commits", []):
+                texts.append((c["sha"], c.get("message") or ""))
+            graphstore.index_texts(
+                conn, [(qid(local), text) for local, text in texts if text],
+                commit=False)
 
-    graphstore.record_window(conn, project, repo, meta.get("from"), meta.get("to"))
-    if meta.get("clone_sha"):
-        graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"])
+        graphstore.record_window(conn, project, repo, meta.get("from"),
+                                 meta.get("to"), commit=False)
+        if meta.get("clone_sha"):
+            graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
+                                     commit=False)
 
 
 def _member_args(base, member, frm, to):
