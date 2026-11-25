@@ -322,3 +322,64 @@ class TestReaderRepoResolution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFollowUps(unittest.TestCase):
+    """Review of the batch: registry host identity, digest member dedupe, HCL
+    comments inside interpolation."""
+
+    def test_private_registry_host_is_not_the_public_module(self):
+        import gather, manifest
+        members = {"Azure/terraform-azurerm-foo"}
+        priv = {"Azure/terraform-azurerm-foo": "private.example.com/Azure/foo/azurerm"}
+        # a public source must not match a member declared on a private host ...
+        self.assertIsNone(gather.resolve_registry_member(
+            "Azure/foo/azurerm", "p", {"Azure/other"},
+            {"Azure/other": priv["Azure/terraform-azurerm-foo"]}))
+        # ... a source on that same host does
+        self.assertIsNotNone(gather.resolve_registry_member(
+            "private.example.com/azure/foo/azurerm//modules/x", "p",
+            {"Azure/other"}, {"Azure/other": priv["Azure/terraform-azurerm-foo"]}))
+        # the naming convention is public-registry only
+        self.assertIsNone(gather.resolve_registry_member(
+            "private.example.com/Azure/foo/azurerm", "p", members, {}))
+        self.assertIsNotNone(gather.resolve_registry_member(
+            "registry.terraform.io/azure/foo/azurerm", "p", members, {}))
+        self.assertEqual(manifest.registry_identity("Azure/foo/azurerm"),
+                         manifest.registry_identity(
+                             "registry.terraform.io/azure/FOO/azurerm//modules/a"))
+
+    def test_manifest_rejects_two_spellings_of_one_registry_module(self):
+        import json, tempfile, manifest
+        doc = {"project": "p", "window": {"from": "2026-01-01", "to": "2026-01-31"},
+               "repos": [
+            {"owner": "Azure", "repo": "a", "registry": "Azure/foo/azurerm"},
+            {"owner": "Azure", "repo": "b",
+             "registry": "registry.terraform.io/azure/foo/azurerm"}]}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(doc, fh)
+        try:
+            with self.assertRaisesRegex(ValueError, "duplicate registry"):
+                manifest.load_manifest(fh.name)
+        finally:
+            os.unlink(fh.name)
+
+    def test_hcl_comment_inside_interpolation_does_not_hide_source(self):
+        import gather
+        tf = ('module "a" {\n'
+              '  name   = "${format(/* " */ "%s", var.name)}"\n'
+              '  source = "Azure/foo/azurerm"\n'
+              '}\n'
+              'module "b" {\n  source = "Azure/bar/azurerm"\n}\n')
+        masked = gather._hcl_mask(tf)
+        self.assertEqual(len(masked), len(tf))
+        self.assertIn('source = "', masked)
+        self.assertEqual(masked.count("source"), 2)
+        self.assertEqual(masked.count("module"), 2)
+
+    def test_digest_resolves_two_spellings_of_one_member_once(self):
+        conn = graphstore.open_store(":memory:")
+        _seed_dependents(conn)
+        self.assertEqual(
+            digest.resolve_members(conn, "proj", ["Azure/A", "azure/a", "AZURE/b"]),
+            ["Azure/A", "Azure/B"])

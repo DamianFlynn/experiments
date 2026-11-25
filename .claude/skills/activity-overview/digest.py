@@ -476,7 +476,8 @@ def resolve_members(conn, project, repos):
             raise ValueError(
                 "repo {!r} has no nodes in project {!r} (repos: {})".format(
                     repo, project, known))
-        resolved.append(stored)
+        if stored not in resolved:      # two spellings of one member: once
+            resolved.append(stored)
     return resolved
 
 

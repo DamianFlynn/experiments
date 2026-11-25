@@ -1846,6 +1846,20 @@ def _hcl_mask(text):
             continue
         if stack:                                       # inside an interpolation
             top = stack[-1]
+            # Comments are legal inside an interpolation expression; a quote or
+            # brace inside one is not syntax.
+            if c == "#" or text.startswith("//", i):
+                j = text.find("\n", i)
+                j = n if j < 0 else j
+                blank(i, j)
+                i = j
+                continue
+            if text.startswith("/*", i):
+                j = text.find("*/", i + 2)
+                j = n if j < 0 else j + 2
+                blank(i, j)
+                i = j
+                continue
             if c == '"':
                 stack.append("str")
             elif c == "{":
@@ -4335,30 +4349,32 @@ def resolve_registry_member(src, project, members, registry_by_slug):
     HashiCorp naming convention (`namespace/name/provider` ->
     `{namespace}/terraform-{provider}-{name}`).
 
-    Both sides are normalised (issue #70): through parse_registry_source, which
-    strips a registry host and a `//submodule` suffix, then compared
-    case-insensitively (registry addresses and GitHub slugs are). A manifest
+    Both sides are normalised (issue #70) through manifest.registry_identity:
+    `//submodule` dropped, case-insensitive, an omitted host equal to
+    `registry.terraform.io`. Any other host is a different registry: it only
+    matches a member declared with that same host, and never the convention. A manifest
     `registry` value that does not parse as a registry address still matches an
     identical (case-insensitive) raw `src`. The returned id uses the member's
     manifest spelling. Pure, deterministic (members tried in sorted order)."""
     if not src:
         return None
     registry_by_slug = registry_by_slug or {}
-    parsed = parse_registry_source(src)
-    want = tuple(p.lower() for p in parsed) if parsed else None
+    want = manifest_mod.registry_identity(src)
     for slug in sorted(members):                       # exact, deterministic
         reg = registry_by_slug.get(slug)
         if not reg:
             continue
-        reg_parsed = parse_registry_source(reg)
-        if reg_parsed is not None:
-            if want is not None and tuple(p.lower() for p in reg_parsed) == want:
+        reg_id = manifest_mod.registry_identity(reg)
+        if reg_id is not None:
+            if reg_id == want:
                 return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
         elif reg.lower() == src.lower():
             return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
-    if parsed is None:
+    # The naming convention maps a PUBLIC registry address to a GitHub repo; a
+    # module on another registry host says nothing about a member repo.
+    if want is None or want[0] != manifest_mod.DEFAULT_REGISTRY_HOST:
         return None
-    namespace, name, provider = parsed
+    namespace, name, provider = parse_registry_source(src)
     member = manifest_mod.canonical_slug(
         "{}/terraform-{}-{}".format(namespace, provider, name),
         manifest_mod.slug_index(members))

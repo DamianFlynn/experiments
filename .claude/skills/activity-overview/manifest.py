@@ -223,12 +223,13 @@ def load_manifest(path):
             if not isinstance(registry, str) or not registry.strip():
                 raise ValueError("manifest: repos[{}]: 'registry' must be a "
                                  "non-empty string when present".format(i))
-            prev = seen_registries.get(registry.lower())
+            reg_key = registry_identity(registry) or registry.lower()
+            prev = seen_registries.get(reg_key)
             if prev is not None:
                 raise ValueError(
                     "manifest: repos[{}]: duplicate registry {!r} on {!r} "
                     "(already declared by {!r})".format(i, registry, slug, prev))
-            seen_registries[registry.lower()] = slug
+            seen_registries[reg_key] = slug
         repos.append({"owner": owner, "repo": repo, "registry": registry})
 
     ticket_prefixes = []
@@ -288,3 +289,24 @@ def canonical_slug(slug, index):
     if not slug:
         return None
     return index.get(slug.lower())
+
+
+DEFAULT_REGISTRY_HOST = "registry.terraform.io"
+
+
+def registry_identity(src):
+    """Normalised identity of a Terraform registry module address
+    `[host/]namespace/name/provider[//submodule]` -> lowercased
+    (host, namespace, name, provider), or None when `src` is not one (local path,
+    URL, VCS shorthand, wrong shape). An omitted host is the public registry
+    (`registry.terraform.io`); any other host is a DIFFERENT registry and is kept,
+    so a private-registry module never equals a public one of the same name."""
+    if not src or src.startswith((".", "/")) or "://" in src:
+        return None
+    parts = [p for p in src.split("//", 1)[0].split("/") if p]
+    host = DEFAULT_REGISTRY_HOST
+    if len(parts) == 4 and "." in parts[0]:
+        host, parts = parts[0], parts[1:]
+    if len(parts) != 3 or "." in parts[0]:
+        return None
+    return (host.lower(),) + tuple(p.lower() for p in parts)
