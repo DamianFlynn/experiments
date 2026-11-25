@@ -85,7 +85,9 @@ def parse_git_log(raw):
         if len(fields) < 5:
             continue
         sha, parents, author, date, subject = (f.strip() for f in fields[:5])
-        files = [ln for ln in lines[1:] if ln.strip()]
+        # `--name-only` paths: C-quoted ones (quote/backslash/control chars, or
+        # non-ASCII without core.quotepath=false) are unquoted.
+        files = [unquote_git_path(ln) for ln in lines[1:] if ln.strip()]
         commits.append({
             "sha": sha,
             "parents": parents.split() if parents.strip() else [],
@@ -103,6 +105,17 @@ def parse_git_log(raw):
 # changed path carries its change type (and rename/copy detection via -M -C gives
 # `R###`/`C###` with old+new paths).
 CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
+
+# `git log` arguments (after `git -C <clone> log`) for acquire()'s three walks,
+# shared with the real-repo tests so they exercise the exact commands. Paths in
+# their output are made comparable by run_git (core.quotepath=false) plus
+# unquote_git_path in each parser.
+COMMIT_WALK_ARGS = (f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+                    "--name-only")
+CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+                  "--name-status", "-M", "-C")
+PATCH_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+                   "-p", "--unified=3", "-M", "-C")
 
 _STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
                      "R": "rename", "C": "copy", "T": "modify"}
@@ -133,13 +146,17 @@ def parse_code_events(raw):
             if change is None or len(cols) < 2:
                 continue
             ev = {"commit": sha, "author": author, "date": date, "change": change}
+            # Path columns are TAB-separated; spaces are literal and a path with a
+            # TAB/newline/quote (or non-ASCII, without core.quotepath=false) is
+            # C-quoted, so unquote each column. Columns are not whitespace-stripped:
+            # a leading/trailing space is part of the name (as in the patch walk).
             if change in ("rename", "copy"):
                 if len(cols) < 3:
                     continue  # malformed R/C line (real `-M -C` always has old+new)
-                ev["old_path"] = cols[1].strip()
-                ev["path"] = cols[2].strip()
+                ev["old_path"] = unquote_git_path(cols[1])
+                ev["path"] = unquote_git_path(cols[2])
             else:
-                ev["path"] = cols[1].strip()
+                ev["path"] = unquote_git_path(cols[1])
             events.append(ev)
     return events
 
@@ -969,7 +986,9 @@ _BICEP_COMMENT_RE = re.compile(r"^\s*(//|/\*|\*/|\*|@sys\.description|@descripti
 _TF_RES_RE = re.compile(r'^\s*resource\s+"([^"]+)"\s+"([^"]+)"')
 _TF_BLOCK_RE = re.compile(r'^\s*(variable|output|module)\s+"([^"]+)"')
 _TF_COMMENT_RE = re.compile(r"^\s*(#|//)")
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# Hunk header `@@ -a[,b] +c[,d] @@`: groups (old_start, old_count, new_start,
+# new_count); an omitted count means 1. The counts delimit the hunk exactly.
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Actionable/decision markers — surfaced as subkind `todo` so the report can focus on
 # them (these are where ideas get broken down into follow-on issues/PRs).
 _TODO_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX|BUG)\b", re.IGNORECASE)
@@ -1022,32 +1041,115 @@ def detect_symbol_decl(lang, text):
     return None
 
 
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13,
+              '"': 34, "\\": 92}
+
+
+def unquote_git_path(path):
+    """Undo git's C-style path quoting. Pure.
+
+    git prints a path wrapped in double quotes, with `\\"`, `\\\\`, `\\t`, `\\n`
+    (etc.) escapes and `\\ooo` octal bytes, when it contains a quote, backslash
+    or control character — and, unless `core.quotepath=false`, any byte >= 0x80
+    (`"docs/caf\\303\\251.md"`). The octal bytes are reassembled and decoded as
+    UTF-8 (`errors="replace"`, like run_git). Anything not wrapped in quotes is
+    returned unchanged."""
+    if len(path) < 2 or path[0] != '"' or path[-1] != '"':
+        return path
+    body, out, i = path[1:-1], bytearray(), 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\" or i + 1 >= len(body):
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in "01234567":
+            j = i + 1
+            while j < len(body) and j < i + 4 and body[j] in "01234567":
+                j += 1
+            out.append(int(body[i + 1:j], 8) & 0xFF)
+            i = j
+        else:
+            out += bytes([_C_ESCAPES[nxt]]) if nxt in _C_ESCAPES else nxt.encode("utf-8")
+            i += 2
+    return out.decode("utf-8", errors="replace")
+
+
+def _diff_header_path(rest):
+    """Path from a `--- `/`+++ ` header remainder: `/dev/null` -> None, C-quoting
+    undone, the `a/`/`b/` prefix dropped. git appends one TAB when the path
+    contains a space (`--- a/with space.md<TAB>`); only that TAB is removed, so
+    other whitespace in a name survives."""
+    if rest.endswith("\t"):
+        rest = rest[:-1]
+    if rest == "/dev/null":
+        return None
+    p = unquote_git_path(rest)
+    return p[2:] if p[:2] in ("a/", "b/") else p
+
+
 def parse_unified_diff(patch):
     """Parse a (multi-file) unified diff into per-file hunks. Pure.
 
     -> [{"path","old_path","hunks":[{"new_start":int,"lines":[(sign,text), ...]}]}]
-    sign in {' ','+','-'}; `/dev/null` paths normalise to None (pure add/delete)."""
+    sign in {' ','+','-'}; `/dev/null` paths normalise to None (pure add/delete).
+
+    Hunk boundaries come from the `@@ -a,b +c,d @@` counts (omitted count = 1):
+    exactly b old-side (` `/`-`) and d new-side (` `/`+`) lines are consumed, so
+    a removed line `-- x` or an added line `++ y` (rendered `--- x` / `+++ y`) is
+    hunk content, never a file header. `--- `/`+++ ` and `rename|copy from|to`
+    are read only in a file's header block (after `diff --git`, before its first
+    `@@`). `\\ No newline at end of file` is skipped and not counted. Once a
+    hunk's counts are exhausted, lines other than a new `@@` or `diff --git` are
+    ignored. C-quoted paths are unquoted (unquote_git_path)."""
     files, cur, hunk = [], None, None
+    old_left = new_left = 0
     for line in (patch or "").split("\n"):
         if line.startswith("diff --git "):
+            # Never hunk content: every content line carries a sign prefix.
             cur = {"path": None, "old_path": None, "hunks": []}
             files.append(cur)
-            hunk = None
-        elif cur is None:
+            hunk, old_left, new_left = None, 0, 0
             continue
+        if cur is None:
+            continue
+        if hunk is not None and (old_left > 0 or new_left > 0):
+            if line.startswith("\\"):
+                continue                       # "\ No newline at end of file"
+            if line == "":
+                line = " "                     # blank context line, prefix stripped
+            sign = line[0]
+            if sign == " " and old_left > 0 and new_left > 0:
+                old_left, new_left = old_left - 1, new_left - 1
+            elif sign == "-" and old_left > 0:
+                old_left -= 1
+            elif sign == "+" and new_left > 0:
+                new_left -= 1
+            else:
+                # Inconsistent with the declared counts (malformed/truncated input):
+                # close the hunk and let the line be checked for a new `@@` below.
+                old_left = new_left = 0
+                sign = None
+            if sign is not None:
+                hunk["lines"].append((sign, line[1:]))
+                continue
+        m = _HUNK_RE.match(line)
+        if m:
+            old_left = 1 if m.group(2) is None else int(m.group(2))
+            new_left = 1 if m.group(4) is None else int(m.group(4))
+            hunk = {"new_start": int(m.group(3)), "lines": []}
+            cur["hunks"].append(hunk)
+        elif cur["hunks"]:
+            continue                           # past the header block
         elif line.startswith("--- "):
-            p = line[4:].strip()
-            cur["old_path"] = None if p == "/dev/null" else (p[2:] if p[:2] in ("a/", "b/") else p)
+            cur["old_path"] = _diff_header_path(line[4:])
         elif line.startswith("+++ "):
-            p = line[4:].strip()
-            cur["path"] = None if p == "/dev/null" else (p[2:] if p[:2] in ("a/", "b/") else p)
-        else:
-            m = _HUNK_RE.match(line)
-            if m:
-                hunk = {"new_start": int(m.group(1)), "lines": []}
-                cur["hunks"].append(hunk)
-            elif hunk is not None and line[:1] in (" ", "+", "-"):
-                hunk["lines"].append((line[0], line[1:]))
+            cur["path"] = _diff_header_path(line[4:])
+        elif line.startswith(("rename from ", "copy from ")):
+            cur["old_path"] = unquote_git_path(line.split(" ", 2)[2])
+        elif line.startswith(("rename to ", "copy to ")):
+            cur["path"] = unquote_git_path(line.split(" ", 2)[2])
     return files
 
 
@@ -1243,6 +1345,25 @@ def parse_patch_events(raw):
         if rec:
             diffs.append(rec)
     return sym, diffs
+
+
+def attach_file_diffs(code_events, file_diffs):
+    """Attach each bounded file diff to its file-level code_event (in place).
+
+    Joins on (commit, path): the patch walk keys by the NEW path (rename target);
+    falls back to `old_path` for the rare case the diff names only the source.
+    Both walks yield unquoted paths, so non-ASCII/space/quoted names join.
+    Omit-when-empty: events without a diff get no `hunk` key."""
+    diff_by_key = {(d["commit"], d["path"]): d["hunk"] for d in file_diffs}
+    if not diff_by_key:
+        return code_events
+    for ev in code_events:
+        hunk = diff_by_key.get((ev.get("commit"), ev.get("path")))
+        if hunk is None and ev.get("old_path"):
+            hunk = diff_by_key.get((ev.get("commit"), ev.get("old_path")))
+        if hunk:
+            ev["hunk"] = hunk
+    return code_events
 
 
 # Ordered code-area patterns for the directory provider (primary, zero-dep).
@@ -1849,7 +1970,7 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if list_files is None:
         def list_files():
-            return run_git(["git", "-C", clone_dir, "ls-files"]).splitlines()
+            return git_ls_files(clone_dir)
     if read_text is None:
         def read_text(rel):
             return _read_text_file(os.path.join(clone_dir, rel))
@@ -2436,7 +2557,17 @@ def run_git(args, cwd=None, timeout=None):
     Decodes git's output as UTF-8 with `errors="replace"`: real-world patches
     can carry non-UTF-8 bytes (latin-1 source, binary hunks), and a strict
     decode would hard-crash the whole run on a single bad byte. Replacing keeps
-    the diff/log walks robust on large repos (e.g. Azure/bicep)."""
+    the diff/log walks robust on large repos (e.g. Azure/bicep).
+
+    When the command is `git`, `-c core.quotepath=false` is inserted right after
+    it so non-ASCII paths print verbatim instead of as C-quoted octal escapes
+    (`"docs/caf\\303\\251.md"`). Paths with a quote, backslash, TAB or newline are
+    still C-quoted by git; the path parsers undo that via unquote_git_path.
+    Non-git commands routed through here (bicep, terraform, graphify) are passed
+    through untouched."""
+    args = list(args)
+    if args and os.path.basename(args[0]) == "git":
+        args = [args[0], "-c", "core.quotepath=false"] + args[1:]
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout)
     if proc.returncode != 0:
@@ -2445,6 +2576,13 @@ def run_git(args, cwd=None, timeout=None):
             f"{proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def git_ls_files(clone_dir, run=None):
+    """Tracked paths of the clone (`git ls-files`), C-quoting undone."""
+    run = run or run_git
+    return [unquote_git_path(ln)
+            for ln in run(["git", "-C", clone_dir, "ls-files"]).splitlines() if ln]
 
 
 def clone_head_sha(clone_dir, run=run_git):
@@ -3579,10 +3717,7 @@ def acquire(args, env):
     # `--since/--until`, which prunes valid in-window commits across timezones.
     commits = []
     if walk_clone:
-        raw = run_git([
-            "git", "-C", clone_dir, "log",
-            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
-        ])
+        raw = run_git(["git", "-C", clone_dir, "log", *COMMIT_WALK_ARGS])
         commits = window_records(parse_git_log(raw), frm, to)
 
     # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
@@ -3591,11 +3726,7 @@ def acquire(args, env):
     # in walk order and derives status from the last (newest) event.
     code_events = []
     if walk_clone:
-        raw_walk = run_git([
-            "git", "-C", clone_dir, "log", "--reverse",
-            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-            "--name-status", "-M", "-C",
-        ])
+        raw_walk = run_git(["git", "-C", clone_dir, "log", *CODE_WALK_ARGS])
         code_events = window_records(parse_code_events(raw_walk), frm, to)
 
     # Phase 3d: symbol-granular change attribution via a single `git log -p` walk
@@ -3603,11 +3734,7 @@ def acquire(args, env):
     # ordering (--reverse) as the file walk so symbol lifecycle/status is correct.
     symbol_events = []
     if walk_clone:
-        raw_patch = run_git([
-            "git", "-C", clone_dir, "log", "--reverse",
-            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-            "-p", "--unified=3", "-M", "-C",
-        ])
+        raw_patch = run_git(["git", "-C", clone_dir, "log", *PATCH_WALK_ARGS])
         # Single pass over the patch text yields BOTH symbol events and the
         # Phase 10 slice-diffs hunks (no double-parse). The bounded, language-agnostic
         # unified-diff per changed (commit, path) comes from the SAME `git log -p`
@@ -3616,16 +3743,7 @@ def acquire(args, env):
         # persists in the ledger. Omit-when-empty for byte-stability.
         raw_symbol_events, file_diffs = parse_patch_events(raw_patch)
         symbol_events = window_records(raw_symbol_events, frm, to)
-        diff_by_key = {(d["commit"], d["path"]): d["hunk"] for d in file_diffs}
-        if diff_by_key:
-            for ev in code_events:
-                hunk = diff_by_key.get((ev.get("commit"), ev.get("path")))
-                # rename/copy: the patch keys by the NEW path (ev["path"]); fall back
-                # to old_path for the rare case the diff names only the source.
-                if hunk is None and ev.get("old_path"):
-                    hunk = diff_by_key.get((ev.get("commit"), ev.get("old_path")))
-                if hunk:
-                    ev["hunk"] = hunk
+        attach_file_diffs(code_events, file_diffs)
 
     # Fallback when deepening could not resolve it: drop any shallow-boundary
     # commit's whole-tree phantom (its parent was grafted away by the bounded clone)

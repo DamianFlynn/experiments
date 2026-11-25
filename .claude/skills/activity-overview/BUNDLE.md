@@ -199,6 +199,10 @@ review's state to `DISMISSED`.
 - **code_events** (gather) — raw file-level events from the full-window
   `git log --name-status -M -C` walk: `[{commit, author, date, change:
   add|modify|delete|rename|copy, path, old_path?}]`. The raw material Link folds.
+  Paths here, in `commits[].files` and in the patch walk are the plain repo-relative
+  path: git runs with `core.quotepath=false` and any C-quoted path (`"…\303\251…"`,
+  or one containing a quote/backslash/TAB/newline) is unquoted, so non-ASCII and
+  spaced names match across the walks and the bounded `hunk` attaches.
 - **symbol_events** (gather) — symbol-granular change events from a single
   full-window `git log -p --unified=3` walk, attributed **diff-locally**: `[{commit,
   author, date, path, lang:"bicep|terraform", subkind:"param|var|output|resource|
