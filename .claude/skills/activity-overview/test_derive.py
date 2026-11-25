@@ -82,6 +82,119 @@ class BuildArtifacts(unittest.TestCase):
         self.assertNotIn("hunk", arts["art:docs/old.md"]["lifecycle"][0])
 
 
+def _ev(change, path, n, old_path=None, author="a"):
+    ev = {"path": path, "change": change, "commit": "c%d" % n, "author": author,
+          "date": "2026-01-%02d" % n}
+    if old_path:
+        ev["old_path"] = old_path
+    return ev
+
+
+def _state(arts, path):
+    a = arts[derive.artifact_id(path)]
+    return (a["status"], a["replaced_by"], [e["event"] for e in a["lifecycle"]])
+
+
+class ArtifactStatusFromLastEvent(unittest.TestCase):
+    """#64: status is derived from the artifact's LAST lifecycle event. `replaced`
+    is only true when that last event is a rename away to a TRACKED successor."""
+
+    def test_rename_then_readd_old_path_is_live(self):
+        arts = derive.build_artifacts({"code_events": [
+            _ev("rename", "docs/b.md", 1, old_path="docs/a.md"),
+            _ev("add", "docs/a.md", 2),
+        ]})
+        self.assertEqual(_state(arts, "docs/a.md"), ("live", None, ["remove", "add"]))
+        self.assertEqual(_state(arts, "docs/b.md"), ("live", None, ["add"]))
+
+    def test_rename_to_untracked_target_is_removed_not_replaced(self):
+        arts = derive.build_artifacts({"code_events": [
+            _ev("rename", "src/x.txt", 1, old_path="docs/z.md"),
+        ]})
+        self.assertNotIn(derive.artifact_id("src/x.txt"), arts)
+        self.assertEqual(_state(arts, "docs/z.md"), ("removed", None, ["remove"]))
+
+    def test_rename_chain_each_points_to_direct_successor(self):
+        arts = derive.build_artifacts({"code_events": [
+            _ev("rename", "docs/b.md", 1, old_path="docs/a.md"),
+            _ev("rename", "docs/c.md", 2, old_path="docs/b.md"),
+        ]})
+        self.assertEqual(_state(arts, "docs/a.md"),
+                         ("replaced", "art:docs/b.md", ["remove"]))
+        self.assertEqual(_state(arts, "docs/b.md"),
+                         ("replaced", "art:docs/c.md", ["add", "remove"]))
+        self.assertEqual(_state(arts, "docs/c.md"), ("live", None, ["add"]))
+
+    def test_rename_then_delete_target(self):
+        # a stays `replaced` by its direct successor b (consumers walk the chain);
+        # b's last event is a plain delete -> `removed`, no successor.
+        arts = derive.build_artifacts({"code_events": [
+            _ev("rename", "docs/b.md", 1, old_path="docs/a.md"),
+            _ev("delete", "docs/b.md", 2),
+        ]})
+        self.assertEqual(_state(arts, "docs/a.md"),
+                         ("replaced", "art:docs/b.md", ["remove"]))
+        self.assertEqual(_state(arts, "docs/b.md"), ("removed", None, ["add", "remove"]))
+
+    def test_readd_after_delete_is_live(self):
+        arts = derive.build_artifacts({"code_events": [
+            _ev("add", "docs/a.md", 1),
+            _ev("delete", "docs/a.md", 2),
+            _ev("add", "docs/a.md", 3),
+        ]})
+        self.assertEqual(_state(arts, "docs/a.md"),
+                         ("live", None, ["add", "remove", "add"]))
+
+    def test_readd_after_rename_then_renamed_away_again(self):
+        # the LAST rename decides the successor, not the first.
+        arts = derive.build_artifacts({"code_events": [
+            _ev("rename", "docs/b.md", 1, old_path="docs/a.md"),
+            _ev("add", "docs/a.md", 2),
+            _ev("rename", "docs/c.md", 3, old_path="docs/a.md"),
+        ]})
+        self.assertEqual(_state(arts, "docs/a.md"),
+                         ("replaced", "art:docs/c.md", ["remove", "add", "remove"]))
+
+    def test_rename_then_delete_of_readded_old_path_is_removed(self):
+        arts = derive.build_artifacts({"code_events": [
+            _ev("rename", "docs/b.md", 1, old_path="docs/a.md"),
+            _ev("add", "docs/a.md", 2),
+            _ev("delete", "docs/a.md", 3),
+        ]})
+        self.assertEqual(_state(arts, "docs/a.md"),
+                         ("removed", None, ["remove", "add", "remove"]))
+
+    def test_symbol_readded_in_source_file_is_not_replaced(self):
+        # Same rule for symbol moves: a source symbol re-added in its own file
+        # after moving is live again. match_symbol_moves treats the name as
+        # ambiguous (added in two files), so no move link / no `replaced`.
+        def sym(change, path, n):
+            return {"lang": "bicep", "subkind": "resource", "name": "foo",
+                    "change": change, "path": path, "commit": "c%d" % n,
+                    "author": "a", "date": "2026-01-%02d" % n,
+                    "before": None, "after": None}
+        bundle = {"code_events": [], "symbol_events": [
+            sym("drop", "a.bicep", 1), sym("add", "b.bicep", 1),
+            sym("add", "a.bicep", 2)]}
+        bundle["artifacts"] = derive.build_artifacts(bundle)
+        derive.link_symbol_identity(bundle)
+        src = bundle["artifacts"]["a.bicep#bicep:resource:foo"]
+        self.assertEqual((src["status"], src["replaced_by"]), ("live", None))
+        self.assertEqual(bundle["symbol_moves"]["links"], [])
+
+    def test_readded_file_does_not_count_as_authored_then_removed(self):
+        bundle = {"code_events": [
+            _ev("add", "docs/a.md", 1, author="ann"),
+            _ev("rename", "docs/b.md", 2, old_path="docs/a.md", author="ann"),
+            _ev("add", "docs/a.md", 3, author="ann"),
+        ]}
+        bundle["artifacts"] = derive.build_artifacts(bundle)
+        bundle["people"] = {"ann": {}}
+        derive.annotate_people_profile(bundle)
+        # a.md is live again; b.md is live -> nothing authored was removed.
+        self.assertEqual(bundle["people"]["ann"]["authored_then_removed"], 0)
+
+
 class AreaIndexAndAttribution(unittest.TestCase):
     def test_area_index_and_lookup(self):
         cg = {"areas": [{"id": "area:a", "paths": ["docs/x.md"]}]}

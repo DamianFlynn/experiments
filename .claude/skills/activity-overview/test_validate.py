@@ -588,5 +588,49 @@ class TestCliMultiRepo(_TmpDirCase):
         self.assertEqual(repos, {"Azure/mod-a", "Azure/mod-b"})
 
 
+class TestArtifactStatusRoundTrip(unittest.TestCase):
+    """#64: the write path (fold_bundle) and read path (no_drift re-derive) use
+    the same derive.build_artifacts, so the last-event status rule round-trips:
+    a renamed-then-re-added path is `live`, a rename to an untracked path is
+    `removed` with no successor."""
+
+    def _bundle(self):
+        def ev(change, path, n, old_path=None):
+            e = {"commit": ("%x" % n) * 40, "author": "alice",
+                 "date": "2026-05-%02d" % n, "change": change, "path": path}
+            if old_path:
+                e["old_path"] = old_path
+            return e
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                ev("add", "docs/a.md", 1),
+                ev("rename", "docs/b.md", 2, old_path="docs/a.md"),
+                ev("add", "docs/a.md", 3),
+                ev("add", "docs/z.md", 4),
+                ev("rename", "src/x.txt", 5, old_path="docs/z.md"),
+            ],
+        }
+
+    def test_status_stored_and_no_drift(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = self._bundle()
+        gather.fold_bundle(conn, bundle)
+        stored = {}
+        for n in graphstore.repo_nodes(conn, "o", "r", "code"):
+            local = graphstore.local_id(n["id"], "o", "r")
+            if graphstore.is_artifact_local(local):
+                stored[local] = n["data"]
+        self.assertEqual((stored["art:docs/a.md"]["status"],
+                          stored["art:docs/a.md"]["replaced_by"]), ("live", None))
+        self.assertEqual((stored["art:docs/z.md"]["status"],
+                          stored["art:docs/z.md"]["replaced_by"]), ("removed", None))
+        for b in (bundle, None):
+            report = validate.validate(conn, project="o", repo="r", bundle=b)
+            c = _check(report, "no_drift")
+            self.assertTrue(c["ok"], c["details"])
+
+
 if __name__ == "__main__":
     unittest.main()

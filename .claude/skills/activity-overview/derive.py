@@ -66,10 +66,14 @@ def build_artifacts(bundle):
     """Fold raw `code_events` into the per-artifact lifecycle ledger (file-level).
 
     Each tracked path (readme/doc/example) gets one entry with an ordered
-    lifecycle. Renames link the old artifact (status `replaced`, `replaced_by`)
-    to the new one. `code_area` is null in Phase 3a (graphify is Phase 3b). Pure.
+    lifecycle. Status comes from the LAST lifecycle event: a rename away to a
+    tracked path (that is still the last event) makes the old artifact `replaced`
+    with `replaced_by` its direct successor; a later re-add makes it `live` again;
+    a delete, or a rename to an untracked path, makes it `removed`. `code_area` is
+    null in Phase 3a (graphify is Phase 3b). Pure.
     """
     artifacts = {}
+    rename_succ = {}   # old aid -> (lifecycle index of its latest rename-away, new aid|None)
 
     def ensure(path):
         kind = classify_artifact_path(path)
@@ -113,9 +117,10 @@ def build_artifacts(bundle):
                     # No hunk on the old-path removal — `ev["hunk"]` is the NEW file's
                     # diff (the patch keys by the rename target), not the old file's.
                     append_event(old_aid, "remove", ev)
-                    artifacts[old_aid]["status"] = "replaced"
-                    # replaced_by is the direct successor; consumers walk the chain for terminal paths (A->B->C).
-                    artifacts[old_aid]["replaced_by"] = new_aid
+                    # Remember WHICH lifecycle entry was the rename-away and its
+                    # successor (None when the target is untracked). The final pass
+                    # below only honours it if that entry is still the LAST event.
+                    rename_succ[old_aid] = (len(artifacts[old_aid]["lifecycle"]) - 1, new_aid)
             continue
         aid = ensure(ev["path"])
         if aid is None:
@@ -142,12 +147,20 @@ def build_artifacts(bundle):
                     "url": _commit_url(bundle, ev["commit"])},
         })
 
-    # Final status from the last lifecycle event (unless already `replaced`).
-    for a in artifacts.values():
-        if a["status"] == "replaced":
-            continue
-        last = a["lifecycle"][-1]["event"] if a["lifecycle"] else None
-        a["status"] = "removed" if last == "remove" else "live"
+    # Final status from the LAST lifecycle event (#64):
+    #   last event add/change          -> `live`, replaced_by None (a re-add revives it)
+    #   last event = rename to a TRACKED path -> `replaced`, replaced_by = that direct
+    #                                     successor (consumers walk A->B->C themselves)
+    #   any other last `remove` (delete, or rename to an untracked path) -> `removed`
+    for aid, a in artifacts.items():
+        lc = a["lifecycle"]
+        last = lc[-1]["event"] if lc else None
+        idx, succ = rename_succ.get(aid, (None, None))
+        if last == "remove" and idx == len(lc) - 1 and succ is not None:
+            a["status"], a["replaced_by"] = "replaced", succ
+        else:
+            a["status"] = "removed" if last == "remove" else "live"
+            a["replaced_by"] = None
     return artifacts
 
 
@@ -418,7 +431,10 @@ def link_symbol_identity(bundle):
     """Apply window-wide symbol moves onto the artifact ledger (Phase 3e). For each move
     the source symbol artifact is `status:"replaced"` + `replaced_by` the dest, the dest
     gets `identity_from`, and both carry `move_confidence`/`move_basis`. Records a
-    `symbol_moves` summary on the bundle. Mutates; safe when there are no symbol_events."""
+    `symbol_moves` summary on the bundle. Mutates; safe when there are no symbol_events.
+    Consistent with build_artifacts' last-event rule (#64): a source symbol re-added in
+    its own file is "added in >1 file" to match_symbol_moves, so it is never linked
+    (and so never marked `replaced`); a linked source has no add after its drop."""
     arts = bundle.get("artifacts", {})
     renames = [(e.get("old_path"), e["path"]) for e in bundle.get("code_events", [])
                if e.get("change") in ("rename", "copy") and e.get("old_path")]

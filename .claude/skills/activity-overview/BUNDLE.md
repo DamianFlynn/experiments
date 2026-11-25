@@ -178,7 +178,11 @@ docsRefs, release_train, sprints, project, diagrams`.
   ids are `art:<path>` (via `artifact_id`); **symbol/comment** ids are
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
-  carry the bounded `before`/`after`.
+  carry the bounded `before`/`after`. `status` is derived from the artifact's **last**
+  lifecycle event: `replaced` only when that event is a rename to a tracked path
+  (`replaced_by` = that direct successor; consumers walk A→B→C); a later re-add makes
+  it `live` again with `replaced_by:null`; a delete, or a rename to an untracked path,
+  is `removed` with `replaced_by:null`.
 - **symbol_moves** (link) — window-wide symbol-identity links: `{ links:[{subkind,
   name, from_path, to_path, from:<src aid>, to:<dst aid>, confidence:"high|medium", basis:
   "file_rename|unique_name"}], by_confidence:{high,medium} }`. Each link object also carries
