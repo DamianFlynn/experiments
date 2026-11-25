@@ -180,9 +180,11 @@ Every PR/issue in scope lands in exactly one bucket, with precedence
 ### 5.4 Forecast
 
 A transparent, rule-based score over `next_candidates` (not machine learning). Signals and
-weights: on next milestone **5.0**, high-priority **3.0**, in motion (open PR / train)
-**2.0**, active in window **1.5**, long-open ≥ 200 days **1.0**. Tiers: **likely ≥ 5**,
-**possible ≥ 2**, else **longshot**. Every candidate lists the signals that produced its score.
+weights: on next milestone **5.0**, high-priority **3.0**, in motion (an open PR, or an
+in-flight train; a rejected or shipped train does not count) **2.0**, active in window
+**1.5**, long-open ≥ 200 days **1.0**. Tiers: **likely ≥ 5**, **possible ≥ 2**, else
+**longshot**. Every candidate lists the signals that produced its score, plus non-scoring
+notes such as "previous attempt rejected".
 
 ### 5.5 Series (progressive installments)
 
@@ -428,6 +430,7 @@ These are real, current limits — plan around them:
 3. **Forecast depends on planning hygiene.** Candidates require a next milestone or one of the
    recognized priority labels (`priority/high`, `priority/critical`, `p0`, `p1`,
    `high-priority`, `critical`). Repos with different label names need the constant extended.
+   "In motion" counts any open PR that references an item, however stale or draft (LLD §14.5).
 4. **Default branch only.** `--branches` is recorded as provenance; the commit walk covers the
    checked-out default branch.
 5. **Open items are fetched every run.** All open PRs/issues are pulled regardless of window

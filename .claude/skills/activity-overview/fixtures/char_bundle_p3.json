@@ -279,6 +279,7 @@
   "forecast": {
     "candidates": [
       {
+        "notes": [],
         "ref": {
           "id": 18,
           "type": "issue",

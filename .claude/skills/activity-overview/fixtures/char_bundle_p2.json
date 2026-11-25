@@ -59,6 +59,7 @@
   "forecast": {
     "candidates": [
       {
+        "notes": [],
         "ref": {
           "id": 44,
           "type": "pr",
@@ -75,6 +76,7 @@
         "train": "train-issue-18"
       },
       {
+        "notes": [],
         "ref": {
           "id": 18,
           "type": "issue",

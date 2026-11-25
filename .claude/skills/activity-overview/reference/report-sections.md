@@ -132,7 +132,9 @@ from a narrator sub-agent that reads ONLY that train's bounded slice:
   **Longshot** (< 2.0); within each, `cand.score` descending.
 - Per candidate: the item's title (`item`, looked up from `cand.ref`) + link (`cand.ref.url`),
   its `cand.train` id if set, and the `cand.signals` list (e.g. "on milestone v1.2 ·
-  high-priority · open PR").
+  high-priority · open PR"), then any `cand.notes` (non-scoring, e.g. "previous attempt
+  rejected"). A train id alone is not work in progress: only an open PR or an `in_flight`
+  train scores "open PR" / "work in progress".
 - The predicted-vs-landed loop is NOT here — it lives in "Since last installment" (only when
   that section is present).
 

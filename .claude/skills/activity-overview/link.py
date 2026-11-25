@@ -928,9 +928,10 @@ def build_forecast(bundle):
     """Compute the next-release forecast over bundle['buckets']['next_candidates'].
 
     Sets bundle['forecast'] = {next_milestone, candidates}.  Each candidate
-    carries a ref (type/id/url), train id, weighted score, tier, and signals.
-    Pure aside from writing forecast onto the bundle; reads buckets, milestones,
-    prs, issues, and meta.  Forward-only: no predicted-vs-landed comparison.
+    carries a ref (type/id/url), train id, weighted score, tier, signals, and
+    non-scoring notes.  Pure aside from writing forecast onto the bundle; reads
+    buckets, milestones, prs, issues, trains, and meta.  Forward-only: no
+    predicted-vs-landed comparison.
     """
     meta        = bundle.get("meta", {})
     period      = window_period(meta)
@@ -952,6 +953,11 @@ def build_forecast(bundle):
             for n in list(pr.get("closes") or []) + list(pr.get("crossref_issues") or []):
                 open_pr_for_issue[n] = True
 
+    # Train outcome by id (#87): only an `in_flight` train is live work; a
+    # rejected / shipped / abandoned train, or an id naming no train, is not.
+    train_outcome = {t.get("id"): t.get("outcome")
+                     for t in bundle.get("trains") or [] if t.get("id")}
+
     def _tier(score):
         if score >= FORECAST_TIER_LIKELY_THRESHOLD:
             return "likely"
@@ -960,7 +966,7 @@ def build_forecast(bundle):
         return "longshot"
 
     def _score_candidate(nc_ref):
-        """Return (score, signals) for one next_candidate ref."""
+        """Return (score, signals, notes) for one next_candidate ref."""
         type_ = nc_ref.get("type")
         id_   = nc_ref.get("id")
         item  = (issue_idx if type_ == "issue" else pr_idx).get(id_, {})
@@ -974,22 +980,31 @@ def build_forecast(bundle):
         ref_dt     = _parse_ts(ref_date[:10] + "T00:00:00Z") if ref_date else None
         age_days   = (ref_dt - created_dt).days if (created_dt and ref_dt) else None
 
-        # Determine in_motion:
-        #   - ref is a PR candidate (open PR is a next_candidate by definition)
-        #   - OR some open PR in the bundle references this issue
-        #   - OR the ref carries a train id
+        # Determine in_motion (#87: live work only):
+        #   - the candidate is itself an open (unmerged) PR
+        #   - OR an open PR in the bundle closes / cross-references this issue
+        #   - OR the candidate's train is `in_flight`
+        # A train that is rejected, shipped or abandoned is NOT work in
+        # progress, and neither is a train id that names no train.
+        outcome = train_outcome.get(train_id) if train_id else None
         if type_ == "pr" and item.get("state") == "open" and not item.get("merged"):
             in_motion = True
             motion_text = "open PR"
-        elif open_pr_for_issue.get(id_):
+        elif type_ == "issue" and open_pr_for_issue.get(id_):
             in_motion = True
             motion_text = "open PR"
-        elif train_id:
+        elif outcome == "in_flight":
             in_motion = True
             motion_text = "work in progress"
         else:
             in_motion = False
             motion_text = ""
+        # Non-scoring context, so a report can say why a train is not counted.
+        notes = []
+        if outcome == "rejected":
+            notes.append("previous attempt rejected")
+        elif outcome == "shipped":
+            notes.append("linked PR already merged")
 
         # Ordered list of (present_bool, weight_key, signal_text).
         checks = [
@@ -1012,17 +1027,18 @@ def build_forecast(bundle):
                 score += FORECAST_WEIGHTS[key]
                 if text:
                     signals.append(text)
-        return score, signals
+        return score, signals, notes
 
     candidates = []
     for nc in bundle.get("buckets", {}).get("next_candidates", []):
-        score, signals = _score_candidate(nc)
+        score, signals, notes = _score_candidate(nc)
         candidates.append({
             "ref":   {"type": nc["type"], "id": nc["id"], "url": nc["url"]},
             "train": nc.get("train"),
             "score": score,
             "tier":  _tier(score),
             "signals": signals,
+            "notes":   notes,
         })
 
     # Sort: score descending, then ref id ascending for determinism on ties.

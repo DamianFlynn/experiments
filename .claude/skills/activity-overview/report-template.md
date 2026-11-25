@@ -58,7 +58,7 @@ PLACEHOLDER RULES — read before filling anything below.
     `link.select_sprints(bundle["sprints"], <reference date>)`.
   - `flow_entry` — bundle["flow"][]. `blocker` — bundle["blockers"][]. Both are
     issues: `number` + `url` only, no title.
-  - `cand` — bundle["forecast"]["candidates"][] `{ref, train, score, tier, signals}`.
+  - `cand` — bundle["forecast"]["candidates"][] `{ref, train, score, tier, signals, notes}`.
   - `delta` — bundle["feature_deltas"][]. `move` — bundle["symbol_moves"]["links"][].
   - `artifact` — a value of bundle["artifacts"]; `ev` — one of its `lifecycle` events.
   - `area` — bundle["code_graph"]["areas"][]. `rule` — bundle["code_owners"][]
@@ -330,21 +330,23 @@ this is not the first installment); otherwise there is no loop to show.
 
 For each `cand` with `cand.tier` "likely" (score ≥ 5.0), `cand.score` descending:
 
-- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}*
+- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}* — {cand.notes}
 
 ### Possible
 
 For each `cand` with `cand.tier` "possible" (score ≥ 2.0):
 
-- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}*
+- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}* — {cand.notes}
 
 ### Longshot
 
 For each `cand` with `cand.tier` "longshot" (score < 2.0):
 
-- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}*
+- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}* — {cand.notes}
 
-(Omit "train …" when `cand.train` is null; join `cand.signals` with " · ".)
+(Omit "train …" when `cand.train` is null; join `cand.signals` with " · ". `cand.notes` is
+non-scoring context, e.g. "previous attempt rejected": join with " · " and omit the "— …"
+part when it is empty.)
 
 ## Feature changes (add / drop / change)
 

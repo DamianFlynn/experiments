@@ -247,12 +247,18 @@ label** (`next_candidates`). Score = sum of signals:
 |---|---:|---|
 | On the next milestone | 5.0 | `on milestone <title>` |
 | High-priority label | 3.0 | `high-priority` |
-| In motion (open PR, PR references it, or part of a train) | 2.0 | `open PR` / `work in progress` |
+| In motion: it is an open PR, an open PR closes/references it, or its train is in flight | 2.0 | `open PR` / `work in progress` |
 | Updated in the window | 1.5 | `active in window` |
 | Open ≥ 200 days | 1.0 | `long-open` |
 
 Tiers: **likely ≥ 5**, **possible ≥ 2**, **longshot < 2**. Open items that are merely active
 (not on the next milestone, not high-priority) appear under **In flight**, not in the forecast.
+
+"In motion" means live work only. An open issue whose only PR was closed unmerged, or that a
+merged PR merely references, is **not** in motion: its train is `rejected` / `shipped`, and
+that scores nothing. Each candidate's `notes` says so instead (`previous attempt rejected`,
+`linked PR already merged`) without changing the score, so the report can mention it. Any
+open PR still counts, however old or draft it is.
 
 ### 6.2 Verifying it next month
 

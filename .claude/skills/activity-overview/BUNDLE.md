@@ -193,11 +193,18 @@ docsRefs, release_train, sprints, project, diagrams`.
   id) to `{ shown:int, total:int, unit:"PRs"|"releases"|"PRs+releases"|"events"|"edges"|"kinds" }`;
   it is `{}` when nothing was cut (caps and ranking keys: `docs/LLD.md` §7).
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
-  train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
+  train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...],
+  notes:[str,...] } ] }`
   — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
   desc. `next_milestone` is the bucket rule's next milestone (always dated; `None` when
   there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
-  / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
+  / `active in window` / `long-open`. The in-motion signal (#87) needs live work: `open PR`
+  when the candidate is an open PR or an open PR `closes`/cross-references the issue;
+  `work in progress` when the candidate's train (looked up in `trains` by `train`) has
+  `outcome` `in_flight`. A `rejected`, `shipped` or `abandoned` train, or a `train` id that
+  names no train in the view, scores nothing. `notes` is non-scoring context (`[]` when
+  none): `previous attempt rejected` (train `rejected`) or `linked PR already merged` (train
+  `shipped`). Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
 

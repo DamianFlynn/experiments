@@ -2565,11 +2565,14 @@ class TestBuildForecast(unittest.TestCase):
             places=4,
         )
 
-    def test_in_motion_via_train_id_on_ref(self):
-        """A next_candidate ref with a train id triggers in_motion."""
+    def test_in_motion_via_in_flight_train(self):
+        """A next_candidate whose train is in_flight triggers in_motion (#87:
+        a bare train id no longer does; see TestForecastWorkInProgress)."""
         issues = [self._issue(93)]
         ncs = [self._nc_ref("issue", 93, train="train-issue-93")]
         bundle = self._bundle(next_candidates=ncs, issues=issues)
+        bundle["trains"] = [{"id": "train-issue-93", "root_issue": 93,
+                             "prs": [930], "outcome": "in_flight"}]
         link.build_forecast(bundle)
         cand = bundle["forecast"]["candidates"][0]
         self.assertAlmostEqual(
@@ -2781,6 +2784,156 @@ class TestBuildForecast(unittest.TestCase):
         )
         link.build_forecast(b3)
         self.assertIn("open PR", b3["forecast"]["candidates"][0]["signals"])
+
+
+class TestForecastWorkInProgress(unittest.TestCase):
+    """#87: `in_motion` ("work in progress") needs LIVE work — the candidate is
+    an open PR, an open PR closes/cross-references it, or its train is
+    `in_flight`. A rejected or shipped train is not work in progress; it is
+    reported as a non-scoring note instead."""
+
+    PERIOD = {"from": "2026-05-01", "to": "2026-05-31"}
+
+    def _issue(self, number, labels=("p1",), created_at="2025-12-01T00:00:00Z",
+               updated_at="2025-12-15T00:00:00Z"):
+        # created 181 days before ref_date: not long-open; updated before the
+        # window: not active. Only the priority label (and motion) can score.
+        return {"number": number, "title": f"Issue {number}", "state": "open",
+                "state_reason": None, "labels": list(labels), "milestone": None,
+                "created_at": created_at, "updated_at": updated_at,
+                "closed_at": None, "kind": "bug",
+                "url": f"https://github.com/o/r/issues/{number}"}
+
+    def _pr(self, number, state, merged, closes=(), crossref=(),
+            updated_at="2025-12-10T00:00:00Z"):
+        return {"number": number, "title": f"fix: pr {number}", "state": state,
+                "merged": merged, "base": "main", "head": f"b{number}",
+                "labels": [], "milestone": None,
+                "created_at": "2025-12-05T00:00:00Z", "updated_at": updated_at,
+                "merged_at": updated_at if merged else None,
+                "closed_at": updated_at if state == "closed" else None,
+                "closes": list(closes), "crossref_issues": list(crossref),
+                "url": f"https://github.com/o/r/pull/{number}"}
+
+    def _run(self, issues, prs):
+        """The real link steps the forecast depends on: trains -> buckets ->
+        forecast. Returns the forecast candidates keyed by (type, id)."""
+        bundle = {"meta": {"period": dict(self.PERIOD), "ref_date": "2026-05-31",
+                           "base_branch": "main"},
+                  "milestones": [], "commits": [], "prs": prs, "issues": issues}
+        bundle["trains"] = link.build_trains(bundle)
+        bundle["buckets"] = link.compute_buckets(bundle)
+        link.build_forecast(bundle)
+        return {(c["ref"]["type"], c["ref"]["id"]): c
+                for c in bundle["forecast"]["candidates"]}
+
+    def test_issue_whose_only_pr_was_rejected_is_not_in_motion(self):
+        """The confirmed repro: open p1 issue #7, its only PR closed unmerged,
+        nothing updated since 2025 -> 3.0 / possible / ['high-priority']."""
+        cands = self._run([self._issue(7)],
+                          [self._pr(70, "closed", False, closes=[7])])
+        c = cands[("issue", 7)]
+        self.assertEqual(c["train"], "train-issue-7")
+        self.assertEqual(c["score"], 3.0)
+        self.assertEqual(c["tier"], "possible")
+        self.assertEqual(c["signals"], ["high-priority"])
+        self.assertEqual(c["notes"], ["previous attempt rejected"])
+
+    def test_issue_crossreferenced_only_by_merged_pr_is_not_in_motion(self):
+        cands = self._run([self._issue(8)],
+                          [self._pr(80, "closed", True, crossref=[8])])
+        c = cands[("issue", 8)]
+        self.assertEqual(c["train"], "train-issue-8")
+        self.assertEqual(c["score"], 3.0)
+        self.assertEqual(c["signals"], ["high-priority"])
+        self.assertEqual(c["notes"], ["linked PR already merged"])
+
+    def test_issue_closed_by_merged_pr_but_still_open_is_not_in_motion(self):
+        cands = self._run([self._issue(9)],
+                          [self._pr(90, "closed", True, closes=[9])])
+        c = cands[("issue", 9)]
+        self.assertEqual(c["signals"], ["high-priority"])
+        self.assertEqual(c["tier"], "possible")
+
+    def test_issue_with_open_pr_is_in_motion(self):
+        cands = self._run([self._issue(10)],
+                          [self._pr(100, "open", False, closes=[10])])
+        c = cands[("issue", 10)]
+        self.assertEqual(c["score"], 5.0)
+        self.assertEqual(c["tier"], "likely")
+        self.assertEqual(c["signals"], ["high-priority", "open PR"])
+        self.assertEqual(c["notes"], [])
+
+    def test_open_pr_crossref_is_in_motion_even_when_train_is_shipped(self):
+        """A merged PR anchors a shipped train on #11; a new open PR that
+        cross-references #11 is live work again."""
+        cands = self._run([self._issue(11)],
+                          [self._pr(110, "closed", True, closes=[11]),
+                           self._pr(111, "open", False, crossref=[11])])
+        c = cands[("issue", 11)]
+        self.assertEqual(c["signals"], ["high-priority", "open PR"])
+        self.assertEqual(c["notes"], ["linked PR already merged"])
+
+    def test_retry_after_rejection_is_in_motion(self):
+        """Rejected PR then a new open PR closing the same issue: the train is
+        in_flight (precedence), so the issue is in motion and no
+        rejected note is shown."""
+        cands = self._run([self._issue(12)],
+                          [self._pr(120, "closed", False, closes=[12]),
+                           self._pr(121, "open", False, closes=[12])])
+        c = cands[("issue", 12)]
+        self.assertIn("open PR", c["signals"])
+        self.assertEqual(c["notes"], [])
+
+    def test_open_pr_candidate_is_in_motion(self):
+        pr = self._pr(130, "open", False)
+        pr["labels"] = ["p1"]
+        cands = self._run([], [pr])
+        c = cands[("pr", 130)]
+        self.assertEqual(c["signals"], ["high-priority", "open PR"])
+
+    def _forecast_with_train(self, outcome):
+        """A candidate whose train is known only from bundle['trains'] (no PR
+        in the view references it, e.g. a trimmed view)."""
+        bundle = {"meta": {"period": dict(self.PERIOD), "ref_date": "2026-05-31"},
+                  "milestones": [], "prs": [], "issues": [self._issue(14)],
+                  "trains": [{"id": "train-issue-14", "root_issue": 14,
+                              "prs": [140], "outcome": outcome}],
+                  "buckets": {"next_candidates": [
+                      {"type": "issue", "id": 14,
+                       "url": "https://github.com/o/r/issues/14",
+                       "train": "train-issue-14"}]}}
+        link.build_forecast(bundle)
+        return bundle["forecast"]["candidates"][0]
+
+    def test_in_flight_train_is_in_motion(self):
+        c = self._forecast_with_train("in_flight")
+        self.assertEqual(c["signals"], ["high-priority", "work in progress"])
+        self.assertEqual(c["score"], 5.0)
+
+    def test_rejected_shipped_abandoned_trains_are_not_in_motion(self):
+        for outcome, notes in (("rejected", ["previous attempt rejected"]),
+                               ("shipped", ["linked PR already merged"]),
+                               ("abandoned", [])):
+            with self.subTest(outcome=outcome):
+                c = self._forecast_with_train(outcome)
+                self.assertEqual(c["signals"], ["high-priority"])
+                self.assertEqual(c["score"], 3.0)
+                self.assertEqual(c["notes"], notes)
+
+    def test_train_id_missing_from_trains_is_not_in_motion(self):
+        """A ref train id that names no train in the bundle proves nothing."""
+        bundle = {"meta": {"period": dict(self.PERIOD), "ref_date": "2026-05-31"},
+                  "milestones": [], "prs": [], "issues": [self._issue(15)],
+                  "trains": [],
+                  "buckets": {"next_candidates": [
+                      {"type": "issue", "id": 15,
+                       "url": "https://github.com/o/r/issues/15",
+                       "train": "train-issue-15"}]}}
+        link.build_forecast(bundle)
+        c = bundle["forecast"]["candidates"][0]
+        self.assertEqual(c["signals"], ["high-priority"])
+        self.assertEqual(c["notes"], [])
 
 
 class TestSliceCLI(unittest.TestCase):

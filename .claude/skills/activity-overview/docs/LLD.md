@@ -728,12 +728,19 @@ For each `next_candidates` ref:
 |---|---:|---|
 | `on_next_milestone` | 5.0 | item milestone == next milestone title |
 | `high_priority` | 3.0 | label in `HIGH_PRIORITY_LABELS` |
-| `in_motion` | 2.0 | it is an open PR; or an open PR `closes`/cross-refs it; or it belongs to a train |
+| `in_motion` | 2.0 | live work only (#87): it is an open PR; or an open PR `closes`/cross-refs it; or its train's `outcome` is `in_flight` |
 | `recent_activity` | 1.5 | `updated_at` in window |
 | `overdue` | 1.0 | `ref_date − created_at ≥ FORECAST_OVERDUE_DAYS` (200) |
 
+The train is looked up in `bundle["trains"]` by the ref's `train` id. A train that is
+`rejected`, `shipped` or `abandoned` is not work in progress (an open issue whose only PR was
+closed unmerged, or that a merged PR merely cross-references, is not in motion), and neither
+is a `train` id that names no train in the bundle. Signal text: `open PR` for the first two
+cases, `work in progress` for an `in_flight` train. `notes` carries non-scoring context: a
+`rejected` train adds `previous attempt rejected`, a `shipped` one `linked PR already merged`.
+
 `tier` = likely (≥ 5.0) / possible (≥ 2.0) / longshot. Candidates sorted by `(−score, id)`.
-Output: `{next_milestone, candidates:[{ref, train, score, tier, signals}]}`. Forward-only —
+Output: `{next_milestone, candidates:[{ref, train, score, tier, signals, notes}]}`. Forward-only —
 verification happens in the next installment's series block.
 
 ### 6.8 Slice — `slice_train(bundle, train_id)`
@@ -1107,6 +1114,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |
 | Incomplete members are not in the digest JSON | #77 surfaces a failed / not-attempted member through gather's exit code, `validate` and a `digest.py`/`view.py` stderr warning only | a formatter reading only the digest/view JSON cannot tell the project is partial | add the incomplete members to the view `meta` (BUNDLE.md change) |
 | Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
+| Any open PR counts as in motion | since #87 `in_motion` needs an open PR or an `in_flight` train, but it does not look at the PR's age, draft state or base branch | an open PR untouched for a year, or a draft, still scores `open PR` (+2.0) for the issue it references | weigh PR recency (e.g. `updated_at` in window) if stale open PRs prove common |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for
