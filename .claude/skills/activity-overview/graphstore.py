@@ -568,6 +568,22 @@ def project_repos(conn, project):
     )
 
 
+def resolve_repo(conn, project, repo):
+    """The stored spelling of `repo` in `project` (issue #70). GitHub names are
+    case-insensitive, so a reader may name a member in any case; ids keep the
+    spelling it was folded under. An exact match wins; otherwise the single
+    stored repo equal to `repo` ignoring case. With no match (or, defensively,
+    several case-variants and no exact one) `repo` is returned unchanged so the
+    caller reports it as unknown. The project itself stays case-sensitive."""
+    if repo is None:
+        return None
+    repos = project_repos(conn, project)
+    if repo in repos:
+        return repo
+    hits = [r for r in repos if r.lower() == repo.lower()]
+    return hits[0] if len(hits) == 1 else repo
+
+
 def repo_nodes(conn, project, repo, node_class=None):
     """All nodes for one project/repo (optionally one node_class), ordered by
     (ts NULLs last, id). Unlike range_query this is *not* window-filtered: it is

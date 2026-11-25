@@ -66,10 +66,14 @@ def build_artifacts(bundle):
     """Fold raw `code_events` into the per-artifact lifecycle ledger (file-level).
 
     Each tracked path (readme/doc/example) gets one entry with an ordered
-    lifecycle. Renames link the old artifact (status `replaced`, `replaced_by`)
-    to the new one. `code_area` is null in Phase 3a (graphify is Phase 3b). Pure.
+    lifecycle. Status comes from the LAST lifecycle event: a rename away to a
+    tracked path (that is still the last event) makes the old artifact `replaced`
+    with `replaced_by` its direct successor; a later re-add makes it `live` again;
+    a delete, or a rename to an untracked path, makes it `removed`. `code_area` is
+    null in Phase 3a (graphify is Phase 3b). Pure.
     """
     artifacts = {}
+    rename_succ = {}   # old aid -> (lifecycle index of its latest rename-away, new aid|None)
 
     def ensure(path):
         kind = classify_artifact_path(path)
@@ -113,9 +117,10 @@ def build_artifacts(bundle):
                     # No hunk on the old-path removal — `ev["hunk"]` is the NEW file's
                     # diff (the patch keys by the rename target), not the old file's.
                     append_event(old_aid, "remove", ev)
-                    artifacts[old_aid]["status"] = "replaced"
-                    # replaced_by is the direct successor; consumers walk the chain for terminal paths (A->B->C).
-                    artifacts[old_aid]["replaced_by"] = new_aid
+                    # Remember WHICH lifecycle entry was the rename-away and its
+                    # successor (None when the target is untracked). The final pass
+                    # below only honours it if that entry is still the LAST event.
+                    rename_succ[old_aid] = (len(artifacts[old_aid]["lifecycle"]) - 1, new_aid)
             continue
         aid = ensure(ev["path"])
         if aid is None:
@@ -142,12 +147,20 @@ def build_artifacts(bundle):
                     "url": _commit_url(bundle, ev["commit"])},
         })
 
-    # Final status from the last lifecycle event (unless already `replaced`).
-    for a in artifacts.values():
-        if a["status"] == "replaced":
-            continue
-        last = a["lifecycle"][-1]["event"] if a["lifecycle"] else None
-        a["status"] = "removed" if last == "remove" else "live"
+    # Final status from the LAST lifecycle event (#64):
+    #   last event add/change          -> `live`, replaced_by None (a re-add revives it)
+    #   last event = rename to a TRACKED path -> `replaced`, replaced_by = that direct
+    #                                     successor (consumers walk A->B->C themselves)
+    #   any other last `remove` (delete, or rename to an untracked path) -> `removed`
+    for aid, a in artifacts.items():
+        lc = a["lifecycle"]
+        last = lc[-1]["event"] if lc else None
+        idx, succ = rename_succ.get(aid, (None, None))
+        if last == "remove" and idx == len(lc) - 1 and succ is not None:
+            a["status"], a["replaced_by"] = "replaced", succ
+        else:
+            a["status"] = "removed" if last == "remove" else "live"
+            a["replaced_by"] = None
     return artifacts
 
 
@@ -219,22 +232,71 @@ def build_modules(bundle, idx):
     return bundle
 
 
-def annotate_review_rounds(bundle):
-    """Set `review_rounds` on each PR that has review submissions (Phase 10).
+_ROUND_REVIEW_STATES = ("approved", "changes_requested", "commented", "dismissed")
 
-    `review_rounds = {count, states}` where `states` is the per-submission state
-    ordered by `submitted_at` (the approve->changes-requested->re-review
-    texture). PRs with no `reviews` are left untouched (no fabricated key). Pure
-    (in place); returns bundle for convenience."""
-    for pr in bundle.get("prs", []):
-        reviews = pr.get("reviews")
-        if not reviews:
+
+def _counted_reviews(pr):
+    """The PR's review submissions that take part in review rounds, oldest
+    first: SUBMITTED (state approved/changes_requested/commented/dismissed AND a
+    `submitted_at`; PENDING drafts never count) and NOT by the PR author (the
+    author's own thread replies are recorded by GitHub as COMMENTED reviews).
+    When the PR author is unknown nobody is excluded on that ground. Order:
+    (submitted_at, integer id, input position) — deterministic."""
+    pr_author = pr.get("author")
+    kept = []
+    for i, r in enumerate(pr.get("reviews") or []):
+        state = (r.get("state") or "").lower()
+        if state not in _ROUND_REVIEW_STATES or not r.get("submitted_at"):
             continue
-        ordered = sorted(reviews, key=lambda r: (r.get("submitted_at") or "",
-                                                 r.get("id") or 0))
+        if pr_author and r.get("author") == pr_author:
+            continue
+        rid = r.get("id")
+        rid = rid if isinstance(rid, int) and not isinstance(rid, bool) else -1
+        kept.append(((r["submitted_at"], rid, i), state, r.get("author")))
+    kept.sort(key=lambda t: t[0])
+    return [(state, author) for _, state, author in kept]
+
+
+def count_review_rounds(counted):
+    """Number of review rounds in an ordered [(state, reviewer)] sequence.
+
+    A *change-request block* is a maximal run of consecutive `changes_requested`
+    submissions from distinct reviewers (a reviewer repeating a change request
+    starts a new block — that is a re-review). Rounds = 0 when there is no
+    counted review, else 1 + the number of change-request blocks followed by at
+    least one later counted review (the re-review that opens the next round).
+    A trailing block with nothing after it does not open a round."""
+    if not counted:
+        return 0
+    rounds = 1
+    block = None  # reviewers in the open change-request block, or None
+    for state, reviewer in counted:
+        if block is not None and (state != "changes_requested" or reviewer in block):
+            rounds += 1          # a later review after a change-request block
+            block = None
+        if state == "changes_requested":
+            if block is None:
+                block = set()
+            block.add(reviewer)
+    return rounds
+
+
+def annotate_review_rounds(bundle):
+    """Set `review_rounds` on each PR with counted review submissions (Phase 10,
+    defined precisely by issue #63 — see BUNDLE.md "Review decision & rounds").
+
+    `review_rounds = {count, states}`: `states` is the state of every counted
+    submission (`_counted_reviews`: submitted, not PENDING, not by the PR
+    author), oldest first; `count` is `count_review_rounds` over them. PRs with
+    no counted review are left untouched (no fabricated key). Pure (in place);
+    returns bundle for convenience."""
+    for pr in bundle.get("prs", []):
+        counted = _counted_reviews(pr)
+        if not counted:
+            continue
         pr["review_rounds"] = {
-            "count": len(ordered),
-            "states": [r.get("state") for r in ordered],
+            "count": count_review_rounds(counted),
+            "states": [state for state, _ in counted],
         }
     return bundle
 
@@ -418,7 +480,10 @@ def link_symbol_identity(bundle):
     """Apply window-wide symbol moves onto the artifact ledger (Phase 3e). For each move
     the source symbol artifact is `status:"replaced"` + `replaced_by` the dest, the dest
     gets `identity_from`, and both carry `move_confidence`/`move_basis`. Records a
-    `symbol_moves` summary on the bundle. Mutates; safe when there are no symbol_events."""
+    `symbol_moves` summary on the bundle. Mutates; safe when there are no symbol_events.
+    Consistent with build_artifacts' last-event rule (#64): a source symbol re-added in
+    its own file is "added in >1 file" to match_symbol_moves, so it is never linked
+    (and so never marked `replaced`); a linked source has no add after its drop."""
     arts = bundle.get("artifacts", {})
     renames = [(e.get("old_path"), e["path"]) for e in bundle.get("code_events", [])
                if e.get("change") in ("rename", "copy") and e.get("old_path")]

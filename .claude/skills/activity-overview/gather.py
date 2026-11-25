@@ -85,7 +85,9 @@ def parse_git_log(raw):
         if len(fields) < 5:
             continue
         sha, parents, author, date, subject = (f.strip() for f in fields[:5])
-        files = [ln for ln in lines[1:] if ln.strip()]
+        # `--name-only` paths: C-quoted ones (quote/backslash/control chars, or
+        # non-ASCII without core.quotepath=false) are unquoted.
+        files = [unquote_git_path(ln) for ln in lines[1:] if ln.strip()]
         commits.append({
             "sha": sha,
             "parents": parents.split() if parents.strip() else [],
@@ -103,6 +105,17 @@ def parse_git_log(raw):
 # changed path carries its change type (and rename/copy detection via -M -C gives
 # `R###`/`C###` with old+new paths).
 CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
+
+# `git log` arguments (after `git -C <clone> log`) for acquire()'s three walks,
+# shared with the real-repo tests so they exercise the exact commands. Paths in
+# their output are made comparable by run_git (core.quotepath=false) plus
+# unquote_git_path in each parser.
+COMMIT_WALK_ARGS = (f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+                    "--name-only")
+CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+                  "--name-status", "-M", "-C")
+PATCH_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+                   "-p", "--unified=3", "-M", "-C")
 
 _STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
                      "R": "rename", "C": "copy", "T": "modify"}
@@ -133,13 +146,17 @@ def parse_code_events(raw):
             if change is None or len(cols) < 2:
                 continue
             ev = {"commit": sha, "author": author, "date": date, "change": change}
+            # Path columns are TAB-separated; spaces are literal and a path with a
+            # TAB/newline/quote (or non-ASCII, without core.quotepath=false) is
+            # C-quoted, so unquote each column. Columns are not whitespace-stripped:
+            # a leading/trailing space is part of the name (as in the patch walk).
             if change in ("rename", "copy"):
                 if len(cols) < 3:
                     continue  # malformed R/C line (real `-M -C` always has old+new)
-                ev["old_path"] = cols[1].strip()
-                ev["path"] = cols[2].strip()
+                ev["old_path"] = unquote_git_path(cols[1])
+                ev["path"] = unquote_git_path(cols[2])
             else:
-                ev["path"] = cols[1].strip()
+                ev["path"] = unquote_git_path(cols[1])
             events.append(ev)
     return events
 
@@ -148,8 +165,9 @@ def parse_code_events(raw):
 # predates it. The boundary commit's parent is grafted away, so `git log -p` /
 # `--name-status` diff it against the EMPTY tree — a whole-tree phantom that would
 # otherwise flood code_events/symbol_events with thousands of spurious "add"s. With
-# the margin the first in-window commit keeps its real parent; shallow_boundary_shas
-# is the belt-and-suspenders that drops any boundary commit that still lands in-window.
+# the margin the first in-window commit keeps its real parent; when the margin holds
+# no earlier commit, deepen_window_boundary deepens past it, and shallow_boundary_shas
+# is the fallback that drops any boundary commit that still lands in-window.
 CLONE_MARGIN_DAYS = 14
 
 
@@ -335,6 +353,54 @@ def in_window_boundary_commits(boundary, commits):
     return sorted(s for s in boundary if s in shas)
 
 
+# `git fetch --deepen=<n>` steps tried, in order, while an in-window commit of the
+# walked branch still sits on the shallow boundary (#68). One commit past the
+# boundary is normally enough (the parent predates `from - margin`); the larger
+# steps cover non-monotonic committer dates. Bounded: at most 1+2+4+8 extra commits
+# per boundary, four fetches.
+BOUNDARY_DEEPEN_STEPS = (1, 2, 4, 8)
+
+
+def _in_window_boundary_on_head(clone_dir, from_date, to_date, run):
+    """Shallow-boundary SHAs that are in-window commits of the checked-out branch
+    (the history the three walks read). Sorted. A root commit is never listed:
+    git records only grafted commits in `.git/shallow`."""
+    boundary = shallow_boundary_shas(clone_dir)
+    if not boundary:
+        return []
+    raw = run(["git", "-C", clone_dir, "log", f"--pretty=format:{CODE_LOG_FORMAT}",
+               "--date=short"])
+    head = window_records(parse_git_log(raw), from_date, to_date)
+    return in_window_boundary_commits(boundary, head)
+
+
+def deepen_window_boundary(clone_dir, from_date, to_date, run=None,
+                           steps=BOUNDARY_DEEPEN_STEPS):
+    """Make in-window shallow-boundary commits real (#68).
+
+    A boundary commit's parent is grafted away, so git diffs it against the empty
+    tree (a whole-tree phantom). When the clone margin held no earlier commit, the
+    first in-window commit is such a commit. Deepen the clone (`git fetch
+    --deepen=<n>`, n from `steps`) until no in-window commit of the walked branch
+    is on the boundary. Stops at the first fetch error (not retried) or when the
+    steps run out. Returns the in-window boundary SHAs still left (sorted; empty
+    when resolved) — the caller falls back to dropping their diffs and files."""
+    run = run or run_git
+    left = _in_window_boundary_on_head(clone_dir, from_date, to_date, run)
+    for n in steps:
+        if not left:
+            break
+        try:
+            run(["git", "-C", clone_dir, "fetch", f"--deepen={n}", "origin"])
+        except RuntimeError as exc:
+            sys.stderr.write(
+                f"warning: could not deepen {clone_dir} past the shallow boundary: "
+                f"{str(exc).strip().splitlines()[-1] if str(exc).strip() else exc}\n")
+            break
+        left = _in_window_boundary_on_head(clone_dir, from_date, to_date, run)
+    return left
+
+
 def in_window(ts, from_date, to_date):
     """True if ISO date/datetime string `ts` falls within [from_date, to_date]
     inclusive. None/empty is never in window. Bounds may be date-only or ISO;
@@ -430,11 +496,13 @@ def parse_qualified_refs(text):
     `/pull/` URL, and an unkeyworded list-tail qualified ref
     (`Fixes a/b#1, a/b#2` -> #2) -> kind 'cross_ref' (is_pr True for /pull/).
     Bare `#N` is left to parse_closing_refs (same-repo). Same-repo qualified refs
-    are returned too; callers skip them by slug. Pure."""
+    are returned too; callers skip them by slug. Dedupe is case-insensitive on
+    owner/repo (GitHub names are, issue #70); the first spelling seen is kept.
+    Pure."""
     out, seen = [], set()
 
     def add(owner, repo, num, kind, is_pr):
-        key = (owner, repo, num)
+        key = (owner.lower(), repo.lower(), num)
         if key not in seen:
             seen.add(key)
             out.append({"owner": owner, "repo": repo, "number": num,
@@ -591,32 +659,60 @@ def normalize_issue(raw):
     }
 
 
-# Review states ranked by how strongly they gate a merge. A PR's decision is
-# the strongest *latest-per-reviewer* signal: any outstanding changes-requested
-# dominates; otherwise an approval; otherwise a bare comment.
-_REVIEW_RANK = {"changes_requested": 3, "approved": 2, "commented": 1, "none": 0}
+# Submitted review states (GitHub: APPROVED, CHANGES_REQUESTED, COMMENTED,
+# DISMISSED; PENDING is an unsubmitted draft and is never counted). Only the
+# "decisive" ones set a reviewer's effective state: GitHub records every
+# review-thread reply as a COMMENTED review and keeps the earlier approval /
+# change request in force, and a dismissed review (whose state GitHub rewrites
+# to DISMISSED) no longer gates the merge.
+_DECISIVE_REVIEW_STATES = ("approved", "changes_requested", "dismissed")
+_SUBMITTED_REVIEW_STATES = _DECISIVE_REVIEW_STATES + ("commented",)
+
+
+def _review_order_key(index, r):
+    """Chronological sort key for a raw review: (submitted_at, id, list index).
+    ISO-8601 UTC `Z` timestamps sort correctly as plain strings; GitHub review
+    ids grow monotonically, so they break same-second ties; the input position
+    is the final, deterministic fallback."""
+    rid = r.get("id")
+    return (r.get("submitted_at") or "",
+            rid if isinstance(rid, int) and not isinstance(rid, bool) else -1,
+            index)
 
 
 def summarize_reviews(raw_reviews):
-    """Reduce raw PR reviews to {reviewers, decision}. Pure."""
-    latest = {}  # login -> (submitted_at, state)
-    for r in raw_reviews or []:
+    """Reduce raw PR reviews to {reviewers, decision}. Pure.
+
+    `reviewers`: sorted logins with at least one SUBMITTED review (PENDING
+    drafts and unknown states are ignored).
+
+    `decision` (issue #63): each reviewer's effective state is their latest
+    APPROVED / CHANGES_REQUESTED / DISMISSED review — a later COMMENTED review
+    never overrides it; a reviewer with none of those is `commented`; an
+    effective DISMISSED contributes nothing. Overall: `changes_requested` if any
+    reviewer's effective state is that, else `approved` if any, else
+    `commented` if any, else `none`."""
+    indexed = sorted(enumerate(raw_reviews or []),
+                     key=lambda p: _review_order_key(p[0], p[1]))
+    effective = {}  # login -> effective state
+    for _, r in indexed:
         login = (r.get("user") or {}).get("login")
         if not login:
             continue
         state = (r.get("state") or "").lower()
-        if state not in _REVIEW_RANK:
+        if state not in _SUBMITTED_REVIEW_STATES:
             continue
-        ts = r.get("submitted_at") or ""
-        # ISO-8601 (UTC `Z`) timestamps sort correctly as plain strings.
-        if login not in latest or ts >= latest[login][0]:
-            latest[login] = (ts, state)
-    reviewers = sorted(latest)
-    decision = "none"
-    for _, state in latest.values():
-        if _REVIEW_RANK[state] > _REVIEW_RANK[decision]:
-            decision = state
-    return {"reviewers": reviewers, "decision": decision}
+        if state in _DECISIVE_REVIEW_STATES:
+            effective[login] = state          # later decisive review wins
+        else:
+            effective.setdefault(login, "commented")
+    states = set(effective.values())
+    for decision in ("changes_requested", "approved", "commented"):
+        if decision in states:
+            break
+    else:
+        decision = "none"
+    return {"reviewers": sorted(effective), "decision": decision}
 
 
 def normalize_review(raw):
@@ -737,18 +833,21 @@ def parse_timeline_crossrefs(raw_timeline):
 def parse_timeline_xrefs(raw_timeline, current_slug):
     """Cross-REPO timeline cross-references (Phase 9): cross-referenced events
     whose source issue/PR lives in a DIFFERENT repo than `current_slug`
-    ('owner/repo'). Same-repo refs are left to parse_timeline_crossrefs. Returns
+    ('owner/repo'). Same-repo refs are left to parse_timeline_crossrefs. Repo
+    comparison and dedupe are case-insensitive (the API's canonical `full_name`
+    may differ in case from the manifest / --owner spelling, issue #70). Returns
     ordered, deduped [{owner, repo, number, kind='cross_ref', is_pr}]. Pure."""
     out, seen = [], set()
+    current = (current_slug or "").lower()
     for ev in raw_timeline or []:
         if ev.get("event") != "cross-referenced":
             continue
         src = (ev.get("source") or {}).get("issue") or {}
         full = ((src.get("repository") or {}).get("full_name")) or ""
         num = src.get("number")
-        if not full or full == current_slug or num is None:
+        if not full or full.lower() == current or num is None:
             continue
-        key = (full, num)
+        key = (full.lower(), num)
         if key in seen:
             continue
         seen.add(key)
@@ -887,7 +986,9 @@ _BICEP_COMMENT_RE = re.compile(r"^\s*(//|/\*|\*/|\*|@sys\.description|@descripti
 _TF_RES_RE = re.compile(r'^\s*resource\s+"([^"]+)"\s+"([^"]+)"')
 _TF_BLOCK_RE = re.compile(r'^\s*(variable|output|module)\s+"([^"]+)"')
 _TF_COMMENT_RE = re.compile(r"^\s*(#|//)")
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# Hunk header `@@ -a[,b] +c[,d] @@`: groups (old_start, old_count, new_start,
+# new_count); an omitted count means 1. The counts delimit the hunk exactly.
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Actionable/decision markers — surfaced as subkind `todo` so the report can focus on
 # them (these are where ideas get broken down into follow-on issues/PRs).
 _TODO_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX|BUG)\b", re.IGNORECASE)
@@ -940,32 +1041,115 @@ def detect_symbol_decl(lang, text):
     return None
 
 
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13,
+              '"': 34, "\\": 92}
+
+
+def unquote_git_path(path):
+    """Undo git's C-style path quoting. Pure.
+
+    git prints a path wrapped in double quotes, with `\\"`, `\\\\`, `\\t`, `\\n`
+    (etc.) escapes and `\\ooo` octal bytes, when it contains a quote, backslash
+    or control character — and, unless `core.quotepath=false`, any byte >= 0x80
+    (`"docs/caf\\303\\251.md"`). The octal bytes are reassembled and decoded as
+    UTF-8 (`errors="replace"`, like run_git). Anything not wrapped in quotes is
+    returned unchanged."""
+    if len(path) < 2 or path[0] != '"' or path[-1] != '"':
+        return path
+    body, out, i = path[1:-1], bytearray(), 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\" or i + 1 >= len(body):
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in "01234567":
+            j = i + 1
+            while j < len(body) and j < i + 4 and body[j] in "01234567":
+                j += 1
+            out.append(int(body[i + 1:j], 8) & 0xFF)
+            i = j
+        else:
+            out += bytes([_C_ESCAPES[nxt]]) if nxt in _C_ESCAPES else nxt.encode("utf-8")
+            i += 2
+    return out.decode("utf-8", errors="replace")
+
+
+def _diff_header_path(rest):
+    """Path from a `--- `/`+++ ` header remainder: `/dev/null` -> None, C-quoting
+    undone, the `a/`/`b/` prefix dropped. git appends one TAB when the path
+    contains a space (`--- a/with space.md<TAB>`); only that TAB is removed, so
+    other whitespace in a name survives."""
+    if rest.endswith("\t"):
+        rest = rest[:-1]
+    if rest == "/dev/null":
+        return None
+    p = unquote_git_path(rest)
+    return p[2:] if p[:2] in ("a/", "b/") else p
+
+
 def parse_unified_diff(patch):
     """Parse a (multi-file) unified diff into per-file hunks. Pure.
 
     -> [{"path","old_path","hunks":[{"new_start":int,"lines":[(sign,text), ...]}]}]
-    sign in {' ','+','-'}; `/dev/null` paths normalise to None (pure add/delete)."""
+    sign in {' ','+','-'}; `/dev/null` paths normalise to None (pure add/delete).
+
+    Hunk boundaries come from the `@@ -a,b +c,d @@` counts (omitted count = 1):
+    exactly b old-side (` `/`-`) and d new-side (` `/`+`) lines are consumed, so
+    a removed line `-- x` or an added line `++ y` (rendered `--- x` / `+++ y`) is
+    hunk content, never a file header. `--- `/`+++ ` and `rename|copy from|to`
+    are read only in a file's header block (after `diff --git`, before its first
+    `@@`). `\\ No newline at end of file` is skipped and not counted. Once a
+    hunk's counts are exhausted, lines other than a new `@@` or `diff --git` are
+    ignored. C-quoted paths are unquoted (unquote_git_path)."""
     files, cur, hunk = [], None, None
+    old_left = new_left = 0
     for line in (patch or "").split("\n"):
         if line.startswith("diff --git "):
+            # Never hunk content: every content line carries a sign prefix.
             cur = {"path": None, "old_path": None, "hunks": []}
             files.append(cur)
-            hunk = None
-        elif cur is None:
+            hunk, old_left, new_left = None, 0, 0
             continue
+        if cur is None:
+            continue
+        if hunk is not None and (old_left > 0 or new_left > 0):
+            if line.startswith("\\"):
+                continue                       # "\ No newline at end of file"
+            if line == "":
+                line = " "                     # blank context line, prefix stripped
+            sign = line[0]
+            if sign == " " and old_left > 0 and new_left > 0:
+                old_left, new_left = old_left - 1, new_left - 1
+            elif sign == "-" and old_left > 0:
+                old_left -= 1
+            elif sign == "+" and new_left > 0:
+                new_left -= 1
+            else:
+                # Inconsistent with the declared counts (malformed/truncated input):
+                # close the hunk and let the line be checked for a new `@@` below.
+                old_left = new_left = 0
+                sign = None
+            if sign is not None:
+                hunk["lines"].append((sign, line[1:]))
+                continue
+        m = _HUNK_RE.match(line)
+        if m:
+            old_left = 1 if m.group(2) is None else int(m.group(2))
+            new_left = 1 if m.group(4) is None else int(m.group(4))
+            hunk = {"new_start": int(m.group(3)), "lines": []}
+            cur["hunks"].append(hunk)
+        elif cur["hunks"]:
+            continue                           # past the header block
         elif line.startswith("--- "):
-            p = line[4:].strip()
-            cur["old_path"] = None if p == "/dev/null" else (p[2:] if p[:2] in ("a/", "b/") else p)
+            cur["old_path"] = _diff_header_path(line[4:])
         elif line.startswith("+++ "):
-            p = line[4:].strip()
-            cur["path"] = None if p == "/dev/null" else (p[2:] if p[:2] in ("a/", "b/") else p)
-        else:
-            m = _HUNK_RE.match(line)
-            if m:
-                hunk = {"new_start": int(m.group(1)), "lines": []}
-                cur["hunks"].append(hunk)
-            elif hunk is not None and line[:1] in (" ", "+", "-"):
-                hunk["lines"].append((line[0], line[1:]))
+            cur["path"] = _diff_header_path(line[4:])
+        elif line.startswith(("rename from ", "copy from ")):
+            cur["old_path"] = unquote_git_path(line.split(" ", 2)[2])
+        elif line.startswith(("rename to ", "copy to ")):
+            cur["path"] = unquote_git_path(line.split(" ", 2)[2])
     return files
 
 
@@ -1163,15 +1347,47 @@ def parse_patch_events(raw):
     return sym, diffs
 
 
+def attach_file_diffs(code_events, file_diffs):
+    """Attach each bounded file diff to its file-level code_event (in place).
+
+    Joins on (commit, path): the patch walk keys by the NEW path (rename target);
+    falls back to `old_path` for the rare case the diff names only the source.
+    Both walks yield unquoted paths, so non-ASCII/space/quoted names join.
+    Omit-when-empty: events without a diff get no `hunk` key."""
+    diff_by_key = {(d["commit"], d["path"]): d["hunk"] for d in file_diffs}
+    if not diff_by_key:
+        return code_events
+    for ev in code_events:
+        hunk = diff_by_key.get((ev.get("commit"), ev.get("path")))
+        if hunk is None and ev.get("old_path"):
+            hunk = diff_by_key.get((ev.get("commit"), ev.get("old_path")))
+        if hunk:
+            ev["hunk"] = hunk
+    return code_events
+
+
 # Ordered code-area patterns for the directory provider (primary, zero-dep).
 # Each entry is (name, predicate(parts) -> area_id_or_None) tried in order; the
 # first match wins. `parts` is path.split("/"). Patterns are directory-first and
 # match how IaC repos define a module. The generic fallback is last.
+_AVM_KINDS = ("res", "ptn", "utl")
+
+
 def _avm_area(parts):
-    # avm/res/<service>/<module>/...  -> the 4-segment module subtree.
-    if len(parts) >= 4 and parts[0] == "avm" and parts[1] in ("res", "ptn", "utl"):
-        return "/".join(parts[:4])
+    # avm/{res,ptn,utl}/<group>/<module>/...  -> the 4-segment module subtree. The
+    # module segment must be a DIRECTORY (a file under it follows, >= 5 parts): a
+    # file directly under the group (avm/res/network/README.md) is not a module and
+    # belongs to the group-level area avm/res/<group>.
+    if len(parts) >= 4 and parts[0] == "avm" and parts[1] in _AVM_KINDS:
+        return "/".join(parts[:4] if len(parts) >= 5 else parts[:3])
     return None
+
+
+def _is_avm_group_area(area_id):
+    """True for an AVM group-level area id `avm/{res,ptn,utl}/<group>` (the home of
+    files directly under a group, e.g. its README) — never a module. Pure."""
+    parts = (area_id or "").split("/")
+    return len(parts) == 3 and parts[0] == "avm" and parts[1] in _AVM_KINDS
 
 
 def _main_bicep_dir(parts):
@@ -1182,8 +1398,9 @@ def _main_bicep_dir(parts):
 
 
 def _terraform_modules_dir(parts):
-    # modules/<name>/... -> modules/<name>.
-    if len(parts) >= 2 and parts[0] == "modules":
+    # modules/<name>/... -> modules/<name>. <name> must be a directory: a file
+    # directly under modules/ (modules/README.md) is not a module and falls through.
+    if len(parts) >= 3 and parts[0] == "modules":
         return "/".join(parts[:2])
     return None
 
@@ -1199,10 +1416,12 @@ def _tf_dir(parts):
 
 
 def _topn_dir(parts, n=2):
-    # generic fallback: the first N path segments (or the file itself if shallower).
+    # generic fallback: the first N segments of the file's DIRECTORY, so a shallow
+    # file (docs/README.md) lands in its directory (docs), never an area named after
+    # the file. A repo-root file has no directory to name and keeps its own name.
     if not parts:
         return None
-    return "/".join(parts[:n])
+    return "/".join(parts[:-1][:n]) or parts[-1]
 
 
 DEFAULT_AREA_PATTERNS = [
@@ -1218,7 +1437,8 @@ def classify_code_area(path, patterns):
     """Map a tracked file path to a single area id (a directory path), or None.
 
     Tries the ordered `patterns` (AVM module subtree, any main.bicep dir, Terraform
-    modules/<name>, any *.tf dir, else a top-2-segment fallback). Pure."""
+    modules/<name>, any *.tf dir, else the top 2 segments of the file's directory;
+    a repo-root file keeps its own name). Pure."""
     if not path:
         return None
     parts = path.split("/")
@@ -1343,29 +1563,50 @@ _BICEP_MODULE_RE = re.compile(
     r"module\s+\w+\s+'(?P<ref>[^']+)'(?:\s*=\s*(?P<open>[\[{]))?")
 
 
+# A non-local Bicep reference scheme: `br:` / `ts:` or an alias `br/<a>:` / `ts/<a>:`.
+_BICEP_SCHEME_RE = re.compile(r"^(?P<scheme>br|ts)(?:/(?P<alias>[^:/]+))?:(?P<body>.*)$")
+# The public Bicep registry (what the built-in `br/public` alias points at).
+_BICEP_PUBLIC_REGISTRY = "mcr.microsoft.com/bicep/"
+
+
+def _split_ref_tag(body):
+    """`<path>:<tag>` / `<path>@<digest>` -> (path, tag-or-None)."""
+    if "@" in body:
+        return tuple(body.split("@", 1))
+    if ":" in body:
+        return tuple(body.rsplit(":", 1))
+    return body, None
+
+
 def parse_bicep_module_refs(source_text):
     """Extract `module <sym> '<ref>'` references from a .bicep source.
 
-    Each result is {ref, registry_path, version, local_path, instances}. Registry
-    refs (`br/public:<path>:<ver>` or `br:<host>/bicep/<path>:<ver>`) split into
-    `registry_path` + `version`; everything else is a `local_path`. `instances` is
-    `"many"` when the module is instantiated as an array (`= [for ...]`), `"one"`
-    for a single `= {`, else None. Pure."""
+    Each result is {ref, registry_path, version, local_path, instances}. Only a
+    PUBLIC Bicep registry ref (`br/public:<path>:<ver>`, or the same registry named
+    explicitly, `br:mcr.microsoft.com/bicep/<path>:<ver>`) sets `registry_path` (the
+    module path in the public registry). A private registry (`br:<other-host>/...`),
+    a template spec (`ts:<sub>/<rg>/<name>:<ver>`, `ts/<alias>:<name>:<ver>`) or a
+    user alias (`br/<alias>:...`) sets neither `registry_path` nor `local_path`:
+    its path says nothing about this repo, so only the raw `ref` (+ `version`) is
+    kept. A ref with no scheme is a `local_path`. `instances` is `"many"` when the
+    module is instantiated as an array (`= [for ...]`), `"one"` for a single
+    `= {`, else None. Pure."""
     refs = []
     for m in _BICEP_MODULE_RE.finditer(source_text or ""):
         ref = m.group("ref")
         open_ch = m.group("open")
         instances = "many" if open_ch == "[" else "one" if open_ch == "{" else None
         registry_path = version = local_path = None
-        if ref.startswith("br/public:") or ref.startswith("br:"):
-            body = ref.split(":", 1)[1]              # drop the br/public or br scheme
-            if ":" in body:
-                path_part, version = body.rsplit(":", 1)
-            else:
-                path_part = body
-            if "/bicep/" in path_part:               # strip an explicit registry host
-                path_part = path_part.split("/bicep/", 1)[1]
-            registry_path = path_part
+        sm = _BICEP_SCHEME_RE.match(ref)
+        if sm:
+            path_part, version = _split_ref_tag(sm.group("body"))
+            alias = sm.group("alias")
+            if sm.group("scheme") == "br" and alias == "public":
+                registry_path = path_part
+            elif (sm.group("scheme") == "br" and alias is None
+                  and path_part.lower().startswith(_BICEP_PUBLIC_REGISTRY)):
+                registry_path = path_part[len(_BICEP_PUBLIC_REGISTRY):]
+            # else: private registry / template spec / user alias -> raw ref only
         else:
             local_path = ref
         refs.append({"ref": ref, "registry_path": registry_path,
@@ -1374,17 +1615,32 @@ def parse_bicep_module_refs(source_text):
     return refs
 
 
-def resolve_module_ref(ref_info, base_path, patterns=None):
+def resolve_module_ref(ref_info, base_path, patterns=None, area_ids=None,
+                       module_exists=None):
     """Map a parsed bicep/tf ref to a canonical area-id (reusing classify_code_area).
 
-    Registry refs classify their `<path>/main.bicep`; local refs are normalised
-    relative to `base_path`'s directory then classified. Returns the area-id, or
-    the raw path when classification declines, or None when nothing is set. Pure."""
+    A public-registry ref (`registry_path`) classifies its `<path>/main.bicep` and
+    maps to that area ONLY when it is a module (not an AVM group-level area) of
+    this repo: in `area_ids` (the areas changed in the window) or, for an untouched
+    module, `module_exists(area)` says its entrypoint is in the clone; otherwise None — never a
+    phantom id for a module that is not in this repo (`area_ids` None => no set
+    => None). Local refs are normalised relative to `base_path`'s directory then
+    classified (the raw dir when classification declines). None when nothing
+    resolvable is set (private registry / template spec / alias refs). Pure."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     rp = ref_info.get("registry_path")
     if rp:
-        probe = rp.rstrip("/") + "/main.bicep"
-        return classify_code_area(probe, patterns) or rp
+        area = classify_code_area(rp.strip("/") + "/main.bicep", patterns)
+        if not area or _is_avm_group_area(area):
+            return None
+        if area in (area_ids or ()):
+            return area
+        # `area_ids` is built from the paths CHANGED in the window, so a module of
+        # this repo that nobody touched is not in it. It is still this repo's
+        # module when its entrypoint is in the clone (`module_exists`).
+        if module_exists is not None and module_exists(area):
+            return area
+        return None
     lp = ref_info.get("local_path")
     if lp:
         base_dir = os.path.dirname(base_path or "")
@@ -1459,7 +1715,8 @@ def _match_repo_area(name, area_ids):
     return None
 
 
-def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None):
+def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None,
+                      module_exists=None):
     """Build inter-area dependency edges for one Bicep area.
 
     Immediate edges (transitive=False) come from the SOURCE refs — fully identified
@@ -1475,7 +1732,7 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     self_id = classify_code_area(base_path, patterns)
 
     for ri in parse_bicep_module_refs(source_text):
-        to = resolve_module_ref(ri, base_path, patterns)
+        to = resolve_module_ref(ri, base_path, patterns, area_ids, module_exists)
         local = False
         # A local relative ref that resolves back to THIS area is a private child
         # submodule (e.g. `nat-rule/main.bicep`), not a self-dependency. Name the
@@ -1503,12 +1760,15 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
         edges.append(edge)
 
     immediate_tos = {e["to"] for e in edges}  # direct deps, already captured above
+    # Only module areas are transitive targets: an AVM group-level area (a group's
+    # README home) would otherwise substring-match nested names like `network`.
+    module_area_ids = [a for a in (area_ids or ()) if not _is_avm_group_area(a)]
     for node in walk_arm_deployments(arm_json):
         # depth 1 == the direct module instantiations (already emitted as immediate
         # source refs); only genuinely-nested deployments are transitive.
         if node["depth"] < 2:
             continue
-        to = _match_repo_area(node.get("metadata_name"), area_ids)
+        to = _match_repo_area(node.get("metadata_name"), module_area_ids)
         if to is None or to == self_id or to in immediate_tos:
             continue
         key = (to, node.get("name"), True)
@@ -1522,9 +1782,154 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     return sorted(edges, key=lambda e: (e["transitive"], str(e["to"]), str(e["ref"])))
 
 
-_TF_MODULE_HEAD_RE = re.compile(r'module\s+"(?P<name>[^"]+)"\s*\{')
-_TF_SOURCE_RE = re.compile(r'source\s*=\s*"(?P<src>[^"]+)"')
-_TF_VERSION_RE = re.compile(r'version\s*=\s*"(?P<ver>[^"]+)"')
+# Module-block parsing runs on an HCL "mask" of the text (see _hcl_mask): comments,
+# string contents and heredocs are blanked to spaces at the SAME offsets, so these
+# patterns only ever see real HCL structure and values are sliced from the
+# original text. A module head must start its line (after optional whitespace);
+# its label may be quoted or a bare identifier.
+_TF_MODULE_HEAD_RE = re.compile(
+    r'(?m)^[ \t]*module[ \t]+(?:"(?P<name>[^"\n]+)"|(?P<ident>[A-Za-z_][\w-]*))[ \t]*\{')
+# A top-level `source`/`version` ARGUMENT: anchored at line start (so
+# `kubernetes_version`/`custom_source` never match), `=` but not `==`, and a
+# plain quoted string value. Depth-0 (not inside a nested block/map/list) is
+# checked separately by _tf_top_level_attr.
+_TF_ATTR_RE = {
+    key: re.compile(r'(?m)^[ \t]*%s[ \t]*=(?!=)[ \t]*"(?P<val>[^"\n]*)"' % key)
+    for key in ("source", "version")}
+_TF_HEREDOC_RE = re.compile(r'<<-?(?P<id>[A-Za-z_][\w-]*)[ \t]*\r?\n')
+_HCL_OPEN, _HCL_CLOSE = "{[(", "}])"
+
+
+def _hcl_mask(text):
+    """Return `text` with HCL comments, string-literal contents and heredoc
+    bodies replaced by spaces (newlines kept), so offsets are unchanged.
+
+    Handles `#` / `//` line comments, `/* */` block comments, double-quoted
+    strings with `\\` escapes, `${...}` / `%{...}` template interpolation (with
+    nested braces and nested strings) and `$${` / `%%{` literal escapes, and
+    `<<ID` / `<<-ID` heredocs closed by a line holding only `ID`. The quote
+    characters of a top-level string are kept so a value's span can be located.
+    An unterminated quoted string ends at the newline (HCL forbids newlines in
+    quoted strings outside interpolation); an unterminated block comment or
+    heredoc runs to the end. Internal helper. Pure."""
+    out = list(text)
+    n = len(text)
+
+    def blank(a, b):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    stack = []          # "str" | [interp_brace_depth]; empty = code context
+    i = 0
+    while i < n:
+        c = text[i]
+        if stack and stack[-1] == "str":
+            if c == "\\":
+                blank(i, min(i + 2, n))
+                i += 2
+            elif c in "$%" and text.startswith(c + c + "{", i):   # literal $${
+                blank(i, i + 3)
+                i += 3
+            elif c in "$%" and text.startswith(c + "{", i):
+                blank(i, i + 2)
+                stack.append([0])
+                i += 2
+            elif c == '"' or (c == "\n" and len(stack) == 1):
+                stack.pop()
+                if stack and c == '"':
+                    blank(i, i + 1)                     # nested string's quote
+                i += 1
+            else:
+                blank(i, i + 1)
+                i += 1
+            continue
+        if stack:                                       # inside an interpolation
+            top = stack[-1]
+            # Comments are legal inside an interpolation expression; a quote or
+            # brace inside one is not syntax.
+            if c == "#" or text.startswith("//", i):
+                j = text.find("\n", i)
+                j = n if j < 0 else j
+                blank(i, j)
+                i = j
+                continue
+            if text.startswith("/*", i):
+                j = text.find("*/", i + 2)
+                j = n if j < 0 else j + 2
+                blank(i, j)
+                i = j
+                continue
+            if c == '"':
+                stack.append("str")
+            elif c == "{":
+                top[0] += 1
+            elif c == "}":
+                if top[0]:
+                    top[0] -= 1
+                else:
+                    stack.pop()
+            blank(i, i + 1)
+            i += 1
+            continue
+        # code context
+        if c == "#" or text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif c == '"':
+            stack.append("str")
+            i += 1
+        elif c == "<" and text.startswith("<<", i):
+            m = _TF_HEREDOC_RE.match(text, i)
+            if not m:
+                i += 1
+                continue
+            end = re.compile(r'(?m)^[ \t]*%s[ \t]*\r?$' % re.escape(m.group("id")))
+            em = end.search(text, m.end())
+            j = n if em is None else em.end()
+            blank(i, j)
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _hcl_depths(masked):
+    """Bracket depth ({, [, ( combined) BEFORE each offset of a masked text, as a
+    list of len(masked)+1. Internal helper. Pure."""
+    depths, d = [0], 0
+    for ch in masked:
+        if ch in _HCL_OPEN:
+            d += 1
+        elif ch in _HCL_CLOSE:
+            d = max(d - 1, 0)
+        depths.append(d)
+    return depths
+
+
+def _tf_top_level_attr(body, key):
+    """Value of the module body's own top-level `key = "..."` argument, or None.
+
+    Ignores the key inside comments, strings, heredocs and nested blocks/maps/
+    lists (e.g. `providers = {...}`, an object input with a `version` field) and
+    longer names ending in the key (`kubernetes_version`). First match wins
+    (HCL rejects a duplicate argument). Internal helper. Pure."""
+    body = body or ""
+    masked = _hcl_mask(body)
+    depths = None
+    for m in _TF_ATTR_RE[key].finditer(masked):
+        if depths is None:
+            depths = _hcl_depths(masked)
+        if depths[m.start()] == 0:
+            return body[m.start("val"):m.end("val")]
+    return None
 # Terraform graph DOT edge. The `[root] ` node prefix is OPTIONAL: older
 # `terraform graph` emitted `"[root] module.x..." -> "[root] ..."`, but modern
 # terraform (>=~1.x default graph) emits unprefixed `"module.x..." -> "..."`.
@@ -1539,27 +1944,37 @@ def _terraform_module_bodies(tf_text):
 
     Non-greedy regexes break on nested blocks (`tags { ... }`, `dynamic`), so the
     body is scanned from the opening `{` to its matching close, counting depth.
-    Internal helper. Pure."""
+    Scanning runs on the HCL mask (_hcl_mask), so a `module "x" {` inside a
+    comment, string or heredoc is not a block and braces in those never count;
+    only modules at file top level (depth 0) are returned. The body is the
+    ORIGINAL text. An unclosed block runs to end of text. Internal helper. Pure."""
     text = tf_text or ""
+    masked = _hcl_mask(text)
+    depths = _hcl_depths(masked)
     out = {}
-    for m in _TF_MODULE_HEAD_RE.finditer(text):
-        depth, i = 1, m.end()
-        while i < len(text) and depth:
-            depth += (text[i] == "{") - (text[i] == "}")
+    for m in _TF_MODULE_HEAD_RE.finditer(masked):
+        brace = m.end() - 1                         # offset of the opening `{`
+        if depths[brace] != 0:
+            continue
+        g = "name" if m.group("name") is not None else "ident"
+        name = text[m.start(g):m.end(g)]
+        i = m.end()
+        while i < len(masked) and depths[i + 1] > 0:
             i += 1
-        out[m.group("name")] = text[m.end():i - 1]
+        out[name] = text[m.end():i]
     return out
 
 
 def parse_terraform_module_blocks(tf_text):
     """Map each `module "<name>" { source = "..." }` to its source string. Pure.
 
-    Brace-balanced so a `source` after a nested block is still found."""
+    Brace-balanced so a `source` after a nested block is still found; only the
+    block's own top-level `source` argument counts (_tf_top_level_attr)."""
     out = {}
     for name, body in _terraform_module_bodies(tf_text).items():
-        sm = _TF_SOURCE_RE.search(body)
-        if sm:
-            out[name] = sm.group("src")
+        src = _tf_top_level_attr(body, "source")
+        if src:
+            out[name] = src
     return out
 
 
@@ -1605,8 +2020,8 @@ def _resolve_tf_module_source(name, sources, bodies, base_dir, patterns):
         area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
             or rel or "main.tf"
         return area, src, None
-    vm = _TF_VERSION_RE.search(bodies.get(name, ""))
-    return None, src, (vm.group("ver") if vm else None)  # external: to=None, ref=src
+    version = _tf_top_level_attr(bodies.get(name, ""), "version") or None
+    return None, src, version                          # external: to=None, ref=src
 
 
 def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
@@ -1626,7 +2041,7 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if list_files is None:
         def list_files():
-            return run_git(["git", "-C", clone_dir, "ls-files"]).splitlines()
+            return git_ls_files(clone_dir)
     if read_text is None:
         def read_text(rel):
             return _read_text_file(os.path.join(clone_dir, rel))
@@ -1782,6 +2197,22 @@ def _area_dir_on_disk(area_id, clone_dir, root_id):
 
 def _has_clone(clone_dir):
     return bool(clone_dir) and os.path.isdir(clone_dir)
+
+
+def _clone_module_exists(clone_dir):
+    """Predicate `area_id -> bool`: the clone holds `<area_id>/main.bicep`. Lets a
+    public-registry ref resolve to a module of this repo that was not changed in
+    the window. An id that escapes the clone (absolute, or `..`) is never a module.
+    None when there is no clone."""
+    if not clone_dir or not os.path.isdir(clone_dir):
+        return None
+
+    def exists(area_id):
+        rel = os.path.normpath(area_id or "")
+        if not area_id or os.path.isabs(rel) or rel.split(os.sep)[0] == "..":
+            return False
+        return os.path.isfile(os.path.join(clone_dir, rel, "main.bicep"))
+    return exists
 
 
 def _bicep_entrypoint(area, clone_dir=None):
@@ -2213,7 +2644,17 @@ def run_git(args, cwd=None, timeout=None):
     Decodes git's output as UTF-8 with `errors="replace"`: real-world patches
     can carry non-UTF-8 bytes (latin-1 source, binary hunks), and a strict
     decode would hard-crash the whole run on a single bad byte. Replacing keeps
-    the diff/log walks robust on large repos (e.g. Azure/bicep)."""
+    the diff/log walks robust on large repos (e.g. Azure/bicep).
+
+    When the command is `git`, `-c core.quotepath=false` is inserted right after
+    it so non-ASCII paths print verbatim instead of as C-quoted octal escapes
+    (`"docs/caf\\303\\251.md"`). Paths with a quote, backslash, TAB or newline are
+    still C-quoted by git; the path parsers undo that via unquote_git_path.
+    Non-git commands routed through here (bicep, terraform, graphify) are passed
+    through untouched."""
+    args = list(args)
+    if args and os.path.basename(args[0]) == "git":
+        args = [args[0], "-c", "core.quotepath=false"] + args[1:]
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout)
     if proc.returncode != 0:
@@ -2222,6 +2663,13 @@ def run_git(args, cwd=None, timeout=None):
             f"{proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def git_ls_files(clone_dir, run=None):
+    """Tracked paths of the clone (`git ls-files`), C-quoting undone."""
+    run = run or run_git
+    return [unquote_git_path(ln)
+            for ln in run(["git", "-C", clone_dir, "ls-files"]).splitlines() if ln]
 
 
 def clone_head_sha(clone_dir, run=run_git):
@@ -2329,7 +2777,9 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
             if kind == "bicep":
                 arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
                 src = read_text(os.path.join(clone_dir, bp))
-                return build_bicep_edges(src, arm, bp, area_ids, patterns), "resolved"
+                return build_bicep_edges(
+                    src, arm, bp, area_ids, patterns,
+                    module_exists=_clone_module_exists(clone_dir)), "resolved"
             rel_dir = os.path.dirname(tp)
             dot = _terraform_graph_dot(run, clone_dir, rel_dir, timeout)
             # Read EVERY *.tf in the module dir (not just the entrypoint): a module's
@@ -2933,6 +3383,30 @@ def parse_project_board(board_nodes):
     return sprints, items_by_ref
 
 
+def _board_index(items_by_ref, slug):
+    """{number: facts} for the board items of repo `slug`, matching the board's
+    `nameWithOwner` case-insensitively (issue #70: the manifest / --owner
+    spelling need not match the API's canonical case). Should two spellings of
+    one item ever appear they merge like parse_project_board does (first non-None
+    status / sprint_id wins), in sorted key order so the result is deterministic.
+    Returns fresh dicts; `items_by_ref` is not mutated. Pure."""
+    want = (slug or "").lower()
+    out = {}
+    for key in sorted(items_by_ref, key=lambda k: (k[0] or "", k[1])):
+        repo_slug, number = key
+        if (repo_slug or "").lower() != want:
+            continue
+        facts = items_by_ref[key]
+        cur = out.get(number)
+        if cur is None:
+            out[number] = dict(facts)
+        else:
+            for k in ("status", "sprint_id"):
+                if cur.get(k) is None:
+                    cur[k] = facts.get(k)
+    return out
+
+
 # A linked Projects v2 board left untouched for this long is treated as
 # deprecated-but-not-removed and skipped (overridable via the env var).
 BOARD_STALE_DAYS = 365
@@ -3318,6 +3792,11 @@ def acquire(args, env):
     # there is no clone (--no-clone with nothing on disk) or only the depth-1 tip
     # of a quiet repo (whose whole-tree diff is not window activity).
     walk_clone = clone_mode in ("fresh", "fetched") and os.path.isdir(clone_dir)
+    if walk_clone:
+        # An in-window commit on the shallow boundary (no commit in the margin
+        # before `frm`) would diff as the whole tree: deepen so its parent is
+        # present and its diff is real (#68). Leftovers are handled after the walks.
+        deepen_window_boundary(clone_dir, frm, to)
 
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
@@ -3327,10 +3806,7 @@ def acquire(args, env):
     # `--since/--until`, which prunes valid in-window commits across timezones.
     commits = []
     if walk_clone:
-        raw = run_git([
-            "git", "-C", clone_dir, "log",
-            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
-        ])
+        raw = run_git(["git", "-C", clone_dir, "log", *COMMIT_WALK_ARGS])
         commits = window_records(parse_git_log(raw), frm, to)
 
     # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
@@ -3339,11 +3815,7 @@ def acquire(args, env):
     # in walk order and derives status from the last (newest) event.
     code_events = []
     if walk_clone:
-        raw_walk = run_git([
-            "git", "-C", clone_dir, "log", "--reverse",
-            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-            "--name-status", "-M", "-C",
-        ])
+        raw_walk = run_git(["git", "-C", clone_dir, "log", *CODE_WALK_ARGS])
         code_events = window_records(parse_code_events(raw_walk), frm, to)
 
     # Phase 3d: symbol-granular change attribution via a single `git log -p` walk
@@ -3351,11 +3823,7 @@ def acquire(args, env):
     # ordering (--reverse) as the file walk so symbol lifecycle/status is correct.
     symbol_events = []
     if walk_clone:
-        raw_patch = run_git([
-            "git", "-C", clone_dir, "log", "--reverse",
-            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-            "-p", "--unified=3", "-M", "-C",
-        ])
+        raw_patch = run_git(["git", "-C", clone_dir, "log", *PATCH_WALK_ARGS])
         # Single pass over the patch text yields BOTH symbol events and the
         # Phase 10 slice-diffs hunks (no double-parse). The bounded, language-agnostic
         # unified-diff per changed (commit, path) comes from the SAME `git log -p`
@@ -3364,28 +3832,25 @@ def acquire(args, env):
         # persists in the ledger. Omit-when-empty for byte-stability.
         raw_symbol_events, file_diffs = parse_patch_events(raw_patch)
         symbol_events = window_records(raw_symbol_events, frm, to)
-        diff_by_key = {(d["commit"], d["path"]): d["hunk"] for d in file_diffs}
-        if diff_by_key:
-            for ev in code_events:
-                hunk = diff_by_key.get((ev.get("commit"), ev.get("path")))
-                # rename/copy: the patch keys by the NEW path (ev["path"]); fall back
-                # to old_path for the rare case the diff names only the source.
-                if hunk is None and ev.get("old_path"):
-                    hunk = diff_by_key.get((ev.get("commit"), ev.get("old_path")))
-                if hunk:
-                    ev["hunk"] = hunk
+        attach_file_diffs(code_events, file_diffs)
 
-    # Drop any shallow-boundary commit whose diff is a whole-tree phantom (its parent
-    # was grafted away by the bounded clone) — guards both walks against inflation.
+    # Fallback when deepening could not resolve it: drop any shallow-boundary
+    # commit's whole-tree phantom (its parent was grafted away by the bounded clone)
+    # from BOTH walks AND clear its commit file list, so area_paths / modules /
+    # touches / train code_areas are not inflated either (#68).
     _boundary = shallow_boundary_shas(clone_dir)
     code_events = drop_boundary_events(code_events, _boundary)
     symbol_events = drop_boundary_events(symbol_events, _boundary)
     _boundary_dropped = in_window_boundary_commits(_boundary, commits)
+    for c in commits:
+        if c.get("sha") in _boundary:
+            c["files"] = []
     if _boundary_dropped:
         sys.stderr.write(
             f"warning: {len(_boundary_dropped)} in-window commit(s) sit at the shallow "
-            f"clone boundary; their whole-tree phantom diffs were dropped (a visible gap "
-            f"in meta.boundary_dropped_commits) — widen the clone margin "
+            f"clone boundary and deepening the clone did not resolve it; their "
+            f"whole-tree phantom diffs and file lists were dropped (a visible gap in "
+            f"meta.boundary_dropped_commits) — widen the clone margin "
             f"(ACTIVITY_CLONE_MARGIN_DAYS, default {CLONE_MARGIN_DAYS}) and re-gather "
             f"to recover: {_boundary_dropped}\n")
 
@@ -3559,9 +4024,9 @@ def acquire(args, env):
             if overlaps:
                 kept[sid] = s
         sprints = kept
-        slug = f"{owner}/{repo}"
+        board = _board_index(items_by_ref, f"{owner}/{repo}")
         for it in prs + issues:
-            facts = items_by_ref.get((slug, it.get("number")))
+            facts = board.get(it.get("number"))
             if not facts:
                 continue
             if facts.get("status") is not None:
@@ -3820,22 +4285,30 @@ def _cross_repo_pr_edges(pr, project, current_repo, members):
       - a ref to a MEMBER repo -> an edge tuple (src_pid, dst_id, kind, None, None)
         where kind is 'closes'/'cross_ref' and dst is the target repo's issue/pr;
       - a ref to a NON-member repo -> an external_refs dict {repo, number, kind}.
-    Same-repo refs are skipped (the bare-#N path already covers them). Pure."""
+    Same-repo refs are skipped (the bare-#N path already covers them).
+
+    Repo slugs compare case-insensitively (issue #70): a ref in any spelling of
+    the current repo is same-repo, and a member ref's edge targets the member's
+    CANONICAL (manifest) spelling, so ids never fork into two id spaces.
+    External refs keep the spelling they were written with. Pure."""
     pid = graphstore.qualify_id(project, current_repo, "pr-{}".format(pr["number"]))
     text = (pr.get("title", "") or "") + "\n" + (pr.get("body") or "")
     refs = parse_qualified_refs(text) + list(pr.get("timeline_xrefs") or [])
+    index = manifest_mod.slug_index(members)
+    current = (current_repo or "").lower()
     edges, external, seen = [], [], set()
     for r in refs:
         slug = "{}/{}".format(r["owner"], r["repo"])
-        if slug == current_repo:
+        if slug.lower() == current:
             continue
         local = ("pr-" if r.get("is_pr") else "issue-") + str(r["number"])
-        key = (slug, local, r["kind"])
+        key = (slug.lower(), local, r["kind"])
         if key in seen:
             continue
         seen.add(key)
-        if slug in members:
-            edges.append((pid, graphstore.qualify_id(project, slug, local),
+        member = manifest_mod.canonical_slug(slug, index)
+        if member is not None:
+            edges.append((pid, graphstore.qualify_id(project, member, local),
                           r["kind"], None, None))
         else:
             external.append({"repo": slug, "number": r["number"], "kind": r["kind"]})
@@ -3872,19 +4345,41 @@ def parse_registry_source(src):
 
 def resolve_registry_member(src, project, members, registry_by_slug):
     """Resolve a registry source to a member's root-area qualified id, or None.
-    Exact (manifest `registry` equals `src`) wins over the HashiCorp naming
-    convention (`namespace/name/provider` -> `{namespace}/terraform-{provider}-{name}`).
-    Pure. Case-sensitive; the convention assumes a lowercase provider (GitHub slugs are case-sensitive)."""
-    for slug in sorted(members):                       # exact, deterministic
-        if src and registry_by_slug.get(slug) == src:
-            return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
-    parsed = parse_registry_source(src)
-    if parsed is None:
+    Exact (the manifest `registry` names the same module as `src`) wins over the
+    HashiCorp naming convention (`namespace/name/provider` ->
+    `{namespace}/terraform-{provider}-{name}`).
+
+    Both sides are normalised (issue #70) through manifest.registry_identity:
+    `//submodule` dropped, case-insensitive, an omitted host equal to
+    `registry.terraform.io`. Any other host is a different registry: it only
+    matches a member declared with that same host, and never the convention. A manifest
+    `registry` value that does not parse as a registry address still matches an
+    identical (case-insensitive) raw `src`. The returned id uses the member's
+    manifest spelling. Pure, deterministic (members tried in sorted order)."""
+    if not src:
         return None
-    namespace, name, provider = parsed
-    slug = "{}/terraform-{}-{}".format(namespace, provider, name)
-    if slug in members:
-        return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+    registry_by_slug = registry_by_slug or {}
+    want = manifest_mod.registry_identity(src)
+    for slug in sorted(members):                       # exact, deterministic
+        reg = registry_by_slug.get(slug)
+        if not reg:
+            continue
+        reg_id = manifest_mod.registry_identity(reg)
+        if reg_id is not None:
+            if reg_id == want:
+                return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+        elif reg.lower() == src.lower():
+            return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+    # The naming convention maps a PUBLIC registry address to a GitHub repo; a
+    # module on another registry host says nothing about a member repo.
+    if want is None or want[0] != manifest_mod.DEFAULT_REGISTRY_HOST:
+        return None
+    namespace, name, provider = parse_registry_source(src)
+    member = manifest_mod.canonical_slug(
+        "{}/terraform-{}-{}".format(namespace, provider, name),
+        manifest_mod.slug_index(members))
+    if member is not None:
+        return graphstore.qualify_id(project, member, _ROOT_AREA_LOCAL)
     return None
 
 

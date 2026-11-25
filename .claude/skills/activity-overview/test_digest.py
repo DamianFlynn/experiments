@@ -46,6 +46,113 @@ def _seed_two_member_store(conn):
                        members=members)
 
 
+def _seed_ticket_store(conn, body1="Implements ABC-123", body2="Implements ABC-123"):
+    """Two members (Azure/r1, Azure/r2), each one merged PR closing a local issue,
+    with NO spine link between them; the PR bodies are `body1` / `body2`."""
+    graphstore.init_schema(conn)
+    members = {"Azure/r1", "Azure/r2"}
+    for repo, pr_n, iss_n, body in (("Azure/r1", 1, 2, body1),
+                                    ("Azure/r2", 3, 4, body2)):
+        b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                      "from": "2026-01-01", "to": "2026-01-31",
+                      "base_branch": "main"},
+             "prs": [{"number": pr_n, "url": "u/{}".format(pr_n),
+                      "state": "closed", "merged": True, "base": "main",
+                      "head": "h{}".format(pr_n),
+                      "merged_at": "2026-01-05T00:00:00Z",
+                      "created_at": "2026-01-02T00:00:00Z",
+                      "closed_at": "2026-01-05T00:00:00Z",
+                      "closes": [iss_n], "crossref_issues": [],
+                      "title": "feat", "body": body}],
+             "issues": [{"number": iss_n, "url": "u/i{}".format(iss_n),
+                         "state": "closed", "closed_at": "2026-01-04T00:00:00Z",
+                         "updated_at": "2026-01-04T00:00:00Z"}],
+             "commits": [], "code_events": [], "milestones": [],
+             "releases": [], "code_graph": {"areas": []}}
+        gather.fold_bundle(conn, b, project="proj", repo=repo, members=members)
+
+
+class TestBogusTicketClusters(unittest.TestCase):
+    """Issue #74 problem 1: UTF-8 / SHA-256 / CVE ids must not glue trains."""
+    FRM, TO = "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"
+    NOISE = "Encode as UTF-8, hash with SHA-256 (HTTP-200, ISO-8601, CVE-2024-1234)"
+
+    def _view(self, **kw):
+        conn = graphstore.open_store(":memory:")
+        _seed_ticket_store(conn, body1=self.NOISE, body2=self.NOISE + " again")
+        return digest.build_project_view(conn, "proj", ["Azure/r1", "Azure/r2"],
+                                         self.FRM, self.TO, **kw)
+
+    def test_default_produces_no_related_work(self):
+        view = self._view()
+        self.assertEqual(len(view["trains"]), 2)
+        self.assertEqual(view["related_work"], [])
+        self.assertTrue(all(t["tickets"] == [] for t in view["trains"]))
+
+    def test_declared_prefixes_ignore_noise_tokens(self):
+        view = self._view(ticket_pattern=digest.ticket_pattern_from_prefixes(["ABC"]))
+        self.assertEqual(view["related_work"], [])
+
+    def test_real_shared_ticket_clusters_when_enabled(self):
+        conn = graphstore.open_store(":memory:")
+        _seed_ticket_store(conn, body1=self.NOISE + " ABC-123",
+                           body2="see ABC-123 " + self.NOISE)
+        view = digest.build_project_view(
+            conn, "proj", ["Azure/r1", "Azure/r2"], self.FRM, self.TO,
+            ticket_pattern=digest.ticket_pattern_from_prefixes(["ABC", "PLAT"]))
+        self.assertEqual(view["related_work"], [{
+            "ticket": "ABC-123",
+            "train_ids": sorted(t["id"] for t in view["trains"])}])
+        self.assertTrue(all(t["tickets"] == ["ABC-123"] for t in view["trains"]))
+
+
+class TestMemberMeta(unittest.TestCase):
+    """Issue #74 problem 3: member meta.owner stays the project scope
+    (append-only); digest adds the real owner/name plus project and slug."""
+
+    def test_manifest_member_meta_has_real_owner_and_slug(self):
+        conn = graphstore.open_store(":memory:")
+        _seed_two_member_store(conn)
+        view = digest.build_project_view(
+            conn, "proj", ["Azure/mod-a", "Azure/mod-b"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        meta = view["members"][0]["bundle"]["meta"]
+        self.assertEqual(meta["owner"], "proj")             # unchanged
+        self.assertEqual(meta["repo"], "Azure/mod-a")       # unchanged
+        self.assertEqual(meta["repo_owner"], "Azure")
+        self.assertEqual(meta["repo_name"], "mod-a")
+        self.assertEqual(meta["project"], "proj")
+        self.assertEqual(meta["slug"], "Azure/mod-a")
+        self.assertEqual(view["members"][1]["bundle"]["meta"]["slug"], "Azure/mod-b")
+
+    def test_member_meta_is_appended_not_reordered(self):
+        conn = graphstore.open_store(":memory:")
+        _seed_two_member_store(conn)
+        members = digest.member_bundles(
+            conn, "proj", ["Azure/mod-a"],
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+        keys = list(members[0]["bundle"]["meta"])
+        self.assertEqual(keys[:2], ["owner", "repo"])
+        self.assertEqual(keys[-4:], ["project", "slug", "repo_owner", "repo_name"])
+
+    def test_single_repo_store_member_meta(self):
+        # a single-repo gather keys the store as project=<owner>, repo=<name>.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        b = {"meta": {"owner": "Azure", "repo": "bicep", "from": "2026-01-01",
+                      "to": "2026-01-31", "base_branch": "main"},
+             "prs": [], "issues": [], "commits": [], "code_events": [],
+             "milestones": [], "releases": [], "code_graph": {"areas": []}}
+        gather.fold_bundle(conn, b, project="Azure", repo="bicep")
+        members = digest.member_bundles(conn, "Azure", ["bicep"],
+                                        "2026-01-01", "2026-01-31")
+        meta = members[0]["bundle"]["meta"]
+        self.assertEqual((meta["owner"], meta["repo"]), ("Azure", "bicep"))
+        self.assertEqual((meta["project"], meta["slug"], meta["repo_owner"],
+                          meta["repo_name"]),
+                         ("Azure", "Azure/bicep", "Azure", "bicep"))
+
+
 class TestMemberBundles(unittest.TestCase):
     def test_one_enriched_bundle_per_member(self):
         conn = graphstore.open_store(":memory:")
@@ -304,10 +411,28 @@ class TestBuildProjectTrainsUnit(unittest.TestCase):
 
 
 class TestTicketGrouping(unittest.TestCase):
-    def test_parse_ticket_refs_default_pattern(self):
+    def test_parse_ticket_refs_explicit_pattern(self):
+        pat = re.compile(r"\b([A-Z]{2,}-\d+)\b")
         self.assertEqual(
-            digest.parse_ticket_refs("see ABC-1234 and ABC-1234 and XY-7, not A1"),
-            ["ABC-1234", "XY-7"])  # ordered, deduped; needs >=2 letters then -digits
+            digest.parse_ticket_refs("see ABC-1234 and ABC-1234 and XY-7, not A1",
+                                     pat),
+            ["ABC-1234", "XY-7"])  # ordered, deduped
+
+    def test_parse_ticket_refs_no_pattern_is_off(self):
+        # Issue #74: ticket parsing is opt-in; with no pattern nothing matches.
+        self.assertEqual(digest.parse_ticket_refs("ABC-1 UTF-8 SHA-256"), [])
+
+    def test_prefix_pattern_matches_only_declared_prefixes(self):
+        pat = digest.ticket_pattern_from_prefixes(["ABC", "PLAT"])
+        self.assertEqual(pat.pattern, r"\b(?:ABC|PLAT)-\d+\b")
+        self.assertEqual(
+            digest.parse_ticket_refs(
+                "ABC-12, PLAT-3, UTF-8, SHA-256, XABC-9, ABC-12x, CVE-2024-1", pat),
+            ["ABC-12", "PLAT-3"])
+
+    def test_prefix_pattern_none_when_no_prefixes(self):
+        self.assertIsNone(digest.ticket_pattern_from_prefixes([]))
+        self.assertIsNone(digest.ticket_pattern_from_prefixes(None))
 
     def test_parse_ticket_refs_empty(self):
         self.assertEqual(digest.parse_ticket_refs(None), [])
@@ -403,7 +528,8 @@ class TestProjectViewTicketIntegration(unittest.TestCase):
                            repo="Azure/r2", members=members)
         view = digest.build_project_view(
             conn, "proj", ["Azure/r1", "Azure/r2"],
-            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+            "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z",
+            ticket_pattern=digest.ticket_pattern_from_prefixes(["ABC"]))
         # each train carries the ticket parsed from its PR body
         self.assertTrue(all("ABC-123" in t["tickets"] for t in view["trains"]))
         self.assertEqual(len(view["trains"]), 2)
@@ -449,6 +575,120 @@ class TestDigestCli(unittest.TestCase):
             rc = digest.main(args)
         return rc, buf.getvalue()
 
+    def _run_store(self, args, seed=None, manifest_obj=None):
+        """Run main against a fresh on-disk store (seeded by `seed`, default the
+        two-member store); a "{manifest}" arg is replaced by the path of a
+        written `manifest_obj`. Returns (rc, stdout, stderr)."""
+        import io, contextlib, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "j.db")
+            disk = graphstore.open_store(store)
+            (seed or _seed_two_member_store)(disk)
+            disk.close()
+            mpath = os.path.join(tmp, "m.json")
+            if manifest_obj is not None:
+                with open(mpath, "w", encoding="utf-8") as fh:
+                    json.dump(manifest_obj, fh)
+            args = [mpath if a == "{manifest}" else a for a in args]
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = digest.main(["--store", store] + args)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_main_unknown_repo_exits_2_listing_repos(self):
+        rc, out, err = self._run_store(["--project", "proj", "--repo", "Azure/nope",
+                                        "--from", "2026-01-01", "--to", "2026-01-31"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("repo 'Azure/nope' has no nodes in project 'proj'", err)
+        self.assertIn("['Azure/mod-a', 'Azure/mod-b']", err)
+
+    def test_main_invalid_or_inverted_window_exits_2(self):
+        for frm, to in (("2026-01-31", "2026-01-01"),
+                        ("2026-01-31T00:00:00Z", "2026-01-30T23:59:59Z"),
+                        ("garbage", "2026-01-31"),
+                        ("2026-01-01", "2026-02-30"),
+                        ("2026-01-01Tjunk", "2026-01-31")):
+            with self.subTest(frm=frm, to=to):
+                rc, out, err = self._run_store(["--project", "proj",
+                                                "--from", frm, "--to", to])
+                self.assertEqual(rc, 2)
+                self.assertEqual(out, "")
+                self.assertIn("digest.py: error:", err)
+
+    def test_main_missing_store_exits_2_and_creates_nothing(self):
+        import io, contextlib, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "absent.db")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = digest.main(["--store", store, "--project", "proj",
+                                  "--from", "2026-01-01", "--to", "2026-01-31"])
+            self.assertEqual(rc, 2)
+            self.assertFalse(os.path.exists(store))
+            self.assertIn("does not exist", err.getvalue())
+
+    _MAN = {"project": "proj", "window": {"from": "2026-01-01", "to": "2026-01-31"},
+            "repos": [{"owner": "Azure", "repo": "r1"},
+                      {"owner": "Azure", "repo": "r2"}],
+            "ticket_prefixes": ["ABC"]}
+
+    def test_main_manifest_ticket_prefixes_enable_clustering(self):
+        rc, out, _err = self._run_store(
+            ["--project", "proj", "--manifest", "{manifest}",
+             "--from", "2026-01-01", "--to", "2026-01-31"],
+            seed=_seed_ticket_store, manifest_obj=self._MAN)
+        self.assertEqual(rc, 0)
+        view = json.loads(out)
+        self.assertEqual([g["ticket"] for g in view["related_work"]], ["ABC-123"])
+
+    def test_main_manifest_supplies_project(self):
+        rc, out, _err = self._run_store(
+            ["--manifest", "{manifest}", "--from", "2026-01-01", "--to", "2026-01-31"],
+            seed=_seed_ticket_store, manifest_obj=self._MAN)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["meta"]["project"], "proj")
+
+    def test_main_no_tickets_by_default(self):
+        rc, out, _err = self._run_store(
+            ["--project", "proj", "--from", "2026-01-01", "--to", "2026-01-31"],
+            seed=_seed_ticket_store)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["related_work"], [])
+
+    def test_main_ticket_pattern_wins_over_manifest(self):
+        rc, out, _err = self._run_store(
+            ["--project", "proj", "--manifest", "{manifest}",
+             "--ticket-pattern", r"\bNOPE-\d+\b",
+             "--from", "2026-01-01", "--to", "2026-01-31"],
+            seed=_seed_ticket_store, manifest_obj=self._MAN)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["related_work"], [])
+
+    def test_main_manifest_project_mismatch_exits_2(self):
+        rc, out, err = self._run_store(
+            ["--project", "other", "--manifest", "{manifest}",
+             "--from", "2026-01-01", "--to", "2026-01-31"],
+            seed=_seed_ticket_store, manifest_obj=self._MAN)
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("does not match --manifest project 'proj'", err)
+
+    def test_main_invalid_manifest_exits_2(self):
+        bad = dict(self._MAN, ticket_prefixes=["AB-C"])
+        rc, out, err = self._run_store(
+            ["--project", "proj", "--manifest", "{manifest}",
+             "--from", "2026-01-01", "--to", "2026-01-31"],
+            seed=_seed_ticket_store, manifest_obj=bad)
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("ticket_prefixes", err)
+
+    def test_main_needs_project_or_manifest(self):
+        rc, out, err = self._run_store(["--from", "2026-01-01", "--to", "2026-01-31"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--project", err)
+
     def test_main_emits_project_view_json(self):
         import io
         import tempfile
@@ -482,18 +722,16 @@ class TestDigestCli(unittest.TestCase):
         self.assertEqual(view["meta"]["repos"], ["Azure/mod-a"])
         self.assertEqual([m["repo"] for m in view["members"]], ["Azure/mod-a"])
 
-    def test_main_unknown_project_is_empty_view(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            store = os.path.join(tmp, "j.db")
-            disk = graphstore.open_store(store); _seed_two_member_store(disk); disk.close()
-            rc, out = self._run(["--store", store, "--project", "nope",
-                                 "--from", "2026-01-01T00:00:00Z",
-                                 "--to", "2026-01-31T23:59:59Z"])
-        self.assertEqual(rc, 0)
-        view = json.loads(out)
-        self.assertEqual(view["meta"]["repos"], [])
-        self.assertEqual(view["trains"], [])
+    def test_main_unknown_project_exits_2(self):
+        # Issue #74: was an empty view + exit 0; now a usage error naming the
+        # projects the store holds.
+        rc, out, err = self._run_store(["--project", "nope",
+                                        "--from", "2026-01-01T00:00:00Z",
+                                        "--to", "2026-01-31T23:59:59Z"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("project 'nope' is not in the store", err)
+        self.assertIn("['proj']", err)
 
     def test_main_custom_ticket_pattern_accepted(self):
         import tempfile
@@ -566,7 +804,9 @@ class TestProjectDigestIntegration(unittest.TestCase):
 
         frm, to = "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"
         repos = graphstore.project_repos(conn, "proj")
-        view = digest.build_project_view(conn, "proj", repos, frm, to)
+        view = digest.build_project_view(
+            conn, "proj", repos, frm, to,
+            ticket_pattern=digest.ticket_pattern_from_prefixes(["ADO"]))
 
         # one cross-repo train (A+B) and one standalone train (C)
         spanning = [t for t in view["trains"] if len(t["repos"]) > 1]

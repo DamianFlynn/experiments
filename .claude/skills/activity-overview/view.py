@@ -100,6 +100,9 @@ def resolve_scope(conn, project, repo):
                     "view use digest.py)")
         raise ValueError(msg)
     if repo is not None:
+        # Any casing of a stored repo selects it (GitHub names are
+        # case-insensitive, issue #70); the stored spelling is what extract reads.
+        repo = detected = graphstore.resolve_repo(conn, project, repo)
         repos = graphstore.project_repos(conn, project)
         if repo not in repos:
             raise ValueError(

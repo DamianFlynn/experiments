@@ -295,3 +295,33 @@ class TestFullStringValidation(unittest.TestCase):
             with self.subTest(a=a, b=b):
                 with self.assertRaises(ValueError):
                     manifest.check_reader_window(a, b)
+
+
+class TestTicketPrefixes(unittest.TestCase):
+    """Issue #74: optional `ticket_prefixes` opts a project into digest's
+    ticket clustering: a list of distinct, non-empty ASCII letter/digit strings."""
+
+    def _load(self, obj):
+        with tempfile.TemporaryDirectory() as tmp:
+            return manifest.load_manifest(_write(tmp, obj))
+
+    def test_absent_defaults_to_empty_list(self):
+        self.assertEqual(self._load(_man())["ticket_prefixes"], [])
+
+    def test_valid_prefixes_kept_in_order(self):
+        obj = dict(_man(), ticket_prefixes=["PLAT", "ABC", "X9"])
+        self.assertEqual(self._load(obj)["ticket_prefixes"], ["PLAT", "ABC", "X9"])
+
+    def test_empty_list_is_allowed(self):
+        self.assertEqual(self._load(dict(_man(), ticket_prefixes=[]))
+                         ["ticket_prefixes"], [])
+
+    def test_rejects_bad_values(self):
+        for bad in ("ABC", None, ["ABC", ""], ["AB-C"], ["ABC\n"], [7], ["A B"],
+                    {"ABC": 1}, ["ABC", "ABC"], ["É"]):
+            with self.subTest(bad=bad):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = _write(tmp, dict(_man(), ticket_prefixes=bad))
+                    with self.assertRaisesRegex(ValueError,
+                                                "manifest: .*ticket_prefixes"):
+                        manifest.load_manifest(path)

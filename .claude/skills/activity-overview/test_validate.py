@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import graphstore
@@ -41,155 +42,149 @@ def _check(report, name):
 
 # --- clean store passes everything --------------------------------------------
 
-def test_clean_store_passes_all_checks():
-    conn = _clean_store()
-    report = validate.validate(conn, project="o", repo="r")
-    assert report.ok is True, [c for c in report.checks if not c["ok"]]
-    # every individual check is ok
-    for c in report.checks:
-        assert c["ok"], c
+class TestCleanStore(unittest.TestCase):
+    def test_clean_store_passes_all_checks(self):
+        conn = _clean_store()
+        report = validate.validate(conn, project="o", repo="r")
+        self.assertIs(report.ok, True, [c for c in report.checks if not c["ok"]])
+        # every individual check is ok
+        for c in report.checks:
+            self.assertTrue(c["ok"], c)
 
+    def test_clean_store_with_bundle_passes_drift_and_idempotency(self):
+        conn = _clean_store()
+        report = validate.validate(conn, project="o", repo="r", bundle=_bundle())
+        self.assertIs(report.ok, True, [c for c in report.checks if not c["ok"]])
+        names = {c["name"] for c in report.checks}
+        self.assertIn("no_drift", names)
+        self.assertIn("idempotency", names)
 
-def test_clean_store_with_bundle_passes_drift_and_idempotency():
-    conn = _clean_store()
-    report = validate.validate(conn, project="o", repo="r", bundle=_bundle())
-    assert report.ok is True, [c for c in report.checks if not c["ok"]]
-    names = {c["name"] for c in report.checks}
-    assert "no_drift" in names
-    assert "idempotency" in names
-
-
-def test_project_repo_autodetected_from_store():
-    conn = _clean_store()
-    report = validate.validate(conn)  # no project/repo passed
-    assert report.ok is True, [c for c in report.checks if not c["ok"]]
+    def test_project_repo_autodetected_from_store(self):
+        conn = _clean_store()
+        report = validate.validate(conn)  # no project/repo passed
+        self.assertIs(report.ok, True, [c for c in report.checks if not c["ok"]])
 
 
 # --- corruption catches -------------------------------------------------------
 
-def test_delete_carol_person_fails_participant_completeness():
-    conn = _clean_store()
-    conn.execute("DELETE FROM nodes WHERE id=?", ("o#person-carol",))
-    conn.commit()
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "participant_completeness")
-    assert c["ok"] is False
-    assert c["severity"] == "ERROR"
-    assert any("carol" in str(d) for d in c["details"]), c["details"]
-    assert report.ok is False
+class TestCorruptionCatches(unittest.TestCase):
+    def test_delete_carol_person_fails_participant_completeness(self):
+        conn = _clean_store()
+        conn.execute("DELETE FROM nodes WHERE id=?", ("o#person-carol",))
+        conn.commit()
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "participant_completeness")
+        self.assertIs(c["ok"], False)
+        self.assertEqual(c["severity"], "ERROR")
+        self.assertTrue(any("carol" in str(d) for d in c["details"]), c["details"])
+        self.assertIs(report.ok, False)
 
+    def test_delete_authored_edge_fails_participant_completeness(self):
+        conn = _clean_store()
+        conn.execute(
+            "DELETE FROM edges WHERE edge_type='authored' AND src_id=? AND dst_id=?",
+            ("o#person-alice", "o/r#pr-42"))
+        conn.commit()
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "participant_completeness")
+        self.assertIs(c["ok"], False)
+        self.assertEqual(c["severity"], "ERROR")
+        self.assertTrue(
+            any("alice" in str(d) and "authored" in str(d) for d in c["details"]),
+            c["details"])
 
-def test_delete_authored_edge_fails_participant_completeness():
-    conn = _clean_store()
-    conn.execute(
-        "DELETE FROM edges WHERE edge_type='authored' AND src_id=? AND dst_id=?",
-        ("o#person-alice", "o/r#pr-42"))
-    conn.commit()
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "participant_completeness")
-    assert c["ok"] is False
-    assert c["severity"] == "ERROR"
-    assert any("alice" in str(d) and "authored" in str(d) for d in c["details"]), \
-        c["details"]
+    def test_dangling_nonspine_edge_fails_referential_integrity(self):
+        conn = _clean_store()
+        graphstore.upsert_edge(conn, "o#person-alice", "o/r#pr-9999", "authored")
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "referential_integrity")
+        self.assertIs(c["ok"], False)
+        self.assertEqual(c["severity"], "ERROR")
+        self.assertTrue(any("pr-9999" in str(d) for d in c["details"]), c["details"])
 
+    def test_dangling_spine_edge_is_not_error(self):
+        conn = _clean_store()
+        # A PR that closes an out-of-window (not-yet-gathered) issue: legitimate
+        # backfill case. closes is a spine edge -> INFO, not ERROR.
+        graphstore.upsert_edge(conn, "o/r#pr-42", "o/r#issue-9999", "closes")
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "referential_integrity")
+        self.assertIs(c["ok"], True, c["details"])
+        # but it IS surfaced as INFO / missing thread
+        self.assertTrue(any(d.get("severity") == "INFO" and "issue-9999" in str(d)
+                            for d in c["details"]), c["details"])
 
-def test_dangling_nonspine_edge_fails_referential_integrity():
-    conn = _clean_store()
-    graphstore.upsert_edge(conn, "o#person-alice", "o/r#pr-9999", "authored")
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "referential_integrity")
-    assert c["ok"] is False
-    assert c["severity"] == "ERROR"
-    assert any("pr-9999" in str(d) for d in c["details"]), c["details"]
+    def test_strip_pr_url_and_number_fails_provenance(self):
+        conn = _clean_store()
+        node = graphstore.get_node(conn, "o/r#pr-42")
+        data = dict(node["data"])
+        data.pop("url", None)
+        data.pop("number", None)
+        graphstore.upsert_node(conn, node["id"], node["project"], node["repo"],
+                               node["node_class"], node["ts"], data)
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "provenance")
+        self.assertIs(c["ok"], False)
+        self.assertEqual(c["severity"], "ERROR")
+        self.assertTrue(any("pr-42" in str(d) for d in c["details"]), c["details"])
 
+    def test_orphan_person_fails_no_fabrication(self):
+        conn = _clean_store()
+        # A person with no contribution edge whatsoever = invented contributor.
+        graphstore.upsert_node(conn, "o#person-ghost", "o", "*", "structure",
+                               None, {"login": "ghost", "modules": [], "areas": []})
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "no_fabrication")
+        self.assertIs(c["ok"], False)
+        self.assertEqual(c["severity"], "ERROR")
+        self.assertTrue(any("ghost" in str(d) for d in c["details"]), c["details"])
 
-def test_dangling_spine_edge_is_not_error():
-    conn = _clean_store()
-    # A PR that closes an out-of-window (not-yet-gathered) issue: legitimate
-    # backfill case. closes is a spine edge -> INFO, not ERROR.
-    graphstore.upsert_edge(conn, "o/r#pr-42", "o/r#issue-9999", "closes")
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "referential_integrity")
-    assert c["ok"] is True, c["details"]
-    # but it IS surfaced as INFO / missing thread
-    assert any(d.get("severity") == "INFO" and "issue-9999" in str(d)
-               for d in c["details"]), c["details"]
+    def test_mutated_person_data_fails_no_drift_with_bundle(self):
+        conn = _clean_store()
+        node = graphstore.get_node(conn, "o#person-carol")
+        data = dict(node["data"])
+        data["areas"] = ["totally-made-up-area"]  # diverge from re-derivation
+        graphstore.upsert_node(conn, node["id"], node["project"], node["repo"],
+                               node["node_class"], node["ts"], data)
+        report = validate.validate(conn, project="o", repo="r", bundle=_bundle())
+        c = _check(report, "no_drift")
+        self.assertIs(c["ok"], False)
+        self.assertEqual(c["severity"], "ERROR")
+        self.assertTrue(any("carol" in str(d) for d in c["details"]), c["details"])
 
+    def test_no_drift_self_sourced_without_bundle(self):
+        """Store-only world (Phase 7): with no --bundle, no_drift + idempotency
+        SELF-SOURCE the raw bundle from the store via extract and still run (and
+        pass on a clean store), so the trust gate is self-contained on a store."""
+        conn = _clean_store()
+        report = validate.validate(conn, project="o", repo="r")
+        names = {c["name"] for c in report.checks}
+        self.assertIn("no_drift", names)
+        self.assertIn("idempotency", names)
+        self.assertIs(_check(report, "no_drift")["ok"], True,
+                      _check(report, "no_drift"))
+        self.assertIs(_check(report, "idempotency")["ok"], True,
+                      _check(report, "idempotency"))
+        self.assertIs(report.ok, True, [c for c in report.checks if not c["ok"]])
 
-def test_strip_pr_url_and_number_fails_provenance():
-    conn = _clean_store()
-    node = graphstore.get_node(conn, "o/r#pr-42")
-    data = dict(node["data"])
-    data.pop("url", None)
-    data.pop("number", None)
-    graphstore.upsert_node(conn, node["id"], node["project"], node["repo"],
-                           node["node_class"], node["ts"], data)
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "provenance")
-    assert c["ok"] is False
-    assert c["severity"] == "ERROR"
-    assert any("pr-42" in str(d) for d in c["details"]), c["details"]
+    def test_empty_id_node_fails_no_fabrication(self):
+        conn = _clean_store()
+        conn.execute(
+            "INSERT INTO nodes (id, project, repo, node_class, ts, data, fetched_at) "
+            "VALUES ('', 'o', 'r', 'social', NULL, '{}', 'now')")
+        conn.commit()
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "no_fabrication")
+        self.assertIs(c["ok"], False)
 
-
-def test_orphan_person_fails_no_fabrication():
-    conn = _clean_store()
-    # A person with no contribution edge whatsoever = invented contributor.
-    graphstore.upsert_node(conn, "o#person-ghost", "o", "*", "structure",
-                           None, {"login": "ghost", "modules": [], "areas": []})
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "no_fabrication")
-    assert c["ok"] is False
-    assert c["severity"] == "ERROR"
-    assert any("ghost" in str(d) for d in c["details"]), c["details"]
-
-
-def test_mutated_person_data_fails_no_drift_with_bundle():
-    conn = _clean_store()
-    node = graphstore.get_node(conn, "o#person-carol")
-    data = dict(node["data"])
-    data["areas"] = ["totally-made-up-area"]  # diverge from re-derivation
-    graphstore.upsert_node(conn, node["id"], node["project"], node["repo"],
-                           node["node_class"], node["ts"], data)
-    report = validate.validate(conn, project="o", repo="r", bundle=_bundle())
-    c = _check(report, "no_drift")
-    assert c["ok"] is False
-    assert c["severity"] == "ERROR"
-    assert any("carol" in str(d) for d in c["details"]), c["details"]
-
-
-def test_no_drift_self_sourced_without_bundle():
-    """Store-only world (Phase 7): with no --bundle, no_drift + idempotency
-    SELF-SOURCE the raw bundle from the store via extract and still run (and
-    pass on a clean store), so the trust gate is self-contained on a store."""
-    conn = _clean_store()
-    report = validate.validate(conn, project="o", repo="r")
-    names = {c["name"] for c in report.checks}
-    assert "no_drift" in names
-    assert "idempotency" in names
-    assert _check(report, "no_drift")["ok"] is True, _check(report, "no_drift")
-    assert _check(report, "idempotency")["ok"] is True, _check(report, "idempotency")
-    assert report.ok is True, [c for c in report.checks if not c["ok"]]
-
-
-def test_empty_id_node_fails_no_fabrication():
-    conn = _clean_store()
-    conn.execute(
-        "INSERT INTO nodes (id, project, repo, node_class, ts, data, fetched_at) "
-        "VALUES ('', 'o', 'r', 'social', NULL, '{}', 'now')")
-    conn.commit()
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "no_fabrication")
-    assert c["ok"] is False
-
-
-def test_schema_conformance_catches_wrong_authored_endpoint():
-    conn = _clean_store()
-    # authored src must be a person- id. Point one at a non-person src.
-    graphstore.upsert_edge(conn, "o/r#pr-42", "o/r#pr-42", "authored")
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "schema_conformance")
-    assert c["ok"] is False
-    assert c["severity"] == "ERROR"
+    def test_schema_conformance_catches_wrong_authored_endpoint(self):
+        conn = _clean_store()
+        # authored src must be a person- id. Point one at a non-person src.
+        graphstore.upsert_edge(conn, "o/r#pr-42", "o/r#pr-42", "authored")
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "schema_conformance")
+        self.assertIs(c["ok"], False)
+        self.assertEqual(c["severity"], "ERROR")
 
 
 # --- Phase 10 slice 1: review/event social nodes + part_of spine -------------
@@ -227,47 +222,45 @@ def _lifecycle_store():
     return conn
 
 
-def test_review_event_id_kinds_classified():
-    conn = _lifecycle_store()
-    cache = {}
-    assert validate._id_kind(conn, "o/r#review-7-100", cache) == "review"
-    assert validate._id_kind(conn, "o/r#event-pr-7-200", cache) == "event"
-    assert validate._id_kind(conn, "o/r#event-issue-3-300", cache) == "event"
+class TestReviewEventSocialNodes(unittest.TestCase):
+    def test_review_event_id_kinds_classified(self):
+        conn = _lifecycle_store()
+        cache = {}
+        self.assertEqual(validate._id_kind(conn, "o/r#review-7-100", cache), "review")
+        self.assertEqual(validate._id_kind(conn, "o/r#event-pr-7-200", cache), "event")
+        self.assertEqual(validate._id_kind(conn, "o/r#event-issue-3-300", cache),
+                         "event")
 
+    def test_review_event_part_of_schema_conforms(self):
+        conn = _lifecycle_store()
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "schema_conformance")
+        self.assertIs(c["ok"], True, c["details"])
 
-def test_review_event_part_of_schema_conforms():
-    conn = _lifecycle_store()
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "schema_conformance")
-    assert c["ok"] is True, c["details"]
+    def test_review_event_nodes_are_sourced(self):
+        conn = _lifecycle_store()
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "provenance")
+        self.assertIs(c["ok"], True, c["details"])
 
+    def test_lifecycle_store_validates_green(self):
+        conn = _lifecycle_store()
+        report = validate.validate(conn, project="o", repo="r")
+        self.assertIs(report.ok, True, [c for c in report.checks if not c["ok"]])
 
-def test_review_event_nodes_are_sourced():
-    conn = _lifecycle_store()
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "provenance")
-    assert c["ok"] is True, c["details"]
-
-
-def test_lifecycle_store_validates_green():
-    conn = _lifecycle_store()
-    report = validate.validate(conn, project="o", repo="r")
-    assert report.ok is True, [c for c in report.checks if not c["ok"]]
-
-
-def test_review_with_orphan_parent_is_info_not_error():
-    # a review whose parent PR is out of window: part_of is spine -> INFO.
-    conn = _lifecycle_store()
-    graphstore.upsert_node(conn, "o/r#review-99-1", "o", "r", "social",
-                           "2026-05-03T00:00:00Z",
-                           {"author": "x", "state": "approved",
-                            "url": "https://gh/o/r/pull/99#r1"})
-    graphstore.upsert_edge(conn, "o/r#review-99-1", "o/r#pr-99", "part_of")
-    report = validate.validate(conn, project="o", repo="r")
-    c = _check(report, "referential_integrity")
-    assert c["ok"] is True, c["details"]
-    assert any(d.get("severity") == "INFO" and "pr-99" in str(d)
-               for d in c["details"]), c["details"]
+    def test_review_with_orphan_parent_is_info_not_error(self):
+        # a review whose parent PR is out of window: part_of is spine -> INFO.
+        conn = _lifecycle_store()
+        graphstore.upsert_node(conn, "o/r#review-99-1", "o", "r", "social",
+                               "2026-05-03T00:00:00Z",
+                               {"author": "x", "state": "approved",
+                                "url": "https://gh/o/r/pull/99#r1"})
+        graphstore.upsert_edge(conn, "o/r#review-99-1", "o/r#pr-99", "part_of")
+        report = validate.validate(conn, project="o", repo="r")
+        c = _check(report, "referential_integrity")
+        self.assertIs(c["ok"], True, c["details"])
+        self.assertTrue(any(d.get("severity") == "INFO" and "pr-99" in str(d)
+                            for d in c["details"]), c["details"])
 
 
 # --- BUG 1: person nodes for ALL participants (live-audit regression) ---------
@@ -324,31 +317,31 @@ def _fold_participants():
     return conn, bundle
 
 
-def test_all_participants_get_person_nodes():
-    conn, _ = _fold_participants()
-    for login in _DROPPED_LOGINS:
-        node = graphstore.get_node(conn, graphstore.qualify_person("o", login))
-        assert node is not None, "missing person node for {}".format(login)
-        assert node["data"]["login"] == login
+class TestAllParticipants(unittest.TestCase):
+    def test_all_participants_get_person_nodes(self):
+        conn, _ = _fold_participants()
+        for login in _DROPPED_LOGINS:
+            node = graphstore.get_node(conn, graphstore.qualify_person("o", login))
+            self.assertIsNotNone(node, "missing person node for {}".format(login))
+            self.assertEqual(node["data"]["login"], login)
 
+    def test_participants_validate_clean(self):
+        conn, bundle = _fold_participants()
+        report = validate.validate(conn, project="o", repo="r", bundle=bundle)
+        # The two checks BUG 1 broke must now pass (no dangling person edges, every
+        # raw login has a person node), and the whole audit is clean.
+        for name in ("participant_completeness", "referential_integrity",
+                     "no_drift"):
+            c = _check(report, name)
+            self.assertIs(c["ok"], True, (name, c["details"]))
+        self.assertIs(report.ok, True, [c for c in report.checks if not c["ok"]])
 
-def test_participants_validate_clean():
-    conn, bundle = _fold_participants()
-    report = validate.validate(conn, project="o", repo="r", bundle=bundle)
-    # The two checks BUG 1 broke must now pass (no dangling person edges, every
-    # raw login has a person node), and the whole audit is clean.
-    for name in ("participant_completeness", "referential_integrity", "no_drift"):
-        c = _check(report, name)
-        assert c["ok"] is True, (name, c["details"])
-    assert report.ok is True, [c for c in report.checks if not c["ok"]]
-
-
-def test_participants_appear_in_extract_people():
-    import extract
-    conn, _ = _fold_participants()
-    out = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31")
-    for login in _DROPPED_LOGINS:
-        assert login in out["people"], login
+    def test_participants_appear_in_extract_people(self):
+        import extract
+        conn, _ = _fold_participants()
+        out = extract.extract(conn, "o", "r", "2026-05-01", "2026-05-31")
+        for login in _DROPPED_LOGINS:
+            self.assertIn(login, out["people"], login)
 
 
 # --- BUG 2: no_drift symbol-artifact id reconstruction (auditor false positive) -
@@ -389,18 +382,19 @@ def _symbol_artifact_bundle():
     }
 
 
-def test_no_drift_no_false_positive_on_symbol_artifact():
-    conn = graphstore.open_store(":memory:")
-    graphstore.init_schema(conn)
-    bundle = _symbol_artifact_bundle()
-    gather.fold_bundle(conn, bundle)
-    report = validate.validate(conn, project="o", repo="r", bundle=bundle)
-    c = _check(report, "no_drift")
-    # No "derived but not stored" (or any) artifact drift for the symbol/comment.
-    bad = [d for d in c["details"]
-           if d.get("kind") == "artifact" and d.get("severity") == "ERROR"]
-    assert bad == [], bad
-    assert c["ok"] is True, c["details"]
+class TestSymbolArtifactNoDrift(unittest.TestCase):
+    def test_no_drift_no_false_positive_on_symbol_artifact(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = _symbol_artifact_bundle()
+        gather.fold_bundle(conn, bundle)
+        report = validate.validate(conn, project="o", repo="r", bundle=bundle)
+        c = _check(report, "no_drift")
+        # No "derived but not stored" (or any) artifact drift for the symbol/comment.
+        bad = [d for d in c["details"]
+               if d.get("kind") == "artifact" and d.get("severity") == "ERROR"]
+        self.assertEqual(bad, [], bad)
+        self.assertIs(c["ok"], True, c["details"])
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -421,31 +415,40 @@ def _run_cli(*args):
         capture_output=True, text=True, cwd=here)
 
 
-def test_cli_passing_store_exits_zero(tmp_path):
-    db = _write_store(tmp_path)
-    r = _run_cli(db, "--project", "o", "--repo", "r")
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "OK" in r.stdout or "ok" in r.stdout.lower()
+class _TmpDirCase(unittest.TestCase):
+    """Gives each test a fresh temporary directory (the stdlib stand-in for the
+    pytest ``tmp_path`` fixture these tests were originally written against)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp_path = tmp.name
 
 
-def test_cli_failing_store_exits_nonzero(tmp_path):
-    db = _write_store(tmp_path)
-    conn = graphstore.open_store(db)
-    conn.execute("DELETE FROM nodes WHERE id=?", ("o#person-carol",))
-    conn.commit()
-    conn.close()
-    r = _run_cli(db, "--project", "o", "--repo", "r")
-    assert r.returncode != 0
-    assert "participant_completeness" in r.stdout
-    assert "carol" in r.stdout
+class TestCli(_TmpDirCase):
+    def test_cli_passing_store_exits_zero(self):
+        db = _write_store(self.tmp_path)
+        r = _run_cli(db, "--project", "o", "--repo", "r")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue("OK" in r.stdout or "ok" in r.stdout.lower(), r.stdout)
 
+    def test_cli_failing_store_exits_nonzero(self):
+        db = _write_store(self.tmp_path)
+        conn = graphstore.open_store(db)
+        conn.execute("DELETE FROM nodes WHERE id=?", ("o#person-carol",))
+        conn.commit()
+        conn.close()
+        r = _run_cli(db, "--project", "o", "--repo", "r")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("participant_completeness", r.stdout)
+        self.assertIn("carol", r.stdout)
 
-def test_cli_with_bundle_runs_drift(tmp_path):
-    db = _write_store(tmp_path)
-    r = _run_cli(db, "--project", "o", "--repo", "r",
-                 "--bundle", os.path.join(FIX, "bundle_p3b.json"))
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "no_drift" in r.stdout
+    def test_cli_with_bundle_runs_drift(self):
+        db = _write_store(self.tmp_path)
+        r = _run_cli(db, "--project", "o", "--repo", "r",
+                     "--bundle", os.path.join(FIX, "bundle_p3b.json"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no_drift", r.stdout)
 
 
 class TestValidateProject(unittest.TestCase):
@@ -563,23 +566,71 @@ def _write_two_member_store(tmp_path):
     return db
 
 
-def test_cli_multi_repo_text_exits_zero(tmp_path):
-    """Regression test for the line-794 format crash: the multi-repo TEXT path
-    must complete without raising and must exit 0 for a clean two-member store."""
-    db = _write_two_member_store(tmp_path)
-    r = _run_cli(db, "--project", "proj")
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "Azure/mod-a" in r.stdout
-    assert "Azure/mod-b" in r.stdout
+class TestCliMultiRepo(_TmpDirCase):
+    def test_cli_multi_repo_text_exits_zero(self):
+        """Regression test for the line-794 format crash: the multi-repo TEXT path
+        must complete without raising and must exit 0 for a clean two-member store."""
+        db = _write_two_member_store(self.tmp_path)
+        r = _run_cli(db, "--project", "proj")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Azure/mod-a", r.stdout)
+        self.assertIn("Azure/mod-b", r.stdout)
+
+    def test_cli_multi_repo_json_exits_zero_and_has_members(self):
+        """The multi-repo JSON path exits 0, parses cleanly, and carries both
+        repos in the 'members' list."""
+        db = _write_two_member_store(self.tmp_path)
+        r = _run_cli(db, "--project", "proj", "--json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        data = json.loads(r.stdout)
+        self.assertIn("members", data)
+        repos = {m["repo"] for m in data["members"]}
+        self.assertEqual(repos, {"Azure/mod-a", "Azure/mod-b"})
 
 
-def test_cli_multi_repo_json_exits_zero_and_has_members(tmp_path):
-    """The multi-repo JSON path exits 0, parses cleanly, and carries both
-    repos in the 'members' list."""
-    db = _write_two_member_store(tmp_path)
-    r = _run_cli(db, "--project", "proj", "--json")
-    assert r.returncode == 0, r.stdout + r.stderr
-    data = json.loads(r.stdout)
-    assert "members" in data
-    repos = {m["repo"] for m in data["members"]}
-    assert repos == {"Azure/mod-a", "Azure/mod-b"}
+class TestArtifactStatusRoundTrip(unittest.TestCase):
+    """#64: the write path (fold_bundle) and read path (no_drift re-derive) use
+    the same derive.build_artifacts, so the last-event status rule round-trips:
+    a renamed-then-re-added path is `live`, a rename to an untracked path is
+    `removed` with no successor."""
+
+    def _bundle(self):
+        def ev(change, path, n, old_path=None):
+            e = {"commit": ("%x" % n) * 40, "author": "alice",
+                 "date": "2026-05-%02d" % n, "change": change, "path": path}
+            if old_path:
+                e["old_path"] = old_path
+            return e
+        return {
+            "meta": {"owner": "o", "repo": "r"},
+            "code_events": [
+                ev("add", "docs/a.md", 1),
+                ev("rename", "docs/b.md", 2, old_path="docs/a.md"),
+                ev("add", "docs/a.md", 3),
+                ev("add", "docs/z.md", 4),
+                ev("rename", "src/x.txt", 5, old_path="docs/z.md"),
+            ],
+        }
+
+    def test_status_stored_and_no_drift(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        bundle = self._bundle()
+        gather.fold_bundle(conn, bundle)
+        stored = {}
+        for n in graphstore.repo_nodes(conn, "o", "r", "code"):
+            local = graphstore.local_id(n["id"], "o", "r")
+            if graphstore.is_artifact_local(local):
+                stored[local] = n["data"]
+        self.assertEqual((stored["art:docs/a.md"]["status"],
+                          stored["art:docs/a.md"]["replaced_by"]), ("live", None))
+        self.assertEqual((stored["art:docs/z.md"]["status"],
+                          stored["art:docs/z.md"]["replaced_by"]), ("removed", None))
+        for b in (bundle, None):
+            report = validate.validate(conn, project="o", repo="r", bundle=b)
+            c = _check(report, "no_drift")
+            self.assertTrue(c["ok"], c["details"])
+
+
+if __name__ == "__main__":
+    unittest.main()

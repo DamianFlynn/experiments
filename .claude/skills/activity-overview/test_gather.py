@@ -447,6 +447,68 @@ class TestReviewsAndTimeline(unittest.TestCase):
     def test_summarize_reviews_empty_is_none(self):
         self.assertEqual(gather.summarize_reviews([])["decision"], "none")
 
+    # --- issue #63: a later COMMENTED/PENDING review must not erase a decision -
+    @staticmethod
+    def _rv(login, state, ts, rid=None):
+        r = {"user": {"login": login}, "state": state, "submitted_at": ts}
+        if rid is not None:
+            r["id"] = rid
+        return r
+
+    def test_summarize_reviews_approve_then_comment_stays_approved(self):
+        raw = [self._rv("a", "APPROVED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a"], "decision": "approved"})
+
+    def test_summarize_reviews_changes_then_comment_stays_changes_requested(self):
+        raw = [self._rv("a", "CHANGES_REQUESTED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"],
+                         "changes_requested")
+
+    def test_summarize_reviews_changes_then_approved_is_approved(self):
+        raw = [self._rv("a", "CHANGES_REQUESTED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z"),
+               self._rv("a", "APPROVED", "2026-05-03T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+
+    def test_summarize_reviews_dismissed_approval_no_longer_counts(self):
+        # GitHub rewrites a dismissed review's state to DISMISSED.
+        raw = [self._rv("a", "DISMISSED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a"], "decision": "none"})
+
+    def test_summarize_reviews_dismissed_then_reapproved(self):
+        raw = [self._rv("a", "DISMISSED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "APPROVED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+
+    def test_summarize_reviews_dismissed_changes_request_unblocks(self):
+        raw = [self._rv("a", "DISMISSED", "2026-05-01T00:00:00Z"),
+               self._rv("b", "APPROVED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a", "b"], "decision": "approved"})
+
+    def test_summarize_reviews_comment_only_is_commented(self):
+        raw = [self._rv("a", "COMMENTED", "2026-05-01T00:00:00Z"),
+               self._rv("b", "DISMISSED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "commented")
+
+    def test_summarize_reviews_pending_ignored(self):
+        raw = [self._rv("a", "APPROVED", "2026-05-01T00:00:00Z"),
+               {"user": {"login": "b"}, "state": "PENDING", "submitted_at": None}]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a"], "decision": "approved"})
+
+    def test_summarize_reviews_same_timestamp_breaks_tie_by_id(self):
+        raw = [self._rv("a", "APPROVED", "2026-05-01T00:00:00Z", rid=2),
+               self._rv("a", "CHANGES_REQUESTED", "2026-05-01T00:00:00Z", rid=1)]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+        self.assertEqual(
+            gather.summarize_reviews(list(reversed(raw)))["decision"], "approved")
+
     def test_parse_timeline_crossrefs_collects_issue_numbers(self):
         raw = [
             {"event": "cross-referenced",
@@ -1037,6 +1099,44 @@ class TestDirectoryCodeAreaProvider(unittest.TestCase):
         self.assertEqual(fp["label"], "firewall-policy")
         self.assertEqual(fp["edges"], [])
 
+    def test_file_directly_under_avm_group_is_not_a_module_area(self):
+        # #73: avm/{res,ptn,utl}/<group>/<file> is not a module (modules are
+        # avm/<kind>/<group>/<module>/...); such a file belongs to its group.
+        P = gather.DEFAULT_AREA_PATTERNS
+        for kind in ("res", "ptn", "utl"):
+            self.assertEqual(
+                gather.classify_code_area(f"avm/{kind}/network/README.md", P),
+                f"avm/{kind}/network")
+        # a real module file is still its 4-segment module area
+        self.assertEqual(
+            gather.classify_code_area("avm/res/network/vnet/README.md", P),
+            "avm/res/network/vnet")
+        cg = gather.build_directory_areas(
+            ["avm/res/network/README.md", "avm/res/network/vnet/main.bicep"], P)
+        self.assertEqual([a["id"] for a in cg["areas"]],
+                         ["avm/res/network", "avm/res/network/vnet"])
+
+    def test_file_directly_under_modules_is_not_a_module_area(self):
+        # #73: modules/<file> is not a module (modules are modules/<name>/...).
+        self.assertEqual(
+            gather.classify_code_area("modules/README.md",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "modules")
+        self.assertEqual(
+            gather.classify_code_area("modules/vnet/README.md",
+                                      gather.DEFAULT_AREA_PATTERNS),
+            "modules/vnet")
+
+    def test_generic_fallback_never_makes_a_nested_file_its_own_area(self):
+        # #73: a two-segment file path (dir/file) falls back to its directory,
+        # not to an area named after the file itself.
+        P = gather.DEFAULT_AREA_PATTERNS
+        self.assertEqual(gather.classify_code_area("docs/README.md", P), "docs")
+        self.assertEqual(
+            gather.classify_code_area(".github/CODEOWNERS", P), ".github")
+        cg = gather.build_directory_areas(["docs/a.md", "docs/b.md"], P)
+        self.assertEqual([a["id"] for a in cg["areas"]], ["docs"])
+
     def test_empty_paths_yield_empty_provider(self):
         cg = gather.build_directory_areas([], gather.DEFAULT_AREA_PATTERNS)
         self.assertEqual(cg, {"provider": "directory", "areas": []})
@@ -1501,7 +1601,8 @@ class TestResolveModuleRef(unittest.TestCase):
               "version": "0.9.0", "local_path": None}
         self.assertEqual(
             gather.resolve_module_ref(ri, "avm/ptn/foo/bar/main.bicep",
-                                      gather.DEFAULT_AREA_PATTERNS),
+                                      gather.DEFAULT_AREA_PATTERNS,
+                                      {"avm/res/storage/storage-account"}),
             "avm/res/storage/storage-account")
 
     def test_local_ref_resolves_relative_to_base(self):
@@ -1513,12 +1614,17 @@ class TestResolveModuleRef(unittest.TestCase):
                                       gather.DEFAULT_AREA_PATTERNS),
             "avm/utl/types/avm-common-types")
 
-    def test_unrecognised_registry_path_falls_back_to_the_path(self):
+    def test_registry_path_not_in_repo_area_set_is_unresolved(self):
+        # #73: was "falls back to the path" — a registry path names a module in the
+        # REGISTRY; it is an in-repo area only when that area exists in the repo's
+        # area set. Otherwise None (the edge keeps the raw ref), never a phantom id.
         ri = {"registry_path": "some/custom/thing", "version": "1.0.0",
               "local_path": None}
+        P = gather.DEFAULT_AREA_PATTERNS
+        self.assertIsNone(gather.resolve_module_ref(ri, "x/main.bicep", P, set()))
+        self.assertIsNone(gather.resolve_module_ref(ri, "x/main.bicep", P))
         self.assertEqual(
-            gather.resolve_module_ref(ri, "x/main.bicep",
-                                      gather.DEFAULT_AREA_PATTERNS),
+            gather.resolve_module_ref(ri, "x/main.bicep", P, {"some/custom/thing"}),
             "some/custom/thing")
 
     def test_empty_ref_resolves_to_none(self):
@@ -1526,6 +1632,150 @@ class TestResolveModuleRef(unittest.TestCase):
             gather.resolve_module_ref({"registry_path": None, "version": None,
                                        "local_path": None}, "x/main.bicep",
                                       gather.DEFAULT_AREA_PATTERNS))
+
+
+class TestBicepReferenceForms(unittest.TestCase):
+    """#73: only the PUBLIC Bicep registry maps to this repo's module areas, and
+    only when the classified area exists in the repo's area set. Private registry
+    (`br:<host>/...`), template-spec (`ts:` / `ts/<alias>:`) and user-alias
+    (`br/<alias>:`) refs are `to: null`, `resolved: false`, raw ref kept."""
+
+    P = gather.DEFAULT_AREA_PATTERNS
+    BASE = "infra/main.bicep"
+    AREAS = {"infra", "avm/res/x/y", "avm/res/network",
+             "avm/res/network/vnet", "bicep/avm/res/x/y"}
+
+    def _parse(self, ref):
+        refs = gather.parse_bicep_module_refs(f"module m '{ref}' = {{}}")
+        self.assertEqual(len(refs), 1)
+        return refs[0]
+
+    def _edge(self, ref, area_ids=None):
+        edges = gather.build_bicep_edges(
+            f"module m '{ref}' = {{}}", {}, self.BASE,
+            self.AREAS if area_ids is None else area_ids, self.P)
+        self.assertEqual(len(edges), 1)
+        return edges[0]
+
+    def assertUnresolved(self, ref, version):
+        e = self._edge(ref)
+        self.assertIsNone(e["to"], ref)
+        self.assertFalse(e["resolved"], ref)
+        self.assertEqual(e["ref"], ref)
+        self.assertEqual(e["version"], version)
+        self.assertNotIn("local", e)
+
+    # --- parse ---------------------------------------------------------------
+    def test_public_alias_parses_registry_path(self):
+        r = self._parse("br/public:avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         ("avm/res/x/y", "1.0", None))
+
+    def test_explicit_public_registry_host_parses_registry_path(self):
+        r = self._parse("br:mcr.microsoft.com/bicep/avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         ("avm/res/x/y", "1.0", None))
+
+    def test_private_registry_is_neither_registry_path_nor_local(self):
+        r = self._parse("br:myacr.azurecr.io/bicep/avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         (None, "1.0", None))
+
+    def test_template_specs_are_neither_registry_path_nor_local(self):
+        for ref, ver in (
+                ("ts:00000000-0000-0000-0000-000000000000/rg/spec:2.0", "2.0"),
+                ("ts/corp:spec:2.0", "2.0")):
+            r = self._parse(ref)
+            self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                             (None, ver, None), ref)
+
+    def test_user_alias_is_neither_registry_path_nor_local(self):
+        r = self._parse("br/corp:avm/res/x/y:1.0")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         (None, "1.0", None))
+
+    def test_local_path_still_local(self):
+        r = self._parse("modules/vnet/main.bicep")
+        self.assertEqual((r["registry_path"], r["version"], r["local_path"]),
+                         (None, None, "modules/vnet/main.bicep"))
+
+    # --- edges ---------------------------------------------------------------
+    def test_public_ref_resolves_only_when_area_exists(self):
+        e = self._edge("br/public:avm/res/x/y:1.0")
+        self.assertEqual((e["to"], e["resolved"], e["version"]),
+                         ("avm/res/x/y", True, "1.0"))
+        e = self._edge("br/public:avm/res/x/y:1.0", area_ids={"infra"})
+        self.assertEqual((e["to"], e["resolved"], e["ref"], e["version"]),
+                         (None, False, "br/public:avm/res/x/y:1.0", "1.0"))
+
+    def test_explicit_public_host_resolves_only_when_area_exists(self):
+        e = self._edge("br:mcr.microsoft.com/bicep/avm/res/x/y:1.0")
+        self.assertEqual((e["to"], e["resolved"]), ("avm/res/x/y", True))
+        e = self._edge("br:MCR.microsoft.com/bicep/avm/res/x/y:1.0")
+        self.assertEqual((e["to"], e["resolved"]), ("avm/res/x/y", True))
+        self.assertIsNone(self._edge("br:mcr.microsoft.com/bicep/avm/res/x/y:1.0",
+                                     area_ids=set())["to"])
+
+    def test_private_registry_ref_is_unresolved_even_if_path_matches_an_area(self):
+        self.assertUnresolved("br:myacr.azurecr.io/bicep/avm/res/x/y:1.0", "1.0")
+        self.assertUnresolved("br:myacr.azurecr.io/avm/res/x/y:1.0", "1.0")
+        self.assertUnresolved("br:myacr.azurecr.io/bicep/modules/vnet:v3", "v3")
+
+    def test_template_spec_refs_are_unresolved_no_phantom_area(self):
+        self.assertUnresolved(
+            "ts:00000000-0000-0000-0000-000000000000/rg/spec:2.0", "2.0")
+        self.assertUnresolved("ts/corp:spec:2.0", "2.0")
+
+    def test_user_alias_ref_is_unresolved(self):
+        self.assertUnresolved("br/corp:avm/res/x/y:1.0", "1.0")
+        self.assertUnresolved("br/corp:modules/vnet", None)
+
+    def test_public_ref_to_untouched_module_resolves_when_in_clone(self):
+        # The area set only holds areas CHANGED in the window; a module of this
+        # repo that nobody touched is still this repo's module when its
+        # entrypoint is in the clone.
+        with tempfile.TemporaryDirectory() as clone:
+            os.makedirs(os.path.join(clone, "avm/res/x/y"))
+            open(os.path.join(clone, "avm/res/x/y/main.bicep"), "w").close()
+            os.makedirs(os.path.join(clone, "avm/res/network"))
+            open(os.path.join(clone, "avm/res/network/main.bicep"), "w").close()
+            exists = gather._clone_module_exists(clone)
+            def edge(ref):
+                return gather.build_bicep_edges(
+                    f"module m '{ref}' = {{}}", {}, self.BASE, {"infra"}, self.P,
+                    module_exists=exists)[0]
+            e = edge("br/public:avm/res/x/y:1.0")
+            self.assertEqual((e["to"], e["resolved"]), ("avm/res/x/y", True))
+            # not in the clone -> still unresolved
+            self.assertIsNone(edge("br/public:avm/res/x/absent:1.0")["to"])
+            # a group is never a module, even with a stray main.bicep
+            self.assertIsNone(edge("br/public:avm/res/network:1.0")["to"])
+            # private registry: never consults the clone
+            self.assertIsNone(edge("br:myacr.azurecr.io/bicep/avm/res/x/y:1.0")["to"])
+            # cannot escape the clone
+            self.assertFalse(exists("../" + os.path.basename(clone) + "/avm/res/x/y"))
+            self.assertFalse(exists("/etc"))
+        self.assertIsNone(gather._clone_module_exists(None))
+
+    def test_public_ref_to_an_avm_group_is_not_a_module(self):
+        # avm/res/network is a group-level (README) area, never a module target.
+        e = self._edge("br/public:avm/res/network:1.0")
+        self.assertIsNone(e["to"])
+        self.assertFalse(e["resolved"])
+
+    def test_transitive_match_skips_avm_group_areas(self):
+        # A nested deployment named like a group must not hang a transitive edge
+        # on the group-level (README) area.
+        arm = {"resources": [{
+            "type": "Microsoft.Resources/deployments", "name": "outer",
+            "properties": {"template": {"metadata": {"name": "outer"},
+                "resources": [{
+                    "type": "Microsoft.Resources/deployments", "name": "inner",
+                    "properties": {"template": {"metadata": {"name": "network"},
+                                                "resources": []}}}]}}}]}
+        edges = gather.build_bicep_edges("", arm, self.BASE,
+                                         {"infra", "avm/res/network"}, self.P)
+        self.assertEqual(edges, [])
 
 
 class TestWalkArmDeployments(unittest.TestCase):
@@ -1576,10 +1826,16 @@ class TestBuildBicepEdges(unittest.TestCase):
         edges = gather.build_bicep_edges(self.src, self.arm, self.base,
                                          self.area_ids, gather.DEFAULT_AREA_PATTERNS)
         imm = {e["to"]: e for e in edges if not e["transitive"]}
-        self.assertEqual(imm["avm/res/storage/storage-account"]["version"], "0.9.0")
-        self.assertEqual(imm["avm/res/storage/storage-account"]["provider"], "bicep")
-        self.assertTrue(imm["avm/res/storage/storage-account"]["resolved"])
+        # key-vault/vault is in the repo's area set -> resolved to its area-id.
         self.assertEqual(imm["avm/res/key-vault/vault"]["version"], "0.6.1")
+        self.assertEqual(imm["avm/res/key-vault/vault"]["provider"], "bicep")
+        self.assertTrue(imm["avm/res/key-vault/vault"]["resolved"])
+        # storage-account is NOT in the area set -> unresolved, raw ref kept (#73).
+        self.assertNotIn("avm/res/storage/storage-account", imm)
+        self.assertEqual(imm[None]["ref"],
+                         "br/public:avm/res/storage/storage-account:0.9.0")
+        self.assertEqual(imm[None]["version"], "0.9.0")
+        self.assertFalse(imm[None]["resolved"])
         # the local ref resolved to its utl area
         self.assertIn("avm/utl/types/avm-common-types", imm)
 
@@ -1734,6 +1990,169 @@ class TestTerraformParsers(unittest.TestCase):
         self.assertEqual(gather.parse_terraform_module_blocks(None), {})
 
 
+class TestTerraformModuleAttributeParsing(unittest.TestCase):
+    """#67: `source`/`version` are the module block's own TOP-LEVEL arguments;
+    comments, strings, heredocs and nested blocks/maps must not leak into them."""
+
+    BASE = "live/prod/main.tf"
+
+    def _edge(self, tf, name="m"):
+        dot = 'digraph {\n"x" -> "module.%s.y"\n}\n' % name
+        edges = gather.build_terraform_edges(
+            tf, dot, self.BASE, set(), gather.DEFAULT_AREA_PATTERNS)
+        self.assertEqual(len(edges), 1, edges)
+        return edges[0]
+
+    def _scan(self, files):
+        return gather.scan_structural_terraform_areas(
+            "clone", gather.DEFAULT_AREA_PATTERNS,
+            list_files=lambda: sorted(files), read_text=lambda rel: files[rel])
+
+    # --- the four confirmed cases ------------------------------------------
+    def test_kubernetes_version_is_not_the_module_version(self):
+        tf = ('module "m" {\n'
+              '  source             = "git::https://example.com/aks.git?ref=v1"\n'
+              '  kubernetes_version = "1.29"\n'
+              '}\n')
+        self.assertIsNone(self._edge(tf)["version"])
+
+    def test_min_tls_version_is_not_the_module_version(self):
+        tf = ('module "m" {\n'
+              '  source          = "Azure/storage/azurerm"\n'
+              '  min_tls_version = "TLS1_2"\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual(e["ref"], "Azure/storage/azurerm")
+        self.assertIsNone(e["version"])
+
+    def test_custom_source_before_source_is_ignored(self):
+        tf = ('module "m" {\n'
+              '  custom_source = "x"\n'
+              '  source        = "../../modules/real"\n'
+              '}\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {"m": "../../modules/real"})
+
+    def test_hash_commented_module_is_not_an_edge(self):
+        tf = ('# module "old" { source = "./modules/old" }\n'
+              'module "m" { source = "./modules/new" }\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {"m": "./modules/new"})
+        got = self._scan({"main.tf": tf})
+        tos = {e["to"] for a in got.values() for e in a["edges"]}
+        self.assertNotIn("modules/old", tos)
+        self.assertIn("modules/new", tos)
+
+    def test_slash_commented_module_is_not_an_edge(self):
+        tf = '// module "old" { source = "./modules/old" }\n'
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {})
+
+    def test_commented_source_line_inside_module_is_ignored(self):
+        tf = ('module "m" {\n'
+              '  # source = "./modules/old"\n'
+              '  // version = "9.9.9"\n'
+              '  source  = "Azure/naming/azurerm"\n'
+              '  version = "0.4.0" # pinned\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual((e["ref"], e["version"]), ("Azure/naming/azurerm", "0.4.0"))
+
+    # --- additional acceptance cases ----------------------------------------
+    def test_version_inside_nested_map_is_ignored(self):
+        tf = ('module "m" {\n'
+              '  source = "Azure/aks/azurerm"\n'
+              '  settings = {\n'
+              '    version = "x"\n'
+              '    source  = "y"\n'
+              '  }\n'
+              '  node_pools = [\n'
+              '    { version = "z" },\n'
+              '  ]\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual(e["ref"], "Azure/aks/azurerm")
+        self.assertIsNone(e["version"])
+
+    def test_source_and_version_after_nested_block_are_found(self):
+        tf = ('module "m" {\n'
+              '  providers = {\n'
+              '    azurerm = azurerm.alt\n'
+              '  }\n'
+              '  tags = { version = "nope" }\n'
+              '  source  = "Azure/naming/azurerm"\n'
+              '  version = "0.4.0"\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual((e["ref"], e["version"]), ("Azure/naming/azurerm", "0.4.0"))
+
+    def test_module_inside_block_comment_is_ignored(self):
+        tf = ('/*\n'
+              'module "old" {\n'
+              '  source = "./modules/old"\n'
+              '}\n'
+              '*/\n'
+              'module "m" { source = "./modules/new" } /* trailing */\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {"m": "./modules/new"})
+
+    def test_hash_inside_string_is_not_a_comment(self):
+        tf = ('module "m" {\n'
+              '  label   = "a # b { c"\n'
+              '  source  = "git::https://example.com/x.git?ref=v1#frag"\n'
+              '  version = "1.0.0"\n'
+              '}\n')
+        e = self._edge(tf)
+        self.assertEqual(e["ref"], "git::https://example.com/x.git?ref=v1#frag")
+        self.assertEqual(e["version"], "1.0.0")
+
+    def test_string_with_escapes_and_interpolation_does_not_break_parsing(self):
+        tf = ('module "m" {\n'
+              '  name   = "say \\"hi\\" ${lookup(var.m, "}", "x")} {"\n'
+              '  source = "./modules/a"\n'
+              '}\n'
+              'module "n" { source = "./modules/b" }\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf),
+                         {"m": "./modules/a", "n": "./modules/b"})
+
+    def test_heredoc_containing_module_text_is_ignored(self):
+        tf = ('locals {\n'
+              '  doc = <<EOT\n'
+              'module "x" {\n'
+              '  source = "./modules/x"\n'
+              '# not a comment }\n'
+              'EOT\n'
+              '}\n'
+              'module "m" {\n'
+              '  policy = <<-JSON\n'
+              '    { "version": "2012", "source = \\"no\\"": 1 }\n'
+              '    version = "bad"\n'
+              '  JSON\n'
+              '  source = "Azure/naming/azurerm"\n'
+              '}\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf),
+                         {"m": "Azure/naming/azurerm"})
+        self.assertIsNone(self._edge(tf)["version"])
+
+    def test_two_modules_on_consecutive_lines(self):
+        tf = ('module "a" { source = "./modules/a" }\n'
+              'module "b" { source = "./modules/b" }\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf),
+                         {"a": "./modules/a", "b": "./modules/b"})
+
+    def test_module_nested_in_another_block_is_not_top_level(self):
+        tf = ('locals {\n'
+              '  x = { module "fake" { source = "./modules/fake" } }\n'
+              '}\n')
+        self.assertEqual(gather.parse_terraform_module_blocks(tf), {})
+
+    def test_static_scan_ignores_comment_and_nested_version(self):
+        files = {"main.tf": ('/* module "old" { source = "./modules/old" } */\n'
+                             'module "aks" {\n'
+                             '  source             = "Azure/aks/azurerm"\n'
+                             '  kubernetes_version = "1.29"\n'
+                             '}\n')}
+        edges = [e for a in self._scan(files).values() for e in a["edges"]]
+        self.assertEqual([(e["to"], e["ref"], e["version"]) for e in edges],
+                         [(None, "Azure/aks/azurerm", None)])
+
+
 class TestBuildTerraformEdges(unittest.TestCase):
     def setUp(self):
         with open(os.path.join(FIX, "terraform_source_sample.tf")) as fh:
@@ -1848,8 +2267,12 @@ class TestExtractIacEdges(unittest.TestCase):
             which=which, run=run, read_text=lambda _p: bicep_src)
         bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
         tos = {e["to"] for e in bar["edges"]}
-        self.assertIn("avm/res/storage/storage-account", tos)
-        self.assertTrue(any(e["version"] == "0.9.0" for e in bar["edges"]))
+        # key-vault/vault is in the area set -> resolved; storage-account is not
+        # -> unresolved, raw ref + version kept (#73).
+        self.assertIn("avm/res/key-vault/vault", tos)
+        self.assertNotIn("avm/res/storage/storage-account", tos)
+        self.assertTrue(any(e["version"] == "0.9.0" and e["to"] is None
+                            for e in bar["edges"]))
         # terraform area stays empty (terraform absent)
         prod = next(a for a in cg["areas"] if a["id"] == "live/prod")
         self.assertEqual(prod["edges"], [])
@@ -2076,10 +2499,11 @@ class TestIacEntrypoint(unittest.TestCase):
             self.assertEqual(build[2], os.path.join(clone, self.KV, "main.bicep"))
             self.assertEqual(area["edges_status"], "resolved")
             by_ref = {e["ref"]: e for e in area["edges"]}
-            # the parent's registry ref is read (it was never read before)...
-            self.assertEqual(
-                by_ref["br/public:avm/res/network/private-endpoint:0.11.0"]["to"],
-                "avm/res/network/private-endpoint")
+            # the parent's registry ref is read (it was never read before)... it is
+            # unresolved (#73): private-endpoint is not in this repo's area set.
+            pe = by_ref["br/public:avm/res/network/private-endpoint:0.11.0"]
+            self.assertEqual((pe["to"], pe["resolved"], pe["version"]),
+                             (None, False, "0.11.0"))
             # ...and the child keeps the existing local <area>/<child> edge shape
             child = by_ref["key/main.bicep"]
             self.assertEqual(child["to"], self.KV + "/key")
@@ -2291,7 +2715,12 @@ class TestAcquireEdgesP3c(unittest.TestCase):
             read_text=lambda _p: src)
         bar = next(a for a in cg["areas"] if a["id"] == "avm/ptn/foo/bar")
         self.assertTrue(bar["edges"])
-        self.assertTrue(any(e["to"] == "avm/res/storage/storage-account"
+        # key-vault/vault is an area of this repo -> resolved; storage-account is
+        # not in the area set -> unresolved with the raw ref kept (#73).
+        self.assertTrue(any(e["to"] == "avm/res/key-vault/vault" and e["resolved"]
+                            for e in bar["edges"]))
+        self.assertTrue(any(e["to"] is None and not e["resolved"]
+                            and e["ref"] == "br/public:avm/res/storage/storage-account:0.9.0"
                             for e in bar["edges"]))
 
 

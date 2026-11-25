@@ -48,6 +48,12 @@ installment** (`docs/USAGE.md` §2.1 explains why).
 | **Bundle view** — one repo, one window (`workspace/view/bundle.json`) | `view.py`, then enriched in place by `link.py`; `render.py` adds `diagrams` | raw facts + `trains`, `buckets`, `forecast`, `flow`, `people`/`halls`, … + `series` (with `--series`) + `diagrams` | every section of a single-repo report; the per-member sections of a multi-repo report |
 | **Project view** — multi-repo only (`workspace/view/project.json`) | `digest.py` (stdout) | merged `trains`, `shipped`, `people`, `modules`, `related_work`, `module_edges`, and `members[i].bundle` | the project-wide sections of a multi-repo report |
 
+`related_work` (ticket-linked trains) is **opt-in**: it stays `[]` unless you pass
+`digest.py --manifest M` with `"ticket_prefixes": ["ABC", …]` declared in the
+manifest, or `--ticket-pattern RE`. In `members[i].bundle.meta`, `owner` is the
+project scope — use the added `slug` (`owner/name`), `repo_owner`, `repo_name` for
+GitHub links (BUNDLE.md). Unknown project/repo or a bad window → exit 2.
+
 Store scope: a single-repo gather stores **project = OWNER, repo = REPO**; a manifest
 gather stores **project = the manifest's `project`, repo = `owner/repo`** per member.
 

@@ -9,24 +9,41 @@ docs/superpowers/specs/2026-06-05-activity-phase9-multirepo.md (S3).
 """
 import argparse
 import json
+import os
 import re
+import sqlite3
 import sys
 
 import extract as extract_mod
 import graphstore
 import link as link_mod
+import manifest as manifest_mod
 
 
-# Internal-ticket reference (Jira/ADO-style): 2+ uppercase letters, hyphen,
-# digits. Conservative so it doesn't swallow enum-like tokens (A1, v2). Override
-# via build_project_view(ticket_pattern=...).
-_DEFAULT_TICKET_RE = re.compile(r"\b([A-Z]{2,}-\d+)\b")
+# Internal-ticket clustering is OPT-IN (issue #74). There is no default pattern:
+# a generic "2+ capitals, hyphen, digits" rule matched UTF-8, SHA-256, HTTP-200,
+# ISO-8601 and CVE-2024 and glued unrelated trains together in `related_work`.
+# A pattern comes from `--ticket-pattern RE`, or from the manifest's declared
+# `ticket_prefixes` via ticket_pattern_from_prefixes.
 
 
-def parse_ticket_refs(text, pattern=_DEFAULT_TICKET_RE):
-    """Ordered, deduped internal-ticket ids in `text`. Pure. Uses capture group 1
+def ticket_pattern_from_prefixes(prefixes):
+    """Compiled `\\b(?:P1|P2)-\\d+\\b` for declared ticket prefixes (e.g. the
+    manifest's `ticket_prefixes`), or None when there are none (clustering off).
+    Prefixes keep their declared order; matching is case-sensitive."""
+    if not prefixes:
+        return None
+    return re.compile(r"\b(?:{})-\d+\b".format(
+        "|".join(re.escape(p) for p in prefixes)))
+
+
+def parse_ticket_refs(text, pattern=None):
+    """Ordered, deduped internal-ticket ids in `text`. Pure. `pattern` None means
+    ticket parsing is off (returns []). Uses capture group 1
     when the pattern has one AND it participated in the match, else the whole
     match — so an optional group that didn't fire never yields a `None` token."""
+    if pattern is None:
+        return []
     out, seen = [], set()
     for m in pattern.finditer(text or ""):
         tok = m.group(1) if (m.re.groups and m.group(1) is not None) else m.group(0)
@@ -61,6 +78,7 @@ def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
     backfill-budget / missing-context diagnostics; the default (None) lets
     extract emit them to stderr, so an incomplete project digest is visible
     without corrupting the JSON on stdout.
+    Each member's `meta` is extended (append-only) by `_member_identity`.
     Returns [{"repo": "owner/repo", "bundle": <enriched dict>}, ...]."""
     out = []
     for repo in repos:
@@ -69,8 +87,31 @@ def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
             backfill=backfill, backfill_budget=backfill_budget,
             warn=warn)
         bundle = link_mod.enrich(bundle)
+        bundle["meta"].update(_member_identity(project, repo))
         out.append({"repo": repo, "bundle": bundle})
     return out
+
+
+def _member_identity(project, repo):
+    """Append-only identity keys for a member bundle's `meta` (issue #74).
+
+    extract's `meta.owner` is the store's PROJECT scope and `meta.repo` the
+    store's repo key — for a manifest member that is `owner=<project>`,
+    `repo="Azure/name"`, so `{owner}/{repo}` is not a GitHub slug. Those two keys
+    are left as they are; these are added:
+      project     the project scope (== meta.owner)
+      slug        the GitHub `owner/name`
+      repo_owner  the GitHub owner (user/org)
+      repo_name   the bare GitHub repository name
+    A manifest member's repo key is already `owner/name`. A single-repo store is
+    keyed project=<owner>, repo=<name> (gather.py --owner/--repo), so its slug is
+    `{project}/{repo}`."""
+    if "/" in repo:
+        repo_owner, repo_name = repo.split("/", 1)
+    else:
+        repo_owner, repo_name = project, repo
+    return {"project": project, "slug": "{}/{}".format(repo_owner, repo_name),
+            "repo_owner": repo_owner, "repo_name": repo_name}
 
 
 def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
@@ -305,13 +346,16 @@ def _merge_modules(members):
 
 
 def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
-                       backfill_budget=50, ticket_pattern=_DEFAULT_TICKET_RE,
+                       backfill_budget=50, ticket_pattern=None,
                        warn=None):
     """The merged project view consumed by report-template.md's narrative step.
     Keys: meta{project,repos,from,to}, members[{repo,bundle}] (per-member raw +
     enriched, for collision-prone per-file sections), trains (project-wide, each
     with a `tickets` list), related_work (ticket clusters), shipped (repo-tagged),
     people (merged by login), modules (repo-qualified).
+
+    `ticket_pattern` (a compiled regex) opts into ticket clustering; None (the
+    default) leaves every train's `tickets` and `related_work` empty.
 
     `warn` is forwarded to member_bundles (extract diagnostics); default None
     lets extract surface incompleteness on stderr."""
@@ -376,34 +420,119 @@ def parse_args(argv):
         description="Emit a multi-repo project digest view (JSON) from a store. "
                     "Output embeds full per-member bundles and can be large for many repos.")
     p.add_argument("--store", required=True, help="path to the journey-graph store")
-    p.add_argument("--project", required=True, help="logical project name")
+    p.add_argument("--project", default=None,
+                   help="logical project name (as keyed in the store). Defaults "
+                        "to the --manifest project; one of the two is required.")
     p.add_argument("--repo", action="append", dest="repos", default=None,
                    help="member repo 'owner/repo'; repeatable. Default: all "
                         "members discovered in the store for the project.")
-    p.add_argument("--from", dest="ts_from", required=True)
-    p.add_argument("--to", dest="ts_to", required=True)
+    p.add_argument("--from", dest="ts_from", required=True,
+                   help="window start (YYYY-MM-DD, or a full ISO timestamp)")
+    p.add_argument("--to", dest="ts_to", required=True,
+                   help="window end (YYYY-MM-DD, or a full ISO timestamp)")
+    p.add_argument("--manifest", default=None,
+                   help="project manifest; its optional 'ticket_prefixes' "
+                        "(e.g. [\"ABC\", \"PLAT\"]) turn on ticket clustering "
+                        "with the pattern \\b(?:ABC|PLAT)-\\d+\\b.")
     p.add_argument("--ticket-pattern", default=None,
-                   help="regex for internal-ticket refs; the first capture group "
-                        "is used if the pattern has one, else the whole match; "
-                        "default matches Jira/ADO-style ABC-1234.")
+                   help="regex for internal-ticket refs (wins over the manifest's "
+                        "ticket_prefixes); the first capture group is used if the "
+                        "pattern has one, else the whole match. Without this or "
+                        "manifest ticket_prefixes, ticket clustering is off and "
+                        "related_work is [].")
     return p.parse_args(argv)
 
 
+def _fail(msg):
+    sys.stderr.write("digest.py: error: {}\n".format(msg))
+    return 2
+
+
+def _store_projects(conn):
+    """Distinct project scopes in the store, sorted (same query as view.py)."""
+    return sorted(r[0] for r in conn.execute(
+        "SELECT DISTINCT project FROM nodes WHERE project IS NOT NULL"))
+
+
+def resolve_members(conn, project, repos):
+    """The member repos to digest, or raise ValueError naming what the store
+    holds: an unknown project lists the store's projects; an unknown `--repo`
+    lists the project's repos (same wording as view.py). A `--repo` in any casing
+    selects the stored member (#70) and is returned in the stored spelling."""
+    projects = _store_projects(conn)
+    if project not in projects:
+        raise ValueError("project {!r} is not in the store (projects: {})".format(
+            project, projects))
+    known = graphstore.project_repos(conn, project)
+    if not known:
+        raise ValueError("project {!r} has no member repos in the store".format(
+            project))
+    if not repos:
+        return known
+    resolved = []
+    for repo in repos:
+        stored = graphstore.resolve_repo(conn, project, repo)
+        if stored not in known:
+            raise ValueError(
+                "repo {!r} has no nodes in project {!r} (repos: {})".format(
+                    repo, project, known))
+        if stored not in resolved:      # two spellings of one member: once
+            resolved.append(stored)
+    return resolved
+
+
 def main(argv=None):
+    """Exit codes: 0 view written to stdout; 2 usage error — bad window, bad
+    --ticket-pattern or --manifest, missing/unreadable store, unknown project or
+    repo. Nothing is written to stdout on exit 2."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        manifest_mod.check_reader_window(args.ts_from, args.ts_to, "--from", "--to")
+    except ValueError as exc:
+        return _fail(str(exc))
+
+    man = None
+    if args.manifest:
+        try:
+            man = manifest_mod.load_manifest(args.manifest)
+        except (OSError, ValueError) as exc:
+            return _fail("cannot use --manifest {!r}: {}".format(args.manifest, exc))
+    project = args.project
+    if man is not None:
+        if project is None:
+            project = man["project"]
+        elif project != man["project"]:
+            return _fail("--project {!r} does not match --manifest project "
+                         "{!r}".format(project, man["project"]))
+    if project is None:
+        return _fail("--project is required (or pass --manifest)")
+
     if args.ticket_pattern:
         try:
             pattern = re.compile(args.ticket_pattern)
         except re.error as e:
-            sys.stderr.write("digest: invalid --ticket-pattern: {}\n".format(e))
-            return 2
+            return _fail("invalid --ticket-pattern: {}".format(e))
     else:
-        pattern = _DEFAULT_TICKET_RE
-    conn = graphstore.open_store(args.store)
+        pattern = ticket_pattern_from_prefixes(
+            man["ticket_prefixes"] if man is not None else None)
+
+    # sqlite3.connect would silently CREATE a missing file; refuse instead.
+    if not os.path.isfile(args.store):
+        return _fail("store {!r} does not exist (run gather.py first)".format(
+            args.store))
     try:
-        repos = args.repos or graphstore.project_repos(conn, args.project)
-        view = build_project_view(conn, args.project, repos,
+        conn = graphstore.open_store(args.store)
+    except sqlite3.DatabaseError as exc:
+        return _fail("cannot read store {!r}: {}".format(args.store, exc))
+    try:
+        try:
+            repos = resolve_members(conn, project, args.repos)
+        except ValueError as exc:
+            return _fail(str(exc))
+        view = build_project_view(conn, project, repos,
                                   args.ts_from, args.ts_to, ticket_pattern=pattern)
+    except sqlite3.DatabaseError as exc:
+        return _fail("cannot read store {!r}: {}".format(args.store, exc))
     finally:
         conn.close()
     sys.stdout.write(json.dumps(view, sort_keys=True, indent=2))

@@ -1314,7 +1314,10 @@ def member_dependents(conn, project, member):
     Unlike the train-oriented queries this returns a FLAT `dependents` list (no
     `summary`/`delivered`) and is time-independent (`scope` carries no window). A
     member with no area nodes (ungathered/unknown slug) yields a needs_gather
-    result, mirroring the sibling queries. Deterministic."""
+    result, mirroring the sibling queries. `member` may be written in any case:
+    it resolves to the stored spelling (issue #70), which `focus` reports.
+    Deterministic."""
+    member = graphstore.resolve_repo(conn, project, member)
     seed_areas = [n["id"] for n in graphstore.repo_nodes(
         conn, project, member, "structure")
         if graphstore.parse_id(n["id"])["local"].startswith("area-")]

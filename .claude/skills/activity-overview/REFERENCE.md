@@ -20,10 +20,17 @@ Mind two org/enterprise policies that surface as a `403` on the first API call
 (gather now prints GitHub's own message and the deciding headers, so the cause
 is named rather than guessed):
 
-- **PAT lifetime caps.** Some enterprises reject classic PATs whose lifetime is
-  too long. Notably **Microsoft Open Source** (which owns `Azure/*`) forbids any
-  classic PAT with a lifetime **> 90 days** — a "no expiration" token is refused.
-  Use an expiry of 90 days or fewer, and rotate it before it lapses.
+- **PAT lifetime caps.** Some enterprises reject personal access tokens whose
+  lifetime is too long. Notably **Microsoft Open Source** (which owns `Azure/*`)
+  refuses any personal access token — **classic or fine-grained** — with a
+  lifetime **over 8 days** (observed 2026-11; the limit was previously longer, so
+  read the 403 message, which states the current figure). For a laptop run, create
+  a token with an expiry of 7 days or less when you need one.
+- **CI needs no personal token for public targets.** The bundled workflow's live
+  jobs use the workflow's built-in token by default (`token_source: builtin`),
+  which is not a personal token and is accepted for public `Azure/*` repos. Set
+  `token_source: secret` (and the `ACTIVITY_TEST_TOKEN` secret) only for private
+  targets.
 - **SAML SSO.** If the org enforces SAML SSO, authorize the token for that org
   (token settings → *Configure SSO*) or the call 403s with an `x-github-sso`
   header.
@@ -93,7 +100,9 @@ python3 spotlight.py dependents Azure/terraform-azurerm-avm-res-keyvault-vault \
 ```
 
 Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
-"registry"?} ] }` — `registry` is an optional exact Terraform registry path; absent,
+"registry"?} ], "ticket_prefixes"? }` — `ticket_prefixes` (e.g. `["ABC"]`) is
+optional and only read by `digest.py --manifest` to turn on `related_work` ticket
+clustering (off by default). `registry` is an optional exact Terraform registry path; absent,
 a member is matched by the HashiCorp naming convention
 (`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`).
 `load_manifest` rejects (with `ValueError`): non-string fields; `/` or `#` in
@@ -115,11 +124,20 @@ defaults when needed: `ACTIVITY_IAC_BUILD_TIMEOUT` (seconds/subprocess, default
 `300`), `ACTIVITY_IAC_MAX_WORKERS` (`8`), `ACTIVITY_IAC_RETRIES` (`1`).
 
 The shallow clone reaches `ACTIVITY_CLONE_MARGIN_DAYS` (default `14`) before the
-window so an in-window commit keeps its real parent. If `meta.boundary_dropped_commits`
-is non-empty (an in-window commit still landed on the shallow boundary, so its
-whole-tree phantom diff was dropped), widen this knob and re-gather to recover it.
+window so an in-window commit keeps its real parent. If the margin holds no earlier
+commit (common on quiet per-module repos), the first in-window commit lands on the
+shallow boundary; gather then deepens the clone (`git fetch --deepen`, at most four
+bounded attempts) until that commit's parent is present, so its diff and file list
+are real. Only if deepening fails is the commit recorded in
+`meta.boundary_dropped_commits`, with its diffs dropped **and** its `files` cleared
+(no whole-tree inflation of areas/modules); widen this knob and re-gather to recover it.
 
-<<<<<<< HEAD
+An existing `--clone-dir` that is a clone of the same repo is **fetched** to that bound
+(and the default branch head checked out) instead of re-cloned; `--no-clone` never creates
+a clone (it fetches an existing one, or gathers API data only when there is none). A repo
+with no commits since the bound is cloned at `--depth=1` and contributes no commits.
+`meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.
+
 ### GitHub API knobs
 
 Every GitHub request has a timeout and is retried with back-off on timeouts and 5xx;
@@ -135,13 +153,6 @@ its minimum is clamped with a warning.
 If a window has more than 1,000 workflow runs (GitHub's per-search cap) gather
 splits the query by day; a single day still over the cap is reported on stderr and
 marked in `workflow_stats._truncated`.
-=======
-An existing `--clone-dir` that is a clone of the same repo is **fetched** to that bound
-(and the default branch head checked out) instead of re-cloned; `--no-clone` never creates
-a clone (it fetches an existing one, or gathers API data only when there is none). A repo
-with no commits since the bound is cloned at `--depth=1` and contributes no commits.
-`meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.
->>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 ### Projects v2 board knobs
 

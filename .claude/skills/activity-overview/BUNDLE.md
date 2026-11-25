@@ -26,6 +26,29 @@ video-script, dashboards) consume the same view. The contract:
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
   modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
   canonical JSON (`sort_keys`), so output is diff-stable.
+- **Project view: `related_work` is opt-in.** Each project train carries a
+  `tickets` list and `related_work` is `[{ticket, train_ids}]` — trains that share
+  an internal ticket id but have no spine link. Ticket parsing is **off by
+  default** (`tickets: []`, `related_work: []` on every train / view): the former
+  default regex (`[A-Z]{2,}-\d+`) matched `UTF-8`, `SHA-256`, `HTTP-200`,
+  `ISO-8601`, `CVE-2024` and glued unrelated trains together (#74). Turn it on
+  with `digest.py --manifest M` when the manifest declares `"ticket_prefixes":
+  ["ABC", "PLAT"]` (pattern `\b(?:ABC|PLAT)-\d+\b`), or with `--ticket-pattern RE`
+  (wins over the manifest).
+- **Project view: member `meta` identity.** In `members[].bundle.meta`, `owner` is
+  the store's **project scope** and `repo` the store's repo key — for a manifest
+  member `owner` is the project name and `repo` is already `owner/name`, so never
+  build a URL from `{meta.owner}/{meta.repo}`. `digest.py` appends four keys to
+  every member's `meta` (append-only; the single-repo bundle view from
+  `view.py`/`link.py` is unchanged): `project` (the project scope), `slug` (the
+  GitHub `owner/name`), `repo_owner` (the GitHub owner) and `repo_name` (the bare
+  repo name). Build GitHub URLs from `slug`. For a single-repo store (project =
+  owner, repo = name) these are `project=owner`, `slug=owner/name`.
+- **Project view CLI errors.** `digest.py` exits **2** (nothing on stdout) for an
+  invalid or inverted `--from/--to` (same rules as `view.py`), a missing/unreadable
+  store, an unknown `--project` (the message lists the store's projects), an
+  unknown `--repo` (lists the project's repos), a bad `--manifest` or
+  `--ticket-pattern`, or a `--project` that differs from the `--manifest` project.
 - **Every fact carries a ref** (see *Ref convention* below), so any consumer can
   cite/fact-check without re-fetching. Narrative is NOT in the view — it's the
   model's job, authored from the view.
@@ -114,7 +137,8 @@ docsRefs, release_train, sprints, project, diagrams`.
 
 - **prs[]** gain `created_at`, `updated_at`, `milestone`, `comments`,
   `review_comments_count`, `reviewers`, `review_decision`
-  (`approved|changes_requested|commented|none`), and `crossref_issues`.
+  (`approved|changes_requested|commented|none`), and `crossref_issues`. See
+  *Review decision & rounds* below for the exact rules.
 - **issues[]** gain `milestone`, `updated_at`, `comments`. Open and
   not-planned-closed issues are now included, not just PR-closing issues.
 - **workflows[]**, **workflow_stats{}**, **releases[]**, **milestones[]** are
@@ -147,6 +171,43 @@ docsRefs, release_train, sprints, project, diagrams`.
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
 
+### Review decision & rounds
+
+GitHub review states are `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`
+and `PENDING`. `PENDING` is an unsubmitted draft and never counts anywhere. GitHub
+records every review-thread reply as a `COMMENTED` review, and rewrites a dismissed
+review's state to `DISMISSED`.
+
+- **`prs[].reviewers`** (`gather.summarize_reviews`) — sorted logins with at least
+  one submitted review (`APPROVED`/`CHANGES_REQUESTED`/`COMMENTED`/`DISMISSED`).
+- **`prs[].review_decision`** (`gather.summarize_reviews`) — per reviewer, the
+  *effective state* is their latest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`
+  review (chronological by `submitted_at`, then review id); a later `COMMENTED`
+  review never overrides it. A reviewer with none of those three is `commented`. An
+  effective `DISMISSED` contributes nothing. Overall: `changes_requested` if any
+  reviewer's effective state is that, else `approved` if any, else `commented` if
+  any, else `none`. So approve → comment = `approved`; changes requested → comment
+  = `changes_requested`; changes requested → approve = `approved`; an approval
+  that was dismissed (and not re-given) is no longer an approval.
+- **`prs[].review_rounds`** `{count, states}` (`derive.annotate_review_rounds`,
+  enrich-time; omitted when the PR has no counted review). A **counted review** is a
+  submission with a `submitted_at` and state `approved`/`changes_requested`/
+  `commented`/`dismissed` (never `pending`) whose author is **not the PR author**
+  (when `pr.author` is unknown, nobody is excluded on that ground). `states` lists
+  every counted review's state, oldest first (`submitted_at`, then integer id, then
+  input order). A **change-request block** is a maximal run of consecutive
+  `changes_requested` counted reviews from distinct reviewers (a reviewer repeating
+  a change request starts a new block — that is a re-review). A **review round**
+  is: the first counted review opens round 1, and each change-request block that is
+  followed by at least one later counted review opens one more round. So
+  `count = 0` with no counted review, else `1 + (change-request blocks followed by a
+  later counted review)`. Examples: `approved` → 1; `commented, approved,
+  approved` → 1; `changes_requested, approved` → 2; bob `changes_requested`, carol
+  `changes_requested`, bob `commented`, carol `approved` → 2 (one block); bob
+  `changes_requested`, bob `changes_requested`, bob `approved` → 3; `approved,
+  changes_requested` (nothing after) → 1. Because the bundle carries no push data,
+  a round is inferred from review order only.
+
 ## Narrative-substrate fields
 
 - **prs[]** gain `review_comments: [{author, author_association, body, url, id, created_at}]`
@@ -161,6 +222,10 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **code_events** (gather) — raw file-level events from the full-window
   `git log --name-status -M -C` walk: `[{commit, author, date, change:
   add|modify|delete|rename|copy, path, old_path?}]`. The raw material Link folds.
+  Paths here, in `commits[].files` and in the patch walk are the plain repo-relative
+  path: git runs with `core.quotepath=false` and any C-quoted path (`"…\303\251…"`,
+  or one containing a quote/backslash/TAB/newline) is unquoted, so non-ASCII and
+  spaced names match across the walks and the bounded `hunk` attaches.
 - **symbol_events** (gather) — symbol-granular change events from a single
   full-window `git log -p --unified=3` walk, attributed **diff-locally**: `[{commit,
   author, date, path, lang:"bicep|terraform", subkind:"param|var|output|resource|
@@ -178,7 +243,11 @@ docsRefs, release_train, sprints, project, diagrams`.
   ids are `art:<path>` (via `artifact_id`); **symbol/comment** ids are
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
-  carry the bounded `before`/`after`.
+  carry the bounded `before`/`after`. `status` is derived from the artifact's **last**
+  lifecycle event: `replaced` only when that event is a rename to a tracked path
+  (`replaced_by` = that direct successor; consumers walk A→B→C); a later re-add makes
+  it `live` again with `replaced_by:null`; a delete, or a rename to an untracked path,
+  is `removed` with `replaced_by:null`.
 - **symbol_moves** (link) — window-wide symbol-identity links: `{ links:[{subkind,
   name, from_path, to_path, from:<src aid>, to:<dst aid>, confidence:"high|medium", basis:
   "file_rename|unique_name"}], by_confidence:{high,medium} }`. Each link object also carries
@@ -209,7 +278,9 @@ docsRefs, release_train, sprints, project, diagrams`.
   "paths": [...], "edges": [] }] }`. The **directory provider** (primary,
   zero-dep, offline) maps each tracked file to its module directory (AVM
   `avm/res/<svc>/<module>/`, any `main.bicep` dir, Terraform `modules/<name>/` or
-  any `*.tf` dir, else a top-2-segment fallback); the area `id` is that directory.
+  any `*.tf` dir, else the top 2 segments of the file's directory — a repo-root file
+  keeps its own name); the area `id` is that directory. A file directly under an AVM
+  group (`avm/res/<svc>/README.md`) is not a module: it maps to the group area `avm/res/<svc>`.
   **graphify** is an OPTIONAL provider for its ~25 tree-sitter languages — it reads
   graphify's real `graph.json` (top keys `nodes`/`links`; each node carries an
   integer `community` + `source_file`; **no** top-level `communities` list; edges
@@ -219,15 +290,15 @@ docsRefs, release_train, sprints, project, diagrams`.
 
   | field | meaning |
   |-------|---------|
-  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable (e.g. a registry module — its identity is in `ref`) |
+  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable — its identity is then in `ref`. A Bicep registry ref maps to an area **only** when it is the public registry (`br/public:<path>:<tag>` or `br:mcr.microsoft.com/bicep/<path>:<tag>`) **and** the classified area (`<path>`) is a module of this repo (changed in the window, or present in the clone as `<path>/main.bicep`); a private registry (`br:<other-host>/…`), template spec (`ts:<sub>/<rg>/<name>:<ver>`, `ts/<alias>:…`), user alias (`br/<alias>:…`) or a public module this repo does not contain is `null` |
   | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred) |
-  | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
+  | `ref` | the raw reference (`br/public:…:<ver>`, `br:<host>/…:<tag>`, `ts:…`, a local path, or a TF `source`), kept verbatim |
   | `version` | pinned version when present, else `null` |
   | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
   | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge. Child edges come from building the **parent**: a child module is never the area's entrypoint |
   | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
-  | `resolved` | `true` when `to` is non-null |
+  | `resolved` | `true` when `to` is non-null (`to: null` ⇔ `resolved: false`; `version` still carries the ref's tag) |
 
   **Build-only.** Edges are populated *only* from a successful `bicep restore`+`bicep build`
   (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned

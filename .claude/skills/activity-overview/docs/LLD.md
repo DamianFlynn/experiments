@@ -138,10 +138,11 @@ sequenceDiagram
   participant REST as GitHub REST
   participant GQL as GitHub GraphQL
   A->>Git: clone --shallow-since=(from - margin)
+  A->>Git: fetch --deepen=n while an in-window commit is on the boundary (bounded)
   A->>Git: log (commits, full walk) then window_records
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
-  A->>A: drop shallow-boundary phantom commits
+  A->>A: fallback: drop unresolved boundary commits' diffs and files
   A->>A: select_code_area_provider (directory or graphify)
   A->>IaC: extract_iac_edges (parallel restore+build / init+graph)
   opt manifest gather
@@ -183,10 +184,17 @@ sequenceDiagram
   untouched.
 - The clone/fetch uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
   margin keeps each in-window commit's real parent in the clone.
-- `shallow_boundary_shas` + `drop_boundary_events` remove events from a commit whose parent
-  was grafted away (its diff would be a whole-tree phantom). Any **in-window** commit dropped
-  this way is recorded in `meta.boundary_dropped_commits` and a warning is printed — widen the
-  margin and re-gather to recover it.
+- If the margin holds no earlier commit, the first in-window commit is a shallow-boundary
+  commit: its parent is grafted away, so git diffs it against the empty tree (a whole-tree
+  phantom). After the clone/fetch, `deepen_window_boundary` runs `git fetch --deepen=n origin`
+  (n from `BOUNDARY_DEEPEN_STEPS` = 1, 2, 4, 8; stops at the first fetch error) until no
+  in-window commit of the checked-out branch is in `.git/shallow`, so its diff and file list
+  are real. A root commit is never in `.git/shallow`; its full file list is genuine.
+- Fallback when deepening could not resolve it: `shallow_boundary_shas` + `drop_boundary_events`
+  remove the commit's code/symbol events **and** its `commits[].files` is cleared, so
+  `area_paths`, module counts, `touches` edges and train `code_areas` are not inflated. Any
+  **in-window** commit handled this way is recorded in `meta.boundary_dropped_commits` and a
+  warning is printed — widen the margin and re-gather to recover it.
 - Commit dates use the committer date; filtering is `window_records` in Python to avoid git's
   timezone-sensitive pruning.
 
@@ -213,11 +221,11 @@ order (graphify does not parse Bicep/HCL, so IaC repos always land here):
 
 | Order | Pattern | Maps | Example |
 |---:|---|---|---|
-| 1 | `avm` (`_avm_area`) | `avm/{res,ptn,utl}/<a>/<b>/…` → 4-segment module subtree | `avm/ptn/ai-ml/landing-zone` |
+| 1 | `avm` (`_avm_area`) | `avm/{res,ptn,utl}/<a>/<b>/…` → 4-segment module subtree; a file directly under the group (`avm/res/<a>/README.md`) → group area `avm/res/<a>` (not a module) | `avm/ptn/ai-ml/landing-zone` |
 | 2 | `main_bicep` | any dir containing `main.bicep` → that dir | `infra/hub/main.bicep` → `infra/hub` |
-| 3 | `terraform_modules` | `modules/<name>/…` | `modules/subnet` |
+| 3 | `terraform_modules` | `modules/<name>/…` (`<name>` a dir; `modules/README.md` falls through) | `modules/subnet` |
 | 4 | `tf_dir` | any `*.tf` dir; **repo-root `*.tf` collapse to one `main.tf` area** | `main.networking.tf` → `main.tf` |
-| 5 | `topn` | fallback: top 2 path segments | `src/Bicep.Core` |
+| 5 | `topn` | fallback: top 2 segments of the file's **directory** (`docs/README.md` → `docs`); a repo-root file keeps its own name | `src/Bicep.Core` |
 
 `_is_scaffold_area` marks Terraform `examples/` and `tests/` subtrees as scaffolding: their
 edges are **skipped at extraction and excluded at fold**, because those trees reference the
@@ -264,16 +272,27 @@ flowchart TB
 - **Build-only:** edges come only from a successful build; static guessing is never emitted.
   A `resolved` area with no edges genuinely has no inter-area dependencies; `timeout`/`failed`
   are **counted gaps**.
-- **Bicep:** `parse_bicep_module_refs` splits `br/public:<path>:<ver>` / `br:<host>/bicep/<path>:<ver>`
-  into `registry_path` + `version`; `resolve_module_ref` classifies `<path>/main.bicep`, so in
-  the BRM monorepo `br/public:avm/res/network/virtual-network:0.x` resolves to the **in-repo**
-  area `avm/res/network/virtual-network`. Transitive edges come from walking nested
+- **Bicep:** `parse_bicep_module_refs` splits a **public**-registry ref (`br/public:<path>:<ver>` /
+  `br:mcr.microsoft.com/bicep/<path>:<ver>`) into `registry_path` + `version`; private-registry
+  (`br:<other-host>/…`), template-spec (`ts:…`, `ts/<alias>:…`) and user-alias (`br/<alias>:…`)
+  refs keep only the raw `ref` + `version`. `resolve_module_ref` classifies `<path>/main.bicep`
+  and returns that area **only when it is a module of this repo** (and not an AVM group area):
+  either in the window's area set (in-window-changed paths) or, for an untouched module, present
+  in the clone as `<area>/main.bicep`. So in the BRM monorepo
+  `br/public:avm/res/network/virtual-network:0.x` resolves to the **in-repo** area
+  `avm/res/network/virtual-network` whether or not it changed in the window; anything else is
+  `to=None, resolved=False` (#73). Transitive edges come from walking nested
   deployments in the compiled ARM (`walk_arm_deployments`).
 - **Terraform:** extraction reads **every `*.tf` in the entrypoint's module dir**; `parse_terraform_graph`
   accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
   first `module.<name>` token gives its owning module. Local sources resolve to repo areas
   (`../..` from a submodule → the root `main.tf` area); registry sources keep `to=None,
-  ref=<source>, version`.
+  ref=<source>, version`. Module blocks are parsed on an HCL mask (`_hcl_mask`: `#`, `//`,
+  `/* */` comments, string contents incl. `${…}` interpolation, and heredocs blanked), so a
+  commented-out or heredoc'd `module "x" {` is never a block; only file-top-level blocks
+  count, and `source`/`version` are the block's own **top-level** arguments
+  (`_tf_top_level_attr`: line-anchored, bracket depth 0), so `kubernetes_version`,
+  `custom_source` or a `version` key inside a nested map/list is ignored.
 - **Concurrency:** a thread pool of `ACTIVITY_IAC_MAX_WORKERS` (8), per-subprocess timeout
   `ACTIVITY_IAC_BUILD_TIMEOUT` (300 s), `ACTIVITY_IAC_RETRIES` (1). With `TF_PLUGIN_CACHE_DIR`
   set, `_terraform_prewarm` runs one serial init first because terraform's plugin cache is not
@@ -636,7 +655,9 @@ Outcome is deliberately ignored (a rejected train's story still matters).
 `effort`: `opened_at`, `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
 (sum), `commits`, `participants` (distinct authors + reviewers + commenters), `stalled`
 (merged and `elapsed_days > TRAIN_STALL_DAYS` = 21). Review rounds and reopen counts are added
-by `annotate_review_rounds` / `annotate_reopen_count`.
+by `annotate_review_rounds` / `annotate_reopen_count`. Review rounds ignore `PENDING` reviews
+and the PR author's own reviews; the exact round and `review_decision` rules are in
+`BUNDLE.md` → *Review decision & rounds*.
 
 ### 6.7 Forecast — `build_forecast`
 
@@ -789,15 +810,21 @@ wires `gather.backfill` with a token (the only network path in a reader).
 
 ## 10. Multi-repo aggregation — `digest.py`
 
-`digest.py --store S --project P [--repo R …] --from F --to T [--ticket-pattern RE]`
-(repos default to `project_repos`). Works for single-repo stores too
-(`--project <owner> --repo <name>`).
+`digest.py --store S [--project P] [--manifest M] [--repo R …] --from F --to T [--ticket-pattern RE]`
+(repos default to `project_repos`; `--project` defaults to the manifest's). Works
+for single-repo stores too (`--project <owner> --repo <name>`). Exit 2 for a bad
+window (`manifest.check_reader_window`), a missing store, an unknown project (lists
+the store's projects) or `--repo` (lists the project's repos). Ticket clustering is
+opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
+`--ticket-pattern` (wins); otherwise `tickets`/`related_work` are `[]`. Each
+`members[].bundle.meta` gains `project`, `slug`, `repo_owner`, `repo_name`
+(`meta.owner` stays the project scope).
 
 ```mermaid
 flowchart TB
   mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>connected components across repos"]
   sc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
-  bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (default [A-Z]{2,}-digits)<br/>cluster into related_work"]
+  bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (opt-in: manifest ticket_prefixes<br/>or --ticket-pattern) cluster into related_work"]
   mb --> mg["_merge_shipped / _merge_people / _merge_modules"]
   pd["project_depends_on: edges_by_type depends_on"] --> me["module_edges<br/>src_repo, src_area, dst_repo, dst_area,<br/>version, transitive, cross_repo"]
   tk --> view
@@ -924,14 +951,10 @@ release/milestone pages`. Because **all open PRs and issues** are included every
 repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
-<<<<<<< HEAD
 off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
 `ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
-A window with more than 1,000 workflow runs costs a few extra requests for the day-splits. (`--no-clone` saves the clone only if you refresh the existing clone yourself —
-gather does not fetch.)
-=======
-off-hours. (A reused `--clone-dir` is fetched rather than re-cloned.)
->>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
+A window with more than 1,000 workflow runs costs a few extra requests for the day-splits.
+(A reused `--clone-dir` is fetched rather than re-cloned.)
 
 ### 14.4 Security
 
@@ -941,7 +964,7 @@ off-hours. (A reused `--clone-dir` is fetched rather than re-cloned.)
 - Recognition-not-blame: `halls` has no shame list; people attribution of stalls is an opt-in
   report appendix.
 
-### 14.4 Known issues (verified, not yet fixed)
+### 14.5 Known issues (verified, not yet fixed)
 
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
@@ -950,12 +973,8 @@ off-hours. (A reused `--clone-dir` is fetched rather than re-cloned.)
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
-<<<<<<< HEAD
-| Clone dir reuse | `git clone` into an existing dir fails; `--no-clone` does not fetch | repeated runs need a fresh dir | fetch/deepen an existing clone |
 | `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
-=======
->>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 The operating guidance in USAGE (one single-window store per installment, series file for
 continuity, wide single gathers for history stores) avoids the first two in practice.

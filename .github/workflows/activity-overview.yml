@@ -44,13 +44,13 @@ on:
         required: false
         default: ""
       token_source:
-        description: "Token for the live gathers: the ACTIVITY_TEST_TOKEN secret, or this workflow's built-in token (public repos only, lower rate limit)"
+        description: "Token for the live gathers: this workflow's built-in token (default; public repos only), or the ACTIVITY_TEST_TOKEN secret (needed for private targets)"
         required: false
         type: choice
-        default: "secret"
+        default: "builtin"
         options:
-          - "secret"
           - "builtin"
+          - "secret"
   schedule:
     # 07:00 UTC on the 1st and 15th of each month (trailing-14-day window).
     - cron: "0 7 1,15 * *"
@@ -133,9 +133,11 @@ jobs:
             -s .claude/skills/activity-overview -p 'test_*.py' -v
 
   live:
-    # The real gather is heavy (clone + API) and needs the ACTIVITY_TEST_TOKEN
-    # secret (never exposed to fork PRs), so it runs only on demand, on the
+    # The real gather is heavy (clone + API), so it runs only on demand, on the
     # schedule, or on a push to the default branch — not on every feature push.
+    # It uses the workflow's built-in token by default (accepted for public
+    # targets; the Azure enterprise refuses personal tokens that live > 8 days).
+    # `token_source: secret` switches to the ACTIVITY_TEST_TOKEN secret.
     needs: tests
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -151,7 +153,7 @@ jobs:
           python-version: "3.12"
 
       - name: Verify the integration secret is present
-        if: inputs.token_source != 'builtin'
+        if: inputs.token_source == 'secret'
         env:
           ACTIVITY_TEST_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
         run: |
@@ -222,7 +224,7 @@ jobs:
 
       - name: Gather the real window into the journey-graph store
         env:
-          GITHUB_TOKEN: ${{ inputs.token_source == 'builtin' && github.token || secrets.ACTIVITY_TEST_TOKEN }}
+          GITHUB_TOKEN: ${{ inputs.token_source == 'secret' && secrets.ACTIVITY_TEST_TOKEN || github.token }}
           OWNER: ${{ steps.cfg.outputs.owner }}
           REPO: ${{ steps.cfg.outputs.repo }}
           FROM: ${{ steps.cfg.outputs.from }}
@@ -290,7 +292,7 @@ jobs:
           python-version: "3.12"
 
       - name: Verify the integration secret is present
-        if: inputs.token_source != 'builtin'
+        if: inputs.token_source == 'secret'
         env:
           ACTIVITY_TEST_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
         run: |
@@ -303,7 +305,7 @@ jobs:
 
       - name: Gather the fixed historical window into a journey-graph store
         env:
-          GITHUB_TOKEN: ${{ inputs.token_source == 'builtin' && github.token || secrets.ACTIVITY_TEST_TOKEN }}
+          GITHUB_TOKEN: ${{ inputs.token_source == 'secret' && secrets.ACTIVITY_TEST_TOKEN || github.token }}
         run: |
           cd .claude/skills/activity-overview
           mkdir -p workspace
@@ -389,7 +391,7 @@ jobs:
           esac
 
       - name: Verify the integration secret is present
-        if: inputs.token_source != 'builtin'
+        if: inputs.token_source == 'secret'
         env:
           ACTIVITY_TEST_TOKEN: ${{ secrets.ACTIVITY_TEST_TOKEN }}
         run: |
@@ -411,7 +413,7 @@ jobs:
 
       - name: Gather the constellation into one project store
         env:
-          GITHUB_TOKEN: ${{ inputs.token_source == 'builtin' && github.token || secrets.ACTIVITY_TEST_TOKEN }}
+          GITHUB_TOKEN: ${{ inputs.token_source == 'secret' && secrets.ACTIVITY_TEST_TOKEN || github.token }}
           # terraform init for an AVM pattern pulls many registry modules: a shared
           # plugin cache avoids re-downloading providers, and each init gets room. A
           # heavy init that still times out degrades gracefully — edge_extraction

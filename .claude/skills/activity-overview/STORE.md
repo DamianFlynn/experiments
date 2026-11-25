@@ -453,8 +453,15 @@ an `owner` that is not a GitHub user/org name (letters, digits, `-` and `_`, not
 starting with `-`, ≤ 39 chars); a `repo` outside GitHub's alphabet (letters, digits,
 `-`, `_`, `.`; ≤ 100 chars; not `.`/`..`); two members naming the same repo
 **case-insensitively** (`o/a` and `O/A`); a `registry` that is present but not a
-non-empty string, or declared by two members (case-insensitively). `gather.py`
-applies the same owner/repo/date checks to `--owner/--repo/--from/--to`.
+non-empty string, or declared by two members (case-insensitively); a
+`ticket_prefixes` that is present but not a list of distinct, non-empty ASCII
+letter/digit strings. `gather.py` applies the same owner/repo/date checks to
+`--owner/--repo/--from/--to`.
+
+The optional top-level `"ticket_prefixes": ["ABC", "PLAT"]` is read only by
+`digest.py --manifest` (gather ignores it): it turns on ticket clustering into
+`related_work` with the pattern `\b(?:ABC|PLAT)-\d+\b`. Without it (or
+`digest.py --ticket-pattern`) `related_work` is `[]`.
 
 gather loops the members, running the existing acquire→fold path once per member
 into the **same store** under `project = manifest.project`, `repo = "{owner}/{repo}"`.
@@ -477,6 +484,19 @@ byte-unchanged (`project = owner`, `repo = <name>`).
   is a host (a dot, e.g. `github.com/org/repo`) is VCS shorthand, never resolved.
   Resolution only runs in a multi-repo fold (`members` + `registry_by_slug` present);
   single-repo folds emit intra-repo edges only.
+- **Repo slugs and registry sources compare case-insensitively** (GitHub names and
+  registry addresses are). Ids keep the **manifest's spelling**
+  (`{project}/{owner}/{repo}#…`); only comparison/lookup is normalised, mapping any
+  spelling to that canonical slug (`manifest.slug_index`), so two spellings never
+  make two id spaces and no store migration is needed. This covers qualified refs,
+  timeline cross-refs (a same-repo ref in another case is not cross-repo), the
+  Projects v2 board lookup, and registry resolution, where **both** sides go through
+  `parse_registry_source` (host and `//submodule` stripped) before an exact or
+  convention match — `registry.terraform.io/azure/foo/azurerm//modules/bar` matches a
+  member declared with `registry: "Azure/foo/azurerm"`. Readers (`spotlight
+  dependents`, `digest --repo`, `view --repo`) accept any casing of a stored repo and
+  resolve it to the stored spelling (`graphstore.resolve_repo`). The **project**
+  name stays case-sensitive.
 
 **Terraform extraction, corrected for real modules.** A Terraform **root module is
 one area** — repo-root `*.tf` files (`main.tf`/`variables.tf`/`main.<topic>.tf`/…)
@@ -528,7 +548,8 @@ independent and idempotent (re-folding a member unions a subset → no change).
 **Readers + validate aggregate the member set.** `digest.py` is the project
 aggregation layer above `extract` (per-member extract+enrich, then merge:
 spine-linked trains stitched across members; trains sharing only an internal ticket
-clustered into `related_work`; Shipped/people/modules merged; cross-repo
+clustered into `related_work` — opt-in, only with the manifest's `ticket_prefixes`
+(`digest.py --manifest`) or `--ticket-pattern`, else `[]`; Shipped/people/modules merged; cross-repo
 `module_edges` for the project-wide blast-radius graph). `spotlight dependents
 <owner/repo>` answers the reverse-dependency (blast-radius) question. `validate.py
 --project <name>` runs the per-member checks **plus** a project-wide
