@@ -234,20 +234,31 @@ def window_records(records, from_date, to_date):
     return [r for r in records if in_window(r.get("date"), from_date, to_date)]
 
 
-_CLOSING_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
+# GitHub closing-keyword grammar (#62). A keyword (close/closes/closed,
+# fix/fixes/fixed, resolve/resolves/resolved; any case), an optional `:`, then
+# ONE reference: `#N`, `owner/repo#N`, or a full
+# `https://github.com/owner/repo/(issues|pull)/N` URL. Each closed issue needs its
+# own keyword: in "Fixes #1, #2" / "Fixes #1 and #2" only #1 closes; #2 is a
+# *listed* ref (GitHub links it as a mention, never closes it). Closing keywords
+# link issues only, so a keyword before a `/pull/` URL is a cross-ref, not a
+# close. No Markdown parsing: a keyword inside a code block / code span matches
+# like anywhere else. Owners/repos: GitHub names — alnum start, then word/.-.
+_CLOSING_KW = r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+_REF = (
+    r"(?:https?://github\.com/(?P<uowner>[A-Za-z0-9][\w.-]*)/"
+    r"(?P<urepo>[A-Za-z0-9][\w.-]*)/(?P<ukind>issues|pull)/(?P<unum>\d+)"
+    r"|(?:(?P<qowner>[A-Za-z0-9][\w.-]*)/(?P<qrepo>[A-Za-z0-9][\w.-]*))?"
+    r"#(?P<num>\d+))"
 )
+_CLOSING_RE = re.compile(_CLOSING_KW + r"(?:\s*:\s*|\s+)" + _REF, re.IGNORECASE)
+# A further ref continuing a closing keyword's list WITHOUT its own keyword:
+# ", #2", ", and #2", " and #2", " & #2". Applied (anchored) right after a match.
+_LIST_TAIL_RE = re.compile(r"(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s*&\s*)" + _REF,
+                           re.IGNORECASE)
 
-# Cross-repo references (Phase 9). A closing keyword qualified with owner/repo
-# (`Closes Azure/repo#12`) -> a `closes` link to that OTHER repo's issue. A bare
-# GitHub URL (`https://github.com/owner/repo/(issues|pull)/N`) -> a `cross_ref`
-# mention (issues -> issue node, pull -> pr node). Bare `#N` stays same-repo
-# (parse_closing_refs). Owners/repos: GitHub names — alnum start, then word/.-.
-_QUALIFIED_CLOSE_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
-    r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)#(?P<num>\d+)",
-    re.IGNORECASE,
-)
+# Cross-repo references (Phase 9). Any github.com issue/PR URL that is not a
+# keyword-closed issue -> a `cross_ref` mention (issues -> issue node, pull -> pr
+# node). Bare `#N` stays same-repo (parse_closing_refs).
 _QUALIFIED_URL_RE = re.compile(
     r"https?://github\.com/"
     r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)/"
@@ -255,12 +266,54 @@ _QUALIFIED_URL_RE = re.compile(
 )
 
 
+def _ref_from_match(m):
+    """(owner, repo, number, is_pr) for a `_REF` match; owner/repo None for a
+    bare `#N`. is_pr is True only for a `/pull/` URL (a bare/qualified `#N`
+    cannot be told apart from an issue without the API)."""
+    if m.group("unum") is not None:
+        return (m.group("uowner"), m.group("urepo"), int(m.group("unum")),
+                m.group("ukind").lower() == "pull")
+    return m.group("qowner"), m.group("qrepo"), int(m.group("num")), False
+
+
+def _scan_closing(text):
+    """Every closing-keyword reference in `text`, in order, as
+    (owner, repo, number, is_pr, closes): the ref right after a keyword has
+    closes=True unless it is a `/pull/` URL; each list-tail ref after it
+    (", #2", " and #2") has closes=False. Pure."""
+    text = text or ""
+    out = []
+    for m in _CLOSING_RE.finditer(text):
+        owner, repo, num, is_pr = _ref_from_match(m)
+        out.append((owner, repo, num, is_pr, not is_pr))
+        pos = m.end()
+        while True:
+            t = _LIST_TAIL_RE.match(text, pos)
+            if not t:
+                break
+            out.append(_ref_from_match(t) + (False,))
+            pos = t.end()
+    return out
+
+
+def _same_repo(owner, repo, slug):
+    """True if a ref is in the current repo: a bare `#N` (owner None) always is;
+    a qualified ref/URL only when `slug` ('owner/repo') matches,
+    case-insensitively (GitHub names are). Without a slug only bare refs are."""
+    if owner is None:
+        return True
+    return bool(slug) and "{}/{}".format(owner, repo).lower() == slug.lower()
+
+
 def parse_qualified_refs(text):
     """Cross-repo refs in PR/issue text, ordered + deduped. Returns a list of
-    {owner, repo, number, kind, is_pr}: closing keywords -> kind 'closes'
-    (is_pr False; closing targets an issue); github.com URLs -> kind 'cross_ref'
-    (is_pr True for /pull/, False for /issues/). Bare `#N` is left to
-    parse_closing_refs (same-repo). Pure."""
+    {owner, repo, number, kind, is_pr}: a keyword-closed qualified issue ref
+    (`Closes owner/repo#N`, `Fixes: https://github.com/o/r/issues/N`) -> kind
+    'closes' (is_pr False); every other github.com URL, a keyword before a
+    `/pull/` URL, and an unkeyworded list-tail qualified ref
+    (`Fixes a/b#1, a/b#2` -> #2) -> kind 'cross_ref' (is_pr True for /pull/).
+    Bare `#N` is left to parse_closing_refs (same-repo). Same-repo qualified refs
+    are returned too; callers skip them by slug. Pure."""
     out, seen = [], set()
 
     def add(owner, repo, num, kind, is_pr):
@@ -270,21 +323,41 @@ def parse_qualified_refs(text):
             out.append({"owner": owner, "repo": repo, "number": num,
                         "kind": kind, "is_pr": is_pr})
 
-    for m in _QUALIFIED_CLOSE_RE.finditer(text or ""):
-        add(m.group("owner"), m.group("repo"), int(m.group("num")), "closes", False)
+    scanned = [r for r in _scan_closing(text) if r[0] is not None]
+    for owner, repo, num, is_pr, closes in scanned:
+        if closes:
+            add(owner, repo, num, "closes", False)
+    for owner, repo, num, is_pr, closes in scanned:
+        if not closes:
+            add(owner, repo, num, "cross_ref", is_pr)
     for m in _QUALIFIED_URL_RE.finditer(text or ""):
         add(m.group("owner"), m.group("repo"), int(m.group("num")), "cross_ref",
             m.group("kind") == "pull")
     return out
 
 
-def parse_closing_refs(text):
-    """Extract issue numbers from GitHub closing keywords, de-duplicated,
-    order-preserving."""
+def parse_closing_refs(text, repo=None):
+    """Same-repo issue numbers GitHub would CLOSE from `text`, de-duplicated,
+    order-preserving (see `_CLOSING_RE`). `repo` ('owner/repo', optional) lets a
+    same-repo qualified ref or full issue URL count; without it only bare `#N`
+    closes (backwards compatible). Cross-repo closes are parse_qualified_refs'."""
     out = []
-    for m in _CLOSING_RE.finditer(text or ""):
-        n = int(m.group(1))
-        if n not in out:
+    for owner, rname, n, _is_pr, closes in _scan_closing(text):
+        if closes and _same_repo(owner, rname, repo) and n not in out:
+            out.append(n)
+    return out
+
+
+def parse_listed_refs(text, repo=None):
+    """Same-repo numbers that continue a closing keyword's list without their
+    own keyword ("Fixes #1, #2" -> [2]): GitHub links these as mentions but does
+    not close them, so they are cross-references. Numbers closed elsewhere in
+    `text` are excluded. Ordered, deduped. `repo` as in parse_closing_refs. Pure."""
+    closed = set(parse_closing_refs(text, repo))
+    out = []
+    for owner, rname, n, is_pr, closes in _scan_closing(text):
+        if (not closes and not is_pr and _same_repo(owner, rname, repo)
+                and n not in closed and n not in out):
             out.append(n)
     return out
 
@@ -344,12 +417,28 @@ def normalize_pr(raw):
         "review_comments_count": raw.get("review_comments", 0) or 0,
         "reviewers": [],
         "review_decision": "none",
-        "crossref_issues": [],
-        "closes": parse_closing_refs(
-            (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
-        ),
+        # seeded with listed-but-not-closed refs ("Fixes #1, #2" -> [2]);
+        # acquire() currently REPLACES this with the timeline cross-refs.
+        "crossref_issues": parse_listed_refs(_pr_text(raw), _pr_repo_slug(raw)),
+        "closes": parse_closing_refs(_pr_text(raw), _pr_repo_slug(raw)),
         "url": raw.get("html_url"),
     }
+
+
+def _pr_text(raw):
+    """The text GitHub scans for closing keywords: title + body."""
+    return (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
+
+
+def _pr_repo_slug(raw):
+    """'owner/repo' of a raw REST PR (base repo, else parsed from html_url), or
+    None. Lets parse_closing_refs recognise a same-repo issue URL. Pure."""
+    full = (((raw.get("base") or {}).get("repo")) or {}).get("full_name")
+    if full:
+        return full
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+)/pull/\d+",
+                 raw.get("html_url") or "")
+    return m.group(1) if m else None
 
 
 def select_merged_prs(prs, from_date, to_date):
@@ -475,15 +564,30 @@ def parse_timeline_merged_by(raw_timeline):
     return login
 
 
-_PR_RE =re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
+_TRAILING_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+_MERGE_PR_RE = re.compile(r"Merge pull request #(\d+)")
+_PAREN_PR_RE = re.compile(r"\(#(\d+)\)")
 
 
 def resolve_commit_pr(message):
-    """Best-effort PR number from a commit subject (merge or squash style)."""
-    m = _PR_RE.search(message or "")
-    if not m:
-        return None
-    return int(m.group(1) or m.group(2))
+    """Best-effort PR number from a commit message (#62). In order:
+      1. a trailing `(#N)` on the SUBJECT line (squash merges append the PR
+         number last, so `Revert "x (#4012)" (#4020)` -> 4020, backports too);
+      2. `Merge pull request #N` (merge-commit style);
+      3. the LAST `(#N)` on the subject line, then the last in the message."""
+    message = message or ""
+    subject = message.split("\n", 1)[0]
+    m = _TRAILING_PR_RE.search(subject)
+    if m:
+        return int(m.group(1))
+    m = _MERGE_PR_RE.search(message)
+    if m:
+        return int(m.group(1))
+    for scope in (subject, message):
+        hits = _PAREN_PR_RE.findall(scope)
+        if hits:
+            return int(hits[-1])
+    return None
 
 
 def attach_commit_prs(commits):

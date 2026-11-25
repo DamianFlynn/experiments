@@ -336,6 +336,18 @@ paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 (warns when truncated) a
   nothing); the body is never read, so "the module breaks" or "not supported" in a body does not
   change kind (#58).
 - `classify_pr_kind` reads conventional-commit prefixes (`feat→feature`, `fix→bug`, `docs→docs`).
+- `normalize_pr` sets `closes = parse_closing_refs(title+body, repo=<base repo slug>)` with
+  GitHub's semantics (#62): keywords `close[sd]`/`fix(e[sd])`/`resolve[sd]`, optional `:`, then
+  `#N`, `owner/repo#N` or a full issue URL; each closed issue needs its own keyword
+  (`Fixes #1, #2` → `[1]`; `Fixes #1, fixes #2` → `[1, 2]`). A same-repo qualified ref/URL is a
+  same-repo close (`repo` is optional; without it only bare `#N` closes). The unkeyworded list
+  tail (`#2`) comes from `parse_listed_refs` and seeds `crossref_issues` (note: `acquire()`
+  currently overwrites that field with the timeline cross-refs). `parse_qualified_refs` returns
+  keyword-closed cross-repo issues as `closes` (incl. keyword + issue URL) and everything else
+  (other URLs, keyword + `/pull/` URL, list tails) as `cross_ref`. No Markdown parsing:
+  keywords in code blocks match too.
+- `resolve_commit_pr` (commit → PR, `part_of`): trailing `(#N)` on the subject line, else
+  `Merge pull request #N`, else the last `(#N)` on the subject, then in the message.
 - `normalize_issue` parses `parse_blocks_refs` ("blocks/blocking #N" outbound, "blocked by /
   depends on #N" inbound); `derive_open_high_activity` flags open issues with ≥ 5 comments or
   ≥ 5 👍.

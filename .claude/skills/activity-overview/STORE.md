@@ -119,6 +119,18 @@ from a root issue over the *spine* edge allowlist:
 [id]}`. `missing` ids are spine nodes referenced but not yet stored (e.g. an
 out-of-window issue a PR closes) — what a reader backfills.
 
+Where the spine edges come from (gather, #62). `closes` follows GitHub's own
+closing-keyword rule: `close[sd]`/`fix(e[sd])`/`resolve[sd]` (any case), optional
+`:`, then one `#N`, `owner/repo#N` or `https://github.com/owner/repo/issues/N`.
+Each closed issue needs its own keyword — `Fixes #1, #2` closes only #1 (#2 is
+kept as a same-repo cross-reference in `crossref_issues`), while `Fixes #1, fixes
+#2` closes both. A same-repo qualified ref or URL is a same-repo `closes`; a
+cross-repo one goes to the cross-repo edge path below; a keyword before a
+`/pull/` URL is a `cross_ref`, never a close. Keywords are matched in code blocks
+too (no Markdown parsing). `part_of` uses the commit subject's **trailing**
+`(#N)` first (so `Revert "x (#4012)" (#4020)` → PR 4020), then `Merge pull
+request #N`, then the last `(#N)`.
+
 ## Code-event ledger (`code_events` table)
 
 One row per artifact lifecycle event: `(artifact_id, event, commit_sha,

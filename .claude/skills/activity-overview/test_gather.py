@@ -2605,6 +2605,169 @@ class TestResolveCommitPr(unittest.TestCase):
         self.assertEqual(commits[0]["pr"], 7)
         self.assertIsNone(commits[1]["pr"])
 
+    # --- #62: squash subjects put the PR number LAST ---------------------------
+    def test_revert_subject_takes_trailing_pr(self):
+        self.assertEqual(
+            gather.resolve_commit_pr('Revert "feat: Add foo (#4012)" (#4020)'), 4020)
+
+    def test_backport_subject_takes_trailing_pr(self):
+        self.assertEqual(
+            gather.resolve_commit_pr("[release/0.30] fix: bar (#3990) (#4001)"), 4001)
+
+    def test_trailing_pr_tolerates_trailing_whitespace(self):
+        self.assertEqual(gather.resolve_commit_pr("fix: baz (#12)  "), 12)
+
+    def test_plain_squash_subject_unchanged(self):
+        self.assertEqual(gather.resolve_commit_pr("Add policy param (#12)"), 12)
+
+    def test_merge_pull_request_beats_inner_paren_ref(self):
+        self.assertEqual(gather.resolve_commit_pr(
+            "Merge pull request #50 from o/revert-(#40)-thing"), 50)
+
+    def test_no_trailing_ref_takes_last_paren_ref(self):
+        self.assertEqual(
+            gather.resolve_commit_pr("Revert (#3) and (#5) partially"), 5)
+
+    def test_only_subject_line_trailing_ref_counts(self):
+        # The subject's trailing (#N) wins over (#N) refs in a body.
+        self.assertEqual(gather.resolve_commit_pr(
+            "feat: thing (#9)\n\n* sub change (#7)\n* other (#8)"), 9)
+
+    def test_attach_uses_trailing_rule(self):
+        commits = [{"sha": "a", "message": 'Revert "x (#1)" (#2)', "pr": None}]
+        gather.attach_commit_prs(commits)
+        self.assertEqual(commits[0]["pr"], 2)
+
+
+class TestClosingRefSemantics(unittest.TestCase):
+    """#62: GitHub closing-keyword semantics for parse_closing_refs /
+    parse_listed_refs / parse_qualified_refs."""
+
+    def test_colon_after_keyword(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes: #12"), [12])
+        self.assertEqual(gather.parse_closing_refs("closes:#3"), [3])
+
+    def test_comma_list_closes_only_first(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes #1, #2"), [1])
+        self.assertEqual(gather.parse_listed_refs("Fixes #1, #2"), [2])
+
+    def test_and_list_closes_only_first(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes #1 and #2"), [1])
+        self.assertEqual(gather.parse_listed_refs("Fixes #1 and #2"), [2])
+
+    def test_each_keyword_closes(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes #1, fixes #2"), [1, 2])
+        self.assertEqual(gather.parse_closing_refs("closes #1 and fixes #2"), [1, 2])
+        self.assertEqual(gather.parse_listed_refs("closes #1 and fixes #2"), [])
+
+    def test_all_nine_keywords_case_insensitive(self):
+        for i, kw in enumerate(("close", "closes", "closed", "fix", "fixes", "fixed",
+                                "resolve", "resolves", "resolved"), start=1):
+            self.assertEqual(gather.parse_closing_refs("{} #{}".format(kw.upper(), i)),
+                             [i], kw)
+
+    def test_non_keywords_do_not_close(self):
+        for text in ("closing #1", "fixing #1", "resolving #1", "prefix #1",
+                     "See #1", "unfixed#1"):
+            self.assertEqual(gather.parse_closing_refs(text), [], text)
+
+    def test_same_repo_url_closes_when_repo_known(self):
+        text = "Closes https://github.com/Azure/bicep/issues/123"
+        self.assertEqual(gather.parse_closing_refs(text, repo="Azure/bicep"), [123])
+        # owner/repo matching is case-insensitive, like GitHub
+        self.assertEqual(gather.parse_closing_refs(text, repo="azure/Bicep"), [123])
+
+    def test_same_repo_url_without_repo_is_backwards_compatible(self):
+        # No slug -> cannot tell same-repo from cross-repo: no bare close.
+        self.assertEqual(
+            gather.parse_closing_refs("Closes https://github.com/Azure/bicep/issues/123"),
+            [])
+
+    def test_other_repo_url_is_not_a_same_repo_close(self):
+        self.assertEqual(gather.parse_closing_refs(
+            "Closes https://github.com/Azure/other/issues/123", repo="Azure/bicep"), [])
+
+    def test_same_repo_qualified_ref_closes(self):
+        self.assertEqual(gather.parse_closing_refs(
+            "Resolves Azure/bicep#5", repo="Azure/bicep"), [5])
+
+    def test_cross_repo_qualified_ref_is_not_a_same_repo_close(self):
+        self.assertEqual(gather.parse_closing_refs(
+            "Resolves owner/repo#5", repo="Azure/bicep"), [])
+
+    def test_pull_url_is_never_closed(self):
+        # Closing keywords link issues, not PRs.
+        self.assertEqual(gather.parse_closing_refs(
+            "Fixes https://github.com/Azure/bicep/pull/9", repo="Azure/bicep"), [])
+
+    def test_url_list_tail_is_listed_not_closed(self):
+        text = ("Fixes https://github.com/o/r/issues/1, "
+                "https://github.com/o/r/issues/2")
+        self.assertEqual(gather.parse_closing_refs(text, repo="o/r"), [1])
+        self.assertEqual(gather.parse_listed_refs(text, repo="o/r"), [2])
+
+    def test_listed_excludes_numbers_closed_elsewhere(self):
+        self.assertEqual(gather.parse_listed_refs("Fixes #1, #2. Also fixes #2"), [])
+
+    def test_keyword_inside_code_block_still_matches(self):
+        # Documented behaviour: no Markdown parsing; a keyword in a fenced block
+        # or inline code span is matched like anywhere else.
+        self.assertEqual(gather.parse_closing_refs("```\nfixes #7\n```"), [7])
+        self.assertEqual(gather.parse_closing_refs("`closes #8`"), [8])
+
+    def test_qualified_cross_repo_close(self):
+        refs = gather.parse_qualified_refs("Resolves owner/repo#5")
+        self.assertEqual(refs, [{"owner": "owner", "repo": "repo", "number": 5,
+                                 "kind": "closes", "is_pr": False}])
+
+    def test_qualified_close_with_colon(self):
+        refs = gather.parse_qualified_refs("Fixes: owner/repo#5")
+        self.assertEqual([r["kind"] for r in refs], ["closes"])
+
+    def test_keyword_url_is_qualified_close(self):
+        refs = gather.parse_qualified_refs(
+            "Closes https://github.com/Azure/other/issues/123")
+        self.assertEqual(refs, [{"owner": "Azure", "repo": "other", "number": 123,
+                                 "kind": "closes", "is_pr": False}])
+
+    def test_keyword_pull_url_stays_cross_ref(self):
+        refs = gather.parse_qualified_refs("Fixes https://github.com/Azure/o/pull/4")
+        self.assertEqual(refs, [{"owner": "Azure", "repo": "o", "number": 4,
+                                 "kind": "cross_ref", "is_pr": True}])
+
+    def test_qualified_list_tail_is_cross_ref(self):
+        refs = gather.parse_qualified_refs("Fixes a/b#1, a/b#2")
+        self.assertEqual([(r["number"], r["kind"]) for r in refs],
+                         [(1, "closes"), (2, "cross_ref")])
+
+    def test_normalize_pr_same_repo_url_closes(self):
+        pr = gather.normalize_pr({
+            "number": 7, "title": "t",
+            "body": "Closes https://github.com/Azure/bicep/issues/123",
+            "html_url": "https://github.com/Azure/bicep/pull/7"})
+        self.assertEqual(pr["closes"], [123])
+
+    def test_normalize_pr_repo_from_base_repo(self):
+        pr = gather.normalize_pr({
+            "number": 7, "body": "Fixes https://github.com/Azure/bicep/issues/3",
+            "base": {"ref": "main", "repo": {"full_name": "Azure/bicep"}}})
+        self.assertEqual(pr["closes"], [3])
+
+    def test_normalize_pr_listed_ref_seeds_crossref_issues(self):
+        pr = gather.normalize_pr({"number": 7, "body": "Fixes #1, #2",
+                                  "html_url": "https://github.com/o/r/pull/7"})
+        self.assertEqual(pr["closes"], [1])
+        self.assertEqual(pr["crossref_issues"], [2])
+
+    def test_cross_repo_edges_still_flow(self):
+        pr = {"number": 10, "title": "", "body": "Resolves Azure/mod-b#5"}
+        external, edges = gather._cross_repo_pr_edges(
+            pr, "Azure", "Azure/mod-a", {"Azure/mod-a", "Azure/mod-b"})
+        self.assertEqual(external, [])
+        self.assertEqual([e[1:3] for e in edges],
+                         [(graphstore.qualify_id("Azure", "Azure/mod-b", "issue-5"),
+                           "closes")])
+
 
 def _fold_fixture_bundle():
     return {
