@@ -41,8 +41,9 @@ def _bundle():
 
 def _mmdc_works():
     """True only if a real `mmdc` can compile a trivial diagram — guards the
-    live-validation test so a missing OR non-functional mmdc (e.g. Puppeteer
-    Chrome absent) skips rather than fails."""
+    live-validation tests. Locally a missing OR non-functional mmdc (e.g.
+    Puppeteer Chrome absent) skips them; under CI (`CI=true`) `_require_mmdc`
+    turns that into a failure so the diagram gate cannot silently skip."""
     mmdc = shutil.which("mmdc")
     if not mmdc:
         return False
@@ -57,6 +58,43 @@ def _mmdc_works():
             return result.returncode == 0
     except Exception:
         return False
+
+
+def _in_ci(environ=None):
+    """True when running under CI (GitHub Actions and most CI systems set
+    `CI=true`)."""
+    env = os.environ if environ is None else environ
+    return env.get("CI", "").strip().lower() in ("true", "1", "yes")
+
+
+def _require_mmdc(testcase, works=None, environ=None):
+    """Skip the calling test when no working mmdc is available — except under
+    CI, where the workflow installs a pinned mermaid-cli and a missing/broken
+    mmdc must FAIL the test rather than skip it (issue #72)."""
+    ok = _mmdc_works() if works is None else works()
+    if ok:
+        return
+    reason = "working mmdc (with browser) not available"
+    if _in_ci(environ):
+        testcase.fail(reason + " but CI=true: the diagram compile gate must run")
+    testcase.skipTest(reason)
+
+
+class TestRequireMmdc(unittest.TestCase):
+    """Regression for #72: under CI the mmdc tests must fail, not skip."""
+
+    def test_fails_under_ci_when_mmdc_missing(self):
+        with self.assertRaises(AssertionError):
+            _require_mmdc(self, works=lambda: False, environ={"CI": "true"})
+
+    def test_skips_locally_when_mmdc_missing(self):
+        for env in ({}, {"CI": ""}, {"CI": "false"}):
+            with self.assertRaises(unittest.SkipTest):
+                _require_mmdc(self, works=lambda: False, environ=env)
+
+    def test_passes_through_when_mmdc_works(self):
+        for env in ({}, {"CI": "true"}):
+            self.assertIsNone(_require_mmdc(self, works=lambda: True, environ=env))
 
 
 class TestBucketsPie(unittest.TestCase):
@@ -174,10 +212,9 @@ class TestMmdcValidation(unittest.TestCase):
 
     def test_real_mmdc_compiles_emitted_diagrams(self):
         # Probe lazily inside the test (not at import time) so collecting/​running
-        # other tests never spawns mmdc, and an installed-but-broken mmdc skips
-        # rather than fails.
-        if not _mmdc_works():
-            self.skipTest("working mmdc (with browser) not available")
+        # other tests never spawns mmdc; a missing/broken mmdc skips locally
+        # but fails under CI=true (#72).
+        _require_mmdc(self)
         with tempfile.TemporaryDirectory() as d:
             real_paths = render.write_diagrams(_bundle(), d)
             render.validate_with_mmdc(list(real_paths.values()))  # raises on failure
@@ -1006,9 +1043,9 @@ class TestTrainSpotlightCLI(unittest.TestCase):
 
 
 class TestTrainFlowchartMmdc(unittest.TestCase):
-    @unittest.skipUnless(_mmdc_works(), "working mmdc (with browser) not available")
     def test_train_flowcharts_compile_via_mmdc(self):
         """Live gate: emitted train flowcharts must actually compile with mmdc."""
+        _require_mmdc(self)
         b = _train_bundle()
         # Ensure there is at least one deep train
         b["trains"][0]["tier"] = "deep"
