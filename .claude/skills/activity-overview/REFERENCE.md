@@ -214,6 +214,17 @@ flags) — it parses the args and defers to `SKILL.md` (gather → validate → 
 python3 -m unittest discover -s .claude/skills/activity-overview -p 'test_*.py' -v
 ```
 
+The CI `spotlight` job's gate can also be run on any store:
+
+```bash
+python3 ci_spotlight_integration.py --store workspace/journey.db [--project P] [--require-all]
+```
+
+It discovers a person, an area, an artifact and a search term inside the project and checks
+the four spotlight answers against the store (see `docs/LLD.md` §15). Exit 0 (all verified,
+or skipped for lack of input), 1 (a check failed, or anything skipped with
+`--require-all`), 2 (usage error).
+
 ## Troubleshooting
 
 - **`error: set GITHUB_TOKEN`** — export a token before running gather.

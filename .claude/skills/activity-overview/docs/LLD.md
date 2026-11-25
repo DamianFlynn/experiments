@@ -1115,6 +1115,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Incomplete members are not in the digest JSON | #77 surfaces a failed / not-attempted member through gather's exit code, `validate` and a `digest.py`/`view.py` stderr warning only | a formatter reading only the digest/view JSON cannot tell the project is partial | add the incomplete members to the view `meta` (BUNDLE.md change) |
 | Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
 | Any open PR counts as in motion | since #87 `in_motion` needs an open PR or an `in_flight` train, but it does not look at the PR's age, draft state or base branch | an open PR untouched for a year, or a draft, still scores `open PR` (+2.0) for the issue it references | weigh PR recency (e.g. `updated_at` in window) if stale open PRs prove common |
+| Spotlight CI gate covers four queries | `ci_spotlight_integration.py` runs `person` / `subsystem` / `symbol` / `grep` only | `module` and `dependents` are exercised by the unit suite but not against the live store | add discovered-argument checks for both (a single-repo store has no cross-repo `depends_on`, so `dependents` belongs on the constellation store) |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for
@@ -1131,6 +1132,24 @@ continuity, wide single gathers for history stores) avoids the first three in pr
   3.12, 3.13, byte-compile + suite); `live` on dispatch, schedule (07:00 UTC on the 1st and
   15th) or default-branch push — real gather into a store (pinned bicep CLI) then
   `validate.py`, using the `ACTIVITY_TEST_TOKEN` secret.
+- CI `spotlight` job (same triggers): gathers a pinned historical week of
+  `Azure/bicep-registry-modules`, runs `validate.py`, then
+  `ci_spotlight_integration.py --store … --require-all`. The gate discovers its query
+  arguments from the store, scoped to the project by a case-sensitive id-prefix range (no
+  `LIKE`, so `_`/`%` in a project name are literal): the most-active person, the most-touched
+  area (with its repo), the code_events key with the most ledger rows, and a term with hits in
+  the project. It then checks each answer against the store: `person` — trains with outcomes
+  from spotlight's vocabulary, member `repos`, chronological project-only timelines, summary
+  counts equal to the delivered trains, citations, determinism; `subsystem` (narrowed with
+  `repo=`) — `repos`, contributor and `depends_on` rows name that member, and every commit/PR
+  that `touches` the area is a touchpoint; `symbol` — one lifecycle row per ledger event in
+  (date, commit) order, outcome `removed` exactly when the last event is `remove`/`delete`, and
+  the artifact somewhere in its identity chain (a move destination is not the chain head);
+  `grep` — the delivered mentions are exactly the project's FTS matches. A check whose input the
+  store lacks is reported as skipped; it fails the run only under `--require-all`. Exit 0 / 1
+  (a check failed, or a skip under `--require-all`) / 2 (usage: missing store, unknown or
+  unnamed `--project`). `test_ci_spotlight_integration.py` runs the gate offline on stores
+  folded from the fixture bundles, a move-destination store and a three-project store.
 
 ## 16. Extension guide
 

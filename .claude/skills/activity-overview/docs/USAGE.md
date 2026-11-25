@@ -548,7 +548,11 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
   Code once the data is ready, review the citations, then publish.
 - **CI assurance.** The repo's GitHub Actions workflow runs the offline tests on every change
   and a scheduled live gather → validate (1st and 15th, 07:00 UTC). Point its
-  `workflow_dispatch` inputs at one of your targets to smoke-test a window.
+  `workflow_dispatch` inputs at one of your targets to smoke-test a window. Its `spotlight`
+  job also runs `ci_spotlight_integration.py --store S --require-all`, which checks the
+  person / subsystem / symbol / grep answers against what the store holds. You can run it on
+  your own store (`--project P` when the store holds several); without `--require-all` a
+  check whose input the store lacks is reported as skipped instead of failing.
 
 ## 11. Troubleshooting
 
