@@ -189,6 +189,29 @@ view's `meta.ref_date` when the view's `--from/--to` equal that window exactly
 `meta.period = {from, to}` from the view's own window (issue #75). Stores folded
 before #75 have no `ref_date:` keys; their views fall back to `to`.
 
+`member_status` (issue #77; written only by a manifest gather): a JSON list of
+`{project, repo, from, to, status[, error]}`, one entry per member and window,
+sorted on `(project, repo, from, to)` — `set_member_status` / `get_member_status`
+/ `incomplete_members`. `status` is the outcome of the member's LATEST attempt for
+that window: `ok`, `failed` (with `error`, a one-line reason of at most 500
+characters, e.g. the HTTP error message) or `not_attempted`. `gather --manifest`
+first records every member it is about to attempt as `not_attempted`, then each as
+`ok` (after its fold committed) or `failed` when its turn ends, so a run that is
+killed mid-way leaves the rest `not_attempted`. The member's own fold is still one
+transaction: a failed member leaves no partial fold. `validate.py` fails a member
+that is not `ok` for any recorded window (`target`, and the project-wide
+`member_status` check); `digest.py` / `view.py` warn on stderr for a window that
+overlaps the one they read. `gather --manifest --resume` re-attempts only the
+members that are not `ok` for the manifest's window. Single-repo stores have no
+`member_status` key.
+
+**Membership.** `project_repos` lists the repos with stored nodes, except a repo
+whose ONLY nodes are `depends_on` stand-ins (`data.synthesized ==
+"depends_on_target"`, `graphstore.STANDIN_MARK`) and for which no window was
+gathered: that is a phantom another member's fold created (typically for a member
+whose own gather failed), not a member. A quiet member with a gathered window
+stays listed even if it holds only stand-ins.
+
 ### Schema version and migration
 
 `graphstore.SCHEMA_VERSION` is **2**. `init_schema` creates a new store at the
@@ -212,7 +235,9 @@ half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
 `add_code_events`, `index_text(s)`, `set_meta`, `record_window`,
 `set_clone_sha`) take `commit=True` by default and `commit=False` to join the
 caller's open transaction. A caller's own uncommitted writes on the same
-connection are committed (or rolled back) with the fold.
+connection are committed (or rolled back) with the fold. A manifest member's
+`member_status` is written in its own transaction right after its fold: a crash
+between the two leaves the member `not_attempted` (re-folding it is idempotent).
 
 ## Writer (gather --store)
 

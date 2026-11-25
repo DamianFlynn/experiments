@@ -49,6 +49,13 @@ video-script, dashboards) consume the same view. The contract:
   store, an unknown `--project` (the message lists the store's projects), an
   unknown `--repo` (lists the project's repos), a bad `--manifest` or
   `--ticket-pattern`, or a `--project` that differs from the `--manifest` project.
+- **Project view members.** `meta.repos` / `members[]` are the project's stored
+  members (`graphstore.project_repos`): a repo present only as another member's
+  `depends_on` stand-in is not one (#77). A manifest member whose last gather of a
+  window overlapping the view failed or was not attempted is absent (or holds only
+  older data); `digest.py` and `view.py` then print a `warning: project … is
+  incomplete` on stderr (exit code unchanged) and `validate.py` fails. The view JSON
+  does not list such members; do not publish a view while that warning stands.
 - **Every fact carries a ref** (see *Ref convention* below), so any consumer can
   cite/fact-check without re-fetching. Narrative is NOT in the view — it's the
   model's job, authored from the view.

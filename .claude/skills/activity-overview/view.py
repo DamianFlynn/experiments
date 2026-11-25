@@ -157,6 +157,10 @@ def main(argv=None):
             project, repo = resolve_scope(conn, args.project, args.repo)
         except ValueError as exc:
             return _fail(str(exc))
+        warning = graphstore.incomplete_warning(conn, project, args.ts_from,
+                                                args.ts_to)
+        if warning:
+            sys.stderr.write("view.py: warning: {}\n".format(warning))
         bundle = extract.extract(conn, project, repo, args.ts_from, args.ts_to,
                                  ref_date=args.ref_date)
     except sqlite3.DatabaseError as exc:

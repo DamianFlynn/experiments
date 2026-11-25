@@ -474,6 +474,12 @@ These are real, current limits — plan around them:
     counts as completed, and a file renamed away keeps its old path `alive` (the ledger records
     the rename under the new path). An area shared by several members is unioned unless the
     query names one (`owner/repo::area` or `--repo`).
+15. **A partial manifest gather is flagged, not completed.** One failing member no longer
+    stops a manifest gather (#77): the others are folded, gather exits 1, and each member's
+    outcome per window is kept in the store (`member_status`), so `validate` fails the
+    project and `digest`/`view` warn until `gather --resume` completes it. The digest and
+    view JSON themselves do not yet carry the incomplete members (LLD §14.5); a formatter
+    must rely on the gate.
 
 15. **Timeline order needs a re-gather for old stores.** Since #82 the view's `timeline`
     orders code events by the commit's full committer timestamp, so a commit at 09:00 sorts

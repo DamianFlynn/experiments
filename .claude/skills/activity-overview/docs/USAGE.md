@@ -375,6 +375,13 @@ python3 $AO/spotlight.py dependents Azure/terraform-azurerm-avm-res-network-virt
   `examples/` and `tests/` are treated as scaffolding, not dependencies. Large patterns pull
   many registry modules during `terraform init` — keep the plugin cache and raise
   `ACTIVITY_IAC_BUILD_TIMEOUT` if `edge_extraction` reports timeouts.
+- **A member fails:** gather folds the other members, prints each failed member with its
+  reason and exits 1; `validate.py` fails the project until it is fixed. Fix the cause, then
+  gather only what is missing (the members already `ok` for the window are not re-fetched):
+
+```bash
+python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones --resume
+```
 
 ### 7.4 AI landing zone
 
@@ -551,6 +558,9 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
 | `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
 | `validate` ERROR `idempotency` (edges +2) on a multi-window store, `no_drift` passing | the probe re-folds every window as one and matches a cross-window symbol move (LLD §14.5) | known limitation; the store is correct. Use one store per installment, or one wide gather for history |
+| `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
+| `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
+| `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
 | Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was built from a store holding several months (arrays are not window-scoped, HLD §10) | rebuild the month from its own single-window store |

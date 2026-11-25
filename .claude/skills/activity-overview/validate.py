@@ -34,7 +34,9 @@ idempotency cannot self-source a bundle they fail with
 The invariants (each a named check; see the per-function docstrings):
     target                  ERROR  the audited (project, repo) has stored nodes
                                     (a mistyped --repo/--project or an empty
-                                    store is a failure, not a vacuous pass).
+                                    store is a failure, not a vacuous pass), and
+                                    its last manifest gather of every recorded
+                                    window is ok (meta member_status, #77).
     referential_integrity   ERROR  every non-spine edge endpoint resolves to a
                                     stored node (dangling spine edge -> INFO).
     participant_completeness ERROR  every login in any raw record has a person
@@ -48,6 +50,11 @@ The invariants (each a named check; see the per-function docstrings):
                                     via extract; --bundle is an optional cross-check).
     idempotency             ERROR  re-folding the bundle changes no counts
                                     (bundle self-sourced from the store).
+Project mode (validate_project) adds two project-wide checks:
+    no_drift_people         ERROR  project people == union re-derived over members.
+    member_status           ERROR  every manifest member's last gather of every
+                                    recorded window is ok (#77); a failed member
+                                    with no node at all is reported here.
 """
 
 import argparse
@@ -232,19 +239,55 @@ def _target_problem(conn, project, repo):
     return None
 
 
+def _incomplete_details(entries):
+    """ERROR details for member run-status entries that are not ok (#77)."""
+    out = []
+    for e in entries:
+        d = {"severity": ERROR, "problem": "member gather did not complete",
+             "repo": e["repo"], "window": "{}..{}".format(e["from"], e["to"]),
+             "status": e["status"]}
+        if e.get("error"):
+            d["error"] = e["error"]
+        out.append(d)
+    return out
+
+
 def check_target(conn, project, repo):
     """The audited (project, repo) exists: the store has nodes, the project has
     nodes and the repo is one of its stored member repos. Without this a
     mistyped --repo/--project, or an empty store, audited nothing and passed
-    (issue #79)."""
+    (issue #79). A manifest member whose last gather of any recorded window
+    failed or was not attempted (meta member_status, issue #77) fails too: its
+    stored data is incomplete."""
     problem = _target_problem(conn, project, repo)
+    incomplete = [e for e in graphstore.incomplete_members(conn, project)
+                  if e["repo"] == repo] if project is not None else []
+    details = _incomplete_details(incomplete)
     if problem is not None:
-        return _check("target", ERROR, [dict(problem, severity=ERROR)])
+        return _check("target", ERROR, [dict(problem, severity=ERROR)] + details)
+    if details:
+        return _check("target", ERROR, details)
     n = conn.execute("SELECT COUNT(*) FROM nodes WHERE project=? AND repo=?",
                      (project, repo)).fetchone()[0]
     return _check("target", ERROR, [{
         "severity": INFO,
         "note": "{} node(s) stored for {} {}".format(n, project, repo)}])
+
+
+def check_member_status(conn, project):
+    """Project-wide (issue #77): every manifest member's last gather of every
+    recorded window is `ok`. A member that failed or was never attempted is an
+    ERROR naming the member, the window and the reason, also when it holds no
+    node at all (it is then not one of the audited member repos). A store no
+    manifest gather wrote records no status and passes."""
+    entries = graphstore.get_member_status(conn, project)
+    details = _incomplete_details(
+        [e for e in entries if e["status"] != graphstore.MEMBER_OK])
+    if not details:
+        details = [{"severity": INFO, "note": (
+            "{} member gather(s) recorded, all ok".format(len(entries))
+            if entries else "no member run status recorded")}]
+    return _check("member_status", ERROR, details)
 
 
 def _local(qid):
@@ -973,8 +1016,11 @@ def validate_project(conn, project, repos):
     Raises ValueError on an empty `repos`: validation ATTESTS trustworthiness,
     and `all([])` would vacuously report ok=True for zero repos, masking a
     misconfigured member set. (digest.build_project_view, which only DESCRIBES,
-    tolerates an empty project and returns an empty view.)"""
-    if not repos:
+    tolerates an empty project and returns an empty view.) The one exception is
+    a project whose members all failed to gather (issue #77): with member run
+    status recorded and no repo holding data, the report has no members and
+    fails on `member_status`."""
+    if not repos and not _has_member_status(conn, project):
         raise ValueError("validate_project: no repos to validate")
     member_reports = []
     for repo in repos:
@@ -982,13 +1028,26 @@ def validate_project(conn, project, repos):
         rep = validate_repo(conn, project, repo, check_people=False)
         member_reports.append({"repo": repo, **rep.to_dict()})
     # PROJECT-WIDE checks (the ones whose unit is the project, not a member repo):
-    # people drift over the cross-member union.
-    project_checks = [_guarded(check_no_drift_people, "no_drift_people",
-                               conn, project, repos)]
+    # people drift over the cross-member union; the manifest members' run status.
+    project_checks = []
+    if repos:
+        project_checks.append(_guarded(check_no_drift_people, "no_drift_people",
+                                       conn, project, repos))
+    project_checks.append(_guarded(check_member_status, "member_status",
+                                   conn, project))
     ok = (all(r["ok"] for r in member_reports)
           and all(c["ok"] for c in project_checks))
     return {"ok": ok, "project": project, "members": member_reports,
             "project_checks": project_checks}
+
+
+def _has_member_status(conn, project):
+    """True when a manifest gather recorded member run status for `project`
+    (also when that record is unreadable: check_member_status reports it)."""
+    try:
+        return bool(graphstore.get_member_status(conn, project))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return True
 
 
 def _guarded(fn, name, *args):
@@ -1093,8 +1152,12 @@ def main(argv=None):
         conn.close()
         return _usage_error(str(exc))
 
-    if repo is None and project is not None \
-            and len(graphstore.project_repos(conn, project)) > 1:
+    # A manifest store (member run status recorded) always takes the project
+    # path when no --repo is named, even when only one member holds data: the
+    # others may have failed (issue #77) and must not drop out of the audit.
+    if args.repo is None and project is not None and (
+            len(graphstore.project_repos(conn, project)) > 1
+            or _has_member_status(conn, project)):
         # Multi-repo project path: run validate_project over all member repos.
         if args.bundle:
             sys.stderr.write("warning: --bundle is ignored in multi-repo "

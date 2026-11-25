@@ -122,6 +122,16 @@ dedupes members case-insensitively, exits 2 on bad/inverted dates, `--limit < 1`
 a duplicate `registry` among the selected members, warns when an `--include` slug is
 not in the index, and times out an index fetch after 30 s.
 
+A member that fails to gather (HTTP error, clone failure, a fold error) does not stop
+the run: the other members are folded, gather prints `member -> reason` and exits 1,
+and the store records each member's outcome for the window in meta `member_status`
+(`ok` / `failed` / `not_attempted`, `STORE.md`). `validate.py` then fails the project
+(`member_status`, and `target` for that member) and `digest.py` / `view.py` warn on
+stderr. `gather.py --manifest M --store S --resume` re-attempts only the members that
+are not `ok` for the manifest's window; a plain re-run gathers every member again. A repo
+that exists in the store only as another member's `depends_on` stand-in is not listed
+as a member.
+
 ### IaC build env knobs (heavy live runs)
 
 `terraform`/`bicep` edge extraction runs in parallel. For a real AVM Terraform

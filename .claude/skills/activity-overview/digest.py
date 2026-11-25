@@ -540,6 +540,10 @@ def main(argv=None):
             repos = resolve_members(conn, project, args.repos)
         except ValueError as exc:
             return _fail(str(exc))
+        warning = graphstore.incomplete_warning(conn, project, args.ts_from,
+                                                args.ts_to)
+        if warning:
+            sys.stderr.write("digest.py: warning: {}\n".format(warning))
         view = build_project_view(conn, project, repos,
                                   args.ts_from, args.ts_to, ticket_pattern=pattern,
                                   ref_date=args.ref_date)

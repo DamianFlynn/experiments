@@ -2819,7 +2819,14 @@ def parse_args(argv):
                    help="path to a multi-repo project manifest (JSON). Mutually "
                         "exclusive with --owner/--repo; folds every member repo "
                         "into one store under the manifest's logical project name.")
+    p.add_argument("--resume", action="store_true",
+                   help="with --manifest: gather only the members whose last "
+                        "attempt for the manifest's window is not 'ok' (failed "
+                        "or not attempted, see meta member_status); members "
+                        "already ok for that window are left as they are.")
     args = p.parse_args(argv)
+    if args.resume and not args.manifest:
+        p.error("--resume needs --manifest")
     # --manifest carries its own member list + window, so the single-repo flags
     # are meaningless alongside it. Enforce the documented exclusivity rather than
     # silently letting the manifest branch win (ambiguous, misleading help text).
@@ -5064,7 +5071,7 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         local = p["local"]
         area_id = local[len("area-"):] if local.startswith("area-") else local
         nodes.append((dst, project, dst_repo, "structure", None,
-                      {"id": area_id, "synthesized": "depends_on_target"},
+                      {"id": area_id, "synthesized": graphstore.STANDIN_MARK},
                       fetched))
 
     # in_milestone (social -> structure): a PR/issue's milestone title links to
@@ -5185,7 +5192,76 @@ def _member_args(base, member, frm, to):
     return ns
 
 
+def _failure_reason(exc):
+    """One-line, deterministic reason for a member that failed with `exc`. The
+    HTTP layer and acquire() stop with SystemExit(<message>); anything else is
+    `<ExceptionType>: <message>`. Capped at 500 characters."""
+    if isinstance(exc, SystemExit):
+        text = exc.code if isinstance(exc.code, str) else \
+            "exit status {}".format(exc.code)
+    else:
+        text = "{}: {}".format(type(exc).__name__, exc) if str(exc) \
+            else type(exc).__name__
+    return " ".join(str(text).split())[:500]
+
+
+def _gather_manifest(conn, args, man):
+    """Gather + fold every manifest member, one at a time (issue #77). A member
+    that fails (any Exception, or the SystemExit the HTTP layer raises) is
+    recorded and the run goes on with the next member; its fold, if it got that
+    far, rolled back as one transaction. Every member to attempt is first
+    recorded `not_attempted` for the window, then `ok` or `failed` (with the
+    reason) when its turn ends, so an interrupted run is visible in the store
+    too. With `--resume`, members already `ok` for this window are skipped.
+    Returns [(slug, reason)] for the members that failed, in manifest order."""
+    project, frm, to = man["project"], man["from"], man["to"]
+    members = manifest_mod.member_slugs(man)
+    registry_by_slug = {
+        "{}/{}".format(m["owner"], m["repo"]): m.get("registry")
+        for m in man["repos"]}
+    slugs = ["{}/{}".format(m["owner"], m["repo"]) for m in man["repos"]]
+    done = set()
+    if args.resume:
+        done = {e["repo"] for e in graphstore.get_member_status(conn, project)
+                if e["from"] == frm and e["to"] == to
+                and e["status"] == graphstore.MEMBER_OK}
+    todo = [s for s in slugs if s not in done]
+    if not todo:
+        sys.stderr.write("nothing to resume: every member of project '{}' is "
+                         "ok for {}..{}\n".format(project, frm, to))
+        return []
+    with conn:
+        graphstore.set_member_status(conn, project, todo, frm, to,
+                                     graphstore.MEMBER_NOT_ATTEMPTED,
+                                     commit=False)
+    failures = []
+    for m, slug in zip(man["repos"], slugs):
+        if slug not in todo:
+            continue
+        try:
+            bundle = acquire(_member_args(args, m, frm, to), os.environ)
+            fold_bundle(conn, bundle, project=project, repo=slug,
+                        members=members, registry_by_slug=registry_by_slug)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - per member
+            reason = _failure_reason(exc)
+            failures.append((slug, reason))
+            sys.stderr.write("member {} failed: {}\n".format(slug, reason))
+            status, error = graphstore.MEMBER_FAILED, reason
+        else:
+            status, error = graphstore.MEMBER_OK, None
+        with conn:
+            graphstore.set_member_status(conn, project, [slug], frm, to,
+                                         status, error, commit=False)
+    sys.stderr.write(
+        "folded {} of {} member repo(s) of project '{}' into store {}\n".format(
+            len(todo) - len(failures), len(todo), project, args.store))
+    return failures
+
+
 def main(argv=None):
+    """Exit: returns the store path when every repo folded. A manifest run in
+    which any member failed still folds the others, then prints a summary
+    (member -> reason) and exits 1 (issue #77)."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     # A non-integer ACTIVITY_* knob fails here, before any clone or API call.
     validate_env_knobs()
@@ -5195,28 +5271,28 @@ def main(argv=None):
         args, "manifest", None) else None
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
-    graphstore.init_schema(conn)
-    if man is not None:
-        members = manifest_mod.member_slugs(man)
-        registry_by_slug = {
-            "{}/{}".format(m["owner"], m["repo"]): m.get("registry")
-            for m in man["repos"]}
-        for m in man["repos"]:
-            member_args = _member_args(args, m, man["from"], man["to"])
-            bundle = acquire(member_args, os.environ)
-            fold_bundle(conn, bundle, project=man["project"],
-                        repo="{}/{}".format(m["owner"], m["repo"]),
-                        members=members, registry_by_slug=registry_by_slug)
-        sys.stderr.write(
-            "folded {} member repo(s) of project '{}' into store {}\n".format(
-                len(man["repos"]), man["project"], args.store))
-    else:
-        # Store-only single-repo path (Phase 7). Same acquire->fold->return as
-        # before; the store setup above is now shared with the manifest branch.
-        bundle = acquire(args, os.environ)
-        fold_bundle(conn, bundle)
-        sys.stderr.write("folded bundle into store {}\n".format(args.store))
-    conn.close()
+    failures = []
+    try:
+        graphstore.init_schema(conn)
+        if man is not None:
+            failures = _gather_manifest(conn, args, man)
+        else:
+            # Store-only single-repo path (Phase 7): acquire -> fold. A failure
+            # propagates as before: there is no other member to go on with.
+            bundle = acquire(args, os.environ)
+            fold_bundle(conn, bundle)
+            sys.stderr.write("folded bundle into store {}\n".format(args.store))
+    finally:
+        conn.close()
+    if failures:
+        lines = ["gather: {} of {} member(s) failed for project '{}' "
+                 "({}..{}):".format(len(failures), len(man["repos"]),
+                                    man["project"], man["from"], man["to"])]
+        lines += ["  {}: {}".format(slug, reason) for slug, reason in failures]
+        lines.append("the other members are folded; re-run with --resume to "
+                     "gather only the failed member(s)")
+        sys.stderr.write("\n".join(lines) + "\n")
+        raise SystemExit(1)
     return args.store
 
 

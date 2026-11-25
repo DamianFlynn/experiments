@@ -113,6 +113,7 @@ scratch store) and `backfill` respectively.
 |---|---|---|
 | `--owner`, `--repo` | — | Single-repo target |
 | `--manifest PATH` | — | Multi-repo project (validated by `manifest.load_manifest` **before** the store is touched) |
+| `--resume` | off | Manifest only: gather just the members not `ok` for the manifest window (meta `member_status`, #77) |
 | `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
 | `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing (`YYYY-MM-DD` or full ISO timestamp, `manifest.check_ref_date`). Stored per window at fold (`ref_date:` meta key) and read back into the view's `meta.ref_date` (§6.1) |
 | `--branches` | `main` | Recorded in `meta`; first is `base_branch` (walk uses the checked-out default branch) |
@@ -126,6 +127,16 @@ scratch store) and `backfill` respectively.
 Single-repo folds use `project = owner`, `repo = <name>`. Manifest folds use
 `project = manifest.project`, `repo = "owner/repo"`, and pass `members` +
 `registry_by_slug` to `fold_bundle` for cross-repo resolution.
+
+Manifest runs gather members one at a time (`_gather_manifest`, issue #77). Each member
+to attempt is first recorded `not_attempted` in meta `member_status` for the manifest
+window; a member whose `acquire` or fold raises (any `Exception`, or the `SystemExit` the
+HTTP layer uses) is recorded `failed` with a one-line reason and the run continues with the
+next member (its fold, one transaction, rolled back); a member that folded is recorded `ok`.
+At the end gather prints `member -> reason` for each failure and exits 1. The store
+connection is closed in a `finally`. `--resume` (manifest only) skips the members already
+`ok` for the window. A `KeyboardInterrupt` is not caught: the remaining members stay
+`not_attempted`.
 
 ### 4.2 `acquire(args, env)` sequence
 
@@ -539,12 +550,13 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 | Group | Functions |
 |---|---|
 | Lifecycle | `open_store`, `open_store_readonly` (existing file, `mode=ro`), `init_schema`, `set_meta`, `get_meta`, `now_iso` |
-| Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` |
+| Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` (repos with nodes, minus stand-in-only repos with no gathered window, #77) |
 | Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)` |
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
 | Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
 | Text | `index_text` / `index_texts` (replace by node id via `fts_map`, no table scan), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
 | Provenance | `record_window`/`get_windows`, `set_clone_sha`/`get_clone_sha` |
+| Member run status | `set_member_status`/`get_member_status`, `incomplete_members(conn, project, ts_from, ts_to)`, `incomplete_warning`, `describe_member_status` (#77) |
 | Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
 
 **Semantics.** Identity columns are immutable; `ts`/`data`/`fetched_at` refresh on re-upsert.
@@ -833,12 +845,13 @@ will not start sandboxed as root). Paths are recorded in `bundle.diagrams`.
 `validate.py STORE [--project P] [--repo R] [--bundle FILE] [--json]` → exit 0 when no ERROR, 1
 otherwise; exit 2 (usage error, no report) when the path does not exist or is not a store,
 when several projects (or repos) are stored and none is named, or when `--bundle` cannot be
-read. When the store (or `--project`) spans several repos and no `--repo` is given, it runs
-`validate_project` over every member plus the project-wide checks.
+read. When the store (or `--project`) spans several repos, or a manifest gather recorded
+member run status for the project, and no `--repo` is given, it runs `validate_project`
+over every member holding data (`project_repos`) plus the project-wide checks.
 
 | Check | Asserts |
 |---|---|
-| `target` | the store has nodes, the project has nodes and the repo is a stored member (case-insensitive, resolved to the stored spelling) |
+| `target` | the store has nodes, the project has nodes and the repo is a stored member (case-insensitive, resolved to the stored spelling); and the member's last gather of every recorded window is `ok` (meta `member_status`, #77) |
 | `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR |
 | `participant_completeness` | every login in any raw record has a person node |
 | `provenance` | every social/code node carries a source identifier (url and/or sha) |
@@ -847,6 +860,7 @@ read. When the store (or `--project`) spans several repos and no `--repo` is giv
 | `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves) |
 | `idempotency` | re-folding into a scratch copy changes no counts |
 | `no_drift_people` (project) | project-scoped people == union re-derived across all members |
+| `member_status` (project) | every manifest member's last gather of every recorded window is `ok`; a `failed` / `not_attempted` member is an ERROR naming the repo, window and reason, also when it holds no node and so is not an audited member (#77). Passes (INFO) on a store with no recorded status |
 
 Every report lists every check in this order (issue #79); none is ever dropped.
 `no_drift`/`idempotency` self-source their bundle via `extract` over the span of the repo's
@@ -1051,6 +1065,7 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 | `graphify` | directory provider used | `code_graph.provider = directory` |
 | FTS5 | `spotlight grep` unavailable | `status: fts_unavailable` |
 | out-of-window spine node | context gap | train `gaps[]` |
+| one manifest member's gather fails | that member has no data for the window; the others are folded | gather exit 1 + summary; meta `member_status`; `validate` ERROR (`target`, `member_status`); `digest`/`view` stderr warning |
 
 ### 14.3 Performance and API budget
 
@@ -1090,6 +1105,8 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
 | Timeline code events of older commits order by day | `committed_at` (#82) is gathered from `%cI` by the commit walk only | commits in a store folded before #82, and backfilled commits (five-field log), have no `committed_at`, so their timeline events keep the bare date and sort before that day's social events | re-gather; log `%cI` in `make_backfill_fetcher` too |
 | Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |
+| Incomplete members are not in the digest JSON | #77 surfaces a failed / not-attempted member through gather's exit code, `validate` and a `digest.py`/`view.py` stderr warning only | a formatter reading only the digest/view JSON cannot tell the project is partial | add the incomplete members to the view `meta` (BUNDLE.md change) |
+| Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for
