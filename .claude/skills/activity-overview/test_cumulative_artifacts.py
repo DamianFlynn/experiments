@@ -44,6 +44,9 @@ def _june():
     june = json.loads(text)
     for item in june.get("prs", []) + june.get("issues", []):
         item["number"] += 100
+        # the citation follows the number (validate's provenance rule, #89)
+        base = item["url"].rsplit("/", 1)[0]
+        item["url"] = "{}/{}".format(base, item["number"])
     june["code_events"] = [e for e in june["code_events"] if e["change"] != "delete"]
     return june
 
@@ -330,13 +333,10 @@ class TestSymbolMovesAcrossWindows(unittest.TestCase):
         conn = _store(may, june)
         self.assertEqual(_artifact_nodes(conn)[self.A][1]["status"], "removed")
         self.assertEqual(_move_edges(conn), [])
-        # no_drift only: validate's idempotency probe re-folds the WHOLE ledger
-        # as one window, which matches this pair as a move and adds two edges —
-        # a limitation of the probe on multi-window stores (documented in LLD
-        # §14.4), not of the store.
-        report = validate.validate(conn, project="o", repo="r")
-        nd = [c for c in report.checks if c["name"] == "no_drift"][0]
-        self.assertTrue(nd["ok"], nd["details"])
+        # The idempotency probe re-folds the whole ledger as one window and so
+        # matches this pair as a move; on a multi-window store it reports that
+        # as a cross-window re-match, not a failure (issue #89).
+        _ok(self, conn)
 
     def test_revived_after_move_is_live_again(self):
         stores = [_store(*o) for o in self._orders(self.CREATE, self.MOVE, self.REVIVE)]

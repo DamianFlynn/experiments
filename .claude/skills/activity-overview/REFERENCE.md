@@ -60,7 +60,16 @@ names one) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 `validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
-error: missing or non-store path, ambiguous store).
+error: missing or non-store path, ambiguous store). It proves the store is consistent
+with its own records — every edge is one the stored records imply (`edge_set`, both
+directions), people are re-derived from the records, every PR/issue cites its own GitHub
+link and every commit id is a real sha — but not that the records match GitHub: a record
+deleted with its edges or a consistently rewritten blob passes. To catch those, save the
+view of the freshly gathered store (`view.py … --out view.json`, before `link.py` enriches it) and later run
+`validate.py STORE --bundle view.json`. On a store holding several windows, edges from
+latest-wins inputs (code graph, CODEOWNERS) are WARNed, not failed; `--repo` of a multi-repo
+project checks only that member's people (the full check runs without `--repo`). See
+`STORE.md` "Trust gate".
 
 **Whole-tree module graph (`--structural-iac`).** By default a single-repo gather builds
 IaC edges only for the areas changed in the window, and only with the `bicep`/`terraform`

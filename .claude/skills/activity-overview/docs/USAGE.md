@@ -562,9 +562,9 @@ One store per stream keeps commands simple and failures isolated.
   person, grep across many months), build `history.db` from **one wide-window gather**
   (e.g. `--from 2026-01-01 --to 2026-11-30`) into a fresh file, and rebuild it — rather than
   folding month after month into it — when you need it refreshed. A single wide fold passes
-  `validate.py`. Folding month after month also passes `no_drift`, but `validate`'s
-  idempotency probe can then report two extra move edges when a symbol left one file in one
-  month and appeared in another file in a later month (LLD §14.5).
+  `validate.py`. Folding month after month passes too, with WARNs for the edges and person
+  areas that come from each month's code graph / CODEOWNERS (only the latest is kept), which
+  `validate` cannot re-derive for older months (LLD §8).
   Wide gathers of busy repos are API-heavy (§11).
 - **Inspect:** `sqlite3 stores/2026-11.db "select project, repo, count(*) from nodes group by 1,2"`;
   folded windows are in `meta.gathered_windows`.
@@ -636,7 +636,12 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
 | `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
-| `validate` ERROR `idempotency` (edges +2) on a multi-window store, `no_drift` passing | the probe re-folds every window as one and matches a cross-window symbol move (LLD §14.5) | known limitation; the store is correct. Use one store per installment, or one wide gather for history |
+| `validate` ERROR `edge_set` "stored but not derivable" / "derived from the stored records but not stored" / "edge data drift" | an edge the stored records do not imply (or a missing one): a producer defect or a hand-edited store | report it; don't publish; re-gather into a fresh store |
+| `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | `owns`/`touches`/`depends_on`/`in_milestone`/`in_iteration`/`blocks` edges and person areas come from latest-wins inputs (code graph, CODEOWNERS, milestone lists) and are never retracted | expected; not a failure. A single-window store is checked exactly |
+| `validate` ERROR `provenance` "url names repo X, the node is in Y" | the repo was renamed or transferred and gathered under its old name (GitHub returns links with the new name), or the node was edited | gather under the repo's current name |
+| `validate` ERROR `provenance` "commit id … is not a 40/64-hex git sha" / ERROR `no_fabrication` id problems | a hand-made or corrupted node; gather writes only real shas and grammar ids | re-gather; never hand-edit the store |
+| `validate --repo R` of a multi-repo project passes but the project run fails `no_drift_people` | a single-member audit checks only the people that member derives (people are project-wide) | run `validate.py STORE --project P` without `--repo` for the full people check |
+| `validate --bundle FILE` ERROR `no_drift` "stored pr differs from --bundle" / "… in --bundle but not stored" | a record changed or was deleted since FILE was saved (or FILE is an older window's bundle on a store that re-fetched the record) | cross-check with a view saved right after the gather that wrote the record |
 | `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
 | `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
 | `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |
@@ -644,7 +649,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
 | Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was built from a store holding several months (arrays are not window-scoped, HLD §10) | rebuild the month from its own single-window store |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
-| A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" after upgrading | the store was folded before commit authors were resolved to logins (#78) | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
+| A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" (and `edge_set` `authored` edges) with a `hint` naming "pre-#78 identity" | the store was folded before commit authors were resolved to logins (#78); the hint names the commits' current author | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
 | A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |
 | `edge_extraction` timeouts | slow `terraform init` / registry | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |
 | No module graph on a Bicep repo | gathered without `--structural-iac`, and `bicep` not installed or no modules changed in window | re-gather with `--structural-iac` (static, no CLI) |

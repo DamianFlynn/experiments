@@ -119,8 +119,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```bash
    python3 validate.py workspace/journey.db
    ```
-   Self-contained on a store (`no_drift` / `idempotency` self-source their raw bundle via
-   `extract`; an external `--bundle` is an optional cross-check, never required). For a
+   Self-contained on a store (`edge_set` / `no_drift` / `idempotency` self-source their raw
+   bundle via `extract`; an external `--bundle` is an optional cross-check, never required). For a
    multi-repo project: `python3 validate.py workspace/journey.db --project <name>` (adds a
    project-wide people check).
 3. **Materialize the bundle view** (store → `workspace/view/bundle.json`, offline):

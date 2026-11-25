@@ -94,12 +94,16 @@ merged `2026-05-31T15:00:00Z` is inside `--to 2026-05-31`, and a commit dated
 `(src_id, dst_id, edge_type, ts, data)`, PK `(src,dst,type)`. Re-upsert
 unions, never appends. Edge types:
 
-`closes` (pr→issue), `part_of` (commit→pr), `cross_ref` (issue↔pr↔commit),
-`duplicate_of`/`spun_off` (issue→issue), `touches` (commit/pr→area),
+`closes` (pr→issue), `part_of` (commit/review/event→pr/issue), `cross_ref`
+(pr→issue/pr), `duplicate_of`/`spun_off` (issue→issue), `touches` (commit→area),
 `authored`/`reviewed`/`merged`/`reported`/`commented`/`reacted` (person→node),
 `owns` (person→area), `depends_on` (area→area, carries version/transitive in
 `data`), `replaced_by`/`identity_from` (artifact→artifact), `blocks`
-(issue→issue), `in_milestone`/`in_iteration` (social→structure).
+(issue→issue), `in_milestone`/`in_iteration` (social→structure). These are
+the endpoint rules `validate` enforces (`schema_conformance`, #89); any other
+edge type is an error. Both ends of an edge are in one project, and `touches`,
+`part_of`, `blocks`, `in_milestone`, `in_iteration`, `replaced_by`,
+`identity_from`, `spun_off` and `duplicate_of` stay inside one repo.
 
 `edges_by_type(edge_type, project)` selects the edges whose `src_id` starts
 with `{project}/` — **case-sensitively** (`Azure` and `azure` are different
@@ -740,12 +744,13 @@ overlapping window is byte-stable. Resume/roll-up read structure from the latest
 ## Trust gate (validate.py)
 
 `python3 validate.py STORE.db` audits the store for trustworthiness and exits
-non-zero on any ERROR (CI-gateable). It is **self-contained on a store**: the two
-real-data checks — `no_drift` (stored people/artifacts == freshly re-derived) and
-`idempotency` (a re-fold changes no counts) — need a raw bundle to re-derive
-against, and when none is passed they **self-source it from the store** via
-`extract` over the store's full activity window. A `--bundle` argument is an
-optional cross-check, never required. This is what makes the store a
+non-zero on any ERROR (CI-gateable). It is **self-contained on a store**: the
+real-data checks — `edge_set` (stored edges == re-derived from the stored records),
+`no_drift` (stored people/artifacts == freshly re-derived) and `idempotency` (a
+re-fold changes no counts) — need a raw bundle to re-derive against, and they
+**self-source it from the store** via `extract` over the store's full activity
+window. A `--bundle` argument is an optional cross-check of the records
+themselves, never required (`edge_set` always uses the self-sourced one). This is what makes the store a
 stand-alone deliverable.
 
 The gate can only fail, never pass by omission (issue #79):
@@ -755,8 +760,8 @@ The gate can only fail, never pass by omission (issue #79):
   the project's stored member repos (a `--repo` in another case resolves to the
   stored spelling, as in the readers). A mistyped name is a failure, not an
   audit of nothing.
-- **Every check is always reported.** When `no_drift`/`idempotency` cannot
-  self-source a bundle they are reported as FAILED with
+- **Every check is always reported.** When `edge_set`/`no_drift`/`idempotency`
+  cannot self-source a bundle they are reported as FAILED with
   `could not self-source: <reason>`: the target has no nodes, a node row cannot
   be decoded, or the repo stores social/code nodes but none carries a `ts` (the
   activity window cannot be recovered). A member holding only structure nodes
@@ -773,6 +778,66 @@ The gate can only fail, never pass by omission (issue #79):
   Readers no longer create `dead_refs` either (`traverse_spine(skip_dead=True)`,
   `is_dead_ref` and `get_dead_refs` treat a missing table as "no tombstones"),
   so auditing a store leaves its file byte-identical.
+
+Strictness (issue #89). Besides the checks above:
+
+- **`edge_set`** — a repo's stored edges equal the edges its stored records
+  imply, in **both** directions: the self-sourced bundle is folded by
+  `gather.fold_bundle` into an empty scratch store and its edges compared with
+  the stored ones (an edge belongs to the repo of its src; a person's edge to
+  the repo of its dst). An extra edge, a missing one, or different edge `data`
+  is an ERROR. A stored edge into another member repo (manifest `closes` /
+  `cross_ref` from a PR's qualified refs, or a registry `depends_on` to a
+  member's root area) must be one the manifest fold derives from the stored PR
+  / code graph; a *missing* cross-repo edge is not detected (it needs the
+  manifest's registries).
+- **`provenance`** — a PR / issue cites `https://github.com/{owner}/{repo}/pull|issues/N`
+  of its own repo (case-insensitive) and number, and `data.number == N`; a
+  review / event cites its parent (or fold's synthesized fallback, or a
+  timeline event's `api.github.com/repos/{owner}/{repo}/` url); a commit id is
+  a 40/64-hex sha equal to `data.sha`.
+- **`no_fabrication`** — ids follow the grammar above, their scope equals the
+  row's `project`/`repo` (people: `{project}` with repo `*`), the local form
+  fits the node class, and no scope is stored under two case spellings.
+- **`no_drift`** — people are re-derived from the records alone (never seeded
+  from the stored person nodes, which made the areas check tautological) and
+  compare `modules`, `areas`, `is_bot` and `login_resolved`. A stored person
+  that is a pre-#78 git-name identity gets a hint naming the commits' current
+  author and "re-gather into a fresh store". `validate --repo <member>` of a
+  multi-member project checks only the people that member derives (derived ⊆
+  stored); the full equality is `no_drift_people` (no `--repo`).
+
+**Multi-window stores** (more than one gathered window recorded for the repo).
+The `code_graph` / `code_owners` singletons, area path lists and the milestone /
+sprint / `blocks` lists are latest-wins and edges are never retracted (#95), so
+`owns`, `touches`, `depends_on`, `in_milestone`, `in_iteration` and `blocks`
+edges of an older window cannot be re-derived: a difference there is a WARN, and
+people's areas compare as derived ⊆ stored (an extra stored area is a WARN).
+Symbol moves are matched per fold window: each stored move must be supported by
+the ledger (its twin edge, a drop of the source — by `move_commit` — and an add
+of the destination, a consistent basis), and a move only a whole-store re-match
+finds is not required. The idempotency probe re-folds every window as one; the
+move and latest-wins edges that adds are reported as INFO, not counted (edges
+are keyed by `(src, dst, type)`, so they are never duplicates). On a one-window
+store all of this is exact.
+
+**What the gate proves, and what it does not.** Self-sourced, it proves the
+store is *consistent*: every edge, person and artifact is exactly what the
+stored records and ledger imply, and every citation points at the node's own
+GitHub object. It does **not** prove the records are what GitHub holds:
+
+- a record deleted together with its edges (and a person left with no other
+  edge), or a blob rewritten consistently (title, `merged`, a comment body, a
+  reviewer dropped with its edge), leaves a consistent store;
+- the artifact part of `no_drift` re-derives artifacts from the store's own
+  ledger plus recorded moves (#76), so a wrong ledger (rows missing or invented)
+  yields matching nodes — the check proves nodes == ledger, not ledger == git.
+
+Pass `--bundle` with a bundle saved when the store was gathered — a `view.py`
+JSON of the fresh store, or a raw bundle — to catch changed or deleted records:
+every PR / issue / commit in it must be stored with the same content (reviews and
+lifecycle compare without the synthesized `url`). It must hold the latest fetch of
+its records. The store keeps no per-fold content digest.
 
 Exit codes: 0 no ERROR; 1 an ERROR check failed (a report is printed); 2 usage
 error with no report (the store path does not exist or is not a store, several

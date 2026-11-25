@@ -2,9 +2,10 @@
 
 A CRITICAL CI gate. The activity report narrates who/what/when/why entirely
 from the journey-graph store, so if the graph is wrong the report lies
-confidently. This harness PROVES a populated store is trustworthy: it re-checks
-the invariants the write path (`gather.fold_bundle`) is supposed to uphold and
-fails loudly — per invariant, per entity — when one is broken.
+confidently. This harness proves a populated store is consistent with its own
+records (see "What the gate proves" below): it re-checks the invariants the
+write path (`gather.fold_bundle`) is supposed to uphold and fails loudly — per
+invariant, per entity — when one is broken.
 
 Read-only over the store: `validate` never mutates it, and the CLI opens the
 store with SQLite's read-only URI mode (graphstore.open_store_readonly), so a
@@ -27,9 +28,10 @@ CLI
 
 Every report lists EVERY check, in a fixed order (issue #79). A check that
 cannot run is a FAILED check, never an omitted one: a check that raises (e.g.
-on a corrupt row, named by its id) fails with the error, and when no_drift /
-idempotency cannot self-source a bundle they fail with
-`could not self-source: <reason>`.
+on a corrupt row, named by its id) fails with the error, and when edge_set /
+no_drift / idempotency cannot self-source a bundle they fail with
+`could not self-source: <reason>`. WARN details (e.g. latest-wins edges on a
+multi-window store) are listed but never fail the gate.
 
 The invariants (each a named check; see the per-function docstrings):
     target                  ERROR  the audited (project, repo) has stored nodes
@@ -41,15 +43,34 @@ The invariants (each a named check; see the per-function docstrings):
                                     stored node (dangling spine edge -> INFO).
     participant_completeness ERROR  every login in any raw record has a person
                                     node + its contribution edge ("carol" class).
-    provenance              ERROR  every social/code node cites a source ref.
+    provenance              ERROR  every social/code node cites a source that is
+                                    its own: PR/issue/review/event urls on
+                                    github.com/{owner}/{repo} with the node's
+                                    number, commit ids 40/64-hex shas (#89).
     no_fabrication          ERROR  no orphan person, every artifact has history,
-                                    no empty/non-round-tripping id.
-    schema_conformance      ERROR  each edge type's endpoints match STORE.md.
+                                    ids follow the grammar and their row's
+                                    project/repo, no case-variant scopes (#89).
+    schema_conformance      ERROR  every edge type has an endpoint rule (unknown
+                                    type -> ERROR) and its endpoints match it.
+    edge_set                ERROR  the repo's stored edges == the edges its stored
+                                    records imply, both directions (#89).
     no_drift                ERROR  stored people/artifacts == freshly re-derived
                                     from the bundle (self-sourced from the store
-                                    via extract; --bundle is an optional cross-check).
+                                    via extract); with --bundle the stored records
+                                    must also equal the bundle's.
     idempotency             ERROR  re-folding the bundle changes no counts
                                     (bundle self-sourced from the store).
+
+What the gate proves, and what it cannot (issue #89). Self-sourced, it proves
+the store is CONSISTENT: every edge, person and artifact is exactly what the
+stored records and ledger imply, and every citation points at the node's own
+GitHub object. It cannot prove the records themselves are what GitHub holds: a
+record deleted together with its edges, a blob rewritten consistently (title,
+merged, a comment body) or a wrong ledger leave a self-consistent store. A
+`--bundle` saved when the store was gathered (a view.py JSON of the fresh store,
+or a raw bundle) catches changed or deleted records; there is no per-fold
+content digest in the store.
+
 Project mode (validate_project) adds two project-wide checks:
     no_drift_people         ERROR  project people == union re-derived over members.
     member_status           ERROR  every manifest member's last gather of every
@@ -60,6 +81,7 @@ Project mode (validate_project) adds two project-wide checks:
 import argparse
 import copy
 import json
+import re
 import sqlite3
 import sys
 
@@ -476,24 +498,120 @@ def _has_source_ref(node):
     return False
 
 
-def check_provenance(conn):
-    """Every social/code node's `data` carries a source identifier (a url and/or
-    number/sha — artifacts may cite via a lifecycle commit ref). A node lacking
-    any source ref = ERROR: the report would cite nothing for it.
+# A git object id: SHA-1 (40 hex) or SHA-256 (64 hex), lower case as git prints.
+_SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+# A GitHub web link to a PR or issue: https://github.com/{owner}/{repo}/
+# {pull|issues}/{N}, optionally followed by a path, query or fragment.
+_GITHUB_ITEM_URL_RE = re.compile(
+    r"\Ahttps://github\.com/([^/?#]+/[^/?#]+)/(pull|issues)/(\d+)(?:[/?#].*)?\Z",
+    re.S)
+_REVIEW_LOCAL_RE = re.compile(r"\Areview-(\d+)-(.+)\Z", re.S)
+_EVENT_LOCAL_RE = re.compile(r"\Aevent-(pr|issue)-(\d+)-(.+)\Z", re.S)
+_ITEM_LOCAL_RE = re.compile(r"\A(pr|issue)-(\d+)\Z")
 
-    Structure singletons (people, areas, milestones, code-graph/owners/label
-    singletons) are exempt — the schema gives them no url, they are not
-    narrated as sourced facts.
+
+def _repo_slug(project, repo):
+    """The GitHub `owner/repo` a node's links must name: the repo column of a
+    multi-repo member (`owner/repo`), else `{project}/{repo}` (single-repo
+    stores use owner = project)."""
+    repo = repo or ""
+    return repo if "/" in repo else "{}/{}".format(project, repo)
+
+
+def _item_url_problem(url, slug, kinds, number):
+    """None when `url` is a github.com link to item `number` of repo `slug`
+    (compared case-insensitively, as GitHub does) under one of `kinds`
+    (`pull`/`issues`); else why not."""
+    m = _GITHUB_ITEM_URL_RE.match(url) if isinstance(url, str) else None
+    if m is None:
+        return "url is not a https://github.com/{owner}/{repo}/pull|issues/{N} link"
+    if m.group(1).lower() != slug.lower():
+        return "url names repo {}, the node is in {}".format(m.group(1), slug)
+    if m.group(2) not in kinds:
+        return "url is a /{}/ link, expected /{}/".format(
+            m.group(2), "/ or /".join(sorted(kinds)))
+    if int(m.group(3)) != number:
+        return "url names #{}, the node is #{}".format(m.group(3), number)
+    return None
+
+
+def _social_provenance_problem(node, local):
+    """Why a PR / issue / review / event node's citation is not its own, or
+    None. Other social local forms fall back to the generic source-ref rule."""
+    data = node["data"]
+    slug = _repo_slug(node["project"], node["repo"])
+    m = _ITEM_LOCAL_RE.match(local)
+    if m:
+        kind, number = m.group(1), int(m.group(2))
+        # issues and PRs share one number space: a backfilled `issue-N` that is
+        # really a PR carries its /pull/N link (gather.make_backfill_fetcher).
+        kinds = {"pull"} if kind == "pr" else {"issues", "pull"}
+        if str(data.get("number")) != str(number):
+            return "data.number {!r} does not match the id".format(data.get("number"))
+        if not data.get("url"):
+            return "no url: a PR/issue must cite its GitHub link"
+        return _item_url_problem(data["url"], slug, kinds, number)
+    m = _REVIEW_LOCAL_RE.match(local)
+    if m:
+        number, url = int(m.group(1)), data.get("url")
+        # fold synthesizes `<pr url or pr-N>#pullrequestreview-<id>` when absent
+        if isinstance(url, str) and url.startswith(
+                "pr-{}#pullrequestreview-".format(number)):
+            return None
+        return _item_url_problem(url, slug, {"pull"}, number)
+    m = _EVENT_LOCAL_RE.match(local)
+    if m:
+        kind, number, url = m.group(1), int(m.group(2)), data.get("url")
+        if isinstance(url, str):
+            # fold's fallback `<parent local>#event-<id>`, or the API url of a
+            # timeline event (https://api.github.com/repos/{slug}/issues/events/N)
+            if url.startswith("{}-{}#event-".format(kind, number)):
+                return None
+            api = "https://api.github.com/repos/{}/".format(slug)
+            if url.lower().startswith(api.lower()):
+                return None
+        kinds = {"pull"} if kind == "pr" else {"issues", "pull"}
+        return _item_url_problem(url, slug, kinds, number)
+    return None if _has_source_ref(node) else "no url/number/sha in data"
+
+
+def check_provenance(conn):
+    """Every social/code node cites a source that is ITS OWN (issue #89):
+
+    - a PR (`pr-N`) / issue (`issue-N`) carries `number == N` and a `url` that
+      is https://github.com/{owner}/{repo}/pull|issues/N for the node's repo
+      (owner/repo compared case-insensitively); a review / lifecycle event
+      cites a link to its parent PR/issue (or fold's synthesized fallback, or a
+      timeline event's API url under the same repo);
+    - a commit's local id is a 40- (or 64-) hex git sha and `data.sha` equals it;
+    - an artifact cites a lifecycle commit ref.
+
+    Any other social/code node needs some url/number/sha. Structure nodes
+    (people, areas, milestones, releases, sprints, singletons) are exempt — the
+    schema gives them no url and they are not narrated as sourced facts. This
+    proves a citation points at the right object, not that the object's
+    content is what GitHub says: that needs --bundle (see no_drift).
     """
     details = []
     for n in _all_nodes(conn):
-        if n["node_class"] == "structure":
+        if n["node_class"] == "structure" or not n["id"]:
             continue
-        if not _has_source_ref(n):
-            details.append({
-                "severity": ERROR, "id": n["id"],
-                "node_class": n["node_class"],
-                "missing": "no url/number/sha/lifecycle ref in data"})
+        local = graphstore.local_id(n["id"], n["project"], n["repo"])
+        problem = None
+        if n["node_class"] == "social":
+            problem = _social_provenance_problem(n, local)
+        elif graphstore.is_artifact_local(local):
+            if not _has_source_ref(n):
+                problem = "no lifecycle commit ref in data"
+        elif n["node_class"] == "code":
+            sha = (n["data"] or {}).get("sha")
+            if not _SHA_RE.match(local):
+                problem = "commit id {!r} is not a 40/64-hex git sha".format(local)
+            elif sha != local:
+                problem = "data.sha {!r} does not match the id".format(sha)
+        if problem:
+            details.append({"severity": ERROR, "id": n["id"],
+                            "node_class": n["node_class"], "problem": problem})
     if not details:
         details.append({"severity": INFO, "note": "all social/code nodes sourced"})
     return _check("provenance", ERROR, details)
@@ -505,6 +623,85 @@ _CONTRIB_EDGE_TYPES = ("authored", "merged", "reviewed", "reported",
                        "commented", "reacted")
 
 
+# The singleton structure nodes fold writes per repo (gather.fold_bundle).
+_SINGLETON_LOCALS = ("workflowstats", "codegraph", "codeowners", "labeltaxonomy")
+_SOCIAL_LOCAL_RE = re.compile(
+    r"\A(?:pr-\d+|issue-\d+|review-\d+-.+|event-(?:pr|issue)-\d+-.+|comment-.+)\Z",
+    re.S)
+_STRUCTURE_PREFIXES = ("area-", "milestone-", "release-", "sprint-")
+
+
+def _id_grammar_problem(node):
+    """Why a node id breaks the id grammar (STORE.md "Identity"), or None.
+
+    Person ids are `{project}#person-{login}` with repo column "*"; every other
+    id is `{project}/{repo}#{local}` and its scope must equal the row's own
+    project/repo columns; the local form must be one the writer produces for
+    the node's class (social: pr-N, issue-N, review-…, event-…, comment-…;
+    code: a 40/64-hex sha or an artifact; structure: area-/milestone-/release-/
+    sprint-… or a singleton)."""
+    nid = node["id"]
+    if "#" not in nid:
+        return "id has no '#': not a qualified {scope}#{local} id"
+    scope, _, local = nid.partition("#")
+    if not scope or not local:
+        return "id has an empty scope or local part"
+    if _is_person_id(nid):
+        if node["repo"] != "*" or scope != node["project"]:
+            return ("person id must be {{project}}#person-{{login}} stored with "
+                    "repo '*' (row project={!r} repo={!r})".format(
+                        node["project"], node["repo"]))
+        if node["node_class"] != "structure":
+            return "person node is not a structure node"
+        login = local[len("person-"):]
+        if not login:
+            return "person id names no login"
+        stored_login = (node["data"] or {}).get("login")
+        if stored_login is not None and stored_login != login:
+            return "person data.login {!r} does not match the id".format(stored_login)
+        return None
+    if node["repo"] == "*":
+        return "only person ids may use the project-wide repo '*'"
+    want = "{}/{}".format(node["project"], node["repo"])
+    if scope != want:
+        return "id scope {!r} disagrees with the row's project/repo {!r}".format(
+            scope, want)
+    cls = node["node_class"]
+    if cls == "social":
+        ok = bool(_SOCIAL_LOCAL_RE.match(local))
+    elif cls == "code":
+        ok = graphstore.is_artifact_local(local) or bool(_SHA_RE.match(local))
+    else:
+        ok = local in _SINGLETON_LOCALS or any(
+            local.startswith(p) and len(local) > len(p) for p in _STRUCTURE_PREFIXES)
+    return None if ok else "local id {!r} is not a {} id form".format(local, cls)
+
+
+def _case_variant_details(nodes):
+    """ERROR details for id scopes stored under several case spellings (one
+    repo forked into two id spaces, issue #70): every id whose scope is not the
+    most-used spelling of its case-folded scope is named."""
+    by_fold = {}
+    for n in nodes:
+        if not n["id"] or "#" not in n["id"]:
+            continue
+        scope = n["id"].partition("#")[0]
+        by_fold.setdefault(scope.lower(), {}).setdefault(scope, []).append(n["id"])
+    details = []
+    for fold in sorted(by_fold):
+        spellings = by_fold[fold]
+        if len(spellings) < 2:
+            continue
+        canonical = sorted(spellings, key=lambda s: (-len(spellings[s]), s))[0]
+        for scope in sorted(s for s in spellings if s != canonical):
+            for nid in sorted(spellings[scope]):
+                details.append({
+                    "severity": ERROR, "id": nid,
+                    "problem": "case-variant duplicate: scope {!r} is also stored "
+                               "as {!r}".format(scope, canonical)})
+    return details
+
+
 def check_no_fabrication(conn):
     """No invented entities, no historyless artifacts, no malformed ids.
 
@@ -514,9 +711,20 @@ def check_no_fabrication(conn):
       write path skips it), so any EXISTING person node must have earned it.
     - Every artifact `code` node (local id `art:<path>` / `<path>#…`) has >=1
       lifecycle event (artifact with no history = ERROR).
-    - No node has an empty/None id; ids round-trip through parse_id.
+    - No node has an empty/None id; ids round-trip through parse_id, follow the
+      id grammar and agree with the row's project/repo columns
+      (_id_grammar_problem), and no scope is stored under two case spellings
+      (issue #89).
     """
     details = []
+    nodes = _all_nodes(conn)
+    for n in nodes:
+        if n["id"]:
+            problem = _id_grammar_problem(n)
+            if problem:
+                details.append({"severity": ERROR, "id": n["id"],
+                                "problem": problem})
+    details.extend(_case_variant_details(nodes))
     # contribution edges by person src
     contrib_src = set()
     for r in conn.execute(
@@ -525,7 +733,7 @@ def check_no_fabrication(conn):
             _CONTRIB_EDGE_TYPES):
         contrib_src.add(r[0])
 
-    for n in _all_nodes(conn):
+    for n in nodes:
         nid = n["id"]
         # id well-formedness
         if not nid:
@@ -606,9 +814,10 @@ def _id_kind(conn, qid, node_cache):
     return node["node_class"]
 
 
-# (edge_type) -> (allowed src kinds, allowed dst kinds). A missing endpoint is
-# not a schema violation here (referential_integrity owns that); we only flag a
-# STORED endpoint whose kind contradicts STORE.md.
+# (edge_type) -> (allowed src kinds, allowed dst kinds): an explicit rule for
+# EVERY edge type the store may hold (issue #89); any other type is an ERROR. A
+# missing endpoint is not a schema violation here (referential_integrity owns
+# that); we only flag a STORED endpoint whose kind contradicts STORE.md.
 _EDGE_SCHEMA = {
     "authored":     ({"person"}, {"pr", "commit"}),
     "merged":       ({"person"}, {"pr"}),
@@ -617,25 +826,44 @@ _EDGE_SCHEMA = {
     "commented":    ({"person"}, {"pr", "issue"}),
     "reacted":      ({"person"}, {"pr", "issue", "commit"}),
     "owns":         ({"person"}, {"area"}),
-    "touches":      ({"commit", "pr"}, {"area"}),
+    "touches":      ({"commit"}, {"area"}),
     "depends_on":   ({"area"}, {"area"}),
     "in_milestone": ({"pr", "issue"}, {"milestone"}),
     "in_iteration": ({"pr", "issue"}, {"sprint"}),
     "closes":       ({"pr"}, {"issue"}),
+    "cross_ref":    ({"pr"}, {"issue", "pr"}),
+    "spun_off":     ({"issue"}, {"issue"}),
+    "duplicate_of": ({"issue"}, {"issue"}),
     "part_of":      ({"commit", "review", "event"}, {"pr", "issue"}),
     "blocks":       ({"issue"}, {"issue"}),
     "replaced_by":  ({"artifact"}, {"artifact"}),
     "identity_from": ({"artifact"}, {"artifact"}),
 }
 
+# Edge types whose two endpoints are always in the SAME repo: the writer derives
+# them inside one repo's bundle. closes / cross_ref / depends_on may cross
+# member repos (manifest folds); contribution edges start at a project person.
+_SAME_REPO_EDGE_TYPES = frozenset((
+    "touches", "part_of", "blocks", "in_milestone", "in_iteration",
+    "replaced_by", "identity_from", "spun_off", "duplicate_of"))
+
+
+def _id_project(qid):
+    """The project an id belongs to: a person's scope, or the first segment of
+    a `{project}/{repo}` scope (a manifest project name holds no '/')."""
+    scope = graphstore.parse_id(qid)["scope"]
+    return scope if _is_person_id(qid) else scope.split("/", 1)[0]
+
 
 def check_schema_conformance(conn):
     """Each edge type's endpoints match STORE.md semantics: `authored` src is a
-    person and dst a pr/commit; `touches` dst is an area; `owns` person->area;
-    `in_milestone` dst is a milestone; etc. A STORED endpoint whose kind
-    contradicts the schema = ERROR (a missing endpoint is referential_integrity's
-    job, not flagged here). `cross_ref` / `spun_off` / `duplicate_of` are
-    polymorphic (issue<->pr<->commit) and are not endpoint-constrained.
+    person and dst a pr/commit; `touches` commit->area; `owns` person->area;
+    `cross_ref` pr->issue/pr; `in_milestone` dst is a milestone; etc. A STORED
+    endpoint whose kind contradicts the schema = ERROR (a missing endpoint is
+    referential_integrity's job, not flagged here). An edge type with no rule
+    in _EDGE_SCHEMA is an ERROR (issue #89: unknown types used to be skipped).
+    Both endpoints of an edge belong to one project, and the types in
+    _SAME_REPO_EDGE_TYPES stay inside one repo.
     """
     cache = {}
     details = []
@@ -643,7 +871,11 @@ def check_schema_conformance(conn):
         et = e["edge_type"]
         rule = _EDGE_SCHEMA.get(et)
         if rule is None:
-            continue  # polymorphic / unconstrained spine edge
+            details.append({
+                "severity": ERROR, "edge_type": et,
+                "src": e["src_id"], "dst": e["dst_id"],
+                "problem": "unknown edge type (no endpoint rule in STORE.md)"})
+            continue
         src_ok, dst_ok = rule
         sk = _id_kind(conn, e["src_id"], cache)
         dk = _id_kind(conn, e["dst_id"], cache)
@@ -655,12 +887,281 @@ def check_schema_conformance(conn):
             details.append({
                 "severity": ERROR, "edge_type": et, "endpoint": "dst",
                 "id": e["dst_id"], "kind": dk, "expected": sorted(dst_ok)})
+        if _id_project(e["src_id"]) != _id_project(e["dst_id"]):
+            details.append({
+                "severity": ERROR, "edge_type": et,
+                "src": e["src_id"], "dst": e["dst_id"],
+                "problem": "edge crosses projects"})
+        elif et in _SAME_REPO_EDGE_TYPES and (
+                graphstore.parse_id(e["src_id"])["scope"]
+                != graphstore.parse_id(e["dst_id"])["scope"]):
+            details.append({
+                "severity": ERROR, "edge_type": et,
+                "src": e["src_id"], "dst": e["dst_id"],
+                "problem": "edge crosses repos (this type stays inside one repo)"})
     if not details:
         details.append({"severity": INFO, "note": "all edge endpoints conform"})
     return _check("schema_conformance", ERROR, details)
 
 
-# --- check 6: store-derived == link-derived (no drift) -----------------------
+# --- check 6: edge set == re-derived from the stored records -----------------
+
+# Re-derived from the stored records alone (record blobs refresh, never go
+# stale): compared exactly in both directions on every store.
+_RECORD_EDGE_TYPES = frozenset((
+    "authored", "merged", "reviewed", "reported", "commented",
+    "closes", "cross_ref", "part_of"))
+# Derived from latest-wins inputs (the codegraph / codeowners singletons, area
+# path lists, the milestone / sprint / blocks lists of the latest fetch): exact
+# on a one-window store; on a multi-window store an older window's edges cannot
+# be re-derived (those inputs are not kept per window, and edges are never
+# retracted, #95), so a difference there is a WARN.
+_CURRENT_STATE_EDGE_TYPES = frozenset((
+    "owns", "touches", "depends_on", "in_milestone", "in_iteration", "blocks"))
+# Symbol moves, matched per fold window: exact on a one-window store; on a
+# multi-window store each stored move must be supported by the ledger
+# (_move_problem) and a cross-window re-match is not required.
+_MOVE_EDGE_TYPES = frozenset(("replaced_by", "identity_from"))
+
+
+def _repo_window_count(conn, project, repo):
+    """How many distinct gathered windows the meta ledger records for this
+    repo (0 when none; an unreadable ledger counts as one, i.e. strict)."""
+    try:
+        wins = graphstore.get_windows(conn)
+    except ValueError:
+        return 1
+    return len({(w.get("from"), w.get("to")) for w in wins
+                if isinstance(w, dict) and w.get("project") == project
+                and w.get("repo") == repo})
+
+
+def _owned_by_repo(src, dst, project, repo):
+    """An edge belongs to the repo whose id space its src is in; a person's
+    edge (project-scoped src) belongs to the repo of its dst."""
+    prefix = graphstore.qualify_id(project, repo, "")
+    if src.startswith(prefix):
+        return True
+    return (_is_person_id(src) and graphstore.parse_id(src)["scope"] == project
+            and dst.startswith(prefix))
+
+
+def _expected_edges(bundle, project, repo):
+    """{(src, dst, type): data} the writer derives from `bundle`: the bundle is
+    folded by gather.fold_bundle into an EMPTY in-memory store and its edges
+    read back. Single-repo semantics (members=None): cross-repo edges, which
+    need the manifest's member set and registries, are checked separately."""
+    scratch = graphstore.open_store(":memory:")
+    try:
+        graphstore.init_schema(scratch)
+        gather.fold_bundle(scratch, copy.deepcopy(bundle), project=project,
+                           repo=repo)
+        return {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
+                for e in (graphstore._row_to_edge(r) for r in
+                          scratch.execute("SELECT * FROM edges"))}
+    finally:
+        scratch.close()
+
+
+def _project_members(conn, project):
+    """Every member slug the store knows for `project`: stored repos plus the
+    repos of recorded member run status (a failed member still was a member)."""
+    members = set(graphstore.project_repos(conn, project))
+    try:
+        members |= {e["repo"] for e in graphstore.get_member_status(conn, project)}
+    except (ValueError, TypeError, KeyError):
+        pass
+    return members
+
+
+def _cross_repo_problem(key, data, bundle, project, repo, members):
+    """None when a stored edge from this repo into ANOTHER member repo is one
+    the manifest fold derives from the stored records: a `closes`/`cross_ref`
+    from a PR's qualified refs / timeline cross-references
+    (gather._cross_repo_pr_edges), or a `depends_on` from an unresolved
+    registry edge of the source area in the stored code graph to a member's
+    root area. Else why not (or "not cross-repo")."""
+    src, dst, et = key
+    dst_scope = graphstore.parse_id(dst)["scope"]
+    if not dst_scope.startswith(project + "/") or \
+            dst_scope == "{}/{}".format(project, repo):
+        return "not cross-repo"
+    dst_repo = dst_scope[len(project) + 1:]
+    local = graphstore.local_id(src, project, repo)
+    if et in ("closes", "cross_ref"):
+        m = _ITEM_LOCAL_RE.match(local)
+        pr = next((p for p in bundle.get("prs") or []
+                   if m and m.group(1) == "pr"
+                   and str(p.get("number")) == m.group(2)), None)
+        if pr is None:
+            return "source is not a stored PR"
+        _, edges = gather._cross_repo_pr_edges(pr, project, repo,
+                                               set(members) | {dst_repo})
+        if any(e[0] == src and e[1] == dst and e[2] == et for e in edges):
+            return None
+        return "the PR's text and timeline do not reference {}".format(dst)
+    if et == "depends_on":
+        if graphstore.local_id(dst) != gather._ROOT_AREA_LOCAL:
+            return "a cross-repo depends_on targets a member's root area"
+        aid = local[len("area-"):] if local.startswith("area-") else None
+        for area in (bundle.get("code_graph") or {}).get("areas") or []:
+            if area.get("id") != aid:
+                continue
+            for e in area.get("edges") or []:
+                if e.get("resolved") or not e.get("ref"):
+                    continue
+                want = {k: v for k, v in e.items() if k != "to"}
+                want.update(resolved=True, cross_repo=True)
+                if want == data:
+                    return None
+        return "no unresolved registry edge of the source area carries this data"
+    return "{} never crosses repos".format(et)
+
+
+def _move_problem(key, data, stored, bundle, project, repo):
+    """None when a stored symbol-move edge is supported by the repo's ledger:
+    its twin (`identity_from` <-> `replaced_by`) carries the same data, both
+    ends are the same non-comment symbol in two files of this repo, the ledger
+    holds a drop of the source (by `move_commit` when recorded) and an add of
+    the destination, and the basis/confidence pair is consistent with the
+    recorded renames. Else why not."""
+    src, dst, et = key
+    twin_type = "identity_from" if et == "replaced_by" else "replaced_by"
+    if (dst, src, twin_type) not in stored or stored[(dst, src, twin_type)] != data:
+        return "no {} twin with the same data".format(twin_type)
+    if et == "identity_from":
+        src, dst = dst, src
+    prefix = graphstore.qualify_id(project, repo, "")
+    if not (src.startswith(prefix) and dst.startswith(prefix)):
+        return "a move stays inside one repo"
+    a = graphstore.split_symbol_local(src[len(prefix):])
+    b = graphstore.split_symbol_local(dst[len(prefix):])
+    if a is None or b is None or a[1:] != b[1:] or a[0] == b[0]:
+        return "the ends are not the same symbol in two files"
+    if a[2] in derive._COMMENT_SUBKINDS:
+        return "comments are never matched as moves"
+    data = data or {}
+
+    def events(change, path):
+        return [e for e in bundle.get("symbol_events") or []
+                if e.get("change") == change and e.get("path") == path
+                and (e.get("lang") or "") == a[1] and e.get("subkind") == a[2]
+                and (e.get("name") or "") == a[3]]
+    drops = events("drop", a[0])
+    if not drops or (data.get("move_commit") and not any(
+            e.get("commit") == data["move_commit"] for e in drops)):
+        return "the ledger holds no drop of the source"
+    if not events("add", b[0]):
+        return "the ledger holds no add of the destination"
+    renames = {(e.get("old_path"), e.get("path"))
+               for e in bundle.get("code_events") or []
+               if e.get("change") in ("rename", "copy")}
+    basis, conf = data.get("move_basis"), data.get("move_confidence")
+    if basis == "file_rename" and conf == "high" and (a[0], b[0]) in renames:
+        return None
+    if basis == "unique_name" and conf == "medium":
+        return None
+    return "basis/confidence {}/{} is not supported by the ledger".format(basis, conf)
+
+
+def check_edge_set(conn, project, repo, bundle):
+    """The repo's stored edges EQUAL the edges its stored records imply, in
+    both directions (issue #89: completeness used to be expected ⊆ stored for
+    contribution edges only, so invented edges passed).
+
+    Expected = what gather.fold_bundle writes for the repo's self-sourced
+    bundle, folded into an empty scratch store (_expected_edges): contribution
+    edges, closes / cross_ref / part_of, blocks, touches, owns, in_milestone,
+    in_iteration, depends_on (from the codegraph singleton) and symbol moves.
+    An edge belongs to the repo of its src, a person's edge to the repo of its
+    dst (_owned_by_repo).
+
+    - derived but not stored -> ERROR; stored but not derivable -> ERROR, with
+      a #78 hint when the source is a pre-#78 git-name person; same key with
+      different data -> ERROR.
+    - A stored edge into ANOTHER member repo is checked against the manifest
+      derivation (_cross_repo_problem); a missing cross-repo edge is not
+      detected (it needs the manifest's registries).
+    - Multi-window store (more than one gathered window recorded for the repo):
+      a difference in a _CURRENT_STATE_EDGE_TYPES edge is a WARN (its inputs are
+      latest-wins), each stored move must be supported by the ledger
+      (_move_problem) and cross-window move re-matches are not required.
+
+    This proves the edges are exactly what the stored records imply, not that
+    the records are what GitHub holds (see no_drift's --bundle cross-check).
+    """
+    multi = _repo_window_count(conn, project, repo) > 1
+    expected = {k: v for k, v in _expected_edges(bundle, project, repo).items()
+                if _owned_by_repo(k[0], k[1], project, repo)}
+    stored = {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
+              for e in _all_edges(conn)
+              if _owned_by_repo(e["src_id"], e["dst_id"], project, repo)}
+    members = None
+    hints = {}
+    details = []
+    per_type = {}
+    for key in sorted(set(stored) | set(expected)):
+        src, dst, et = key
+        per_type.setdefault(et, {"stored": 0, "derived": 0})
+        if key in stored:
+            per_type[et]["stored"] += 1
+        if key in expected:
+            per_type[et]["derived"] += 1
+        base = {"edge_type": et, "src": src, "dst": dst}
+        lenient = multi and et in _CURRENT_STATE_EDGE_TYPES
+        if key in stored and key in expected:
+            if stored[key] != expected[key] and not lenient and not (
+                    multi and et in _MOVE_EDGE_TYPES):
+                details.append(dict(base, severity=ERROR,
+                                    problem="edge data drift",
+                                    stored=stored[key], expected=expected[key]))
+            continue
+        if key in expected:
+            if multi and et in _MOVE_EDGE_TYPES:
+                continue   # a cross-window re-match: no single window had it
+            details.append(dict(
+                base, severity=WARN if lenient else ERROR,
+                problem="derived from the stored records but not stored"
+                        + (" (latest-wins input on a multi-window store)"
+                           if lenient else "")))
+            continue
+        # stored but not derivable from this repo's records
+        if members is None:
+            members = _project_members(conn, project)
+        cross = _cross_repo_problem(key, stored[key], bundle, project, repo,
+                                    members)
+        if cross is None:
+            continue
+        if multi and et in _MOVE_EDGE_TYPES:
+            problem = _move_problem(key, stored[key], stored, bundle, project, repo)
+            if problem is None:
+                continue
+            details.append(dict(base, severity=ERROR, data=stored[key],
+                                problem="move edge not supported by the "
+                                        "ledger: " + problem))
+            continue
+        d = dict(base, severity=WARN if lenient else ERROR,
+                 problem="stored but not derivable from the stored records"
+                         + (" (latest-wins input on a multi-window store; stale "
+                            "until edges are retracted, #95)" if lenient else ""))
+        if cross != "not cross-repo":
+            d["cross_repo"] = cross
+        if _is_person_id(src):
+            if src not in hints:
+                hints[src] = _pre78_hint(conn, project, src)
+            if hints[src]:
+                d["hint"] = hints[src]
+        details.append(d)
+    details.append({"severity": INFO, "summary": "per_type_counts",
+                    "note": "{} stored edge(s) of this repo compared with {} "
+                            "re-derived from its records{}".format(
+                                len(stored), len(expected),
+                                " (multi-window store)" if multi else ""),
+                    "counts": per_type})
+    return _check("edge_set", ERROR, details)
+
+
+# --- check 7: store-derived == link-derived (no drift) -----------------------
 
 def _derive_people(bundle):
     """Re-derive the people projection exactly as the write path does, via the
@@ -671,13 +1172,19 @@ def _derive_people(bundle):
     area_idx = derive.area_index(bundle.get("code_graph", {}) or {})
     resolved = copy.deepcopy(bundle.get("commits") or [])
     gather.attach_commit_prs(resolved)
-    view = {**bundle, "commits": resolved, "people": dict(bundle.get("people") or {})}
+    # Seeded with NO people (issue #89): a self-sourced bundle's `people` is
+    # read from the stored person nodes, and enumerate only ADDS to its seed, so
+    # seeding with it made the areas check tautological. A raw gather bundle
+    # carries `people: {}`, so this is also exactly what the writer derives.
+    view = {**bundle, "commits": resolved, "people": {}}
     return derive.enumerate_participants(view, area_idx)
 
 
 def _stored_project_people(conn, project):
-    """The stored project-scoped people projection {login: {modules, areas, is_bot}}.
-    People carry the repo sentinel "*", so this reads them once for the project."""
+    """The stored project-scoped people projection
+    {login: {modules, areas, is_bot, login_resolved}}. People carry the repo
+    sentinel "*", so this reads them once for the project. `login_resolved` is
+    False only for an unresolved commit author (#78)."""
     out = {}
     for n in _repo_nodes(conn, project, "*", "structure"):
         local = _local(n["id"])
@@ -686,7 +1193,8 @@ def _stored_project_people(conn, project):
             d = n["data"] or {}
             out[login] = {"modules": sorted(d.get("modules") or []),
                           "areas": sorted(d.get("areas") or []),
-                          "is_bot": bool(d.get("is_bot"))}
+                          "is_bot": bool(d.get("is_bot")),
+                          "login_resolved": d.get("login_resolved") is not False}
     return out
 
 
@@ -694,31 +1202,117 @@ def _norm_people(people):
     """Normalize a derived people dict to the stored projection's key fields."""
     return {login: {"modules": sorted(rec.get("modules") or []),
                     "areas": sorted(rec.get("areas") or []),
-                    "is_bot": bool(rec.get("is_bot"))}
+                    "is_bot": bool(rec.get("is_bot")),
+                    "login_resolved": rec.get("login_resolved") is not False}
             for login, rec in people.items()}
 
 
-def _people_drift_details(stored_people, want_norm):
-    """The ERROR details for any divergence between stored and re-derived people."""
+# How strictly stored people are compared with the re-derivation:
+#   exact  - same logins, same fields (one-window, one-repo store; project mode)
+#   window - same logins and flags; areas/modules: derived ⊆ stored, an extra
+#            stored area is a WARN (a multi-window store: each window attributed
+#            areas with ITS code graph, and only the latest one is stored)
+#   member - derived ⊆ stored for logins and areas, flags exact (one member of
+#            a multi-member project: people are project-wide, the full equality
+#            is no_drift_people's; or an external --bundle of one window of a
+#            multi-window store)
+PEOPLE_EXACT, PEOPLE_WINDOW, PEOPLE_MEMBER = "exact", "window", "member"
+
+
+def _pre78_hint(conn, project, person_qid):
+    """An actionable hint when a stored person is a pre-#78 git-name identity,
+    else None: the node has no `login_resolved` flag (written before #78), all
+    its contribution edges are `authored` -> commit, and those commits now
+    name another author. Folding a post-#78 bundle into a pre-#78 store leaves
+    exactly this behind; it is a real mismatch, not a false alarm."""
+    row = conn.execute("SELECT data FROM nodes WHERE id=?", (person_qid,)).fetchone()
+    try:
+        pdata = json.loads(row[0]) if row else {}
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(pdata, dict) or "login_resolved" in pdata:
+        return None
+    login = graphstore.local_id(person_qid)[len("person-"):]
+    authors = set()
+    contrib = 0
+    for dst, et in conn.execute("SELECT dst_id, edge_type FROM edges "
+                                "WHERE src_id=?", (person_qid,)):
+        if et not in _CONTRIB_EDGE_TYPES:
+            continue
+        contrib += 1
+        node = conn.execute("SELECT node_class, data FROM nodes WHERE id=?",
+                            (dst,)).fetchone()
+        if et != "authored" or node is None or node[0] != "code":
+            return None
+        try:
+            author = (json.loads(node[1]) or {}).get("author")
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if author == login:
+            return None
+        authors.add(str(author))
+    if not contrib:
+        return None
+    return ("pre-#78 identity: {!r} is a commit's git author name from before "
+            "people were keyed by GitHub login (#78); the same commit(s) now name "
+            "{}. Folding a post-#78 bundle into a pre-#78 store leaves the old "
+            "person node and its `authored` edges beside the login-keyed ones. "
+            "Re-gather into a fresh store (STORE.md \"Identity (#78)\").".format(
+                login, ", ".join(sorted(authors))))
+
+
+def _people_drift_details(stored_people, want_norm, mode=PEOPLE_EXACT,
+                          conn=None, project=None):
+    """The details for any divergence between stored and re-derived people,
+    under `mode` (PEOPLE_EXACT / PEOPLE_WINDOW / PEOPLE_MEMBER, see above). A
+    stored person that is not derivable carries a #78 hint when it is a
+    pre-#78 git-name identity (needs `conn`/`project`)."""
     details = []
     for login in sorted(set(stored_people) | set(want_norm)):
         if login not in stored_people:
             details.append({"severity": ERROR, "kind": "person", "login": login,
                             "problem": "derived but not stored", "expected": want_norm[login]})
-        elif login not in want_norm:
+            continue
+        if login not in want_norm:
+            if mode == PEOPLE_MEMBER:
+                continue   # another member's person: audited project-wide
+            d = {"severity": ERROR, "kind": "person", "login": login,
+                 "problem": "stored but not derivable", "stored": stored_people[login]}
+            if conn is not None:
+                hint = _pre78_hint(conn, project,
+                                   graphstore.qualify_person(project, login))
+                if hint:
+                    d["hint"] = hint
+            details.append(d)
+            continue
+        s, w = stored_people[login], want_norm[login]
+        if mode == PEOPLE_EXACT:
+            if s != w:
+                details.append({"severity": ERROR, "kind": "person", "login": login,
+                                "problem": "person drift", "stored": s, "expected": w})
+            continue
+        bad = [f for f in ("is_bot", "login_resolved") if s[f] != w[f]]
+        missing = {f: sorted(set(w[f]) - set(s[f])) for f in ("areas", "modules")
+                   if set(w[f]) - set(s[f])}
+        if bad or missing:
             details.append({"severity": ERROR, "kind": "person", "login": login,
-                            "problem": "stored but not derivable", "stored": stored_people[login]})
-        elif stored_people[login] != want_norm[login]:
-            details.append({"severity": ERROR, "kind": "person", "login": login,
-                            "problem": "person drift",
-                            "stored": stored_people[login], "expected": want_norm[login]})
+                            "problem": "person drift", "fields": bad,
+                            "missing": missing, "stored": s, "expected": w})
+        extra = {f: sorted(set(s[f]) - set(w[f])) for f in ("areas", "modules")
+                 if set(s[f]) - set(w[f])}
+        if extra and mode == PEOPLE_WINDOW:
+            details.append({"severity": WARN, "kind": "person", "login": login,
+                            "problem": "stored areas not re-derivable from the "
+                                       "latest code graph (multi-window store)",
+                            "extra": extra})
     return details
 
 
 def _derive_people_project(conn, project, repos):
     """Re-derive the PROJECT-WIDE people aggregate: per-member enumerate (exactly as
-    each fold does), unioned across members (areas/modules union, is_bot OR) — the
-    read-side mirror of the union-merge fold_bundle writes."""
+    each fold does), unioned across members (areas/modules union, is_bot OR,
+    unresolved if any member derived it unresolved) — the read-side mirror of
+    the union-merge fold_bundle writes."""
     agg = {}
     for repo in repos:
         bundle, reason = _self_source_bundle(conn, project, repo)
@@ -726,29 +1320,96 @@ def _derive_people_project(conn, project, repos):
             raise _NotSourced("{}: {}".format(repo, reason))
         for login, rec in _derive_people(bundle).items():
             cur = agg.setdefault(login, {"areas": set(), "modules": set(),
-                                         "is_bot": False})
+                                         "is_bot": False, "login_resolved": True})
             cur["areas"] |= set(rec.get("areas") or [])
             cur["modules"] |= set(rec.get("modules") or [])
             cur["is_bot"] = cur["is_bot"] or bool(rec.get("is_bot"))
+            if rec.get("login_resolved") is False:
+                cur["login_resolved"] = False
     return {login: {"modules": sorted(v["modules"]), "areas": sorted(v["areas"]),
-                    "is_bot": v["is_bot"]} for login, v in agg.items()}
+                    "is_bot": v["is_bot"], "login_resolved": v["login_resolved"]}
+            for login, v in agg.items()}
 
 
 def check_no_drift_people(conn, project, repos):
     """PROJECT-WIDE people no-drift: the stored project-scoped person nodes equal
     the people re-derived across ALL members and unioned (mirroring fold_bundle's
     union-merge). People are project-scoped, so this is the correct granularity — a
-    per-member check can never reproduce the cross-member union."""
+    per-member check can never reproduce the cross-member union. Exact, except
+    that when any member holds several gathered windows the areas compare as
+    derived ⊆ stored (PEOPLE_WINDOW)."""
     try:
         want = _norm_people(_derive_people_project(conn, project, repos))
     except _NotSourced as exc:
         return _not_sourced("no_drift_people", str(exc))
     stored = _stored_project_people(conn, project)
-    details = _people_drift_details(stored, want)
-    if not details:
+    multi = any(_repo_window_count(conn, project, r) > 1 for r in repos)
+    details = _people_drift_details(stored, want,
+                                    PEOPLE_WINDOW if multi else PEOPLE_EXACT,
+                                    conn, project)
+    if not any(d["severity"] == ERROR for d in details):
         details.append({"severity": INFO,
                         "note": "store matches re-derived project people"})
     return _check("no_drift_people", ERROR, details)
+
+
+# Keys fold adds to a stored record that the raw bundle record lacks.
+_FOLD_ADDED_RECORD_KEYS = ("external_refs",)
+# Keys a view (extract) adds to a record from other stored rows.
+_VIEW_ADDED_RECORD_KEYS = ("blocking", "blocked_by")
+
+
+def _comparable_record(rec):
+    """A record in the form both a raw bundle and a saved view (view.py /
+    extract output) agree on: the view re-attaches `reviews` / `lifecycle`
+    from their own nodes (in timestamp order, with fold's synthesized `url`),
+    so those lists compare as sorted entries without `url`."""
+    out = {k: v for k, v in rec.items() if k not in _VIEW_ADDED_RECORD_KEYS}
+    for key in ("reviews", "lifecycle"):
+        if isinstance(out.get(key), list):
+            out[key] = sorted(
+                json.dumps({k: v for k, v in e.items() if k != "url"}
+                           if isinstance(e, dict) else e, sort_keys=True)
+                for e in out[key])
+    return out
+
+
+def _record_drift_details(conn, project, repo, bundle):
+    """With an EXTERNAL --bundle: each PR / issue / commit record in it must be
+    stored, with the same content. This is what the store alone cannot show — a
+    record deleted together with its edges, or a blob rewritten consistently
+    (title, merged, a comment body, a reviewer dropped with its edge). The
+    bundle is a raw bundle (gather.acquire's return value) or a view saved
+    from the store when it was gathered (view.py output), so it must hold the
+    latest fetch of its records: an older window's bundle on a store that
+    re-fetched a record later reports that record as different."""
+    details = []
+    groups = (("pr", bundle.get("prs") or [], lambda r: "pr-{}".format(r.get("number"))),
+              ("issue", bundle.get("issues") or [],
+               lambda r: "issue-{}".format(r.get("number"))),
+              ("commit", bundle.get("commits") or [], lambda r: r.get("sha")))
+    for kind, records, local_of in groups:
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            local = local_of(rec)
+            qid = graphstore.qualify_id(project, repo, local)
+            row = conn.execute("SELECT * FROM nodes WHERE id=?", (qid,)).fetchone()
+            if row is None:
+                details.append({"severity": ERROR, "kind": "record", "id": qid,
+                                "problem": "{} in --bundle but not stored".format(kind)})
+                continue
+            stored = _comparable_record(_node(row)["data"])
+            rec = _comparable_record(rec)
+            fields = sorted(
+                k for k in set(stored) | set(rec)
+                if stored.get(k) != rec.get(k)
+                and not (k in _FOLD_ADDED_RECORD_KEYS and k not in rec))
+            if fields:
+                details.append({"severity": ERROR, "kind": "record", "id": qid,
+                                "problem": "stored {} differs from --bundle".format(kind),
+                                "fields": fields})
+    return details
 
 
 def _derive_artifacts(conn, project, repo, bundle):
@@ -771,31 +1432,63 @@ def _derive_artifacts(conn, project, repo, bundle):
         extract.recorded_moves(conn, project, repo))
 
 
-def check_no_drift(conn, project, repo, bundle, check_people=True):
+def _people_mode(conn, project, repo, external):
+    """The PEOPLE_* comparison mode for a single-repo no_drift (see above). An
+    external --bundle is exact on a one-window single-repo store (it is then
+    the whole store) and a subset check otherwise (the store holds people the
+    bundle never saw)."""
+    multi = _repo_window_count(conn, project, repo) > 1
+    if len(graphstore.project_repos(conn, project)) > 1 or (external and multi):
+        return PEOPLE_MEMBER
+    return PEOPLE_WINDOW if multi else PEOPLE_EXACT
+
+
+def check_no_drift(conn, project, repo, bundle, check_people=True,
+                   external=False):
     """Store-derived == link-derived (the carol-check generalized to ANY data).
 
     Re-derive people and artifacts from the bundle (running attach_commit_prs
     first, exactly as the write path does) and assert the STORED person/artifact
     nodes equal the freshly derived set — same ids, same key fields. Any
-    difference = ERROR with the diff. This is the strongest real-data guarantee:
-    it catches a stored projection that has silently drifted from what the data
-    says it should be.
+    difference = ERROR with the diff.
 
-    `check_people=False` skips the people section: people are PROJECT-scoped (one
-    node per login, areas/modules unioned across all member repos), so in a
-    multi-repo project they are audited ONCE project-wide by
-    check_no_drift_people, not per member (a single member's bundle can never
-    re-derive the cross-member union). Artifacts are repo-scoped and always
-    checked here. Single-repo callers keep the default (repo == whole project)."""
+    People are re-derived from the records alone (never seeded with the stored
+    person nodes) and compare modules, areas, is_bot and login_resolved. How
+    strictly (_people_mode): exact on a one-window single-repo store; on a
+    multi-window store the areas compare as derived ⊆ stored (extra -> WARN);
+    when `repo` is one member of a multi-member project, or `bundle` is an
+    external --bundle on a multi-window store, only the people this bundle
+    derives are checked (derived ⊆ stored) — people are project-wide and
+    their full equality is check_no_drift_people's (validate_project). A stored person that is not
+    derivable carries a #78 hint when it is a pre-#78 git-name identity.
+
+    Artifacts are re-derived from the store's OWN ledger plus recorded moves
+    (#76), so this proves the nodes equal their ledger, not that the ledger is
+    right. With an `external` bundle the stored PR / issue / commit records must
+    also equal the bundle's (_record_drift_details): the only way to detect a
+    deleted record or a rewritten blob.
+
+    `check_people=False` skips the people section (validate_project audits
+    them once project-wide)."""
     details = []
 
     # --- people (skipped per-member in a project: audited once by
     #     check_no_drift_people over the cross-member union) ---
     if check_people:
-        want_people = _derive_people(bundle)
+        want_norm = _norm_people(_derive_people(bundle))
         stored_people = _stored_project_people(conn, project)
-        want_norm = _norm_people(want_people)
-        details.extend(_people_drift_details(stored_people, want_norm))
+        mode = _people_mode(conn, project, repo, external)
+        details.extend(_people_drift_details(stored_people, want_norm, mode,
+                                             conn, project))
+        if mode == PEOPLE_MEMBER:
+            details.append({"severity": INFO, "note": (
+                "people: the {} derived from this {} are stored with at least "
+                "these areas; the full people equality is checked project-wide "
+                "(validate.py without --repo)".format(
+                    len(want_norm), "--bundle" if external else "member"))})
+
+    if external:
+        details.extend(_record_drift_details(conn, project, repo, bundle))
 
     # --- artifacts ---
     # The stored artifact id is `{project}/{repo}#{local}` where the SYMBOL-artifact
@@ -831,12 +1524,12 @@ def check_no_drift(conn, project, repo, bundle, check_people=True):
                     "stored": len(s.get("lifecycle") or []),
                     "expected": len(w.get("lifecycle") or [])})
 
-    if not details:
+    if not any(d["severity"] == ERROR for d in details):
         details.append({"severity": INFO, "note": "store matches re-derived people+artifacts"})
     return _check("no_drift", ERROR, details)
 
 
-# --- check 7: idempotency probe ----------------------------------------------
+# --- check 8: idempotency probe ----------------------------------------------
 
 def _counts(conn):
     return {
@@ -846,21 +1539,52 @@ def _counts(conn):
     }
 
 
-def check_idempotency(conn, bundle):
+def _edge_keys(conn):
+    return {(r[0], r[1], r[2]) for r in conn.execute(
+        "SELECT src_id, dst_id, edge_type FROM edges")}
+
+
+def check_idempotency(conn, bundle, project=None, repo=None):
     """Re-fold the bundle into a SECONDARY in-memory copy of the store and assert
     node/edge/code_event counts are unchanged (durable dedup holds).
 
     Read-only over the audited store: we copy it into memory, re-fold there, and
     compare counts. A count that grows means a fold path is non-idempotent (it
     would silently inflate the graph on every overlapping window).
+
+    Multi-window store (`project`/`repo` given and more than one gathered
+    window recorded for it): the self-sourced bundle holds every window as one,
+    so the re-fold can match a symbol move no single window had (a drop in one
+    window, a unique add in a later one) and re-derive latest-wins edges
+    (touches/owns/depends_on/in_milestone/in_iteration/blocks) for older
+    records. Edges are keyed by (src, dst, type), so such new edges are a
+    different derivation scope, never a duplicate: they are listed as INFO and
+    left out of the edge count (issue #89, LLD §14.5). On a one-window store
+    every change still fails.
     """
+    multi = project is not None and _repo_window_count(conn, project, repo) > 1
     before = _counts(conn)
+    keys_before = _edge_keys(conn) if multi else None
     copy_conn = graphstore.open_store(":memory:")
     conn.backup(copy_conn)
     gather.fold_bundle(copy_conn, bundle)
     after = _counts(copy_conn)
+    excused = []
+    if multi:
+        excused = sorted(
+            k for k in _edge_keys(copy_conn) - keys_before
+            if k[2] in _MOVE_EDGE_TYPES or k[2] in _CURRENT_STATE_EDGE_TYPES)
+        after["edges"] -= len(excused)
     copy_conn.close()
     details = []
+    if excused:
+        details.append({
+            "severity": INFO,
+            "note": "{} edge(s) a whole-store re-fold derives that no single "
+                    "window did (cross-window move re-match / latest-wins "
+                    "input on a multi-window store): not a dedup failure".format(
+                        len(excused)),
+            "edges": [list(k) for k in excused[:20]]})
     for k in ("nodes", "edges", "code_events"):
         if after[k] != before[k]:
             details.append({
@@ -978,19 +1702,29 @@ def validate_repo(conn, project, repo, bundle=None, check_people=True):
         _guarded(check_no_fabrication, "no_fabrication", conn),
         _guarded(check_schema_conformance, "schema_conformance", conn),
     ]
+    # edge_set always audits the store against ITS OWN records (self-sourced),
+    # also when an external bundle is passed: the bundle's job is to vouch for
+    # the records themselves (no_drift's record cross-check).
+    self_bundle, self_reason = _self_source_bundle(conn, project, repo)
+    if self_bundle is None:
+        checks.append(_not_sourced("edge_set", self_reason))
+    else:
+        checks.append(_guarded(check_edge_set, "edge_set",
+                               conn, project, repo, self_bundle))
     if bundle is not None:
         drift_bundle, reason = bundle, None
     else:
-        drift_bundle, reason = _self_source_bundle(conn, project, repo)
+        drift_bundle, reason = self_bundle, self_reason
     if drift_bundle is None:
         # No bundle to re-derive against: these checks FAIL, never vanish.
         checks.append(_not_sourced("no_drift", reason))
         checks.append(_not_sourced("idempotency", reason))
     else:
         checks.append(_guarded(check_no_drift, "no_drift",
-                               conn, project, repo, drift_bundle, check_people))
+                               conn, project, repo, drift_bundle, check_people,
+                               bundle is not None))
         checks.append(_guarded(check_idempotency, "idempotency",
-                               conn, drift_bundle))
+                               conn, drift_bundle, project, repo))
     return Report(checks)
 
 

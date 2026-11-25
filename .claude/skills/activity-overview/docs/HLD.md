@@ -475,7 +475,8 @@ These are real, current limits — plan around them:
     `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
     latest gathered window only.
 10. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
-    `depends_on` edge in an existing store.
+    `depends_on` edge in an existing store. On a multi-window store `validate` reports such
+    stale latest-wins edges as WARN, not ERROR.
 11. **Terraform transitive edges come from the build.** Every `module {}` block an area
     declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
     (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:
@@ -523,8 +524,19 @@ Item 8 is why USAGE recommends one store per installment; it is a candidate for 
 [§11](#11-extension-points-and-roadmap). Artifact folding is cumulative: each fold rebuilds the
 artifacts it touches from the whole change ledger, so a store holding several windows passes
 `validate.no_drift` whatever the fold order. Symbol moves are matched per window; on such a
-store `validate`'s idempotency probe, which re-folds every window as one, can report a move
-that no single window had (LLD §14.5).
+store `validate` checks each recorded move against the ledger instead of re-matching across
+windows, and its idempotency probe reports a whole-store re-match as INFO (LLD §8).
+
+**What the trust gate proves (#89).** `validate` proves the store is *consistent*: every edge
+is exactly what the stored records imply (`edge_set`, both directions), people are re-derived
+from the records alone, every PR/issue/review/event cites its own GitHub link and every commit
+id is a real sha, and ids follow the grammar. It does not prove the records are what GitHub
+holds: a record deleted with all its edges, a blob rewritten consistently, or a wrong change
+ledger (artifacts are compared with the store's own ledger) leave a consistent store. A
+`--bundle` saved at gather time (a `view.py` JSON of the fresh store) catches changed or deleted
+records; the store keeps no per-fold content digest. On a store holding several windows, the
+edges and people areas that come from latest-wins inputs (item 9) can only be WARNed about, not
+proven.
 
 ## 11. Extension points and roadmap
 

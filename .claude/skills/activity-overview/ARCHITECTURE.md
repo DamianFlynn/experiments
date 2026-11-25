@@ -119,7 +119,7 @@ C4Container
     Container(derive, "derive.py", "Python (pure leaf)", "Pure projections: artifacts, areas, people, symbols, flow, halls")
     Container(link, "link.py", "Python (offline)", "Enrich: trains, buckets, forecast, slices, series")
     Container(render, "render.py", "Python + mmdc", "Emit + validate Mermaid diagrams")
-    Container(validate, "validate.py", "Python (offline)", "Trust gate: 8 audits over the store")
+    Container(validate, "validate.py", "Python (offline)", "Trust gate: 9 audits over the store")
     Container(spotlight, "spotlight.py", "Python (offline)", "Cross-window analytics reader")
     Container(digest, "digest.py", "Python (offline)", "Multi-repo project view aggregator")
     Container(report, "SKILL.md + report-template.md", "Agent-authored", "The narrative, grounded in the view")
@@ -523,17 +523,24 @@ not ship. *How:* pure text emitters build the Mermaid, then **mmdc compiles ever
 
 Remember the promise: *the digest must be believable*. Since the entire narrative comes
 from the database, **a wrong database means a lying report.** `validate.py` is the gate
-that proves the database is sound — run it before you trust any digest.
+that proves the database is consistent — run it before you trust any digest.
 
-> ⭐ **The trust gate.** `validate.py` runs **eight audits** over the store. The headline
+> ⭐ **The trust gate.** `validate.py` runs **nine audits** over the store. The headline
 > ones:
-> - **provenance** — *every* fact carries a source link (no anonymous claims);
+> - **provenance** — *every* fact carries a source link, and it is the fact's own (the
+>   right repo and number on github.com; a real commit sha);
 > - **referential integrity** — every edge points at things that exist;
 > - **schema conformance** — every relationship matches the allowed shapes (the edge
->   model in Chapter 3);
+>   model in Chapter 3); an unknown relationship type is an error;
+> - **edge set** — the stored relationships are exactly the ones the stored records imply,
+>   nothing missing and nothing invented;
 > - **no-drift** — re-deriving from the store reproduces the same view (the golden
 >   guarantee, enforced);
 > - **idempotency** — re-folding changes nothing.
+>
+> What it cannot see from the store alone: a record deleted together with all its
+> relationships, or a record rewritten consistently. Keep the view saved right after the
+> gather and pass it as `--bundle` to catch those (`STORE.md` "Trust gate").
 
 > 🟦 **New here: a "CI gate".** **CI** (continuous integration) is the robot that checks
 > every change automatically. A **gate** is a check that must pass before work proceeds.
@@ -617,7 +624,7 @@ just one window.
 # Epilogue — the whole story in three sentences
 
 Programs collect the facts deterministically and remember them in a graph that grows on
-your disk; a trust gate proves the graph is sound and fully sourced; then the AI writes
+your disk; a trust gate proves the graph is consistent and fully sourced; then the AI writes
 the story **only** from that graph, citing every claim so you can check it. That is the
 core principle made real — *gather is deterministic, analysis is the model's judgment* —
 and it's why the digest is both readable **and** believable.
@@ -710,8 +717,8 @@ kept 6, diff cap 6000 chars; flow — stale 30 days, upvote min 5, traction min 
 | Run never finishes (huge repo) | per-item enrichment + code walk | narrow window; `--no-workflows`; reuse clone (`--no-clone`); run where there's no hard step timeout |
 
 > ⭐ **The golden rule of debugging this system:** never trust a digest whose store hasn't
-> passed `validate.py`. If validate is green, the facts are sound and fully sourced — and
-> the story written from them is defensible.
+> passed `validate.py`. If validate is green, the graph is consistent with its own records
+> and every fact cites its own source — and the story written from them is defensible.
 
 ---
 

@@ -32,7 +32,8 @@ def _base(**extra):
                      "message": "refactor (#1)",
                      "files": ["a/main.tf", "b/main.tf"]}],
         "prs": [{"number": 1, "author": "alice", "merged": True,
-                 "merged_at": "2026-05-03", "url": "https://x/1"}],
+                 "merged_at": "2026-05-03",
+                 "url": "https://github.com/o/r/pull/1"}],
         "issues": [],
     }
     b.update(extra)

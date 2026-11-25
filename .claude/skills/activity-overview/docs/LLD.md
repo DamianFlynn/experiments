@@ -925,28 +925,70 @@ over every member holding data (`project_repos`) plus the project-wide checks.
 |---|---|
 | `target` | the store has nodes, the project has nodes and the repo is a stored member (case-insensitive, resolved to the stored spelling); and the member's last gather of every recorded window is `ok` (meta `member_status`, #77) |
 | `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR |
-| `participant_completeness` | every login in any raw record has a person node |
-| `provenance` | every social/code node carries a source identifier (url and/or sha) |
-| `no_fabrication` | no invented entities, no historyless artifacts, no malformed ids |
-| `schema_conformance` | each edge type's endpoint classes match STORE.md |
-| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves) |
-| `idempotency` | re-folding into a scratch copy changes no counts |
-| `no_drift_people` (project) | project-scoped people == union re-derived across all members |
+| `participant_completeness` | every login in any raw record has a person node and its contribution edge |
+| `provenance` | every social/code node cites its own source: a PR/issue `url` is `https://github.com/{owner}/{repo}/pull\|issues/N` for the node's repo (case-insensitive) and `data.number == N`; a review/event cites its parent (or fold's synthesized fallback, or a timeline event's `api.github.com/repos/{owner}/{repo}/` url); a commit id is a 40/64-hex sha equal to `data.sha`; an artifact cites a lifecycle commit (#89) |
+| `no_fabrication` | no orphan person, no historyless artifact; every id follows the grammar, its scope equals the row's `project`/`repo` (people: `{project}` + repo `*`) and its local form fits the node class; no scope is stored under two case spellings (#89) |
+| `schema_conformance` | every edge type has an explicit endpoint rule (an unknown type is an ERROR); endpoint kinds match it; both ends are in one project; same-repo types stay in one repo (#89) |
+| `edge_set` | the repo's stored edges == the edges `gather.fold_bundle` writes for its self-sourced bundle in an empty scratch store, in both directions and with equal `data`; cross-repo edges are checked against the manifest derivation (#89) |
+| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (people from the records alone, with `login_resolved`; artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves); with `--bundle`, the stored PR/issue/commit records == the bundle's |
+| `idempotency` | re-folding into a scratch copy changes no counts (on a multi-window store, cross-window move re-matches and latest-wins edges are INFO, not counted) |
+| `no_drift_people` (project) | project-scoped people == union re-derived across all members (areas derived ⊆ stored when a member holds several windows) |
 | `member_status` (project) | every manifest member's last gather of every recorded window is `ok`; a `failed` / `not_attempted` member is an ERROR naming the repo, window and reason, also when it holds no node and so is not an audited member (#77). Passes (INFO) on a store with no recorded status |
 
 Every report lists every check in this order (issue #79); none is ever dropped.
-`no_drift`/`idempotency` self-source their bundle via `extract` over the span of the repo's
-timestamped nodes; a repo with only structure nodes (a quiet member) uses its recorded gathered
-windows instead; `--bundle` is an optional cross-check. When no bundle can be sourced (no nodes
-for the target, an undecodable node row, or social/code nodes with no `ts` at all) both checks
-FAIL with `could not self-source: <reason>`, and project-mode `no_drift_people` fails likewise.
+`edge_set`/`no_drift`/`idempotency` self-source their bundle via `extract` over the span of the
+repo's timestamped nodes; a repo with only structure nodes (a quiet member) uses its recorded
+gathered windows instead; `--bundle` is an optional cross-check (`edge_set` always uses the
+self-sourced bundle). When no bundle can be sourced (no nodes for the target, an undecodable node
+row, or social/code nodes with no `ts` at all) the three checks FAIL with
+`could not self-source: <reason>`, and project-mode `no_drift_people` fails likewise.
+
+**Strictness rules (#89).**
+
+- *Edge set.* `_expected_edges` folds the self-sourced bundle into an empty in-memory store
+  (single-repo semantics, `members=None`) and reads its edges back; `_owned_by_repo` assigns an
+  edge to the repo of its src (a person's edge to the repo of its dst). `derived but not stored`,
+  `stored but not derivable` and `edge data drift` are ERRORs. A stored edge into another member
+  repo passes when `gather._cross_repo_pr_edges` (members = stored repos, `member_status` repos
+  and the dst repo) derives it from the stored PR, or, for `depends_on`, when an unresolved
+  registry edge of the source area in the `codegraph` singleton carries the edge's `data` and the
+  dst is a member's root area. A missing cross-repo edge is not detected.
+- *Edge classes.* Record-derived (`authored`, `merged`, `reviewed`, `reported`, `commented`,
+  `closes`, `cross_ref`, `part_of`): exact on every store. Latest-wins (`owns`, `touches`,
+  `depends_on`, `in_milestone`, `in_iteration`, `blocks`): exact on a one-window store, WARN on a
+  multi-window one (its inputs are not kept per window; edges are not retracted, #95). Moves
+  (`replaced_by`, `identity_from`): exact on a one-window store; on a multi-window one each stored
+  move must pass `_move_problem` (twin edge with equal data, same non-comment symbol in two files,
+  a ledger drop of the source — by `move_commit` — and an add of the destination, basis/confidence
+  consistent with the renames) and whole-store re-matches are not required. A repo is
+  multi-window when `gathered_windows` records more than one `(from, to)` for it.
+- *People.* `_derive_people` seeds `enumerate_participants` with `people: {}`: a self-sourced
+  bundle's `people` is read from the stored person nodes, and the enumerator only adds to its
+  seed, so seeding with it made the areas check tautological. Modes (`_people_mode`): exact
+  (one-window single-repo store; project mode), window (multi-window: logins and flags exact,
+  areas derived ⊆ stored, extra → WARN), member (`--repo` of a multi-member project, or an external
+  `--bundle` on a multi-window store: derived ⊆ stored for logins and areas). A stored person that
+  is not derivable gets a `hint` from `_pre78_hint` when it has no `login_resolved` flag and all its
+  contribution edges are `authored` → commits that now name another author.
+- *Records (`--bundle`).* `_record_drift_details`: every PR/issue/commit of the bundle is stored
+  with equal content (`external_refs` added by a manifest fold is ignored; `reviews`/`lifecycle`
+  compare as sorted entries without `url`; `blocking`/`blocked_by` added by a view are ignored), so
+  a saved `view.py` JSON of the freshly gathered store works as the bundle.
+
+**What it proves.** Self-sourced: the store is consistent with its own records and ledger, and
+every citation is the node's own GitHub object. Not provable from the store alone: a record
+deleted with all its edges, a blob rewritten consistently, or a wrong ledger (the artifact part
+of `no_drift` compares nodes with the store's own ledger since #76, so a ledger with missing or
+invented rows yields matching nodes). `--bundle` covers the first two; nothing in the store
+covers the third (no per-fold content digest is recorded).
 Every check runs under `_guarded`: an exception — e.g. `CorruptRow` for data that is not valid
 JSON or a social/code/person blob that is not an object — becomes a failed ERROR check carrying
 the error and the row id, so text and `--json` reports are always produced.
 
 **Read-only.** The CLI opens the store with `graphstore.open_store_readonly(path)` (SQLite
 `file:…?mode=ro` URI; raises `FileNotFoundError` for a missing path and never creates it; no
-WAL pragma, no schema step). The idempotency re-fold runs in an in-memory `backup` copy. The
+WAL pragma, no schema step). The idempotency re-fold runs in an in-memory `backup` copy and the
+`edge_set` re-derivation in an empty in-memory store. The
 tombstone readers (`traverse_spine(skip_dead=True)`, `is_dead_ref`, `get_dead_refs`) treat a
 missing `dead_refs` table as empty instead of creating it; only `record_dead_ref` creates it.
 
@@ -1169,7 +1211,6 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
 | View arrays not window-scoped on multi-window stores | arrays come from `repo_nodes` (buckets are bounded by `meta.period` since #75) | `prs`/`issues`/`commits` and trains span all stored history (member and project views) | window the materialized arrays to in-window + spine context |
-| Idempotency probe re-matches moves over the whole store | `validate.check_idempotency` re-folds the self-sourced bundle (every window as one); `match_symbol_moves` then sees a symbol dropped from one file in one window and added (uniquely) to another in a later window as a move | `idempotency` ERROR: edges +2 on a correct multi-window store (only in that case; `no_drift` passes) | re-fold per recorded window in the probe, or exclude move edges from its count |
 | `enrich` re-matches moves over the view | `link.enrich` runs `link_symbol_identity` over the view's whole `symbol_events` | on a multi-window store the view's artifacts can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
@@ -1181,6 +1222,9 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
 | Pre-#84 stores have no base branch | fold stores `branches:` meta keys only since #84 | their views carry `meta.base_branch: null`, `extract` warns, and every merged PR (stacked, release-branch) counts as shipped, as before #84 | re-gather the window |
 | One mainline per view | `link` compares a PR's `base` with one `meta.base_branch` | a roll-up spanning a default-branch rename (`master` → `main`) gets `null` (warned), so its merges are not told apart; view each gathered window on its own | carry a set of mainline names if needed |
+| Trust gate cannot see record content changes | self-sourced checks compare the store with its own records and ledger; no per-fold content digest is recorded (it would need a `fold_bundle` change) | a record deleted with all its edges, a consistently rewritten blob or a wrong ledger pass a store-only `validate` | `--bundle` with a view saved at gather time catches the first two; a fold digest in `meta` would cover the rest |
+| Multi-window stores: latest-wins edges are WARN | the inputs of `owns`/`touches`/`depends_on`/`in_milestone`/`in_iteration`/`blocks` and of people's areas are not kept per window, and edges are not retracted (#95) | on a store holding several windows a stale or tampered edge of those types, or an extra stored area, is a WARN, not an ERROR | per-window singletons (and #95 retraction) would make them exact |
+| A renamed or transferred repo fails `provenance` | PR/issue urls must name the node's repo; the API returns the current name after a rename | gathering a repo under its old name (manifest or `--repo`) stores `html_url`s of the new name and fails `provenance` | gather under the current name |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
 | Timeline code events of older commits order by day | `committed_at` (#82) is gathered from `%cI` by the commit walk only | commits in a store folded before #82, and backfilled commits (five-field log), have no `committed_at`, so their timeline events keep the bare date and sort before that day's social events | re-gather; log `%cI` in `make_backfill_fetcher` too |
 | Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |
@@ -1193,7 +1237,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for
-continuity, wide single gathers for history stores) avoids the first three in practice.
+continuity, wide single gathers for history stores) avoids the first two in practice.
 
 ## 15. Testing and CI
 

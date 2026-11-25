@@ -45,7 +45,8 @@ def _member_bundle(args):
         "meta": {"owner": args.owner, "repo": args.repo,
                  "from": getattr(args, "from"), "to": args.to,
                  "base_branch": "main"},
-        "prs": [{"number": n, "url": "u/pr/{}".format(n), "state": "closed",
+        "prs": [{"number": n, "url": "https://github.com/{}/{}/pull/{}".format(
+                     args.owner, args.repo, n), "state": "closed",
                  "merged": True, "author": "dev{}".format(n),
                  "created_at": "2026-01-05T00:00:00Z",
                  "merged_at": "2026-01-10T00:00:00Z",
