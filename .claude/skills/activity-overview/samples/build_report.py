@@ -35,6 +35,7 @@ PROJECT = view["meta"]["project"]
 FROM, TO = view["meta"]["from"], view["meta"]["to"]
 TODAY = datetime.date.today().isoformat()
 
+import derive  # noqa: E402  (codeowners_rules: list or legacy dict form)
 import graphstore  # noqa: E402  (qualify/parse ids, same as digest.py)
 
 
@@ -270,8 +271,8 @@ W("| Repo | Module (area) | CODEOWNERS | Commits | PRs | Files |")
 W("|---|---|---|---|---|---|")
 for m in view["members"]:
     repo = m["repo"]
-    co = (m["bundle"].get("code_owners") or {})
-    owner = "; ".join(sorted({o for owners in co.values() for o in owners})) or "—"
+    co = derive.codeowners_rules(m["bundle"].get("code_owners"))
+    owner = "; ".join(sorted({o for _p, owners in co for o in owners})) or "—"
     repo_mods = [(k.split("::", 1)[1], s) for k, s in mods.items()
                  if k.startswith(repo + "::")]
     repo_mods.sort(key=lambda kv: (-kv[1].get("files_changed", 0),

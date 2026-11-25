@@ -439,7 +439,7 @@ def _materialize_people(conn, project):
 def _materialize_singleton(conn, project, repo, local):
     """Read back a per-repo singleton fact persisted as a structure node under a
     well-known local id (workflow_stats/code_graph/code_owners/label_taxonomy).
-    Returns the stored dict, or None if the node was never written (so extract
+    Returns the stored value, or None if the node was never written (so extract
     does not fabricate an empty key for repos that had no such fact)."""
     node = graphstore.get_node(conn, graphstore.qualify_id(project, repo, local))
     return node["data"] if node is not None else None

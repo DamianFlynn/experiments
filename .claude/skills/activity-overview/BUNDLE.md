@@ -251,8 +251,24 @@ docsRefs, release_train, sprints, project, diagrams`.
   with an empty `edges` list genuinely means "no inter-area dependencies"; `timeout`/`failed`
   mean "not determined" (re-run to resolve). The integration gate reds when the unresolved rate
   is non-trivial, so an incomplete graph is re-run rather than silently shipped.
-- **code_owners** `{ "<path|glob>": ["login", ...] }` — parsed from the clone's
-  CODEOWNERS (`.github/`/root/`docs/`); `@org/team` and `@user` kept as logins.
+- **code_owners** `[ { "pattern": "<path|glob>", "owners": ["login", ...] }, ... ]` —
+  parsed from the clone's CODEOWNERS (`.github/`/root/`docs/`), one rule per line **in
+  file order** (duplicates kept). `@org/team` and `@user` are kept as logins (the `@`
+  stripped), emails as-is. Blank/`#` lines, inline `# comments` and GitLab `[Section]`
+  headers are dropped; a pattern with no owners is kept with `owners: []` (it
+  un-assigns ownership). Matching follows GitHub's CODEOWNERS rules
+  (`derive.codeowners_owners`): leading or middle `/` anchors at the root, trailing
+  `/` = directory, `*`/`?` within a segment, `**` across segments, a slash-less
+  pattern matches at any depth, a matched directory covers everything under it
+  (except an anchored `dir/*`, which covers only direct files), `!` negation is
+  unsupported, and **the last matching rule wins** (no union). **Area ownership**
+  (`derive.area_owners`): a directory area is owned by the owners of the last rule
+  that matches the area directory itself (`<area>/`), so a file-only rule such as
+  `*.tf` does not own the area even though it may own files in it; a graphify
+  `community:<n>` area is owned by the union of its files' owners. Readers also
+  accept the legacy `{pattern: owners}` dict (stores written before #65); that form
+  was stored key-sorted, so its file order — and therefore last-match-wins — is
+  only as good as the sorted order until the repo is re-gathered.
 - **label_taxonomy** `{ "<facet>": { "<namespace>": ["label", ...] }, "source":
   "auto|config|merged" }` — auto-detected structured label namespaces mapped to
   facets (`area`/`priority`/`status`/`lifecycle`/`kind`/`class`), with optional config
@@ -332,7 +348,7 @@ data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
   | `first_seen` / `last_active` | min / max ISO date (`YYYY-MM-DD`) across the login's activity (PRs authored/merged-by, commits, issues, reviews); `null` when none |
   | `examples_authored` / `docs_authored` / `symbols_authored` | distinct artifacts with an `add` lifecycle event by this login, bucketed by `kind` (example; doc+readme; symbol) (int) |
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
-  | `stale_owned` | distinct owned `code_owners` prefixes (owner list includes login) that contain a stalled train (a stalled train's `code_areas` entry `startswith` the prefix) (int) |
+  | `stale_owned` | distinct areas in a stalled train's `code_areas` that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
 
   Counts are always present (ints, may be 0); `merge_rate`/`review_latency_days`/
   `first_seen`/`last_active` are present as `null` when N/A. Deterministic.

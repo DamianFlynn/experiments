@@ -464,7 +464,10 @@ unstored spine ids (minus known-dead when `skip_dead`).
    `code_events`, `symbol_events`) from the repo's nodes + ledger; re-attach reviews/lifecycle
    onto parents; surface `blocks` as `blocking`/`blocked_by`.
 5. Read back `artifacts` and `people` (the write path already derived them) and the singleton
-   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`).
+   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`). `code_owners` is an
+   ordered rule list so CODEOWNERS last-match-wins order survives the sorted-key JSON store;
+   `fold_bundle` (`owns`) and `annotate_people_profile` (`stale_owned`) share one matcher,
+   `derive.compile_codeowners`/`area_owners` (area = last rule matching `<area>/`).
 
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
@@ -873,6 +876,7 @@ gather does not fetch.)
 | View not window-scoped on multi-window stores | `extract._materialize_meta` omits `period`; arrays come from `repo_nodes` | prior windows' merges counted as shipped; trains/commits span all stored history (member and project views) | emit `meta.period`/`ref_date` from `ts_from/ts_to`; window the materialized arrays to in-window + spine context |
 | Trust gate fails after a second overlapping fold | `fold_bundle` upserts artifact nodes with the incoming window's lifecycle; `code_events` keeps all windows | `validate.no_drift` "lifecycle length drift" | rebuild artifact lifecycle from the full ledger on fold (or merge with the stored one) |
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
+| Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | Clone dir reuse | `git clone` into an existing dir fails; `--no-clone` does not fetch | repeated runs need a fresh dir | fetch/deepen an existing clone |
 

@@ -1129,32 +1129,45 @@ class TestProviderSelection(unittest.TestCase):
 
 
 class TestParseCodeowners(unittest.TestCase):
+    # parse_codeowners returns an ORDERED rule list (#65); index by pattern here.
     def setUp(self):
         with open(os.path.join(FIX, "codeowners_sample.txt")) as fh:
             self.text = fh.read()
 
+    def _by_pattern(self):
+        return {r["pattern"]: r["owners"]
+                for r in gather.parse_codeowners(self.text)}
+
     def test_maps_glob_to_logins_stripping_at(self):
-        owners = gather.parse_codeowners(self.text)
+        owners = self._by_pattern()
         self.assertEqual(owners["avm/res/network/"], ["alice", "bob"])
         self.assertEqual(owners["avm/res/storage/"], ["carol"])
         self.assertEqual(owners["*.bicep"], ["bicep-reviewers"])
 
     def test_team_handles_are_kept_as_owners(self):
-        owners = gather.parse_codeowners(self.text)
+        owners = self._by_pattern()
         self.assertEqual(owners["docs/"], ["org/docs-team", "dave"])
         self.assertEqual(owners["*"], ["org/maintainers"])
 
     def test_comments_and_blank_lines_ignored(self):
-        owners = gather.parse_codeowners(self.text)
-        self.assertNotIn("#", "".join(owners))
-        self.assertEqual(len(owners), 5)
+        rules = gather.parse_codeowners(self.text)
+        self.assertNotIn("#", "".join(r["pattern"] for r in rules))
+        self.assertEqual(len(rules), 5)
+
+    def test_file_order_preserved(self):
+        self.assertEqual([r["pattern"] for r in gather.parse_codeowners(self.text)],
+                         ["*", "avm/res/network/", "avm/res/storage/", "docs/",
+                          "*.bicep"])
 
     def test_permissive_on_empty_or_none(self):
-        self.assertEqual(gather.parse_codeowners(""), {})
-        self.assertEqual(gather.parse_codeowners(None), {})
+        self.assertEqual(gather.parse_codeowners(""), [])
+        self.assertEqual(gather.parse_codeowners(None), [])
 
-    def test_pattern_with_no_owners_is_skipped(self):
-        self.assertEqual(gather.parse_codeowners("docs/   \n"), {})
+    def test_pattern_with_no_owners_is_kept_as_unassignment(self):
+        # CODEOWNERS: a rule with no owners un-assigns matching paths, so it is
+        # kept (it used to be dropped, which let an earlier rule win wrongly).
+        self.assertEqual(gather.parse_codeowners("docs/   \n"),
+                         [{"pattern": "docs/", "owners": []}])
 
 
 class TestDetectLabelTaxonomy(unittest.TestCase):
@@ -1434,7 +1447,8 @@ class TestAcquireAssemblyP3b(unittest.TestCase):
 
     def test_code_owners_present(self):
         b = self._bundle()
-        self.assertIn("avm/res/network/", b["code_owners"])
+        self.assertIn("avm/res/network/",
+                      [r["pattern"] for r in b["code_owners"]])
 
 
 class TestParseBicepModuleRefs(unittest.TestCase):

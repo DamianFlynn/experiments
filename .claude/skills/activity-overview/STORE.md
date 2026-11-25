@@ -158,11 +158,13 @@ writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
 `cross_ref`, and `part_of`. It also persists the per-repo **singleton facts**
 `workflow_stats`, `code_graph`, `code_owners`, and `label_taxonomy` — each as a
-whole-dict `structure` node under a well-known local id (`workflowstats`,
+whole-value `structure` node under a well-known local id (`workflowstats`,
 `codegraph`, `codeowners`, `labeltaxonomy`) with NULL `ts` (excluded from window
 scans), identity-keyed and idempotent. A singleton node is written only when its
 source value is present and non-empty, so a reader never reconstructs a
-fabricated empty key.
+fabricated empty key. Node `data` is JSON-encoded with sorted keys, so
+`code_owners` is an ordered rule **list** (not a pattern-keyed dict): list order
+survives the round trip, and CODEOWNERS precedence depends on it.
 
 **Slice 7b-1 (step 2) additionally persists the artifact substrate** (derived on
 the write path via the shared `derive.py` leaf module — `derive.build_artifacts`
@@ -227,8 +229,12 @@ edges** (all derived on the write path via the shared `derive.py` leaf —
   `issue.author`), `commented` (person→pr/issue from `comments_list` +
   `review_comments` authors). `reacted` is **not** written: reactions are stored
   as aggregate counts (`summarize_reactions`), with no per-reactor login to key on.
-- **`owns` (person→area)** from `code_owners` — each owner of a path-prefix owns
-  every area whose paths fall under that prefix. **`touches` (commit→area)** from
+- **`owns` (person→area)** from `code_owners` — each owner returned by
+  `derive.area_owners` for the area: the owners of the **last** CODEOWNERS rule
+  matching the area directory (`<area>/`; graphify community areas: union over
+  their files), with GitHub CODEOWNERS pattern semantics (see BUNDLE.md
+  `code_owners`). Rules are not unioned; an owner-less last match emits no edge.
+  `stale_owned` uses the same matcher. **`touches` (commit→area)** from
   `derive._commit_areas` (a commit's files → the areas they land in). **`depends_on`
   (area→area)** from `code_graph["edges"]`, carrying `{version,transitive,…}` in
   the edge `data`. **`in_milestone` (social→structure)** from a PR/issue's

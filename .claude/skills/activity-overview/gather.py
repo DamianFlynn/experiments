@@ -1634,24 +1634,40 @@ def _terraform_graph_dot(run, clone_dir, rel_dir, timeout=None):
     return run(["terraform", f"-chdir={full}", "graph"], timeout=timeout)
 
 
-def parse_codeowners(text):
-    """Parse a CODEOWNERS file into {pattern: [login, ...]}.
+_CODEOWNERS_TOKEN = re.compile(r"(?:\\.|\S)+")
 
-    Each non-comment line is `<pattern> <owner...>`; `@user` / `@org/team` are
-    stripped of the leading `@`. Lines with a pattern but no owners are skipped.
-    Order-preserving owners, last-pattern-wins on duplicate patterns. Pure."""
-    owners = {}
+
+def parse_codeowners(text):
+    """Parse a CODEOWNERS file into an ORDERED rule list
+    `[{"pattern": "<pattern>", "owners": ["login", ...]}, ...]`, in file order.
+
+    Each rule line is `<pattern> <owner...> [# comment]`. Blank lines and lines
+    starting with `#` are skipped; an inline `# comment` (the first token starting
+    with `#` after the pattern) and everything after it is dropped; GitLab-style
+    section headers (`[Section]`, `^[Section]`, `[Section][2] @owner`) are not
+    GitHub syntax and are skipped. `@user` / `@org/team` are stripped of the
+    leading `@`; emails are kept as-is. A pattern with NO owners is KEPT (with
+    `owners: []`): in CODEOWNERS it un-assigns ownership for matching paths.
+    Duplicate patterns are kept in place — order matters because the last
+    matching rule wins (derive.codeowners_owners). A list, not a dict, so the
+    rule order survives the store (node data is JSON-encoded with sorted keys).
+    Pure."""
+    rules = []
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split()
-        pattern, handles = parts[0], parts[1:]
-        logins = [h[1:] if h.startswith("@") else h for h in handles]
-        if not logins:
+        if line.startswith("[") or line.startswith("^["):
             continue
-        owners[pattern] = logins
-    return owners
+        tokens = _CODEOWNERS_TOKEN.findall(line)
+        pattern, handles = tokens[0], []
+        for tok in tokens[1:]:
+            if tok.startswith("#"):
+                break
+            handles.append(tok)
+        logins = [h[1:] if h.startswith("@") else h for h in handles]
+        rules.append({"pattern": pattern, "owners": logins})
+    return rules
 
 
 # Conventional label namespace -> facet (auto-detect). AVM uses `Class:`/`Type:`/
@@ -3564,18 +3580,19 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                           ev.get("created_at"), data, fetched))
             edges.append((qid(local), issid, "part_of", None, None))
 
-    # owns (person -> area): code_owners maps a path-prefix to owner logins; an
-    # owner owns every area whose paths fall under that prefix.
-    owners = bundle.get("code_owners") or {}
-    if owners:
+    # owns (person -> area): CODEOWNERS semantics via derive.area_owners — an
+    # area is owned by the owners of the LAST rule matching the area directory
+    # (graphify community areas: union over their files). Same matcher as
+    # derive.annotate_people_profile's stale_owned.
+    owner_rules = derive.compile_codeowners(bundle.get("code_owners"))
+    if owner_rules:
         areas_by_id = {}
         for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
             areas_by_id[area.get("id") or area.get("name") or area.get("path")] = area
-        for prefix, logins in owners.items():
-            for aid, area in areas_by_id.items():
-                if any((p or "").startswith(prefix) for p in area.get("paths") or []):
-                    for login in logins or []:
-                        contrib(login, "area-{}".format(aid), "owns")
+        for aid in sorted(a for a in areas_by_id if a):
+            for login in derive.area_owners(owner_rules, aid,
+                                            areas_by_id[aid].get("paths") or []):
+                contrib(login, "area-{}".format(aid), "owns")
 
     # touches (commit/pr -> area): the distinct areas a commit's files land in.
     for c in bundle.get("commits", []):

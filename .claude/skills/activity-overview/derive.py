@@ -443,6 +443,159 @@ def link_symbol_identity(bundle):
 
 
 # ---------------------------------------------------------------------------
+# CODEOWNERS matching (one matcher for the write path — fold_bundle's `owns`
+# edges — and the read path — annotate_people_profile's `stale_owned`).
+# ---------------------------------------------------------------------------
+#
+# Semantics (GitHub CODEOWNERS = gitignore patterns, minus negation/char classes):
+#   - a leading `/` anchors the pattern at the repo root; a `/` anywhere but the
+#     end also anchors it; a pattern with no such slash (`*.tf`, `docs`, `apps/`)
+#     matches at any depth;
+#   - a trailing `/` matches a directory only (and everything under it);
+#   - a pattern that matches a directory also matches everything under it —
+#     EXCEPT an anchored pattern whose last segment is a lone `*` (`docs/*`, `/*`),
+#     which GitHub documents as owning only the files directly in that directory;
+#   - `*` / `?` match within one path segment, `**` across segments;
+#   - patterns starting with `!` (negation) are unsupported -> never match;
+#   - the LAST matching rule in file order wins (owners are never unioned across
+#     rules); a matching rule with no owners un-assigns ownership.
+
+
+def codeowners_rules(code_owners):
+    """Normalize a bundle `code_owners` value to an ordered list of
+    `(pattern, [owner, ...])`.
+
+    Accepts the ordered list form parse_codeowners emits
+    (`[{"pattern": p, "owners": [...]}, ...]`), `[p, owners]` pairs, and the
+    legacy `{pattern: owners}` dict (insertion order; a dict read back from an
+    old store is key-SORTED, so its file order is already lost). Pure."""
+    if not code_owners:
+        return []
+    if isinstance(code_owners, dict):
+        return [(p, list(o or [])) for p, o in code_owners.items()]
+    out = []
+    for entry in code_owners:
+        if isinstance(entry, dict):
+            p, o = entry.get("pattern"), entry.get("owners")
+        else:
+            p, o = entry[0], entry[1]
+        if p:
+            out.append((p, list(o or [])))
+    return out
+
+
+def _codeowners_segment_re(seg):
+    out = []
+    i = 0
+    while i < len(seg):
+        ch = seg[i]
+        if ch == "\\" and i + 1 < len(seg):
+            out.append(_re.escape(seg[i + 1]))
+            i += 2
+            continue
+        if ch == "*":
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        else:
+            out.append(_re.escape(ch))
+        i += 1
+    return "".join(out)
+
+
+def _compile_codeowners_pattern(pattern):
+    """Compile one CODEOWNERS pattern to `(regex, dir_only, files_only, head)`,
+    or None for a pattern that can never match (negation, empty, bare `/`).
+    `head` is the literal leading text of an anchored pattern (up to its first
+    `*`/`?`/`\\`; "" when unanchored) — every candidate the regex can match is a
+    prefix of the path, so a path not starting with `head` cannot match. A cheap
+    pre-filter that never changes a result. Pure."""
+    p = (pattern or "").strip()
+    if not p or p.startswith("!"):
+        return None
+    dir_only = p.endswith("/")
+    body = p.rstrip("/")
+    anchored = body.startswith("/") or "/" in body.lstrip("/")
+    body = body.lstrip("/")
+    if not body:
+        return None
+    segs = body.split("/")
+    parts = []
+    for i, s in enumerate(segs):
+        last = i == len(segs) - 1
+        if s == "**":
+            parts.append(".+" if last else "(?:[^/]+/)*")
+        else:
+            parts.append(_codeowners_segment_re(s) + ("" if last else "/"))
+    rx = "".join(parts)
+    if not anchored:
+        rx = "(?:.*/)?" + rx
+    files_only = anchored and segs[-1] == "*" and not dir_only
+    head = _re.split(r"[*?\\]", body, 1)[0] if anchored else ""
+    return _re.compile("^" + rx + "$"), dir_only, files_only, head
+
+
+def compile_codeowners(code_owners):
+    """Compile a `code_owners` value (any form codeowners_rules accepts) into the
+    ordered rule list codeowners_owners/area_owners consume. Compile once, match
+    many. Pure."""
+    rules = []
+    for pattern, owners in codeowners_rules(code_owners):
+        rules.append((pattern, owners, _compile_codeowners_pattern(pattern)))
+    return rules
+
+
+def _codeowners_rule_matches(compiled, full, ancestors, is_dir):
+    rx, dir_only, files_only, head = compiled
+    if not full.startswith(head):
+        return False
+    if rx.match(full):
+        if files_only:
+            if not is_dir:
+                return True
+        elif is_dir or not dir_only:
+            return True
+    if files_only:
+        return False
+    # a pattern matching an ancestor directory owns everything under it
+    return any(rx.match(d) for d in ancestors)
+
+
+def codeowners_owners(rules, path, is_dir=False):
+    """Owners of `path` under compiled `rules` (compile_codeowners): the owners of
+    the LAST rule that matches, `[]` when none matches or the last match has no
+    owners. `is_dir=True` treats `path` as a directory (a trailing `/` on `path`
+    means the same). Pure."""
+    if not path:
+        return []
+    is_dir = is_dir or path.endswith("/")
+    parts = [s for s in path.split("/") if s]
+    if not parts:
+        return []
+    full = "/".join(parts)
+    ancestors = ["/".join(parts[:k]) for k in range(1, len(parts))]
+    owners = []
+    for _pattern, rule_owners, compiled in rules:
+        if compiled and _codeowners_rule_matches(compiled, full, ancestors, is_dir):
+            owners = rule_owners
+    return list(owners)
+
+
+def area_owners(rules, area_id, paths=()):
+    """Owners of a code area. A directory area (the id is its directory path, e.g.
+    `avm/res/network/virtual-network`) is owned by the owners of the last rule
+    that matches the area directory itself (`<area>/`) — so a rule that only
+    matches some files inside it (`*.tf`) does not make its owners own the area.
+    A graphify `community:<n>` area has no directory: it is owned by the union of
+    the owners of its `paths`, sorted. Pure."""
+    if not area_id:
+        return []
+    if area_id.startswith("community:"):
+        return sorted({o for p in paths or () for o in codeowners_owners(rules, p)})
+    return codeowners_owners(rules, area_id, is_dir=True)
+
+
+# ---------------------------------------------------------------------------
 # Phase 11 slice 1: people profile + recognition halls
 # ---------------------------------------------------------------------------
 
@@ -476,7 +629,7 @@ def annotate_people_profile(bundle):
     commits = bundle.get("commits", [])
     issues = bundle.get("issues", [])
     artifacts = bundle.get("artifacts", {})
-    code_owners = bundle.get("code_owners", {})
+    code_owners = bundle.get("code_owners")
     trains = bundle.get("trains", [])
 
     # Single pass per collection (O(P+N), not O(P*N)): accumulate per-login counters
@@ -560,16 +713,21 @@ def annotate_people_profile(bundle):
             if removed:
                 acc[login]["authored_then_removed"] += 1
 
-    # stale_owned: owned code_owners prefixes that contain a stalled train.
-    stalled_areas = []
+    # stale_owned: distinct areas touched by a stalled train that the login owns
+    # (area_owners: the last CODEOWNERS rule matching the area directory — the
+    # same matcher fold_bundle uses for `owns` edges).
+    stalled_areas = set()
     for t in trains:
         if (t.get("effort") or {}).get("stalled"):
-            stalled_areas.extend(t.get("code_areas") or [])
+            stalled_areas.update(a for a in (t.get("code_areas") or []) if a)
+    owner_rules = compile_codeowners(code_owners)
+    area_paths = {a.get("id"): a.get("paths") or []
+                  for a in (bundle.get("code_graph") or {}).get("areas") or []}
+    stalled_owners = {a: set(area_owners(owner_rules, a, area_paths.get(a)))
+                      for a in stalled_areas} if owner_rules else {}
 
     def _stale_owned(login):
-        return sum(1 for prefix, owners in code_owners.items()
-                   if login in (owners or [])
-                   and any(a.startswith(prefix) for a in stalled_areas))
+        return sum(1 for owners in stalled_owners.values() if login in owners)
 
     for login, profile in people.items():
         a = acc[login]
