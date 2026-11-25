@@ -382,6 +382,34 @@ class TestCliAndAuth(unittest.TestCase):
                     gather.parse_args(["--manifest", "workspace/project.json",
                                        "--store", "workspace/store.db", *extra])
 
+    def _parse_error(self, owner="o", repo="r", frm="2026-05-01", to="2026-05-31"):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err):
+            # '--flag=value' so a value like '-x' reaches the validator instead
+            # of being read by argparse as an option.
+            gather.parse_args(["--owner=" + owner, "--repo=" + repo,
+                               "--from=" + frm, "--to=" + to, "--store", "s.db"])
+        self.assertEqual(cm.exception.code, 2)
+        return err.getvalue()
+
+    def test_parse_args_rejects_bad_single_repo_values(self):
+        # issue #57: the single-repo flags get the manifest's validation.
+        cases = [
+            ({"repo": "b?per_page=1#"}, "--repo"),
+            ({"repo": " a b "}, "--repo"),
+            ({"repo": ".."}, "--repo"),
+            ({"owner": "-x"}, "--owner"),
+            ({"owner": ".."}, "--owner"),
+            ({"owner": "o/x"}, "--owner"),
+            ({"frm": "31/05/2026"}, "--from"),
+            ({"frm": "20260501"}, "--from"),
+            ({"to": "2026-13-99"}, "--to"),
+            ({"frm": "2026-05-31", "to": "2026-05-01"}, "is after --to"),
+        ]
+        for kwargs, needle in cases:
+            with self.subTest(**kwargs):
+                self.assertIn(needle, self._parse_error(**kwargs))
+
     def test_resolve_token_prefers_github_token(self):
         self.assertEqual(
             gather.resolve_token({"GITHUB_TOKEN": "gh", "GH_TOKEN": "alt"}), "gh"
@@ -3017,7 +3045,7 @@ class TestFoldBundleOverride(unittest.TestCase):
 class TestManifestMain(unittest.TestCase):
     def test_member_args_clones_namespace_with_overrides(self):
         base = gather.parse_args([
-            "--owner", "x", "--repo", "y", "--from", "a", "--to", "b",
+            "--owner", "x", "--repo", "y", "--from", "2026-01-01", "--to", "2026-01-31",
             "--store", "s.db", "--no-clone"])
         member = gather._member_args(
             base, {"owner": "Azure", "repo": "mod-a", "registry": None},

@@ -57,7 +57,7 @@
 | `validate.py` | 907 | Trust gate (audits) | — | — |
 | `spotlight.py` | 1,685 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
 | `digest.py` | 414 | Multi-repo project view | — | — |
-| `manifest.py` / `manifest_from_index.py` | — / 221 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
+| `manifest.py` / `manifest_from_index.py` | 195 / 278 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
 | `transcript.py` | 116 | VTT/SRT/TXT normalization | — | — |
 
 ```mermaid
@@ -113,7 +113,7 @@ scratch store) and `backfill` respectively.
 |---|---|---|
 | `--owner`, `--repo` | — | Single-repo target |
 | `--manifest PATH` | — | Multi-repo project (validated by `manifest.load_manifest` **before** the store is touched) |
-| `--from`, `--to` | — | Window (`YYYY-MM-DD`) |
+| `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
 | `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing |
 | `--branches` | `main` | Recorded in `meta`; first is `base_branch` (walk uses the checked-out default branch) |
 | `--clone-dir` | `workspace/<repo>-clone` | Clone location |
@@ -750,12 +750,22 @@ member, so emitted `repos` may exceed the requested set.
 
 ## 11. Supporting tools
 
-- **`manifest.py`** — `load_manifest` validates `{project (no "/"), window{from,to}, repos[≥1]{owner, repo, registry?}}`; `member_slugs`.
+- **`manifest.py`** — `load_manifest` validates `{project (str, no "/" or "#"), window{from ≤ to, YYYY-MM-DD},
+  repos[≥1]{owner, repo (GitHub name rules), registry? (non-empty str)}}`, rejecting duplicate
+  members and duplicate `registry` values case-insensitively; every failure is a `ValueError`
+  (rules in `STORE.md` § Multi-repo project). `member_slugs`. The field checks
+  (`check_owner/check_repo/check_date/check_window/check_project`) are shared with
+  `gather.parse_args` (single-repo flags), `view.parse_args` and `manifest_from_index`.
 - **`manifest_from_index.py`** — reads the AVM **Terraform** index CSVs
   (`Terraform{Resource,Pattern,Utility}Modules.csv` in `Azure/Azure-Verified-Modules`) via
   `--avm res|ptn|utl` or `--index FILE|URL|-`; filters `--kind/--status/--name-contains/
   --include/--exclude/--limit`; writes the manifest (`--out` or stdout), deriving `registry`
-  from `PublicRegistryReference`.
+  from `PublicRegistryReference`. `RepoURL` loses `.git`, query and fragment; a row whose
+  owner/repo GitHub could not host is dropped; members, `--include` and `--exclude` compare
+  case-insensitively (first index row of a case variant wins). Exit 2 on invalid/inverted
+  dates, `--limit < 1` or a duplicate `registry` in the selection; an `--include` not in the
+  index is a stderr warning; index fetches time out after 30 s. Its output always passes
+  `load_manifest`.
 - **`transcript.py PATH`** — strips WebVTT/SRT headers, NOTE/STYLE blocks, cue timings,
   indices and inline tags; collapses rolling-caption duplicates; `.txt`/`.md` pass through;
   missing file → exit 2.

@@ -34,7 +34,6 @@ Stdlib only. Python 3.
 """
 
 import argparse
-import datetime
 import json
 import os
 import sqlite3
@@ -42,6 +41,7 @@ import sys
 
 import extract
 import graphstore
+import manifest
 import validate
 
 
@@ -64,14 +64,13 @@ def parse_args(argv):
     p.add_argument("--out", required=True,
                    help="bundle view JSON to write (parent dirs are created)")
     args = p.parse_args(argv)
-    for flag, value in (("--from", args.ts_from), ("--to", args.ts_to)):
-        try:
-            datetime.date.fromisoformat(value[:10])
-        except ValueError:
-            p.error("{} must start with an ISO date YYYY-MM-DD, got {!r}".format(
-                flag, value))
-    if args.ts_from[:10] > args.ts_to[:10]:
-        p.error("--from {} is after --to {}".format(args.ts_from, args.ts_to))
+    # Shared date rules (manifest.check_window): a real YYYY-MM-DD date, from <=
+    # to. Only the leading 10 characters are checked, so a full timestamp passes.
+    try:
+        manifest.check_window(args.ts_from[:10], args.ts_to[:10], "--from", "--to")
+    except ValueError as exc:
+        p.error("{} (given --from {!r}, --to {!r})".format(
+            exc, args.ts_from, args.ts_to))
     return args
 
 

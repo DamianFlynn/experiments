@@ -1930,6 +1930,24 @@ def parse_args(argv):
     if args.manifest and (args.owner or args.repo
                           or getattr(args, "from") or args.to):
         p.error("--manifest is mutually exclusive with --owner/--repo/--from/--to")
+    # Single-repo flags get the same name/date rules as a manifest member
+    # (shared validators in manifest.py): owner/repo go unescaped into API and
+    # clone URLs, and the window must be real YYYY-MM-DD dates with from <= to.
+    # Presence is still checked by acquire(); here only given values are checked.
+    frm = getattr(args, "from")
+    try:
+        if args.owner is not None:
+            manifest_mod.check_owner(args.owner, "--owner")
+        if args.repo is not None:
+            manifest_mod.check_repo(args.repo, "--repo")
+        if frm is not None:
+            manifest_mod.check_date(frm, "--from")
+        if args.to is not None:
+            manifest_mod.check_date(args.to, "--to")
+        if frm is not None and args.to is not None:
+            manifest_mod.check_window(frm, args.to, "--from", "--to")
+    except ValueError as exc:
+        p.error(str(exc))
     return args
 
 

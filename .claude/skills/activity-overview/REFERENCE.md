@@ -96,6 +96,15 @@ Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
 "registry"?} ] }` — `registry` is an optional exact Terraform registry path; absent,
 a member is matched by the HashiCorp naming convention
 (`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`).
+`load_manifest` rejects (with `ValueError`): non-string fields; `/` or `#` in
+`project`; dates that are not `YYYY-MM-DD` or an inverted window; owner/repo names
+GitHub would not accept; duplicate members (case-insensitive) and a `registry`
+declared twice. The full rule list is in `STORE.md` § Multi-repo project; the same
+owner/repo/date checks apply to `gather.py --owner/--repo/--from/--to`.
+`manifest_from_index.py` strips `.git`, `?query` and `#fragment` from `RepoURL`,
+dedupes members case-insensitively, exits 2 on bad/inverted dates, `--limit < 1` or
+a duplicate `registry` among the selected members, warns when an `--include` slug is
+not in the index, and times out an index fetch after 30 s.
 
 ### IaC build env knobs (heavy live runs)
 

@@ -122,7 +122,10 @@ class TestViewSingleRepo(_TmpCase):
         self.assertFalse(os.path.exists(self.path("x.json")))
 
     def test_bad_dates_exit_2(self):
-        for frm, to in (("May", "2026-05-31"), ("2026-05-31", "2026-05-01")):
+        # '20260531' is accepted by Python 3.11's fromisoformat but is not the
+        # documented YYYY-MM-DD form (shared validator, issue #57).
+        for frm, to in (("May", "2026-05-31"), ("2026-05-31", "2026-05-01"),
+                        ("2026-05-01", "20260531")):
             code, _ = _run_main(["--store", self.db, "--from", frm, "--to", to,
                                  "--out", self.path("x.json")])
             self.assertEqual(code, 2, (frm, to))

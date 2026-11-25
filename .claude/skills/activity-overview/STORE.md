@@ -31,8 +31,8 @@ Helpers: `qualify_id`, `qualify_person`, `parse_id`, `local_id`,
 
 - **Scope vs local: split on the FIRST `#`.** The scope (`{project}/{repo}` or
   `{project}`) never contains `#` (GitHub owner/repo names and logins cannot;
-  a manifest `project` name is assumed not to — `manifest.py` does not yet
-  reject one, but `local_id(qid, project, repo)` strips a known prefix exactly). A local id MAY contain `#`, so
+  a manifest `project` name cannot — `manifest.load_manifest` rejects `/` and
+  `#` in it; `local_id(qid, project, repo)` strips a known prefix exactly). A local id MAY contain `#`, so
   everything after the first `#` is the local id. `parse_id` implements this;
   `local_id(qid, project=None, repo=None)` returns the full local id (stripping
   exactly `{project}/{repo}#` when both are given). Never `rpartition` on `#` —
@@ -384,6 +384,16 @@ python3 gather.py --manifest workspace/manifest.json --store workspace/journey.d
       "registry": "Azure/avm-res-storage-storageaccount/azurerm" },
     { "owner": "Azure", "repo": "terraform-azurerm-avm-res-keyvault-vault" } ] }
 ```
+
+`manifest.load_manifest` validates the file before the store is touched and raises
+`ValueError` (`manifest: …`) on: a non-string or empty field; a `project` containing
+`/` or `#`; a window bound that is not a real `YYYY-MM-DD` date, or `from` after `to`;
+an `owner` that is not a GitHub user/org name (letters, digits, single hyphens, not
+starting with `-`, ≤ 39 chars); a `repo` outside GitHub's alphabet (letters, digits,
+`-`, `_`, `.`; ≤ 100 chars; not `.`/`..`); two members naming the same repo
+**case-insensitively** (`o/a` and `O/A`); a `registry` that is present but not a
+non-empty string, or declared by two members (case-insensitively). `gather.py`
+applies the same owner/repo/date checks to `--owner/--repo/--from/--to`.
 
 gather loops the members, running the existing acquire→fold path once per member
 into the **same store** under `project = manifest.project`, `repo = "{owner}/{repo}"`.

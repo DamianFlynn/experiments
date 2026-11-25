@@ -19,6 +19,11 @@ import json
 import sys
 import urllib.request
 
+import manifest as manifest_mod
+
+# Seconds before a remote index fetch gives up.
+INDEX_FETCH_TIMEOUT = 30
+
 # Canonical AVM-Terraform module-index CSVs (main branch). Bump deliberately.
 _AVM_BASE = ("https://raw.githubusercontent.com/Azure/Azure-Verified-Modules/"
              "main/docs/static/module-indexes/")
@@ -31,17 +36,31 @@ _KINDS = ("res", "ptn", "utl")
 
 
 def _owner_repo_from_url(url):
-    """('Azure', 'terraform-azurerm-avm-res-x') from a github RepoURL, or None."""
+    """('Azure', 'terraform-azurerm-avm-res-x') from a github RepoURL, or None.
+    A trailing '.git', a query string and a fragment are stripped; a URL whose
+    owner/repo is not a valid GitHub name yields None."""
     if not url:
         return None
     s = url.strip().rstrip("/")
     i = s.find("github.com/")
     if i < 0:
         return None
-    parts = [p for p in s[i + len("github.com/"):].split("/") if p]
+    # Drop any query/fragment ('...?tab=readme', '...#readme') before splitting.
+    s = s[i + len("github.com/"):].split("?", 1)[0].split("#", 1)[0]
+    parts = [p for p in s.split("/") if p]
     if len(parts) < 2:
         return None
-    return parts[0], parts[1]
+    owner, repo = parts[0], parts[1]
+    if repo.lower().endswith(".git"):
+        repo = repo[:-len(".git")]
+    # A name GitHub cannot host would be refused by load_manifest: treat the row
+    # as unusable (like a missing RepoURL) rather than emit a bad manifest.
+    try:
+        manifest_mod.check_owner(owner)
+        manifest_mod.check_repo(repo)
+    except ValueError:
+        return None
+    return owner, repo
 
 
 def _registry_from_reference(ref):
@@ -109,15 +128,26 @@ def build_manifest(rows, project, frm, to, *, kinds=None, statuses=None,
     (case-insensitive substring, any-match), `name_contains` (substring on the
     module name, any-match), `exclude` ('owner/repo' slugs to drop). `include`
     ('owner/repo' slugs) bypasses the kind/status/name filters for rows present in
-    the index. Members are deduped by slug and sorted; `limit` caps the count after
-    sorting. Deterministic and pure."""
-    inc, exc = set(include or []), set(exclude or [])
+    the index. Slugs (members, `include`, `exclude`) compare case-insensitively,
+    as GitHub names do; of two case variants the first row in index order is
+    kept. Members are sorted; `limit` (>= 1) caps the count after sorting.
+    Deterministic and pure.
+
+    Raises ValueError when the result would not pass `manifest.load_manifest`:
+    a bad `project`, dates that are not YYYY-MM-DD or are inverted, `limit < 1`,
+    or two selected members declaring the same `registry`."""
+    manifest_mod.check_project(project, "--project")
+    manifest_mod.check_window(frm, to, "--from", "--to")
+    if limit is not None and limit < 1:
+        raise ValueError("--limit must be >= 1, got {}".format(limit))
+    inc = {s.lower() for s in include or []}
+    exc = {s.lower() for s in exclude or []}
     kset = set(kinds) if kinds else None
     sset = [s.lower() for s in statuses] if statuses else None
     nset = [n.lower() for n in name_contains] if name_contains else None
     seen, members = set(), []
     for r in rows:
-        slug = "{}/{}".format(r["owner"], r["repo"])
+        slug = "{}/{}".format(r["owner"], r["repo"]).lower()
         if slug in exc or slug in seen:
             continue
         if slug not in inc:
@@ -133,6 +163,17 @@ def build_manifest(rows, project, frm, to, *, kinds=None, statuses=None,
     members.sort(key=lambda m: (m["owner"], m["repo"]))
     if limit is not None:
         members = members[:limit]
+    registries = {}
+    for m in members:
+        reg = m["registry"]
+        if reg is None:
+            continue
+        slug = "{}/{}".format(m["owner"], m["repo"])
+        if reg.lower() in registries:
+            raise ValueError(
+                "duplicate registry {!r} on {!r} and {!r}; narrow the selection "
+                "with --exclude".format(reg, registries[reg.lower()], slug))
+        registries[reg.lower()] = slug
     return {"project": project, "window": {"from": frm, "to": to}, "repos": members}
 
 
@@ -144,7 +185,7 @@ def _read_index(src, opener=urllib.request.urlopen):
         # Send a User-Agent like the rest of the skill (gather.http_get_json) — some
         # servers reject UA-less requests.
         req = urllib.request.Request(src, headers={"User-Agent": "activity-overview"})
-        with opener(req) as resp:                      # nosec - operator-supplied URL
+        with opener(req, timeout=INDEX_FETCH_TIMEOUT) as resp:                      # nosec - operator-supplied URL
             return resp.read().decode("utf-8-sig")
     with open(src, encoding="utf-8-sig") as fh:
         return fh.read()
@@ -171,18 +212,24 @@ def parse_args(argv):
                         "regardless of kind/status/name filters; repeatable.")
     p.add_argument("--exclude", action="append", default=[],
                    help="'owner/repo' to drop; repeatable.")
-    p.add_argument("--limit", type=int, default=None, help="cap member count.")
+    p.add_argument("--limit", type=int, default=None,
+                   help="cap member count (>= 1).")
     p.add_argument("--out", default=None, help="write manifest here (default: stdout).")
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    # Enforce the manifest contract up front (mirrors manifest.load_manifest) so we
-    # never emit a manifest that the loader would reject.
-    if not args.project or "/" in args.project:
-        sys.stderr.write("manifest-from-index: --project must be non-empty and "
-                         "must not contain '/'\n")
+    # Enforce the manifest contract up front (the shared manifest.py checks) so
+    # we never emit a manifest that the loader would reject, and fail before any
+    # network fetch. build_manifest re-checks these and the registry uniqueness.
+    try:
+        manifest_mod.check_project(args.project, "--project")
+        manifest_mod.check_window(args.frm, args.to, "--from", "--to")
+        if args.limit is not None and args.limit < 1:
+            raise ValueError("--limit must be >= 1, got {}".format(args.limit))
+    except ValueError as exc:
+        sys.stderr.write("manifest-from-index: {}\n".format(exc))
         return 2
     sources = list(args.index) + [AVM_INDEX_URLS[k] for k in args.avm]
     if not sources:
@@ -198,10 +245,20 @@ def main(argv=None):
             sys.stderr.write("manifest-from-index: failed to read index {!r}: "
                              "{}\n".format(src, exc))
             return 2
-    manifest = build_manifest(
-        rows, args.project, args.frm, args.to,
-        kinds=args.kinds, statuses=args.statuses, name_contains=args.name_contains,
-        include=args.include, exclude=args.exclude, limit=args.limit)
+    known = {"{}/{}".format(r["owner"], r["repo"]).lower() for r in rows}
+    for slug in args.include:
+        if slug.lower() not in known:
+            sys.stderr.write("manifest-from-index: warning: --include {!r} is not "
+                             "in the index; ignored\n".format(slug))
+    try:
+        manifest = build_manifest(
+            rows, args.project, args.frm, args.to,
+            kinds=args.kinds, statuses=args.statuses,
+            name_contains=args.name_contains,
+            include=args.include, exclude=args.exclude, limit=args.limit)
+    except ValueError as exc:
+        sys.stderr.write("manifest-from-index: {}\n".format(exc))
+        return 2
     if not manifest["repos"]:
         sys.stderr.write("manifest-from-index: no members matched the filters "
                          "(check --kind/--status/--name-contains/--include)\n")
