@@ -143,7 +143,8 @@ def build_timeline(bundle):
 
     Event shape: {ts, actor, layer:'social'|'code', event, ref:{type,...,url},
     subject:{kind,name,path}}. Social events come from PR/issue comments + review
-    comments; code events from artifact lifecycle entries. Sorted by ts.
+    comments; code events from artifact lifecycle entries, stamped with the
+    commit's `committed_at` when the bundle's commits carry it. Sorted by ts.
     Malformed records that lack created_at fall back to URL ordering as a last
     resort (not a normal case — well-formed comment objects carry created_at). Pure.
     """
@@ -182,10 +183,17 @@ def build_timeline(bundle):
                    {"kind": "comment", "name": None, "path": None},
                    c.get("created_at") or curl)
 
+    # A code event's ts is its commit's full committer timestamp (`committed_at`,
+    # UTC, issue #82) so it interleaves with same-day social events by real
+    # time. Commits gathered before #82 carry none: the event keeps the bare day,
+    # which sorts before that day's timestamped social events.
+    committed_at = {c.get("sha"): c.get("committed_at")
+                    for c in bundle.get("commits") or [] if c.get("committed_at")}
     for art in bundle.get("artifacts", {}).values():
         for ev in art.get("lifecycle", []):
             events.append({
-                "ts": ev.get("date") or "", "actor": ev.get("author"),
+                "ts": committed_at.get(ev.get("commit")) or ev.get("date") or "",
+                "actor": ev.get("author"),
                 "layer": "code", "event": ev["event"], "ref": ev["ref"],
                 "subject": {"kind": art["kind"], "name": art["name"],
                             "path": art["path"]},
@@ -731,14 +739,18 @@ def _cap_lifecycle(event_objs):
 def _cap_train_diffs(deltas):
     """Bound the TOTAL `diff` chars across a train's feature_deltas. Pure.
 
-    Keeps each delta's `diff` until SLICE_DIFF_CAP chars are used, then strips `diff`
-    from the remaining deltas (copying only those, so the bundle is never mutated —
-    the slice is read-only by contract). Returns (deltas_out, dropped_count) where
-    dropped_count is how many deltas had their diff omitted for the budget."""
+    Walks the deltas in order and keeps a delta's `diff` only if it fits in what is
+    left of SLICE_DIFF_CAP (`used + len(diff) <= SLICE_DIFF_CAP`), so the kept total
+    never exceeds the cap (issue #82: the check used to run before adding, letting
+    the diff that crossed the cap through). A diff that does not fit is stripped
+    (copying only that delta, so the bundle is never mutated — the slice is
+    read-only by contract); a later, smaller diff that still fits is kept. Returns
+    (deltas_out, dropped_count) where dropped_count is how many deltas had their
+    diff omitted for the budget."""
     out, used, dropped = [], 0, 0
     for d in deltas:
         diff = d.get("diff")
-        if diff and used < SLICE_DIFF_CAP:
+        if diff and used + len(diff) <= SLICE_DIFF_CAP:
             out.append(d)            # within budget: keep as-is (by reference)
             used += len(diff)
         elif diff:
@@ -779,8 +791,8 @@ def slice_train(bundle, train_id):
           "commits": [ { sha, message*, author, date } ],
           "feature_deltas": [ ... only this train's deltas; file-level deltas may carry
                                a bounded `diff`. The combined diff chars are capped to
-                               SLICE_DIFF_CAP: once spent, later deltas have `diff`
-                               OMITTED (the delta is still listed) ... ],
+                               SLICE_DIFF_CAP: a diff that does not fit in what is
+                               left is OMITTED (the delta is still listed) ... ],
           "feature_deltas_diff_overflow": <# deltas whose diff was omitted for the cap>,
           "symbol_moves":   [ ... only moves whose from/to artifact id is
                                referenced by this train's feature_deltas ... ]
@@ -1023,6 +1035,46 @@ def build_forecast(bundle):
     return bundle
 
 
+# Item fields that hold a list or an object. A JSON null in one of them (a
+# hand-edited view, a REST object with `"labels": null`, an older store) would
+# raise TypeError deep in enrich; `_null_collections_to_empty` reads it as empty.
+_NULLABLE_LISTS = {
+    "prs": ("labels", "reviewers", "closes", "crossref_issues", "comments_list",
+            "review_comments", "reviews", "lifecycle", "timeline_xrefs"),
+    "issues": ("labels", "assignees", "comments_list", "lifecycle", "blocks",
+               "blocking", "blocked_by"),
+    "commits": ("files", "parents"),
+}
+_NULLABLE_DICTS = ("facets", "reactions")
+
+
+def _null_collections_to_empty(bundle):
+    """Make enrich total over JSON nulls (issue #82). In place: on each PR /
+    issue / commit, a list field that is null becomes [], an object field
+    (`facets`, `reactions`) that is null becomes {}, and a null reaction count
+    becomes 0. Only keys that are present AND null change, so a well-formed
+    bundle is untouched (no key is added). A null top-level `prs` / `issues` /
+    `commits` becomes []."""
+    for coll, fields in _NULLABLE_LISTS.items():
+        if coll in bundle and bundle[coll] is None:
+            bundle[coll] = []
+        for item in bundle.get(coll, []):
+            for key in fields:
+                if key in item and item[key] is None:
+                    item[key] = []
+            if coll == "commits":
+                continue
+            for key in _NULLABLE_DICTS:
+                if key in item and item[key] is None:
+                    item[key] = {}
+            reactions = item.get("reactions")
+            if isinstance(reactions, dict):
+                for key, count in reactions.items():
+                    if count is None:
+                        reactions[key] = 0
+    return bundle
+
+
 def enrich(bundle):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the window narrative projections (timeline/feature_deltas) and Phase 3b
@@ -1034,7 +1086,9 @@ def enrich(bundle):
     CONSUMES them (build_timeline / attribute_code_areas read `artifacts`). The
     setdefaults below keep enrich total for callers that hand it a bundle without
     those keys (e.g. a raw fixture fed directly, not through extract): enrich
-    never KeyErrors and never recomputes them."""
+    never KeyErrors and never recomputes them. Null list/object fields on
+    PRs/issues/commits are read as empty first (`_null_collections_to_empty`)."""
+    _null_collections_to_empty(bundle)
     bundle.setdefault("artifacts", {})
     bundle.setdefault("people", {})
     attach_commit_prs(bundle["commits"])
@@ -1069,6 +1123,55 @@ def enrich(bundle):
     return bundle
 
 
+def _load_series_index(series_path):
+    """Read the append-only series index: a JSON list of installment objects.
+    Absent, empty or whitespace-only (a freshly `touch`ed or truncated file) is
+    the first installment ([]). Anything else that is not a list of objects
+    (invalid JSON, an object, a list holding a non-object) exits 2 with a message
+    naming the file, rather than a traceback or a crash at `installments[-1]`
+    (#82); a corrupt-but-present index is never silently discarded."""
+    try:
+        with open(series_path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return []
+    if not raw.strip():
+        return []
+    try:
+        installments = json.loads(raw)
+    except ValueError as exc:
+        problem = "is not valid JSON ({})".format(exc)
+    else:
+        if not isinstance(installments, list):
+            problem = "is a JSON {}, not a list of installments".format(
+                type(installments).__name__)
+        elif not all(isinstance(i, dict) for i in installments):
+            problem = "holds an entry that is not an installment object"
+        else:
+            return installments
+    sys.stderr.write("link.py --series: series index {} {}; fix or remove it\n"
+                     .format(series_path, problem))
+    raise SystemExit(2)
+
+
+def _write_json_atomic(path, obj):
+    """Write `obj` as indented JSON to `path` atomically: into `<path>.tmp` (same
+    directory, as view.write_view and render do), then os.replace over `path`. An
+    interrupted write leaves the previous file intact and removes the temp file
+    (#82). The bytes are those of a plain json.dump(obj, fh, indent=2)."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     # Accept ONLY the documented shapes: `BUNDLE`, `BUNDLE --slice TRAIN_ID`, or
@@ -1089,29 +1192,19 @@ def main(argv=None):
         raise SystemExit(2)
     with open(path, encoding="utf-8") as fh:
         bundle = json.load(fh)
+    # Load (and shape-check) the series index BEFORE any work, so a malformed
+    # index stops the run with rc 2 and nothing is written.
+    installments = _load_series_index(series_path) if series_path is not None else None
     enrich(bundle)
     if series_path is not None:
-        # Phase 13: series continuity. Load the append-only index (absent/empty
-        # ⇒ first installment), compute the `series` block against the last
-        # recorded installment, then append THIS installment's snapshot and write
-        # the index back. Without `--series` no `series` key is added, so the
-        # standard digest stays byte-identical.
-        try:
-            with open(series_path, encoding="utf-8") as fh:
-                raw = fh.read()
-            # Absent OR empty/whitespace-only (e.g. a freshly `touch`ed or
-            # truncated file) ⇒ first installment. A non-empty but malformed
-            # index still raises, surfacing a clear error rather than silently
-            # discarding a corrupt-but-present index.
-            installments = json.loads(raw) if raw.strip() else []
-        except FileNotFoundError:
-            installments = []
+        # Phase 13: series continuity. Compute the `series` block against the
+        # last recorded installment and append THIS installment's snapshot.
+        # Without `--series` no `series` key is added, so the standard digest
+        # stays byte-identical. The index is written AFTER the bundle (below): a
+        # run that cannot write its bundle records no installment (#82).
         prior = installments[-1] if installments else None
         bundle["series"] = series.compute_series(bundle, prior)
         installments.append(series.installment_snapshot(bundle))
-        os.makedirs(os.path.dirname(os.path.abspath(series_path)), exist_ok=True)
-        with open(series_path, "w", encoding="utf-8") as fh:
-            json.dump(installments, fh, indent=2)
     if slice_id is not None:
         # Phase 4b: emit ONE train's bounded, self-contained slice as JSON for a
         # narrator sub-agent. Read-only — the bundle file is NOT rewritten.
@@ -1123,8 +1216,10 @@ def main(argv=None):
         json.dump(sliced, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return slice_id
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(bundle, fh, indent=2)
+    _write_json_atomic(path, bundle)
+    if series_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(series_path)), exist_ok=True)
+        _write_json_atomic(series_path, installments)
     sys.stderr.write(
         f"linked {len(bundle['trains'])} trains, "
         f"{len(bundle['buckets']['shipped'])} shipped into {path}\n"

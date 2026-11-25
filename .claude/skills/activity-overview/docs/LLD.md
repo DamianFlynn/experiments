@@ -626,6 +626,11 @@ flowchart TB
 
 Order matters: significance needs code areas; forecast needs buckets and milestones; people
 profiles need trains and artifacts. `artifacts`/`people` are **consumed**, not recomputed.
+Before the first step, `_null_collections_to_empty` makes enrich total over JSON nulls (#82): a
+null list field on a PR/issue/commit (`labels`, `reviewers`, `comments_list`, `files`, …) becomes
+`[]`, a null `facets`/`reactions` becomes `{}` and a null reaction count `0`. Only present-and-null
+keys change, so well-formed bundles (and the goldens) are untouched. The REST normalisers used by
+backfill (`normalize_pr`/`normalize_issue`) likewise read a null `labels`/`assignees` as empty.
 
 ### 6.4 Decision trains — `build_trains`
 
@@ -724,8 +729,11 @@ verification happens in the next installment's series block.
 Pure, read-only, raises `KeyError` on an unknown id. Returns `{train, issue, prs, commits,
 feature_deltas, symbol_moves}` plus review rounds, capped reviews/lifecycle and reopen counts.
 Caps: text `SLICE_TEXT_CAP` = 1500 chars (with `…[+N chars]`), `SLICE_COMMENTS_KEPT` = 6 per list
-(overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars
-(`feature_deltas_diff_overflow` counts dropped diffs).
+(overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars: walking the train's
+deltas in order, a `diff` is kept only if `used + len(diff) <= SLICE_DIFF_CAP` (#82), so the kept
+total never exceeds the cap; a diff that does not fit is omitted (the delta stays listed) and
+counted in `feature_deltas_diff_overflow`. BUNDLE.md documents every slice key; a docs-contract
+test (`test_link_small_fixes.py`) compares it with `slice_train`'s output.
 
 ### 6.9 Series — `series.py` via `link.py BUNDLE --series series.json`
 
@@ -745,7 +753,11 @@ flowchart TB
 
 Identity is `(type, id)`; URLs are excluded. `installment_snapshot` =
 `{from, to, ref_date, shipped:[{type,id}], in_flight:[{type,id,board_status?}],
-forecast:[{type,id,tier}]}`. A malformed non-empty index raises rather than being discarded.
+forecast:[{type,id,tier}]}`. The index is read and shape-checked before enrich: a non-empty
+index that is not a JSON list of objects exits 2 with `link.py --series: series index <path> …`
+and nothing is written (it is never silently discarded). The bundle is written first and the
+index second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves
+the previous file intact, and a run that cannot write its bundle appends no installment.
 **Every invocation appends** — run it exactly once per installment. Recovery from a double
 run: remove *every* snapshot whose `from`/`to` is the duplicated month (removing only the last
 leaves the month compared with itself), plus any later snapshots, then replay the saved
@@ -1076,6 +1088,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Terraform edges are build-gated on single-repo gathers | no structural scan without a manifest (#80 decision) | without `terraform` (or with a failed init), a single-repo bundle has no Terraform edges, even though its direct edges are source-parsed | opt-in static fallback with its own `edges_status` |
 | Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
+| Timeline code events of older commits order by day | `committed_at` (#82) is gathered from `%cI` by the commit walk only | commits in a store folded before #82, and backfilled commits (five-field log), have no `committed_at`, so their timeline events keep the bare date and sort before that day's social events | re-gather; log `%cI` in `make_backfill_fetcher` too |
 | Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 

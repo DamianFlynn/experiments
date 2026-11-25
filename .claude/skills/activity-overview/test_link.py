@@ -2861,20 +2861,20 @@ class TestCapTrainDiffs(unittest.TestCase):
     def test_keeps_within_budget_strips_beyond_without_mutating_bundle(self):
         half = link.SLICE_DIFF_CAP // 2 + 100  # two of these exceed the budget
         big = "x" * half
-        # The budget is checked BEFORE adding each diff, so the delta that *spends* the
-        # remaining budget is kept (cumulative `used` can end up over cap); the NEXT
-        # delta is the one stripped.
+        # A diff is kept only if it fits in what is left of the budget (#82: the
+        # check used to run BEFORE adding, so the diff that crossed the cap was
+        # kept and the kept total could reach ~2x the cap).
         deltas = [
-            {"name": "a", "diff": big},   # used 0 (< cap)     -> kept; used -> ~half
-            {"name": "b", "diff": big},   # used ~half (< cap) -> kept; used -> >cap
-            {"name": "c", "diff": big},   # used >cap          -> diff stripped
-            {"name": "d"},                # no diff            -> untouched
+            {"name": "a", "diff": big},   # 0 + half <= cap      -> kept; used ~half
+            {"name": "b", "diff": big},   # half + half > cap    -> diff stripped
+            {"name": "c", "diff": big},   # still does not fit   -> diff stripped
+            {"name": "d"},                # no diff              -> untouched
         ]
         original = copy.deepcopy(deltas)
         out, dropped = link._cap_train_diffs(deltas)
-        self.assertEqual(dropped, 1)
+        self.assertEqual(dropped, 2)
         self.assertIn("diff", out[0])
-        self.assertIn("diff", out[1])
+        self.assertNotIn("diff", out[1])      # stripped for the budget
         self.assertNotIn("diff", out[2])      # stripped for the budget
         self.assertEqual(out[3], {"name": "d"})
         # the bundle's deltas are NOT mutated (slice is read-only by contract)

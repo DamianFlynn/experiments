@@ -90,10 +90,12 @@ the rest (engagement, code areas, trains, people/flow).
   milestones, sprints, forecast age and flow staleness: the view's `--ref-date` if given, else
   the gather `--ref-date` stored for exactly this window, else `to`.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
-  message, files, pr }]` (`pr` set by link).
+  committed_at?, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
   (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
-  across committer timezones.
+  across committer timezones. `committed_at` (#82) is the full committer timestamp (`%cI`)
+  in UTC, `YYYY-MM-DDTHH:MM:SSZ`; it orders the `timeline` only (windowing stays on `date`).
+  It is absent on commits gathered before #82 and on backfilled commits.
   **People identity (#78):** `author` is the author's **GitHub login** — the same key PR, issue,
   review and comment records use — so one person is one `people` entry. `gather.resolve_commit_authors`
   resolves it from real data, in order: the commits-list API's `author.login` for that SHA
@@ -289,6 +291,10 @@ review's state to `DISMISSED`.
   (artifact lifecycle) events. `ref.id` is the PR/issue number for social events
   and the commit sha for code events (the bundle-wide `{type, id, url}` ref
   convention). Social events have no file `subject.path`; code events carry both.
+  `ts` is the comment's `created_at` for social events and the commit's `committed_at`
+  for code events (#82), so same-day events interleave by real time; a code event whose
+  commit has no `committed_at` falls back to its date (`YYYY-MM-DD`), which sorts before
+  that day's timestamped social events. Ties break on `ref.url`.
 - **feature_deltas** `[{ area, kind:"add|drop|change", subject, name, before,
   after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
   }]` — a projection over `artifacts` (add→add, remove→drop, change→change). For
@@ -428,21 +434,37 @@ review's state to `DISMISSED`.
     "train":          { id, kind, outcome, significance, tier, effort,
                         code_areas, evidence },
     "issue":          { number, title, body*, url, labels, kind,
-                        comments*:[body*], comments_overflow } | None,
+                        comments*:[body*], comments_overflow,
+                        lifecycle:[{event, actor, created_at, label}],
+                        lifecycle_overflow, reopen_count } | None,
     "prs":            [ { number, title, body*, state, merged, created_at,
                           merged_at, url, reviewers:[login], review_decision,
                           review_comments*:[body*], review_comments_overflow,
-                          comments*:[body*], comments_overflow } ],
+                          comments*:[body*], comments_overflow,
+                          review_rounds:{count, states} | None,
+                          reviews:[{author, state, submitted_at, body*}],
+                          reviews_overflow,
+                          lifecycle:[{event, actor, created_at, label}],
+                          lifecycle_overflow, reopen_count } ],
     "commits":        [ { sha, message*, author, date } ],
     "feature_deltas": [ ...this train's deltas only... ],
+    "feature_deltas_diff_overflow": <int>,
     "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ]
   }
   ```
 
   (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
-  chars with a `…[+N chars]` marker; each comment list capped at `SLICE_COMMENTS_KEPT` = 6
-  bodies, overflow count in `<key>_overflow`.) Raises `KeyError` on unknown id. Does not
-  mutate the bundle.
+  chars with a `…[+N chars]` marker. Each comment list, `reviews` and `lifecycle` is
+  capped at `SLICE_COMMENTS_KEPT` = 6 entries, overflow count in `<key>_overflow`.
+  `reviews` are the PR's review submissions; `lifecycle` the allowlisted timeline
+  events (id/url dropped); `reopen_count` how often the issue/PR was reopened;
+  `review_rounds` the PR's `{count, states}` or `None` when it has no counted review.
+  `feature_deltas` file-level entries may carry a bounded `diff`; the combined diff
+  chars kept in one slice never exceed `SLICE_DIFF_CAP` = 6000: walking the deltas in
+  order, a diff is kept only if it fits in what is left of the budget, otherwise it is
+  omitted (the delta is still listed) and counted in `feature_deltas_diff_overflow`.)
+  Raises `KeyError` on unknown id. Does not mutate the bundle. The key lists above are
+  checked against `slice_train`'s output by `test_link_small_fixes.py`.
 
 ## People profile, recognition halls, flow & blockers
 

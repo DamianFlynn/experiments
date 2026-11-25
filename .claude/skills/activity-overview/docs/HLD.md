@@ -475,6 +475,11 @@ These are real, current limits — plan around them:
     the rename under the new path). An area shared by several members is unioned unless the
     query names one (`owner/repo::area` or `--repo`).
 
+15. **Timeline order needs a re-gather for old stores.** Since #82 the view's `timeline`
+    orders code events by the commit's full committer timestamp, so a commit at 09:00 sorts
+    after a comment at 08:00 the same day. Commits folded before that change (and backfilled
+    commits) only have a day, so their events still sort before that day's comments.
+
 Item 8 is why USAGE recommends one store per installment; it is a candidate for a code fix
 (window the materialized arrays in `extract`), tracked in
 [§11](#11-extension-points-and-roadmap). Artifact folding is cumulative: each fold rebuilds the

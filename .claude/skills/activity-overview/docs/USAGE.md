@@ -210,7 +210,11 @@ flowchart TB
    belongs to. If you run it twice for the same month, the file ends with two entries for that
    month: delete **every** entry for that month (deleting only the last leaves the month
    compared with itself), then run `--series` once. If later months were already appended,
-   delete that suffix too and replay the saved bundles oldest → newest.
+   delete that suffix too and replay the saved bundles oldest → newest. `link` writes the
+   bundle and then the series file, each atomically, so an interrupted run leaves both as they
+   were (or only the bundle updated — re-run `--series` once). A series file that is not a JSON
+   list of entries stops `link` with exit code 2 and a message naming the file; nothing is
+   written until you fix or remove it.
 6. **Render**, then **author**: the report's *Since last installment* section uses
    `bundle.series` — new items, carried-over items (with prior board status) and the forecast
    loop (last month's predictions landed / not yet).

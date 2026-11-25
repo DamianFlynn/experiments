@@ -79,6 +79,10 @@ def parse_git_log(raw):
     carries a sixth field (the author email, `%ae`, COMMIT_WALK_ARGS) it is kept as
     a TRANSIENT `author_email` key: `resolve_commit_authors` reads it to find the
     author's GitHub login and removes it, so no email reaches the bundle (#78).
+    A seventh field (the strict-ISO committer timestamp, `%cI`) becomes
+    `committed_at`, normalised to UTC `YYYY-MM-DDTHH:MM:SSZ` (the GitHub API's
+    form) so it sorts against comment timestamps; `date` stays the day used for
+    windowing. An empty or unparseable timestamp adds no key (#82).
     """
     commits = []
     for chunk in raw.split(RECORD_SEP):
@@ -103,8 +107,25 @@ def parse_git_log(raw):
         }
         if len(fields) > 5:
             commit["author_email"] = fields[5].strip()
+        if len(fields) > 6:
+            committed_at = _utc_timestamp(fields[6].strip())
+            if committed_at:
+                commit["committed_at"] = committed_at
         commits.append(commit)
     return commits
+
+
+def _utc_timestamp(value):
+    """A strict-ISO timestamp with an offset (`%cI`) as UTC
+    `YYYY-MM-DDTHH:MM:SSZ`, or None when it is empty, unparseable or has no
+    offset. Pure."""
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.utcoffset() is None:
+        return None
+    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # git log format for the full-window code-event walk (Phase 3a). Same RECORD_SEP/
@@ -119,8 +140,11 @@ CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
 # unquote_git_path in each parser.
 # The commit walk alone also asks for the author email (`%ae`, appended LAST so the
 # shared five-field header parses unchanged); it is only used to resolve the
-# author's GitHub login and is never stored (#78).
-COMMIT_LOG_FORMAT = CODE_LOG_FORMAT + "%x1f%ae"
+# author's GitHub login and is never stored (#78). After it comes the strict-ISO
+# committer timestamp (`%cI`, unaffected by `--date=short`), stored as the
+# commit's `committed_at` so the timeline orders same-day events by real time
+# (#82).
+COMMIT_LOG_FORMAT = CODE_LOG_FORMAT + "%x1f%ae%x1f%cI"
 COMMIT_WALK_ARGS = (f"--pretty=format:{COMMIT_LOG_FORMAT}", "--date=short",
                     "--name-only")
 CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
@@ -594,7 +618,7 @@ def normalize_pr(raw):
         "body": raw.get("body") or "",
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
-        "labels": [lbl["name"] for lbl in raw.get("labels", [])],
+        "labels": [lbl["name"] for lbl in raw.get("labels") or []],
         "milestone": milestone.get("title") if milestone else None,
         "merged": bool(raw.get("merged_at")),
         "merged_by": (raw.get("merged_by") or {}).get("login")
@@ -652,8 +676,8 @@ def normalize_issue(raw):
         "kind": "other",  # refined in later phases (issue types/labels/template)
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
-        "labels": [lbl["name"] for lbl in raw.get("labels", [])],
-        "assignees": [a["login"] for a in raw.get("assignees", [])],
+        "labels": [lbl["name"] for lbl in raw.get("labels") or []],
+        "assignees": [a["login"] for a in raw.get("assignees") or []],
         "milestone": milestone.get("title") if milestone else None,
         "state": raw.get("state"),
         "state_reason": raw.get("state_reason"),
