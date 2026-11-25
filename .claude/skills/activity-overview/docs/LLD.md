@@ -138,10 +138,11 @@ sequenceDiagram
   participant REST as GitHub REST
   participant GQL as GitHub GraphQL
   A->>Git: clone --shallow-since=(from - margin)
+  A->>Git: fetch --deepen=n while an in-window commit is on the boundary (bounded)
   A->>Git: log (commits, full walk) then window_records
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
-  A->>A: drop shallow-boundary phantom commits
+  A->>A: fallback: drop unresolved boundary commits' diffs and files
   A->>A: select_code_area_provider (directory or graphify)
   A->>IaC: extract_iac_edges (parallel restore+build / init+graph)
   opt manifest gather
@@ -183,10 +184,17 @@ sequenceDiagram
   untouched.
 - The clone/fetch uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
   margin keeps each in-window commit's real parent in the clone.
-- `shallow_boundary_shas` + `drop_boundary_events` remove events from a commit whose parent
-  was grafted away (its diff would be a whole-tree phantom). Any **in-window** commit dropped
-  this way is recorded in `meta.boundary_dropped_commits` and a warning is printed — widen the
-  margin and re-gather to recover it.
+- If the margin holds no earlier commit, the first in-window commit is a shallow-boundary
+  commit: its parent is grafted away, so git diffs it against the empty tree (a whole-tree
+  phantom). After the clone/fetch, `deepen_window_boundary` runs `git fetch --deepen=n origin`
+  (n from `BOUNDARY_DEEPEN_STEPS` = 1, 2, 4, 8; stops at the first fetch error) until no
+  in-window commit of the checked-out branch is in `.git/shallow`, so its diff and file list
+  are real. A root commit is never in `.git/shallow`; its full file list is genuine.
+- Fallback when deepening could not resolve it: `shallow_boundary_shas` + `drop_boundary_events`
+  remove the commit's code/symbol events **and** its `commits[].files` is cleared, so
+  `area_paths`, module counts, `touches` edges and train `code_areas` are not inflated. Any
+  **in-window** commit handled this way is recorded in `meta.boundary_dropped_commits` and a
+  warning is printed — widen the margin and re-gather to recover it.
 - Commit dates use the committer date; filtering is `window_records` in Python to avoid git's
   timezone-sensitive pruning.
 

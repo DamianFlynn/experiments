@@ -91,6 +91,12 @@ in-window commit's real parent in the clone, so `boundary_dropped_commits` is
 empty for all three members and the feature-change / content-lifecycle ledgers are
 complete across the constellation.
 
+Since #68 gather deepens the clone itself when an in-window commit lands on the
+shallow boundary (`git fetch --deepen`, bounded), so the default margin should no
+longer leave `boundary_dropped_commits` non-empty; the wider margin above is kept
+as recorded for this sample. If deepening ever fails, the dropped commit's `files`
+are cleared too, so it no longer makes every module look changed.
+
 ### Module-dependency graph: structural, not window-scoped
 
 The dependency graph is **structural** — `gather` statically parses every module's

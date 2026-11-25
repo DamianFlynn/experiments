@@ -148,8 +148,9 @@ def parse_code_events(raw):
 # predates it. The boundary commit's parent is grafted away, so `git log -p` /
 # `--name-status` diff it against the EMPTY tree — a whole-tree phantom that would
 # otherwise flood code_events/symbol_events with thousands of spurious "add"s. With
-# the margin the first in-window commit keeps its real parent; shallow_boundary_shas
-# is the belt-and-suspenders that drops any boundary commit that still lands in-window.
+# the margin the first in-window commit keeps its real parent; when the margin holds
+# no earlier commit, deepen_window_boundary deepens past it, and shallow_boundary_shas
+# is the fallback that drops any boundary commit that still lands in-window.
 CLONE_MARGIN_DAYS = 14
 
 
@@ -333,6 +334,54 @@ def in_window_boundary_commits(boundary, commits):
     widening CLONE_MARGIN_DAYS recovers them. Sorted; empty in the common case."""
     shas = {c.get("sha") for c in commits}
     return sorted(s for s in boundary if s in shas)
+
+
+# `git fetch --deepen=<n>` steps tried, in order, while an in-window commit of the
+# walked branch still sits on the shallow boundary (#68). One commit past the
+# boundary is normally enough (the parent predates `from - margin`); the larger
+# steps cover non-monotonic committer dates. Bounded: at most 1+2+4+8 extra commits
+# per boundary, four fetches.
+BOUNDARY_DEEPEN_STEPS = (1, 2, 4, 8)
+
+
+def _in_window_boundary_on_head(clone_dir, from_date, to_date, run):
+    """Shallow-boundary SHAs that are in-window commits of the checked-out branch
+    (the history the three walks read). Sorted. A root commit is never listed:
+    git records only grafted commits in `.git/shallow`."""
+    boundary = shallow_boundary_shas(clone_dir)
+    if not boundary:
+        return []
+    raw = run(["git", "-C", clone_dir, "log", f"--pretty=format:{CODE_LOG_FORMAT}",
+               "--date=short"])
+    head = window_records(parse_git_log(raw), from_date, to_date)
+    return in_window_boundary_commits(boundary, head)
+
+
+def deepen_window_boundary(clone_dir, from_date, to_date, run=None,
+                           steps=BOUNDARY_DEEPEN_STEPS):
+    """Make in-window shallow-boundary commits real (#68).
+
+    A boundary commit's parent is grafted away, so git diffs it against the empty
+    tree (a whole-tree phantom). When the clone margin held no earlier commit, the
+    first in-window commit is such a commit. Deepen the clone (`git fetch
+    --deepen=<n>`, n from `steps`) until no in-window commit of the walked branch
+    is on the boundary. Stops at the first fetch error (not retried) or when the
+    steps run out. Returns the in-window boundary SHAs still left (sorted; empty
+    when resolved) — the caller falls back to dropping their diffs and files."""
+    run = run or run_git
+    left = _in_window_boundary_on_head(clone_dir, from_date, to_date, run)
+    for n in steps:
+        if not left:
+            break
+        try:
+            run(["git", "-C", clone_dir, "fetch", f"--deepen={n}", "origin"])
+        except RuntimeError as exc:
+            sys.stderr.write(
+                f"warning: could not deepen {clone_dir} past the shallow boundary: "
+                f"{str(exc).strip().splitlines()[-1] if str(exc).strip() else exc}\n")
+            break
+        left = _in_window_boundary_on_head(clone_dir, from_date, to_date, run)
+    return left
 
 
 def in_window(ts, from_date, to_date):
@@ -3516,6 +3565,11 @@ def acquire(args, env):
     # there is no clone (--no-clone with nothing on disk) or only the depth-1 tip
     # of a quiet repo (whose whole-tree diff is not window activity).
     walk_clone = clone_mode in ("fresh", "fetched") and os.path.isdir(clone_dir)
+    if walk_clone:
+        # An in-window commit on the shallow boundary (no commit in the margin
+        # before `frm`) would diff as the whole tree: deepen so its parent is
+        # present and its diff is real (#68). Leftovers are handled after the walks.
+        deepen_window_boundary(clone_dir, frm, to)
 
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
@@ -3573,17 +3627,23 @@ def acquire(args, env):
                 if hunk:
                     ev["hunk"] = hunk
 
-    # Drop any shallow-boundary commit whose diff is a whole-tree phantom (its parent
-    # was grafted away by the bounded clone) — guards both walks against inflation.
+    # Fallback when deepening could not resolve it: drop any shallow-boundary
+    # commit's whole-tree phantom (its parent was grafted away by the bounded clone)
+    # from BOTH walks AND clear its commit file list, so area_paths / modules /
+    # touches / train code_areas are not inflated either (#68).
     _boundary = shallow_boundary_shas(clone_dir)
     code_events = drop_boundary_events(code_events, _boundary)
     symbol_events = drop_boundary_events(symbol_events, _boundary)
     _boundary_dropped = in_window_boundary_commits(_boundary, commits)
+    for c in commits:
+        if c.get("sha") in _boundary:
+            c["files"] = []
     if _boundary_dropped:
         sys.stderr.write(
             f"warning: {len(_boundary_dropped)} in-window commit(s) sit at the shallow "
-            f"clone boundary; their whole-tree phantom diffs were dropped (a visible gap "
-            f"in meta.boundary_dropped_commits) — widen the clone margin "
+            f"clone boundary and deepening the clone did not resolve it; their "
+            f"whole-tree phantom diffs and file lists were dropped (a visible gap in "
+            f"meta.boundary_dropped_commits) — widen the clone margin "
             f"(ACTIVITY_CLONE_MARGIN_DAYS, default {CLONE_MARGIN_DAYS}) and re-gather "
             f"to recover: {_boundary_dropped}\n")
 

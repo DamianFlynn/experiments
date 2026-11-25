@@ -536,7 +536,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
 | Last month's merges appear as shipped this month | the view was built from a store holding several months (no `meta.period`, HLD §10) | rebuild the month from its own single-window store |
-| Warning: boundary-dropped commits | shallow clone too shallow | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
+| Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
 | `edge_extraction` timeouts | slow `terraform init` / registry | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |
 | No module graph on a Bicep repo | `bicep` not installed, or no modules changed in window | install bicep; graph is window-scoped |
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |

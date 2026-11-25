@@ -122,9 +122,13 @@ defaults when needed: `ACTIVITY_IAC_BUILD_TIMEOUT` (seconds/subprocess, default
 `300`), `ACTIVITY_IAC_MAX_WORKERS` (`8`), `ACTIVITY_IAC_RETRIES` (`1`).
 
 The shallow clone reaches `ACTIVITY_CLONE_MARGIN_DAYS` (default `14`) before the
-window so an in-window commit keeps its real parent. If `meta.boundary_dropped_commits`
-is non-empty (an in-window commit still landed on the shallow boundary, so its
-whole-tree phantom diff was dropped), widen this knob and re-gather to recover it.
+window so an in-window commit keeps its real parent. If the margin holds no earlier
+commit (common on quiet per-module repos), the first in-window commit lands on the
+shallow boundary; gather then deepens the clone (`git fetch --deepen`, at most four
+bounded attempts) until that commit's parent is present, so its diff and file list
+are real. Only if deepening fails is the commit recorded in
+`meta.boundary_dropped_commits`, with its diffs dropped **and** its `files` cleared
+(no whole-tree inflation of areas/modules); widen this knob and re-gather to recover it.
 
 An existing `--clone-dir` that is a clone of the same repo is **fetched** to that bound
 (and the default branch head checked out) instead of re-cloned; `--no-clone` never creates
