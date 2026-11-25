@@ -16,7 +16,7 @@ pipeline's).
 > **journey-graph store** — that graph is the deliverable and it **accretes over time**
 > (idempotent fold; re-running over an overlapping window never double-counts, so the
 > store grows as you gather more windows/repos). The flat bundle is a **transient view**
-> the reader stage (`extract`) materializes from the store; `link`/`render` consume it,
+> the reader stage (`extract`, CLI `view.py`) materializes from the store; `link`/`render` consume it,
 > guarded by the golden-bundle equivalence gate. Validate any store with
 > `python3 validate.py workspace/journey.db` (self-contained — no bundle file).
 
@@ -36,7 +36,22 @@ the structured view).
 
 ## Procedure
 
-1. **Acquire → store.** Run the gather CLI (requires `GITHUB_TOKEN` with `repo` scope and
+Every step below is one command with explicit input and output paths. Run them from
+the skill directory; `workspace/` is this run's working directory (any path works, as
+long as each step reads what the previous one wrote). Use a **new store per
+installment** (`docs/USAGE.md` §2.1 explains why).
+
+**Two artifacts feed the report:**
+
+| Artifact | Made by | Holds | Used for |
+|---|---|---|---|
+| **Bundle view** — one repo, one window (`workspace/view/bundle.json`) | `view.py`, then enriched in place by `link.py`; `render.py` adds `diagrams` | raw facts + `trains`, `buckets`, `forecast`, `flow`, `people`/`halls`, … + `series` (with `--series`) + `diagrams` | every section of a single-repo report; the per-member sections of a multi-repo report |
+| **Project view** — multi-repo only (`workspace/view/project.json`) | `digest.py` (stdout) | merged `trains`, `shipped`, `people`, `modules`, `related_work`, `module_edges`, and `members[i].bundle` | the project-wide sections of a multi-repo report |
+
+Store scope: a single-repo gather stores **project = OWNER, repo = REPO**; a manifest
+gather stores **project = the manifest's `project`, repo = `owner/repo`** per member.
+
+1. **Gather → store.** Run the gather CLI (requires `GITHUB_TOKEN` with `repo` scope and
    `git` on PATH). gather auto-discovers and ingests the repo's Projects v2 board(s) when
    the token also has `read:project`; without that scope (or with `--no-project-board`) the
    board layer cleanly degrades to empty and the rest of the run is unaffected. The
@@ -50,20 +65,14 @@ the structured view).
      resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges` and records
      `code_graph.edge_extraction` (`resolved`/`timeout`/`failed`/`skipped`); absent the CLIs (or
      the module registry), edges are left empty and the rest of the run is unaffected.
-   - **Roll-up / resume are store-native.** A long view is a wider `range_query` over the store
+   - **Roll-up / resume are store-native.** A long view is a wider window over the store
      (no separate roll-up artifact); a refresh re-folds the same window against the pinned
      `meta.clone_sha` (idempotent dedup keeps it overlap-safe). The flat-bundle `--rollup` /
      `--resume` / `--out` flags were retired with the bundle file.
-   - **Validate the store (trust gate).** Audit the graph for trustworthiness; this is the
-     store's acceptance check and is fully self-contained on a store:
-     ```bash
-     python3 validate.py workspace/journey.db
-     ```
-     `no_drift` / `idempotency` self-source their raw bundle from the store via `extract`; an
-     external `--bundle` is an optional cross-check, never required.
    - **Multi-repo project.** To fold several repos under one logical
      project (e.g. an Azure Verified Modules — Terraform constellation, where each
-     module is its own repo), pass a **manifest** instead of `--owner/--repo`:
+     module is its own repo), pass a **manifest** instead of `--owner/--repo/--from/--to`
+     (the window comes from the manifest):
      ```bash
      python3 gather.py --manifest workspace/manifest.json --store workspace/journey.db
      ```
@@ -85,18 +94,11 @@ the structured view).
        `--include`/`--exclude`/`--limit`. The output is exactly the contract
        `gather --manifest` folds; hand-authoring is the fallback for a fixed set.
 
-     gather folds each
-     member under `project=<manifest.project>`, `repo="owner/repo"`. Cross-repo
-     decision-train edges (qualified `owner/repo#N` refs + repo-aware timeline
+     gather folds each member under `project=<manifest.project>`, `repo="owner/repo"`.
+     Cross-repo decision-train edges (qualified `owner/repo#N` refs + repo-aware timeline
      cross-refs) and cross-repo Terraform `depends_on` (registry source → the member
      that publishes it) form automatically; `examples/`/`tests/` Terraform subtrees
-     are treated as scaffolding (not module dependencies). Validate the whole project with
-     `python3 validate.py workspace/journey.db --project <name>` (adds a
-     project-wide people check). A project digest view (cross-repo trains, merged
-     Shipped/ownership, `related_work` ticket clusters, the project module-dependency
-     graph) comes from `python3 digest.py --store workspace/journey.db --project <name>
-     --from FROM --to TO`; the blast radius for one member is `python3 spotlight.py
-     dependents <owner/repo> --store workspace/journey.db --project <name>`.
+     are treated as scaffolding (not module dependencies).
      - **Heavy live runs.** A real AVM pattern module's `terraform init` pulls dozens
        of registry modules; set a shared `TF_PLUGIN_CACHE_DIR` (gather warms it once,
        then extracts in parallel) and, if needed, raise `ACTIVITY_IAC_BUILD_TIMEOUT`
@@ -105,53 +107,90 @@ the structured view).
        the shallow-clone boundary (their whole-tree phantom diffs were dropped — see
        `meta.boundary_dropped_commits`), widen `ACTIVITY_CLONE_MARGIN_DAYS` (default
        `14`) and re-gather so each in-window commit keeps its real parent.
-2. **Materialize + Link.** The reader stage rebuilds the bundle view from the store
-   (`extract`) and enriches it offline (no network):
+2. **Validate the store (trust gate).** Stop and fix the cause unless it prints
+   `RESULT: OK` (exit 0):
    ```bash
-   python3 link.py <bundle-view>
+   python3 validate.py workspace/journey.db
    ```
-   This adds `trains` and classifies all four `buckets` (`shipped`, `rejected`,
-   `in_flight`, `next_candidates`).
-
-   **Series continuity (optional).** For a recurring digest, pass an append-only
-   index so this installment is framed against the last one:
+   Self-contained on a store (`no_drift` / `idempotency` self-source their raw bundle via
+   `extract`; an external `--bundle` is an optional cross-check, never required). For a
+   multi-repo project: `python3 validate.py workspace/journey.db --project <name>` (adds a
+   project-wide people check).
+3. **Materialize the bundle view** (store → `workspace/view/bundle.json`, offline):
    ```bash
-   python3 link.py <bundle-view> --series series.json
+   python3 view.py --store workspace/journey.db --from FROM --to TO --out workspace/view/bundle.json
    ```
-   This adds `bundle["series"]` (`new` / `carried_over` / `forecast_loop`) and
-   appends this installment's snapshot to `series.json`. The file is a thin
-   convenience index over the store — never an override; delete it to start a
-   fresh series (the next run is then a "first installment"). Without `--series`
-   the digest is byte-identical to before.
-3. **Render diagrams.** Preflight: `mmdc` must be on PATH
-   (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
-   `graphify` is **optional** (used only for its supported languages); when it is
-   absent — e.g. on Bicep/Terraform repos — the **directory provider** supplies
-   code areas, so no install is required for code-area attribution to work.
-
-   Then:
+   Use the FROM/TO you gathered (for a manifest, its window). `--project`/`--repo` are
+   auto-detected when the store holds one project with one repo; otherwise pass them
+   (single repo: `--project OWNER --repo REPO`). For a **multi-repo project**, run it once
+   per member you report on — `python3 view.py --store workspace/journey.db --project <name>
+   --repo <owner/repo> --from FROM --to TO --out workspace/view/<owner>__<repo>.json` — and
+   use that file in steps 4–6. It writes the **raw** view only (no trains/buckets yet) and
+   exits 2 with a message when the scope is ambiguous, unknown or empty.
+4. **Link** (enriches the bundle view **in place**, offline). For a recurring digest pass
+   the append-only series index so this installment is framed against the last one —
+   **exactly once per installment** (each run appends):
    ```bash
-   python3 render.py <bundle-view>
+   python3 link.py workspace/view/bundle.json --series workspace/series.json
    ```
-   This writes `workspace/diagrams/*.mmd`, records `bundle.diagrams`, and **fails
-   if any diagram does not compile** under `mmdc`.
-   The manifest now also includes `content_timeline`, `deltas_bar`,
-   `contributor_graph`, and `kind_breakdown`.
-4. **Community-call transcript (optional).** If the user provides a
+   This adds `trains`, the four `buckets` (`shipped`, `rejected`, `in_flight`,
+   `next_candidates`), `forecast`, `flow`, … and `series` (`new` / `carried_over` /
+   `forecast_loop`). The series file is a thin convenience index over the store — never an
+   override; delete it to start a fresh series. For a one-off digest run
+   `python3 link.py workspace/view/bundle.json` instead (no `series` key is added).
+   Multi-repo: keep one series file per member (`workspace/series/<owner>__<repo>.json`).
+5. **Render diagrams** (rewrites the bundle view with `diagrams`). Preflight: `mmdc` must
+   be on PATH (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
+   `graphify` is **optional** (used only for its supported languages); when it is absent —
+   e.g. on Bicep/Terraform repos — the **directory provider** supplies code areas.
+   ```bash
+   python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams
+   ```
+   Writes `workspace/diagrams/*.mmd` (the flat diagrams plus one flowchart per deep-tier
+   train) and **fails if any diagram does not compile** under `mmdc`. **`bundle.diagrams`
+   paths are relative to the parent of `--diagrams-dir`** — here `workspace/`, so
+   `diagrams/buckets_pie.mmd` is the file `workspace/diagrams/buckets_pie.mmd`. Only the
+   bundle view file `render.py` rewrote carries `diagrams`. If `mmdc` is unavailable, add
+   `--skip-validate` and say in the report that the diagrams are unvalidated.
+6. **Train slices** (read-only; one per train you narrate — at least every
+   `tier: "deep"` train). The bounded, self-contained evidence a per-train narrator reads:
+   ```bash
+   python3 link.py workspace/view/bundle.json --slice <train-id> > workspace/view/<train-id>.slice.json
+   ```
+   Train ids are `bundle["trains"][].id`.
+7. **Project view** (multi-repo only; skip for a single repo):
+   ```bash
+   python3 digest.py --store workspace/journey.db --project <name> --from FROM --to TO > workspace/view/project.json
+   ```
+   Its `members[i].bundle` is enriched but has no `series` or `diagrams` — read those from
+   the member's own bundle view file (steps 3–5). The cross-repo module graph is
+   `render.emit_project_module_graph(view["module_edges"])`.
+8. **Community-call transcript (optional).** If the user provides a
    community-call transcript (a local file passed explicitly, or a `transcript`
    path in `projects.json`) — no network, user-provided only — normalize it to
    clean prose first:
    ```bash
-   python3 transcript.py path/to/call.vtt
+   python3 transcript.py path/to/call.vtt > workspace/view/transcript.txt
    ```
    `transcript.py` strips WebVTT/SRT structure (headers, NOTE/STYLE blocks, cue
    timings, SRT indices, inline tags) and collapses rolling-caption duplicates;
-   plain `.txt`/`.md` passes through. Read its stdout and author the **Community
-   call highlights** section grounded ONLY in that text (see the report rules
-   below). No transcript ⇒ skip this step and omit the section.
-5. **Write the report.** Read the materialized bundle view and fill
-   `report-template.md`, embedding each `bundle.diagrams` file as a fenced mermaid block.
-   Cite each fact with its `url`. Do not state anything the view does not contain.
+   plain `.txt`/`.md` passes through. Author the **Community call highlights** section
+   grounded ONLY in that text (see the report rules below). No transcript ⇒ skip this
+   step and omit the section.
+9. **Write the report** (e.g. `workspace/report.md`) by filling `report-template.md`.
+   Cite each fact with its `url`; do not state anything the views do not contain.
+   - **Single repo:** every section reads the bundle view. Where the template says
+     `view["shipped"]` read `bundle["buckets"]["shipped"]`; `view["trains"]` →
+     `bundle["trains"]`; `view["people"]` / `view["modules"]` → `bundle["people"]` /
+     `bundle["modules"]`; `view["members"][i]["bundle"]` → the bundle view itself. Omit
+     *Related work* and *Cross-repo module dependency graph* (project view only).
+   - **Multi-repo:** project-wide sections (executive summary, shipped, decision trains,
+     related work, cross-repo module graph, module ownership) read the project view;
+     per-member sections (since last installment, activity at a glance, releases, CI/CD,
+     in flight, sprints, rejected, stalled/blocked, forecast, feature changes, content
+     lifecycle, module graph, contributors, issue kinds) read each member's bundle view.
+   - Embed each `bundle.diagrams` file (resolved against the parent of `--diagrams-dir`)
+     as a fenced mermaid block, and ground each train's narrative in its slice.
 
 ## Report rules
 
@@ -183,7 +222,7 @@ relevant slice and narrate it grounded:
 - **Blast radius / dependents** of a module: `python3 spotlight.py dependents <owner/repo>
   --store <db> --project <name>`.
 - **One train's slice** (for narration or a spotlight): `python3 link.py <view> --slice <id>`;
-  `python3 render.py --train <id>` for its flowchart.
+  `python3 render.py <view> --train <id>` for its flowchart.
 - **Multi-repo project view** (the structured fact base other formatters consume): `python3
   digest.py --store <db> --project <name> --from FROM --to TO` — see `BUNDLE.md` for the
   contract.

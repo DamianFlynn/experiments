@@ -46,14 +46,30 @@ member repos) and gather folds into it **idempotently** (re-running an overlappi
 window never double-counts), so the journey graph accretes over time. It's a local,
 rebuildable cache; delete the file to start fresh, or re-gather to refresh against the
 pinned clone SHA (see `STORE.md`). A single store *can* hold **multiple** projects/repos,
-but then the readers need to be told which: `validate.py` (and `digest.py`/`spotlight.py`)
-error asking for `--project` (and `--repo` when a project spans several) — the bare
-`validate.py workspace/journey.db` example above assumes a single-project store.
+but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
+`spotlight.py`) error asking for `--project` (and `--repo` when a project spans several) —
+the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 
-The report vertical (`extract → link → render → report`) **composes from the
-store** — `extract` materializes the bundle as a transient view, then `link`/
-`render` consume it (guarded by the golden-bundle equivalence gate). Render with
-the skill (see `SKILL.md`).
+The report vertical (`view → link → render → report`) **composes from the
+store** — `view.py` (the CLI over `extract`) materializes one repo's raw bundle view,
+then `link.py` enriches it in place and `render.py` adds `diagrams` (guarded by the
+golden-bundle equivalence gate):
+
+```bash
+python3 view.py --store workspace/journey.db --from 2026-05-01 --to 2026-05-31 \
+    --out workspace/view/bundle.json        # [--project OWNER --repo REPO]
+python3 link.py workspace/view/bundle.json --series workspace/series.json
+python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams
+```
+
+`view.py --store DB [--project P] [--repo R] --from F --to T --out PATH` auto-detects
+`--project`/`--repo` when the store holds exactly one (single-repo gather: project =
+owner, repo = name; manifest: project = manifest name, repo = `owner/repo`), writes
+exactly what `extract.extract` returns (raw keys, extract's deterministic order), does
+no network backfill, and exits 2 when the scope is ambiguous, unknown or empty, or the
+store is missing. For a multi-repo project, `--repo` selects one member; the merged
+project view comes from `digest.py`. The full step-by-step procedure (and which report
+sections read which view) is in `SKILL.md`.
 
 ### Multi-repo project
 
@@ -126,9 +142,10 @@ discovers slash commands under `.claude/commands/` (project) or `~/.claude/comma
 ln -s ../skills/activity-overview/commands/activity.md .claude/commands/activity.md
 ```
 
-Then: `/activity <owner/repo|project> <from> <to> [--transcript PATH] [--series PATH]
-[options]` — it parses the args and defers to `SKILL.md` (gather → link → render →
-report).
+Then: `/activity <owner/repo> <from> <to> [options]` or `/activity --manifest PATH
+[options]` (options: `--store PATH`, `--transcript PATH`, `--series PATH`, gather
+flags) — it parses the args and defers to `SKILL.md` (gather → validate → view → link
+→ render → slices → report).
 
 ## Tests
 

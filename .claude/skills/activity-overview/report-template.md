@@ -1,10 +1,23 @@
 # {project} — Activity Digest ({from} → {to})
 
-<!-- Multi-repo digest. All sections below consume the JSON view emitted by
-     `python3 digest.py --store <path> --project <name> --from ... --to ...`.
-     Per-member (single-repo) sections render once per entry in
-     `view["members"][i]["bundle"]`; project-wide sections read the merged keys
-     (trains, shipped, people, modules, related_work). -->
+<!-- Two inputs (SKILL.md "Procedure" says how each is made):
+     * `bundle` = the per-repo BUNDLE VIEW file: `view.py --out B`, then
+       `link.py B [--series S]` and `render.py B --diagrams-dir D` (both rewrite B).
+       It is the only file with `series` and `diagrams`. `bundle.diagrams` paths
+       are relative to the PARENT of D (D=workspace/diagrams -> resolve
+       `diagrams/x.mmd` as workspace/diagrams/x.mmd).
+     * `view` = the PROJECT VIEW (multi-repo only):
+       `digest.py --store <path> --project <name> --from ... --to ...`, with the
+       merged keys (trains, shipped, people, modules, related_work, module_edges).
+     Single-repo report: there is no `view`; read everything from `bundle`:
+       view["shipped"] -> bundle["buckets"]["shipped"], view["trains"] ->
+       bundle["trains"], view["people"]/view["modules"] -> bundle["people"]/
+       bundle["modules"], view["members"][i]["bundle"] -> bundle; omit Related work
+       and Cross-repo module dependency graph.
+     Multi-repo report: project-wide sections read `view`; per-member sections
+       render once per member from that member's bundle view file. Wherever a
+       section below says `view["members"][i]["bundle"]`, use the member's bundle
+       view file — digest's embedded copy has no `series` or `diagrams`. -->
 
 ## Executive summary
 

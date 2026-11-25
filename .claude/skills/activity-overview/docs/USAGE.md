@@ -135,51 +135,38 @@ python3 $AO/gather.py --owner Azure --repo bicep-registry-modules \
 # 2 · Trust gate — stop if this is not "RESULT: OK"
 python3 $AO/validate.py $DB --project Azure --repo bicep-registry-modules
 
-# 3 · Materialize the view (single repo: project = owner, repo = name)
-python3 $AO/digest.py --store $DB --project Azure --repo bicep-registry-modules \
-  --from $FROM --to $TO > $S/views/$M/view.json
-```
-
-There is no standalone `extract` command; `digest.py` runs extract + enrich for each member and
-emits the view. Split it into per-member bundle files (and the project module graph) with this
-helper — save it once as `~/activity/split_view.py` (outside the skill folder):
-
-```python
-# split_view.py  —  usage: python3 split_view.py <skill-dir> <view.json> <out-dir>
-import json, os, sys
-skill, view_path, out_dir = sys.argv[1:4]
-sys.path.insert(0, skill)
-import render
-view = json.load(open(view_path))
-os.makedirs(out_dir, exist_ok=True)
-for m in view["members"]:
-    p = os.path.join(out_dir, m["repo"].replace("/", "__") + ".bundle.json")
-    json.dump(m["bundle"], open(p, "w"), indent=2, sort_keys=True)
-    print("member bundle:", p)
-mmd = render.emit_project_module_graph(view.get("module_edges", []))
-open(os.path.join(out_dir, "project_module_graph.mmd"), "w").write(mmd)
-print("project module graph:", os.path.join(out_dir, "project_module_graph.mmd"))
-```
-
-```bash
-python3 ~/activity/split_view.py $AO $S/views/$M/view.json $S/views/$M
-B=$S/views/$M/bicep-registry-modules.bundle.json      # single-repo member file name
+# 3 · Materialize the bundle view (single repo: project = owner, repo = name;
+#     both are auto-detected when the store holds only this repo)
+B=$S/views/$M/bundle.json
+python3 $AO/view.py --store $DB --project Azure --repo bicep-registry-modules \
+  --from $FROM --to $TO --out $B
 
 # 4 · Link with series continuity (ONCE per installment — it appends to series.json)
 python3 $AO/link.py $B --series $S/series.json
 
-# 5 · Diagrams (mmdc validates each; add --skip-validate if mmdc is unavailable)
+# 5 · Diagrams (mmdc validates each; add --skip-validate if mmdc is unavailable).
+#     bundle.diagrams paths are relative to the PARENT of --diagrams-dir ($S/views/$M).
 python3 $AO/render.py $B --diagrams-dir $S/views/$M/diagrams
 
 # 6 · One train's bounded evidence (what a narrator sub-agent reads)
 python3 $AO/link.py $B --slice train-issue-1234 > $S/views/$M/train-issue-1234.slice.json
 ```
 
+`view.py` writes the **raw** bundle view (`extract`); `link.py` enriches it in place and
+`render.py` adds `diagrams`, so keep `$B` — it is what you replay if the series ever needs
+rebuilding. `view.py` exits 2 with a message when `--project`/`--repo` are ambiguous, unknown, or
+have no data in the store.
+
 Then ask Claude to write the report from `$B` (+ slices + diagrams) following
 `reference/report-sections.md`, and save it as `$S/reports/2026-11.md`.
 
-> **Note on file names.** A single-repo member is keyed by the bare repo name
-> (`bicep-registry-modules.bundle.json`); manifest members are `owner__repo.bundle.json`.
+> **Multi-repo (manifest) stores.** Members are stored as `--project <manifest project>
+> --repo <owner/repo>`: run `view.py` → `link.py` → `render.py` once per member you report on
+> (e.g. `--out $S/views/$M/Azure__terraform-azurerm-avm-ptn-foo.json`). The merged project
+> view (cross-repo trains, merged shipped/people/modules, `related_work`, `module_edges`)
+> comes from `digest.py --store $DB --project <name> --from $FROM --to $TO`; its embedded
+> `members[i].bundle` has no `series` or `diagrams` — use the member's bundle view file for
+> those. The cross-repo module graph is `render.emit_project_module_graph(view["module_edges"])`.
 
 ## 5. Runbook — progressive monthly updates
 
@@ -190,7 +177,7 @@ flowchart TB
   a["1 · Pick window<br/>first..last day of the month,<br/>ref-date = last day"] --> b["2 · gather into a NEW store<br/>stores/YYYY-MM.db, fresh clone dir"]
   b --> c{"3 · validate OK?"}
   c -- no --> fix["fix cause (see §11), re-gather<br/>into the same monthly store"] --> b
-  c -- yes --> d["4 · digest to views/YYYY-MM/view.json<br/>+ split_view, keep the bundle"]
+  c -- yes --> d["4 · view.py to views/YYYY-MM/bundle.json<br/>keep the bundle"]
   d --> e["5 · link --series (exactly once)<br/>compares with last month's snapshot"]
   e --> f["6 · render diagrams"]
   f --> g["7 · Claude authors report<br/>reports/YYYY-MM.md"]
