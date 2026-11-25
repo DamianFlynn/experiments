@@ -455,6 +455,13 @@ These are real, current limits — plan around them:
 12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
+13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
+    commit's git author to the login PR/issue/review records use (GitHub's commits listing per
+    SHA, then a `users.noreply.github.com` email), so a PR author and their commits are one
+    person. A commit whose email GitHub links to no account and that has no noreply email
+    stays a separate person keyed by its git name and flagged `login_resolved: false` — never
+    merged with a login on a guess. Stores folded before this change key commit authors by git
+    name: re-gather them into a fresh store rather than folding new windows on top.
 
 Items 8–9 are why USAGE recommends one store per installment; they are candidates for code
 fixes (set `meta.period` and window the materialized arrays in `extract`; make artifact

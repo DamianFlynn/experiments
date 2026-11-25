@@ -537,6 +537,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
 | Last month's merges appear as shipped this month | the view was built from a store holding several months (no `meta.period`, HLD §10) | rebuild the month from its own single-window store |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
+| A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" after upgrading | the store was folded before commit authors were resolved to logins (#78) | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
+| A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |
 | `edge_extraction` timeouts | slow `terraform init` / registry | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |
 | No module graph on a Bicep repo | `bicep` not installed, or no modules changed in window | install bicep; graph is window-scoped |
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
@@ -551,7 +553,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 - The token is **read-only** in effect — the skill never writes to GitHub — but treat it as a
   secret: environment/keychain only, never in manifests, scripts or reports; create short-lived
   tokens (the Azure org accepts 8 days at most).
-- Stores and clones contain repository content and contributor logins; keep them in your
+- Stores and clones contain repository content and contributor logins (and commit author
+  names; author emails are read to resolve logins but never stored); keep them in your
   workspace, not in shared folders.
 - Public reports never attribute stalls to individuals; the internal attribution appendix is
   opt-in — only request it for internal audiences.

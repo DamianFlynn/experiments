@@ -158,6 +158,10 @@ sequenceDiagram
     A->>REST: comments, timeline
   end
   A->>A: detect_label_taxonomy, apply_facets, classify_issue_kind
+  opt window has commits
+    A->>REST: commits?sha=HEAD&since&until (author.login per SHA)
+    A->>A: resolve_commit_authors (API login, noreply email, else flagged git name)
+  end
   A->>REST: workflow runs, releases, milestones
   opt token has read:project
     A->>GQL: Projects v2 boards (maintained only), items, iterations
@@ -312,6 +316,7 @@ flowchart TB
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
 | Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | referenced 404s tolerated (`allow_404`) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
+| Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
 
 Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
@@ -713,9 +718,10 @@ bundles in chronological order.
 |---|---|---|
 | `build_artifacts` | `artifacts{}` | lifecycle per file/symbol; status from newest event |
 | `match_symbol_moves` / `link_symbol_identity` | `symbol_moves` | same `(lang, subkind, name)` dropped in one file, added in one other; `high` when git also flags a rename |
-| `enumerate_participants` | all logins | the single source of truth for "who" (write path and auditor) |
+| `enumerate_participants` | all logins | the single source of truth for "who" (write path and auditor); a person keyed by an unresolved commit author gets `login_resolved: false` |
 | `attribute_people_areas` | `people[].modules/areas` | commit files + reviewed PRs' areas |
-| `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*` |
+| `unresolved_person_key` | person key | the git name of a commit author gather could not resolve to a login, `+ " (git)"` when login-shaped, so it never equals a login (#78) |
+| `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*`; git-name forms `GitHub Actions`, `Dependabot`, `Dependabot Preview`, `Renovate`, `Renovate Bot` (case/space-insensitive), each also with the `" (git)"` suffix |
 | `annotate_people_profile` | per-login metrics | prs authored/merged/reviewed, merge rate, review latency (median), first/last active, examples/docs/symbols authored |
 | `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored`, top 10; **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
@@ -947,7 +953,8 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 
 Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open PRs) + 4 × kept PRs
 + pages(issues since from) + pages(open issues) + 2 × issues + referenced issues + workflow/
-release/milestone pages`. Because **all open PRs and issues** are included every run, busy
+release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100⌉` (the last term is
+the commit-author login listing, #78; zero for a window with no commits). Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
@@ -974,6 +981,9 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
+| Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
+| Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
+| Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for

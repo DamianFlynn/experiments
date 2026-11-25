@@ -265,7 +265,22 @@ edges** (all derived on the write path via the shared `derive.py` leaf —
   `*-organizer`, or `copilot-*` (`derive.is_bot_login`); bots are TAGGED, never
   dropped (dropping = losing data). Each upserts as a `structure` node id
   `qualify_person(project, login)` (`{project}#person-{login}`), NULL `ts`,
-  `data` = `{login, modules, areas, is_bot}`. The `repo` column is the project
+  `data` = `{login, modules, areas, is_bot[, login_resolved]}`.
+  **Identity (#78):** the key is the GitHub **login** for every participant,
+  commit authors included — gather resolves a commit's git author to its login
+  (commits-list API `author.login` by SHA, then a `users.noreply.github.com`
+  email; see BUNDLE.md `commits`), so a PR author and the same person's commits
+  share ONE person node. A commit author gather could not resolve keeps its git
+  name as the key (suffixed `" (git)"` when the name is login-shaped, so it can
+  never equal a login) and its node carries `login_resolved: false`; the key is
+  absent on every other person. `is_bot` also recognises git-name bot forms
+  (`GitHub Actions`, `Dependabot`, `Renovate Bot`, a `[bot]` name, with or
+  without the suffix). The commit `code` node's data keeps both `author` (the
+  person key) and `author_name` (the git name); the author email is never
+  stored. **Person ids changed with #78:** a store folded before it holds commit
+  authors as `person-<git name>` nodes; folding a post-#78 bundle into it adds
+  the login-keyed nodes beside them (the old ones are not retracted), so
+  **re-gather such a store into a fresh file** rather than folding on top. The `repo` column is the project
   sentinel `"*"` (people aggregate across a project's repos), so re-folding the
   same login from another repo upserts the identical id — one node, never a
   cross-repo duplicate — and the sentinel keeps the row out of any single repo's

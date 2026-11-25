@@ -82,10 +82,24 @@ the rest (engagement, code areas, trains, people/flow).
   records how gather obtained the clone (see `gather.prepare_clone`); it is in the bundle
   `acquire` assembles and is not folded into the store. (Store-only — see `STORE.md`; this bundle shape is the
   transient view `extract` materializes from the store, not a produced file.)
-- `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
+- `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
+  message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
   (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
   across committer timezones.
+  **People identity (#78):** `author` is the author's **GitHub login** — the same key PR, issue,
+  review and comment records use — so one person is one `people` entry. `gather.resolve_commit_authors`
+  resolves it from real data, in order: the commits-list API's `author.login` for that SHA
+  (`login_source: "commits_api"`), then a `users.noreply.github.com` author email
+  (`<id>+<login>@…` or `<login>@…`; `login_source: "noreply_email"`; the spelling of a PR/issue
+  login that differs only in case wins). The PR author is never assumed. `author_name` is the
+  git author name (`%an`). When neither source resolves it, `login_resolved` is `false`, there is
+  no `login_source`, and `author` is the git name — suffixed `" (git)"` when the name could itself
+  be a login (`derive.unresolved_person_key`), so an unresolved name never equals, and is never
+  merged with, a real login. The author email is read only to resolve the login and is **not
+  stored**. `code_events[].author` / `symbol_events[].author` carry the same resolved value.
+  Bundles gathered before #78 have no `author_name`/`login_resolved` and keep the git name in
+  `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
@@ -365,6 +379,10 @@ review's state to `DISMISSED`.
   activity counts across the window's commits.
 - **people[].modules / people[].areas** — the areas a person authored (their
   commits' files) or reviewed (their reviewed PRs' areas).
+- **people{}** keys are GitHub logins (see `commits[].author`). An entry keyed by an
+  unresolved commit author's git name carries `login_resolved: false` (absent on every
+  other entry); `is_bot` also recognises git-name forms (`GitHub Actions`, `Dependabot`,
+  `Renovate Bot`, a `[bot]` name, and those with the `" (git)"` suffix).
 - **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
 - **Symbol/comment artifacts** carry `before`/`after`/`detail` on feature_deltas
@@ -405,7 +423,7 @@ review's state to `DISMISSED`.
 
 These are **enrich-time projections** computed by `link.enrich` over the
 materialized bundle (siblings of `forecast`/`modules`) — not stored person-node
-data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
+data. The stored `people` projection (`{modules, areas, is_bot[, login_resolved:false]}`) is unchanged;
 `enrich` MERGES the profile fields onto it.
 
 - **people[]** — each `{login: {...}}` entry, in addition to its stored

@@ -364,6 +364,28 @@ def attribute_people_areas(bundle, idx):
 import re as _re
 
 _BOT_EXACT = {"github-actions", "microsoft-github-policy-service"}
+# Name forms (#78): an UNRESOLVED commit author is keyed by its git `%an`, which for
+# automation is often a display name rather than the App login. Compared lower-cased
+# with whitespace collapsed.
+_BOT_NAMES = {"github actions", "dependabot", "dependabot preview", "renovate",
+              "renovate bot"}
+
+# People identity (#78). A commit author gather could NOT resolve to a GitHub login
+# keeps its git name as the person key; when that name could itself be a login
+# (letters/digits/hyphens, optional `[bot]`) this suffix is appended, so an
+# unresolved name can never equal — and be silently merged with — a real login.
+# A name that cannot be a login (a space, a dot, ...) is already disjoint.
+UNRESOLVED_NAME_SUFFIX = " (git)"
+_LOGIN_SHAPED_RE = _re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$")
+
+
+def unresolved_person_key(name):
+    """The person key for a commit author whose login is unknown: the git name,
+    suffixed with UNRESOLVED_NAME_SUFFIX when it is login-shaped. Pure."""
+    if name and _LOGIN_SHAPED_RE.match(name):
+        return name + UNRESOLVED_NAME_SUFFIX
+    return name
 _BOT_RE = _re.compile(
     r"""(?ix)
     ^ (?:
@@ -376,11 +398,16 @@ _BOT_RE = _re.compile(
 
 
 def is_bot_login(login):
-    """True when `login` is an automation account (tagged, never dropped). Pure."""
+    """True when `login` is an automation account (tagged, never dropped). Also
+    recognises the git-name forms an unresolved commit author is keyed by
+    (`GitHub Actions`, `Dependabot`, `github-actions (git)`). Pure."""
     if not login:
         return False
+    if login.endswith(UNRESOLVED_NAME_SUFFIX):
+        login = login[:-len(UNRESOLVED_NAME_SUFFIX)]
     low = login.lower()
-    return low in _BOT_EXACT or bool(_BOT_RE.match(login))
+    return (low in _BOT_EXACT or " ".join(low.split()) in _BOT_NAMES
+            or bool(_BOT_RE.match(login)))
 
 
 def enumerate_participants(bundle, idx=None):
@@ -397,6 +424,13 @@ def enumerate_participants(bundle, idx=None):
     empty `modules`/`areas`. Every login is bot-tagged via `is_bot_login` — tagged,
     not dropped, so no "who" is ever lost.
 
+    People identity (#78): a commit's `author` is already the GitHub login when
+    gather resolved it. A commit gather could NOT resolve (`login_resolved` is
+    False) is keyed by its git name (see `unresolved_person_key`, so the key never
+    equals a login) and that person carries `login_resolved: False`; the key is
+    omitted otherwise (resolved logins, and commits from bundles gathered before
+    #78, which carry no flag).
+
     The CALLER must have run `attach_commit_prs` on the bundle's commits first (so
     commit->PR mapping is present, mirroring enrich / the carol fix); both
     `gather.fold_bundle` and `validate.no_drift` do exactly that on a copy. Pure.
@@ -411,7 +445,7 @@ def enumerate_participants(bundle, idx=None):
 
     out = {}
 
-    def add(login):
+    def add(login, unresolved=False):
         if not login:
             return
         if login not in out:
@@ -421,6 +455,8 @@ def enumerate_participants(bundle, idx=None):
                 "areas": sorted(rec.get("areas") or []),
                 "is_bot": is_bot_login(login),
             }
+        if unresolved:
+            out[login]["login_resolved"] = False
 
     for pr in bundle.get("prs", []):
         add(pr.get("author"))
@@ -434,7 +470,7 @@ def enumerate_participants(bundle, idx=None):
         for c in iss.get("comments_list") or []:
             add(c.get("author"))
     for c in bundle.get("commits", []):
-        add(c.get("author"))
+        add(c.get("author"), unresolved=c.get("login_resolved") is False)
     return out
 
 

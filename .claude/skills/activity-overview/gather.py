@@ -74,7 +74,10 @@ def parse_git_log(raw):
     """Parse `git log` output formatted with RECORD_SEP/FIELD_SEP separators.
 
     Each record: <sha>\x1f<parents>\x1f<author>\x1f<date>\x1f<subject> followed by
-    newline-separated file paths. Returns a list of commit dicts.
+    newline-separated file paths. Returns a list of commit dicts. When the record
+    carries a sixth field (the author email, `%ae`, COMMIT_WALK_ARGS) it is kept as
+    a TRANSIENT `author_email` key: `resolve_commit_authors` reads it to find the
+    author's GitHub login and removes it, so no email reaches the bundle (#78).
     """
     commits = []
     for chunk in raw.split(RECORD_SEP):
@@ -88,7 +91,7 @@ def parse_git_log(raw):
         # `--name-only` paths: C-quoted ones (quote/backslash/control chars, or
         # non-ASCII without core.quotepath=false) are unquoted.
         files = [unquote_git_path(ln) for ln in lines[1:] if ln.strip()]
-        commits.append({
+        commit = {
             "sha": sha,
             "parents": parents.split() if parents.strip() else [],
             "author": author,
@@ -96,7 +99,10 @@ def parse_git_log(raw):
             "message": subject,
             "files": files,
             "pr": None,  # resolved in link.py
-        })
+        }
+        if len(fields) > 5:
+            commit["author_email"] = fields[5].strip()
+        commits.append(commit)
     return commits
 
 
@@ -110,7 +116,11 @@ CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
 # shared with the real-repo tests so they exercise the exact commands. Paths in
 # their output are made comparable by run_git (core.quotepath=false) plus
 # unquote_git_path in each parser.
-COMMIT_WALK_ARGS = (f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+# The commit walk alone also asks for the author email (`%ae`, appended LAST so the
+# shared five-field header parses unchanged); it is only used to resolve the
+# author's GitHub login and is never stored (#78).
+COMMIT_LOG_FORMAT = CODE_LOG_FORMAT + "%x1f%ae"
+COMMIT_WALK_ARGS = (f"--pretty=format:{COMMIT_LOG_FORMAT}", "--date=short",
                     "--name-only")
 CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
                   "--name-status", "-M", "-C")
@@ -808,6 +818,100 @@ def attach_commit_prs(commits):
     for c in commits:
         c["pr"] = resolve_commit_pr(c.get("message", ""))
     return commits
+
+
+# --- People identity (#78): commit author -> GitHub login --------------------
+#
+# PR/issue/review participants are GitHub LOGINS; git gives a commit author only
+# as a free-text NAME (`%an`) and an email (`%ae`). Each commit's author is
+# resolved to a login from real data, in this order:
+#   1. the commits-list API's `author.login` for that SHA (GitHub's own link of the
+#      commit email to an account) — `login_source: "commits_api"`;
+#   2. a `users.noreply.github.com` author email, which embeds the login
+#      (`<id>+<login>@…`, or the older `<login>@…`) — `login_source: "noreply_email"`;
+#   3. otherwise the git name, flagged `login_resolved: false` and keyed by
+#      `derive.unresolved_person_key` so it can never equal (merge with) a login.
+# The PR author is NOT assumed to be the commit author: no guessing.
+
+_NOREPLY_EMAIL_RE = re.compile(
+    r"^(?:\d+\+)?([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?)"
+    r"@users\.noreply\.github\.com$", re.IGNORECASE)
+
+
+def login_from_noreply_email(email):
+    """The GitHub login embedded in a `users.noreply.github.com` email, or None.
+    Pure."""
+    m = _NOREPLY_EMAIL_RE.match((email or "").strip())
+    return m.group(1) if m else None
+
+
+def commit_logins_from_api(items):
+    """{sha: login} from commits-list API items (`author.login`; `author` is null
+    when GitHub links the commit email to no account — those are skipped). Pure."""
+    out = {}
+    for it in items or []:
+        login = ((it or {}).get("author") or {}).get("login")
+        if it.get("sha") and login:
+            out[it["sha"]] = login
+    return out
+
+
+def commits_api_url(api, head_sha, frm, to):
+    """The commits-list listing for the walked history: from the clone's HEAD,
+    bounded to the window widened by one day each side (git dates are in the
+    committer's own timezone; the SHA join discards anything extra). Pure."""
+    query = urllib.parse.urlencode([
+        ("sha", head_sha),
+        ("since", _shift_date(frm, -1)[:10] + "T00:00:00Z"),
+        ("until", _shift_date(to, 1)[:10] + "T23:59:59Z"),
+        ("per_page", "100"),
+    ], safe=":")
+    return f"{api}/commits?{query}"
+
+
+def resolve_commit_authors(commits, api_logins, known_logins=()):
+    """Resolve each commit's `author` to a GitHub login, in place (#78).
+
+    Sets `author` (the login, or the unresolved person key), `author_name` (the
+    git `%an`), `login_resolved` and, when resolved, `login_source`; removes the
+    transient `author_email`. A noreply-email login takes the spelling of a
+    `known_logins` entry that differs only in case (GitHub logins are
+    case-insensitive). Returns {sha: author} so the code/symbol events of the
+    same commits can be re-keyed (`remap_event_authors`). Deterministic."""
+    by_lower = {}
+    for login in sorted(k for k in known_logins if k):
+        by_lower.setdefault(login.lower(), login)
+    out = {}
+    for c in commits:
+        name = c.get("author_name", c.get("author")) or ""
+        email = c.pop("author_email", None)
+        login, source = api_logins.get(c.get("sha")), "commits_api"
+        if not login:
+            login, source = login_from_noreply_email(email), "noreply_email"
+            if login:
+                login = by_lower.get(login.lower(), login)
+        c["author_name"] = name
+        if login:
+            c["author"] = login
+            c["login_resolved"] = True
+            c["login_source"] = source
+        else:
+            c["author"] = derive.unresolved_person_key(name)
+            c["login_resolved"] = False
+            c.pop("login_source", None)
+        if c.get("sha"):
+            out[c["sha"]] = c["author"]
+    return out
+
+
+def remap_event_authors(events, by_sha):
+    """Re-key code/symbol events' `author` to their commit's resolved author, in
+    place, so artifact lifecycle credit lands on the same person as the commit.
+    Events of a commit not in `by_sha` keep their git name. Pure otherwise."""
+    for ev in events:
+        if ev.get("commit") in by_sha:
+            ev["author"] = by_sha[ev["commit"]]
+    return events
 
 
 def parse_timeline_crossrefs(raw_timeline):
@@ -3979,6 +4083,28 @@ def acquire(args, env):
         # native issue type when the repo uses them (acquire fetches it per issue
         # in the existing issue loop — see Step 3a); the classifier is pure.
         issue["kind"] = classify_issue_kind(issue, label_taxonomy, types_present)
+
+    # People identity (#78): resolve each commit author (git name) to the GitHub
+    # login PR/issue/review records use, so one person is one key. One paginated
+    # commits-list listing (ceil(commits / 100) REST calls, none for an empty
+    # window) joined on SHA; then the noreply email; else flagged unresolved.
+    # Code/symbol events are re-keyed to the same author.
+    if commits:
+        head = clone_head_sha(clone_dir)
+        api_items = fetch_all(get_page, commits_api_url(api, head, frm, to)) \
+            if head else []
+        known = set()
+        for it in prs + issues:
+            known.add(it.get("author"))
+            known.add(it.get("merged_by"))
+            known.update(it.get("reviewers") or [])
+            for c in (it.get("comments_list") or []) + (it.get("review_comments") or []):
+                known.add(c.get("author"))
+        known.discard(None)
+        by_sha = resolve_commit_authors(
+            commits, commit_logins_from_api(api_items), known)
+        remap_event_authors(code_events, by_sha)
+        remap_event_authors(symbol_events, by_sha)
 
     workflows = []
     workflow_stats = {}
