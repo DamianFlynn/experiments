@@ -234,3 +234,22 @@ def load_manifest(path):
 def member_slugs(manifest):
     """The set of 'owner/repo' slugs for a (loaded) manifest dict."""
     return {"{}/{}".format(r["owner"], r["repo"]) for r in manifest.get("repos", [])}
+
+
+def slug_index(slugs):
+    """{lowercased 'owner/repo': canonical spelling} for a set of slugs (issue
+    #70). GitHub names compare case-insensitively, so lookups go through the
+    lowercased key while node ids keep the canonical (manifest) spelling.
+    load_manifest already refuses two members that differ only in case; for any
+    other input the lexicographically first spelling wins (deterministic)."""
+    out = {}
+    for slug in sorted(slugs or ()):
+        out.setdefault(slug.lower(), slug)
+    return out
+
+
+def canonical_slug(slug, index):
+    """The canonical spelling of `slug` in a `slug_index`, or None if absent."""
+    if not slug:
+        return None
+    return index.get(slug.lower())

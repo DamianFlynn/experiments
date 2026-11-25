@@ -430,11 +430,13 @@ def parse_qualified_refs(text):
     `/pull/` URL, and an unkeyworded list-tail qualified ref
     (`Fixes a/b#1, a/b#2` -> #2) -> kind 'cross_ref' (is_pr True for /pull/).
     Bare `#N` is left to parse_closing_refs (same-repo). Same-repo qualified refs
-    are returned too; callers skip them by slug. Pure."""
+    are returned too; callers skip them by slug. Dedupe is case-insensitive on
+    owner/repo (GitHub names are, issue #70); the first spelling seen is kept.
+    Pure."""
     out, seen = [], set()
 
     def add(owner, repo, num, kind, is_pr):
-        key = (owner, repo, num)
+        key = (owner.lower(), repo.lower(), num)
         if key not in seen:
             seen.add(key)
             out.append({"owner": owner, "repo": repo, "number": num,
@@ -765,18 +767,21 @@ def parse_timeline_crossrefs(raw_timeline):
 def parse_timeline_xrefs(raw_timeline, current_slug):
     """Cross-REPO timeline cross-references (Phase 9): cross-referenced events
     whose source issue/PR lives in a DIFFERENT repo than `current_slug`
-    ('owner/repo'). Same-repo refs are left to parse_timeline_crossrefs. Returns
+    ('owner/repo'). Same-repo refs are left to parse_timeline_crossrefs. Repo
+    comparison and dedupe are case-insensitive (the API's canonical `full_name`
+    may differ in case from the manifest / --owner spelling, issue #70). Returns
     ordered, deduped [{owner, repo, number, kind='cross_ref', is_pr}]. Pure."""
     out, seen = [], set()
+    current = (current_slug or "").lower()
     for ev in raw_timeline or []:
         if ev.get("event") != "cross-referenced":
             continue
         src = (ev.get("source") or {}).get("issue") or {}
         full = ((src.get("repository") or {}).get("full_name")) or ""
         num = src.get("number")
-        if not full or full == current_slug or num is None:
+        if not full or full.lower() == current or num is None:
             continue
-        key = (full, num)
+        key = (full.lower(), num)
         if key in seen:
             continue
         seen.add(key)
@@ -3102,6 +3107,30 @@ def parse_project_board(board_nodes):
     return sprints, items_by_ref
 
 
+def _board_index(items_by_ref, slug):
+    """{number: facts} for the board items of repo `slug`, matching the board's
+    `nameWithOwner` case-insensitively (issue #70: the manifest / --owner
+    spelling need not match the API's canonical case). Should two spellings of
+    one item ever appear they merge like parse_project_board does (first non-None
+    status / sprint_id wins), in sorted key order so the result is deterministic.
+    Returns fresh dicts; `items_by_ref` is not mutated. Pure."""
+    want = (slug or "").lower()
+    out = {}
+    for key in sorted(items_by_ref, key=lambda k: (k[0] or "", k[1])):
+        repo_slug, number = key
+        if (repo_slug or "").lower() != want:
+            continue
+        facts = items_by_ref[key]
+        cur = out.get(number)
+        if cur is None:
+            out[number] = dict(facts)
+        else:
+            for k in ("status", "sprint_id"):
+                if cur.get(k) is None:
+                    cur[k] = facts.get(k)
+    return out
+
+
 # A linked Projects v2 board left untouched for this long is treated as
 # deprecated-but-not-removed and skipped (overridable via the env var).
 BOARD_STALE_DAYS = 365
@@ -3728,9 +3757,9 @@ def acquire(args, env):
             if overlaps:
                 kept[sid] = s
         sprints = kept
-        slug = f"{owner}/{repo}"
+        board = _board_index(items_by_ref, f"{owner}/{repo}")
         for it in prs + issues:
-            facts = items_by_ref.get((slug, it.get("number")))
+            facts = board.get(it.get("number"))
             if not facts:
                 continue
             if facts.get("status") is not None:
@@ -3989,22 +4018,30 @@ def _cross_repo_pr_edges(pr, project, current_repo, members):
       - a ref to a MEMBER repo -> an edge tuple (src_pid, dst_id, kind, None, None)
         where kind is 'closes'/'cross_ref' and dst is the target repo's issue/pr;
       - a ref to a NON-member repo -> an external_refs dict {repo, number, kind}.
-    Same-repo refs are skipped (the bare-#N path already covers them). Pure."""
+    Same-repo refs are skipped (the bare-#N path already covers them).
+
+    Repo slugs compare case-insensitively (issue #70): a ref in any spelling of
+    the current repo is same-repo, and a member ref's edge targets the member's
+    CANONICAL (manifest) spelling, so ids never fork into two id spaces.
+    External refs keep the spelling they were written with. Pure."""
     pid = graphstore.qualify_id(project, current_repo, "pr-{}".format(pr["number"]))
     text = (pr.get("title", "") or "") + "\n" + (pr.get("body") or "")
     refs = parse_qualified_refs(text) + list(pr.get("timeline_xrefs") or [])
+    index = manifest_mod.slug_index(members)
+    current = (current_repo or "").lower()
     edges, external, seen = [], [], set()
     for r in refs:
         slug = "{}/{}".format(r["owner"], r["repo"])
-        if slug == current_repo:
+        if slug.lower() == current:
             continue
         local = ("pr-" if r.get("is_pr") else "issue-") + str(r["number"])
-        key = (slug, local, r["kind"])
+        key = (slug.lower(), local, r["kind"])
         if key in seen:
             continue
         seen.add(key)
-        if slug in members:
-            edges.append((pid, graphstore.qualify_id(project, slug, local),
+        member = manifest_mod.canonical_slug(slug, index)
+        if member is not None:
+            edges.append((pid, graphstore.qualify_id(project, member, local),
                           r["kind"], None, None))
         else:
             external.append({"repo": slug, "number": r["number"], "kind": r["kind"]})
@@ -4041,19 +4078,39 @@ def parse_registry_source(src):
 
 def resolve_registry_member(src, project, members, registry_by_slug):
     """Resolve a registry source to a member's root-area qualified id, or None.
-    Exact (manifest `registry` equals `src`) wins over the HashiCorp naming
-    convention (`namespace/name/provider` -> `{namespace}/terraform-{provider}-{name}`).
-    Pure. Case-sensitive; the convention assumes a lowercase provider (GitHub slugs are case-sensitive)."""
-    for slug in sorted(members):                       # exact, deterministic
-        if src and registry_by_slug.get(slug) == src:
-            return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+    Exact (the manifest `registry` names the same module as `src`) wins over the
+    HashiCorp naming convention (`namespace/name/provider` ->
+    `{namespace}/terraform-{provider}-{name}`).
+
+    Both sides are normalised (issue #70): through parse_registry_source, which
+    strips a registry host and a `//submodule` suffix, then compared
+    case-insensitively (registry addresses and GitHub slugs are). A manifest
+    `registry` value that does not parse as a registry address still matches an
+    identical (case-insensitive) raw `src`. The returned id uses the member's
+    manifest spelling. Pure, deterministic (members tried in sorted order)."""
+    if not src:
+        return None
+    registry_by_slug = registry_by_slug or {}
     parsed = parse_registry_source(src)
+    want = tuple(p.lower() for p in parsed) if parsed else None
+    for slug in sorted(members):                       # exact, deterministic
+        reg = registry_by_slug.get(slug)
+        if not reg:
+            continue
+        reg_parsed = parse_registry_source(reg)
+        if reg_parsed is not None:
+            if want is not None and tuple(p.lower() for p in reg_parsed) == want:
+                return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+        elif reg.lower() == src.lower():
+            return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
     if parsed is None:
         return None
     namespace, name, provider = parsed
-    slug = "{}/terraform-{}-{}".format(namespace, provider, name)
-    if slug in members:
-        return graphstore.qualify_id(project, slug, _ROOT_AREA_LOCAL)
+    member = manifest_mod.canonical_slug(
+        "{}/terraform-{}-{}".format(namespace, provider, name),
+        manifest_mod.slug_index(members))
+    if member is not None:
+        return graphstore.qualify_id(project, member, _ROOT_AREA_LOCAL)
     return None
 
 

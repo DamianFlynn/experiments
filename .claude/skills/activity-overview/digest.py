@@ -401,7 +401,10 @@ def main(argv=None):
         pattern = _DEFAULT_TICKET_RE
     conn = graphstore.open_store(args.store)
     try:
-        repos = args.repos or graphstore.project_repos(conn, args.project)
+        # --repo in any casing selects the stored member (issue #70).
+        repos = ([graphstore.resolve_repo(conn, args.project, r)
+                  for r in args.repos] if args.repos
+                 else graphstore.project_repos(conn, args.project))
         view = build_project_view(conn, args.project, repos,
                                   args.ts_from, args.ts_to, ticket_pattern=pattern)
     finally:

@@ -477,6 +477,19 @@ byte-unchanged (`project = owner`, `repo = <name>`).
   is a host (a dot, e.g. `github.com/org/repo`) is VCS shorthand, never resolved.
   Resolution only runs in a multi-repo fold (`members` + `registry_by_slug` present);
   single-repo folds emit intra-repo edges only.
+- **Repo slugs and registry sources compare case-insensitively** (GitHub names and
+  registry addresses are). Ids keep the **manifest's spelling**
+  (`{project}/{owner}/{repo}#…`); only comparison/lookup is normalised, mapping any
+  spelling to that canonical slug (`manifest.slug_index`), so two spellings never
+  make two id spaces and no store migration is needed. This covers qualified refs,
+  timeline cross-refs (a same-repo ref in another case is not cross-repo), the
+  Projects v2 board lookup, and registry resolution, where **both** sides go through
+  `parse_registry_source` (host and `//submodule` stripped) before an exact or
+  convention match — `registry.terraform.io/azure/foo/azurerm//modules/bar` matches a
+  member declared with `registry: "Azure/foo/azurerm"`. Readers (`spotlight
+  dependents`, `digest --repo`, `view --repo`) accept any casing of a stored repo and
+  resolve it to the stored spelling (`graphstore.resolve_repo`). The **project**
+  name stays case-sensitive.
 
 **Terraform extraction, corrected for real modules.** A Terraform **root module is
 one area** — repo-root `*.tf` files (`main.tf`/`variables.tf`/`main.<topic>.tf`/…)
