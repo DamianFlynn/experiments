@@ -48,7 +48,11 @@ Each train in `bundle["trains"]` carries `significance`, `tier` (`"deep"`/`"ment
 - **MENTION trains** (`tier == "mention"`) collapse to one line:
   `- train-id — {title} — {outcome} ({PR count} PR(s))`.
 
-`render.py --train <id>` produces a spotlight flowchart on demand for any tier.
+`render.py <bundle> --train <id>` produces a spotlight flowchart on demand for any tier.
+
+Large windows: every diagram is capped (with a visible "+K more" marker) to stay inside
+Mermaid's limits. When `diagrams.truncated[<name or train id>]` is present, say so under the
+embedded diagram, e.g. *"Showing 200 of 700 PRs."* (`shown` of `total` `unit`).
 
 ### Per-train narration (sub-agent pass)
 For EACH deep train, fill its `<!-- narrative: <train-id> -->` slot with a sourced narrative

@@ -125,7 +125,10 @@ docsRefs, release_train, sprints, project, diagrams`.
   map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written by `render.py` (one adaptive
   Mermaid `flowchart` per DEEP train; mode C with code-area annotation nodes when
   `len(prs) ≤ TRAIN_FLOW_MAX_PRS` and `len(distinct code_areas) ≤ TRAIN_FLOW_MAX_AREAS`, else
-  mode A bare chain). On-demand spotlight render via `render.py --train <id>` (any tier).
+  mode A bare chain). On-demand spotlight render via `render.py <bundle> --train <id>` (any
+  tier). **`diagrams.truncated`** maps each diagram that hit a size cap (flat key or train
+  id) to `{ shown:int, total:int, unit:"PRs"|"releases"|"PRs+releases"|"events"|"edges"|"kinds" }`;
+  it is `{}` when nothing was cut (caps and ranking keys: `docs/LLD.md` §7).
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
   train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
   — forward-only next-release forecast over `buckets.next_candidates`, sorted by score

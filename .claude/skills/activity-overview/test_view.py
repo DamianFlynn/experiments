@@ -255,8 +255,8 @@ class TestEndToEnd(_TmpCase):
         base = os.path.dirname(diagrams)
         self.assertTrue(rendered["diagrams"])
         for name, rel in rendered["diagrams"].items():
-            if name == "train_flowcharts":
-                continue
+            if not isinstance(rel, str):
+                continue          # nested maps: train_flowcharts, truncated
             self.assertTrue(rel.startswith("diagrams/"), rel)
             self.assertTrue(os.path.isfile(os.path.join(base, rel)), rel)
 

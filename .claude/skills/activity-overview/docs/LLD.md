@@ -53,7 +53,7 @@
 | `derive.py` | 738 | Pure projections shared by write and read paths (artifacts, people, flow, halls) | — | — |
 | `link.py` | 1,116 | `enrich`: trains, buckets, timeline, deltas, areas, significance, effort, forecast; `--slice`, `--series` | — | — |
 | `series.py` | 132 | Pure installment snapshot + comparison | — | — |
-| `render.py` | 610 | Mermaid emitters + `mmdc` validation | — | — |
+| `render.py` | 1,010 | Mermaid emitters (size-capped) + `mmdc` validation | — | — |
 | `validate.py` | 907 | Trust gate (audits) | — | — |
 | `spotlight.py` | 1,685 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
 | `digest.py` | 414 | Multi-repo project view | — | — |
@@ -642,22 +642,51 @@ bundles in chronological order.
 ## 7. Present — `render.py`
 
 `render.py BUNDLE [--diagrams-dir workspace/diagrams] [--export svg|png] [--skip-validate] [--train ID]`.
+The bundle is always required (`render.py BUNDLE --train ID` for a spotlight). An unknown
+`--train` id is a clean usage error (exit 2, nothing written), like `link.py --slice`.
+`--export` runs `mmdc` and therefore always validates; combining it with `--skip-validate`
+is rejected (exit 2).
 
-| Diagram key | Emitter | Mermaid type |
-|---|---|---|
-| `buckets_pie` | `emit_buckets_pie` | pie |
-| `timeline_gantt` | `emit_timeline_gantt` | gantt |
-| `content_timeline` | `emit_content_timeline` | timeline |
-| `deltas_bar` | `emit_deltas_bar` | xychart-beta |
-| `contributor_graph` | `emit_contributor_graph` | flowchart |
-| `kind_breakdown` | `emit_kind_breakdown` | pie |
-| `module_graph` | `emit_module_graph` | flowchart |
-| `blocker_graph` | `emit_blocker_graph` (≤ 40 edges) | flowchart |
-| `train_flowcharts{id}` | `emit_train_flowchart` (deep trains) | flowchart; mode C with area nodes when ≤ `TRAIN_FLOW_MAX_PRS` (4) PRs and ≤ `TRAIN_FLOW_MAX_AREAS` (5) areas, else mode A chain |
-| project module graph | `emit_project_module_graph(module_edges)` | flowchart (used by digest reports) |
+| Diagram key | Emitter | Mermaid type | Cap (top-N key) and "+K more" marker |
+|---|---|---|---|
+| `buckets_pie` | `emit_buckets_pie` | pie | fixed size (≤ 4 slices) |
+| `timeline_gantt` | `emit_timeline_gantt` | gantt | `GANTT_MAX_PRS` (200) most recently created PRs (created_at desc, number desc), drawn chronologically, plus a `+K more PRs not shown` row; `GANTT_MAX_RELEASES` (30) latest releases |
+| `content_timeline` | `emit_content_timeline` | timeline | latest `TIMELINE_MAX_DAYS` (40) dates (an `earlier : +K more events on M earlier dates` period replaces the rest); first `TIMELINE_MAX_EVENTS_PER_DAY` (8) events per date in bundle order, then `+K more events` |
+| `deltas_bar` | `emit_deltas_bar` | xychart-beta | fixed size (3 bars) |
+| `contributor_graph` | `emit_contributor_graph` | flowchart | `GRAPH_MAX_EDGES` (120) edges, breadth-first: key = (area's position in the person's list, login, area), so every contributor keeps an edge first; `+K more edges not shown` node |
+| `kind_breakdown` | `emit_kind_breakdown` | pie | `PIE_MAX_SLICES` (10): largest kinds (count desc, name), the last slice `+K more kinds` sums the rest |
+| `module_graph` | `emit_module_graph` | flowchart | `GRAPH_MAX_EDGES` (120) edges by target in-degree desc (blast-radius hubs first), then src, dst, label; `+K more edges not shown` node |
+| `blocker_graph` | `emit_blocker_graph` | flowchart | `BLOCKER_MAX_EDGES` (40) edges in (blocker, blocked) order; `+K more blocked` node |
+| `train_flowcharts{id}` | `emit_train_flowchart` (deep trains) | flowchart; mode C with area nodes when ≤ `TRAIN_FLOW_MAX_PRS` (4) PRs and ≤ `TRAIN_FLOW_MAX_AREAS` (5) areas, else mode A chain | `TRAIN_FLOW_MAX_PR_NODES` (60) PRs in the train's `prs` order; the rest collapse into one `+K more PRs not shown` node in the chain |
+| project module graph | `emit_project_module_graph(module_edges, notes=None)` | flowchart (used by digest reports) | as `module_graph` |
 
-Every emitted file is compiled with `mmdc` unless `--skip-validate`; a non-compiling diagram
-fails the run. Paths are recorded in `bundle.diagrams`.
+**Size limits.** Mermaid (mmdc 12.2.0, default config) has two hard limits, recorded as
+`MERMAID_MAX_TEXT` = 50,000 characters (JS string length) and `MERMAID_MAX_EDGES` = 500. Above
+the text limit mmdc exits **0** and writes an error SVG ("Maximum text size in diagram
+exceeded"); above the edge limit it exits 1 ("Edge limit exceeded"). The caps above keep every
+diagram below both (≤ 122 edges; estimated worst case ≈ 35k characters with 40-char labels;
+a 700-PR / 800-edge / 1,500-event test bundle renders at ≤ 20k); in addition each capped
+emitter re-renders with all its caps scaled by 0.75 until the text fits `DIAGRAM_TEXT_BUDGET`
+(40,000), which only matters for pathological labels (e.g. many emoji, which count double).
+Caps are deterministic: the same bundle always yields the same diagram. What was cut is
+recorded in `bundle.diagrams.truncated` (`{name|train-id: {shown, total, unit}}`, `{}` when
+nothing was cut) and printed as `note: … capped` lines, so the report can say so.
+
+**Node ids** come from `_stable_node_id(prefix, text)`: `<prefix>_<text>` when the text is
+1–32 ASCII letters/digits (`p_alice`, `pr_42`), else `<prefix>_<sanitised head ≤ 24>_<sha1[:8]>`,
+so `a-b` / `a/b` / `a_b` and long paths sharing a prefix stay distinct; a per-diagram
+`_NodeIds` allocator also resolves any hash clash with a `_2`, `_3` suffix. The old
+`_node_id` (sanitise + 60-char cut, which merged such nodes) is gone.
+
+**Validation.** Every emitted file is compiled with `mmdc` unless `--skip-validate`; a
+non-compiling diagram fails the run (exit 1). A diagram fails when mmdc exits non-zero, when it
+writes no output, or when the SVG it writes with exit 0 is Mermaid's error diagram ("Syntax
+error in text", "Maximum text size in diagram exceeded", `aria-roledescription="error"`); a
+source longer than `MERMAID_MAX_TEXT` is rejected before mmdc runs. Each diagram is compiled to
+a temporary SVG first; `--export svg` copies that checked SVG beside the `.mmd`, `--export png`
+then runs mmdc again for the PNG. `ACTIVITY_MMDC_PUPPETEER_CONFIG` names a puppeteer config
+passed as `mmdc -p`; without it, a run as root gets a generated `--no-sandbox` config (Chrome
+will not start sandboxed as root). Paths are recorded in `bundle.diagrams`.
 
 ## 8. Trust — `validate.py`
 
@@ -760,6 +789,7 @@ diff-stable.
 | `TF_PLUGIN_CACHE_DIR` | unset | Shared terraform provider cache (enables serial pre-warm) |
 | `ACTIVITY_BOARD_STALE_DAYS` | 365 | Board treated as deprecated beyond this |
 | `ACTIVITY_BOARD_MAX_ITEMS` | 5000 | Per-board item cap |
+| `ACTIVITY_MMDC_PUPPETEER_CONFIG` | unset | Puppeteer config file passed to `mmdc -p` (as root without it: generated `--no-sandbox` config) |
 
 **Code constants** (change deliberately; tests pin many of them)
 
@@ -775,6 +805,12 @@ diff-stable.
 | `SLICE_TEXT_CAP` / `SLICE_COMMENTS_KEPT` / `SLICE_DIFF_CAP` | 1500 / 6 / 6000 | link |
 | Flow thresholds | stale 30 d, upvotes 5, comments 5, hung 60 d | derive |
 | `TRAIN_FLOW_MAX_PRS` / `_AREAS` | 4 / 5 | render |
+| `MERMAID_MAX_TEXT` / `MERMAID_MAX_EDGES` | 50,000 / 500 (Mermaid's defaults, verified with mmdc 12.2.0) | render |
+| `DIAGRAM_TEXT_BUDGET` | 40,000 | render |
+| `GRAPH_MAX_EDGES` / `BLOCKER_MAX_EDGES` | 120 / 40 | render |
+| `GANTT_MAX_PRS` / `GANTT_MAX_RELEASES` | 200 / 30 | render |
+| `TIMELINE_MAX_DAYS` / `TIMELINE_MAX_EVENTS_PER_DAY` | 40 / 8 | render |
+| `TRAIN_FLOW_MAX_PR_NODES` / `PIE_MAX_SLICES` | 60 / 10 | render |
 | `DEFAULT_AREA_PATTERNS` | §4.5 | gather |
 
 ## 14. Cross-cutting concerns
