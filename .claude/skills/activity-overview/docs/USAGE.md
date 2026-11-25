@@ -337,9 +337,13 @@ python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
   `avm/ptn/network/hub-networking`, `avm/ptn/alz`. Single-repo gather.
 - **Areas:** one area per module (the `avm` pattern), so shipped-by-area, module ownership and
   feature deltas are per module.
-- **Dependencies:** with the `bicep` CLI installed, `br/public:avm/res/...` references resolve
-  to the in-repo module areas (ptn → res). Edges are built for modules **changed in the
-  window**; untouched modules have no edges that month.
+- **Dependencies:** `br/public:avm/res/...` references resolve to the in-repo module areas
+  (ptn → res). Gather with **`--structural-iac`** to get the whole module graph: every
+  module's direct references are read statically from its `main.bicep` (no `bicep` CLI
+  needed, about 0.2 s per 1,000 modules), so modules nobody touched that month still have
+  their edges and their consumers. With the `bicep` CLI the in-window modules also get
+  transitive edges from the build. Without the flag, edges exist only for modules **changed
+  in the window**, and only when `bicep` is installed.
 - **Cost:** BRM is very busy and every run fetches *all* open PRs and issues with per-item
   calls. Expect a long, API-heavy gather; run it once per month, consider
   `--no-workflows` if you don't need the CI-health section, and watch for 403 rate-limit
@@ -349,8 +353,13 @@ python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
 ```bash
 S=~/activity/avm-bicep; mkdir -p $S/stores
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
-  --store $S/stores/$M.db --clone-dir $S/clone
+  --store $S/stores/$M.db --clone-dir $S/clone --structural-iac
 python3 $AO/validate.py $S/stores/$M.db --project Azure --repo bicep-registry-modules
+
+# blast radius of one module inside the monorepo: which modules consume it (direct, then
+# transitive). Needs the --structural-iac gather above.
+python3 $AO/spotlight.py dependents Azure/bicep-registry-modules::avm/res/network/virtual-network \
+  --store $S/stores/$M.db --project Azure --md
 
 # module biographies: this month's store covers this month; for longer history use a
 # history store built from ONE wide-window gather (see §8)
@@ -449,8 +458,10 @@ python3 $AO/spotlight.py module avm/ptn/ai-ml/landing-zone --store ~/activity/av
 
 Ask Claude for one *AI landing zone* report from both: the `ai-lz` project view (Terraform +
 docs/portal community activity, cross-repo trains, blast radius of the composed modules) and
-the BRM module slice (Bicep pattern changes). Remember that **cross-repo Bicep dependencies
-are not resolved** — the Bicep side's dependencies are the in-BRM ones.
+the BRM module slice (Bicep pattern changes). The Bicep side's dependencies are the in-BRM
+ones (both the pattern and the modules it composes live in BRM). Cross-repo Bicep
+dependencies are resolved only inside one manifest, from a member that references
+`br/public:` modules to a BRM member declared with `bicep_registry_prefix` (see §7.5).
 
 To refresh the Terraform member list from the index instead of hand-authoring:
 `manifest_from_index.py --avm ptn --avm res --project ai-lz --from … --to … --name-contains aiml`
@@ -489,6 +500,40 @@ Blast radius before a networking change:
 python3 $AO/spotlight.py dependents Azure/terraform-azurerm-avm-res-network-azurefirewall \
   --store ~/activity/hub-lz/stores/$M.db --project hub-lz --md
 ```
+
+**An enterprise Bicep landing zone consuming AVM.** Put your landing-zone repo(s) and BRM in
+one manifest and declare on BRM the path prefix it publishes under in the public registry.
+Every `br/public:avm/...:<version>` (or `br:mcr.microsoft.com/bicep/avm/...`) reference in your
+repos then becomes a cross-repo `depends_on` to the BRM module area, with the pinned version:
+
+```json
+{
+  "project": "contoso-lz",
+  "window": { "from": "2026-11-01", "to": "2026-11-30" },
+  "repos": [
+    { "owner": "Contoso", "repo": "platform-landing-zone" },
+    { "owner": "Azure", "repo": "bicep-registry-modules", "bicep_registry_prefix": "avm/" }
+  ]
+}
+```
+
+```bash
+S=~/activity/contoso-lz; mkdir -p $S/stores $S/views
+python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones
+python3 $AO/validate.py $S/stores/$M.db --project contoso-lz
+# which of our modules pin this AVM module (and BRM's own consumers of it)
+python3 $AO/spotlight.py dependents Azure/bicep-registry-modules::avm/res/key-vault/vault \
+  --store $S/stores/$M.db --project contoso-lz --md
+```
+
+Manifest members always get the whole-tree scan, so modules that did not change in the
+window are included. Limits: only the **public** registry resolves — references through a
+private ACR (`br:<acr>.azurecr.io/...`), a template spec (`ts:`) or a `bicepconfig.json`
+alias stay unresolved (`to: null`); the scan reads each module's `main.bicep` only, so
+landing-zone modules whose entry file has another name are not scanned; and including BRM
+makes the gather as API-heavy as the §7.2 one (all its open PRs and issues are fetched).
+If BRM's gather fails, the edges still resolve (the targets become stand-in anchor nodes)
+but `validate` fails the project until `gather --resume` completes it.
 
 ### 7.6 Choosing store boundaries
 
@@ -538,7 +583,8 @@ One store per stream keeps commands simple and failures isolated.
 | One symbol's or file's lifecycle | `spotlight.py symbol <artifact-id> --store S --project P` (a file as `art:<path>` or `<path>`; a deleted file reads `removed`) |
 | Activity inside an area | `spotlight.py subsystem <area> --store S --project P --from F --to T` |
 | Full-text search | `spotlight.py grep 'breaking change' --store S --project P` (one argument: quote a multi-word phrase; it is matched literally, within `P` only) |
-| Blast radius (TF constellations) | `spotlight.py dependents <owner/repo> --store S --project P` |
+| Blast radius (members) | `spotlight.py dependents <owner/repo> --store S --project P` |
+| Blast radius (one module area, in-repo and cross-repo) | `spotlight.py dependents <owner/repo>::<area> --store S --project P` (gather single repos with `--structural-iac`) |
 | Project view for a formatter | `digest.py --store S --project P --from F --to T` (schema: `BUNDLE.md`) |
 | Ticket-linked related work | `digest.py … --manifest M` with `"ticket_prefixes": ["ABC"]` in the manifest, or `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (off by default: `related_work` is `[]`) |
 | Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`) |
@@ -601,7 +647,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" after upgrading | the store was folded before commit authors were resolved to logins (#78) | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
 | A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |
 | `edge_extraction` timeouts | slow `terraform init` / registry | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |
-| No module graph on a Bicep repo | `bicep` not installed, or no modules changed in window | install bicep; graph is window-scoped |
+| No module graph on a Bicep repo | gathered without `--structural-iac`, and `bicep` not installed or no modules changed in window | re-gather with `--structural-iac` (static, no CLI) |
+| A landing-zone `br/public:avm/...` ref has no cross-repo edge | BRM is not a manifest member, or has no `bicep_registry_prefix`, or the ref goes through a private registry / alias | add BRM with `"bicep_registry_prefix": "avm/"`; private-registry refs are not resolved |
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
 | Empty board/sprint sections | token lacks `read:project`, or no maintained board | add scope or accept |
 | `render.py` fails | `mmdc` missing, or Chromium sandbox as root | install mmdc; as root use a puppeteer `--no-sandbox` config (throwaway environments only) or `--skip-validate` |

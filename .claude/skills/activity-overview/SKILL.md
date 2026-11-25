@@ -238,7 +238,9 @@ relevant slice and narrate it grounded:
   An area found in several members (a multi-repo project) is unioned and each row names its
   `repo`; write `owner/repo::<area>` (or add `--repo owner/repo`) for one member.
 - **Blast radius / dependents** of a module: `python3 spotlight.py dependents <owner/repo>
-  --store <db> --project <name>`.
+  --store <db> --project <name>` (which members depend on it), or
+  `dependents <owner/repo>::<area>` (which module areas, in-repo or in other members,
+  depend on one module — gather a single monorepo with `--structural-iac` first).
 - **One train's slice** (for narration or a spotlight): `python3 link.py <view> --slice <id>`;
   `python3 render.py <view> --train <id>` for its flowchart.
 - **Multi-repo project view** (the structured fact base other formatters consume): `python3

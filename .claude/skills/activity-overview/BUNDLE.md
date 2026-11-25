@@ -388,10 +388,15 @@ review's state to `DISMISSED`.
   `terraform init` wrote. A call inside a downloaded package is attributed to that package's
   module. Without the manifest, `to` and `ref` are `null`. A nested target that is already an
   edge (same area, or the same registry module ignoring `//submodule`) is not repeated: direct
-  wins. **Static edges on manifest gathers:** a multi-repo (manifest) gather also adds the
-  whole-tree structural scan. It emits the same direct edges, without `terraform`, for every
-  module dir in the clone (see STORE.md). Single-repo gathers do not run that scan and stay
-  build-gated. The `bicep` and
+  wins. **Static edges (structural scan, #92):** a multi-repo (manifest) gather, and a
+  single-repo gather given `--structural-iac`, also adds the whole-tree structural scan. It
+  emits the same direct edges, without `terraform` or `bicep`, for every Terraform module dir
+  and every Bicep module (`<area>/main.bicep`) in the clone, including modules not changed in
+  the window, which are appended as areas (see STORE.md). A Bicep scan edge is exactly a
+  build-path immediate edge (`transitive: false`, same `to`/`ref`/`version`/`local`/
+  `instances`); a public-registry ref resolves in-repo when `<path>/main.bicep` is a tracked
+  module. Transitive Bicep edges still need the build. Without the flag a single-repo gather
+  does not run the scan and stays build-gated (byte-stable). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 

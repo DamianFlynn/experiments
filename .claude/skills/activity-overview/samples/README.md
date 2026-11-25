@@ -155,4 +155,5 @@ Closing the boundary gap removed that accident and the graph collapsed to only t
 in-window-built areas (2 edges) — honest but thin. The static whole-tree scan
 restores the full graph (6 edges: 4 cross-repo + 2 intra-repo) **honestly**,
 independent of churn. Single-repo gathers keep the original window-scoped behaviour
-(byte-stable golden bundle); the structural scan is gated to manifest projects.
+(byte-stable golden bundle) unless given `--structural-iac`; manifest projects always
+get the scan, which since #92 covers Bicep modules (`<area>/main.bicep`) as well.

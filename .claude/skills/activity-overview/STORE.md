@@ -537,6 +537,17 @@ python3 gather.py --manifest workspace/manifest.json --store workspace/journey.d
     { "owner": "Azure", "repo": "terraform-azurerm-avm-res-keyvault-vault" } ] }
 ```
 
+A Bicep publisher declares the module path prefix it publishes under in the public
+Bicep registry instead (issue #92), e.g. for an enterprise landing zone consuming AVM:
+
+```json
+{ "project": "contoso-lz",
+  "window": { "from": "2026-03-01", "to": "2026-03-31" },
+  "repos": [
+    { "owner": "Azure", "repo": "bicep-registry-modules", "bicep_registry_prefix": "avm/" },
+    { "owner": "Contoso", "repo": "landing-zone" } ] }
+```
+
 `manifest.load_manifest` validates the file before the store is touched and raises
 `ValueError` (`manifest: …`) on: a non-string or empty field; a `project` containing
 `/` or `#`; a window bound that is not a real `YYYY-MM-DD` date, or `from` after `to`;
@@ -548,6 +559,10 @@ non-empty string, or declared by two members (case-insensitively); a member
 `branch` (optional, issue #84: that member's mainline, beating a global
 `--branches`) that is present but not a non-empty string without whitespace or
 control characters, or starts with `-`; a
+`bicep_registry_prefix` that is present but not a lowercase public-registry path
+prefix (OCI path segments such as `avm/`; no `br/public:` scheme, no leading `/`),
+or declared by two members (a trailing `/` is ignored; nested prefixes such as
+`avm` and `avm/ptn/contoso` are allowed and the longer one wins); a
 `ticket_prefixes` that is present but not a list of distinct, non-empty ASCII
 letter/digit strings. `gather.py` applies the same owner/repo/date checks to
 `--owner/--repo/--from/--to`.
@@ -578,6 +593,25 @@ byte-unchanged (`project = owner`, `repo = <name>`).
   is a host (a dot, e.g. `github.com/org/repo`) is VCS shorthand, never resolved.
   Resolution only runs in a multi-repo fold (`members` + `registry_by_slug` present);
   single-repo folds emit intra-repo edges only.
+- **Cross-repo `depends_on` (Bicep, #92).** A Bicep edge (`provider: "bicep"`) that
+  the gather left unresolved (`to=None`) resolves through
+  `resolve_bicep_registry_member`: only a **public**-registry ref
+  (`br/public:<path>:<tag>` or `br:mcr.microsoft.com/bicep/<path>:<tag>`) can, and it
+  maps to the member whose `bicep_registry_prefix` is a whole-segment prefix of
+  `<path>` (case-insensitive; longest prefix wins). The target is that member's
+  **module area**, `classify_code_area("<path>/main.bicep")` — e.g.
+  `br/public:avm/res/key-vault/vault:0.9.0` →
+  `{project}/Azure/bicep-registry-modules#area-avm/res/key-vault/vault` — because a
+  public-registry path is the module's directory in the publisher's repo (as in
+  bicep-registry-modules). The edge keeps `ref`/`version`/`provider: "bicep"` and
+  gains `resolved: true`, `cross_repo: true`. **Never resolved:** a private
+  registry (`br:<other-host>/…`), a template spec (`ts:…`), a user alias
+  (`br/<alias>:…`), a public path no member declares, an AVM group path
+  (`avm/res/<group>`), and the referencing member's own prefix (its own unresolved
+  ref names a module its tree does not hold; in-repo resolution is the
+  gather's job). Those stay `to: null` in the bundle and produce no stored edge.
+  Bicep edges never go through the Terraform resolver, and Terraform edges never
+  through this one.
 - **Repo slugs and registry sources compare case-insensitively** (GitHub names and
   registry addresses are). Ids keep the **manifest's spelling**
   (`{project}/{owner}/{repo}#…`); only comparison/lookup is normalised, mapping any
@@ -613,8 +647,10 @@ under concurrency). The IaC build knobs are env-overridable for heavy runs:
 `ACTIVITY_IAC_RETRIES` (1).
 
 A cross-repo `depends_on` resolves to the producer member's module-root area
-(`area-main.tf`). That root is only created by the producer's own fold when its
-`main.tf` is an in-window code area — usually it is not. The consumer fold
+(`area-main.tf`), or for Bicep to the publisher's module area
+(`area-avm/res/<group>/<module>`). That node is only created by the producer's own
+fold when it is an area of the producer's bundle — an in-window code area, or a
+module the structural scan appended — and often it is not. The consumer fold
 therefore **ensures the target node exists** (a minimal `structure` stand-in,
 create-if-absent so a producer's real area always wins), keeping the edge from
 dangling. The node is an edge anchor only: `extract` rebuilds `code_graph` from
@@ -630,8 +666,30 @@ gathers, `scan_structural_terraform_areas` additionally parses every module's
 `merge_structural_areas` unions them into `code_graph` (existing areas keep their
 DOT edges + gain missing structural ones; untouched module dirs are appended). The
 blast-radius graph is then the repo's full module structure regardless of in-window
-activity. Gated to manifest folds so single-repo bundles stay byte-stable; `git
-ls-files` lists only tracked `.tf`, excluding vendored `.terraform/` modules.
+activity. `git ls-files` lists only tracked `.tf`, excluding vendored `.terraform/`
+modules.
+
+**Bicep structural scan (#92).** `scan_structural_bicep_areas` does the same for
+Bicep, from the same single `git ls-files` listing (`apply_structural_scan` runs
+the Terraform then the Bicep scan and merges both with `merge_structural_areas`).
+A Bicep **module area** is an area whose own entrypoint `<area>/main.bicep` (the
+root `main.bicep` for the root area) is tracked; AVM group areas, areas without an
+own `main.bicep`, and `examples/`/`tests/` scaffolding are not modules, and a
+private child (`<module>/<child>/main.bicep`) belongs to its parent area and is not
+read. Each module's edges are `build_bicep_edges` over that one file with no ARM
+tree — exactly the build path's immediate (`transitive: false`) edges, so the
+merge's `(to, ref)` dedup never doubles a built edge and build-derived edges (and
+their transitive edges) win. A public-registry ref resolves in-repo when its
+module area is one of the tracked module areas; anything else stays `to: null`
+for the cross-repo fold above. Cost: one pass over the listing and one read per
+module entrypoint, no `bicep` CLI (about 0.2 s for 1,000 module dirs).
+
+**When the scan runs.** Every manifest member (`_member_args` sets
+`structural_iac`), and a single-repo gather given `--structural-iac` (Terraform and
+Bicep). A single-repo gather without the flag stays window-scoped and build-gated,
+so its bundle (and the golden-bundle gate) is byte-stable. With the scan, every
+module is an area node, so `spotlight dependents owner/repo::<area>` (the
+consumers of one module) works inside a monorepo such as bicep-registry-modules.
 
 **Terraform direct vs transitive (#80).** The build path and the structural scan
 use one rule for direct edges: every `module {}` block in the area dir's own
@@ -658,7 +716,9 @@ spine-linked trains stitched across members; trains sharing only an internal tic
 clustered into `related_work` — opt-in, only with the manifest's `ticket_prefixes`
 (`digest.py --manifest`) or `--ticket-pattern`, else `[]`; Shipped/people/modules merged; cross-repo
 `module_edges` for the project-wide blast-radius graph). `spotlight dependents
-<owner/repo>` answers the reverse-dependency (blast-radius) question. `validate.py
+<owner/repo>` answers the reverse-dependency (blast-radius) question per member;
+`spotlight dependents <owner/repo>::<area>` answers it per module area (direct and
+transitive consumers, in-repo and cross-repo; #92). `validate.py
 --project <name>` runs the per-member checks **plus** a project-wide
 `no_drift_people` check that re-derives people across **all** members and unions
 them (the read-side mirror of the fold) — people are project-scoped, so they are

@@ -1758,6 +1758,31 @@ def _split_ref_tag(body):
     return body, None
 
 
+def _bicep_ref_parts(ref):
+    """(registry_path, version, local_path) of one Bicep module ref string.
+
+    Only a PUBLIC Bicep registry ref (`br/public:<path>:<tag>`, or the same
+    registry named explicitly, `br:mcr.microsoft.com/bicep/<path>:<tag>`; the host
+    compares case-insensitively) sets `registry_path`. A private registry, a
+    template spec or a user alias sets neither path (only its `version`). A ref
+    with no scheme is a `local_path`. Pure; shared by the source parser and the
+    multi-repo fold, which sees only the raw `ref` stored on an edge."""
+    registry_path = version = local_path = None
+    sm = _BICEP_SCHEME_RE.match(ref or "")
+    if sm:
+        path_part, version = _split_ref_tag(sm.group("body"))
+        alias = sm.group("alias")
+        if sm.group("scheme") == "br" and alias == "public":
+            registry_path = path_part
+        elif (sm.group("scheme") == "br" and alias is None
+              and path_part.lower().startswith(_BICEP_PUBLIC_REGISTRY)):
+            registry_path = path_part[len(_BICEP_PUBLIC_REGISTRY):]
+        # else: private registry / template spec / user alias -> raw ref only
+    elif ref:
+        local_path = ref
+    return registry_path, version, local_path
+
+
 def parse_bicep_module_refs(source_text):
     """Extract `module <sym> '<ref>'` references from a .bicep source.
 
@@ -1776,19 +1801,7 @@ def parse_bicep_module_refs(source_text):
         ref = m.group("ref")
         open_ch = m.group("open")
         instances = "many" if open_ch == "[" else "one" if open_ch == "{" else None
-        registry_path = version = local_path = None
-        sm = _BICEP_SCHEME_RE.match(ref)
-        if sm:
-            path_part, version = _split_ref_tag(sm.group("body"))
-            alias = sm.group("alias")
-            if sm.group("scheme") == "br" and alias == "public":
-                registry_path = path_part
-            elif (sm.group("scheme") == "br" and alias is None
-                  and path_part.lower().startswith(_BICEP_PUBLIC_REGISTRY)):
-                registry_path = path_part[len(_BICEP_PUBLIC_REGISTRY):]
-            # else: private registry / template spec / user alias -> raw ref only
-        else:
-            local_path = ref
+        registry_path, version, local_path = _bicep_ref_parts(ref)
         refs.append({"ref": ref, "registry_path": registry_path,
                      "version": version, "local_path": local_path,
                      "instances": instances})
@@ -2346,11 +2359,12 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
 
 
 def merge_structural_areas(code_graph, structural):
-    """Union the static structural terraform areas/edges into `code_graph`
-    (multi-repo blast-radius augmentation). An in-window area keeps its DOT-derived
-    edges and gains any structural edge not already present (dedup by (to, ref));
-    module areas the in-window walk never saw are appended (deterministic by id)
-    with their .tf paths + edges. Mutates and returns code_graph."""
+    """Union static structural areas/edges (scan_structural_terraform_areas or
+    scan_structural_bicep_areas) into `code_graph` (whole-tree blast-radius
+    augmentation). An in-window area keeps its build-derived edges and gains any
+    structural edge not already present (dedup by (to, ref)); module areas the
+    in-window walk never saw are appended (deterministic by id) with their IaC
+    paths + edges. Mutates and returns code_graph."""
     areas = code_graph.setdefault("areas", [])
     by_id = {a["id"]: a for a in areas}
     for aid, info in sorted(structural.items()):
@@ -2365,6 +2379,78 @@ def merge_structural_areas(code_graph, structural):
         else:
             areas.append({"id": aid, "label": _area_label(aid),
                           "paths": info["paths"], "edges": info["edges"]})
+    return code_graph
+
+
+def scan_structural_bicep_areas(clone_dir, patterns=None, list_files=None,
+                                read_text=None):
+    """Statically discover EVERY Bicep module area in the clone tree and its
+    DIRECT `module <sym> '<ref>'` edges, WITHOUT `bicep build` (issue #92).
+
+    The Bicep counterpart of scan_structural_terraform_areas. A module area is an
+    area (classify_code_area) whose own entrypoint `<area>/main.bicep` is tracked
+    (the repo-root `main.bicep` for the root area); an AVM group area, an area
+    with no entrypoint of its own, and `examples/`/`tests/` scaffolding are not
+    modules. Its edges are build_bicep_edges over that ONE file with no ARM tree,
+    i.e. exactly the build path's immediate (`transitive: false`) edges: a local
+    ref resolves to its area (a private child keeps the `<area>/<child>` naming
+    and `local`/`instances` markers), a public-registry ref resolves in-repo when
+    its module area is one of the tracked module areas, and anything else
+    (another repo's module, a private registry, a template spec, an alias) is
+    kept unresolved (`to: null`) with its `ref` + `version`. Transitive edges
+    need the ARM tree and come only from the build path.
+
+    Cost: one pass over the listing, one read per module entrypoint; no other
+    file is opened. Returns {area_id: {"paths": [the area's non-scaffold .bicep
+    files], "edges": [...]}}. `list_files`/`read_text` are injectable for offline
+    tests; defaults list tracked files via git and read from disk."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    if list_files is None:
+        def list_files():
+            return git_ls_files(clone_dir)
+    if read_text is None:
+        def read_text(rel):
+            return _read_text_file(os.path.join(clone_dir, rel))
+
+    by_area, entry = {}, {}
+    for rel in list_files():
+        if not rel.endswith(".bicep"):
+            continue
+        aid = classify_code_area(rel, patterns)
+        if aid is None or _is_scaffold_area(aid) or _is_scaffold_path(rel):
+            continue
+        by_area.setdefault(aid, set()).add(rel)
+        if rel == _rel_join(_area_rel_dir(aid, _BICEP_ROOT_ID), "main.bicep"):
+            entry[aid] = rel
+
+    modules = {aid for aid in entry if not _is_avm_group_area(aid)}
+    out = {}
+    for aid in sorted(modules):
+        edges = build_bicep_edges(read_text(entry[aid]), None, entry[aid],
+                                  modules, patterns,
+                                  module_exists=modules.__contains__)
+        out[aid] = {"paths": sorted(by_area[aid]), "edges": edges}
+    return out
+
+
+def apply_structural_scan(code_graph, clone_dir, patterns=None, list_files=None,
+                          read_text=None):
+    """Merge the whole-tree Terraform and Bicep module scans into `code_graph`
+    (merge_structural_areas; Terraform first, as before). The tracked-file
+    listing is taken ONCE and shared by both scans. Runs for manifest members
+    and for a single-repo gather given `--structural-iac`. Mutates and returns
+    code_graph."""
+    if list_files is None:
+        files = git_ls_files(clone_dir)
+    else:
+        files = list(list_files())
+
+    def listed():
+        return files
+    merge_structural_areas(code_graph, scan_structural_terraform_areas(
+        clone_dir, patterns, list_files=listed, read_text=read_text))
+    merge_structural_areas(code_graph, scan_structural_bicep_areas(
+        clone_dir, patterns, list_files=listed, read_text=read_text))
     return code_graph
 
 
@@ -2866,6 +2952,14 @@ def parse_args(argv):
     # bundle is a transient view extract materializes from the store (Phase 8
     # reader stage). Roll-up = a wider range_query; resume = re-fold against the
     # pinned clone_sha — both store-native, so the flat-bundle flags are gone.
+    # Whole-tree module graph (issue #92): statically scan every tracked
+    # Terraform module dir and Bicep `<area>/main.bicep` for direct module deps,
+    # not just the areas changed in the window. Always on for --manifest members.
+    p.add_argument("--structural-iac", dest="structural_iac", action="store_true",
+                   help="also scan the whole tracked tree for Terraform and Bicep "
+                        "module dependencies (static, no build), so modules not "
+                        "changed in the window still appear with their direct "
+                        "edges; always on for --manifest members")
     p.add_argument("--store", required=True,
                    help="path to the SQLite journey-graph store to fold into "
                         "(the sole gather deliverable)")
@@ -4185,13 +4279,14 @@ def acquire(args, env):
     # a clone on disk.
     if not args.no_clone or os.path.isdir(clone_dir):
         code_graph = extract_iac_edges(code_graph, clone_dir)
-        # Multi-repo (project) gathers additionally fold the WHOLE module tree's
-        # static `source` deps (no terraform init) so the cross-repo blast-radius
-        # graph is structural, not limited to in-window-changed areas. Gated off the
-        # manifest path: single-repo bundles stay byte-stable (golden-bundle gate).
+        # Multi-repo (project) gathers -- and a single-repo gather given
+        # `--structural-iac` -- additionally fold the WHOLE module tree's static
+        # Terraform `source` and Bicep `module` deps (no terraform init, no bicep
+        # build) so the blast-radius graph is structural, not limited to
+        # in-window-changed areas. Off by default for a single repo: its bundles
+        # stay byte-stable (golden-bundle gate).
         if getattr(args, "structural_iac", False) and os.path.isdir(clone_dir):
-            code_graph = merge_structural_areas(
-                code_graph, scan_structural_terraform_areas(clone_dir))
+            code_graph = apply_structural_scan(code_graph, clone_dir)
 
     # CODEOWNERS from the clone (local file; try the conventional locations).
     code_owners = {}
@@ -4724,12 +4819,65 @@ def resolve_registry_member(src, project, members, registry_by_slug):
     return None
 
 
-def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
+def resolve_bicep_registry_member(ref, project, members, prefix_by_slug,
+                                  exclude=None):
+    """Resolve a Bicep public-registry module ref to the qualified id of the
+    publishing member's module area, or None (issue #92).
+
+    `ref` is the raw ref an edge carries. Only a PUBLIC registry ref
+    (`br/public:<path>:<tag>` / `br:mcr.microsoft.com/bicep/<path>:<tag>`,
+    _bicep_ref_parts) can resolve; a private registry, template spec, alias or
+    local ref never does. The publisher is the member whose manifest
+    `bicep_registry_prefix` (`prefix_by_slug`, normalised without a trailing '/')
+    is a whole-segment, case-insensitive prefix of `<path>`; the longest prefix
+    wins, then the sorted slug. Its module area is classify_code_area of
+    `<path>/main.bicep` (so `avm/res/<group>/<module>`): the registry path is the
+    module's directory in the publisher's repo, as in bicep-registry-modules. An
+    AVM group path is never a module. `exclude` (the referencing member) is never
+    a target: its own unresolved ref names a module it does not hold, and an
+    in-repo edge is the build/scan's job. The id uses the member's manifest
+    spelling (members match case-insensitively). Pure, deterministic."""
+    if not ref or not prefix_by_slug:
+        return None
+    path = _bicep_ref_parts(ref)[0]
+    if not path:
+        return None
+    path = path.strip("/")
+    low = path.lower()
+    prefixes = {}
+    for slug, prefix in sorted(prefix_by_slug.items()):
+        if prefix:
+            prefixes.setdefault(slug.lower(), prefix.strip("/").lower())
+    skip = exclude.lower() if exclude else None
+    best = None
+    for slug in sorted(members or ()):
+        pre = prefixes.get(slug.lower())
+        if not pre or slug.lower() == skip:
+            continue
+        if low != pre and not low.startswith(pre + "/"):
+            continue
+        if best is None or len(pre) > best[0]:
+            best = (len(pre), slug)
+    if best is None:
+        return None
+    area = classify_code_area(path + "/main.bicep", DEFAULT_AREA_PATTERNS)
+    if not area or _is_avm_group_area(area):
+        return None
+    return graphstore.qualify_id(project, best[1], "area-{}".format(area))
+
+
+def _fold_depends_on(bundle, project, repo, members, registry_by_slug,
+                     bicep_prefix_by_slug=None):
     """Yield (src_qid, dst_qid, data) depends_on triples from a bundle's area
     edges. Resolved-local edges -> intra-repo. Unresolved registry edges resolve
-    to a member's root area ONLY in multi-repo folds (`members` non-empty and
-    `registry_by_slug` not None); single-repo folds skip them (byte-stable).
-    `examples/`/`tests/` source areas are skipped (scaffolding, not module deps). Pure."""
+    cross-repo ONLY in multi-repo folds (`members` non-empty and
+    `registry_by_slug` not None); single-repo folds skip them (byte-stable). A
+    Bicep edge (`provider: "bicep"`) resolves through the members' public Bicep
+    registry prefixes (`bicep_prefix_by_slug`, resolve_bicep_registry_member) to
+    the publisher's module area; any other edge through the Terraform registry
+    (resolve_registry_member) to a member's root area. Either way the stored edge
+    gains `resolved`/`cross_repo` true. `examples/`/`tests/` source areas are
+    skipped (scaffolding, not module deps). Pure."""
     def q(slug, local):
         return graphstore.qualify_id(project, slug, local)
     areas = (bundle.get("code_graph", {}) or {}).get("areas") or []
@@ -4744,8 +4892,13 @@ def _fold_depends_on(bundle, project, repo, members, registry_by_slug):
                 data = {k: v for k, v in e.items() if k != "to"}
             elif (not e.get("resolved") and members and registry_by_slug is not None
                   and e.get("ref")):
-                dst = resolve_registry_member(e["ref"], project, members,
-                                              registry_by_slug)
+                if e.get("provider") == "bicep":
+                    dst = resolve_bicep_registry_member(
+                        e["ref"], project, members, bicep_prefix_by_slug,
+                        exclude=repo)
+                else:
+                    dst = resolve_registry_member(e["ref"], project, members,
+                                                  registry_by_slug)
                 if dst is None:
                     continue
                 data = {k: v for k, v in e.items() if k != "to"}
@@ -4821,7 +4974,7 @@ def _fold_artifacts(conn, bundle, project, repo, fetched):
 
 
 def fold_bundle(conn, bundle, project=None, repo=None, members=None,
-                registry_by_slug=None):
+                registry_by_slug=None, bicep_prefix_by_slug=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
     upsert nodes, spine edges, and the file-level code-event ledger. Idempotent
     — re-folding an overlapping window mutates nothing already correct. See
@@ -4841,7 +4994,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # LOGICAL project (`project`) with `repo` = "owner/repo". Single-repo runs pass
     # neither and fall back to meta.owner/meta.repo — byte-identical to before.
     # `members` (a set/dict of "owner/repo" slugs) gates cross-repo edge emission;
-    # None (single-repo) skips it entirely.
+    # None (single-repo) skips it entirely. `registry_by_slug` (Terraform
+    # registry) and `bicep_prefix_by_slug` (public Bicep registry path prefix,
+    # issue #92) map each member to what it publishes, for _fold_depends_on.
     if project is None:
         project = meta.get("owner")
     if repo is None:
@@ -5105,10 +5260,12 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # Phase 3c stamps edges per area (code_graph.areas[].edges); there is no
     # top-level edges key. A resolved-local edge -> an intra-repo depends_on; an
     # unresolved registry edge resolves to a cross-repo member only in multi-repo
-    # folds (see _fold_depends_on, threaded with members + registry_by_slug).
+    # folds (see _fold_depends_on, threaded with members + registry_by_slug and,
+    # for Bicep public-registry refs, bicep_prefix_by_slug).
     _dep_dsts = set()
     for src, dst, data in _fold_depends_on(bundle, project, repo, members,
-                                           registry_by_slug):
+                                           registry_by_slug,
+                                           bicep_prefix_by_slug):
         edges.append((src, dst, "depends_on", None, data or None))
         _dep_dsts.add(dst)
 
@@ -5306,6 +5463,9 @@ def _gather_manifest(conn, args, man):
     registry_by_slug = {
         "{}/{}".format(m["owner"], m["repo"]): m.get("registry")
         for m in man["repos"]}
+    bicep_prefix_by_slug = {
+        "{}/{}".format(m["owner"], m["repo"]): m.get("bicep_registry_prefix")
+        for m in man["repos"]}
     slugs = ["{}/{}".format(m["owner"], m["repo"]) for m in man["repos"]]
     done = set()
     if args.resume:
@@ -5328,7 +5488,8 @@ def _gather_manifest(conn, args, man):
         try:
             bundle = acquire(_member_args(args, m, frm, to), os.environ)
             fold_bundle(conn, bundle, project=project, repo=slug,
-                        members=members, registry_by_slug=registry_by_slug)
+                        members=members, registry_by_slug=registry_by_slug,
+                        bicep_prefix_by_slug=bicep_prefix_by_slug)
         except (Exception, SystemExit) as exc:  # noqa: BLE001 - per member
             reason = _failure_reason(exc)
             failures.append((slug, reason))

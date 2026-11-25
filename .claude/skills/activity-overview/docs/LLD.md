@@ -156,8 +156,8 @@ sequenceDiagram
   A->>A: fallback: drop unresolved boundary commits' diffs and files
   A->>A: select_code_area_provider (directory or graphify)
   A->>IaC: extract_iac_edges (parallel restore+build / init+graph)
-  opt manifest gather
-    A->>A: scan_structural_terraform_areas + merge_structural_areas
+  opt manifest gather, or --structural-iac
+    A->>A: apply_structural_scan (Terraform + Bicep scans, merge_structural_areas)
   end
   A->>A: parse_codeowners
   A->>REST: closed PRs (until updated < from) + all open PRs
@@ -291,8 +291,9 @@ flowchart TB
 - **Build-only:** this path emits an area's edges only after a successful build. A `resolved`
   area with no edges genuinely has no inter-area dependencies; `timeout`/`failed` are
   **counted gaps**. (For Terraform the direct edges themselves are source-parsed, and manifest
-  gathers add static edges for every module dir through the structural scan below. Single-repo
-  gathers keep the build gate: no `terraform` means no Terraform edges. Decided in #80.)
+  gathers — and single-repo gathers given `--structural-iac` — add static Terraform and Bicep
+  edges for every module through the structural scan below. A single-repo gather without the
+  flag keeps the build gate: no `terraform`/`bicep` means no edges. Decided in #80 and #92.)
 - **Bicep:** `parse_bicep_module_refs` splits a **public**-registry ref (`br/public:<path>:<ver>` /
   `br:mcr.microsoft.com/bicep/<path>:<ver>`) into `registry_path` + `version`; private-registry
   (`br:<other-host>/…`), template-spec (`ts:…`, `ts/<alias>:…`) and user-alias (`br/<alias>:…`)
@@ -331,13 +332,23 @@ flowchart TB
   `ACTIVITY_IAC_BUILD_TIMEOUT` (300 s), `ACTIVITY_IAC_RETRIES` (1). With `TF_PLUGIN_CACHE_DIR`
   set, `_terraform_prewarm` runs one serial init first because terraform's plugin cache is not
   safe under concurrent writes.
-- **Structural scan (manifest gathers only):** `scan_structural_terraform_areas` statically parses
-  every tracked module's `source` references (`git ls-files`, no `terraform init`; per area
-  only the area dir's own `*.tf`, nested `examples/`/`tests/` files excluded) and
-  `merge_structural_areas` unions them, so the dependency graph reflects structure rather than
-  in-window churn. Its direct edges match those of a built area (`_tf_direct_edges`), so the
-  merge adds untouched module dirs and never contradicts a built area's direct set. Single-repo
-  gathers skip this to keep golden bundles byte-stable.
+- **Structural scan (manifest gathers, or `--structural-iac`):** `apply_structural_scan` takes
+  one `git ls-files` listing and runs two static scans over it, merging each with
+  `merge_structural_areas` (an existing area keeps its build-derived edges and gains missing
+  ones, deduped on `(to, ref)`; untouched module areas are appended, sorted by id), so the
+  dependency graph reflects structure rather than in-window churn.
+  `scan_structural_terraform_areas` parses every tracked module's `source` references (no
+  `terraform init`; per area only the area dir's own `*.tf`, nested `examples/`/`tests/` files
+  excluded); its direct edges match a built area's (`_tf_direct_edges`).
+  `scan_structural_bicep_areas` (#92) finds every Bicep **module area** — an area whose own
+  `<area>/main.bicep` (root: `main.bicep`) is tracked, not an AVM group area, not scaffolding —
+  reads that one file and runs `build_bicep_edges(source, None, …)`: exactly the build path's
+  immediate edges (local refs, private children as `<area>/<child>` with `local`/`instances`,
+  public refs resolved in-repo when the module area is tracked, everything else `to=None`).
+  Child `main.bicep` files are listed in the area's `paths` but never read. Cost is linear in
+  the tracked files and one read per module (about 0.2 s for 1,000 module dirs, measured on a
+  synthetic tree with 3,000 `.bicep` files). The flag is off by default for single repos so
+  golden bundles stay byte-stable; `_member_args` turns it on for every manifest member.
 
 ### 4.7 GitHub REST acquisition
 
@@ -454,7 +465,7 @@ creation `add` plus a later move `add` into an ambiguous pair); the nodes apply 
 move, a source only while its last event is a remove. Cost: one read of the repo's ledger per
 fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows).
 
-### 4.11 Cross-repo `depends_on` resolution (Terraform)
+### 4.11 Cross-repo `depends_on` resolution (Terraform, Bicep)
 
 ```mermaid
 flowchart TB
@@ -470,6 +481,24 @@ flowchart TB
   cv -- no --> drop3["non-member: no edge"]
   hit --> anchor["ensure target #area-main.tf exists<br/>(structure stand-in, create-if-absent)"]
   anchor --> out["depends_on src area to member root area<br/>data: version, transitive, cross_repo = true"]
+```
+
+**Bicep (#92).** An unresolved edge with `provider: "bicep"` takes
+`resolve_bicep_registry_member(ref, project, members, bicep_prefix_by_slug, exclude=repo)`
+instead (Terraform edges never do, and Bicep edges never reach the Terraform resolver):
+
+```mermaid
+flowchart TB
+  e["bicep edge: to = None, ref"] --> m{"multi-repo fold with<br/>bicep_prefix_by_slug?"}
+  m -- no --> drop1["no cross-repo edge"]
+  m -- yes --> p{"_bicep_ref_parts: public registry?<br/>br/public:path or br:mcr.microsoft.com/bicep/path"}
+  p -- "no (private br:, ts:, alias)" --> drop2["not resolved"]
+  p -- yes --> pre{"a member other than the referencing one<br/>whose bicep_registry_prefix is a<br/>whole-segment prefix of path?<br/>(case-insensitive, longest wins)"}
+  pre -- no --> drop3["no edge"]
+  pre -- yes --> cls{"classify path/main.bicep:<br/>a module area (not an AVM group)?"}
+  cls -- no --> drop3
+  cls -- yes --> anchor["ensure target #area-path exists<br/>(structure stand-in, create-if-absent)"]
+  anchor --> out["depends_on src area to publisher module area<br/>data: ref, version, provider bicep, cross_repo = true"]
 ```
 
 ### 4.12 Backfill seam
@@ -933,6 +962,7 @@ missing `dead_refs` table as empty instead of creating it; only `record_dead_ref
 | `grep <phrase>` | `text_mining` | FTS5 search over PR/issue/commit text (needs FTS5) |
 | `module [owner/repo::]<area>` | `slice_module` | full-history module biography envelope |
 | `dependents <owner/repo>` | `member_dependents` | reverse `depends_on` BFS — blast radius |
+| `dependents <owner/repo>::<area>` | `area_dependents` (#92) | reverse `depends_on` BFS from one area node: `direct` and all (`dependents`) consumer areas as `owner/repo::area`, in-repo and cross-repo; a single-repo store accepts `owner/repo` for its (project=owner, repo=name) |
 
 Results share an envelope `{query, focus, focus_kind, project, status, scope, …}`.
 `status` may be `needs_gather` or `fts_unavailable` — valid answers, exit 0. `--complete`
@@ -1100,7 +1130,9 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 
 | Missing | Effect | Signal |
 |---|---|---|
-| `bicep` / `terraform` | no IaC edges (manifest gathers keep the static Terraform direct edges) | `edge_extraction` counts `skipped` |
+| `bicep` / `terraform` | no build-derived IaC edges; manifest gathers and `--structural-iac` keep the static direct Terraform and Bicep edges (no Bicep transitive edges) | `edge_extraction` counts `skipped` |
+| a member's `bicep_registry_prefix` (manifest) | other members' `br/public:` refs into it stay `to: null`, no cross-repo `depends_on` | edge `resolved: false` in the member bundle |
+| non-public Bicep registry (private ACR, template spec, alias) | never resolved across repos | edge `resolved: false`, raw `ref` kept |
 | `.terraform/modules/modules.json` | nested Terraform edges have no target (`to=ref=null`) | edge has `address`/`via` but no `ref` |
 | registry unreachable / slow init | some areas unresolved | `timeout` / `failed` counts |
 | `read:project` scope | no board status / sprints | empty board layer |
@@ -1143,7 +1175,9 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
-| Terraform edges are build-gated on single-repo gathers | no structural scan without a manifest (#80 decision) | without `terraform` (or with a failed init), a single-repo bundle has no Terraform edges, even though its direct edges are source-parsed | opt-in static fallback with its own `edges_status` |
+| IaC edges are build-gated on single-repo gathers by default | the structural scan is opt-in for single repos (`--structural-iac`, #92) to keep golden bundles byte-stable | without the flag and without `terraform`/`bicep` (or with a failed build), a single-repo bundle has no IaC edges; scan edges do not change an area's `edges_status` | pass `--structural-iac`; a scan-specific `edges_status` if needed |
+| Bicep structural scan reads `main.bicep` entrypoints only | a module area is one with a tracked `<area>/main.bicep` (#66 entrypoint rule); only `module` statements are parsed | modules whose entry file has another name (common in landing-zone repos, e.g. `hubNetworking.bicep`) are not scanned; `import … from 'br/public:…'` type imports and child-module refs are not edges; Bicep transitive edges still need `bicep build` | a configurable entrypoint pattern; parse `import` |
+| Cross-repo Bicep resolution is public-registry only | `resolve_bicep_registry_member` (#92) honours `br/public:` / `br:mcr.microsoft.com/bicep/` only and assumes the registry path is the publisher's module directory | refs through a private ACR, a template spec or a `bicepconfig.json` alias never become cross-repo edges; a publisher whose published path differs from its directory gets a stand-in at the registry path | a private-registry prefix + path mapping in the manifest |
 | Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
 | Pre-#84 stores have no base branch | fold stores `branches:` meta keys only since #84 | their views carry `meta.base_branch: null`, `extract` warns, and every merged PR (stacked, release-branch) counts as shipped, as before #84 | re-gather the window |
 | One mainline per view | `link` compares a PR's `base` with one `meta.base_branch` | a roll-up spanning a default-branch rename (`master` → `main`) gets `null` (warned), so its merges are not told apart; view each gathered window on its own | carry a set of mainline names if needed |
@@ -1202,4 +1236,4 @@ continuity, wide single gathers for history stores) avoids the first three in pr
 | New stored fact | `fold_bundle` + `extract` reader + `validate` conformance | must keep `no_drift` and characterization green |
 | New spotlight query | function + `_RENDERERS` entry + dispatch in `main` | envelope shape; exit 0 for "no data" statuses |
 | New formatter | consume the view (see `examples/formatters/`) | read `meta.schema_version` |
-| Cross-repo Bicep deps | mirror `resolve_registry_member` for `br/public:` paths in `_fold_depends_on` | gate on manifest folds to keep single-repo goldens stable |
+| Cross-repo Bicep deps from other registries | `resolve_bicep_registry_member` + `manifest.check_bicep_registry_prefix` (#92) | keep it manifest-gated; never route Bicep edges through the Terraform resolver |

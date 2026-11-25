@@ -356,7 +356,8 @@ making forecasts meaningful on each target.
 | Target | Shape | How it is gathered | What you get |
 |---|---|---|---|
 | **Bicep** (`Azure/bicep`) | One product repo (the Bicep compiler and tooling, .NET) | Single repo | Shipped/trains/forecast/flow/people. Code areas by directory (`src/<project>`); no IaC edges (not an IaC repo). |
-| **AVM Bicep** (`Azure/bicep-registry-modules`) | One monorepo, 500+ resource and ~50 pattern modules | Single repo | Areas per module (`avm/res/<svc>/<mod>`, `avm/ptn/<group>/<mod>`); `br/public:` references resolve to in-repo module areas; per-module biographies. |
+| **AVM Bicep** (`Azure/bicep-registry-modules`) | One monorepo, 500+ resource and ~50 pattern modules | Single repo (`--structural-iac` for the whole module graph) | Areas per module (`avm/res/<svc>/<mod>`, `avm/ptn/<group>/<mod>`); `br/public:` references resolve to in-repo module areas; per-module biographies; per-module blast radius (`spotlight dependents owner/repo::<area>`). |
+| **Bicep landing zone** (an enterprise repo consuming AVM Bicep) | One or more repos referencing `br/public:avm/...` | Manifest with BRM as a member declaring `bicep_registry_prefix: "avm/"` | Cross-repo `depends_on` from the landing zone's modules to the BRM modules they pin, with versions. |
 | **AVM Terraform** | One repo per module | Manifest (generated from the AVM Terraform index) | Cross-repo trains; structural cross-repo `depends_on`; blast radius per module. |
 | **AI landing zone** | TF pattern constellation + Bicep pattern module in BRM + docs/portal hub repo | TF: manifest. Bicep: the BRM store, scoped to `avm/ptn/ai-ml/landing-zone`. Hub repo: manifest member (social layer) | End-to-end view of the AI LZ: code, dependencies and community discussion. |
 | **Hub / platform LZ (ALZ)** | TF ALZ + connectivity pattern repos; Bicep `avm/ptn/alz`, `avm/ptn/network/hub-networking`; docs hub; ALZ-Bicep classic (archival scheduled) | TF: manifest. Bicep: BRM store scoped to those areas | Platform-LZ change tracking, blast radius of networking modules, deprecation tracking. |
@@ -429,11 +430,21 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 
 These are real, current limits — plan around them:
 
-1. **Cross-repo `depends_on` is Terraform-only.** Bicep `br/public:` references resolve to
-   areas *inside the same repo* — perfect for the BRM monorepo, but a Bicep reference from
-   another repo into BRM is not resolved across repos.
-2. **Bicep module graph is window-scoped.** Bicep edges are built only for areas changed
-   in the window; the whole-tree structural scan exists for **Terraform manifest** gathers only.
+1. **Cross-repo Bicep `depends_on` needs a declared publisher and the public registry.**
+   Since #92 a manifest member that declares `bicep_registry_prefix` (e.g. `"avm/"` on
+   `Azure/bicep-registry-modules`) receives cross-repo `depends_on` edges from other members'
+   `br/public:<path>:<tag>` (or `br:mcr.microsoft.com/bicep/<path>:<tag>`) references, to its
+   module area `<path>`. The registry path must equal the module's directory in that repo (true
+   for BRM). Private registries (`br:<acr>/…`), template specs, user aliases (including a
+   `bicepconfig.json` alias that points at the public registry) and public modules no member
+   declares stay unresolved. A single-repo gather never resolves across repos.
+2. **Bicep module graph is window-scoped unless the structural scan runs.** Without it, Bicep
+   edges are built only for areas changed in the window, and only with the `bicep` CLI. The
+   whole-tree structural scan (#92) runs for every manifest member and for a single-repo gather
+   given `--structural-iac`; it adds every module's **direct** edges statically. Transitive
+   Bicep edges still come only from `bicep build`. The scan reads only `<area>/main.bicep`
+   entrypoints: a module whose entry file has another name, and `import … from 'br/public:…'`
+   type imports, are not dependencies in this graph.
 3. **Forecast depends on planning hygiene.** Candidates require a next milestone or one of the
    recognized priority labels (`priority/high`, `priority/critical`, `p0`, `p1`,
    `high-priority`, `critical`). Repos with different label names need the constant extended.
@@ -470,8 +481,8 @@ These are real, current limits — plan around them:
     (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:
     calls whose module tree holds no resources are not in the graph, and without init's
     `modules.json` a nested call's target is unknown and is not folded. Single-repo gathers emit
-    no Terraform edges at all without `terraform` (no structural scan); manifest gathers still
-    get the static direct edges for every module dir.
+    no Terraform edges at all without `terraform` unless given `--structural-iac`; manifest
+    gathers always get the static direct edges for every module dir.
 12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
@@ -524,5 +535,5 @@ that no single window had (LLD §14.5).
 | Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
 | Multi-window stores (limitation 8) | `extract._materialize_meta` (+ windowed arrays) — not implemented (artifact folding is already cumulative) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
-| Cross-repo Bicep dependencies | Would mirror `resolve_registry_member` for `br/public:` paths (not implemented) |
+| Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |
 | New spotlight lens | Add a query + renderer in `spotlight.py` |

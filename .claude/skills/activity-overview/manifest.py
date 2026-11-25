@@ -2,7 +2,8 @@
 
 A manifest declares a LOGICAL project name, one gather window, and an explicit
 set of member repos (each `owner/repo`, with an optional Terraform registry path
-used for cross-repo dependency resolution in a later slice). JSON, stdlib-only —
+and an optional public Bicep registry path prefix, both used for cross-repo
+dependency resolution). JSON, stdlib-only —
 consistent with the rest of the skill. This is the contract `gather --manifest`
 folds against; how the manifest is authored (hand-written, or generated from the
 AVM index) is out of scope.
@@ -176,12 +177,15 @@ def load_manifest(path):
     """Read + validate a manifest file. Returns a normalized dict:
     {"project": str, "from": str, "to": str,
      "repos": [{"owner": str, "repo": str, "registry": str|None,
-                "branch": str|None}, ...],
+                "branch": str|None,
+                "bicep_registry_prefix": str|None}, ...],
      "ticket_prefixes": [str, ...]}   # optional in the file; [] when absent
     `ticket_prefixes` (e.g. ["ABC", "PLAT"]) opts the project into digest.py's
     ticket clustering (`related_work`); see check_ticket_prefixes.
     Raises ValueError (message prefixed 'manifest: ') on any missing, mistyped or
-    malformed field, an inverted window, or a duplicate member / registry."""
+    malformed field, an inverted window, or a duplicate member / registry /
+    bicep_registry_prefix. `bicep_registry_prefix` is returned normalised (no
+    trailing '/'); see check_bicep_registry_prefix."""
     with open(path, encoding="utf-8") as fh:
         raw = json.load(fh)
     if not isinstance(raw, dict):
@@ -211,7 +215,7 @@ def load_manifest(path):
         raise ValueError("manifest: 'repos' must list at least one member")
 
     repos = []
-    seen_slugs, seen_registries = {}, {}
+    seen_slugs, seen_registries, seen_prefixes = {}, {}, {}
     for i, r in enumerate(raw_repos):
         if not isinstance(r, dict):
             raise ValueError("manifest: each repo must be an object with "
@@ -259,8 +263,26 @@ def load_manifest(path):
                 check_branch(branch)
             except ValueError as exc:
                 raise ValueError("manifest: repos[{}]: {}".format(i, exc)) from None
+        # bicep_registry_prefix is optional (issue #92): the module path prefix
+        # this member publishes under in the PUBLIC Bicep registry (e.g. "avm"
+        # for Azure/bicep-registry-modules). A consumer's `br/public:<path>:<tag>`
+        # ref under it resolves to this member's module area `<path>`. Unique
+        # across members, so one prefix names exactly one publisher.
+        prefix = r.get("bicep_registry_prefix")
+        if prefix is not None:
+            try:
+                prefix = check_bicep_registry_prefix(prefix)
+            except ValueError as exc:
+                raise ValueError("manifest: repos[{}]: {}".format(i, exc)) from None
+            prev = seen_prefixes.get(prefix)
+            if prev is not None:
+                raise ValueError(
+                    "manifest: repos[{}]: duplicate bicep_registry_prefix {!r} on "
+                    "{!r} (already declared by {!r})".format(i, prefix, slug, prev))
+            seen_prefixes[prefix] = slug
         repos.append({"owner": owner, "repo": repo, "registry": registry,
-                      "branch": branch})
+                      "branch": branch,
+                      "bicep_registry_prefix": prefix})
 
     ticket_prefixes = []
     if "ticket_prefixes" in raw:
@@ -271,6 +293,31 @@ def load_manifest(path):
 
     return {"project": project, "from": date_from, "to": date_to, "repos": repos,
             "ticket_prefixes": ticket_prefixes}
+
+
+# One path component of an OCI repository name (the public Bicep registry is an
+# OCI registry): lowercase letters/digits, separated by a single '.', '_', '__'
+# or a run of '-'.
+_OCI_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_BICEP_PREFIX_RE = re.compile(r"{0}(?:/{0})*".format(_OCI_COMPONENT))
+
+
+def check_bicep_registry_prefix(value, what="'bicep_registry_prefix'"):
+    """Return the normalised (no trailing '/') public Bicep registry module path
+    prefix `value` (e.g. "avm/" -> "avm"), else raise ValueError naming `what`.
+    It is a path in the public registry, not a reference: no `br/public:` or
+    `br:mcr.microsoft.com/bicep/` scheme, no leading '/', and only lowercase OCI
+    path components (registry repository paths are lowercase)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("{} must be a non-empty string when present, got "
+                         "{!r}".format(what, value))
+    norm = value[:-1] if value.endswith("/") else value
+    if not _BICEP_PREFIX_RE.fullmatch(norm):
+        raise ValueError(
+            "{} must be a module path prefix in the public Bicep registry such "
+            "as 'avm/' (lowercase path segments, no 'br/public:' scheme, no "
+            "leading '/'), got {!r}".format(what, value))
+    return norm
 
 
 # An internal-ticket prefix (the `ABC` of `ABC-123`): ASCII letters/digits only,

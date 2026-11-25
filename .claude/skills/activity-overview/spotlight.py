@@ -1476,6 +1476,78 @@ def member_dependents(conn, project, member):
     }
 
 
+def _stored_area_repo(conn, project, qual):
+    """The stored repo a `owner/repo` area qualifier names, or None. A project
+    store keeps members as `owner/repo`; a single-repo store keeps project=owner
+    and repo=name, so `owner/repo` there names (project, name). Any case."""
+    repos = _project_repos(conn, project)
+    stored = graphstore.resolve_repo(conn, project, qual)
+    if stored in repos:
+        return stored
+    owner, _, name = qual.partition("/")
+    if owner.lower() == project.lower():
+        stored = graphstore.resolve_repo(conn, project, name)
+        if stored in repos:
+            return stored
+    return None
+
+
+def _area_label_of(project, node_id):
+    """`owner/repo::area` for an area node id (single-repo or project store)."""
+    p = graphstore.parse_id(node_id)
+    rest = p["scope"][len(project) + 1:]
+    repo = rest if "/" in rest else p["scope"]
+    return "{}{}{}".format(repo, _AREA_REPO_SEP, p["local"][len("area-"):])
+
+
+def area_dependents(conn, project, area):
+    """Blast radius of ONE module area (issue #92): every area that depends on
+    it, directly or transitively, via inbound depends_on edges — in the same repo
+    (e.g. the bicep-registry-modules modules consuming
+    `avm/res/network/virtual-network`) and, in a project store, in other members.
+    `area` is `owner/repo::<area id>` (the repo in any case; the area id exact).
+
+    Returns `dependents` (all, sorted `owner/repo::area`) and `direct` (those
+    with an edge straight to it). Time-independent, like member_dependents. An
+    unknown repo or an area with no node is a needs_gather answer. Deterministic."""
+    qual, local = _split_area_arg(area)
+    stored = _stored_area_repo(conn, project, qual) if qual else None
+    seed = (graphstore.qualify_id(project, stored, "area-" + local)
+            if stored is not None else None)
+    if seed is None or graphstore.get_node(conn, seed) is None:
+        return {
+            "query": "dependents", "focus": area, "focus_kind": "area",
+            "project": project, "status": "needs_gather",
+            "scope": _scope(None, None),
+            "guidance": ("no area node for {}; name it owner/repo::<area id> and "
+                         "gather that repo (with --structural-iac for a "
+                         "single repo, so modules unchanged in the window are "
+                         "areas too)".format(area)),
+        }
+    seen, frontier, direct = {seed}, [seed], set()
+    while frontier:
+        nxt = []
+        for nid in frontier:
+            for e in graphstore.get_edges(conn, nid, direction="in",
+                                          edge_types=["depends_on"]):
+                src = e["src_id"]
+                if nid == seed:
+                    direct.add(src)
+                if src not in seen:
+                    seen.add(src)
+                    nxt.append(src)
+        frontier = nxt
+    seen.discard(seed)
+    direct.discard(seed)
+    return {
+        "query": "dependents", "focus": _area_label_of(project, seed),
+        "focus_kind": "area", "project": project, "status": "ok",
+        "scope": _scope(None, None),
+        "direct": sorted(_area_label_of(project, n) for n in direct),
+        "dependents": sorted(_area_label_of(project, n) for n in seen),
+    }
+
+
 def _render_train_md(t):
     """One delivery train as deterministic markdown: outcome badge + the
     focus's touchpoints, then the cited spine timeline."""
@@ -1651,6 +1723,14 @@ def _render_dependents_md(res):
             res["focus"], res["guidance"])
     deps = res.get("dependents") or []
     head = "## spotlight: blast radius `{}`\n".format(res["focus"])
+    if res.get("focus_kind") == "area":
+        if not deps:
+            return head + "\nNothing in the store depends on this area.\n"
+        direct = set(res.get("direct") or [])
+        return head + "\nAreas that depend on it (direct, then transitive):\n\n" \
+            + "\n".join("- `{}`{}".format(d, "" if d in direct else " (transitive)")
+                        for d in sorted(deps, key=lambda d: (d not in direct, d))) \
+            + "\n"
     if not deps:
         return head + "\nNothing in the project depends on this member.\n"
     return head + "\nMembers that (transitively) depend on it:\n\n" + "\n".join(
@@ -1861,7 +1941,10 @@ def main(argv=None):
                            repo=args.repo,
                            backfill=backfill, complete_budget=cb)
     elif args.query == "dependents":
-        res = member_dependents(conn, project, arg)
+        if _split_area_arg(arg)[0] is not None:     # owner/repo::area (#92)
+            res = area_dependents(conn, project, arg)
+        else:
+            res = member_dependents(conn, project, arg)
     conn.close()
 
     if args.md:

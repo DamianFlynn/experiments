@@ -62,6 +62,16 @@ the bare `validate.py workspace/journey.db` example above assumes a single-proje
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
 error: missing or non-store path, ambiguous store).
 
+**Whole-tree module graph (`--structural-iac`).** By default a single-repo gather builds
+IaC edges only for the areas changed in the window, and only with the `bicep`/`terraform`
+CLIs. `gather.py ... --structural-iac` also scans every tracked Terraform module dir and
+Bicep `<area>/main.bicep` for its direct module references (static: no build, no CLI; one
+read per module entrypoint), so modules nobody touched in the window still appear with
+their edges — use it on a monorepo such as `Azure/bicep-registry-modules` before asking
+`spotlight.py dependents owner/repo::<area>`. Manifest members always get the scan. The
+flag adds areas and edges to the bundle, so a store gathered with it differs from one
+gathered without it.
+
 The report vertical (`view → link → render → report`) **composes from the
 store** — `view.py` (the CLI over `extract`) materializes one repo's raw bundle view,
 then `link.py` enriches it in place and `render.py` adds `diagrams` (guarded by the
@@ -104,10 +114,12 @@ python3 digest.py --store workspace/journey.db --project avm-tf-storage \
     --from 2026-03-01 --to 2026-03-31           # merged project view (JSON)
 python3 spotlight.py dependents Azure/terraform-azurerm-avm-res-keyvault-vault \
     --store workspace/journey.db --project avm-tf-storage   # blast radius
+python3 spotlight.py dependents Azure/bicep-registry-modules::avm/res/network/virtual-network \
+    --store workspace/journey.db --project contoso-lz   # consumers of one module area
 ```
 
 Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
-"registry"?, "branch"?} ], "ticket_prefixes"? }` — `branch` (optional) is that member's
+"registry"?, "branch"?, "bicep_registry_prefix"?} ], "ticket_prefixes"? }` — `branch` (optional) is that member's
 mainline when it is not the repo's default branch (it beats a global `--branches`;
 absent, gather resolves each member's own default branch, so members with different
 defaults are fine). `ticket_prefixes` (e.g. `["ABC"]`) is
@@ -115,10 +127,17 @@ optional and only read by `digest.py --manifest` to turn on `related_work` ticke
 clustering (off by default). `registry` is an optional exact Terraform registry path; absent,
 a member is matched by the HashiCorp naming convention
 (`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`).
+`bicep_registry_prefix` (e.g. `"avm/"` on `Azure/bicep-registry-modules`) is the
+optional module path prefix a member publishes under in the **public** Bicep
+registry: another member's `br/public:<path>:<tag>` (or
+`br:mcr.microsoft.com/bicep/<path>:<tag>`) ref under it becomes a cross-repo
+`depends_on` to that member's module area `<path>`. Private registries, template
+specs and aliases are never resolved.
 `load_manifest` rejects (with `ValueError`): non-string fields; `/` or `#` in
 `project`; dates that are not `YYYY-MM-DD` or an inverted window; owner/repo names
 GitHub would not accept; duplicate members (case-insensitive) and a `registry`
-declared twice. The full rule list is in `STORE.md` § Multi-repo project; the same
+declared twice, a malformed `bicep_registry_prefix` (lowercase registry path
+segments only, no `br/public:` scheme) or one declared twice. The full rule list is in `STORE.md` § Multi-repo project; the same
 owner/repo/date checks apply to `gather.py --owner/--repo/--from/--to`.
 `manifest_from_index.py` strips `.git`, `?query` and `#fragment` from `RepoURL`,
 dedupes members case-insensitively, exits 2 on bad/inverted dates, `--limit < 1` or
