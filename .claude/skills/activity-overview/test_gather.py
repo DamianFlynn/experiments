@@ -1850,6 +1850,184 @@ class TestExtractIacEdges(unittest.TestCase):
         self.assertEqual(cg["edge_extraction"]["skipped"], 2)
 
 
+class TestIacEntrypoint(unittest.TestCase):
+    """#66: an area is built from its OWN entrypoint (`<area>/main.bicep`, or the
+    area dir's *.tf set), resolved on disk in the clone — never from a child module
+    that sorts first, a path deleted in the window, or a nested examples/tests file."""
+
+    KV = "avm/res/key-vault/vault"
+
+    @staticmethod
+    def _tree(root, files):
+        for rel, text in files.items():
+            full = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as fh:
+                fh.write(text)
+
+    def test_key_vault_parent_wins_over_sorted_child(self):
+        # The issue's repro: sorted paths put access-policy/ before main.bicep.
+        area = {"id": self.KV, "paths": sorted([
+            self.KV + "/main.bicep",
+            self.KV + "/access-policy/main.bicep",
+            self.KV + "/key/main.bicep"])}
+        self.assertEqual(gather._bicep_entrypoint(area), self.KV + "/main.bicep")
+
+    def test_key_vault_parent_wins_on_disk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                self.KV + "/main.bicep": "",
+                self.KV + "/access-policy/main.bicep": "",
+                self.KV + "/key/main.bicep": ""})
+            area = {"id": self.KV, "paths": sorted([
+                self.KV + "/main.bicep", self.KV + "/access-policy/main.bicep"])}
+            self.assertEqual(gather._bicep_entrypoint(area, clone),
+                             self.KV + "/main.bicep")
+
+    def test_only_child_changed_still_builds_parent(self):
+        # Only a child changed in the window, so the parent's main.bicep is not in
+        # `paths` at all; it is still the area's entrypoint because it is on disk.
+        import tempfile
+        parent_src = ("module kv_key 'key/main.bicep' = [for k in keys: {}]\n"
+                      "module pe 'br/public:avm/res/network/private-endpoint:0.11.0'"
+                      " = {}\n")
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                self.KV + "/main.bicep": parent_src,
+                self.KV + "/key/main.bicep": "param name string\n"})
+            area = {"id": self.KV, "label": "vault",
+                    "paths": [self.KV + "/key/main.bicep"], "edges": []}
+            self.assertEqual(gather._bicep_entrypoint(area, clone),
+                             self.KV + "/main.bicep")
+            built = []
+
+            def run(cmd, **kw):
+                built.append(cmd)
+                return '{"resources": []}' if cmd[:2] == ["bicep", "build"] else ""
+
+            cg = {"provider": "directory", "areas": [area]}
+            gather.extract_iac_edges(
+                cg, clone, which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+                run=run, read_text=gather._read_text_file)
+            build = next(c for c in built if c[:2] == ["bicep", "build"])
+            self.assertEqual(build[2], os.path.join(clone, self.KV, "main.bicep"))
+            self.assertEqual(area["edges_status"], "resolved")
+            by_ref = {e["ref"]: e for e in area["edges"]}
+            # the parent's registry ref is read (it was never read before)...
+            self.assertEqual(
+                by_ref["br/public:avm/res/network/private-endpoint:0.11.0"]["to"],
+                "avm/res/network/private-endpoint")
+            # ...and the child keeps the existing local <area>/<child> edge shape
+            child = by_ref["key/main.bicep"]
+            self.assertEqual(child["to"], self.KV + "/key")
+            self.assertTrue(child["local"])
+            self.assertEqual(child["instances"], "many")
+
+    def test_deleted_entrypoint_is_not_chosen(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            # parent main.bicep deleted in the window; a child remains on disk
+            self._tree(clone, {"avm/res/a/b/child/main.bicep": ""})
+            area = {"id": "avm/res/a/b", "paths": [
+                "avm/res/a/b/child/main.bicep", "avm/res/a/b/main.bicep"]}
+            self.assertIsNone(gather._bicep_entrypoint(area, clone))
+            # a whole module dir deleted in the window: nothing on disk to build
+            gone = {"id": "infra/app", "label": "app",
+                    "paths": ["infra/app/main.bicep"], "edges": []}
+            self.assertIsNone(gather._bicep_entrypoint(gone, clone))
+            calls = []
+            cg = {"provider": "directory", "areas": [gone]}
+            gather.extract_iac_edges(
+                cg, clone, which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+                run=lambda cmd, **kw: calls.append(cmd) or "", read_text=lambda _p: "")
+            self.assertEqual(calls, [])
+            self.assertEqual(gone["edges_status"], "skipped")
+
+    def test_fallback_when_area_id_is_not_a_directory(self):
+        # e.g. a graphify `community:<n>` area: shallowest EXISTING, non-scaffold
+        # main.bicep among its paths (a deleted shallower one is not chosen).
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                "svc/core/main.bicep": "", "svc/core/child/main.bicep": "",
+                "svc/examples/demo/main.bicep": ""})
+            area = {"id": "community:3", "paths": sorted([
+                "svc/core/child/main.bicep", "svc/core/main.bicep",
+                "svc/examples/demo/main.bicep", "gone/main.bicep"])}
+            self.assertEqual(gather._bicep_entrypoint(area, clone),
+                             "svc/core/main.bicep")
+
+    def test_root_area_sentinels_resolve_to_repo_root(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {"main.bicep": "", "variables.tf": "", "main.tf": ""})
+            self.assertEqual(gather._bicep_entrypoint(
+                {"id": "main.bicep", "paths": ["main.bicep"]}, clone), "main.bicep")
+            self.assertEqual(gather._tf_entrypoint(
+                {"id": "main.tf", "paths": ["variables.tf"]}, clone), "main.tf")
+
+    def test_tf_entrypoint_ignores_nested_example(self):
+        area = {"id": "modules/sub", "paths": sorted([
+            "modules/sub/examples/x/main.tf", "modules/sub/main.tf"])}
+        self.assertEqual(gather._tf_entrypoint(area), "modules/sub/main.tf")
+        # only the example changed and nothing else is known -> nothing to build
+        self.assertIsNone(gather._tf_entrypoint(
+            {"id": "modules/sub", "paths": ["modules/sub/examples/x/main.tf"]}))
+
+    def test_tf_only_example_changed_builds_module_dir_on_disk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                "modules/sub/main.tf": 'resource "x" "y" {}\n',
+                "modules/sub/variables.tf": "",
+                "modules/sub/examples/x/main.tf": 'module "s" { source = "../../" }\n'})
+            area = {"id": "modules/sub", "label": "sub",
+                    "paths": ["modules/sub/examples/x/main.tf"], "edges": []}
+            self.assertEqual(gather._tf_entrypoint(area, clone), "modules/sub/main.tf")
+            chdirs = []
+
+            def run(cmd, **kw):
+                chdirs.append(cmd[1])
+                return 'digraph {\n"a" -> "module.s.b"\n}\n' if cmd[-1] == "graph" else ""
+
+            cg = {"provider": "directory", "areas": [area]}
+            gather.extract_iac_edges(
+                cg, clone,
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=gather._read_text_file)
+            self.assertTrue(chdirs)
+            self.assertTrue(all(d == "-chdir=" + os.path.join(clone, "modules/sub")
+                                for d in chdirs))
+            self.assertEqual(area["edges_status"], "resolved")
+            self.assertFalse(any(e["to"] == "modules/sub" for e in area["edges"]))
+
+    def test_structural_scan_modules_sub_example_emits_no_self_edge(self):
+        files = {
+            "modules/sub/main.tf": 'resource "azurerm_subnet" "s" {}\n',
+            "modules/sub/examples/x/main.tf": 'module "s" { source = "../../" }\n',
+        }
+        out = gather.scan_structural_terraform_areas(
+            "/clone", list_files=lambda: list(files),
+            read_text=lambda rel: files[rel])
+        self.assertEqual(set(out), {"modules/sub"})
+        self.assertEqual(out["modules/sub"]["edges"], [])
+        self.assertEqual(out["modules/sub"]["paths"], ["modules/sub/main.tf"])
+
+    def test_structural_scan_reads_only_the_module_dir(self):
+        # the module's own *.tf (all of them) are read; base dir is the area dir
+        files = {
+            "modules/sub/main.tf": "",
+            "modules/sub/net.tf": 'module "peer" { source = "../peer" }\n',
+            "modules/peer/main.tf": "",
+        }
+        out = gather.scan_structural_terraform_areas(
+            "/clone", list_files=lambda: list(files),
+            read_text=lambda rel: files[rel])
+        self.assertEqual([(e["to"], e["ref"]) for e in out["modules/sub"]["edges"]],
+                         [("modules/peer", "../peer")])
+
+
 class TestIacEdgeHardening(unittest.TestCase):
     """Phase 3c.1: per-build timeout, retry, and VISIBLE gaps (edges_status +
     edge_extraction summary) so a killed/slow build is never a silent empty."""

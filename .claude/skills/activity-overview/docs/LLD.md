@@ -211,6 +211,12 @@ order (graphify does not parse Bicep/HCL, so IaC repos always land here):
 `_is_scaffold_area` marks Terraform `examples/` and `tests/` subtrees as scaffolding: their
 edges are **skipped at extraction and excluded at fold**, because those trees reference the
 module under test through CI-manipulated relative paths and test-only registry modules.
+`_is_scaffold_path` applies the same test to a *file*, so a nested scaffold file that
+classifies into its module's area (`modules/sub/examples/x/main.tf` → `modules/sub`) is never
+read or built as that module.
+
+Area `paths` are the in-window **changed** files (including deleted ones), so they are not
+used to pick what to build; the entrypoint is resolved on disk (§4.6).
 
 ### 4.6 IaC dependency edges (`extract_iac_edges`)
 
@@ -234,6 +240,16 @@ flowchart TB
   SK --> AGG
 ```
 
+- **Entrypoint (`_bicep_entrypoint` / `_tf_entrypoint`, resolved on disk in the clone):**
+  when the area id is a directory in the checkout, Bicep builds `<area id>/main.bicep` and
+  Terraform uses that directory's `*.tf` set (`main.tf` preferred as the representative
+  path), whichever files changed in the window; if that file/set is absent, the area is
+  `skipped`. Only when the area id is not a directory (graphify `community:<n>`, a deleted
+  dir) does it fall back to the shallowest of the area's `paths` that exists on disk. Root
+  sentinels `main.bicep` / `main.tf` name the repo root. Paths missing from the checkout and
+  files under nested `examples/`/`tests/` are never chosen, so an AVM child module
+  (`avm/res/key-vault/vault/access-policy/main.bicep`) is never built in place of its parent.
+  With no clone directory on disk (offline callers) the same rule runs over `paths` alone.
 - **Build-only:** edges come only from a successful build; static guessing is never emitted.
   A `resolved` area with no edges genuinely has no inter-area dependencies; `timeout`/`failed`
   are **counted gaps**.
@@ -242,7 +258,7 @@ flowchart TB
   the BRM monorepo `br/public:avm/res/network/virtual-network:0.x` resolves to the **in-repo**
   area `avm/res/network/virtual-network`. Transitive edges come from walking nested
   deployments in the compiled ARM (`walk_arm_deployments`).
-- **Terraform:** `_tf_entrypoint` reads **every `*.tf` in the module dir**; `parse_terraform_graph`
+- **Terraform:** extraction reads **every `*.tf` in the entrypoint's module dir**; `parse_terraform_graph`
   accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
   first `module.<name>` token gives its owning module. Local sources resolve to repo areas
   (`../..` from a submodule → the root `main.tf` area); registry sources keep `to=None,
@@ -252,7 +268,8 @@ flowchart TB
   set, `_terraform_prewarm` runs one serial init first because terraform's plugin cache is not
   safe under concurrent writes.
 - **Structural scan (manifest gathers only):** `scan_structural_terraform_areas` statically parses
-  every tracked module's `source` references (`git ls-files`, no `terraform init`) and
+  every tracked module's `source` references (`git ls-files`, no `terraform init`; per area
+  only the area dir's own `*.tf`, nested `examples/`/`tests/` files excluded) and
   `merge_structural_areas` unions them, so the dependency graph reflects structure rather than
   in-window churn. Single-repo gathers skip this to keep golden bundles byte-stable.
 

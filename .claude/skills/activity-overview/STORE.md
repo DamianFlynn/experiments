@@ -384,7 +384,10 @@ escaping the repo is unresolved, never a phantom dangling area. **`examples/` an
 `tests/` subtrees are scaffolding** (they reference the module-under-test and test
 fixtures, often other registry modules, via CI-manipulated paths) — they are
 **skipped at extraction and excluded at fold**, so they never become bogus intra-
-or cross-repo dependencies. `terraform graph` runs through the same parallel pool
+or cross-repo dependencies; that includes scaffold files nested inside a module
+(`modules/sub/examples/x/main.tf`), which are never read or built as `modules/sub`.
+The module dir is resolved on disk in the clone, whichever of its files changed in
+the window (see BUNDLE.md, *Entrypoint*). `terraform graph` runs through the same parallel pool
 as the bicep build; with a shared `TF_PLUGIN_CACHE_DIR` a one-shot serial provider
 warm-up precedes the parallel inits (terraform's plugin cache is not write-safe
 under concurrency). The IaC build knobs are env-overridable for heavy runs:

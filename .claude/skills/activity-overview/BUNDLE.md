@@ -211,7 +211,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
   | `version` | pinned version when present, else `null` |
   | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
-  | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge |
+  | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge. Child edges come from building the **parent**: a child module is never the area's entrypoint |
   | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
   | `resolved` | `true` when `to` is non-null |
@@ -224,6 +224,15 @@ docsRefs, release_train, sprints, project, diagrams`.
   repo* (deep external-module internals are not fabricated into edges). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
+
+  **Entrypoint.** Each area is built from its *own* module, resolved on disk in the clone
+  regardless of which files changed in the window: Bicep builds `<area id>/main.bicep`
+  (never `<area>/<child>/main.bicep`, so a child-only change still builds the parent);
+  Terraform runs in the area dir and reads its whole `*.tf` set. A path missing from the
+  checkout (deleted in the window) and any file under a nested `examples/`/`tests/` subtree
+  (e.g. `modules/sub/examples/x/main.tf`) are never the entrypoint. Only when the area id is
+  not a directory (a graphify `community:<n>` area) is the shallowest existing match among
+  the area's `paths` used. No entrypoint on disk ⇒ `edges_status: skipped`.
 
   **Visible gaps.** Per-module builds run in parallel, each bounded by a generous
   per-subprocess timeout (a healthy build finishes well under it; the bound only trips a

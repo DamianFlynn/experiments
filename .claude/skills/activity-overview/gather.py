@@ -1007,6 +1007,16 @@ def _is_scaffold_area(area_id):
     return bool({"examples", "tests"} & set((area_id or "").split("/")))
 
 
+def _is_scaffold_path(path):
+    """True for a FILE inside an `examples/` or `tests/` subtree at any depth.
+
+    A nested scaffold file (e.g. `modules/sub/examples/x/main.tf`) classifies to its
+    module's area (`modules/sub`), so the area-level `_is_scaffold_area` check does
+    not catch it; entrypoint selection and the structural scan use this so such a
+    file is never read or built as the module itself. Pure."""
+    return _is_scaffold_area(os.path.dirname(path or ""))
+
+
 def build_directory_areas(paths, patterns):
     """Fold a list of tracked file paths into the `code_graph` directory provider.
 
@@ -1388,17 +1398,21 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
         if not rel.endswith(".tf"):                # only terraform sources
             continue
         aid = classify_code_area(rel, patterns)
-        if aid is None or _is_scaffold_area(aid):
+        # skip scaffold areas AND scaffold files nested inside a module area
+        # (modules/<x>/examples/...): they are tests of the module, not the module.
+        if aid is None or _is_scaffold_area(aid) or _is_scaffold_path(rel):
             continue
         by_area.setdefault(aid, []).append(rel)
 
     out = {}
     for aid, paths in by_area.items():
         paths = sorted(set(paths))
-        entry = next((p for p in paths if p == "main.tf" or p.endswith("/main.tf")),
-                     paths[0])
-        base_dir = os.path.dirname(entry)
-        text = "\n".join(read_text(p) for p in paths)
+        # The module is the area dir's own *.tf set (terraform reads one dir as one
+        # module); a nested dir is only used when the area dir itself has no *.tf.
+        mod_dir = _tf_module_dir(aid, paths)
+        own = [p for p in paths if os.path.dirname(p) == mod_dir]
+        base_dir = mod_dir
+        text = "\n".join(read_text(p) for p in own)
         bodies = _terraform_module_bodies(text)
         sources = parse_terraform_module_blocks(text)
         edges, seen = [], set()
@@ -1478,19 +1492,115 @@ def _read_text_file(path):
         return fh.read()
 
 
-def _bicep_entrypoint(area):
-    for p in area.get("paths", []):
-        if p == "main.bicep" or p.endswith("/main.bicep"):
-            return p
+# The area ids the directory provider gives to REPO-ROOT IaC files: `_main_bicep_dir`
+# -> "main.bicep", `_tf_dir` -> "main.tf". Each names the root module, whose
+# directory is the repo root (""). Each kind only honours its own sentinel.
+_BICEP_ROOT_ID = "main.bicep"
+_TF_ROOT_ID = "main.tf"
+
+
+def _area_rel_dir(area_id, root_id):
+    """The clone-relative directory an area id names ("" for the repo root)."""
+    return "" if area_id == root_id else (area_id or "")
+
+
+def _rel_join(rel_dir, name):
+    return f"{rel_dir}/{name}" if rel_dir else name
+
+
+def _shallowest(paths):
+    """Deterministic shallowest path (fewest segments, then lexical)."""
+    return min(paths, key=lambda p: (p.count("/"), p), default=None)
+
+
+def _pick_main_tf(files):
+    """`main.tf` from one directory's *.tf list when present, else the first."""
+    files = sorted(files)
+    return next((f for f in files if os.path.basename(f) == "main.tf"),
+                files[0] if files else None)
+
+
+def _tf_module_dir(area_id, tf_paths):
+    """The directory whose *.tf set is this area's module, from a known file list:
+    the area dir itself when it holds any of `tf_paths`, else the shallowest dir
+    among them (an area id that is not a module dir, e.g. a graphify community)."""
+    own = _area_rel_dir(area_id, _TF_ROOT_ID)
+    if any(os.path.dirname(p) == own for p in tf_paths):
+        return own
+    shallow = _shallowest(tf_paths)
+    return os.path.dirname(shallow) if shallow is not None else None
+
+
+def _area_dir_on_disk(area_id, clone_dir, root_id):
+    """The area's directory when it exists in the clone (root sentinel -> ""), else
+    None (the area id is not a directory: deleted, or a non-path id)."""
+    if area_id == root_id:
+        return ""
+    rel = _area_rel_dir(area_id, root_id)
+    if rel and os.path.isdir(os.path.join(clone_dir, rel)):
+        return rel
     return None
 
 
-def _tf_entrypoint(area):
-    tfs = [p for p in area.get("paths", []) if p.endswith(".tf")]
-    for p in tfs:
-        if p == "main.tf" or p.endswith("/main.tf"):
-            return p
-    return tfs[0] if tfs else None
+def _has_clone(clone_dir):
+    return bool(clone_dir) and os.path.isdir(clone_dir)
+
+
+def _bicep_entrypoint(area, clone_dir=None):
+    """The `main.bicep` that IS this area's module, or None.
+
+    With a clone on disk: `<area id>/main.bicep` when the area id is a directory in
+    the checkout — whichever files changed in the window, so a child-only change
+    still builds the parent, and never a child module (`<area>/<child>/main.bicep`)
+    that happens to sort first. When the area dir exists but has no `main.bicep`
+    (deleted) nothing is built. Only when the area id is NOT a directory (deleted
+    dir, graphify `community:<n>`) does it fall back to the shallowest of the area's
+    paths that exists on disk. Never a path missing from the checkout, never one
+    under a nested `examples/`/`tests/` subtree. Without a clone (offline callers)
+    the same rule runs over `paths` alone."""
+    aid = area.get("id") or ""
+    cands = [p for p in area.get("paths", [])
+             if (p == "main.bicep" or p.endswith("/main.bicep"))
+             and not _is_scaffold_path(p)]
+    if _has_clone(clone_dir):
+        rel = _area_dir_on_disk(aid, clone_dir, _BICEP_ROOT_ID)
+        if rel is not None:
+            entry = _rel_join(rel, "main.bicep")
+            return entry if os.path.isfile(os.path.join(clone_dir, entry)) else None
+        cands = [p for p in cands if os.path.isfile(os.path.join(clone_dir, p))]
+    else:
+        own = _rel_join(_area_rel_dir(aid, _BICEP_ROOT_ID), "main.bicep")
+        if own in cands:
+            return own
+    return _shallowest(cands)
+
+
+def _tf_entrypoint(area, clone_dir=None):
+    """A `.tf` file in the directory that IS this area's module, or None (`main.tf`
+    when that dir has one). Callers use its directory: terraform runs there and
+    every `*.tf` in it is read.
+
+    With a clone on disk: the area dir's own `*.tf` set when the area id is a
+    directory in the checkout (regardless of which files changed in the window);
+    otherwise the dir of the shallowest of the area's `.tf` paths that exists on
+    disk. Never a path missing from the checkout, never one under a nested
+    `examples/`/`tests/` subtree (`modules/sub/examples/x/main.tf` is not
+    `modules/sub`). Without a clone the same rule runs over `paths` alone."""
+    aid = area.get("id") or ""
+    tfs = [p for p in area.get("paths", [])
+           if p.endswith(".tf") and not _is_scaffold_path(p)]
+    if _has_clone(clone_dir):
+        rel = _area_dir_on_disk(aid, clone_dir, _TF_ROOT_ID)
+        if rel is not None:
+            return _pick_main_tf(_list_tf_files(clone_dir, rel))
+        tfs = [p for p in tfs if os.path.isfile(os.path.join(clone_dir, p))]
+        shallow = _shallowest(tfs)
+        if shallow is None:
+            return None
+        return _pick_main_tf(_list_tf_files(clone_dir, os.path.dirname(shallow))
+                             or [shallow])
+    mod_dir = _tf_module_dir(aid, tfs)
+    return _pick_main_tf([p for p in tfs if os.path.dirname(p) == mod_dir])
 
 
 def _bicep_build_arm(run, clone_dir, rel_path, timeout=None):
@@ -1898,8 +2008,10 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
     `timeout` (build exceeded the bound after retries), `failed` (build errored
     after retries), `skipped` (no entrypoint or its CLI absent). A timeout/failure
     leaves edges untouched but is reported via the status so the gap is visible."""
-    bp = _bicep_entrypoint(area)
-    tp = _tf_entrypoint(area)
+    # Entrypoints are resolved on disk in the clone (the area's own module file),
+    # not from the in-window changed paths — see _bicep_entrypoint/_tf_entrypoint.
+    bp = _bicep_entrypoint(area, clone_dir)
+    tp = _tf_entrypoint(area, clone_dir)
     if bp and have_bicep:
         kind = "bicep"
     elif tp and have_tf:
@@ -1938,7 +2050,7 @@ def _terraform_prewarm(build_areas, clone_dir, run, timeout):
     to share the same providers. Best-effort: a single warm-up failing is ignored
     (that area's parallel build still runs and reports its own status)."""
     for area in build_areas:
-        tp = _tf_entrypoint(area)
+        tp = _tf_entrypoint(area, clone_dir)
         if not tp:
             continue
         full = os.path.join(clone_dir, os.path.dirname(tp) or ".")
