@@ -14,7 +14,7 @@ author or board status**. Resolve those with the template's LOOKUP RULE: the
 `bundle["prs"]` / `bundle["issues"]` row whose `number` equals `ref.id` (in the project
 view, in the bundle of the member whose `repo` equals `ref.repo`). Trains have no title:
 use the root issue's title, else the first PR's. The reference date is `meta.ref_date`
-when present, else `meta.to` (views do not carry `ref_date` yet).
+(every view carries it; it defaults to `meta.to`).
 
 ## Executive summary
 3–5 bullets — features, releases, CI health, key risks — informed by board + call context.
@@ -147,8 +147,7 @@ bucket refs; `bundle["sprints"]` holds `{id: {title, start, end}}`.
   when no item carries a status.
 - **Sprints (release-train framing)** — ONLY when `bundle["sprints"]` is non-empty (the board
   defines an iteration field). Resolve previous / current / next via
-  `link.select_sprints(bundle["sprints"], ref)` with the reference date (`meta.ref_date` when
-  present, else `meta.to`); each result is `{id, title, start, end}`. Per sprint list the
+  `link.select_sprints(bundle["sprints"], ref)` with the reference date (`meta.ref_date`); each result is `{id, title, start, end}`. Per sprint list the
   items whose `item.iteration` equals `sprint.id` (shipped vs in-flight). Omit for status-only
   boards (usually absent). Deterministic data; the framing prose is the agent's.
 

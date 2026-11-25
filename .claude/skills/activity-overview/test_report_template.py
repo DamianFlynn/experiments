@@ -117,9 +117,7 @@ AGENT_DERIVED = {
 
 # Fields a document may name before the code emits them; each document states
 # the fallback next to the name.
-PENDING = {
-    "meta.ref_date": "views carry no ref_date yet (issue #75); fall back to meta.to",
-}
+PENDING = {}
 
 _SEG = r"(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[^\]\s]*\])"
 PATH_RE = re.compile(r"(?<![\w.\"'/<-])([A-Za-z_][A-Za-z0-9_]*)((?:" + _SEG + r")+)")

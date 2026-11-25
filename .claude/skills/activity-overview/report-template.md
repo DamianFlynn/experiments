@@ -78,8 +78,7 @@ PLACEHOLDER RULES — read before filling anything below.
   `ptrain.prs` / `ptrain.issues` entries are `<project>/<repo>#pr-<n>` /
   `#issue-<n>`: look `<n>` up in member `<repo>`, whose own single-repo train for
   the same anchor is `train-issue-<n>` (or `train-pr-<n>`).
-* REFERENCE DATE: `meta.ref_date` when present, else `meta.to` (views do not
-  carry `ref_date` yet).
+* REFERENCE DATE: `meta.ref_date` (every view carries it; it defaults to `meta.to`).
 * TRUNCATED DIAGRAMS: when `diagrams.truncated` has an entry for an embedded
   diagram, say so under it: "Showing {diagrams.truncated[].shown} of
   {diagrams.truncated[].total} {diagrams.truncated[].unit}."
@@ -269,7 +268,7 @@ status when `item.board_status` is set.
 <!-- Sprints — ONLY when bundle["sprints"] is non-empty (an iteration board). Most
      boards are status-only (no iterations) -> OMIT this whole section. Resolve
      previous / current / next with `link.select_sprints(bundle["sprints"], ref)`
-     where ref is the reference date (`meta.ref_date` when present, else `meta.to`);
+     where ref is the reference date (`meta.ref_date`);
      per sprint, list the items whose `item.iteration` equals `sprint.id`. -->
 
 - **Current sprint:** {sprint.title} ({sprint.start} → {sprint.end}) — {count of items whose item.iteration is sprint.id}
