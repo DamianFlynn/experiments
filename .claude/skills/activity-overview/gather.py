@@ -2671,7 +2671,10 @@ def parse_args(argv):
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
     p.add_argument("--ref-date", default=None,
-                   help="Reference date for milestone framing (default: --to).")
+                   help="Reference date for milestone/sprint/forecast/flow "
+                        "framing (YYYY-MM-DD or a full ISO timestamp; default: "
+                        "--to). Stored with the window; view.py/digest.py "
+                        "read it back.")
     p.add_argument("--include-workflows", dest="include_workflows",
                    action="store_true", default=True)
     p.add_argument("--no-workflows", dest="include_workflows", action="store_false")
@@ -2721,6 +2724,9 @@ def parse_args(argv):
             manifest_mod.check_date(args.to, "--to")
         if frm is not None and args.to is not None:
             manifest_mod.check_window(frm, args.to, "--from", "--to")
+        # Stored with the window at fold and read back by every view (#75).
+        if args.ref_date is not None:
+            manifest_mod.check_ref_date(args.ref_date, "--ref-date")
     except ValueError as exc:
         p.error(str(exc))
     return args
@@ -4980,6 +4986,14 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
 
         graphstore.record_window(conn, project, repo, meta.get("from"),
                                  meta.get("to"), commit=False)
+        # The window's reference date (issue #75): acquire() sets meta.ref_date
+        # to `--ref-date` or `to`; the view of this window reads it back.
+        # Always written (falling back to `to`), so a re-fold of the same window
+        # without `--ref-date` resets an earlier override.
+        ref_date = meta.get("ref_date") or meta.get("to")
+        if ref_date:
+            graphstore.set_ref_date(conn, project, repo, meta.get("from"),
+                                    meta.get("to"), ref_date, commit=False)
         if meta.get("clone_sha"):
             graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
                                      commit=False)

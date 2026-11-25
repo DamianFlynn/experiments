@@ -438,11 +438,14 @@ These are real, current limits — plan around them:
 6. **No standalone `extract` CLI.** The on-disk bundle view is obtained via `digest.py`
    (which works for single repos too); see USAGE §4.
 7. **Narrative is not in CI.** The live CI job stops at the trust gate.
-8. **Views assume a single-window store.** `extract` does not emit `meta.period`, and it
-   materializes the repo's *whole* stored node set, so a view built from a store holding
-   several windows counts every stored merge as shipped (buckets fall back to "in window" when
-   `period` is absent) and its trains/commits include all stored history. This affects both
-   member bundles and the project view.
+8. **Views assume a single-window store (partly fixed).** Since issue #75 a view carries its
+   window (`meta.period`, `meta.ref_date`), so shipped and rejected count only items merged or
+   closed in the view's window, and in flight only items updated in it (or on the current
+   milestone), on member bundles
+   and the project view alike, and gather's `--ref-date` is kept with the window. Still open:
+   `extract` materializes the repo's *whole* stored node set, so on a store holding several
+   windows the view's `prs`/`issues`/`commits` arrays and its trains include all stored
+   history (window-scoped arrays are a follow-up).
 9. **Repeated folds of overlapping files fail the trust gate.** On re-fold, an artifact node's
    lifecycle is replaced by the incoming window's while the change ledger keeps every window,
    so `validate.no_drift` reports lifecycle drift once a second window touches the same files.
@@ -464,8 +467,8 @@ These are real, current limits — plan around them:
     name: re-gather them into a fresh store rather than folding new windows on top.
 
 Items 8–9 are why USAGE recommends one store per installment; they are candidates for code
-fixes (set `meta.period` and window the materialized arrays in `extract`; make artifact
-folding cumulative), tracked in [§11](#11-extension-points-and-roadmap).
+fixes (window the materialized arrays in `extract`; make artifact folding cumulative),
+tracked in [§11](#11-extension-points-and-roadmap).
 
 ## 11. Extension points and roadmap
 

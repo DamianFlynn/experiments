@@ -125,6 +125,14 @@ def _bound_instant(value, what, end):
                      "YYYY-MM-DDTHH:MM:SSZ, got {!r}".format(what, value))
 
 
+def check_ref_date(value, what="--ref-date"):
+    """Return `value` if it is a usable reference date (issue #75): a real
+    `YYYY-MM-DD` date or a full ISO timestamp, validated in full like a reader
+    window bound. Readers compare it by its date (`[:10]`)."""
+    _bound_instant(value, what, end=False)
+    return value
+
+
 def check_reader_window(ts_from, ts_to, what_from="--from", what_to="--to"):
     """Validate a READER window (view/digest/spotlight): each bound is a date or a
     full timestamp, validated in full, and from <= to as instants (a date-only

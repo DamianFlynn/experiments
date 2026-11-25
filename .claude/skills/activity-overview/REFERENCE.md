@@ -72,10 +72,12 @@ python3 link.py workspace/view/bundle.json --series workspace/series.json
 python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams
 ```
 
-`view.py --store DB [--project P] [--repo R] --from F --to T --out PATH` auto-detects
+`view.py --store DB [--project P] [--repo R] --from F --to T --out PATH [--ref-date D]` auto-detects
 `--project`/`--repo` when the store holds exactly one (single-repo gather: project =
 owner, repo = name; manifest: project = manifest name, repo = `owner/repo`), writes
-exactly what `extract.extract` returns (raw keys, extract's deterministic order), does
+exactly what `extract.extract` returns (raw keys, extract's deterministic order) — with
+`meta.period` = `{F, T}` (the window `link.py` buckets to) and `meta.ref_date` = `D`, else
+gather's `--ref-date` stored for exactly this window, else `T` — does
 no network backfill, and exits 2 when the scope is ambiguous, unknown or empty, or the
 store is missing. For a multi-repo project, `--repo` selects one member; the merged
 project view comes from `digest.py`. The full step-by-step procedure (and which report

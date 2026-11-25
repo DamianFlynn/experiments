@@ -831,6 +831,25 @@ def get_clone_sha(conn, project, repo):
     return get_meta(conn, _clone_sha_key(project, repo))
 
 
+def _ref_date_key(project, repo, frm, to):
+    return "ref_date:{}/{}:{}:{}".format(project, repo, frm, to)
+
+
+def set_ref_date(conn, project, repo, frm, to, ref_date, commit=True):
+    """Record the reference date a gathered window [frm, to] was folded with
+    (issue #75: gather `--ref-date`, else the window's `to`). One value per
+    (project, repo, from, to); a re-fold of the same window replaces it.
+    `commit=False` leaves the write in the caller's open transaction."""
+    set_meta(conn, _ref_date_key(project, repo, frm, to), ref_date,
+             commit=commit)
+
+
+def get_ref_date(conn, project, repo, frm, to):
+    """Return the reference date stored for exactly this gathered window, or
+    None when that window was not folded (or was folded before issue #75)."""
+    return get_meta(conn, _ref_date_key(project, repo, frm, to))
+
+
 _DEAD_REFS_DDL = (
     "CREATE TABLE IF NOT EXISTS dead_refs ("
     "id TEXT PRIMARY KEY, project TEXT, reason TEXT, first_seen TEXT)"

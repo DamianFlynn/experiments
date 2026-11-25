@@ -126,7 +126,10 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```bash
    python3 view.py --store workspace/journey.db --from FROM --to TO --out workspace/view/bundle.json
    ```
-   Use the FROM/TO you gathered (for a manifest, its window). `--project`/`--repo` are
+   Use the FROM/TO you gathered (for a manifest, its window): the view records them as
+   `meta.period` and `link.py` buckets only that window's items. `meta.ref_date` is the
+   `--ref-date` you gathered with (when FROM/TO match the gathered window exactly), else TO;
+   `view.py --ref-date D` overrides it. `--project`/`--repo` are
    auto-detected when the store holds one project with one repo; otherwise pass them
    (single repo: `--project OWNER --repo REPO`). For a **multi-repo project**, run it once
    per member you report on — `python3 view.py --store workspace/journey.db --project <name>

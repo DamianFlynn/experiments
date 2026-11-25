@@ -69,10 +69,13 @@ def group_related_work(trains):
 
 
 def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
-                   backfill_budget=50, warn=None):
+                   backfill_budget=50, warn=None, ref_date=None):
     """Materialize + enrich one bundle per member repo, in `repos` order.
     Each is the single-repo enriched bundle for that member, produced via
-    the unmodified extract -> link.enrich path.
+    the unmodified extract -> link.enrich path, so each carries the window
+    (`meta.period`, buckets limited to it) and `meta.ref_date` (issue #75).
+    `ref_date` overrides every member's reference date; None lets extract use
+    the value stored for the window, else `ts_to`.
 
     `warn` is an optional callable(str) forwarded to extract for spine
     backfill-budget / missing-context diagnostics; the default (None) lets
@@ -85,7 +88,7 @@ def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
         bundle = extract_mod.extract(
             conn, project, repo, ts_from, ts_to,
             backfill=backfill, backfill_budget=backfill_budget,
-            warn=warn)
+            warn=warn, ref_date=ref_date)
         bundle = link_mod.enrich(bundle)
         bundle["meta"].update(_member_identity(project, repo))
         out.append({"repo": repo, "bundle": bundle})
@@ -347,7 +350,7 @@ def _merge_modules(members):
 
 def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
                        backfill_budget=50, ticket_pattern=None,
-                       warn=None):
+                       warn=None, ref_date=None):
     """The merged project view consumed by report-template.md's narrative step.
     Keys: meta{project,repos,from,to}, members[{repo,bundle}] (per-member raw +
     enriched, for collision-prone per-file sections), trains (project-wide, each
@@ -358,10 +361,11 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     default) leaves every train's `tickets` and `related_work` empty.
 
     `warn` is forwarded to member_bundles (extract diagnostics); default None
-    lets extract surface incompleteness on stderr."""
+    lets extract surface incompleteness on stderr. `ref_date` is forwarded to
+    member_bundles (override of each member's `meta.ref_date`)."""
     members = member_bundles(conn, project, repos, ts_from, ts_to,
                              backfill=backfill, backfill_budget=backfill_budget,
-                             warn=warn)
+                             warn=warn, ref_date=ref_date)
     comps = spine_components(conn, project, repos, ts_from, ts_to)
     trains = build_project_trains(members, comps, project)
     _attach_tickets(members, trains, project, ticket_pattern)
@@ -440,6 +444,11 @@ def parse_args(argv):
                         "pattern has one, else the whole match. Without this or "
                         "manifest ticket_prefixes, ticket clustering is off and "
                         "related_work is [].")
+    p.add_argument("--ref-date", dest="ref_date", default=None,
+                   help="reference date for every member's meta.ref_date "
+                        "(YYYY-MM-DD or a full ISO timestamp). Default: the "
+                        "--ref-date gather stored for exactly this window, "
+                        "else --to.")
     return p.parse_args(argv)
 
 
@@ -482,12 +491,14 @@ def resolve_members(conn, project, repos):
 
 
 def main(argv=None):
-    """Exit codes: 0 view written to stdout; 2 usage error — bad window, bad
-    --ticket-pattern or --manifest, missing/unreadable store, unknown project or
-    repo. Nothing is written to stdout on exit 2."""
+    """Exit codes: 0 view written to stdout; 2 usage error — bad window or
+    --ref-date, bad --ticket-pattern or --manifest, missing/unreadable store,
+    unknown project or repo. Nothing is written to stdout on exit 2."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         manifest_mod.check_reader_window(args.ts_from, args.ts_to, "--from", "--to")
+        if args.ref_date is not None:
+            manifest_mod.check_ref_date(args.ref_date, "--ref-date")
     except ValueError as exc:
         return _fail(str(exc))
 
@@ -530,7 +541,8 @@ def main(argv=None):
         except ValueError as exc:
             return _fail(str(exc))
         view = build_project_view(conn, project, repos,
-                                  args.ts_from, args.ts_to, ticket_pattern=pattern)
+                                  args.ts_from, args.ts_to, ticket_pattern=pattern,
+                                  ref_date=args.ref_date)
     except sqlite3.DatabaseError as exc:
         return _fail("cannot read store {!r}: {}".format(args.store, exc))
     finally:

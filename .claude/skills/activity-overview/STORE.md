@@ -174,7 +174,14 @@ significant and otherwise raise `OperationalError`.
 Key/value provenance: `schema_version` (see below); `gathered_windows` (JSON list of
 folded `{project,repo,from,to}`, deduped — `record_window`/`get_windows`);
 `clone_sha:{project}/{repo}` (the tree a repo was last gathered against, for
-deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`).
+deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`);
+`ref_date:{project}/{repo}:{from}:{to}` (the reference date a gathered window was
+folded with: gather `--ref-date`, else the window's `to`; a re-fold of the same
+window replaces it — `set_ref_date`/`get_ref_date`). `extract` stamps it into the
+view's `meta.ref_date` when the view's `--from/--to` equal that window exactly
+(else the view's `to`; a view/digest `--ref-date` overrides both), and stamps
+`meta.period = {from, to}` from the view's own window (issue #75). Stores folded
+before #75 have no `ref_date:` keys; their views fall back to `to`.
 
 ### Schema version and migration
 
@@ -193,7 +200,7 @@ Code older than v2 writing into a v2 store would add `fts_text` rows without
 ## Transactions (atomic folds)
 
 `fold_bundle` writes a fold as **one transaction** (`with conn:`): nodes,
-edges, code events, the FTS index, `gathered_windows` and `clone_sha` commit
+edges, code events, the FTS index, `gathered_windows`, `ref_date` and `clone_sha` commit
 together, and any exception rolls all of them back, so readers never see a
 half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
 `add_code_events`, `index_text(s)`, `set_meta`, `record_window`,

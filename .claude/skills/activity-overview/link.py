@@ -47,6 +47,14 @@ def _in_window(ts, period):
     return graphstore.ts_in_window(ts, period.get("from"), period.get("to"))
 
 
+def window_period(meta):
+    """The window a bundle's buckets/forecast are limited to (issue #75):
+    `meta.period`, else `{from, to}`. Shared by compute_buckets and
+    build_forecast so the two never disagree. With neither set, both bounds are
+    None and `_in_window` stays permissive (dateless fixtures)."""
+    return meta.get("period") or {"from": meta.get("from"), "to": meta.get("to")}
+
+
 def _high_priority(item):
     return any((lbl or "").lower() in HIGH_PRIORITY_LABELS
                for lbl in item.get("labels", []))
@@ -380,7 +388,7 @@ def compute_buckets(bundle):
     """Full four-way bucketing: one bucket per item, precedence
     shipped > rejected > next_candidates > in_flight. Refs carry their train id."""
     meta = bundle.get("meta", {})
-    period = meta.get("period")
+    period = window_period(meta)
     base_branch = meta.get("base_branch")
     ref_date = meta.get("ref_date") or meta.get("to") or ""
     current_ms, next_ms = select_milestones(bundle.get("milestones", []), ref_date)
@@ -913,10 +921,7 @@ def build_forecast(bundle):
     prs, issues, and meta.  Forward-only: no predicted-vs-landed comparison.
     """
     meta        = bundle.get("meta", {})
-    # Production bundles carry meta.period; fall back to meta.from/to so bundles
-    # built via build_bundle (no period key) still window `recent_activity`
-    # correctly instead of _in_window treating every item as in-window.
-    period      = meta.get("period") or {"from": meta.get("from"), "to": meta.get("to")}
+    period      = window_period(meta)
     ref_date    = meta.get("ref_date") or meta.get("to") or ""
 
     # Resolve next milestone title via the shared helper.

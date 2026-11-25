@@ -19,7 +19,8 @@ Options:
 - `--series PATH` — an append-only `series.json` index so this installment is
   framed against the previous one ("Since last installment").
 - Any other gather flag (e.g. `--no-project-board`, `--ref-date`, `--clone-dir`)
-  passes through to `gather.py`.
+  passes through to `gather.py`. `--ref-date` is stored with the window and
+  `view.py`/`digest.py` read it back into `meta.ref_date`.
 
 Steps (run from the skill directory; STORE is `--store` or `workspace/journey.db`,
 FROM/TO the window):

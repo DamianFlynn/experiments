@@ -4,7 +4,7 @@ The CLI face of `extract.extract` (the reader stage). gather writes only the
 store; this writes the per-repo **bundle view** file that `link.py` enriches in
 place and `render.py` draws from:
 
-    python3 view.py --store DB [--project P] [--repo R] --from F --to T --out bundle.json
+    python3 view.py --store DB [--project P] [--repo R] --from F --to T --out bundle.json [--ref-date D]
 
 Store scoping (how gather keys what it folds):
   * single repo (`gather.py --owner O --repo N`): project = O, repo = N
@@ -16,6 +16,10 @@ project / the project holds exactly one repo (same rule as `validate.py`).
 For a multi-repo project, `--repo` selects ONE member; the merged project view
 (cross-repo trains, merged shipped/people/modules, related_work, module_edges)
 comes from `digest.py`, not from this tool.
+
+The view carries its window (issue #75): `meta.period` = {--from, --to}, so
+`link.py` buckets only this window's items, and `meta.ref_date` = `--ref-date`,
+else the `--ref-date` gather stored for exactly this window, else `--to`.
 
 Output: exactly what `extract.extract` returns (the RAW keys only — no trains /
 buckets / diagrams; run `link.py` next), as indented JSON. Arrays are already
@@ -63,6 +67,10 @@ def parse_args(argv):
                    help="window end (YYYY-MM-DD, or a full ISO timestamp)")
     p.add_argument("--out", required=True,
                    help="bundle view JSON to write (parent dirs are created)")
+    p.add_argument("--ref-date", dest="ref_date", default=None,
+                   help="reference date written to meta.ref_date (YYYY-MM-DD "
+                        "or a full ISO timestamp). Default: the --ref-date "
+                        "gather stored for exactly this window, else --to.")
     args = p.parse_args(argv)
     # Shared reader-window rules (manifest.check_reader_window): each bound is a
     # real YYYY-MM-DD date or a full ISO timestamp, validated in FULL (no junk
@@ -72,6 +80,11 @@ def parse_args(argv):
     except ValueError as exc:
         p.error("{} (given --from {!r}, --to {!r})".format(
             exc, args.ts_from, args.ts_to))
+    if args.ref_date is not None:
+        try:
+            manifest.check_ref_date(args.ref_date, "--ref-date")
+        except ValueError as exc:
+            p.error(str(exc))
     return args
 
 
@@ -144,7 +157,8 @@ def main(argv=None):
             project, repo = resolve_scope(conn, args.project, args.repo)
         except ValueError as exc:
             return _fail(str(exc))
-        bundle = extract.extract(conn, project, repo, args.ts_from, args.ts_to)
+        bundle = extract.extract(conn, project, repo, args.ts_from, args.ts_to,
+                                 ref_date=args.ref_date)
     except sqlite3.DatabaseError as exc:
         return _fail("cannot read store {!r}: {}".format(args.store, exc))
     finally:

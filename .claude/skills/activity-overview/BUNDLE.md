@@ -82,6 +82,13 @@ the rest (engagement, code areas, trains, people/flow).
   records how gather obtained the clone (see `gather.prepare_clone`); it is in the bundle
   `acquire` assembles and is not folded into the store. (Store-only — see `STORE.md`; this bundle shape is the
   transient view `extract` materializes from the store, not a produced file.)
+  A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
+  to` (+ `clone_sha`), **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).
+  `period` is the window `compute_buckets` and `build_forecast` limit to (`link.window_period`:
+  `period`, else `{from, to}`), so items the store holds from other windows — or old items
+  gather pulled because they were updated in the window — fall in no bucket. `ref_date` frames
+  milestones, sprints, forecast age and flow staleness: the view's `--ref-date` if given, else
+  the gather `--ref-date` stored for exactly this window, else `to`.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
   message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it

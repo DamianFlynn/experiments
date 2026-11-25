@@ -92,9 +92,9 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 
 > **Why one store per installment?** The store layer is idempotent and *can* accumulate many
 > windows, but two current limitations make an accumulated store unsuitable for monthly
-> digests (HLD §10): (1) a view materialized from a multi-window store is not scoped to its
-> window — `extract` emits no `meta.period`, so buckets treat every stored merge as in-window,
-> and trains/commits include all stored history; (2) after a second fold that touches the same
+> digests (HLD §10): (1) a view materialized from a multi-window store is only partly scoped to
+> its window — its buckets (shipped, rejected, in flight) are bounded by `meta.period`, but its
+> `prs`/`issues`/`commits` arrays and trains include all stored history; (2) after a second fold that touches the same
 > files, `validate.py` fails `no_drift` (artifact lifecycles keep only the latest window while
 > the change ledger keeps all). A single-window store per installment — the way CI and the
 > golden tests use it — avoids both. An optional accumulated `history.db` is still useful for
@@ -191,7 +191,9 @@ flowchart TB
 
 1. **Window.** Use calendar months: `--from 2026-11-01 --to 2026-11-30`. `--ref-date` defaults
    to `--to`, which frames milestones, sprints, forecast age and flow staleness — keep the
-   default for month-end reports.
+   default for month-end reports. gather stores it with the window, and `view.py`/`digest.py`
+   read it back when their `--from/--to` are that exact window (else they use their `--to`);
+   both also take `--ref-date` to override it.
 2. **Gather into this month's own store** (`stores/YYYY-MM.db`). Re-running the same window
    into the same store is safe (idempotent). `gather` clones into `--clone-dir`, or, when that
    directory already holds a clone of the same repo, fetches it to the window's history bound
@@ -538,7 +540,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `no_drift` "lifecycle length drift" | several overlapping windows folded into one store (known limitation, HLD §10) | use one store per installment; rebuild history stores from one wide gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
-| Last month's merges appear as shipped this month | the view was built from a store holding several months (no `meta.period`, HLD §10) | rebuild the month from its own single-window store |
+| Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was built from a store holding several months (arrays are not window-scoped, HLD §10) | rebuild the month from its own single-window store |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
 | A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" after upgrading | the store was folded before commit authors were resolved to logins (#78) | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
 | A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |

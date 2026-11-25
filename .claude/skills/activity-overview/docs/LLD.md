@@ -114,7 +114,7 @@ scratch store) and `backfill` respectively.
 | `--owner`, `--repo` | — | Single-repo target |
 | `--manifest PATH` | — | Multi-repo project (validated by `manifest.load_manifest` **before** the store is touched) |
 | `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
-| `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing |
+| `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing (`YYYY-MM-DD` or full ISO timestamp, `manifest.check_ref_date`). Stored per window at fold (`ref_date:` meta key) and read back into the view's `meta.ref_date` (§6.1) |
 | `--branches` | `main` | Recorded in `meta`; first is `base_branch` (walk uses the checked-out default branch) |
 | `--clone-dir` | `workspace/<repo>-clone` | Clone location |
 | `--no-clone` | off | Reuse an existing clone |
@@ -536,7 +536,7 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
 
 ## 6. Read and enrich
 
-### 6.1 `extract.extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None, backfill=None, backfill_budget=50)`
+### 6.1 `extract.extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None, backfill=None, backfill_budget=50, ref_date=None)`
 
 1. `range_query` the window for in-window nodes.
 2. Seed trains from in-window **anchors** (PR/issue; reviews/events never seed), then
@@ -551,14 +551,19 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    `fold_bundle` (`owns`) and `annotate_people_profile` (`stale_owned`) share one matcher,
    `derive.compile_codeowners`/`area_owners` (area = last rule matching `<area>/`).
 
+6. `_materialize_meta` (issue #75): `owner, repo, from, to` (+ `clone_sha`), `period =
+   {from: ts_from, to: ts_to}` (the requested bounds, unchanged — the same ones step 1 uses)
+   and `ref_date` = the `ref_date` argument (view/digest `--ref-date`), else
+   `graphstore.get_ref_date(project, repo, ts_from, ts_to)` (stored by fold for exactly that
+   gathered window), else `ts_to`.
+
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
-> **Single-window assumption.** `_materialize_meta` emits `owner, repo, from, to` (+
-> `clone_sha`) — no `period` or `ref_date` — and steps 4–5 read the repo's *whole* stored node
-> set, not just the window. On a store gathered for one window this is exact (and is what the
-> golden-equivalence tests pin). On a store holding several windows, the view includes every
-> stored PR/issue/commit/train, and `compute_buckets` (which treats a missing `period` as
-> "in window") counts every stored merge as shipped. See HLD §10 items 8–9 and §14.4.
+> **Single-window assumption (arrays).** Steps 4–5 read the repo's *whole* stored node set,
+> not just the window. On a store gathered for one window this is exact (and is what the
+> golden-equivalence tests pin). On a store holding several windows, the view's arrays and
+> trains include every stored PR/issue/commit; the buckets do not, because `meta.period`
+> bounds them (§6.5). See HLD §10 items 8–9 and §14.5.
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -614,9 +619,12 @@ conventional-commit prefix. Each train records `prs`, `commits`, `code_areas`,
 
 ### 6.5 Buckets — `compute_buckets`
 
-Evaluated per PR then per issue; first matching rule wins. "In window" uses `meta.period`;
-when `period` is absent (as in an `extract` view) `_in_window` returns true for every
-timestamp:
+Evaluated per PR then per issue; first matching rule wins. "In window" uses
+`link.window_period(meta)` — `meta.period`, else `{from: meta.from, to: meta.to}` — the same
+helper `build_forecast` uses (issue #75). Every `extract` view carries `period`, so an issue
+closed in an earlier window but commented on in this one, or an open issue last touched long
+ago, falls in no bucket. Only a bundle with neither `period` nor `from`/`to` (dateless
+fixtures) is unbounded; an item with no timestamp counts as in window:
 
 ```mermaid
 flowchart TB
@@ -831,10 +839,13 @@ wires `gather.backfill` with a token (the only network path in a reader).
 
 ## 10. Multi-repo aggregation — `digest.py`
 
-`digest.py --store S [--project P] [--manifest M] [--repo R …] --from F --to T [--ticket-pattern RE]`
+`digest.py --store S [--project P] [--manifest M] [--repo R …] --from F --to T [--ticket-pattern RE] [--ref-date D]`
 (repos default to `project_repos`; `--project` defaults to the manifest's). Works
-for single-repo stores too (`--project <owner> --repo <name>`). Exit 2 for a bad
-window (`manifest.check_reader_window`), a missing store, an unknown project (lists
+for single-repo stores too (`--project <owner> --repo <name>`). Each member bundle is an
+`extract` view, so it carries `meta.period`/`meta.ref_date` and its buckets (and so the
+merged `shipped`) are limited to the window; `--ref-date` overrides every member's
+`ref_date` (§6.1). Exit 2 for a bad
+window (`manifest.check_reader_window`), a bad `--ref-date`, a missing store, an unknown project (lists
 the store's projects) or `--repo` (lists the project's repos). Ticket clustering is
 opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
 `--ticket-pattern` (wins); otherwise `tickets`/`related_work` are `[]`. Each
@@ -990,7 +1001,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
-| View not window-scoped on multi-window stores | `extract._materialize_meta` omits `period`; arrays come from `repo_nodes` | prior windows' merges counted as shipped; trains/commits span all stored history (member and project views) | emit `meta.period`/`ref_date` from `ts_from/ts_to`; window the materialized arrays to in-window + spine context |
+| View arrays not window-scoped on multi-window stores | arrays come from `repo_nodes` (buckets are bounded by `meta.period` since #75) | `prs`/`issues`/`commits` and trains span all stored history (member and project views) | window the materialized arrays to in-window + spine context |
 | Trust gate fails after a second overlapping fold | `fold_bundle` upserts artifact nodes with the incoming window's lifecycle; `code_events` keeps all windows | `validate.no_drift` "lifecycle length drift" | rebuild artifact lifecycle from the full ledger on fold (or merge with the stored one) |
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |

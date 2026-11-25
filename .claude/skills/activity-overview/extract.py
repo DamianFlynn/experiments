@@ -33,9 +33,12 @@ Materialization approach (slice 7a part 1)
    `symbol_events` (see `_materialize_symbol_events`) so the self-sourced raw
    bundle is COMPLETE — `derive.build_artifacts` re-derives the symbol/comment
    artifacts exactly, and the self-sourced `validate` no_drift passes.
-5. Reconstruct `meta` (owner/repo/from/to, + clone_sha if recorded) so it
-   round-trips. `ref_date`/`period` are NOT stored by P6 and are intentionally not
-   reconstructed — enrich falls back to meta["to"] and {from,to} deterministically.
+5. Reconstruct `meta` (owner/repo/from/to, + clone_sha if recorded) and stamp
+   the view's window (issue #75): `period` = the requested {from, to}, so
+   `link.compute_buckets` limits shipped/rejected/in_flight to this window even
+   when the store holds other windows' items; `ref_date` = the explicit
+   override, else the value fold stored for exactly this gathered window
+   (gather `--ref-date`, default its `to`), else this view's `to`.
 
 Deterministic ordering matches the golden bundles: prs/issues by number, commits
 by sha, milestones by number, releases by tag/name, code_events by source order.
@@ -129,7 +132,7 @@ def _train_anchor(node):
 
 
 def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
-            backfill=None, backfill_budget=50):
+            backfill=None, backfill_budget=50, ref_date=None):
     """Materialize a rev-13 RAW bundle view for project/repo over [ts_from, ts_to].
 
     Returns a bundle dict carrying ONLY raw keys; run `link.enrich` on it to add
@@ -147,6 +150,9 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     When `backfill` is None (the default) behavior is EXACTLY as before — the
     `missing` ids are only warned about — so existing callers/characterization
     are byte-identical.
+
+    `ref_date` (optional) overrides the reference date stamped into
+    `meta.ref_date` (view.py / digest.py `--ref-date`); see `_materialize_meta`.
     """
     if warn is None:
         warn = lambda msg: sys.stderr.write(msg + "\n")  # noqa: E731
@@ -197,7 +203,8 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     _context_ids = set(spine["reached"]) - in_window_ids  # noqa: F841
 
     # 3+4. Materialize raw arrays from the full repo node set + the ledger.
-    bundle = {"meta": _materialize_meta(conn, project, repo, ts_from, ts_to)}
+    bundle = {"meta": _materialize_meta(conn, project, repo, ts_from, ts_to,
+                                        ref_date=ref_date)}
 
     socials = graphstore.repo_nodes(conn, project, repo, node_class="social")
     bundle["prs"] = _by(
@@ -450,13 +457,25 @@ def _by(records, key):
     return sorted(records, key=key)
 
 
-def _materialize_meta(conn, project, repo, ts_from, ts_to):
-    """Reconstruct raw `meta` so it round-trips: owner/repo/window (+clone_sha if
-    recorded). ref_date/period are not P6-stored — enrich derives equivalents."""
+def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None):
+    """Reconstruct raw `meta`: owner/repo/window (+clone_sha if recorded), plus
+    the view's window (issue #75):
+
+    - `period` = {from, to} exactly as requested: the bounds the in-window
+      range query uses, in the shape gather's own bundle carries, so
+      `link.compute_buckets` / `build_forecast` window this view.
+    - `ref_date` = `ref_date` if given, else the value fold stored for exactly
+      this (project, repo, from, to) window, else `ts_to`.
+    """
     meta = {"owner": project, "repo": repo, "from": ts_from, "to": ts_to}
     clone_sha = graphstore.get_clone_sha(conn, project, repo)
     if clone_sha:
         meta["clone_sha"] = clone_sha
+    meta["period"] = {"from": ts_from, "to": ts_to}
+    meta["ref_date"] = (
+        ref_date
+        or graphstore.get_ref_date(conn, project, repo, ts_from, ts_to)
+        or ts_to)
     return meta
 
 
