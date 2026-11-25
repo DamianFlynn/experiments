@@ -44,10 +44,12 @@ class TestIdentity(unittest.TestCase):
             "avm#person-octocat",
         )
 
-    def test_parse_id_splits_on_last_hash(self):
+    def test_parse_id_splits_on_first_hash(self):
+        # Issue #54: the scope never contains '#', a local id may (symbol ids
+        # `<path>#<lang>:<subkind>:<name>`), so the split is on the FIRST '#'.
         parsed = graphstore.parse_id("avm/bicep-registry-modules#path/main.bicep#x")
-        self.assertEqual(parsed["scope"], "avm/bicep-registry-modules#path/main.bicep")
-        self.assertEqual(parsed["local"], "x")
+        self.assertEqual(parsed["scope"], "avm/bicep-registry-modules")
+        self.assertEqual(parsed["local"], "path/main.bicep#x")
 
     def test_qualified_ids_do_not_collide_across_repos(self):
         a = graphstore.qualify_id("avm", "repo-a", "issue-1")

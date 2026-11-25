@@ -422,8 +422,11 @@ Plus `fts_text` (FTS5 virtual table) when `fts5_available(conn)`.
 | Person (project-scoped, `repo = "*"`) | `{project}#person-{login}` | `qualify_person` |
 | Locals | `pr-N`, `issue-N`, `<sha>`, `art:<path>`, `<path>#<lang>:<subkind>:<name>`, `area-<id>`, `milestone-N`, `release-<tag>`, `sprint-<id>`, singletons `codegraph` … | — |
 
-`parse_id` splits scope on the first `/` and local on the last `#`, so `repo = "owner/repo"`
-(manifest mode) is safe.
+`parse_id` splits scope from local on the FIRST `#` (a local id may contain `#`;
+see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, so
+`repo = "owner/repo"` (manifest mode) is safe. `local_id` returns the full local id;
+`split_symbol_local` tells a symbol id from a file path containing `#` by its
+`<lang>:<subkind>:<name>` tail.
 
 ### 5.3 API
 

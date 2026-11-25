@@ -2908,25 +2908,31 @@ def classify_id(qid):
     """Classify a qualified node id into its node_class + a fetch `kind`, from
     the LOCAL id form (mirrors fold_bundle's id conventions):
 
-      social: `pr-<n>` / `issue-<n>` / `comment-<id>`
-      code:   a bare `<sha>` commit (artifact ids carry `art:`/`#` and are a
-              substrate detail, never a spine target — classified `code` too)
+      social: `pr-<n>` / `issue-<n>` / `comment-<id>` / `review-…` / `event-…`
+      code:   a bare `<sha>` commit (kind `code`), or an artifact — `art:<path>`
+              or `<path>#<lang>:<subkind>:<name>` (graphstore.is_artifact_local) —
+              stored as `code` but given kind `artifact`: a substrate detail,
+              never a spine target, and never fetched as a sha.
       structure: everything else (milestones/releases/areas/singletons/person-)
 
+    `local` is the FULL local id (graphstore.local_id: everything after the
+    first `#`), so a symbol id keeps its `<path>#` part.
     Returns {"node_class", "kind", "local"}.
     """
-    local = graphstore.parse_id(qid)["local"]
-    if local.startswith(("pr-", "issue-", "comment-")):
-        kind = "social"
+    local = graphstore.local_id(qid)
+    # Artifact form first: a symbol's PATH may start with a prefix tested below
+    # (`issue-templates/main.tf#terraform:…`).
+    if graphstore.is_artifact_local(local):
+        kind, node_class = "artifact", "code"
+    elif local.startswith(("pr-", "issue-", "comment-", "review-", "event-")):
+        kind, node_class = "social", "social"
     elif local.startswith(("milestone-", "release-", "area-", "person-",
                            "sprint-")) \
-            or local.startswith("art:") or "#" in local \
             or local in ("workflowstats", "codegraph", "codeowners",
                          "labeltaxonomy"):
-        kind = "structure"
+        kind, node_class = "structure", "structure"
     else:
-        kind = "code"  # bare <sha> commit
-    node_class = "structure" if kind == "structure" else kind
+        kind, node_class = "code", "code"  # bare <sha> commit
     return {"node_class": node_class, "kind": kind, "local": local}
 
 

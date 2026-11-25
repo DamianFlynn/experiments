@@ -7,6 +7,7 @@ the function API below. See STORE.md for the schema and identity rules.
 
 import datetime
 import json
+import re
 import sqlite3
 import time
 
@@ -136,9 +137,70 @@ def qualify_person(project, login):
 
 
 def parse_id(qid):
-    """Split a qualified id into {scope, local} on the last '#'."""
-    scope, _, local = qid.rpartition("#")
+    """Split a qualified id into {scope, local} on the FIRST '#'.
+
+    The scope (`{project}/{repo}` or `{project}`) never contains '#' (GitHub
+    owner/repo names and logins cannot), while a local id may: a symbol/comment
+    artifact is `<path>#<lang>:<subkind>:<name>`, and the path or the name can
+    carry further '#'. So everything after the first '#' is the local id."""
+    scope, _, local = qid.partition("#")
     return {"scope": scope, "local": local}
+
+
+def local_id(qid, project=None, repo=None):
+    """The FULL local id of a qualified id (every internal '#' preserved).
+
+    When `project`/`repo` are known and `qid` starts with `{project}/{repo}#`,
+    exactly that prefix is stripped; otherwise this is `parse_id(qid)["local"]`
+    (split on the first '#'). The one helper every reader uses to recover a
+    local id — never rpartition on '#'."""
+    if project is not None and repo is not None:
+        prefix = qualify_id(project, repo, "")
+        if qid.startswith(prefix):
+            return qid[len(prefix):]
+    return parse_id(qid)["local"]
+
+
+# A symbol/comment artifact local id ends in `#<lang>:<subkind>:<name>`. `lang`
+# is an identifier-like token (possibly empty: fold writes `lang or ""`),
+# `subkind` a non-empty one; neither contains '#', ':', '/', '.' or whitespace.
+# `name` is free text (may contain '#', ':' and spaces, or be empty).
+_SYMBOL_TAIL_RE = re.compile(r"([A-Za-z0-9_+-]*):([A-Za-z0-9_-]+):(.*)\Z", re.S)
+
+
+def split_symbol_local(local):
+    """Split a symbol/comment artifact LOCAL id into (path, lang, subkind, name),
+    or return None when `local` is not one (a bare file path — even one that
+    contains '#' — an `art:<path>` file artifact, a sha, `pr-N`, ...).
+
+    Rule: the separator is the FIRST '#' that is preceded by a non-empty path
+    and followed by the `<lang>:<subkind>:` tail shape (see _SYMBOL_TAIL_RE).
+    A '#' inside a path is followed by more path text (`C#-guide.md`,
+    `C#/main.tf#...`), which never has that shape, so it is skipped; '#'s inside
+    the name come after the separator and stay in the name. Ids starting with
+    `art:` are file artifacts and never symbols."""
+    if not local or local.startswith("art:"):
+        return None
+    start = 0
+    while True:
+        i = local.find("#", start)
+        if i < 0:
+            return None
+        if i > 0:
+            m = _SYMBOL_TAIL_RE.match(local, i + 1)
+            if m:
+                return (local[:i], m.group(1), m.group(2), m.group(3))
+        start = i + 1
+
+
+def is_symbol_local(local):
+    """True when `local` is a symbol/comment artifact local id."""
+    return split_symbol_local(local) is not None
+
+
+def is_artifact_local(local):
+    """True for any artifact local id: `art:<path>` (file) or a symbol id."""
+    return bool(local) and (local.startswith("art:") or is_symbol_local(local))
 
 
 def _row_to_node(row):

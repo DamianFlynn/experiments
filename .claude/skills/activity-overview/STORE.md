@@ -24,7 +24,40 @@ Every node id is namespaced so multi-repo data cannot collide:
 - Project-scoped (people only): `{project}#person-{login}` — a person
   aggregates across all repos in a project.
 
-Helpers: `qualify_id`, `qualify_person`, `parse_id`.
+Helpers: `qualify_id`, `qualify_person`, `parse_id`, `local_id`,
+`split_symbol_local` / `is_symbol_local` / `is_artifact_local`.
+
+### Parsing grammar (readers)
+
+- **Scope vs local: split on the FIRST `#`.** The scope (`{project}/{repo}` or
+  `{project}`) never contains `#` (GitHub owner/repo names and logins cannot;
+  a manifest `project` name is assumed not to — `manifest.py` does not yet
+  reject one, but `local_id(qid, project, repo)` strips a known prefix exactly). A local id MAY contain `#`, so
+  everything after the first `#` is the local id. `parse_id` implements this;
+  `local_id(qid, project=None, repo=None)` returns the full local id (stripping
+  exactly `{project}/{repo}#` when both are given). Never `rpartition` on `#` —
+  that truncates `<path>#<lang>:<subkind>:<name>` to `<lang>:<subkind>:<name>`
+  (and to an empty local for a comment named `#### networking ####`).
+- **Local forms.** `pr-N`, `issue-N`, `comment-…`, `review-…`, `event-…`
+  (social); a bare `<sha>` (commit); `art:<path>` (file artifact; the path may
+  contain `#`); `<path>#<lang>:<subkind>:<name>` (symbol/comment artifact; both
+  `path` and `name` may contain `#`, `name` may contain `:` or be empty, `lang`
+  may be empty); `area-…`, `milestone-…`, `release-…`, `sprint-…`, `person-…`
+  and the singletons (structure). Readers test the artifact forms BEFORE the
+  `pr-`/`issue-`/`release-`/… prefixes, because a symbol's path can start with
+  one of them (`issue-templates/main.tf#terraform:…`).
+- **File path containing `#` vs symbol id** (`split_symbol_local`). The symbol
+  separator is the FIRST `#` that follows a non-empty path and is followed by
+  the tail shape `<lang>:<subkind>:` where `lang` matches `[A-Za-z0-9_+-]*` and
+  `subkind` matches `[A-Za-z0-9_-]+` (no `#`, `:`, `/`, `.` or whitespace);
+  the rest is the name. A `#` inside a path is followed by more path text
+  (`docs/C#-guide.md`, `C#/main.tf#terraform:resource:x`), which never has that
+  shape, so it is skipped. An id starting `art:` is never a symbol. This matters
+  for the `code_events` ledger, whose file-level rows are keyed by the bare
+  `<path>`: a row is a symbol row iff its local id has that tail.
+- **Residual ambiguity.** A file path in which a `#` is directly followed by
+  `<token>:<token>:` (e.g. `notes#a:b:c.md`) would be read as a symbol id. Git
+  paths with `:` are rare (and invalid on Windows); no such path is expected.
 
 ## Node classes (`nodes` table)
 

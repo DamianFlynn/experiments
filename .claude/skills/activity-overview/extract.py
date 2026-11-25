@@ -96,13 +96,10 @@ def _local(node_id):
 
 
 def _full_local(node_id, project, repo):
-    """The node's local id with ONLY the `{project}/{repo}#` scope prefix stripped.
-    Unlike `_local` (which rpartitions on the LAST `#`, truncating a symbol
-    artifact's `<path>#<lang>:<subkind>:<name>` local id down to
-    `<lang>:<subkind>:<name>`), this preserves any internal `#` — so symbol/comment
-    artifact ids round-trip intact and never collide by key."""
-    prefix = "{}/{}#".format(project, repo)
-    return node_id[len(prefix):] if node_id.startswith(prefix) else _local(node_id)
+    """The node's local id with ONLY the `{project}/{repo}#` scope prefix stripped
+    (graphstore.local_id). Preserves any internal `#` — so symbol/comment
+    artifact ids `<path>#<lang>:<subkind>:<name>` round-trip intact."""
+    return graphstore.local_id(node_id, project, repo)
 
 
 def _is_commit_node(node):
@@ -473,9 +470,11 @@ def _materialize_code_events(conn, project, repo):
         # The repo-qualified remainder is the artifact's local id form: `<path>`
         # for a file event, `<path>#<lang>:<subkind>:<name>` for a symbol one.
         # Skip symbol-granular rows — they are part of the artifact substrate, not
-        # this raw file-level `code_events` array (file paths have no `#`).
+        # this raw file-level `code_events` array. A file path MAY contain `#`
+        # (`docs/C#-guide.md`); the symbol form is told apart by its
+        # `<lang>:<subkind>:<name>` tail (graphstore.split_symbol_local).
         remainder = _full_local(aid, project, repo)
-        if "#" in remainder:
+        if graphstore.is_symbol_local(remainder):
             continue
         rec = {
             "commit": ev["commit_sha"],
@@ -503,14 +502,15 @@ def _materialize_symbol_events(conn, project, repo):
     artifact's local id `<path>#<lang>:<subkind>:<name>` (mirrored from
     gather.fold_bundle), carrying before/after; file-level rows are `<path>` and
     are handled by `_materialize_code_events`. We split SYMBOL rows out by that
-    form: the repo-qualified remainder contains a SECOND `#` (the first `#`
-    separates `path` from `lang:subkind:name`). A bare `<path>` remainder (file
-    event) has no second `#` and is skipped here.
+    form (graphstore.split_symbol_local): the remainder after the repo prefix
+    ends in a `#<lang>:<subkind>:<name>` tail. A bare `<path>` remainder (file
+    event — even one whose path contains `#`) has no such tail and is skipped.
 
     Per-row reconstruction:
       - strip the `{project}/{repo}#` prefix to recover the local id, then split
-        ONCE on `#` -> `path`, `lang:subkind:name`, then `.split(":", 2)` ->
-        `[lang, subkind, name]` (name kept whole — may contain `:`/parens/commas).
+        it with graphstore.split_symbol_local -> `path`, `lang`, `subkind`,
+        `name` (`#` allowed in path and name; name kept whole — may contain
+        `:`/`#`/parens/commas).
       - commit/author/date/before/after come straight from the row columns.
       - `change`: the row stored the MAPPED event (derive._SYMBOL_CHANGE_TO_EVENT);
         we reverse it (`_EVENT_TO_SYMBOL_CHANGE`) to a change that recomputes the
@@ -520,15 +520,13 @@ def _materialize_symbol_events(conn, project, repo):
     for ev in graphstore.repo_code_events(conn, project, repo):
         aid = ev["artifact_id"]
         remainder = _full_local(aid, project, repo)
-        # Symbol rows have a second `#`: `<path>#<lang>:<subkind>:<name>`. A bare
-        # `<path>` file-level row has none and belongs to code_events, not here.
-        if "#" not in remainder:
+        # Symbol rows end in `#<lang>:<subkind>:<name>`. A bare `<path>` file-level
+        # row (even with `#` in the path) has no such tail and belongs to
+        # code_events, not here.
+        split = graphstore.split_symbol_local(remainder)
+        if split is None:
             continue
-        path, _, sym = remainder.partition("#")
-        parts = sym.split(":", 2)
-        if len(parts) != 3:
-            continue  # malformed symbol id (defensive; fold never writes these)
-        lang, subkind, name = parts
+        path, lang, subkind, name = split
         out.append({
             "path": path,
             "lang": lang,
