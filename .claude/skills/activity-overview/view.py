@@ -58,16 +58,17 @@ def parse_args(argv):
                    help="repo (single repo: the bare name; manifest member: "
                         "'owner/name'). Auto-detected when the project holds one.")
     p.add_argument("--from", dest="ts_from", required=True,
-                   help="window start (YYYY-MM-DD)")
+                   help="window start (YYYY-MM-DD, or a full ISO timestamp)")
     p.add_argument("--to", dest="ts_to", required=True,
-                   help="window end (YYYY-MM-DD)")
+                   help="window end (YYYY-MM-DD, or a full ISO timestamp)")
     p.add_argument("--out", required=True,
                    help="bundle view JSON to write (parent dirs are created)")
     args = p.parse_args(argv)
-    # Shared date rules (manifest.check_window): a real YYYY-MM-DD date, from <=
-    # to. Only the leading 10 characters are checked, so a full timestamp passes.
+    # Shared reader-window rules (manifest.check_reader_window): each bound is a
+    # real YYYY-MM-DD date or a full ISO timestamp, validated in FULL (no junk
+    # after the date), and from <= to as instants.
     try:
-        manifest.check_window(args.ts_from[:10], args.ts_to[:10], "--from", "--to")
+        manifest.check_reader_window(args.ts_from, args.ts_to, "--from", "--to")
     except ValueError as exc:
         p.error("{} (given --from {!r}, --to {!r})".format(
             exc, args.ts_from, args.ts_to))

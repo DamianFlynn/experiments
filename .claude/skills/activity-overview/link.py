@@ -1,6 +1,7 @@
 """Offline link layer: enrich a bundle with trains and buckets. No network."""
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -1103,6 +1104,7 @@ def main(argv=None):
         prior = installments[-1] if installments else None
         bundle["series"] = series.compute_series(bundle, prior)
         installments.append(series.installment_snapshot(bundle))
+        os.makedirs(os.path.dirname(os.path.abspath(series_path)), exist_ok=True)
         with open(series_path, "w", encoding="utf-8") as fh:
             json.dump(installments, fh, indent=2)
     if slice_id is not None:

@@ -581,17 +581,32 @@ def codeowners_owners(rules, path, is_dir=False):
     return list(owners)
 
 
+# Area ids the directory provider gives the repo-root module (gather keeps the
+# same two literals as _TF_ROOT_ID / _BICEP_ROOT_ID; derive is a leaf, so they are
+# repeated here rather than imported).
+ROOT_AREA_IDS = ("main.tf", "main.bicep")
+_ROOT_PROBE = "__activity_overview_repo_root__"
+
+
 def area_owners(rules, area_id, paths=()):
     """Owners of a code area. A directory area (the id is its directory path, e.g.
     `avm/res/network/virtual-network`) is owned by the owners of the last rule
     that matches the area directory itself (`<area>/`) — so a rule that only
     matches some files inside it (`*.tf`) does not make its owners own the area.
     A graphify `community:<n>` area has no directory: it is owned by the union of
-    the owners of its `paths`, sorted. Pure."""
+    the owners of its `paths`, sorted. The repo-root module (`main.tf` /
+    `main.bicep`) is owned by the last catch-all rule only. Pure."""
     if not area_id:
         return []
     if area_id.startswith("community:"):
         return sorted({o for p in paths or () for o in codeowners_owners(rules, p)})
+    if area_id in ROOT_AREA_IDS:
+        # The repo-root module's area id is file-shaped (`main.tf` / `main.bicep`),
+        # but it stands for the ROOT DIRECTORY. Matching the id as a path would let
+        # a file rule (`*.tf`, `*.bicep`) claim the whole root module. The root is
+        # owned by the last catch-all rule — one that matches an arbitrary
+        # top-level directory (`*`, `**`, `/**`) — and by nothing more specific.
+        return codeowners_owners(rules, _ROOT_PROBE, is_dir=True)
     return codeowners_owners(rules, area_id, is_dir=True)
 
 

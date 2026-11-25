@@ -259,3 +259,29 @@ class TestStaleOwned(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RootModuleOwnership(unittest.TestCase):
+    """The repo-root module's area id is file-shaped (`main.tf` / `main.bicep`)
+    but stands for the root DIRECTORY: a file rule must not claim it."""
+
+    def _rules(self, *pairs):
+        return derive.compile_codeowners(
+            [{"pattern": p, "owners": [o]} for p, o in pairs])
+
+    def test_file_rule_does_not_claim_the_root_module(self):
+        for area, pat in (("main.tf", "*.tf"), ("main.bicep", "*.bicep")):
+            with self.subTest(area=area):
+                self.assertEqual(
+                    derive.area_owners(self._rules((pat, "erin")), area), [])
+                self.assertEqual(
+                    derive.area_owners(
+                        self._rules(("*", "carol"), (pat, "erin")), area),
+                    ["carol"])
+
+    def test_root_is_owned_by_the_last_catch_all_only(self):
+        rules = self._rules(("*", "carol"), ("/modules/", "dave"))
+        self.assertEqual(derive.area_owners(rules, "main.tf"), ["carol"])
+        self.assertEqual(
+            derive.area_owners(self._rules(("*", "a"), ("/**", "b")), "main.bicep"),
+            ["b"])

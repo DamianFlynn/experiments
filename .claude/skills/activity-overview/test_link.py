@@ -2888,3 +2888,21 @@ class TestCapTrainDiffs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSeriesDirectoryIsCreated(unittest.TestCase):
+    def test_series_file_in_a_new_directory(self):
+        # A per-member series path (series/<owner>__<repo>.json) on a fresh run:
+        # link.py must create the directory instead of failing.
+        with open(os.path.join(FIX, "bundle_sample.json")) as fh:
+            bundle = json.load(fh)
+        with tempfile.TemporaryDirectory() as d:
+            bpath = os.path.join(d, "b.json")
+            with open(bpath, "w") as fh:
+                json.dump(bundle, fh)
+            spath = os.path.join(d, "series", "o__r.json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                link.main([bpath, "--series", spath])
+            self.assertTrue(os.path.isfile(spath))
+            with open(spath) as fh:
+                self.assertEqual(len(json.load(fh)), 1)

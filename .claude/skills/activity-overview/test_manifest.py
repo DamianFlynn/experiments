@@ -267,3 +267,31 @@ class TestSharedValidators(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFullStringValidation(unittest.TestCase):
+    def test_trailing_newline_is_rejected(self):
+        # `$` also matches before a final newline; the checks must use fullmatch.
+        for check, value in ((manifest.check_owner, "Azure\n"),
+                             (manifest.check_repo, "bicep\n"),
+                             (lambda v: manifest.check_date(v, "date"),
+                              "2026-05-01\n")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    check(value)
+
+    def test_reader_window_validates_whole_bounds(self):
+        ok = (("2026-05-01", "2026-05-31"), ("2026-05-01", "2026-05-01"),
+              ("2026-05-01T00:00:00Z", "2026-05-31T23:59:59Z"),
+              ("2026-05-01T09:00:00+02:00", "2026-05-01"))
+        for a, b in ok:
+            with self.subTest(a=a, b=b):
+                self.assertEqual(manifest.check_reader_window(a, b), (a, b))
+        bad = (("2026-05-01Tgarbage", "2026-05-31"),
+               ("2026-05-01T12:00:00Z", "2026-05-01T09:00:00Z"),
+               ("2026-05-31", "2026-05-01"), ("2026-02-30", "2026-03-01"),
+               ("2026-05-01\n", "2026-05-31"), ("20260501", "2026-05-31"))
+        for a, b in bad:
+            with self.subTest(a=a, b=b):
+                with self.assertRaises(ValueError):
+                    manifest.check_reader_window(a, b)

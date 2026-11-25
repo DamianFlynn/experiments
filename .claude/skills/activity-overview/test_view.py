@@ -125,10 +125,19 @@ class TestViewSingleRepo(_TmpCase):
         # '20260531' is accepted by Python 3.11's fromisoformat but is not the
         # documented YYYY-MM-DD form (shared validator, issue #57).
         for frm, to in (("May", "2026-05-31"), ("2026-05-31", "2026-05-01"),
-                        ("2026-05-01", "20260531")):
+                        ("2026-05-01", "20260531"),
+                        # junk after the date / reversed same-day times
+                        ("2026-05-01Tgarbage", "2026-05-31"),
+                        ("2026-05-01T12:00:00Z", "2026-05-01T09:00:00Z")):
             code, _ = _run_main(["--store", self.db, "--from", frm, "--to", to,
                                  "--out", self.path("x.json")])
             self.assertEqual(code, 2, (frm, to))
+
+    def test_full_timestamp_bounds_are_accepted(self):
+        code, _ = _run_main(["--store", self.db, "--from", "2026-05-01T00:00:00Z",
+                             "--to", "2026-05-31T23:59:59Z",
+                             "--out", self.path("ts.json")])
+        self.assertEqual(code, 0)
 
 
 class TestViewStoreErrors(_TmpCase):
