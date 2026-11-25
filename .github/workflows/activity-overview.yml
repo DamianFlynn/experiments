@@ -360,11 +360,16 @@ jobs:
           TERRAFORM_VERSION: 1.15.5
         run: |
           base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"
-          curl -sSLo tf.zip "${base}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          set -euo pipefail
+          zip="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          # Keep the official file name: `sha256sum -c` looks the file up by the
+          # name recorded in SHA256SUMS (saving it as tf.zip made the check fail
+          # with "No such file" on every run).
+          curl -sSLo "$zip" "${base}/${zip}"
           curl -sSLo tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
           # Verify the official checksum before unpacking (supply-chain integrity).
-          grep " terraform_${TERRAFORM_VERSION}_linux_amd64.zip$" tf.sums | sha256sum -c -
-          unzip -o tf.zip terraform
+          grep " ${zip}$" tf.sums | sha256sum -c -
+          unzip -o "$zip" terraform
           sudo mv terraform /usr/local/bin/terraform
           installed="$(terraform version | head -1)"
           echo "$installed"
