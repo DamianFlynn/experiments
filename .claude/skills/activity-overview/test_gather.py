@@ -354,7 +354,8 @@ class TestCliAndAuth(unittest.TestCase):
         self.assertEqual(args.repo, "r")
         self.assertEqual(getattr(args, "from"), "2026-05-01")
         self.assertEqual(args.to, "2026-05-31")
-        self.assertEqual(args.branches, "main")
+        # No hard-wired "main" (#84): unset means "resolve the repo default".
+        self.assertIsNone(args.branches)
         self.assertFalse(args.no_clone)
         self.assertEqual(args.store, "workspace/store.db")
 

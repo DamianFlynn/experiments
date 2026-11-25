@@ -107,7 +107,10 @@ python3 spotlight.py dependents Azure/terraform-azurerm-avm-res-keyvault-vault \
 ```
 
 Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
-"registry"?} ], "ticket_prefixes"? }` — `ticket_prefixes` (e.g. `["ABC"]`) is
+"registry"?, "branch"?} ], "ticket_prefixes"? }` — `branch` (optional) is that member's
+mainline when it is not the repo's default branch (it beats a global `--branches`;
+absent, gather resolves each member's own default branch, so members with different
+defaults are fine). `ticket_prefixes` (e.g. `["ABC"]`) is
 optional and only read by `digest.py --manifest` to turn on `related_work` ticket
 clustering (off by default). `registry` is an optional exact Terraform registry path; absent,
 a member is matched by the HashiCorp naming convention

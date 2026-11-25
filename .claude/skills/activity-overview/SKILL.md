@@ -82,9 +82,10 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
      ```bash
      python3 gather.py --manifest workspace/manifest.json --store workspace/journey.db
      ```
-     The manifest is `{project, window:{from,to}, repos:[{owner, repo, registry?}]}`
+     The manifest is `{project, window:{from,to}, repos:[{owner, repo, registry?, branch?}]}`
      (`registry` optional — an exact Terraform registry path; absent → resolved by
-     the HashiCorp naming convention).
+     the HashiCorp naming convention; `branch` optional — the member's mainline when
+     it is not the repo's default branch, which gather otherwise detects per member).
      - **Generate/refresh the manifest from the AVM index first** (recommended), so
        it tracks the current module set. The published AVM index is the source of
        truth for which member repos and registry paths exist, so regenerating before

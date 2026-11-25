@@ -203,13 +203,22 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     _context_ids = set(spine["reached"]) - in_window_ids  # noqa: F841
 
     # 3+4. Materialize raw arrays from the full repo node set + the ledger.
+    branch_problems = []
     bundle = {"meta": _materialize_meta(conn, project, repo, ts_from, ts_to,
-                                        ref_date=ref_date)}
+                                        ref_date=ref_date,
+                                        problems=branch_problems)}
 
     socials = graphstore.repo_nodes(conn, project, repo, node_class="social")
     bundle["prs"] = _by(
         [n["data"] for n in socials if _local(n["id"]).startswith("pr-")],
         key=lambda d: d.get("number"))
+    # Unknown mainline (issue #84): link then counts EVERY merged PR as merged
+    # into it (the pre-#84 behaviour). Say so whenever that decides anything.
+    if branch_problems and any(p.get("merged") for p in bundle["prs"]):
+        warn("extract: base branch unknown for {}/{} [{} .. {}]: {}; every "
+             "merged PR is counted as merged into the mainline (stacked / "
+             "release-branch merges are not told apart)".format(
+                 project, repo, ts_from, ts_to, branch_problems[0]))
     bundle["issues"] = _by(
         [n["data"] for n in socials if _local(n["id"]).startswith("issue-")],
         key=lambda d: d.get("number"))
@@ -460,7 +469,66 @@ def _by(records, key):
     return sorted(records, key=key)
 
 
-def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None):
+def _overlaps(window, ts_from, ts_to):
+    """Does a gathered window {from, to} share at least one day with the view
+    window [ts_from, ts_to]? Compared on the date prefix; a None bound on the
+    view side is open."""
+    w_from, w_to = (window.get("from") or "")[:10], (window.get("to") or "")[:10]
+    if ts_to and w_from and w_from > ts_to[:10]:
+        return False
+    if ts_from and w_to and w_to < ts_from[:10]:
+        return False
+    return True
+
+
+def _resolve_branches(conn, project, repo, ts_from, ts_to):
+    """The view's mainline (issue #84): (base_branch, branches, problem).
+
+    - The value fold stored for exactly this (project, repo, from, to) window.
+    - Otherwise (a roll-up or sub-window view) the gathered windows of this
+      repo that overlap the view: their recorded base branch when they agree.
+    - Otherwise None, with `problem` saying why: the windows disagree (e.g. the
+      default branch was renamed), gather could not determine it, or nothing
+      is stored (a store folded before #84). Never a guessed `main`.
+    `problem` is None when a base branch was found."""
+    exact = graphstore.get_branches(conn, project, repo, ts_from, ts_to)
+    if exact is not None:
+        entries = [exact]
+    else:
+        windows = sorted(
+            (w for w in graphstore.get_windows(conn)
+             if w.get("project") == project and w.get("repo") == repo
+             and _overlaps(w, ts_from, ts_to)),
+            key=lambda w: (w.get("from") or "", w.get("to") or ""))
+        entries = [e for e in (graphstore.get_branches(
+            conn, project, repo, w.get("from"), w.get("to")) for w in windows)
+            if e is not None]
+    known = sorted({e["base_branch"] for e in entries if e.get("base_branch")})
+    if len(known) == 1:
+        base = known[0]
+        branches = [base]
+        for e in entries:
+            if e.get("base_branch") != base:
+                continue
+            for b in e.get("branches") or []:
+                if b not in branches:
+                    branches.append(b)
+        return base, branches, None
+    if len(known) > 1:
+        problem = ("the gathered windows it spans recorded different base "
+                   "branches ({}); view each window on its own".format(
+                       ", ".join(known)))
+    elif entries:
+        problem = ("gather could not determine it (no `--branches`, no clone "
+                   "default branch, no API answer); re-gather with `--branches`")
+    else:
+        problem = ("no base branch is stored for this window (store folded "
+                   "before issue #84); re-gather it")
+    return None, [], problem
+
+
+def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None,
+                      problems=None):
     """Reconstruct raw `meta`: owner/repo/window (+clone_sha if recorded), plus
     the view's window (issue #75):
 
@@ -469,11 +537,20 @@ def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None):
       `link.compute_buckets` / `build_forecast` window this view.
     - `ref_date` = `ref_date` if given, else the value fold stored for exactly
       this (project, repo, from, to) window, else `ts_to`.
+
+    and the analyzed mainline (issue #84): `base_branch` (None when unknown,
+    see `_resolve_branches`) and `branches`, so `link` can tell a merge into
+    the mainline from a stacked / release-branch merge. When it is unknown
+    the reason is appended to `problems` (if a list is passed).
     """
     meta = {"owner": project, "repo": repo, "from": ts_from, "to": ts_to}
     clone_sha = graphstore.get_clone_sha(conn, project, repo)
     if clone_sha:
         meta["clone_sha"] = clone_sha
+    meta["base_branch"], meta["branches"], problem = _resolve_branches(
+        conn, project, repo, ts_from, ts_to)
+    if problem and problems is not None:
+        problems.append(problem)
     meta["period"] = {"from": ts_from, "to": ts_to}
     meta["ref_date"] = (
         ref_date

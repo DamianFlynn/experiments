@@ -145,6 +145,18 @@ def check_reader_window(ts_from, ts_to, what_from="--from", what_to="--to"):
     return ts_from, ts_to
 
 
+def check_branch(value, what="'branch'"):
+    """Return `value` if it can name a git branch: a non-empty string with no
+    whitespace or control characters that does not start with '-' (so it can
+    never read as a git option). Raises ValueError otherwise."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("{} must be a non-empty string".format(what))
+    if value.startswith("-") or any(c.isspace() or ord(c) < 32 or ord(c) == 127
+                                    for c in value):
+        raise ValueError("{} {!r} is not a branch name".format(what, value))
+    return value
+
+
 def check_project(value, what="'project'"):
     """Return `value` if usable as a logical project name. It is the scope prefix
     of every node id, so '/' (scope separator) and '#' (scope/local separator,
@@ -163,7 +175,8 @@ def check_project(value, what="'project'"):
 def load_manifest(path):
     """Read + validate a manifest file. Returns a normalized dict:
     {"project": str, "from": str, "to": str,
-     "repos": [{"owner": str, "repo": str, "registry": str|None}, ...],
+     "repos": [{"owner": str, "repo": str, "registry": str|None,
+                "branch": str|None}, ...],
      "ticket_prefixes": [str, ...]}   # optional in the file; [] when absent
     `ticket_prefixes` (e.g. ["ABC", "PLAT"]) opts the project into digest.py's
     ticket clustering (`related_work`); see check_ticket_prefixes.
@@ -238,7 +251,16 @@ def load_manifest(path):
                     "manifest: repos[{}]: duplicate registry {!r} on {!r} "
                     "(already declared by {!r})".format(i, registry, slug, prev))
             seen_registries[reg_key] = slug
-        repos.append({"owner": owner, "repo": repo, "registry": registry})
+        # branch is optional (issue #84): the member's mainline when it is not
+        # the repo's default branch; absent -> gather resolves the default.
+        branch = r.get("branch")
+        if branch is not None:
+            try:
+                check_branch(branch)
+            except ValueError as exc:
+                raise ValueError("manifest: repos[{}]: {}".format(i, exc)) from None
+        repos.append({"owner": owner, "repo": repo, "registry": registry,
+                      "branch": branch})
 
     ticket_prefixes = []
     if "ticket_prefixes" in raw:

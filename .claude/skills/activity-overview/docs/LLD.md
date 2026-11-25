@@ -116,7 +116,7 @@ scratch store) and `backfill` respectively.
 | `--resume` | off | Manifest only: gather just the members not `ok` for the manifest window (meta `member_status`, #77) |
 | `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
 | `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing (`YYYY-MM-DD` or full ISO timestamp, `manifest.check_ref_date`). Stored per window at fold (`ref_date:` meta key) and read back into the view's `meta.ref_date` (§6.1) |
-| `--branches` | `main` | Recorded in `meta`; first is `base_branch` (walk uses the checked-out default branch) |
+| `--branches` | repo default | Comma list; first is `meta.base_branch`. Unset: a manifest member's `branch`, else the clone's `origin/HEAD`, else the API `default_branch` (`resolve_branches`); unresolved → `null` + stderr warning. Stored per window at fold (`branches:` meta key). The walk uses the checked-out default branch |
 | `--clone-dir` | `workspace/<repo>-clone` | Clone location |
 | `--no-clone` | off | Reuse an existing clone |
 | `--include-workflows` / `--no-workflows` | on | CI run stats |
@@ -197,6 +197,10 @@ sequenceDiagram
   - `none` — `--no-clone` and no clone on disk: nothing is created; the walks are empty.
   A non-empty dir that is not a git clone, or is a clone of another remote, raises and is left
   untouched.
+- `resolve_branches` (issue #84) then fixes `meta.branches` / `meta.base_branch`: `--branches`
+  (or the manifest member's `branch`), else the clone's `origin/HEAD` (else its checked-out
+  branch), else one `GET /repos/{o}/{r}` for `default_branch` (only when there is no clone),
+  else `null` with a stderr warning. Never a hard-wired `main`.
 - The clone/fetch uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
   margin keeps each in-window commit's real parent in the clone.
 - If the margin holds no earlier commit, the first in-window commit is a shallow-boundary
@@ -596,7 +600,11 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    {from: ts_from, to: ts_to}` (the requested bounds, unchanged — the same ones step 1 uses)
    and `ref_date` = the `ref_date` argument (view/digest `--ref-date`), else
    `graphstore.get_ref_date(project, repo, ts_from, ts_to)` (stored by fold for exactly that
-   gathered window), else `ts_to`.
+   gathered window), else `ts_to`. Issue #84 adds `base_branch` / `branches`
+   (`_resolve_branches`): `graphstore.get_branches` for exactly that window, else the
+   non-null values of the overlapping gathered windows of the repo when they agree, else
+   `null` / `[]` — and, when a merged PR is in the view, a `warn` saying why (windows
+   disagree, gather could not determine it, or a pre-#84 store). Never a guessed `main`.
 
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
@@ -1137,6 +1145,8 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
 | Terraform edges are build-gated on single-repo gathers | no structural scan without a manifest (#80 decision) | without `terraform` (or with a failed init), a single-repo bundle has no Terraform edges, even though its direct edges are source-parsed | opt-in static fallback with its own `edges_status` |
 | Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
+| Pre-#84 stores have no base branch | fold stores `branches:` meta keys only since #84 | their views carry `meta.base_branch: null`, `extract` warns, and every merged PR (stacked, release-branch) counts as shipped, as before #84 | re-gather the window |
+| One mainline per view | `link` compares a PR's `base` with one `meta.base_branch` | a roll-up spanning a default-branch rename (`master` → `main`) gets `null` (warned), so its merges are not told apart; view each gathered window on its own | carry a set of mainline names if needed |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
 | Timeline code events of older commits order by day | `committed_at` (#82) is gathered from `%cI` by the commit walk only | commits in a store folded before #82, and backfilled commits (five-field log), have no `committed_at`, so their timeline events keep the bare date and sort before that day's social events | re-gather; log `%cI` in `make_backfill_fetcher` too |
 | Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |

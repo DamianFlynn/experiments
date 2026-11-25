@@ -189,6 +189,17 @@ view's `meta.ref_date` when the view's `--from/--to` equal that window exactly
 (else the view's `to`; a view/digest `--ref-date` overrides both), and stamps
 `meta.period = {from, to}` from the view's own window (issue #75). Stores folded
 before #75 have no `ref_date:` keys; their views fall back to `to`.
+`branches:{project}/{repo}:{from}:{to}` (issue #84): JSON
+`{"base_branch": str|null, "branches": [str]}`, the mainline a gathered window was
+analyzed against (gather `--branches` / manifest member `branch`, else the repo default
+branch; `null` when gather could not determine it); a re-fold of the same window replaces
+it — `set_branches`/`get_branches`. Written only when the folded bundle's `meta` has a
+`base_branch` key (every gather since #84). `extract` stamps `meta.base_branch` /
+`meta.branches` from the exact window, else from the gathered windows of that repo the
+view overlaps when their non-null values agree, else `null` / `[]` with a stderr warning
+(when a merged PR is in the view). Stores folded before #84 have no `branches:` keys, so
+their views report the base branch unknown and count every merged PR as shipped, as
+before; re-gather to get stacked / release-branch PRs told apart.
 
 `member_status` (issue #77; written only by a manifest gather): a JSON list of
 `{project, repo, from, to, status[, error]}`, one entry per member and window,
@@ -230,7 +241,7 @@ Code older than v2 writing into a v2 store would add `fts_text` rows without
 ## Transactions (atomic folds)
 
 `fold_bundle` writes a fold as **one transaction** (`with conn:`): nodes,
-edges, code events, the FTS index, `gathered_windows`, `ref_date` and `clone_sha` commit
+edges, code events, the FTS index, `gathered_windows`, `ref_date`, `branches` and `clone_sha` commit
 together, and any exception rolls all of them back, so readers never see a
 half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
 `add_code_events`, `index_text(s)`, `set_meta`, `record_window`,
@@ -533,7 +544,10 @@ an `owner` that is not a GitHub user/org name (letters, digits, `-` and `_`, not
 starting with `-`, ≤ 39 chars); a `repo` outside GitHub's alphabet (letters, digits,
 `-`, `_`, `.`; ≤ 100 chars; not `.`/`..`); two members naming the same repo
 **case-insensitively** (`o/a` and `O/A`); a `registry` that is present but not a
-non-empty string, or declared by two members (case-insensitively); a
+non-empty string, or declared by two members (case-insensitively); a member
+`branch` (optional, issue #84: that member's mainline, beating a global
+`--branches`) that is present but not a non-empty string without whitespace or
+control characters, or starts with `-`; a
 `ticket_prefixes` that is present but not a list of distinct, non-empty ASCII
 letter/digit strings. `gather.py` applies the same owner/repo/date checks to
 `--owner/--repo/--from/--to`.

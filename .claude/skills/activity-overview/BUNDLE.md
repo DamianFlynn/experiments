@@ -82,6 +82,15 @@ the rest (engagement, code areas, trains, people/flow).
   schema_version`. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
   from it is a stacked/fork contribution (merged into another branch, not main) — kept in `prs`
   as context but not counted as shipped-to-main (see `commits`/`date` note below and trains).
+  gather takes it from `--branches` (first entry) or a manifest member's `branch`, else the
+  repo's default branch (the clone's `origin/HEAD`, else the GitHub API `default_branch`);
+  there is no hard-wired `main`. `branches` is the list it was given or resolved. Views carry
+  both (issue #84): fold stores them per gathered window and `extract` re-emits them —
+  the exact window's value, else the agreeing value of the gathered windows the view
+  overlaps. **`base_branch: null`** (with `branches: []`) means unknown — gather could not
+  determine it, the overlapped windows disagree, or the store was folded before #84; `link`
+  then counts every merged PR as merged into the mainline (no stacked-PR detection) and
+  `extract` warns on stderr when that decides anything.
   Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
   It pins the exact source tree (edges are a pure function of source), which is the basis for
   the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,

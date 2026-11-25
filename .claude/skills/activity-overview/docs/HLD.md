@@ -438,8 +438,12 @@ These are real, current limits — plan around them:
    recognized priority labels (`priority/high`, `priority/critical`, `p0`, `p1`,
    `high-priority`, `critical`). Repos with different label names need the constant extended.
    "In motion" counts any open PR that references an item, however stale or draft (LLD §14.5).
-4. **Default branch only.** `--branches` is recorded as provenance; the commit walk covers the
-   checked-out default branch.
+4. **Default branch only.** The commit walk covers the checked-out default branch; extra
+   `--branches` entries are recorded as provenance only. The *mainline* that "shipped" counts
+   merges into (`meta.base_branch`) is the repo's real default branch (or `--branches` / a
+   manifest member `branch`), stored per window and carried by every view (issue #84). Stores
+   gathered before #84 have none: their views warn and count every merged PR as shipped until
+   re-gathered.
 5. **Open items are fetched every run.** All open PRs/issues are pulled regardless of window
    (they feed in-flight/forecast), each with per-item review/timeline/comment calls. On very
    busy repos (e.g. BRM) a gather is API-heavy. On a rate limit, gather waits for the reset

@@ -201,7 +201,13 @@ flowchart TB
    creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
    only (empty commit/code walks). A repo with no commits since `--from` minus the clone margin
    is cloned at depth 1 and has no commits in the window. `meta.clone_mode` records which
-   (`fresh`, `fetched`, `depth1-fallback`, `none`).
+   (`fresh`, `fetched`, `depth1-fallback`, `none`). "Shipped" means merged into the repo's
+   **default branch**, which gather detects (clone `origin/HEAD`, else the API) and stores
+   with the window as `meta.base_branch`; a PR merged into a feature or release branch is
+   not shipped (a stacked PR shows as `contributing_prs` on its parent's train). Pass
+   `--branches B` (or a manifest member `branch`) when the mainline is not the default.
+   Stores gathered before issue #84 have no stored base branch: their views warn and count
+   every merged PR as shipped — re-gather them.
 3. **Validate.** Never publish from a store that is not `RESULT: OK`.
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
    they are what you re-link if a month's series entry needs refreshing.
@@ -578,6 +584,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | 403 on first call with `x-github-sso` | SAML SSO not authorized | authorize the token for the org |
 | 403 with `x-ratelimit-remaining: 0` | rate limited (busy repo) | wait until `x-ratelimit-reset`, re-run (idempotent) |
 | 403 mentioning token lifetime | token lifetime over the org's limit (8 days for `Azure/*`, classic and fine-grained) | new token with an expiry inside the limit the message states |
+| `extract: base branch unknown for …` on view/digest | store gathered before #84, gather could not determine it, or a roll-up spans windows with different base branches | re-gather (with `--branches` if needed), or view each gathered window on its own |
 | `validate` → multiple projects (exit 2) | store holds several projects/repos | pass `--project` (and `--repo`) |
 | `validate: error: store … does not exist` / `is not a journey-graph store` (exit 2) | wrong path (validate never creates a file) | point it at the store `gather --store` wrote |
 | `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |

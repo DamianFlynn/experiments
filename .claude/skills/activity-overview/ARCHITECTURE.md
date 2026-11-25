@@ -638,7 +638,7 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--manifest PATH` | — | multi-repo project manifest |
 | `--from` / `--to` | — | window (YYYY-MM-DD) |
 | `--ref-date` | `--to` | reference point for milestone/sprint/forecast/flow framing; stored with the window, read back by `view.py`/`digest.py` |
-| `--branches` | `main` | mainline(s); first is `base_branch` |
+| `--branches` | repo default | mainline(s); first is `base_branch`. Unset: manifest member `branch`, else the repo's default branch (clone `origin/HEAD`, else API) |
 | `--clone-dir` | auto | clone location (reuse to enable `--no-clone`) |
 | `--no-clone` | off | reuse an existing clone (still runs `git log`) |
 | `--no-workflows` / `--include-workflows` | on | CI workflow-run stats |
@@ -699,7 +699,7 @@ kept 6, diff cap 6000 chars; flow — stale 30 days, upvote min 5, traction min 
 |---------|--------------|-----|
 | `error: set GITHUB_TOKEN` | no token | export `GITHUB_TOKEN` (`repo`, +`read:project` for boards) |
 | `403` on the first call | SAML SSO / PAT lifetime policy | authorize SSO; use a token within the org's lifetime limit (8 days for Azure, classic and fine-grained) |
-| Empty "shipped" | nothing merged in window | widen `--from/--to`; check the `--branches` mainline |
+| Empty "shipped" | nothing merged in window, or merged into a branch other than `meta.base_branch` | widen `--from/--to`; check `meta.base_branch` (pass `--branches` or a manifest member `branch` if the mainline is not the repo default) |
 | Board section empty | no `read:project`, or no/closed/stale board | add the scope; the layer degrades cleanly |
 | `meta.boundary_dropped_commits` non-empty | a commit sat on the shallow graft | raise `ACTIVITY_CLONE_MARGIN_DAYS`, re-gather |
 | IaC `edge_extraction: timeout` | slow `terraform init` | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |

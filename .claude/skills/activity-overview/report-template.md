@@ -79,6 +79,11 @@ PLACEHOLDER RULES — read before filling anything below.
   `#issue-<n>`: look `<n>` up in member `<repo>`, whose own single-repo train for
   the same anchor is `train-issue-<n>` (or `train-pr-<n>`).
 * REFERENCE DATE: `meta.ref_date` (every view carries it; it defaults to `meta.to`).
+* BASE BRANCH: `meta.base_branch` is the mainline "shipped" means merged into; a
+  PR merged into any other branch is not shipped (it may appear in
+  `train.contributing_prs`). In the project view read it per member
+  (`member.bundle.meta`). When it is `null` the store did not know it, so every
+  merged PR was counted as shipped: say so in one line under the report title.
 * TRUNCATED DIAGRAMS: when `diagrams.truncated` has an entry for an embedded
   diagram, say so under it: "Showing {diagrams.truncated[].shown} of
   {diagrams.truncated[].total} {diagrams.truncated[].unit}."

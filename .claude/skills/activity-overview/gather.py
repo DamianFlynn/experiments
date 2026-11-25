@@ -310,6 +310,57 @@ def _default_branch(clone_dir, run):
     return run(["git", "-C", clone_dir, "symbolic-ref", "--short", "HEAD"]).strip()
 
 
+def _clone_default_branch(clone_dir, run):
+    """The remote default branch recorded in an existing clone, without network:
+    `refs/remotes/origin/HEAD` (set by `git clone`, refreshed by prepare_clone's
+    `remote set-head --auto` on a reused clone), else the checked-out branch
+    (prepare_clone checks the default out). None when neither resolves."""
+    for ref in ("refs/remotes/origin/HEAD", "HEAD"):
+        try:
+            name = run(["git", "-C", clone_dir, "symbolic-ref", "--short",
+                        ref]).strip()
+        except RuntimeError:
+            continue
+        if ref != "HEAD":
+            if not name.startswith("origin/"):
+                continue
+            name = name[len("origin/"):]
+        if name and name != "HEAD":
+            return name
+    return None
+
+
+def resolve_branches(explicit, clone_dir, clone_mode, get_repo=None, run=None):
+    """Decide the branches a gather analyzes (issue #84) ->
+    (branches, base_branch, source). `base_branch` is the mainline: a PR merged
+    into any other branch is a stacked / release-branch merge, not shipped.
+
+    1. `explicit` (the `--branches` value, or a manifest member's `branch`):
+       comma-separated, the first is the mainline.
+    2. The clone's remote default branch (`_clone_default_branch`) -- the same
+       branch the commit walk covers.
+    3. `get_repo()` -> the GitHub repo object's `default_branch` (one REST
+       call; used when there is no clone, e.g. `--no-clone` with none on disk).
+    4. Unknown: ([], None, None). Never a guessed `main`: the caller warns and
+       the view reports the base branch as unknown.
+    """
+    run = run or run_git
+    if explicit:
+        branches = [b.strip() for b in str(explicit).split(",") if b.strip()]
+        if branches:
+            return branches, branches[0], "--branches"
+    if clone_mode != "none" and os.path.isdir(os.path.join(clone_dir, ".git")):
+        name = _clone_default_branch(clone_dir, run)
+        if name:
+            return [name], name, "clone"
+    if get_repo is not None:
+        repo_obj = get_repo()
+        name = repo_obj.get("default_branch") if isinstance(repo_obj, dict) else None
+        if isinstance(name, str) and name.strip():
+            return [name.strip()], name.strip(), "api"
+    return [], None, None
+
+
 def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
     """Make `clone_dir` a bounded clone of `repo_url` for a window starting
     `from_date`, and return how (recorded as `meta.clone_mode`):
@@ -2785,7 +2836,10 @@ def parse_args(argv):
     p.add_argument("--repo")
     p.add_argument("--from", dest="from")
     p.add_argument("--to")
-    p.add_argument("--branches", default="main")
+    p.add_argument("--branches", default=None,
+                   help="comma-separated branches; the first is the mainline "
+                        "(meta.base_branch). Default: the repo's default "
+                        "branch (from the clone, else the GitHub API).")
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
     p.add_argument("--ref-date", default=None,
@@ -4047,8 +4101,23 @@ def acquire(args, env):
         # present and its diff is real (#68). Leftovers are handled after the walks.
         deepen_window_boundary(clone_dir, frm, to)
 
-    # Phase 1 walks the checked-out default branch only; `args.branches` is
-    # recorded in meta for provenance but not yet applied to the log/clone.
+    # The mainline (issue #84): `--branches` / a manifest member's `branch`,
+    # else the clone's default branch, else the API's `default_branch`.
+    branches, base_branch, branch_source = resolve_branches(
+        args.branches, clone_dir, clone_mode,
+        get_repo=lambda: _paginated(token)(
+            f"https://api.github.com/repos/{owner}/{repo}")[0])
+    if base_branch is None:
+        sys.stderr.write(
+            f"warning: {owner}/{repo}: could not determine the base branch "
+            f"(no --branches, no clone default branch, no API default_branch); "
+            f"meta.base_branch=null, so every merged PR will count as merged "
+            f"into the mainline\n")
+    elif branch_source != "--branches":
+        sys.stderr.write(f"note: {owner}/{repo}: base branch {base_branch!r} "
+                         f"(the repo default branch, from the {branch_source})\n")
+    # Phase 1 walks the checked-out default branch only; the other `branches`
+    # are recorded in meta for provenance but not yet applied to the log/clone.
     # Multi-branch commit walking arrives in a later phase.
     # The shallow clone already bounds history to ~CLONE_MARGIN_DAYS before `frm`;
     # we walk it fully and window in Python (window_records) rather than with git's
@@ -4309,10 +4378,11 @@ def acquire(args, env):
     ref_date = getattr(args, "ref_date", None) or to
     meta = {
         "owner": owner, "repo": repo, "from": frm, "to": to,
-        "branches": args.branches.split(","), "clone_dir": clone_dir,
+        "branches": branches, "clone_dir": clone_dir,
         # the analyzed mainline branch: PRs merged into other branches are stacked/
         # fork contributions, not shipped-to-main (link.build_trains keys on this).
-        "base_branch": args.branches.split(",")[0],
+        # None when unknown (see resolve_branches); fold stores it per window.
+        "base_branch": base_branch,
         "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
         "clone_mode": clone_mode,
         "boundary_dropped_commits": _boundary_dropped,
@@ -5173,6 +5243,14 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         if ref_date:
             graphstore.set_ref_date(conn, project, repo, meta.get("from"),
                                     meta.get("to"), ref_date, commit=False)
+        # The window's mainline (issue #84): acquire() always sets
+        # meta.base_branch (None when it could not be determined), so a re-fold
+        # replaces it. A bundle without the key (hand-built, pre-#84) stores
+        # nothing and its view reports the base branch as unknown.
+        if "base_branch" in meta:
+            graphstore.set_branches(conn, project, repo, meta.get("from"),
+                                    meta.get("to"), meta.get("base_branch"),
+                                    meta.get("branches"), commit=False)
         if meta.get("clone_sha"):
             graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
                                      commit=False)
@@ -5190,6 +5268,10 @@ def _member_args(base, member, frm, to):
     clone_dir = "{}/{}-{}-clone".format(base_dir, member["owner"], member["repo"])
     fields = {**vars(base), "owner": member["owner"], "repo": member["repo"],
               "clone_dir": clone_dir}
+    # A member's own `branch` (issue #84) beats a global --branches; with
+    # neither, acquire resolves each member's default branch on its own.
+    if member.get("branch"):
+        fields["branches"] = member["branch"]
     ns = argparse.Namespace(**fields)
     setattr(ns, "from", frm)   # 'from' is a Python keyword: set via attribute
     ns.to = to
