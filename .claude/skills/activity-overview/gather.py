@@ -458,7 +458,21 @@ def parse_timeline_lifecycle(raw_timeline):
     return out
 
 
-_PR_RE = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
+def parse_timeline_merged_by(raw_timeline):
+    """Login of the actor of the (last) `merged` timeline event, or None. Pure.
+
+    The list-pulls endpoint omits `merged_by` (only GET /pulls/{n} carries it);
+    acquire already fetches each kept PR's issue timeline, whose `merged` event
+    actor is the merger, so this recovers it with no extra API call. A deleted
+    (ghost) actor yields None."""
+    login = None
+    for ev in raw_timeline or []:
+        if ev.get("event") == "merged":
+            login = (ev.get("actor") or {}).get("login")
+    return login
+
+
+_PR_RE =re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
 
 
 def resolve_commit_pr(message):
@@ -2576,6 +2590,64 @@ def _attach_timeline_xrefs(pr, timeline, current_slug):
         pr["timeline_xrefs"] = xrefs
 
 
+def dedupe_raw_prs(raws):
+    """One raw PR per number (issue #56 item 7). A page shift during
+    `sort=updated` paging — or a PR that changed state between the closed and
+    open fetches — can list the same PR twice. Keeps the snapshot with the
+    latest `updated_at` (ties: the first seen), in first-appearance order, so
+    the result is deterministic. Pure."""
+    best, order = {}, []
+    for raw in raws or []:
+        n = raw["number"]
+        if n not in best:
+            order.append(n)
+            best[n] = raw
+        elif (raw.get("updated_at") or "") > (best[n].get("updated_at") or ""):
+            best[n] = raw
+    return [best[n] for n in order]
+
+
+def enrich_pr(pr, get_page, api, current_slug):
+    """Per-PR enrichment for a kept PR (mutates `pr`): reviews, issue timeline
+    (crossrefs, cross-repo xrefs, lifecycle), review comments and conversation
+    comments — four paginated fetches via `get_page`, no more.
+
+    The list-pulls payload `normalize_pr` sees omits `merged_by`, `comments` and
+    `review_comments` (only GET /pulls/{n} has them, issue #61). Rather than one
+    extra detail call per PR, they are derived from what is fetched here:
+    `merged_by` from the timeline `merged` event actor (only when the PR is
+    merged and the payload did not already name the merger), and both counts
+    from the lengths of the fully-paginated comment lists."""
+    num = pr["number"]
+    reviews = fetch_all(get_page, f"{api}/pulls/{num}/reviews?per_page=100")
+    summary = summarize_reviews(reviews)
+    pr["reviewers"] = summary["reviewers"]
+    pr["review_decision"] = summary["decision"]
+    # Phase 10 slice 1: KEEP the individual review submissions (fold persists
+    # them as `review` social nodes). Only set the key when non-empty so the
+    # bundle/extract stay byte-stable for PRs with no reviews.
+    submissions = [normalize_review(r) for r in reviews]
+    if submissions:
+        pr["reviews"] = submissions
+    timeline = fetch_all(get_page, f"{api}/issues/{num}/timeline?per_page=100")
+    pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+    _attach_timeline_xrefs(pr, timeline, current_slug)
+    # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
+    # ready_for_review). Omit-when-empty for byte stability.
+    lifecycle = parse_timeline_lifecycle(timeline)
+    if lifecycle:
+        pr["lifecycle"] = lifecycle
+    if pr.get("merged") and not pr.get("merged_by"):
+        pr["merged_by"] = parse_timeline_merged_by(timeline)
+    review_comments = fetch_all(get_page, f"{api}/pulls/{num}/comments?per_page=100")
+    pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
+    conv_comments = fetch_all(get_page, f"{api}/issues/{num}/comments?per_page=100")
+    pr["comments_list"] = [normalize_comment(c) for c in conv_comments]
+    pr["comments"] = len(pr["comments_list"])
+    pr["review_comments_count"] = len(pr["review_comments"])
+    return pr
+
+
 def acquire(args, env):
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
         sys.stderr.write("error: --owner --repo --from --to are required\n")
@@ -2702,7 +2774,7 @@ def acquire(args, env):
         get_page, f"{api}/pulls?state=open&sort=updated&direction=desc&per_page=100")
 
     prs = []
-    for raw in raw_closed + raw_open:
+    for raw in dedupe_raw_prs(raw_closed + raw_open):
         pr = normalize_pr(raw)
         # Keep: merged-in-window, closed-unmerged-in-window, or any open PR.
         keep = (
@@ -2713,31 +2785,7 @@ def acquire(args, env):
         )
         if not keep:
             continue
-        reviews = fetch_all(get_page, f"{api}/pulls/{pr['number']}/reviews?per_page=100")
-        summary = summarize_reviews(reviews)
-        pr["reviewers"] = summary["reviewers"]
-        pr["review_decision"] = summary["decision"]
-        # Phase 10 slice 1: KEEP the individual review submissions (fold persists
-        # them as `review` social nodes). Only set the key when non-empty so the
-        # bundle/extract stay byte-stable for PRs with no reviews.
-        submissions = [normalize_review(r) for r in reviews]
-        if submissions:
-            pr["reviews"] = submissions
-        timeline = fetch_all(
-            get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
-        pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
-        _attach_timeline_xrefs(pr, timeline, f"{owner}/{repo}")
-        # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
-        # ready_for_review). Omit-when-empty for byte stability.
-        lifecycle = parse_timeline_lifecycle(timeline)
-        if lifecycle:
-            pr["lifecycle"] = lifecycle
-        review_comments = fetch_all(
-            get_page, f"{api}/pulls/{pr['number']}/comments?per_page=100")
-        pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
-        conv_comments = fetch_all(
-            get_page, f"{api}/issues/{pr['number']}/comments?per_page=100")
-        pr["comments_list"] = [normalize_comment(c) for c in conv_comments]
+        enrich_pr(pr, get_page, api, f"{owner}/{repo}")
         prs.append(pr)
 
     # Issue set: every issue a kept PR closes or cross-references, plus open and

@@ -64,6 +64,10 @@ the rest (engagement, code areas, trains, people/flow).
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
+  PRs are de-duplicated by `number` (a PR listed twice across pages keeps its latest snapshot).
+  `merged` is `merged_at != null`. GitHub's list-pulls payload omits `merged_by` and the comment
+  counts, so `acquire` takes `merged_by` from the actor of the PR's issue-timeline `merged` event
+  (`null` for an unmerged PR or a deleted account) — no extra per-PR call.
 - `issues` — issues in scope (PR-closing, plus open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
 - `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
@@ -142,7 +146,8 @@ docsRefs, release_train, sprints, project, diagrams`.
 
 - **prs[]** gain `review_comments: [{author, author_association, body, url, id, created_at}]`
   (inline diff comments) and `comments_list: [{...same shape}]` (conversation
-  comments). The integer count stays under `comments` / `review_comments_count`;
+  comments). The integer count stays under `comments` / `review_comments_count`
+  (in `acquire`, the lengths of `comments_list` / `review_comments`);
   the body arrays live under `comments_list` (the `comments` name was already taken
   by the count).
 - **issues[]** gain `comments_list: [{...}]`, `reactions: {"+1","-1","heart",

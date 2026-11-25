@@ -814,6 +814,126 @@ class TestAcquireAssemblyP3(unittest.TestCase):
         self.assertEqual(kinds, {"add", "modify", "delete", "rename"})
 
 
+class TestListPullsEnrichment(unittest.TestCase):
+    """#61 / #56 item 7: the list-pulls payload omits merged_by / comments /
+    review_comments, so acquire derives them from data it already fetches per
+    PR (timeline `merged` actor, comment-list lengths) — no extra /pulls/{n}
+    call — and de-duplicates PRs repeated across pages. Fixture is constructed
+    from the documented list schema (see its `_provenance`)."""
+
+    API = "https://api.github.com/repos/o/r"
+
+    def setUp(self):
+        with open(os.path.join(FIX, "rest_list_pulls_sample.json")) as fh:
+            self.data = json.load(fh)
+        self.calls = []
+
+    def _get_page(self, url):
+        self.calls.append(url)
+        path = url[len(self.API):].split("?")[0]
+        parts = path.strip("/").split("/")  # e.g. ['pulls', '42', 'reviews']
+        num = parts[1]
+        if parts[0] == "pulls" and parts[2] == "reviews":
+            return self.data["reviews"].get(num, []), None
+        if parts[0] == "pulls" and parts[2] == "comments":
+            return self.data["review_comments"].get(num, []), None
+        if parts[0] == "issues" and parts[2] == "timeline":
+            return self.data["timeline"].get(num, []), None
+        if parts[0] == "issues" and parts[2] == "comments":
+            return self.data["comments"].get(num, []), None
+        raise AssertionError("unexpected fetch: " + url)
+
+    def _prs(self):
+        raws = gather.dedupe_raw_prs(self.data["list_closed"] + self.data["list_open"])
+        prs = []
+        for raw in raws:
+            pr = gather.normalize_pr(raw)
+            gather.enrich_pr(pr, self._get_page, self.API, "o/r")
+            prs.append(pr)
+        return prs
+
+    def test_list_fixture_really_lacks_detail_fields(self):
+        for raw in self.data["list_closed"] + self.data["list_open"]:
+            for key in ("merged", "merged_by", "comments", "review_comments"):
+                self.assertNotIn(key, raw)
+
+    def test_parse_timeline_merged_by(self):
+        self.assertEqual(
+            gather.parse_timeline_merged_by(self.data["timeline"]["42"]), "bob")
+        self.assertIsNone(
+            gather.parse_timeline_merged_by(self.data["timeline"]["43"]))
+        self.assertIsNone(gather.parse_timeline_merged_by(None))
+        # ghost (deleted) actor -> None, not a crash
+        self.assertIsNone(gather.parse_timeline_merged_by(
+            [{"event": "merged", "actor": None}]))
+
+    def test_merged_by_and_counts_from_already_fetched_data(self):
+        by = {p["number"]: p for p in self._prs()}
+        pr42 = by[42]
+        self.assertTrue(pr42["merged"])
+        self.assertEqual(pr42["merged_at"], "2026-05-10T12:00:00Z")
+        self.assertEqual(pr42["merged_by"], "bob")
+        self.assertEqual(pr42["comments"], 3)
+        self.assertEqual(pr42["review_comments_count"], 2)
+        self.assertFalse(by[43]["merged"])
+        self.assertIsNone(by[43]["merged_by"])
+        self.assertEqual(by[43]["comments"], 0)
+        self.assertEqual(by[44]["comments"], 1)
+        self.assertEqual(by[44]["review_comments_count"], 0)
+        self.assertIsNone(by[44]["merged_by"])
+
+    def test_no_extra_pr_detail_call(self):
+        self._prs()
+        # exactly 4 per-PR enrichment calls, none to GET /pulls/{n} itself
+        self.assertEqual(len(self.calls), 4 * 3)
+        for url in self.calls:
+            path = url[len(self.API):].split("?")[0].strip("/").split("/")
+            self.assertEqual(len(path), 3, url)
+
+    def test_duplicate_pr_across_pages_yields_one(self):
+        raws = self.data["list_closed"] + self.data["list_open"]
+        self.assertEqual([r["number"] for r in raws], [42, 43, 42, 44])
+        self.assertEqual([p["number"] for p in self._prs()], [42, 43, 44])
+
+    def test_dedupe_keeps_latest_snapshot(self):
+        old = {"number": 7, "updated_at": "2026-05-01T00:00:00Z", "state": "open"}
+        new = {"number": 7, "updated_at": "2026-05-02T00:00:00Z", "state": "closed"}
+        other = {"number": 8, "updated_at": "2026-05-01T00:00:00Z"}
+        out = gather.dedupe_raw_prs([old, other, new])
+        self.assertEqual([r["number"] for r in out], [7, 8])
+        self.assertEqual(out[0]["state"], "closed")
+        # ties keep the first occurrence
+        tie = dict(old, state="other")
+        self.assertEqual(gather.dedupe_raw_prs([old, tie])[0]["state"], "open")
+
+    def test_detail_payload_merged_by_not_overridden(self):
+        # a /pulls/{n}-shaped raw (backfill path) already names the merger
+        pr = gather.normalize_pr({"number": 42, "merged_at": "2026-05-10T12:00:00Z",
+                                  "merged_by": {"login": "zed"}})
+        gather.enrich_pr(pr, self._get_page, self.API, "o/r")
+        self.assertEqual(pr["merged_by"], "zed")
+
+    def test_fold_writes_merged_edge(self):
+        bundle = {"meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                           "to": "2026-05-31"},
+                  "prs": self._prs(), "issues": [], "commits": []}
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, bundle)
+        merged = graphstore.get_edges(conn, "o/r#pr-42", direction="in",
+                                      edge_types=["merged"])
+        self.assertEqual([e["src_id"] for e in merged],
+                         [graphstore.qualify_person("o", "bob")])
+
+    def test_effort_review_comments_nonzero(self):
+        import link
+        prs = self._prs()
+        bundle = {"meta": {"owner": "o", "repo": "r"}, "prs": prs, "issues": [],
+                  "trains": [{"id": "train-pr-42", "prs": [42], "commits": []}]}
+        link.annotate_train_effort(bundle)
+        self.assertEqual(bundle["trains"][0]["effort"]["review_comments"], 2)
+
+
 class TestDirectoryCodeAreaProvider(unittest.TestCase):
     def test_avm_module_dir_is_the_four_segment_subtree(self):
         # AVM: avm/res/<service>/<module>/...  -> area = that 4-seg dir
