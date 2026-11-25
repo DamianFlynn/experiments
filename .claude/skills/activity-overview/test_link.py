@@ -404,6 +404,120 @@ class TestSelectMilestonesAndBuckets(unittest.TestCase):
         self.assertEqual(current["title"], "v1.2.0")
         self.assertEqual(nxt["title"], "v1.3.0")
 
+    # --- #59: undated milestones are never selected; all-overdue rule ---------
+
+    @staticmethod
+    def _ms(title, due_on, number, state="open"):
+        return {"title": title, "state": state, "due_on": due_on, "number": number}
+
+    def _titles(self, milestones, ref_date):
+        cur, nxt = link.select_milestones(milestones, ref_date)
+        return (cur["title"] if cur else None, nxt["title"] if nxt else None)
+
+    def test_select_milestones_no_milestones(self):
+        self.assertEqual(self._titles([], "2026-05-20"), (None, None))
+
+    def test_select_milestones_only_undated_selects_nothing(self):
+        ms = [self._ms("Backlog", None, 1), self._ms("Someday", None, 2)]
+        self.assertEqual(self._titles(ms, "2026-05-20"), (None, None))
+
+    def test_select_milestones_undated_never_next_alongside_dated(self):
+        # Issue #59 scenario 1: v2 (dated, upcoming) + Backlog (undated).
+        ms = [self._ms("Backlog", None, 1),
+              self._ms("v2", "2026-06-30T00:00:00Z", 7)]
+        self.assertEqual(self._titles(ms, "2026-05-20"), ("v2", None))
+
+    def test_select_milestones_undated_never_current_when_dated_overdue(self):
+        # Issue #59 scenario 2: only overdue milestones plus Backlog.
+        ms = [self._ms("v1.0", "2026-01-31T00:00:00Z", 2),
+              self._ms("v1.1", "2026-03-31T00:00:00Z", 3),
+              self._ms("Backlog", None, 1)]
+        self.assertEqual(self._titles(ms, "2026-05-20"), ("v1.1", None))
+
+    def test_select_milestones_all_overdue_latest_is_current_no_next(self):
+        # Issue #59 scenario 3: the most recently due overdue one is current.
+        ms = [self._ms("v1.0", "2026-01-31T00:00:00Z", 2),
+              self._ms("v1.2", "2026-04-30T00:00:00Z", 4),
+              self._ms("v1.1", "2026-03-31T00:00:00Z", 3)]
+        self.assertEqual(self._titles(ms, "2026-05-20"), ("v1.2", None))
+
+    def test_select_milestones_overdue_plus_upcoming_ignores_overdue(self):
+        ms = [self._ms("old", "2026-01-31T00:00:00Z", 2),
+              self._ms("v1.2", "2026-05-31T00:00:00Z", 4),
+              self._ms("v1.3", "2026-06-30T00:00:00Z", 5),
+              self._ms("Backlog", None, 1)]
+        self.assertEqual(self._titles(ms, "2026-05-20"), ("v1.2", "v1.3"))
+
+    def test_select_milestones_same_due_date_tie_break_by_number(self):
+        ms = [self._ms("b", "2026-06-30T00:00:00Z", 9),
+              self._ms("a", "2026-06-30T00:00:00Z", 4)]
+        self.assertEqual(self._titles(ms, "2026-05-20"), ("a", "b"))
+        self.assertEqual(self._titles(list(reversed(ms)), "2026-05-20"), ("a", "b"))
+        # all-overdue with a tie on the latest date: lowest number wins, no next.
+        self.assertEqual(self._titles(ms, "2026-07-15"), ("a", None))
+        self.assertEqual(self._titles(list(reversed(ms)), "2026-07-15"), ("a", None))
+
+    def test_select_milestones_closed_ignored(self):
+        ms = [self._ms("v1.2", "2026-05-31T00:00:00Z", 4, state="closed"),
+              self._ms("v1.3", "2026-06-30T00:00:00Z", 5),
+              self._ms("v1.1", "2026-04-30T00:00:00Z", 3, state="closed")]
+        self.assertEqual(self._titles(ms, "2026-05-20"), ("v1.3", None))
+        only_closed = [self._ms("v1.2", "2026-05-31T00:00:00Z", 4, state="closed")]
+        self.assertEqual(self._titles(only_closed, "2026-05-20"), (None, None))
+
+    def test_select_milestones_ref_date_timestamp_equals_date(self):
+        # A milestone due ON the ref day is still upcoming whether ref_date is
+        # given as a date or a full ISO timestamp.
+        ms = [self._ms("v1.2", "2026-05-31T00:00:00Z", 4),
+              self._ms("v1.3", "2026-06-30T00:00:00Z", 5)]
+        self.assertEqual(self._titles(ms, "2026-05-31"), ("v1.2", "v1.3"))
+        self.assertEqual(self._titles(ms, "2026-05-31T23:59:59Z"), ("v1.2", "v1.3"))
+
+    def test_buckets_backlog_milestone_items_not_next_or_in_flight(self):
+        # Issue #59: a 2021 issue on the undated Backlog milestone, untouched in
+        # the window, must not become a next_candidate (nor in_flight).
+        bundle = {
+            "meta": {"period": {"from": "2026-05-01", "to": "2026-05-31"},
+                     "ref_date": "2026-05-31"},
+            "milestones": [self._ms("v2", "2026-06-30T00:00:00Z", 2),
+                           self._ms("Backlog", None, 1)],
+            "prs": [],
+            "issues": [{"number": 7, "state": "open", "labels": [],
+                        "milestone": "Backlog",
+                        "created_at": "2021-03-01T00:00:00Z",
+                        "updated_at": "2021-03-01T00:00:00Z",
+                        "url": "https://github.com/o/r/issues/7"}],
+            "trains": [],
+        }
+        b = link.compute_buckets(bundle)
+        self.assertEqual(b["next_candidates"], [])
+        self.assertEqual(b["in_flight"], [])
+
+    def test_buckets_only_overdue_plus_backlog_backlog_not_in_flight(self):
+        # Issue #59 scenario 2: Backlog must not become `current`, so its stale
+        # items are not swept into in_flight; the latest overdue one is current.
+        bundle = {
+            "meta": {"period": {"from": "2026-05-01", "to": "2026-05-31"},
+                     "ref_date": "2026-05-31"},
+            "milestones": [self._ms("v1.1", "2026-03-31T00:00:00Z", 3),
+                           self._ms("Backlog", None, 1)],
+            "prs": [],
+            "issues": [
+                {"number": 7, "state": "open", "labels": [], "milestone": "Backlog",
+                 "created_at": "2021-03-01T00:00:00Z",
+                 "updated_at": "2021-03-01T00:00:00Z",
+                 "url": "https://github.com/o/r/issues/7"},
+                {"number": 8, "state": "open", "labels": [], "milestone": "v1.1",
+                 "created_at": "2026-01-01T00:00:00Z",
+                 "updated_at": "2026-01-01T00:00:00Z",
+                 "url": "https://github.com/o/r/issues/8"},
+            ],
+            "trains": [],
+        }
+        b = link.compute_buckets(bundle)
+        self.assertEqual(b["next_candidates"], [])
+        self.assertEqual([r["id"] for r in b["in_flight"]], [8])
+
     def test_select_sprints_prev_current_next(self):
         sprints = {
             "IT_done": {"title": "S4", "start": "2025-12-29", "end": "2026-01-11"},
@@ -2272,6 +2386,27 @@ class TestBuildForecast(unittest.TestCase):
         bundle = self._bundle(milestones=milestones)
         link.build_forecast(bundle)
         self.assertIsNone(bundle["forecast"]["next_milestone"])
+
+    def test_backlog_milestone_item_not_scored_on_next_milestone(self):
+        """#59: an item on an undated 'Backlog' milestone is never scored
+        on_next_milestone, even when it is the only other open milestone."""
+        issues = [self._issue(7, milestone="Backlog",
+                              created_at="2021-03-01T00:00:00Z",
+                              updated_at="2021-03-01T00:00:00Z")]
+        milestones = [
+            self._open_ms("v2", "2026-06-30T00:00:00Z", 2),
+            self._open_ms("Backlog", None, 1),
+        ]
+        bundle = self._bundle(next_candidates=[self._nc_ref("issue", 7)],
+                              milestones=milestones, issues=issues)
+        link.build_forecast(bundle)
+        fc = bundle["forecast"]
+        self.assertIsNone(fc["next_milestone"])
+        cand = fc["candidates"][0]
+        self.assertNotIn("on milestone Backlog", cand["signals"])
+        self.assertEqual(cand["signals"], ["long-open"])
+        self.assertEqual(cand["score"], link.FORECAST_WEIGHTS["overdue"])
+        self.assertEqual(cand["tier"], "longshot")
 
     # ------------------------------------------------------------------
     # Signal: on_next_milestone (heavy)

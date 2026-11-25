@@ -51,25 +51,37 @@ def _high_priority(item):
 
 
 def _ms_sort_key(m):
-    # `or 0` (not a default arg) guarantees an int secondary key even when
-    # `number` is present-but-null; real GitHub milestone numbers are >= 1, so
-    # collapsing a hypothetical 0 to 0 is harmless.
-    return ((m.get("due_on") or "9999-12-31")[:10], m.get("number") or 0)
+    # Only called on DATED milestones (select_milestones drops undated ones), so
+    # the due day is always a real date. `or 0` (not a default arg) guarantees an
+    # int secondary key even when `number` is present-but-null; real GitHub
+    # milestone numbers are >= 1, so collapsing a hypothetical 0 to 0 is harmless.
+    return (m["due_on"][:10], m.get("number") or 0)
 
 
 def select_milestones(milestones, ref_date):
-    """(current, next) open milestones by due date. current = earliest open whose
-    due date is on/after ref_date (else the earliest open); next = the one after."""
-    open_ms = sorted((m for m in milestones if m.get("state") == "open"),
-                     key=_ms_sort_key)
-    if not open_ms:
+    """(current, next) open, DATED milestones relative to `ref_date` (#59).
+
+    Undated open milestones (e.g. a "Backlog" bucket) are never selected; if no
+    open milestone has a due date the result is (None, None). Dated ones are
+    ordered by (due day, number). Comparison is by calendar day, so `ref_date`
+    may be a date or a full ISO timestamp.
+      - Some due on/after ref day: current = the earliest of those, next = the
+        one after it (None if none).
+      - All overdue: current = the most recently due (lowest number on a tie),
+        next = None.
+    """
+    dated = sorted((m for m in milestones or []
+                    if m.get("state") == "open" and m.get("due_on")),
+                   key=_ms_sort_key)
+    if not dated:
         return None, None
-    current = next(
-        (m for m in open_ms if (m.get("due_on") or "9999-12-31")[:10] >= ref_date),
-        open_ms[0])
-    idx = open_ms.index(current)
-    nxt = open_ms[idx + 1] if idx + 1 < len(open_ms) else None
-    return current, nxt
+    ref = (ref_date or "")[:10]
+    upcoming = [m for m in dated if m["due_on"][:10] >= ref]
+    if upcoming:
+        return upcoming[0], (upcoming[1] if len(upcoming) > 1 else None)
+    latest_day = dated[-1]["due_on"][:10]
+    current = next(m for m in dated if m["due_on"][:10] == latest_day)
+    return current, None
 
 
 def select_sprints(sprints, ref_date):

@@ -520,9 +520,12 @@ flowchart TB
   i1 -- no --> NB
 ```
 
-`select_milestones(milestones, ref_date)`: open milestones sorted by `(due_on or 9999-12-31,
-number)`; **current** = earliest due on/after `ref_date` (else earliest open); **next** = the
-one after it. `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`,
+`select_milestones(milestones, ref_date)`: only **open, dated** milestones are eligible
+(an undated one such as "Backlog" is never current or next; none dated → `(None, None)`),
+sorted by `(due day, number)` and compared to `ref_date[:10]` (date or ISO timestamp).
+**current** = earliest due on/after the ref day, **next** = the one after it; if every dated
+milestone is overdue, **current** = the most recently due (lowest number on a tie) and
+**next** = `None`. `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`,
 `high-priority`, `critical` (case-insensitive exact match).
 
 ### 6.6 Significance and effort

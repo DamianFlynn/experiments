@@ -265,7 +265,10 @@ The following installment's `series.forecast_loop` lists each previous candidate
 
 - **Milestones drive the strongest signal.** If a repo uses milestones for releases, the
   forecast will track them automatically (`select_milestones`: current = earliest open due
-  on/after the ref date; next = the following one).
+  on/after the ref date; next = the following one). Only milestones **with a due date**
+  count: an undated "Backlog"-style milestone is never current or next, so give release
+  milestones a due date. If every dated milestone is overdue, the most recently due one is
+  current and there is no next (so no `on milestone` signal).
 - **Priority labels must match.** Recognized labels (case-insensitive, exact):
   `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`, `critical`. Check a repo
   with `gh label list -R <owner/repo> --limit 200`. If it uses other names (for example a

@@ -115,7 +115,11 @@ docsRefs, release_train, sprints, project, diagrams`.
   populated (see the schema block in the design spec).
 - **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
   `next_candidates` (one bucket per item; precedence shipped > rejected >
-  next_candidates > in_flight). Each ref may carry a `train` id.
+  next_candidates > in_flight). Each ref may carry a `train` id. The current/next
+  milestones come from `select_milestones`: open milestones **with a due date** only
+  (undated ones, e.g. "Backlog", are never selected; none dated → no current/next);
+  current = earliest due on/after `ref_date`'s day, next = the one after; if all are
+  overdue, current = the most recently due and next = none. Ties break by number.
 - **diagrams{}** maps `buckets_pie` / `timeline_gantt` to their `.mmd` paths,
   written and mmdc-validated by `render.py`. **`diagrams.train_flowcharts`** is a nested
   map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written by `render.py` (one adaptive
@@ -125,7 +129,8 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
   train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
   — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
-  desc. Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
+  desc. `next_milestone` is the bucket rule's next milestone (always dated; `None` when
+  there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
   / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
