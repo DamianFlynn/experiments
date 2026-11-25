@@ -92,3 +92,30 @@ class TestSuiteHygiene(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoMergeConflictMarkers(unittest.TestCase):
+    """A conflict resolved by hand can leave `<<<<<<<` / `>>>>>>>` blocks in a
+    file that no test reads (docs). This reached the default branch once; fail
+    the suite if any tracked text file in the skill still carries them."""
+
+    _MARKERS = ("<<<<<<< ", ">>>>>>> ")
+    _SUFFIXES = (".py", ".md", ".json", ".yml", ".yaml", ".txt", ".csv", ".mmd")
+
+    def test_no_conflict_markers_in_skill_files(self):
+        root = os.path.dirname(os.path.abspath(__file__))
+        hits = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("workspace", "__pycache__", ".git")]
+            for name in filenames:
+                if not name.endswith(self._SUFFIXES):
+                    continue
+                path = os.path.join(dirpath, name)
+                if os.path.abspath(path) == os.path.abspath(__file__):
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for n, line in enumerate(fh, 1):
+                        if line.startswith(self._MARKERS):
+                            hits.append("%s:%d" % (os.path.relpath(path, root), n))
+        self.assertEqual(hits, [], "merge-conflict markers left in: %s" % hits)
