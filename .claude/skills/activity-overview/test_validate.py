@@ -632,5 +632,276 @@ class TestArtifactStatusRoundTrip(unittest.TestCase):
             self.assertTrue(c["ok"], c["details"])
 
 
+# --- issue #79: no false passes, every check reported, read-only, no crashes --
+
+EXPECTED_CHECKS = ["target", "referential_integrity", "participant_completeness",
+                   "provenance", "no_fabrication", "schema_conformance",
+                   "no_drift", "idempotency"]
+
+
+def _failed_names(checks):
+    return sorted(c["name"] for c in checks if not c["ok"])
+
+
+class TestNoFalsePass(unittest.TestCase):
+    """Each scenario used to print `RESULT: OK` with no_drift/idempotency silently
+    dropped. It must now fail on a named check, and list every expected check."""
+
+    def assert_all_checks_listed(self, report):
+        self.assertEqual([c["name"] for c in report.checks], EXPECTED_CHECKS)
+
+    def test_clean_store_lists_every_check(self):
+        report = validate.validate(_clean_store(), project="o", repo="r")
+        self.assert_all_checks_listed(report)
+        self.assertIs(report.ok, True, _failed_names(report.checks))
+
+    def test_unknown_repo_fails_target(self):
+        report = validate.validate(_clean_store(), project="o", repo="typo")
+        self.assert_all_checks_listed(report)
+        self.assertIs(report.ok, False)
+        self.assertEqual(_failed_names(report.checks),
+                         ["idempotency", "no_drift", "target"])
+        target = _check(report, "target")
+        self.assertIn("typo", json.dumps(target["details"]))
+        self.assertIn("could not self-source",
+                      json.dumps(_check(report, "no_drift")["details"]))
+
+    def test_unknown_project_fails_target(self):
+        report = validate.validate(_clean_store(), project="nope", repo="r")
+        self.assert_all_checks_listed(report)
+        self.assertIs(_check(report, "target")["ok"], False)
+        self.assertIs(report.ok, False)
+
+    def test_unknown_project_without_repo_fails_target(self):
+        report = validate.validate(_clean_store(), project="nope")
+        self.assert_all_checks_listed(report)
+        self.assertIs(_check(report, "target")["ok"], False)
+
+    def test_zero_node_store_fails_with_and_without_target(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        for kw in ({"project": "o", "repo": "r"}, {}):
+            report = validate.validate(conn, **kw)
+            self.assert_all_checks_listed(report)
+            self.assertIs(report.ok, False, kw)
+            self.assertIs(_check(report, "target")["ok"], False, kw)
+
+    def test_null_ts_store_cannot_self_source(self):
+        conn = _clean_store()
+        conn.execute("UPDATE nodes SET ts=NULL")
+        conn.commit()
+        report = validate.validate(conn, project="o", repo="r")
+        self.assert_all_checks_listed(report)
+        self.assertIs(report.ok, False)
+        for name in ("no_drift", "idempotency"):
+            c = _check(report, name)
+            self.assertIs(c["ok"], False, c)
+            self.assertIn("could not self-source", json.dumps(c["details"]))
+
+    def test_repo_case_variant_resolves_to_stored_spelling(self):
+        report = validate.validate(_clean_store(), project="o", repo="R")
+        self.assertIs(report.ok, True, _failed_names(report.checks))
+
+    def test_quiet_member_still_runs_drift_and_idempotency(self):
+        # A member with only structure nodes (no activity in its window) is a
+        # legitimate store: it self-sources from its recorded gathered window.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        for repo in ("Azure/mod-a", "Azure/mod-b"):
+            b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
+                          "from": "2026-01-01", "to": "2026-01-31"},
+                 "prs": [], "issues": [], "commits": [], "code_events": [],
+                 "milestones": [], "releases": [], "code_graph": {"areas": []}}
+            gather.fold_bundle(conn, b, project="proj", repo=repo,
+                               members={"Azure/mod-a", "Azure/mod-b"})
+        agg = validate.validate_project(conn, "proj", ["Azure/mod-a", "Azure/mod-b"])
+        self.assertTrue(agg["ok"], agg)
+        for m in agg["members"]:
+            self.assertEqual([c["name"] for c in m["checks"]], EXPECTED_CHECKS)
+
+    def test_validate_project_unknown_member_fails(self):
+        agg = validate.validate_project(_clean_store(), "o", ["r", "ghost"])
+        self.assertFalse(agg["ok"])
+        by_repo = {m["repo"]: m["ok"] for m in agg["members"]}
+        self.assertEqual(by_repo, {"r": True, "ghost": False})
+        people = agg["project_checks"][0]
+        self.assertEqual(people["name"], "no_drift_people")
+        self.assertIs(people["ok"], False)
+        self.assertIn("could not self-source", json.dumps(people["details"]))
+
+
+class TestCorruptRowsReported(unittest.TestCase):
+    def test_corrupt_edge_json_is_a_failed_check_naming_the_row(self):
+        conn = _clean_store()
+        conn.execute("UPDATE edges SET data='{not json' WHERE src_id=? AND "
+                     "dst_id=? AND edge_type='authored'",
+                     ("o#person-alice", "o/r#pr-42"))
+        conn.commit()
+        report = validate.validate(conn, project="o", repo="r")
+        self.assertEqual([c["name"] for c in report.checks], EXPECTED_CHECKS)
+        self.assertIs(report.ok, False)
+        c = _check(report, "referential_integrity")
+        self.assertIs(c["ok"], False)
+        self.assertIn("o/r#pr-42", json.dumps(c["details"]))
+
+    def test_list_typed_node_blob_is_a_failed_check_naming_the_row(self):
+        conn = _clean_store()
+        conn.execute("UPDATE nodes SET data='[1, 2]' WHERE id='o/r#pr-42'")
+        conn.commit()
+        report = validate.validate(conn, project="o", repo="r")
+        self.assertEqual([c["name"] for c in report.checks], EXPECTED_CHECKS)
+        self.assertIs(report.ok, False)
+        for name in ("provenance", "no_drift", "idempotency"):
+            c = _check(report, name)
+            self.assertIs(c["ok"], False, name)
+            self.assertIn("o/r#pr-42", json.dumps(c["details"]), name)
+
+    def test_every_check_is_guarded(self):
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+        names = ["check_referential_integrity", "check_participant_completeness",
+                 "check_provenance", "check_no_fabrication",
+                 "check_schema_conformance"]
+        for fn in names:
+            orig = getattr(validate, fn)
+            setattr(validate, fn, boom)
+            try:
+                report = validate.validate(_clean_store(), project="o", repo="r")
+            finally:
+                setattr(validate, fn, orig)
+            self.assertEqual([c["name"] for c in report.checks], EXPECTED_CHECKS)
+            self.assertEqual(_failed_names(report.checks),
+                             [fn[len("check_"):]], fn)
+
+
+class TestReadOnlyOpen(_TmpDirCase):
+    def test_open_store_readonly_missing_path_raises_and_creates_nothing(self):
+        path = os.path.join(self.tmp_path, "nosuch.db")
+        with self.assertRaises(FileNotFoundError):
+            graphstore.open_store_readonly(path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_open_store_readonly_rejects_writes(self):
+        db = _write_store(self.tmp_path)
+        conn = graphstore.open_store_readonly(db)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] > 0,
+                         True)
+        with self.assertRaises(Exception):
+            conn.execute("DELETE FROM nodes")
+
+    def test_dead_ref_readers_do_not_create_the_table(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        conn.execute("DROP TABLE dead_refs")
+        self.assertFalse(graphstore.is_dead_ref(conn, "o/r#issue-1"))
+        self.assertEqual(graphstore.get_dead_refs(conn), [])
+        graphstore.traverse_spine(conn, ["o/r#pr-1"], skip_dead=True)
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='dead_refs'").fetchone())
+
+
+def _sha256(path):
+    import hashlib
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+class TestCliIssue79(_TmpDirCase):
+    def _raw(self, db, sql):
+        import sqlite3
+        conn = sqlite3.connect(db)
+        conn.execute(sql)
+        conn.commit()
+        conn.close()
+
+    def assert_fails_on(self, r, name):
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("[FAIL] {}".format(name), r.stdout)
+        self.assertIn("RESULT: FAIL", r.stdout)
+
+    def test_cli_false_pass_scenarios_exit_one(self):
+        db = _write_store(self.tmp_path)
+        self.assert_fails_on(_run_cli(db, "--project", "o", "--repo", "typo"),
+                             "target")
+        self.assert_fails_on(_run_cli(db, "--project", "nope", "--repo", "r"),
+                             "target")
+        empty = os.path.join(self.tmp_path, "empty.db")
+        conn = graphstore.open_store(empty)
+        graphstore.init_schema(conn)
+        conn.close()
+        self.assert_fails_on(_run_cli(empty, "--project", "o", "--repo", "r"),
+                             "target")
+        self.assert_fails_on(_run_cli(empty), "target")
+        self._raw(db, "UPDATE nodes SET ts=NULL")
+        r = _run_cli(db, "--project", "o", "--repo", "r")
+        self.assert_fails_on(r, "no_drift")
+        self.assert_fails_on(r, "idempotency")
+
+    def test_cli_missing_store_exits_two_and_creates_nothing(self):
+        path = os.path.join(self.tmp_path, "nosuch.db")
+        r = _run_cli(path)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("nosuch.db", r.stderr)
+        self.assertFalse(os.path.exists(path))
+
+    def test_cli_ambiguous_project_is_a_usage_error(self):
+        db = _write_store(self.tmp_path)
+        conn = graphstore.open_store(db)
+        graphstore.upsert_node(conn, "p2/x#pr-1", "p2", "x", "social",
+                               "2026-05-02T00:00:00Z", {"number": 1})
+        conn.close()
+        r = _run_cli(db)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("--project", r.stderr)
+
+    def test_cli_not_a_store_exits_two(self):
+        path = os.path.join(self.tmp_path, "notes.txt")
+        with open(path, "w") as fh:
+            fh.write("not a database\n")
+        r = _run_cli(path)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_cli_audit_leaves_store_byte_identical(self):
+        db = _write_store(self.tmp_path)
+        before = _sha256(db)
+        r = _run_cli(db, "--project", "o", "--repo", "r")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(_sha256(db), before)
+
+    def test_cli_store_without_dead_refs_is_byte_identical(self):
+        db = _write_store(self.tmp_path)
+        self._raw(db, "DROP TABLE dead_refs")
+        before = _sha256(db)
+        r = _run_cli(db, "--project", "o", "--repo", "r")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(_sha256(db), before)
+        import sqlite3
+        conn = sqlite3.connect(db)
+        self.assertIsNone(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='dead_refs'").fetchone())
+        conn.close()
+
+    def test_cli_corrupt_rows_produce_text_and_json_reports(self):
+        db = _write_store(self.tmp_path)
+        self._raw(db, "UPDATE edges SET data='{not json' WHERE src_id='o#person-alice' "
+                      "AND dst_id='o/r#pr-42' AND edge_type='authored'")
+        self.assert_fails_on(_run_cli(db, "--project", "o", "--repo", "r"),
+                             "referential_integrity")
+        self._raw(db, "UPDATE nodes SET data='[1, 2]' WHERE id='o/r#pr-42'")
+        self.assert_fails_on(_run_cli(db, "--project", "o", "--repo", "r"),
+                             "provenance")
+        r = _run_cli(db, "--project", "o", "--repo", "r", "--json")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        data = json.loads(r.stdout)
+        self.assertIs(data["ok"], False)
+        self.assertEqual([c["name"] for c in data["checks"]], EXPECTED_CHECKS)
+        self.assertIn("o/r#pr-42", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

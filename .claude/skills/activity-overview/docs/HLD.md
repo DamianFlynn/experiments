@@ -95,7 +95,7 @@ flowchart TB
     S[("journey.db<br/>graphstore.py")]
   end
   subgraph L3["3 · Trust"]
-    V["validate.py<br/>8 audits"]
+    V["validate.py<br/>9 audits"]
   end
   subgraph L4["4 · Read and enrich (offline)"]
     X["extract.py<br/>materialize a window view"]
@@ -410,7 +410,7 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 | **Verifiability** | Every fact carries a `{type, id, url}` ref; narrator citations are filtered to the slice. |
 | **Determinism** | Sorted JSON, ordered range queries, pure projections; same store → byte-identical view. |
 | **Idempotency** | Identity-keyed upserts and set-semantics ledger; re-folds are no-ops. Proven by `validate.idempotency`. |
-| **Trust** | `validate.py` gates every report: provenance, referential integrity, schema conformance, no fabrication, participant completeness, no drift, idempotency (+ project-wide people). |
+| **Trust** | `validate.py` gates every report (read-only; a check that cannot run fails, never disappears): target exists, provenance, referential integrity, schema conformance, no fabrication, participant completeness, no drift, idempotency (+ project-wide people). |
 | **Graceful degradation** | Missing CLIs, scopes, boards or FTS5 produce empty or clearly-flagged sections, not failures; IaC gaps are counted (`edge_extraction`). |
 | **Offline readers** | Only `gather` (and opt-in `--complete` backfill) touch the network; everything else replays from the store. |
 | **Security** | Read-only token; no write-back; secrets only in the environment; recognition-not-blame by default. |

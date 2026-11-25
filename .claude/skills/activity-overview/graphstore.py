@@ -7,9 +7,11 @@ the function API below. See STORE.md for the schema and identity rules.
 
 import datetime
 import json
+import os
 import re
 import sqlite3
 import time
+import urllib.parse
 
 # Store schema version (meta `schema_version`). History:
 #   1 - initial schema.
@@ -96,6 +98,22 @@ def open_store(path=":memory:"):
     conn.row_factory = sqlite3.Row
     if path != ":memory:":
         conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def open_store_readonly(path):
+    """Open an EXISTING store strictly read-only (issue #79), for auditors.
+
+    Unlike open_store this never creates the file (a missing path raises
+    FileNotFoundError), sets no journal mode and runs no schema step; the
+    connection is opened with SQLite's `mode=ro` URI, so any write through it
+    raises sqlite3.OperationalError instead of touching the store."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError("store not found: {}".format(path))
+    uri = "file:{}?mode=ro".format(
+        urllib.parse.quote(os.path.abspath(path), safe="/"))
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -652,8 +670,7 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES,
     # reaches the dead id from both sides before the filter runs.
     next_id = "CASE WHEN e.src_id = r.id THEN e.dst_id ELSE e.src_id END"
     dead_clause = ""
-    if skip_dead:
-        _ensure_dead_refs(conn)
+    if skip_dead and _has_dead_refs(conn):
         dead_clause = " AND ({}) NOT IN (SELECT id FROM dead_refs)".format(next_id)
 
     seed_values = ",".join("(?)" for _ in seed_ids)
@@ -820,9 +837,19 @@ _DEAD_REFS_DDL = (
 )
 
 
+def _has_dead_refs(conn):
+    """True if the store has a dead_refs table. Readers check this instead of
+    creating the table, so a read never writes schema (issue #79): a store
+    without the table simply has no tombstones."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dead_refs'"
+    ).fetchone() is not None
+
+
 def _ensure_dead_refs(conn):
-    """Create the dead_refs table if absent. Lets the tombstone helpers work on
-    a store opened directly (not via init_schema) or one that predates 8d."""
+    """Create the dead_refs table if absent. Lets record_dead_ref work on a
+    store opened directly (not via init_schema) or one that predates 8d. Only
+    the writer calls it; readers use _has_dead_refs (issue #79)."""
     conn.execute(_DEAD_REFS_DDL)
 
 
@@ -844,14 +871,16 @@ def record_dead_ref(conn, id, reason="absent"):
 
 def is_dead_ref(conn, id):
     """True if `id` has been tombstoned as a known-absent phantom."""
-    _ensure_dead_refs(conn)
+    if not _has_dead_refs(conn):
+        return False
     row = conn.execute("SELECT 1 FROM dead_refs WHERE id=?", (id,)).fetchone()
     return row is not None
 
 
 def get_dead_refs(conn):
     """All tombstoned ids, sorted (deterministic)."""
-    _ensure_dead_refs(conn)
+    if not _has_dead_refs(conn):
+        return []
     return [r[0] for r in conn.execute("SELECT id FROM dead_refs ORDER BY id")]
 
 

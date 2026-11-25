@@ -593,9 +593,38 @@ real-data checks — `no_drift` (stored people/artifacts == freshly re-derived) 
 `idempotency` (a re-fold changes no counts) — need a raw bundle to re-derive
 against, and when none is passed they **self-source it from the store** via
 `extract` over the store's full activity window. A `--bundle` argument is an
-optional cross-check, never required. The auditor never mutates the store and
-survives a corrupt one (a re-derive/re-fold that raises becomes a failed ERROR
-check, not a crash). This is what makes the store a stand-alone deliverable.
+optional cross-check, never required. This is what makes the store a
+stand-alone deliverable.
+
+The gate can only fail, never pass by omission (issue #79):
+
+- **The target must exist.** The first check, `target`, fails when the store
+  holds no nodes, when `--project` has no nodes, or when `--repo` is not one of
+  the project's stored member repos (a `--repo` in another case resolves to the
+  stored spelling, as in the readers). A mistyped name is a failure, not an
+  audit of nothing.
+- **Every check is always reported.** When `no_drift`/`idempotency` cannot
+  self-source a bundle they are reported as FAILED with
+  `could not self-source: <reason>`: the target has no nodes, a node row cannot
+  be decoded, or the repo stores social/code nodes but none carries a `ts` (the
+  activity window cannot be recovered). A member holding only structure nodes
+  (nothing happened in its window) self-sources over its recorded gathered
+  window instead. In project mode `no_drift_people` fails the same way when a
+  member cannot be self-sourced.
+- **No crashes.** Every check is guarded: a corrupt row (data that is not valid
+  JSON, or a social/code/person blob that is not a JSON object) or any other
+  exception becomes a failed ERROR check naming the error and the row id, and
+  `--json` output is still produced.
+- **Read-only.** The CLI opens the store with `graphstore.open_store_readonly`
+  (SQLite `mode=ro` URI): it never creates a missing file, sets no journal mode
+  and runs no schema step. The idempotency re-fold runs in an in-memory copy.
+  Readers no longer create `dead_refs` either (`traverse_spine(skip_dead=True)`,
+  `is_dead_ref` and `get_dead_refs` treat a missing table as "no tombstones"),
+  so auditing a store leaves its file byte-identical.
+
+Exit codes: 0 no ERROR; 1 an ERROR check failed (a report is printed); 2 usage
+error with no report (the store path does not exist or is not a store, several
+projects or repos and none named, unreadable `--bundle`).
 
 ## Determinism
 

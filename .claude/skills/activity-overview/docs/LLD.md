@@ -509,7 +509,7 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 
 | Group | Functions |
 |---|---|
-| Lifecycle | `open_store`, `init_schema`, `set_meta`, `get_meta`, `now_iso` |
+| Lifecycle | `open_store`, `open_store_readonly` (existing file, `mode=ro`), `init_schema`, `set_meta`, `get_meta`, `now_iso` |
 | Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` |
 | Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)` |
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
@@ -779,11 +779,14 @@ will not start sandboxed as root). Paths are recorded in `bundle.diagrams`.
 ## 8. Trust — `validate.py`
 
 `validate.py STORE [--project P] [--repo R] [--bundle FILE] [--json]` → exit 0 when no ERROR, 1
-otherwise. When the store (or `--project`) spans several repos and no `--repo` is given, it runs
+otherwise; exit 2 (usage error, no report) when the path does not exist or is not a store,
+when several projects (or repos) are stored and none is named, or when `--bundle` cannot be
+read. When the store (or `--project`) spans several repos and no `--repo` is given, it runs
 `validate_project` over every member plus the project-wide checks.
 
 | Check | Asserts |
 |---|---|
+| `target` | the store has nodes, the project has nodes and the repo is a stored member (case-insensitive, resolved to the stored spelling) |
 | `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR |
 | `participant_completeness` | every login in any raw record has a person node |
 | `provenance` | every social/code node carries a source identifier (url and/or sha) |
@@ -793,9 +796,21 @@ otherwise. When the store (or `--project`) spans several repos and no `--repo` i
 | `idempotency` | re-folding into a scratch copy changes no counts |
 | `no_drift_people` (project) | project-scoped people == union re-derived across all members |
 
-The auditor never mutates the store; a check that raises is reported as a failed ERROR, not a
-crash. `no_drift`/`idempotency` self-source their bundle via `extract` over the store's
-gathered windows; `--bundle` is an optional cross-check.
+Every report lists every check in this order (issue #79); none is ever dropped.
+`no_drift`/`idempotency` self-source their bundle via `extract` over the span of the repo's
+timestamped nodes; a repo with only structure nodes (a quiet member) uses its recorded gathered
+windows instead; `--bundle` is an optional cross-check. When no bundle can be sourced (no nodes
+for the target, an undecodable node row, or social/code nodes with no `ts` at all) both checks
+FAIL with `could not self-source: <reason>`, and project-mode `no_drift_people` fails likewise.
+Every check runs under `_guarded`: an exception — e.g. `CorruptRow` for data that is not valid
+JSON or a social/code/person blob that is not an object — becomes a failed ERROR check carrying
+the error and the row id, so text and `--json` reports are always produced.
+
+**Read-only.** The CLI opens the store with `graphstore.open_store_readonly(path)` (SQLite
+`file:…?mode=ro` URI; raises `FileNotFoundError` for a missing path and never creates it; no
+WAL pragma, no schema step). The idempotency re-fold runs in an in-memory `backup` copy. The
+tombstone readers (`traverse_spine(skip_dead=True)`, `is_dead_ref`, `get_dead_refs`) treat a
+missing `dead_refs` table as empty instead of creating it; only `record_dead_ref` creates it.
 
 ## 9. Cross-window reader — `spotlight.py`
 

@@ -531,7 +531,10 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | 403 on first call with `x-github-sso` | SAML SSO not authorized | authorize the token for the org |
 | 403 with `x-ratelimit-remaining: 0` | rate limited (busy repo) | wait until `x-ratelimit-reset`, re-run (idempotent) |
 | 403 mentioning token lifetime | token lifetime over the org's limit (8 days for `Azure/*`, classic and fine-grained) | new token with an expiry inside the limit the message states |
-| `validate` → multiple projects | store holds several projects/repos | pass `--project` (and `--repo`) |
+| `validate` → multiple projects (exit 2) | store holds several projects/repos | pass `--project` (and `--repo`) |
+| `validate: error: store … does not exist` / `is not a journey-graph store` (exit 2) | wrong path (validate never creates a file) | point it at the store `gather --store` wrote |
+| `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |
+| `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
 | `validate` ERROR `no_drift` "lifecycle length drift" | several overlapping windows folded into one store (known limitation, HLD §10) | use one store per installment; rebuild history stores from one wide gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |

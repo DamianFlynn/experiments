@@ -56,6 +56,9 @@ pinned clone SHA (see `STORE.md`). A single store *can* hold **multiple** projec
 but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
 `spotlight.py`) error asking for `--project` (and `--repo` when a project spans several) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
+`validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
+mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
+error: missing or non-store path, ambiguous store).
 
 The report vertical (`view → link → render → report`) **composes from the
 store** — `view.py` (the CLI over `extract`) materializes one repo's raw bundle view,
