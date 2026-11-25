@@ -155,7 +155,10 @@ def check_project(value, what="'project'"):
 def load_manifest(path):
     """Read + validate a manifest file. Returns a normalized dict:
     {"project": str, "from": str, "to": str,
-     "repos": [{"owner": str, "repo": str, "registry": str|None}, ...]}.
+     "repos": [{"owner": str, "repo": str, "registry": str|None}, ...],
+     "ticket_prefixes": [str, ...]}   # optional in the file; [] when absent
+    `ticket_prefixes` (e.g. ["ABC", "PLAT"]) opts the project into digest.py's
+    ticket clustering (`related_work`); see check_ticket_prefixes.
     Raises ValueError (message prefixed 'manifest: ') on any missing, mistyped or
     malformed field, an inverted window, or a duplicate member / registry."""
     with open(path, encoding="utf-8") as fh:
@@ -228,7 +231,39 @@ def load_manifest(path):
             seen_registries[registry.lower()] = slug
         repos.append({"owner": owner, "repo": repo, "registry": registry})
 
-    return {"project": project, "from": date_from, "to": date_to, "repos": repos}
+    ticket_prefixes = []
+    if "ticket_prefixes" in raw:
+        try:
+            ticket_prefixes = check_ticket_prefixes(raw["ticket_prefixes"])
+        except ValueError as exc:
+            raise ValueError("manifest: {}".format(exc)) from None
+
+    return {"project": project, "from": date_from, "to": date_to, "repos": repos,
+            "ticket_prefixes": ticket_prefixes}
+
+
+# An internal-ticket prefix (the `ABC` of `ABC-123`): ASCII letters/digits only,
+# so it can be placed in a regex alternation and never spans a '-'.
+_TICKET_PREFIX_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def check_ticket_prefixes(value, what="'ticket_prefixes'"):
+    """Return `value` (a list of distinct, non-empty ASCII letter/digit strings)
+    unchanged, else raise ValueError naming `what`. An empty list is allowed
+    (no ticket clustering)."""
+    if not isinstance(value, list):
+        raise ValueError("{} must be a list of prefixes such as [\"ABC\"], got "
+                         "{} {!r}".format(what, type(value).__name__, value))
+    seen = set()
+    for i, p in enumerate(value):
+        if not isinstance(p, str) or not _TICKET_PREFIX_RE.fullmatch(p):
+            raise ValueError(
+                "{}[{}] must be a non-empty string of letters and digits "
+                "(A-Z, a-z, 0-9), got {!r}".format(what, i, p))
+        if p in seen:
+            raise ValueError("{}[{}]: duplicate prefix {!r}".format(what, i, p))
+        seen.add(p)
+    return value
 
 
 def member_slugs(manifest):

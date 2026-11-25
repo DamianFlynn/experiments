@@ -497,7 +497,7 @@ One store per stream keeps commands simple and failures isolated.
 | Full-text search | `spotlight.py grep '"breaking change"' --store S --project P` (FTS5 syntax — quote phrases) |
 | Blast radius (TF constellations) | `spotlight.py dependents <owner/repo> --store S --project P` |
 | Project view for a formatter | `digest.py --store S --project P --from F --to T` (schema: `BUNDLE.md`) |
-| Ticket-linked related work | `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (default matches `ABC-123`) |
+| Ticket-linked related work | `digest.py … --manifest M` with `"ticket_prefixes": ["ABC"]` in the manifest, or `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (off by default: `related_work` is `[]`) |
 | Complete out-of-window threads | add `--complete` to `person/subsystem/grep` (uses the token; bounded) |
 
 Reference formatters that consume the view: `samples/build_report.py` (structural Markdown

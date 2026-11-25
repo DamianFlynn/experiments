@@ -662,7 +662,9 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 Queries: `person` · `symbol` · `subsystem` · `grep` · `module` · `dependents`.
 
 ### `digest.py` — project view (offline)
-`digest.py --store STORE --project NAME [--repo … (repeatable)] --from F --to T [--ticket-pattern RE]`.
+`digest.py --store STORE [--project NAME] [--manifest M] [--repo … (repeatable)] --from F --to T [--ticket-pattern RE]`.
+Ticket clustering (`related_work`) is opt-in via the manifest's `ticket_prefixes`
+or `--ticket-pattern`; unknown project/repo or a bad window exits 2.
 
 ### `manifest_from_index.py` — build a manifest
 `--avm res|ptn|utl` (or `--index FILE|URL|-`) · `--project` · `--from`/`--to` ·

@@ -26,6 +26,29 @@ video-script, dashboards) consume the same view. The contract:
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
   modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
   canonical JSON (`sort_keys`), so output is diff-stable.
+- **Project view: `related_work` is opt-in.** Each project train carries a
+  `tickets` list and `related_work` is `[{ticket, train_ids}]` — trains that share
+  an internal ticket id but have no spine link. Ticket parsing is **off by
+  default** (`tickets: []`, `related_work: []` on every train / view): the former
+  default regex (`[A-Z]{2,}-\d+`) matched `UTF-8`, `SHA-256`, `HTTP-200`,
+  `ISO-8601`, `CVE-2024` and glued unrelated trains together (#74). Turn it on
+  with `digest.py --manifest M` when the manifest declares `"ticket_prefixes":
+  ["ABC", "PLAT"]` (pattern `\b(?:ABC|PLAT)-\d+\b`), or with `--ticket-pattern RE`
+  (wins over the manifest).
+- **Project view: member `meta` identity.** In `members[].bundle.meta`, `owner` is
+  the store's **project scope** and `repo` the store's repo key — for a manifest
+  member `owner` is the project name and `repo` is already `owner/name`, so never
+  build a URL from `{meta.owner}/{meta.repo}`. `digest.py` appends four keys to
+  every member's `meta` (append-only; the single-repo bundle view from
+  `view.py`/`link.py` is unchanged): `project` (the project scope), `slug` (the
+  GitHub `owner/name`), `repo_owner` (the GitHub owner) and `repo_name` (the bare
+  repo name). Build GitHub URLs from `slug`. For a single-repo store (project =
+  owner, repo = name) these are `project=owner`, `slug=owner/name`.
+- **Project view CLI errors.** `digest.py` exits **2** (nothing on stdout) for an
+  invalid or inverted `--from/--to` (same rules as `view.py`), a missing/unreadable
+  store, an unknown `--project` (the message lists the store's projects), an
+  unknown `--repo` (lists the project's repos), a bad `--manifest` or
+  `--ticket-pattern`, or a `--project` that differs from the `--manifest` project.
 - **Every fact carries a ref** (see *Ref convention* below), so any consumer can
   cite/fact-check without re-fetching. Narrative is NOT in the view — it's the
   model's job, authored from the view.

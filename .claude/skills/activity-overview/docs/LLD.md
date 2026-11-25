@@ -810,15 +810,21 @@ wires `gather.backfill` with a token (the only network path in a reader).
 
 ## 10. Multi-repo aggregation — `digest.py`
 
-`digest.py --store S --project P [--repo R …] --from F --to T [--ticket-pattern RE]`
-(repos default to `project_repos`). Works for single-repo stores too
-(`--project <owner> --repo <name>`).
+`digest.py --store S [--project P] [--manifest M] [--repo R …] --from F --to T [--ticket-pattern RE]`
+(repos default to `project_repos`; `--project` defaults to the manifest's). Works
+for single-repo stores too (`--project <owner> --repo <name>`). Exit 2 for a bad
+window (`manifest.check_reader_window`), a missing store, an unknown project (lists
+the store's projects) or `--repo` (lists the project's repos). Ticket clustering is
+opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
+`--ticket-pattern` (wins); otherwise `tickets`/`related_work` are `[]`. Each
+`members[].bundle.meta` gains `project`, `slug`, `repo_owner`, `repo_name`
+(`meta.owner` stays the project scope).
 
 ```mermaid
 flowchart TB
   mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>connected components across repos"]
   sc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
-  bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (default [A-Z]{2,}-digits)<br/>cluster into related_work"]
+  bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (opt-in: manifest ticket_prefixes<br/>or --ticket-pattern) cluster into related_work"]
   mb --> mg["_merge_shipped / _merge_people / _merge_modules"]
   pd["project_depends_on: edges_by_type depends_on"] --> me["module_edges<br/>src_repo, src_area, dst_repo, dst_area,<br/>version, transitive, cross_repo"]
   tk --> view

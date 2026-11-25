@@ -39,6 +39,14 @@ interpretation): **6** module-dependency edges — **4 cross-repo** (pattern roo
 trains (**0** cross-repo); **0** `related_work` clusters; **44** shipped items;
 `meta.boundary_dropped_commits` empty for all members.
 
+Each `members[].bundle.meta` carries `owner` = the project scope
+(`avm-tf-aiml-lz`) and `repo` = the `owner/name` key, plus the identity keys
+`digest.py` appends (#74): `project`, `slug` (e.g.
+`Azure/terraform-azurerm-avm-res-network-virtualnetwork`), `repo_owner`,
+`repo_name` — build GitHub links from `slug`. (Those four keys were added to the
+committed file by applying `digest._member_identity` to each member rather than by
+re-gathering; they depend only on the project and member names.)
+
 ## How it was produced
 
 Requires `git`, `terraform` (1.15.5 used here), a `GITHUB_TOKEN` with `repo` scope

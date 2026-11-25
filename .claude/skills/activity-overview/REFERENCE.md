@@ -100,7 +100,9 @@ python3 spotlight.py dependents Azure/terraform-azurerm-avm-res-keyvault-vault \
 ```
 
 Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
-"registry"?} ] }` — `registry` is an optional exact Terraform registry path; absent,
+"registry"?} ], "ticket_prefixes"? }` — `ticket_prefixes` (e.g. `["ABC"]`) is
+optional and only read by `digest.py --manifest` to turn on `related_work` ticket
+clustering (off by default). `registry` is an optional exact Terraform registry path; absent,
 a member is matched by the HashiCorp naming convention
 (`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`).
 `load_manifest` rejects (with `ValueError`): non-string fields; `/` or `#` in

@@ -125,7 +125,8 @@
      ticket reference (Jira/ADO-style, e.g. ABC-1234) but are NOT connected by
      any GitHub closes/cross_ref edge. They are distinct-repo deliverables whose
      only shared signal is the internal ticket. This section makes that
-     invisible coupling visible.
+     invisible coupling visible. Opt-in: it is always [] unless digest.py ran
+     with a manifest declaring `ticket_prefixes` or with `--ticket-pattern`.
      Omit the section entirely when `view["related_work"]` is empty. -->
 
 | Ticket | Trains |
