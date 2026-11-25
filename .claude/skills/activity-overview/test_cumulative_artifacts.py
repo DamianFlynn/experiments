@@ -270,7 +270,9 @@ class TestSymbolMovesAcrossWindows(unittest.TestCase):
     A = "a.bicep#bicep:resource:fw"
     B = "b.bicep#bicep:resource:fw"
     C = "c.bicep#bicep:resource:fw"
-    EDGE = '{"move_basis": "unique_name", "move_confidence": "medium"}'
+    # the move edge also records the source's drop commit (`move_commit`)
+    EDGE = ('{"move_basis": "unique_name", "move_commit": "%s", '
+            '"move_confidence": "medium"}' % ("a2" * 20))
 
     def _orders(self, *bundles):
         return (bundles, tuple(reversed(bundles)))
@@ -289,6 +291,36 @@ class TestSymbolMovesAcrossWindows(unittest.TestCase):
                  ("o/r#" + self.B, "o/r#" + self.A, "identity_from", self.EDGE)])
             _ok(self, conn)
         self.assertEqual(_artifact_nodes(stores[0]), _artifact_nodes(stores[1]))
+
+    def test_readding_an_old_destination_does_not_revive_an_old_move(self):
+        # A -> B (June), A revived (July), A -> C (August), B re-added (September):
+        # A is replaced by C, the move that IS its final removal, whatever
+        # happens to B afterwards.
+        august = _sym_bundle("2026-08-01", "2026-08-31", [
+            _sym("a.bicep", "drop", "fw", "a4" * 20, "2026-08-10"),
+            _sym("c.bicep", "add", "fw", "a4" * 20, "2026-08-10")])
+        september = _sym_bundle("2026-09-01", "2026-09-30", [
+            _sym("b.bicep", "add", "fw", "b5" * 20, "2026-09-05")])
+        for order in ((self.CREATE, self.MOVE, self.REVIVE, august, september),
+                      (september, august, self.REVIVE, self.MOVE, self.CREATE)):
+            a = _artifact_nodes(_store(*order))[self.A][1]
+            self.assertEqual((a["status"], a["replaced_by"]),
+                             ("replaced", self.C))
+
+    def test_revived_then_deleted_without_a_move_is_removed(self):
+        # A -> B (June), A revived and later deleted with no new move (July):
+        # the June move does not explain the July deletion.
+        july = _sym_bundle("2026-07-01", "2026-07-31", [
+            _sym("a.bicep", "add", "fw", "a3" * 20, "2026-07-03"),
+            _sym("a.bicep", "drop", "fw", "a4" * 20, "2026-07-10")])
+        for order in ((self.CREATE, self.MOVE, july),
+                      (july, self.MOVE, self.CREATE)):
+            arts = _artifact_nodes(_store(*order))
+            a = arts[self.A][1]
+            self.assertEqual((a["status"], a.get("replaced_by")),
+                             ("removed", None))
+            # B still knows where it came from
+            self.assertEqual(arts[self.B][1]["identity_from"], self.A)
 
     def test_drop_and_add_in_different_windows_is_not_a_move(self):
         may = _sym_bundle("2026-05-01", "2026-05-31",
@@ -376,3 +408,84 @@ class TestChronologicalLifecycle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLifecycleOrderIsCommitTime(unittest.TestCase):
+    """`date` is the committer's LOCAL day; lifecycles follow the UTC commit
+    time when the commits carry it, so a later commit made in a timezone that is
+    still on the previous day is not replayed first."""
+
+    def _bundle(self, with_times):
+        add, delete = "a" * 40, "b" * 40
+        commits = [
+            # 2026-05-02T00:30+02:00 == 2026-05-01T22:30Z (local day: the 2nd)
+            {"sha": add, "date": "2026-05-02"},
+            # 2026-05-01T23:30Z (local day: the 1st) -- the LATER commit
+            {"sha": delete, "date": "2026-05-01"}]
+        if with_times:
+            commits[0]["committed_at"] = "2026-05-01T22:30:00Z"
+            commits[1]["committed_at"] = "2026-05-01T23:30:00Z"
+        ev = lambda change, sha, day: {  # noqa: E731
+            "path": "docs/a.md", "change": change, "commit": sha,
+            "author": "x", "date": day}
+        return {"meta": {"owner": "o", "repo": "r"}, "commits": commits,
+                "code_events": [ev("add", add, "2026-05-02"),
+                                ev("delete", delete, "2026-05-01")]}
+
+    def test_utc_commit_time_orders_the_lifecycle(self):
+        art = derive.build_artifacts(self._bundle(True))["art:docs/a.md"]
+        self.assertEqual([e["event"] for e in art["lifecycle"]], ["add", "remove"])
+        self.assertEqual(art["status"], "removed")
+
+    def test_store_round_trip_keeps_commit_time_order(self):
+        bundle = self._bundle(True)
+        bundle["meta"].update({"from": "2026-05-01", "to": "2026-05-31"})
+        conn = _store(bundle)
+        art = _artifact_nodes(conn)["art:docs/a.md"][1]
+        self.assertEqual([e["event"] for e in art["lifecycle"]], ["add", "remove"])
+        _ok(self, conn)
+
+
+class TestReviewFollowUps(unittest.TestCase):
+    def test_project_with_no_member_nodes_fails_even_if_status_says_ok(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.set_member_status(conn, "p", ["o/r"], "2026-01-01", "2026-01-31",
+                                     graphstore.MEMBER_OK)
+        report = validate.validate_project(conn, "p", [])
+        self.assertFalse(report["ok"])
+        names = {c["name"]: c["ok"] for c in report["project_checks"]}
+        self.assertIs(names.get("target"), False)
+
+    def test_unreadable_window_ledger_does_not_break_member_discovery(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_nodes(conn, [
+            ("p/o/b#area-main.tf", "p", "o/b", "structure", None,
+             {"id": "main.tf", "synthesized": graphstore.STANDIN_MARK}, None)])
+        graphstore.set_meta(conn, "gathered_windows", "{not json")
+        self.assertEqual(graphstore.project_repos(conn, "p"), ["o/b"])
+
+    def test_series_index_with_bad_nested_fields_exits_2(self):
+        import io
+        import tempfile
+        import contextlib
+        import link
+        for doc in ('[{"shipped": null}]', '[{"forecast": [null]}]',
+                    '[{"in_flight": {"a": 1}}]'):
+            with tempfile.TemporaryDirectory() as tmp:
+                idx = os.path.join(tmp, "series.json")
+                with open(idx, "w") as fh:
+                    fh.write(doc)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), \
+                        self.assertRaises(SystemExit) as cm:
+                    link._load_series_index(idx)
+                self.assertEqual(cm.exception.code, 2, doc)
+                self.assertIn("not a list of reference objects", err.getvalue())
+        # a well-formed index still loads
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "series.json")
+            with open(idx, "w") as fh:
+                fh.write('[{"shipped": [{"type": "pr", "id": 1}], "forecast": []}]')
+            self.assertEqual(len(link._load_series_index(idx)), 1)

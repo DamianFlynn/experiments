@@ -600,6 +600,9 @@ def _only_standins(conn, project, repo):
         "SELECT data FROM nodes WHERE project=? AND repo=?", (project, repo)))
 
 
+_UNKNOWN_WINDOWS = object()
+
+
 def project_repos(conn, project):
     """The project's distinct MEMBER repos (`owner/repo`), sorted. Excludes the
     `"*"` person sentinel so people (project-scoped) never count as a repo. This
@@ -617,10 +620,16 @@ def project_repos(conn, project):
     for repo in repos:
         if _only_standins(conn, project, repo):
             if gathered is None:
-                gathered = {w.get("repo") for w in get_windows(conn)
-                            if isinstance(w, dict)
-                            and w.get("project") == project}
-            if repo not in gathered:
+                try:
+                    gathered = {w.get("repo") for w in get_windows(conn)
+                                if isinstance(w, dict)
+                                and w.get("project") == project}
+                except ValueError:
+                    # Unreadable window ledger: cannot tell a quiet member from a
+                    # phantom. Keep the repo listed so an audit examines (and
+                    # fails) it, rather than raising during discovery.
+                    gathered = _UNKNOWN_WINDOWS
+            if gathered is not _UNKNOWN_WINDOWS and repo not in gathered:
                 continue
         out.append(repo)
     return sorted(out)

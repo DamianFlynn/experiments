@@ -137,8 +137,9 @@ One row per artifact lifecycle event: `(artifact_id, event, commit_sha,
 author, date, hunk, ref, before, after, detail)`, PK `(artifact, commit,
 event)` → set semantics (re-seeing a commit is a no-op). The ledger keeps every
 folded window, and it is the source of truth for the artifact nodes: an
-artifact's `lifecycle[]` is all of its ledger rows ordered by date (same-day rows
-keep ledger order). File-level rows are
+artifact's `lifecycle[]` is all of its ledger rows in commit order: by the commit's UTC
+committer time (`committed_at` on the commit node) when it is stored, else by the
+event's `date`, the committer's local day (ties keep ledger order). File-level rows are
 keyed by the bare `<path>` (not the `art:<path>` node id) and keep git's change verb
 (`add`/`modify`/`delete`/`rename`/`copy`); symbol rows carry the mapped event
 (`add`/`change`/`remove`). A reader maps `art:<path>` to `<path>` before reading the
@@ -293,7 +294,10 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
 - **Symbol-move edges.** Confident window-wide symbol moves
   (`derive.match_symbol_moves`) upsert `replaced_by` (src→dst) and
   `identity_from` (dst→src) artifact→artifact edges carrying
-  `move_confidence`/`move_basis` in the edge `data`. Idempotent by (src,dst,type).
+  `move_confidence`/`move_basis` and `move_commit` (the source's drop commit, so a
+  reader can tell which removal of the source the move explains) in the edge `data`.
+  Idempotent by (src,dst,type). A source is `replaced` by a move only when that move is
+  its final removal; a source revived and deleted again without a new move is `removed`.
   Moves are matched **per fold window** (the bundle's own events), not over the
   whole ledger: over months, a symbol's creation `add` and its later move `add`
   would make every move ambiguous. The edges are the record of the moves; the

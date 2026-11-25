@@ -259,7 +259,8 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # fall to the end, ordered by id.
     arts = {_full_local(n["id"], project, repo): n["data"]
             for n in codes if _is_artifact_node(n)}
-    bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"])
+    bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"],
+                                           derive.commit_times(bundle))
 
     # people: the per-login modules/areas fold persisted as project-scoped person
     # `structure` nodes (repo sentinel "*", local id `person-<login>`). Read them
@@ -346,7 +347,7 @@ def _attach_reviews_and_lifecycle(socials, prs, issues):
             parent["lifecycle"] = _sorted(evs, "created_at")
 
 
-def _order_artifacts(arts, code_events):
+def _order_artifacts(arts, code_events, times=None):
     """Order the artifact dict to match build_artifacts' INSERTION order so
     order-sensitive consumers (build_timeline's same-(ts,url) tie-break) reproduce
     byte-for-byte. build_artifacts, per code_event in source order, ensures the
@@ -364,7 +365,7 @@ def _order_artifacts(arts, code_events):
         if path:
             order.setdefault("art:" + path, len(order))
 
-    for ev in derive.chronological(code_events):
+    for ev in derive.chronological(code_events, times):
         change = ev.get("change")
         if change in ("rename", "copy") and ev.get("old_path"):
             _see(ev.get("path"))            # new-path artifact: ensured first
@@ -503,8 +504,23 @@ def recorded_moves(conn, project, repo):
         out.append({"from": e["src_id"][len(prefix):],
                     "to": e["dst_id"][len(prefix):],
                     "confidence": data.get("move_confidence"),
-                    "basis": data.get("move_basis")})
+                    "basis": data.get("move_basis"),
+                    "commit": data.get("move_commit")})
     return out
+
+
+def commit_times(conn, project, repo):
+    """The repo's stored commits that carry a full UTC committer timestamp, as
+    `[{"sha", "committed_at"}]` (sorted by sha): the `commits` input
+    derive.chronological needs to order lifecycle events by real commit time
+    rather than the committer's local day."""
+    out = []
+    for n in graphstore.repo_nodes(conn, project, repo, "code"):
+        data = n["data"] if isinstance(n["data"], dict) else {}
+        # commit nodes only (artifact nodes carry a lifecycle, never a sha)
+        if data.get("sha") and data.get("committed_at") and "lifecycle" not in data:
+            out.append({"sha": data["sha"], "committed_at": data["committed_at"]})
+    return sorted(out, key=lambda c: c["sha"])
 
 
 def _materialize_code_events(conn, project, repo):

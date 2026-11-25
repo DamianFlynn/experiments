@@ -4735,7 +4735,8 @@ def _fold_artifacts(conn, bundle, project, repo, fetched):
     code_events, symbol_events = extract.ledger_events(conn, project, repo)
     artifacts = derive.artifact_projection(
         {"meta": bundle.get("meta", {}), "code_events": code_events,
-         "symbol_events": symbol_events}, moves)
+         "symbol_events": symbol_events,
+         "commits": extract.commit_times(conn, project, repo)}, moves)
     nodes = []
     for local, art in artifacts.items():
         if local not in affected:
@@ -4866,6 +4867,10 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         src = qid("{}#{}:{}:{}".format(m["from_path"], lang, m["subkind"], m["name"]))
         dst = qid("{}#{}:{}:{}".format(m["to_path"], lang, m["subkind"], m["name"]))
         data = {"move_confidence": m["confidence"], "move_basis": m["basis"]}
+        if m.get("commit"):
+            # the source's drop commit: lets the cumulative projection tell
+            # WHICH removal of the source this move explains.
+            data["move_commit"] = m["commit"]
         edges.append((src, dst, "replaced_by", None, data))
         edges.append((dst, src, "identity_from", None, data))
 

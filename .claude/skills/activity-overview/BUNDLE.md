@@ -273,8 +273,8 @@ review's state to `DISMISSED`.
   ids are `art:<path>` (via `artifact_id`); **symbol/comment** ids are
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
-  carry the bounded `before`/`after`. `lifecycle` is in date order (same-day events keep
-  git/ledger order); a view from a store is cumulative — it holds every folded window's
+  carry the bounded `before`/`after`. `lifecycle` is in commit order (the commit's UTC `committed_at`
+  when known, else the local `date`; ties keep git/ledger order); a view from a store is cumulative — it holds every folded window's
   events, not only the view's window. `status` is derived from the artifact's **last**
   lifecycle event: `replaced` only when that event is a rename to a tracked path
   (`replaced_by` = that direct successor; consumers walk A→B→C); a later re-add makes

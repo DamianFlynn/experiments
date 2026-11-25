@@ -1123,6 +1123,22 @@ def enrich(bundle):
     return bundle
 
 
+def _installment_problem(installments):
+    """Why the reference lists series.compute_series reads from an installment
+    (`shipped`, `in_flight`, `forecast`) cannot be used, or None. Each must be a
+    list of objects when present."""
+    for n, inst in enumerate(installments):
+        for key in ("shipped", "in_flight", "forecast"):
+            if key not in inst:
+                continue
+            refs = inst[key]
+            if not isinstance(refs, list) \
+                    or not all(isinstance(r, dict) for r in refs):
+                return ("installment {} has a `{}` that is not a list of "
+                        "reference objects".format(n, key))
+    return None
+
+
 def _load_series_index(series_path):
     """Read the append-only series index: a JSON list of installment objects.
     Absent, empty or whitespace-only (a freshly `touch`ed or truncated file) is
@@ -1148,7 +1164,9 @@ def _load_series_index(series_path):
         elif not all(isinstance(i, dict) for i in installments):
             problem = "holds an entry that is not an installment object"
         else:
-            return installments
+            problem = _installment_problem(installments)
+            if problem is None:
+                return installments
     sys.stderr.write("link.py --series: series index {} {}; fix or remove it\n"
                      .format(series_path, problem))
     raise SystemExit(2)

@@ -762,8 +762,13 @@ def _derive_artifacts(conn, project, repo, bundle):
     code, symbols = extract.ledger_events(conn, project, repo)
     events = derive.merge_ledger_events(
         {"code_events": code, "symbol_events": symbols}, bundle)
-    return derive.artifact_projection({**events, "meta": bundle.get("meta", {})},
-                                      extract.recorded_moves(conn, project, repo))
+    # Same commit times the writer used (the store's), plus the bundle's own for
+    # commits the store does not hold yet.
+    commits = list(bundle.get("commits") or []) \
+        + extract.commit_times(conn, project, repo)
+    return derive.artifact_projection(
+        {**events, "meta": bundle.get("meta", {}), "commits": commits},
+        extract.recorded_moves(conn, project, repo))
 
 
 def check_no_drift(conn, project, repo, bundle, check_people=True):
@@ -1033,6 +1038,12 @@ def validate_project(conn, project, repos):
     if repos:
         project_checks.append(_guarded(check_no_drift_people, "no_drift_people",
                                        conn, project, repos))
+    else:
+        # Nothing to audit is never a pass, whatever member_status says (its
+        # entries can all read `ok` while the members' nodes are gone).
+        project_checks.append(_check("target", ERROR, [{
+            "severity": ERROR, "project": project,
+            "problem": "project has no member repo with stored nodes"}]))
     project_checks.append(_guarded(check_member_status, "member_status",
                                    conn, project))
     ok = (all(r["ok"] for r in member_reports)
