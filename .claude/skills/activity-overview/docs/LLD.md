@@ -276,11 +276,12 @@ flowchart TB
   `br:mcr.microsoft.com/bicep/<path>:<ver>`) into `registry_path` + `version`; private-registry
   (`br:<other-host>/…`), template-spec (`ts:…`, `ts/<alias>:…`) and user-alias (`br/<alias>:…`)
   refs keep only the raw `ref` + `version`. `resolve_module_ref` classifies `<path>/main.bicep`
-  and returns that area **only when it is in the repo's area set** (and is not an AVM group
-  area), so in the BRM monorepo `br/public:avm/res/network/virtual-network:0.x` resolves to the
-  **in-repo** area `avm/res/network/virtual-network` when that area is present; anything else is
-  `to=None, resolved=False` (#73). Note the area set is the window's (in-window-changed paths),
-  so a public ref to an untouched module is unresolved. Transitive edges come from walking nested
+  and returns that area **only when it is a module of this repo** (and not an AVM group area):
+  either in the window's area set (in-window-changed paths) or, for an untouched module, present
+  in the clone as `<area>/main.bicep`. So in the BRM monorepo
+  `br/public:avm/res/network/virtual-network:0.x` resolves to the **in-repo** area
+  `avm/res/network/virtual-network` whether or not it changed in the window; anything else is
+  `to=None, resolved=False` (#73). Transitive edges come from walking nested
   deployments in the compiled ARM (`walk_arm_deployments`).
 - **Terraform:** extraction reads **every `*.tf` in the entrypoint's module dir**; `parse_terraform_graph`
   accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's

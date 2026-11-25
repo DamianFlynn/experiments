@@ -1730,6 +1730,33 @@ class TestBicepReferenceForms(unittest.TestCase):
         self.assertUnresolved("br/corp:avm/res/x/y:1.0", "1.0")
         self.assertUnresolved("br/corp:modules/vnet", None)
 
+    def test_public_ref_to_untouched_module_resolves_when_in_clone(self):
+        # The area set only holds areas CHANGED in the window; a module of this
+        # repo that nobody touched is still this repo's module when its
+        # entrypoint is in the clone.
+        with tempfile.TemporaryDirectory() as clone:
+            os.makedirs(os.path.join(clone, "avm/res/x/y"))
+            open(os.path.join(clone, "avm/res/x/y/main.bicep"), "w").close()
+            os.makedirs(os.path.join(clone, "avm/res/network"))
+            open(os.path.join(clone, "avm/res/network/main.bicep"), "w").close()
+            exists = gather._clone_module_exists(clone)
+            def edge(ref):
+                return gather.build_bicep_edges(
+                    f"module m '{ref}' = {{}}", {}, self.BASE, {"infra"}, self.P,
+                    module_exists=exists)[0]
+            e = edge("br/public:avm/res/x/y:1.0")
+            self.assertEqual((e["to"], e["resolved"]), ("avm/res/x/y", True))
+            # not in the clone -> still unresolved
+            self.assertIsNone(edge("br/public:avm/res/x/absent:1.0")["to"])
+            # a group is never a module, even with a stray main.bicep
+            self.assertIsNone(edge("br/public:avm/res/network:1.0")["to"])
+            # private registry: never consults the clone
+            self.assertIsNone(edge("br:myacr.azurecr.io/bicep/avm/res/x/y:1.0")["to"])
+            # cannot escape the clone
+            self.assertFalse(exists("../" + os.path.basename(clone) + "/avm/res/x/y"))
+            self.assertFalse(exists("/etc"))
+        self.assertIsNone(gather._clone_module_exists(None))
+
     def test_public_ref_to_an_avm_group_is_not_a_module(self):
         # avm/res/network is a group-level (README) area, never a module target.
         e = self._edge("br/public:avm/res/network:1.0")

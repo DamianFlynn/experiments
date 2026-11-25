@@ -267,7 +267,7 @@ review's state to `DISMISSED`.
 
   | field | meaning |
   |-------|---------|
-  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable — its identity is then in `ref`. A Bicep registry ref maps to an area **only** when it is the public registry (`br/public:<path>:<tag>` or `br:mcr.microsoft.com/bicep/<path>:<tag>`) **and** the classified area (`<path>`) is in this repo's area set; a private registry (`br:<other-host>/…`), template spec (`ts:<sub>/<rg>/<name>:<ver>`, `ts/<alias>:…`), user alias (`br/<alias>:…`) or a public module this repo's area set lacks is `null` |
+  | `to` | canonical target **repo area-id** (`avm/res/<svc>/<module>` or a local dir), or `null` when the target is external/unresolvable — its identity is then in `ref`. A Bicep registry ref maps to an area **only** when it is the public registry (`br/public:<path>:<tag>` or `br:mcr.microsoft.com/bicep/<path>:<tag>`) **and** the classified area (`<path>`) is a module of this repo (changed in the window, or present in the clone as `<path>/main.bicep`); a private registry (`br:<other-host>/…`), template spec (`ts:<sub>/<rg>/<name>:<ver>`, `ts/<alias>:…`), user alias (`br/<alias>:…`) or a public module this repo does not contain is `null` |
   | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred) |
   | `ref` | the raw reference (`br/public:…:<ver>`, `br:<host>/…:<tag>`, `ts:…`, a local path, or a TF `source`), kept verbatim |
   | `version` | pinned version when present, else `null` |

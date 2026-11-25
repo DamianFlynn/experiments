@@ -1615,12 +1615,14 @@ def parse_bicep_module_refs(source_text):
     return refs
 
 
-def resolve_module_ref(ref_info, base_path, patterns=None, area_ids=None):
+def resolve_module_ref(ref_info, base_path, patterns=None, area_ids=None,
+                       module_exists=None):
     """Map a parsed bicep/tf ref to a canonical area-id (reusing classify_code_area).
 
     A public-registry ref (`registry_path`) classifies its `<path>/main.bicep` and
-    maps to that area ONLY when the area is in `area_ids` (this repo's area set)
-    and is a module (not an AVM group-level area); otherwise None — never a
+    maps to that area ONLY when it is a module (not an AVM group-level area) of
+    this repo: in `area_ids` (the areas changed in the window) or, for an untouched
+    module, `module_exists(area)` says its entrypoint is in the clone; otherwise None — never a
     phantom id for a module that is not in this repo (`area_ids` None => no set
     => None). Local refs are normalised relative to `base_path`'s directory then
     classified (the raw dir when classification declines). None when nothing
@@ -1629,7 +1631,14 @@ def resolve_module_ref(ref_info, base_path, patterns=None, area_ids=None):
     rp = ref_info.get("registry_path")
     if rp:
         area = classify_code_area(rp.strip("/") + "/main.bicep", patterns)
-        if area and area in (area_ids or ()) and not _is_avm_group_area(area):
+        if not area or _is_avm_group_area(area):
+            return None
+        if area in (area_ids or ()):
+            return area
+        # `area_ids` is built from the paths CHANGED in the window, so a module of
+        # this repo that nobody touched is not in it. It is still this repo's
+        # module when its entrypoint is in the clone (`module_exists`).
+        if module_exists is not None and module_exists(area):
             return area
         return None
     lp = ref_info.get("local_path")
@@ -1706,7 +1715,8 @@ def _match_repo_area(name, area_ids):
     return None
 
 
-def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None):
+def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None,
+                      module_exists=None):
     """Build inter-area dependency edges for one Bicep area.
 
     Immediate edges (transitive=False) come from the SOURCE refs — fully identified
@@ -1722,7 +1732,7 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None)
     self_id = classify_code_area(base_path, patterns)
 
     for ri in parse_bicep_module_refs(source_text):
-        to = resolve_module_ref(ri, base_path, patterns, area_ids)
+        to = resolve_module_ref(ri, base_path, patterns, area_ids, module_exists)
         local = False
         # A local relative ref that resolves back to THIS area is a private child
         # submodule (e.g. `nat-rule/main.bicep`), not a self-dependency. Name the
@@ -2173,6 +2183,22 @@ def _area_dir_on_disk(area_id, clone_dir, root_id):
 
 def _has_clone(clone_dir):
     return bool(clone_dir) and os.path.isdir(clone_dir)
+
+
+def _clone_module_exists(clone_dir):
+    """Predicate `area_id -> bool`: the clone holds `<area_id>/main.bicep`. Lets a
+    public-registry ref resolve to a module of this repo that was not changed in
+    the window. An id that escapes the clone (absolute, or `..`) is never a module.
+    None when there is no clone."""
+    if not clone_dir or not os.path.isdir(clone_dir):
+        return None
+
+    def exists(area_id):
+        rel = os.path.normpath(area_id or "")
+        if not area_id or os.path.isabs(rel) or rel.split(os.sep)[0] == "..":
+            return False
+        return os.path.isfile(os.path.join(clone_dir, rel, "main.bicep"))
+    return exists
 
 
 def _bicep_entrypoint(area, clone_dir=None):
@@ -2737,7 +2763,9 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
             if kind == "bicep":
                 arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
                 src = read_text(os.path.join(clone_dir, bp))
-                return build_bicep_edges(src, arm, bp, area_ids, patterns), "resolved"
+                return build_bicep_edges(
+                    src, arm, bp, area_ids, patterns,
+                    module_exists=_clone_module_exists(clone_dir)), "resolved"
             rel_dir = os.path.dirname(tp)
             dot = _terraform_graph_dot(run, clone_dir, rel_dir, timeout)
             # Read EVERY *.tf in the module dir (not just the entrypoint): a module's
