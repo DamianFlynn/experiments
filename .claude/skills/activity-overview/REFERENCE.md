@@ -20,10 +20,17 @@ Mind two org/enterprise policies that surface as a `403` on the first API call
 (gather now prints GitHub's own message and the deciding headers, so the cause
 is named rather than guessed):
 
-- **PAT lifetime caps.** Some enterprises reject classic PATs whose lifetime is
-  too long. Notably **Microsoft Open Source** (which owns `Azure/*`) forbids any
-  classic PAT with a lifetime **> 90 days** — a "no expiration" token is refused.
-  Use an expiry of 90 days or fewer, and rotate it before it lapses.
+- **PAT lifetime caps.** Some enterprises reject personal access tokens whose
+  lifetime is too long. Notably **Microsoft Open Source** (which owns `Azure/*`)
+  refuses any personal access token — **classic or fine-grained** — with a
+  lifetime **over 8 days** (observed 2026-11; the limit was previously longer, so
+  read the 403 message, which states the current figure). For a laptop run, create
+  a token with an expiry of 7 days or less when you need one.
+- **CI needs no personal token for public targets.** The bundled workflow's live
+  jobs use the workflow's built-in token by default (`token_source: builtin`),
+  which is not a personal token and is accepted for public `Azure/*` repos. Set
+  `token_source: secret` (and the `ACTIVITY_TEST_TOKEN` secret) only for private
+  targets.
 - **SAML SSO.** If the org enforces SAML SSO, authorize the token for that org
   (token settings → *Configure SSO*) or the call 403s with an `x-github-sso`
   header.

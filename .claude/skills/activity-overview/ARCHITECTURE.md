@@ -696,7 +696,7 @@ kept 6, diff cap 6000 chars; flow — stale 30 days, upvote min 5, traction min 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `error: set GITHUB_TOKEN` | no token | export `GITHUB_TOKEN` (`repo`, +`read:project` for boards) |
-| `403` on the first call | SAML SSO / PAT lifetime policy | authorize SSO; use a PAT ≤ 90 days (Azure org) |
+| `403` on the first call | SAML SSO / PAT lifetime policy | authorize SSO; use a token within the org's lifetime limit (8 days for Azure, classic and fine-grained) |
 | Empty "shipped" | nothing merged in window | widen `--from/--to`; check the `--branches` mainline |
 | Board section empty | no `read:project`, or no/closed/stale board | add the scope; the layer degrades cleanly |
 | `meta.boundary_dropped_commits` non-empty | a commit sat on the shallow graft | raise `ACTIVITY_CLONE_MARGIN_DAYS`, re-gather |

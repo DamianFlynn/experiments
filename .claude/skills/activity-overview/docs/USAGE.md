@@ -44,8 +44,9 @@ curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-lin
 
 - **Classic PAT** with `public_repo` (public targets) or `repo` (private), plus
   **`read:project`** if you want Projects v2 board status and sprints.
-- **Azure org policy:** Microsoft Open Source rejects classic PATs with a lifetime **over 90
-  days** — set an expiry ≤ 90 days and rotate. If an org enforces SAML SSO, authorize the token
+- **Azure org policy:** Microsoft Open Source refuses any personal access token — classic or
+  fine-grained — with a lifetime **over 8 days** (observed 2026-11; the 403 message states the
+  current limit). Create a token with an expiry of 7 days or less when you sit down to run. If an org enforces SAML SSO, authorize the token
   for it (*token settings → Configure SSO*).
 - Keep it out of files and shell history. On macOS, store it in the Keychain and export it
   per session:
@@ -529,7 +530,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `error: set GITHUB_TOKEN` | no token in env | export it (§1.1) |
 | 403 on first call with `x-github-sso` | SAML SSO not authorized | authorize the token for the org |
 | 403 with `x-ratelimit-remaining: 0` | rate limited (busy repo) | wait until `x-ratelimit-reset`, re-run (idempotent) |
-| 403 mentioning token lifetime | PAT lifetime > 90 days (Azure org) | new PAT with ≤ 90-day expiry |
+| 403 mentioning token lifetime | token lifetime over the org's limit (8 days for `Azure/*`, classic and fine-grained) | new token with an expiry inside the limit the message states |
 | `validate` → multiple projects | store holds several projects/repos | pass `--project` (and `--repo`) |
 | `validate` ERROR `no_drift` "lifecycle length drift" | several overlapping windows folded into one store (known limitation, HLD §10) | use one store per installment; rebuild history stores from one wide gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
@@ -548,8 +549,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 ## 12. Security and hygiene
 
 - The token is **read-only** in effect — the skill never writes to GitHub — but treat it as a
-  secret: environment/keychain only, never in manifests, scripts or reports; rotate within
-  the 90-day policy.
+  secret: environment/keychain only, never in manifests, scripts or reports; create short-lived
+  tokens (the Azure org accepts 8 days at most).
 - Stores and clones contain repository content and contributor logins; keep them in your
   workspace, not in shared folders.
 - Public reports never attribute stalls to individuals; the internal attribution appendix is
