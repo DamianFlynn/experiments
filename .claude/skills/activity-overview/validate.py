@@ -974,13 +974,34 @@ def _project_members(conn, project):
     return members
 
 
+def _cross_repo_dep_target(edge):
+    """The local id a manifest fold gives the TARGET of an unresolved registry
+    edge once it resolves to another member: a Terraform module source names the
+    member's root module (gather._ROOT_AREA_LOCAL); a Bicep public-registry ref
+    names the publisher's module area, the directory of `<path>/main.bicep`
+    (gather.resolve_bicep_registry_member). None when the ref cannot resolve
+    across repos at all (a private registry, template spec or alias)."""
+    if edge.get("provider") == "bicep":
+        path = (gather._bicep_ref_parts(edge.get("ref"))[0] or "").strip("/")
+        if not path:
+            return None
+        area = gather.classify_code_area(path + "/main.bicep",
+                                         gather.DEFAULT_AREA_PATTERNS)
+        if not area or gather._is_avm_group_area(area):
+            return None
+        return "area-" + area
+    return gather._ROOT_AREA_LOCAL
+
+
 def _cross_repo_problem(key, data, bundle, project, repo, members):
     """None when a stored edge from this repo into ANOTHER member repo is one
     the manifest fold derives from the stored records: a `closes`/`cross_ref`
     from a PR's qualified refs / timeline cross-references
     (gather._cross_repo_pr_edges), or a `depends_on` from an unresolved
-    registry edge of the source area in the stored code graph to a member's
-    root area. Else why not (or "not cross-repo")."""
+    registry edge of the source area in the stored code graph to the area that
+    edge resolves to in a member (_cross_repo_dep_target: the root module for
+    Terraform, the module directory for a Bicep public-registry ref). Else why
+    not (or "not cross-repo")."""
     src, dst, et = key
     dst_scope = graphstore.parse_id(dst)["scope"]
     if not dst_scope.startswith(project + "/") or \
@@ -1001,9 +1022,9 @@ def _cross_repo_problem(key, data, bundle, project, repo, members):
             return None
         return "the PR's text and timeline do not reference {}".format(dst)
     if et == "depends_on":
-        if graphstore.local_id(dst) != gather._ROOT_AREA_LOCAL:
-            return "a cross-repo depends_on targets a member's root area"
+        dst_local = graphstore.local_id(dst)
         aid = local[len("area-"):] if local.startswith("area-") else None
+        wrong_target = None
         for area in (bundle.get("code_graph") or {}).get("areas") or []:
             if area.get("id") != aid:
                 continue
@@ -1012,8 +1033,15 @@ def _cross_repo_problem(key, data, bundle, project, repo, members):
                     continue
                 want = {k: v for k, v in e.items() if k != "to"}
                 want.update(resolved=True, cross_repo=True)
-                if want == data:
+                if want != data:
+                    continue
+                expected = _cross_repo_dep_target(e)
+                if expected is not None and dst_local == expected:
                     return None
+                wrong_target = expected
+        if wrong_target is not None:
+            return ("this registry edge resolves to a member's {!r}, not {!r}"
+                    .format(wrong_target, dst_local))
         return "no unresolved registry edge of the source area carries this data"
     return "{} never crosses repos".format(et)
 

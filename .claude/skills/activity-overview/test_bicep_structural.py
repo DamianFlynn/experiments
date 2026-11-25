@@ -457,6 +457,34 @@ class TestCrossRepoBicepFold(unittest.TestCase):
                     conn, "proj", graphstore.project_repos(conn, "proj"))
                 self.assertTrue(rep["ok"], json.dumps(rep, indent=1)[:3000])
 
+    def test_validate_rejects_bicep_dependency_pointed_at_the_wrong_area(self):
+        # The trust check knows where a Bicep public-registry ref resolves: the
+        # publisher's MODULE area. The same edge data re-pointed at the
+        # publisher's root area (the Terraform rule) is not derivable.
+        conn = _store()
+        self._fold(conn, LZ, self._consumer())
+        self._fold(conn, BRM, _bundle(BRM, _areas(_scan(BRM_FILES))))
+        rows = conn.execute(
+            "SELECT src_id, dst_id, data FROM edges WHERE edge_type='depends_on' "
+            "AND src_id LIKE ? AND dst_id LIKE ?",
+            ("proj/{}#%".format(LZ), "proj/{}#%".format(BRM))).fetchall()
+        self.assertTrue(rows)
+        src, dst, data = rows[0]
+        wrong = "proj/{}#area-main.tf".format(BRM)
+        self.assertNotEqual(dst, wrong)
+        conn.execute("UPDATE edges SET dst_id=? WHERE src_id=? AND dst_id=? "
+                     "AND edge_type='depends_on'", (wrong, src, dst))
+        graphstore.upsert_nodes(conn, [
+            (wrong, "proj", BRM, "structure", None,
+             {"id": "main.tf", "synthesized": graphstore.STANDIN_MARK}, None)])
+        conn.commit()
+        rep = validate.validate_project(
+            conn, "proj", graphstore.project_repos(conn, "proj"))
+        self.assertFalse(rep["ok"])
+        failed = {c["name"] for m in rep["members"] for c in m["checks"]
+                  if not c["ok"]}
+        self.assertIn("edge_set", failed)
+
     def test_real_publisher_area_wins_over_stand_in(self):
         files = dict(BRM_FILES)
         files["avm/res/key-vault/vault/main.bicep"] = "param x string\n"
