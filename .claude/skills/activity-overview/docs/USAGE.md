@@ -162,7 +162,10 @@ Then ask Claude to write the report from `$B` (+ slices + diagrams) following
 
 > **Multi-repo (manifest) stores.** Members are stored as `--project <manifest project>
 > --repo <owner/repo>`: run `view.py` → `link.py` → `render.py` once per member you report on
-> (e.g. `--out $S/views/$M/Azure__terraform-azurerm-avm-ptn-foo.json`). The merged project
+> (e.g. `--out $S/views/$M/Azure__terraform-azurerm-avm-ptn-foo.json`), with a separate
+> series file (`$S/series/<owner>__<repo>.json`) and diagrams dir
+> (`$S/views/$M/diagrams/<owner>__<repo>`) per member so members never overwrite each other
+> or share a series index. The merged project
 > view (cross-repo trains, merged shipped/people/modules, `related_work`, `module_edges`)
 > comes from `digest.py --store $DB --project <name> --from $FROM --to $TO`; its embedded
 > `members[i].bundle` has no `series` or `diagrams` — use the member's bundle view file for

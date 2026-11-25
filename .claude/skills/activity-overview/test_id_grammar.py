@@ -120,6 +120,21 @@ class ValidateIdGrammar(unittest.TestCase):
         report = validate.validate(conn, project="o", repo="r")
         self.assertTrue(report.ok, [c for c in report.checks if not c["ok"]])
 
+    def test_symbol_under_person_prefixed_path_is_an_artifact_not_a_person(self):
+        # A symbol whose PATH starts with `person-` (first-`#` parsing makes its
+        # local id start with `person-`) must stay an artifact: no orphan-person
+        # report, and its move edges conform.
+        conn = _store(_base(symbol_events=[
+            _sym("person-data/main.tf", "resource", "azurerm_x.this", "drop"),
+            _sym("b/main.tf", "resource", "azurerm_x.this", "add"),
+        ]))
+        qid = "o/r#person-data/main.tf#terraform:resource:azurerm_x.this"
+        self.assertFalse(validate._is_person_id(qid))
+        self.assertFalse(validate._is_person_id("o/r#art:person-notes.md"))
+        self.assertTrue(validate._is_person_id("o#person-alice"))
+        report = validate.validate(conn, project="o", repo="r")
+        self.assertTrue(report.ok, [c for c in report.checks if not c["ok"]])
+
     def test_symbol_move_endpoints_classified_artifact(self):
         conn = _store(_move_bundle())
         kind = validate._id_kind(

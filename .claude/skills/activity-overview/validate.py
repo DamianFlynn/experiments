@@ -138,8 +138,12 @@ def _local(qid):
 
 def _is_person_id(qid):
     """Project-scoped person id `{project}#person-{login}`. Classified by the
-    LOCAL id, so a symbol whose path/name merely contains `#person-` is not."""
-    return _local(qid).startswith("person-")
+    LOCAL id, so a symbol whose path/name merely contains `#person-` is not —
+    and an artifact whose PATH starts with `person-` (e.g. the symbol
+    `person-data/main.tf#terraform:resource:x`, or `art:person-notes.md`) is an
+    artifact, never a person."""
+    local = _local(qid)
+    return local.startswith("person-") and not graphstore.is_artifact_local(local)
 
 
 # --- check 1: referential integrity ------------------------------------------

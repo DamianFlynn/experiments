@@ -125,7 +125,7 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    (single repo: `--project OWNER --repo REPO`). For a **multi-repo project**, run it once
    per member you report on — `python3 view.py --store workspace/journey.db --project <name>
    --repo <owner/repo> --from FROM --to TO --out workspace/view/<owner>__<repo>.json` — and
-   use that file in steps 4–6. It writes the **raw** view only (no trains/buckets yet) and
+   use that file in steps 4–6. Keep members apart in every later step too: give each member its own bundle, series and diagrams paths — `workspace/view/<owner>__<repo>.json`, `series/<owner>__<repo>.json`, `--diagrams-dir workspace/diagrams/<owner>__<repo>` — so one member never overwrites another's files or is compared with a different repo in the series; each member's `bundle.diagrams` paths resolve against the parent of ITS diagrams dir. It writes the **raw** view only (no trains/buckets yet) and
    exits 2 with a message when the scope is ambiguous, unknown or empty.
 4. **Link** (enriches the bundle view **in place**, offline). For a recurring digest pass
    the append-only series index so this installment is framed against the last one —

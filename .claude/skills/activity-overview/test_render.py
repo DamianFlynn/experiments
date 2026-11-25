@@ -1558,6 +1558,40 @@ class TestRenderCLI(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
 
 
+class TestSvgErrorDetection(unittest.TestCase):
+    """An error MESSAGE in the SVG is only an error when the diagram's own source
+    did not contain it; Mermaid's error ROLE is always an error."""
+
+    def _svg(self, body):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = os.path.join(d, "x.svg")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return p
+
+    def test_label_mentioning_error_phrases_is_valid(self):
+        for phrase in ("Syntax error in text",
+                       "Maximum text size in diagram exceeded"):
+            src = 'flowchart LR\n    a["Fix %s"]\n' % phrase
+            svg = self._svg('<svg aria-roledescription="flowchart-v2">'
+                            '<text>Fix %s</text></svg>' % phrase)
+            self.assertIsNone(render._svg_error(svg, src), phrase)
+
+    def test_error_phrase_not_from_source_is_an_error(self):
+        svg = self._svg('<svg aria-roledescription="flowchart-v2">'
+                        '<text>Maximum text size in diagram exceeded</text></svg>')
+        self.assertIn("Maximum text size",
+                      render._svg_error(svg, "flowchart LR\n    a[\"ok\"]\n"))
+        self.assertIn("Maximum text size", render._svg_error(svg))
+
+    def test_error_role_is_always_an_error(self):
+        svg = self._svg('<svg aria-roledescription="error">'
+                        '<text>Syntax error in text</text></svg>')
+        src = 'pie\n    "Syntax error in text" : 1\n'
+        self.assertIn("error", render._svg_error(svg, src))
+
+
 class TestScaleMmdc(unittest.TestCase):
     """Live gates against real mmdc (skipped only when no working mmdc)."""
 

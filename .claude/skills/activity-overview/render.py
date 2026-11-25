@@ -849,26 +849,36 @@ def ensure_mmdc(which=shutil.which):
 # Mermaid draws its error diagram instead (role "error" for parse errors; the text
 # limit draws a message box inside an otherwise normal-looking SVG). Checked after
 # every compile.
-_ERROR_SVG_MARKERS = (
+_ERROR_SVG_ROLE = 'aria-roledescription="error"'       # structural: a parse error
+# The text-limit failure has NO structural marker: Mermaid draws a normal-looking
+# diagram whose only label is this message. It is therefore only treated as an
+# error when the diagram SOURCE does not itself contain the phrase (a PR titled
+# "Fix Maximum text size in diagram exceeded" is a valid label, not a failure).
+_ERROR_SVG_TEXTS = (
     "Maximum text size in diagram exceeded",
     "Syntax error in text",
-    'aria-roledescription="error"',
 )
 
 PUPPETEER_CONFIG_ENV = "ACTIVITY_MMDC_PUPPETEER_CONFIG"
 _NO_SANDBOX = {"args": ["--no-sandbox", "--disable-setuid-sandbox"]}
 
 
-def _svg_error(svg_path):
-    """None when `svg_path` holds a real diagram, else a reason string."""
+def _svg_error(svg_path, source=""):
+    """None when `svg_path` holds a real diagram, else a reason string.
+
+    Mermaid's error role is decisive. Its error MESSAGES are only decisive when
+    they cannot have come from the diagram's own text (`source`), so a valid
+    diagram that merely mentions them in a label is not rejected."""
     try:
         with open(svg_path, encoding="utf-8", errors="replace") as fh:
             svg = fh.read()
     except OSError:
         return "mmdc reported success but wrote no output"
-    for marker in _ERROR_SVG_MARKERS:
-        if marker in svg:
-            return f"mmdc rendered an error diagram ({marker})"
+    for text in _ERROR_SVG_TEXTS:
+        if text in svg and text not in (source or ""):
+            return f"mmdc rendered an error diagram ({text})"
+    if _ERROR_SVG_ROLE in svg:
+        return f"mmdc rendered an error diagram ({_ERROR_SVG_ROLE})"
     return None
 
 
@@ -933,7 +943,12 @@ def validate_with_mmdc(paths, export=None, runner=subprocess.run, which=shutil.w
                             capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(f"mmdc failed to render {path}:\n{result.stderr}")
-            reason = _svg_error(out)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as _fh:
+                    source = _fh.read()
+            except OSError:
+                source = ""
+            reason = _svg_error(out, source)
             if reason:
                 raise RuntimeError(f"mmdc failed to render {path}: {reason}")
             if export == "svg":

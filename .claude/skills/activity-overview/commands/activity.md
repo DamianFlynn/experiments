@@ -31,7 +31,7 @@ FROM/TO the window):
    - validate: `python3 validate.py STORE` — stop unless `RESULT: OK`
      (multi-repo: `python3 validate.py STORE --project <name>`)
    - view: `python3 view.py --store STORE --from FROM --to TO --out workspace/view/bundle.json`
-     (multi-repo: add `--project <name> --repo <owner/repo>` per member)
+     (multi-repo: add `--project <name> --repo <owner/repo>` per member, and give each member its own bundle, series and diagrams paths — `workspace/view/<owner>__<repo>.json`, `series/<owner>__<repo>.json`, `--diagrams-dir workspace/diagrams/<owner>__<repo>` — so one member never overwrites another's files or is compared with a different repo in the series; each member's `bundle.diagrams` paths resolve against the parent of ITS diagrams dir; use those member paths in the link, render and slice commands below)
    - link: `python3 link.py workspace/view/bundle.json --series SERIES` when `--series`
      was given, else `python3 link.py workspace/view/bundle.json`
    - render: `python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams`
