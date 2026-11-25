@@ -13,7 +13,8 @@ Usage:
 
 Options:
 - `--store PATH` — the journey-graph store to write and read (default
-  `workspace/journey.db`; use a new store per installment).
+  `workspace/journey.db`; use a new store per installment, or see `docs/USAGE.md` §2.1
+  for growing one store month by month).
 - `--transcript PATH` — a community-call transcript (`.vtt`/`.srt`/`.txt`/`.md`,
   local file, no network) to fold into the report's **Community call highlights**.
 - `--series PATH` — a `series.json` index (one entry per window) so this

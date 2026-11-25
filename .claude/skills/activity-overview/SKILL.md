@@ -39,7 +39,9 @@ the structured view).
 Every step below is one command with explicit input and output paths. Run them from
 the skill directory; `workspace/` is this run's working directory (any path works, as
 long as each step reads what the previous one wrote). Use a **new store per
-installment** (`docs/USAGE.md` §2.1 explains why).
+installment** (`docs/USAGE.md` §2.1 explains when one store that grows month by month also
+works: views are window-scoped, but a past month re-viewed later shows today's record
+state).
 
 **Two artifacts feed the report:**
 

@@ -734,7 +734,24 @@ A multi-window "wider view" is a **single wider `range_query`** over the union o
 folded windows — a `WHERE ts BETWEEN …`, NOT a multi-bundle merge. Folding two
 adjacent windows (March, April) then range-querying `[March-start, April-end]`
 returns the union of their in-window nodes; each narrow window still returns only
-its own. Overlapping re-folds are idempotent (identity-keyed nodes/edges, set
+its own.
+
+**Window-scoped views (issue #85).** `extract` builds a view from the records of
+its window only, not from the repo's whole node set: PRs merged/closed in the
+window or open by its end, issues closed/updated in it or open by its end or
+closed/cross-referenced by a view PR (train context), commits dated in it and
+their ledger rows, releases published in it, reviews/events with their parent,
+any node whose `ts` is in the window and any undated node (BUNDLE.md "Window
+scope"). Artifact nodes stay cumulative in the store (#76); a view keeps each
+artifact's lifecycle events of its window, with status as of the window's end.
+So one store can grow window by window: a view of one gathered window equals the
+view of a store holding only that window (up to PR/issue records a later gather
+refreshed — nodes are upserted latest-wins, and the view then carries
+`meta.state_as_of`), and a view over `[March-start, April-end]` is the union of
+the two. Not windowed: milestones, sprints, people's `modules`/`areas` (union
+over windows) and the per-repo singletons (`workflowstats`, `codegraph`,
+`codeowners`, `labeltaxonomy`: the latest gather's structure facts, #94).
+Overlapping re-folds are idempotent (identity-keyed nodes/edges, set
 semantics on the ledger, deduped `gathered_windows`), so re-extracting an
 overlapping window is byte-stable. Resume/roll-up read structure from the latest
 `clone_sha` (`set_clone_sha`/`get_clone_sha`) and the `gathered_windows` ledger

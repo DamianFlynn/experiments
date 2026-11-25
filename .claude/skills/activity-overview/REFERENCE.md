@@ -98,7 +98,9 @@ python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams
 owner, repo = name; manifest: project = manifest name, repo = `owner/repo`), writes
 exactly what `extract.extract` returns (raw keys, extract's deterministic order) — with
 `meta.period` = `{F, T}` (the window `link.py` buckets to) and `meta.ref_date` = `D`, else
-gather's `--ref-date` stored for exactly this window, else `T` — does
+gather's `--ref-date` stored for exactly this window, else `T` — holds only the window's
+records (on a store holding several windows; BUNDLE.md "Window scope", with
+`meta.state_as_of` when the store also holds a later window), does
 no network backfill, and exits 2 when the scope is ambiguous, unknown or empty, or the
 store is missing. For a multi-repo project, `--repo` selects one member; the merged
 project view comes from `digest.py`. The full step-by-step procedure (and which report

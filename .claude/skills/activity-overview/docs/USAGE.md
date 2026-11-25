@@ -90,14 +90,30 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
   .tfcache/         (shared TF_PLUGIN_CACHE_DIR)
 ```
 
-> **Why one store per installment?** The store layer is idempotent and *can* accumulate many
-> windows (artifact lifecycles are cumulative, so such a store passes `no_drift` whatever the
-> fold order), but a current limitation makes an accumulated store unsuitable for monthly
-> digests (HLD §10): a view materialized from a multi-window store is only partly scoped to
-> its window — its buckets (shipped, rejected, in flight) are bounded by `meta.period`, but its
-> `prs`/`issues`/`commits` arrays and trains include all stored history. A single-window store
-> per installment — the way CI and the golden tests use it — avoids it. An optional accumulated
-> `history.db` is still useful for cross-window `spotlight` queries (§8).
+> **One store per installment, or one store that grows?** Both work. Since issue #85 every
+> view is scoped to its window (BUNDLE.md "Window scope"), so you may instead keep **one
+> store per stream** (`stores/<stream>.db`) and gather each new month into it.
+>
+> *Safe on an accumulated store:* viewing or digesting the month you have just gathered (the
+> latest window) gives exactly what that month's own single-window store gives: its PRs,
+> issues, commits, code and symbol events, releases, trains, timeline, feature deltas,
+> modules, people, halls and buckets, with artifact lifecycles limited to the month and their
+> status as of its end. A view over several gathered months (a quarter) is their union.
+>
+> *Not safe, or different:* (1) **re-viewing an earlier month later** shows each PR/issue as
+> the latest gather saw it (state, labels, milestone, comments; the view says so in
+> `meta.state_as_of`): an item open at that month's end but closed since is missing from it,
+> and its in-flight / next / forecast reflect today's open set — keep each month's view and
+> report from the time you made them (`views/`, `reports/`) and don't re-link an old month
+> into `series.json` from a grown store; (2) the per-repo facts (`workflow_stats` CI health,
+> `code_graph`, `code_owners`, label taxonomy) are the **latest** gather's in every view, so a
+> past month or a quarter shows the latest month's CI statistics (issue #94); (3) a person's
+> `modules`/`areas` are the union over all stored months; (4) on such a store `validate` can
+> only warn about, not prove, the edges that come from latest-wins inputs (ownership,
+> dependencies, milestones); (5) edges are never retracted (a removed module `source` keeps its
+> `depends_on`, HLD §10 item 10). A single-window store per installment — the way CI and the
+> golden tests use it — has none of these, which is why the commands below still create one;
+> an accumulated `history.db` is useful for cross-window `spotlight` queries either way (§8).
 
 ## 3. Running it through Claude Code (the normal way)
 
@@ -244,7 +260,7 @@ flowchart TB
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
 | Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end (a month recorded after a later one is marked `captured: "backfill"`, but a first month captured late cannot be detected). |
 | Missed a month | Gather it for delivery history; its in-flight/forecast are "as of now" (above). Keep it out of the series chain, or note in the report that the comparison spans two months. |
-| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that. A wider `digest` window over a monthly store adds nothing, and singletons such as `workflow_stats` (CI health) only describe the window they were gathered for. Keep quarterly installments in a separate series file. |
+| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing, and singletons such as `workflow_stats` (CI health) only describe the latest window gathered into the store. Keep quarterly installments in a separate series file. |
 | Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
 
 ### 5.4 Multi-repo streams and series
@@ -647,7 +663,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
-| Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was built from a store holding several months (arrays are not window-scoped, HLD §10) | rebuild the month from its own single-window store |
+| Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was made before issue #85 from a store holding several months | re-run `view`/`digest` with the current skill (views are window-scoped); a PR/issue of another month is in the view only as train context (an issue a view PR closes or cross-references) |
+| A past month's view has `meta.state_as_of` and fewer in-flight items than its report had | the store has grown since: records are stored latest-wins, so items closed after that month are not open in it (HLD §10 item 8) | use the view saved at the time; don't rebuild past months' in-flight from a grown store |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
 | A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" (and `edge_set` `authored` edges) with a `hint` naming "pre-#78 identity" | the store was folded before commit authors were resolved to logins (#78); the hint names the commits' current author | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
 | A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |

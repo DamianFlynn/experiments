@@ -614,13 +614,33 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
 
 1. `range_query` the window for in-window nodes.
 2. Seed trains from in-window **anchors** (PR/issue; reviews/events never seed), then
-   `traverse_spine` to pull out-of-window context (`in_window: false`).
+   `traverse_spine` to find out-of-window spine nodes (for completion / backfill).
 3. `complete.complete_train` (see 6.2) — with `backfill=None` this is warn-only.
-4. Materialize the raw arrays (`commits`, `prs`, `issues`, `milestones`, `releases`, `sprints`,
-   `code_events`, `symbol_events`) from the repo's nodes + ledger; re-attach reviews/lifecycle
-   onto parents; surface `blocks` as `blocking`/`blocked_by`.
+4. Materialize the raw arrays from the repo's nodes + ledger, **window-scoped** (issue #85;
+   the rule mirrors what `gather` collects for a window, applied to each record's latest
+   stored state; every test is `ts_in_window`):
+   - `prs`: merged in the window, closed unmerged in it, or open with `created_at` by its end;
+   - `issues`: `closed_at` or `updated_at` in the window, open with `created_at` by its end,
+     or the target of a `closes`/`cross_ref` edge from a view PR (**train context** — what
+     gather fetches for a window's PRs). PRs are never pulled in as context: `link` counts
+     every PR in the arrays;
+   - `commits`: `date` in the window; `code_events`/`symbol_events`: the ledger rows of those
+     commits (a row whose commit is not stored: its own date decides);
+   - any pr/issue/commit node whose own `ts` is in the window (`range_query`), and any undated
+     node (it cannot be placed in a window);
+   - `releases`: `published_at` in the window (or undated); `milestones`, `sprints` and the
+     singletons: not windowed (current structure).
+   Re-attach reviews/lifecycle onto the view's parents (a review/event follows its parent,
+   whatever its own timestamp); surface `blocks` as `blocking`/`blocked_by`.
 5. Read back `artifacts` and `people` (the write path already derived them) and the singleton
-   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`). `code_owners` is an
+   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`). Window scope:
+   each artifact's `lifecycle` keeps the view's events (same predicate as the ledger rows) and
+   an artifact with none is left out; `status`/`replaced_by`/move fields are as of the
+   window's end — the stored node when the ledger holds nothing dated after `ts_to`, else
+   `derive.artifact_projection` over the ledger up to `ts_to` with the recorded moves, laid
+   over the stored record (`_artifacts_as_of`). `people` drops the logins that contribute to
+   this repo's stored records but to none of the view's (`_window_people`, same enumerator
+   as fold); logins with no contribution to this repo are untouched (#88). `code_owners` is an
    ordered rule list so CODEOWNERS last-match-wins order survives the sorted-key JSON store;
    `fold_bundle` (`owns`) and `annotate_people_profile` (`stale_owned`) share one matcher,
    `derive.compile_codeowners`/`area_owners` (area = last rule matching `<area>/`).
@@ -634,16 +654,19 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    non-null values of the overlapping gathered windows of the repo when they agree, else
    `null` / `[]` — and, when a merged PR is in the view, a `warn` saying why (windows
    disagree, gather could not determine it, or a pre-#84 store). Never a guessed `main`.
+   Issue #85 adds `state_as_of` = the latest `to` of the repo's gathered windows, only when
+   that is after `ts_to` (the view's records are stored latest-wins).
 
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
-> **Single-window assumption (arrays).** Steps 4–5 read the repo's *whole* stored node set,
-> not just the window. On a store gathered for one window this is exact (and is what the
-> golden-equivalence tests pin). On a store holding several windows, the view's arrays and
-> trains include every stored PR/issue/commit; the buckets do not, because `meta.period`
-> bounds them (§6.5). See HLD §10 item 8 and §14.5.
-> (Artifacts are already right: their stored nodes are cumulative over every folded
-> window, #76.)
+> **Window scope (issue #85).** On a store holding only the viewed window, steps 4–5 select
+> every stored record, so single-window views are byte-identical to before (the golden and
+> characterization tests pin this). On a store holding several windows, a view of one
+> gathered window equals the view of a store holding only that window, up to records a later
+> gather refreshed; a view spanning several windows is their union. `digest` applies the same
+> decision to its spine components (`window_components`), so a project train does not fold in
+> another window's PR/issue as an orphan ref. Not windowed: the per-repo singletons (latest
+> gather, #94) and people's `modules`/`areas` (union over windows). See HLD §10 item 8.
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -1059,7 +1082,8 @@ opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
 ```mermaid
 flowchart TB
   mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>connected components across repos"]
-  sc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
+  sc --> wc["window_components:<br/>drop stored member anchors<br/>not in that member's view (#85)"]
+  wc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
   bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (opt-in: manifest ticket_prefixes<br/>or --ticket-pattern) cluster into related_work"]
   mb --> mg["_merge_shipped / _merge_people / _merge_modules"]
   pd["project_depends_on: edges_by_type depends_on"] --> me["module_edges<br/>src_repo, src_area, dst_repo, dst_area,<br/>version, transitive, cross_repo"]
@@ -1067,6 +1091,11 @@ flowchart TB
   mg --> view
   me --> view["project view<br/>meta, members[].bundle, trains, related_work,<br/>shipped, people, modules, module_edges"]
 ```
+
+`window_components` (issue #85) removes from each component the stored PR/issue anchors of a
+member repo that its window-scoped view left out, so on a store holding several windows a
+component reaching another window cannot fold that window's PRs/issues into this window's
+project trains (on a single-window store it removes nothing).
 
 Caveat (documented in code): a train spanning more than `max_depth` spine hops can split
 into two components; and restricting `--repo` cannot hide a real spine edge into another
@@ -1210,9 +1239,9 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
-| View arrays not window-scoped on multi-window stores | arrays come from `repo_nodes` (buckets are bounded by `meta.period` since #75) | `prs`/`issues`/`commits` and trains span all stored history (member and project views) | window the materialized arrays to in-window + spine context |
-| `enrich` re-matches moves over the view | `link.enrich` runs `link_symbol_identity` over the view's whole `symbol_events` | on a multi-window store the view's artifacts can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
-| Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
+| Past-month views show the latest record state | PR/issue nodes are upserted latest-wins; a view is window-scoped (#85) but reads the stored record | on a store holding later windows, a past month's view shows today's state/labels/milestone/comments (`meta.state_as_of`); an item open at that month's end but closed since is not in it; an item updated in that month and again later is in the later month only | per-window snapshots of the record at fold |
+| `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; since #85 a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
+| Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | every view (a past month, a wider digest window) shows the latest gather's CI stats and structure | store per-window singletons or aggregate (#94) |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
@@ -1236,8 +1265,9 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | No series for a project view | `link.py --series` keys installments per bundle and items by `(type, id)` | a multi-repo constellation keeps one series per member bundle (USAGE §5.4) | key items by `repo` + type + id and accept the digest view |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
-The operating guidance in USAGE (one single-window store per installment, series file for
-continuity, wide single gathers for history stores) avoids the first two in practice.
+The operating guidance in USAGE §2.1 (one single-window store per installment, or one
+accumulated store viewed month by month as it grows; series file for continuity) says which of
+these affect an accumulated store.
 
 ## 15. Testing and CI
 

@@ -105,6 +105,27 @@ the rest (engagement, code areas, trains, people/flow).
   gather pulled because they were updated in the window — fall in no bucket. `ref_date` frames
   milestones, sprints, forecast age and flow staleness: the view's `--ref-date` if given, else
   the gather `--ref-date` stored for exactly this window, else `to`.
+  **`state_as_of`** (issue #85, omit-when-absent) is the `to` of the repo's latest gathered
+  window, present only when that is after the view's `to`: the view is of an earlier window
+  than the store's latest, and its PR/issue records (state, labels, milestone, `updated_at`,
+  comments) are as the latest gather saw them, not as they were at the view's `to`.
+  **Window scope** (issue #85): a view holds only its window's records — the rule mirrors what
+  gather collects for a window, applied to each record's latest stored state:
+  `prs` merged in the window, closed (unmerged) in it, or open and created by its end;
+  `issues` closed or updated in it, open and created by its end, or closed / cross-referenced
+  by one of the view's PRs (**train context**: an issue from another window can be here; a PR
+  never is); `commits` dated in it and the `code_events` / `symbol_events` of those commits;
+  `releases` published in it; reviews / lifecycle events with their parent; any record whose
+  stored timestamp is in the window, and any undated one (it cannot be placed in a window).
+  `artifacts` keep only the window's lifecycle events (an artifact with none is absent), with
+  `status` / `replaced_by` / move fields as of the window's end. `people` drops a login whose
+  contribution to this repo lies only outside the window (people with no contribution to this
+  repo are not filtered here — a member bundle still lists the project's other people, #88);
+  `modules` / `areas` on a person are the store's union over every window. Not windowed:
+  `milestones`, `sprints` and the per-repo singletons `workflow_stats`, `code_graph`,
+  `code_owners`, `label_taxonomy` — current structure, as of the latest gather (#94). On a
+  store holding only the viewed window every stored record is in the view; a view spanning
+  several gathered windows is their union.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
   committed_at?, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
@@ -308,8 +329,9 @@ review's state to `DISMISSED`.
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
   carry the bounded `before`/`after`. `lifecycle` is in commit order (the commit's UTC `committed_at`
-  when known, else the local `date`; ties keep git/ledger order); a view from a store is cumulative — it holds every folded window's
-  events, not only the view's window. `status` is derived from the artifact's **last**
+  when known, else the local `date`; ties keep git/ledger order). A view from a store holds
+  only the view's window's events (issue #85; the stored node is cumulative over every folded
+  window, #76) and `status`/`replaced_by` are as of the window's end. `status` is derived from the artifact's **last**
   lifecycle event: `replaced` only when that event is a rename to a tracked path
   (`replaced_by` = that direct successor; consumers walk A→B→C); a later re-add makes
   it `live` again with `replaced_by:null`; a delete, or a rename to an untracked path,
@@ -323,8 +345,9 @@ review's state to `DISMISSED`.
   the dest, the dest carries `identity_from`, and both carry `move_confidence`/`move_basis`.
   In a store the moves are matched per folded window and the stored artifacts apply all of
   them (STORE.md, symbol-move edges); a source re-added later is `live` again. `link.enrich`
-  still re-matches over the view's whole `symbol_events`, which on a multi-window store can
-  add a move no single window had (LLD §14.5).
+  still re-matches over the view's `symbol_events`: a view of one gathered window holds only
+  that window's events (the set fold matched), but a view spanning several gathered windows
+  can add a move no single window had (LLD §14.5).
   `confidence` is `high` only when git also flags the file pair as a rename/copy. (Name-changed
   renames via body fingerprint are deferred.)
 - **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},

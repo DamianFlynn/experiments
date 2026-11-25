@@ -16,17 +16,33 @@ Materialization approach (slice 7a part 1)
 1. Range-query the in-window social + code nodes (graphstore.range_query) — these
    are conceptually `in_window: true` and are what activity counts reflect.
 2. Seed a bounded spine traversal (graphstore.traverse_spine) from every in-window
-   social node's train anchor to pull out-of-window spine *context* nodes
-   (`in_window: false`). `missing` spine ids (referenced but not yet stored — e.g.
-   an out-of-window issue a PR closes) are only WARNED about here; wiring backfill
-   is slice 7c. Activity counts never include context or missing nodes.
-3. Materialize the raw arrays from the node `data` blobs. The materialization
-   *source* for the arrays is `graphstore.repo_nodes` (all social/code/structure
-   nodes for the repo, NOT window-filtered): the raw arrays must include NULL-ts
-   nodes the window scan legitimately drops (un-dated commits, degenerate
-   fixtures), while the window/spine sets above still drive the in_window tagging.
+   social node's train anchor to find out-of-window spine nodes. `missing` spine
+   ids (referenced but not yet stored — e.g. an out-of-window issue a PR closes)
+   are WARNED about, or fetched through the `backfill` seam (slice 7c). Which
+   out-of-window records enter the arrays as train context is decided in step 3
+   (issues a view PR closes / cross-references), not by this traversal.
+3. Materialize the raw arrays from the node `data` blobs of the records that
+   belong to THIS window (issue #85 — a store holding several windows must not
+   leak the others into the view). The rule mirrors what gather collects for a
+   window, applied to each record's latest stored state:
+   - a PR merged in the window, closed (unmerged) in the window, or open and
+     created by the window's end;
+   - an issue closed or updated in the window, open and created by the
+     window's end, or closed / cross-referenced by one of the view's PRs
+     (train context — the issues gather fetches for a window's PRs);
+   - a commit dated in the window; reviews / lifecycle events of a view
+     pr/issue; releases published in the window;
+   - any node whose own `ts` is in the window (range_query) and any undated
+     node (it cannot be placed in a window; un-dated commits, degenerate
+     fixtures).
+   Milestones, sprints and the per-repo singletons are not windowed (current
+   structure, latest gather wins). On a store holding only the viewed window
+   this selects every stored record, so single-window views are unchanged; a
+   view spanning several gathered windows is their union.
 4. Reconstruct `code_events` from the ledger in insertion (rowid) order via
-   `graphstore.repo_code_events`, which equals the original source order. The
+   `graphstore.repo_code_events`, which equals the original source order,
+   keeping the rows of the view's commits (a row whose commit is not stored
+   is kept when its own date is in the window). The
    SAME ledger also carries the symbol-granular rows fold persisted (keyed by the
    symbol artifact id `<path>#<lang>:<subkind>:<name>`, with before/after); those
    are split OUT of the file-level `code_events` array and reconstructed into
@@ -38,7 +54,14 @@ Materialization approach (slice 7a part 1)
    `link.compute_buckets` limits shipped/rejected/in_flight to this window even
    when the store holds other windows' items; `ref_date` = the explicit
    override, else the value fold stored for exactly this gathered window
-   (gather `--ref-date`, default its `to`), else this view's `to`.
+   (gather `--ref-date`, default its `to`), else this view's `to`; and, when
+   the repo has a gathered window ending after this view (issue #85),
+   `state_as_of` = that latest `to` (records are stored latest-wins).
+6. `artifacts`: the stored artifact nodes with each lifecycle limited to the
+   view's events (an artifact with none is left out) and status /
+   replaced_by / move fields as of the window's end; `people`: the stored
+   project people minus logins that worked in this repo only outside the
+   window. See `_artifacts_as_of` / `_window_people`.
 
 Deterministic ordering matches the golden bundles: prs/issues by number, commits
 by sha, milestones by number, releases by tag/name, code_events by source order.
@@ -197,20 +220,22 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     if real_gaps:
         warn("extract: {} spine context node(s) referenced but not stored: "
              "{}".format(len(real_gaps), ", ".join(sorted(real_gaps))))
-    # context_ids: reached-but-out-of-window nodes (in_window: false). Recorded for
-    # completeness / future per-node tagging; the raw arrays below are sourced from
-    # repo_nodes so they already include these (including any just backfilled).
-    _context_ids = set(spine["reached"]) - in_window_ids  # noqa: F841
-
-    # 3+4. Materialize raw arrays from the full repo node set + the ledger.
+    # 3+4. Materialize the raw arrays: the repo's stored nodes + ledger rows
+    #      that belong to THIS window (issue #85; see `_view_socials`).
     branch_problems = []
     bundle = {"meta": _materialize_meta(conn, project, repo, ts_from, ts_to,
                                         ref_date=ref_date,
                                         problems=branch_problems)}
 
     socials = graphstore.repo_nodes(conn, project, repo, node_class="social")
+    codes = graphstore.repo_nodes(conn, project, repo, node_class="code")
+    commit_nodes = [n for n in codes if _is_commit_node(n)]
+    view_socials = _view_socials(conn, project, repo, socials, in_window_ids,
+                                 ts_from, ts_to)
+    view_commits = [n for n in commit_nodes
+                    if not n["ts"] or n["id"] in in_window_ids]
     bundle["prs"] = _by(
-        [n["data"] for n in socials if _local(n["id"]).startswith("pr-")],
+        [n["data"] for n in view_socials if _local(n["id"]).startswith("pr-")],
         key=lambda d: d.get("number"))
     # Unknown mainline (issue #84): link then counts EVERY merged PR as merged
     # into it (the pre-#84 behaviour). Say so whenever that decides anything.
@@ -220,7 +245,8 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
              "release-branch merges are not told apart)".format(
                  project, repo, ts_from, ts_to, branch_problems[0]))
     bundle["issues"] = _by(
-        [n["data"] for n in socials if _local(n["id"]).startswith("issue-")],
+        [n["data"] for n in view_socials
+         if _local(n["id"]).startswith("issue-")],
         key=lambda d: d.get("number"))
 
     # Phase 10 slice 1: re-attach the review/lifecycle social nodes onto their
@@ -228,6 +254,8 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # the RAW substrate. The derived review_rounds/reopen_count are computed in
     # link.enrich (with forecast/modules), not here, so extract stays raw-only.
     # Done ONLY when such nodes exist so PRs/issues with none stay byte-identical.
+    # A review/event follows its parent: it is attached only to a pr/issue in
+    # this view (orphans are skipped), whatever its own timestamp.
     _attach_reviews_and_lifecycle(socials, bundle["prs"], bundle["issues"])
 
     # Phase 11 slice 1: surface the store's `blocks` issue->issue edges as resolved
@@ -239,18 +267,25 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (local id `art:<path>` for files, `<path>#<lang>:<subkind>:<name>` for
     # symbols). Commits reconstruct the raw `commits` array; the artifact nodes
     # (everything else) reconstruct the `artifacts` projection below.
-    codes = graphstore.repo_nodes(conn, project, repo, node_class="code")
     bundle["commits"] = _by(
-        [n["data"] for n in codes if _is_commit_node(n)],
+        [n["data"] for n in view_commits],
         key=lambda d: str(d.get("sha")))
 
     # code_events / symbol_events share one ledger: the file-level rows (`<path>`)
     # reconstruct the raw `code_events` array; the symbol-keyed rows
     # (`<path>#<lang>:<subkind>:<name>`, before/after) reconstruct `symbol_events`.
     # Both readers split the ledger by that form so a symbol row is NEVER
-    # double-counted into code_events (and vice-versa).
-    bundle["code_events"] = _materialize_code_events(conn, project, repo)
-    bundle["symbol_events"] = _materialize_symbol_events(conn, project, repo)
+    # double-counted into code_events (and vice-versa). Only the rows of this
+    # view's commits are kept (`in_view`); a row whose commit is not stored at
+    # all is kept when its own date is in the window (or it has none).
+    in_view = _event_filter(
+        {str(n["data"].get("sha")) for n in view_commits},
+        {str(n["data"].get("sha")) for n in commit_nodes}, ts_from, ts_to)
+    ledger = graphstore.repo_code_events(conn, project, repo)
+    bundle["code_events"] = _materialize_code_events(
+        conn, project, repo, rows=ledger, keep=in_view)
+    bundle["symbol_events"] = _materialize_symbol_events(
+        conn, project, repo, rows=ledger, keep=in_view)
 
     # artifacts: the per-file lifecycle ledger fold persisted as artifact `code`
     # nodes (the non-commit ones). Read the stored data blobs back into the dict
@@ -266,8 +301,16 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # each artifact path in the (already source-ordered) code_events — to reproduce
     # the same timeline byte-for-byte. Artifacts with no code_event (none today)
     # fall to the end, ordered by id.
-    arts = {_full_local(n["id"], project, repo): n["data"]
-            for n in codes if _is_artifact_node(n)}
+    #
+    # Window scope (issue #85): each artifact's `lifecycle` keeps only the events
+    # of this view (`in_view`) and an artifact with none is left out, so
+    # timeline / feature_deltas / modules see this window's code history only.
+    # `status` / `replaced_by` / `identity_from` are as of the window's END: the
+    # stored (cumulative) node when the ledger holds nothing dated after the
+    # window, else the same projection over the ledger up to the window's end
+    # (`_artifacts_as_of`).
+    arts = _artifacts_as_of(conn, project, repo, codes, ledger, ts_to)
+    arts = _window_lifecycles(arts, in_view)
     bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"],
                                            derive.commit_times(bundle))
 
@@ -275,8 +318,18 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # `structure` nodes (repo sentinel "*", local id `person-<login>`). Read them
     # back into the dict keyed by login, dropping the redundant stored `login`
     # field so the shape matches attribute_people_areas' output. Materialized from
-    # the store, NOT re-derived.
-    bundle["people"] = _materialize_people(conn, project)
+    # the store, NOT re-derived. Window scope (issue #85): a login that worked in
+    # THIS repo only outside the window is left out (`_window_people`); people
+    # who never worked in this repo are untouched (the per-member scoping of
+    # project people is issue #88's).
+    bundle["people"] = _window_people(
+        _materialize_people(conn, project),
+        all_records={"prs": [n["data"] for n in socials
+                             if _local(n["id"]).startswith("pr-")],
+                     "issues": [n["data"] for n in socials
+                                if _local(n["id"]).startswith("issue-")],
+                     "commits": [n["data"] for n in commit_nodes]},
+        view_records=bundle)
 
     structure = graphstore.repo_nodes(conn, project, repo, node_class="structure")
     bundle["milestones"] = _by(
@@ -284,9 +337,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
          if _local(n["id"]).startswith("milestone-")],
         key=lambda d: (d.get("number") is None, d.get("number"),
                        d.get("title") or ""))
+    # Releases published in the window (gather's own rule), or undated.
     bundle["releases"] = _by(
         [n["data"] for n in structure
-         if _local(n["id"]).startswith("release-")],
+         if _local(n["id"]).startswith("release-")
+         and (not n["ts"] or graphstore.ts_in_window(n["ts"], ts_from, ts_to))],
         key=lambda d: d.get("tag_name") or d.get("name") or "")
 
     # Phase 12 slice 1: sprints materialize from the `sprint-<id>` structure nodes
@@ -388,6 +443,218 @@ def _order_artifacts(arts, code_events, times=None):
         return (order.get(aid, fallback), aid)
 
     return {aid: arts[aid] for aid in sorted(arts, key=rank)}
+
+
+# ---------------------------------------------------------------------------
+# Window scope (issue #85): which stored records belong to a window's view.
+#
+# A store grows window by window, so a view must not read the repo's whole
+# node set. The rule mirrors what `gather` collects for a window, applied to
+# each record's latest stored state, so a view of one gathered window on an
+# accumulated store equals the view of a store holding only that window (up
+# to records a later gather refreshed), and a view spanning several windows is
+# their union. Every window test is `graphstore.ts_in_window` (#52).
+# ---------------------------------------------------------------------------
+
+def _open_by(data, ts_to):
+    """An item whose stored state is open and that was created by the window's
+    end (or has no created_at). Its state is the latest gather's, so it was
+    open at the end of every window since its creation."""
+    if data.get("state") != "open" or data.get("merged"):
+        return False
+    created = data.get("created_at")
+    return not created or graphstore.ts_in_window(created, None, ts_to)
+
+
+def _pr_in_window(data, ts_from, ts_to):
+    """gather's PR rule: merged in the window, closed (unmerged) in the
+    window, or open (here: open and created by the window's end)."""
+    if data.get("merged"):
+        return graphstore.ts_in_window(data.get("merged_at"), ts_from, ts_to)
+    if data.get("state") == "closed":
+        return graphstore.ts_in_window(data.get("closed_at"), ts_from, ts_to)
+    return _open_by(data, ts_to)
+
+
+def _issue_in_window(data, ts_from, ts_to):
+    """gather's issue rule (minus train context, see `_view_socials`): closed
+    or updated in the window, or open and created by the window's end."""
+    return (graphstore.ts_in_window(data.get("closed_at"), ts_from, ts_to)
+            or graphstore.ts_in_window(data.get("updated_at"), ts_from, ts_to)
+            or _open_by(data, ts_to))
+
+
+def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to):
+    """The pr/issue social nodes of one window's view, in `socials` order.
+
+    A node is in the view when it is undated (it cannot be placed in any
+    window), its own `ts` is in the window (`in_window_ids`, from
+    range_query), or its record passes `_pr_in_window` / `_issue_in_window`.
+    An issue is also in the view as TRAIN CONTEXT when a PR of the view
+    closes or cross-references it (a `closes` / `cross_ref` edge), which is
+    exactly the set gather fetches for a window's PRs. PRs are never pulled in
+    as context: link counts every PR in the arrays (trains, people, timeline),
+    so a PR from another window would be counted as this window's activity.
+    Review and lifecycle-event nodes are not returned; they follow their
+    parent (see `_attach_reviews_and_lifecycle`)."""
+    def dated_in(n):
+        return not n["ts"] or n["id"] in in_window_ids
+
+    prs = {n["id"] for n in socials if _local(n["id"]).startswith("pr-")
+           and (dated_in(n) or _pr_in_window(n["data"], ts_from, ts_to))}
+    issue_prefix = graphstore.qualify_id(project, repo, "issue-")
+    context = set()
+    for edge_type in ("closes", "cross_ref"):
+        for e in graphstore.edges_by_type(conn, edge_type, project):
+            if e["src_id"] in prs and e["dst_id"].startswith(issue_prefix):
+                context.add(e["dst_id"])
+    out = []
+    for n in socials:
+        local = _local(n["id"])
+        if local.startswith("pr-"):
+            if n["id"] in prs:
+                out.append(n)
+        elif local.startswith("issue-"):
+            if (n["id"] in context or dated_in(n)
+                    or _issue_in_window(n["data"], ts_from, ts_to)):
+                out.append(n)
+    return out
+
+
+def _event_filter(view_shas, stored_shas, ts_from, ts_to):
+    """keep(commit_sha, date) for ledger rows and artifact lifecycle entries:
+    the event of a commit in the view; never that of a stored commit outside
+    it; for a commit the store does not hold, the event's own date decides
+    (an undated one is kept)."""
+    def keep(sha, date):
+        if sha is not None and str(sha) in view_shas:
+            return True
+        if sha is not None and str(sha) in stored_shas:
+            return False
+        return not date or graphstore.ts_in_window(date, ts_from, ts_to)
+    return keep
+
+
+# Artifact fields that depend on the WHOLE lifecycle (last event / moves), so
+# they differ between "as of the window's end" and "as of the latest gather".
+_AS_OF_FIELDS = ("status", "replaced_by")
+_MOVE_FIELDS = ("identity_from", "move_confidence", "move_basis")
+
+
+def _artifacts_as_of(conn, project, repo, codes, ledger, ts_to):
+    """The repo's artifact records {local id: data} with status as of the end
+    of the window.
+
+    The stored nodes are cumulative (#76): status / replaced_by / move fields
+    are those of the latest folded event. When the ledger holds no event dated
+    after `ts_to` that IS the status at the window's end, and the stored nodes
+    are returned untouched. Otherwise the same projection fold writes
+    (derive.artifact_projection, with the recorded moves) is run over the
+    ledger rows dated up to `ts_to`, and its status / replaced_by / move fields
+    are laid over copies of the stored records (whose lifecycle entries, refs
+    and code_area are kept as stored)."""
+    stored = {_full_local(n["id"], project, repo): n["data"]
+              for n in codes if _is_artifact_node(n)}
+    later = [r for r in ledger if r["date"]
+             and not graphstore.ts_in_window(r["date"], None, ts_to)]
+    if not ts_to or not later:
+        return stored
+
+    def upto(_sha, date):
+        return not date or graphstore.ts_in_window(date, None, ts_to)
+
+    as_of = derive.artifact_projection(
+        {"meta": {"owner": project, "repo": repo},
+         "code_events": _materialize_code_events(
+             conn, project, repo, rows=ledger, keep=upto),
+         "symbol_events": _materialize_symbol_events(
+             conn, project, repo, rows=ledger, keep=upto),
+         "commits": commit_times(conn, project, repo)},
+        recorded_moves(conn, project, repo))
+    out = {}
+    for aid, data in stored.items():
+        then = as_of.get(aid)
+        if then is None:
+            out[aid] = data   # no event by the window's end: trimmed out later
+            continue
+        rec = dict(data)
+        for key in _AS_OF_FIELDS:
+            if key in then:
+                rec[key] = then[key]
+        for key in _MOVE_FIELDS:
+            if key in then:
+                rec[key] = then[key]
+            else:
+                rec.pop(key, None)
+        out[aid] = rec
+    return out
+
+
+def _window_lifecycles(arts, keep):
+    """Each artifact with its lifecycle limited to the view's events (`keep`);
+    an artifact left with none is dropped. An artifact with no lifecycle at all
+    cannot be placed in a window and is kept. Records whose lifecycle is
+    entirely in the view are returned as-is (single-window stores read back
+    byte-identical)."""
+    out = {}
+    for aid, art in arts.items():
+        lc = art.get("lifecycle") or []
+        if not lc:
+            out[aid] = art
+            continue
+        kept = [e for e in lc if keep(e.get("commit"), e.get("date"))]
+        if not kept:
+            continue
+        out[aid] = art if len(kept) == len(lc) else {**art, "lifecycle": kept}
+    return out
+
+
+def _participants(records):
+    """The logins with a contribution edge in `records` ({prs, issues,
+    commits}): the SAME enumerator fold uses to write person nodes, fed only
+    the login-bearing fields (null lists read as empty; no file lists, so no
+    area attribution is computed — only the keys are used)."""
+    def lst(value):
+        return list(value or [])
+    prs = [{"number": p.get("number"), "author": p.get("author"),
+            "merged_by": p.get("merged_by"), "reviewers": lst(p.get("reviewers")),
+            "comments_list": lst(p.get("comments_list")),
+            "review_comments": lst(p.get("review_comments"))}
+           for p in records.get("prs") or []]
+    issues = [{"author": i.get("author"),
+               "comments_list": lst(i.get("comments_list"))}
+              for i in records.get("issues") or []]
+    commits = [{"sha": c.get("sha"), "author": c.get("author")}
+               for c in records.get("commits") or []]
+    return set(derive.enumerate_participants(
+        {"prs": prs, "issues": issues, "commits": commits}))
+
+
+def _window_people(people, all_records, view_records):
+    """The stored project people minus the logins that contribute to this
+    repo's stored records but to none of the view's: someone who worked here
+    only in another window is not one of this window's people. Logins with no
+    contribution to this repo at all are kept unchanged (project people in a
+    member bundle are issue #88's to scope). Records are the stored ones
+    (modules / areas: the project-wide union over every folded window)."""
+    repo_logins = _participants(all_records)
+    view_logins = _participants(view_records)
+    if repo_logins <= view_logins:
+        return people
+    return {login: rec for login, rec in people.items()
+            if login in view_logins or login not in repo_logins}
+
+
+def _latest_gathered_to(conn, project, repo):
+    """The latest `to` of this repo's gathered windows, or None."""
+    try:
+        windows = graphstore.get_windows(conn)
+    except ValueError:
+        return None
+    tos = [w.get("to") for w in windows if isinstance(w, dict)
+           and w.get("project") == project and w.get("repo") == repo
+           and w.get("to")]
+    return max(tos, key=lambda t: t[:10]) if tos else None
 
 
 def _attach_blocks(conn, project, repo, issues):
@@ -556,6 +823,13 @@ def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None,
         ref_date
         or graphstore.get_ref_date(conn, project, repo, ts_from, ts_to)
         or ts_to)
+    # Issue #85: records are stored latest-wins, so a view of an earlier
+    # window shows open/closed state, labels, milestones and comments as of a
+    # later gather. Say so: `state_as_of` = the end of the repo's latest
+    # gathered window, present only when that is after this view's end.
+    latest = _latest_gathered_to(conn, project, repo)
+    if latest and ts_to and not graphstore.ts_in_window(latest, None, ts_to):
+        meta["state_as_of"] = latest
     return meta
 
 
@@ -600,12 +874,20 @@ def commit_times(conn, project, repo):
     return sorted(out, key=lambda c: c["sha"])
 
 
-def _materialize_code_events(conn, project, repo):
+def _materialize_code_events(conn, project, repo, rows=None, keep=None):
     """Reconstruct the raw `code_events` array from the file-level ledger, in
     original source order (ledger rowid order). rename/copy recover `old_path`
-    from the event's `detail` (fold_bundle stored old_path there)."""
+    from the event's `detail` (fold_bundle stored old_path there).
+
+    `rows` (optional) are ledger rows already read by the caller; `keep` an
+    optional predicate keep(commit_sha, date) -> bool limiting the result to
+    one window's rows (issue #85). Both None = the WHOLE ledger."""
     out = []
-    for ev in graphstore.repo_code_events(conn, project, repo):
+    if rows is None:
+        rows = graphstore.repo_code_events(conn, project, repo)
+    for ev in rows:
+        if keep is not None and not keep(ev["commit_sha"], ev["date"]):
+            continue
         aid = ev["artifact_id"]
         # The repo-qualified remainder is the artifact's local id form: `<path>`
         # for a file event, `<path>#<lang>:<subkind>:<name>` for a symbol one.
@@ -634,7 +916,7 @@ def _materialize_code_events(conn, project, repo):
     return out
 
 
-def _materialize_symbol_events(conn, project, repo):
+def _materialize_symbol_events(conn, project, repo, rows=None, keep=None):
     """Reconstruct the raw `symbol_events` array from the SYMBOL-granular ledger
     rows fold persisted, in original source order (ledger rowid order).
 
@@ -655,9 +937,14 @@ def _materialize_symbol_events(conn, project, repo):
       - `change`: the row stored the MAPPED event (derive._SYMBOL_CHANGE_TO_EVENT);
         we reverse it (`_EVENT_TO_SYMBOL_CHANGE`) to a change that recomputes the
         same event in build_artifacts, so the artifact lifecycle round-trips.
-    Returns [] when the repo has no symbol rows (the goldens). Source-ordered."""
+    Returns [] when the repo has no symbol rows (the goldens). Source-ordered.
+    `rows` / `keep`: as for `_materialize_code_events`."""
     out = []
-    for ev in graphstore.repo_code_events(conn, project, repo):
+    if rows is None:
+        rows = graphstore.repo_code_events(conn, project, repo)
+    for ev in rows:
+        if keep is not None and not keep(ev["commit_sha"], ev["date"]):
+            continue
         aid = ev["artifact_id"]
         remainder = _full_local(aid, project, repo)
         # Symbol rows end in `#<lang>:<subkind>:<name>`. A bare `<path>` file-level

@@ -159,6 +159,36 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
     return comps
 
 
+def window_components(conn, project, members, components):
+    """`components` without the stored pr/issue anchors of a member repo that
+    are NOT in that member's view (issue #85).
+
+    traverse_spine has no window filter, so on a store holding several
+    windows a component can reach another window's PRs/issues, and
+    build_project_trains would fold them into this window's project trains as
+    orphan refs. A member's view (extract) already decides which of its
+    stored records belong to the window; this applies the same decision to
+    the components. Ids of repos that are not members, and ids the store does
+    not hold (referenced, never gathered), are kept as before. On a store
+    holding only the viewed window every stored anchor is in its member's
+    view, so nothing is removed."""
+    out_of_view = set()
+    for m in members:
+        repo, bundle = m["repo"], m["bundle"]
+        in_view = {graphstore.qualify_id(project, repo, "pr-{}".format(p["number"]))
+                   for p in bundle.get("prs", [])}
+        in_view |= {graphstore.qualify_id(project, repo,
+                                          "issue-{}".format(i["number"]))
+                    for i in bundle.get("issues", [])}
+        for n in graphstore.repo_nodes(conn, project, repo, node_class="social"):
+            local = graphstore.parse_id(n["id"])["local"]
+            if local.startswith(("pr-", "issue-")) and n["id"] not in in_view:
+                out_of_view.add(n["id"])
+    if not out_of_view:
+        return components
+    return [frozenset(c - out_of_view) for c in components]
+
+
 # outcome precedence when member trains merge into one project train (mirrors
 # link.build_trains' shipped > in_flight > rejected > abandoned).
 _OUTCOME_RANK = {"shipped": 3, "in_flight": 2, "rejected": 1, "abandoned": 0}
@@ -366,7 +396,9 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     members = member_bundles(conn, project, repos, ts_from, ts_to,
                              backfill=backfill, backfill_budget=backfill_budget,
                              warn=warn, ref_date=ref_date)
-    comps = spine_components(conn, project, repos, ts_from, ts_to)
+    comps = window_components(
+        conn, project, members,
+        spine_components(conn, project, repos, ts_from, ts_to))
     trains = build_project_trains(members, comps, project)
     _attach_tickets(members, trains, project, ticket_pattern)
     related = group_related_work(trains)

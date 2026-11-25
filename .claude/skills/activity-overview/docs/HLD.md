@@ -140,10 +140,11 @@ Every PR, issue, commit, review, person, code area, milestone, release and sprin
 **node**; relationships (`authored`, `closes`, `part_of`, `touches`, `depends_on`, `blocks`,
 `in_milestone`, …) are typed **edges**. Ids are qualified (`project/repo#pr-123`), so writes
 are **idempotent**: re-gathering an overlapping window changes nothing that is already
-correct. The storage layer can therefore hold many windows. Today, however, the *readers*
-assume one window per store (see [§10](#10-constraints-and-known-limitations)), so the
-recommended operating model is **one single-window store per installment**, with continuity
-carried by the series file (§5.5).
+correct. The storage layer can therefore hold many windows, and since issue #85 the readers
+scope every view to its window: one store can grow month after month and each month's view
+holds only that month's records (with continuity carried by the series file, §5.5). What a
+store holding several windows still cannot give a past month is listed in
+[§10](#10-constraints-and-known-limitations) item 8.
 
 ### 5.2 Decision train
 
@@ -463,14 +464,20 @@ These are real, current limits — plan around them:
 6. **No standalone `extract` CLI.** The on-disk bundle view is obtained via `digest.py`
    (which works for single repos too); see USAGE §4.
 7. **Narrative is not in CI.** The live CI job stops at the trust gate.
-8. **Views assume a single-window store (partly fixed).** Since issue #75 a view carries its
-   window (`meta.period`, `meta.ref_date`), so shipped and rejected count only items merged or
-   closed in the view's window, and in flight only items updated in it (or on the current
-   milestone), on member bundles
-   and the project view alike, and gather's `--ref-date` is kept with the window. Still open:
-   `extract` materializes the repo's *whole* stored node set, so on a store holding several
-   windows the view's `prs`/`issues`/`commits` arrays and its trains include all stored
-   history (window-scoped arrays are a follow-up).
+8. **A store holding several windows shows past months with today's record state.** Views
+   are window-scoped (#75, #85): a view carries its window (`meta.period`, `meta.ref_date`)
+   and holds only the records a gather of that window collects — PRs merged/closed in it or
+   open by its end, issues closed/updated in it or open by its end or closed/cross-referenced
+   by its PRs, its commits and their code/symbol events, its releases (BUNDLE.md "Window
+   scope") — so trains, timeline, feature deltas, modules, people and halls are the window's,
+   on member bundles and the project view alike. What remains: records are stored
+   latest-wins, so a past month's view shows each PR/issue as the latest gather saw it
+   (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when). An
+   item that was open at the end of that month but has closed since is not in its view
+   (its stored state is closed, outside the month); an item updated in that month and again
+   later is in the later month's view only. People's `modules`/`areas` are the union over every
+   window; the per-repo singletons are the latest gather's (item 9); a view spanning several
+   gathered windows can still match a symbol move across them (LLD §14.5).
 9. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
     `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
     latest gathered window only.
@@ -519,13 +526,13 @@ These are real, current limits — plan around them:
     blocks (`link` names them on stderr). A month recorded after a later one is marked
     `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
 
-Item 8 is why USAGE recommends one store per installment; it is a candidate for a code fix
-(window the materialized arrays in `extract`), tracked in
-[§11](#11-extension-points-and-roadmap). Artifact folding is cumulative: each fold rebuilds the
-artifacts it touches from the whole change ledger, so a store holding several windows passes
-`validate.no_drift` whatever the fold order. Symbol moves are matched per window; on such a
-store `validate` checks each recorded move against the ledger instead of re-matching across
-windows, and its idempotency probe reports a whole-store re-match as INFO (LLD §8).
+Item 8 is what USAGE weighs when choosing between one accumulated store and one store per
+installment. Artifact folding is cumulative: each fold rebuilds the artifacts it touches from
+the whole change ledger, so a store holding several windows passes `validate.no_drift`
+whatever the fold order, and a view shows each artifact's status as of its window's end.
+Symbol moves are matched per window; on such a store `validate` checks each recorded move
+against the ledger instead of re-matching across windows, and its idempotency probe reports
+a whole-store re-match as INFO (LLD §8).
 
 **What the trust gate proves (#89).** `validate` proves the store is *consistent*: every edge
 is exactly what the stored records imply (`edge_set`, both directions), people are re-derived
@@ -545,7 +552,7 @@ proven.
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
 | Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
-| Multi-window stores (limitation 8) | `extract._materialize_meta` (+ windowed arrays) — not implemented (artifact folding is already cumulative) |
+| Historical record state on multi-window stores (limitation 8) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |
 | New spotlight lens | Add a query + renderer in `spotlight.py` |
