@@ -127,8 +127,7 @@ DB=$S/stores/$M.db               # a NEW store for this installment
 mkdir -p $S/stores $S/views/$M
 
 # 1 · Acquire → store (network; the only step that needs the token).
-#     gather always clones fresh: the --clone-dir must NOT already exist.
-rm -rf $S/clone
+#     gather clones into --clone-dir, or fetches it if it already holds a clone of this repo.
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules \
   --from $FROM --to $TO --store $DB --clone-dir $S/clone
 
@@ -177,7 +176,7 @@ Then ask Claude to write the report from `$B` (+ slices + diagrams) following
 
 ```mermaid
 flowchart TB
-  a["1 · Pick window<br/>first..last day of the month,<br/>ref-date = last day"] --> b["2 · gather into a NEW store<br/>stores/YYYY-MM.db, fresh clone dir"]
+  a["1 · Pick window<br/>first..last day of the month,<br/>ref-date = last day"] --> b["2 · gather into a NEW store<br/>stores/YYYY-MM.db, clone dir reused"]
   b --> c{"3 · validate OK?"}
   c -- no --> fix["fix cause (see §11), re-gather<br/>into the same monthly store"] --> b
   c -- yes --> d["4 · view.py to views/YYYY-MM/bundle.json<br/>keep the bundle"]
@@ -193,10 +192,14 @@ flowchart TB
    to `--to`, which frames milestones, sprints, forecast age and flow staleness — keep the
    default for month-end reports.
 2. **Gather into this month's own store** (`stores/YYYY-MM.db`). Re-running the same window
-   into the same store is safe (idempotent). `gather` always clones: point `--clone-dir` at a
-   path that does not exist yet (delete last month's clone first). `--no-clone` skips the clone
-   but walks whatever history is already in that directory — it does not fetch, so only use it
-   on a clone you have just refreshed yourself.
+   into the same store is safe (idempotent). `gather` clones into `--clone-dir`, or, when that
+   directory already holds a clone of the same repo, fetches it to the window's history bound
+   and checks out the default branch head — so last month's clone dir can be reused. A
+   directory that is not a clone of this repo is refused, never deleted. `--no-clone` never
+   creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
+   only (empty commit/code walks). A repo with no commits since `--from` minus the clone margin
+   is cloned at depth 1 and has no commits in the window. `meta.clone_mode` records which
+   (`fresh`, `fetched`, `depth1-fallback`, `none`).
 3. **Validate.** Never publish from a store that is not `RESULT: OK`.
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
    they are what you replay if the series ever needs rebuilding.
@@ -273,8 +276,8 @@ The following installment's `series.forecast_loop` lists each previous candidate
 ## 7. Playbooks per target estate
 
 The commands below reuse `AO`, `FROM`, `TO` and `M` (e.g. `2026-11`) from §4 and write each
-installment to its own store, `$S/stores/$M.db`. Delete the clone directory before each
-gather — `gather` always clones fresh.
+installment to its own store, `$S/stores/$M.db`. The clone directory is reused: `gather`
+fetches an existing clone instead of cloning again.
 
 ### 7.1 Bicep — `Azure/bicep`
 
@@ -286,7 +289,7 @@ gather — `gather` always clones fresh.
 - **Command:**
 
 ```bash
-S=~/activity/bicep; mkdir -p $S/stores; rm -rf $S/clone
+S=~/activity/bicep; mkdir -p $S/stores
 python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
   --store $S/stores/$M.db --clone-dir $S/clone
 ```
@@ -311,7 +314,7 @@ python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
 - **Commands:**
 
 ```bash
-S=~/activity/avm-bicep; mkdir -p $S/stores; rm -rf $S/clone
+S=~/activity/avm-bicep; mkdir -p $S/stores
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
   --store $S/stores/$M.db --clone-dir $S/clone
 python3 $AO/validate.py $S/stores/$M.db --project Azure --repo bicep-registry-modules
@@ -345,7 +348,7 @@ python3 $AO/manifest_from_index.py --avm res --avm ptn \
 ```bash
 export TF_PLUGIN_CACHE_DIR=~/activity/.tfcache && mkdir -p "$TF_PLUGIN_CACHE_DIR"
 export ACTIVITY_CLONE_MARGIN_DAYS=120        # what the bundled sample used to keep every in-window commit's parent
-mkdir -p $S/stores $S/views; rm -rf $S/clones        # manifest: --clone-dir is the PARENT dir
+mkdir -p $S/stores $S/views                          # manifest: --clone-dir is the PARENT dir
 python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones
 python3 $AO/validate.py $S/stores/$M.db --project avm-tf-network
 python3 $AO/digest.py --store $S/stores/$M.db --project avm-tf-network --from $FROM --to $TO > $S/views/$M.json
@@ -397,7 +400,7 @@ naming convention resolves Terraform members):
 ```
 
 ```bash
-S=~/activity/ai-lz; mkdir -p $S/stores $S/views; rm -rf $S/clones
+S=~/activity/ai-lz; mkdir -p $S/stores $S/views
 python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones
 python3 $AO/validate.py $S/stores/$M.db --project ai-lz
 python3 $AO/digest.py --store $S/stores/$M.db --project ai-lz --from $FROM --to $TO > $S/views/$M.json
@@ -479,8 +482,8 @@ One store per stream keeps commands simple and failures isolated.
   folded windows are in `meta.gathered_windows`.
 - **Dependency edges are never retracted.** A store keeps every `depends_on` edge it has
   folded; a fresh store reflects the checkout gathered for that window.
-- **Clones** are separate (`--clone-dir`) and must be deleted before the next gather into the
-  same path.
+- **Clones** are separate (`--clone-dir`); the next gather into the same path fetches the
+  existing clone (it must be a clone of the same repo).
 
 ## 9. Readers cookbook
 
@@ -510,7 +513,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 ```
 
   where `monthly.sh` computes last month's `FROM`/`TO`/`M`, exports the token from your secret
-  store, deletes the stream's clone directory, and runs §4 steps 1–3 for each stream into a new
+  store, and runs §4 steps 1–3 for each stream into a new
   `stores/$M.db` (stop the stream on a non-zero exit). Running it at month-end (or the 1st)
   matters: in-flight work, milestones and board status are captured as they are at gather time.
 - **Narrative.** Run `/activity` (or the manual §4 steps 4–6 + "write the report") in Claude
@@ -530,7 +533,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` → multiple projects | store holds several projects/repos | pass `--project` (and `--repo`) |
 | `validate` ERROR `no_drift` "lifecycle length drift" | several overlapping windows folded into one store (known limitation, HLD §10) | use one store per installment; rebuild history stores from one wide gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
-| `fatal: destination path ... already exists` | `--clone-dir` (or the default `workspace/<repo>-clone`) still exists | delete it and re-run; gather always clones fresh |
+| `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
 | Last month's merges appear as shipped this month | the view was built from a store holding several months (no `meta.period`, HLD §10) | rebuild the month from its own single-window store |
 | Warning: boundary-dropped commits | shallow clone too shallow | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
 | `edge_extraction` timeouts | slow `terraform init` / registry | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |

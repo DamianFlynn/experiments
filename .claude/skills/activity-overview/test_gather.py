@@ -4406,3 +4406,26 @@ class TestFetchProjectBoard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSeededCrossrefsSurviveEnrichment(unittest.TestCase):
+    """The "mentioned, not closed" refs normalize_pr seeds from the body (#62)
+    must survive the timeline merge in enrich_pr (#61), order-preserving."""
+
+    def test_list_tail_ref_kept_and_timeline_refs_appended(self):
+        pr = {"number": 5, "merged": False, "crossref_issues": [2]}
+        timeline = [{"event": "cross-referenced",
+                     "source": {"issue": {"number": 9}}},
+                    {"event": "cross-referenced",
+                     "source": {"issue": {"number": 2}}}]
+
+        def get_page(url):
+            return (timeline if "/timeline" in url else []), None
+
+        gather.enrich_pr(pr, get_page, "https://api.github.com/repos/o/r", "o/r")
+        self.assertEqual(pr["crossref_issues"][0], 2)
+        self.assertEqual(sorted(pr["crossref_issues"]),
+                         sorted(set(pr["crossref_issues"])))
+        self.assertEqual(pr["crossref_issues"],
+                         [2] + [n for n in gather.parse_timeline_crossrefs(timeline)
+                                if n != 2])

@@ -176,19 +176,136 @@ def _shift_date(date_str, days):
         return date_str
 
 
-def build_clone_cmd(repo_url, from_date, clone_dir):
+def _shallow_selector(from_date, depth1=False):
+    """The history bound shared by clone and fetch: `--shallow-since=<from - margin>`,
+    or `--depth=1` for the quiet-repo fallback."""
+    if depth1:
+        return "--depth=1"
+    return f"--shallow-since={_shift_date(from_date, -_clone_margin_days())}"
+
+
+def build_clone_cmd(repo_url, from_date, clone_dir, depth1=False):
     """Construct the bounded, partial clone command (network-free to build).
 
     `--shallow-since` reaches CLONE_MARGIN_DAYS before `from_date` (override with
     ACTIVITY_CLONE_MARGIN_DAYS) so the shallow boundary commit (whole-tree phantom
-    diff) sits OUTSIDE the report window."""
+    diff) sits OUTSIDE the report window. `depth1=True` is the quiet-repo fallback
+    (see prepare_clone): just the tip, so HEAD exists for the IaC/CODEOWNERS steps."""
     return [
         "git", "clone",
         "--filter=blob:none",
-        f"--shallow-since={_shift_date(from_date, -_clone_margin_days())}",
+        _shallow_selector(from_date, depth1),
         "--no-single-branch",
         repo_url, clone_dir,
     ]
+
+
+def build_fetch_cmd(clone_dir, from_date, depth1=False):
+    """Refresh an existing clone to the same history bound a fresh clone would get.
+    `--shallow-since` on fetch deepens OR shortens the shallow boundary, so a reused
+    clone ends up with the same boundary as a fresh one for this window."""
+    return ["git", "-C", clone_dir, "fetch", "--prune",
+            _shallow_selector(from_date, depth1), "origin"]
+
+
+# git's message when `--shallow-since` matches no commit on any fetched ref (the
+# repo has been quiet since before `from - margin`). Only THIS failure falls back
+# to --depth=1; any other clone/fetch error (network, auth, missing repo) raises.
+_NO_SHALLOW_COMMITS = "no commits selected for shallow requests"
+
+
+def _normalize_remote(url):
+    """Comparable form of a remote URL: GitHub ssh forms mapped to https, case
+    folded, trailing `/` and `.git` dropped."""
+    u = (url or "").strip()
+    for pre in ("git@github.com:", "ssh://git@github.com/"):
+        if u.lower().startswith(pre):
+            u = "https://github.com/" + u[len(pre):]
+    u = u.rstrip("/")
+    if u.lower().endswith(".git"):
+        u = u[:-4]
+    return u.rstrip("/").lower()
+
+
+def _shallow_or_depth1(run, build):
+    """Run `build(depth1=False)`; on the quiet-repo failure retry `build(depth1=True)`.
+    Returns True when the depth-1 fallback was used."""
+    try:
+        run(build(False))
+        return False
+    except RuntimeError as exc:
+        if _NO_SHALLOW_COMMITS not in str(exc):
+            raise
+    run(build(True))
+    return True
+
+
+def _default_branch(clone_dir, run):
+    """The remote's default branch name for an existing clone. Refreshes
+    `origin/HEAD` first (best effort), falls back to the checked-out branch."""
+    try:
+        run(["git", "-C", clone_dir, "remote", "set-head", "origin", "--auto"])
+    except RuntimeError:
+        pass
+    try:
+        ref = run(["git", "-C", clone_dir, "symbolic-ref", "--short",
+                   "refs/remotes/origin/HEAD"]).strip()
+        if ref.startswith("origin/"):
+            return ref[len("origin/"):]
+    except RuntimeError:
+        pass
+    return run(["git", "-C", clone_dir, "symbolic-ref", "--short", "HEAD"]).strip()
+
+
+def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
+    """Make `clone_dir` a bounded clone of `repo_url` for a window starting
+    `from_date`, and return how (recorded as `meta.clone_mode`):
+
+    - "fresh": no (or an empty) dir -> `git clone --shallow-since=<from - margin>`.
+    - "fetched": the dir is already a clone of the SAME remote -> `git fetch
+      --shallow-since=...` (deepens or shortens to the window's bound) and check
+      out the remote default branch head. So a second monthly run into the same
+      `--clone-dir` works, and `--no-clone` no longer walks stale history.
+    - "depth1-fallback": `--shallow-since` selected no commits (a quiet repo) ->
+      retried with `--depth=1`, so HEAD exists for IaC edges / CODEOWNERS / the
+      structural scan; the caller treats the commit walks as empty.
+    - "none": `no_clone` and no clone on disk -> nothing created; walks degrade
+      to empty.
+
+    An existing non-empty dir that is not a git clone, or is a clone of a
+    different remote, raises RuntimeError and is left untouched (never deleted).
+    """
+    run = run or run_git
+    exists = os.path.exists(clone_dir)
+    if exists and os.path.isdir(clone_dir) and not os.listdir(clone_dir):
+        exists = False      # an empty dir is as good as none: git clone accepts it
+    if exists:
+        if not os.path.exists(os.path.join(clone_dir, ".git")):
+            raise RuntimeError(
+                f"--clone-dir {clone_dir} exists but is not a git clone; "
+                f"point --clone-dir elsewhere or remove it")
+        try:
+            have = run(["git", "-C", clone_dir, "config", "--get",
+                        "remote.origin.url"]).strip()
+        except RuntimeError:
+            have = ""
+        if _normalize_remote(have) != _normalize_remote(repo_url):
+            raise RuntimeError(
+                f"--clone-dir {clone_dir} is a clone of a different remote "
+                f"({have or 'no origin'}), not {repo_url}; point --clone-dir elsewhere")
+        depth1 = _shallow_or_depth1(
+            run, lambda d1: build_fetch_cmd(clone_dir, from_date, d1))
+        branch = _default_branch(clone_dir, run)
+        run(["git", "-C", clone_dir, "checkout", "-q", "-B", branch,
+             f"refs/remotes/origin/{branch}"])
+        return "depth1-fallback" if depth1 else "fetched"
+    if no_clone:
+        return "none"
+    # git clone needs the parent dir to exist for the default workspace/ path.
+    os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
+    depth1 = _shallow_or_depth1(
+        run, lambda d1: build_clone_cmd(repo_url, from_date, clone_dir, d1))
+    return "depth1-fallback" if depth1 else "fresh"
 
 
 def shallow_boundary_shas(clone_dir):
@@ -3152,7 +3269,11 @@ def enrich_pr(pr, get_page, api, current_slug):
     if submissions:
         pr["reviews"] = submissions
     timeline = fetch_all(get_page, f"{api}/issues/{num}/timeline?per_page=100")
-    pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
+    # Keep the refs normalize_pr seeded from the body (list tails such as the #2
+    # in "Fixes #1, #2": mentioned, not closed) and add the timeline's, in order.
+    seeded = list(pr.get("crossref_issues") or [])
+    pr["crossref_issues"] = seeded + [
+        n for n in parse_timeline_crossrefs(timeline) if n not in seeded]
     _attach_timeline_xrefs(pr, timeline, current_slug)
     # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
     # ready_for_review). Omit-when-empty for byte stability.
@@ -3170,6 +3291,11 @@ def enrich_pr(pr, get_page, api, current_slug):
     return pr
 
 
+def _github_remote_url(owner, repo):
+    """The clone/fetch URL for a member repo (a seam so tests can use file://)."""
+    return f"https://github.com/{owner}/{repo}.git"
+
+
 def acquire(args, env):
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
         sys.stderr.write("error: --owner --repo --from --to are required\n")
@@ -3178,12 +3304,20 @@ def acquire(args, env):
     owner, repo = args.owner, args.repo
     frm, to = getattr(args, "from"), args.to
     clone_dir = args.clone_dir or f"workspace/{repo}-clone"
-    repo_url = f"https://github.com/{owner}/{repo}.git"
+    repo_url = _github_remote_url(owner, repo)
 
-    if not args.no_clone:
-        # git clone needs the parent dir to exist for the default workspace/ path.
-        os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
-        run_git(build_clone_cmd(repo_url, frm, clone_dir))
+    # Clone fresh, or fetch an existing clone of the same remote; a quiet repo
+    # (nothing since `frm - margin`) falls back to --depth=1 (see prepare_clone).
+    clone_mode = prepare_clone(repo_url, frm, clone_dir, no_clone=args.no_clone)
+    if clone_mode == "depth1-fallback":
+        sys.stderr.write(
+            f"note: {owner}/{repo} has no commits since the clone bound "
+            f"(--from minus {_clone_margin_days()} days); cloned at --depth=1 and "
+            f"treating the commit walks as empty (meta.clone_mode=depth1-fallback)\n")
+    # All three git walks need real window history on disk: skipped (empty) when
+    # there is no clone (--no-clone with nothing on disk) or only the depth-1 tip
+    # of a quiet repo (whose whole-tree diff is not window activity).
+    walk_clone = clone_mode in ("fresh", "fetched") and os.path.isdir(clone_dir)
 
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
@@ -3191,18 +3325,20 @@ def acquire(args, env):
     # The shallow clone already bounds history to ~CLONE_MARGIN_DAYS before `frm`;
     # we walk it fully and window in Python (window_records) rather than with git's
     # `--since/--until`, which prunes valid in-window commits across timezones.
-    raw = run_git([
-        "git", "-C", clone_dir, "log",
-        f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
-    ])
-    commits = window_records(parse_git_log(raw), frm, to)
+    commits = []
+    if walk_clone:
+        raw = run_git([
+            "git", "-C", clone_dir, "log",
+            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
+        ])
+        commits = window_records(parse_git_log(raw), frm, to)
 
     # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
-    # Guarded so --no-clone / missing clone degrades gracefully to empty.
+    # Guarded (walk_clone) so a missing clone degrades gracefully to empty.
     # `--reverse` so events arrive OLDEST→NEWEST: build_artifacts appends lifecycle
     # in walk order and derives status from the last (newest) event.
     code_events = []
-    if not args.no_clone or os.path.isdir(clone_dir):
+    if walk_clone:
         raw_walk = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
@@ -3214,7 +3350,7 @@ def acquire(args, env):
     # (diff-local, no per-commit checkout). Same guard/degradation + oldest→newest
     # ordering (--reverse) as the file walk so symbol lifecycle/status is correct.
     symbol_events = []
-    if not args.no_clone or os.path.isdir(clone_dir):
+    if walk_clone:
         raw_patch = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
@@ -3442,6 +3578,7 @@ def acquire(args, env):
         # fork contributions, not shipped-to-main (link.build_trains keys on this).
         "base_branch": args.branches.split(",")[0],
         "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
+        "clone_mode": clone_mode,
         "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }

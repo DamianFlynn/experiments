@@ -455,8 +455,6 @@ These are real, current limits — plan around them:
 12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
-13. **Fresh clone per gather.** `gather` always runs `git clone` into `--clone-dir` (which must
-    not exist); `--no-clone` reuses a clone without fetching.
 
 Items 8–9 are why USAGE recommends one store per installment; they are candidates for code
 fixes (set `meta.period` and window the materialized arrays in `extract`; make artifact

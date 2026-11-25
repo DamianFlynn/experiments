@@ -166,11 +166,22 @@ sequenceDiagram
 
 ### 4.3 Clone and windowing
 
-- Unless `--no-clone`, `acquire` always runs `git clone` (`build_clone_cmd`) into `--clone-dir`
-  (default `workspace/<repo>-clone`; for manifests `--clone-dir` is the parent of per-member
-  `<owner>-<repo>-clone` dirs), so the directory must not already exist. `--no-clone` walks an
-  existing clone **without fetching** — only correct if that clone was refreshed beforehand.
-- The clone uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
+- `acquire` calls `prepare_clone` on `--clone-dir` (default `workspace/<repo>-clone`; for
+  manifests `--clone-dir` is the parent of per-member `<owner>-<repo>-clone` dirs) and records
+  the outcome in `meta.clone_mode`:
+  - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`).
+  - `fetched` — the dir is already a clone of the same remote (`remote.origin.url`, GitHub
+    https/ssh forms compared equal): `git fetch --prune --shallow-since=…` (`build_fetch_cmd`;
+    deepens or shortens to this window's bound) then `checkout -B <default branch>` at the
+    fetched `origin/<default branch>`. Applies with and without `--no-clone`.
+  - `depth1-fallback` — `--shallow-since` selected no commits (git: "no commits selected for
+    shallow requests", a quiet repo): the clone/fetch is retried with `--depth=1` so HEAD exists
+    for IaC edges / CODEOWNERS / the structural scan; the three git walks are skipped (empty).
+    Any other clone/fetch error still raises.
+  - `none` — `--no-clone` and no clone on disk: nothing is created; the walks are empty.
+  A non-empty dir that is not a git clone, or is a clone of another remote, raises and is left
+  untouched.
+- The clone/fetch uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
   margin keeps each in-window commit's real parent in the clone.
 - `shallow_boundary_shas` + `drop_boundary_events` remove events from a commit whose parent
   was grafted away (its diff would be a whole-tree phantom). Any **in-window** commit dropped
@@ -913,10 +924,14 @@ release/milestone pages`. Because **all open PRs and issues** are included every
 repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
+<<<<<<< HEAD
 off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
 `ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
 A window with more than 1,000 workflow runs costs a few extra requests for the day-splits. (`--no-clone` saves the clone only if you refresh the existing clone yourself —
 gather does not fetch.)
+=======
+off-hours. (A reused `--clone-dir` is fetched rather than re-cloned.)
+>>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 ### 14.4 Security
 
@@ -935,9 +950,12 @@ gather does not fetch.)
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
+<<<<<<< HEAD
 | Clone dir reuse | `git clone` into an existing dir fails; `--no-clone` does not fetch | repeated runs need a fresh dir | fetch/deepen an existing clone |
 | `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
+=======
+>>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 The operating guidance in USAGE (one single-window store per installment, series file for
 continuity, wide single gathers for history stores) avoids the first two in practice.

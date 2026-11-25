@@ -55,7 +55,9 @@ the rest (engagement, code areas, trains, people/flow).
   Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
   It pins the exact source tree (edges are a pure function of source), which is the basis for
   the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,
-  idempotent by identity. (Store-only — see `STORE.md`; this bundle shape is the
+  idempotent by identity. **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` | `none`)
+  records how gather obtained the clone (see `gather.prepare_clone`); it is in the bundle
+  `acquire` assembles and is not folded into the store. (Store-only — see `STORE.md`; this bundle shape is the
   transient view `extract` materializes from the store, not a produced file.)
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it

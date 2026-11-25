@@ -449,7 +449,7 @@ python3 gather.py --manifest workspace/manifest.json --store workspace/journey.d
 `manifest.load_manifest` validates the file before the store is touched and raises
 `ValueError` (`manifest: …`) on: a non-string or empty field; a `project` containing
 `/` or `#`; a window bound that is not a real `YYYY-MM-DD` date, or `from` after `to`;
-an `owner` that is not a GitHub user/org name (letters, digits, single hyphens, not
+an `owner` that is not a GitHub user/org name (letters, digits, `-` and `_`, not
 starting with `-`, ≤ 39 chars); a `repo` outside GitHub's alphabet (letters, digits,
 `-`, `_`, `.`; ≤ 100 chars; not `.`/`..`); two members naming the same repo
 **case-insensitively** (`o/a` and `O/A`); a `registry` that is present but not a

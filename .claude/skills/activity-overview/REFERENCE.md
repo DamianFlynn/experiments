@@ -119,6 +119,7 @@ window so an in-window commit keeps its real parent. If `meta.boundary_dropped_c
 is non-empty (an in-window commit still landed on the shallow boundary, so its
 whole-tree phantom diff was dropped), widen this knob and re-gather to recover it.
 
+<<<<<<< HEAD
 ### GitHub API knobs
 
 Every GitHub request has a timeout and is retried with back-off on timeouts and 5xx;
@@ -134,6 +135,13 @@ its minimum is clamped with a warning.
 If a window has more than 1,000 workflow runs (GitHub's per-search cap) gather
 splits the query by day; a single day still over the cap is reported on stderr and
 marked in `workflow_stats._truncated`.
+=======
+An existing `--clone-dir` that is a clone of the same repo is **fetched** to that bound
+(and the default branch head checked out) instead of re-cloned; `--no-clone` never creates
+a clone (it fetches an existing one, or gathers API data only when there is none). A repo
+with no commits since the bound is cloned at `--depth=1` and contributes no commits.
+`meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.
+>>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 ### Projects v2 board knobs
 
