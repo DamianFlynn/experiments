@@ -641,7 +641,9 @@ Outcome is deliberately ignored (a rejected train's story still matters).
 `effort`: `opened_at`, `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
 (sum), `commits`, `participants` (distinct authors + reviewers + commenters), `stalled`
 (merged and `elapsed_days > TRAIN_STALL_DAYS` = 21). Review rounds and reopen counts are added
-by `annotate_review_rounds` / `annotate_reopen_count`.
+by `annotate_review_rounds` / `annotate_reopen_count`. Review rounds ignore `PENDING` reviews
+and the PR author's own reviews; the exact round and `review_decision` rules are in
+`BUNDLE.md` → *Review decision & rounds*.
 
 ### 6.7 Forecast — `build_forecast`
 

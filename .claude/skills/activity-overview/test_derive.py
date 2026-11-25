@@ -347,6 +347,116 @@ class ReviewRoundsAndReopenCount(unittest.TestCase):
         self.assertEqual(bundle["prs"][0]["review_rounds"]["states"],
                          ["commented", "approved"])
 
+    # --- issue #63: precise review-round definition ------------------------
+    @staticmethod
+    def _rounds(reviews, author="alice"):
+        bundle = {"prs": [{"number": 1, "author": author, "reviews": reviews}]}
+        derive.annotate_review_rounds(bundle)
+        return bundle["prs"][0].get("review_rounds")
+
+    def test_review_rounds_exclude_pending_and_author_replies(self):
+        # observed before the fix: count 3, ['pending','approved','commented']
+        got = self._rounds([
+            {"id": 3, "author": "bob", "state": "pending", "submitted_at": None},
+            {"id": 1, "author": "carol", "state": "approved",
+             "submitted_at": "2026-01-02T00:00:00Z"},
+            {"id": 2, "author": "alice", "state": "commented",
+             "submitted_at": "2026-01-03T00:00:00Z"},
+        ])
+        self.assertEqual(got, {"count": 1, "states": ["approved"]})
+
+    def test_review_rounds_only_author_or_pending_omits_key(self):
+        self.assertIsNone(self._rounds([
+            {"id": 1, "author": "alice", "state": "commented",
+             "submitted_at": "2026-01-03T00:00:00Z"},
+            {"id": 2, "author": "bob", "state": "pending", "submitted_at": None},
+        ]))
+
+    def test_review_rounds_changes_requested_then_rereview_opens_round(self):
+        got = self._rounds([
+            {"id": 1, "author": "bob", "state": "changes_requested",
+             "submitted_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "author": "alice", "state": "commented",
+             "submitted_at": "2026-01-01T12:00:00Z"},  # author reply: ignored
+            {"id": 3, "author": "bob", "state": "changes_requested",
+             "submitted_at": "2026-01-02T00:00:00Z"},
+            {"id": 4, "author": "bob", "state": "approved",
+             "submitted_at": "2026-01-03T00:00:00Z"},
+        ])
+        # round 1: bob requests changes; round 2: bob re-reviews and requests
+        # changes again (a repeat reviewer starts a new block); round 3: bob
+        # approves.
+        self.assertEqual(got, {"count": 3, "states": [
+            "changes_requested", "changes_requested", "approved"]})
+
+    def test_review_rounds_each_rereview_after_changes_opens_round(self):
+        got = self._rounds([
+            {"id": 1, "author": "bob", "state": "changes_requested",
+             "submitted_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "author": "bob", "state": "commented",
+             "submitted_at": "2026-01-02T00:00:00Z"},
+            {"id": 3, "author": "bob", "state": "changes_requested",
+             "submitted_at": "2026-01-03T00:00:00Z"},
+            {"id": 4, "author": "bob", "state": "approved",
+             "submitted_at": "2026-01-04T00:00:00Z"},
+        ])
+        self.assertEqual(got["count"], 3)
+
+    def test_review_rounds_concurrent_changes_requests_are_one_round(self):
+        # bob and carol both request changes before any re-review -> one block;
+        # the first later review that is not a change request opens round 2.
+        got = self._rounds([
+            {"id": 1, "author": "bob", "state": "changes_requested",
+             "submitted_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "author": "carol", "state": "changes_requested",
+             "submitted_at": "2026-01-01T01:00:00Z"},
+            {"id": 3, "author": "bob", "state": "commented",
+             "submitted_at": "2026-01-02T00:00:00Z"},
+            {"id": 4, "author": "carol", "state": "approved",
+             "submitted_at": "2026-01-03T00:00:00Z"},
+        ])
+        self.assertEqual(got["count"], 2)
+
+    def test_review_rounds_no_change_request_is_one_round(self):
+        got = self._rounds([
+            {"id": 1, "author": "bob", "state": "commented",
+             "submitted_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "author": "carol", "state": "approved",
+             "submitted_at": "2026-01-02T00:00:00Z"},
+            {"id": 3, "author": "bob", "state": "approved",
+             "submitted_at": "2026-01-03T00:00:00Z"},
+        ])
+        self.assertEqual(got, {"count": 1,
+                               "states": ["commented", "approved", "approved"]})
+
+    def test_review_rounds_trailing_change_request_does_not_open_round(self):
+        got = self._rounds([
+            {"id": 1, "author": "bob", "state": "approved",
+             "submitted_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "author": "carol", "state": "changes_requested",
+             "submitted_at": "2026-01-02T00:00:00Z"},
+        ])
+        self.assertEqual(got["count"], 1)
+
+    def test_review_rounds_state_case_insensitive(self):
+        got = self._rounds([
+            {"id": 1, "author": "bob", "state": "CHANGES_REQUESTED",
+             "submitted_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "author": "bob", "state": "PENDING", "submitted_at": None},
+            {"id": 3, "author": "bob", "state": "APPROVED",
+             "submitted_at": "2026-01-02T00:00:00Z"},
+        ])
+        self.assertEqual(got, {"count": 2,
+                               "states": ["changes_requested", "approved"]})
+
+    def test_review_rounds_unknown_pr_author_keeps_all_submitted(self):
+        got = self._rounds([
+            {"id": 1, "author": "alice", "state": "commented",
+             "submitted_at": "2026-01-01T00:00:00Z"},
+            {"id": 2, "author": "bob", "state": "pending", "submitted_at": None},
+        ], author=None)
+        self.assertEqual(got, {"count": 1, "states": ["commented"]})
+
     def test_reopen_count_on_pr_and_issue(self):
         bundle = {
             "prs": [{"number": 7, "lifecycle": [

@@ -591,32 +591,60 @@ def normalize_issue(raw):
     }
 
 
-# Review states ranked by how strongly they gate a merge. A PR's decision is
-# the strongest *latest-per-reviewer* signal: any outstanding changes-requested
-# dominates; otherwise an approval; otherwise a bare comment.
-_REVIEW_RANK = {"changes_requested": 3, "approved": 2, "commented": 1, "none": 0}
+# Submitted review states (GitHub: APPROVED, CHANGES_REQUESTED, COMMENTED,
+# DISMISSED; PENDING is an unsubmitted draft and is never counted). Only the
+# "decisive" ones set a reviewer's effective state: GitHub records every
+# review-thread reply as a COMMENTED review and keeps the earlier approval /
+# change request in force, and a dismissed review (whose state GitHub rewrites
+# to DISMISSED) no longer gates the merge.
+_DECISIVE_REVIEW_STATES = ("approved", "changes_requested", "dismissed")
+_SUBMITTED_REVIEW_STATES = _DECISIVE_REVIEW_STATES + ("commented",)
+
+
+def _review_order_key(index, r):
+    """Chronological sort key for a raw review: (submitted_at, id, list index).
+    ISO-8601 UTC `Z` timestamps sort correctly as plain strings; GitHub review
+    ids grow monotonically, so they break same-second ties; the input position
+    is the final, deterministic fallback."""
+    rid = r.get("id")
+    return (r.get("submitted_at") or "",
+            rid if isinstance(rid, int) and not isinstance(rid, bool) else -1,
+            index)
 
 
 def summarize_reviews(raw_reviews):
-    """Reduce raw PR reviews to {reviewers, decision}. Pure."""
-    latest = {}  # login -> (submitted_at, state)
-    for r in raw_reviews or []:
+    """Reduce raw PR reviews to {reviewers, decision}. Pure.
+
+    `reviewers`: sorted logins with at least one SUBMITTED review (PENDING
+    drafts and unknown states are ignored).
+
+    `decision` (issue #63): each reviewer's effective state is their latest
+    APPROVED / CHANGES_REQUESTED / DISMISSED review — a later COMMENTED review
+    never overrides it; a reviewer with none of those is `commented`; an
+    effective DISMISSED contributes nothing. Overall: `changes_requested` if any
+    reviewer's effective state is that, else `approved` if any, else
+    `commented` if any, else `none`."""
+    indexed = sorted(enumerate(raw_reviews or []),
+                     key=lambda p: _review_order_key(p[0], p[1]))
+    effective = {}  # login -> effective state
+    for _, r in indexed:
         login = (r.get("user") or {}).get("login")
         if not login:
             continue
         state = (r.get("state") or "").lower()
-        if state not in _REVIEW_RANK:
+        if state not in _SUBMITTED_REVIEW_STATES:
             continue
-        ts = r.get("submitted_at") or ""
-        # ISO-8601 (UTC `Z`) timestamps sort correctly as plain strings.
-        if login not in latest or ts >= latest[login][0]:
-            latest[login] = (ts, state)
-    reviewers = sorted(latest)
-    decision = "none"
-    for _, state in latest.values():
-        if _REVIEW_RANK[state] > _REVIEW_RANK[decision]:
-            decision = state
-    return {"reviewers": reviewers, "decision": decision}
+        if state in _DECISIVE_REVIEW_STATES:
+            effective[login] = state          # later decisive review wins
+        else:
+            effective.setdefault(login, "commented")
+    states = set(effective.values())
+    for decision in ("changes_requested", "approved", "commented"):
+        if decision in states:
+            break
+    else:
+        decision = "none"
+    return {"reviewers": sorted(effective), "decision": decision}
 
 
 def normalize_review(raw):

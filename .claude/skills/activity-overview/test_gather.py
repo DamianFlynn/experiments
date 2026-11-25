@@ -447,6 +447,68 @@ class TestReviewsAndTimeline(unittest.TestCase):
     def test_summarize_reviews_empty_is_none(self):
         self.assertEqual(gather.summarize_reviews([])["decision"], "none")
 
+    # --- issue #63: a later COMMENTED/PENDING review must not erase a decision -
+    @staticmethod
+    def _rv(login, state, ts, rid=None):
+        r = {"user": {"login": login}, "state": state, "submitted_at": ts}
+        if rid is not None:
+            r["id"] = rid
+        return r
+
+    def test_summarize_reviews_approve_then_comment_stays_approved(self):
+        raw = [self._rv("a", "APPROVED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a"], "decision": "approved"})
+
+    def test_summarize_reviews_changes_then_comment_stays_changes_requested(self):
+        raw = [self._rv("a", "CHANGES_REQUESTED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"],
+                         "changes_requested")
+
+    def test_summarize_reviews_changes_then_approved_is_approved(self):
+        raw = [self._rv("a", "CHANGES_REQUESTED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z"),
+               self._rv("a", "APPROVED", "2026-05-03T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+
+    def test_summarize_reviews_dismissed_approval_no_longer_counts(self):
+        # GitHub rewrites a dismissed review's state to DISMISSED.
+        raw = [self._rv("a", "DISMISSED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "COMMENTED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a"], "decision": "none"})
+
+    def test_summarize_reviews_dismissed_then_reapproved(self):
+        raw = [self._rv("a", "DISMISSED", "2026-05-01T00:00:00Z"),
+               self._rv("a", "APPROVED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+
+    def test_summarize_reviews_dismissed_changes_request_unblocks(self):
+        raw = [self._rv("a", "DISMISSED", "2026-05-01T00:00:00Z"),
+               self._rv("b", "APPROVED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a", "b"], "decision": "approved"})
+
+    def test_summarize_reviews_comment_only_is_commented(self):
+        raw = [self._rv("a", "COMMENTED", "2026-05-01T00:00:00Z"),
+               self._rv("b", "DISMISSED", "2026-05-02T00:00:00Z")]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "commented")
+
+    def test_summarize_reviews_pending_ignored(self):
+        raw = [self._rv("a", "APPROVED", "2026-05-01T00:00:00Z"),
+               {"user": {"login": "b"}, "state": "PENDING", "submitted_at": None}]
+        self.assertEqual(gather.summarize_reviews(raw),
+                         {"reviewers": ["a"], "decision": "approved"})
+
+    def test_summarize_reviews_same_timestamp_breaks_tie_by_id(self):
+        raw = [self._rv("a", "APPROVED", "2026-05-01T00:00:00Z", rid=2),
+               self._rv("a", "CHANGES_REQUESTED", "2026-05-01T00:00:00Z", rid=1)]
+        self.assertEqual(gather.summarize_reviews(raw)["decision"], "approved")
+        self.assertEqual(
+            gather.summarize_reviews(list(reversed(raw)))["decision"], "approved")
+
     def test_parse_timeline_crossrefs_collects_issue_numbers(self):
         raw = [
             {"event": "cross-referenced",

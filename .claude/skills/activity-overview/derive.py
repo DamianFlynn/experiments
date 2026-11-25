@@ -232,22 +232,71 @@ def build_modules(bundle, idx):
     return bundle
 
 
-def annotate_review_rounds(bundle):
-    """Set `review_rounds` on each PR that has review submissions (Phase 10).
+_ROUND_REVIEW_STATES = ("approved", "changes_requested", "commented", "dismissed")
 
-    `review_rounds = {count, states}` where `states` is the per-submission state
-    ordered by `submitted_at` (the approve->changes-requested->re-review
-    texture). PRs with no `reviews` are left untouched (no fabricated key). Pure
-    (in place); returns bundle for convenience."""
-    for pr in bundle.get("prs", []):
-        reviews = pr.get("reviews")
-        if not reviews:
+
+def _counted_reviews(pr):
+    """The PR's review submissions that take part in review rounds, oldest
+    first: SUBMITTED (state approved/changes_requested/commented/dismissed AND a
+    `submitted_at`; PENDING drafts never count) and NOT by the PR author (the
+    author's own thread replies are recorded by GitHub as COMMENTED reviews).
+    When the PR author is unknown nobody is excluded on that ground. Order:
+    (submitted_at, integer id, input position) — deterministic."""
+    pr_author = pr.get("author")
+    kept = []
+    for i, r in enumerate(pr.get("reviews") or []):
+        state = (r.get("state") or "").lower()
+        if state not in _ROUND_REVIEW_STATES or not r.get("submitted_at"):
             continue
-        ordered = sorted(reviews, key=lambda r: (r.get("submitted_at") or "",
-                                                 r.get("id") or 0))
+        if pr_author and r.get("author") == pr_author:
+            continue
+        rid = r.get("id")
+        rid = rid if isinstance(rid, int) and not isinstance(rid, bool) else -1
+        kept.append(((r["submitted_at"], rid, i), state, r.get("author")))
+    kept.sort(key=lambda t: t[0])
+    return [(state, author) for _, state, author in kept]
+
+
+def count_review_rounds(counted):
+    """Number of review rounds in an ordered [(state, reviewer)] sequence.
+
+    A *change-request block* is a maximal run of consecutive `changes_requested`
+    submissions from distinct reviewers (a reviewer repeating a change request
+    starts a new block — that is a re-review). Rounds = 0 when there is no
+    counted review, else 1 + the number of change-request blocks followed by at
+    least one later counted review (the re-review that opens the next round).
+    A trailing block with nothing after it does not open a round."""
+    if not counted:
+        return 0
+    rounds = 1
+    block = None  # reviewers in the open change-request block, or None
+    for state, reviewer in counted:
+        if block is not None and (state != "changes_requested" or reviewer in block):
+            rounds += 1          # a later review after a change-request block
+            block = None
+        if state == "changes_requested":
+            if block is None:
+                block = set()
+            block.add(reviewer)
+    return rounds
+
+
+def annotate_review_rounds(bundle):
+    """Set `review_rounds` on each PR with counted review submissions (Phase 10,
+    defined precisely by issue #63 — see BUNDLE.md "Review decision & rounds").
+
+    `review_rounds = {count, states}`: `states` is the state of every counted
+    submission (`_counted_reviews`: submitted, not PENDING, not by the PR
+    author), oldest first; `count` is `count_review_rounds` over them. PRs with
+    no counted review are left untouched (no fabricated key). Pure (in place);
+    returns bundle for convenience."""
+    for pr in bundle.get("prs", []):
+        counted = _counted_reviews(pr)
+        if not counted:
+            continue
         pr["review_rounds"] = {
-            "count": len(ordered),
-            "states": [r.get("state") for r in ordered],
+            "count": count_review_rounds(counted),
+            "states": [state for state, _ in counted],
         }
     return bundle
 

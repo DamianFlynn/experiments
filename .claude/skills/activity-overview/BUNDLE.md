@@ -114,7 +114,8 @@ docsRefs, release_train, sprints, project, diagrams`.
 
 - **prs[]** gain `created_at`, `updated_at`, `milestone`, `comments`,
   `review_comments_count`, `reviewers`, `review_decision`
-  (`approved|changes_requested|commented|none`), and `crossref_issues`.
+  (`approved|changes_requested|commented|none`), and `crossref_issues`. See
+  *Review decision & rounds* below for the exact rules.
 - **issues[]** gain `milestone`, `updated_at`, `comments`. Open and
   not-planned-closed issues are now included, not just PR-closing issues.
 - **workflows[]**, **workflow_stats{}**, **releases[]**, **milestones[]** are
@@ -146,6 +147,43 @@ docsRefs, release_train, sprints, project, diagrams`.
   / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
+
+### Review decision & rounds
+
+GitHub review states are `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`
+and `PENDING`. `PENDING` is an unsubmitted draft and never counts anywhere. GitHub
+records every review-thread reply as a `COMMENTED` review, and rewrites a dismissed
+review's state to `DISMISSED`.
+
+- **`prs[].reviewers`** (`gather.summarize_reviews`) — sorted logins with at least
+  one submitted review (`APPROVED`/`CHANGES_REQUESTED`/`COMMENTED`/`DISMISSED`).
+- **`prs[].review_decision`** (`gather.summarize_reviews`) — per reviewer, the
+  *effective state* is their latest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`
+  review (chronological by `submitted_at`, then review id); a later `COMMENTED`
+  review never overrides it. A reviewer with none of those three is `commented`. An
+  effective `DISMISSED` contributes nothing. Overall: `changes_requested` if any
+  reviewer's effective state is that, else `approved` if any, else `commented` if
+  any, else `none`. So approve → comment = `approved`; changes requested → comment
+  = `changes_requested`; changes requested → approve = `approved`; an approval
+  that was dismissed (and not re-given) is no longer an approval.
+- **`prs[].review_rounds`** `{count, states}` (`derive.annotate_review_rounds`,
+  enrich-time; omitted when the PR has no counted review). A **counted review** is a
+  submission with a `submitted_at` and state `approved`/`changes_requested`/
+  `commented`/`dismissed` (never `pending`) whose author is **not the PR author**
+  (when `pr.author` is unknown, nobody is excluded on that ground). `states` lists
+  every counted review's state, oldest first (`submitted_at`, then integer id, then
+  input order). A **change-request block** is a maximal run of consecutive
+  `changes_requested` counted reviews from distinct reviewers (a reviewer repeating
+  a change request starts a new block — that is a re-review). A **review round**
+  is: the first counted review opens round 1, and each change-request block that is
+  followed by at least one later counted review opens one more round. So
+  `count = 0` with no counted review, else `1 + (change-request blocks followed by a
+  later counted review)`. Examples: `approved` → 1; `commented, approved,
+  approved` → 1; `changes_requested, approved` → 2; bob `changes_requested`, carol
+  `changes_requested`, bob `commented`, carol `approved` → 2 (one block); bob
+  `changes_requested`, bob `changes_requested`, bob `approved` → 3; `approved,
+  changes_requested` (nothing after) → 1. Because the bundle carries no push data,
+  a round is inferred from review order only.
 
 ## Narrative-substrate fields
 
