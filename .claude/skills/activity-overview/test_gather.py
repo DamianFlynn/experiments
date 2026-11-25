@@ -382,6 +382,34 @@ class TestCliAndAuth(unittest.TestCase):
                     gather.parse_args(["--manifest", "workspace/project.json",
                                        "--store", "workspace/store.db", *extra])
 
+    def _parse_error(self, owner="o", repo="r", frm="2026-05-01", to="2026-05-31"):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err):
+            # '--flag=value' so a value like '-x' reaches the validator instead
+            # of being read by argparse as an option.
+            gather.parse_args(["--owner=" + owner, "--repo=" + repo,
+                               "--from=" + frm, "--to=" + to, "--store", "s.db"])
+        self.assertEqual(cm.exception.code, 2)
+        return err.getvalue()
+
+    def test_parse_args_rejects_bad_single_repo_values(self):
+        # issue #57: the single-repo flags get the manifest's validation.
+        cases = [
+            ({"repo": "b?per_page=1#"}, "--repo"),
+            ({"repo": " a b "}, "--repo"),
+            ({"repo": ".."}, "--repo"),
+            ({"owner": "-x"}, "--owner"),
+            ({"owner": ".."}, "--owner"),
+            ({"owner": "o/x"}, "--owner"),
+            ({"frm": "31/05/2026"}, "--from"),
+            ({"frm": "20260501"}, "--from"),
+            ({"to": "2026-13-99"}, "--to"),
+            ({"frm": "2026-05-31", "to": "2026-05-01"}, "is after --to"),
+        ]
+        for kwargs, needle in cases:
+            with self.subTest(**kwargs):
+                self.assertIn(needle, self._parse_error(**kwargs))
+
     def test_resolve_token_prefers_github_token(self):
         self.assertEqual(
             gather.resolve_token({"GITHUB_TOKEN": "gh", "GH_TOKEN": "alt"}), "gh"
@@ -814,6 +842,126 @@ class TestAcquireAssemblyP3(unittest.TestCase):
         self.assertEqual(kinds, {"add", "modify", "delete", "rename"})
 
 
+class TestListPullsEnrichment(unittest.TestCase):
+    """#61 / #56 item 7: the list-pulls payload omits merged_by / comments /
+    review_comments, so acquire derives them from data it already fetches per
+    PR (timeline `merged` actor, comment-list lengths) — no extra /pulls/{n}
+    call — and de-duplicates PRs repeated across pages. Fixture is constructed
+    from the documented list schema (see its `_provenance`)."""
+
+    API = "https://api.github.com/repos/o/r"
+
+    def setUp(self):
+        with open(os.path.join(FIX, "rest_list_pulls_sample.json")) as fh:
+            self.data = json.load(fh)
+        self.calls = []
+
+    def _get_page(self, url):
+        self.calls.append(url)
+        path = url[len(self.API):].split("?")[0]
+        parts = path.strip("/").split("/")  # e.g. ['pulls', '42', 'reviews']
+        num = parts[1]
+        if parts[0] == "pulls" and parts[2] == "reviews":
+            return self.data["reviews"].get(num, []), None
+        if parts[0] == "pulls" and parts[2] == "comments":
+            return self.data["review_comments"].get(num, []), None
+        if parts[0] == "issues" and parts[2] == "timeline":
+            return self.data["timeline"].get(num, []), None
+        if parts[0] == "issues" and parts[2] == "comments":
+            return self.data["comments"].get(num, []), None
+        raise AssertionError("unexpected fetch: " + url)
+
+    def _prs(self):
+        raws = gather.dedupe_raw_prs(self.data["list_closed"] + self.data["list_open"])
+        prs = []
+        for raw in raws:
+            pr = gather.normalize_pr(raw)
+            gather.enrich_pr(pr, self._get_page, self.API, "o/r")
+            prs.append(pr)
+        return prs
+
+    def test_list_fixture_really_lacks_detail_fields(self):
+        for raw in self.data["list_closed"] + self.data["list_open"]:
+            for key in ("merged", "merged_by", "comments", "review_comments"):
+                self.assertNotIn(key, raw)
+
+    def test_parse_timeline_merged_by(self):
+        self.assertEqual(
+            gather.parse_timeline_merged_by(self.data["timeline"]["42"]), "bob")
+        self.assertIsNone(
+            gather.parse_timeline_merged_by(self.data["timeline"]["43"]))
+        self.assertIsNone(gather.parse_timeline_merged_by(None))
+        # ghost (deleted) actor -> None, not a crash
+        self.assertIsNone(gather.parse_timeline_merged_by(
+            [{"event": "merged", "actor": None}]))
+
+    def test_merged_by_and_counts_from_already_fetched_data(self):
+        by = {p["number"]: p for p in self._prs()}
+        pr42 = by[42]
+        self.assertTrue(pr42["merged"])
+        self.assertEqual(pr42["merged_at"], "2026-05-10T12:00:00Z")
+        self.assertEqual(pr42["merged_by"], "bob")
+        self.assertEqual(pr42["comments"], 3)
+        self.assertEqual(pr42["review_comments_count"], 2)
+        self.assertFalse(by[43]["merged"])
+        self.assertIsNone(by[43]["merged_by"])
+        self.assertEqual(by[43]["comments"], 0)
+        self.assertEqual(by[44]["comments"], 1)
+        self.assertEqual(by[44]["review_comments_count"], 0)
+        self.assertIsNone(by[44]["merged_by"])
+
+    def test_no_extra_pr_detail_call(self):
+        self._prs()
+        # exactly 4 per-PR enrichment calls, none to GET /pulls/{n} itself
+        self.assertEqual(len(self.calls), 4 * 3)
+        for url in self.calls:
+            path = url[len(self.API):].split("?")[0].strip("/").split("/")
+            self.assertEqual(len(path), 3, url)
+
+    def test_duplicate_pr_across_pages_yields_one(self):
+        raws = self.data["list_closed"] + self.data["list_open"]
+        self.assertEqual([r["number"] for r in raws], [42, 43, 42, 44])
+        self.assertEqual([p["number"] for p in self._prs()], [42, 43, 44])
+
+    def test_dedupe_keeps_latest_snapshot(self):
+        old = {"number": 7, "updated_at": "2026-05-01T00:00:00Z", "state": "open"}
+        new = {"number": 7, "updated_at": "2026-05-02T00:00:00Z", "state": "closed"}
+        other = {"number": 8, "updated_at": "2026-05-01T00:00:00Z"}
+        out = gather.dedupe_raw_prs([old, other, new])
+        self.assertEqual([r["number"] for r in out], [7, 8])
+        self.assertEqual(out[0]["state"], "closed")
+        # ties keep the first occurrence
+        tie = dict(old, state="other")
+        self.assertEqual(gather.dedupe_raw_prs([old, tie])[0]["state"], "open")
+
+    def test_detail_payload_merged_by_not_overridden(self):
+        # a /pulls/{n}-shaped raw (backfill path) already names the merger
+        pr = gather.normalize_pr({"number": 42, "merged_at": "2026-05-10T12:00:00Z",
+                                  "merged_by": {"login": "zed"}})
+        gather.enrich_pr(pr, self._get_page, self.API, "o/r")
+        self.assertEqual(pr["merged_by"], "zed")
+
+    def test_fold_writes_merged_edge(self):
+        bundle = {"meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                           "to": "2026-05-31"},
+                  "prs": self._prs(), "issues": [], "commits": []}
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, bundle)
+        merged = graphstore.get_edges(conn, "o/r#pr-42", direction="in",
+                                      edge_types=["merged"])
+        self.assertEqual([e["src_id"] for e in merged],
+                         [graphstore.qualify_person("o", "bob")])
+
+    def test_effort_review_comments_nonzero(self):
+        import link
+        prs = self._prs()
+        bundle = {"meta": {"owner": "o", "repo": "r"}, "prs": prs, "issues": [],
+                  "trains": [{"id": "train-pr-42", "prs": [42], "commits": []}]}
+        link.annotate_train_effort(bundle)
+        self.assertEqual(bundle["trains"][0]["effort"]["review_comments"], 2)
+
+
 class TestDirectoryCodeAreaProvider(unittest.TestCase):
     def test_avm_module_dir_is_the_four_segment_subtree(self):
         # AVM: avm/res/<service>/<module>/...  -> area = that 4-seg dir
@@ -981,32 +1129,45 @@ class TestProviderSelection(unittest.TestCase):
 
 
 class TestParseCodeowners(unittest.TestCase):
+    # parse_codeowners returns an ORDERED rule list (#65); index by pattern here.
     def setUp(self):
         with open(os.path.join(FIX, "codeowners_sample.txt")) as fh:
             self.text = fh.read()
 
+    def _by_pattern(self):
+        return {r["pattern"]: r["owners"]
+                for r in gather.parse_codeowners(self.text)}
+
     def test_maps_glob_to_logins_stripping_at(self):
-        owners = gather.parse_codeowners(self.text)
+        owners = self._by_pattern()
         self.assertEqual(owners["avm/res/network/"], ["alice", "bob"])
         self.assertEqual(owners["avm/res/storage/"], ["carol"])
         self.assertEqual(owners["*.bicep"], ["bicep-reviewers"])
 
     def test_team_handles_are_kept_as_owners(self):
-        owners = gather.parse_codeowners(self.text)
+        owners = self._by_pattern()
         self.assertEqual(owners["docs/"], ["org/docs-team", "dave"])
         self.assertEqual(owners["*"], ["org/maintainers"])
 
     def test_comments_and_blank_lines_ignored(self):
-        owners = gather.parse_codeowners(self.text)
-        self.assertNotIn("#", "".join(owners))
-        self.assertEqual(len(owners), 5)
+        rules = gather.parse_codeowners(self.text)
+        self.assertNotIn("#", "".join(r["pattern"] for r in rules))
+        self.assertEqual(len(rules), 5)
+
+    def test_file_order_preserved(self):
+        self.assertEqual([r["pattern"] for r in gather.parse_codeowners(self.text)],
+                         ["*", "avm/res/network/", "avm/res/storage/", "docs/",
+                          "*.bicep"])
 
     def test_permissive_on_empty_or_none(self):
-        self.assertEqual(gather.parse_codeowners(""), {})
-        self.assertEqual(gather.parse_codeowners(None), {})
+        self.assertEqual(gather.parse_codeowners(""), [])
+        self.assertEqual(gather.parse_codeowners(None), [])
 
-    def test_pattern_with_no_owners_is_skipped(self):
-        self.assertEqual(gather.parse_codeowners("docs/   \n"), {})
+    def test_pattern_with_no_owners_is_kept_as_unassignment(self):
+        # CODEOWNERS: a rule with no owners un-assigns matching paths, so it is
+        # kept (it used to be dropped, which let an earlier rule win wrongly).
+        self.assertEqual(gather.parse_codeowners("docs/   \n"),
+                         [{"pattern": "docs/", "owners": []}])
 
 
 class TestDetectLabelTaxonomy(unittest.TestCase):
@@ -1108,6 +1269,128 @@ class TestFacetsAndKind(unittest.TestCase):
             "other")
 
 
+class TestIssueKindLabelSchemes(unittest.TestCase):
+    """#58: kind from real label schemes, with the taxonomy auto-detected from
+    the item's own labels (as `acquire` does over all repo labels)."""
+
+    def _kind(self, labels, title="x", body="", template=None,
+              issue_type=None, types_present=False):
+        issue = {"labels": labels, "title": title, "body": body}
+        if template is not None:
+            issue["template"] = template
+        if issue_type is not None:
+            issue["issue_type"] = issue_type
+        tax = gather.detect_label_taxonomy(labels)
+        return gather.classify_issue_kind(issue, tax, types_present)
+
+    # --- AVM (`Type:` + `Class:` + `Needs:`) ---------------------------------
+    def test_avm_bug_with_class_module_label_is_bug(self):
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Bug 🐛", "Needs: Triage 🔍"],
+            title="x fails"), "bug")
+
+    def test_avm_feature_request_with_class_module_label_is_feature(self):
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Feature Request ✨"]), "feature")
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Feature Request ➕"]), "feature")
+
+    def test_avm_question_and_docs_types(self):
+        self.assertEqual(self._kind(
+            ["Class: Utility Module 📦", "Type: Question/Feedback 🙋"]), "question")
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Type: Documentation 📄",
+             "Status: In PR 👉", "Language: Bicep 💪"]), "docs")
+
+    def test_avm_type_avm_with_module_proposal_template_is_module_request(self):
+        self.assertEqual(self._kind(
+            ["Type: AVM 🅰️ ✌️ Ⓜ️", "Class: Pattern Module 📦"],
+            template="module_proposal.yml"), "module-request")
+
+    def test_class_label_alone_never_decides_kind(self):
+        self.assertEqual(self._kind(
+            ["Class: Resource Module 📦", "Language: Terraform 🌐"],
+            title="deploy fails"), "other")
+
+    def test_class_namespace_is_not_a_kind_facet(self):
+        tax = gather.detect_label_taxonomy(
+            ["Class: Resource Module 📦", "Type: Bug 🐛"])
+        self.assertEqual(list(tax["kind"]), ["Type:"])
+        self.assertEqual(tax["class"], {"Class:": ["Class: Resource Module 📦"]})
+        # `class` is not one of the stamped facets
+        f = gather.apply_facets({"labels": ["Class: Resource Module 📦"]}, tax)
+        self.assertEqual(set(f), {"area", "priority", "status", "lifecycle"})
+        self.assertTrue(all(v is None for v in f.values()))
+
+    def test_avm_module_issue_title_is_not_module_request(self):
+        # AVM's bug template titles issues "[AVM Module Issue]: ..."; a bare
+        # "module" word is not a module request.
+        self.assertEqual(self._kind(["Class: Resource Module 📦"],
+                                    title="[AVM Module Issue]: deploy fails"),
+                         "other")
+
+    def test_module_proposal_title_is_module_request(self):
+        self.assertEqual(self._kind([], title="[Module Proposal]: avm/res/foo"),
+                         "module-request")
+
+    # --- conventional label schemes (must keep working) ----------------------
+    def test_namespaced_kind_and_type_labels(self):
+        self.assertEqual(self._kind(["kind/bug"]), "bug")
+        self.assertEqual(self._kind(["kind/feature", "area/networking"]), "feature")
+        self.assertEqual(self._kind(["type: feature"]), "feature")
+        self.assertEqual(self._kind(["Type: Bug"]), "bug")
+        self.assertEqual(self._kind(["type: docs"]), "docs")
+
+    def test_bare_kind_labels(self):
+        self.assertEqual(self._kind(["bug"]), "bug")
+        self.assertEqual(self._kind(["enhancement"]), "feature")
+        self.assertEqual(self._kind(["documentation"]), "docs")
+        self.assertEqual(self._kind(["question", "help wanted"]), "question")
+        self.assertEqual(self._kind(["Bug 🐛"]), "bug")
+        # a bare label that merely contains a kind word is not a kind label
+        self.assertEqual(self._kind(["good first issue"], title="misc"), "other")
+        self.assertEqual(self._kind(["bug-bash"], title="misc"), "other")
+
+    def test_namespaced_type_label_beats_bare_label(self):
+        self.assertEqual(self._kind(["enhancement", "Type: Bug 🐛"]), "bug")
+
+    def test_native_issue_type_still_wins(self):
+        self.assertEqual(self._kind(["Type: Bug 🐛"], issue_type="Feature",
+                                    types_present=True), "feature")
+
+    def test_label_beats_template(self):
+        self.assertEqual(self._kind(["Type: Bug 🐛"], template="feature_request.md"),
+                         "bug")
+
+    # --- free-text heuristic: title only, whole words -------------------------
+    def test_bug_label_with_module_in_body_is_bug(self):
+        self.assertEqual(self._kind(["bug"], title="x fails",
+                                    body="the storage module breaks"), "bug")
+
+    def test_body_text_is_not_classified(self):
+        self.assertEqual(self._kind([], title="x fails",
+                                    body="not supported in docker"), "other")
+        self.assertEqual(self._kind([], title="x fails",
+                                    body="new feature, a bug, docs"), "other")
+
+    def test_title_matches_whole_words_not_substrings(self):
+        self.assertEqual(self._kind([], title="debugger crashes"), "other")
+        self.assertEqual(self._kind([], title="not supported in docker"), "other")
+        self.assertEqual(self._kind([], title="Feature request: add cmk"), "feature")
+        self.assertEqual(self._kind([], title="Fix bug in output"), "bug")
+        self.assertEqual(self._kind([], title="How do I configure this?"),
+                         "question")
+
+    def test_template_filenames(self):
+        self.assertEqual(self._kind([], template="bug_report.yml"), "bug")
+        self.assertEqual(self._kind([], template="feature_request.md"), "feature")
+        self.assertEqual(self._kind([], template="module_request.md"),
+                         "module-request")
+        self.assertEqual(self._kind([], template="module-proposal.yml"),
+                         "module-request")
+        self.assertEqual(self._kind([], template="avm_module_issue.yml"), "other")
+
+
 class TestAcquireAssemblyP3b(unittest.TestCase):
     """Compose the Phase 3b helpers over recorded inputs, offline."""
 
@@ -1164,7 +1447,8 @@ class TestAcquireAssemblyP3b(unittest.TestCase):
 
     def test_code_owners_present(self):
         b = self._bundle()
-        self.assertIn("avm/res/network/", b["code_owners"])
+        self.assertIn("avm/res/network/",
+                      [r["pattern"] for r in b["code_owners"]])
 
 
 class TestParseBicepModuleRefs(unittest.TestCase):
@@ -1728,6 +2012,184 @@ class TestExtractIacEdges(unittest.TestCase):
         self.assertEqual(cg["edge_extraction"]["skipped"], 2)
 
 
+class TestIacEntrypoint(unittest.TestCase):
+    """#66: an area is built from its OWN entrypoint (`<area>/main.bicep`, or the
+    area dir's *.tf set), resolved on disk in the clone — never from a child module
+    that sorts first, a path deleted in the window, or a nested examples/tests file."""
+
+    KV = "avm/res/key-vault/vault"
+
+    @staticmethod
+    def _tree(root, files):
+        for rel, text in files.items():
+            full = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as fh:
+                fh.write(text)
+
+    def test_key_vault_parent_wins_over_sorted_child(self):
+        # The issue's repro: sorted paths put access-policy/ before main.bicep.
+        area = {"id": self.KV, "paths": sorted([
+            self.KV + "/main.bicep",
+            self.KV + "/access-policy/main.bicep",
+            self.KV + "/key/main.bicep"])}
+        self.assertEqual(gather._bicep_entrypoint(area), self.KV + "/main.bicep")
+
+    def test_key_vault_parent_wins_on_disk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                self.KV + "/main.bicep": "",
+                self.KV + "/access-policy/main.bicep": "",
+                self.KV + "/key/main.bicep": ""})
+            area = {"id": self.KV, "paths": sorted([
+                self.KV + "/main.bicep", self.KV + "/access-policy/main.bicep"])}
+            self.assertEqual(gather._bicep_entrypoint(area, clone),
+                             self.KV + "/main.bicep")
+
+    def test_only_child_changed_still_builds_parent(self):
+        # Only a child changed in the window, so the parent's main.bicep is not in
+        # `paths` at all; it is still the area's entrypoint because it is on disk.
+        import tempfile
+        parent_src = ("module kv_key 'key/main.bicep' = [for k in keys: {}]\n"
+                      "module pe 'br/public:avm/res/network/private-endpoint:0.11.0'"
+                      " = {}\n")
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                self.KV + "/main.bicep": parent_src,
+                self.KV + "/key/main.bicep": "param name string\n"})
+            area = {"id": self.KV, "label": "vault",
+                    "paths": [self.KV + "/key/main.bicep"], "edges": []}
+            self.assertEqual(gather._bicep_entrypoint(area, clone),
+                             self.KV + "/main.bicep")
+            built = []
+
+            def run(cmd, **kw):
+                built.append(cmd)
+                return '{"resources": []}' if cmd[:2] == ["bicep", "build"] else ""
+
+            cg = {"provider": "directory", "areas": [area]}
+            gather.extract_iac_edges(
+                cg, clone, which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+                run=run, read_text=gather._read_text_file)
+            build = next(c for c in built if c[:2] == ["bicep", "build"])
+            self.assertEqual(build[2], os.path.join(clone, self.KV, "main.bicep"))
+            self.assertEqual(area["edges_status"], "resolved")
+            by_ref = {e["ref"]: e for e in area["edges"]}
+            # the parent's registry ref is read (it was never read before)...
+            self.assertEqual(
+                by_ref["br/public:avm/res/network/private-endpoint:0.11.0"]["to"],
+                "avm/res/network/private-endpoint")
+            # ...and the child keeps the existing local <area>/<child> edge shape
+            child = by_ref["key/main.bicep"]
+            self.assertEqual(child["to"], self.KV + "/key")
+            self.assertTrue(child["local"])
+            self.assertEqual(child["instances"], "many")
+
+    def test_deleted_entrypoint_is_not_chosen(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            # parent main.bicep deleted in the window; a child remains on disk
+            self._tree(clone, {"avm/res/a/b/child/main.bicep": ""})
+            area = {"id": "avm/res/a/b", "paths": [
+                "avm/res/a/b/child/main.bicep", "avm/res/a/b/main.bicep"]}
+            self.assertIsNone(gather._bicep_entrypoint(area, clone))
+            # a whole module dir deleted in the window: nothing on disk to build
+            gone = {"id": "infra/app", "label": "app",
+                    "paths": ["infra/app/main.bicep"], "edges": []}
+            self.assertIsNone(gather._bicep_entrypoint(gone, clone))
+            calls = []
+            cg = {"provider": "directory", "areas": [gone]}
+            gather.extract_iac_edges(
+                cg, clone, which=lambda n: "/usr/bin/bicep" if n == "bicep" else None,
+                run=lambda cmd, **kw: calls.append(cmd) or "", read_text=lambda _p: "")
+            self.assertEqual(calls, [])
+            self.assertEqual(gone["edges_status"], "skipped")
+
+    def test_fallback_when_area_id_is_not_a_directory(self):
+        # e.g. a graphify `community:<n>` area: shallowest EXISTING, non-scaffold
+        # main.bicep among its paths (a deleted shallower one is not chosen).
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                "svc/core/main.bicep": "", "svc/core/child/main.bicep": "",
+                "svc/examples/demo/main.bicep": ""})
+            area = {"id": "community:3", "paths": sorted([
+                "svc/core/child/main.bicep", "svc/core/main.bicep",
+                "svc/examples/demo/main.bicep", "gone/main.bicep"])}
+            self.assertEqual(gather._bicep_entrypoint(area, clone),
+                             "svc/core/main.bicep")
+
+    def test_root_area_sentinels_resolve_to_repo_root(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {"main.bicep": "", "variables.tf": "", "main.tf": ""})
+            self.assertEqual(gather._bicep_entrypoint(
+                {"id": "main.bicep", "paths": ["main.bicep"]}, clone), "main.bicep")
+            self.assertEqual(gather._tf_entrypoint(
+                {"id": "main.tf", "paths": ["variables.tf"]}, clone), "main.tf")
+
+    def test_tf_entrypoint_ignores_nested_example(self):
+        area = {"id": "modules/sub", "paths": sorted([
+            "modules/sub/examples/x/main.tf", "modules/sub/main.tf"])}
+        self.assertEqual(gather._tf_entrypoint(area), "modules/sub/main.tf")
+        # only the example changed and nothing else is known -> nothing to build
+        self.assertIsNone(gather._tf_entrypoint(
+            {"id": "modules/sub", "paths": ["modules/sub/examples/x/main.tf"]}))
+
+    def test_tf_only_example_changed_builds_module_dir_on_disk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as clone:
+            self._tree(clone, {
+                "modules/sub/main.tf": 'resource "x" "y" {}\n',
+                "modules/sub/variables.tf": "",
+                "modules/sub/examples/x/main.tf": 'module "s" { source = "../../" }\n'})
+            area = {"id": "modules/sub", "label": "sub",
+                    "paths": ["modules/sub/examples/x/main.tf"], "edges": []}
+            self.assertEqual(gather._tf_entrypoint(area, clone), "modules/sub/main.tf")
+            chdirs = []
+
+            def run(cmd, **kw):
+                chdirs.append(cmd[1])
+                return 'digraph {\n"a" -> "module.s.b"\n}\n' if cmd[-1] == "graph" else ""
+
+            cg = {"provider": "directory", "areas": [area]}
+            gather.extract_iac_edges(
+                cg, clone,
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=gather._read_text_file)
+            self.assertTrue(chdirs)
+            self.assertTrue(all(d == "-chdir=" + os.path.join(clone, "modules/sub")
+                                for d in chdirs))
+            self.assertEqual(area["edges_status"], "resolved")
+            self.assertFalse(any(e["to"] == "modules/sub" for e in area["edges"]))
+
+    def test_structural_scan_modules_sub_example_emits_no_self_edge(self):
+        files = {
+            "modules/sub/main.tf": 'resource "azurerm_subnet" "s" {}\n',
+            "modules/sub/examples/x/main.tf": 'module "s" { source = "../../" }\n',
+        }
+        out = gather.scan_structural_terraform_areas(
+            "/clone", list_files=lambda: list(files),
+            read_text=lambda rel: files[rel])
+        self.assertEqual(set(out), {"modules/sub"})
+        self.assertEqual(out["modules/sub"]["edges"], [])
+        self.assertEqual(out["modules/sub"]["paths"], ["modules/sub/main.tf"])
+
+    def test_structural_scan_reads_only_the_module_dir(self):
+        # the module's own *.tf (all of them) are read; base dir is the area dir
+        files = {
+            "modules/sub/main.tf": "",
+            "modules/sub/net.tf": 'module "peer" { source = "../peer" }\n',
+            "modules/peer/main.tf": "",
+        }
+        out = gather.scan_structural_terraform_areas(
+            "/clone", list_files=lambda: list(files),
+            read_text=lambda rel: files[rel])
+        self.assertEqual([(e["to"], e["ref"]) for e in out["modules/sub"]["edges"]],
+                         [("modules/peer", "../peer")])
+
+
 class TestIacEdgeHardening(unittest.TestCase):
     """Phase 3c.1: per-build timeout, retry, and VISIBLE gaps (edges_status +
     edge_extraction summary) so a killed/slow build is never a silent empty."""
@@ -2142,6 +2604,169 @@ class TestResolveCommitPr(unittest.TestCase):
         gather.attach_commit_prs(commits)
         self.assertEqual(commits[0]["pr"], 7)
         self.assertIsNone(commits[1]["pr"])
+
+    # --- #62: squash subjects put the PR number LAST ---------------------------
+    def test_revert_subject_takes_trailing_pr(self):
+        self.assertEqual(
+            gather.resolve_commit_pr('Revert "feat: Add foo (#4012)" (#4020)'), 4020)
+
+    def test_backport_subject_takes_trailing_pr(self):
+        self.assertEqual(
+            gather.resolve_commit_pr("[release/0.30] fix: bar (#3990) (#4001)"), 4001)
+
+    def test_trailing_pr_tolerates_trailing_whitespace(self):
+        self.assertEqual(gather.resolve_commit_pr("fix: baz (#12)  "), 12)
+
+    def test_plain_squash_subject_unchanged(self):
+        self.assertEqual(gather.resolve_commit_pr("Add policy param (#12)"), 12)
+
+    def test_merge_pull_request_beats_inner_paren_ref(self):
+        self.assertEqual(gather.resolve_commit_pr(
+            "Merge pull request #50 from o/revert-(#40)-thing"), 50)
+
+    def test_no_trailing_ref_takes_last_paren_ref(self):
+        self.assertEqual(
+            gather.resolve_commit_pr("Revert (#3) and (#5) partially"), 5)
+
+    def test_only_subject_line_trailing_ref_counts(self):
+        # The subject's trailing (#N) wins over (#N) refs in a body.
+        self.assertEqual(gather.resolve_commit_pr(
+            "feat: thing (#9)\n\n* sub change (#7)\n* other (#8)"), 9)
+
+    def test_attach_uses_trailing_rule(self):
+        commits = [{"sha": "a", "message": 'Revert "x (#1)" (#2)', "pr": None}]
+        gather.attach_commit_prs(commits)
+        self.assertEqual(commits[0]["pr"], 2)
+
+
+class TestClosingRefSemantics(unittest.TestCase):
+    """#62: GitHub closing-keyword semantics for parse_closing_refs /
+    parse_listed_refs / parse_qualified_refs."""
+
+    def test_colon_after_keyword(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes: #12"), [12])
+        self.assertEqual(gather.parse_closing_refs("closes:#3"), [3])
+
+    def test_comma_list_closes_only_first(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes #1, #2"), [1])
+        self.assertEqual(gather.parse_listed_refs("Fixes #1, #2"), [2])
+
+    def test_and_list_closes_only_first(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes #1 and #2"), [1])
+        self.assertEqual(gather.parse_listed_refs("Fixes #1 and #2"), [2])
+
+    def test_each_keyword_closes(self):
+        self.assertEqual(gather.parse_closing_refs("Fixes #1, fixes #2"), [1, 2])
+        self.assertEqual(gather.parse_closing_refs("closes #1 and fixes #2"), [1, 2])
+        self.assertEqual(gather.parse_listed_refs("closes #1 and fixes #2"), [])
+
+    def test_all_nine_keywords_case_insensitive(self):
+        for i, kw in enumerate(("close", "closes", "closed", "fix", "fixes", "fixed",
+                                "resolve", "resolves", "resolved"), start=1):
+            self.assertEqual(gather.parse_closing_refs("{} #{}".format(kw.upper(), i)),
+                             [i], kw)
+
+    def test_non_keywords_do_not_close(self):
+        for text in ("closing #1", "fixing #1", "resolving #1", "prefix #1",
+                     "See #1", "unfixed#1"):
+            self.assertEqual(gather.parse_closing_refs(text), [], text)
+
+    def test_same_repo_url_closes_when_repo_known(self):
+        text = "Closes https://github.com/Azure/bicep/issues/123"
+        self.assertEqual(gather.parse_closing_refs(text, repo="Azure/bicep"), [123])
+        # owner/repo matching is case-insensitive, like GitHub
+        self.assertEqual(gather.parse_closing_refs(text, repo="azure/Bicep"), [123])
+
+    def test_same_repo_url_without_repo_is_backwards_compatible(self):
+        # No slug -> cannot tell same-repo from cross-repo: no bare close.
+        self.assertEqual(
+            gather.parse_closing_refs("Closes https://github.com/Azure/bicep/issues/123"),
+            [])
+
+    def test_other_repo_url_is_not_a_same_repo_close(self):
+        self.assertEqual(gather.parse_closing_refs(
+            "Closes https://github.com/Azure/other/issues/123", repo="Azure/bicep"), [])
+
+    def test_same_repo_qualified_ref_closes(self):
+        self.assertEqual(gather.parse_closing_refs(
+            "Resolves Azure/bicep#5", repo="Azure/bicep"), [5])
+
+    def test_cross_repo_qualified_ref_is_not_a_same_repo_close(self):
+        self.assertEqual(gather.parse_closing_refs(
+            "Resolves owner/repo#5", repo="Azure/bicep"), [])
+
+    def test_pull_url_is_never_closed(self):
+        # Closing keywords link issues, not PRs.
+        self.assertEqual(gather.parse_closing_refs(
+            "Fixes https://github.com/Azure/bicep/pull/9", repo="Azure/bicep"), [])
+
+    def test_url_list_tail_is_listed_not_closed(self):
+        text = ("Fixes https://github.com/o/r/issues/1, "
+                "https://github.com/o/r/issues/2")
+        self.assertEqual(gather.parse_closing_refs(text, repo="o/r"), [1])
+        self.assertEqual(gather.parse_listed_refs(text, repo="o/r"), [2])
+
+    def test_listed_excludes_numbers_closed_elsewhere(self):
+        self.assertEqual(gather.parse_listed_refs("Fixes #1, #2. Also fixes #2"), [])
+
+    def test_keyword_inside_code_block_still_matches(self):
+        # Documented behaviour: no Markdown parsing; a keyword in a fenced block
+        # or inline code span is matched like anywhere else.
+        self.assertEqual(gather.parse_closing_refs("```\nfixes #7\n```"), [7])
+        self.assertEqual(gather.parse_closing_refs("`closes #8`"), [8])
+
+    def test_qualified_cross_repo_close(self):
+        refs = gather.parse_qualified_refs("Resolves owner/repo#5")
+        self.assertEqual(refs, [{"owner": "owner", "repo": "repo", "number": 5,
+                                 "kind": "closes", "is_pr": False}])
+
+    def test_qualified_close_with_colon(self):
+        refs = gather.parse_qualified_refs("Fixes: owner/repo#5")
+        self.assertEqual([r["kind"] for r in refs], ["closes"])
+
+    def test_keyword_url_is_qualified_close(self):
+        refs = gather.parse_qualified_refs(
+            "Closes https://github.com/Azure/other/issues/123")
+        self.assertEqual(refs, [{"owner": "Azure", "repo": "other", "number": 123,
+                                 "kind": "closes", "is_pr": False}])
+
+    def test_keyword_pull_url_stays_cross_ref(self):
+        refs = gather.parse_qualified_refs("Fixes https://github.com/Azure/o/pull/4")
+        self.assertEqual(refs, [{"owner": "Azure", "repo": "o", "number": 4,
+                                 "kind": "cross_ref", "is_pr": True}])
+
+    def test_qualified_list_tail_is_cross_ref(self):
+        refs = gather.parse_qualified_refs("Fixes a/b#1, a/b#2")
+        self.assertEqual([(r["number"], r["kind"]) for r in refs],
+                         [(1, "closes"), (2, "cross_ref")])
+
+    def test_normalize_pr_same_repo_url_closes(self):
+        pr = gather.normalize_pr({
+            "number": 7, "title": "t",
+            "body": "Closes https://github.com/Azure/bicep/issues/123",
+            "html_url": "https://github.com/Azure/bicep/pull/7"})
+        self.assertEqual(pr["closes"], [123])
+
+    def test_normalize_pr_repo_from_base_repo(self):
+        pr = gather.normalize_pr({
+            "number": 7, "body": "Fixes https://github.com/Azure/bicep/issues/3",
+            "base": {"ref": "main", "repo": {"full_name": "Azure/bicep"}}})
+        self.assertEqual(pr["closes"], [3])
+
+    def test_normalize_pr_listed_ref_seeds_crossref_issues(self):
+        pr = gather.normalize_pr({"number": 7, "body": "Fixes #1, #2",
+                                  "html_url": "https://github.com/o/r/pull/7"})
+        self.assertEqual(pr["closes"], [1])
+        self.assertEqual(pr["crossref_issues"], [2])
+
+    def test_cross_repo_edges_still_flow(self):
+        pr = {"number": 10, "title": "", "body": "Resolves Azure/mod-b#5"}
+        external, edges = gather._cross_repo_pr_edges(
+            pr, "Azure", "Azure/mod-a", {"Azure/mod-a", "Azure/mod-b"})
+        self.assertEqual(external, [])
+        self.assertEqual([e[1:3] for e in edges],
+                         [(graphstore.qualify_id("Azure", "Azure/mod-b", "issue-5"),
+                           "closes")])
 
 
 def _fold_fixture_bundle():
@@ -2597,7 +3222,7 @@ class TestFoldBundleOverride(unittest.TestCase):
 class TestManifestMain(unittest.TestCase):
     def test_member_args_clones_namespace_with_overrides(self):
         base = gather.parse_args([
-            "--owner", "x", "--repo", "y", "--from", "a", "--to", "b",
+            "--owner", "x", "--repo", "y", "--from", "2026-01-01", "--to", "2026-01-31",
             "--store", "s.db", "--no-clone"])
         member = gather._member_args(
             base, {"owner": "Azure", "repo": "mod-a", "registry": None},
@@ -3781,3 +4406,26 @@ class TestFetchProjectBoard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSeededCrossrefsSurviveEnrichment(unittest.TestCase):
+    """The "mentioned, not closed" refs normalize_pr seeds from the body (#62)
+    must survive the timeline merge in enrich_pr (#61), order-preserving."""
+
+    def test_list_tail_ref_kept_and_timeline_refs_appended(self):
+        pr = {"number": 5, "merged": False, "crossref_issues": [2]}
+        timeline = [{"event": "cross-referenced",
+                     "source": {"issue": {"number": 9}}},
+                    {"event": "cross-referenced",
+                     "source": {"issue": {"number": 2}}}]
+
+        def get_page(url):
+            return (timeline if "/timeline" in url else []), None
+
+        gather.enrich_pr(pr, get_page, "https://api.github.com/repos/o/r", "o/r")
+        self.assertEqual(pr["crossref_issues"][0], 2)
+        self.assertEqual(sorted(pr["crossref_issues"]),
+                         sorted(set(pr["crossref_issues"])))
+        self.assertEqual(pr["crossref_issues"],
+                         [2] + [n for n in gather.parse_timeline_crossrefs(timeline)
+                                if n != 2])

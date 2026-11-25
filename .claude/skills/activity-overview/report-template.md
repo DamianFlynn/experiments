@@ -1,10 +1,23 @@
 # {project} — Activity Digest ({from} → {to})
 
-<!-- Multi-repo digest. All sections below consume the JSON view emitted by
-     `python3 digest.py --store <path> --project <name> --from ... --to ...`.
-     Per-member (single-repo) sections render once per entry in
-     `view["members"][i]["bundle"]`; project-wide sections read the merged keys
-     (trains, shipped, people, modules, related_work). -->
+<!-- Two inputs (SKILL.md "Procedure" says how each is made):
+     * `bundle` = the per-repo BUNDLE VIEW file: `view.py --out B`, then
+       `link.py B [--series S]` and `render.py B --diagrams-dir D` (both rewrite B).
+       It is the only file with `series` and `diagrams`. `bundle.diagrams` paths
+       are relative to the PARENT of D (D=workspace/diagrams -> resolve
+       `diagrams/x.mmd` as workspace/diagrams/x.mmd).
+     * `view` = the PROJECT VIEW (multi-repo only):
+       `digest.py --store <path> --project <name> --from ... --to ...`, with the
+       merged keys (trains, shipped, people, modules, related_work, module_edges).
+     Single-repo report: there is no `view`; read everything from `bundle`:
+       view["shipped"] -> bundle["buckets"]["shipped"], view["trains"] ->
+       bundle["trains"], view["people"]/view["modules"] -> bundle["people"]/
+       bundle["modules"], view["members"][i]["bundle"] -> bundle; omit Related work
+       and Cross-repo module dependency graph.
+     Multi-repo report: project-wide sections read `view`; per-member sections
+       render once per member from that member's bundle view file. Wherever a
+       section below says `view["members"][i]["bundle"]`, use the member's bundle
+       view file — digest's embedded copy has no `series` or `diagrams`. -->
 
 ## Executive summary
 
@@ -141,6 +154,8 @@ For each release in `releases` (newest first): tag, name, date, and link.
 ## CI/CD health
 
 For each workflow in `workflow_stats`: total runs and success/failure split.
+Skip the reserved `_truncated` key; when it is present, say the counts are partial
+(GitHub's 1,000-run search cap).
 
 - **{workflow}** — {success}/{total} succeeded ({failure} failed, {cancelled} cancelled).
 
@@ -182,18 +197,22 @@ never attributes a stall/blocker to a person (that is the gated internal appendi
 Omit the whole section when `flow`/`blockers` are empty and there are no stalled trains.
 
 **Flow pathologies** — the per-issue classification in `bundle["flow"]` (deterministic;
-each entry already carries its `state`, `age_days`, `reactions`, `blocked_by`, and
-`signals`). Group by `state` in this order — **blocked → upvoted_but_ignored →
+each entry already carries its `state`, `age_days`, `reactions`, `blocked_by` (open
+blockers only), `blocked_by_unknown`, and `signals`). `blocked` means at least one
+**open** blocker; a closed blocker no longer blocks; `hung` means old **and** stale (no
+update for 30 days). Group by `state` in this order — **blocked → upvoted_but_ignored →
 traction_then_abandoned → hung** — each issue cited:
 
 - [{title}]({url}) (#{number}) — *{state}* — {", ".join(flow_entry.signals)}
 
-**Top blockers** — issues ranked by how many others they block, from
+**Top blockers** — open issues ranked by how many other open issues they block, from
 `bundle["blockers"]` (highest `blocks_count` first) — the ones to unblock first:
 
 - [{title}]({url}) (#{number}) — blocks {blocks_count}: {blocks joined as #N, …}
 
-{Embed the dependency graph when `diagrams.blocker_graph` is present:}
+{Embed the dependency graph when `diagrams.blocker_graph` is present. It draws every stored
+`blocks` relation, including ones whose blocker is already closed, so it can show more
+than the open-only lists above:}
 
 ```mermaid
 {diagrams.blocker_graph}

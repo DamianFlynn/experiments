@@ -53,11 +53,11 @@
 | `derive.py` | 738 | Pure projections shared by write and read paths (artifacts, people, flow, halls) | — | — |
 | `link.py` | 1,116 | `enrich`: trains, buckets, timeline, deltas, areas, significance, effort, forecast; `--slice`, `--series` | — | — |
 | `series.py` | 132 | Pure installment snapshot + comparison | — | — |
-| `render.py` | 610 | Mermaid emitters + `mmdc` validation | — | — |
+| `render.py` | 1,010 | Mermaid emitters (size-capped) + `mmdc` validation | — | — |
 | `validate.py` | 907 | Trust gate (audits) | — | — |
 | `spotlight.py` | 1,685 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
 | `digest.py` | 414 | Multi-repo project view | — | — |
-| `manifest.py` / `manifest_from_index.py` | — / 221 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
+| `manifest.py` / `manifest_from_index.py` | 195 / 278 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
 | `transcript.py` | 116 | VTT/SRT/TXT normalization | — | — |
 
 ```mermaid
@@ -113,7 +113,7 @@ scratch store) and `backfill` respectively.
 |---|---|---|
 | `--owner`, `--repo` | — | Single-repo target |
 | `--manifest PATH` | — | Multi-repo project (validated by `manifest.load_manifest` **before** the store is touched) |
-| `--from`, `--to` | — | Window (`YYYY-MM-DD`) |
+| `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
 | `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing |
 | `--branches` | `main` | Recorded in `meta`; first is `base_branch` (walk uses the checked-out default branch) |
 | `--clone-dir` | `workspace/<repo>-clone` | Clone location |
@@ -166,11 +166,22 @@ sequenceDiagram
 
 ### 4.3 Clone and windowing
 
-- Unless `--no-clone`, `acquire` always runs `git clone` (`build_clone_cmd`) into `--clone-dir`
-  (default `workspace/<repo>-clone`; for manifests `--clone-dir` is the parent of per-member
-  `<owner>-<repo>-clone` dirs), so the directory must not already exist. `--no-clone` walks an
-  existing clone **without fetching** — only correct if that clone was refreshed beforehand.
-- The clone uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
+- `acquire` calls `prepare_clone` on `--clone-dir` (default `workspace/<repo>-clone`; for
+  manifests `--clone-dir` is the parent of per-member `<owner>-<repo>-clone` dirs) and records
+  the outcome in `meta.clone_mode`:
+  - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`).
+  - `fetched` — the dir is already a clone of the same remote (`remote.origin.url`, GitHub
+    https/ssh forms compared equal): `git fetch --prune --shallow-since=…` (`build_fetch_cmd`;
+    deepens or shortens to this window's bound) then `checkout -B <default branch>` at the
+    fetched `origin/<default branch>`. Applies with and without `--no-clone`.
+  - `depth1-fallback` — `--shallow-since` selected no commits (git: "no commits selected for
+    shallow requests", a quiet repo): the clone/fetch is retried with `--depth=1` so HEAD exists
+    for IaC edges / CODEOWNERS / the structural scan; the three git walks are skipped (empty).
+    Any other clone/fetch error still raises.
+  - `none` — `--no-clone` and no clone on disk: nothing is created; the walks are empty.
+  A non-empty dir that is not a git clone, or is a clone of another remote, raises and is left
+  untouched.
+- The clone/fetch uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
   margin keeps each in-window commit's real parent in the clone.
 - `shallow_boundary_shas` + `drop_boundary_events` remove events from a commit whose parent
   was grafted away (its diff would be a whole-tree phantom). Any **in-window** commit dropped
@@ -211,6 +222,12 @@ order (graphify does not parse Bicep/HCL, so IaC repos always land here):
 `_is_scaffold_area` marks Terraform `examples/` and `tests/` subtrees as scaffolding: their
 edges are **skipped at extraction and excluded at fold**, because those trees reference the
 module under test through CI-manipulated relative paths and test-only registry modules.
+`_is_scaffold_path` applies the same test to a *file*, so a nested scaffold file that
+classifies into its module's area (`modules/sub/examples/x/main.tf` → `modules/sub`) is never
+read or built as that module.
+
+Area `paths` are the in-window **changed** files (including deleted ones), so they are not
+used to pick what to build; the entrypoint is resolved on disk (§4.6).
 
 ### 4.6 IaC dependency edges (`extract_iac_edges`)
 
@@ -234,6 +251,16 @@ flowchart TB
   SK --> AGG
 ```
 
+- **Entrypoint (`_bicep_entrypoint` / `_tf_entrypoint`, resolved on disk in the clone):**
+  when the area id is a directory in the checkout, Bicep builds `<area id>/main.bicep` and
+  Terraform uses that directory's `*.tf` set (`main.tf` preferred as the representative
+  path), whichever files changed in the window; if that file/set is absent, the area is
+  `skipped`. Only when the area id is not a directory (graphify `community:<n>`, a deleted
+  dir) does it fall back to the shallowest of the area's `paths` that exists on disk. Root
+  sentinels `main.bicep` / `main.tf` name the repo root. Paths missing from the checkout and
+  files under nested `examples/`/`tests/` are never chosen, so an AVM child module
+  (`avm/res/key-vault/vault/access-policy/main.bicep`) is never built in place of its parent.
+  With no clone directory on disk (offline callers) the same rule runs over `paths` alone.
 - **Build-only:** edges come only from a successful build; static guessing is never emitted.
   A `resolved` area with no edges genuinely has no inter-area dependencies; `timeout`/`failed`
   are **counted gaps**.
@@ -242,7 +269,7 @@ flowchart TB
   the BRM monorepo `br/public:avm/res/network/virtual-network:0.x` resolves to the **in-repo**
   area `avm/res/network/virtual-network`. Transitive edges come from walking nested
   deployments in the compiled ARM (`walk_arm_deployments`).
-- **Terraform:** `_tf_entrypoint` reads **every `*.tf` in the module dir**; `parse_terraform_graph`
+- **Terraform:** extraction reads **every `*.tf` in the entrypoint's module dir**; `parse_terraform_graph`
   accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
   first `module.<name>` token gives its owning module. Local sources resolve to repo areas
   (`../..` from a submodule → the root `main.tf` area); registry sources keep `to=None,
@@ -252,7 +279,8 @@ flowchart TB
   set, `_terraform_prewarm` runs one serial init first because terraform's plugin cache is not
   safe under concurrent writes.
 - **Structural scan (manifest gathers only):** `scan_structural_terraform_areas` statically parses
-  every tracked module's `source` references (`git ls-files`, no `terraform init`) and
+  every tracked module's `source` references (`git ls-files`, no `terraform init`; per area
+  only the area dir's own `*.tf`, nested `examples/`/`tests/` files excluded) and
   `merge_structural_areas` unions them, so the dependency graph reflects structure rather than
   in-window churn. Single-repo gathers skip this to keep golden bundles byte-stable.
 
@@ -265,11 +293,36 @@ flowchart TB
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
 | Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | referenced 404s tolerated (`allow_404`) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
-| Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state |
+| Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
 
-Kept PRs = merged in-window, closed-unmerged in-window, or open. `http_get_json` surfaces
-GitHub's message plus the deciding headers (`x-ratelimit-*`, `x-github-sso`,
-`x-accepted-oauth-scopes`) on any HTTP error; there is no automatic back-off.
+Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
+goes through `_github_open` (injectable `opener`/`sleep`/`clock`, so tests never sleep or touch
+the network):
+
+- **Timeouts and retries.** Each request carries `timeout=ACTIVITY_HTTP_TIMEOUT` (60 s).
+  Timeouts, connection errors and 500/502/503/504 are retried up to `ACTIVITY_HTTP_RETRIES` (3)
+  extra times with back-off 1, 2, 4 … s (cap 60 s), then fail with a message naming the URL and
+  the attempt count.
+- **Rate limits** (GitHub's documented rules). A 403/429 with `Retry-After` waits that long; with
+  `x-ratelimit-remaining: 0` (primary) waits until `x-ratelimit-reset`; a secondary-limit
+  message with neither header waits 60 s, doubling on repeats. A GraphQL 200 carrying a
+  `RATE_LIMITED` error waits for the reset too. Each wait is announced on stderr (seconds and
+  the UTC time it ends), is refused when longer than `ACTIVITY_RATE_LIMIT_MAX_WAIT` (3600 s;
+  `0` = never wait), and at most `RATE_LIMIT_MAX_WAITS` (5) are made per request. Any other 403
+  (SAML SSO, token scope) fails fast with the diagnostic: GitHub's message plus the deciding
+  headers (`x-ratelimit-*`, `retry-after`, `x-github-sso`, `x-accepted-oauth-scopes`).
+- **Auth on redirects.** The token is attached only to `https://api.github.com` URLs, and the
+  redirect handler drops `Authorization` when a 3xx leaves that host (urllib's default handler
+  re-sends it).
+- **Errors.** `http_get_json` raises `SystemExit` (fail fast). `graphql_post` raises
+  `GitHubAPIError` (a normal `Exception`); when GraphQL returns `errors` alongside non-empty
+  `data` it keeps the data and warns. The board layer catches both, so a failed page degrades
+  to the items already fetched.
+- **Workflow runs.** `actions/runs?created=` returns at most 1,000 results per search (GitHub
+  docs). `fetch_workflow_runs` reads the first page's `total_count`; at or over the cap the
+  range is split by day and re-queried. A single day still at the cap is left truncated: a
+  stderr warning, and `workflow_stats._truncated = {truncated, cap, fetched, total_count,
+  ranges}` (a reserved key, present only then).
 
 ### 4.8 Projects v2 boards
 
@@ -284,10 +337,28 @@ paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 (warns when truncated) a
 ### 4.9 Classification
 
 - `detect_label_taxonomy` auto-detects structured label namespaces → facets
-  `area|priority|status|lifecycle|kind`; `apply_facets` stamps the first match per facet.
+  `area|priority|status|lifecycle|kind|class` (`type`/`kind` → `kind`; AVM `Class:` → `class`, a
+  scope facet that is never a kind source); `apply_facets` stamps the first match per facet
+  (`area|priority|status|lifecycle` only).
 - `classify_issue_kind` → `feature|module-request|bug|idea|question|docs|other`, in precedence:
-  native issue type → label kind facet → issue-template filename → title/body heuristic → other.
+  native issue type → label kind (`kind` facet labels, then a bare label that is exactly a kind
+  word such as `bug`/`enhancement`) → issue-template filename → title heuristic → other. All
+  steps match whole words via `_KIND_PHRASES` (module phrases first; a bare "module" maps to
+  nothing); the body is never read, so "the module breaks" or "not supported" in a body does not
+  change kind (#58).
 - `classify_pr_kind` reads conventional-commit prefixes (`feat→feature`, `fix→bug`, `docs→docs`).
+- `normalize_pr` sets `closes = parse_closing_refs(title+body, repo=<base repo slug>)` with
+  GitHub's semantics (#62): keywords `close[sd]`/`fix(e[sd])`/`resolve[sd]`, optional `:`, then
+  `#N`, `owner/repo#N` or a full issue URL; each closed issue needs its own keyword
+  (`Fixes #1, #2` → `[1]`; `Fixes #1, fixes #2` → `[1, 2]`). A same-repo qualified ref/URL is a
+  same-repo close (`repo` is optional; without it only bare `#N` closes). The unkeyworded list
+  tail (`#2`) comes from `parse_listed_refs` and seeds `crossref_issues` (note: `acquire()`
+  currently overwrites that field with the timeline cross-refs). `parse_qualified_refs` returns
+  keyword-closed cross-repo issues as `closes` (incl. keyword + issue URL) and everything else
+  (other URLs, keyword + `/pull/` URL, list tails) as `cross_ref`. No Markdown parsing:
+  keywords in code blocks match too.
+- `resolve_commit_pr` (commit → PR, `part_of`): trailing `(#N)` on the subject line, else
+  `Merge pull request #N`, else the last `(#N)` on the subject, then in the message.
 - `normalize_issue` parses `parse_blocks_refs` ("blocks/blocking #N" outbound, "blocked by /
   depends on #N" inbound); `derive_open_high_activity` flags open issues with ≥ 5 comments or
   ≥ 5 👍.
@@ -389,7 +460,12 @@ erDiagram
   nodes ||--o{ code_events : "artifact"
 ```
 
-Plus `fts_text` (FTS5 virtual table) when `fts5_available(conn)`.
+Plus `fts_text` (FTS5 virtual table) and its `fts_map(node_id PK, fts_rowid)` side table
+when `fts5_available(conn)`. Indexes beyond the primary keys: `nodes (project, repo,
+node_class, ts)`, `nodes (ts)`, `edges (src_id, edge_type)`, `edges (dst_id, edge_type)`,
+`edges (edge_type, src_id, dst_id)`, `code_events (artifact_id, date)`. Store
+`schema_version` is 2; `init_schema` migrates a v1 store in place (adds the edges index,
+creates and back-fills `fts_map`) — see STORE.md "Schema version and migration".
 
 ### 5.2 Identity grammar
 
@@ -399,8 +475,11 @@ Plus `fts_text` (FTS5 virtual table) when `fts5_available(conn)`.
 | Person (project-scoped, `repo = "*"`) | `{project}#person-{login}` | `qualify_person` |
 | Locals | `pr-N`, `issue-N`, `<sha>`, `art:<path>`, `<path>#<lang>:<subkind>:<name>`, `area-<id>`, `milestone-N`, `release-<tag>`, `sprint-<id>`, singletons `codegraph` … | — |
 
-`parse_id` splits scope on the first `/` and local on the last `#`, so `repo = "owner/repo"`
-(manifest mode) is safe.
+`parse_id` splits scope from local on the FIRST `#` (a local id may contain `#`;
+see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, so
+`repo = "owner/repo"` (manifest mode) is safe. `local_id` returns the full local id;
+`split_symbol_local` tells a symbol id from a file path containing `#` by its
+`<lang>:<subkind>:<name>` tail.
 
 ### 5.3 API
 
@@ -411,14 +490,25 @@ Plus `fts_text` (FTS5 virtual table) when `fts5_available(conn)`.
 | Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)` |
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
 | Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
-| Text | `index_text` (delete-then-insert), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
+| Text | `index_text` / `index_texts` (replace by node id via `fts_map`, no table scan), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
 | Provenance | `record_window`/`get_windows`, `set_clone_sha`/`get_clone_sha` |
 | Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
 
 **Semantics.** Identity columns are immutable; `ts`/`data`/`fetched_at` refresh on re-upsert.
 Edges union. `range_query` orders by `(ts, id)` and excludes NULL-`ts` structure nodes.
+Window bounds are granularity-safe: node `ts` mixes date-only (commits, artifacts) and ISO
+datetimes (PRs, issues, reviews, events), and bounds may be either. `range_query` and the
+shared predicate `ts_in_window(ts, ts_from, ts_to)` compare each bound at the coarser
+granularity of the pair (a date-only value covers its whole day; datetime-vs-datetime is
+exact), inclusive, either bound optional. `complete._in_window`, `spotlight` window checks,
+`gather.in_window` and `link._in_window` delegate to `ts_in_window`; no caller pads bounds.
 `traverse_spine` walks spine edges **undirected**, depth-capped; `missing` lists referenced but
 unstored spine ids (minus known-dead when `skip_dead`).
+`edges_by_type` / `repo_code_events` filter on the literal `{project}/` / `{project}/{repo}#`
+id prefix **case-sensitively** as an index range (`>= prefix AND < prefix-successor`), not
+`LIKE`. Batch writers and the meta setters take `commit=False`; `gather.fold_bundle` uses it
+to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clone_sha`) in
+**one transaction** — an exception mid-fold leaves the store unchanged.
 
 ## 6. Read and enrich
 
@@ -432,7 +522,10 @@ unstored spine ids (minus known-dead when `skip_dead`).
    `code_events`, `symbol_events`) from the repo's nodes + ledger; re-attach reviews/lifecycle
    onto parents; surface `blocks` as `blocking`/`blocked_by`.
 5. Read back `artifacts` and `people` (the write path already derived them) and the singleton
-   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`).
+   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`). `code_owners` is an
+   ordered rule list so CODEOWNERS last-match-wins order survives the sorted-key JSON store;
+   `fold_bundle` (`owns`) and `annotate_people_profile` (`stale_owned`) share one matcher,
+   `derive.compile_codeowners`/`area_owners` (area = last rule matching `<area>/`).
 
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
@@ -520,9 +613,12 @@ flowchart TB
   i1 -- no --> NB
 ```
 
-`select_milestones(milestones, ref_date)`: open milestones sorted by `(due_on or 9999-12-31,
-number)`; **current** = earliest due on/after `ref_date` (else earliest open); **next** = the
-one after it. `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`,
+`select_milestones(milestones, ref_date)`: only **open, dated** milestones are eligible
+(an undated one such as "Backlog" is never current or next; none dated → `(None, None)`),
+sorted by `(due day, number)` and compared to `ref_date[:10]` (date or ISO timestamp).
+**current** = earliest due on/after the ref day, **next** = the one after it; if every dated
+milestone is overdue, **current** = the most recently due (lowest number on a tie) and
+**next** = `None`. `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`,
 `high-priority`, `critical` (case-insensitive exact match).
 
 ### 6.6 Significance and effort
@@ -601,28 +697,57 @@ bundles in chronological order.
 | `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*` |
 | `annotate_people_profile` | per-login metrics | prs authored/merged/reviewed, merge rate, review latency (median), first/last active, examples/docs/symbols authored |
 | `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored`, top 10; **no shame/blame** |
-| `build_flow` | `flow[]` | open issues: `blocked` → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d, no open PR) |
-| `build_blockers` | `blockers[]` | out-degree in blocker → blocked graph, sorted desc |
+| `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
+| `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (and feed `blocker_graph`) |
 
 ## 7. Present — `render.py`
 
 `render.py BUNDLE [--diagrams-dir workspace/diagrams] [--export svg|png] [--skip-validate] [--train ID]`.
+The bundle is always required (`render.py BUNDLE --train ID` for a spotlight). An unknown
+`--train` id is a clean usage error (exit 2, nothing written), like `link.py --slice`.
+`--export` runs `mmdc` and therefore always validates; combining it with `--skip-validate`
+is rejected (exit 2).
 
-| Diagram key | Emitter | Mermaid type |
-|---|---|---|
-| `buckets_pie` | `emit_buckets_pie` | pie |
-| `timeline_gantt` | `emit_timeline_gantt` | gantt |
-| `content_timeline` | `emit_content_timeline` | timeline |
-| `deltas_bar` | `emit_deltas_bar` | xychart-beta |
-| `contributor_graph` | `emit_contributor_graph` | flowchart |
-| `kind_breakdown` | `emit_kind_breakdown` | pie |
-| `module_graph` | `emit_module_graph` | flowchart |
-| `blocker_graph` | `emit_blocker_graph` (≤ 40 edges) | flowchart |
-| `train_flowcharts{id}` | `emit_train_flowchart` (deep trains) | flowchart; mode C with area nodes when ≤ `TRAIN_FLOW_MAX_PRS` (4) PRs and ≤ `TRAIN_FLOW_MAX_AREAS` (5) areas, else mode A chain |
-| project module graph | `emit_project_module_graph(module_edges)` | flowchart (used by digest reports) |
+| Diagram key | Emitter | Mermaid type | Cap (top-N key) and "+K more" marker |
+|---|---|---|---|
+| `buckets_pie` | `emit_buckets_pie` | pie | fixed size (≤ 4 slices) |
+| `timeline_gantt` | `emit_timeline_gantt` | gantt | `GANTT_MAX_PRS` (200) most recently created PRs (created_at desc, number desc), drawn chronologically, plus a `+K more PRs not shown` row; `GANTT_MAX_RELEASES` (30) latest releases |
+| `content_timeline` | `emit_content_timeline` | timeline | latest `TIMELINE_MAX_DAYS` (40) dates (an `earlier : +K more events on M earlier dates` period replaces the rest); first `TIMELINE_MAX_EVENTS_PER_DAY` (8) events per date in bundle order, then `+K more events` |
+| `deltas_bar` | `emit_deltas_bar` | xychart-beta | fixed size (3 bars) |
+| `contributor_graph` | `emit_contributor_graph` | flowchart | `GRAPH_MAX_EDGES` (120) edges, breadth-first: key = (area's position in the person's list, login, area), so every contributor keeps an edge first; `+K more edges not shown` node |
+| `kind_breakdown` | `emit_kind_breakdown` | pie | `PIE_MAX_SLICES` (10): largest kinds (count desc, name), the last slice `+K more kinds` sums the rest |
+| `module_graph` | `emit_module_graph` | flowchart | `GRAPH_MAX_EDGES` (120) edges by target in-degree desc (blast-radius hubs first), then src, dst, label; `+K more edges not shown` node |
+| `blocker_graph` | `emit_blocker_graph` | flowchart | `BLOCKER_MAX_EDGES` (40) edges in (blocker, blocked) order; `+K more blocked` node |
+| `train_flowcharts{id}` | `emit_train_flowchart` (deep trains) | flowchart; mode C with area nodes when ≤ `TRAIN_FLOW_MAX_PRS` (4) PRs and ≤ `TRAIN_FLOW_MAX_AREAS` (5) areas, else mode A chain | `TRAIN_FLOW_MAX_PR_NODES` (60) PRs in the train's `prs` order; the rest collapse into one `+K more PRs not shown` node in the chain |
+| project module graph | `emit_project_module_graph(module_edges, notes=None)` | flowchart (used by digest reports) | as `module_graph` |
 
-Every emitted file is compiled with `mmdc` unless `--skip-validate`; a non-compiling diagram
-fails the run. Paths are recorded in `bundle.diagrams`.
+**Size limits.** Mermaid (mmdc 12.2.0, default config) has two hard limits, recorded as
+`MERMAID_MAX_TEXT` = 50,000 characters (JS string length) and `MERMAID_MAX_EDGES` = 500. Above
+the text limit mmdc exits **0** and writes an error SVG ("Maximum text size in diagram
+exceeded"); above the edge limit it exits 1 ("Edge limit exceeded"). The caps above keep every
+diagram below both (≤ 122 edges; estimated worst case ≈ 35k characters with 40-char labels;
+a 700-PR / 800-edge / 1,500-event test bundle renders at ≤ 20k); in addition each capped
+emitter re-renders with all its caps scaled by 0.75 until the text fits `DIAGRAM_TEXT_BUDGET`
+(40,000), which only matters for pathological labels (e.g. many emoji, which count double).
+Caps are deterministic: the same bundle always yields the same diagram. What was cut is
+recorded in `bundle.diagrams.truncated` (`{name|train-id: {shown, total, unit}}`, `{}` when
+nothing was cut) and printed as `note: … capped` lines, so the report can say so.
+
+**Node ids** come from `_stable_node_id(prefix, text)`: `<prefix>_<text>` when the text is
+1–32 ASCII letters/digits (`p_alice`, `pr_42`), else `<prefix>_<sanitised head ≤ 24>_<sha1[:8]>`,
+so `a-b` / `a/b` / `a_b` and long paths sharing a prefix stay distinct; a per-diagram
+`_NodeIds` allocator also resolves any hash clash with a `_2`, `_3` suffix. The old
+`_node_id` (sanitise + 60-char cut, which merged such nodes) is gone.
+
+**Validation.** Every emitted file is compiled with `mmdc` unless `--skip-validate`; a
+non-compiling diagram fails the run (exit 1). A diagram fails when mmdc exits non-zero, when it
+writes no output, or when the SVG it writes with exit 0 is Mermaid's error diagram ("Syntax
+error in text", "Maximum text size in diagram exceeded", `aria-roledescription="error"`); a
+source longer than `MERMAID_MAX_TEXT` is rejected before mmdc runs. Each diagram is compiled to
+a temporary SVG first; `--export svg` copies that checked SVG beside the `.mmd`, `--export png`
+then runs mmdc again for the PNG. `ACTIVITY_MMDC_PUPPETEER_CONFIG` names a puppeteer config
+passed as `mmdc -p`; without it, a run as root gets a generated `--no-sandbox` config (Chrome
+will not start sandboxed as root). Paths are recorded in `bundle.diagrams`.
 
 ## 8. Trust — `validate.py`
 
@@ -686,12 +811,22 @@ member, so emitted `repos` may exceed the requested set.
 
 ## 11. Supporting tools
 
-- **`manifest.py`** — `load_manifest` validates `{project (no "/"), window{from,to}, repos[≥1]{owner, repo, registry?}}`; `member_slugs`.
+- **`manifest.py`** — `load_manifest` validates `{project (str, no "/" or "#"), window{from ≤ to, YYYY-MM-DD},
+  repos[≥1]{owner, repo (GitHub name rules), registry? (non-empty str)}}`, rejecting duplicate
+  members and duplicate `registry` values case-insensitively; every failure is a `ValueError`
+  (rules in `STORE.md` § Multi-repo project). `member_slugs`. The field checks
+  (`check_owner/check_repo/check_date/check_window/check_project`) are shared with
+  `gather.parse_args` (single-repo flags), `view.parse_args` and `manifest_from_index`.
 - **`manifest_from_index.py`** — reads the AVM **Terraform** index CSVs
   (`Terraform{Resource,Pattern,Utility}Modules.csv` in `Azure/Azure-Verified-Modules`) via
   `--avm res|ptn|utl` or `--index FILE|URL|-`; filters `--kind/--status/--name-contains/
   --include/--exclude/--limit`; writes the manifest (`--out` or stdout), deriving `registry`
-  from `PublicRegistryReference`.
+  from `PublicRegistryReference`. `RepoURL` loses `.git`, query and fragment; a row whose
+  owner/repo GitHub could not host is dropped; members, `--include` and `--exclude` compare
+  case-insensitively (first index row of a case variant wins). Exit 2 on invalid/inverted
+  dates, `--limit < 1` or a duplicate `registry` in the selection; an `--include` not in the
+  index is a stderr warning; index fetches time out after 30 s. Its output always passes
+  `load_manifest`.
 - **`transcript.py PATH`** — strips WebVTT/SRT headers, NOTE/STYLE blocks, cue timings,
   indices and inline tags; collapses rolling-caption duplicates; `.txt`/`.md` pass through;
   missing file → exit 2.
@@ -722,9 +857,18 @@ diff-stable.
 | `ACTIVITY_IAC_BUILD_TIMEOUT` | 300 | Seconds per IaC subprocess |
 | `ACTIVITY_IAC_MAX_WORKERS` | 8 | Parallel IaC builds |
 | `ACTIVITY_IAC_RETRIES` | 1 | Extra attempts on timeout/failure |
+| `ACTIVITY_HTTP_TIMEOUT` | 60 | Seconds per GitHub API request |
+| `ACTIVITY_HTTP_RETRIES` | 3 | Extra attempts on timeout / connection error / 5xx |
+| `ACTIVITY_RATE_LIMIT_MAX_WAIT` | 3600 | Longest single rate-limit wait in seconds (`0` = fail instead of waiting) |
 | `TF_PLUGIN_CACHE_DIR` | unset | Shared terraform provider cache (enables serial pre-warm) |
 | `ACTIVITY_BOARD_STALE_DAYS` | 365 | Board treated as deprecated beyond this |
 | `ACTIVITY_BOARD_MAX_ITEMS` | 5000 | Per-board item cap |
+| `ACTIVITY_MMDC_PUPPETEER_CONFIG` | unset | Puppeteer config file passed to `mmdc -p` (as root without it: generated `--no-sandbox` config) |
+
+Integer knobs `ACTIVITY_HTTP_*`, `ACTIVITY_RATE_LIMIT_MAX_WAIT` and `ACTIVITY_IAC_*` are read
+at call time (not at import) and checked by `validate_env_knobs()` at the start of `main`: a
+non-integer value exits with an error naming the variable; a value below its minimum (1 for
+timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 
 **Code constants** (change deliberately; tests pin many of them)
 
@@ -740,6 +884,12 @@ diff-stable.
 | `SLICE_TEXT_CAP` / `SLICE_COMMENTS_KEPT` / `SLICE_DIFF_CAP` | 1500 / 6 / 6000 | link |
 | Flow thresholds | stale 30 d, upvotes 5, comments 5, hung 60 d | derive |
 | `TRAIN_FLOW_MAX_PRS` / `_AREAS` | 4 / 5 | render |
+| `MERMAID_MAX_TEXT` / `MERMAID_MAX_EDGES` | 50,000 / 500 (Mermaid's defaults, verified with mmdc 12.2.0) | render |
+| `DIAGRAM_TEXT_BUDGET` | 40,000 | render |
+| `GRAPH_MAX_EDGES` / `BLOCKER_MAX_EDGES` | 120 / 40 | render |
+| `GANTT_MAX_PRS` / `GANTT_MAX_RELEASES` | 200 / 30 | render |
+| `TIMELINE_MAX_DAYS` / `TIMELINE_MAX_EVENTS_PER_DAY` | 40 / 8 | render |
+| `TRAIN_FLOW_MAX_PR_NODES` / `PIE_MAX_SLICES` | 60 / 10 | render |
 | `DEFAULT_AREA_PATTERNS` | §4.5 | gather |
 
 ## 14. Cross-cutting concerns
@@ -774,8 +924,14 @@ release/milestone pages`. Because **all open PRs and issues** are included every
 repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
-off-hours. (`--no-clone` saves the clone only if you refresh the existing clone yourself —
+<<<<<<< HEAD
+off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
+`ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
+A window with more than 1,000 workflow runs costs a few extra requests for the day-splits. (`--no-clone` saves the clone only if you refresh the existing clone yourself —
 gather does not fetch.)
+=======
+off-hours. (A reused `--clone-dir` is fetched rather than re-cloned.)
+>>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 ### 14.4 Security
 
@@ -792,8 +948,14 @@ gather does not fetch.)
 | View not window-scoped on multi-window stores | `extract._materialize_meta` omits `period`; arrays come from `repo_nodes` | prior windows' merges counted as shipped; trains/commits span all stored history (member and project views) | emit `meta.period`/`ref_date` from `ts_from/ts_to`; window the materialized arrays to in-window + spine context |
 | Trust gate fails after a second overlapping fold | `fold_bundle` upserts artifact nodes with the incoming window's lifecycle; `code_events` keeps all windows | `validate.no_drift` "lifecycle length drift" | rebuild artifact lifecycle from the full ledger on fold (or merge with the stored one) |
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
+| Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
+<<<<<<< HEAD
 | Clone dir reuse | `git clone` into an existing dir fails; `--no-clone` does not fetch | repeated runs need a fresh dir | fetch/deepen an existing clone |
+| `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
+| Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
+=======
+>>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 The operating guidance in USAGE (one single-window store per installment, series file for
 continuity, wide single gathers for history stores) avoids the first two in practice.

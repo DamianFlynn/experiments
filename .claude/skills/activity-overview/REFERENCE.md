@@ -46,14 +46,30 @@ member repos) and gather folds into it **idempotently** (re-running an overlappi
 window never double-counts), so the journey graph accretes over time. It's a local,
 rebuildable cache; delete the file to start fresh, or re-gather to refresh against the
 pinned clone SHA (see `STORE.md`). A single store *can* hold **multiple** projects/repos,
-but then the readers need to be told which: `validate.py` (and `digest.py`/`spotlight.py`)
-error asking for `--project` (and `--repo` when a project spans several) — the bare
-`validate.py workspace/journey.db` example above assumes a single-project store.
+but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
+`spotlight.py`) error asking for `--project` (and `--repo` when a project spans several) —
+the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 
-The report vertical (`extract → link → render → report`) **composes from the
-store** — `extract` materializes the bundle as a transient view, then `link`/
-`render` consume it (guarded by the golden-bundle equivalence gate). Render with
-the skill (see `SKILL.md`).
+The report vertical (`view → link → render → report`) **composes from the
+store** — `view.py` (the CLI over `extract`) materializes one repo's raw bundle view,
+then `link.py` enriches it in place and `render.py` adds `diagrams` (guarded by the
+golden-bundle equivalence gate):
+
+```bash
+python3 view.py --store workspace/journey.db --from 2026-05-01 --to 2026-05-31 \
+    --out workspace/view/bundle.json        # [--project OWNER --repo REPO]
+python3 link.py workspace/view/bundle.json --series workspace/series.json
+python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams
+```
+
+`view.py --store DB [--project P] [--repo R] --from F --to T --out PATH` auto-detects
+`--project`/`--repo` when the store holds exactly one (single-repo gather: project =
+owner, repo = name; manifest: project = manifest name, repo = `owner/repo`), writes
+exactly what `extract.extract` returns (raw keys, extract's deterministic order), does
+no network backfill, and exits 2 when the scope is ambiguous, unknown or empty, or the
+store is missing. For a multi-repo project, `--repo` selects one member; the merged
+project view comes from `digest.py`. The full step-by-step procedure (and which report
+sections read which view) is in `SKILL.md`.
 
 ### Multi-repo project
 
@@ -80,6 +96,15 @@ Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
 "registry"?} ] }` — `registry` is an optional exact Terraform registry path; absent,
 a member is matched by the HashiCorp naming convention
 (`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`).
+`load_manifest` rejects (with `ValueError`): non-string fields; `/` or `#` in
+`project`; dates that are not `YYYY-MM-DD` or an inverted window; owner/repo names
+GitHub would not accept; duplicate members (case-insensitive) and a `registry`
+declared twice. The full rule list is in `STORE.md` § Multi-repo project; the same
+owner/repo/date checks apply to `gather.py --owner/--repo/--from/--to`.
+`manifest_from_index.py` strips `.git`, `?query` and `#fragment` from `RepoURL`,
+dedupes members case-insensitively, exits 2 on bad/inverted dates, `--limit < 1` or
+a duplicate `registry` among the selected members, warns when an `--include` slug is
+not in the index, and times out an index fetch after 30 s.
 
 ### IaC build env knobs (heavy live runs)
 
@@ -93,6 +118,30 @@ The shallow clone reaches `ACTIVITY_CLONE_MARGIN_DAYS` (default `14`) before the
 window so an in-window commit keeps its real parent. If `meta.boundary_dropped_commits`
 is non-empty (an in-window commit still landed on the shallow boundary, so its
 whole-tree phantom diff was dropped), widen this knob and re-gather to recover it.
+
+<<<<<<< HEAD
+### GitHub API knobs
+
+Every GitHub request has a timeout and is retried with back-off on timeouts and 5xx;
+on a rate limit gather waits for the reset (it prints how long and until when) and
+continues. Override the defaults when needed: `ACTIVITY_HTTP_TIMEOUT` (seconds per
+request, default `60`), `ACTIVITY_HTTP_RETRIES` (extra attempts, `3`) and
+`ACTIVITY_RATE_LIMIT_MAX_WAIT` (longest single rate-limit wait in seconds, `3600`;
+`0` fails instead of waiting). A 403 that is not a rate limit (SAML SSO, scope)
+still fails at once. A non-integer value for an `ACTIVITY_HTTP_*`,
+`ACTIVITY_RATE_LIMIT_MAX_WAIT` or `ACTIVITY_IAC_*` knob is an error; a value below
+its minimum is clamped with a warning.
+
+If a window has more than 1,000 workflow runs (GitHub's per-search cap) gather
+splits the query by day; a single day still over the cap is reported on stderr and
+marked in `workflow_stats._truncated`.
+=======
+An existing `--clone-dir` that is a clone of the same repo is **fetched** to that bound
+(and the default branch head checked out) instead of re-cloned; `--no-clone` never creates
+a clone (it fetches an existing one, or gathers API data only when there is none). A repo
+with no commits since the bound is cloned at `--depth=1` and contributes no commits.
+`meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.
+>>>>>>> 206fe9e (activity-overview gather: reuse existing clones, fall back to depth 1 on quiet repos)
 
 ### Projects v2 board knobs
 
@@ -126,9 +175,10 @@ discovers slash commands under `.claude/commands/` (project) or `~/.claude/comma
 ln -s ../skills/activity-overview/commands/activity.md .claude/commands/activity.md
 ```
 
-Then: `/activity <owner/repo|project> <from> <to> [--transcript PATH] [--series PATH]
-[options]` — it parses the args and defers to `SKILL.md` (gather → link → render →
-report).
+Then: `/activity <owner/repo> <from> <to> [options]` or `/activity --manifest PATH
+[options]` (options: `--store PATH`, `--transcript PATH`, `--series PATH`, gather
+flags) — it parses the args and defers to `SKILL.md` (gather → validate → view → link
+→ render → slices → report).
 
 ## Tests
 

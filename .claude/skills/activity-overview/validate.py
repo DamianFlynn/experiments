@@ -132,11 +132,18 @@ def _detect_project_repo(conn, project, repo, allow_multi=False):
 
 
 def _local(qid):
-    return graphstore.parse_id(qid)["local"]
+    """Full local id (everything after the first `#`; see graphstore.local_id)."""
+    return graphstore.local_id(qid)
 
 
 def _is_person_id(qid):
-    return "#person-" in qid
+    """Project-scoped person id `{project}#person-{login}`. Classified by the
+    LOCAL id, so a symbol whose path/name merely contains `#person-` is not —
+    and an artifact whose PATH starts with `person-` (e.g. the symbol
+    `person-data/main.tf#terraform:resource:x`, or `art:person-notes.md`) is an
+    artifact, never a person."""
+    local = _local(qid)
+    return local.startswith("person-") and not graphstore.is_artifact_local(local)
 
 
 # --- check 1: referential integrity ------------------------------------------
@@ -382,7 +389,9 @@ def check_no_fabrication(conn):
         # artifact with no history
         elif n["node_class"] == "code":
             local = parsed["local"]
-            is_artifact = local.startswith("art:") or "#" in local
+            # `art:<path>` file artifacts and `<path>#<lang>:<subkind>:<name>`
+            # symbol/comment artifacts (graphstore.is_artifact_local).
+            is_artifact = graphstore.is_artifact_local(local)
             if is_artifact:
                 lifecycle = (n["data"] or {}).get("lifecycle") or []
                 if not lifecycle:
@@ -404,6 +413,10 @@ def _id_kind(conn, qid, node_cache):
     local = _local(qid)
     if _is_person_id(qid):
         return "person"
+    # Artifact form first: a symbol's PATH may itself start with a prefix below
+    # (`issue-templates/main.tf#terraform:…`, `release-notes/…`).
+    if graphstore.is_artifact_local(local):
+        return "artifact"
     if local.startswith("area-"):
         return "area"
     if local.startswith("milestone-"):
@@ -422,8 +435,6 @@ def _id_kind(conn, qid, node_cache):
         return "pr"
     if local.startswith("issue-"):
         return "issue"
-    if local.startswith("art:") or "#" in local:
-        return "artifact"
     node = node_cache.get(qid)
     if node is None and qid not in node_cache:
         node = graphstore.get_node(conn, qid)
@@ -613,19 +624,14 @@ def check_no_drift(conn, project, repo, bundle, check_people=True):
 
     # --- artifacts ---
     # The stored artifact id is `{project}/{repo}#{local}` where the SYMBOL-artifact
-    # local is itself a double-`#` form `{path}#{lang}:{subkind}:{name}`. `_local`
-    # (parse_id) rpartitions on the LAST `#`, which truncates a symbol id to
-    # `{lang}:{subkind}:{name}` — so it would never match the derived `{path}#…`
-    # key and 86 real artifacts were FALSELY reported "derived but not stored". Strip
-    # ONLY the repo prefix to recover the true local id (mirroring how fold_bundle /
-    # extract reconstruct it).
+    # local is itself a double-`#` form `{path}#{lang}:{subkind}:{name}`. Strip
+    # ONLY the repo prefix (graphstore.local_id) to recover the true local id
+    # (mirroring how fold_bundle / extract reconstruct it).
     want_arts = _derive_artifacts(bundle)
     stored_arts = {}
-    repo_prefix = "{}/{}#".format(project, repo)
     for n in graphstore.repo_nodes(conn, project, repo, "code"):
-        nid = n["id"]
-        local = nid[len(repo_prefix):] if nid.startswith(repo_prefix) else _local(nid)
-        if local.startswith("art:") or "#" in local:
+        local = graphstore.local_id(n["id"], project, repo)
+        if graphstore.is_artifact_local(local):
             stored_arts[local] = n["data"] or {}
     art_fields = ("kind", "path", "name", "status", "replaced_by", "code_area")
     for aid in sorted(set(stored_arts) | set(want_arts)):

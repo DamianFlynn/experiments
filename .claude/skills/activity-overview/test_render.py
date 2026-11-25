@@ -39,24 +39,92 @@ def _bundle():
         return json.load(fh)
 
 
+_MMDC_PROBE = {}
+
+
 def _mmdc_works():
     """True only if a real `mmdc` can compile a trivial diagram — guards the
-    live-validation test so a missing OR non-functional mmdc (e.g. Puppeteer
-    Chrome absent) skips rather than fails."""
-    mmdc = shutil.which("mmdc")
-    if not mmdc:
-        return False
-    try:
-        with tempfile.TemporaryDirectory() as d:
-            src = os.path.join(d, "probe.mmd")
-            out = os.path.join(d, "probe.svg")
-            with open(src, "w", encoding="utf-8") as fh:
-                fh.write('pie\n    "A" : 1\n')
-            result = subprocess.run([mmdc, "-i", src, "-o", out, "-q"],
-                                    capture_output=True, text=True)
-            return result.returncode == 0
-    except Exception:
-        return False
+    live-validation tests. Locally a missing OR non-functional mmdc (e.g. Puppeteer
+    Chrome absent) skips them; under CI (`CI=true`) `_require_mmdc` turns that
+    into a failure so the diagram gate cannot silently skip. Probes through render's own
+    `validate_with_mmdc`, so the probe uses the same command line (incl. the
+    optional/root puppeteer config) as the tests it guards. Cached: one probe
+    per test run."""
+    if "ok" not in _MMDC_PROBE:
+        ok = False
+        if shutil.which("mmdc"):
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    src = os.path.join(d, "probe.mmd")
+                    with open(src, "w", encoding="utf-8") as fh:
+                        fh.write('pie\n    "A" : 1\n')
+                    render.validate_with_mmdc([src])
+                    ok = True
+            except (Exception, SystemExit):
+                ok = False
+        _MMDC_PROBE["ok"] = ok
+    return _MMDC_PROBE["ok"]
+
+
+def _fake_mmdc(svg='<svg aria-roledescription="pie"></svg>', returncode=0,
+               stderr="", calls=None):
+    """A stand-in for `subprocess.run(mmdc ...)`: writes `svg` to the `-o` path
+    (as real mmdc does on exit 0) and returns `returncode`. Records each command
+    in `calls` when given. render now inspects the written SVG, so a fake that
+    writes nothing is (correctly) treated as a failed render."""
+    def run(cmd, **kw):
+        if calls is not None:
+            calls.append(list(cmd))
+        if returncode == 0 and svg is not None:
+            out = cmd[cmd.index("-o") + 1]
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write(svg)
+
+        class R:
+            pass
+        r = R()
+        r.returncode = returncode
+        r.stderr = stderr
+        r.stdout = ""
+        return r
+    return run
+
+
+def _in_ci(environ=None):
+    """True when running under CI (GitHub Actions and most CI systems set
+    `CI=true`)."""
+    env = os.environ if environ is None else environ
+    return env.get("CI", "").strip().lower() in ("true", "1", "yes")
+
+
+def _require_mmdc(testcase, works=None, environ=None):
+    """Skip the calling test when no working mmdc is available — except under
+    CI, where the workflow installs a pinned mermaid-cli and a missing/broken
+    mmdc must FAIL the test rather than skip it (issue #72)."""
+    ok = _mmdc_works() if works is None else works()
+    if ok:
+        return
+    reason = "working mmdc (with browser) not available"
+    if _in_ci(environ):
+        testcase.fail(reason + " but CI=true: the diagram compile gate must run")
+    testcase.skipTest(reason)
+
+
+class TestRequireMmdc(unittest.TestCase):
+    """Regression for #72: under CI the mmdc tests must fail, not skip."""
+
+    def test_fails_under_ci_when_mmdc_missing(self):
+        with self.assertRaises(AssertionError):
+            _require_mmdc(self, works=lambda: False, environ={"CI": "true"})
+
+    def test_skips_locally_when_mmdc_missing(self):
+        for env in ({}, {"CI": ""}, {"CI": "false"}):
+            with self.assertRaises(unittest.SkipTest):
+                _require_mmdc(self, works=lambda: False, environ=env)
+
+    def test_passes_through_when_mmdc_works(self):
+        for env in ({}, {"CI": "true"}):
+            self.assertIsNone(_require_mmdc(self, works=lambda: True, environ=env))
 
 
 class TestBucketsPie(unittest.TestCase):
@@ -174,10 +242,9 @@ class TestMmdcValidation(unittest.TestCase):
 
     def test_real_mmdc_compiles_emitted_diagrams(self):
         # Probe lazily inside the test (not at import time) so collecting/​running
-        # other tests never spawns mmdc, and an installed-but-broken mmdc skips
-        # rather than fails.
-        if not _mmdc_works():
-            self.skipTest("working mmdc (with browser) not available")
+        # other tests never spawns mmdc; a missing/broken mmdc skips locally
+        # but fails under CI=true (#72).
+        _require_mmdc(self)
         with tempfile.TemporaryDirectory() as d:
             real_paths = render.write_diagrams(_bundle(), d)
             render.validate_with_mmdc(list(real_paths.values()))  # raises on failure
@@ -273,12 +340,9 @@ class TestEndToEndOffline(unittest.TestCase):
         self.assertTrue(bundle["buckets"]["next_candidates"])
         with tempfile.TemporaryDirectory() as d:
             manifest = render.write_diagrams(bundle, d)
-            # validation path runs with a stubbed mmdc (returncode 0)
-            class Ok:
-                returncode = 0
-                stderr = ""
+            # validation path runs with a stubbed mmdc (returncode 0, valid SVG)
             render.validate_with_mmdc(list(manifest.values()),
-                                      runner=lambda cmd, **kw: Ok(),
+                                      runner=_fake_mmdc(),
                                       which=lambda _n: "/usr/bin/mmdc")
             self.assertLessEqual({"buckets_pie", "timeline_gantt"}, set(bundle["diagrams"]))
             self.assertTrue(os.path.exists(manifest["buckets_pie"]))
@@ -428,11 +492,8 @@ class TestEndToEndOfflineP3(unittest.TestCase):
                 {"buckets_pie", "timeline_gantt", "content_timeline", "deltas_bar"},
                 set(real))
 
-            class Ok:
-                returncode = 0
-                stderr = ""
             render.validate_with_mmdc(list(real.values()),
-                                      runner=lambda cmd, **kw: Ok(),
+                                      runner=_fake_mmdc(),
                                       which=lambda _n: "/usr/bin/mmdc")
 
 
@@ -710,9 +771,9 @@ class TestEmitTrainFlowchart(unittest.TestCase):
         pr_number = train["prs"][0]          # 42
         mmd = render.emit_train_flowchart(b, train)
         lines = mmd.splitlines()
-        iss_id = render._node_id("iss", str(issue_number))
-        pr_id = render._node_id("pr", str(pr_number))
-        out_id = render._node_id("out", train["id"])
+        iss_id = render._stable_node_id("iss", str(issue_number))
+        pr_id = render._stable_node_id("pr", str(pr_number))
+        out_id = render._stable_node_id("out", train["id"])
         # The specific issue -> PR edge must be present
         self.assertIn(f"    {iss_id} --> {pr_id}", lines)
         # The PR -> outcome edge must also be present
@@ -888,8 +949,8 @@ class TestEmitTrainFlowchart(unittest.TestCase):
         self.assertIn("alpha", mmd)
         self.assertIn("beta", mmd)
         # Only one node per distinct area (node id is deterministic from area name)
-        alpha_id = render._node_id("area", "area/alpha")
-        beta_id = render._node_id("area", "area/beta")
+        alpha_id = render._stable_node_id("area", "area/alpha")
+        beta_id = render._stable_node_id("area", "area/beta")
         # Each distinct area node declaration appears exactly once
         node_lines = [ln for ln in mmd.splitlines()
                       if alpha_id in ln and '("' in ln]
@@ -1006,9 +1067,9 @@ class TestTrainSpotlightCLI(unittest.TestCase):
 
 
 class TestTrainFlowchartMmdc(unittest.TestCase):
-    @unittest.skipUnless(_mmdc_works(), "working mmdc (with browser) not available")
     def test_train_flowcharts_compile_via_mmdc(self):
         """Live gate: emitted train flowcharts must actually compile with mmdc."""
+        _require_mmdc(self)
         b = _train_bundle()
         # Ensure there is at least one deep train
         b["trains"][0]["tier"] = "deep"
@@ -1065,9 +1126,13 @@ class TestProjectModuleGraph(unittest.TestCase):
         # them into one, mis-wiring the cross-repo edge.
         a = "Azure/terraform-azurerm-avm-res-network-virtualnetwork-peering-alpha"
         b = "Azure/terraform-azurerm-avm-res-network-virtualnetwork-peering-bravo"
-        # precondition: the old id WOULD have collided (proves the bug is real)
-        self.assertEqual(render._node_id("m", a + "::main.tf"),
-                         render._node_id("m", b + "::main.tf"))
+        # precondition: the old 60-char-truncation id (the removed `_node_id`,
+        # reproduced inline) WOULD have collided (proves the bug is real)
+        def legacy_node_id(prefix, text):
+            return f"{prefix}_" + "".join(
+                ch if ch.isalnum() else "_" for ch in text)[:60 - len(prefix) - 1]
+        self.assertEqual(legacy_node_id("m", a + "::main.tf"),
+                         legacy_node_id("m", b + "::main.tf"))
         edges = [{"src_repo": a, "src_area": "main.tf",
                   "dst_repo": b, "dst_area": "main.tf",
                   "version": "1.0.0", "transitive": False, "cross_repo": True}]
@@ -1102,6 +1167,479 @@ class TestProjectModuleGraph(unittest.TestCase):
         base_defs = sum(1 for ln in mmd.splitlines()
                         if ln.strip().startswith("m_") and ln.strip().endswith('("base")'))
         self.assertEqual(base_defs, 1)
+
+
+# --------------------------------------------------------------------------
+# Issue #71: size limits, node-id collisions, CLI handling, `\r` stripping.
+# --------------------------------------------------------------------------
+
+def _scale_bundle():
+    """A large-window bundle that, uncapped, exceeds Mermaid's text limit (gantt,
+    content timeline) AND edge limit (module + contributor graphs): 700 PRs,
+    800 module edges, 700 person->area edges, 1,500 content events, a 300-PR
+    deep train, issue kinds with quotes, and CR/LF in titles."""
+    prs = []
+    for n in range(1, 701):
+        day = 1 + (n % 28)
+        prs.append({
+            "number": n,
+            "title": f"PR {n} adds a reasonably long descriptive title\r\nsecond line",
+            "state": "closed" if n % 3 else "open", "merged": bool(n % 3),
+            "created_at": f"2026-05-{day:02d}T00:00:00Z",
+            "merged_at": f"2026-05-{min(day + 1, 31):02d}T00:00:00Z" if n % 3 else None,
+            "closed_at": None, "milestone": None})
+    people = {f"user{u:03d}": {"modules": [f"avm/res/group{u}/module-{k}"
+                                           for k in range(10)]}
+              for u in range(70)}
+    areas = [{"id": f"avm/res/src/area-{i}",
+              "edges": [{"to": f"avm/res/dst/target-{(i * 20 + j) % 300}",
+                         "resolved": True, "version": f"0.{j}.0"} for j in range(20)]}
+             for i in range(40)]
+    artifacts = {}
+    for a in range(50):
+        artifacts[f"art:docs/page-{a}.md"] = {
+            "kind": "doc", "name": f"page-{a}.md\r\nx", "path": f"docs/page-{a}.md",
+            "lifecycle": [{"event": "change", "author": f"user{a % 7}",
+                           "date": f"2026-05-{1 + (e % 30):02d}"} for e in range(30)]}
+    kinds = [f"kind-{k}" for k in range(14)] + ['we"ird "quoted" kind']
+    issues = [{"number": 5000 + i, "kind": kinds[i % len(kinds)],
+               "title": f"Issue {i}"} for i in range(150)]
+    issues[0]["blocking"] = [5001 + i for i in range(60)]
+    trains = [{"id": "train-issue-5000", "kind": "feature", "root_issue": 5000,
+               "prs": list(range(1, 301)), "commits": [], "code_areas": [],
+               "outcome": "shipped", "evidence": [], "tier": "deep"}]
+    return {
+        "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
+        "prs": prs,
+        "releases": [{"name": f"v1.{i}.0\r\n", "published_at": "2026-05-15T00:00:00Z"}
+                     for i in range(5)],
+        "people": people, "code_graph": {"areas": areas}, "artifacts": artifacts,
+        "issues": issues, "trains": trains, "feature_deltas": [],
+        "buckets": {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
+    }
+
+
+def _flow_edges(mmd):
+    return [ln for ln in mmd.splitlines() if "-->" in ln]
+
+
+class TestDiagramCaps(unittest.TestCase):
+    """Every emitter stays under Mermaid's limits with an explicit '+K more'
+    marker, deterministically, and the truncation is recorded."""
+
+    def test_limits_are_documented_constants(self):
+        self.assertEqual(render.MERMAID_MAX_TEXT, 50000)
+        self.assertEqual(render.MERMAID_MAX_EDGES, 500)
+        self.assertLess(render.DIAGRAM_TEXT_BUDGET, render.MERMAID_MAX_TEXT)
+        self.assertLess(render.GRAPH_MAX_EDGES, render.MERMAID_MAX_EDGES)
+
+    def test_every_flat_diagram_fits_text_budget(self):
+        out = render.render(_scale_bundle())
+        for name, text in out.items():
+            self.assertLessEqual(render._mermaid_len(text),
+                                 render.DIAGRAM_TEXT_BUDGET, name)
+
+    def test_gantt_700_prs_capped_with_marker(self):
+        mmd = render.emit_timeline_gantt(_scale_bundle())
+        cap = render.GANTT_MAX_PRS
+        tasks = [ln for ln in mmd.splitlines() if ln.strip().startswith("#")]
+        self.assertEqual(len(tasks), cap)
+        self.assertIn(f"+{700 - cap} more PRs not shown", mmd)
+        # the most recently created PRs are kept (documented key)
+        self.assertIn("#699 ", mmd)
+
+    def test_module_graph_800_edges_capped_with_marker(self):
+        mmd = render.emit_module_graph(_scale_bundle())
+        self.assertEqual(len(_flow_edges(mmd)), render.GRAPH_MAX_EDGES)
+        self.assertIn(f"+{800 - render.GRAPH_MAX_EDGES} more edges not shown", mmd)
+
+    def test_contributor_graph_700_edges_capped_with_marker(self):
+        mmd = render.emit_contributor_graph(_scale_bundle())
+        self.assertEqual(len(_flow_edges(mmd)), render.GRAPH_MAX_EDGES)
+        self.assertIn(f"+{700 - render.GRAPH_MAX_EDGES} more edges not shown", mmd)
+        # breadth-first key: every contributor keeps at least one edge
+        for u in range(70):
+            self.assertIn(f'"user{u:03d}"', mmd)
+
+    def test_content_timeline_1500_events_capped_with_marker(self):
+        mmd = render.emit_content_timeline(_scale_bundle())
+        self.assertLessEqual(render._mermaid_len(mmd), render.DIAGRAM_TEXT_BUDGET)
+        self.assertIn("more events", mmd)
+
+    def test_train_flowchart_300_prs_capped_with_marker(self):
+        b = _scale_bundle()
+        mmd = render.emit_train_flowchart(b, b["trains"][0])
+        self.assertLessEqual(len(_flow_edges(mmd)), render.MERMAID_MAX_EDGES)
+        self.assertIn(f"+{300 - render.TRAIN_FLOW_MAX_PR_NODES} more PRs", mmd)
+
+    def test_kind_pie_capped_and_quotes_sanitised(self):
+        mmd = render.emit_kind_breakdown(_scale_bundle())
+        slices = [ln for ln in mmd.splitlines() if ln.strip().startswith('"')]
+        self.assertEqual(len(slices), render.PIE_MAX_SLICES)
+        self.assertIn("more kinds", mmd)
+        for ln in slices:  # exactly the two delimiting quotes per slice line
+            self.assertEqual(ln.count('"'), 2, ln)
+
+    def test_kind_pie_quote_in_small_input_sanitised(self):
+        mmd = render.emit_kind_breakdown({"issues": [{"kind": 'a"b'}]})
+        self.assertIn('"a\'b" : 1', mmd)
+
+    def test_blocker_graph_marker_counts_omitted(self):
+        mmd = render.emit_blocker_graph(_scale_bundle())
+        self.assertEqual(len(_flow_edges(mmd)), render.BLOCKER_MAX_EDGES)
+        self.assertIn(f"+{60 - render.BLOCKER_MAX_EDGES} more", mmd)
+
+    def test_project_module_graph_capped(self):
+        edges = [{"src_repo": f"Az/r{i % 9}", "src_area": f"s{i}",
+                  "dst_repo": "Az/dst", "dst_area": f"d{i % 50}",
+                  "version": "1.0.0", "transitive": False, "cross_repo": True}
+                 for i in range(700)]
+        mmd = render.emit_project_module_graph(edges)
+        self.assertEqual(len(_flow_edges(mmd)), render.GRAPH_MAX_EDGES)
+        self.assertIn("more edges not shown", mmd)
+        self.assertLessEqual(render._mermaid_len(mmd), render.DIAGRAM_TEXT_BUDGET)
+
+    def test_caps_are_deterministic_under_input_order(self):
+        import random
+        b1 = _scale_bundle()
+        b2 = _scale_bundle()
+        rnd = random.Random(7)
+        rnd.shuffle(b2["prs"])
+        rnd.shuffle(b2["code_graph"]["areas"])
+        b2["people"] = dict(sorted(b2["people"].items(), reverse=True))
+        for fn in (render.emit_timeline_gantt, render.emit_module_graph,
+                   render.emit_contributor_graph):
+            self.assertEqual(fn(b1), fn(b2), fn.__name__)
+
+    def test_small_inputs_not_truncated(self):
+        b = _bundle()
+        with tempfile.TemporaryDirectory() as d:
+            render.write_diagrams(b, os.path.join(d, "diagrams"))
+        self.assertEqual(b["diagrams"]["truncated"], {})
+
+    def test_truncation_recorded_in_bundle_diagrams(self):
+        b = _scale_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            render.write_diagrams(b, os.path.join(d, "diagrams"))
+        tr = b["diagrams"]["truncated"]
+        self.assertEqual(tr["timeline_gantt"],
+                         {"shown": render.GANTT_MAX_PRS, "total": 700, "unit": "PRs"})
+        self.assertEqual(tr["module_graph"],
+                         {"shown": render.GRAPH_MAX_EDGES, "total": 800,
+                          "unit": "edges"})
+        self.assertEqual(tr["contributor_graph"]["total"], 700)
+        self.assertEqual(tr["content_timeline"]["total"], 1500)
+        self.assertEqual(tr["content_timeline"]["unit"], "events")
+        self.assertIn("kind_breakdown", tr)
+        self.assertIn("blocker_graph", tr)
+        self.assertEqual(tr["train-issue-5000"]["total"], 300)
+        # the train flowchart map is untouched by the truncation map
+        self.assertIn("train-issue-5000", b["diagrams"]["train_flowcharts"])
+
+    def test_spotlight_records_train_truncation(self):
+        b = _scale_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            render.write_diagrams(b, os.path.join(d, "diagrams"),
+                                  train_id="train-issue-5000")
+        self.assertEqual(b["diagrams"]["truncated"]["train-issue-5000"]["unit"], "PRs")
+
+
+class TestNodeIds(unittest.TestCase):
+    """Node ids are collision-free (no `_node_id` 60-char/sanitise merges)."""
+
+    def test_legacy_node_id_removed(self):
+        self.assertFalse(hasattr(render, "_node_id"))
+
+    def test_simple_keys_stay_readable(self):
+        self.assertEqual(render._stable_node_id("p", "alice"), "p_alice")
+        self.assertEqual(render._stable_node_id("pr", "42"), "pr_42")
+
+    def test_sanitisation_collisions_are_distinct(self):
+        ids = {render._stable_node_id("a", t) for t in ("a-b", "a/b", "a_b", "ab")}
+        self.assertEqual(len(ids), 4)
+
+    def _node_decls(self, mmd):
+        return [ln.strip() for ln in mmd.splitlines()
+                if "-->" not in ln and ("(" in ln or "[" in ln)]
+
+    def test_contributor_graph_colliding_areas_are_distinct_nodes(self):
+        b = {"people": {"alice": {"modules": ["a-b", "a/b", "a_b"]},
+                        "a-l": {"modules": ["x"]}, "a_l": {"modules": ["x"]}}}
+        mmd = render.emit_contributor_graph(b)
+        self.assertEqual(len(_flow_edges(mmd)), 5)
+        decls = self._node_decls(mmd)
+        self.assertEqual(len(decls), 3 + 1 + 3)   # 3 areas + x + 3 people
+        self.assertEqual(len({d.split("(")[0].split("[")[0] for d in decls}), 7)
+
+    def test_module_graph_colliding_paths_are_distinct_nodes(self):
+        long = "avm/res/document-db/database-account/sql-database/container/"
+        targets = ["modules/key-vault", "modules/key_vault", "modules/key/vault",
+                   long + "sql-role-assignment", long + "stored-procedure"]
+        b = {"code_graph": {"areas": [{"id": "app", "edges": [
+            {"to": t, "resolved": True} for t in targets]}]}}
+        mmd = render.emit_module_graph(b)
+        dsts = {ln.split("-->")[1].strip() for ln in _flow_edges(mmd)}
+        self.assertEqual(len(dsts), 5)
+
+    def test_train_flowchart_colliding_areas_are_distinct_nodes(self):
+        b = _train_bundle()
+        train = dict(b["trains"][0], code_areas=["x/a-b", "x/a_b", "x/a/b"])
+        mmd = render.emit_train_flowchart(b, train)
+        area_edges = [ln for ln in _flow_edges(mmd) if "area_" in ln]
+        self.assertEqual(len({ln.split("-->")[1].strip() for ln in area_edges}), 3)
+
+    def test_unique_ids_even_on_forced_hash_collision(self):
+        alloc = render._NodeIds()
+        a = alloc("m", "x-y")
+        orig = render._stable_node_id
+        try:
+            render._stable_node_id = lambda prefix, text: a   # force a clash
+            b = alloc("m", "x/y")
+            c = alloc("m", "x/y")
+        finally:
+            render._stable_node_id = orig
+        self.assertNotEqual(a, b)
+        self.assertEqual(b, c)          # stable per text within one diagram
+
+
+class TestCarriageReturns(unittest.TestCase):
+    def test_gantt_and_timeline_strip_cr(self):
+        b = _bundle()
+        b["prs"][0]["title"] = "Fix\r\nthing\rhere"
+        self.assertNotIn("\r", render.emit_timeline_gantt(b))
+        p3 = _p3_bundle()
+        p3["artifacts"]["art:docs/firewall.md"]["name"] = "fire\r\nwall.md"
+        self.assertNotIn("\r", render.emit_content_timeline(p3))
+
+    def test_flow_labels_strip_cr(self):
+        b = _train_bundle()
+        b["prs"][0]["title"] = "Add\r\npolicy"
+        self.assertNotIn("\r", render.emit_train_flowchart(b, b["trains"][0]))
+
+    def test_label_helpers(self):
+        for fn in (render._gantt_label, render._timeline_text, render._flow_label):
+            self.assertNotIn("\r", fn("a\r\nb\rc\td"))
+
+
+class TestErrorSvgDetection(unittest.TestCase):
+    def _mmd(self, d, text='pie\n    "A" : 1\n'):
+        path = os.path.join(d, "x.mmd")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def _assert_rejects(self, svg, needle):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(RuntimeError) as ctx:
+                render.validate_with_mmdc([self._mmd(d)], runner=_fake_mmdc(svg=svg),
+                                          which=lambda _n: "/usr/bin/mmdc")
+        self.assertIn(needle, str(ctx.exception))
+
+    def test_max_text_size_svg_is_failure(self):
+        self._assert_rejects('<svg aria-roledescription="flowchart-v2"><text>'
+                             'Maximum text size in diagram exceeded</text></svg>',
+                             "Maximum text size")
+
+    def test_syntax_error_svg_is_failure(self):
+        self._assert_rejects('<svg aria-roledescription="error"><text>'
+                             'Syntax error in text</text></svg>', "Syntax error")
+
+    def test_error_role_svg_is_failure(self):
+        self._assert_rejects('<svg aria-roledescription="error"></svg>', "error")
+
+    def test_missing_output_is_failure(self):
+        self._assert_rejects(None, "no output")
+
+    def test_oversize_source_rejected_before_mmdc(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            big = ("pie\n    title " + "x" * render.MERMAID_MAX_TEXT
+                   + '\n    "A" : 1\n')
+            with self.assertRaises(RuntimeError) as ctx:
+                render.validate_with_mmdc([self._mmd(d, big)],
+                                          runner=_fake_mmdc(calls=calls),
+                                          which=lambda _n: "/usr/bin/mmdc")
+        self.assertIn("text limit", str(ctx.exception))
+        self.assertEqual(calls, [])
+
+    def test_valid_svg_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            render.validate_with_mmdc([self._mmd(d)], runner=_fake_mmdc(),
+                                      which=lambda _n: "/usr/bin/mmdc")
+
+    def test_png_export_validated_via_svg_first(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            mmd = self._mmd(d)
+            render.validate_with_mmdc([mmd], export="png",
+                                      runner=_fake_mmdc(calls=calls),
+                                      which=lambda _n: "/usr/bin/mmdc")
+            outs = [c[c.index("-o") + 1] for c in calls]
+            self.assertTrue(outs[0].endswith(".svg"))
+            self.assertEqual(outs[1], os.path.join(d, "x.png"))
+            self.assertTrue(os.path.exists(os.path.join(d, "x.png")))
+
+    def test_bad_svg_not_exported(self):
+        with tempfile.TemporaryDirectory() as d:
+            mmd = self._mmd(d)
+            with self.assertRaises(RuntimeError):
+                render.validate_with_mmdc(
+                    [mmd], export="svg",
+                    runner=_fake_mmdc(svg='<svg aria-roledescription="error"/>'),
+                    which=lambda _n: "/usr/bin/mmdc")
+            self.assertFalse(os.path.exists(os.path.join(d, "x.svg")))
+
+
+class TestPuppeteerConfig(unittest.TestCase):
+    def _cmd(self, env, euid):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            mmd = os.path.join(d, "x.mmd")
+            with open(mmd, "w") as fh:
+                fh.write("pie\n")
+            render.validate_with_mmdc([mmd], runner=_fake_mmdc(calls=calls),
+                                      which=lambda _n: "/usr/bin/mmdc",
+                                      env=env, euid=euid)
+        return calls[0]
+
+    def test_env_var_config_passed(self):
+        cmd = self._cmd({"ACTIVITY_MMDC_PUPPETEER_CONFIG": "/cfg/p.json"}, euid=1000)
+        self.assertEqual(cmd[cmd.index("-p") + 1], "/cfg/p.json")
+
+    def test_root_gets_no_sandbox_config(self):
+        self.assertIn("-p", self._cmd({}, euid=0))
+
+    def test_non_root_without_env_has_no_config(self):
+        self.assertNotIn("-p", self._cmd({}, euid=1000))
+
+
+class TestRenderCLI(unittest.TestCase):
+    def _write_bundle(self, d, bundle):
+        path = os.path.join(d, "b.json")
+        with open(path, "w") as fh:
+            json.dump(bundle, fh)
+        return path
+
+    def test_unknown_train_is_clean_rc2(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_bundle(d, _train_bundle())
+            before = open(path).read()
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                render.main([path, "--diagrams-dir", os.path.join(d, "dg"),
+                             "--train", "train-nope", "--skip-validate"])
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("train-nope", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertEqual(open(path).read(), before)        # bundle untouched
+            self.assertFalse(os.path.exists(os.path.join(d, "dg")))
+
+    def test_unknown_train_subprocess_has_no_traceback(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.py")
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_bundle(d, _train_bundle())
+            r = subprocess.run([sys.executable, script, path, "--train", "nope",
+                                "--skip-validate", "--diagrams-dir",
+                                os.path.join(d, "dg")],
+                               capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_export_with_skip_validate_rejected(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_bundle(d, _train_bundle())
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as ctx:
+                render.main([path, "--export", "svg", "--skip-validate"])
+            self.assertEqual(ctx.exception.code, 2)
+
+
+class TestSvgErrorDetection(unittest.TestCase):
+    """An error MESSAGE in the SVG is only an error when the diagram's own source
+    did not contain it; Mermaid's error ROLE is always an error."""
+
+    def _svg(self, body):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = os.path.join(d, "x.svg")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return p
+
+    def test_label_mentioning_error_phrases_is_valid(self):
+        for phrase in ("Syntax error in text",
+                       "Maximum text size in diagram exceeded"):
+            src = 'flowchart LR\n    a["Fix %s"]\n' % phrase
+            svg = self._svg('<svg aria-roledescription="flowchart-v2">'
+                            '<text>Fix %s</text></svg>' % phrase)
+            self.assertIsNone(render._svg_error(svg, src), phrase)
+
+    def test_error_phrase_not_from_source_is_an_error(self):
+        svg = self._svg('<svg aria-roledescription="flowchart-v2">'
+                        '<text>Maximum text size in diagram exceeded</text></svg>')
+        self.assertIn("Maximum text size",
+                      render._svg_error(svg, "flowchart LR\n    a[\"ok\"]\n"))
+        self.assertIn("Maximum text size", render._svg_error(svg))
+
+    def test_error_role_is_always_an_error(self):
+        svg = self._svg('<svg aria-roledescription="error">'
+                        '<text>Syntax error in text</text></svg>')
+        src = 'pie\n    "Syntax error in text" : 1\n'
+        self.assertIn("error", render._svg_error(svg, src))
+
+
+class TestScaleMmdc(unittest.TestCase):
+    """Live gates against real mmdc (skipped only when no working mmdc)."""
+
+    def setUp(self):
+        _require_mmdc(self)
+
+    def test_scale_bundle_renders_valid_capped_diagrams(self):
+        # 700 PRs, 800 module edges, 700 contributor edges, 1,500 events, a 300-PR
+        # train, quoted kinds and CR/LF titles: every diagram compiles to a real
+        # (non-error) SVG under mmdc's default limits.
+        b = _scale_bundle()
+        with tempfile.TemporaryDirectory() as d:
+            real = render.write_diagrams(b, os.path.join(d, "diagrams"))
+            render.validate_with_mmdc(list(real.values()))
+
+    def test_real_syntax_error_svg_detected(self):
+        # mmdc exits 0 on a pie with a stray quote but writes an error SVG.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "bad.mmd")
+            with open(path, "w") as fh:
+                fh.write('pie\n    "a"b" : 1\n')
+            with self.assertRaises(RuntimeError) as ctx:
+                render.validate_with_mmdc([path])
+        self.assertIn("error", str(ctx.exception).lower())
+
+    def test_real_max_text_size_svg_detected(self):
+        # bypass the pre-check to prove the post-mmdc inspection catches it too.
+        orig = render.MERMAID_MAX_TEXT
+        render.MERMAID_MAX_TEXT = 10 ** 9
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "big.mmd")
+                with open(path, "w") as fh:
+                    fh.write("pie\n    title " + "x" * 50100 + '\n    "A" : 1\n')
+                with self.assertRaises(RuntimeError) as ctx:
+                    render.validate_with_mmdc([path])
+        finally:
+            render.MERMAID_MAX_TEXT = orig
+        self.assertIn("Maximum text size", str(ctx.exception))
+
+    def test_crlf_titles_compile(self):
+        b = _bundle()
+        b["prs"][0]["title"] = "Fix\r\nthing"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "g.mmd")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(render.emit_timeline_gantt(b))
+            render.validate_with_mmdc([path])
 
 
 if __name__ == "__main__":

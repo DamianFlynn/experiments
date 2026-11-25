@@ -44,10 +44,12 @@ class TestIdentity(unittest.TestCase):
             "avm#person-octocat",
         )
 
-    def test_parse_id_splits_on_last_hash(self):
+    def test_parse_id_splits_on_first_hash(self):
+        # Issue #54: the scope never contains '#', a local id may (symbol ids
+        # `<path>#<lang>:<subkind>:<name>`), so the split is on the FIRST '#'.
         parsed = graphstore.parse_id("avm/bicep-registry-modules#path/main.bicep#x")
-        self.assertEqual(parsed["scope"], "avm/bicep-registry-modules#path/main.bicep")
-        self.assertEqual(parsed["local"], "x")
+        self.assertEqual(parsed["scope"], "avm/bicep-registry-modules")
+        self.assertEqual(parsed["local"], "path/main.bicep#x")
 
     def test_qualified_ids_do_not_collide_across_repos(self):
         a = graphstore.qualify_id("avm", "repo-a", "issue-1")
@@ -443,13 +445,10 @@ class TestScaleSmoke(unittest.TestCase):
         # guard the real intent — the window scan must use idx_nodes_window, not
         # a full table scan. A query-plan assertion is deterministic across CI
         # runners/Python versions, unlike a wall-clock threshold. This EXPLAIN
-        # mirrors the query range_query runs for a single repo.
-        plan = conn.execute(
-            "EXPLAIN QUERY PLAN "
-            "SELECT * FROM nodes WHERE project=? AND repo IN (?) "
-            "AND ts IS NOT NULL AND ts BETWEEN ? AND ? ORDER BY ts, id",
-            ["p", "r", "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z"],
-        ).fetchall()
+        # is the exact query range_query runs for a single repo.
+        sql, params = graphstore._range_query_sql(
+            "p", ["r"], "2026-04-01T00:00:00Z", "2026-04-30T23:59:59Z", None)
+        plan = conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
         detail = " ".join(str(row[-1]) for row in plan)
         self.assertIn("idx_nodes_window", detail)
 

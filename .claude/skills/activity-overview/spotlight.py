@@ -116,7 +116,15 @@ def _node_kind(node_id, data):
     """Derive a node's kind for a timeline row from its id / data: one of
     pr / issue / commit / release / comment / symbol / file, else the node's
     structural prefix. Deterministic."""
-    local = graphstore.parse_id(node_id)["local"]
+    local = graphstore.local_id(node_id)
+    # Artifacts first, by id form (graphstore.split_symbol_local's tail rule):
+    # `art:<path>` (path may contain `#`) is a file; `<path>#<lang>:<subkind>:
+    # <name>` is a symbol/comment — whose PATH may start with a prefix tested
+    # below (`issue-templates/…`, `release-notes/…`).
+    if local.startswith("art:"):
+        return "file"
+    if graphstore.is_symbol_local(local):
+        return "symbol"
     # Phase 10: review submissions / lifecycle events are social leaves on the
     # PR/issue spine. Classify by their own prefix BEFORE the /pull/ url heuristic
     # below — their url carries the parent PR's /pull/ path and would otherwise be
@@ -141,10 +149,6 @@ def _node_kind(node_id, data):
         return "milestone"
     if local.startswith("person-"):
         return "person"
-    if "#" in local:
-        return "symbol"
-    if local.startswith("art:"):
-        return "file"
     if (data or {}).get("sha") is not None:
         return "commit"
     return "node"
@@ -437,9 +441,9 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None,
             "WHERE author=? AND event='add' AND artifact_id LIKE ? ESCAPE '\\'",
             (login, like)).fetchall()
         for (aid,) in rows:
-            local = aid[len(prefix):] if aid.startswith(prefix) else aid
-            if "#" not in local:
-                continue  # file-level artifact, not a symbol
+            local = graphstore.local_id(aid, project, repo)
+            if not graphstore.is_symbol_local(local):
+                continue  # file-level artifact (path may contain `#`), not a symbol
             symbols_authored.append({"id": aid})
             rm = conn.execute(
                 "SELECT 1 FROM code_events "
@@ -511,54 +515,33 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None,
     )
 
 
-def _as_iso(bound, end_of_day=False):
-    """Normalize a date-only value (`YYYY-MM-DD`) to a full ISO datetime so
-    lexicographic comparison stays correct against ISO datetimes. A value that
-    already carries a time (`T...`) — or None — is returned unchanged."""
-    if bound is None or "T" in bound:
-        return bound
-    return bound + ("T23:59:59Z" if end_of_day else "T00:00:00Z")
-
-
 def _completion_window(ts_from, ts_to):
-    """The normalized (lo, hi) ISO bounds for completion's window check, or None
-    when unbounded. Date-only bounds are widened to start/end-of-day so they
-    compare correctly against ISO datetimes (mirrors `_date_in_range`)."""
+    """The (lo, hi) bounds for completion's window check, or None when
+    unbounded. Bounds are passed through as given (date-only or ISO): the
+    granularity rule — a date-only ts or bound covers its whole day — lives in
+    `graphstore.ts_in_window`, which both `_ts_in_window` and
+    `complete._in_window` delegate to (issue #52)."""
     if ts_from is None and ts_to is None:
         return None
-    return (_as_iso(ts_from), _as_iso(ts_to, end_of_day=True))
+    return (ts_from, ts_to)
 
 
 def _ts_in_window(ts, window):
-    """True if `ts` falls within a normalized (lo, hi) completion window (either
-    bound may be None). An empty ts cannot be proven in-window -> False."""
+    """True if `ts` falls within a (lo, hi) completion window (either bound may
+    be None). An empty ts cannot be proven in-window -> False."""
     if window is None:
         return True
-    if not ts:
-        return False
     lo, hi = window
-    if lo is not None and ts < lo:
-        return False
-    if hi is not None and ts > hi:
-        return False
-    return True
+    return graphstore.ts_in_window(ts, lo, hi)
 
 
 def _date_in_range(ts, ts_from, ts_to):
     """A train/event date filter. An empty ts is excluded once a bound is set.
-    Date-only bounds are normalized to the start/end of day, so an inclusive
-    `--to` of `2026-01-12` still matches a same-day ISO datetime like
-    `2026-01-12T14:00:00Z` (a raw string `>` would otherwise exclude it)."""
-    if not ts:
-        return False
-    t = _as_iso(ts)
-    lo = _as_iso(ts_from)
-    hi = _as_iso(ts_to, end_of_day=True)
-    if lo is not None and t < lo:
-        return False
-    if hi is not None and t > hi:
-        return False
-    return True
+    Granularity-safe via `graphstore.ts_in_window`: an inclusive `--to` of
+    `2026-01-12` still matches a same-day ISO datetime like
+    `2026-01-12T14:00:00Z`, and a date-only ts (a commit day) matches an ISO
+    bound on that same day."""
+    return graphstore.ts_in_window(ts, ts_from, ts_to)
 
 
 def _person_comment_excerpt(conn, dst_id, login):
@@ -582,9 +565,13 @@ def _normalize_artifact_id(conn, project, artifact_id):
     resolved. A qualified id is returned as-is. A local id is matched against
     the project's repos: the first repo for which the qualified id has a node OR
     a code_events row wins (deterministic by repo order)."""
-    if artifact_id.startswith("{}/".format(project)):
-        return artifact_id  # already project-qualified
-    for repo in _project_repos(conn, project):
+    repos = _project_repos(conn, project)
+    # Qualified iff it starts with a known `{project}/{repo}#` scope — NOT merely
+    # `{project}/`, which a local path (`{project}/main.tf#...`) can also start with.
+    for repo in repos:
+        if artifact_id.startswith(graphstore.qualify_id(project, repo, "")):
+            return artifact_id  # already project-qualified
+    for repo in repos:
         cand = graphstore.qualify_id(project, repo, artifact_id)
         if graphstore.get_node(conn, cand) is not None:
             return cand
@@ -593,6 +580,8 @@ def _normalize_artifact_id(conn, project, artifact_id):
             (cand,)).fetchone()
         if row:
             return cand
+    if artifact_id.startswith("{}/".format(project)):
+        return artifact_id  # qualified for a repo not (yet) stored: keep as given
     return None
 
 
@@ -1092,13 +1081,11 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None):
         lifecycle, overflow, ordered = _lifecycle(members)
         all_dates.extend(e["date"] for e in ordered if e["date"])
         # symbol/comment artifacts vs file artifacts. The id form is the tell:
-        # a symbol's local id is `<path>#<lang>:<subkind>:<name>` (a `#` after the
-        # repo scope), a file's is `art:<path>` / a bare path. Strip the
-        # `{project}/{repo}#` qualifier so the symbol `#` isn't masked by the
-        # scope separator (parse_id splits on the LAST `#`).
-        prefix = "{}/{}#".format(node["project"], node["repo"])
-        art_local = rep[len(prefix):] if rep.startswith(prefix) else rep
-        if "#" in art_local:
+        # a symbol's local id is `<path>#<lang>:<subkind>:<name>`, a file's is
+        # `art:<path>` / a bare path (either may contain `#`). Strip the
+        # `{project}/{repo}#` qualifier and apply the tail-shape rule.
+        art_local = graphstore.local_id(rep, node["project"], node["repo"])
+        if graphstore.is_symbol_local(art_local):
             entry = {
                 "id": rep,
                 "kind": data.get("kind"),

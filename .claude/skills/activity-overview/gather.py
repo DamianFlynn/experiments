@@ -7,13 +7,16 @@ import argparse
 import concurrent.futures
 import copy
 import datetime
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import derive
@@ -173,19 +176,136 @@ def _shift_date(date_str, days):
         return date_str
 
 
-def build_clone_cmd(repo_url, from_date, clone_dir):
+def _shallow_selector(from_date, depth1=False):
+    """The history bound shared by clone and fetch: `--shallow-since=<from - margin>`,
+    or `--depth=1` for the quiet-repo fallback."""
+    if depth1:
+        return "--depth=1"
+    return f"--shallow-since={_shift_date(from_date, -_clone_margin_days())}"
+
+
+def build_clone_cmd(repo_url, from_date, clone_dir, depth1=False):
     """Construct the bounded, partial clone command (network-free to build).
 
     `--shallow-since` reaches CLONE_MARGIN_DAYS before `from_date` (override with
     ACTIVITY_CLONE_MARGIN_DAYS) so the shallow boundary commit (whole-tree phantom
-    diff) sits OUTSIDE the report window."""
+    diff) sits OUTSIDE the report window. `depth1=True` is the quiet-repo fallback
+    (see prepare_clone): just the tip, so HEAD exists for the IaC/CODEOWNERS steps."""
     return [
         "git", "clone",
         "--filter=blob:none",
-        f"--shallow-since={_shift_date(from_date, -_clone_margin_days())}",
+        _shallow_selector(from_date, depth1),
         "--no-single-branch",
         repo_url, clone_dir,
     ]
+
+
+def build_fetch_cmd(clone_dir, from_date, depth1=False):
+    """Refresh an existing clone to the same history bound a fresh clone would get.
+    `--shallow-since` on fetch deepens OR shortens the shallow boundary, so a reused
+    clone ends up with the same boundary as a fresh one for this window."""
+    return ["git", "-C", clone_dir, "fetch", "--prune",
+            _shallow_selector(from_date, depth1), "origin"]
+
+
+# git's message when `--shallow-since` matches no commit on any fetched ref (the
+# repo has been quiet since before `from - margin`). Only THIS failure falls back
+# to --depth=1; any other clone/fetch error (network, auth, missing repo) raises.
+_NO_SHALLOW_COMMITS = "no commits selected for shallow requests"
+
+
+def _normalize_remote(url):
+    """Comparable form of a remote URL: GitHub ssh forms mapped to https, case
+    folded, trailing `/` and `.git` dropped."""
+    u = (url or "").strip()
+    for pre in ("git@github.com:", "ssh://git@github.com/"):
+        if u.lower().startswith(pre):
+            u = "https://github.com/" + u[len(pre):]
+    u = u.rstrip("/")
+    if u.lower().endswith(".git"):
+        u = u[:-4]
+    return u.rstrip("/").lower()
+
+
+def _shallow_or_depth1(run, build):
+    """Run `build(depth1=False)`; on the quiet-repo failure retry `build(depth1=True)`.
+    Returns True when the depth-1 fallback was used."""
+    try:
+        run(build(False))
+        return False
+    except RuntimeError as exc:
+        if _NO_SHALLOW_COMMITS not in str(exc):
+            raise
+    run(build(True))
+    return True
+
+
+def _default_branch(clone_dir, run):
+    """The remote's default branch name for an existing clone. Refreshes
+    `origin/HEAD` first (best effort), falls back to the checked-out branch."""
+    try:
+        run(["git", "-C", clone_dir, "remote", "set-head", "origin", "--auto"])
+    except RuntimeError:
+        pass
+    try:
+        ref = run(["git", "-C", clone_dir, "symbolic-ref", "--short",
+                   "refs/remotes/origin/HEAD"]).strip()
+        if ref.startswith("origin/"):
+            return ref[len("origin/"):]
+    except RuntimeError:
+        pass
+    return run(["git", "-C", clone_dir, "symbolic-ref", "--short", "HEAD"]).strip()
+
+
+def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
+    """Make `clone_dir` a bounded clone of `repo_url` for a window starting
+    `from_date`, and return how (recorded as `meta.clone_mode`):
+
+    - "fresh": no (or an empty) dir -> `git clone --shallow-since=<from - margin>`.
+    - "fetched": the dir is already a clone of the SAME remote -> `git fetch
+      --shallow-since=...` (deepens or shortens to the window's bound) and check
+      out the remote default branch head. So a second monthly run into the same
+      `--clone-dir` works, and `--no-clone` no longer walks stale history.
+    - "depth1-fallback": `--shallow-since` selected no commits (a quiet repo) ->
+      retried with `--depth=1`, so HEAD exists for IaC edges / CODEOWNERS / the
+      structural scan; the caller treats the commit walks as empty.
+    - "none": `no_clone` and no clone on disk -> nothing created; walks degrade
+      to empty.
+
+    An existing non-empty dir that is not a git clone, or is a clone of a
+    different remote, raises RuntimeError and is left untouched (never deleted).
+    """
+    run = run or run_git
+    exists = os.path.exists(clone_dir)
+    if exists and os.path.isdir(clone_dir) and not os.listdir(clone_dir):
+        exists = False      # an empty dir is as good as none: git clone accepts it
+    if exists:
+        if not os.path.exists(os.path.join(clone_dir, ".git")):
+            raise RuntimeError(
+                f"--clone-dir {clone_dir} exists but is not a git clone; "
+                f"point --clone-dir elsewhere or remove it")
+        try:
+            have = run(["git", "-C", clone_dir, "config", "--get",
+                        "remote.origin.url"]).strip()
+        except RuntimeError:
+            have = ""
+        if _normalize_remote(have) != _normalize_remote(repo_url):
+            raise RuntimeError(
+                f"--clone-dir {clone_dir} is a clone of a different remote "
+                f"({have or 'no origin'}), not {repo_url}; point --clone-dir elsewhere")
+        depth1 = _shallow_or_depth1(
+            run, lambda d1: build_fetch_cmd(clone_dir, from_date, d1))
+        branch = _default_branch(clone_dir, run)
+        run(["git", "-C", clone_dir, "checkout", "-q", "-B", branch,
+             f"refs/remotes/origin/{branch}"])
+        return "depth1-fallback" if depth1 else "fetched"
+    if no_clone:
+        return "none"
+    # git clone needs the parent dir to exist for the default workspace/ path.
+    os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
+    depth1 = _shallow_or_depth1(
+        run, lambda d1: build_clone_cmd(repo_url, from_date, clone_dir, d1))
+    return "depth1-fallback" if depth1 else "fresh"
 
 
 def shallow_boundary_shas(clone_dir):
@@ -217,11 +337,10 @@ def in_window_boundary_commits(boundary, commits):
 
 def in_window(ts, from_date, to_date):
     """True if ISO date/datetime string `ts` falls within [from_date, to_date]
-    inclusive, comparing on the date prefix. None/empty is never in window."""
-    if not ts:
-        return False
-    day = ts[:10]
-    return from_date <= day <= to_date
+    inclusive. None/empty is never in window. Bounds may be date-only or ISO;
+    the granularity-safe rule is `graphstore.ts_in_window` (a date-only value
+    covers its whole day, so an ISO `from` no longer drops the first day)."""
+    return graphstore.ts_in_window(ts, from_date, to_date)
 
 
 def window_records(records, from_date, to_date):
@@ -232,20 +351,31 @@ def window_records(records, from_date, to_date):
     return [r for r in records if in_window(r.get("date"), from_date, to_date)]
 
 
-_CLOSING_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
+# GitHub closing-keyword grammar (#62). A keyword (close/closes/closed,
+# fix/fixes/fixed, resolve/resolves/resolved; any case), an optional `:`, then
+# ONE reference: `#N`, `owner/repo#N`, or a full
+# `https://github.com/owner/repo/(issues|pull)/N` URL. Each closed issue needs its
+# own keyword: in "Fixes #1, #2" / "Fixes #1 and #2" only #1 closes; #2 is a
+# *listed* ref (GitHub links it as a mention, never closes it). Closing keywords
+# link issues only, so a keyword before a `/pull/` URL is a cross-ref, not a
+# close. No Markdown parsing: a keyword inside a code block / code span matches
+# like anywhere else. Owners/repos: GitHub names — alnum start, then word/.-.
+_CLOSING_KW = r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+_REF = (
+    r"(?:https?://github\.com/(?P<uowner>[A-Za-z0-9][\w.-]*)/"
+    r"(?P<urepo>[A-Za-z0-9][\w.-]*)/(?P<ukind>issues|pull)/(?P<unum>\d+)"
+    r"|(?:(?P<qowner>[A-Za-z0-9][\w.-]*)/(?P<qrepo>[A-Za-z0-9][\w.-]*))?"
+    r"#(?P<num>\d+))"
 )
+_CLOSING_RE = re.compile(_CLOSING_KW + r"(?:\s*:\s*|\s+)" + _REF, re.IGNORECASE)
+# A further ref continuing a closing keyword's list WITHOUT its own keyword:
+# ", #2", ", and #2", " and #2", " & #2". Applied (anchored) right after a match.
+_LIST_TAIL_RE = re.compile(r"(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s*&\s*)" + _REF,
+                           re.IGNORECASE)
 
-# Cross-repo references (Phase 9). A closing keyword qualified with owner/repo
-# (`Closes Azure/repo#12`) -> a `closes` link to that OTHER repo's issue. A bare
-# GitHub URL (`https://github.com/owner/repo/(issues|pull)/N`) -> a `cross_ref`
-# mention (issues -> issue node, pull -> pr node). Bare `#N` stays same-repo
-# (parse_closing_refs). Owners/repos: GitHub names — alnum start, then word/.-.
-_QUALIFIED_CLOSE_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
-    r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)#(?P<num>\d+)",
-    re.IGNORECASE,
-)
+# Cross-repo references (Phase 9). Any github.com issue/PR URL that is not a
+# keyword-closed issue -> a `cross_ref` mention (issues -> issue node, pull -> pr
+# node). Bare `#N` stays same-repo (parse_closing_refs).
 _QUALIFIED_URL_RE = re.compile(
     r"https?://github\.com/"
     r"(?P<owner>[A-Za-z0-9][\w.-]*)/(?P<repo>[A-Za-z0-9][\w.-]*)/"
@@ -253,12 +383,54 @@ _QUALIFIED_URL_RE = re.compile(
 )
 
 
+def _ref_from_match(m):
+    """(owner, repo, number, is_pr) for a `_REF` match; owner/repo None for a
+    bare `#N`. is_pr is True only for a `/pull/` URL (a bare/qualified `#N`
+    cannot be told apart from an issue without the API)."""
+    if m.group("unum") is not None:
+        return (m.group("uowner"), m.group("urepo"), int(m.group("unum")),
+                m.group("ukind").lower() == "pull")
+    return m.group("qowner"), m.group("qrepo"), int(m.group("num")), False
+
+
+def _scan_closing(text):
+    """Every closing-keyword reference in `text`, in order, as
+    (owner, repo, number, is_pr, closes): the ref right after a keyword has
+    closes=True unless it is a `/pull/` URL; each list-tail ref after it
+    (", #2", " and #2") has closes=False. Pure."""
+    text = text or ""
+    out = []
+    for m in _CLOSING_RE.finditer(text):
+        owner, repo, num, is_pr = _ref_from_match(m)
+        out.append((owner, repo, num, is_pr, not is_pr))
+        pos = m.end()
+        while True:
+            t = _LIST_TAIL_RE.match(text, pos)
+            if not t:
+                break
+            out.append(_ref_from_match(t) + (False,))
+            pos = t.end()
+    return out
+
+
+def _same_repo(owner, repo, slug):
+    """True if a ref is in the current repo: a bare `#N` (owner None) always is;
+    a qualified ref/URL only when `slug` ('owner/repo') matches,
+    case-insensitively (GitHub names are). Without a slug only bare refs are."""
+    if owner is None:
+        return True
+    return bool(slug) and "{}/{}".format(owner, repo).lower() == slug.lower()
+
+
 def parse_qualified_refs(text):
     """Cross-repo refs in PR/issue text, ordered + deduped. Returns a list of
-    {owner, repo, number, kind, is_pr}: closing keywords -> kind 'closes'
-    (is_pr False; closing targets an issue); github.com URLs -> kind 'cross_ref'
-    (is_pr True for /pull/, False for /issues/). Bare `#N` is left to
-    parse_closing_refs (same-repo). Pure."""
+    {owner, repo, number, kind, is_pr}: a keyword-closed qualified issue ref
+    (`Closes owner/repo#N`, `Fixes: https://github.com/o/r/issues/N`) -> kind
+    'closes' (is_pr False); every other github.com URL, a keyword before a
+    `/pull/` URL, and an unkeyworded list-tail qualified ref
+    (`Fixes a/b#1, a/b#2` -> #2) -> kind 'cross_ref' (is_pr True for /pull/).
+    Bare `#N` is left to parse_closing_refs (same-repo). Same-repo qualified refs
+    are returned too; callers skip them by slug. Pure."""
     out, seen = [], set()
 
     def add(owner, repo, num, kind, is_pr):
@@ -268,21 +440,41 @@ def parse_qualified_refs(text):
             out.append({"owner": owner, "repo": repo, "number": num,
                         "kind": kind, "is_pr": is_pr})
 
-    for m in _QUALIFIED_CLOSE_RE.finditer(text or ""):
-        add(m.group("owner"), m.group("repo"), int(m.group("num")), "closes", False)
+    scanned = [r for r in _scan_closing(text) if r[0] is not None]
+    for owner, repo, num, is_pr, closes in scanned:
+        if closes:
+            add(owner, repo, num, "closes", False)
+    for owner, repo, num, is_pr, closes in scanned:
+        if not closes:
+            add(owner, repo, num, "cross_ref", is_pr)
     for m in _QUALIFIED_URL_RE.finditer(text or ""):
         add(m.group("owner"), m.group("repo"), int(m.group("num")), "cross_ref",
             m.group("kind") == "pull")
     return out
 
 
-def parse_closing_refs(text):
-    """Extract issue numbers from GitHub closing keywords, de-duplicated,
-    order-preserving."""
+def parse_closing_refs(text, repo=None):
+    """Same-repo issue numbers GitHub would CLOSE from `text`, de-duplicated,
+    order-preserving (see `_CLOSING_RE`). `repo` ('owner/repo', optional) lets a
+    same-repo qualified ref or full issue URL count; without it only bare `#N`
+    closes (backwards compatible). Cross-repo closes are parse_qualified_refs'."""
     out = []
-    for m in _CLOSING_RE.finditer(text or ""):
-        n = int(m.group(1))
-        if n not in out:
+    for owner, rname, n, _is_pr, closes in _scan_closing(text):
+        if closes and _same_repo(owner, rname, repo) and n not in out:
+            out.append(n)
+    return out
+
+
+def parse_listed_refs(text, repo=None):
+    """Same-repo numbers that continue a closing keyword's list without their
+    own keyword ("Fixes #1, #2" -> [2]): GitHub links these as mentions but does
+    not close them, so they are cross-references. Numbers closed elsewhere in
+    `text` are excluded. Ordered, deduped. `repo` as in parse_closing_refs. Pure."""
+    closed = set(parse_closing_refs(text, repo))
+    out = []
+    for owner, rname, n, is_pr, closes in _scan_closing(text):
+        if (not closes and not is_pr and _same_repo(owner, rname, repo)
+                and n not in closed and n not in out):
             out.append(n)
     return out
 
@@ -342,12 +534,28 @@ def normalize_pr(raw):
         "review_comments_count": raw.get("review_comments", 0) or 0,
         "reviewers": [],
         "review_decision": "none",
-        "crossref_issues": [],
-        "closes": parse_closing_refs(
-            (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
-        ),
+        # seeded with listed-but-not-closed refs ("Fixes #1, #2" -> [2]);
+        # acquire() currently REPLACES this with the timeline cross-refs.
+        "crossref_issues": parse_listed_refs(_pr_text(raw), _pr_repo_slug(raw)),
+        "closes": parse_closing_refs(_pr_text(raw), _pr_repo_slug(raw)),
         "url": raw.get("html_url"),
     }
+
+
+def _pr_text(raw):
+    """The text GitHub scans for closing keywords: title + body."""
+    return (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
+
+
+def _pr_repo_slug(raw):
+    """'owner/repo' of a raw REST PR (base repo, else parsed from html_url), or
+    None. Lets parse_closing_refs recognise a same-repo issue URL. Pure."""
+    full = (((raw.get("base") or {}).get("repo")) or {}).get("full_name")
+    if full:
+        return full
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+)/pull/\d+",
+                 raw.get("html_url") or "")
+    return m.group(1) if m else None
 
 
 def select_merged_prs(prs, from_date, to_date):
@@ -459,15 +667,44 @@ def parse_timeline_lifecycle(raw_timeline):
     return out
 
 
-_PR_RE = re.compile(r"Merge pull request #(\d+)|\(#(\d+)\)")
+def parse_timeline_merged_by(raw_timeline):
+    """Login of the actor of the (last) `merged` timeline event, or None. Pure.
+
+    The list-pulls endpoint omits `merged_by` (only GET /pulls/{n} carries it);
+    acquire already fetches each kept PR's issue timeline, whose `merged` event
+    actor is the merger, so this recovers it with no extra API call. A deleted
+    (ghost) actor yields None."""
+    login = None
+    for ev in raw_timeline or []:
+        if ev.get("event") == "merged":
+            login = (ev.get("actor") or {}).get("login")
+    return login
+
+
+_TRAILING_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+_MERGE_PR_RE = re.compile(r"Merge pull request #(\d+)")
+_PAREN_PR_RE = re.compile(r"\(#(\d+)\)")
 
 
 def resolve_commit_pr(message):
-    """Best-effort PR number from a commit subject (merge or squash style)."""
-    m = _PR_RE.search(message or "")
-    if not m:
-        return None
-    return int(m.group(1) or m.group(2))
+    """Best-effort PR number from a commit message (#62). In order:
+      1. a trailing `(#N)` on the SUBJECT line (squash merges append the PR
+         number last, so `Revert "x (#4012)" (#4020)` -> 4020, backports too);
+      2. `Merge pull request #N` (merge-commit style);
+      3. the LAST `(#N)` on the subject line, then the last in the message."""
+    message = message or ""
+    subject = message.split("\n", 1)[0]
+    m = _TRAILING_PR_RE.search(subject)
+    if m:
+        return int(m.group(1))
+    m = _MERGE_PR_RE.search(message)
+    if m:
+        return int(m.group(1))
+    for scope in (subject, message):
+        hits = _PAREN_PR_RE.findall(scope)
+        if hits:
+            return int(hits[-1])
+    return None
 
 
 def attach_commit_prs(commits):
@@ -1008,6 +1245,16 @@ def _is_scaffold_area(area_id):
     return bool({"examples", "tests"} & set((area_id or "").split("/")))
 
 
+def _is_scaffold_path(path):
+    """True for a FILE inside an `examples/` or `tests/` subtree at any depth.
+
+    A nested scaffold file (e.g. `modules/sub/examples/x/main.tf`) classifies to its
+    module's area (`modules/sub`), so the area-level `_is_scaffold_area` check does
+    not catch it; entrypoint selection and the structural scan use this so such a
+    file is never read or built as the module itself. Pure."""
+    return _is_scaffold_area(os.path.dirname(path or ""))
+
+
 def build_directory_areas(paths, patterns):
     """Fold a list of tracked file paths into the `code_graph` directory provider.
 
@@ -1389,17 +1636,21 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
         if not rel.endswith(".tf"):                # only terraform sources
             continue
         aid = classify_code_area(rel, patterns)
-        if aid is None or _is_scaffold_area(aid):
+        # skip scaffold areas AND scaffold files nested inside a module area
+        # (modules/<x>/examples/...): they are tests of the module, not the module.
+        if aid is None or _is_scaffold_area(aid) or _is_scaffold_path(rel):
             continue
         by_area.setdefault(aid, []).append(rel)
 
     out = {}
     for aid, paths in by_area.items():
         paths = sorted(set(paths))
-        entry = next((p for p in paths if p == "main.tf" or p.endswith("/main.tf")),
-                     paths[0])
-        base_dir = os.path.dirname(entry)
-        text = "\n".join(read_text(p) for p in paths)
+        # The module is the area dir's own *.tf set (terraform reads one dir as one
+        # module); a nested dir is only used when the area dir itself has no *.tf.
+        mod_dir = _tf_module_dir(aid, paths)
+        own = [p for p in paths if os.path.dirname(p) == mod_dir]
+        base_dir = mod_dir
+        text = "\n".join(read_text(p) for p in own)
         bodies = _terraform_module_bodies(text)
         sources = parse_terraform_module_blocks(text)
         edges, seen = [], set()
@@ -1479,19 +1730,115 @@ def _read_text_file(path):
         return fh.read()
 
 
-def _bicep_entrypoint(area):
-    for p in area.get("paths", []):
-        if p == "main.bicep" or p.endswith("/main.bicep"):
-            return p
+# The area ids the directory provider gives to REPO-ROOT IaC files: `_main_bicep_dir`
+# -> "main.bicep", `_tf_dir` -> "main.tf". Each names the root module, whose
+# directory is the repo root (""). Each kind only honours its own sentinel.
+_BICEP_ROOT_ID = "main.bicep"
+_TF_ROOT_ID = "main.tf"
+
+
+def _area_rel_dir(area_id, root_id):
+    """The clone-relative directory an area id names ("" for the repo root)."""
+    return "" if area_id == root_id else (area_id or "")
+
+
+def _rel_join(rel_dir, name):
+    return f"{rel_dir}/{name}" if rel_dir else name
+
+
+def _shallowest(paths):
+    """Deterministic shallowest path (fewest segments, then lexical)."""
+    return min(paths, key=lambda p: (p.count("/"), p), default=None)
+
+
+def _pick_main_tf(files):
+    """`main.tf` from one directory's *.tf list when present, else the first."""
+    files = sorted(files)
+    return next((f for f in files if os.path.basename(f) == "main.tf"),
+                files[0] if files else None)
+
+
+def _tf_module_dir(area_id, tf_paths):
+    """The directory whose *.tf set is this area's module, from a known file list:
+    the area dir itself when it holds any of `tf_paths`, else the shallowest dir
+    among them (an area id that is not a module dir, e.g. a graphify community)."""
+    own = _area_rel_dir(area_id, _TF_ROOT_ID)
+    if any(os.path.dirname(p) == own for p in tf_paths):
+        return own
+    shallow = _shallowest(tf_paths)
+    return os.path.dirname(shallow) if shallow is not None else None
+
+
+def _area_dir_on_disk(area_id, clone_dir, root_id):
+    """The area's directory when it exists in the clone (root sentinel -> ""), else
+    None (the area id is not a directory: deleted, or a non-path id)."""
+    if area_id == root_id:
+        return ""
+    rel = _area_rel_dir(area_id, root_id)
+    if rel and os.path.isdir(os.path.join(clone_dir, rel)):
+        return rel
     return None
 
 
-def _tf_entrypoint(area):
-    tfs = [p for p in area.get("paths", []) if p.endswith(".tf")]
-    for p in tfs:
-        if p == "main.tf" or p.endswith("/main.tf"):
-            return p
-    return tfs[0] if tfs else None
+def _has_clone(clone_dir):
+    return bool(clone_dir) and os.path.isdir(clone_dir)
+
+
+def _bicep_entrypoint(area, clone_dir=None):
+    """The `main.bicep` that IS this area's module, or None.
+
+    With a clone on disk: `<area id>/main.bicep` when the area id is a directory in
+    the checkout — whichever files changed in the window, so a child-only change
+    still builds the parent, and never a child module (`<area>/<child>/main.bicep`)
+    that happens to sort first. When the area dir exists but has no `main.bicep`
+    (deleted) nothing is built. Only when the area id is NOT a directory (deleted
+    dir, graphify `community:<n>`) does it fall back to the shallowest of the area's
+    paths that exists on disk. Never a path missing from the checkout, never one
+    under a nested `examples/`/`tests/` subtree. Without a clone (offline callers)
+    the same rule runs over `paths` alone."""
+    aid = area.get("id") or ""
+    cands = [p for p in area.get("paths", [])
+             if (p == "main.bicep" or p.endswith("/main.bicep"))
+             and not _is_scaffold_path(p)]
+    if _has_clone(clone_dir):
+        rel = _area_dir_on_disk(aid, clone_dir, _BICEP_ROOT_ID)
+        if rel is not None:
+            entry = _rel_join(rel, "main.bicep")
+            return entry if os.path.isfile(os.path.join(clone_dir, entry)) else None
+        cands = [p for p in cands if os.path.isfile(os.path.join(clone_dir, p))]
+    else:
+        own = _rel_join(_area_rel_dir(aid, _BICEP_ROOT_ID), "main.bicep")
+        if own in cands:
+            return own
+    return _shallowest(cands)
+
+
+def _tf_entrypoint(area, clone_dir=None):
+    """A `.tf` file in the directory that IS this area's module, or None (`main.tf`
+    when that dir has one). Callers use its directory: terraform runs there and
+    every `*.tf` in it is read.
+
+    With a clone on disk: the area dir's own `*.tf` set when the area id is a
+    directory in the checkout (regardless of which files changed in the window);
+    otherwise the dir of the shallowest of the area's `.tf` paths that exists on
+    disk. Never a path missing from the checkout, never one under a nested
+    `examples/`/`tests/` subtree (`modules/sub/examples/x/main.tf` is not
+    `modules/sub`). Without a clone the same rule runs over `paths` alone."""
+    aid = area.get("id") or ""
+    tfs = [p for p in area.get("paths", [])
+           if p.endswith(".tf") and not _is_scaffold_path(p)]
+    if _has_clone(clone_dir):
+        rel = _area_dir_on_disk(aid, clone_dir, _TF_ROOT_ID)
+        if rel is not None:
+            return _pick_main_tf(_list_tf_files(clone_dir, rel))
+        tfs = [p for p in tfs if os.path.isfile(os.path.join(clone_dir, p))]
+        shallow = _shallowest(tfs)
+        if shallow is None:
+            return None
+        return _pick_main_tf(_list_tf_files(clone_dir, os.path.dirname(shallow))
+                             or [shallow])
+    mod_dir = _tf_module_dir(aid, tfs)
+    return _pick_main_tf([p for p in tfs if os.path.dirname(p) == mod_dir])
 
 
 def _bicep_build_arm(run, clone_dir, rel_path, timeout=None):
@@ -1511,34 +1858,55 @@ def _terraform_graph_dot(run, clone_dir, rel_dir, timeout=None):
     return run(["terraform", f"-chdir={full}", "graph"], timeout=timeout)
 
 
-def parse_codeowners(text):
-    """Parse a CODEOWNERS file into {pattern: [login, ...]}.
+_CODEOWNERS_TOKEN = re.compile(r"(?:\\.|\S)+")
 
-    Each non-comment line is `<pattern> <owner...>`; `@user` / `@org/team` are
-    stripped of the leading `@`. Lines with a pattern but no owners are skipped.
-    Order-preserving owners, last-pattern-wins on duplicate patterns. Pure."""
-    owners = {}
+
+def parse_codeowners(text):
+    """Parse a CODEOWNERS file into an ORDERED rule list
+    `[{"pattern": "<pattern>", "owners": ["login", ...]}, ...]`, in file order.
+
+    Each rule line is `<pattern> <owner...> [# comment]`. Blank lines and lines
+    starting with `#` are skipped; an inline `# comment` (the first token starting
+    with `#` after the pattern) and everything after it is dropped; GitLab-style
+    section headers (`[Section]`, `^[Section]`, `[Section][2] @owner`) are not
+    GitHub syntax and are skipped. `@user` / `@org/team` are stripped of the
+    leading `@`; emails are kept as-is. A pattern with NO owners is KEPT (with
+    `owners: []`): in CODEOWNERS it un-assigns ownership for matching paths.
+    Duplicate patterns are kept in place — order matters because the last
+    matching rule wins (derive.codeowners_owners). A list, not a dict, so the
+    rule order survives the store (node data is JSON-encoded with sorted keys).
+    Pure."""
+    rules = []
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split()
-        pattern, handles = parts[0], parts[1:]
-        logins = [h[1:] if h.startswith("@") else h for h in handles]
-        if not logins:
+        if line.startswith("[") or line.startswith("^["):
             continue
-        owners[pattern] = logins
-    return owners
+        tokens = _CODEOWNERS_TOKEN.findall(line)
+        pattern, handles = tokens[0], []
+        for tok in tokens[1:]:
+            if tok.startswith("#"):
+                break
+            handles.append(tok)
+        logins = [h[1:] if h.startswith("@") else h for h in handles]
+        rules.append({"pattern": pattern, "owners": logins})
+    return rules
 
 
 # Conventional label namespace -> facet (auto-detect). AVM uses `Class:`/`Type:`/
 # `Needs:`; most repos use `area`/`priority`/`status`/`lifecycle` with `:` or `/`.
+# AVM's `Class:` (Resource/Pattern/Utility Module) says what *scope* an issue is
+# about, not what kind of issue it is — nearly every AVM issue carries one — so
+# it is its own `class` facet (recorded in the taxonomy, never a kind source, and
+# not stamped by `apply_facets`). Only `type`/`kind` namespaces feed the kind facet.
 _AUTO_FACET_NAMESPACES = {
     "area": "area", "component": "area",
     "priority": "priority", "p": "priority",
     "status": "status", "needs": "status",
     "lifecycle": "lifecycle",
-    "type": "kind", "kind": "kind", "class": "kind",
+    "type": "kind", "kind": "kind",
+    "class": "class",
 }
 
 
@@ -1602,24 +1970,51 @@ def detect_label_taxonomy(labels, config=None):
 
 _FACET_KEYS = ("area", "priority", "status", "lifecycle")
 
-# Native issue-type / label-value tokens -> canonical kind.
-_KIND_TOKENS = {
-    "feature": "feature", "enhancement": "feature",
-    "module": "module-request", "module-request": "module-request",
-    "module request": "module-request",
-    "bug": "bug", "defect": "bug",
-    "idea": "idea", "proposal": "idea",
-    "question": "question", "support": "question",
-    "doc": "docs", "docs": "docs", "documentation": "docs",
-}
+# Native issue-type / label-value / template / title word sequences -> canonical
+# kind, in match priority order (the specific multi-word module phrases first).
+# Matched on whole words only: a bare "module" (e.g. AVM's "[AVM Module Issue]"
+# bug titles, `avm_module_issue.yml`) is NOT a module request, "debugger" is not
+# "bug" and "supported" is not "support".
+_KIND_PHRASES = (
+    (("module", "request"), "module-request"),
+    (("module", "proposal"), "module-request"),
+    (("feature", "request"), "feature"),
+    (("feature",), "feature"), (("enhancement",), "feature"),
+    (("bug",), "bug"), (("defect",), "bug"),
+    (("idea",), "idea"), (("proposal",), "idea"),
+    (("question",), "question"), (("support",), "question"),
+    (("doc",), "docs"), (("docs",), "docs"), (("documentation",), "docs"),
+)
 _VALID_KINDS = {"feature", "module-request", "bug", "idea", "question", "docs", "other"}
+_KIND_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _kind_words(text):
+    """Lowercase ASCII-alphanumeric words of `text` (punctuation, `_`, `-`, `/`
+    and emoji are separators)."""
+    return tuple(_KIND_WORD_RE.findall((text or "").lower()))
 
 
 def _kind_from_token(text):
-    """Map a free token (issue-type name, label value, template stem) to a kind."""
-    low = (text or "").strip().lower()
-    for token, kind in _KIND_TOKENS.items():
-        if token in low:
+    """Map free text (issue-type name, label value, template stem, title) to a
+    kind: the first `_KIND_PHRASES` entry occurring as a whole-word sequence."""
+    words = _kind_words(text)
+    for phrase, kind in _KIND_PHRASES:
+        n = len(phrase)
+        if any(words[i:i + n] == phrase for i in range(len(words) - n + 1)):
+            return kind
+    return None
+
+
+def _kind_from_bare_label(label):
+    """Kind of an un-namespaced label that is *exactly* a kind phrase (`bug`,
+    `enhancement`, `documentation`, `Bug 🐛`), else None. A label that merely
+    contains a kind word (`good first issue`, `bug-bash`) is not a kind label."""
+    if _namespace_of(label):
+        return None
+    words = _kind_words(label)
+    for phrase, kind in _KIND_PHRASES:
+        if words == phrase:
             return kind
     return None
 
@@ -1647,28 +2042,36 @@ def apply_facets(item, taxonomy):
 def classify_issue_kind(issue, taxonomy, types_present):
     """Classify an issue into one of feature/module-request/bug/idea/question/docs/other.
 
-    Priority: native GitHub issue type (when present) -> label `kind` facet ->
-    issue-template filename -> title/body heuristic -> other. Pure."""
+    Priority: native GitHub issue type (when present) -> label kind (the
+    `type:`/`kind:` facet labels, then a bare label that is exactly a kind word
+    such as `bug`/`enhancement`) -> issue-template filename -> title heuristic
+    -> other. `Class:` labels never decide kind, and the free-text heuristic
+    reads the title only (whole words), never the body. Pure."""
     # 1. native issue type
     if types_present:
         kind = _kind_from_token(issue.get("issue_type"))
         if kind:
             return kind
-    # 2. label kind facet (the values carried under the taxonomy's `kind` facet)
+    # 2a. label kind facet (the values carried under the taxonomy's `kind` facet)
     for lbl in _labels_in_taxonomy(issue, taxonomy, "kind"):
         value = lbl.split(":", 1)[-1] if ":" in lbl else lbl.split("/", 1)[-1]
         kind = _kind_from_token(value)
         if kind:
             return kind
+    # 2b. bare kind labels (GitHub defaults: bug, enhancement, documentation, ...)
+    for lbl in issue.get("labels") or []:
+        kind = _kind_from_bare_label(lbl)
+        if kind:
+            return kind
     # 3. issue-template filename (e.g. module_request.md, bug_report.yml)
-    kind = _kind_from_token((issue.get("template") or "").replace("_", " "))
+    kind = _kind_from_token(issue.get("template"))
     if kind:
         return kind
-    # 4. title/body heuristic
-    text = f"{issue.get('title','')} {issue.get('body','')}"
-    if "?" in (issue.get("title") or ""):
+    # 4. title heuristic (title only: bodies mention modules, bugs, "support" ...)
+    title = issue.get("title") or ""
+    if "?" in title:
         return "question"
-    kind = _kind_from_token(text)
+    kind = _kind_from_token(title)
     if kind:
         return kind
     return "other"
@@ -1767,6 +2170,24 @@ def parse_args(argv):
     if args.manifest and (args.owner or args.repo
                           or getattr(args, "from") or args.to):
         p.error("--manifest is mutually exclusive with --owner/--repo/--from/--to")
+    # Single-repo flags get the same name/date rules as a manifest member
+    # (shared validators in manifest.py): owner/repo go unescaped into API and
+    # clone URLs, and the window must be real YYYY-MM-DD dates with from <= to.
+    # Presence is still checked by acquire(); here only given values are checked.
+    frm = getattr(args, "from")
+    try:
+        if args.owner is not None:
+            manifest_mod.check_owner(args.owner, "--owner")
+        if args.repo is not None:
+            manifest_mod.check_repo(args.repo, "--repo")
+        if frm is not None:
+            manifest_mod.check_date(frm, "--from")
+        if args.to is not None:
+            manifest_mod.check_date(args.to, "--to")
+        if frm is not None and args.to is not None:
+            manifest_mod.check_window(frm, args.to, "--from", "--to")
+    except ValueError as exc:
+        p.error(str(exc))
     return args
 
 
@@ -1829,9 +2250,41 @@ def clone_head_sha(clone_dir, run=run_git):
 # providers serially first so the parallel inits are cache HITS (no race) — keeping
 # parallel extraction safe without lowering the workers. The defaults are unchanged
 # for the offline test/CI path.
-IAC_BUILD_TIMEOUT = int(os.environ.get("ACTIVITY_IAC_BUILD_TIMEOUT", "300"))  # seconds per subprocess
-IAC_MAX_WORKERS = int(os.environ.get("ACTIVITY_IAC_MAX_WORKERS", "8"))        # parallel per-module builds
-IAC_RETRIES = int(os.environ.get("ACTIVITY_IAC_RETRIES", "1"))               # extra attempts on timeout/failure
+#
+# These are the DEFAULTS. The env overrides are read at CALL time (_iac_settings)
+# through `_env_int`, never at import: a non-integer is a clear error naming the
+# variable, and an out-of-range value (e.g. ACTIVITY_IAC_MAX_WORKERS=0, which
+# ThreadPoolExecutor rejects) is clamped to its minimum with a warning.
+IAC_BUILD_TIMEOUT = 300  # seconds per subprocess   (ACTIVITY_IAC_BUILD_TIMEOUT, min 1)
+IAC_MAX_WORKERS = 8      # parallel per-module builds (ACTIVITY_IAC_MAX_WORKERS, min 1)
+IAC_RETRIES = 1          # extra attempts on timeout/failure (ACTIVITY_IAC_RETRIES, min 0)
+
+
+def _env_int(name, default, minimum, env=None):
+    """Read an integer env knob. Unset/blank -> `default`. A non-integer raises
+    SystemExit with a message naming the variable and the bad value. A value
+    below `minimum` is clamped to `minimum` with a stderr warning."""
+    env = os.environ if env is None else env
+    raw = env.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        raise SystemExit(
+            "error: {} must be an integer (got {!r})".format(name, raw)) from None
+    if value < minimum:
+        sys.stderr.write("warning: {}={} is below the minimum {}; using {}\n".format(
+            name, value, minimum, minimum))
+        return minimum
+    return value
+
+
+def _iac_settings(env=None):
+    """(timeout, max_workers, retries) for the IaC edge build, from env at call time."""
+    return (_env_int("ACTIVITY_IAC_BUILD_TIMEOUT", IAC_BUILD_TIMEOUT, 1, env),
+            _env_int("ACTIVITY_IAC_MAX_WORKERS", IAC_MAX_WORKERS, 1, env),
+            _env_int("ACTIVITY_IAC_RETRIES", IAC_RETRIES, 0, env))
 
 
 def _list_tf_files(clone_dir, rel_dir):
@@ -1859,8 +2312,10 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
     `timeout` (build exceeded the bound after retries), `failed` (build errored
     after retries), `skipped` (no entrypoint or its CLI absent). A timeout/failure
     leaves edges untouched but is reported via the status so the gap is visible."""
-    bp = _bicep_entrypoint(area)
-    tp = _tf_entrypoint(area)
+    # Entrypoints are resolved on disk in the clone (the area's own module file),
+    # not from the in-window changed paths — see _bicep_entrypoint/_tf_entrypoint.
+    bp = _bicep_entrypoint(area, clone_dir)
+    tp = _tf_entrypoint(area, clone_dir)
     if bp and have_bicep:
         kind = "bicep"
     elif tp and have_tf:
@@ -1899,7 +2354,7 @@ def _terraform_prewarm(build_areas, clone_dir, run, timeout):
     to share the same providers. Best-effort: a single warm-up failing is ignored
     (that area's parallel build still runs and reports its own status)."""
     for area in build_areas:
-        tp = _tf_entrypoint(area)
+        tp = _tf_entrypoint(area, clone_dir)
         if not tp:
             continue
         full = os.path.join(clone_dir, os.path.dirname(tp) or ".")
@@ -1912,8 +2367,7 @@ def _terraform_prewarm(build_areas, clone_dir, run, timeout):
 
 def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
                       read_text=_read_text_file, patterns=None,
-                      max_workers=IAC_MAX_WORKERS, timeout=IAC_BUILD_TIMEOUT,
-                      retries=IAC_RETRIES):
+                      max_workers=None, timeout=None, retries=None):
     """Enrich each area's `edges` with inter-area dependency edges (BUILD-ONLY).
 
     Each area with a main.bicep (and `bicep` on PATH) or a *.tf (and `terraform` on
@@ -1924,6 +2378,12 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
     `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
+    # None -> the env-overridable defaults (read now, not at import). An explicit
+    # max_workers is still clamped so ThreadPoolExecutor never sees a value < 1.
+    env_timeout, env_workers, env_retries = _iac_settings()
+    timeout = env_timeout if timeout is None else timeout
+    max_workers = env_workers if max_workers is None else max(1, max_workers)
+    retries = env_retries if retries is None else retries
     areas = code_graph.get("areas", [])
     area_ids = {a["id"] for a in areas}
     have_bicep = bool(which("bicep"))
@@ -1971,31 +2431,246 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     return code_graph
 
 
-def http_get_json(url, token, allow_404=False):
-    """GET a GitHub API URL → (parsed_json, next_url). Not unit-tested.
+# --- GitHub HTTP layer (#56) ---------------------------------------------------
+#
+# Every REST and GraphQL call goes through `_github_open`, which adds:
+#   * a timeout on every request (ACTIVITY_HTTP_TIMEOUT, default 60 s), so one
+#     stalled connection cannot hang the run;
+#   * bounded retries with exponential back-off on timeouts, connection errors
+#     and 5xx (ACTIVITY_HTTP_RETRIES, default 3 extra attempts);
+#   * rate-limit back-off per GitHub's documented rules: a 403/429 with
+#     `x-ratelimit-remaining: 0` (primary) waits until `x-ratelimit-reset`; one
+#     with `Retry-After` waits that long; a secondary-limit message with neither
+#     header waits 60 s, doubling on repeats. Every wait is announced on stderr
+#     (how long, until when), is capped by ACTIVITY_RATE_LIMIT_MAX_WAIT (default
+#     3600 s, 0 = never wait) and at most RATE_LIMIT_MAX_WAITS waits are made per
+#     request. Any other 403 (SAML SSO, token scope) fails fast with the existing
+#     diagnostic;
+#   * a redirect handler that drops `Authorization` when a 3xx leaves
+#     https://api.github.com (urllib's default handler would re-send it), and the
+#     token is only ever attached to https://api.github.com URLs in the first place.
+# `opener`, `sleep` and `clock` are injectable so the suite never sleeps or
+# touches the network. The token never appears in a log line or error message:
+# only URLs (which carry no credentials) and GitHub's response headers are shown.
 
-    On an HTTP error, GitHub explains the cause in the response body and a few
-    headers (rate limit vs. SAML SSO vs. token scope). urllib discards both by
-    default, leaving only a bare "HTTP Error 403", so we surface them ourselves.
+GITHUB_API_HOST = "api.github.com"
+HTTP_TIMEOUT = 60                  # seconds per request   (ACTIVITY_HTTP_TIMEOUT, min 1)
+HTTP_RETRIES = 3                   # extra attempts on timeout/5xx (ACTIVITY_HTTP_RETRIES, min 0)
+RATE_LIMIT_MAX_WAIT = 3600         # longest single wait, s (ACTIVITY_RATE_LIMIT_MAX_WAIT, min 0)
+RATE_LIMIT_MAX_WAITS = 5           # rate-limit waits per request before giving up
+SECONDARY_RATE_LIMIT_WAIT = 60     # GitHub: "wait at least one minute" with no header
+_RETRYABLE_STATUS = (500, 502, 503, 504)
+_BACKOFF_CAP = 60
+
+
+class GitHubAPIError(Exception):
+    """A GitHub API failure (HTTP error, exhausted retries, GraphQL errors with no
+    data). A normal Exception, so best-effort layers (the Projects v2 board) can
+    catch it and degrade. REST `http_get_json` re-raises it as SystemExit to keep
+    its fail-fast contract."""
+
+
+def _http_settings(env=None):
+    """(timeout, retries, max_wait) from env at call time (validated)."""
+    return (_env_int("ACTIVITY_HTTP_TIMEOUT", HTTP_TIMEOUT, 1, env),
+            _env_int("ACTIVITY_HTTP_RETRIES", HTTP_RETRIES, 0, env),
+            _env_int("ACTIVITY_RATE_LIMIT_MAX_WAIT", RATE_LIMIT_MAX_WAIT, 0, env))
+
+
+def validate_env_knobs(env=None):
+    """Parse every integer env knob once, up front, so a bad value fails before
+    any clone or API call (SystemExit naming the variable)."""
+    _http_settings(env)
+    _iac_settings(env)
+
+
+def _auth_allowed(url):
+    """The token is only ever sent to https://api.github.com."""
+    parts = urllib.parse.urlsplit(url or "")
+    return parts.scheme == "https" and (parts.hostname or "").lower() == GITHUB_API_HOST
+
+
+class _GitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but strip `Authorization` when the target is not
+    https://api.github.com (e.g. a signed blob-storage URL for logs/artifacts)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and not _auth_allowed(newurl):
+            for store in (new.headers, new.unredirected_hdrs):
+                for key in [k for k in store if k.lower() == "authorization"]:
+                    del store[key]
+        return new
+
+
+def _default_opener():
+    return urllib.request.build_opener(_GitHubRedirectHandler)
+
+
+def _github_headers(url, token, extra=None):
+    headers = {"Accept": "application/vnd.github+json",
+               "User-Agent": "activity-overview"}
+    if token and _auth_allowed(url):
+        headers["Authorization"] = f"Bearer {token}"
+    headers.update(extra or {})
+    return headers
+
+
+def _header_int(headers, name):
+    value = headers.get(name) if headers is not None else None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _error_message(body):
+    try:
+        return json.loads((body or b"").decode()).get("message", "") or ""
+    except Exception:
+        return ""
+
+
+def _rate_limit_wait(code, headers, message, clock, secondary_seen=0):
+    """Classify a refusal. Returns (kind, seconds) with kind 'primary' or
+    'secondary', or (None, 0) for a response that is NOT a rate limit (a genuine
+    403 for SSO/scope must fail fast). Follows GitHub's documented rules: honour
+    Retry-After; with x-ratelimit-remaining 0 wait until x-ratelimit-reset; a
+    secondary limit with neither header waits a minute, growing on repeats."""
+    if code not in (403, 429):
+        return None, 0
+    remaining = str(headers.get("x-ratelimit-remaining") or "").strip()
+    retry_after = _header_int(headers, "Retry-After")
+    text = (message or "").lower()
+    secondary_msg = "secondary rate limit" in text or "abuse" in text
+    if retry_after is not None:
+        return ("primary" if remaining == "0" and not secondary_msg
+                else "secondary"), max(1, retry_after)
+    if remaining == "0":
+        reset = _header_int(headers, "x-ratelimit-reset")
+        wait = SECONDARY_RATE_LIMIT_WAIT if reset is None else int(reset - clock()) + 1
+        return ("secondary" if secondary_msg else "primary"), max(1, wait)
+    if secondary_msg or code == 429:
+        return "secondary", SECONDARY_RATE_LIMIT_WAIT * (2 ** secondary_seen)
+    return None, 0
+
+
+def _utc(ts):
+    return datetime.datetime.fromtimestamp(
+        ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _wait_for_rate_limit(kind, wait, url, waits, max_wait, sleep, clock, diagnostic):
+    """Sleep out one rate-limit window (bounded + announced on stderr) or raise."""
+    if waits > RATE_LIMIT_MAX_WAITS:
+        raise GitHubAPIError(
+            f"{diagnostic}\n  rate limit: still limited after "
+            f"{RATE_LIMIT_MAX_WAITS} waits; giving up.")
+    if wait > max_wait:
+        raise GitHubAPIError(
+            f"{diagnostic}\n  rate limit: {kind} limit resets in {wait}s (at "
+            f"{_utc(clock() + wait)}), longer than ACTIVITY_RATE_LIMIT_MAX_WAIT="
+            f"{max_wait}s; not waiting. Re-run later or raise the cap.")
+    sys.stderr.write(
+        f"warning: GitHub {kind} rate limit hit on {url}; waiting {wait}s "
+        f"(until {_utc(clock() + wait)}) [wait {waits}/{RATE_LIMIT_MAX_WAITS}]\n")
+    sleep(wait)
+
+
+def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
+                 rate_limited=None):
+    """Send `req` with timeout, retries and rate-limit back-off. Returns
+    (headers, body_bytes), or (None, 404) for a 404 when allow_404. Raises
+    GitHubAPIError on any other failure.
+
+    `rate_limited(headers, body)` optionally reports a rate limit signalled in a
+    200 body (GraphQL `RATE_LIMITED`); it returns True to trigger a wait."""
+    opener = opener or _default_opener()
+    sleep = sleep or time.sleep
+    clock = clock or time.time
+    timeout, retries, max_wait = _http_settings()
+    attempt, waits, secondary = 0, 0, 0
+
+    def backoff(reason):
+        nonlocal attempt
+        attempt += 1
+        delay = min(_BACKOFF_CAP, 2 ** (attempt - 1))
+        sys.stderr.write(
+            f"warning: GitHub API {reason} for {url}; retrying in {delay}s "
+            f"(attempt {attempt + 1}/{retries + 1})\n")
+        sleep(delay)
+
+    while True:
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                headers, body = resp.headers, resp.read()
+        except urllib.error.HTTPError as err:
+            if allow_404 and err.code == 404:
+                return None, 404
+            try:
+                body = err.read()
+            except Exception:
+                body = b""
+            diagnostic = _format_http_error(url, err, body)
+            kind, wait = _rate_limit_wait(err.code, err.headers,
+                                          _error_message(body), clock, secondary)
+            if kind:
+                waits += 1
+                secondary += kind == "secondary"
+                _wait_for_rate_limit(kind, wait, url, waits, max_wait, sleep,
+                                     clock, diagnostic)
+                continue
+            if err.code in _RETRYABLE_STATUS and attempt < retries:
+                backoff(f"{err.code}")
+                continue
+            if err.code in _RETRYABLE_STATUS:
+                diagnostic += f"\n  gave up after {attempt + 1} attempt(s)."
+            raise GitHubAPIError(diagnostic) from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+            # URLError (DNS, refused, wrapped timeout), TimeoutError/socket.timeout
+            # and ConnectionError (resets) are OSError subclasses; HTTPException
+            # covers RemoteDisconnected / IncompleteRead mid-body.
+            reason = getattr(err, "reason", None) or err
+            if attempt < retries:
+                backoff(f"request failed ({type(err).__name__}: {reason})")
+                continue
+            raise GitHubAPIError(
+                f"error: GitHub API request to {url} failed after {attempt + 1} "
+                f"attempt(s): {type(err).__name__}: {reason} "
+                f"(timeout {timeout}s; ACTIVITY_HTTP_TIMEOUT / "
+                f"ACTIVITY_HTTP_RETRIES tune this)") from None
+        if rate_limited is not None and rate_limited(headers, body):
+            waits += 1
+            reset = _header_int(headers, "x-ratelimit-reset")
+            wait = (SECONDARY_RATE_LIMIT_WAIT if reset is None
+                    else max(1, int(reset - clock()) + 1))
+            _wait_for_rate_limit("primary", wait, url, waits, max_wait, sleep,
+                                 clock, f"error: GitHub API rate limited for {url}")
+            continue
+        return headers, body
+
+
+def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=None):
+    """GET a GitHub API URL → (parsed_json, next_url).
+
+    Timeouts, retries, rate-limit back-off and redirect auth-stripping come from
+    `_github_open` (see the section comment above). On an HTTP error, GitHub
+    explains the cause in the response body and a few headers (rate limit vs.
+    SAML SSO vs. token scope); `_format_http_error` surfaces both.
 
     With allow_404=True a 404 returns (None, 404) instead of raising, so the
-    backfill seam can map a definitively-absent ref to ABSENT. All other HTTP
-    errors still raise SystemExit with the diagnostic.
+    backfill seam can map a definitively-absent ref to ABSENT. All other
+    failures raise SystemExit with the diagnostic (fail fast).
     """
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "activity-overview",
-    })
+    req = urllib.request.Request(url, headers=_github_headers(url, token))
     try:
-        with urllib.request.urlopen(req) as resp:
-            body = json.loads(resp.read().decode())
-            nxt = _next_link(resp.headers.get("Link", ""))
-        return body, nxt
-    except urllib.error.HTTPError as err:
-        if allow_404 and err.code == 404:
-            return None, 404
-        raise SystemExit(_format_http_error(url, err)) from err
+        headers, body = _github_open(req, url, allow_404=allow_404, opener=opener,
+                                     sleep=sleep, clock=clock)
+    except GitHubAPIError as err:
+        raise SystemExit(str(err)) from None
+    if headers is None and body == 404:
+        return None, 404
+    return json.loads(body.decode()), _next_link(headers.get("Link", ""))
 
 
 # Headers GitHub uses to explain a refusal; surfaced verbatim on error so the
@@ -2003,24 +2678,28 @@ def http_get_json(url, token, allow_404=False):
 _DIAGNOSTIC_HEADERS = (
     "x-ratelimit-remaining",
     "x-ratelimit-reset",
+    "retry-after",
     "x-github-sso",
     "x-accepted-oauth-scopes",
     "x-oauth-scopes",
 )
 
 
-def _format_http_error(url, err):
+def _format_http_error(url, err, body=None):
     """Build a one-screen diagnostic from an HTTPError: status, GitHub's message,
-    and the headers that disambiguate a 403."""
-    try:
-        detail = json.loads(err.read().decode()).get("message", "")
-    except Exception:
-        detail = ""
+    and the headers that disambiguate a 403. `body` is the already-read response
+    body (an HTTPError body can only be read once); None reads it here."""
+    if body is None:
+        try:
+            body = err.read()
+        except Exception:
+            body = b""
+    detail = _error_message(body)
     lines = [f"error: GitHub API {err.code} for {url}"]
     if detail:
         lines.append(f"  message: {detail}")
     for name in _DIAGNOSTIC_HEADERS:
-        value = err.headers.get(name)
+        value = err.headers.get(name) if err.headers is not None else None
         if value:
             lines.append(f"  {name}: {value}")
     if err.code == 403:
@@ -2034,9 +2713,9 @@ def _format_http_error(url, err):
 # --- Projects v2 (Phase 12): GraphQL board ingest ----------------------------
 #
 # gather is REST-only everywhere else; this is its single GraphQL call. The
-# helper is kept THIN (like http_get_json) and is NOT unit-tested — the
-# normalization (parse_project_board) and the fetch driver (fetch_project_board)
-# ARE, against crafted fixtures.
+# helper is kept THIN (like http_get_json); it is tested through an injected
+# opener (test_github_api.py), and the normalization (parse_project_board) and
+# the fetch driver (fetch_project_board) against crafted fixtures.
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 
@@ -2127,29 +2806,49 @@ query($id:ID!, $cursor:String) {
 """.strip()
 
 
-def graphql_post(token, query, variables=None):
+def _graphql_rate_limited(headers, body):
+    """True when a 200 GraphQL response reports a RATE_LIMITED error."""
+    try:
+        errors = json.loads(body.decode()).get("errors") or []
+    except Exception:
+        return False
+    return any(isinstance(e, dict) and e.get("type") == "RATE_LIMITED"
+               for e in errors)
+
+
+def graphql_post(token, query, variables=None, opener=None, sleep=None, clock=None):
     """POST a GraphQL query to GitHub's `/graphql`, returning the parsed `data`.
-    Not unit-tested (like http_get_json). Surfaces HTTP errors via the same
-    diagnostic as http_get_json, and surfaces GraphQL `errors` (200-with-errors,
-    e.g. a missing `read:project` scope) as a SystemExit so the caller can degrade.
+
+    Shares `_github_open` with http_get_json (timeout, retries, rate-limit
+    back-off incl. a 200 carrying a `RATE_LIMITED` error, redirect auth-strip).
+    Failures raise `GitHubAPIError` — a normal Exception, so the board layer's
+    "never hard-fail" contract can catch it. When the response carries `errors`
+    AND non-empty `data` (e.g. one inaccessible board among several), the partial
+    `data` is KEPT and the errors are warned on stderr; only errors with no data
+    raise.
     """
     payload = json.dumps({"query": query, "variables": variables or {}}).encode()
-    req = urllib.request.Request(GRAPHQL_URL, data=payload, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "activity-overview",
-    })
+    req = urllib.request.Request(GRAPHQL_URL, data=payload, headers=_github_headers(
+        GRAPHQL_URL, token, {"Content-Type": "application/json"}))
+    _, raw = _github_open(req, GRAPHQL_URL, opener=opener, sleep=sleep, clock=clock,
+                          rate_limited=_graphql_rate_limited)
     try:
-        with urllib.request.urlopen(req) as resp:
-            body = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as err:
-        raise SystemExit(_format_http_error(GRAPHQL_URL, err)) from err
-    if body.get("errors"):
+        body = json.loads(raw.decode())
+    except ValueError as err:
+        raise GitHubAPIError(
+            f"error: GraphQL {GRAPHQL_URL} returned non-JSON: {err}") from None
+    data = body.get("data") if isinstance(body, dict) else None
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if errors:
         msgs = "; ".join(
-            e.get("message", "") for e in body["errors"] if isinstance(e, dict))
-        raise SystemExit(f"error: GraphQL {GRAPHQL_URL} returned errors: {msgs}")
-    return body.get("data") or {}
+            e.get("message", "") for e in errors if isinstance(e, dict))
+        if not data:
+            raise GitHubAPIError(
+                f"error: GraphQL {GRAPHQL_URL} returned errors: {msgs}")
+        sys.stderr.write(
+            f"warning: GraphQL {GRAPHQL_URL} returned partial data with errors "
+            f"(keeping the data): {msgs}\n")
+    return data or {}
 
 
 def _iter_end(start, duration):
@@ -2303,7 +3002,10 @@ def _paginate_board_items(graphql, board, owner, repo, max_items):
         try:
             page = graphql(PROJECT_BOARD_ITEMS_QUERY,
                            {"id": board_id, "cursor": cursor})
-        except Exception as err:  # noqa: BLE001
+        except (SystemExit, Exception) as err:  # noqa: BLE001 — degrade, never hard-fail
+            # SystemExit too: an injected/legacy graphql callable may signal an
+            # HTTP error that way, and it is a BaseException `except Exception`
+            # would miss (a 502 on page 2 used to escape fetch_project_board).
             sys.stderr.write(
                 "warning: partial Projects v2 board #{} for {}/{}: {}\n".format(
                     board.get("number"), owner, repo, err))
@@ -2333,7 +3035,7 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     at `max_items`. `ref_date` (the window's ref/`to` date) anchors the staleness
     check.
 
-    Degrades CLEANLY to ({}, {}) on any error (a GraphQL `errors` SystemExit, a
+    Degrades CLEANLY to ({}, {}) on any error (a GitHubAPIError / SystemExit, a
     network failure, a null repository, or no linked/maintained board) — a board
     fetch must NEVER hard-fail the run. `graphql` is injectable so the suite tests
     this driver against fixtures with no network.
@@ -2350,6 +3052,14 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     if not repo_obj:
         return {}, {}
     boards = (repo_obj.get("projectsV2") or {}).get("nodes") or []
+    # Partial GraphQL data (graphql_post keeps `data` alongside `errors`) leaves a
+    # null node for a board this token cannot read: drop it, keep the others.
+    unreadable = sum(1 for b in boards if not isinstance(b, dict))
+    if unreadable:
+        sys.stderr.write(
+            "warning: {} Projects v2 board(s) for {}/{} could not be read; "
+            "ingesting the rest.\n".format(unreadable, owner, repo))
+        boards = [b for b in boards if isinstance(b, dict)]
     if not boards:
         return {}, {}
 
@@ -2401,19 +3111,113 @@ def _paginated(token):
     return get_page
 
 
-def _runs_page(get_page, api, frm, to):
-    """Walk actions/runs, whose pages wrap the list under `workflow_runs`."""
-    runs = []
-    url = f"{api}/actions/runs?created={frm}..{to}&per_page=100"
-    # The `created=` query param bounds the window server-side; the per-page
-    # `< frm` check below is a defensive early-exit guard.
-    while url:
+# GitHub documents that `actions/runs` "will return up to 1,000 results for each
+# search" when filtered by `created` (also actor/branch/event/status/...). A busy
+# repo can exceed that in one month, so a capped range is split by day and each
+# half re-queried; only a SINGLE day still over the cap is left truncated, and
+# then it is VISIBLE: a stderr warning plus a marker in workflow_stats.
+WORKFLOW_RUNS_SEARCH_CAP = 1000
+# Reserved key in the name-keyed workflow_stats map (no real workflow is named
+# this); present ONLY when the runs were truncated, so normal stats are unchanged.
+WORKFLOW_STATS_TRUNCATED_KEY = "_truncated"
+
+
+def _split_created_range(lo, hi):
+    """Split an inclusive created=lo..hi range into two halves by day, or None
+    when it is a single day (or the dates do not parse). Keeps the original
+    outer bounds; inner bounds use the same form (date or UTC timestamp)."""
+    try:
+        lo_d = datetime.date.fromisoformat(str(lo)[:10])
+        hi_d = datetime.date.fromisoformat(str(hi)[:10])
+    except (TypeError, ValueError):
+        return None
+    if lo_d >= hi_d:
+        return None
+    mid = lo_d + datetime.timedelta(days=(hi_d - lo_d).days // 2)
+    nxt = mid + datetime.timedelta(days=1)
+    iso = "T" in str(lo) or "T" in str(hi)
+    left_hi = f"{mid.isoformat()}T23:59:59Z" if iso else mid.isoformat()
+    right_lo = f"{nxt.isoformat()}T00:00:00Z" if iso else nxt.isoformat()
+    return (lo, left_hi), (right_lo, hi)
+
+
+def fetch_workflow_runs(get_page, api, frm, to, cap=WORKFLOW_RUNS_SEARCH_CAP):
+    """Walk actions/runs for created=frm..to without silently hitting GitHub's
+    per-search result cap. Returns (runs, truncation) where truncation is None
+    when complete, else {"truncated": True, "cap", "fetched", "total_count",
+    "ranges"} (also warned on stderr).
+
+    The first page's `total_count` decides: at/over the cap and spanning more
+    than one day, the range is split by day (newest half first, matching the
+    API's created-desc order) WITHOUT paging further. A leaf range is flagged
+    when it fetched fewer runs than its `total_count`, or reached the cap (a
+    `total_count` that is itself capped cannot prove completeness)."""
+    capped, top_total = [], []
+
+    def walk(lo, hi):
+        url = f"{api}/actions/runs?created={lo}..{hi}&per_page=100"
         payload, url = get_page(url)
-        page = payload.get("workflow_runs", []) if isinstance(payload, dict) else payload
-        runs.extend(page)
-        if page and page[-1].get("created_at", "")[:10] < frm:
-            break
-    return runs
+        total = payload.get("total_count") if isinstance(payload, dict) else None
+        total = total if isinstance(total, int) else None
+        if not top_total:
+            top_total.append(total)
+        if total is not None and total >= cap:
+            halves = _split_created_range(lo, hi)
+            if halves:
+                (l_lo, l_hi), (r_lo, r_hi) = halves
+                return walk(r_lo, r_hi) + walk(l_lo, l_hi)
+        runs = []
+        while True:
+            page = (payload.get("workflow_runs", []) if isinstance(payload, dict)
+                    else payload) or []
+            runs.extend(page)
+            # The `created=` filter bounds the range server-side; this per-page
+            # `< lo` check is a defensive early-exit guard.
+            if not url or (page and page[-1].get("created_at", "")[:10] < str(lo)[:10]):
+                break
+            payload, url = get_page(url)
+        if len(runs) >= cap or (total is not None and len(runs) < total):
+            capped.append({"range": f"{lo}..{hi}", "fetched": len(runs),
+                           "total_count": total})
+        return runs
+
+    raw = walk(frm, to)
+    seen, runs = set(), []
+    for r in raw:
+        rid = r.get("id") if isinstance(r, dict) else None
+        if rid is not None:
+            if rid in seen:
+                continue
+            seen.add(rid)
+        runs.append(r)
+    if not capped:
+        return runs, None
+    truncation = {"truncated": True, "cap": cap, "fetched": len(runs),
+                  "total_count": top_total[0] if top_total else None,
+                  "ranges": [c["range"] for c in capped]}
+    sys.stderr.write(
+        "warning: workflow runs for {}..{} are TRUNCATED: GitHub returns at most "
+        "{} runs per search and {} still hit that cap after splitting by day "
+        "(fetched {} of {} reported). workflow_stats is marked {!r}.\n".format(
+            frm, to, cap, ", ".join(truncation["ranges"]), len(runs),
+            truncation["total_count"] if truncation["total_count"] is not None
+            else "unknown", WORKFLOW_STATS_TRUNCATED_KEY))
+    return runs, truncation
+
+
+def mark_workflow_stats_truncated(stats, truncation):
+    """Return workflow_stats with the truncation marker added (if any)."""
+    if not truncation:
+        return stats
+    out = dict(stats or {})
+    out[WORKFLOW_STATS_TRUNCATED_KEY] = dict(truncation)
+    return out
+
+
+def _runs_page(get_page, api, frm, to):
+    """Walk actions/runs (pages wrap the list under `workflow_runs`). Thin
+    wrapper over fetch_workflow_runs that drops the truncation record."""
+    return fetch_workflow_runs(get_page, api, frm, to)[0]
 
 
 def _attach_timeline_xrefs(pr, timeline, current_slug):
@@ -2425,6 +3229,73 @@ def _attach_timeline_xrefs(pr, timeline, current_slug):
         pr["timeline_xrefs"] = xrefs
 
 
+def dedupe_raw_prs(raws):
+    """One raw PR per number (issue #56 item 7). A page shift during
+    `sort=updated` paging — or a PR that changed state between the closed and
+    open fetches — can list the same PR twice. Keeps the snapshot with the
+    latest `updated_at` (ties: the first seen), in first-appearance order, so
+    the result is deterministic. Pure."""
+    best, order = {}, []
+    for raw in raws or []:
+        n = raw["number"]
+        if n not in best:
+            order.append(n)
+            best[n] = raw
+        elif (raw.get("updated_at") or "") > (best[n].get("updated_at") or ""):
+            best[n] = raw
+    return [best[n] for n in order]
+
+
+def enrich_pr(pr, get_page, api, current_slug):
+    """Per-PR enrichment for a kept PR (mutates `pr`): reviews, issue timeline
+    (crossrefs, cross-repo xrefs, lifecycle), review comments and conversation
+    comments — four paginated fetches via `get_page`, no more.
+
+    The list-pulls payload `normalize_pr` sees omits `merged_by`, `comments` and
+    `review_comments` (only GET /pulls/{n} has them, issue #61). Rather than one
+    extra detail call per PR, they are derived from what is fetched here:
+    `merged_by` from the timeline `merged` event actor (only when the PR is
+    merged and the payload did not already name the merger), and both counts
+    from the lengths of the fully-paginated comment lists."""
+    num = pr["number"]
+    reviews = fetch_all(get_page, f"{api}/pulls/{num}/reviews?per_page=100")
+    summary = summarize_reviews(reviews)
+    pr["reviewers"] = summary["reviewers"]
+    pr["review_decision"] = summary["decision"]
+    # Phase 10 slice 1: KEEP the individual review submissions (fold persists
+    # them as `review` social nodes). Only set the key when non-empty so the
+    # bundle/extract stay byte-stable for PRs with no reviews.
+    submissions = [normalize_review(r) for r in reviews]
+    if submissions:
+        pr["reviews"] = submissions
+    timeline = fetch_all(get_page, f"{api}/issues/{num}/timeline?per_page=100")
+    # Keep the refs normalize_pr seeded from the body (list tails such as the #2
+    # in "Fixes #1, #2": mentioned, not closed) and add the timeline's, in order.
+    seeded = list(pr.get("crossref_issues") or [])
+    pr["crossref_issues"] = seeded + [
+        n for n in parse_timeline_crossrefs(timeline) if n not in seeded]
+    _attach_timeline_xrefs(pr, timeline, current_slug)
+    # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
+    # ready_for_review). Omit-when-empty for byte stability.
+    lifecycle = parse_timeline_lifecycle(timeline)
+    if lifecycle:
+        pr["lifecycle"] = lifecycle
+    if pr.get("merged") and not pr.get("merged_by"):
+        pr["merged_by"] = parse_timeline_merged_by(timeline)
+    review_comments = fetch_all(get_page, f"{api}/pulls/{num}/comments?per_page=100")
+    pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
+    conv_comments = fetch_all(get_page, f"{api}/issues/{num}/comments?per_page=100")
+    pr["comments_list"] = [normalize_comment(c) for c in conv_comments]
+    pr["comments"] = len(pr["comments_list"])
+    pr["review_comments_count"] = len(pr["review_comments"])
+    return pr
+
+
+def _github_remote_url(owner, repo):
+    """The clone/fetch URL for a member repo (a seam so tests can use file://)."""
+    return f"https://github.com/{owner}/{repo}.git"
+
+
 def acquire(args, env):
     if not (args.owner and args.repo and getattr(args, "from") and args.to):
         sys.stderr.write("error: --owner --repo --from --to are required\n")
@@ -2433,12 +3304,20 @@ def acquire(args, env):
     owner, repo = args.owner, args.repo
     frm, to = getattr(args, "from"), args.to
     clone_dir = args.clone_dir or f"workspace/{repo}-clone"
-    repo_url = f"https://github.com/{owner}/{repo}.git"
+    repo_url = _github_remote_url(owner, repo)
 
-    if not args.no_clone:
-        # git clone needs the parent dir to exist for the default workspace/ path.
-        os.makedirs(os.path.dirname(clone_dir) or ".", exist_ok=True)
-        run_git(build_clone_cmd(repo_url, frm, clone_dir))
+    # Clone fresh, or fetch an existing clone of the same remote; a quiet repo
+    # (nothing since `frm - margin`) falls back to --depth=1 (see prepare_clone).
+    clone_mode = prepare_clone(repo_url, frm, clone_dir, no_clone=args.no_clone)
+    if clone_mode == "depth1-fallback":
+        sys.stderr.write(
+            f"note: {owner}/{repo} has no commits since the clone bound "
+            f"(--from minus {_clone_margin_days()} days); cloned at --depth=1 and "
+            f"treating the commit walks as empty (meta.clone_mode=depth1-fallback)\n")
+    # All three git walks need real window history on disk: skipped (empty) when
+    # there is no clone (--no-clone with nothing on disk) or only the depth-1 tip
+    # of a quiet repo (whose whole-tree diff is not window activity).
+    walk_clone = clone_mode in ("fresh", "fetched") and os.path.isdir(clone_dir)
 
     # Phase 1 walks the checked-out default branch only; `args.branches` is
     # recorded in meta for provenance but not yet applied to the log/clone.
@@ -2446,18 +3325,20 @@ def acquire(args, env):
     # The shallow clone already bounds history to ~CLONE_MARGIN_DAYS before `frm`;
     # we walk it fully and window in Python (window_records) rather than with git's
     # `--since/--until`, which prunes valid in-window commits across timezones.
-    raw = run_git([
-        "git", "-C", clone_dir, "log",
-        f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
-    ])
-    commits = window_records(parse_git_log(raw), frm, to)
+    commits = []
+    if walk_clone:
+        raw = run_git([
+            "git", "-C", clone_dir, "log",
+            f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short", "--name-only",
+        ])
+        commits = window_records(parse_git_log(raw), frm, to)
 
     # Phase 3a: full-window file-level code-event walk (--name-status -M -C).
-    # Guarded so --no-clone / missing clone degrades gracefully to empty.
+    # Guarded (walk_clone) so a missing clone degrades gracefully to empty.
     # `--reverse` so events arrive OLDEST→NEWEST: build_artifacts appends lifecycle
     # in walk order and derives status from the last (newest) event.
     code_events = []
-    if not args.no_clone or os.path.isdir(clone_dir):
+    if walk_clone:
         raw_walk = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
@@ -2469,7 +3350,7 @@ def acquire(args, env):
     # (diff-local, no per-commit checkout). Same guard/degradation + oldest→newest
     # ordering (--reverse) as the file walk so symbol lifecycle/status is correct.
     symbol_events = []
-    if not args.no_clone or os.path.isdir(clone_dir):
+    if walk_clone:
         raw_patch = run_git([
             "git", "-C", clone_dir, "log", "--reverse",
             f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
@@ -2544,14 +3425,14 @@ def acquire(args, env):
     raw_closed = fetch_until(
         get_page,
         f"{api}/pulls?state=closed&sort=updated&direction=desc&per_page=100",
-        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
+        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm[:10],
     )
     # ...plus all currently-open PRs (these feed in_flight / next_candidates).
     raw_open = fetch_all(
         get_page, f"{api}/pulls?state=open&sort=updated&direction=desc&per_page=100")
 
     prs = []
-    for raw in raw_closed + raw_open:
+    for raw in dedupe_raw_prs(raw_closed + raw_open):
         pr = normalize_pr(raw)
         # Keep: merged-in-window, closed-unmerged-in-window, or any open PR.
         keep = (
@@ -2562,31 +3443,7 @@ def acquire(args, env):
         )
         if not keep:
             continue
-        reviews = fetch_all(get_page, f"{api}/pulls/{pr['number']}/reviews?per_page=100")
-        summary = summarize_reviews(reviews)
-        pr["reviewers"] = summary["reviewers"]
-        pr["review_decision"] = summary["decision"]
-        # Phase 10 slice 1: KEEP the individual review submissions (fold persists
-        # them as `review` social nodes). Only set the key when non-empty so the
-        # bundle/extract stay byte-stable for PRs with no reviews.
-        submissions = [normalize_review(r) for r in reviews]
-        if submissions:
-            pr["reviews"] = submissions
-        timeline = fetch_all(
-            get_page, f"{api}/issues/{pr['number']}/timeline?per_page=100")
-        pr["crossref_issues"] = parse_timeline_crossrefs(timeline)
-        _attach_timeline_xrefs(pr, timeline, f"{owner}/{repo}")
-        # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
-        # ready_for_review). Omit-when-empty for byte stability.
-        lifecycle = parse_timeline_lifecycle(timeline)
-        if lifecycle:
-            pr["lifecycle"] = lifecycle
-        review_comments = fetch_all(
-            get_page, f"{api}/pulls/{pr['number']}/comments?per_page=100")
-        pr["review_comments"] = [normalize_review_comment(c) for c in review_comments]
-        conv_comments = fetch_all(
-            get_page, f"{api}/issues/{pr['number']}/comments?per_page=100")
-        pr["comments_list"] = [normalize_comment(c) for c in conv_comments]
+        enrich_pr(pr, get_page, api, f"{owner}/{repo}")
         prs.append(pr)
 
     # Issue set: every issue a kept PR closes or cross-references, plus open and
@@ -2598,7 +3455,7 @@ def acquire(args, env):
     raw_repo_issues = fetch_until(
         get_page,
         f"{api}/issues?state=all&sort=updated&direction=desc&per_page=100",
-        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm,
+        lambda page: bool(page) and page[-1].get("updated_at", "")[:10] >= frm[:10],
     )
     # Open issues untouched during the window are still relevant to the in_flight
     # / next_candidates buckets (e.g. milestone-scoped work that hasn't moved), so
@@ -2661,9 +3518,10 @@ def acquire(args, env):
     workflows = []
     workflow_stats = {}
     if getattr(args, "include_workflows", True):
-        raw_runs = _runs_page(get_page, api, frm, to)
+        raw_runs, runs_truncation = fetch_workflow_runs(get_page, api, frm, to)
         workflows = [normalize_workflow(r) for r in raw_runs]
-        workflow_stats = aggregate_workflow_stats(workflows)
+        workflow_stats = mark_workflow_stats_truncated(
+            aggregate_workflow_stats(workflows), runs_truncation)
 
     releases = []
     if getattr(args, "include_releases", True):
@@ -2720,6 +3578,7 @@ def acquire(args, env):
         # fork contributions, not shipped-to-main (link.build_trains keys on this).
         "base_branch": args.branches.split(",")[0],
         "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
+        "clone_mode": clone_mode,
         "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
@@ -2757,25 +3616,31 @@ def classify_id(qid):
     """Classify a qualified node id into its node_class + a fetch `kind`, from
     the LOCAL id form (mirrors fold_bundle's id conventions):
 
-      social: `pr-<n>` / `issue-<n>` / `comment-<id>`
-      code:   a bare `<sha>` commit (artifact ids carry `art:`/`#` and are a
-              substrate detail, never a spine target — classified `code` too)
+      social: `pr-<n>` / `issue-<n>` / `comment-<id>` / `review-…` / `event-…`
+      code:   a bare `<sha>` commit (kind `code`), or an artifact — `art:<path>`
+              or `<path>#<lang>:<subkind>:<name>` (graphstore.is_artifact_local) —
+              stored as `code` but given kind `artifact`: a substrate detail,
+              never a spine target, and never fetched as a sha.
       structure: everything else (milestones/releases/areas/singletons/person-)
 
+    `local` is the FULL local id (graphstore.local_id: everything after the
+    first `#`), so a symbol id keeps its `<path>#` part.
     Returns {"node_class", "kind", "local"}.
     """
-    local = graphstore.parse_id(qid)["local"]
-    if local.startswith(("pr-", "issue-", "comment-")):
-        kind = "social"
+    local = graphstore.local_id(qid)
+    # Artifact form first: a symbol's PATH may start with a prefix tested below
+    # (`issue-templates/main.tf#terraform:…`).
+    if graphstore.is_artifact_local(local):
+        kind, node_class = "artifact", "code"
+    elif local.startswith(("pr-", "issue-", "comment-", "review-", "event-")):
+        kind, node_class = "social", "social"
     elif local.startswith(("milestone-", "release-", "area-", "person-",
                            "sprint-")) \
-            or local.startswith("art:") or "#" in local \
             or local in ("workflowstats", "codegraph", "codeowners",
                          "labeltaxonomy"):
-        kind = "structure"
+        kind, node_class = "structure", "structure"
     else:
-        kind = "code"  # bare <sha> commit
-    node_class = "structure" if kind == "structure" else kind
+        kind, node_class = "code", "code"  # bare <sha> commit
     return {"node_class": node_class, "kind": kind, "local": local}
 
 
@@ -3341,18 +4206,19 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                           ev.get("created_at"), data, fetched))
             edges.append((qid(local), issid, "part_of", None, None))
 
-    # owns (person -> area): code_owners maps a path-prefix to owner logins; an
-    # owner owns every area whose paths fall under that prefix.
-    owners = bundle.get("code_owners") or {}
-    if owners:
+    # owns (person -> area): CODEOWNERS semantics via derive.area_owners — an
+    # area is owned by the owners of the LAST rule matching the area directory
+    # (graphify community areas: union over their files). Same matcher as
+    # derive.annotate_people_profile's stale_owned.
+    owner_rules = derive.compile_codeowners(bundle.get("code_owners"))
+    if owner_rules:
         areas_by_id = {}
         for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
             areas_by_id[area.get("id") or area.get("name") or area.get("path")] = area
-        for prefix, logins in owners.items():
-            for aid, area in areas_by_id.items():
-                if any((p or "").startswith(prefix) for p in area.get("paths") or []):
-                    for login in logins or []:
-                        contrib(login, "area-{}".format(aid), "owns")
+        for aid in sorted(a for a in areas_by_id if a):
+            for login in derive.area_owners(owner_rules, aid,
+                                            areas_by_id[aid].get("paths") or []):
+                contrib(login, "area-{}".format(aid), "owns")
 
     # touches (commit/pr -> area): the distinct areas a commit's files land in.
     for c in bundle.get("commits", []):
@@ -3456,39 +4322,46 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             nodes.append((qid(local), project, repo, "structure", None,
                           value, fetched))
 
-    graphstore.upsert_nodes(conn, nodes)
-    graphstore.upsert_edges(conn, edges)
-    graphstore.add_code_events(conn, events)
+    # One fold = ONE transaction (issue #55): nodes, edges, code events, the FTS
+    # index and the window/clone_sha provenance commit together or not at all.
+    # `with conn:` commits on success and rolls back on any exception, so a crash
+    # mid-fold never leaves a half-folded store for readers to serve. (A caller's
+    # own uncommitted writes on this connection join the same transaction.)
+    with conn:
+        graphstore.upsert_nodes(conn, nodes, commit=False)
+        graphstore.upsert_edges(conn, edges, commit=False)
+        graphstore.add_code_events(conn, events, commit=False)
 
-    # fts_text: index the searchable text per owning node id so `spotlight grep`
-    # has something to MATCH (Phase 8a prerequisite). FTS5-gated — when the
-    # SQLite build lacks FTS5 the store stays valid and we skip silently.
-    # index_text is delete-then-insert per node id, so re-folding re-indexes
-    # cleanly (idempotent). Sources (the approved scope, decision 1):
-    #   - PR social nodes: title + body + embedded comment/review authors+bodies
-    #   - issue social nodes: title + body + embedded comment authors+bodies
-    #   - commit code nodes: the commit message
-    if graphstore.fts5_available(conn):
-        # Batch the FTS writes into one transaction (index_text(commit=False) +
-        # a single commit) and skip empty text: many tiny commits over a large
-        # window is wasteful, and empty searchable text indexes nothing useful.
-        def _index(node_local, text):
-            if text:
-                graphstore.index_text(conn, qid(node_local), text, commit=False)
-        for pr in bundle.get("prs", []):
-            _index("pr-{}".format(pr["number"]), _social_text(
-                pr,
-                (pr.get("comments_list") or []) + (pr.get("review_comments") or [])))
-        for iss in bundle.get("issues", []):
-            _index("issue-{}".format(iss["number"]),
-                   _social_text(iss, iss.get("comments_list") or []))
-        for c in bundle.get("commits", []):
-            _index(c["sha"], c.get("message") or "")
-        conn.commit()
+        # fts_text: index the searchable text per owning node id so `spotlight
+        # grep` has something to MATCH (Phase 8a prerequisite). FTS5-gated —
+        # when the SQLite build lacks FTS5 the store stays valid and we skip
+        # silently. Re-indexing a node id replaces its text (via fts_map, no
+        # table scan), so re-folding re-indexes cleanly (idempotent). Sources
+        # (the approved scope, decision 1):
+        #   - PR social nodes: title + body + embedded comment/review authors+bodies
+        #   - issue social nodes: title + body + embedded comment authors+bodies
+        #   - commit code nodes: the commit message
+        # Empty text is skipped: it indexes nothing useful.
+        if graphstore.fts5_available(conn):
+            texts = []
+            for pr in bundle.get("prs", []):
+                texts.append(("pr-{}".format(pr["number"]), _social_text(
+                    pr,
+                    (pr.get("comments_list") or []) + (pr.get("review_comments") or []))))
+            for iss in bundle.get("issues", []):
+                texts.append(("issue-{}".format(iss["number"]),
+                              _social_text(iss, iss.get("comments_list") or [])))
+            for c in bundle.get("commits", []):
+                texts.append((c["sha"], c.get("message") or ""))
+            graphstore.index_texts(
+                conn, [(qid(local), text) for local, text in texts if text],
+                commit=False)
 
-    graphstore.record_window(conn, project, repo, meta.get("from"), meta.get("to"))
-    if meta.get("clone_sha"):
-        graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"])
+        graphstore.record_window(conn, project, repo, meta.get("from"),
+                                 meta.get("to"), commit=False)
+        if meta.get("clone_sha"):
+            graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
+                                     commit=False)
 
 
 def _member_args(base, member, frm, to):
@@ -3512,6 +4385,8 @@ def _member_args(base, member, frm, to):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    # A non-integer ACTIVITY_* knob fails here, before any clone or API call.
+    validate_env_knobs()
     # Load + validate the manifest BEFORE touching the store, so a bad/missing
     # manifest fails fast instead of leaving an empty DB behind.
     man = manifest_mod.load_manifest(args.manifest) if getattr(

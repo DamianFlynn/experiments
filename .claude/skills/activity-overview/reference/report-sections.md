@@ -48,7 +48,11 @@ Each train in `bundle["trains"]` carries `significance`, `tier` (`"deep"`/`"ment
 - **MENTION trains** (`tier == "mention"`) collapse to one line:
   `- train-id — {title} — {outcome} ({PR count} PR(s))`.
 
-`render.py --train <id>` produces a spotlight flowchart on demand for any tier.
+`render.py <bundle> --train <id>` produces a spotlight flowchart on demand for any tier.
+
+Large windows: every diagram is capped (with a visible "+K more" marker) to stay inside
+Mermaid's limits. When `diagrams.truncated[<name or train id>]` is present, say so under the
+embedded diagram, e.g. *"Showing 200 of 700 PRs."* (`shown` of `total` `unit`).
 
 ### Per-train narration (sub-agent pass)
 For EACH deep train, fill its `<!-- narrative: <train-id> -->` slot with a sourced narrative
@@ -157,12 +161,15 @@ Flow-health from the **deterministic** `flow` + `blockers` projections (plus tra
 each item CITING its url:
 - **Flow pathologies** — `bundle["flow"]` is the per-OPEN-issue classification (`blocked` /
   `upvoted_but_ignored` / `traction_then_abandoned` / `hung`; healthy omitted). Each entry
-  carries `state`, `age_days`, `reactions`, `blocked_by`, and a ready `signals` list — group by
+  carries `state`, `age_days`, `reactions`, `blocked_by` (OPEN blockers only),
+  `blocked_by_unknown` (blockers not in the bundle), and a ready `signals` list — group by
   `state` (blocked → upvoted_but_ignored → traction_then_abandoned → hung) and render the
-  signals; no agent-side classifying.
-- **Top blockers** — `bundle["blockers"]` ranks issues by `blocks_count` (how many each blocks,
-  highest first) — the ones to unblock first. Embed `diagrams.blocker_graph` (blocker → blocked)
-  when present.
+  signals; no agent-side classifying. A closed blocker does not make an issue `blocked`;
+  `hung` = open ≥ 60 d AND no update for ≥ 30 d.
+- **Top blockers** — `bundle["blockers"]` ranks OPEN issues by `blocks_count` (how many other
+  OPEN issues each blocks, highest first) — the ones to unblock first. Embed
+  `diagrams.blocker_graph` (blocker → blocked) when present; it draws the raw stored relation,
+  closed blockers included.
 - **Stalled trains** — deep trains whose `train.effort.stalled` is true (train-level, distinct
   from the issue-level flow); report the train + `effort.elapsed_days` (longest-stalled first),
   citing the train's root issue / PR url.

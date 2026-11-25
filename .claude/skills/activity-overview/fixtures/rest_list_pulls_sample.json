@@ -1,0 +1,96 @@
+{
+  "_provenance": "CONSTRUCTED, not a captured response. Items under `list_closed` / `list_open` are shaped like GitHub's documented `pull-request-simple` schema returned by GET /repos/{o}/{r}/pulls (list pull requests): they carry merged_at but NOT merged, merged_by, comments, review_comments, commits, additions, deletions or changed_files, which only GET /repos/{o}/{r}/pulls/{n} returns. Fields irrelevant to the gather are trimmed. PR 42 appears twice in list_closed to model a page shift during sort=updated paging (issue #56 item 7). Per-PR endpoints are keyed by PR number.",
+  "window": {"from": "2026-05-01", "to": "2026-05-31"},
+  "list_closed": [
+    {"url": "https://api.github.com/repos/o/r/pulls/42", "id": 1042, "number": 42,
+     "html_url": "https://github.com/o/r/pull/42", "state": "closed", "locked": false,
+     "title": "Add AzureFirewall policy param", "user": {"login": "alice"},
+     "body": "Implements the policy parameter. Fixes #17.", "labels": [{"name": "enhancement"}],
+     "milestone": null, "created_at": "2026-05-02T09:00:00Z", "updated_at": "2026-05-10T12:00:00Z",
+     "closed_at": "2026-05-10T12:00:00Z", "merged_at": "2026-05-10T12:00:00Z",
+     "merge_commit_sha": "aaaa", "assignees": [], "requested_reviewers": [],
+     "head": {"ref": "feature/policy"}, "base": {"ref": "main"},
+     "comments_url": "https://api.github.com/repos/o/r/issues/42/comments",
+     "review_comments_url": "https://api.github.com/repos/o/r/pulls/42/comments",
+     "author_association": "MEMBER", "auto_merge": null, "draft": false},
+    {"url": "https://api.github.com/repos/o/r/pulls/43", "id": 1043, "number": 43,
+     "html_url": "https://github.com/o/r/pull/43", "state": "closed", "locked": false,
+     "title": "Rejected experiment", "user": {"login": "carol"}, "body": "",
+     "labels": [], "milestone": null, "created_at": "2026-05-03T09:00:00Z",
+     "updated_at": "2026-05-09T12:00:00Z", "closed_at": "2026-05-09T12:00:00Z",
+     "merged_at": null, "merge_commit_sha": "bbbb", "assignees": [], "requested_reviewers": [],
+     "head": {"ref": "exp"}, "base": {"ref": "main"},
+     "comments_url": "https://api.github.com/repos/o/r/issues/43/comments",
+     "review_comments_url": "https://api.github.com/repos/o/r/pulls/43/comments",
+     "author_association": "CONTRIBUTOR", "auto_merge": null, "draft": false},
+    {"url": "https://api.github.com/repos/o/r/pulls/42", "id": 1042, "number": 42,
+     "html_url": "https://github.com/o/r/pull/42", "state": "closed", "locked": false,
+     "title": "Add AzureFirewall policy param", "user": {"login": "alice"},
+     "body": "Implements the policy parameter. Fixes #17.", "labels": [{"name": "enhancement"}],
+     "milestone": null, "created_at": "2026-05-02T09:00:00Z", "updated_at": "2026-05-10T12:00:00Z",
+     "closed_at": "2026-05-10T12:00:00Z", "merged_at": "2026-05-10T12:00:00Z",
+     "merge_commit_sha": "aaaa", "assignees": [], "requested_reviewers": [],
+     "head": {"ref": "feature/policy"}, "base": {"ref": "main"},
+     "comments_url": "https://api.github.com/repos/o/r/issues/42/comments",
+     "review_comments_url": "https://api.github.com/repos/o/r/pulls/42/comments",
+     "author_association": "MEMBER", "auto_merge": null, "draft": false}
+  ],
+  "list_open": [
+    {"url": "https://api.github.com/repos/o/r/pulls/44", "id": 1044, "number": 44,
+     "html_url": "https://github.com/o/r/pull/44", "state": "open", "locked": false,
+     "title": "Still open", "user": {"login": "dave"}, "body": "Resolves #18",
+     "labels": [], "milestone": null, "created_at": "2026-05-04T09:00:00Z",
+     "updated_at": "2026-05-20T09:00:00Z", "closed_at": null, "merged_at": null,
+     "merge_commit_sha": null, "assignees": [], "requested_reviewers": [],
+     "head": {"ref": "wip"}, "base": {"ref": "main"},
+     "comments_url": "https://api.github.com/repos/o/r/issues/44/comments",
+     "review_comments_url": "https://api.github.com/repos/o/r/pulls/44/comments",
+     "author_association": "MEMBER", "auto_merge": null, "draft": false}
+  ],
+  "reviews": {
+    "42": [{"id": 501, "user": {"login": "bob"}, "state": "APPROVED",
+            "submitted_at": "2026-05-09T10:00:00Z", "body": "",
+            "html_url": "https://github.com/o/r/pull/42#pullrequestreview-501"}]
+  },
+  "timeline": {
+    "42": [
+      {"id": 9001, "event": "committed"},
+      {"id": 9002, "event": "merged", "actor": {"login": "bob"},
+       "created_at": "2026-05-10T12:00:00Z", "commit_id": "aaaa"},
+      {"id": 9003, "event": "closed", "actor": {"login": "bob"},
+       "created_at": "2026-05-10T12:00:00Z"}
+    ],
+    "43": [
+      {"id": 9101, "event": "closed", "actor": {"login": "carol"},
+       "created_at": "2026-05-09T12:00:00Z"}
+    ]
+  },
+  "review_comments": {
+    "42": [
+      {"id": 601, "user": {"login": "bob"}, "body": "Inline: extract this branch.",
+       "html_url": "https://github.com/o/r/pull/42#discussion_r601",
+       "created_at": "2026-05-09T09:00:00Z"},
+      {"id": 602, "user": {"login": "erin"}, "body": "Inline: typo.",
+       "html_url": "https://github.com/o/r/pull/42#discussion_r602",
+       "created_at": "2026-05-09T09:30:00Z"}
+    ]
+  },
+  "comments": {
+    "42": [
+      {"id": 701, "user": {"login": "bob"}, "body": "LGTM once the example is added.",
+       "html_url": "https://github.com/o/r/pull/42#issuecomment-701",
+       "created_at": "2026-05-08T09:00:00Z"},
+      {"id": 702, "user": {"login": "alice"}, "body": "Added.",
+       "html_url": "https://github.com/o/r/pull/42#issuecomment-702",
+       "created_at": "2026-05-08T11:00:00Z"},
+      {"id": 703, "user": {"login": "frank"}, "body": "Thanks!",
+       "html_url": "https://github.com/o/r/pull/42#issuecomment-703",
+       "created_at": "2026-05-10T13:00:00Z"}
+    ],
+    "44": [
+      {"id": 801, "user": {"login": "alice"}, "body": "Any update?",
+       "html_url": "https://github.com/o/r/pull/44#issuecomment-801",
+       "created_at": "2026-05-15T09:00:00Z"}
+    ]
+  }
+}

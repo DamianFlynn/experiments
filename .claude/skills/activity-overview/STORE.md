@@ -24,7 +24,40 @@ Every node id is namespaced so multi-repo data cannot collide:
 - Project-scoped (people only): `{project}#person-{login}` — a person
   aggregates across all repos in a project.
 
-Helpers: `qualify_id`, `qualify_person`, `parse_id`.
+Helpers: `qualify_id`, `qualify_person`, `parse_id`, `local_id`,
+`split_symbol_local` / `is_symbol_local` / `is_artifact_local`.
+
+### Parsing grammar (readers)
+
+- **Scope vs local: split on the FIRST `#`.** The scope (`{project}/{repo}` or
+  `{project}`) never contains `#` (GitHub owner/repo names and logins cannot;
+  a manifest `project` name cannot — `manifest.load_manifest` rejects `/` and
+  `#` in it; `local_id(qid, project, repo)` strips a known prefix exactly). A local id MAY contain `#`, so
+  everything after the first `#` is the local id. `parse_id` implements this;
+  `local_id(qid, project=None, repo=None)` returns the full local id (stripping
+  exactly `{project}/{repo}#` when both are given). Never `rpartition` on `#` —
+  that truncates `<path>#<lang>:<subkind>:<name>` to `<lang>:<subkind>:<name>`
+  (and to an empty local for a comment named `#### networking ####`).
+- **Local forms.** `pr-N`, `issue-N`, `comment-…`, `review-…`, `event-…`
+  (social); a bare `<sha>` (commit); `art:<path>` (file artifact; the path may
+  contain `#`); `<path>#<lang>:<subkind>:<name>` (symbol/comment artifact; both
+  `path` and `name` may contain `#`, `name` may contain `:` or be empty, `lang`
+  may be empty); `area-…`, `milestone-…`, `release-…`, `sprint-…`, `person-…`
+  and the singletons (structure). Readers test the artifact forms BEFORE the
+  `pr-`/`issue-`/`release-`/… prefixes, because a symbol's path can start with
+  one of them (`issue-templates/main.tf#terraform:…`).
+- **File path containing `#` vs symbol id** (`split_symbol_local`). The symbol
+  separator is the FIRST `#` that follows a non-empty path and is followed by
+  the tail shape `<lang>:<subkind>:` where `lang` matches `[A-Za-z0-9_+-]*` and
+  `subkind` matches `[A-Za-z0-9_-]+` (no `#`, `:`, `/`, `.` or whitespace);
+  the rest is the name. A `#` inside a path is followed by more path text
+  (`docs/C#-guide.md`, `C#/main.tf#terraform:resource:x`), which never has that
+  shape, so it is skipped. An id starting `art:` is never a symbol. This matters
+  for the `code_events` ledger, whose file-level rows are keyed by the bare
+  `<path>`: a row is a symbol row iff its local id has that tail.
+- **Residual ambiguity.** A file path in which a `#` is directly followed by
+  `<token>:<token>:` (e.g. `notes#a:b:c.md`) would be read as a symbol id. Git
+  paths with `:` are rare (and invalid on Windows); no such path is expected.
 
 ## Node classes (`nodes` table)
 
@@ -44,6 +77,18 @@ nothing already correct — the dedup guarantee is durable, not recomputed.
 `structure` nodes typically carry NULL `ts` and are excluded from window
 range scans (they are not activity).
 
+**`ts` granularity and window bounds.** `ts` is mixed: commits and artifacts
+store a date-only `YYYY-MM-DD`; PRs, issues, reviews and events store an ISO
+datetime. Window bounds may also be either form (`--to 2026-05-31` or
+`2026-05-31T23:59:59Z`). Every window check — `range_query`'s SQL and the
+Python predicate `graphstore.ts_in_window(ts, from, to)` that `complete`,
+`spotlight`, `gather.in_window` and `link._in_window` delegate to — applies one
+rule: each bound is compared at the **coarser** granularity of the pair, so a
+date-only `ts` or bound covers its whole day; only datetime-vs-datetime is
+compared exactly. Both ends are inclusive, either bound may be None. So a PR
+merged `2026-05-31T15:00:00Z` is inside `--to 2026-05-31`, and a commit dated
+`2026-03-01` is inside `from=2026-03-01T00:00:00Z`.
+
 ## Edges (`edges` table)
 
 `(src_id, dst_id, edge_type, ts, data)`, PK `(src,dst,type)`. Re-upsert
@@ -56,6 +101,14 @@ unions, never appends. Edge types:
 `data`), `replaced_by`/`identity_from` (artifact→artifact), `blocks`
 (issue→issue), `in_milestone`/`in_iteration` (social→structure).
 
+`edges_by_type(edge_type, project)` selects the edges whose `src_id` starts
+with `{project}/` — **case-sensitively** (`Azure` and `azure` are different
+projects) and as an index range (`src_id >= '{project}/' AND src_id <
+'{project}0'` on `idx_edges_type_src (edge_type, src_id, dst_id)`), never a
+`LIKE` (case-insensitive in SQLite, so it cannot use an index and mixed
+projects that differ only in case). `repo_code_events(project, repo)` filters
+`code_events.artifact_id` on the `{project}/{repo}#` prefix the same way.
+
 ### Spine edges and decision trains
 
 A decision train is **not stored** — it is the connected component reachable
@@ -66,6 +119,18 @@ from a root issue over the *spine* edge allowlist:
 [id]}`. `missing` ids are spine nodes referenced but not yet stored (e.g. an
 out-of-window issue a PR closes) — what a reader backfills.
 
+Where the spine edges come from (gather, #62). `closes` follows GitHub's own
+closing-keyword rule: `close[sd]`/`fix(e[sd])`/`resolve[sd]` (any case), optional
+`:`, then one `#N`, `owner/repo#N` or `https://github.com/owner/repo/issues/N`.
+Each closed issue needs its own keyword — `Fixes #1, #2` closes only #1 (#2 is
+kept as a same-repo cross-reference in `crossref_issues`), while `Fixes #1, fixes
+#2` closes both. A same-repo qualified ref or URL is a same-repo `closes`; a
+cross-repo one goes to the cross-repo edge path below; a keyword before a
+`/pull/` URL is a `cross_ref`, never a close. Keywords are matched in code blocks
+too (no Markdown parsing). `part_of` uses the commit subject's **trailing**
+`(#N)` first (so `Revert "x (#4012)" (#4020)` → PR 4020), then `Merge pull
+request #N`, then the last `(#N)`.
+
 ## Code-event ledger (`code_events` table)
 
 One row per artifact lifecycle event: `(artifact_id, event, commit_sha,
@@ -75,18 +140,28 @@ event)` → set semantics (re-seeing a commit is a no-op). An artifact's
 
 ## Text index (`fts_text`, FTS5)
 
-`index_text(node_id, text)` (delete-then-insert; idempotent) feeds an FTS5
-index; `fts_search(query)` returns matching node ids ranked by relevance.
-Created only when the SQLite build supports FTS5 (`fts5_available`); the
-text-mining spotlight query depends on it.
+`index_text(node_id, text)` / `index_texts([(node_id, text), ...])` (replace
+any text already indexed for the node; idempotent) feed an FTS5 index;
+`fts_search(query)` returns matching node ids ranked by relevance. Created only
+when the SQLite build supports FTS5 (`fts5_available`); the text-mining
+spotlight query depends on it.
+
+`fts_text(node_id UNINDEXED, text)` cannot look a row up by `node_id` without
+scanning the whole virtual table, so (schema v2) the side table
+`fts_map(node_id PK, fts_rowid)` records which `fts_text` rowid holds each
+node's text. Re-indexing is a primary-key lookup in `fts_map` plus a rowid
+delete/insert in `fts_text` (same rowid reused), so a fold's FTS cost is linear
+in the fold, not in the store. `fts_map` is created and back-filled by
+`init_schema`, and lazily by `index_text(s)` on a store that skipped
+`init_schema` (e.g. `validate`'s in-memory idempotency copy).
 
 **Populated on the fold path.** `fold_bundle` indexes searchable
 text per owning node id, keyed so a hit hydrates back to the node it came from:
 PR/issue `social` nodes index their title + body + embedded comment/review
 authors+bodies; commit `code` nodes index the commit message. The call is
 FTS5-gated (skipped silently when the build lacks FTS5 — the store stays valid)
-and idempotent (`index_text` is delete-then-insert per node id, so re-folding
-an overlapping window re-indexes cleanly without duplicates).
+and idempotent (re-indexing a node id replaces its text, so re-folding an
+overlapping window re-indexes cleanly without duplicates).
 
 `fts_search` passes `query` straight to the FTS5 `MATCH` operator, so the
 argument must be a **valid FTS5 query**. Callers searching user-derived terms
@@ -96,10 +171,35 @@ significant and otherwise raise `OperationalError`.
 
 ## Meta (`meta` table)
 
-Key/value provenance: `schema_version`; `gathered_windows` (JSON list of
+Key/value provenance: `schema_version` (see below); `gathered_windows` (JSON list of
 folded `{project,repo,from,to}`, deduped — `record_window`/`get_windows`);
 `clone_sha:{project}/{repo}` (the tree a repo was last gathered against, for
 deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`).
+
+### Schema version and migration
+
+`graphstore.SCHEMA_VERSION` is **2**. `init_schema` creates a new store at the
+current version and migrates an older one **in place**; every step is additive
+and idempotent, and the stored version is raised, never lowered.
+
+| Version | Change | Migration from the previous version |
+|---|---|---|
+| 1 | initial schema | — |
+| 2 | `fts_map` side table; `idx_edges_type_src` index (issue #55) | create the index; create `fts_map`, collapse any duplicate `fts_text` rows per node (newest kept) and back-fill the map from `fts_text` |
+
+Code older than v2 writing into a v2 store would add `fts_text` rows without
+`fts_map` entries (duplicate text on re-index); do not mix versions on one store.
+
+## Transactions (atomic folds)
+
+`fold_bundle` writes a fold as **one transaction** (`with conn:`): nodes,
+edges, code events, the FTS index, `gathered_windows` and `clone_sha` commit
+together, and any exception rolls all of them back, so readers never see a
+half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
+`add_code_events`, `index_text(s)`, `set_meta`, `record_window`,
+`set_clone_sha`) take `commit=True` by default and `commit=False` to join the
+caller's open transaction. A caller's own uncommitted writes on the same
+connection are committed (or rolled back) with the fold.
 
 ## Writer (gather --store)
 
@@ -113,11 +213,13 @@ writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
 `cross_ref`, and `part_of`. It also persists the per-repo **singleton facts**
 `workflow_stats`, `code_graph`, `code_owners`, and `label_taxonomy` — each as a
-whole-dict `structure` node under a well-known local id (`workflowstats`,
+whole-value `structure` node under a well-known local id (`workflowstats`,
 `codegraph`, `codeowners`, `labeltaxonomy`) with NULL `ts` (excluded from window
 scans), identity-keyed and idempotent. A singleton node is written only when its
 source value is present and non-empty, so a reader never reconstructs a
-fabricated empty key.
+fabricated empty key. Node `data` is JSON-encoded with sorted keys, so
+`code_owners` is an ordered rule **list** (not a pattern-keyed dict): list order
+survives the round trip, and CODEOWNERS precedence depends on it.
 
 **Slice 7b-1 (step 2) additionally persists the artifact substrate** (derived on
 the write path via the shared `derive.py` leaf module — `derive.build_artifacts`
@@ -182,8 +284,12 @@ edges** (all derived on the write path via the shared `derive.py` leaf —
   `issue.author`), `commented` (person→pr/issue from `comments_list` +
   `review_comments` authors). `reacted` is **not** written: reactions are stored
   as aggregate counts (`summarize_reactions`), with no per-reactor login to key on.
-- **`owns` (person→area)** from `code_owners` — each owner of a path-prefix owns
-  every area whose paths fall under that prefix. **`touches` (commit→area)** from
+- **`owns` (person→area)** from `code_owners` — each owner returned by
+  `derive.area_owners` for the area: the owners of the **last** CODEOWNERS rule
+  matching the area directory (`<area>/`; graphify community areas: union over
+  their files), with GitHub CODEOWNERS pattern semantics (see BUNDLE.md
+  `code_owners`). Rules are not unioned; an owner-less last match emits no edge.
+  `stale_owned` uses the same matcher. **`touches` (commit→area)** from
   `derive._commit_areas` (a commit's files → the areas they land in). **`depends_on`
   (area→area)** from `code_graph["edges"]`, carrying `{version,transitive,…}` in
   the edge `data`. **`in_milestone` (social→structure)** from a PR/issue's
@@ -340,6 +446,16 @@ python3 gather.py --manifest workspace/manifest.json --store workspace/journey.d
     { "owner": "Azure", "repo": "terraform-azurerm-avm-res-keyvault-vault" } ] }
 ```
 
+`manifest.load_manifest` validates the file before the store is touched and raises
+`ValueError` (`manifest: …`) on: a non-string or empty field; a `project` containing
+`/` or `#`; a window bound that is not a real `YYYY-MM-DD` date, or `from` after `to`;
+an `owner` that is not a GitHub user/org name (letters, digits, `-` and `_`, not
+starting with `-`, ≤ 39 chars); a `repo` outside GitHub's alphabet (letters, digits,
+`-`, `_`, `.`; ≤ 100 chars; not `.`/`..`); two members naming the same repo
+**case-insensitively** (`o/a` and `O/A`); a `registry` that is present but not a
+non-empty string, or declared by two members (case-insensitively). `gather.py`
+applies the same owner/repo/date checks to `--owner/--repo/--from/--to`.
+
 gather loops the members, running the existing acquire→fold path once per member
 into the **same store** under `project = manifest.project`, `repo = "{owner}/{repo}"`.
 The slash in `repo` is benign — every join is on the full string, every split is
@@ -372,7 +488,10 @@ escaping the repo is unresolved, never a phantom dangling area. **`examples/` an
 `tests/` subtrees are scaffolding** (they reference the module-under-test and test
 fixtures, often other registry modules, via CI-manipulated paths) — they are
 **skipped at extraction and excluded at fold**, so they never become bogus intra-
-or cross-repo dependencies. `terraform graph` runs through the same parallel pool
+or cross-repo dependencies; that includes scaffold files nested inside a module
+(`modules/sub/examples/x/main.tf`), which are never read or built as `modules/sub`.
+The module dir is resolved on disk in the clone, whichever of its files changed in
+the window (see BUNDLE.md, *Entrypoint*). `terraform graph` runs through the same parallel pool
 as the bicep build; with a shared `TF_PLUGIN_CACHE_DIR` a one-shot serial provider
 warm-up precedes the parallel inits (terraform's plugin cache is not write-safe
 under concurrency). The IaC build knobs are env-overridable for heavy runs:
@@ -445,4 +564,6 @@ check, not a crash). This is what makes the store a stand-alone deliverable.
 ## Determinism
 
 `data` blobs serialize with `sort_keys=True`; `range_query` orders by
-`(ts, id)`. Given fixed inputs the store is byte-stable (modulo `fetched_at`).
+`(ts, id)` and applies the granularity-safe window rule above (`ts_in_window`),
+so the same window gives the same node set whether its bounds are written as
+dates or as start/end-of-day datetimes. Given fixed inputs the store is byte-stable (modulo `fetched_at`).

@@ -462,13 +462,13 @@ people-and-flow features worth calling out:
 
 ```mermaid
 flowchart TB
-  open[open issue] --> b{blocked_by?}
+  open[open issue] --> b{blocked by an<br/>OPEN issue?}
   b -- yes --> BL[blocked]
   b -- no --> u{👍 ≥ 5 AND stale<br/>AND no open PR?}
   u -- yes --> UP[upvoted_but_ignored]
   u -- no --> t{≥ 5 comments AND stale<br/>AND no open PR?}
   t -- yes --> TR[traction_then_abandoned]
-  t -- no --> h{age ≥ 60d AND no open PR?}
+  t -- no --> h{age ≥ 60d AND stale<br/>AND no open PR?}
   h -- yes --> HU[hung]
   h -- no --> HE[healthy → omitted]
 ```
@@ -678,7 +678,9 @@ Queries: `person` · `symbol` · `subsystem` · `grep` · `module` · `dependent
 **Environment variables:** `GITHUB_TOKEN`/`GH_TOKEN` (auth) · `ACTIVITY_CLONE_MARGIN_DAYS`
 (14) · `ACTIVITY_BOARD_STALE_DAYS` (365) · `ACTIVITY_BOARD_MAX_ITEMS` (5000) ·
 `ACTIVITY_IAC_BUILD_TIMEOUT` (300s) · `ACTIVITY_IAC_MAX_WORKERS` (8) ·
-`ACTIVITY_IAC_RETRIES` (1) · `TF_PLUGIN_CACHE_DIR` (shared terraform cache).
+`ACTIVITY_IAC_RETRIES` (1) · `ACTIVITY_HTTP_TIMEOUT` (60s) · `ACTIVITY_HTTP_RETRIES` (3) ·
+`ACTIVITY_RATE_LIMIT_MAX_WAIT` (3600s) · `TF_PLUGIN_CACHE_DIR` (shared terraform cache).
+A non-integer value for an integer knob is an error; one below its minimum is clamped.
 
 **Tunable constants (in code):** trains — top-N=8, significance floor=20.0, stall=21 days;
 forecast — likely ≥5.0, possible ≥2.0, overdue=200 days; slices — text cap 1500, comments
@@ -719,4 +721,5 @@ whether a train gets a full write-up · **slice** = one train's bounded, self-co
 evidence for the narrator · **flow** = an open issue's stuck-ness pathology ·
 **halls.fame** = the recognition ranking · **blast radius** = the set of repos that depend
 on a given one · **idempotent** = re-running changes nothing · **provenance** = the source
-link attached to every fact · **schema_version** = `1` (stamped on every view and the store).
+link attached to every fact · **schema_version** = `1` on the bundle view; the store's `meta.schema_version` is `2`
+(STORE.md).

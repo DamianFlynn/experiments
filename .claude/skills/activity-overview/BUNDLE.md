@@ -55,7 +55,9 @@ the rest (engagement, code areas, trains, people/flow).
   Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
   It pins the exact source tree (edges are a pure function of source), which is the basis for
   the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,
-  idempotent by identity. (Store-only — see `STORE.md`; this bundle shape is the
+  idempotent by identity. **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` | `none`)
+  records how gather obtained the clone (see `gather.prepare_clone`); it is in the bundle
+  `acquire` assembles and is not folded into the store. (Store-only — see `STORE.md`; this bundle shape is the
   transient view `extract` materializes from the store, not a produced file.)
 - `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
@@ -64,6 +66,10 @@ the rest (engagement, code areas, trains, people/flow).
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
+  PRs are de-duplicated by `number` (a PR listed twice across pages keeps its latest snapshot).
+  `merged` is `merged_at != null`. GitHub's list-pulls payload omits `merged_by` and the comment
+  counts, so `acquire` takes `merged_by` from the actor of the PR's issue-timeline `merged` event
+  (`null` for an unmerged PR or a deleted account) — no extra per-PR call.
 - `issues` — issues in scope (PR-closing, plus open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
 - `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
@@ -112,20 +118,31 @@ docsRefs, release_train, sprints, project, diagrams`.
 - **issues[]** gain `milestone`, `updated_at`, `comments`. Open and
   not-planned-closed issues are now included, not just PR-closing issues.
 - **workflows[]**, **workflow_stats{}**, **releases[]**, **milestones[]** are
-  populated (see the schema block in the design spec).
+  populated (see the schema block in the design spec). `workflow_stats` is keyed by
+  workflow name, plus the reserved key `_truncated` ONLY when GitHub's 1,000-run
+  search cap could not be split away: `{truncated, cap, fetched, total_count,
+  ranges}`. Consumers listing workflows skip keys starting with `_`.
 - **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
   `next_candidates` (one bucket per item; precedence shipped > rejected >
-  next_candidates > in_flight). Each ref may carry a `train` id.
+  next_candidates > in_flight). Each ref may carry a `train` id. The current/next
+  milestones come from `select_milestones`: open milestones **with a due date** only
+  (undated ones, e.g. "Backlog", are never selected; none dated → no current/next);
+  current = earliest due on/after `ref_date`'s day, next = the one after; if all are
+  overdue, current = the most recently due and next = none. Ties break by number.
 - **diagrams{}** maps `buckets_pie` / `timeline_gantt` to their `.mmd` paths,
   written and mmdc-validated by `render.py`. **`diagrams.train_flowcharts`** is a nested
   map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written by `render.py` (one adaptive
   Mermaid `flowchart` per DEEP train; mode C with code-area annotation nodes when
   `len(prs) ≤ TRAIN_FLOW_MAX_PRS` and `len(distinct code_areas) ≤ TRAIN_FLOW_MAX_AREAS`, else
-  mode A bare chain). On-demand spotlight render via `render.py --train <id>` (any tier).
+  mode A bare chain). On-demand spotlight render via `render.py <bundle> --train <id>` (any
+  tier). **`diagrams.truncated`** maps each diagram that hit a size cap (flat key or train
+  id) to `{ shown:int, total:int, unit:"PRs"|"releases"|"PRs+releases"|"events"|"edges"|"kinds" }`;
+  it is `{}` when nothing was cut (caps and ranking keys: `docs/LLD.md` §7).
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
   train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
   — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
-  desc. Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
+  desc. `next_milestone` is the bucket rule's next milestone (always dated; `None` when
+  there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
   / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
@@ -134,7 +151,8 @@ docsRefs, release_train, sprints, project, diagrams`.
 
 - **prs[]** gain `review_comments: [{author, author_association, body, url, id, created_at}]`
   (inline diff comments) and `comments_list: [{...same shape}]` (conversation
-  comments). The integer count stays under `comments` / `review_comments_count`;
+  comments). The integer count stays under `comments` / `review_comments_count`
+  (in `acquire`, the lengths of `comments_list` / `review_comments`);
   the body arrays live under `comments_list` (the `comments` name was already taken
   by the count).
 - **issues[]** gain `comments_list: [{...}]`, `reactions: {"+1","-1","heart",
@@ -206,7 +224,7 @@ docsRefs, release_train, sprints, project, diagrams`.
   | `ref` | the raw reference (`br/public:…:<ver>`, a local path, or a TF `source`) |
   | `version` | pinned version when present, else `null` |
   | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
-  | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge |
+  | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge. Child edges come from building the **parent**: a child module is never the area's entrypoint |
   | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
   | `resolved` | `true` when `to` is non-null |
@@ -220,6 +238,15 @@ docsRefs, release_train, sprints, project, diagrams`.
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 
+  **Entrypoint.** Each area is built from its *own* module, resolved on disk in the clone
+  regardless of which files changed in the window: Bicep builds `<area id>/main.bicep`
+  (never `<area>/<child>/main.bicep`, so a child-only change still builds the parent);
+  Terraform runs in the area dir and reads its whole `*.tf` set. A path missing from the
+  checkout (deleted in the window) and any file under a nested `examples/`/`tests/` subtree
+  (e.g. `modules/sub/examples/x/main.tf`) are never the entrypoint. Only when the area id is
+  not a directory (a graphify `community:<n>` area) is the shallowest existing match among
+  the area's `paths` used. No entrypoint on disk ⇒ `edges_status: skipped`.
+
   **Visible gaps.** Per-module builds run in parallel, each bounded by a generous
   per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
   genuinely hung process) and retried once. Each area carries `edges_status` ∈
@@ -229,16 +256,37 @@ docsRefs, release_train, sprints, project, diagrams`.
   with an empty `edges` list genuinely means "no inter-area dependencies"; `timeout`/`failed`
   mean "not determined" (re-run to resolve). The integration gate reds when the unresolved rate
   is non-trivial, so an incomplete graph is re-run rather than silently shipped.
-- **code_owners** `{ "<path|glob>": ["login", ...] }` — parsed from the clone's
-  CODEOWNERS (`.github/`/root/`docs/`); `@org/team` and `@user` kept as logins.
+- **code_owners** `[ { "pattern": "<path|glob>", "owners": ["login", ...] }, ... ]` —
+  parsed from the clone's CODEOWNERS (`.github/`/root/`docs/`), one rule per line **in
+  file order** (duplicates kept). `@org/team` and `@user` are kept as logins (the `@`
+  stripped), emails as-is. Blank/`#` lines, inline `# comments` and GitLab `[Section]`
+  headers are dropped; a pattern with no owners is kept with `owners: []` (it
+  un-assigns ownership). Matching follows GitHub's CODEOWNERS rules
+  (`derive.codeowners_owners`): leading or middle `/` anchors at the root, trailing
+  `/` = directory, `*`/`?` within a segment, `**` across segments, a slash-less
+  pattern matches at any depth, a matched directory covers everything under it
+  (except an anchored `dir/*`, which covers only direct files), `!` negation is
+  unsupported, and **the last matching rule wins** (no union). **Area ownership**
+  (`derive.area_owners`): a directory area is owned by the owners of the last rule
+  that matches the area directory itself (`<area>/`), so a file-only rule such as
+  `*.tf` does not own the area even though it may own files in it; a graphify
+  `community:<n>` area is owned by the union of its files' owners. Readers also
+  accept the legacy `{pattern: owners}` dict (stores written before #65); that form
+  was stored key-sorted, so its file order — and therefore last-match-wins — is
+  only as good as the sorted order until the repo is re-gathered.
 - **label_taxonomy** `{ "<facet>": { "<namespace>": ["label", ...] }, "source":
   "auto|config|merged" }` — auto-detected structured label namespaces mapped to
-  facets (`area`/`priority`/`status`/`lifecycle`/`kind`), with optional config
-  override/extend. Degrades to `{ "source": "auto" }` (no facets) on unstructured labels.
+  facets (`area`/`priority`/`status`/`lifecycle`/`kind`/`class`), with optional config
+  override/extend. Only `type:`/`kind:` namespaces form the `kind` facet; AVM's
+  `Class:` (Resource/Pattern/Utility Module) is a scope facet `class`, recorded but never
+  used for kind. Degrades to `{ "source": "auto" }` (no facets) on unstructured labels.
 - **issues[]/prs[]** gain **facets** `{ area, priority, status, lifecycle }`
   (each the first matching label or null). **issues[]** gain **kind** ∈
   `feature|module-request|bug|idea|question|docs|other` (native issue type →
-  label kind facet → template filename → title/body heuristic → other).
+  label kind (`type:`/`kind:` facet labels, then a bare label that is exactly a kind word,
+  e.g. `bug`/`enhancement`/`documentation`) → template filename → **title** heuristic → other).
+  Matching is on whole words, never substrings; a bare "module" is not a module request
+  (only "module request"/"module proposal" are); issue bodies are never read.
 - **artifacts[].code_area** and **feature_deltas[].area** are **populated** when the
   path resolves to a `code_graph` area; null otherwise.
 - **trains[].code_areas** — the distinct areas of a train's commits' files.
@@ -305,7 +353,7 @@ data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
   | `first_seen` / `last_active` | min / max ISO date (`YYYY-MM-DD`) across the login's activity (PRs authored/merged-by, commits, issues, reviews); `null` when none |
   | `examples_authored` / `docs_authored` / `symbols_authored` | distinct artifacts with an `add` lifecycle event by this login, bucketed by `kind` (example; doc+readme; symbol) (int) |
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
-  | `stale_owned` | distinct owned `code_owners` prefixes (owner list includes login) that contain a stalled train (a stalled train's `code_areas` entry `startswith` the prefix) (int) |
+  | `stale_owned` | distinct areas in a stalled train's `code_areas` that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
 
   Counts are always present (ints, may be 0); `merge_rate`/`review_latency_days`/
   `first_seen`/`last_active` are present as `null` when N/A. Deterministic.
@@ -315,27 +363,48 @@ data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
   commits_authored`, keeps `score > 0`, sorts by `(-score, login)`, takes the top
   10 (else `[]`). **`halls.internal`/`shame`/`blame` are intentionally NOT built**
   — per the "recognition, not blame" stance.
+- **Blocker state.** `issue["blocking"]` / `issue["blocked_by"]` (set by
+  `extract._attach_blocks`) are the **raw stored relation**, whatever the state of
+  the issues at either end; `diagrams.blocker_graph` draws that raw relation. `flow`
+  and `blockers` apply an **open-only** filter on top, using the `state` of the
+  bundle's own issues: an issue at the other end counts only when it is in the
+  bundle with `state == "open"`. A number **absent from the bundle** has **unknown**
+  state; it never counts as open (gather pulls every open issue of the repo, so an
+  issue it did not gather was not open at gather time, or is not an issue of this
+  repo), and `flow` lists such blockers separately in `blocked_by_unknown` rather
+  than dropping them silently.
 - **flow** `[ { number, url, state, age_days, reactions, blocked_by:[num],
-  signals:[str] } ]` (`build_flow`) — one entry per OPEN issue classified into a
-  non-healthy **pathology** (healthy issues are omitted to stay lean). `state` is
-  the pathology, in precedence order (first match wins):
-  - `blocked` — `blocked_by` non-empty.
+  blocked_by_unknown:[num], signals:[str] } ]` (`build_flow`) — one entry per OPEN
+  issue classified into a non-healthy **pathology** (healthy issues are omitted to
+  stay lean). `blocked_by` holds only the issue's **open** blockers (sorted,
+  unique); closed blockers are dropped; `blocked_by_unknown` holds blockers absent
+  from the bundle (always present, `[]` when none). `state` is the pathology, in
+  precedence order (first match wins):
+  - `blocked` — at least one **open** blocker (`blocked_by` non-empty). An issue
+    whose blockers are all closed or unknown is not `blocked` and is classified
+    by its own signals below.
   - `upvoted_but_ignored` — `+1` reactions `≥ FLOW_UPVOTE_MIN` (5) AND stale
     (`updated_at` `≥ FLOW_STALE_DAYS` = 30 days before `ref_date`) AND no open
     linked PR.
   - `traction_then_abandoned` — `≥ FLOW_TRACTION_MIN` (5) comments AND stale AND
     no open linked PR.
-  - `hung` — `age_days ≥ FLOW_HUNG_DAYS` (60) AND no open linked PR.
+  - `hung` — `age_days ≥ FLOW_HUNG_DAYS` (60) AND stale AND no open linked PR. An
+    old issue with recent activity (updated < 30 days before `ref_date`) is not
+    `hung`; neither is one without `updated_at` (recency unknown, so not stale).
   An issue with an OPEN (unmerged) linked PR (via PR `closes`/`crossref_issues`)
   is exempt from the activity-starved pathologies (work is in flight). `age_days`
   is `null` when the issue has no `created_at`. `signals` is a human-readable
-  list (`"blocked by N issue(s)"`, `"N reactions"`, `"stale Nd"`, `"N comments"`,
-  `"open Nd"`), each included only when relevant. `age_days`/staleness use
-  `meta.ref_date` (fallback `meta.to`). Sorted by `number`. Empty `[]` when all
-  open issues are healthy.
+  list (`"blocked by N issue(s)"` counting open blockers only, `"N blocker(s) of
+  unknown state"`, `"N reactions"`, `"stale Nd"`, `"N comments"`, `"open Nd"`),
+  each included only when relevant. `age_days`/staleness use `meta.ref_date`
+  (fallback `meta.to`). Sorted by `number`. Empty `[]` when all open issues are
+  healthy.
 - **blockers** `[ { number, url, blocks_count, blocks:[num] } ]`
-  (`build_blockers`) — issues ranked by **how many other issues each one blocks**
-  (`blocks_count`, i.e. out-degree in the blocker→blocked graph established by
-  `extract._attach_blocks`, read off `issue["blocking"]`). One entry per issue with
-  a non-empty `blocking` list; `blocks` is the sorted unique set it blocks. Sorted
-  by `blocks_count` desc then `number`. Empty `[]` when nothing blocks.
+  (`build_blockers`) — **open** issues ranked by **how many other open issues each
+  one blocks** (`blocks_count`, i.e. out-degree in the blocker→blocked graph read
+  off `issue["blocking"]`, restricted to open issues). A closed blocker is not
+  listed; `blocks` is the sorted unique set of blocked issues that are in the
+  bundle with `state == "open"` (closed and unknown-state dependants are not
+  counted); a blocker left with no open dependant is omitted. Sorted by
+  `blocks_count` desc then `number`. Empty `[]` when nothing open blocks anything
+  open.

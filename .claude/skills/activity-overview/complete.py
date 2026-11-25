@@ -15,18 +15,12 @@ import graphstore
 def _in_window(node, window):
     """A node is in-window if there is no window, or its ts falls in [from, to].
     A node with no ts is treated as out-of-window (cannot prove it's inside).
-    Either bound may be None (a one-sided window)."""
+    Either bound may be None (a one-sided window). Granularity-safe: delegates
+    to `graphstore.ts_in_window` (a date-only ts or bound covers its whole day)."""
     if window is None:
         return True
-    ts = node.get("ts")
-    if ts is None:
-        return False
     frm, to = window
-    if frm is not None and ts < frm:
-        return False
-    if to is not None and ts > to:
-        return False
-    return True
+    return graphstore.ts_in_window(node.get("ts"), frm, to)
 
 
 def _spine_neighbors(conn, qid, edge_types):
