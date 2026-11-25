@@ -1,0 +1,1 @@
+{"Modules":[{"Key":"","Source":"","Dir":"."},{"Key":"naming","Source":"registry.terraform.io/Azure/naming/azurerm","Version":"0.4.0","Dir":".terraform/modules/naming"},{"Key":"pe","Source":"./modules/pe","Dir":"modules/pe"},{"Key":"vnet","Source":"./modules/vnet","Dir":"modules/vnet"},{"Key":"vnet.subnet","Source":"../subnet","Dir":"modules/subnet"}]}

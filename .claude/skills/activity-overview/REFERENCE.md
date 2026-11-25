@@ -54,8 +54,13 @@ window never double-counts), so the journey graph accretes over time. It's a loc
 rebuildable cache; delete the file to start fresh, or re-gather to refresh against the
 pinned clone SHA (see `STORE.md`). A single store *can* hold **multiple** projects/repos,
 but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
-`spotlight.py`) error asking for `--project` (and `--repo` when a project spans several) —
+`spotlight.py`) error asking for `--project` (and `--repo` when a project spans several;
+`spotlight.py` instead unions an area across members unless `--repo` or `owner/repo::area`
+names one) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
+`validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
+mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
+error: missing or non-store path, ambiguous store).
 
 The report vertical (`view → link → render → report`) **composes from the
 store** — `view.py` (the CLI over `extract`) materializes one repo's raw bundle view,
@@ -69,10 +74,12 @@ python3 link.py workspace/view/bundle.json --series workspace/series.json
 python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams
 ```
 
-`view.py --store DB [--project P] [--repo R] --from F --to T --out PATH` auto-detects
+`view.py --store DB [--project P] [--repo R] --from F --to T --out PATH [--ref-date D]` auto-detects
 `--project`/`--repo` when the store holds exactly one (single-repo gather: project =
 owner, repo = name; manifest: project = manifest name, repo = `owner/repo`), writes
-exactly what `extract.extract` returns (raw keys, extract's deterministic order), does
+exactly what `extract.extract` returns (raw keys, extract's deterministic order) — with
+`meta.period` = `{F, T}` (the window `link.py` buckets to) and `meta.ref_date` = `D`, else
+gather's `--ref-date` stored for exactly this window, else `T` — does
 no network backfill, and exits 2 when the scope is ambiguous, unknown or empty, or the
 store is missing. For a multi-repo project, `--repo` selects one member; the merged
 project view comes from `digest.py`. The full step-by-step procedure (and which report
@@ -114,6 +121,16 @@ owner/repo/date checks apply to `gather.py --owner/--repo/--from/--to`.
 dedupes members case-insensitively, exits 2 on bad/inverted dates, `--limit < 1` or
 a duplicate `registry` among the selected members, warns when an `--include` slug is
 not in the index, and times out an index fetch after 30 s.
+
+A member that fails to gather (HTTP error, clone failure, a fold error) does not stop
+the run: the other members are folded, gather prints `member -> reason` and exits 1,
+and the store records each member's outcome for the window in meta `member_status`
+(`ok` / `failed` / `not_attempted`, `STORE.md`). `validate.py` then fails the project
+(`member_status`, and `target` for that member) and `digest.py` / `view.py` warn on
+stderr. `gather.py --manifest M --store S --resume` re-attempts only the members that
+are not `ok` for the manifest's window; a plain re-run gathers every member again. A repo
+that exists in the store only as another member's `depends_on` stand-in is not listed
+as a member.
 
 ### IaC build env knobs (heavy live runs)
 

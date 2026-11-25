@@ -91,14 +91,13 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 ```
 
 > **Why one store per installment?** The store layer is idempotent and *can* accumulate many
-> windows, but two current limitations make an accumulated store unsuitable for monthly
-> digests (HLD §10): (1) a view materialized from a multi-window store is not scoped to its
-> window — `extract` emits no `meta.period`, so buckets treat every stored merge as in-window,
-> and trains/commits include all stored history; (2) after a second fold that touches the same
-> files, `validate.py` fails `no_drift` (artifact lifecycles keep only the latest window while
-> the change ledger keeps all). A single-window store per installment — the way CI and the
-> golden tests use it — avoids both. An optional accumulated `history.db` is still useful for
-> cross-window `spotlight` queries (§8).
+> windows (artifact lifecycles are cumulative, so such a store passes `no_drift` whatever the
+> fold order), but a current limitation makes an accumulated store unsuitable for monthly
+> digests (HLD §10): a view materialized from a multi-window store is only partly scoped to
+> its window — its buckets (shipped, rejected, in flight) are bounded by `meta.period`, but its
+> `prs`/`issues`/`commits` arrays and trains include all stored history. A single-window store
+> per installment — the way CI and the golden tests use it — avoids it. An optional accumulated
+> `history.db` is still useful for cross-window `spotlight` queries (§8).
 
 ## 3. Running it through Claude Code (the normal way)
 
@@ -191,7 +190,9 @@ flowchart TB
 
 1. **Window.** Use calendar months: `--from 2026-11-01 --to 2026-11-30`. `--ref-date` defaults
    to `--to`, which frames milestones, sprints, forecast age and flow staleness — keep the
-   default for month-end reports.
+   default for month-end reports. gather stores it with the window, and `view.py`/`digest.py`
+   read it back when their `--from/--to` are that exact window (else they use their `--to`);
+   both also take `--ref-date` to override it.
 2. **Gather into this month's own store** (`stores/YYYY-MM.db`). Re-running the same window
    into the same store is safe (idempotent). `gather` clones into `--clone-dir`, or, when that
    directory already holds a clone of the same repo, fetches it to the window's history bound
@@ -209,7 +210,11 @@ flowchart TB
    belongs to. If you run it twice for the same month, the file ends with two entries for that
    month: delete **every** entry for that month (deleting only the last leaves the month
    compared with itself), then run `--series` once. If later months were already appended,
-   delete that suffix too and replay the saved bundles oldest → newest.
+   delete that suffix too and replay the saved bundles oldest → newest. `link` writes the
+   bundle and then the series file, each atomically, so an interrupted run leaves both as they
+   were (or only the bundle updated — re-run `--series` once). A series file that is not a JSON
+   list of entries stops `link` with exit code 2 and a message naming the file; nothing is
+   written until you fix or remove it.
 6. **Render**, then **author**: the report's *Since last installment* section uses
    `bundle.series` — new items, carried-over items (with prior board status) and the forecast
    loop (last month's predictions landed / not yet).
@@ -370,6 +375,13 @@ python3 $AO/spotlight.py dependents Azure/terraform-azurerm-avm-res-network-virt
   `examples/` and `tests/` are treated as scaffolding, not dependencies. Large patterns pull
   many registry modules during `terraform init` — keep the plugin cache and raise
   `ACTIVITY_IAC_BUILD_TIMEOUT` if `edge_extraction` reports timeouts.
+- **A member fails:** gather folds the other members, prints each failed member with its
+  reason and exits 1; `validate.py` fails the project until it is fixed. Fix the cause, then
+  gather only what is missing (the members already `ok` for the window are not re-fetched):
+
+```bash
+python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones --resume
+```
 
 ### 7.4 AI landing zone
 
@@ -477,7 +489,9 @@ One store per stream keeps commands simple and failures isolated.
   person, grep across many months), build `history.db` from **one wide-window gather**
   (e.g. `--from 2026-01-01 --to 2026-11-30`) into a fresh file, and rebuild it — rather than
   folding month after month into it — when you need it refreshed. A single wide fold passes
-  `validate.py`; repeatedly folding overlapping months currently fails `no_drift` (HLD §10).
+  `validate.py`. Folding month after month also passes `no_drift`, but `validate`'s
+  idempotency probe can then report two extra move edges when a symbol left one file in one
+  month and appeared in another file in a later month (LLD §14.5).
   Wide gathers of busy repos are API-heavy (§11).
 - **Inspect:** `sqlite3 stores/2026-11.db "select project, repo, count(*) from nodes group by 1,2"`;
   folded windows are in `meta.gathered_windows`.
@@ -492,13 +506,20 @@ One store per stream keeps commands simple and failures isolated.
 |---|---|
 | Contributor across all history | `spotlight.py person <login> --store S --project P --md` |
 | Module biography | `spotlight.py module <area> --store S --project P --md` (or `--json` for the narrator) |
-| One symbol's lifecycle | `spotlight.py symbol <artifact-id> --store S --project P` |
+| One member's copy of an area | `spotlight.py module owner/repo::<area> …` or `… module <area> --repo owner/repo` (same for `subsystem`); without it an area present in several members (e.g. `main.tf`) is unioned and every row names its repo |
+| One symbol's or file's lifecycle | `spotlight.py symbol <artifact-id> --store S --project P` (a file as `art:<path>` or `<path>`; a deleted file reads `removed`) |
 | Activity inside an area | `spotlight.py subsystem <area> --store S --project P --from F --to T` |
-| Full-text search | `spotlight.py grep '"breaking change"' --store S --project P` (FTS5 syntax — quote phrases) |
+| Full-text search | `spotlight.py grep 'breaking change' --store S --project P` (one argument: quote a multi-word phrase; it is matched literally, within `P` only) |
 | Blast radius (TF constellations) | `spotlight.py dependents <owner/repo> --store S --project P` |
 | Project view for a formatter | `digest.py --store S --project P --from F --to T` (schema: `BUNDLE.md`) |
 | Ticket-linked related work | `digest.py … --manifest M` with `"ticket_prefixes": ["ABC"]` in the manifest, or `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (off by default: `related_work` is `[]`) |
-| Complete out-of-window threads | add `--complete` to `person/subsystem/grep` (uses the token; bounded) |
+| Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`) |
+
+`spotlight.py` exits 2 with usage for a wrong argument count, a flag the query does not take,
+a bad `--from/--to`, a missing or empty store, a store with several projects and no
+`--project` (the error lists them) and an unknown `--repo`. Train outcomes are `shipped`,
+`in_flight`, `rejected`, `abandoned` (an issue closed not-planned/duplicate) and
+`direct_push` (commits with no PR) — see LLD §9.
 
 Reference formatters that consume the view: `samples/build_report.py` (structural Markdown
 skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
@@ -531,12 +552,21 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | 403 on first call with `x-github-sso` | SAML SSO not authorized | authorize the token for the org |
 | 403 with `x-ratelimit-remaining: 0` | rate limited (busy repo) | wait until `x-ratelimit-reset`, re-run (idempotent) |
 | 403 mentioning token lifetime | token lifetime over the org's limit (8 days for `Azure/*`, classic and fine-grained) | new token with an expiry inside the limit the message states |
-| `validate` → multiple projects | store holds several projects/repos | pass `--project` (and `--repo`) |
-| `validate` ERROR `no_drift` "lifecycle length drift" | several overlapping windows folded into one store (known limitation, HLD §10) | use one store per installment; rebuild history stores from one wide gather |
+| `validate` → multiple projects (exit 2) | store holds several projects/repos | pass `--project` (and `--repo`) |
+| `validate: error: store … does not exist` / `is not a journey-graph store` (exit 2) | wrong path (validate never creates a file) | point it at the store `gather --store` wrote |
+| `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |
+| `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
+| `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
+| `validate` ERROR `idempotency` (edges +2) on a multi-window store, `no_drift` passing | the probe re-folds every window as one and matches a cross-window symbol move (LLD §14.5) | known limitation; the store is correct. Use one store per installment, or one wide gather for history |
+| `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
+| `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
+| `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
-| Last month's merges appear as shipped this month | the view was built from a store holding several months (no `meta.period`, HLD §10) | rebuild the month from its own single-window store |
+| Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was built from a store holding several months (arrays are not window-scoped, HLD §10) | rebuild the month from its own single-window store |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
+| A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" after upgrading | the store was folded before commit authors were resolved to logins (#78) | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
+| A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |
 | `edge_extraction` timeouts | slow `terraform init` / registry | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |
 | No module graph on a Bicep repo | `bicep` not installed, or no modules changed in window | install bicep; graph is window-scoped |
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
@@ -551,7 +581,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 - The token is **read-only** in effect — the skill never writes to GitHub — but treat it as a
   secret: environment/keychain only, never in manifests, scripts or reports; create short-lived
   tokens (the Azure org accepts 8 days at most).
-- Stores and clones contain repository content and contributor logins; keep them in your
+- Stores and clones contain repository content and contributor logins (and commit author
+  names; author emails are read to resolve logins but never stored); keep them in your
   workspace, not in shared folders.
 - Public reports never attribute stalls to individuals; the internal attribution appendix is
   opt-in — only request it for internal audiences.

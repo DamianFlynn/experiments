@@ -7,9 +7,11 @@ the function API below. See STORE.md for the schema and identity rules.
 
 import datetime
 import json
+import os
 import re
 import sqlite3
 import time
+import urllib.parse
 
 # Store schema version (meta `schema_version`). History:
 #   1 - initial schema.
@@ -96,6 +98,22 @@ def open_store(path=":memory:"):
     conn.row_factory = sqlite3.Row
     if path != ":memory:":
         conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def open_store_readonly(path):
+    """Open an EXISTING store strictly read-only (issue #79), for auditors.
+
+    Unlike open_store this never creates the file (a missing path raises
+    FileNotFoundError), sets no journal mode and runs no schema step; the
+    connection is opened with SQLite's `mode=ro` URI, so any write through it
+    raises sqlite3.OperationalError instead of touching the store."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError("store not found: {}".format(path))
+    uri = "file:{}?mode=ro".format(
+        urllib.parse.quote(os.path.abspath(path), safe="/"))
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -557,15 +575,64 @@ def range_query(conn, project, repos, ts_from, ts_to, node_class=None):
     return [_row_to_node(r) for r in conn.execute(sql, params)]
 
 
+# `data.synthesized` of the minimal area node a fold creates for a depends_on
+# target it has not stored (gather.fold_bundle). It is an edge anchor, not data.
+STANDIN_MARK = "depends_on_target"
+
+
+def _is_standin(data):
+    """True for a stored stand-in's `data` JSON text."""
+    if "synthesized" not in data:
+        return False
+    try:
+        return json.loads(data).get("synthesized") == STANDIN_MARK
+    except (ValueError, AttributeError):
+        return False
+
+
+def _only_standins(conn, project, repo):
+    """True when every node of (project, repo) is a depends_on stand-in."""
+    if conn.execute("SELECT 1 FROM nodes WHERE project=? AND repo=? "
+                    "AND node_class != 'structure' LIMIT 1",
+                    (project, repo)).fetchone():
+        return False
+    return all(_is_standin(r[0]) for r in conn.execute(
+        "SELECT data FROM nodes WHERE project=? AND repo=?", (project, repo)))
+
+
+_UNKNOWN_WINDOWS = object()
+
+
 def project_repos(conn, project):
     """The project's distinct MEMBER repos (`owner/repo`), sorted. Excludes the
     `"*"` person sentinel so people (project-scoped) never count as a repo. This
-    is store-only member discovery: a reader needs just the store + project name."""
-    return sorted(
-        r[0] for r in conn.execute(
-            "SELECT DISTINCT repo FROM nodes WHERE project=? AND repo != '*'",
-            (project,))
-    )
+    is store-only member discovery: a reader needs just the store + project name.
+
+    A repo whose ONLY nodes are depends_on stand-ins (`data.synthesized ==
+    STANDIN_MARK`) is listed only when a window was gathered for it (a quiet
+    member). Otherwise it is a phantom that another member's fold created, e.g.
+    for a member whose own gather failed (issue #77), and is left out."""
+    repos = [r[0] for r in conn.execute(
+        "SELECT DISTINCT repo FROM nodes WHERE project=? AND repo != '*'",
+        (project,))]
+    gathered = None
+    out = []
+    for repo in repos:
+        if _only_standins(conn, project, repo):
+            if gathered is None:
+                try:
+                    gathered = {w.get("repo") for w in get_windows(conn)
+                                if isinstance(w, dict)
+                                and w.get("project") == project}
+                except ValueError:
+                    # Unreadable window ledger: cannot tell a quiet member from a
+                    # phantom. Keep the repo listed so an audit examines (and
+                    # fails) it, rather than raising during discovery.
+                    gathered = _UNKNOWN_WINDOWS
+            if gathered is not _UNKNOWN_WINDOWS and repo not in gathered:
+                continue
+        out.append(repo)
+    return sorted(out)
 
 
 def resolve_repo(conn, project, repo):
@@ -652,8 +719,7 @@ def traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES,
     # reaches the dead id from both sides before the filter runs.
     next_id = "CASE WHEN e.src_id = r.id THEN e.dst_id ELSE e.src_id END"
     dead_clause = ""
-    if skip_dead:
-        _ensure_dead_refs(conn)
+    if skip_dead and _has_dead_refs(conn):
         dead_clause = " AND ({}) NOT IN (SELECT id FROM dead_refs)".format(next_id)
 
     seed_values = ",".join("(?)" for _ in seed_ids)
@@ -799,6 +865,86 @@ def get_windows(conn):
     return json.loads(raw) if raw else []
 
 
+# Per-member run status of a manifest gather (issue #77), meta `member_status`:
+# a JSON list of {project, repo, from, to, status[, error]}, one entry per
+# (project, repo, from, to), sorted on that key. `status` is the outcome of the
+# LATEST attempt to gather that member for that window.
+MEMBER_OK = "ok"
+MEMBER_FAILED = "failed"
+MEMBER_NOT_ATTEMPTED = "not_attempted"
+MEMBER_STATUSES = (MEMBER_OK, MEMBER_FAILED, MEMBER_NOT_ATTEMPTED)
+
+
+def _status_key(entry):
+    return (entry["project"], entry["repo"], entry["from"], entry["to"])
+
+
+def set_member_status(conn, project, repos, frm, to, status, error=None,
+                      commit=True):
+    """Record `status` (one of MEMBER_STATUSES) for each repo in `repos` (an
+    iterable of `owner/repo`) for the window [frm, to], replacing that member's
+    earlier entry for the same window. `error` (a one-line reason) is stored
+    only with MEMBER_FAILED. `commit=False`: see upsert_nodes."""
+    if status not in MEMBER_STATUSES:
+        raise ValueError("unknown member status: {}".format(status))
+    entries = {_status_key(e): e for e in get_member_status(conn)}
+    for repo in repos:
+        entry = {"project": project, "repo": repo, "from": frm, "to": to,
+                 "status": status}
+        if status == MEMBER_FAILED:
+            entry["error"] = error or "unknown error"
+        entries[_status_key(entry)] = entry
+    set_meta(conn, "member_status",
+             json.dumps([entries[k] for k in sorted(entries)], sort_keys=True),
+             commit=commit)
+
+
+def get_member_status(conn, project=None):
+    """The recorded member run statuses (optionally of one project), sorted on
+    (project, repo, from, to). Empty for a store no manifest gather wrote."""
+    raw = get_meta(conn, "member_status")
+    entries = json.loads(raw) if raw else []
+    return [e for e in entries if project is None or e["project"] == project]
+
+
+def incomplete_members(conn, project, ts_from=None, ts_to=None):
+    """The member status entries of `project` that are not MEMBER_OK, limited
+    to windows that overlap [ts_from, ts_to] (compared on the YYYY-MM-DD day;
+    either bound may be None)."""
+    lo = ts_from[:10] if ts_from else None
+    hi = ts_to[:10] if ts_to else None
+    return [e for e in get_member_status(conn, project)
+            if e["status"] != MEMBER_OK
+            and (hi is None or e["from"] <= hi)
+            and (lo is None or e["to"] >= lo)]
+
+
+def describe_member_status(entry):
+    """One line for an incomplete member: `repo [from..to] status[: error]`."""
+    line = "{} [{}..{}] {}".format(entry["repo"], entry["from"], entry["to"],
+                                   entry["status"])
+    if entry.get("error"):
+        line += ": " + entry["error"]
+    return line
+
+
+def incomplete_warning(conn, project, ts_from=None, ts_to=None):
+    """The reader warning (digest.py, view.py) for a project whose members'
+    last gather of a window overlapping [ts_from, ts_to] failed or was not
+    attempted (issue #77), or None when there is nothing to warn about."""
+    try:
+        missing = incomplete_members(conn, project, ts_from, ts_to)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return "the member run status of project {!r} is unreadable".format(
+            project)
+    if not missing:
+        return None
+    return ("project {!r} is incomplete: the last gather of these members did "
+            "not finish (re-run gather.py --manifest ... --resume):\n{}".format(
+                project, "\n".join("  " + describe_member_status(e)
+                                   for e in missing)))
+
+
 def _clone_sha_key(project, repo):
     return "clone_sha:{}/{}".format(project, repo)
 
@@ -814,15 +960,44 @@ def get_clone_sha(conn, project, repo):
     return get_meta(conn, _clone_sha_key(project, repo))
 
 
+def _ref_date_key(project, repo, frm, to):
+    return "ref_date:{}/{}:{}:{}".format(project, repo, frm, to)
+
+
+def set_ref_date(conn, project, repo, frm, to, ref_date, commit=True):
+    """Record the reference date a gathered window [frm, to] was folded with
+    (issue #75: gather `--ref-date`, else the window's `to`). One value per
+    (project, repo, from, to); a re-fold of the same window replaces it.
+    `commit=False` leaves the write in the caller's open transaction."""
+    set_meta(conn, _ref_date_key(project, repo, frm, to), ref_date,
+             commit=commit)
+
+
+def get_ref_date(conn, project, repo, frm, to):
+    """Return the reference date stored for exactly this gathered window, or
+    None when that window was not folded (or was folded before issue #75)."""
+    return get_meta(conn, _ref_date_key(project, repo, frm, to))
+
+
 _DEAD_REFS_DDL = (
     "CREATE TABLE IF NOT EXISTS dead_refs ("
     "id TEXT PRIMARY KEY, project TEXT, reason TEXT, first_seen TEXT)"
 )
 
 
+def _has_dead_refs(conn):
+    """True if the store has a dead_refs table. Readers check this instead of
+    creating the table, so a read never writes schema (issue #79): a store
+    without the table simply has no tombstones."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dead_refs'"
+    ).fetchone() is not None
+
+
 def _ensure_dead_refs(conn):
-    """Create the dead_refs table if absent. Lets the tombstone helpers work on
-    a store opened directly (not via init_schema) or one that predates 8d."""
+    """Create the dead_refs table if absent. Lets record_dead_ref work on a
+    store opened directly (not via init_schema) or one that predates 8d. Only
+    the writer calls it; readers use _has_dead_refs (issue #79)."""
     conn.execute(_DEAD_REFS_DDL)
 
 
@@ -844,14 +1019,16 @@ def record_dead_ref(conn, id, reason="absent"):
 
 def is_dead_ref(conn, id):
     """True if `id` has been tombstoned as a known-absent phantom."""
-    _ensure_dead_refs(conn)
+    if not _has_dead_refs(conn):
+        return False
     row = conn.execute("SELECT 1 FROM dead_refs WHERE id=?", (id,)).fetchone()
     return row is not None
 
 
 def get_dead_refs(conn):
     """All tombstoned ids, sorted (deterministic)."""
-    _ensure_dead_refs(conn)
+    if not _has_dead_refs(conn):
+        return []
     return [r[0] for r in conn.execute("SELECT id FROM dead_refs ORDER BY id")]
 
 

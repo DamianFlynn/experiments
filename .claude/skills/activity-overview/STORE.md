@@ -135,8 +135,15 @@ request #N`, then the last `(#N)`.
 
 One row per artifact lifecycle event: `(artifact_id, event, commit_sha,
 author, date, hunk, ref, before, after, detail)`, PK `(artifact, commit,
-event)` → set semantics (re-seeing a commit is a no-op). An artifact's
-`lifecycle[]` is `get_code_events(artifact_id)` ordered by date.
+event)` → set semantics (re-seeing a commit is a no-op). The ledger keeps every
+folded window, and it is the source of truth for the artifact nodes: an
+artifact's `lifecycle[]` is all of its ledger rows in commit order: by the commit's UTC
+committer time (`committed_at` on the commit node) when it is stored, else by the
+event's `date`, the committer's local day (ties keep ledger order). File-level rows are
+keyed by the bare `<path>` (not the `art:<path>` node id) and keep git's change verb
+(`add`/`modify`/`delete`/`rename`/`copy`); symbol rows carry the mapped event
+(`add`/`change`/`remove`). A reader maps `art:<path>` to `<path>` before reading the
+ledger and treats both `delete` and `remove` as the artifact's end (`spotlight symbol`).
 
 ## Text index (`fts_text`, FTS5)
 
@@ -174,7 +181,37 @@ significant and otherwise raise `OperationalError`.
 Key/value provenance: `schema_version` (see below); `gathered_windows` (JSON list of
 folded `{project,repo,from,to}`, deduped — `record_window`/`get_windows`);
 `clone_sha:{project}/{repo}` (the tree a repo was last gathered against, for
-deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`).
+deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`);
+`ref_date:{project}/{repo}:{from}:{to}` (the reference date a gathered window was
+folded with: gather `--ref-date`, else the window's `to`; a re-fold of the same
+window replaces it — `set_ref_date`/`get_ref_date`). `extract` stamps it into the
+view's `meta.ref_date` when the view's `--from/--to` equal that window exactly
+(else the view's `to`; a view/digest `--ref-date` overrides both), and stamps
+`meta.period = {from, to}` from the view's own window (issue #75). Stores folded
+before #75 have no `ref_date:` keys; their views fall back to `to`.
+
+`member_status` (issue #77; written only by a manifest gather): a JSON list of
+`{project, repo, from, to, status[, error]}`, one entry per member and window,
+sorted on `(project, repo, from, to)` — `set_member_status` / `get_member_status`
+/ `incomplete_members`. `status` is the outcome of the member's LATEST attempt for
+that window: `ok`, `failed` (with `error`, a one-line reason of at most 500
+characters, e.g. the HTTP error message) or `not_attempted`. `gather --manifest`
+first records every member it is about to attempt as `not_attempted`, then each as
+`ok` (after its fold committed) or `failed` when its turn ends, so a run that is
+killed mid-way leaves the rest `not_attempted`. The member's own fold is still one
+transaction: a failed member leaves no partial fold. `validate.py` fails a member
+that is not `ok` for any recorded window (`target`, and the project-wide
+`member_status` check); `digest.py` / `view.py` warn on stderr for a window that
+overlaps the one they read. `gather --manifest --resume` re-attempts only the
+members that are not `ok` for the manifest's window. Single-repo stores have no
+`member_status` key.
+
+**Membership.** `project_repos` lists the repos with stored nodes, except a repo
+whose ONLY nodes are `depends_on` stand-ins (`data.synthesized ==
+"depends_on_target"`, `graphstore.STANDIN_MARK`) and for which no window was
+gathered: that is a phantom another member's fold created (typically for a member
+whose own gather failed), not a member. A quiet member with a gathered window
+stays listed even if it holds only stand-ins.
 
 ### Schema version and migration
 
@@ -193,13 +230,15 @@ Code older than v2 writing into a v2 store would add `fts_text` rows without
 ## Transactions (atomic folds)
 
 `fold_bundle` writes a fold as **one transaction** (`with conn:`): nodes,
-edges, code events, the FTS index, `gathered_windows` and `clone_sha` commit
+edges, code events, the FTS index, `gathered_windows`, `ref_date` and `clone_sha` commit
 together, and any exception rolls all of them back, so readers never see a
 half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
 `add_code_events`, `index_text(s)`, `set_meta`, `record_window`,
 `set_clone_sha`) take `commit=True` by default and `commit=False` to join the
 caller's open transaction. A caller's own uncommitted writes on the same
-connection are committed (or rolled back) with the fold.
+connection are committed (or rolled back) with the fold. A manifest member's
+`member_status` is written in its own transaction right after its fold: a crash
+between the two leaves the member `not_attempted` (re-folding it is idempotent).
 
 ## Writer (gather --store)
 
@@ -231,6 +270,18 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
   artifacts — with `ts` = the artifact's last lifecycle-event date and `data` =
   the full artifact record. Additive to (and distinct from) the commit `code`
   nodes, which keep their bare-`<sha>` local id. Idempotent by id.
+  **Cumulative (#76):** after writing its ledger rows, a fold rebuilds every
+  artifact its bundle names (plus the other end of any recorded move touching
+  one) from the repo's WHOLE ledger — `extract.ledger_events` →
+  `derive.artifact_projection` (lifecycle in date order via
+  `derive.chronological`, status from the last event, then the recorded moves).
+  `validate.no_drift` re-derives with the same readers and rule, so a store
+  holding several windows passes it, and folding windows in any order, or
+  re-folding one, gives the same nodes. A fold with no code/symbol events skips
+  this; one that has them reads the repo's ledger once (linear in its size).
+  No schema change. A single-window store is unchanged. A multi-window store
+  written before #76 keeps window-only artifact nodes until a fold names them:
+  re-fold each of its windows (or rebuild it) to repair them all.
 - **`symbol_events` ledger.** The symbol-granular lifecycle
   (`gather.parse_symbol_events`) is persisted into the `code_events` table keyed
   by the SYMBOL artifact id `<path>#<lang>:<subkind>:<name>`, carrying the rich
@@ -243,7 +294,18 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
 - **Symbol-move edges.** Confident window-wide symbol moves
   (`derive.match_symbol_moves`) upsert `replaced_by` (src→dst) and
   `identity_from` (dst→src) artifact→artifact edges carrying
-  `move_confidence`/`move_basis` in the edge `data`. Idempotent by (src,dst,type).
+  `move_confidence`/`move_basis` and `move_commit` (the source's drop commit, so a
+  reader can tell which removal of the source the move explains) in the edge `data`.
+  Idempotent by (src,dst,type). A source is `replaced` by a move only when that move is
+  its final removal; a source revived and deleted again without a new move is `removed`.
+  Moves are matched **per fold window** (the bundle's own events), not over the
+  whole ledger: over months, a symbol's creation `add` and its later move `add`
+  would make every move ambiguous. The edges are the record of the moves; the
+  artifact nodes apply all of them (`derive.apply_recorded_moves`): a dest
+  takes `identity_from` from its most recent incoming move, and a source is
+  `replaced` by the dest of its most recent outgoing move only while its last
+  lifecycle event is a remove (a later re-add makes it `live` again). So a drop
+  in one window and an add in another are not a move. Edges are never retracted.
 
 **Slice 7b-1 (step 3) additionally persists people + the contribution / non-spine
 edges** (all derived on the write path via the shared `derive.py` leaf —
@@ -265,7 +327,22 @@ edges** (all derived on the write path via the shared `derive.py` leaf —
   `*-organizer`, or `copilot-*` (`derive.is_bot_login`); bots are TAGGED, never
   dropped (dropping = losing data). Each upserts as a `structure` node id
   `qualify_person(project, login)` (`{project}#person-{login}`), NULL `ts`,
-  `data` = `{login, modules, areas, is_bot}`. The `repo` column is the project
+  `data` = `{login, modules, areas, is_bot[, login_resolved]}`.
+  **Identity (#78):** the key is the GitHub **login** for every participant,
+  commit authors included — gather resolves a commit's git author to its login
+  (commits-list API `author.login` by SHA, then a `users.noreply.github.com`
+  email; see BUNDLE.md `commits`), so a PR author and the same person's commits
+  share ONE person node. A commit author gather could not resolve keeps its git
+  name as the key (suffixed `" (git)"` when the name is login-shaped, so it can
+  never equal a login) and its node carries `login_resolved: false`; the key is
+  absent on every other person. `is_bot` also recognises git-name bot forms
+  (`GitHub Actions`, `Dependabot`, `Renovate Bot`, a `[bot]` name, with or
+  without the suffix). The commit `code` node's data keeps both `author` (the
+  person key) and `author_name` (the git name); the author email is never
+  stored. **Person ids changed with #78:** a store folded before it holds commit
+  authors as `person-<git name>` nodes; folding a post-#78 bundle into it adds
+  the login-keyed nodes beside them (the old ones are not retracted), so
+  **re-gather such a store into a fresh file** rather than folding on top. The `repo` column is the project
   sentinel `"*"` (people aggregate across a project's repos), so re-folding the
   same login from another repo upserts the identical id — one node, never a
   cross-repo duplicate — and the sentinel keeps the row out of any single repo's
@@ -307,8 +384,10 @@ RAW-only view — it additionally reconstructs:
 
 - **`artifacts`** by reading the artifact `code` nodes (the non-commit ones —
   local id `art:<path>` / `<path>#…`), keyed by that local id (== `artifact_id`).
-  extract restores build_artifacts' code_events insertion order so order-sensitive
-  consumers (`build_timeline`'s same-`(ts,url)` tie-break) reproduce byte-for-byte.
+  extract restores build_artifacts' code_events insertion order (date order,
+  ties in ledger order — independent of which window was folded first) so
+  order-sensitive consumers (`build_timeline`'s same-`(ts,url)` tie-break)
+  reproduce byte-for-byte.
 - **`people`** by reading the project-scoped person `structure` nodes (repo
   sentinel `"*"`, local id `person-<login>`), keyed by login (the redundant stored
   `login` field is dropped). Because fold now persists ALL participants, this
@@ -403,7 +482,8 @@ The single-node `backfill` bridge is promoted into a shared
 along the causal spine, **bounded by the query's time window** (level-0
 directly-referenced anchors always filled; transitive expansion stops at the
 window edge; closure when no window). Both readers call it — `extract` (refactored
-off its inline loop) and `spotlight` (its four queries gain optional `--complete`).
+off its inline loop) and `spotlight` (its train queries — `person`, `subsystem`,
+`grep`, `module` — take optional `--complete`).
 `gather.backfill` stays the single-node primitive `complete.py` orchestrates
 through the **injected** fetch seam, so `complete.py` does no I/O and `spotlight`
 stays reader-only.
@@ -539,6 +619,19 @@ blast-radius graph is then the repo's full module structure regardless of in-win
 activity. Gated to manifest folds so single-repo bundles stay byte-stable; `git
 ls-files` lists only tracked `.tf`, excluding vendored `.terraform/` modules.
 
+**Terraform direct vs transitive (#80).** The build path and the structural scan
+use one rule for direct edges: every `module {}` block in the area dir's own
+`*.tf` is a `transitive: false` edge, consumed or not. So a structural edge never
+contradicts a built one, and the merge dedups on `(to, ref)`. `terraform graph`
+only adds **nested** calls (`module.a.module.b`, both DOT layouts) as
+`transitive: true` edges carrying `address`/`via`. Their targets are read from
+init's `.terraform/modules/modules.json`. A nested target already reached by an
+edge is dropped: the same area, or the same registry module ignoring host case
+and `//submodule`, which is exactly what `_fold_depends_on` resolves to one
+member. So a transitive duplicate cannot overwrite a direct `depends_on`, which
+is keyed `(src, dst, depends_on)`. A nested edge with no known target (no
+manifest) has `to = ref = null` and is never folded.
+
 **People aggregate across members.** Person nodes are project-scoped (`repo="*"`).
 Each per-member fold **unions** a person's `areas`/`modules` (and ORs `is_bot`)
 with the already-stored node — a plain upsert would overwrite, so a member where a
@@ -578,9 +671,38 @@ real-data checks — `no_drift` (stored people/artifacts == freshly re-derived) 
 `idempotency` (a re-fold changes no counts) — need a raw bundle to re-derive
 against, and when none is passed they **self-source it from the store** via
 `extract` over the store's full activity window. A `--bundle` argument is an
-optional cross-check, never required. The auditor never mutates the store and
-survives a corrupt one (a re-derive/re-fold that raises becomes a failed ERROR
-check, not a crash). This is what makes the store a stand-alone deliverable.
+optional cross-check, never required. This is what makes the store a
+stand-alone deliverable.
+
+The gate can only fail, never pass by omission (issue #79):
+
+- **The target must exist.** The first check, `target`, fails when the store
+  holds no nodes, when `--project` has no nodes, or when `--repo` is not one of
+  the project's stored member repos (a `--repo` in another case resolves to the
+  stored spelling, as in the readers). A mistyped name is a failure, not an
+  audit of nothing.
+- **Every check is always reported.** When `no_drift`/`idempotency` cannot
+  self-source a bundle they are reported as FAILED with
+  `could not self-source: <reason>`: the target has no nodes, a node row cannot
+  be decoded, or the repo stores social/code nodes but none carries a `ts` (the
+  activity window cannot be recovered). A member holding only structure nodes
+  (nothing happened in its window) self-sources over its recorded gathered
+  window instead. In project mode `no_drift_people` fails the same way when a
+  member cannot be self-sourced.
+- **No crashes.** Every check is guarded: a corrupt row (data that is not valid
+  JSON, or a social/code/person blob that is not a JSON object) or any other
+  exception becomes a failed ERROR check naming the error and the row id, and
+  `--json` output is still produced.
+- **Read-only.** The CLI opens the store with `graphstore.open_store_readonly`
+  (SQLite `mode=ro` URI): it never creates a missing file, sets no journal mode
+  and runs no schema step. The idempotency re-fold runs in an in-memory copy.
+  Readers no longer create `dead_refs` either (`traverse_spine(skip_dead=True)`,
+  `is_dead_ref` and `get_dead_refs` treat a missing table as "no tombstones"),
+  so auditing a store leaves its file byte-identical.
+
+Exit codes: 0 no ERROR; 1 an ERROR check failed (a report is printed); 2 usage
+error with no report (the store path does not exist or is not a store, several
+projects or repos and none named, unreadable `--bundle`).
 
 ## Determinism
 

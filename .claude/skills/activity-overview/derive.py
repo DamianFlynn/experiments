@@ -62,12 +62,133 @@ _CHANGE_TO_EVENT = {"add": "add", "copy": "add", "modify": "change", "delete": "
 _SYMBOL_CHANGE_TO_EVENT = {"add": "add", "drop": "remove", "change": "change"}
 
 
+def commit_times(bundle):
+    """{sha: committed_at} for the bundle's commits that carry the full UTC
+    committer timestamp (gather records it; older stores do not). Pure."""
+    return {c.get("sha"): c.get("committed_at")
+            for c in bundle.get("commits") or []
+            if isinstance(c, dict) and c.get("sha") and c.get("committed_at")}
+
+
+def chronological(events, times=None):
+    """Events in lifecycle order (#76). The key is the commit's UTC committer
+    timestamp when `times` ({sha: committed_at}, see commit_times) knows it,
+    else the event's `date`. `date` is the committer's LOCAL calendar day, so on
+    its own it can put a later commit first when two committers sit in different
+    timezones around midnight; the UTC timestamp cannot. Ties (the events of one
+    commit, or of one day when no timestamp is known) keep their given order
+    (git walk / ledger order). A store's ledger holds its windows in FOLD order,
+    so without this a window folded late would supply the "last" event. Stable
+    sort; returns a new list."""
+    times = times or {}
+    return sorted(events,
+                  key=lambda e: times.get(e.get("commit")) or e.get("date") or "")
+
+
+def _code_event_key(ev):
+    return ("file", ev.get("path"), ev.get("commit"), ev.get("change"))
+
+
+def _symbol_event_key(ev):
+    return ("symbol", ev.get("path"), ev.get("lang"), ev.get("subkind"),
+            ev.get("name") or "", ev.get("commit"),
+            _SYMBOL_CHANGE_TO_EVENT.get(ev.get("change"), "change"))
+
+
+def merge_ledger_events(ledger, bundle):
+    """`ledger` (a bundle-shaped dict whose code_events/symbol_events were read
+    back from the store) plus the events of `bundle` that the store does not hold
+    yet, deduplicated by the ledger's identity (artifact, commit, event) — first
+    one wins, as the ledger's INSERT OR IGNORE does. Used by validate so an
+    external bundle is checked against "the store after folding it". Pure."""
+    out = dict(ledger)
+    for key, ident in (("code_events", _code_event_key),
+                       ("symbol_events", _symbol_event_key)):
+        merged, seen = [], set()
+        for ev in list(ledger.get(key) or []) + list(bundle.get(key) or []):
+            if key == "code_events" and not ev.get("path"):
+                continue                   # fold never writes a path-less event
+            k = ident(ev)
+            if k not in seen:
+                seen.add(k)
+                merged.append(ev)
+        out[key] = merged
+    return out
+
+
+def artifact_projection(bundle, moves):
+    """The artifact nodes a store holds (#76): build_artifacts over the repo's
+    whole ledger (`bundle` carries its code_events/symbol_events), then the
+    store's recorded symbol `moves` (apply_recorded_moves). fold_bundle writes
+    it and validate's no_drift re-derives it, so writer and auditor share one
+    rule. Pure."""
+    return apply_recorded_moves(build_artifacts(bundle), moves)
+
+
+def apply_recorded_moves(artifacts, moves):
+    """Apply recorded symbol moves onto a cumulative artifact projection (#76).
+    Mutates and returns `artifacts`.
+
+    Moves are matched per fold window (match_symbol_moves; recorded as
+    `replaced_by` edges), never over the whole ledger: across months a symbol's
+    creation `add` and its later move `add` would make every move ambiguous.
+    `moves` = [{"from", "to", "confidence", "basis", "commit"}] (local ids;
+    `commit` is the source's drop commit in the window that matched the move,
+    None on edges recorded before it was kept). A move whose endpoints are not
+    both artifacts is ignored. For one window this equals link_symbol_identity.
+    Across windows an artifact can gain several moves, and each move is judged
+    by ITS OWN evidence, not by whatever happened to its endpoints later:
+      - a source is `replaced` / `replaced_by` a move's dest only when that move
+        IS the source's final removal: the source's last lifecycle event is a
+        remove made by the move's `commit`. A source revived and later deleted
+        without a new move is plain `removed`; re-adding an old destination
+        does not bring an old move back;
+      - a dest takes `identity_from` (and confidence/basis) from its most recent
+        incoming move, ranked by the position of the move's drop in the
+        source's lifecycle.
+    A move without a recorded `commit` falls back to the source's latest remove.
+    Ties break on the id, so the order of `moves` does not matter."""
+    def drop_index(src, commit):
+        lc = artifacts[src]["lifecycle"]
+        idx = [i for i, e in enumerate(lc) if e["event"] == "remove"
+               and (commit is None or e.get("commit") == commit)]
+        return idx[-1] if idx else None
+
+    incoming, outgoing = {}, {}
+    for m in moves:
+        src, dst = m["from"], m["to"]
+        if src not in artifacts or dst not in artifacts:
+            continue
+        i = drop_index(src, m.get("commit"))
+        if i is None:
+            continue                      # the move's drop is not in the ledger
+        when = artifacts[src]["lifecycle"][i].get("date") or ""
+        rank = (when, src)
+        if dst not in incoming or rank > incoming[dst][0]:
+            incoming[dst] = (rank, m)
+        if i == len(artifacts[src]["lifecycle"]) - 1:   # the FINAL removal
+            rank = (dst,)
+            if src not in outgoing or rank > outgoing[src][0]:
+                outgoing[src] = (rank, m)
+    for dst, (_rank, m) in incoming.items():
+        artifacts[dst]["identity_from"] = m["from"]
+        artifacts[dst]["move_confidence"] = m["confidence"]
+        artifacts[dst]["move_basis"] = m["basis"]
+    for src, (_rank, m) in outgoing.items():
+        artifacts[src]["status"] = "replaced"
+        artifacts[src]["replaced_by"] = m["to"]
+        artifacts[src]["move_confidence"] = m["confidence"]
+        artifacts[src]["move_basis"] = m["basis"]
+    return artifacts
+
+
 def build_artifacts(bundle):
     """Fold raw `code_events` into the per-artifact lifecycle ledger (file-level).
 
-    Each tracked path (readme/doc/example) gets one entry with an ordered
-    lifecycle. Status comes from the LAST lifecycle event: a rename away to a
-    tracked path (that is still the last event) makes the old artifact `replaced`
+    Each tracked path (readme/doc/example) gets one entry with a lifecycle in
+    date order (`chronological`; same-day events keep their given order).
+    Status comes from the LAST lifecycle event: a rename away to a tracked path
+    (that is still the last event) makes the old artifact `replaced`
     with `replaced_by` its direct successor; a later re-add makes it `live` again;
     a delete, or a rename to an untracked path, makes it `removed`. `code_area` is
     null in Phase 3a (graphify is Phase 3b). Pure.
@@ -105,7 +226,8 @@ def build_artifacts(bundle):
             entry["hunk"] = hunk
         artifacts[aid]["lifecycle"].append(entry)
 
-    for ev in bundle.get("code_events", []):
+    times = commit_times(bundle)
+    for ev in chronological(bundle.get("code_events", []), times):
         change = ev["change"]
         if change in ("rename", "copy") and ev.get("old_path"):
             new_aid = ensure(ev["path"])
@@ -130,7 +252,7 @@ def build_artifacts(bundle):
     # Phase 3d: fold symbol-granular events into kind:symbol/comment artifacts.
     # Each carries a bounded before/after on its lifecycle entry (file-level entries
     # leave those absent). id = "<path>#<lang>:<subkind>:<name>" (stable per symbol).
-    for ev in bundle.get("symbol_events", []):
+    for ev in chronological(bundle.get("symbol_events", []), times):
         kind = "comment" if ev["subkind"] in ("comment", "todo") else "symbol"
         aid = f'{ev["path"]}#{ev["lang"]}:{ev["subkind"]}:{ev["name"] or ""}'
         if aid not in artifacts:
@@ -364,6 +486,28 @@ def attribute_people_areas(bundle, idx):
 import re as _re
 
 _BOT_EXACT = {"github-actions", "microsoft-github-policy-service"}
+# Name forms (#78): an UNRESOLVED commit author is keyed by its git `%an`, which for
+# automation is often a display name rather than the App login. Compared lower-cased
+# with whitespace collapsed.
+_BOT_NAMES = {"github actions", "dependabot", "dependabot preview", "renovate",
+              "renovate bot"}
+
+# People identity (#78). A commit author gather could NOT resolve to a GitHub login
+# keeps its git name as the person key; when that name could itself be a login
+# (letters/digits/hyphens, optional `[bot]`) this suffix is appended, so an
+# unresolved name can never equal — and be silently merged with — a real login.
+# A name that cannot be a login (a space, a dot, ...) is already disjoint.
+UNRESOLVED_NAME_SUFFIX = " (git)"
+_LOGIN_SHAPED_RE = _re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$")
+
+
+def unresolved_person_key(name):
+    """The person key for a commit author whose login is unknown: the git name,
+    suffixed with UNRESOLVED_NAME_SUFFIX when it is login-shaped. Pure."""
+    if name and _LOGIN_SHAPED_RE.match(name):
+        return name + UNRESOLVED_NAME_SUFFIX
+    return name
 _BOT_RE = _re.compile(
     r"""(?ix)
     ^ (?:
@@ -376,11 +520,16 @@ _BOT_RE = _re.compile(
 
 
 def is_bot_login(login):
-    """True when `login` is an automation account (tagged, never dropped). Pure."""
+    """True when `login` is an automation account (tagged, never dropped). Also
+    recognises the git-name forms an unresolved commit author is keyed by
+    (`GitHub Actions`, `Dependabot`, `github-actions (git)`). Pure."""
     if not login:
         return False
+    if login.endswith(UNRESOLVED_NAME_SUFFIX):
+        login = login[:-len(UNRESOLVED_NAME_SUFFIX)]
     low = login.lower()
-    return low in _BOT_EXACT or bool(_BOT_RE.match(login))
+    return (low in _BOT_EXACT or " ".join(low.split()) in _BOT_NAMES
+            or bool(_BOT_RE.match(login)))
 
 
 def enumerate_participants(bundle, idx=None):
@@ -397,6 +546,13 @@ def enumerate_participants(bundle, idx=None):
     empty `modules`/`areas`. Every login is bot-tagged via `is_bot_login` — tagged,
     not dropped, so no "who" is ever lost.
 
+    People identity (#78): a commit's `author` is already the GitHub login when
+    gather resolved it. A commit gather could NOT resolve (`login_resolved` is
+    False) is keyed by its git name (see `unresolved_person_key`, so the key never
+    equals a login) and that person carries `login_resolved: False`; the key is
+    omitted otherwise (resolved logins, and commits from bundles gathered before
+    #78, which carry no flag).
+
     The CALLER must have run `attach_commit_prs` on the bundle's commits first (so
     commit->PR mapping is present, mirroring enrich / the carol fix); both
     `gather.fold_bundle` and `validate.no_drift` do exactly that on a copy. Pure.
@@ -411,7 +567,7 @@ def enumerate_participants(bundle, idx=None):
 
     out = {}
 
-    def add(login):
+    def add(login, unresolved=False):
         if not login:
             return
         if login not in out:
@@ -421,6 +577,8 @@ def enumerate_participants(bundle, idx=None):
                 "areas": sorted(rec.get("areas") or []),
                 "is_bot": is_bot_login(login),
             }
+        if unresolved:
+            out[login]["login_resolved"] = False
 
     for pr in bundle.get("prs", []):
         add(pr.get("author"))
@@ -434,7 +592,7 @@ def enumerate_participants(bundle, idx=None):
         for c in iss.get("comments_list") or []:
             add(c.get("author"))
     for c in bundle.get("commits", []):
-        add(c.get("author"))
+        add(c.get("author"), unresolved=c.get("login_resolved") is False)
     return out
 
 
@@ -449,9 +607,10 @@ def match_symbol_moves(symbol_events, rename_pairs=()):
     source file, one dest file, different) are linked; ambiguous names (boilerplate
     dropped/added in >1 file) are SKIPPED — the key false-positive guard. `confidence`
     is `high` when `(src, dst)` is also a git rename/copy pair, else `medium`. Comments
-    are excluded. -> [{lang, subkind, name, from_path, to_path, confidence, basis}] (sorted).
+    are excluded. -> [{lang, subkind, name, from_path, to_path, confidence, basis,
+    commit}] (sorted); `commit` is the source's (last) drop commit in these events.
     Keyed by `lang` too, so a Bicep symbol can't link to a same-named Terraform one."""
-    drops, adds = {}, {}
+    drops, adds, drop_commit = {}, {}, {}
     for e in symbol_events:
         if e.get("subkind") in _COMMENT_SUBKINDS:
             continue
@@ -459,6 +618,8 @@ def match_symbol_moves(symbol_events, rename_pairs=()):
         bucket = drops if e.get("change") == "drop" else adds if e.get("change") == "add" else None
         if bucket is not None and e.get("path"):
             bucket.setdefault(key, set()).add(e["path"])
+            if bucket is drops:
+                drop_commit[(key, e["path"])] = e.get("commit")   # last drop wins
     renames = {(a, b) for a, b in rename_pairs}
     moves = []
     for key, src in drops.items():
@@ -472,7 +633,7 @@ def match_symbol_moves(symbol_events, rename_pairs=()):
         basis = "file_rename" if (a, b) in renames else "unique_name"
         moves.append({"lang": lang, "subkind": subkind, "name": name, "from_path": a,
                       "to_path": b, "confidence": "high" if basis == "file_rename" else "medium",
-                      "basis": basis})
+                      "basis": basis, "commit": drop_commit.get((key, a))})
     return sorted(moves, key=lambda m: (m["from_path"], str(m["subkind"]), str(m["name"])))
 
 
@@ -502,7 +663,8 @@ def link_symbol_identity(bundle):
                 arts[aid]["move_confidence"] = m["confidence"]
                 arts[aid]["move_basis"] = m["basis"]
             summary[m["confidence"]] += 1
-            linked.append({**m, "from": src, "to": dst})
+            linked.append({**{k: v for k, v in m.items() if k != "commit"},
+                           "from": src, "to": dst})
     bundle["symbol_moves"] = {"links": linked, "by_confidence": summary}
     return bundle
 

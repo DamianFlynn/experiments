@@ -1,0 +1,25 @@
+// Hand-written in the legacy (terraform < 1.7) graph layout with the [root]
+// node prefix, for terraform_nested_root.tf; NOT captured from a run.
+digraph {
+	compound = "true"
+	newrank = "true"
+	subgraph "root" {
+		"[root] module.naming.random_string.unique (expand)" [label = "module.naming.random_string.unique", shape = "box"]
+		"[root] module.pe.terraform_data.endpoint (expand)" [label = "module.pe.terraform_data.endpoint", shape = "box"]
+		"[root] module.vnet.module.subnet.terraform_data.subnet (expand)" [label = "module.vnet.module.subnet.terraform_data.subnet", shape = "box"]
+		"[root] module.vnet.terraform_data.network (expand)" [label = "module.vnet.terraform_data.network", shape = "box"]
+		"[root] provider[\"registry.terraform.io/hashicorp/random\"]" [label = "provider[\"registry.terraform.io/hashicorp/random\"]", shape = "diamond"]
+		"[root] terraform_data.rg (expand)" [label = "terraform_data.rg", shape = "box"]
+		"[root] module.naming (close)" -> "[root] module.naming.random_string.unique (expand)"
+		"[root] module.naming.random_string.unique (expand)" -> "[root] provider[\"registry.terraform.io/hashicorp/random\"]"
+		"[root] module.pe (close)" -> "[root] module.pe.terraform_data.endpoint (expand)"
+		"[root] module.pe.terraform_data.endpoint (expand)" -> "[root] module.vnet.output.id (expand)"
+		"[root] module.vnet.module.subnet (close)" -> "[root] module.vnet.module.subnet.terraform_data.subnet (expand)"
+		"[root] module.vnet.module.subnet.terraform_data.subnet (expand)" -> "[root] module.vnet.terraform_data.network (expand)"
+		"[root] module.vnet.output.id (expand)" -> "[root] module.vnet.terraform_data.network (expand)"
+		"[root] module.vnet.terraform_data.network (expand)" -> "[root] terraform_data.rg (expand)"
+		"[root] root" -> "[root] module.naming (close)"
+		"[root] root" -> "[root] module.pe (close)"
+		"[root] root" -> "[root] module.vnet.module.subnet (close)"
+	}
+}

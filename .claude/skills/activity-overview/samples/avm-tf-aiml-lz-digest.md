@@ -62,9 +62,9 @@ flowchart LR
 | Consumer (repo · area) | Depends on (repo · area) | Version | Cross-repo | Transitive |
 |---|---|---|---|---|
 | `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `0.16.0` | yes | no |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | yes | yes |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `main.tf` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | yes | no |
 | `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `=0.16.0` | yes | no |
-| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | yes | yes |
+| `terraform-azurerm-avm-ptn-aiml-landing-zone` · `modules/example_hub_vnet` | `terraform-azurerm-avm-res-operationalinsights-workspace` · `main.tf` | `0.4.2` | yes | no |
 | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/peering` | — | no | no |
 | `terraform-azurerm-avm-res-network-virtualnetwork` · `main.tf` | `terraform-azurerm-avm-res-network-virtualnetwork` · `modules/subnet` | — | no | no |
 

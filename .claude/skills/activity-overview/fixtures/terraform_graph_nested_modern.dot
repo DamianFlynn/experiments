@@ -1,0 +1,30 @@
+// Hand-written in the terraform >= 1.7 graph layout (resource nodes only, one
+// cluster per module call) for terraform_nested_root.tf; NOT captured from a run.
+digraph G {
+  rankdir = "RL";
+  node [shape = rect, fontname = "sans-serif"];
+  "terraform_data.rg" [label="terraform_data.rg"];
+  subgraph "cluster_module.naming" {
+    label = "module.naming"
+    fontname = "sans-serif"
+    "module.naming.random_string.unique" [label="random_string.unique"];
+  }
+  subgraph "cluster_module.pe" {
+    label = "module.pe"
+    fontname = "sans-serif"
+    "module.pe.terraform_data.endpoint" [label="terraform_data.endpoint"];
+  }
+  subgraph "cluster_module.vnet" {
+    label = "module.vnet"
+    fontname = "sans-serif"
+    "module.vnet.terraform_data.network" [label="terraform_data.network"];
+  }
+  subgraph "cluster_module.vnet.module.subnet" {
+    label = "module.vnet.module.subnet"
+    fontname = "sans-serif"
+    "module.vnet.module.subnet.terraform_data.subnet" [label="terraform_data.subnet"];
+  }
+  "module.pe.terraform_data.endpoint" -> "module.vnet.terraform_data.network";
+  "module.vnet.module.subnet.terraform_data.subnet" -> "module.vnet.terraform_data.network";
+  "module.vnet.terraform_data.network" -> "terraform_data.rg";
+}

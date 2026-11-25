@@ -6,7 +6,9 @@ confidently. This harness PROVES a populated store is trustworthy: it re-checks
 the invariants the write path (`gather.fold_bundle`) is supposed to uphold and
 fails loudly — per invariant, per entity — when one is broken.
 
-Read-only over the store: `validate` never mutates it. stdlib only.
+Read-only over the store: `validate` never mutates it, and the CLI opens the
+store with SQLite's read-only URI mode (graphstore.open_store_readonly), so a
+missing path is never created. stdlib only.
 
 API
     validate(conn, project=None, repo=None, bundle=None) -> Report
@@ -17,10 +19,24 @@ API
 
 CLI
     python3 validate.py STORE.db [--project P --repo R] [--bundle bundle.json]
-    Prints a readable report; exits non-zero iff any ERROR-severity check fails
-    (so CI can gate on it). WARN/INFO never fail the gate.
+    Prints a readable report; exits 1 iff any ERROR-severity check fails (so CI
+    can gate on it). WARN/INFO never fail the gate. Exits 2, with no report, on
+    a usage error: the store path does not exist or is not a store, the store
+    holds several projects (or repos) and none was named, or --bundle is
+    unreadable.
+
+Every report lists EVERY check, in a fixed order (issue #79). A check that
+cannot run is a FAILED check, never an omitted one: a check that raises (e.g.
+on a corrupt row, named by its id) fails with the error, and when no_drift /
+idempotency cannot self-source a bundle they fail with
+`could not self-source: <reason>`.
 
 The invariants (each a named check; see the per-function docstrings):
+    target                  ERROR  the audited (project, repo) has stored nodes
+                                    (a mistyped --repo/--project or an empty
+                                    store is a failure, not a vacuous pass), and
+                                    its last manifest gather of every recorded
+                                    window is ok (meta member_status, #77).
     referential_integrity   ERROR  every non-spine edge endpoint resolves to a
                                     stored node (dangling spine edge -> INFO).
     participant_completeness ERROR  every login in any raw record has a person
@@ -34,6 +50,11 @@ The invariants (each a named check; see the per-function docstrings):
                                     via extract; --bundle is an optional cross-check).
     idempotency             ERROR  re-folding the bundle changes no counts
                                     (bundle self-sourced from the store).
+Project mode (validate_project) adds two project-wide checks:
+    no_drift_people         ERROR  project people == union re-derived over members.
+    member_status           ERROR  every manifest member's last gather of every
+                                    recorded window is ok (#77); a failed member
+                                    with no node at all is reported here.
 """
 
 import argparse
@@ -82,16 +103,64 @@ def _check(name, severity, details):
 
 # --- store introspection helpers ---------------------------------------------
 
+class CorruptRow(Exception):
+    """A stored row the auditor cannot decode. `row` names it (a node id, or
+    `src -[type]-> dst` for an edge) so the failed check points at the row."""
+
+    def __init__(self, row, problem):
+        super().__init__("{}: {}".format(row, problem))
+        self.row = row
+
+
+def _node(row):
+    """Decode a node row, raising CorruptRow (naming the node id) when its data
+    blob is not valid JSON, or when a social/code/person node's blob is not a
+    JSON object (the writer always stores a dict for those). Repo singletons
+    may legitimately hold other JSON (`codeowners` is an ordered rule list)."""
+    try:
+        node = graphstore._row_to_node(row)
+    except (TypeError, ValueError) as exc:
+        raise CorruptRow(row["id"], "node data is not valid JSON ({})".format(exc))
+    needs_object = (node["node_class"] != "structure"
+                    or _is_person_id(node["id"] or ""))
+    if needs_object and not isinstance(node["data"], dict):
+        raise CorruptRow(row["id"], "node data is a JSON {}, not an object".format(
+            type(node["data"]).__name__))
+    return node
+
+
+def _edge(row):
+    """Decode an edge row, raising CorruptRow (naming the edge) on bad JSON."""
+    try:
+        return graphstore._row_to_edge(row)
+    except (TypeError, ValueError) as exc:
+        raise CorruptRow("{} -[{}]-> {}".format(
+            row["src_id"], row["edge_type"], row["dst_id"]),
+            "edge data is not valid JSON ({})".format(exc))
+
+
 def _all_node_ids(conn):
     return {r[0] for r in conn.execute("SELECT id FROM nodes")}
 
 
 def _all_nodes(conn):
-    return [graphstore._row_to_node(r) for r in conn.execute("SELECT * FROM nodes")]
+    return [_node(r) for r in conn.execute("SELECT * FROM nodes")]
 
 
 def _all_edges(conn):
-    return [graphstore._row_to_edge(r) for r in conn.execute("SELECT * FROM edges")]
+    return [_edge(r) for r in conn.execute("SELECT * FROM edges")]
+
+
+def _repo_nodes(conn, project, repo, node_class=None):
+    """graphstore.repo_nodes (same rows, same order) decoded via _node, so a
+    corrupt row raises CorruptRow naming it instead of a bare JSON error."""
+    sql = "SELECT * FROM nodes WHERE project=? AND repo=?"
+    params = [project, repo]
+    if node_class is not None:
+        sql += " AND node_class=?"
+        params.append(node_class)
+    sql += " ORDER BY ts IS NULL, ts, id"
+    return [_node(r) for r in conn.execute(sql, params)]
 
 
 def _detect_project_repo(conn, project, repo, allow_multi=False):
@@ -129,6 +198,96 @@ def _detect_project_repo(conn, project, repo, allow_multi=False):
             raise ValueError(
                 "project {} holds multiple repos {} — pass --repo".format(project, repos))
     return project, repo
+
+
+def _resolve_target(conn, project, repo, allow_multi=False):
+    """(project, repo) to audit, WITHOUT ever turning a missing target into a
+    pass (issue #79). Like _detect_project_repo, but an empty store (no project
+    given) or a project with no stored repo (no repo given) comes back with the
+    unknown part as None, so check_target reports it as a failed check rather
+    than raising. Ambiguity (several projects/repos, none named) still raises
+    ValueError: that is a usage error, not a verdict. A named repo is resolved
+    to its stored spelling (GitHub names are case-insensitive, issue #70)."""
+    if project is None and not _store_projects(conn):
+        return None, repo
+    if project is not None and repo is None \
+            and not graphstore.project_repos(conn, project):
+        return project, None
+    project, repo = _detect_project_repo(conn, project, repo, allow_multi)
+    if repo is not None:
+        repo = graphstore.resolve_repo(conn, project, repo)
+    return project, repo
+
+
+def _store_projects(conn):
+    return sorted(r[0] for r in conn.execute(
+        "SELECT DISTINCT project FROM nodes WHERE project IS NOT NULL"))
+
+
+def _target_problem(conn, project, repo):
+    """Why (project, repo) cannot be audited, or None when it has stored nodes."""
+    projects = _store_projects(conn)
+    if not projects:
+        return {"problem": "store holds no nodes"}
+    if project is None or project not in projects:
+        return {"problem": "project has no nodes in the store",
+                "project": project, "stored_projects": projects}
+    repos = graphstore.project_repos(conn, project)
+    if repo is None or repo not in repos:
+        return {"problem": "repo has no nodes in this project",
+                "project": project, "repo": repo, "stored_repos": repos}
+    return None
+
+
+def _incomplete_details(entries):
+    """ERROR details for member run-status entries that are not ok (#77)."""
+    out = []
+    for e in entries:
+        d = {"severity": ERROR, "problem": "member gather did not complete",
+             "repo": e["repo"], "window": "{}..{}".format(e["from"], e["to"]),
+             "status": e["status"]}
+        if e.get("error"):
+            d["error"] = e["error"]
+        out.append(d)
+    return out
+
+
+def check_target(conn, project, repo):
+    """The audited (project, repo) exists: the store has nodes, the project has
+    nodes and the repo is one of its stored member repos. Without this a
+    mistyped --repo/--project, or an empty store, audited nothing and passed
+    (issue #79). A manifest member whose last gather of any recorded window
+    failed or was not attempted (meta member_status, issue #77) fails too: its
+    stored data is incomplete."""
+    problem = _target_problem(conn, project, repo)
+    incomplete = [e for e in graphstore.incomplete_members(conn, project)
+                  if e["repo"] == repo] if project is not None else []
+    details = _incomplete_details(incomplete)
+    if problem is not None:
+        return _check("target", ERROR, [dict(problem, severity=ERROR)] + details)
+    if details:
+        return _check("target", ERROR, details)
+    n = conn.execute("SELECT COUNT(*) FROM nodes WHERE project=? AND repo=?",
+                     (project, repo)).fetchone()[0]
+    return _check("target", ERROR, [{
+        "severity": INFO,
+        "note": "{} node(s) stored for {} {}".format(n, project, repo)}])
+
+
+def check_member_status(conn, project):
+    """Project-wide (issue #77): every manifest member's last gather of every
+    recorded window is `ok`. A member that failed or was never attempted is an
+    ERROR naming the member, the window and the reason, also when it holds no
+    node at all (it is then not one of the audited member repos). A store no
+    manifest gather wrote records no status and passes."""
+    entries = graphstore.get_member_status(conn, project)
+    details = _incomplete_details(
+        [e for e in entries if e["status"] != graphstore.MEMBER_OK])
+    if not details:
+        details = [{"severity": INFO, "note": (
+            "{} member gather(s) recorded, all ok".format(len(entries))
+            if entries else "no member run status recorded")}]
+    return _check("member_status", ERROR, details)
 
 
 def _local(qid):
@@ -285,7 +444,7 @@ def _reconstruct_raw_from_store(conn, project, repo):
     participant-completeness can run WITHOUT an external bundle (e.g. live CI
     over a real store). PRs/issues keep their comments embedded in `data`."""
     prs, issues, commits = [], [], []
-    for n in graphstore.repo_nodes(conn, project, repo):
+    for n in _repo_nodes(conn, project, repo):
         local = _local(n["id"])
         if n["node_class"] == "social" and local.startswith("pr-"):
             prs.append(n["data"])
@@ -437,7 +596,8 @@ def _id_kind(conn, qid, node_cache):
         return "issue"
     node = node_cache.get(qid)
     if node is None and qid not in node_cache:
-        node = graphstore.get_node(conn, qid)
+        row = conn.execute("SELECT * FROM nodes WHERE id=?", (qid,)).fetchone()
+        node = _node(row) if row else None
         node_cache[qid] = node
     if node is None:
         return "<missing>"
@@ -519,7 +679,7 @@ def _stored_project_people(conn, project):
     """The stored project-scoped people projection {login: {modules, areas, is_bot}}.
     People carry the repo sentinel "*", so this reads them once for the project."""
     out = {}
-    for n in graphstore.repo_nodes(conn, project, "*", "structure"):
+    for n in _repo_nodes(conn, project, "*", "structure"):
         local = _local(n["id"])
         if local.startswith("person-"):
             login = local[len("person-"):]
@@ -561,9 +721,9 @@ def _derive_people_project(conn, project, repos):
     read-side mirror of the union-merge fold_bundle writes."""
     agg = {}
     for repo in repos:
-        bundle = _self_source_bundle(conn, project, repo)
+        bundle, reason = _self_source_bundle(conn, project, repo)
         if bundle is None:
-            continue
+            raise _NotSourced("{}: {}".format(repo, reason))
         for login, rec in _derive_people(bundle).items():
             cur = agg.setdefault(login, {"areas": set(), "modules": set(),
                                          "is_bot": False})
@@ -579,7 +739,10 @@ def check_no_drift_people(conn, project, repos):
     the people re-derived across ALL members and unioned (mirroring fold_bundle's
     union-merge). People are project-scoped, so this is the correct granularity — a
     per-member check can never reproduce the cross-member union."""
-    want = _norm_people(_derive_people_project(conn, project, repos))
+    try:
+        want = _norm_people(_derive_people_project(conn, project, repos))
+    except _NotSourced as exc:
+        return _not_sourced("no_drift_people", str(exc))
     stored = _stored_project_people(conn, project)
     details = _people_drift_details(stored, want)
     if not details:
@@ -588,12 +751,24 @@ def check_no_drift_people(conn, project, repos):
     return _check("no_drift_people", ERROR, details)
 
 
-def _derive_artifacts(bundle):
-    """Re-derive the artifact projection exactly as the write path does:
-    build_artifacts then link_symbol_identity (on a copy carrying them)."""
-    artifacts = derive.build_artifacts(bundle)
-    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
-    return artifacts
+def _derive_artifacts(conn, project, repo, bundle):
+    """Re-derive the artifact projection exactly as the write path does (#76):
+    derive.artifact_projection over the repo's WHOLE stored ledger, plus any
+    events of `bundle` the ledger does not hold yet (so an external bundle is
+    checked against "the store after folding it", and a store holding more
+    windows than the bundle is not drift). A self-sourced bundle IS the ledger,
+    so for it this is the ledger alone. Symbol moves are the ones fold recorded
+    (matched per window; the ledger has no window boundaries to re-match them)."""
+    code, symbols = extract.ledger_events(conn, project, repo)
+    events = derive.merge_ledger_events(
+        {"code_events": code, "symbol_events": symbols}, bundle)
+    # Same commit times the writer used (the store's), plus the bundle's own for
+    # commits the store does not hold yet.
+    commits = list(bundle.get("commits") or []) \
+        + extract.commit_times(conn, project, repo)
+    return derive.artifact_projection(
+        {**events, "meta": bundle.get("meta", {}), "commits": commits},
+        extract.recorded_moves(conn, project, repo))
 
 
 def check_no_drift(conn, project, repo, bundle, check_people=True):
@@ -627,7 +802,7 @@ def check_no_drift(conn, project, repo, bundle, check_people=True):
     # local is itself a double-`#` form `{path}#{lang}:{subkind}:{name}`. Strip
     # ONLY the repo prefix (graphstore.local_id) to recover the true local id
     # (mirroring how fold_bundle / extract reconstruct it).
-    want_arts = _derive_artifacts(bundle)
+    want_arts = _derive_artifacts(conn, project, repo, bundle)
     stored_arts = {}
     for n in graphstore.repo_nodes(conn, project, repo, "code"):
         local = graphstore.local_id(n["id"], project, repo)
@@ -711,19 +886,72 @@ def _store_window(conn, project, repo):
     return (row[0], row[1]) if row else (None, None)
 
 
+def _gathered_window(conn, project, repo):
+    """(min from, max to) over the gathered windows recorded for project/repo
+    in the meta ledger, or (None, None) when none is recorded."""
+    try:
+        wins = [w for w in graphstore.get_windows(conn)
+                if isinstance(w, dict) and w.get("project") == project
+                and w.get("repo") == repo and w.get("from") and w.get("to")]
+    except ValueError:
+        return None, None
+    if not wins:
+        return None, None
+    return min(w["from"] for w in wins), max(w["to"] for w in wins)
+
+
+class _NotSourced(Exception):
+    """A bundle could not be self-sourced; the message is the reason."""
+
+
+def _not_sourced(name, reason):
+    return _check(name, ERROR, [{
+        "severity": ERROR, "problem": "could not self-source: {}".format(reason)}])
+
+
 def _self_source_bundle(conn, project, repo):
     """Reconstruct the raw bundle FROM THE STORE via extract, over the store's
     full activity window. In a store-only world (Phase 7) there is no bundle
     FILE; the bundle is the transient view extract materializes. Running it here
-    lets no_drift/idempotency audit the store with no external input. Returns
-    None when the store has no in-window activity (nothing to self-source)."""
+    lets no_drift/idempotency audit the store with no external input.
+
+    Returns (bundle, None), or (None, reason) when no bundle can be sourced;
+    the caller then FAILS no_drift/idempotency with that reason (issue #79:
+    they used to be silently dropped, so the audit passed on nothing):
+      - the (project, repo) has no stored nodes;
+      - a stored node cannot be decoded (CorruptRow, naming it);
+      - social/code nodes are stored but none carries a timestamp, so the
+        activity window cannot be recovered;
+      - extract itself raises.
+    A member holding only structure nodes (a quiet member: nothing happened in
+    its window) is legitimate; it self-sources over its recorded gathered
+    window instead (and fails when none is recorded)."""
+    problem = _target_problem(conn, project, repo)
+    if problem is not None:
+        return None, "{} (project={}, repo={})".format(
+            problem["problem"], project, repo)
+    try:
+        nodes = _repo_nodes(conn, project, repo)
+    except CorruptRow as exc:
+        return None, str(exc)
     ts_from, ts_to = _store_window(conn, project, repo)
     if ts_from is None or ts_to is None:
-        return None
+        activity = sum(1 for n in nodes if n["node_class"] != "structure")
+        if activity:
+            return None, ("{} social/code node(s) stored but none carries a "
+                          "timestamp, so the activity window cannot be "
+                          "recovered".format(activity))
+        ts_from, ts_to = _gathered_window(conn, project, repo)
+        if ts_from is None:
+            return None, ("no timestamped node and no recorded gathered "
+                          "window for this repo")
     # extract materializes only RAW keys; that is exactly what no_drift /
     # idempotency re-derive against (they run derive.* themselves).
-    return extract.extract(conn, project, repo, ts_from, ts_to,
-                           warn=lambda _msg: None)
+    try:
+        return extract.extract(conn, project, repo, ts_from, ts_to,
+                               warn=lambda _msg: None), None
+    except Exception as exc:  # noqa: BLE001 - reported as a failed check
+        return None, "extract failed: {}: {}".format(type(exc).__name__, exc)
 
 
 def validate_repo(conn, project, repo, bundle=None, check_people=True):
@@ -738,20 +966,27 @@ def validate_repo(conn, project, repo, bundle=None, check_people=True):
     here: project-scoped people are audited once project-wide by
     check_no_drift_people, not per member.
     """
+    # Every check is _guarded: the auditor must never crash on a bad store. A
+    # check that raises (a corrupt row, a re-derive/re-fold failure) is a failed
+    # ERROR check naming the error, and every check is always listed (#79).
     checks = [
-        check_referential_integrity(conn),
-        check_participant_completeness(conn, project, repo, bundle),
-        check_provenance(conn),
-        check_no_fabrication(conn),
-        check_schema_conformance(conn),
+        _guarded(check_target, "target", conn, project, repo),
+        _guarded(check_referential_integrity, "referential_integrity", conn),
+        _guarded(check_participant_completeness, "participant_completeness",
+                 conn, project, repo, bundle),
+        _guarded(check_provenance, "provenance", conn),
+        _guarded(check_no_fabrication, "no_fabrication", conn),
+        _guarded(check_schema_conformance, "schema_conformance", conn),
     ]
-    drift_bundle = bundle if bundle is not None \
-        else _self_source_bundle(conn, project, repo)
-    if drift_bundle is not None:
-        # A self-sourced bundle mirrors the store; if the store is corrupt the
-        # re-derive/re-fold can RAISE. The auditor must never crash on a bad
-        # store — surface the failure as an ERROR detail so the gate still fails
-        # loudly (the structural checks above usually name the root cause).
+    if bundle is not None:
+        drift_bundle, reason = bundle, None
+    else:
+        drift_bundle, reason = _self_source_bundle(conn, project, repo)
+    if drift_bundle is None:
+        # No bundle to re-derive against: these checks FAIL, never vanish.
+        checks.append(_not_sourced("no_drift", reason))
+        checks.append(_not_sourced("idempotency", reason))
+    else:
         checks.append(_guarded(check_no_drift, "no_drift",
                                conn, project, repo, drift_bundle, check_people))
         checks.append(_guarded(check_idempotency, "idempotency",
@@ -768,8 +1003,13 @@ def validate(conn, project=None, repo=None, bundle=None):
     passed they SELF-SOURCE it from the store (via extract over the store's full
     window) so the gate is self-contained on a store-only deliverable. A passed
     `bundle` is honored as an optional cross-check but is never required.
+
+    An unknown project/repo or an empty store is a failed `target` check (with
+    no_drift/idempotency failed as "could not self-source"), not a pass; only
+    an ambiguous store (several projects or repos, none named) raises
+    ValueError.
     """
-    project, repo = _detect_project_repo(conn, project, repo)
+    project, repo = _resolve_target(conn, project, repo)
     return validate_repo(conn, project, repo, bundle)
 
 
@@ -781,8 +1021,11 @@ def validate_project(conn, project, repos):
     Raises ValueError on an empty `repos`: validation ATTESTS trustworthiness,
     and `all([])` would vacuously report ok=True for zero repos, masking a
     misconfigured member set. (digest.build_project_view, which only DESCRIBES,
-    tolerates an empty project and returns an empty view.)"""
-    if not repos:
+    tolerates an empty project and returns an empty view.) The one exception is
+    a project whose members all failed to gather (issue #77): with member run
+    status recorded and no repo holding data, the report has no members and
+    fails on `member_status`."""
+    if not repos and not _has_member_status(conn, project):
         raise ValueError("validate_project: no repos to validate")
     member_reports = []
     for repo in repos:
@@ -790,12 +1033,32 @@ def validate_project(conn, project, repos):
         rep = validate_repo(conn, project, repo, check_people=False)
         member_reports.append({"repo": repo, **rep.to_dict()})
     # PROJECT-WIDE checks (the ones whose unit is the project, not a member repo):
-    # people drift over the cross-member union.
-    project_checks = [check_no_drift_people(conn, project, repos)]
+    # people drift over the cross-member union; the manifest members' run status.
+    project_checks = []
+    if repos:
+        project_checks.append(_guarded(check_no_drift_people, "no_drift_people",
+                                       conn, project, repos))
+    else:
+        # Nothing to audit is never a pass, whatever member_status says (its
+        # entries can all read `ok` while the members' nodes are gone).
+        project_checks.append(_check("target", ERROR, [{
+            "severity": ERROR, "project": project,
+            "problem": "project has no member repo with stored nodes"}]))
+    project_checks.append(_guarded(check_member_status, "member_status",
+                                   conn, project))
     ok = (all(r["ok"] for r in member_reports)
           and all(c["ok"] for c in project_checks))
     return {"ok": ok, "project": project, "members": member_reports,
             "project_checks": project_checks}
+
+
+def _has_member_status(conn, project):
+    """True when a manifest gather recorded member run status for `project`
+    (also when that record is unreadable: check_member_status reports it)."""
+    try:
+        return bool(graphstore.get_member_status(conn, project))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return True
 
 
 def _guarded(fn, name, *args):
@@ -804,10 +1067,12 @@ def _guarded(fn, name, *args):
     try:
         return fn(*args)
     except Exception as exc:  # noqa: BLE001 - auditor must survive a bad store
-        return _check(name, ERROR, [{
-            "severity": ERROR,
-            "problem": "check could not run on this store",
-            "error": "{}: {}".format(type(exc).__name__, exc)}])
+        detail = {"severity": ERROR,
+                  "problem": "check could not run on this store",
+                  "error": "{}: {}".format(type(exc).__name__, exc)}
+        if isinstance(exc, CorruptRow):
+            detail["row"] = exc.row
+        return _check(name, ERROR, [detail])
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -845,6 +1110,11 @@ def _format_report(report, project, repo):
     return "\n".join(lines)
 
 
+def _usage_error(msg):
+    sys.stderr.write("validate.py: error: {}\n".format(msg))
+    return 2
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Audit a journey-graph store for trustworthiness.")
@@ -860,18 +1130,45 @@ def main(argv=None):
                         help="emit the report as JSON instead of text")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
-    conn = graphstore.open_store(args.store)
+    # Read-only (issue #79): never create a missing store, never write to it.
+    try:
+        conn = graphstore.open_store_readonly(args.store)
+    except FileNotFoundError:
+        return _usage_error("store {!r} does not exist".format(args.store))
+    except sqlite3.Error as exc:
+        return _usage_error("cannot open store {!r}: {}".format(args.store, exc))
+    try:
+        conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchall()
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        return _usage_error("{!r} is not a journey-graph store ({})".format(
+            args.store, exc))
     bundle = None
     if args.bundle:
-        with open(args.bundle) as fh:
-            bundle = json.load(fh)
+        try:
+            with open(args.bundle) as fh:
+                bundle = json.load(fh)
+        except (OSError, ValueError) as exc:
+            conn.close()
+            return _usage_error("cannot read --bundle {!r}: {}".format(
+                args.bundle, exc))
 
-    # Detect project/repo; allow_multi=True so multi-repo stores don't raise
-    # when --repo is omitted — the project path handles them.
-    project, repo = _detect_project_repo(conn, args.project, args.repo,
-                                          allow_multi=True)
+    # Resolve project/repo; allow_multi=True so multi-repo stores don't raise
+    # when --repo is omitted (the project path handles them). An unknown or
+    # empty target comes back unresolved and FAILS the `target` check.
+    try:
+        project, repo = _resolve_target(conn, args.project, args.repo,
+                                        allow_multi=True)
+    except ValueError as exc:
+        conn.close()
+        return _usage_error(str(exc))
 
-    if repo is None:
+    # A manifest store (member run status recorded) always takes the project
+    # path when no --repo is named, even when only one member holds data: the
+    # others may have failed (issue #77) and must not drop out of the audit.
+    if args.repo is None and project is not None and (
+            len(graphstore.project_repos(conn, project)) > 1
+            or _has_member_status(conn, project)):
         # Multi-repo project path: run validate_project over all member repos.
         if args.bundle:
             sys.stderr.write("warning: --bundle is ignored in multi-repo "

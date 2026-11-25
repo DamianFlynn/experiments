@@ -15,10 +15,11 @@ running the current pipeline `fold -> extract -> link.enrich` and applying the
 normalization below; capture was run twice and confirmed byte-identical, so the
 snapshots carry no nondeterministic data.
 
-NORMALIZATION RULE (Agent F: reuse this verbatim). Drop only the volatile/
-unstored meta keys (`_VOLATILE_META`: ref_date, period, generated_at,
-schema_version) — the same meta keys test_extract._normalize drops, since enrich
-falls back to deterministic equivalents for them. Unlike test_extract, this gate
+NORMALIZATION RULE (Agent F: reuse this verbatim). Drop only the volatile meta
+keys (`_VOLATILE_META`: generated_at, schema_version). Issue #75 made extract
+stamp `period` and `ref_date` into the view's meta, so those two are no longer
+dropped: the snapshots were re-captured once to add them (meta only; no other
+key changed). Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is
 canonical JSON: json.dumps(obj, sort_keys=True, indent=2).
@@ -38,10 +39,10 @@ import link  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
-# Same meta keys test_extract._normalize drops: P6 does not store them (extract
-# cannot reconstruct them) or they are volatile; enrich falls back to
-# deterministic equivalents, so dropping them changes no other output.
-_VOLATILE_META = ("ref_date", "period", "generated_at", "schema_version")
+# Volatile meta keys, dropped before comparison. `ref_date` and `period` were
+# dropped here too until issue #75; extract now stamps them (the view's window
+# and reference date), so the snapshots pin them as part of the view contract.
+_VOLATILE_META = ("generated_at", "schema_version")
 
 
 def _load(name):

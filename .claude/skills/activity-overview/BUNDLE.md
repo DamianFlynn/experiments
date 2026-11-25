@@ -49,6 +49,13 @@ video-script, dashboards) consume the same view. The contract:
   store, an unknown `--project` (the message lists the store's projects), an
   unknown `--repo` (lists the project's repos), a bad `--manifest` or
   `--ticket-pattern`, or a `--project` that differs from the `--manifest` project.
+- **Project view members.** `meta.repos` / `members[]` are the project's stored
+  members (`graphstore.project_repos`): a repo present only as another member's
+  `depends_on` stand-in is not one (#77). A manifest member whose last gather of a
+  window overlapping the view failed or was not attempted is absent (or holds only
+  older data); `digest.py` and `view.py` then print a `warning: project … is
+  incomplete` on stderr (exit code unchanged) and `validate.py` fails. The view JSON
+  does not list such members; do not publish a view while that warning stands.
 - **Every fact carries a ref** (see *Ref convention* below), so any consumer can
   cite/fact-check without re-fetching. Narrative is NOT in the view — it's the
   model's job, authored from the view.
@@ -82,10 +89,33 @@ the rest (engagement, code areas, trains, people/flow).
   records how gather obtained the clone (see `gather.prepare_clone`); it is in the bundle
   `acquire` assembles and is not folded into the store. (Store-only — see `STORE.md`; this bundle shape is the
   transient view `extract` materializes from the store, not a produced file.)
-- `commits` — `[{ sha, parents, author, date, message, files, pr }]` (`pr` set by link).
+  A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
+  to` (+ `clone_sha`), **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).
+  `period` is the window `compute_buckets` and `build_forecast` limit to (`link.window_period`:
+  `period`, else `{from, to}`), so items the store holds from other windows — or old items
+  gather pulled because they were updated in the window — fall in no bucket. `ref_date` frames
+  milestones, sprints, forecast age and flow staleness: the view's `--ref-date` if given, else
+  the gather `--ref-date` stored for exactly this window, else `to`.
+- `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
+  committed_at?, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
   (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
-  across committer timezones.
+  across committer timezones. `committed_at` (#82) is the full committer timestamp (`%cI`)
+  in UTC, `YYYY-MM-DDTHH:MM:SSZ`; it orders the `timeline` only (windowing stays on `date`).
+  It is absent on commits gathered before #82 and on backfilled commits.
+  **People identity (#78):** `author` is the author's **GitHub login** — the same key PR, issue,
+  review and comment records use — so one person is one `people` entry. `gather.resolve_commit_authors`
+  resolves it from real data, in order: the commits-list API's `author.login` for that SHA
+  (`login_source: "commits_api"`), then a `users.noreply.github.com` author email
+  (`<id>+<login>@…` or `<login>@…`; `login_source: "noreply_email"`; the spelling of a PR/issue
+  login that differs only in case wins). The PR author is never assumed. `author_name` is the
+  git author name (`%an`). When neither source resolves it, `login_resolved` is `false`, there is
+  no `login_source`, and `author` is the git name — suffixed `" (git)"` when the name could itself
+  be a login (`derive.unresolved_person_key`), so an unresolved name never equals, and is never
+  merged with, a real login. The author email is read only to resolve the login and is **not
+  stored**. `code_events[].author` / `symbol_events[].author` carry the same resolved value.
+  Bundles gathered before #78 have no `author_name`/`login_resolved` and keep the git name in
+  `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
@@ -243,7 +273,9 @@ review's state to `DISMISSED`.
   ids are `art:<path>` (via `artifact_id`); **symbol/comment** ids are
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
-  carry the bounded `before`/`after`. `status` is derived from the artifact's **last**
+  carry the bounded `before`/`after`. `lifecycle` is in commit order (the commit's UTC `committed_at`
+  when known, else the local `date`; ties keep git/ledger order); a view from a store is cumulative — it holds every folded window's
+  events, not only the view's window. `status` is derived from the artifact's **last**
   lifecycle event: `replaced` only when that event is a rename to a tracked path
   (`replaced_by` = that direct successor; consumers walk A→B→C); a later re-add makes
   it `live` again with `replaced_by:null`; a delete, or a rename to an untracked path,
@@ -255,6 +287,10 @@ review's state to `DISMISSED`.
   symbol dropped in ONE file and added in ONE other (precision over recall — ambiguous/boilerplate
   names are skipped). On the linked artifacts the source is `status:"replaced"` + `replaced_by`
   the dest, the dest carries `identity_from`, and both carry `move_confidence`/`move_basis`.
+  In a store the moves are matched per folded window and the stored artifacts apply all of
+  them (STORE.md, symbol-move edges); a source re-added later is `live` again. `link.enrich`
+  still re-matches over the view's whole `symbol_events`, which on a multi-window store can
+  add a move no single window had (LLD §14.5).
   `confidence` is `high` only when git also flags the file pair as a rename/copy. (Name-changed
   renames via body fingerprint are deferred.)
 - **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},
@@ -262,6 +298,10 @@ review's state to `DISMISSED`.
   (artifact lifecycle) events. `ref.id` is the PR/issue number for social events
   and the commit sha for code events (the bundle-wide `{type, id, url}` ref
   convention). Social events have no file `subject.path`; code events carry both.
+  `ts` is the comment's `created_at` for social events and the commit's `committed_at`
+  for code events (#82), so same-day events interleave by real time; a code event whose
+  commit has no `committed_at` falls back to its date (`YYYY-MM-DD`), which sorts before
+  that day's timestamped social events. Ties break on `ref.url`.
 - **feature_deltas** `[{ area, kind:"add|drop|change", subject, name, before,
   after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
   }]` — a projection over `artifacts` (add→add, remove→drop, change→change). For
@@ -294,18 +334,30 @@ review's state to `DISMISSED`.
   | `kind` | `"module"` — inter-area module dependency (resource-level `dependsOn` edges are deferred) |
   | `ref` | the raw reference (`br/public:…:<ver>`, `br:<host>/…:<tag>`, `ts:…`, a local path, or a TF `source`), kept verbatim |
   | `version` | pinned version when present, else `null` |
-  | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree |
+  | `transitive` | `false` = a direct source reference; `true` = discovered deeper in the resolved build tree. Terraform (#80): every `module {}` block in the area's own `*.tf` is `false`, consumed or not; `true` only for a **nested** call (`module.a.module.b`) found in the `terraform graph` DOT |
+  | `address` | Terraform nested edges only: the call's module address, e.g. `module.a.module.b` |
+  | `via` | Terraform nested edges only: the parent call it is reached through, e.g. `module.a`; its first segment is one of the area's own `module "<name>"` blocks |
   | `local` | present + `true` when the ref is a **private child submodule** of this area (a local relative path resolving under the area); `to` is then the named child node `<area>/<child>` instead of a self edge. A ref to the area's own `main.bicep` is recursion and stays a self edge. Child edges come from building the **parent**: a child module is never the area's entrypoint |
   | `instances` | `"many"` for an array instantiation (`= [for …]`, i.e. multiple instances), `"one"` for a single `= {`, on local child edges |
   | `provider` | `"bicep"` or `"terraform"` |
   | `resolved` | `true` when `to` is non-null (`to: null` ⇔ `resolved: false`; `version` still carries the ref's tag) |
 
-  **Build-only.** Edges are populated *only* from a successful `bicep restore`+`bicep build`
+  **Build-only (per area).** An area's edges are populated *only* from a successful `bicep restore`+`bicep build`
   (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned
-  working tree. When the CLI or registry is unavailable, or a build fails, `edges` stays `[]` —
-  the skill never emits static, unvalidated edges. Immediate (`transitive:false`) edges are fully
-  identified (area-id + version) from source; transitive edges connect to *other areas in the
-  repo* (deep external-module internals are not fabricated into edges). The `bicep` and
+  working tree. When the CLI or registry is unavailable, or a build fails, that area's `edges`
+  stays `[]`. Immediate (`transitive:false`) edges are fully identified (area-id + version) from
+  source. Bicep transitive edges connect to *other areas in the repo* (deep external-module
+  internals are not fabricated into edges). **Terraform (#80):** the direct edges are the area's
+  own `module {}` blocks, parsed from source, so a module nobody consumes still has its edge. The
+  build only adds nested calls. Each nested call is `transitive:true` with `address`/`via`, and
+  its target (`to`/`ref`/`version`) comes from the `.terraform/modules/modules.json` that the same
+  `terraform init` wrote. A call inside a downloaded package is attributed to that package's
+  module. Without the manifest, `to` and `ref` are `null`. A nested target that is already an
+  edge (same area, or the same registry module ignoring `//submodule`) is not repeated: direct
+  wins. **Static edges on manifest gathers:** a multi-repo (manifest) gather also adds the
+  whole-tree structural scan. It emits the same direct edges, without `terraform`, for every
+  module dir in the clone (see STORE.md). Single-repo gathers do not run that scan and stay
+  build-gated. The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 
@@ -365,6 +417,10 @@ review's state to `DISMISSED`.
   activity counts across the window's commits.
 - **people[].modules / people[].areas** — the areas a person authored (their
   commits' files) or reviewed (their reviewed PRs' areas).
+- **people{}** keys are GitHub logins (see `commits[].author`). An entry keyed by an
+  unresolved commit author's git name carries `login_resolved: false` (absent on every
+  other entry); `is_bot` also recognises git-name forms (`GitHub Actions`, `Dependabot`,
+  `Renovate Bot`, a `[bot]` name, and those with the `" (git)"` suffix).
 - **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
   people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
 - **Symbol/comment artifacts** carry `before`/`after`/`detail` on feature_deltas
@@ -385,27 +441,43 @@ review's state to `DISMISSED`.
     "train":          { id, kind, outcome, significance, tier, effort,
                         code_areas, evidence },
     "issue":          { number, title, body*, url, labels, kind,
-                        comments*:[body*], comments_overflow } | None,
+                        comments*:[body*], comments_overflow,
+                        lifecycle:[{event, actor, created_at, label}],
+                        lifecycle_overflow, reopen_count } | None,
     "prs":            [ { number, title, body*, state, merged, created_at,
                           merged_at, url, reviewers:[login], review_decision,
                           review_comments*:[body*], review_comments_overflow,
-                          comments*:[body*], comments_overflow } ],
+                          comments*:[body*], comments_overflow,
+                          review_rounds:{count, states} | None,
+                          reviews:[{author, state, submitted_at, body*}],
+                          reviews_overflow,
+                          lifecycle:[{event, actor, created_at, label}],
+                          lifecycle_overflow, reopen_count } ],
     "commits":        [ { sha, message*, author, date } ],
     "feature_deltas": [ ...this train's deltas only... ],
+    "feature_deltas_diff_overflow": <int>,
     "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ]
   }
   ```
 
   (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
-  chars with a `…[+N chars]` marker; each comment list capped at `SLICE_COMMENTS_KEPT` = 6
-  bodies, overflow count in `<key>_overflow`.) Raises `KeyError` on unknown id. Does not
-  mutate the bundle.
+  chars with a `…[+N chars]` marker. Each comment list, `reviews` and `lifecycle` is
+  capped at `SLICE_COMMENTS_KEPT` = 6 entries, overflow count in `<key>_overflow`.
+  `reviews` are the PR's review submissions; `lifecycle` the allowlisted timeline
+  events (id/url dropped); `reopen_count` how often the issue/PR was reopened;
+  `review_rounds` the PR's `{count, states}` or `None` when it has no counted review.
+  `feature_deltas` file-level entries may carry a bounded `diff`; the combined diff
+  chars kept in one slice never exceed `SLICE_DIFF_CAP` = 6000: walking the deltas in
+  order, a diff is kept only if it fits in what is left of the budget, otherwise it is
+  omitted (the delta is still listed) and counted in `feature_deltas_diff_overflow`.)
+  Raises `KeyError` on unknown id. Does not mutate the bundle. The key lists above are
+  checked against `slice_train`'s output by `test_link_small_fixes.py`.
 
 ## People profile, recognition halls, flow & blockers
 
 These are **enrich-time projections** computed by `link.enrich` over the
 materialized bundle (siblings of `forecast`/`modules`) — not stored person-node
-data. The stored `people` projection (`{modules, areas, is_bot}`) is unchanged;
+data. The stored `people` projection (`{modules, areas, is_bot[, login_resolved:false]}`) is unchanged;
 `enrich` MERGES the profile fields onto it.
 
 - **people[]** — each `{login: {...}}` entry, in addition to its stored

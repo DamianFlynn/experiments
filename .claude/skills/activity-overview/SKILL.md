@@ -126,7 +126,10 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```bash
    python3 view.py --store workspace/journey.db --from FROM --to TO --out workspace/view/bundle.json
    ```
-   Use the FROM/TO you gathered (for a manifest, its window). `--project`/`--repo` are
+   Use the FROM/TO you gathered (for a manifest, its window): the view records them as
+   `meta.period` and `link.py` buckets only that window's items. `meta.ref_date` is the
+   `--ref-date` you gathered with (when FROM/TO match the gathered window exactly), else TO;
+   `view.py --ref-date D` overrides it. `--project`/`--repo` are
    auto-detected when the store holds one project with one repo; otherwise pass them
    (single repo: `--project OWNER --repo REPO`). For a **multi-repo project**, run it once
    per member you report on — `python3 view.py --store workspace/journey.db --project <name>
@@ -186,10 +189,16 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
 9. **Write the report** (e.g. `workspace/report.md`) by filling `report-template.md`.
    Cite each fact with its `url`; do not state anything the views do not contain.
    - **Single repo:** every section reads the bundle view. Where the template says
-     `view["shipped"]` read `bundle["buckets"]["shipped"]`; `view["trains"]` →
-     `bundle["trains"]`; `view["people"]` / `view["modules"]` → `bundle["people"]` /
-     `bundle["modules"]`; `view["members"][i]["bundle"]` → the bundle view itself. Omit
-     *Related work* and *Cross-repo module dependency graph* (project view only).
+     `view["shipped"]` read `bundle["buckets"]["shipped"]`; `view["people"]` /
+     `view["modules"]` → `bundle["people"]` / `bundle["modules"]` (keyed by area id);
+     `view["members"][i]["bundle"]` → the bundle view itself. There are no project
+     trains: render *Decision trains* from the template's deep-train and mention-train
+     blocks over `bundle["trains"]`. Omit *Related work* and *Cross-repo module
+     dependency graph* (project view only).
+   - **Field names:** fill placeholders by the template's "Placeholder rules" block.
+     Refs (`buckets`, `view["shipped"]`, `series`, forecast candidates) and `flow` /
+     `blockers` entries carry an id and url but no title: look the title, state,
+     author and board status up in `bundle["prs"]` / `bundle["issues"]` by number.
    - **Multi-repo:** project-wide sections (executive summary, shipped, decision trains,
      related work, cross-repo module graph, module ownership) read the project view;
      per-member sections (since last installment, activity at a glance, releases, CI/CD,
@@ -225,6 +234,8 @@ relevant slice and narrate it grounded:
 
 - **Module biography** (how one module evolved across ALL history): `python3 spotlight.py
   module <area> --store <db> --project <name> --json` → narrate per `reference/report-sections.md`.
+  An area found in several members (a multi-repo project) is unioned and each row names its
+  `repo`; write `owner/repo::<area>` (or add `--repo owner/repo`) for one member.
 - **Blast radius / dependents** of a module: `python3 spotlight.py dependents <owner/repo>
   --store <db> --project <name>`.
 - **One train's slice** (for narration or a spotlight): `python3 link.py <view> --slice <id>`;

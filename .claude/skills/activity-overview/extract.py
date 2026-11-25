@@ -33,9 +33,12 @@ Materialization approach (slice 7a part 1)
    `symbol_events` (see `_materialize_symbol_events`) so the self-sourced raw
    bundle is COMPLETE — `derive.build_artifacts` re-derives the symbol/comment
    artifacts exactly, and the self-sourced `validate` no_drift passes.
-5. Reconstruct `meta` (owner/repo/from/to, + clone_sha if recorded) so it
-   round-trips. `ref_date`/`period` are NOT stored by P6 and are intentionally not
-   reconstructed — enrich falls back to meta["to"] and {from,to} deterministically.
+5. Reconstruct `meta` (owner/repo/from/to, + clone_sha if recorded) and stamp
+   the view's window (issue #75): `period` = the requested {from, to}, so
+   `link.compute_buckets` limits shipped/rejected/in_flight to this window even
+   when the store holds other windows' items; `ref_date` = the explicit
+   override, else the value fold stored for exactly this gathered window
+   (gather `--ref-date`, default its `to`), else this view's `to`.
 
 Deterministic ordering matches the golden bundles: prs/issues by number, commits
 by sha, milestones by number, releases by tag/name, code_events by source order.
@@ -129,7 +132,7 @@ def _train_anchor(node):
 
 
 def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
-            backfill=None, backfill_budget=50):
+            backfill=None, backfill_budget=50, ref_date=None):
     """Materialize a rev-13 RAW bundle view for project/repo over [ts_from, ts_to].
 
     Returns a bundle dict carrying ONLY raw keys; run `link.enrich` on it to add
@@ -147,6 +150,9 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     When `backfill` is None (the default) behavior is EXACTLY as before — the
     `missing` ids are only warned about — so existing callers/characterization
     are byte-identical.
+
+    `ref_date` (optional) overrides the reference date stamped into
+    `meta.ref_date` (view.py / digest.py `--ref-date`); see `_materialize_meta`.
     """
     if warn is None:
         warn = lambda msg: sys.stderr.write(msg + "\n")  # noqa: E731
@@ -197,7 +203,8 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     _context_ids = set(spine["reached"]) - in_window_ids  # noqa: F841
 
     # 3+4. Materialize raw arrays from the full repo node set + the ledger.
-    bundle = {"meta": _materialize_meta(conn, project, repo, ts_from, ts_to)}
+    bundle = {"meta": _materialize_meta(conn, project, repo, ts_from, ts_to,
+                                        ref_date=ref_date)}
 
     socials = graphstore.repo_nodes(conn, project, repo, node_class="social")
     bundle["prs"] = _by(
@@ -252,7 +259,8 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # fall to the end, ordered by id.
     arts = {_full_local(n["id"], project, repo): n["data"]
             for n in codes if _is_artifact_node(n)}
-    bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"])
+    bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"],
+                                           derive.commit_times(bundle))
 
     # people: the per-login modules/areas fold persisted as project-scoped person
     # `structure` nodes (repo sentinel "*", local id `person-<login>`). Read them
@@ -339,7 +347,7 @@ def _attach_reviews_and_lifecycle(socials, prs, issues):
             parent["lifecycle"] = _sorted(evs, "created_at")
 
 
-def _order_artifacts(arts, code_events):
+def _order_artifacts(arts, code_events, times=None):
     """Order the artifact dict to match build_artifacts' INSERTION order so
     order-sensitive consumers (build_timeline's same-(ts,url) tie-break) reproduce
     byte-for-byte. build_artifacts, per code_event in source order, ensures the
@@ -348,14 +356,16 @@ def _order_artifacts(arts, code_events):
     monotonic ordinal, so a rename whose old/new ids sort against insertion order
     (e.g. a->z, which must stay [new, old]) is not flipped by a lexical tie-break.
     Artifacts never named by a code_event (symbol/comment nodes) fall last, ordered
-    by id. Pure; does not mutate the records."""
+    by id. The replay walks the events in build_artifacts' own order
+    (derive.chronological), so a multi-window store reads back the same order
+    whichever window was folded first. Pure; does not mutate the records."""
     order = {}
 
     def _see(path):
         if path:
             order.setdefault("art:" + path, len(order))
 
-    for ev in code_events:
+    for ev in derive.chronological(code_events, times):
         change = ev.get("change")
         if change in ("rename", "copy") and ev.get("old_path"):
             _see(ev.get("path"))            # new-path artifact: ensured first
@@ -450,14 +460,67 @@ def _by(records, key):
     return sorted(records, key=key)
 
 
-def _materialize_meta(conn, project, repo, ts_from, ts_to):
-    """Reconstruct raw `meta` so it round-trips: owner/repo/window (+clone_sha if
-    recorded). ref_date/period are not P6-stored — enrich derives equivalents."""
+def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None):
+    """Reconstruct raw `meta`: owner/repo/window (+clone_sha if recorded), plus
+    the view's window (issue #75):
+
+    - `period` = {from, to} exactly as requested: the bounds the in-window
+      range query uses, in the shape gather's own bundle carries, so
+      `link.compute_buckets` / `build_forecast` window this view.
+    - `ref_date` = `ref_date` if given, else the value fold stored for exactly
+      this (project, repo, from, to) window, else `ts_to`.
+    """
     meta = {"owner": project, "repo": repo, "from": ts_from, "to": ts_to}
     clone_sha = graphstore.get_clone_sha(conn, project, repo)
     if clone_sha:
         meta["clone_sha"] = clone_sha
+    meta["period"] = {"from": ts_from, "to": ts_to}
+    meta["ref_date"] = (
+        ref_date
+        or graphstore.get_ref_date(conn, project, repo, ts_from, ts_to)
+        or ts_to)
     return meta
+
+
+def ledger_events(conn, project, repo):
+    """The repo's WHOLE code-event ledger as raw `(code_events, symbol_events)`
+    arrays (every folded window, ledger order). fold_bundle rebuilds artifact
+    nodes from it and validate re-derives them from it (#76): one reader for the
+    writer and the auditor."""
+    return (_materialize_code_events(conn, project, repo),
+            _materialize_symbol_events(conn, project, repo))
+
+
+def recorded_moves(conn, project, repo):
+    """The repo's symbol moves as fold recorded them (one match per window, as
+    `replaced_by` edges): [{"from", "to", "confidence", "basis"}] with local ids,
+    in edge order. Input to derive.apply_recorded_moves (#76)."""
+    prefix = graphstore.qualify_id(project, repo, "")
+    out = []
+    for e in graphstore.edges_by_type(conn, "replaced_by", project):
+        if not (e["src_id"].startswith(prefix) and e["dst_id"].startswith(prefix)):
+            continue
+        data = e["data"] or {}
+        out.append({"from": e["src_id"][len(prefix):],
+                    "to": e["dst_id"][len(prefix):],
+                    "confidence": data.get("move_confidence"),
+                    "basis": data.get("move_basis"),
+                    "commit": data.get("move_commit")})
+    return out
+
+
+def commit_times(conn, project, repo):
+    """The repo's stored commits that carry a full UTC committer timestamp, as
+    `[{"sha", "committed_at"}]` (sorted by sha): the `commits` input
+    derive.chronological needs to order lifecycle events by real commit time
+    rather than the committer's local day."""
+    out = []
+    for n in graphstore.repo_nodes(conn, project, repo, "code"):
+        data = n["data"] if isinstance(n["data"], dict) else {}
+        # commit nodes only (artifact nodes carry a lifecycle, never a sha)
+        if data.get("sha") and data.get("committed_at") and "lifecycle" not in data:
+            out.append({"sha": data["sha"], "committed_at": data["committed_at"]})
+    return sorted(out, key=lambda c: c["sha"])
 
 
 def _materialize_code_events(conn, project, repo):

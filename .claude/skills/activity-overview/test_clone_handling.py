@@ -229,6 +229,25 @@ class TestAcquireCloneStep(_RepoCase):
         self.assertIsNone(b["meta"]["clone_sha"])
         self.assertFalse(os.path.exists(self.clone))
 
+    def test_ref_date_survives_gather_fold_view(self):
+        # Issue #75: `gather --ref-date X` -> fold -> view meta.ref_date == X;
+        # without the flag the view's ref_date is the window's `to`.
+        import extract
+        import graphstore
+        self.commit("a", "2026-05-20")
+        for extra, want in ((("--ref-date", "2026-05-25"), "2026-05-25"),
+                            ((), "2026-05-31")):
+            b = self._acquire(*extra)
+            conn = graphstore.open_store(":memory:")
+            graphstore.init_schema(conn)
+            gather.fold_bundle(conn, b)
+            meta = extract.extract(conn, "o", "r", "2026-05-18", "2026-05-31",
+                                   warn=lambda _m: None)["meta"]
+            conn.close()
+            self.assertEqual(meta["ref_date"], want)
+            self.assertEqual(meta["period"],
+                             {"from": "2026-05-18", "to": "2026-05-31"})
+
 
 if __name__ == "__main__":
     unittest.main()

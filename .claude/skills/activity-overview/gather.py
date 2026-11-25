@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 
 import derive
+import extract
 import graphstore
 import manifest as manifest_mod
 
@@ -74,7 +75,14 @@ def parse_git_log(raw):
     """Parse `git log` output formatted with RECORD_SEP/FIELD_SEP separators.
 
     Each record: <sha>\x1f<parents>\x1f<author>\x1f<date>\x1f<subject> followed by
-    newline-separated file paths. Returns a list of commit dicts.
+    newline-separated file paths. Returns a list of commit dicts. When the record
+    carries a sixth field (the author email, `%ae`, COMMIT_WALK_ARGS) it is kept as
+    a TRANSIENT `author_email` key: `resolve_commit_authors` reads it to find the
+    author's GitHub login and removes it, so no email reaches the bundle (#78).
+    A seventh field (the strict-ISO committer timestamp, `%cI`) becomes
+    `committed_at`, normalised to UTC `YYYY-MM-DDTHH:MM:SSZ` (the GitHub API's
+    form) so it sorts against comment timestamps; `date` stays the day used for
+    windowing. An empty or unparseable timestamp adds no key (#82).
     """
     commits = []
     for chunk in raw.split(RECORD_SEP):
@@ -88,7 +96,7 @@ def parse_git_log(raw):
         # `--name-only` paths: C-quoted ones (quote/backslash/control chars, or
         # non-ASCII without core.quotepath=false) are unquoted.
         files = [unquote_git_path(ln) for ln in lines[1:] if ln.strip()]
-        commits.append({
+        commit = {
             "sha": sha,
             "parents": parents.split() if parents.strip() else [],
             "author": author,
@@ -96,8 +104,28 @@ def parse_git_log(raw):
             "message": subject,
             "files": files,
             "pr": None,  # resolved in link.py
-        })
+        }
+        if len(fields) > 5:
+            commit["author_email"] = fields[5].strip()
+        if len(fields) > 6:
+            committed_at = _utc_timestamp(fields[6].strip())
+            if committed_at:
+                commit["committed_at"] = committed_at
+        commits.append(commit)
     return commits
+
+
+def _utc_timestamp(value):
+    """A strict-ISO timestamp with an offset (`%cI`) as UTC
+    `YYYY-MM-DDTHH:MM:SSZ`, or None when it is empty, unparseable or has no
+    offset. Pure."""
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.utcoffset() is None:
+        return None
+    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # git log format for the full-window code-event walk (Phase 3a). Same RECORD_SEP/
@@ -110,7 +138,14 @@ CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
 # shared with the real-repo tests so they exercise the exact commands. Paths in
 # their output are made comparable by run_git (core.quotepath=false) plus
 # unquote_git_path in each parser.
-COMMIT_WALK_ARGS = (f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+# The commit walk alone also asks for the author email (`%ae`, appended LAST so the
+# shared five-field header parses unchanged); it is only used to resolve the
+# author's GitHub login and is never stored (#78). After it comes the strict-ISO
+# committer timestamp (`%cI`, unaffected by `--date=short`), stored as the
+# commit's `committed_at` so the timeline orders same-day events by real time
+# (#82).
+COMMIT_LOG_FORMAT = CODE_LOG_FORMAT + "%x1f%ae%x1f%cI"
+COMMIT_WALK_ARGS = (f"--pretty=format:{COMMIT_LOG_FORMAT}", "--date=short",
                     "--name-only")
 CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
                   "--name-status", "-M", "-C")
@@ -583,7 +618,7 @@ def normalize_pr(raw):
         "body": raw.get("body") or "",
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
-        "labels": [lbl["name"] for lbl in raw.get("labels", [])],
+        "labels": [lbl["name"] for lbl in raw.get("labels") or []],
         "milestone": milestone.get("title") if milestone else None,
         "merged": bool(raw.get("merged_at")),
         "merged_by": (raw.get("merged_by") or {}).get("login")
@@ -641,8 +676,8 @@ def normalize_issue(raw):
         "kind": "other",  # refined in later phases (issue types/labels/template)
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
-        "labels": [lbl["name"] for lbl in raw.get("labels", [])],
-        "assignees": [a["login"] for a in raw.get("assignees", [])],
+        "labels": [lbl["name"] for lbl in raw.get("labels") or []],
+        "assignees": [a["login"] for a in raw.get("assignees") or []],
         "milestone": milestone.get("title") if milestone else None,
         "state": raw.get("state"),
         "state_reason": raw.get("state_reason"),
@@ -808,6 +843,100 @@ def attach_commit_prs(commits):
     for c in commits:
         c["pr"] = resolve_commit_pr(c.get("message", ""))
     return commits
+
+
+# --- People identity (#78): commit author -> GitHub login --------------------
+#
+# PR/issue/review participants are GitHub LOGINS; git gives a commit author only
+# as a free-text NAME (`%an`) and an email (`%ae`). Each commit's author is
+# resolved to a login from real data, in this order:
+#   1. the commits-list API's `author.login` for that SHA (GitHub's own link of the
+#      commit email to an account) — `login_source: "commits_api"`;
+#   2. a `users.noreply.github.com` author email, which embeds the login
+#      (`<id>+<login>@…`, or the older `<login>@…`) — `login_source: "noreply_email"`;
+#   3. otherwise the git name, flagged `login_resolved: false` and keyed by
+#      `derive.unresolved_person_key` so it can never equal (merge with) a login.
+# The PR author is NOT assumed to be the commit author: no guessing.
+
+_NOREPLY_EMAIL_RE = re.compile(
+    r"^(?:\d+\+)?([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?)"
+    r"@users\.noreply\.github\.com$", re.IGNORECASE)
+
+
+def login_from_noreply_email(email):
+    """The GitHub login embedded in a `users.noreply.github.com` email, or None.
+    Pure."""
+    m = _NOREPLY_EMAIL_RE.match((email or "").strip())
+    return m.group(1) if m else None
+
+
+def commit_logins_from_api(items):
+    """{sha: login} from commits-list API items (`author.login`; `author` is null
+    when GitHub links the commit email to no account — those are skipped). Pure."""
+    out = {}
+    for it in items or []:
+        login = ((it or {}).get("author") or {}).get("login")
+        if it.get("sha") and login:
+            out[it["sha"]] = login
+    return out
+
+
+def commits_api_url(api, head_sha, frm, to):
+    """The commits-list listing for the walked history: from the clone's HEAD,
+    bounded to the window widened by one day each side (git dates are in the
+    committer's own timezone; the SHA join discards anything extra). Pure."""
+    query = urllib.parse.urlencode([
+        ("sha", head_sha),
+        ("since", _shift_date(frm, -1)[:10] + "T00:00:00Z"),
+        ("until", _shift_date(to, 1)[:10] + "T23:59:59Z"),
+        ("per_page", "100"),
+    ], safe=":")
+    return f"{api}/commits?{query}"
+
+
+def resolve_commit_authors(commits, api_logins, known_logins=()):
+    """Resolve each commit's `author` to a GitHub login, in place (#78).
+
+    Sets `author` (the login, or the unresolved person key), `author_name` (the
+    git `%an`), `login_resolved` and, when resolved, `login_source`; removes the
+    transient `author_email`. A noreply-email login takes the spelling of a
+    `known_logins` entry that differs only in case (GitHub logins are
+    case-insensitive). Returns {sha: author} so the code/symbol events of the
+    same commits can be re-keyed (`remap_event_authors`). Deterministic."""
+    by_lower = {}
+    for login in sorted(k for k in known_logins if k):
+        by_lower.setdefault(login.lower(), login)
+    out = {}
+    for c in commits:
+        name = c.get("author_name", c.get("author")) or ""
+        email = c.pop("author_email", None)
+        login, source = api_logins.get(c.get("sha")), "commits_api"
+        if not login:
+            login, source = login_from_noreply_email(email), "noreply_email"
+            if login:
+                login = by_lower.get(login.lower(), login)
+        c["author_name"] = name
+        if login:
+            c["author"] = login
+            c["login_resolved"] = True
+            c["login_source"] = source
+        else:
+            c["author"] = derive.unresolved_person_key(name)
+            c["login_resolved"] = False
+            c.pop("login_source", None)
+        if c.get("sha"):
+            out[c["sha"]] = c["author"]
+    return out
+
+
+def remap_event_authors(events, by_sha):
+    """Re-key code/symbol events' `author` to their commit's resolved author, in
+    place, so artifact lifecycle credit lands on the same person as the commit.
+    Events of a commit not in `by_sha` keep their git name. Pure otherwise."""
+    for ev in events:
+        if ev.get("commit") in by_sha:
+            ev["author"] = by_sha[ev["commit"]]
+    return events
 
 
 def parse_timeline_crossrefs(raw_timeline):
@@ -1930,13 +2059,13 @@ def _tf_top_level_attr(body, key):
         if depths[m.start()] == 0:
             return body[m.start("val"):m.end("val")]
     return None
-# Terraform graph DOT edge. The `[root] ` node prefix is OPTIONAL: older
-# `terraform graph` emitted `"[root] module.x..." -> "[root] ..."`, but modern
-# terraform (>=~1.x default graph) emits unprefixed `"module.x..." -> "..."`.
-# Matching both keeps inter-module dependency extraction working across versions.
-_TF_EDGE_RE = re.compile(
-    r'"(?:\[root\]\s*)?(?P<a>[^"]+)"\s*->\s*"(?:\[root\]\s*)?(?P<b>[^"]+)"')
-_TF_MODULE_TOKEN_RE = re.compile(r"module\.([A-Za-z0-9_-]+)")
+# Terraform graph DOT: every quoted string is a candidate node address. The
+# `[root] ` node prefix is OPTIONAL: older `terraform graph` emitted
+# `"[root] module.x..."`, modern terraform (>= 1.7) emits unprefixed `"module.x..."`.
+# A node's module CALL chain is its leading `module.<name>` segments (an instance
+# key `[0]` / `["k"]` may follow each name): `module.a.module.b.res.x` -> (a, b).
+_TF_DOT_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_TF_MODULE_STEP_RE = re.compile(r'module\.([A-Za-z0-9_-]+)(?:\[[^\]]*\])?(?:\.|(?=\s)|$)')
 
 
 def _terraform_module_bodies(tf_text):
@@ -1978,23 +2107,55 @@ def parse_terraform_module_blocks(tf_text):
     return out
 
 
-def _first_tf_module(node):
-    m = _TF_MODULE_TOKEN_RE.search(node or "")
-    return m.group(1) if m else None
+def _tf_module_chain(node):
+    """The module call chain a DOT node address lives in: `module.a.module.b.res`
+    -> ("a", "b"); a root-module node -> (). Instance keys are dropped. Pure."""
+    node = node.replace('\\"', '"')
+    if node.startswith("[root]"):
+        node = node[len("[root]"):].lstrip()
+    chain, pos = [], 0
+    while True:
+        m = _TF_MODULE_STEP_RE.match(node, pos)
+        if not m:
+            return tuple(chain)
+        chain.append(m.group(1))
+        pos = m.end()
 
 
-def parse_terraform_graph(dot_text):
-    """Extract (from_module|None, to_module) dependency pairs from terraform graph DOT.
-
-    A node's first `module.<name>` token is its owning module (None = root). An edge
-    A->B becomes (module(A), module(B)) when B is in a module and differs from A.
+def parse_terraform_module_chains(dot_text):
+    """Every module call chain the terraform graph DOT shows, with all its
+    prefixes: a node in `module.a.module.b` yields ("a",) and ("a", "b"). Read
+    from every quoted node address (edges and node declarations), so it works on
+    the legacy `[root] `-prefixed and the modern resource-only layout alike. The
+    DOT says WHICH module calls exist below the root, not who depends on whom.
     Deterministic (sorted, deduped). Pure."""
-    pairs = set()
-    for m in _TF_EDGE_RE.finditer(dot_text or ""):
-        a, b = _first_tf_module(m.group("a")), _first_tf_module(m.group("b"))
-        if b and a != b:
-            pairs.add((a, b))
-    return sorted(pairs, key=lambda p: (p[0] or "", p[1]))
+    chains = set()
+    for m in _TF_DOT_STRING_RE.finditer(dot_text or ""):
+        chain = _tf_module_chain(m.group(1))
+        for i in range(1, len(chain) + 1):
+            chains.add(chain[:i])
+    return sorted(chains)
+
+
+def parse_terraform_modules_manifest(text):
+    """Parse terraform's own record of the installed module tree,
+    `.terraform/modules/modules.json` (written by `terraform init`), into
+    {call chain: {"source", "version", "dir"}}; the root entry (Key "") is
+    dropped. Malformed input or entries are ignored ({} / skipped). Pure."""
+    try:
+        doc = json.loads(text or "")
+    except ValueError:
+        return {}
+    mods = doc.get("Modules") if isinstance(doc, dict) else None
+    out = {}
+    for e in mods if isinstance(mods, list) else ():
+        if not isinstance(e, dict) or not isinstance(e.get("Key"), str) or not e["Key"]:
+            continue
+        out[tuple(e["Key"].split("."))] = {
+            "source": e.get("Source") if isinstance(e.get("Source"), str) else None,
+            "version": e.get("Version") if isinstance(e.get("Version"), str) else None,
+            "dir": e.get("Dir") if isinstance(e.get("Dir"), str) else None}
+    return out
 
 
 def _resolve_tf_module_source(name, sources, bodies, base_dir, patterns):
@@ -2008,20 +2169,84 @@ def _resolve_tf_module_source(name, sources, bodies, base_dir, patterns):
     if not src:
         return None, None, None
     if src.startswith(".") or src.startswith("/"):
-        joined = os.path.normpath(os.path.join(base_dir, src))
-        if joined == os.pardir or joined.startswith(os.pardir + os.sep):
-            # escapes the repo (e.g. ../../.. above root): unresolvable to a
-            # repo area -> external (to=None), never a phantom dangling area.
-            return None, src, None
-        # normpath('.') is the repo root; classify it the same way root files
-        # are (-> "main.tf"), so a local source pointing at the root module
-        # resolves to the SAME area id as the root module's own files.
-        rel = "" if joined == os.curdir else joined
-        area = classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
-            or rel or "main.tf"
-        return area, src, None
+        return _tf_local_area(base_dir, src, patterns), src, None
     version = _tf_top_level_attr(bodies.get(name, ""), "version") or None
     return None, src, version                          # external: to=None, ref=src
+
+
+def _tf_local_area(base_dir, path, patterns):
+    """The repo area id of a local module dir `path` (relative to `base_dir`), or
+    None when it escapes the repo. Pure."""
+    joined = os.path.normpath(os.path.join(base_dir, path))
+    if joined == os.pardir or joined.startswith(os.pardir + os.sep):
+        # escapes the repo (e.g. ../../.. above root): unresolvable to a
+        # repo area -> external (to=None), never a phantom dangling area.
+        return None
+    # normpath('.') is the repo root; classify it the same way root files
+    # are (-> "main.tf"), so a local source pointing at the root module
+    # resolves to the SAME area id as the root module's own files.
+    rel = "" if joined == os.curdir else joined
+    return classify_code_area((rel + "/main.tf").lstrip("/"), patterns) \
+        or rel or "main.tf"
+
+
+def _tf_direct_edges(tf_text, base_dir, patterns):
+    """The DIRECT edges of one Terraform module: one per top-level `module {}`
+    block with a `source` in `tf_text` (the module dir's whole *.tf set), consumed
+    or not, all `transitive: false`; deduped on (to, ref), sorted. Shared by the
+    build path (build_terraform_edges) and the static whole-tree scan, so both
+    report the same direct set. Pure."""
+    bodies = _terraform_module_bodies(tf_text)
+    sources = parse_terraform_module_blocks(tf_text)
+    edges, seen = [], set()
+    for name in sources:                           # only blocks WITH a source
+        to, ref, version = _resolve_tf_module_source(name, sources, bodies,
+                                                      base_dir, patterns)
+        if ref is None or (to, ref) in seen:
+            continue
+        seen.add((to, ref))
+        edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
+                      "transitive": False, "provider": "terraform",
+                      "resolved": to is not None})
+    return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
+
+
+def _resolve_tf_nested(chain, manifest, base_dir, patterns):
+    """Resolve a NESTED module call chain via the init module manifest
+    (parse_terraform_modules_manifest) to (to|None, ref|None, version).
+
+    A module installed in the working tree (its `Dir` outside `.terraform/`) is a
+    repo dir -> its area, with the recorded `Source` as `ref`. One installed under
+    `.terraform/modules/` belongs to a downloaded package: it is attributed to the
+    nearest call in its chain (itself first) with a remote source, e.g. a
+    registry module's internal `./modules/x` is that registry module. Unknown
+    (no manifest entry, no remote ancestor) -> (None, None, None). Pure."""
+    entry = manifest.get(chain)
+    d = os.path.normpath(entry["dir"]) if entry and entry["dir"] else None
+    if d is None:
+        return None, None, None
+    if not (os.path.isabs(d) or d == ".terraform"
+            or d.startswith(".terraform" + os.sep)):
+        return _tf_local_area(base_dir, d, patterns), entry["source"], None
+    for i in range(len(chain), 0, -1):
+        anc = manifest.get(chain[:i]) or {}
+        src = anc.get("source")
+        if src and not src.startswith((".", "/")):
+            return None, src, anc.get("version")
+    return None, None, None
+
+
+def _tf_target_identity(to, ref):
+    """What a module edge points at, for 'direct wins' dedup: a repo area, else the
+    registry module (manifest.registry_identity: host-defaulted, case-folded,
+    `//submodule` dropped — exactly what a multi-repo fold resolves to one member),
+    else the raw ref. None when unknown. Pure."""
+    if to is not None:
+        return ("area", to)
+    if ref is None:
+        return None
+    reg = manifest_mod.registry_identity(ref)
+    return ("registry",) + reg if reg else ("ref", ref)
 
 
 def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
@@ -2064,22 +2289,8 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
         # module); a nested dir is only used when the area dir itself has no *.tf.
         mod_dir = _tf_module_dir(aid, paths)
         own = [p for p in paths if os.path.dirname(p) == mod_dir]
-        base_dir = mod_dir
         text = "\n".join(read_text(p) for p in own)
-        bodies = _terraform_module_bodies(text)
-        sources = parse_terraform_module_blocks(text)
-        edges, seen = [], set()
-        for name in sources:                       # only blocks WITH a source
-            to, ref, version = _resolve_tf_module_source(name, sources, bodies,
-                                                          base_dir, patterns)
-            if ref is None or (to, ref) in seen:
-                continue
-            seen.add((to, ref))
-            edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
-                          "transitive": False, "provider": "terraform",
-                          "resolved": to is not None})
-        out[aid] = {"paths": paths,
-                    "edges": sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))}
+        out[aid] = {"paths": paths, "edges": _tf_direct_edges(text, mod_dir, patterns)}
     return out
 
 
@@ -2106,38 +2317,49 @@ def merge_structural_areas(code_graph, structural):
     return code_graph
 
 
-def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None):
-    """Build inter-area dependency edges for one Terraform area.
+def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None,
+                          modules_json=None):
+    """Build inter-area dependency edges for one Terraform area (#80).
 
-    Joins terraform-graph module pairs with the `module {source=}` blocks. A LOCAL
-    source resolves to a repo area-id (via classify_code_area, relative to base_path)
-    → `to`=area, `resolved`=True. A REGISTRY/external source cannot map to a repo area,
-    so — like the Bicep path and the schema (`to`: area-id|null) — `to`=None,
-    `resolved`=False, with the source kept in `ref` (+ pinned `version`). The DOT graph
-    is transitive: a module the root depends on directly is `transitive`=False; one
-    reached ONLY through another module is `transitive`=True (and direct wins if both).
-    Pure; deterministic."""
+    DIRECT edges are the area's own `module {}` blocks (`tf_text` = the module
+    dir's whole *.tf set): every block with a `source` is `transitive`=False,
+    whether or not anything consumes it (_tf_direct_edges, the same rule as the
+    static whole-tree scan). A LOCAL source resolves to a repo area-id (via
+    classify_code_area, relative to base_path) → `to`=area, `resolved`=True. A
+    REGISTRY/external source cannot map to a repo area, so — like the Bicep path
+    and the schema (`to`: area-id|null) — `to`=None, `resolved`=False, with the
+    source kept in `ref` (+ pinned `version`).
+
+    The terraform graph DOT is used ONLY for NESTED module calls
+    (`module.a.module.b`, parse_terraform_module_chains): each is a
+    `transitive`=True edge carrying its `address` and the parent call it is
+    reached `via`. Its target comes from `modules_json` (the
+    `.terraform/modules/modules.json` the same `terraform init` wrote;
+    _resolve_tf_nested); without it the target is unknown (`to`/`ref` None) but
+    the edge is still recorded. Direct wins: a nested call whose target is
+    already a direct edge (or an earlier nested one) is not repeated
+    (_tf_target_identity). Pure; deterministic."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
-    bodies = _terraform_module_bodies(tf_text)
-    sources = parse_terraform_module_blocks(tf_text)
     base_dir = os.path.dirname(base_path or "")
-
-    pairs = parse_terraform_graph(dot_text)
-    direct = {b for a, b in pairs if a is None}    # modules the root depends on
-    edges = []
-    seen = set()
-    for _a, b in pairs:
-        to, ref, version = _resolve_tf_module_source(b, sources, bodies, base_dir, patterns)
-        if ref is None:                            # module block with no source
+    edges = _tf_direct_edges(tf_text, base_dir, patterns)
+    seen = {_tf_target_identity(e["to"], e["ref"]) for e in edges}
+    manifest = parse_terraform_modules_manifest(modules_json) if modules_json else {}
+    nested = []
+    for chain in parse_terraform_module_chains(dot_text):
+        if len(chain) < 2:                         # a root call: direct, from source
             continue
-        key = (to, ref)
+        to, ref, version = _resolve_tf_nested(chain, manifest, base_dir, patterns)
+        address = ".".join("module." + n for n in chain)
+        key = _tf_target_identity(to, ref) or ("address", address)
         if key in seen:
             continue
         seen.add(key)
-        edges.append({"to": to, "kind": "module", "ref": ref, "version": version,
-                      "transitive": b not in direct, "provider": "terraform",
-                      "resolved": to is not None})
-    return sorted(edges, key=lambda e: (str(e["to"]), str(e["ref"])))
+        nested.append({"to": to, "kind": "module", "ref": ref, "version": version,
+                       "transitive": True, "provider": "terraform",
+                       "resolved": to is not None, "address": address,
+                       "via": address.rsplit(".module.", 1)[0]})
+    return sorted(edges + nested,
+                  key=lambda e: (str(e["to"]), str(e["ref"]), e.get("address", "")))
 
 
 def _read_text_file(path):
@@ -2567,7 +2789,10 @@ def parse_args(argv):
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
     p.add_argument("--ref-date", default=None,
-                   help="Reference date for milestone framing (default: --to).")
+                   help="Reference date for milestone/sprint/forecast/flow "
+                        "framing (YYYY-MM-DD or a full ISO timestamp; default: "
+                        "--to). Stored with the window; view.py/digest.py "
+                        "read it back.")
     p.add_argument("--include-workflows", dest="include_workflows",
                    action="store_true", default=True)
     p.add_argument("--no-workflows", dest="include_workflows", action="store_false")
@@ -2594,7 +2819,14 @@ def parse_args(argv):
                    help="path to a multi-repo project manifest (JSON). Mutually "
                         "exclusive with --owner/--repo; folds every member repo "
                         "into one store under the manifest's logical project name.")
+    p.add_argument("--resume", action="store_true",
+                   help="with --manifest: gather only the members whose last "
+                        "attempt for the manifest's window is not 'ok' (failed "
+                        "or not attempted, see meta member_status); members "
+                        "already ok for that window are left as they are.")
     args = p.parse_args(argv)
+    if args.resume and not args.manifest:
+        p.error("--resume needs --manifest")
     # --manifest carries its own member list + window, so the single-repo flags
     # are meaningless alongside it. Enforce the documented exclusivity rather than
     # silently letting the manifest branch win (ambiguous, misleading help text).
@@ -2617,6 +2849,9 @@ def parse_args(argv):
             manifest_mod.check_date(args.to, "--to")
         if frm is not None and args.to is not None:
             manifest_mod.check_window(frm, args.to, "--from", "--to")
+        # Stored with the window at fold and read back by every view (#75).
+        if args.ref_date is not None:
+            manifest_mod.check_ref_date(args.ref_date, "--ref-date")
     except ValueError as exc:
         p.error(str(exc))
     return args
@@ -2752,6 +2987,18 @@ def _list_tf_files(clone_dir, rel_dir):
     return [os.path.join(rel_dir, f) if rel_dir else f for f in names]
 
 
+def _read_tf_modules_json(read_text, clone_dir, rel_dir):
+    """The `.terraform/modules/modules.json` that `terraform init` just wrote in the
+    module dir (its record of the installed module tree, used to name NESTED
+    module calls), or None when it is absent or unreadable — the nested edges then
+    keep an unknown target; the build itself still counts as resolved."""
+    try:
+        return read_text(os.path.join(clone_dir, rel_dir, ".terraform", "modules",
+                                      "modules.json"))
+    except Exception:
+        return None
+
+
 def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf,
                         run, read_text, timeout, retries):
     """Resolve ONE area's edges. Returns (edges_or_None, status). Never raises.
@@ -2787,7 +3034,9 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
             # the whole dir. Fall back to the entrypoint if the dir can't be listed.
             tf_files = _list_tf_files(clone_dir, rel_dir) or [tp]
             src = "\n".join(read_text(os.path.join(clone_dir, f)) for f in tf_files)
-            return build_terraform_edges(src, dot, tp, area_ids, patterns), "resolved"
+            mods = _read_tf_modules_json(read_text, clone_dir, rel_dir)
+            return build_terraform_edges(src, dot, tp, area_ids, patterns,
+                                         modules_json=mods), "resolved"
         except subprocess.TimeoutExpired:
             status = "timeout"   # hung build: bounded, retried, then recorded
         except Exception:
@@ -3980,6 +4229,28 @@ def acquire(args, env):
         # in the existing issue loop — see Step 3a); the classifier is pure.
         issue["kind"] = classify_issue_kind(issue, label_taxonomy, types_present)
 
+    # People identity (#78): resolve each commit author (git name) to the GitHub
+    # login PR/issue/review records use, so one person is one key. One paginated
+    # commits-list listing (ceil(commits / 100) REST calls, none for an empty
+    # window) joined on SHA; then the noreply email; else flagged unresolved.
+    # Code/symbol events are re-keyed to the same author.
+    if commits:
+        head = clone_head_sha(clone_dir)
+        api_items = fetch_all(get_page, commits_api_url(api, head, frm, to)) \
+            if head else []
+        known = set()
+        for it in prs + issues:
+            known.add(it.get("author"))
+            known.add(it.get("merged_by"))
+            known.update(it.get("reviewers") or [])
+            for c in (it.get("comments_list") or []) + (it.get("review_comments") or []):
+                known.add(c.get("author"))
+        known.discard(None)
+        by_sha = resolve_commit_authors(
+            commits, commit_logins_from_api(api_items), known)
+        remap_event_authors(code_events, by_sha)
+        remap_event_authors(symbol_events, by_sha)
+
     workflows = []
     workflow_stats = {}
     if getattr(args, "include_workflows", True):
@@ -4438,6 +4709,47 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
     }
 
 
+def _fold_artifacts(conn, bundle, project, repo, fetched):
+    """Artifact `code` node rows for one fold, rebuilt from the repo's WHOLE
+    stored ledger (#76). Call inside the fold's transaction, after this bundle's
+    ledger rows and move edges are written.
+
+    The ledger keeps every window's rows, so each node is
+    derive.artifact_projection over all of them (lifecycle in date order, status
+    from the last event) plus the moves recorded by every fold — the same readers
+    (extract.ledger_events / recorded_moves) and rule validate's no_drift
+    re-runs. The store therefore equals its re-derivation by construction, and
+    folding windows in any order, or re-folding one, converges.
+
+    Only nodes this bundle can change are rewritten: the artifacts its events
+    name, plus the other endpoint of any recorded move touching one of them (a
+    move's ranking reads both endpoints' lifecycles). A bundle with no code or
+    symbol events changes no artifact and skips the ledger read."""
+    if not (bundle.get("code_events") or bundle.get("symbol_events")):
+        return []
+    affected = set(derive.build_artifacts(bundle))
+    moves = extract.recorded_moves(conn, project, repo)
+    for m in moves:
+        if m["from"] in affected or m["to"] in affected:
+            affected.update((m["from"], m["to"]))
+    code_events, symbol_events = extract.ledger_events(conn, project, repo)
+    artifacts = derive.artifact_projection(
+        {"meta": bundle.get("meta", {}), "code_events": code_events,
+         "symbol_events": symbol_events,
+         "commits": extract.commit_times(conn, project, repo)}, moves)
+    nodes = []
+    for local, art in artifacts.items():
+        if local not in affected:
+            continue
+        # ts: the artifact's last lifecycle event date (its most-recent activity);
+        # None when it has no events (degrades cleanly, excluded from window scans).
+        lc = art.get("lifecycle") or []
+        ts = lc[-1]["date"] if lc else None
+        nodes.append((graphstore.qualify_id(project, repo, local), project, repo,
+                      "code", ts, art, fetched))
+    return nodes
+
+
 def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                 registry_by_slug=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
@@ -4526,20 +4838,10 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             ev.get("date"), ev.get("hunk"), None, None, None, ev.get("old_path"),
         ))
 
-    # code: artifact substrate (Phase 7b-1 step 2). Derive the per-artifact
-    # lifecycle ledger and symbol-identity moves from the raw bundle (pure, via
-    # `derive`), then persist them additively alongside the commit `code` nodes
-    # and the file-level ledger above. The artifact's own id form is the local
-    # id: `art:<path>` for file artifacts, `<path>#<lang>:<subkind>:<name>` for
-    # symbol/comment ones (see derive.build_artifacts).
-    artifacts = derive.build_artifacts(bundle)
-    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
-    for local, art in artifacts.items():
-        # ts: the artifact's last lifecycle event date (its most-recent activity);
-        # None when it has no events (degrades cleanly, excluded from window scans).
-        lc = art.get("lifecycle") or []
-        ts = lc[-1]["date"] if lc else None
-        nodes.append((qid(local), project, repo, "code", ts, art, fetched))
+    # code: artifact substrate (file `art:<path>` and symbol/comment
+    # `<path>#<lang>:<subkind>:<name>` nodes) is CUMULATIVE (#76): rebuilt from
+    # the repo's whole stored ledger once this bundle's rows are in it — see
+    # _fold_artifacts, called in the transaction below.
 
     # code: symbol-granular lifecycle ledger, keyed by the SYMBOL artifact id,
     # carrying the rich before/after fields (file-level entries leave them NULL).
@@ -4555,6 +4857,8 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # code: symbol-move edges (artifact -> artifact). Each confident move links
     # the source symbol `replaced_by` the dest and the dest `identity_from` the
     # source, both carrying move_confidence/move_basis. Idempotent by (src,dst,type).
+    # Matched within THIS window only; _fold_artifacts applies the recorded
+    # moves of every window onto the nodes (#76).
     for m in derive.match_symbol_moves(
             bundle.get("symbol_events", []),
             [(e.get("old_path"), e["path"]) for e in bundle.get("code_events", [])
@@ -4563,6 +4867,10 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         src = qid("{}#{}:{}:{}".format(m["from_path"], lang, m["subkind"], m["name"]))
         dst = qid("{}#{}:{}:{}".format(m["to_path"], lang, m["subkind"], m["name"]))
         data = {"move_confidence": m["confidence"], "move_basis": m["basis"]}
+        if m.get("commit"):
+            # the source's drop commit: lets the cumulative projection tell
+            # WHICH removal of the source this move explains.
+            data["move_commit"] = m["commit"]
         edges.append((src, dst, "replaced_by", None, data))
         edges.append((dst, src, "identity_from", None, data))
 
@@ -4768,7 +5076,7 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         local = p["local"]
         area_id = local[len("area-"):] if local.startswith("area-") else local
         nodes.append((dst, project, dst_repo, "structure", None,
-                      {"id": area_id, "synthesized": "depends_on_target"},
+                      {"id": area_id, "synthesized": graphstore.STANDIN_MARK},
                       fetched))
 
     # in_milestone (social -> structure): a PR/issue's milestone title links to
@@ -4826,6 +5134,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         graphstore.upsert_nodes(conn, nodes, commit=False)
         graphstore.upsert_edges(conn, edges, commit=False)
         graphstore.add_code_events(conn, events, commit=False)
+        graphstore.upsert_nodes(
+            conn, _fold_artifacts(conn, bundle, project, repo, fetched),
+            commit=False)
 
         # fts_text: index the searchable text per owning node id so `spotlight
         # grep` has something to MATCH (Phase 8a prerequisite). FTS5-gated —
@@ -4854,6 +5165,14 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
 
         graphstore.record_window(conn, project, repo, meta.get("from"),
                                  meta.get("to"), commit=False)
+        # The window's reference date (issue #75): acquire() sets meta.ref_date
+        # to `--ref-date` or `to`; the view of this window reads it back.
+        # Always written (falling back to `to`), so a re-fold of the same window
+        # without `--ref-date` resets an earlier override.
+        ref_date = meta.get("ref_date") or meta.get("to")
+        if ref_date:
+            graphstore.set_ref_date(conn, project, repo, meta.get("from"),
+                                    meta.get("to"), ref_date, commit=False)
         if meta.get("clone_sha"):
             graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
                                      commit=False)
@@ -4878,7 +5197,76 @@ def _member_args(base, member, frm, to):
     return ns
 
 
+def _failure_reason(exc):
+    """One-line, deterministic reason for a member that failed with `exc`. The
+    HTTP layer and acquire() stop with SystemExit(<message>); anything else is
+    `<ExceptionType>: <message>`. Capped at 500 characters."""
+    if isinstance(exc, SystemExit):
+        text = exc.code if isinstance(exc.code, str) else \
+            "exit status {}".format(exc.code)
+    else:
+        text = "{}: {}".format(type(exc).__name__, exc) if str(exc) \
+            else type(exc).__name__
+    return " ".join(str(text).split())[:500]
+
+
+def _gather_manifest(conn, args, man):
+    """Gather + fold every manifest member, one at a time (issue #77). A member
+    that fails (any Exception, or the SystemExit the HTTP layer raises) is
+    recorded and the run goes on with the next member; its fold, if it got that
+    far, rolled back as one transaction. Every member to attempt is first
+    recorded `not_attempted` for the window, then `ok` or `failed` (with the
+    reason) when its turn ends, so an interrupted run is visible in the store
+    too. With `--resume`, members already `ok` for this window are skipped.
+    Returns [(slug, reason)] for the members that failed, in manifest order."""
+    project, frm, to = man["project"], man["from"], man["to"]
+    members = manifest_mod.member_slugs(man)
+    registry_by_slug = {
+        "{}/{}".format(m["owner"], m["repo"]): m.get("registry")
+        for m in man["repos"]}
+    slugs = ["{}/{}".format(m["owner"], m["repo"]) for m in man["repos"]]
+    done = set()
+    if args.resume:
+        done = {e["repo"] for e in graphstore.get_member_status(conn, project)
+                if e["from"] == frm and e["to"] == to
+                and e["status"] == graphstore.MEMBER_OK}
+    todo = [s for s in slugs if s not in done]
+    if not todo:
+        sys.stderr.write("nothing to resume: every member of project '{}' is "
+                         "ok for {}..{}\n".format(project, frm, to))
+        return []
+    with conn:
+        graphstore.set_member_status(conn, project, todo, frm, to,
+                                     graphstore.MEMBER_NOT_ATTEMPTED,
+                                     commit=False)
+    failures = []
+    for m, slug in zip(man["repos"], slugs):
+        if slug not in todo:
+            continue
+        try:
+            bundle = acquire(_member_args(args, m, frm, to), os.environ)
+            fold_bundle(conn, bundle, project=project, repo=slug,
+                        members=members, registry_by_slug=registry_by_slug)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - per member
+            reason = _failure_reason(exc)
+            failures.append((slug, reason))
+            sys.stderr.write("member {} failed: {}\n".format(slug, reason))
+            status, error = graphstore.MEMBER_FAILED, reason
+        else:
+            status, error = graphstore.MEMBER_OK, None
+        with conn:
+            graphstore.set_member_status(conn, project, [slug], frm, to,
+                                         status, error, commit=False)
+    sys.stderr.write(
+        "folded {} of {} member repo(s) of project '{}' into store {}\n".format(
+            len(todo) - len(failures), len(todo), project, args.store))
+    return failures
+
+
 def main(argv=None):
+    """Exit: returns the store path when every repo folded. A manifest run in
+    which any member failed still folds the others, then prints a summary
+    (member -> reason) and exits 1 (issue #77)."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     # A non-integer ACTIVITY_* knob fails here, before any clone or API call.
     validate_env_knobs()
@@ -4888,28 +5276,28 @@ def main(argv=None):
         args, "manifest", None) else None
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
-    graphstore.init_schema(conn)
-    if man is not None:
-        members = manifest_mod.member_slugs(man)
-        registry_by_slug = {
-            "{}/{}".format(m["owner"], m["repo"]): m.get("registry")
-            for m in man["repos"]}
-        for m in man["repos"]:
-            member_args = _member_args(args, m, man["from"], man["to"])
-            bundle = acquire(member_args, os.environ)
-            fold_bundle(conn, bundle, project=man["project"],
-                        repo="{}/{}".format(m["owner"], m["repo"]),
-                        members=members, registry_by_slug=registry_by_slug)
-        sys.stderr.write(
-            "folded {} member repo(s) of project '{}' into store {}\n".format(
-                len(man["repos"]), man["project"], args.store))
-    else:
-        # Store-only single-repo path (Phase 7). Same acquire->fold->return as
-        # before; the store setup above is now shared with the manifest branch.
-        bundle = acquire(args, os.environ)
-        fold_bundle(conn, bundle)
-        sys.stderr.write("folded bundle into store {}\n".format(args.store))
-    conn.close()
+    failures = []
+    try:
+        graphstore.init_schema(conn)
+        if man is not None:
+            failures = _gather_manifest(conn, args, man)
+        else:
+            # Store-only single-repo path (Phase 7): acquire -> fold. A failure
+            # propagates as before: there is no other member to go on with.
+            bundle = acquire(args, os.environ)
+            fold_bundle(conn, bundle)
+            sys.stderr.write("folded bundle into store {}\n".format(args.store))
+    finally:
+        conn.close()
+    if failures:
+        lines = ["gather: {} of {} member(s) failed for project '{}' "
+                 "({}..{}):".format(len(failures), len(man["repos"]),
+                                    man["project"], man["from"], man["to"])]
+        lines += ["  {}: {}".format(slug, reason) for slug, reason in failures]
+        lines.append("the other members are folded; re-run with --resume to "
+                     "gather only the failed member(s)")
+        sys.stderr.write("\n".join(lines) + "\n")
+        raise SystemExit(1)
     return args.store
 
 

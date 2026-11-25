@@ -637,7 +637,7 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--owner` / `--repo` | — | single-repo target (mutually exclusive with `--manifest`) |
 | `--manifest PATH` | — | multi-repo project manifest |
 | `--from` / `--to` | — | window (YYYY-MM-DD) |
-| `--ref-date` | `--to` | reference point for milestone/sprint/forecast/flow framing |
+| `--ref-date` | `--to` | reference point for milestone/sprint/forecast/flow framing; stored with the window, read back by `view.py`/`digest.py` |
 | `--branches` | `main` | mainline(s); first is `base_branch` |
 | `--clone-dir` | auto | clone location (reuse to enable `--no-clone`) |
 | `--no-clone` | off | reuse an existing clone (still runs `git log`) |
@@ -658,11 +658,11 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 `validate.py STORE` · `--project` · `--repo` · `--bundle` (optional cross-check) · `--json`.
 
 ### `spotlight.py` — analytics (offline)
-`spotlight.py <query> <arg> --store STORE [--project] [--from] [--to] [--json|--md] [--complete]`.
+`spotlight.py <query> <arg> --store STORE [--project] [--repo] [--from] [--to] [--json|--md] [--complete]`.
 Queries: `person` · `symbol` · `subsystem` · `grep` · `module` · `dependents`.
 
 ### `digest.py` — project view (offline)
-`digest.py --store STORE [--project NAME] [--manifest M] [--repo … (repeatable)] --from F --to T [--ticket-pattern RE]`.
+`digest.py --store STORE [--project NAME] [--manifest M] [--repo … (repeatable)] --from F --to T [--ticket-pattern RE] [--ref-date D]`.
 Ticket clustering (`related_work`) is opt-in via the manifest's `ticket_prefixes`
 or `--ticket-pattern`; unknown project/repo or a bad window exits 2.
 

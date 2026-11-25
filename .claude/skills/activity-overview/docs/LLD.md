@@ -55,7 +55,7 @@
 | `series.py` | 132 | Pure installment snapshot + comparison | — | — |
 | `render.py` | 1,010 | Mermaid emitters (size-capped) + `mmdc` validation | — | — |
 | `validate.py` | 907 | Trust gate (audits) | — | — |
-| `spotlight.py` | 1,685 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
+| `spotlight.py` | 1,875 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
 | `digest.py` | 414 | Multi-repo project view | — | — |
 | `manifest.py` / `manifest_from_index.py` | 195 / 278 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
 | `transcript.py` | 116 | VTT/SRT/TXT normalization | — | — |
@@ -113,8 +113,9 @@ scratch store) and `backfill` respectively.
 |---|---|---|
 | `--owner`, `--repo` | — | Single-repo target |
 | `--manifest PATH` | — | Multi-repo project (validated by `manifest.load_manifest` **before** the store is touched) |
+| `--resume` | off | Manifest only: gather just the members not `ok` for the manifest window (meta `member_status`, #77) |
 | `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
-| `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing |
+| `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing (`YYYY-MM-DD` or full ISO timestamp, `manifest.check_ref_date`). Stored per window at fold (`ref_date:` meta key) and read back into the view's `meta.ref_date` (§6.1) |
 | `--branches` | `main` | Recorded in `meta`; first is `base_branch` (walk uses the checked-out default branch) |
 | `--clone-dir` | `workspace/<repo>-clone` | Clone location |
 | `--no-clone` | off | Reuse an existing clone |
@@ -126,6 +127,16 @@ scratch store) and `backfill` respectively.
 Single-repo folds use `project = owner`, `repo = <name>`. Manifest folds use
 `project = manifest.project`, `repo = "owner/repo"`, and pass `members` +
 `registry_by_slug` to `fold_bundle` for cross-repo resolution.
+
+Manifest runs gather members one at a time (`_gather_manifest`, issue #77). Each member
+to attempt is first recorded `not_attempted` in meta `member_status` for the manifest
+window; a member whose `acquire` or fold raises (any `Exception`, or the `SystemExit` the
+HTTP layer uses) is recorded `failed` with a one-line reason and the run continues with the
+next member (its fold, one transaction, rolled back); a member that folded is recorded `ok`.
+At the end gather prints `member -> reason` for each failure and exits 1. The store
+connection is closed in a `finally`. `--resume` (manifest only) skips the members already
+`ok` for the window. A `KeyboardInterrupt` is not caught: the remaining members stay
+`not_attempted`.
 
 ### 4.2 `acquire(args, env)` sequence
 
@@ -158,6 +169,10 @@ sequenceDiagram
     A->>REST: comments, timeline
   end
   A->>A: detect_label_taxonomy, apply_facets, classify_issue_kind
+  opt window has commits
+    A->>REST: commits?sha=HEAD&since&until (author.login per SHA)
+    A->>A: resolve_commit_authors (API login, noreply email, else flagged git name)
+  end
   A->>REST: workflow runs, releases, milestones
   opt token has read:project
     A->>GQL: Projects v2 boards (maintained only), items, iterations
@@ -248,7 +263,7 @@ flowchart TB
   C -- "*.tf and terraform on PATH" --> TF["terraform init -backend=false<br/>+ terraform graph (DOT)"]
   C -- none --> SK
   BI --> BE["build_bicep_edges<br/>source refs + walk_arm_deployments"]
-  TF --> TE["build_terraform_edges<br/>parse_terraform_graph + module blocks"]
+  TF --> TE["build_terraform_edges<br/>module blocks (direct) + DOT nested calls<br/>+ .terraform/modules/modules.json"]
   BE --> R["edges with to, ref, version,<br/>transitive, local, instances"]
   TE --> R
   BI -. "timeout / failure, retried IAC_RETRIES" .-> F["edges_status = timeout / failed"]
@@ -269,9 +284,11 @@ flowchart TB
   files under nested `examples/`/`tests/` are never chosen, so an AVM child module
   (`avm/res/key-vault/vault/access-policy/main.bicep`) is never built in place of its parent.
   With no clone directory on disk (offline callers) the same rule runs over `paths` alone.
-- **Build-only:** edges come only from a successful build; static guessing is never emitted.
-  A `resolved` area with no edges genuinely has no inter-area dependencies; `timeout`/`failed`
-  are **counted gaps**.
+- **Build-only:** this path emits an area's edges only after a successful build. A `resolved`
+  area with no edges genuinely has no inter-area dependencies; `timeout`/`failed` are
+  **counted gaps**. (For Terraform the direct edges themselves are source-parsed, and manifest
+  gathers add static edges for every module dir through the structural scan below. Single-repo
+  gathers keep the build gate: no `terraform` means no Terraform edges. Decided in #80.)
 - **Bicep:** `parse_bicep_module_refs` splits a **public**-registry ref (`br/public:<path>:<ver>` /
   `br:mcr.microsoft.com/bicep/<path>:<ver>`) into `registry_path` + `version`; private-registry
   (`br:<other-host>/…`), template-spec (`ts:…`, `ts/<alias>:…`) and user-alias (`br/<alias>:…`)
@@ -283,9 +300,22 @@ flowchart TB
   `avm/res/network/virtual-network` whether or not it changed in the window; anything else is
   `to=None, resolved=False` (#73). Transitive edges come from walking nested
   deployments in the compiled ARM (`walk_arm_deployments`).
-- **Terraform:** extraction reads **every `*.tf` in the entrypoint's module dir**; `parse_terraform_graph`
-  accepts DOT edges with or without the legacy `[root] ` node prefix (`_TF_EDGE_RE`); a node's
-  first `module.<name>` token gives its owning module. Local sources resolve to repo areas
+- **Terraform (#80):** extraction reads **every `*.tf` in the entrypoint's module dir**. The
+  **direct** set is that dir's own `module {}` blocks (`_tf_direct_edges`): every block with a
+  `source` is an edge with `transitive=false`, whether or not anything consumes its outputs.
+  This is the same function the structural scan uses. The DOT is used only for **nested** calls:
+  `parse_terraform_module_chains` reads every quoted node address, with or without the legacy
+  `[root] ` prefix and with instance keys dropped, and takes its leading `module.<name>` segments
+  as a call chain (`module.a.module.b.res` → `(a, b)`). Each chain of length ≥ 2 is a
+  `transitive=true` edge carrying `address` (`module.a.module.b`) and `via` (`module.a`). Its
+  target comes from the `.terraform/modules/modules.json` that the same `terraform init` wrote
+  (`_resolve_tf_nested`). A `Dir` in the working tree is a repo area, with `ref` set to the
+  recorded `Source`. A `Dir` under `.terraform/modules/` belongs to a downloaded package and is
+  attributed to the nearest call in its chain with a remote source, with that call's `Source`
+  and `Version`. With no manifest, the target is unknown (`to=ref=null`). Direct wins: a nested
+  target that is already an edge is not repeated (`_tf_target_identity`: the area, else the
+  registry identity without `//submodule`, else the raw ref). The DOT shows only calls that
+  contain resources, either directly or deeper down. Local sources resolve to repo areas
   (`../..` from a submodule → the root `main.tf` area); registry sources keep `to=None,
   ref=<source>, version`. Module blocks are parsed on an HCL mask (`_hcl_mask`: `#`, `//`,
   `/* */` comments, string contents incl. `${…}` interpolation, and heredocs blanked), so a
@@ -301,7 +331,9 @@ flowchart TB
   every tracked module's `source` references (`git ls-files`, no `terraform init`; per area
   only the area dir's own `*.tf`, nested `examples/`/`tests/` files excluded) and
   `merge_structural_areas` unions them, so the dependency graph reflects structure rather than
-  in-window churn. Single-repo gathers skip this to keep golden bundles byte-stable.
+  in-window churn. Its direct edges match those of a built area (`_tf_direct_edges`), so the
+  merge adds untouched module dirs and never contradicts a built area's direct set. Single-repo
+  gathers skip this to keep golden bundles byte-stable.
 
 ### 4.7 GitHub REST acquisition
 
@@ -312,6 +344,7 @@ flowchart TB
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
 | Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | referenced 404s tolerated (`allow_404`) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
+| Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
 
 Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
@@ -393,7 +426,7 @@ flowchart TB
   s2["2 · social issues<br/>+ blocks edges (only between gathered issues)"]
   s3["3 · code commits + part_of edges"]
   s4["4 · file-level code_events ledger"]
-  s5["5 · artifact code nodes (derive.build_artifacts)<br/>+ symbol code_events + replaced_by / identity_from"]
+  s5["5 · symbol code_events + replaced_by / identity_from (moves matched in this window)<br/>+ artifact code nodes rebuilt from the WHOLE ledger (_fold_artifacts)"]
   s6["6 · structure: milestones, areas, releases, sprints"]
   s7["7 · people (derive.enumerate_participants, repo = *)<br/>union across members, bots tagged"]
   s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; owns; touches; in_milestone; in_iteration"]
@@ -404,6 +437,18 @@ flowchart TB
 
 (The exact statement order inside the function differs slightly; the grouping above is the
 logical sequence. FTS text is indexed as PR/issue/commit nodes are written (FTS5-gated).)
+
+**Artifact nodes are cumulative (#76).** Inside the fold's transaction, after the ledger rows
+and move edges are written, `_fold_artifacts` reads the repo's whole ledger back
+(`extract.ledger_events`) and the recorded moves (`extract.recorded_moves`), runs
+`derive.artifact_projection` (= `build_artifacts`, lifecycle in date order via
+`derive.chronological`, then `derive.apply_recorded_moves`) and upserts the artifacts the
+bundle names plus the other end of any recorded move touching one. `validate.no_drift` runs
+the same readers and projection, so store == re-derived by construction and the fold is
+order-independent. Symbol moves stay matched per window (whole-ledger matching would turn a
+creation `add` plus a later move `add` into an ambiguous pair); the nodes apply every recorded
+move, a source only while its last event is a remove. Cost: one read of the repo's ledger per
+fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows).
 
 ### 4.11 Cross-repo `depends_on` resolution (Terraform)
 
@@ -504,13 +549,14 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 
 | Group | Functions |
 |---|---|
-| Lifecycle | `open_store`, `init_schema`, `set_meta`, `get_meta`, `now_iso` |
-| Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` |
+| Lifecycle | `open_store`, `open_store_readonly` (existing file, `mode=ro`), `init_schema`, `set_meta`, `get_meta`, `now_iso` |
+| Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` (repos with nodes, minus stand-in-only repos with no gathered window, #77) |
 | Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)` |
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
 | Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
 | Text | `index_text` / `index_texts` (replace by node id via `fts_map`, no table scan), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
 | Provenance | `record_window`/`get_windows`, `set_clone_sha`/`get_clone_sha` |
+| Member run status | `set_member_status`/`get_member_status`, `incomplete_members(conn, project, ts_from, ts_to)`, `incomplete_warning`, `describe_member_status` (#77) |
 | Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
 
 **Semantics.** Identity columns are immutable; `ts`/`data`/`fetched_at` refresh on re-upsert.
@@ -523,7 +569,7 @@ exact), inclusive, either bound optional. `complete._in_window`, `spotlight` win
 `gather.in_window` and `link._in_window` delegate to `ts_in_window`; no caller pads bounds.
 `traverse_spine` walks spine edges **undirected**, depth-capped; `missing` lists referenced but
 unstored spine ids (minus known-dead when `skip_dead`).
-`edges_by_type` / `repo_code_events` filter on the literal `{project}/` / `{project}/{repo}#`
+`edges_by_type` / `repo_code_events` (and `spotlight`'s person scan) filter on the literal `{project}/` / `{project}/{repo}#`
 id prefix **case-sensitively** as an index range (`>= prefix AND < prefix-successor`), not
 `LIKE`. Batch writers and the meta setters take `commit=False`; `gather.fold_bundle` uses it
 to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clone_sha`) in
@@ -531,7 +577,7 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
 
 ## 6. Read and enrich
 
-### 6.1 `extract.extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None, backfill=None, backfill_budget=50)`
+### 6.1 `extract.extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None, backfill=None, backfill_budget=50, ref_date=None)`
 
 1. `range_query` the window for in-window nodes.
 2. Seed trains from in-window **anchors** (PR/issue; reviews/events never seed), then
@@ -546,14 +592,21 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    `fold_bundle` (`owns`) and `annotate_people_profile` (`stale_owned`) share one matcher,
    `derive.compile_codeowners`/`area_owners` (area = last rule matching `<area>/`).
 
+6. `_materialize_meta` (issue #75): `owner, repo, from, to` (+ `clone_sha`), `period =
+   {from: ts_from, to: ts_to}` (the requested bounds, unchanged — the same ones step 1 uses)
+   and `ref_date` = the `ref_date` argument (view/digest `--ref-date`), else
+   `graphstore.get_ref_date(project, repo, ts_from, ts_to)` (stored by fold for exactly that
+   gathered window), else `ts_to`.
+
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
-> **Single-window assumption.** `_materialize_meta` emits `owner, repo, from, to` (+
-> `clone_sha`) — no `period` or `ref_date` — and steps 4–5 read the repo's *whole* stored node
-> set, not just the window. On a store gathered for one window this is exact (and is what the
-> golden-equivalence tests pin). On a store holding several windows, the view includes every
-> stored PR/issue/commit/train, and `compute_buckets` (which treats a missing `period` as
-> "in window") counts every stored merge as shipped. See HLD §10 items 8–9 and §14.4.
+> **Single-window assumption (arrays).** Steps 4–5 read the repo's *whole* stored node set,
+> not just the window. On a store gathered for one window this is exact (and is what the
+> golden-equivalence tests pin). On a store holding several windows, the view's arrays and
+> trains include every stored PR/issue/commit; the buckets do not, because `meta.period`
+> bounds them (§6.5). See HLD §10 item 8 and §14.5.
+> (Artifacts are already right: their stored nodes are cumulative over every folded
+> window, #76.)
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -585,6 +638,11 @@ flowchart TB
 
 Order matters: significance needs code areas; forecast needs buckets and milestones; people
 profiles need trains and artifacts. `artifacts`/`people` are **consumed**, not recomputed.
+Before the first step, `_null_collections_to_empty` makes enrich total over JSON nulls (#82): a
+null list field on a PR/issue/commit (`labels`, `reviewers`, `comments_list`, `files`, …) becomes
+`[]`, a null `facets`/`reactions` becomes `{}` and a null reaction count `0`. Only present-and-null
+keys change, so well-formed bundles (and the goldens) are untouched. The REST normalisers used by
+backfill (`normalize_pr`/`normalize_issue`) likewise read a null `labels`/`assignees` as empty.
 
 ### 6.4 Decision trains — `build_trains`
 
@@ -609,9 +667,12 @@ conventional-commit prefix. Each train records `prs`, `commits`, `code_areas`,
 
 ### 6.5 Buckets — `compute_buckets`
 
-Evaluated per PR then per issue; first matching rule wins. "In window" uses `meta.period`;
-when `period` is absent (as in an `extract` view) `_in_window` returns true for every
-timestamp:
+Evaluated per PR then per issue; first matching rule wins. "In window" uses
+`link.window_period(meta)` — `meta.period`, else `{from: meta.from, to: meta.to}` — the same
+helper `build_forecast` uses (issue #75). Every `extract` view carries `period`, so an issue
+closed in an earlier window but commented on in this one, or an open issue last touched long
+ago, falls in no bucket. Only a bundle with neither `period` nor `from`/`to` (dateless
+fixtures) is unbounded; an item with no timestamp counts as in window:
 
 ```mermaid
 flowchart TB
@@ -680,8 +741,11 @@ verification happens in the next installment's series block.
 Pure, read-only, raises `KeyError` on an unknown id. Returns `{train, issue, prs, commits,
 feature_deltas, symbol_moves}` plus review rounds, capped reviews/lifecycle and reopen counts.
 Caps: text `SLICE_TEXT_CAP` = 1500 chars (with `…[+N chars]`), `SLICE_COMMENTS_KEPT` = 6 per list
-(overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars
-(`feature_deltas_diff_overflow` counts dropped diffs).
+(overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars: walking the train's
+deltas in order, a `diff` is kept only if `used + len(diff) <= SLICE_DIFF_CAP` (#82), so the kept
+total never exceeds the cap; a diff that does not fit is omitted (the delta stays listed) and
+counted in `feature_deltas_diff_overflow`. BUNDLE.md documents every slice key; a docs-contract
+test (`test_link_small_fixes.py`) compares it with `slice_train`'s output.
 
 ### 6.9 Series — `series.py` via `link.py BUNDLE --series series.json`
 
@@ -701,7 +765,11 @@ flowchart TB
 
 Identity is `(type, id)`; URLs are excluded. `installment_snapshot` =
 `{from, to, ref_date, shipped:[{type,id}], in_flight:[{type,id,board_status?}],
-forecast:[{type,id,tier}]}`. A malformed non-empty index raises rather than being discarded.
+forecast:[{type,id,tier}]}`. The index is read and shape-checked before enrich: a non-empty
+index that is not a JSON list of objects exits 2 with `link.py --series: series index <path> …`
+and nothing is written (it is never silently discarded). The bundle is written first and the
+index second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves
+the previous file intact, and a run that cannot write its bundle appends no installment.
 **Every invocation appends** — run it exactly once per installment. Recovery from a double
 run: remove *every* snapshot whose `from`/`to` is the duplicated month (removing only the last
 leaves the month compared with itself), plus any later snapshots, then replay the saved
@@ -711,11 +779,13 @@ bundles in chronological order.
 
 | Function | Output | Rule highlights |
 |---|---|---|
-| `build_artifacts` | `artifacts{}` | lifecycle per file/symbol; status from newest event |
+| `build_artifacts` | `artifacts{}` | lifecycle per file/symbol in date order (`chronological`); status from newest event |
+| `artifact_projection` / `apply_recorded_moves` | stored artifact nodes | `build_artifacts` over the whole ledger + the store's per-window symbol moves (#76) |
 | `match_symbol_moves` / `link_symbol_identity` | `symbol_moves` | same `(lang, subkind, name)` dropped in one file, added in one other; `high` when git also flags a rename |
-| `enumerate_participants` | all logins | the single source of truth for "who" (write path and auditor) |
+| `enumerate_participants` | all logins | the single source of truth for "who" (write path and auditor); a person keyed by an unresolved commit author gets `login_resolved: false` |
 | `attribute_people_areas` | `people[].modules/areas` | commit files + reviewed PRs' areas |
-| `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*` |
+| `unresolved_person_key` | person key | the git name of a commit author gather could not resolve to a login, `+ " (git)"` when login-shaped, so it never equals a login (#78) |
+| `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*`; git-name forms `GitHub Actions`, `Dependabot`, `Dependabot Preview`, `Renovate`, `Renovate Bot` (case/space-insensitive), each also with the `" (git)"` suffix |
 | `annotate_people_profile` | per-login metrics | prs authored/merged/reviewed, merge rate, review latency (median), first/last active, examples/docs/symbols authored |
 | `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored`, top 10; **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
@@ -773,47 +843,98 @@ will not start sandboxed as root). Paths are recorded in `bundle.diagrams`.
 ## 8. Trust — `validate.py`
 
 `validate.py STORE [--project P] [--repo R] [--bundle FILE] [--json]` → exit 0 when no ERROR, 1
-otherwise. When the store (or `--project`) spans several repos and no `--repo` is given, it runs
-`validate_project` over every member plus the project-wide checks.
+otherwise; exit 2 (usage error, no report) when the path does not exist or is not a store,
+when several projects (or repos) are stored and none is named, or when `--bundle` cannot be
+read. When the store (or `--project`) spans several repos, or a manifest gather recorded
+member run status for the project, and no `--repo` is given, it runs `validate_project`
+over every member holding data (`project_repos`) plus the project-wide checks.
 
 | Check | Asserts |
 |---|---|
+| `target` | the store has nodes, the project has nodes and the repo is a stored member (case-insensitive, resolved to the stored spelling); and the member's last gather of every recorded window is `ok` (meta `member_status`, #77) |
 | `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR |
 | `participant_completeness` | every login in any raw record has a person node |
 | `provenance` | every social/code node carries a source identifier (url and/or sha) |
 | `no_fabrication` | no invented entities, no historyless artifacts, no malformed ids |
 | `schema_conformance` | each edge type's endpoint classes match STORE.md |
-| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle |
+| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves) |
 | `idempotency` | re-folding into a scratch copy changes no counts |
 | `no_drift_people` (project) | project-scoped people == union re-derived across all members |
+| `member_status` (project) | every manifest member's last gather of every recorded window is `ok`; a `failed` / `not_attempted` member is an ERROR naming the repo, window and reason, also when it holds no node and so is not an audited member (#77). Passes (INFO) on a store with no recorded status |
 
-The auditor never mutates the store; a check that raises is reported as a failed ERROR, not a
-crash. `no_drift`/`idempotency` self-source their bundle via `extract` over the store's
-gathered windows; `--bundle` is an optional cross-check.
+Every report lists every check in this order (issue #79); none is ever dropped.
+`no_drift`/`idempotency` self-source their bundle via `extract` over the span of the repo's
+timestamped nodes; a repo with only structure nodes (a quiet member) uses its recorded gathered
+windows instead; `--bundle` is an optional cross-check. When no bundle can be sourced (no nodes
+for the target, an undecodable node row, or social/code nodes with no `ts` at all) both checks
+FAIL with `could not self-source: <reason>`, and project-mode `no_drift_people` fails likewise.
+Every check runs under `_guarded`: an exception — e.g. `CorruptRow` for data that is not valid
+JSON or a social/code/person blob that is not an object — becomes a failed ERROR check carrying
+the error and the row id, so text and `--json` reports are always produced.
+
+**Read-only.** The CLI opens the store with `graphstore.open_store_readonly(path)` (SQLite
+`file:…?mode=ro` URI; raises `FileNotFoundError` for a missing path and never creates it; no
+WAL pragma, no schema step). The idempotency re-fold runs in an in-memory `backup` copy. The
+tombstone readers (`traverse_spine(skip_dead=True)`, `is_dead_ref`, `get_dead_refs`) treat a
+missing `dead_refs` table as empty instead of creating it; only `record_dead_ref` creates it.
 
 ## 9. Cross-window reader — `spotlight.py`
 
-`spotlight.py QUERY ARG --store S [--project P] [--from F] [--to T] [--json|--md] [--complete [--complete-budget N]]`
+`spotlight.py QUERY ARG --store S [--project P] [--repo R] [--from F] [--to T] [--json|--md] [--complete [--complete-budget N]]`
 
 | Query | Function | Answers |
 |---|---|---|
 | `person <login>` | `person_impact` | one contributor's footprint across trains/areas |
-| `symbol <artifact-id>` | `pattern_evolution` | one symbol's lifecycle |
-| `subsystem <area>` | `subsystem_split` | activity split within an area |
+| `symbol <artifact-id>` | `pattern_evolution` | one symbol's or file's lifecycle |
+| `subsystem [owner/repo::]<area>` | `subsystem_split` | activity split within an area |
 | `grep <phrase>` | `text_mining` | FTS5 search over PR/issue/commit text (needs FTS5) |
-| `module <area>` | `slice_module` | full-history module biography envelope |
+| `module [owner/repo::]<area>` | `slice_module` | full-history module biography envelope |
 | `dependents <owner/repo>` | `member_dependents` | reverse `depends_on` BFS — blast radius |
 
 Results share an envelope `{query, focus, focus_kind, project, status, scope, …}`.
 `status` may be `needs_gather` or `fts_unavailable` — valid answers, exit 0. `--complete`
 wires `gather.backfill` with a token (the only network path in a reader).
 
+Rules (issue #81):
+
+- **Project scope.** `fts_text` is store-wide, so `grep` keeps only ids starting
+  `{project}/` or `{project}#`; `summary.matches` counts the matches inside the trains
+  that survive `--from/--to` (not every raw hit). `person`'s authored-symbol scan uses the
+  case-sensitive `{project}/{repo}#` index range (`graphstore._prefix_range`), not `LIKE`.
+  A NUL byte in a phrase is read as a space.
+- **Areas across repos.** `subsystem`/`module` look the area up in **every** project repo
+  and union the results (the same area id — `main.tf`, `docs` — is common across members);
+  `owner/repo::area` or `--repo` (any case, `graphstore.resolve_repo`) narrows to one
+  member. Every row names its repo: envelope `repos` (members whose area answered),
+  contributor `repos`, depends_on `repo` (the member whose area node the edge hangs off),
+  module symbol/file `repo` (files sort by `(path, repo)`), and every train's `repos`.
+- **Symbol query and file artifacts.** The file-level ledger is keyed by the bare path;
+  `art:<path>` (the node id) and `<path>` both read it (`_ledger_key`, shared with
+  `slice_module`). A lifecycle ending in `remove` (symbol) or `delete` (file, git's verb)
+  is `removed`. A local id is qualified only against known `{project}/{repo}#` prefixes,
+  so a path that starts with the project name (`avm/res/…`) still resolves.
+- **Train outcome** (`_outcome`, the `link.build_trains` vocabulary and precedence):
+  `shipped` (release, merged PR, or — no PR — an issue closed as completed; a closed issue
+  without `state_reason` counts as completed) > `in_flight` (open PR, or — no PR — open
+  issue) > `rejected` (PRs, all closed unmerged) > `direct_push` (no PR, no open/completed
+  issue, but commits) > `abandoned` (only issues closed `not_planned`/`duplicate`);
+  anything else `in_flight`. Rendered badges: `[direct-push]`, `[abandoned]`.
+- **CLI.** Exactly one query argument; `--complete` only for the train queries
+  (`person`, `subsystem`, `grep`, `module`); `--repo` only for `subsystem`/`module`;
+  `--from/--to` not for `dependents` and validated by `manifest.check_reader_window`. A
+  missing (never created) or unreadable store, an empty store, an unknown `--project` or,
+  with several projects, no `--project` (the message lists the store's projects), and an
+  unknown `--repo`/qualifier (lists the project's repos) all exit 2 with usage.
+
 ## 10. Multi-repo aggregation — `digest.py`
 
-`digest.py --store S [--project P] [--manifest M] [--repo R …] --from F --to T [--ticket-pattern RE]`
+`digest.py --store S [--project P] [--manifest M] [--repo R …] --from F --to T [--ticket-pattern RE] [--ref-date D]`
 (repos default to `project_repos`; `--project` defaults to the manifest's). Works
-for single-repo stores too (`--project <owner> --repo <name>`). Exit 2 for a bad
-window (`manifest.check_reader_window`), a missing store, an unknown project (lists
+for single-repo stores too (`--project <owner> --repo <name>`). Each member bundle is an
+`extract` view, so it carries `meta.period`/`meta.ref_date` and its buckets (and so the
+merged `shipped`) are limited to the window; `--ref-date` overrides every member's
+`ref_date` (§6.1). Exit 2 for a bad
+window (`manifest.check_reader_window`), a bad `--ref-date`, a missing store, an unknown project (lists
 the store's projects) or `--repo` (lists the project's repos). Ticket clustering is
 opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
 `--ticket-pattern` (wins); otherwise `tickets`/`related_work` are `[]`. Each
@@ -928,26 +1049,30 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 - `range_query` orders by `(ts, id)`; JSON `sort_keys`; collections sorted; tie-breaks by id.
 - The only non-deterministic fields are `fetched_at` and `dead_refs.first_seen`, both excluded
   from determinism assertions.
-- Idempotency is per window: re-folding the **same** window is a no-op. Folding **different**
-  overlapping windows is not fully cumulative — see §14.4.
+- Idempotency is per window: re-folding the **same** window is a no-op. Artifact nodes are
+  cumulative across **different** (even overlapping) windows and independent of fold order
+  (§4.10); the views are not yet window-scoped — see §14.5.
 
 ### 14.2 Degradation matrix
 
 | Missing | Effect | Signal |
 |---|---|---|
-| `bicep` / `terraform` | no IaC edges | `edge_extraction` counts `skipped` |
+| `bicep` / `terraform` | no IaC edges (manifest gathers keep the static Terraform direct edges) | `edge_extraction` counts `skipped` |
+| `.terraform/modules/modules.json` | nested Terraform edges have no target (`to=ref=null`) | edge has `address`/`via` but no `ref` |
 | registry unreachable / slow init | some areas unresolved | `timeout` / `failed` counts |
 | `read:project` scope | no board status / sprints | empty board layer |
 | `mmdc` | render fails (or use `--skip-validate`) | error |
 | `graphify` | directory provider used | `code_graph.provider = directory` |
 | FTS5 | `spotlight grep` unavailable | `status: fts_unavailable` |
 | out-of-window spine node | context gap | train `gaps[]` |
+| one manifest member's gather fails | that member has no data for the window; the others are folded | gather exit 1 + summary; meta `member_status`; `validate` ERROR (`target`, `member_status`); `digest`/`view` stderr warning |
 
 ### 14.3 Performance and API budget
 
 Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open PRs) + 4 × kept PRs
 + pages(issues since from) + pages(open issues) + 2 × issues + referenced issues + workflow/
-release/milestone pages`. Because **all open PRs and issues** are included every run, busy
+release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100⌉` (the last term is
+the commit-author login listing, #78; zero for a window with no commits). Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
@@ -968,16 +1093,24 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
-| View not window-scoped on multi-window stores | `extract._materialize_meta` omits `period`; arrays come from `repo_nodes` | prior windows' merges counted as shipped; trains/commits span all stored history (member and project views) | emit `meta.period`/`ref_date` from `ts_from/ts_to`; window the materialized arrays to in-window + spine context |
-| Trust gate fails after a second overlapping fold | `fold_bundle` upserts artifact nodes with the incoming window's lifecycle; `code_events` keeps all windows | `validate.no_drift` "lifecycle length drift" | rebuild artifact lifecycle from the full ledger on fold (or merge with the stored one) |
+| View arrays not window-scoped on multi-window stores | arrays come from `repo_nodes` (buckets are bounded by `meta.period` since #75) | `prs`/`issues`/`commits` and trains span all stored history (member and project views) | window the materialized arrays to in-window + spine context |
+| Idempotency probe re-matches moves over the whole store | `validate.check_idempotency` re-folds the self-sourced bundle (every window as one); `match_symbol_moves` then sees a symbol dropped from one file in one window and added (uniquely) to another in a later window as a move | `idempotency` ERROR: edges +2 on a correct multi-window store (only in that case; `no_drift` passes) | re-fold per recorded window in the probe, or exclude move edges from its count |
+| `enrich` re-matches moves over the view | `link.enrich` runs `link_symbol_identity` over the view's whole `symbol_events` | on a multi-window store the view's artifacts can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
-| `spotlight` prefix filter still `LIKE` | `spotlight._like_prefix` (person-impact `code_events` query) uses case-insensitive `LIKE` | projects differing only in case can mix there; unindexed scan | reuse `graphstore._prefix_range` (issue #55 fixed `edges_by_type`/`repo_code_events` only) |
+| Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
+| Terraform edges are build-gated on single-repo gathers | no structural scan without a manifest (#80 decision) | without `terraform` (or with a failed init), a single-repo bundle has no Terraform edges, even though its direct edges are source-parsed | opt-in static fallback with its own `edges_status` |
+| Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
+| Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
+| Timeline code events of older commits order by day | `committed_at` (#82) is gathered from `%cI` by the commit walk only | commits in a store folded before #82, and backfilled commits (five-field log), have no `committed_at`, so their timeline events keep the bare date and sort before that day's social events | re-gather; log `%cI` in `make_backfill_fetcher` too |
+| Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |
+| Incomplete members are not in the digest JSON | #77 surfaces a failed / not-attempted member through gather's exit code, `validate` and a `digest.py`/`view.py` stderr warning only | a formatter reading only the digest/view JSON cannot tell the project is partial | add the incomplete members to the view `meta` (BUNDLE.md change) |
+| Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for
-continuity, wide single gathers for history stores) avoids the first two in practice.
+continuity, wide single gathers for history stores) avoids the first three in practice.
 
 ## 15. Testing and CI
 

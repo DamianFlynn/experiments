@@ -1959,19 +1959,15 @@ class TestTerraformParsers(unittest.TestCase):
         )
         self.assertEqual(gather.parse_terraform_module_blocks(tf)["x"], "../mods/x")
 
-    def test_graph_yields_module_dependency_pairs(self):
-        pairs = gather.parse_terraform_graph(self.dot)
-        # root (None) -> naming ; vnet -> naming
-        self.assertIn((None, "naming"), pairs)
-        self.assertIn(("vnet", "naming"), pairs)
-
-    def test_graph_ignores_same_module_self_edges(self):
-        pairs = gather.parse_terraform_graph(self.dot)
-        self.assertFalse([p for p in pairs if p[0] == p[1] and p[0] is not None])
+    def test_graph_yields_module_call_chains(self):
+        # #80: the DOT is read for the module CALL addresses its nodes carry, not
+        # for resource dependency pairs (legacy `[root] ` prefixed sample).
+        chains = gather.parse_terraform_module_chains(self.dot)
+        self.assertEqual(chains, [("naming",), ("vnet",)])
 
     def test_graph_parses_modern_unprefixed_dot(self):
         # Modern `terraform graph` (>=~1.x) omits the `[root] ` node prefix and
-        # uses fully-qualified resource node names; pairs must still be recovered.
+        # uses fully-qualified resource node names; chains must still be recovered.
         dot = (
             'digraph G {\n'
             '  "azurerm_resource_group.this" -> "module.vnet.azapi_resource.vnet";\n'
@@ -1979,14 +1975,13 @@ class TestTerraformParsers(unittest.TestCase):
             '  "module.vnet.azapi_resource.vnet" -> "module.vnet.random_uuid.t";\n'
             '}\n'
         )
-        pairs = gather.parse_terraform_graph(dot)
-        self.assertIn((None, "vnet"), pairs)          # root -> module.vnet
-        self.assertIn(("vnet", "naming"), pairs)       # cross-module edge
-        self.assertNotIn(("vnet", "vnet"), pairs)      # same-module self-edge dropped
+        chains = gather.parse_terraform_module_chains(dot)
+        self.assertEqual(chains, [("naming",), ("vnet",)])
 
     def test_empty_inputs(self):
         self.assertEqual(gather.parse_terraform_module_blocks(""), {})
-        self.assertEqual(gather.parse_terraform_graph(""), [])
+        self.assertEqual(gather.parse_terraform_module_chains(""), [])
+        self.assertEqual(gather.parse_terraform_module_chains(None), [])
         self.assertEqual(gather.parse_terraform_module_blocks(None), {})
 
 
@@ -2180,9 +2175,10 @@ class TestBuildTerraformEdges(unittest.TestCase):
         self.assertEqual(naming[0]["version"], "0.4.0")
         self.assertEqual(naming[0]["provider"], "terraform")
 
-    def test_only_transitive_local_module_is_marked_transitive(self):
-        # subnet is reached ONLY through vnet (never from root) -> transitive=True;
-        # vnet is a direct root dependency -> transitive=False.
+    def test_every_root_module_block_is_direct(self):
+        # #80: subnet's resources are reached only through vnet's, but the root
+        # DECLARES `module "subnet"`, so it is a direct dependency like vnet.
+        # (Before #80 the DOT resource edges made subnet transitive=True.)
         tf = ('module "vnet" { source = "../../modules/vnet" }\n'
               'module "subnet" { source = "../../modules/subnet" }\n')
         dot = ('digraph {\n'
@@ -2193,7 +2189,7 @@ class TestBuildTerraformEdges(unittest.TestCase):
             tf, dot, self.base, set(), gather.DEFAULT_AREA_PATTERNS)
         by_to = {e["to"]: e for e in edges}
         self.assertFalse(by_to["modules/vnet"]["transitive"])
-        self.assertTrue(by_to["modules/subnet"]["transitive"])
+        self.assertFalse(by_to["modules/subnet"]["transitive"])
 
     def test_edges_dedupe_and_are_marked_provider_terraform(self):
         edges = gather.build_terraform_edges(
@@ -2230,6 +2226,211 @@ class TestBuildTerraformEdges(unittest.TestCase):
         self.assertIsNone(edges[0]["to"])
         self.assertFalse(edges[0]["resolved"])
         self.assertEqual(edges[0]["ref"], "../../..")
+
+
+class TestTerraformDirectVsTransitive(unittest.TestCase):
+    """#80: the direct set is the area's own `module {}` blocks (every one, consumed
+    or not, transitive=False); the DOT only adds NESTED module calls
+    (`module.a.module.b`), transitive=True and attributed to their parent."""
+
+    BASE = "main.tf"
+
+    def _fix(self, name):
+        with open(os.path.join(FIX, name)) as fh:
+            return fh.read()
+
+    def _edges(self, tf, dot, modules_json=None, base=None):
+        return gather.build_terraform_edges(
+            tf, dot, base or self.BASE, set(), gather.DEFAULT_AREA_PATTERNS,
+            modules_json=modules_json)
+
+    @staticmethod
+    def _tuples(edges):
+        return [(e["to"], e["ref"], e["version"], e["transitive"]) for e in edges]
+
+    # --- the confirmed repro: root calls vnet + pe, pe -> vnet -> rg (root) ----
+    VNET_PE_TF = (
+        'resource "azurerm_resource_group" "rg" {}\n'
+        'module "vnet" {\n'
+        '  source  = "Azure/avm-res-network-virtualnetwork/azurerm"\n'
+        '  version = "0.16.0"\n'
+        '}\n'
+        'module "pe" {\n'
+        '  source  = "Azure/avm-res-network-privateendpoint/azurerm"\n'
+        '  version = "0.2.0"\n'
+        '}\n')
+
+    def test_vnet_pe_repro_modern_dot_two_direct_edges(self):
+        dot = ('digraph G {\n'
+               '  "module.pe.azurerm_private_endpoint.this" -> '
+               '"module.vnet.azapi_resource.vnet";\n'
+               '  "module.vnet.azapi_resource.vnet" -> '
+               '"azurerm_resource_group.rg";\n'
+               '}\n')
+        self.assertEqual(self._tuples(self._edges(self.VNET_PE_TF, dot)), [
+            (None, "Azure/avm-res-network-privateendpoint/azurerm", "0.2.0", False),
+            (None, "Azure/avm-res-network-virtualnetwork/azurerm", "0.16.0", False)])
+
+    def test_vnet_pe_repro_legacy_dot_two_direct_edges(self):
+        dot = ('digraph {\n'
+               '"[root] module.pe.azurerm_private_endpoint.this (expand)" -> '
+               '"[root] module.vnet.azapi_resource.vnet (expand)"\n'
+               '"[root] module.vnet.azapi_resource.vnet (expand)" -> '
+               '"[root] azurerm_resource_group.rg (expand)"\n'
+               '}\n')
+        self.assertEqual(self._tuples(self._edges(self.VNET_PE_TF, dot)), [
+            (None, "Azure/avm-res-network-privateendpoint/azurerm", "0.2.0", False),
+            (None, "Azure/avm-res-network-virtualnetwork/azurerm", "0.16.0", False)])
+
+    def test_declared_but_unconsumed_module_still_has_a_direct_edge(self):
+        tf = 'module "naming" {\n  source  = "Azure/naming/azurerm"\n  version = "0.4.0"\n}\n'
+        dot = 'digraph G {\n  "terraform_data.x" [label="terraform_data.x"];\n}\n'
+        for d in (dot, ""):                        # no module node in the DOT at all
+            self.assertEqual(self._tuples(self._edges(tf, d)),
+                             [(None, "Azure/naming/azurerm", "0.4.0", False)])
+
+    # --- nested module calls -------------------------------------------------
+    def test_nested_chain_yields_transitive_edge_via_parent(self):
+        tf = 'module "a" { source = "./modules/a" }\n'
+        dot = 'digraph G {\n  "module.a.module.b.terraform_data.x" -> "module.a.terraform_data.y";\n}\n'
+        edges = self._edges(tf, dot)
+        direct = [e for e in edges if not e["transitive"]]
+        nested = [e for e in edges if e["transitive"]]
+        self.assertEqual(self._tuples(direct), [("modules/a", "./modules/a", None, False)])
+        # no modules.json: the nested call's source is unknown -> no target, no ref,
+        # but the edge exists and names its address and the parent it is reached via
+        self.assertEqual(nested, [{
+            "to": None, "kind": "module", "ref": None, "version": None,
+            "transitive": True, "provider": "terraform", "resolved": False,
+            "address": "module.a.module.b", "via": "module.a"}])
+
+    def test_deeper_chains_and_instance_keys(self):
+        tf = 'module "a" { source = "./modules/a" }\n'
+        dot = ('digraph {\n'
+               '"[root] module.a[\\"k\\"].module.b[0].module.c.terraform_data.x (expand)"'
+               ' -> "[root] terraform_data.y (expand)"\n}\n')
+        self.assertEqual(gather.parse_terraform_module_chains(dot),
+                         [("a",), ("a", "b"), ("a", "b", "c")])
+        nested = [(e["address"], e["via"]) for e in self._edges(tf, dot) if e["transitive"]]
+        self.assertEqual(nested, [("module.a.module.b", "module.a"),
+                                  ("module.a.module.b.module.c", "module.a.module.b")])
+
+    def test_nested_local_module_resolved_from_modules_json(self):
+        tf = self._fix("terraform_nested_root.tf")
+        dot = self._fix("terraform_graph_nested_modern.dot")
+        mj = self._fix("terraform_nested_modules.json")
+        edges = self._edges(tf, dot, mj)
+        self.assertEqual(self._tuples(edges), [
+            (None, "Azure/naming/azurerm", "0.4.0", False),
+            ("modules/pe", "./modules/pe", None, False),
+            ("modules/subnet", "../subnet", None, True),
+            ("modules/vnet", "./modules/vnet", None, False)])
+        sub = next(e for e in edges if e["transitive"])
+        self.assertEqual((sub["address"], sub["via"], sub["resolved"]),
+                         ("module.vnet.module.subnet", "module.vnet", True))
+        # direct edges keep their pre-#80 shape (no address/via keys)
+        self.assertTrue(all("via" not in e for e in edges if not e["transitive"]))
+
+    def test_legacy_and_modern_fixture_dot_agree(self):
+        modern = gather.parse_terraform_module_chains(
+            self._fix("terraform_graph_nested_modern.dot"))
+        legacy = gather.parse_terraform_module_chains(
+            self._fix("terraform_graph_nested_legacy.dot"))
+        self.assertEqual(modern, [("naming",), ("pe",), ("vnet",), ("vnet", "subnet")])
+        self.assertEqual(legacy, modern)
+
+    def test_nested_registry_module_reached_through_local_parent(self):
+        tf = 'module "platform" { source = "./modules/platform" }\n'
+        dot = ('digraph G {\n'
+               '  "module.platform.module.law.azurerm_log_analytics_workspace.this"'
+               ' -> "module.platform.module.law.module.diag.terraform_data.d";\n}\n')
+        mj = json.dumps({"Modules": [
+            {"Key": "", "Source": "", "Dir": "."},
+            {"Key": "platform", "Source": "./modules/platform", "Dir": "modules/platform"},
+            {"Key": "platform.law",
+             "Source": "registry.terraform.io/Azure/avm-res-operationalinsights-workspace/azurerm",
+             "Version": "0.4.2", "Dir": ".terraform/modules/platform.law"},
+            {"Key": "platform.law.diag", "Source": "./modules/diag",
+             "Dir": ".terraform/modules/platform.law/modules/diag"}]})
+        nested = [e for e in self._edges(tf, dot, mj) if e["transitive"]]
+        # law is a transitive registry edge with its pinned version; diag lives
+        # INSIDE law's downloaded package, so it is the same module -> not repeated
+        self.assertEqual([(e["to"], e["ref"], e["version"], e["via"]) for e in nested], [
+            (None, "registry.terraform.io/Azure/avm-res-operationalinsights-workspace/azurerm",
+             "0.4.2", "module.platform")])
+
+    def test_nested_target_already_direct_is_not_repeated(self):
+        # root declares law directly AND reaches it again through platform: direct
+        # wins (same registry module ignoring host case/`//submodule`), so the
+        # multi-repo fold never sees a transitive duplicate overwrite the direct one.
+        tf = ('module "platform" { source = "./modules/platform" }\n'
+              'module "law" {\n'
+              '  source  = "Azure/avm-res-operationalinsights-workspace/azurerm"\n'
+              '  version = "0.4.2"\n}\n'
+              'module "subnet" { source = "./modules/subnet" }\n')
+        dot = ('digraph G {\n'
+               '  "module.platform.module.law.x.y" -> "module.platform.module.sub.x.y";\n}\n')
+        mj = json.dumps({"Modules": [
+            {"Key": "platform", "Source": "./modules/platform", "Dir": "modules/platform"},
+            {"Key": "platform.law",
+             "Source": "registry.terraform.io/azure/avm-res-operationalinsights-workspace/azurerm",
+             "Version": "0.4.2", "Dir": ".terraform/modules/platform.law"},
+            {"Key": "platform.sub", "Source": "../subnet", "Dir": "modules/subnet"}]})
+        edges = self._edges(tf, dot, mj)
+        self.assertEqual([e for e in edges if e["transitive"]], [])
+        self.assertEqual(len(edges), 3)
+
+    def test_bad_modules_json_degrades_to_unknown_source(self):
+        tf = 'module "a" { source = "./modules/a" }\n'
+        dot = 'digraph G {\n  "module.a.module.b.r.x" -> "r.y";\n}\n'
+        for mj in ("", "not json", "[]", '{"Modules": "x"}', '{"Modules": [1, {"Key": 2}]}'):
+            nested = [e for e in self._edges(tf, dot, mj) if e["transitive"]]
+            self.assertEqual([(e["ref"], e["address"]) for e in nested],
+                             [(None, "module.a.module.b")], mj)
+
+    def test_output_is_deterministic(self):
+        tf = self._fix("terraform_nested_root.tf")
+        dot = self._fix("terraform_graph_nested_legacy.dot")
+        mj = self._fix("terraform_nested_modules.json")
+        shuffled = "\n".join(reversed(dot.splitlines()))
+        self.assertEqual(self._edges(tf, dot, mj), self._edges(tf, shuffled, mj))
+
+    # --- single-repo build and manifest structural scan agree on the direct set -
+    def test_build_direct_set_equals_structural_scan(self):
+        tf = self._fix("terraform_nested_root.tf")
+        built = [e for e in self._edges(tf, self._fix("terraform_graph_nested_modern.dot"))
+                 if not e["transitive"]]
+        files = {"main.tf": tf}
+        scanned = gather.scan_structural_terraform_areas(
+            "/clone", list_files=lambda: list(files), read_text=lambda r: files[r])
+        self.assertEqual(built, scanned["main.tf"]["edges"])
+
+    def test_extract_reads_modules_json_written_by_init(self):
+        with tempfile.TemporaryDirectory() as clone:
+            with open(os.path.join(clone, "main.tf"), "w") as fh:
+                fh.write(self._fix("terraform_nested_root.tf"))
+            os.makedirs(os.path.join(clone, ".terraform", "modules"))
+            with open(os.path.join(clone, ".terraform", "modules", "modules.json"),
+                      "w") as fh:
+                fh.write(self._fix("terraform_nested_modules.json"))
+            dot = self._fix("terraform_graph_nested_modern.dot")
+
+            def run(cmd, **kw):
+                return dot if cmd[-1] == "graph" else ""
+
+            cg = {"provider": "directory", "areas": [
+                {"id": "main.tf", "label": "main.tf", "paths": ["main.tf"], "edges": []}]}
+            gather.extract_iac_edges(
+                cg, clone,
+                which=lambda n: "/usr/bin/terraform" if n == "terraform" else None,
+                run=run, read_text=gather._read_text_file)
+            area = cg["areas"][0]
+            self.assertEqual(area["edges_status"], "resolved")
+            self.assertEqual(self._tuples(area["edges"]), [
+                (None, "Azure/naming/azurerm", "0.4.0", False),
+                ("modules/pe", "./modules/pe", None, False),
+                ("modules/subnet", "../subnet", None, True),
+                ("modules/vnet", "./modules/vnet", None, False)])
 
 
 class TestExtractIacEdges(unittest.TestCase):

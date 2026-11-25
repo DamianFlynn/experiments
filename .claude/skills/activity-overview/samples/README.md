@@ -35,9 +35,20 @@ vertical: `gather (manifest) → store → validate → digest`.
 What the bundle contains for the window `2026-03-16 → 2026-03-22` (facts, not
 interpretation): **6** module-dependency edges — **4 cross-repo** (pattern root
 `main.tf` and `modules/example_hub_vnet` → vnet `0.16.0` and operationalinsights
-`0.4.2` transitive) + **2 intra-repo** (vnet → subnet, peering); **21** decision
+`0.4.2`, all direct) + **2 intra-repo** (vnet → subnet, peering); **21** decision
 trains (**0** cross-repo); **0** `related_work` clusters; **44** shipped items;
 `meta.boundary_dropped_commits` empty for all members.
+
+**`transitive` flags re-derived for #80, not re-gathered.** The live gather marked
+14 Terraform edges `transitive: true` (including both operationalinsights
+`module_edges`) only because no root resource consumed that module's outputs. Since
+#80 every `module {}` block an area declares is a direct dependency, and every edge
+in this sample came from such a block (each carries the block's own `ref` and
+`version`), so those 14 flags were set to `false` in `digest_view.json` and the two
+`Transitive` cells in the digest table changed to `no`. Nothing else changed: the
+edge and cross-repo counts are the same. A fresh gather would also add the nested
+`module.a.module.b` calls that `terraform graph` shows, as `transitive: true` edges
+with `address`/`via`. Those cannot be re-derived without re-running terraform.
 
 Each `members[].bundle.meta` carries `owner` = the project scope
 (`avm-tf-aiml-lz`) and `repo` = the `owner/name` key, plus the identity keys

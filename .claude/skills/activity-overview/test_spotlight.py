@@ -1555,5 +1555,381 @@ class TestSliceModuleCLI(unittest.TestCase):
         self.assertEqual(rc, 0)
 
 
+# --------------------------------------------------------------------------
+# Issue #81 regressions: grep project/scope, multi-repo areas, file artifacts
+# in the symbol query, train outcomes without a PR, CLI rough edges.
+# --------------------------------------------------------------------------
+
+_F81 = "2026-01-01T00:00:00Z"
+
+
+def _mem_store():
+    conn = graphstore.open_store(":memory:")
+    graphstore.init_schema(conn)
+    return conn
+
+
+class TestGrepProjectAndScope(unittest.TestCase):
+    """#81 item 1: fts_search is store-wide; grep keeps only the project's ids
+    and counts matches after the time-scope filter."""
+
+    def setUp(self):
+        self.conn = _mem_store()
+        if not graphstore.fts5_available(self.conn):
+            self.skipTest("FTS5 unavailable")
+        graphstore.upsert_nodes(self.conn, [
+            ("o/r#issue-5", "o", "r", "social", "2026-01-05T00:00:00Z",
+             {"number": 5, "title": "done thing", "state": "open"}, _F81),
+            ("other/z#issue-9", "other", "z", "social", "2026-01-06T00:00:00Z",
+             {"number": 9, "title": "done thing", "state": "open"}, _F81),
+        ])
+        graphstore.index_texts(self.conn, [("o/r#issue-5", "done thing"),
+                                           ("other/z#issue-9", "done thing")])
+
+    def test_other_project_matches_excluded(self):
+        res = spotlight.text_mining(self.conn, "o", "done thing")
+        self.assertEqual([t["anchor"] for t in res["delivered"]], ["o/r#issue-5"])
+        self.assertEqual(res["summary"], {"matches": 1, "trains": 1})
+
+    def test_match_count_respects_time_scope(self):
+        res = spotlight.text_mining(self.conn, "o", "done thing",
+                                    ts_from="2030-01-01")
+        self.assertEqual(res["summary"], {"matches": 0, "trains": 0})
+        self.assertEqual(res["delivered"], [])
+
+    def test_project_prefix_is_exact(self):
+        # project "o" must not pick up project "ox" ids
+        graphstore.upsert_nodes(self.conn, [
+            ("ox/r#issue-1", "ox", "r", "social", "2026-01-05T00:00:00Z",
+             {"number": 1, "title": "done thing"}, _F81)])
+        graphstore.index_texts(self.conn, [("ox/r#issue-1", "done thing")])
+        res = spotlight.text_mining(self.conn, "o", "done thing")
+        self.assertEqual([t["anchor"] for t in res["delivered"]], ["o/r#issue-5"])
+
+    def test_nul_byte_in_phrase_does_not_raise(self):
+        res = spotlight.text_mining(self.conn, "o", "done\x00thing")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(spotlight._fts_query("\x00"), '""')
+
+
+def _two_repo_area_store(conn):
+    """Area `docs` (root area, as every Terraform member has `main.tf`) in two
+    repos, each with its codegraph, a file artifact docs/x.md, a touching
+    commit by a different author and an outgoing depends_on edge."""
+    nodes, edges, events = [], [], []
+    for repo, who, sha in (("Az/a", "alice", "s1"), ("Az/b", "bob", "s2")):
+        q = lambda local, repo=repo: graphstore.qualify_id("P", repo, local)
+        nodes += [
+            (q("area-docs"), "P", repo, "structure", None, {"id": "docs"}, _F81),
+            (q("area-lib"), "P", repo, "structure", None, {"id": "lib"}, _F81),
+            (q("codegraph"), "P", repo, "structure", None,
+             {"areas": [{"id": "docs", "paths": ["docs/x.md"], "edges": []}]},
+             _F81),
+            (q("art:docs/x.md"), "P", repo, "code", "2026-01-05",
+             {"kind": "doc", "path": "docs/x.md", "status": "live"}, _F81),
+            (q(sha), "P", repo, "code", "2026-01-05",
+             {"sha": sha, "author": who, "message": "edit docs"}, _F81),
+        ]
+        edges += [(q(sha), q("area-docs"), "touches", None, None),
+                  (q("area-docs"), q("area-lib"), "depends_on", None,
+                   {"version": None, "transitive": False})]
+        events.append((q("docs/x.md"), "add", sha, who, "2026-01-05",
+                       None, None, None, None, None))
+    graphstore.upsert_nodes(conn, nodes)
+    graphstore.upsert_edges(conn, edges)
+    graphstore.add_code_events(conn, events)
+
+
+class TestMultiRepoArea(unittest.TestCase):
+    """#81 item 2: an area present in several repos is unioned across them
+    (or narrowed with `owner/repo::area` / repo=), and every row names its repo."""
+
+    def setUp(self):
+        self.conn = _mem_store()
+        _two_repo_area_store(self.conn)
+
+    def test_subsystem_unions_repos(self):
+        res = spotlight.subsystem_split(self.conn, "P", "docs")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["repos"], ["Az/a", "Az/b"])
+        self.assertEqual(res["contributors"], [
+            {"login": "alice", "relation": "touches", "repos": ["Az/a"]},
+            {"login": "bob", "relation": "touches", "repos": ["Az/b"]}])
+        self.assertEqual(sorted(t["anchor"] for t in res["delivered"]),
+                         ["P/Az/a#s1", "P/Az/b#s2"])
+        self.assertEqual({t["anchor"]: t["repos"] for t in res["delivered"]},
+                         {"P/Az/a#s1": ["Az/a"], "P/Az/b#s2": ["Az/b"]})
+        self.assertEqual([(d["repo"], d["id"]) for d in res["depends_on"]["out"]],
+                         [("Az/a", "P/Az/a#area-lib"), ("Az/b", "P/Az/b#area-lib")])
+
+    def test_subsystem_repo_qualified_area(self):
+        res = spotlight.subsystem_split(self.conn, "P", "Az/b::docs")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["focus"], "docs")
+        self.assertEqual(res["repos"], ["Az/b"])
+        self.assertEqual([c["login"] for c in res["contributors"]], ["bob"])
+        self.assertEqual([t["anchor"] for t in res["delivered"]], ["P/Az/b#s2"])
+
+    def test_repo_keyword_and_case_insensitive_repo(self):
+        a = spotlight.subsystem_split(self.conn, "P", "docs", repo="az/B")
+        b = spotlight.subsystem_split(self.conn, "P", "az/b::docs")
+        self.assertEqual(a, b)
+        self.assertEqual(a["repos"], ["Az/b"])
+
+    def test_conflicting_repo_raises(self):
+        with self.assertRaises(ValueError):
+            spotlight.subsystem_split(self.conn, "P", "Az/a::docs", repo="Az/b")
+
+    def test_unknown_repo_needs_gather(self):
+        res = spotlight.subsystem_split(self.conn, "P", "Az/zz::docs")
+        self.assertEqual(res["status"], "needs_gather")
+
+    def test_module_rows_carry_repo(self):
+        res = spotlight.slice_module(self.conn, "P", "docs")
+        self.assertEqual([(f["path"], f["repo"]) for f in res["files"]],
+                         [("docs/x.md", "Az/a"), ("docs/x.md", "Az/b")])
+        self.assertEqual(res["repos"], ["Az/a", "Az/b"])
+        self.assertEqual(len(res["trains"]), 2)
+
+    def test_module_repo_qualified_area(self):
+        res = spotlight.slice_module(self.conn, "P", "Az/a::docs")
+        self.assertEqual([(f["path"], f["repo"]) for f in res["files"]],
+                         [("docs/x.md", "Az/a")])
+        self.assertEqual([t["anchor"] for t in res["trains"]], ["P/Az/a#s1"])
+
+    def test_module_md_names_repo(self):
+        md = spotlight.render_md(spotlight.slice_module(self.conn, "P", "docs"))
+        self.assertIn("`docs/x.md` (Az/a)", md)
+        self.assertIn("`docs/x.md` (Az/b)", md)
+
+
+class TestSymbolFileArtifacts(unittest.TestCase):
+    """#81 item 3: file artifacts in the symbol query."""
+
+    def setUp(self):
+        self.conn = _mem_store()
+        q = lambda local: graphstore.qualify_id("o", "o/r", local)
+        graphstore.upsert_nodes(self.conn, [
+            (q("art:docs/firewall.md"), "o", "o/r", "code", "2026-01-09",
+             {"kind": "doc", "path": "docs/firewall.md", "status": "removed"},
+             _F81)])
+        graphstore.add_code_events(self.conn, [
+            (q("docs/firewall.md"), "add", "s1", "a", "2026-01-02",
+             None, None, None, None, None),
+            (q("docs/firewall.md"), "delete", "s2", "a", "2026-01-09",
+             None, None, None, None, None)])
+
+    def test_deleted_file_is_removed(self):
+        res = spotlight.pattern_evolution(self.conn, "o", "docs/firewall.md")
+        self.assertEqual(res["summary"], {"events": 2, "outcome": "removed"})
+
+    def test_art_form_reads_the_bare_path_ledger(self):
+        res = spotlight.pattern_evolution(self.conn, "o", "art:docs/firewall.md")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["summary"], {"events": 2, "outcome": "removed"})
+        self.assertEqual([r["event"] for r in res["delivered"][0]["timeline"]],
+                         ["add", "delete"])
+
+    def test_qualified_art_form(self):
+        res = spotlight.pattern_evolution(self.conn, "o",
+                                          "o/o/r#art:docs/firewall.md")
+        self.assertEqual(res["summary"]["events"], 2)
+
+    def test_local_path_starting_with_project_name(self):
+        conn = _mem_store()
+        q = lambda local: graphstore.qualify_id("avm", "Azure/brm", local)
+        path = "avm/res/net/fw/main.bicep"
+        graphstore.upsert_nodes(conn, [
+            (q("art:" + path), "avm", "Azure/brm", "code", "2026-01-02",
+             {"kind": "code", "path": path}, _F81)])
+        graphstore.add_code_events(conn, [
+            (q(path), "add", "s1", "a", "2026-01-02",
+             None, None, None, None, None)])
+        res = spotlight.pattern_evolution(conn, "avm", path)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["summary"]["events"], 1)
+        res = spotlight.pattern_evolution(conn, "avm", "art:" + path)
+        self.assertEqual(res["summary"]["events"], 1)
+
+
+class TestTrainOutcomes(unittest.TestCase):
+    """#81 item 4: outcomes for trains without a PR, aligned with
+    link.build_trains (shipped > in_flight > rejected > abandoned) plus
+    `direct_push` for a commit-only train."""
+
+    @staticmethod
+    def _n(local, **data):
+        nid = graphstore.qualify_id("o", "o/r", local)
+        if local.startswith("pr-"):
+            data.setdefault("url", "https://github.com/o/r/pull/1")
+        return {"id": nid, "ts": "2026-01-01", "data": data}
+
+    def test_not_planned_issue_is_abandoned(self):
+        self.assertEqual(spotlight._outcome([self._n(
+            "issue-3", state="closed", state_reason="not_planned")]), "abandoned")
+
+    def test_duplicate_issue_is_abandoned(self):
+        self.assertEqual(spotlight._outcome([self._n(
+            "issue-3", state="closed", state_reason="duplicate")]), "abandoned")
+
+    def test_completed_issue_is_shipped(self):
+        self.assertEqual(spotlight._outcome([self._n(
+            "issue-3", state="closed", state_reason="completed")]), "shipped")
+
+    def test_open_issue_is_in_flight(self):
+        self.assertEqual(spotlight._outcome([
+            self._n("issue-3", state="open"),
+            self._n("abc123", sha="abc123")]), "in_flight")
+
+    def test_commit_only_train_is_direct_push(self):
+        self.assertEqual(spotlight._outcome([self._n("abc123", sha="abc123")]),
+                         "direct_push")
+
+    def test_open_pr_beats_closed_pr(self):
+        self.assertEqual(spotlight._outcome([
+            self._n("pr-1", state="closed", merged=False),
+            self._n("pr-2", state="open", merged=False)]), "in_flight")
+
+    def test_closed_unmerged_pr_is_rejected(self):
+        self.assertEqual(spotlight._outcome([
+            self._n("pr-1", state="closed", merged=False),
+            self._n("issue-3", state="open")]), "rejected")
+
+    def test_subsystem_scenario(self):
+        conn = _mem_store()
+        q = lambda local: graphstore.qualify_id("o", "o/r", local)
+        graphstore.upsert_nodes(conn, [
+            (q("issue-3"), "o", "o/r", "social", "2026-01-03T00:00:00Z",
+             {"number": 3, "title": "won't do", "state": "closed",
+              "state_reason": "not_planned"}, _F81),
+            (q("abc123"), "o", "o/r", "code", "2026-01-04",
+             {"sha": "abc123", "author": "alice", "message": "direct push"},
+             _F81),
+            (q("area-docs"), "o", "o/r", "structure", None, {"id": "docs"}, _F81),
+        ])
+        graphstore.upsert_edges(conn, [
+            (q("issue-3"), q("area-docs"), "touches", None, None),
+            (q("abc123"), q("area-docs"), "touches", None, None)])
+        res = spotlight.subsystem_split(conn, "o", "docs")
+        self.assertEqual({t["anchor"]: t["outcome"] for t in res["delivered"]},
+                         {q("issue-3"): "abandoned", q("abc123"): "direct_push"})
+        md = spotlight.render_md(res)
+        self.assertIn("[abandoned]", md)
+        self.assertIn("[direct-push]", md)
+
+
+class TestCLIRoughEdges(unittest.TestCase):
+    """#81 item 5: argument count, --complete, project detection, --repo."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.multi = os.path.join(self.tmp, "multi.db")
+        conn = graphstore.open_store(self.multi)
+        graphstore.init_schema(conn)
+        graphstore.upsert_nodes(conn, [
+            ("o/r#issue-5", "o", "r", "social", None, {"title": "x"}, _F81),
+            ("other/z#issue-9", "other", "z", "social", None, {"title": "x"},
+             _F81)])
+        conn.close()
+        self.empty = os.path.join(self.tmp, "empty.db")
+        conn = graphstore.open_store(self.empty)
+        graphstore.init_schema(conn)
+        conn.close()
+        self.area = os.path.join(self.tmp, "area.db")
+        conn = graphstore.open_store(self.area)
+        graphstore.init_schema(conn)
+        _two_repo_area_store(conn)
+        conn.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *args):
+        env = dict(os.environ)
+        env.pop("GITHUB_TOKEN", None)
+        return subprocess.run(
+            [sys.executable, os.path.join(HERE, "spotlight.py")] + list(args),
+            capture_output=True, text=True, env=env)
+
+    def _usage_error(self, r, needle):
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("usage:", r.stderr)
+        self.assertIn(needle, r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_extra_positional_words_rejected(self):
+        r = self._run("grep", "foo", "bar", "--store", self.multi,
+                      "--project", "o")
+        self._usage_error(r, "exactly one argument")
+
+    def test_missing_argument_rejected(self):
+        r = self._run("person", "--store", self.multi, "--project", "o")
+        self._usage_error(r, "exactly one argument")
+
+    def test_multi_project_store_lists_projects(self):
+        r = self._run("person", "alice", "--store", self.multi)
+        self._usage_error(r, "'o', 'other'")
+
+    def test_empty_store(self):
+        r = self._run("person", "alice", "--store", self.empty)
+        self._usage_error(r, "no project")
+
+    def test_unknown_project_lists_projects(self):
+        r = self._run("person", "alice", "--store", self.multi,
+                      "--project", "nope")
+        self._usage_error(r, "'o', 'other'")
+
+    def test_missing_store_not_created(self):
+        missing = os.path.join(self.tmp, "nope.db")
+        r = self._run("person", "alice", "--store", missing)
+        self._usage_error(r, "does not exist")
+        self.assertFalse(os.path.exists(missing))
+
+    def test_bad_window_rejected(self):
+        r = self._run("person", "alice", "--store", self.multi,
+                      "--project", "o", "--from", "2026-02-01",
+                      "--to", "2026-01-01")
+        self._usage_error(r, "--from")
+        r = self._run("person", "alice", "--store", self.multi,
+                      "--project", "o", "--to", "January")
+        self._usage_error(r, "--to")
+
+    def test_module_complete_is_wired(self):
+        r = self._run("module", "docs", "--store", self.area, "--complete")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("honest-only", r.stderr)
+        out = json.loads(r.stdout)
+        self.assertTrue(all("complete" in t for t in out["trains"]))
+
+    def test_complete_rejected_where_unsupported(self):
+        for q, arg in (("symbol", "docs/x.md"), ("dependents", "Az/a")):
+            r = self._run(q, arg, "--store", self.area, "--complete")
+            self._usage_error(r, "--complete")
+
+    def test_repo_flag(self):
+        r = self._run("subsystem", "docs", "--store", self.area,
+                      "--repo", "az/b")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["repos"], ["Az/b"])
+        r = self._run("subsystem", "Az/b::docs", "--store", self.area)
+        self.assertEqual(json.loads(r.stdout)["repos"], ["Az/b"])
+
+    def test_repo_flag_errors(self):
+        r = self._run("subsystem", "docs", "--store", self.area,
+                      "--repo", "Az/zz")
+        self._usage_error(r, "'Az/a', 'Az/b'")
+        r = self._run("module", "Az/zz::docs", "--store", self.area)
+        self._usage_error(r, "'Az/a', 'Az/b'")
+        r = self._run("subsystem", "Az/a::docs", "--store", self.area,
+                      "--repo", "Az/b")
+        self._usage_error(r, "--repo")
+        r = self._run("person", "alice", "--store", self.area,
+                      "--repo", "Az/a")
+        self._usage_error(r, "--repo")
+
+
 if __name__ == "__main__":
     unittest.main()
