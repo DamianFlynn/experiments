@@ -264,7 +264,9 @@ review's state to `DISMISSED`.
   ids are `art:<path>` (via `artifact_id`); **symbol/comment** ids are
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
-  carry the bounded `before`/`after`. `status` is derived from the artifact's **last**
+  carry the bounded `before`/`after`. `lifecycle` is in date order (same-day events keep
+  git/ledger order); a view from a store is cumulative — it holds every folded window's
+  events, not only the view's window. `status` is derived from the artifact's **last**
   lifecycle event: `replaced` only when that event is a rename to a tracked path
   (`replaced_by` = that direct successor; consumers walk A→B→C); a later re-add makes
   it `live` again with `replaced_by:null`; a delete, or a rename to an untracked path,
@@ -276,6 +278,10 @@ review's state to `DISMISSED`.
   symbol dropped in ONE file and added in ONE other (precision over recall — ambiguous/boilerplate
   names are skipped). On the linked artifacts the source is `status:"replaced"` + `replaced_by`
   the dest, the dest carries `identity_from`, and both carry `move_confidence`/`move_basis`.
+  In a store the moves are matched per folded window and the stored artifacts apply all of
+  them (STORE.md, symbol-move edges); a source re-added later is `live` again. `link.enrich`
+  still re-matches over the view's whole `symbol_events`, which on a multi-window store can
+  add a move no single window had (LLD §14.5).
   `confidence` is `high` only when git also flags the file pair as a rename/copy. (Name-changed
   renames via body fingerprint are deferred.)
 - **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},

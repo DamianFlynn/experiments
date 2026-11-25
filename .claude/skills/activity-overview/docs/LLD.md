@@ -415,7 +415,7 @@ flowchart TB
   s2["2 · social issues<br/>+ blocks edges (only between gathered issues)"]
   s3["3 · code commits + part_of edges"]
   s4["4 · file-level code_events ledger"]
-  s5["5 · artifact code nodes (derive.build_artifacts)<br/>+ symbol code_events + replaced_by / identity_from"]
+  s5["5 · symbol code_events + replaced_by / identity_from (moves matched in this window)<br/>+ artifact code nodes rebuilt from the WHOLE ledger (_fold_artifacts)"]
   s6["6 · structure: milestones, areas, releases, sprints"]
   s7["7 · people (derive.enumerate_participants, repo = *)<br/>union across members, bots tagged"]
   s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; owns; touches; in_milestone; in_iteration"]
@@ -426,6 +426,18 @@ flowchart TB
 
 (The exact statement order inside the function differs slightly; the grouping above is the
 logical sequence. FTS text is indexed as PR/issue/commit nodes are written (FTS5-gated).)
+
+**Artifact nodes are cumulative (#76).** Inside the fold's transaction, after the ledger rows
+and move edges are written, `_fold_artifacts` reads the repo's whole ledger back
+(`extract.ledger_events`) and the recorded moves (`extract.recorded_moves`), runs
+`derive.artifact_projection` (= `build_artifacts`, lifecycle in date order via
+`derive.chronological`, then `derive.apply_recorded_moves`) and upserts the artifacts the
+bundle names plus the other end of any recorded move touching one. `validate.no_drift` runs
+the same readers and projection, so store == re-derived by construction and the fold is
+order-independent. Symbol moves stay matched per window (whole-ledger matching would turn a
+creation `add` plus a later move `add` into an ambiguous pair); the nodes apply every recorded
+move, a source only while its last event is a remove. Cost: one read of the repo's ledger per
+fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows).
 
 ### 4.11 Cross-repo `depends_on` resolution (Terraform)
 
@@ -580,7 +592,9 @@ The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 > not just the window. On a store gathered for one window this is exact (and is what the
 > golden-equivalence tests pin). On a store holding several windows, the view's arrays and
 > trains include every stored PR/issue/commit; the buckets do not, because `meta.period`
-> bounds them (§6.5). See HLD §10 items 8–9 and §14.5.
+> bounds them (§6.5). See HLD §10 item 8 and §14.5.
+> (Artifacts are already right: their stored nodes are cumulative over every folded
+> window, #76.)
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -741,7 +755,8 @@ bundles in chronological order.
 
 | Function | Output | Rule highlights |
 |---|---|---|
-| `build_artifacts` | `artifacts{}` | lifecycle per file/symbol; status from newest event |
+| `build_artifacts` | `artifacts{}` | lifecycle per file/symbol in date order (`chronological`); status from newest event |
+| `artifact_projection` / `apply_recorded_moves` | stored artifact nodes | `build_artifacts` over the whole ledger + the store's per-window symbol moves (#76) |
 | `match_symbol_moves` / `link_symbol_identity` | `symbol_moves` | same `(lang, subkind, name)` dropped in one file, added in one other; `high` when git also flags a rename |
 | `enumerate_participants` | all logins | the single source of truth for "who" (write path and auditor); a person keyed by an unresolved commit author gets `login_resolved: false` |
 | `attribute_people_areas` | `people[].modules/areas` | commit files + reviewed PRs' areas |
@@ -817,7 +832,7 @@ read. When the store (or `--project`) spans several repos and no `--repo` is giv
 | `provenance` | every social/code node carries a source identifier (url and/or sha) |
 | `no_fabrication` | no invented entities, no historyless artifacts, no malformed ids |
 | `schema_conformance` | each edge type's endpoint classes match STORE.md |
-| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle |
+| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves) |
 | `idempotency` | re-folding into a scratch copy changes no counts |
 | `no_drift_people` (project) | project-scoped people == union re-derived across all members |
 
@@ -1008,8 +1023,9 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 - `range_query` orders by `(ts, id)`; JSON `sort_keys`; collections sorted; tie-breaks by id.
 - The only non-deterministic fields are `fetched_at` and `dead_refs.first_seen`, both excluded
   from determinism assertions.
-- Idempotency is per window: re-folding the **same** window is a no-op. Folding **different**
-  overlapping windows is not fully cumulative — see §14.4.
+- Idempotency is per window: re-folding the **same** window is a no-op. Artifact nodes are
+  cumulative across **different** (even overlapping) windows and independent of fold order
+  (§4.10); the views are not yet window-scoped — see §14.5.
 
 ### 14.2 Degradation matrix
 
@@ -1051,7 +1067,8 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
 | View arrays not window-scoped on multi-window stores | arrays come from `repo_nodes` (buckets are bounded by `meta.period` since #75) | `prs`/`issues`/`commits` and trains span all stored history (member and project views) | window the materialized arrays to in-window + spine context |
-| Trust gate fails after a second overlapping fold | `fold_bundle` upserts artifact nodes with the incoming window's lifecycle; `code_events` keeps all windows | `validate.no_drift` "lifecycle length drift" | rebuild artifact lifecycle from the full ledger on fold (or merge with the stored one) |
+| Idempotency probe re-matches moves over the whole store | `validate.check_idempotency` re-folds the self-sourced bundle (every window as one); `match_symbol_moves` then sees a symbol dropped from one file in one window and added (uniquely) to another in a later window as a move | `idempotency` ERROR: edges +2 on a correct multi-window store (only in that case; `no_drift` passes) | re-fold per recorded window in the probe, or exclude move edges from its count |
+| `enrich` re-matches moves over the view | `link.enrich` runs `link_symbol_identity` over the view's whole `symbol_events` | on a multi-window store the view's artifacts can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
 | Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | wider digest windows don't widen CI stats etc. | store per-window singletons or aggregate |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
@@ -1063,7 +1080,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE (one single-window store per installment, series file for
-continuity, wide single gathers for history stores) avoids the first two in practice.
+continuity, wide single gathers for history stores) avoids the first three in practice.
 
 ## 15. Testing and CI
 

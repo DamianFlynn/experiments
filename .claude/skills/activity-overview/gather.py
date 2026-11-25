@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 
 import derive
+import extract
 import graphstore
 import manifest as manifest_mod
 
@@ -4677,6 +4678,46 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
     }
 
 
+def _fold_artifacts(conn, bundle, project, repo, fetched):
+    """Artifact `code` node rows for one fold, rebuilt from the repo's WHOLE
+    stored ledger (#76). Call inside the fold's transaction, after this bundle's
+    ledger rows and move edges are written.
+
+    The ledger keeps every window's rows, so each node is
+    derive.artifact_projection over all of them (lifecycle in date order, status
+    from the last event) plus the moves recorded by every fold — the same readers
+    (extract.ledger_events / recorded_moves) and rule validate's no_drift
+    re-runs. The store therefore equals its re-derivation by construction, and
+    folding windows in any order, or re-folding one, converges.
+
+    Only nodes this bundle can change are rewritten: the artifacts its events
+    name, plus the other endpoint of any recorded move touching one of them (a
+    move's ranking reads both endpoints' lifecycles). A bundle with no code or
+    symbol events changes no artifact and skips the ledger read."""
+    if not (bundle.get("code_events") or bundle.get("symbol_events")):
+        return []
+    affected = set(derive.build_artifacts(bundle))
+    moves = extract.recorded_moves(conn, project, repo)
+    for m in moves:
+        if m["from"] in affected or m["to"] in affected:
+            affected.update((m["from"], m["to"]))
+    code_events, symbol_events = extract.ledger_events(conn, project, repo)
+    artifacts = derive.artifact_projection(
+        {"meta": bundle.get("meta", {}), "code_events": code_events,
+         "symbol_events": symbol_events}, moves)
+    nodes = []
+    for local, art in artifacts.items():
+        if local not in affected:
+            continue
+        # ts: the artifact's last lifecycle event date (its most-recent activity);
+        # None when it has no events (degrades cleanly, excluded from window scans).
+        lc = art.get("lifecycle") or []
+        ts = lc[-1]["date"] if lc else None
+        nodes.append((graphstore.qualify_id(project, repo, local), project, repo,
+                      "code", ts, art, fetched))
+    return nodes
+
+
 def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                 registry_by_slug=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
@@ -4765,20 +4806,10 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             ev.get("date"), ev.get("hunk"), None, None, None, ev.get("old_path"),
         ))
 
-    # code: artifact substrate (Phase 7b-1 step 2). Derive the per-artifact
-    # lifecycle ledger and symbol-identity moves from the raw bundle (pure, via
-    # `derive`), then persist them additively alongside the commit `code` nodes
-    # and the file-level ledger above. The artifact's own id form is the local
-    # id: `art:<path>` for file artifacts, `<path>#<lang>:<subkind>:<name>` for
-    # symbol/comment ones (see derive.build_artifacts).
-    artifacts = derive.build_artifacts(bundle)
-    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
-    for local, art in artifacts.items():
-        # ts: the artifact's last lifecycle event date (its most-recent activity);
-        # None when it has no events (degrades cleanly, excluded from window scans).
-        lc = art.get("lifecycle") or []
-        ts = lc[-1]["date"] if lc else None
-        nodes.append((qid(local), project, repo, "code", ts, art, fetched))
+    # code: artifact substrate (file `art:<path>` and symbol/comment
+    # `<path>#<lang>:<subkind>:<name>` nodes) is CUMULATIVE (#76): rebuilt from
+    # the repo's whole stored ledger once this bundle's rows are in it — see
+    # _fold_artifacts, called in the transaction below.
 
     # code: symbol-granular lifecycle ledger, keyed by the SYMBOL artifact id,
     # carrying the rich before/after fields (file-level entries leave them NULL).
@@ -4794,6 +4825,8 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # code: symbol-move edges (artifact -> artifact). Each confident move links
     # the source symbol `replaced_by` the dest and the dest `identity_from` the
     # source, both carrying move_confidence/move_basis. Idempotent by (src,dst,type).
+    # Matched within THIS window only; _fold_artifacts applies the recorded
+    # moves of every window onto the nodes (#76).
     for m in derive.match_symbol_moves(
             bundle.get("symbol_events", []),
             [(e.get("old_path"), e["path"]) for e in bundle.get("code_events", [])
@@ -5065,6 +5098,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         graphstore.upsert_nodes(conn, nodes, commit=False)
         graphstore.upsert_edges(conn, edges, commit=False)
         graphstore.add_code_events(conn, events, commit=False)
+        graphstore.upsert_nodes(
+            conn, _fold_artifacts(conn, bundle, project, repo, fetched),
+            commit=False)
 
         # fts_text: index the searchable text per owning node id so `spotlight
         # grep` has something to MATCH (Phase 8a prerequisite). FTS5-gated —

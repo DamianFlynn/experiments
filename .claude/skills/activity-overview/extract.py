@@ -355,14 +355,16 @@ def _order_artifacts(arts, code_events):
     monotonic ordinal, so a rename whose old/new ids sort against insertion order
     (e.g. a->z, which must stay [new, old]) is not flipped by a lexical tie-break.
     Artifacts never named by a code_event (symbol/comment nodes) fall last, ordered
-    by id. Pure; does not mutate the records."""
+    by id. The replay walks the events in build_artifacts' own order
+    (derive.chronological), so a multi-window store reads back the same order
+    whichever window was folded first. Pure; does not mutate the records."""
     order = {}
 
     def _see(path):
         if path:
             order.setdefault("art:" + path, len(order))
 
-    for ev in code_events:
+    for ev in derive.chronological(code_events):
         change = ev.get("change")
         if change in ("rename", "copy") and ev.get("old_path"):
             _see(ev.get("path"))            # new-path artifact: ensured first
@@ -477,6 +479,32 @@ def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None):
         or graphstore.get_ref_date(conn, project, repo, ts_from, ts_to)
         or ts_to)
     return meta
+
+
+def ledger_events(conn, project, repo):
+    """The repo's WHOLE code-event ledger as raw `(code_events, symbol_events)`
+    arrays (every folded window, ledger order). fold_bundle rebuilds artifact
+    nodes from it and validate re-derives them from it (#76): one reader for the
+    writer and the auditor."""
+    return (_materialize_code_events(conn, project, repo),
+            _materialize_symbol_events(conn, project, repo))
+
+
+def recorded_moves(conn, project, repo):
+    """The repo's symbol moves as fold recorded them (one match per window, as
+    `replaced_by` edges): [{"from", "to", "confidence", "basis"}] with local ids,
+    in edge order. Input to derive.apply_recorded_moves (#76)."""
+    prefix = graphstore.qualify_id(project, repo, "")
+    out = []
+    for e in graphstore.edges_by_type(conn, "replaced_by", project):
+        if not (e["src_id"].startswith(prefix) and e["dst_id"].startswith(prefix)):
+            continue
+        data = e["data"] or {}
+        out.append({"from": e["src_id"][len(prefix):],
+                    "to": e["dst_id"][len(prefix):],
+                    "confidence": data.get("move_confidence"),
+                    "basis": data.get("move_basis")})
+    return out
 
 
 def _materialize_code_events(conn, project, repo):

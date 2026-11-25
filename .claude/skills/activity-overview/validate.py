@@ -708,12 +708,19 @@ def check_no_drift_people(conn, project, repos):
     return _check("no_drift_people", ERROR, details)
 
 
-def _derive_artifacts(bundle):
-    """Re-derive the artifact projection exactly as the write path does:
-    build_artifacts then link_symbol_identity (on a copy carrying them)."""
-    artifacts = derive.build_artifacts(bundle)
-    derive.link_symbol_identity({**bundle, "artifacts": artifacts})
-    return artifacts
+def _derive_artifacts(conn, project, repo, bundle):
+    """Re-derive the artifact projection exactly as the write path does (#76):
+    derive.artifact_projection over the repo's WHOLE stored ledger, plus any
+    events of `bundle` the ledger does not hold yet (so an external bundle is
+    checked against "the store after folding it", and a store holding more
+    windows than the bundle is not drift). A self-sourced bundle IS the ledger,
+    so for it this is the ledger alone. Symbol moves are the ones fold recorded
+    (matched per window; the ledger has no window boundaries to re-match them)."""
+    code, symbols = extract.ledger_events(conn, project, repo)
+    events = derive.merge_ledger_events(
+        {"code_events": code, "symbol_events": symbols}, bundle)
+    return derive.artifact_projection({**events, "meta": bundle.get("meta", {})},
+                                      extract.recorded_moves(conn, project, repo))
 
 
 def check_no_drift(conn, project, repo, bundle, check_people=True):
@@ -747,7 +754,7 @@ def check_no_drift(conn, project, repo, bundle, check_people=True):
     # local is itself a double-`#` form `{path}#{lang}:{subkind}:{name}`. Strip
     # ONLY the repo prefix (graphstore.local_id) to recover the true local id
     # (mirroring how fold_bundle / extract reconstruct it).
-    want_arts = _derive_artifacts(bundle)
+    want_arts = _derive_artifacts(conn, project, repo, bundle)
     stored_arts = {}
     for n in graphstore.repo_nodes(conn, project, repo, "code"):
         local = graphstore.local_id(n["id"], project, repo)

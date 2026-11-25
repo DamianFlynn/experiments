@@ -91,14 +91,13 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 ```
 
 > **Why one store per installment?** The store layer is idempotent and *can* accumulate many
-> windows, but two current limitations make an accumulated store unsuitable for monthly
-> digests (HLD §10): (1) a view materialized from a multi-window store is only partly scoped to
+> windows (artifact lifecycles are cumulative, so such a store passes `no_drift` whatever the
+> fold order), but a current limitation makes an accumulated store unsuitable for monthly
+> digests (HLD §10): a view materialized from a multi-window store is only partly scoped to
 > its window — its buckets (shipped, rejected, in flight) are bounded by `meta.period`, but its
-> `prs`/`issues`/`commits` arrays and trains include all stored history; (2) after a second fold that touches the same
-> files, `validate.py` fails `no_drift` (artifact lifecycles keep only the latest window while
-> the change ledger keeps all). A single-window store per installment — the way CI and the
-> golden tests use it — avoids both. An optional accumulated `history.db` is still useful for
-> cross-window `spotlight` queries (§8).
+> `prs`/`issues`/`commits` arrays and trains include all stored history. A single-window store
+> per installment — the way CI and the golden tests use it — avoids it. An optional accumulated
+> `history.db` is still useful for cross-window `spotlight` queries (§8).
 
 ## 3. Running it through Claude Code (the normal way)
 
@@ -479,7 +478,9 @@ One store per stream keeps commands simple and failures isolated.
   person, grep across many months), build `history.db` from **one wide-window gather**
   (e.g. `--from 2026-01-01 --to 2026-11-30`) into a fresh file, and rebuild it — rather than
   folding month after month into it — when you need it refreshed. A single wide fold passes
-  `validate.py`; repeatedly folding overlapping months currently fails `no_drift` (HLD §10).
+  `validate.py`. Folding month after month also passes `no_drift`, but `validate`'s
+  idempotency probe can then report two extra move edges when a symbol left one file in one
+  month and appeared in another file in a later month (LLD §14.5).
   Wide gathers of busy repos are API-heavy (§11).
 - **Inspect:** `sqlite3 stores/2026-11.db "select project, repo, count(*) from nodes group by 1,2"`;
   folded windows are in `meta.gathered_windows`.
@@ -544,7 +545,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate: error: store … does not exist` / `is not a journey-graph store` (exit 2) | wrong path (validate never creates a file) | point it at the store `gather --store` wrote |
 | `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
-| `validate` ERROR `no_drift` "lifecycle length drift" | several overlapping windows folded into one store (known limitation, HLD §10) | use one store per installment; rebuild history stores from one wide gather |
+| `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
+| `validate` ERROR `idempotency` (edges +2) on a multi-window store, `no_drift` passing | the probe re-folds every window as one and matches a cross-window symbol move (LLD §14.5) | known limitation; the store is correct. Use one store per installment, or one wide gather for history |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
 | Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was built from a store holding several months (arrays are not window-scoped, HLD §10) | rebuild the month from its own single-window store |

@@ -62,12 +62,107 @@ _CHANGE_TO_EVENT = {"add": "add", "copy": "add", "modify": "change", "delete": "
 _SYMBOL_CHANGE_TO_EVENT = {"add": "add", "drop": "remove", "change": "change"}
 
 
+def chronological(events):
+    """Events in lifecycle order (#76): by `date` (the committer day), ties keep
+    their given order (git walk / ledger order). A store's ledger holds its
+    windows in FOLD order, so without this a window folded late would supply the
+    "last" event. Stable sort; returns a new list."""
+    return sorted(events, key=lambda e: e.get("date") or "")
+
+
+def _code_event_key(ev):
+    return ("file", ev.get("path"), ev.get("commit"), ev.get("change"))
+
+
+def _symbol_event_key(ev):
+    return ("symbol", ev.get("path"), ev.get("lang"), ev.get("subkind"),
+            ev.get("name") or "", ev.get("commit"),
+            _SYMBOL_CHANGE_TO_EVENT.get(ev.get("change"), "change"))
+
+
+def merge_ledger_events(ledger, bundle):
+    """`ledger` (a bundle-shaped dict whose code_events/symbol_events were read
+    back from the store) plus the events of `bundle` that the store does not hold
+    yet, deduplicated by the ledger's identity (artifact, commit, event) — first
+    one wins, as the ledger's INSERT OR IGNORE does. Used by validate so an
+    external bundle is checked against "the store after folding it". Pure."""
+    out = dict(ledger)
+    for key, ident in (("code_events", _code_event_key),
+                       ("symbol_events", _symbol_event_key)):
+        merged, seen = [], set()
+        for ev in list(ledger.get(key) or []) + list(bundle.get(key) or []):
+            if key == "code_events" and not ev.get("path"):
+                continue                   # fold never writes a path-less event
+            k = ident(ev)
+            if k not in seen:
+                seen.add(k)
+                merged.append(ev)
+        out[key] = merged
+    return out
+
+
+def artifact_projection(bundle, moves):
+    """The artifact nodes a store holds (#76): build_artifacts over the repo's
+    whole ledger (`bundle` carries its code_events/symbol_events), then the
+    store's recorded symbol `moves` (apply_recorded_moves). fold_bundle writes
+    it and validate's no_drift re-derives it, so writer and auditor share one
+    rule. Pure."""
+    return apply_recorded_moves(build_artifacts(bundle), moves)
+
+
+def apply_recorded_moves(artifacts, moves):
+    """Apply recorded symbol moves onto a cumulative artifact projection (#76).
+    Mutates and returns `artifacts`.
+
+    Moves are matched per fold window (match_symbol_moves; recorded as
+    `replaced_by` edges), never over the whole ledger: across months a symbol's
+    creation `add` and its later move `add` would make every move ambiguous.
+    `moves` = [{"from", "to", "confidence", "basis"}] (local ids); one whose
+    endpoints are not both artifacts is ignored. For one window this equals
+    link_symbol_identity. Across windows an artifact can gain several moves:
+      - a dest takes `identity_from` (and that move's confidence/basis) from its
+        most recent incoming move, ranked by the source's latest `remove`;
+      - a source is `replaced` / `replaced_by` the dest of its most recent
+        outgoing move, ranked by the dest's latest `add`, only while its LAST
+        lifecycle event is a remove (a later re-add revives it: #64's
+        last-event rule); that move's confidence/basis then win.
+    Ties break on the id, so the order of `moves` does not matter."""
+    def latest(aid, event):
+        return max((e.get("date") or "" for e in artifacts[aid]["lifecycle"]
+                    if e["event"] == event), default="")
+
+    incoming, outgoing = {}, {}
+    for m in moves:
+        src, dst = m["from"], m["to"]
+        if src not in artifacts or dst not in artifacts:
+            continue
+        rank = (latest(src, "remove"), src)
+        if dst not in incoming or rank > incoming[dst][0]:
+            incoming[dst] = (rank, m)
+        rank = (latest(dst, "add"), dst)
+        if src not in outgoing or rank > outgoing[src][0]:
+            outgoing[src] = (rank, m)
+    for dst, (_rank, m) in incoming.items():
+        artifacts[dst]["identity_from"] = m["from"]
+        artifacts[dst]["move_confidence"] = m["confidence"]
+        artifacts[dst]["move_basis"] = m["basis"]
+    for src, (_rank, m) in outgoing.items():
+        lc = artifacts[src]["lifecycle"]
+        if lc and lc[-1]["event"] == "remove":
+            artifacts[src]["status"] = "replaced"
+            artifacts[src]["replaced_by"] = m["to"]
+            artifacts[src]["move_confidence"] = m["confidence"]
+            artifacts[src]["move_basis"] = m["basis"]
+    return artifacts
+
+
 def build_artifacts(bundle):
     """Fold raw `code_events` into the per-artifact lifecycle ledger (file-level).
 
-    Each tracked path (readme/doc/example) gets one entry with an ordered
-    lifecycle. Status comes from the LAST lifecycle event: a rename away to a
-    tracked path (that is still the last event) makes the old artifact `replaced`
+    Each tracked path (readme/doc/example) gets one entry with a lifecycle in
+    date order (`chronological`; same-day events keep their given order).
+    Status comes from the LAST lifecycle event: a rename away to a tracked path
+    (that is still the last event) makes the old artifact `replaced`
     with `replaced_by` its direct successor; a later re-add makes it `live` again;
     a delete, or a rename to an untracked path, makes it `removed`. `code_area` is
     null in Phase 3a (graphify is Phase 3b). Pure.
@@ -105,7 +200,7 @@ def build_artifacts(bundle):
             entry["hunk"] = hunk
         artifacts[aid]["lifecycle"].append(entry)
 
-    for ev in bundle.get("code_events", []):
+    for ev in chronological(bundle.get("code_events", [])):
         change = ev["change"]
         if change in ("rename", "copy") and ev.get("old_path"):
             new_aid = ensure(ev["path"])
@@ -130,7 +225,7 @@ def build_artifacts(bundle):
     # Phase 3d: fold symbol-granular events into kind:symbol/comment artifacts.
     # Each carries a bounded before/after on its lifecycle entry (file-level entries
     # leave those absent). id = "<path>#<lang>:<subkind>:<name>" (stable per symbol).
-    for ev in bundle.get("symbol_events", []):
+    for ev in chronological(bundle.get("symbol_events", [])):
         kind = "comment" if ev["subkind"] in ("comment", "todo") else "symbol"
         aid = f'{ev["path"]}#{ev["lang"]}:{ev["subkind"]}:{ev["name"] or ""}'
         if aid not in artifacts:

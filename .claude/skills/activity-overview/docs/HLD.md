@@ -446,42 +446,42 @@ These are real, current limits — plan around them:
    `extract` materializes the repo's *whole* stored node set, so on a store holding several
    windows the view's `prs`/`issues`/`commits` arrays and its trains include all stored
    history (window-scoped arrays are a follow-up).
-9. **Repeated folds of overlapping files fail the trust gate.** On re-fold, an artifact node's
-   lifecycle is replaced by the incoming window's while the change ledger keeps every window,
-   so `validate.no_drift` reports lifecycle drift once a second window touches the same files.
-   (Module biographies are unaffected — `spotlight module` reads the ledger.)
-10. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
+9. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
     `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
     latest gathered window only.
-11. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
+10. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
     `depends_on` edge in an existing store.
-12. **Terraform transitive edges come from the build.** Every `module {}` block an area
+11. **Terraform transitive edges come from the build.** Every `module {}` block an area
     declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
     (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:
     calls whose module tree holds no resources are not in the graph, and without init's
     `modules.json` a nested call's target is unknown and is not folded. Single-repo gathers emit
     no Terraform edges at all without `terraform` (no structural scan); manifest gathers still
     get the static direct edges for every module dir.
-13. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
+12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
-14. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
+13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
     commit's git author to the login PR/issue/review records use (GitHub's commits listing per
     SHA, then a `users.noreply.github.com` email), so a PR author and their commits are one
     person. A commit whose email GitHub links to no account and that has no noreply email
     stays a separate person keyed by its git name and flagged `login_resolved: false` — never
     merged with a login on a guess. Stores folded before this change key commit authors by git
     name: re-gather them into a fresh store rather than folding new windows on top.
-15. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the causal
+14. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the causal
     spine and judges the outcome from the nodes it reached (same vocabulary as `link`, plus
     `direct_push` for commits that landed with no PR). A closed issue without a close reason
     counts as completed, and a file renamed away keeps its old path `alive` (the ledger records
     the rename under the new path). An area shared by several members is unioned unless the
     query names one (`owner/repo::area` or `--repo`).
 
-Items 8–9 are why USAGE recommends one store per installment; they are candidates for code
-fixes (window the materialized arrays in `extract`; make artifact folding cumulative),
-tracked in [§11](#11-extension-points-and-roadmap).
+Item 8 is why USAGE recommends one store per installment; it is a candidate for a code fix
+(window the materialized arrays in `extract`), tracked in
+[§11](#11-extension-points-and-roadmap). Artifact folding is cumulative: each fold rebuilds the
+artifacts it touches from the whole change ledger, so a store holding several windows passes
+`validate.no_drift` whatever the fold order. Symbol moves are matched per window; on such a
+store `validate`'s idempotency probe, which re-folds every window as one, can report a move
+that no single window had (LLD §14.5).
 
 ## 11. Extension points and roadmap
 
@@ -490,7 +490,7 @@ tracked in [§11](#11-extension-points-and-roadmap).
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
 | Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
-| Multi-window stores (limitations 8–9) | `extract._materialize_meta` (+ windowed arrays) and cumulative artifact folding in `fold_bundle` — not implemented |
+| Multi-window stores (limitation 8) | `extract._materialize_meta` (+ windowed arrays) — not implemented (artifact folding is already cumulative) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies | Would mirror `resolve_registry_member` for `br/public:` paths (not implemented) |
 | New spotlight lens | Add a query + renderer in `spotlight.py` |

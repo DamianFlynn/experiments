@@ -135,8 +135,10 @@ request #N`, then the last `(#N)`.
 
 One row per artifact lifecycle event: `(artifact_id, event, commit_sha,
 author, date, hunk, ref, before, after, detail)`, PK `(artifact, commit,
-event)` → set semantics (re-seeing a commit is a no-op). An artifact's
-`lifecycle[]` is `get_code_events(artifact_id)` ordered by date. File-level rows are
+event)` → set semantics (re-seeing a commit is a no-op). The ledger keeps every
+folded window, and it is the source of truth for the artifact nodes: an
+artifact's `lifecycle[]` is all of its ledger rows ordered by date (same-day rows
+keep ledger order). File-level rows are
 keyed by the bare `<path>` (not the `art:<path>` node id) and keep git's change verb
 (`add`/`modify`/`delete`/`rename`/`copy`); symbol rows carry the mapped event
 (`add`/`change`/`remove`). A reader maps `art:<path>` to `<path>` before reading the
@@ -242,6 +244,18 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
   artifacts — with `ts` = the artifact's last lifecycle-event date and `data` =
   the full artifact record. Additive to (and distinct from) the commit `code`
   nodes, which keep their bare-`<sha>` local id. Idempotent by id.
+  **Cumulative (#76):** after writing its ledger rows, a fold rebuilds every
+  artifact its bundle names (plus the other end of any recorded move touching
+  one) from the repo's WHOLE ledger — `extract.ledger_events` →
+  `derive.artifact_projection` (lifecycle in date order via
+  `derive.chronological`, status from the last event, then the recorded moves).
+  `validate.no_drift` re-derives with the same readers and rule, so a store
+  holding several windows passes it, and folding windows in any order, or
+  re-folding one, gives the same nodes. A fold with no code/symbol events skips
+  this; one that has them reads the repo's ledger once (linear in its size).
+  No schema change. A single-window store is unchanged. A multi-window store
+  written before #76 keeps window-only artifact nodes until a fold names them:
+  re-fold each of its windows (or rebuild it) to repair them all.
 - **`symbol_events` ledger.** The symbol-granular lifecycle
   (`gather.parse_symbol_events`) is persisted into the `code_events` table keyed
   by the SYMBOL artifact id `<path>#<lang>:<subkind>:<name>`, carrying the rich
@@ -255,6 +269,14 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
   (`derive.match_symbol_moves`) upsert `replaced_by` (src→dst) and
   `identity_from` (dst→src) artifact→artifact edges carrying
   `move_confidence`/`move_basis` in the edge `data`. Idempotent by (src,dst,type).
+  Moves are matched **per fold window** (the bundle's own events), not over the
+  whole ledger: over months, a symbol's creation `add` and its later move `add`
+  would make every move ambiguous. The edges are the record of the moves; the
+  artifact nodes apply all of them (`derive.apply_recorded_moves`): a dest
+  takes `identity_from` from its most recent incoming move, and a source is
+  `replaced` by the dest of its most recent outgoing move only while its last
+  lifecycle event is a remove (a later re-add makes it `live` again). So a drop
+  in one window and an add in another are not a move. Edges are never retracted.
 
 **Slice 7b-1 (step 3) additionally persists people + the contribution / non-spine
 edges** (all derived on the write path via the shared `derive.py` leaf —
@@ -333,8 +355,10 @@ RAW-only view — it additionally reconstructs:
 
 - **`artifacts`** by reading the artifact `code` nodes (the non-commit ones —
   local id `art:<path>` / `<path>#…`), keyed by that local id (== `artifact_id`).
-  extract restores build_artifacts' code_events insertion order so order-sensitive
-  consumers (`build_timeline`'s same-`(ts,url)` tie-break) reproduce byte-for-byte.
+  extract restores build_artifacts' code_events insertion order (date order,
+  ties in ledger order — independent of which window was folded first) so
+  order-sensitive consumers (`build_timeline`'s same-`(ts,url)` tie-break)
+  reproduce byte-for-byte.
 - **`people`** by reading the project-scoped person `structure` nodes (repo
   sentinel `"*"`, local id `person-<login>`), keyed by login (the redundant stored
   `login` field is dropped). Because fold now persists ALL participants, this
