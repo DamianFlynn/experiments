@@ -927,7 +927,7 @@ PROFILE_COUNT_FIELDS = ("prs_authored", "prs_merged", "prs_reviewed",
                         "commits_authored", "issues_opened",
                         "examples_authored", "docs_authored",
                         "symbols_authored", "authored_then_removed",
-                        "stale_owned")
+                        "stale_owned", "prs_opened", "own_pr_commits")
 
 
 def _first_reviews(pr):
@@ -994,8 +994,29 @@ def annotate_people_profile(bundle):
                    "commits_authored": 0, "issues_opened": 0,
                    "examples_authored": 0, "docs_authored": 0,
                    "symbols_authored": 0, "authored_then_removed": 0,
+                   "own_pr_commits": 0, "prs_opened": 0,
                    "latencies": [], "dates": []}
            for login in people}
+    # `prs_opened` (#97 final gate): the person's PRs created inside the
+    # window, by calendar day. A view also holds PRs created earlier (still
+    # open, or closed in the window), which `prs_authored` counts.
+    window = (bundle.get("meta") or {}).get("period") or {}
+    if not window:
+        meta = bundle.get("meta") or {}
+        window = {"from": meta.get("from"), "to": meta.get("to")}
+    w_from = (window.get("from") or "")[:10] or None
+    w_to = (window.get("to") or "")[:10] or None
+
+    def opened_in_window(pr):
+        day = (pr.get("created_at") or "")[:10]
+        if not day or not (w_from or w_to):
+            return None   # unknown: the window or the creation day is missing
+        return (w_from is None or day >= w_from) and (w_to is None or day <= w_to)
+
+    opened = [opened_in_window(pr) for pr in prs]
+    # emitted only when it differs from `prs_authored` for someone: when the
+    # view holds a PR created outside the window
+    emit_opened = any(o is False for o in opened)
 
     def add_date(login, ts):
         if login in acc:
@@ -1003,10 +1024,12 @@ def annotate_people_profile(bundle):
             if d:
                 acc[login]["dates"].append(d)
 
-    for pr in prs:
+    for pr, was_opened in zip(prs, opened):
         author = pr.get("author")
         if author in acc:
             acc[author]["prs_authored"] += 1
+            if was_opened:
+                acc[author]["prs_opened"] += 1
             if pr.get("merged"):
                 acc[author]["prs_merged"] += 1
             add_date(author, pr.get("created_at"))
@@ -1027,11 +1050,18 @@ def annotate_people_profile(bundle):
         for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
             add_date(c.get("author"), c.get("created_at"))
 
+    # the author of each merged PR, so a commit that lands the committer's own
+    # merged PR (a squash / landing commit, `commit.pr`) is known (#97 final
+    # gate: the hall score does not count that work a third time)
+    merged_author = {pr.get("number"): pr.get("author") for pr in prs
+                     if pr.get("merged") and pr.get("author")}
     for c in commits:
         au = c.get("author")
         if au in acc:
             acc[au]["commits_authored"] += 1
             add_date(au, c.get("date"))
+            if c.get("pr") is not None and merged_author.get(c.get("pr")) == au:
+                acc[au]["own_pr_commits"] += 1
 
     for iss in issues:
         au = iss.get("author")
@@ -1097,6 +1127,12 @@ def annotate_people_profile(bundle):
             "authored_then_removed": a["authored_then_removed"],
             "stale_owned": _stale_owned(login),
         })
+        # omit-when-not-applicable (older bundles and the golden views keep
+        # their shape): see the notes where each is counted
+        if emit_opened:
+            profile["prs_opened"] = a["prs_opened"]
+        if a["own_pr_commits"]:
+            profile["own_pr_commits"] = a["own_pr_commits"]
 
     return bundle
 
@@ -1105,10 +1141,15 @@ def build_halls(bundle):
     """Build `bundle["halls"] = {"fame": [...]}` — recognition only.
 
     Run AFTER annotate_people_profile (reads its counts). For each NON-bot login,
-    score = prs_merged*2 + prs_reviewed + commits_authored; keep score>0, sort by
-    (-score, login), take top 10. `halls.internal`/`shame`/`blame` are
-    intentionally NOT built (recognition, not blame). Pure (sets halls); returns
-    bundle."""
+    score = prs_merged*2 + prs_reviewed + (commits_authored - own_pr_commits);
+    keep score>0, sort by (-score, login), take top 10. `own_pr_commits` (0
+    when absent) are the person's commits that land a merged PR they authored
+    (a squash / landing commit): that work already scores through
+    `prs_merged`, so it is not counted again (#97 final gate) — only commits
+    not attributable to their own merged PRs (direct pushes, commits on
+    others' PRs) add to the score. A fame entry carries `own_pr_commits` when
+    it is not 0. `halls.internal`/`shame`/`blame` are intentionally NOT built
+    (recognition, not blame). Pure (sets halls); returns bundle."""
     people = bundle.get("people") or {}
     fame = []
     for login, profile in people.items():
@@ -1117,17 +1158,21 @@ def build_halls(bundle):
         prs_merged = profile.get("prs_merged", 0)
         prs_reviewed = profile.get("prs_reviewed", 0)
         commits_authored = profile.get("commits_authored", 0)
-        score = prs_merged * 2 + prs_reviewed + commits_authored
+        own_pr_commits = profile.get("own_pr_commits") or 0
+        score = prs_merged * 2 + prs_reviewed + commits_authored - own_pr_commits
         if score <= 0:
             continue
-        fame.append({
+        entry = {
             "login": login,
             "score": score,
             "prs_merged": prs_merged,
             "prs_reviewed": prs_reviewed,
             "commits_authored": commits_authored,
             "areas": profile.get("areas", []),
-        })
+        }
+        if own_pr_commits:
+            entry["own_pr_commits"] = own_pr_commits
+        fame.append(entry)
     fame.sort(key=lambda e: (-e["score"], e["login"]))
     bundle["halls"] = {"fame": fame[:10]}
     return bundle

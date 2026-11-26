@@ -108,6 +108,23 @@ class TestComputeSeriesCarryOver(unittest.TestCase):
             ("pr", 6, "shipped", "in_flight"),
         ])
 
+    def test_new_opened_is_the_new_work_created_in_the_window(self):
+        # validation finding 18: `new` is new to the series; an issue open for
+        # years and first touched this window is in it, but not in new_opened
+        prior = series.installment_snapshot(_bundle(shipped=[("pr", 1)]))
+        cur = _bundle(
+            shipped=[("pr", 300)], in_flight=[("issue", 2308), ("pr", 301)],
+            prs=[{"number": 300, "created_at": "2026-01-04T10:00:00Z"},
+                 {"number": 301, "created_at": "2025-12-31T23:00:00Z"}],
+            issues=[{"number": 2308, "created_at": "2024-02-01T00:00:00Z"}])
+        s = series.compute_series(cur, prior)
+        self.assertEqual([(e["type"], e["id"]) for e in s["new"]],
+                         [("issue", 2308), ("pr", 300), ("pr", 301)])
+        self.assertEqual(s["new_opened"],
+                         [{"type": "pr", "id": 300, "url": "http://x/pr/300",
+                           "bucket": "shipped"}])
+        self.assertEqual(series.compute_series(cur, None)["new_opened"], [])
+
     def test_carried_without_prior_board_status_uses_bucket(self):
         prior = series.installment_snapshot(_bundle(in_flight=[("pr", 9)]))
         cur = _bundle(in_flight=[("pr", 9)])

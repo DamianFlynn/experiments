@@ -58,7 +58,9 @@ PLACEHOLDER RULES — read before filling anything below.
     that took more than 21 days to land (`train.effort.elapsed_days`).
     `train.prs` holds every attempt (rejected, merged, still open); each PR's own
     outcome is `train.pr_outcomes["<pr number>"]` ("merged" / "open" / "rejected").
-    `train.issues` is every issue its PRs close; `train.root_issue` is the lowest.
+    `train.issues` is every issue its merged or open PRs close; `train.root_issue`
+    is the lowest. A rejected attempt in a train with a merged or open PR adds no
+    issue of its own (a closing reference takes effect only when its PR merges).
   - `ptrain` — a project train, view["trains"][] (`id`, `repos`, `kind`, `outcome`,
     `prs`, `issues`, `commits`, `code_areas`, `tickets`, `evidence`). It has no
     `tier`, `effort`, `root_issue` or title. `ptrain.code_areas` are
@@ -113,6 +115,20 @@ PLACEHOLDER RULES — read before filling anything below.
 * TRUNCATED DIAGRAMS: when `diagrams.truncated` has an entry for an embedded
   diagram, say so under it: "Showing {diagrams.truncated[].shown} of
   {diagrams.truncated[].total} {diagrams.truncated[].unit}."
+* LONG LISTS (like the diagram caps): a list or table with one row per item
+  shows at most 40 rows — Shipped this period, each area of Shipped by code
+  area, the mention-train lines (or each theme group of them), Feature changes,
+  Symbol-level changes, Content lifecycle, In flight, Rejected / abandoned,
+  each flow-pathology group, each forecast tier. Keep the section's own order
+  (most substantial first) and cut the rest. When a list is cut, its LAST line
+  is mandatory: "Showing N of M <unit> — the full list is in the bundle
+  (`<key>`)", with N and M counted from the data and `<key>` the bundle key the
+  rows come from (e.g. `buckets.shipped`, `feature_deltas`, `artifacts`,
+  `trains`). Never drop that line, and never write about the cut rows as if
+  they were listed. Deep-train blocks are not cut (`train.tier` already bounds
+  them). A train that touches more than 10 code areas (`train.code_areas`) is
+  CROSS-CUTTING: describe it once, under "Cross-cutting changes" (see Decision
+  trains and Shipped by code area), never once per area.
 * AGENT-DERIVED placeholders (no field of that name exists; fill by the rule):
   - {short title} — `item.title` of the train's root issue (`train.root_issue`),
     else of its first PR (`train.prs`). For a project train, the same rule on the
@@ -151,7 +167,11 @@ placeholder-rules:end -->
      prior to compare against. Framing prose is the agent's; the membership is
      deterministic and every item cites its ref. -->
 
-**New this installment:** rows of `series.new` (first seen this window).
+**New to the series:** rows of `series.new` — shipped or in-flight items this report
+series had not seen in the previous installment. That is NOT "newly opened": an issue open
+for years and first touched this window is in it. The items actually created inside this
+window are the rows of `series.new_opened` (a subset): lead with their count ("N of the M new
+items were opened this window") and never call the rest of `series.new` new work.
 
 - [{item.title}]({ref.url}) ({ref.type} #{ref.id})
 
@@ -199,6 +219,9 @@ keep them out of any hit rate:
 |------|-------|-----|
 | `{ref.repo}` | [{item.title}]({ref.url}) | {ref.type} #{ref.id} |
 
+At most 40 rows (LONG LISTS); when cut, end with "Showing N of M shipped items — the full
+list is in the bundle (`buckets.shipped`)".
+
 ## Decision trains
 
 <!-- Multi-repo: one project-train block per `ptrain` in view["trains"], then
@@ -209,7 +232,21 @@ keep them out of any hit rate:
      Order most-substantial first (rank by the number of `ptrain.prs` plus
      `ptrain.commits`; ties by outcome shipped > in_flight > rejected >
      abandoned), cross-repo trains (more than one `ptrain.repos`) first.
-     `ptrain.tickets` is [] unless digest ran with ticket parsing switched on. -->
+     `ptrain.tickets` is [] unless digest ran with ticket parsing switched on.
+     MONOREPO OF INDEPENDENT PRS: when nearly every train is a single PR (e.g.
+     the largest train holds one or two PRs), a month-long campaign is dozens
+     of separate trains with no closing reference between them. Then do not
+     list the mention trains flat: group them by theme — read from the PR
+     titles (their conventional prefix and the module or path they name) and
+     from `train.code_areas` — one bold theme line each ("CI reliability —
+     14 trains", "metadata platform — 9 trains") followed by its train lines,
+     every theme backed by the train ids under it. The grouping is the
+     writer's framing; the trains listed are the data. Put CROSS-CUTTING
+     trains (more than 10 `train.code_areas`; usually a mechanical sweep) in
+     one "Cross-cutting changes" group, each once. A deep train that is such
+     a sweep (one PR, kind chore / docs / other) gets its flowchart, effort
+     line and a short narrative, not a long one. LONG LISTS applies to each
+     group. -->
 
 ### {short title} — `{ptrain.id}`
 
@@ -248,7 +285,9 @@ keep them out of any hit rate:
 
 <!-- narrative: <train-id> -->
 
-**Mention trains** (`train.tier` "mention") — one line each:
+**Mention trains** (`train.tier` "mention") — one line each (grouped by theme on a
+monorepo of independent PRs, see above; at most 40 lines per group, then the LONG LISTS
+"Showing N of M trains" line):
 
 - `{train.id}` — {short title} — {train.outcome} ({count of train.prs} PR(s))
 
@@ -348,6 +387,10 @@ Shipped work is never listed here: a train that took long to land
 **Flow pathologies** — the per-issue classification in bundle["flow"] (deterministic;
 each `flow_entry` carries `state`, `age_days`, `reactions`, `blocked_by` (open
 blockers only), `blocked_by_unknown`, and `signals`; the title comes from `item`).
+`flow` covers the repo's WHOLE open backlog as of the reference date, not this month's
+work: every open issue the view holds, however old. Open the subsection with one line
+saying so — "Open backlog of the whole repo as of {meta.ref_date}, not only this
+month's issues" — and never present a flow count as something that happened this month.
 `blocked` means at least one **open** blocker; a closed blocker no longer blocks;
 `hung` means old **and** stale (no update for 30 days). Group by `flow_entry.state`
 in this order — **blocked → upvoted_but_ignored → traction_then_abandoned → hung** —
@@ -387,6 +430,15 @@ this is not the first installment); otherwise there is no loop to show.
 
 **Next milestone:** {forecast.next_milestone} *(or "none identified" when null)*
 
+Candidates are open items on the next milestone, with a priority label, or open PRs approved
+with no later change request (signal "approved, no later change request"). When
+`forecast.candidates` is empty, write "No forecast this installment", then each reason in
+{forecast.notes} as a bullet, then one line pointing the reader to USAGE §6.3 ("Making it
+meaningful on your repos", `docs/USAGE.md`) for what a repo needs to get a forecast. An empty
+list with no `forecast.notes` means nothing was open. Never invent candidates. When
+`forecast.priority_patterns` is present, the operator added priority-label patterns: say
+which in one line.
+
 ### Likely
 
 For each `cand` with `cand.tier` "likely" (score ≥ 5.0), `cand.score` descending:
@@ -407,7 +459,8 @@ For each `cand` with `cand.tier` "longshot" (score < 2.0):
 
 (Omit "train …" when `cand.train` is null; join `cand.signals` with " · ". `cand.notes` is
 non-scoring context, e.g. "previous attempt rejected": join with " · " and omit the "— …"
-part when it is empty.)
+part when it is empty. At most 40 candidates per tier, LONG LISTS: "Showing N of M
+candidates — the full list is in the bundle (`forecast.candidates`)".)
 
 ## Feature changes (add / drop / change)
 
@@ -422,6 +475,10 @@ code area when the path resolves to one, else null.
 | Kind | Subject | Name | Author | PR | Commit |
 |------|---------|------|--------|----|--------|
 | {delta.kind} | {delta.subject} | {delta.name} | {delta.author} | {delta.pr} (or "—") | [{delta.commit} (first 7)]({delta.url}) |
+
+At most 40 rows (LONG LISTS): a month can hold thousands of deltas. When cut, keep the
+table's first 40 rows and end with "Showing N of M feature changes — the full list is in the
+bundle (`feature_deltas`)"; `diagrams.deltas_bar` above still shows the whole mix.
 
 **Moves** — when `symbol_moves.links` is non-empty, collapse the matching add/drop
 rows into one "moved" row per `move`: `{move.name}` {move.from_path} → {move.to_path}
@@ -457,11 +514,19 @@ lifecycle event `ev`:
 
 - **{artifact.name}** ({artifact.kind}, `{artifact.path}`) — {artifact.status}. Lifecycle: {ev.event} by {ev.author} on {ev.date} ([{ev.commit} (first 7)]({ev.ref.url})), …; replaced by `{artifact.replaced_by}` when set.
 
+At most 40 artifacts (LONG LISTS; removed / replaced ones first). When cut, end with "Showing
+N of M artifacts — the full list is in the bundle (`artifacts`)".
+
 ## Shipped by code area
 
 Group the `buckets.shipped` refs by their train's code areas: `ref.train` is a
 `train.id`; that train's `train.code_areas` are `area.id` values. Items with no
-train or no resolved area fall under "Unattributed".
+train or no resolved area fall under "Unattributed". An item whose train is
+CROSS-CUTTING (more than 10 `train.code_areas`) is listed once, under a
+"Cross-cutting changes" heading with its area count, not under each of its areas.
+At most 40 items per area (LONG LISTS: "Showing N of M items — the full list is in the
+bundle (`buckets.shipped`)"); with more than 40 areas, show the 40 with the most shipped
+items and end with "Showing N of M areas".
 
 ### {area.label} (`{area.id}`)
 
@@ -535,7 +600,9 @@ lifecycle) where useful.
 
 Who moved the project this period (public — recognition, not blame). The ranking is
 **deterministic** — read it straight off `halls.fame` (footprint score
-`prs_merged*2 + prs_reviewed + commits_authored`, highest first), and pull each person's
+`prs_merged*2 + prs_reviewed + commits_authored - own_pr_commits`, highest first:
+`fame.own_pr_commits`, absent when 0, are commits that land the person's own merged PRs —
+squash commits — which already score through `prs_merged`), and pull each person's
 detail from their profile, `person` = the `people` entry for `fame.login`
 (`person.prs_authored`, `person.prs_merged`, `person.merge_rate`, `person.prs_reviewed`,
 `person.commits_authored`, `person.issues_opened`, `person.review_latency_days`,
@@ -552,9 +619,14 @@ reviewed (`pr.reviewers`) so the footprint is grounded. Omit the whole section w
      are "<repo>::<area>". A member's own section reads that member's bundle,
      whose `people` are only the people with a contribution in that member. -->
 
-| Contributor | Authored | Merged | Reviewed | Commits | Areas | Evidence |
-|-------------|----------|--------|----------|---------|-------|----------|
-| `{fame.login}` | {person.prs_authored} | {person.prs_merged} | {person.prs_reviewed} | {person.commits_authored} | {person.areas} | [#{pr.number}]({pr.url}), … |
+`person.prs_authored` counts every PR of the person IN THIS VIEW — opened this window, or
+opened earlier and still open or closed in it — not "PRs opened this month". The PRs they
+opened inside the window are `person.prs_opened`; the key is absent when every PR in the
+view was opened in the window, and then equals `person.prs_authored`.
+
+| Contributor | Opened | PRs in scope | Merged | Reviewed | Commits | Areas | Evidence |
+|-------------|--------|--------------|--------|----------|---------|-------|----------|
+| `{fame.login}` | {person.prs_opened} (or {person.prs_authored} when absent) | {person.prs_authored} | {person.prs_merged} | {person.prs_reviewed} | {person.commits_authored} | {person.areas} | [#{pr.number}]({pr.url}), … |
 
 Optionally note responsiveness/tenure where it adds signal — e.g. *"median review
 latency {person.review_latency_days}d · active {person.first_seen} →

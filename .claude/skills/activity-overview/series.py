@@ -231,7 +231,12 @@ def compute_series(bundle, prior):
     - `prior`: `{from, to, captured}` of the installment compared against
       (None on the first). `captured` is None for a pre-#86 entry.
     - `new`: this window's shipped + in_flight items the prior snapshot did not
-      know at all (in none of its buckets nor its forecast).
+      know at all (in none of its buckets nor its forecast) — new to the
+      SERIES, which includes old items first touched this window.
+    - `new_opened`: the rows of `new` whose PR / issue was created inside
+      this window (by calendar day of its `created_at`): the work actually
+      opened this window (#97 final gate). An item without `created_at` is
+      not in it.
     - `carried_over`: items in the prior's in_flight that are in ANY of this
       window's four buckets, each with its current `bucket` and the
       `prior_status` (the prior board status, or "in_flight" when none) — so
@@ -247,6 +252,7 @@ def compute_series(bundle, prior):
             "first_installment": True,
             "prior": None,
             "new": [],
+            "new_opened": [],
             "carried_over": [],
             "forecast_loop": {"landed": [], "not_yet": [], "dropped": []},
         }
@@ -271,6 +277,19 @@ def compute_series(bundle, prior):
             # else: known last time and not carried work — neither.
     new.sort(key=_ref_sort)
     carried.sort(key=_ref_sort)
+    created = {("pr", p.get("number")): p.get("created_at")
+               for p in bundle.get("prs", [])}
+    created.update({("issue", i.get("number")): i.get("created_at")
+                    for i in bundle.get("issues", [])})
+    w_from, w_to = (str(b)[:10] if b else None
+                    for b in bundle_window(bundle.get("meta", {})))
+
+    def opened_in_window(entry):
+        day = (created.get(_key(entry)) or "")[:10]
+        return bool(day) and (w_from is None or day >= w_from) \
+            and (w_to is None or day <= w_to)
+
+    new_opened = [dict(e) for e in new if opened_in_window(e)]
 
     now_shipped = {_key(r) for r in buckets.get("shipped", [])}
     now_rejected = {_key(r) for r in buckets.get("rejected", [])}
@@ -289,6 +308,7 @@ def compute_series(bundle, prior):
         "prior": {"from": prior.get("from"), "to": prior.get("to"),
                   "captured": prior.get("captured")},
         "new": new,
+        "new_opened": new_opened,
         "carried_over": carried,
         "forecast_loop": loop,
     }

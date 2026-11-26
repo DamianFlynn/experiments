@@ -49,7 +49,9 @@ video-script, dashboards) consume the same view. The contract:
   parts are disjoint and nobody is counted twice: the counts (`prs_authored`,
   `prs_merged`, `prs_reviewed`, `commits_authored`, `issues_opened`,
   `examples_authored`, `docs_authored`, `symbols_authored`, `authored_then_removed`,
-  `stale_owned`; `derive.PROFILE_COUNT_FIELDS`) are **summed**; `merge_rate` is
+  `stale_owned`, `own_pr_commits`, `prs_opened`; `derive.PROFILE_COUNT_FIELDS`) are
+  **summed** (a member that omits `prs_opened` contributes its `prs_authored`, which it then
+  equals; the project people carry `prs_opened` when any member does); `merge_rate` is
   recomputed from the summed `prs_merged / prs_authored`; `review_latency_days` is the
   median of **every** member's latency samples (not a median of member medians);
   `first_seen` is the earliest and `last_active` the latest; `modules` / `areas` are
@@ -63,7 +65,9 @@ video-script, dashboards) consume the same view. The contract:
   (`digest.build_project_trains`). Each is the union of the member trains (`trains[]` of
   `members[].bundle`) whose anchors fall in one connected group of the cross-repo spine
   (`closes` / `cross_ref` edges between members), plus any member PR / issue of that group
-  that has no train of its own. **Ids are qualified:** a PR is `<project>/<repo>#pr-<n>`, an
+  that has no train of its own. A `closes` edge from a member PR to an issue that PR's own
+  member train does not list (a rejected attempt's other issues, #97 final gate) is not
+  followed, so a project train of one member is exactly that member's train. **Ids are qualified:** a PR is `<project>/<repo>#pr-<n>`, an
   issue `<project>/<repo>#issue-<n>`, a commit `<project>/<repo>#<sha>`, where `<repo>` is the
   store's repo key (`owner/name` for a manifest member). `id` is `"ptrain-" +` the smallest
   qualified PR / issue id (so `ptrain-<project>/<repo>#issue-<n>` or `#pr-<n>`); the member's
@@ -311,6 +315,16 @@ the rest (engagement, code areas, trains, people/flow).
   trains. A `closes` number that is one of the bundle's PRs is not an issue (GitHub closes no
   PR by keyword): it neither anchors nor joins a train (#110). `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
   or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.
+  **A closing reference takes effect only when its PR merges (#97 final gate).** Only merged
+  and open PRs join issues into a train and anchor it. A rejected PR that closes an issue of
+  such a train is listed in it as a rejected attempt (`prs`, `pr_outcomes`, its commits, and
+  its reviewers / participants in `effort`) but adds none of its other issues and never
+  changes the train's `root_issue`, `issues`, `kind`, `outcome`, `effort.opened_at` or
+  `effort.elapsed_days`; when its issues touch several such trains it joins the one with the
+  lowest of those issue numbers. Rejected PRs whose issues are in no merged/open train join
+  each other over their issues, as before (a `"rejected"` train). So an issue only a rejected
+  PR named beside a shipped one stays out of the shipped train (and its bucket ref carries no
+  train). The order of the records never changes the result.
   A train is anchored by its lowest closed issue — `root_issue`, id `train-issue-<n>` — or, when
   its PRs close no issue (process not followed / a forked PR), by its lowest **PR**
   (`train-pr-<n>`). `outcome`, by precedence shipped > in_flight > rejected > abandoned:
@@ -489,7 +503,9 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   `ranges` concatenated, largest `cap`).
 - **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
   `next_candidates` (one bucket per item; precedence shipped > rejected >
-  next_candidates > in_flight). Each ref may carry a `train` id. The current/next
+  next_candidates > in_flight). Each ref may carry a `train` id. An open item is a
+  next candidate when it is on the next milestone, has a priority label or is an
+  approved PR (both below, under **forecast**). The current/next
   milestones come from `select_milestones`: open milestones **with a due date** only
   (undated ones, e.g. "Backlog", are never selected; none dated → no current/next);
   current = earliest due on/after `ref_date`'s day, next = the one after; if all are
@@ -510,11 +526,28 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   it is `{}` when nothing was cut (caps and ranking keys: `docs/LLD.md` §7).
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
   train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...],
-  notes:[str,...] } ] }`
+  notes:[str,...] } ][, notes:[str,...]][, priority_patterns:[str,...]] }`
   — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
   desc. `next_milestone` is the bucket rule's next milestone (always dated; `None` when
-  there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
-  / `active in window` / `long-open`. The in-motion signal (#87) needs live work: `open PR`
+  there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` /
+  `approved, no later change request` / `open PR` or `work in progress`
+  / `active in window` / `long-open`. **Priority labels (#97 final gate):** a label is
+  high priority when it is one of `link.HIGH_PRIORITY_LABELS` (exact, case-insensitive) or
+  matches one of `link.PRIORITY_LABEL_PATTERNS` (regular expressions searched
+  case-insensitively: priority high / critical / urgent / P0 / P1, high priority, a bare
+  P0 / P1, urgent, critical (not "non-critical"), blocker, immediate attention), plus any
+  `link.py BUNDLE --priority-label PATTERN` (repeatable), which are then listed in
+  `forecast.priority_patterns` (absent without the flag). **Approved PR:** an open,
+  unmerged PR that is not a draft (`draft` true; gather does not record it yet, so it is
+  read when present) with an `approved` review by someone other than its author and no
+  `changes_requested` review submitted after the latest such approval, as the view's
+  `reviews` record them (`link.approved_pr`; a dismissed approval reads `dismissed`; the
+  PR's `review_decision` is today's and is not used). It needs no milestone discipline and
+  scores 3.0 (with `open PR`, 5.0: likely); next month's `series.forecast_loop` checks
+  whether it shipped. **`forecast.notes`** (absent otherwise) — when there is no
+  candidate although the view holds an open PR or issue, one plain sentence per signal
+  source saying why (no usable next milestone and the reason, no priority label, no
+  approved PR); a view with nothing open has no notes. The in-motion signal (#87) needs live work: `open PR`
   when the candidate is an open PR or an open PR `closes`/cross-references the issue;
   `work in progress` when the candidate's train (looked up in `trains` by `train`) has
   `outcome` `in_flight`. A `rejected`, `shipped` or `abandoned` train, or a `train` id that
@@ -526,14 +559,17 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
 - **series** (only with `link.py BUNDLE --series INDEX`; absent otherwise) —
-  `{ first_installment:bool, prior:{from,to,captured}|None, new:[row],
+  `{ first_installment:bool, prior:{from,to,captured}|None, new:[row], new_opened:[row],
   carried_over:[row], forecast_loop:{ landed:[loop], not_yet:[loop], dropped:[loop] } }`.
   The comparison is against the installment recorded for the window **immediately before**
   this bundle's window (`meta.period`, else `meta.from`/`meta.to`) in the index — not the
   last one appended. A `row` is `{type, id, url, bucket}` (`bucket` = this window's bucket);
   carried rows add `prior_status` (the prior board status, else `"in_flight"`). `new` = this
   window's `shipped` / `in_flight` items the prior installment did not know at all (in none
-  of its buckets nor its forecast). `carried_over` = items in the prior's `in_flight` that
+  of its buckets nor its forecast) — new to the **series**, not newly opened: an old issue
+  first touched this window is in it. `new_opened` (#97 final gate) = the rows of `new` whose
+  PR / issue `created_at` falls inside this window (by calendar day; `[]` on the first
+  installment): the work actually opened this window. `carried_over` = items in the prior's `in_flight` that
   are in **any** of this window's four buckets (so in-flight work that was rejected or
   moved to `next_candidates` is reported, with that `bucket`). A `loop` row is
   `{type, id, tier}` for each prior forecast candidate: `landed` = now in `shipped`,
@@ -894,11 +930,13 @@ across members (see "Project view: `people` and `halls`").
 
   | field | meaning |
   |-------|---------|
-  | `prs_authored` | PRs with `author == login` (int) |
+  | `prs_authored` | PRs in the view with `author == login` (int): every in-scope PR — opened in the window, or opened earlier and still open or closed in it — NOT "PRs opened this month" |
+  | `prs_opened` | of those, PRs whose `created_at` falls inside the window (`meta.period`, by calendar day) (int). Present on every person only when the view holds a PR created outside the window; absent otherwise, and then equal to `prs_authored` (#97 final gate) |
   | `prs_merged` | of those, PRs with truthy `merged` (int) |
   | `merge_rate` | `round(prs_merged/prs_authored, 3)`, `null` when 0 authored |
   | `prs_reviewed` | PRs where login is in `reviewers` (int) |
-  | `commits_authored` | commits with `author == login` (int) |
+  | `commits_authored` | commits with `author == login` (int) — the true count |
+  | `own_pr_commits` | of those, commits whose `pr` is a merged PR authored by the same login — the landing (squash) commit of their own PR (int); absent when 0 (#97 final gate) |
   | `issues_opened` | issues with `author == login` (int) |
   | `review_latency_days` | median, over reviewed PRs, of (login's earliest `reviews[].submitted_at` − `pr.created_at`) in days; `null` when no timestamped review |
   | `first_seen` / `last_active` | min / max ISO date (`YYYY-MM-DD`) across the login's activity (PRs authored/merged-by, commits, issues, reviews); `null` when none |
@@ -906,13 +944,19 @@ across members (see "Project view: `people` and `halls`").
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
   | `stale_owned` | distinct areas in a stalled train's `code_areas` (an open train with `effort.stalled`, #112) that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
 
-  Counts are always present (ints, may be 0); `merge_rate`/`review_latency_days`/
+  Counts are always present (ints, may be 0), except `prs_opened` and `own_pr_commits`
+  (present when applicable, above); `merge_rate`/`review_latency_days`/
   `first_seen`/`last_active` are present as `null` when N/A. Deterministic.
 - **halls** `{ "fame": [ { login, score, prs_merged, prs_reviewed,
-  commits_authored, areas } ] }` (`build_halls`) — **recognition only.** `fame`
-  ranks NON-bot logins by footprint `score = prs_merged*2 + prs_reviewed +
-  commits_authored`, keeps `score > 0`, sorts by `(-score, login)`, takes the top
-  10 (else `[]`). **`halls.internal`/`shame`/`blame` are intentionally NOT built**
+  commits_authored, areas[, own_pr_commits] } ] }` (`build_halls`) — **recognition only.** `fame`
+  ranks NON-bot logins by footprint
+  `score = prs_merged*2 + prs_reviewed + (commits_authored - own_pr_commits)`
+  (`own_pr_commits` 0 when absent), keeps `score > 0`, sorts by `(-score, login)`, takes the top
+  10 (else `[]`). A commit that lands the person's own merged PR (a squash commit) already
+  scores through `prs_merged`, so it is not counted again (#97 final gate): on a squash-merge
+  repo an authored-and-merged PR scores 2 and a review 1; only commits not attributable to
+  the person's own merged PRs (direct pushes, commits on others' PRs) add to the score. An
+  entry carries `own_pr_commits` when it is not 0. No other weight changed. **`halls.internal`/`shame`/`blame` are intentionally NOT built**
   — per the "recognition, not blame" stance.
 - **issues[].blocks** — `[{ number, direction:"out"|"in" }]`, the blocking references gather
   parsed from that issue's own text (`gather.parse_blocks_refs`), in text order, deduped:

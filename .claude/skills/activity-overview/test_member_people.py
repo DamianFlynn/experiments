@@ -293,9 +293,13 @@ class ProjectViewPeople(unittest.TestCase):
     def test_project_halls_rank_on_merged_figures(self):
         for conn in self.stores:
             fame = _project(conn)["halls"]["fame"]
+            # each commit here lands its author's own merged PR, so it does
+            # not score again (#97 final gate): hank 2*2 + 3 reviews = 7
             self.assertEqual([(h["login"], h["score"]) for h in fame],
-                             [("hank", 9), ("alice", 3), ("gina", 3),
-                              ("zed", 3)])
+                             [("hank", 7), ("alice", 2), ("gina", 2),
+                              ("zed", 2)])
+            self.assertEqual([h.get("own_pr_commits") for h in fame],
+                             [2, 1, 1, 1])
             self.assertEqual(fame[0]["areas"],
                              ["o/a::core", "o/a::mod-x", "o/b::core",
                               "o/b::mod-y"])
@@ -427,6 +431,22 @@ class MergeHelpers(unittest.TestCase):
         self.assertIsNone(x["review_latency_days"])
         # inputs untouched
         self.assertEqual(members[0]["bundle"]["people"]["x"]["areas"], ["core"])
+        # no member holds a PR opened before the window: no prs_opened
+        self.assertNotIn("prs_opened", x)
+
+    def test_merge_people_prs_opened_falls_back_to_authored(self):
+        # validation finding 16: a member omits `prs_opened` when all its PRs
+        # were opened in the window (it equals prs_authored there)
+        members = [
+            {"repo": "Az/a", "bundle": {"prs": [], "people": {
+                "x": {"prs_authored": 3, "prs_opened": 1},
+                "y": {"prs_authored": 1, "prs_opened": 1}}}},
+            {"repo": "Az/b", "bundle": {"prs": [], "people": {
+                "x": {"prs_authored": 2}, "z": {"prs_authored": 4}}}},
+        ]
+        merged = digest._merge_people(members)
+        self.assertEqual({k: v["prs_opened"] for k, v in merged.items()},
+                         {"x": 3, "y": 1, "z": 4})
 
 
 if __name__ == "__main__":

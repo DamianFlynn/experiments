@@ -347,9 +347,15 @@ flowchart TB
      is not defined when a quarter covering it is in the same index. Keep roll-ups (quarters,
      years) in their own index file, e.g. `series-quarterly.json`.
 6. **Render**, then **author**: the report's *Since last installment* section uses
-   `bundle.series` — new items, carried-over items (with prior board status and where each is
+   `bundle.series` — items new to the series (`series.new`; `series.new_opened` are the ones
+   actually created this month), carried-over items (with prior board status and where each is
    now: shipped, in flight, re-planned or rejected) and the forecast loop (last month's
    predictions landed / not yet / dropped).
+   **Empty forecast?** Check `forecast.candidates` the first time you link a repo. When it is
+   empty, `forecast.notes` says which signal source is missing (no dated next milestone, no
+   priority label, no approved open PR), and the forecast loop will stay empty every month
+   until that changes: read §6.3 now — usually a `--priority-label` pattern for the repo's own
+   wording, passed on every month's `link.py` run, is enough.
 
 ### 5.3 First installment, catching up, and roll-ups
 
@@ -434,19 +440,25 @@ the full people check.
 
 ### 6.1 What it is
 
-The forecast scores **open items that are on the next milestone or carry a high-priority
-label** (`next_candidates`). Score = sum of signals:
+The forecast scores **open items that are on the next milestone, carry a high-priority
+label, or are open PRs approved with no later change request** (`next_candidates`). Score =
+sum of signals:
 
 | Signal | Points | Shown as |
 |---|---:|---|
 | On the next milestone | 5.0 | `on milestone <title>` |
 | High-priority label | 3.0 | `high-priority` |
+| Approved open PR: not a draft, an approving review by someone other than its author and no change request after it | 3.0 | `approved, no later change request` |
 | In motion: it is an open PR, an open PR closes/references it, or its train is in flight | 2.0 | `open PR` / `work in progress` |
 | Updated in the window | 1.5 | `active in window` |
 | Open ≥ 200 days | 1.0 | `long-open` |
 
-Tiers: **likely ≥ 5**, **possible ≥ 2**, **longshot < 2**. Open items that are merely active
-(not on the next milestone, not high-priority) appear under **In flight**, not in the forecast.
+Tiers: **likely ≥ 5**, **possible ≥ 2**, **longshot < 2**. An approved open PR is also an
+open PR (in motion), so it is at least **likely**: the signal needs no milestone discipline.
+Open items that are merely active (not on the next milestone, not high-priority, not an
+approved PR) appear under **In flight**, not in the forecast. When there is no candidate
+although items are open, `forecast.notes` lists why, one line per missing signal source
+(§6.3).
 
 "In motion" means live work only. An open issue whose only PR was closed unmerged, or that a
 merged PR merely references, is **not** in motion: its train is `rejected` / `shipped` (or,
@@ -471,14 +483,27 @@ calibrate how much weight readers should put on each tier; skip installments who
   count: an undated "Backlog"-style milestone is never current or next, so give release
   milestones a due date. If every dated milestone is overdue, the most recently due one is
   current and there is no next (so no `on milestone` signal).
-- **Priority labels must match.** Recognized labels (case-insensitive, exact):
-  `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`, `critical`. Check a repo
-  with `gh label list -R <owner/repo> --limit 200`. If it uses other names (for example a
-  `Priority: High` style), the high-priority signal will not fire; extend
-  `HIGH_PRIORITY_LABELS` in `link.py` (lower-case) and keep the change in your fork.
-- **No milestones and no matching labels** → the forecast is legitimately empty. The report
-  should then say "no forecast signals" and lean on *In flight*, *Stalled/blocked* and board
-  status instead of inventing predictions.
+- **Priority labels are matched by pattern.** A label counts as high priority when it is one
+  of `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`, `critical`, or
+  contains (case-insensitive) one of the default patterns: priority high / critical / urgent /
+  P0 / P1 (`Priority: High`, `priority/p1`), high priority, a bare P0 / P1, urgent, critical
+  (not "non-critical"), blocker, immediate attention (`Needs: Immediate Attention
+  :bangbang:`). Check a repo's labels with `gh label list -R <owner/repo> --limit 200`. For
+  other wording, add patterns on each run:
+  `python3 $AO/link.py $B --series $S/series.json --priority-label 'response overdue' --priority-label 'sev ?1'`
+  — each a case-insensitive regular expression, searched in each label; repeat the flag for
+  more. The patterns used are recorded in `forecast.priority_patterns`; pass the same ones
+  every month so the loop compares like with like. An invalid pattern stops `link.py` with
+  exit 2.
+- **Approved PRs work without any process.** An open, non-draft PR with an approving review
+  and no later change request is a candidate (`approved, no later change request`), so a repo
+  with no milestones and no priority labels still gets a forecast whenever reviewers approve
+  work, and next month's loop checks whether it shipped. A dismissed approval does not count.
+  (Gather does not record draft status yet; a `draft` field is honoured when present.)
+- **None of the three** → the forecast is legitimately empty and `forecast.notes` says why. The
+  report then says "no forecast this installment" with those reasons and a pointer to this
+  section, and leans on *In flight*, *Stalled/blocked* and board status instead of inventing
+  predictions.
 - **Projects v2 boards** add `board_status` to in-flight items and sprint framing; they do not
   change forecast scores.
 

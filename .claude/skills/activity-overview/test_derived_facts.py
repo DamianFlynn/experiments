@@ -198,6 +198,19 @@ class TestProjectTrainsAreLinkTrains(unittest.TestCase):
         view = _project_view(b)
         self.assertSameTrains(view)
 
+    def test_rejected_attempt_does_not_pull_its_other_issue_in(self):
+        # #97 final gate (validation finding 13): the rejected PR 3 closes
+        # issues 5 and 2; only the merged PR 1 (closing 5) joins issues into
+        # a train, so the open issue 2 is in no project train either.
+        b = _raw_bundle([_pr(1, merged=True, state="closed", closes=[5]),
+                         _pr(3, state="closed", closes=[5, 2])],
+                        [_issue(5), _issue(2, state="open")])
+        view = _project_view(b)
+        self.assertEqual([(t["id"], t["prs"], t["issues"]) for t in view["trains"]],
+                         [("ptrain-o/r#issue-5", ["o/r#pr-1", "o/r#pr-3"],
+                           ["o/r#issue-5"])])
+        self.assertSameTrains(view)
+
     def test_spine_constant_unchanged(self):
         # extract (train context) and spotlight still walk every spine edge.
         self.assertIn("cross_ref", graphstore.SPINE_EDGE_TYPES)

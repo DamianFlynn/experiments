@@ -966,7 +966,9 @@ flowchart TB
   tm -- no --> sb{"merged into a member PR's head?<br/>(head_repo + head)"}
   sb -- yes --> cp["contributing_prs on that PR's train"]
   sb -- no --> nt["no train"]
-  mb --> uf["join member PRs over the issues they CLOSE<br/>(union-find; a mention does not join)"]
+  mb --> uf["join MERGED / OPEN member PRs over the issues they CLOSE<br/>(union-find; a mention does not join)"]
+  mb --> rj["a REJECTED PR closing an issue of such a train:<br/>an attempt in it (lowest such issue), no issue of its own;<br/>else rejected PRs join each other over their issues"]
+  rj --> an
   uf --> an{"group closes an issue?"}
   an -- yes --> ti["train-issue-N: N = lowest closed issue<br/>issues = every closed issue"]
   an -- no --> tp["train-pr-N: N = lowest PR"]
@@ -984,6 +986,14 @@ issue are one train (`prs`), each with its own outcome in `pr_outcomes` (`{"<pr#
 "merged"|"open"|"rejected"}`). Member PRs and the issues they `close` are joined into connected
 groups; each group is one train, every issue it closes is in `issues` and is indexed to it by
 `train_index` (so its bucket ref carries the train id), and `root_issue` is the lowest of them.
+Only merged and open PRs' closing references join and anchor (#97 final gate: a closing
+reference takes effect only when its PR merges). A rejected PR that closes an issue of such a
+train is an attempt in it — in `prs` / `pr_outcomes`, its commits and reviewers counted — in
+the train holding the lowest of its issues that such a train has, and adds none of its other
+issues; it never changes `root_issue`, `issues`, `kind`, `outcome`, `effort.opened_at` or
+`elapsed_days`. Rejected PRs whose issues no merged/open PR closes join each other as before.
+`digest.link_components` follows the same rule: a member PR's `closes` edge to an issue its own
+link train does not list is not followed.
 `crossref_issues` (mentions, timeline cross-references, list tails such as the `#2` of
 `Fixes #1, #2`) never join or anchor: they stay spine `cross_ref` edges for `extract`'s train
 context and `spotlight` only (`digest` does not follow them, §10). A `closes` number that is a
@@ -1024,7 +1034,7 @@ flowchart TB
   r2 -- yes --> RJ
   r2 -- no --> o{"state open?"}
   o -- no --> NB["no bucket"]
-  o -- yes --> n1{"on NEXT milestone,<br/>or high-priority label?"}
+  o -- yes --> n1{"on NEXT milestone, high-priority label,<br/>or approved open PR?"}
   n1 -- yes --> NC["next_candidates"]
   n1 -- no --> i1{"on CURRENT milestone,<br/>or updated_at in window?"}
   i1 -- yes --> IF["in_flight"]
@@ -1036,8 +1046,15 @@ flowchart TB
 sorted by `(due day, number)` and compared to `ref_date[:10]` (date or ISO timestamp).
 **current** = earliest due on/after the ref day, **next** = the one after it; if every dated
 milestone is overdue, **current** = the most recently due (lowest number on a tie) and
-**next** = `None`. `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`,
-`high-priority`, `critical` (case-insensitive exact match).
+**next** = `None`. A label is high priority (`_high_priority`) when it is in
+`HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`,
+`critical` (case-insensitive exact match) or matches a regular expression of
+`PRIORITY_LABEL_PATTERNS` (searched case-insensitively: priority high / critical / urgent /
+P0 / P1, high priority, a bare P0 / P1, urgent, critical but not non-critical, blocker,
+immediate attention) or of the operator's `link.py --priority-label PATTERN` (repeatable,
+recorded in `forecast.priority_patterns`). An approved open PR (`approved_pr`: open, unmerged,
+not `draft`, an `approved` review by someone other than its author and no `changes_requested`
+review after the latest such approval, from the view's `reviews`) is a next candidate too.
 
 ### 6.6 Significance and effort
 
@@ -1051,7 +1068,9 @@ tier         = "deep" if rank ≤ TRAIN_SIGNIFICANCE_TOP_N (8) or significance �
 Kind weights: feature 3.0, module-request 3.0, bug 2.0, idea 1.5, docs/chore/other 1.0.
 Outcome is deliberately ignored (a rejected train's story still matters).
 
-`effort`, over every PR and issue of the train (#93): `opened_at` (earliest `created_at`),
+`effort`, over every PR and issue of the train (#93): `opened_at` (earliest `created_at` of
+the train's issues and its merged / open PRs — a rejected attempt beside them does not date
+the train, #97 final gate; a train of rejected PRs only is dated by them),
 `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
 (sum), `commits`, `participants` (distinct authors + reviewers + commenters), and the stall
 flags (#112, threshold `TRAIN_STALL_DAYS` = 21, strict `>`): for an `in_flight` train,
@@ -1072,7 +1091,8 @@ For each `next_candidates` ref:
 | Signal | Weight | Fires when |
 |---|---:|---|
 | `on_next_milestone` | 5.0 | item milestone == next milestone title |
-| `high_priority` | 3.0 | label in `HIGH_PRIORITY_LABELS` |
+| `high_priority` | 3.0 | a label in `HIGH_PRIORITY_LABELS` or matching `PRIORITY_LABEL_PATTERNS` / `--priority-label` (§6.5) |
+| `approved` | 3.0 | an open PR approved with no later change request (`approved_pr`, §6.5); signal text `approved, no later change request` |
 | `in_motion` | 2.0 | live work only (#87): it is an open PR; or an open PR `closes`/cross-refs it; or its train's `outcome` is `in_flight` |
 | `recent_activity` | 1.5 | `updated_at` in window |
 | `overdue` | 1.0 | `ref_date − created_at ≥ FORECAST_OVERDUE_DAYS` (200) |
@@ -1089,7 +1109,10 @@ shipped carries that train id and so the `linked PR already merged` note (its ow
 signal is unchanged).
 
 `tier` = likely (≥ 5.0) / possible (≥ 2.0) / longshot. Candidates sorted by `(−score, id)`.
-Output: `{next_milestone, candidates:[{ref, train, score, tier, signals, notes}]}`. Forward-only —
+Output: `{next_milestone, candidates:[{ref, train, score, tier, signals, notes}]}`, plus
+`notes` (a list of plain sentences: why there is no candidate — no usable next milestone and
+the reason, no priority label, no approved PR) when the candidates are empty although the view
+holds an open item, and `priority_patterns` when the operator passed any. Forward-only —
 verification happens in the next installment's series block.
 
 ### 6.8 Slice — `slice_train(bundle, train_id)`
@@ -1155,7 +1178,8 @@ window. Identity of items is `(type, id)`; URLs are excluded. `installment_snaps
 in_flight:[{type,id,board_status?}], next_candidates:[{type,id}], rejected:[{type,id}],
 forecast:[{type,id,tier}]}`. `compute_series`: `new` = this window's shipped/in_flight refs in
 none of the prior's lists (pre-#86 snapshots have no `next_candidates`/`rejected`, which
-then count as empty); `carried_over` = prior in_flight refs found in any of the four current
+then count as empty) — new to the series, not newly opened; `new_opened` = the `new` rows
+whose item `created_at` is inside the window (calendar day); `carried_over` = prior in_flight refs found in any of the four current
 buckets, each with `bucket` and `prior_status`; `forecast_loop` = prior forecast refs now in
 `shipped` (`landed`), in `rejected` (`dropped`) or neither (`not_yet`); `prior` =
 `{from, to, captured}` of the predecessor.
@@ -1182,8 +1206,8 @@ previous file intact, and a run that cannot write its bundle records no installm
 | `attribute_people_areas` | `people[].modules/areas` | commit files + reviewed PRs' areas |
 | `unresolved_person_key` | person key | the git name of a commit author gather could not resolve to a login, `+ " (git)"` when login-shaped, so it never equals a login (#78) |
 | `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*`; git-name forms `GitHub Actions`, `Dependabot`, `Dependabot Preview`, `Renovate`, `Renovate Bot` (case/space-insensitive), each also with the `" (git)"` suffix |
-| `annotate_people_profile` | per-login metrics | prs authored/merged/reviewed, merge rate, review latency (median), first/last active, examples/docs/symbols authored |
-| `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored`, top 10; **no shame/blame** |
+| `annotate_people_profile` | per-login metrics | prs authored (in scope) / opened in the window (`prs_opened`, when the view holds an earlier PR) / merged / reviewed, merge rate, commits and `own_pr_commits` (landing commits of their own merged PRs, when not 0), review latency (median), first/last active, examples/docs/symbols authored |
+| `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored − own_pr_commits` (a commit landing the person's own merged PR is not counted again), top 10; **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
 | `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (`blocker_graph` applies the same open-only filter, #101) |
 
@@ -1594,10 +1618,10 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 | `TRAIN_KIND_WEIGHTS` | feature 3, module-request 3, bug 2, idea 1.5, else 1 | link |
 | `TRAIN_SIGNIFICANCE_TOP_N` / `_FLOOR` | 8 / 20.0 | link |
 | `TRAIN_STALL_DAYS` | 21 | link |
-| `FORECAST_WEIGHTS` | 5.0 / 3.0 / 2.0 / 1.5 / 1.0 | link |
+| `FORECAST_WEIGHTS` | 5.0 / 3.0 / 3.0 (approved) / 2.0 / 1.5 / 1.0 | link |
 | `FORECAST_TIER_LIKELY_THRESHOLD` / `_POSSIBLE_` | 5.0 / 2.0 | link |
 | `FORECAST_OVERDUE_DAYS` | 200 | link |
-| `HIGH_PRIORITY_LABELS` | see §6.5 | link |
+| `HIGH_PRIORITY_LABELS` / `PRIORITY_LABEL_PATTERNS` | see §6.5 | link |
 | `SLICE_TEXT_CAP` / `SLICE_COMMENTS_KEPT` / `SLICE_DIFF_CAP` | 1500 / 6 / 6000 | link |
 | Flow thresholds | stale 30 d, upvotes 5, comments 5, hung 60 d | derive |
 | `TRAIN_FLOW_MAX_PRS` / `_AREAS` | 4 / 5 | render |
@@ -1837,7 +1861,7 @@ these affect an accumulated store.
 | Change | Where | Watch out for |
 |---|---|---|
 | New repo layout → areas | add `(name, fn)` to `DEFAULT_AREA_PATTERNS` (order matters) | area ids appear in stored nodes; re-gather after changing |
-| Org priority labels | `link.HIGH_PRIORITY_LABELS` | lower-case exact match |
+| Org priority labels | `link.py --priority-label PATTERN` per run; defaults in `link.PRIORITY_LABEL_PATTERNS` / `HIGH_PRIORITY_LABELS` | patterns are case-insensitive regular expressions (searched); an invalid one is a usage error |
 | Forecast / significance tuning | constants in `link.py` | tests pin thresholds; update tests + BUNDLE.md |
 | New view field | compute in `link.enrich` or `derive` (pure) | append-only; document in BUNDLE.md; omit when empty |
 | New stored fact | `fold_bundle` + `extract` reader + `validate` conformance | must keep `no_drift` and characterization green |

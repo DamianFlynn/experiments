@@ -245,11 +245,27 @@ def link_components(conn, project, members, components):
       - `issue-N` of a member repo whose `pr-N` the store holds: "Fixes #N"
         where #N is a PR closes nothing (GitHub numbers issues and PRs from one
         sequence, so it is not an issue), and link ignores it.
+    And the closing references that join no link train (#97 final gate): a
+    `closes` edge from a member PR to an issue its own link train does not
+    list — a rejected attempt's other issues (link.build_trains: only a
+    merged or open PR's closing references join issues into a train) — is
+    not followed.
     What is left is re-split, as window_components does, by what is still
     connected without them."""
-    blocked = set()
+    blocked, blocked_edges = set(), set()
     for m in members:
         repo, bundle = m["repo"], m["bundle"]
+        train_issues = {n: set(t.get("issues") or [])
+                        for t in bundle.get("trains", []) for n in t.get("prs", [])}
+        for p in bundle.get("prs", []):
+            own = train_issues.get(p["number"])
+            if own is None:
+                continue
+            for n in p.get("closes") or []:
+                if n not in own:
+                    blocked_edges.add(frozenset((
+                        graphstore.qualify_id(project, repo, "pr-{}".format(p["number"])),
+                        graphstore.qualify_id(project, repo, "issue-{}".format(n)))))
         in_trains = {n for t in bundle.get("trains", []) for n in t.get("prs", [])}
         for p in bundle.get("prs", []):
             if p["number"] not in in_trains:
@@ -268,8 +284,9 @@ def link_components(conn, project, members, components):
                 blocked.add(shadow)
     out = []
     for comp in components:
-        if comp & blocked:
-            out.extend(g for g in _split_without(conn, comp - blocked, blocked)
+        if comp & blocked or any(e <= comp for e in blocked_edges):
+            out.extend(g for g in _split_without(conn, comp - blocked, blocked,
+                                                 blocked_edges)
                        if g)
         else:
             out.append(comp)
@@ -281,9 +298,10 @@ def _is_anchor(nid):
     return graphstore.parse_id(nid)["local"].startswith(("pr-", "issue-"))
 
 
-def _split_without(conn, kept, blocked):
+def _split_without(conn, kept, blocked, blocked_edges=frozenset()):
     """Partition the anchors `kept` into the groups still connected over the
-    train edges (TRAIN_EDGE_TYPES) when the `blocked` anchors are removed.
+    train edges (TRAIN_EDGE_TYPES) when the `blocked` anchors are removed and
+    the `blocked_edges` (frozensets of the two endpoint ids) are not followed.
     Non-anchor nodes (commits) may still bridge; other anchors outside `kept`
     do not. Returns frozensets ordered by smallest id (an empty `kept` yields
     one empty set, so a component is never silently dropped from the list's
@@ -303,6 +321,8 @@ def _split_without(conn, kept, blocked):
                         edge_types=list(TRAIN_EDGE_TYPES)):
                     other = e["dst_id"] if e["src_id"] == nid else e["src_id"]
                     if other in visited or other in blocked:
+                        continue
+                    if frozenset((nid, other)) in blocked_edges:
                         continue
                     if _is_anchor(other) and other not in kept:
                         continue
@@ -509,11 +529,16 @@ def _merge_people(members):
       is_bot                OR; login_resolved false when any member says so
     Any other field is kept from the first member's record. Member records are
     not mutated. Order: first appearance over members in `members` order."""
-    people, samples = {}, {}
+    people, samples, opened = {}, {}, {}
     for m in members:
         repo, bundle = m["repo"], m["bundle"]
         latencies = derive.review_latency_samples(bundle.get("prs") or [])
         for login, rec in (bundle.get("people", {}) or {}).items():
+            # `prs_opened` is omitted by a member whose PRs were all opened in
+            # the window (it then equals `prs_authored` there)
+            seen, total = opened.get(login, (False, 0))
+            opened[login] = (seen or "prs_opened" in rec,
+                             total + (rec.get("prs_opened", rec.get("prs_authored")) or 0))
             if login not in people:
                 cur = dict(rec)  # copy: preserve all fields, don't alias
                 cur["modules"], cur["areas"], cur["is_bot"] = [], [], False
@@ -540,6 +565,8 @@ def _merge_people(members):
                 cur["login_resolved"] = False
             samples.setdefault(login, []).extend(latencies.get(login, []))
     for login, cur in people.items():
+        if any(seen for seen, _total in opened.values()):
+            cur["prs_opened"] = opened[login][1]
         if "prs_authored" in cur:
             authored = cur["prs_authored"]
             cur["merge_rate"] = (round(cur.get("prs_merged", 0) / authored, 3)

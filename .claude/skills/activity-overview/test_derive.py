@@ -680,6 +680,64 @@ class TestPeopleProfile(unittest.TestCase):
         # halls.internal/shame/blame intentionally omitted
         self.assertEqual(set(bundle["halls"]), {"fame"})
 
+    def _squash_bundle(self):
+        """Squash-merge repo (validation finding 14): every merged PR lands as
+        one commit by its author. alice authored and merged 2 PRs (2 landing
+        commits) and pushed 1 commit directly; bob reviewed 3 PRs and
+        committed once on alice's PR #1."""
+        prs = [{"number": 1, "author": "alice", "merged": True,
+                "created_at": "2026-09-02T00:00:00Z", "reviewers": ["bob"],
+                "reviews": [{"author": "bob", "state": "approved",
+                             "submitted_at": "2026-09-03T00:00:00Z"}]},
+               {"number": 2, "author": "alice", "merged": True,
+                "created_at": "2026-09-04T00:00:00Z", "reviewers": ["bob"]},
+               {"number": 3, "author": "carol", "merged": False,
+                "created_at": "2026-09-05T00:00:00Z", "reviewers": ["bob"]}]
+        commits = [{"sha": "a1", "author": "alice", "pr": 1, "date": "2026-09-03"},
+                   {"sha": "a2", "author": "alice", "pr": 2, "date": "2026-09-05"},
+                   {"sha": "a3", "author": "alice", "pr": None, "date": "2026-09-06"},
+                   {"sha": "b1", "author": "bob", "pr": 1, "date": "2026-09-03"}]
+        return {"meta": {"period": {"from": "2026-09-01", "to": "2026-09-30"}},
+                "people": {"alice": {"areas": [], "is_bot": False},
+                           "bob": {"areas": [], "is_bot": False},
+                           "carol": {"areas": [], "is_bot": False}},
+                "prs": prs, "commits": commits, "issues": []}
+
+    def test_landing_commits_of_own_prs_do_not_score_again(self):
+        b = self._squash_bundle()
+        derive.annotate_people_profile(b)
+        derive.build_halls(b)
+        alice = b["people"]["alice"]
+        self.assertEqual(alice["commits_authored"], 3)   # the true count
+        self.assertEqual(alice["own_pr_commits"], 2)
+        # bob's commit is on alice's PR, not his own: it scores
+        self.assertNotIn("own_pr_commits", b["people"]["bob"])
+        fame = {e["login"]: e for e in b["halls"]["fame"]}
+        # alice: 2*2 + 0 + (3 - 2) = 5 (was 2*2 + 3 = 7)
+        self.assertEqual(fame["alice"]["score"], 5)
+        self.assertEqual(fame["alice"]["own_pr_commits"], 2)
+        self.assertEqual(fame["alice"]["commits_authored"], 3)
+        # bob: 0*2 + 3 + 1 = 4
+        self.assertEqual(fame["bob"]["score"], 4)
+        self.assertNotIn("own_pr_commits", fame["bob"])
+
+    def test_prs_opened_counts_prs_created_in_the_window(self):
+        # validation finding 16: prs_authored counts every in-scope PR; a PR
+        # created before the window (still open, or closed in it) is not one
+        # the person opened this month
+        b = self._squash_bundle()
+        b["prs"][1]["created_at"] = "2026-07-30T00:00:00Z"
+        derive.annotate_people_profile(b)
+        alice = b["people"]["alice"]
+        self.assertEqual((alice["prs_authored"], alice["prs_opened"]), (2, 1))
+        self.assertEqual(b["people"]["bob"]["prs_opened"], 0)
+        self.assertEqual(b["people"]["carol"]["prs_opened"], 1)
+
+    def test_prs_opened_omitted_when_every_pr_was_opened_in_the_window(self):
+        b = self._squash_bundle()
+        derive.annotate_people_profile(b)
+        self.assertFalse(any("prs_opened" in p for p in b["people"].values()))
+
     def test_build_halls_empty_when_no_score(self):
         bundle = {"people": {
             "alice": {"areas": [], "is_bot": False, "prs_merged": 0,

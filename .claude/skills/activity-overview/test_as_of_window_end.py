@@ -277,9 +277,12 @@ class LateGatheredMonth(unittest.TestCase):
     def test_buckets(self):
         b = self.enriched
         self.assertEqual(_bucket(b, "shipped"), [("pr", 12)])
+        # PR 10 was approved on 2026-10-20 and the change request came on
+        # 2026-11-10, after the end: as of the end it is an approved open PR,
+        # a next candidate (#97 final gate), not merely in flight
         self.assertEqual(_bucket(b, "in_flight"),
-                         [("issue", 21), ("issue", 23), ("pr", 10),
-                          ("pr", 13)])
+                         [("issue", 21), ("issue", 23), ("pr", 13)])
+        self.assertEqual(_bucket(b, "next_candidates"), [("pr", 10)])
         self.assertEqual(_bucket(b, "rejected"), [])
 
     def test_train_outcomes(self):
