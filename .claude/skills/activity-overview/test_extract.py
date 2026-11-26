@@ -395,13 +395,11 @@ class ExtractArtifactsKeyNoCollision(unittest.TestCase):
         self.assertEqual(set(arts), set(derive.build_artifacts(bundle)),
                          "extract artifacts map must key exactly as build_artifacts")
 
-    def test_rename_artifact_order_matches_build_artifacts(self):
-        # Regression (Copilot re-review on #13): for a rename, build_artifacts
-        # ensures the NEW-path artifact before the replaced OLD-path one, so
-        # insertion order is [new, old]. _order_artifacts gave both the same
-        # event-index rank then tie-broke by id, flipping renames whose old id
-        # sorts before the new (e.g. a->z) to [old, new] — which can change
-        # build_timeline's same-(ts,url) tie-break. Order must follow insertion.
+    def test_rename_artifacts_keyed_in_id_order(self):
+        # Issue #100: artifact key order carries no meaning any more (every
+        # consumer orders by an explicit key), so extract keys the dict in id
+        # order — the order view.py's sort_keys output reads back in — not in
+        # build_artifacts' insertion order ([new, old] for a rename).
         c1 = "d" * 40
         bundle = {
             "meta": {"owner": "o", "repo": "r",
@@ -421,12 +419,13 @@ class ExtractArtifactsKeyNoCollision(unittest.TestCase):
         m = bundle["meta"]
         ex = extract.extract(conn, m["owner"], m["repo"], m["from"], m["to"],
                              warn=lambda _m: None)
-        # New (z) before replaced old (a) — matching build_artifacts, NOT lexical.
+        self.assertEqual(list(derive.build_artifacts(bundle)),
+                         ["art:z/README.md", "art:a/README.md"])
         self.assertEqual(list(ex["artifacts"]),
-                         list(derive.build_artifacts(bundle)))
-        self.assertEqual(list(ex["artifacts"]),
-                         ["art:z/README.md", "art:a/README.md"],
-                         "rename must keep [new, old] order, not lexical [old, new]")
+                         ["art:a/README.md", "art:z/README.md"])
+        # The enriched timeline is the same whichever way the dict is keyed.
+        rebuilt = dict(ex, artifacts=dict(reversed(list(ex["artifacts"].items()))))
+        self.assertEqual(link.build_timeline(rebuilt), link.build_timeline(ex))
 
 
 class ExtractSymbolMovesRoundTrip(unittest.TestCase):

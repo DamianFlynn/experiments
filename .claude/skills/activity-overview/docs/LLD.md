@@ -709,6 +709,13 @@ null list field on a PR/issue/commit (`labels`, `reviewers`, `comments_list`, `f
 keys change, so well-formed bundles (and the goldens) are untouched. The REST normalisers used by
 backfill (`normalize_pr`/`normalize_issue`) likewise read a null `labels`/`assignees` as empty.
 
+Enrich never reads the key order of a bundle object (#100). `build_timeline` sorts by
+`(ts, ref.url, layer)` and then, for code events, `(artifact id, lifecycle position)`;
+`compute_feature_deltas` by `(event time, artifact id, lifecycle position)`; render's content
+timeline walks artifacts in id order. Everything else that iterates `people` / `modules` /
+`artifacts` either writes per-key results or sorts its output. So `view.py` writes `sort_keys`
+JSON like `digest.py`, and `test_key_order.py` enriches key-reversed bundles to prove it.
+
 ### 6.4 Decision trains — `build_trains`
 
 ```mermaid

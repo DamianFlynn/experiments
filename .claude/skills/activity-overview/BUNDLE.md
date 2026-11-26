@@ -25,7 +25,14 @@ video-script, dashboards) consume the same view. The contract:
   digest.py --store <db> --project <name> --from … --to …` emits the merged
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
   halls, modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
-  canonical JSON (`sort_keys`), so output is diff-stable.
+  canonical JSON (`sort_keys`; `view.py` writes the raw view the same way), so output is
+  diff-stable. **Object key order carries no meaning (issue #100):** every list derived
+  from an object (`timeline`, `feature_deltas`, the content-timeline diagram) has an
+  explicit, total sort key, so enriching a bundle gives the same result whatever order its
+  objects' keys are in — a member taken from `digest.py` output and re-enriched equals the
+  same member produced by `view.py` + `link.py`. (The legacy `{pattern: owners}` form of
+  `code_owners` is the one exception: its key order is the CODEOWNERS rule order; current
+  gathers write the ordered list form.)
 - **Project view: `people` and `halls` (issue #88).** `people` is the union of the
   members' `people` by login, each figure combined across members. A member bundle's
   `people` hold only that member's contributors and count only its records, so the
@@ -375,14 +382,18 @@ review's state to `DISMISSED`.
   `ts` is the comment's `created_at` for social events and the commit's `committed_at`
   for code events (#82), so same-day events interleave by real time; a code event whose
   commit has no `committed_at` falls back to its date (`YYYY-MM-DD`), which sorts before
-  that day's timestamped social events. Ties break on `ref.url`.
+  that day's timestamped social events. Order is `(ts, ref.url, layer)` — social before
+  code — then, for code events, artifact id and the event's position in that artifact's
+  lifecycle (social events with an equal `(ts, ref.url)` keep their list order); it never
+  depends on the key order of `artifacts` (#100).
 - **feature_deltas** `[{ area, kind:"add|drop|change", subject, name, before,
   after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
   }]` — a projection over `artifacts` (add→add, remove→drop, change→change). For
   **symbol/comment** subjects `before`/`after` carry the bounded hunk
   snippet and `detail` is `"<lang> <subkind> <name>"`; file-level deltas leave them
   null. `area` is filled by area attribution. `pr`/`train` resolve best-effort via
-  the commit→PR map.
+  the commit→PR map. Ordered by event time (the commit's `committed_at`, else the
+  event's date), then `artifact`, then lifecycle position (#100).
 - **diagrams{}** now also maps `content_timeline` (Mermaid `timeline`) and
   `deltas_bar` (Mermaid `xychart-beta` bar).
 

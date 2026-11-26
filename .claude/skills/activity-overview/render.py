@@ -233,7 +233,8 @@ def emit_content_timeline(bundle, notes=None):
 
     Capped at the TIMELINE_MAX_DAYS latest periods (sorted date order; an
     `earlier : +K more events on M earlier dates` period replaces the rest) and at
-    TIMELINE_MAX_EVENTS_PER_DAY events per period (the first ones in bundle order,
+    TIMELINE_MAX_EVENTS_PER_DAY events per period (the first ones by artifact
+    id, then lifecycle position — never the key order of `artifacts`, #100 —
     then a `+K more events` event)."""
     return _fit(lambda scale, n: _content_timeline(bundle, scale, n), notes)
 
@@ -244,7 +245,9 @@ def _content_timeline(bundle, scale, notes):
              f"    title Content lifecycle ({meta.get('from','')} - {meta.get('to','')})"]
     by_date = {}
     verb = {"add": "built", "change": "changed", "remove": "dropped"}
-    for art in bundle.get("artifacts", {}).values():
+    arts = bundle.get("artifacts", {})
+    for aid in sorted(arts):
+        art = arts[aid]
         for ev in art.get("lifecycle", []):
             day = (_one_line((ev.get("date") or "")[:10]).replace(":", "-").strip()
                    or "undated")

@@ -144,20 +144,28 @@ def build_timeline(bundle):
     Event shape: {ts, actor, layer:'social'|'code', event, ref:{type,...,url},
     subject:{kind,name,path}}. Social events come from PR/issue comments + review
     comments; code events from artifact lifecycle entries, stamped with the
-    commit's `committed_at` when the bundle's commits carry it. Sorted by ts.
-    Malformed records that lack created_at fall back to URL ordering as a last
-    resort (not a normal case — well-formed comment objects carry created_at). Pure.
+    commit's `committed_at` when the bundle's commits carry it. Malformed records
+    that lack created_at fall back to URL ordering as a last resort (not a normal
+    case — well-formed comment objects carry created_at). Pure.
+
+    Order (#100) is total and independent of the key order of any dict in the
+    bundle: (ts, ref.url, layer — social before code —, then for a code event
+    its artifact id and its position in that artifact's lifecycle). Social
+    events with an equal (ts, url) keep the order of the `prs` / `issues` /
+    comment lists they come from (lists, so that order is data). The insertion
+    order of `artifacts` no longer breaks ties.
     """
-    events = []
+    keyed = []   # (sort key, event)
 
     def social(actor, event, ref_type, number, url, subject, ts):
-        events.append({
+        ev = {
             "ts": ts or "", "actor": actor, "layer": "social", "event": event,
             # `id` (not `number`) to match the bundle-wide ref convention
             # {type, id, url} used everywhere else (and the gate's well_formed).
             "ref": {"type": ref_type, "id": number, "url": url},
             "subject": subject,
-        })
+        }
+        keyed.append(((ev["ts"], str(url or ""), 0, "", len(keyed)), ev))
 
     for pr in bundle.get("prs", []):
         url = pr.get("url")
@@ -189,19 +197,22 @@ def build_timeline(bundle):
     # which sorts before that day's timestamped social events.
     committed_at = {c.get("sha"): c.get("committed_at")
                     for c in bundle.get("commits") or [] if c.get("committed_at")}
-    for art in bundle.get("artifacts", {}).values():
-        for ev in art.get("lifecycle", []):
-            events.append({
+    for aid, art in bundle.get("artifacts", {}).items():
+        for i, ev in enumerate(art.get("lifecycle", [])):
+            out = {
                 "ts": committed_at.get(ev.get("commit")) or ev.get("date") or "",
                 "actor": ev.get("author"),
                 "layer": "code", "event": ev["event"], "ref": ev["ref"],
                 "subject": {"kind": art["kind"], "name": art["name"],
                             "path": art["path"]},
-            })
+            }
+            keyed.append(((out["ts"], str(ev["ref"].get("url") or ""), 1,
+                           str(aid), i), out))
 
-    # Stable sort by ts (then by url so equal-ts events are deterministic).
-    events.sort(key=lambda e: (e["ts"], str(e["ref"].get("url") or "")))
-    return events
+    # No two keys are equal: artifact ids are unique and `i` is unique within an
+    # artifact; a social key ends in its own position in `keyed`.
+    keyed.sort(key=lambda ke: ke[0])
+    return [ev for _key, ev in keyed]
 
 
 _EVENT_TO_DELTA = {"add": "add", "remove": "drop", "change": "change"}
@@ -216,16 +227,22 @@ def compute_feature_deltas(bundle):
     `before`/`after` carry the bounded hunk snippet and `detail` is
     "<lang> <subkind> <name>"; file-level deltas leave them null. `area` is filled
     later by attribute_code_areas. Pure.
+
+    Order (#100): by the event's time (its commit's `committed_at`, else its
+    `date`, as build_timeline stamps it), then artifact id, then the event's
+    position in that artifact's lifecycle — total, and independent of the key
+    order of `artifacts`.
     """
     commit_to_pr = {c["sha"]: c.get("pr") for c in bundle.get("commits", [])}
+    times = derive.commit_times(bundle)
     pr_to_train = {}
     for t in bundle.get("trains", []):
         for n in t.get("prs", []):
             pr_to_train[n] = t["id"]
 
-    deltas = []
+    keyed = []   # (sort key, delta)
     for aid, art in bundle.get("artifacts", {}).items():
-        for ev in art.get("lifecycle", []):
+        for i, ev in enumerate(art.get("lifecycle", [])):
             kind = _EVENT_TO_DELTA.get(ev["event"])
             if kind is None:
                 continue
@@ -253,8 +270,10 @@ def compute_feature_deltas(bundle):
             # before/after unchanged. Omit-when-empty for byte stability.
             if not is_symbol and ev.get("hunk"):
                 delta["diff"] = ev["hunk"]
-            deltas.append(delta)
-    return deltas
+            ts = times.get(ev.get("commit")) or ev.get("date") or ""
+            keyed.append(((ts, str(aid), i), delta))
+    keyed.sort(key=lambda kd: kd[0])
+    return [d for _key, d in keyed]
 
 
 def _targets_mainline(pr, base_branch):

@@ -399,10 +399,10 @@ RAW-only view — it additionally reconstructs:
 
 - **`artifacts`** by reading the artifact `code` nodes (the non-commit ones —
   local id `art:<path>` / `<path>#…`), keyed by that local id (== `artifact_id`).
-  extract restores build_artifacts' code_events insertion order (date order,
-  ties in ledger order — independent of which window was folded first) so
-  order-sensitive consumers (`build_timeline`'s same-`(ts,url)` tie-break)
-  reproduce byte-for-byte.
+  extract keys the dict in artifact-id order; no consumer depends on that order
+  (issue #100: `build_timeline`, `compute_feature_deltas` and render's content
+  timeline each sort by an explicit key), so a view read back from `sort_keys`
+  JSON enriches byte-for-byte the same.
 - **`people`** by reading the project-scoped person `structure` nodes (repo
   sentinel `"*"`, local id `person-<login>`), keyed by login (the redundant stored
   `login` field is dropped). Because fold now persists ALL participants, the

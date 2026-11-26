@@ -22,7 +22,17 @@ dropped: the snapshots were re-captured once to add them (meta only; no other
 key changed). Issue #84 made extract stamp `base_branch` and `branches`; the
 golden bundles carry no `base_branch`, so their views report it unknown
 (`null`, `[]`) and the snapshots were re-captured once more to add those two
-meta keys (no other key changed). Unlike test_extract, this gate
+meta keys (no other key changed). Issue #100 gave `timeline` and
+`feature_deltas` a total sort key that no longer reads the insertion order of
+`artifacts`; char_bundle_p3.json was re-captured once for it, by a script that
+refused to write unless the only difference was list order. What moved: in
+`timeline`, the two code events of commit c1 (2026-05-03) now run
+docs/firewall.md before examples/basic/main.bicep (artifact id order), and the
+rename in commit c3 (2026-05-18) now lists the add of
+examples/advanced/main.bicep before the remove of examples/basic/main.bicep;
+`feature_deltas` are now in event-time order, then artifact id (they were
+grouped by artifact in insertion order). No other key changed, and the other
+four snapshots did not change. Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is
 canonical JSON: json.dumps(obj, sort_keys=True, indent=2).

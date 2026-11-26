@@ -22,11 +22,12 @@ The view carries its window (issue #75): `meta.period` = {--from, --to}, so
 else the `--ref-date` gather stored for exactly this window, else `--to`.
 
 Output: exactly what `extract.extract` returns (the RAW keys only — no trains /
-buckets / diagrams; run `link.py` next), as indented JSON. Arrays are already
-sorted deterministically by extract. Object keys are written in extract's
-order, NOT re-sorted: the order of `artifacts` breaks same-timestamp ties in
-`link.build_timeline`, so re-sorting the keys would change the enriched
-timeline / feature_deltas. The output is byte-identical run to run.
+buckets / diagrams; run `link.py` next), as canonical indented JSON
+(`sort_keys`, like `digest.py`). Arrays are already sorted deterministically
+by extract; object key order carries no meaning, since every consumer orders by
+an explicit key (issue #100), so `link.py` on this file gives the same result
+as enriching extract's in-memory bundle. The output is byte-identical run to
+run.
 
 No network: missing out-of-window spine context is only warned about on stderr
 (extract's warn-only mode); nothing is backfilled.
@@ -125,14 +126,14 @@ def resolve_scope(conn, project, repo):
 
 
 def write_view(bundle, out):
-    """Write the bundle atomically (tmp + replace) as indented JSON, keeping
-    extract's key order (see the module docstring for why it is not sorted)."""
+    """Write the bundle atomically (tmp + replace) as canonical indented JSON
+    (keys sorted, issue #100)."""
     parent = os.path.dirname(out)
     if parent:
         os.makedirs(parent, exist_ok=True)
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(bundle, fh, indent=2, ensure_ascii=False)
+        json.dump(bundle, fh, indent=2, ensure_ascii=False, sort_keys=True)
         fh.write("\n")
     os.replace(tmp, out)
 

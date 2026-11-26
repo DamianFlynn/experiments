@@ -295,14 +295,10 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # build_artifacts uses — so enrich/render consume it unchanged. Materialized
     # from the store, NOT re-derived.
     #
-    # ORDER MATTERS: build_timeline iterates `artifacts.values()` and its stable
-    # ts-sort lets the iteration order break ties between same-(ts,url) lifecycle
-    # events (e.g. a rename's remove-old + add-new from one commit). repo_nodes
-    # returns nodes by (ts, id), but build_artifacts inserts artifacts in
-    # code_events SOURCE order, so we restore that order here — first appearance of
-    # each artifact path in the (already source-ordered) code_events — to reproduce
-    # the same timeline byte-for-byte. Artifacts with no code_event (none today)
-    # fall to the end, ordered by id.
+    # Key order carries no meaning (issue #100): every consumer orders
+    # artifacts by an explicit key (link.build_timeline / compute_feature_deltas,
+    # render's content timeline), so the dict is simply keyed in id order — the
+    # same order view.py's `sort_keys` output reads back in.
     #
     # Window scope (issue #85): each artifact's `lifecycle` keeps only the events
     # of this view (`in_view`) and an artifact with none is left out, so
@@ -313,8 +309,7 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_artifacts_as_of`).
     arts = _artifacts_as_of(conn, project, repo, codes, ledger, ts_to)
     arts = _window_lifecycles(arts, in_view)
-    bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"],
-                                           derive.commit_times(bundle))
+    bundle["artifacts"] = {aid: arts[aid] for aid in sorted(arts)}
 
     # people: the project-scoped person `structure` nodes fold persisted (repo
     # sentinel "*", local id `person-<login>`), read back into the dict keyed by
@@ -407,40 +402,6 @@ def _attach_reviews_and_lifecycle(socials, prs, issues):
         parent = (pr_by_num if kind == "pr" else issue_by_num).get(num)
         if parent is not None:
             parent["lifecycle"] = _sorted(evs, "created_at")
-
-
-def _order_artifacts(arts, code_events, times=None):
-    """Order the artifact dict to match build_artifacts' INSERTION order so
-    order-sensitive consumers (build_timeline's same-(ts,url) tie-break) reproduce
-    byte-for-byte. build_artifacts, per code_event in source order, ensures the
-    `path` artifact first and — on a rename — the `old_path` (replaced) artifact
-    second; first occurrence wins. We replay that exact first-ensure sequence as a
-    monotonic ordinal, so a rename whose old/new ids sort against insertion order
-    (e.g. a->z, which must stay [new, old]) is not flipped by a lexical tie-break.
-    Artifacts never named by a code_event (symbol/comment nodes) fall last, ordered
-    by id. The replay walks the events in build_artifacts' own order
-    (derive.chronological), so a multi-window store reads back the same order
-    whichever window was folded first. Pure; does not mutate the records."""
-    order = {}
-
-    def _see(path):
-        if path:
-            order.setdefault("art:" + path, len(order))
-
-    for ev in derive.chronological(code_events, times):
-        change = ev.get("change")
-        if change in ("rename", "copy") and ev.get("old_path"):
-            _see(ev.get("path"))            # new-path artifact: ensured first
-            if change == "rename":
-                _see(ev.get("old_path"))    # then the replaced old-path artifact
-        else:
-            _see(ev.get("path"))
-    fallback = len(order)
-
-    def rank(aid):
-        return (order.get(aid, fallback), aid)
-
-    return {aid: arts[aid] for aid in sorted(arts, key=rank)}
 
 
 # ---------------------------------------------------------------------------
