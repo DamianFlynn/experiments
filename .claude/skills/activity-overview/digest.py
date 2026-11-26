@@ -187,7 +187,56 @@ def window_components(conn, project, members, components):
                 out_of_view.add(n["id"])
     if not out_of_view:
         return components
-    return [frozenset(c - out_of_view) for c in components]
+    out = []
+    for comp in components:
+        kept = comp - out_of_view
+        if kept == comp:
+            out.append(comp)
+        else:
+            # An out-of-view anchor may have been the only thing joining two
+            # trains: re-split what is left by what is still connected WITHOUT
+            # passing through an out-of-view anchor.
+            out.extend(_split_without(conn, kept, out_of_view))
+    out.sort(key=lambda c: min(c) if c else "")
+    return out
+
+
+def _is_anchor(nid):
+    return graphstore.parse_id(nid)["local"].startswith(("pr-", "issue-"))
+
+
+def _split_without(conn, kept, blocked):
+    """Partition the anchors `kept` into the groups still connected over the
+    spine when the `blocked` anchors are removed. Non-anchor spine nodes
+    (commits) may still bridge; other anchors outside `kept` do not. Returns
+    frozensets ordered by smallest id (an empty `kept` yields one empty set, so
+    a component is never silently dropped from the list's shape)."""
+    if not kept:
+        return [frozenset()]
+    groups, seen = [], set()
+    for start in sorted(kept):
+        if start in seen:
+            continue
+        group, frontier, visited = {start}, [start], {start}
+        while frontier:
+            nxt = []
+            for nid in frontier:
+                for e in graphstore.get_edges(
+                        conn, nid, direction="both",
+                        edge_types=list(graphstore.SPINE_EDGE_TYPES)):
+                    other = e["dst_id"] if e["src_id"] == nid else e["src_id"]
+                    if other in visited or other in blocked:
+                        continue
+                    if _is_anchor(other) and other not in kept:
+                        continue
+                    visited.add(other)
+                    nxt.append(other)
+                    if other in kept:
+                        group.add(other)
+            frontier = nxt
+        seen |= group
+        groups.append(frozenset(group))
+    return groups
 
 
 # outcome precedence when member trains merge into one project train (mirrors

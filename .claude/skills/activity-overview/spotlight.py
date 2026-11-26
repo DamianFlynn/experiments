@@ -1531,7 +1531,10 @@ def area_dependents(conn, project, area):
             for e in graphstore.get_edges(conn, nid, direction="in",
                                           edge_types=["depends_on"]):
                 src = e["src_id"]
-                if nid == seed:
+                # A stored edge marked transitive (a nested deployment the
+                # build resolved) reaches the seed through another module: it
+                # widens the blast radius but is not a direct consumer.
+                if nid == seed and not (e.get("data") or {}).get("transitive"):
                     direct.add(src)
                 if src not in seen:
                     seen.add(src)

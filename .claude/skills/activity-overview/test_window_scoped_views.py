@@ -566,3 +566,56 @@ def _hashable(x):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFollowUps(unittest.TestCase):
+    def test_pruned_bridge_pr_no_longer_joins_two_trains(self):
+        # issue-1 and issue-2 are separate trains this month; a PR from another
+        # month references both. Once that PR is out of view the two issues
+        # must be two components again, as on a store holding only this month.
+        import digest
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        q = lambda local: graphstore.qualify_id("p", "o/r", local)  # noqa: E731
+        graphstore.upsert_nodes(conn, [
+            (q(l), "p", "o/r", "social", "2026-05-10T00:00:00Z", {}, None)
+            for l in ("issue-1", "issue-2", "pr-9")])
+        graphstore.upsert_edges(conn, [
+            (q("pr-9"), q("issue-1"), "cross_ref", None, {}),
+            (q("pr-9"), q("issue-2"), "cross_ref", None, {})])
+        members = [{"repo": "o/r", "bundle": {
+            "prs": [], "issues": [{"number": 1}, {"number": 2}]}}]
+        comps = digest.window_components(
+            conn, "p", members,
+            [frozenset({q("issue-1"), q("issue-2"), q("pr-9")})])
+        self.assertEqual(sorted(sorted(c) for c in comps),
+                         [[q("issue-1")], [q("issue-2")]])
+        # still joined when something in view connects them
+        graphstore.upsert_nodes(conn, [
+            (q("pr-3"), "p", "o/r", "social", "2026-05-11T00:00:00Z", {}, None)])
+        graphstore.upsert_edges(conn, [
+            (q("pr-3"), q("issue-1"), "closes", None, {}),
+            (q("pr-3"), q("issue-2"), "closes", None, {})])
+        members[0]["bundle"]["prs"] = [{"number": 3}]
+        comps = digest.window_components(
+            conn, "p", members,
+            [frozenset({q("issue-1"), q("issue-2"), q("pr-9"), q("pr-3")})])
+        self.assertEqual([sorted(c) for c in comps],
+                         [[q("issue-1"), q("issue-2"), q("pr-3")]])
+
+    def test_transitive_edge_is_not_a_direct_dependent(self):
+        import spotlight
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        q = lambda a: graphstore.qualify_id("o", "r", "area-" + a)  # noqa: E731
+        graphstore.upsert_nodes(conn, [
+            (q(a), "o", "r", "structure", None, {"id": a}, None)
+            for a in ("a", "b", "c")])
+        graphstore.upsert_edges(conn, [
+            (q("b"), q("c"), "depends_on", None, {"transitive": False}),
+            (q("a"), q("b"), "depends_on", None, {"transitive": False}),
+            (q("a"), q("c"), "depends_on", None, {"transitive": True})])
+        res = spotlight.area_dependents(conn, "o", "o/r::c")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["direct"], ["o/r::b"])
+        self.assertEqual(res["dependents"], ["o/r::a", "o/r::b"])
