@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7406 deprecated the legacy modules directory by removing its retirement and archival notice files. It merged after approval from jtracey93.",
+ "proposed": "The PR body says the goal is to clean up documentation by removing status banners and references to past releases or replacement modules.",
+ "changed": "The feature deltas show 129 drops under modules/, including 43 ARCHIVED.md, 43 README.md, 22 REPLACED.md and 21 RETIRED.md files. The body names ai/bing-resource, ai/cognitiveservices and app/app-configuration.",
+ "rejected": null,
+ "shipped": "The notice and README files under the legacy modules directory were removed in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7406",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7406",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7406",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7406",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/c83bfa2063a7fe892188010b1b6aa21407f94d34",
+   "backs": "shipped"
+  }
+ ]
+}

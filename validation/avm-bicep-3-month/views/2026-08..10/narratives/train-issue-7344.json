@@ -1,0 +1,37 @@
+{
+ "summary": "Issue 7344 reported that the SQL Managed Instance module capped storageSizeInGB too low. The train shipped two PRs on 2026-10-02: a README-generation fix and a SQL MI patch-release preparation with clarified storage bounds.",
+ "proposed": "The issue said the module's schema allowed a maximum storageSizeInGB of 8192 GB, so larger values failed validation even though the issue states Azure SQL Managed Instance supports up to 16384 GB. PR 7442 separately fixed Set-ModuleReadme, which referenced the wrong property when a module's tests used a 'keys' property.",
+ "changed": "PR 7442 corrected the README generation script and added a SQL MI change to re-trigger publishing; its feature deltas show common-types imports moving from 0.6.1 to 0.7.0 and test dependency API versions being bumped. PR 7444 clarified the storageSizeInGB description to 'from 32 to 32768 in increments of 32 GB', regenerated main.json and README, left version.json at 0.5, moved the max test's enforcedLocation from eastus to eastasia, and made the instance name in the four e2e scenarios use uniqueString(resourceGroup.id). In review, a reviewer questioned changelog entries that were duplicated or of no value to consumers, and one review comment contained a suggestion removing lines.",
+ "rejected": null,
+ "shipped": "Both PRs merged on 2026-10-02 (7442 and 7444, commits 0636922 and 4113a2a). The shipped SQL MI change is a non-behavioural source and description change plus test updates; the PR body states it does not itself publish a release.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/issues/7344",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7442",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7442",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7444",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7444",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/063692211eca4c12b932178c16fb306c4cdd7ab7",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/4113a2a528ce0bb3dd86732ca271333bf18e087f",
+   "backs": "shipped"
+  }
+ ]
+}

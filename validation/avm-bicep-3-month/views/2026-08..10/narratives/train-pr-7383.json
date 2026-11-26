@@ -1,0 +1,33 @@
+{
+ "summary": "PR 7383 retired ORPHANED.md markers so orphaning and adoption only require changing the owners array in a family's root metadata.json. It merged after approval from jtracey93.",
+ "proposed": "The old compliance assertion compared marker files with owner handles from the public module index, which can lag an approved metadata change, as a network-connection validation failure showed.",
+ "changed": "Get-ModuleList.ps1 now resolves ownership from validated root metadata, including inherited child ownership and team handles. The PR was rebased on 2026-09-23 after #7389 removed the obsolete assertion, and the retired assertion is not reintroduced since the metadata gate enforces ownership validity. A reviewer asked whether to later add badges that look up status from the index, and the author said it could go on the backlog.",
+ "rejected": "The old marker-versus-index compliance assertion was removed and explicitly not reintroduced or duplicated.",
+ "shipped": "ORPHANED.md files were dropped and README files updated across about two dozen modules, with changes in utilities/pipelines and utilities/tests.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7383",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7383",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7383",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7383",
+   "backs": "rejected"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7383",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/0a2689ec06ca1d908bc722f2d9080d8ec07cfb3e",
+   "backs": "shipped"
+  }
+ ]
+}

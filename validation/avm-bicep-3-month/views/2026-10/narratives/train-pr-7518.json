@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7518 added a CI mechanism to register required Azure resource providers before e2e tests. It merged on 2026-10-11 with no recorded review.",
+ "proposed": "The body proposes an optional repository-root .required-resource-providers.json, in the same format as .required-features.json, listing provider namespaces per module path, with avm/res/hybrid-container-service/provisioned-cluster-instance as the first consumer.",
+ "changed": "The deployment action registers providers right after feature registration and before token replacement, validation or deployment. It skips registered providers, waits on existing Registering operations, registers NotRegistered/Unregistered ones once, and fails explicitly on invalid declarations, identity mismatches, approval-required or unknown states, errors and timeouts. Missing or unrelated declarations and WhatIf are no-ops without Azure calls.",
+ "rejected": null,
+ "shipped": "Merged 2026-10-11 as commit f006e66, touching .github/actions, .required-resource-providers.json, utilities/pipelines and utilities/tests. The initial consumer is avm/res/hybrid-container-service/provisioned-cluster-instance with 13 prerequisites.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7518",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7518",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7518",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/f006e66bf04bbbec7b618e0eba22742558266946",
+   "backs": "shipped"
+  }
+ ]
+}

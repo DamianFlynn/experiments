@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7339 added GitHub Actions secrets and variables as the preferred source of extra Bicep end-to-end test parameters, keeping the CI Key Vault as a fallback. It merged after approval from jtracey93.",
+ "proposed": "Let CI supply extra e2e test parameters from GitHub secrets and variables rather than only from the CI Key Vault.",
+ "changed": "Names with a CI_ or CI__ prefix are matched case-insensitively to declared Bicep parameters, with precedence CI_ secret > CI__ secret > CI_ variable > CI__ variable > legacy Key Vault secret. Multiple aliases within the same winning prefix are rejected as ambiguous, and CI_KEY_VAULT_NAME is reserved for legacy vault config. The github-advanced-security bot raised CodeQL 'Excessive Secrets Exposure' alerts on toJSON(secrets) before approval.",
+ "rejected": null,
+ "shipped": "The change merged touching .github/actions, .github/workflows, utilities/pipelines, utilities/tests and utilities/tools.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7339",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7339",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7339",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7339",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/ff91fabe4014cd2dd5b67b5ae15f8db968d92ef9",
+   "backs": "shipped"
+  }
+ ]
+}

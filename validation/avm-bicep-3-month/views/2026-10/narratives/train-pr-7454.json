@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7454 fixed several CI README-generation problems and applied related module fixes. It merged on 2026-10-03 after one approval.",
+ "proposed": "The PR body lists a regex bug where `a: 'a.b'` was detected as an object reference (affecting operational-insights/workspace and its quota parameter), an issue with RPC batches, missing handling of renamed files in the Git-Diff function, and cross-reference logic that broke when ptn modules shared a name with res modules.",
+ "changed": "The body describes fixing the regex, RPC-batch handling and cross-reference logic, adding support for `R` (moved/renamed) files in the Git-Diff function, correcting diverse folder paths, and deprecating dev-test-labs/lab/secret because the API no longer supports it. The author ran Set-AVMModule recursively over all modules with no further suggested changes.",
+ "rejected": null,
+ "shipped": "Merged 2026-10-03 as commit 574f7d7. Feature deltas show README and CHANGELOG changes in modules including db-for-my-sql/flexible-server (advanced-threat-protection renamed to advanced-threat-protection-setting), dev-test-lab/lab, devices/iot-hub, and two ptn modules.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7454",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7454",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7454",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/574f7d7184a2541e5eb6e7ea3c3e5b80ab19488a",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7257 is a rebase of PR 6710 that adds SecuredByPerimeter as a publicNetworkAccess option for the document-db/database-account module. It was approved and merged.",
+ "proposed": "The PR body says the original change lets networkRestrictions.publicNetworkAccess be set to SecuredByPerimeter, so Cosmos DB accounts can be secured with a Network Security Perimeter. It describes this as more granular than traditional public network access settings.",
+ "changed": "The PR is a rebase that preserves the original author, poornachandugade. The slice shows a new e2e test, tests/e2e/perimeter/main.test.bicep, which pins the location to eastasia with a comment that a single-zone region is used for NSP tests. The README and CHANGELOG were updated, the latter with a 0.20.1 entry.",
+ "rejected": null,
+ "shipped": "Commit 9f9ea1a merged the SecuredByPerimeter support, the 0.20.1 CHANGELOG entry, the README changes and the perimeter e2e test under avm/res/document-db/database-account.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7257",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7257",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7257",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/9f9ea1a18204e262be9a4a64e3e3cc7fbe5e509d",
+   "backs": "shipped"
+  }
+ ]
+}

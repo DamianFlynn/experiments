@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7458 replaced tenant-specific service-principal object IDs in CI test fixtures with Microsoft Graph lookups. It merged on 2026-10-11 with no recorded review.",
+ "proposed": "The PR body says nine modules outside the live diff of PR 7374 relied on three tenant-specific built-in service-principal object-ID CI inputs, and asks to look them up by stable application ID instead.",
+ "changed": "Per the body, 20 test entrypoints now use Graph `existing` lookups via the root microsoftGraphV1 extension and pass the resolved `.id` to the unchanged dependency or module parameter. Feature deltas show, for example in azure-stack-hci/cluster, a new optional builtInServicePrincipalObjectId parameter and an `existing` hciResourceProvider Microsoft.Graph/servicePrincipals resource replacing the required hciResourceProviderObjectId parameter.",
+ "rejected": null,
+ "shipped": "Merged 2026-10-11 as commit 063ef55, touching test fixtures for dev-ops-infrastructure/pool, the azure-stack-hci modules, hybrid-container-service/provisioned-cluster-instance and kubernetes-runtime/load-balancer. The body states public module interfaces, versions, roles and locations are unchanged.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7458",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7458",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7458",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/063ef550c5b61b46eab222f05b30693dacaf8bc9",
+   "backs": "shipped"
+  }
+ ]
+}

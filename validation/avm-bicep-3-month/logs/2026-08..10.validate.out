@@ -1,0 +1,55 @@
+trust audit: OK  (project=Azure repo=bicep-registry-modules)
+============================================================
+[ok  ] target  (ERROR)
+      - 7643 node(s) stored for Azure bicep-registry-modules
+[ok  ] referential_integrity  (ERROR)
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - per_type_counts
+[ok  ] participant_completeness  (ERROR)
+      - all participants present
+[ok  ] provenance  (ERROR)
+      - all social/code nodes sourced
+[ok  ] no_fabrication  (ERROR)
+      - no orphans/fabrications
+[ok  ] schema_conformance  (ERROR)
+      - all edge endpoints conform
+[ok  ] meta_integrity  (ERROR)
+      - store meta of 1 gathered window(s) is well formed
+[ok  ] edge_set  (ERROR)
+      - 6356 stored edge(s) of this repo compared with 6356 re-derived from its records
+[ok  ] no_drift  (ERROR)
+      - store matches re-derived people+artifacts
+[ok  ] idempotency  (ERROR)
+      - re-fold is a no-op
+============================================================
+RESULT: OK

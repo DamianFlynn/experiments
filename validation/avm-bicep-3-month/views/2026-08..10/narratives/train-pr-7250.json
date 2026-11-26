@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7250 fixed child module deployment name collisions when several instances of the same resource type are deployed into one resource group at once. It was merged across seven modules.",
+ "proposed": "The PR body says the uniqueString(subscription().id, resourceGroup().id, location) names introduced in #6316 are not unique enough for simultaneous deployments of the same type. It applies the fix already merged for operational-insights/workspace in #7249.",
+ "changed": "The parent resource name was added to the uniqueString() inputs of child deployment names. This was done in automation-account, azure-firewall, dns-resolver, firewall-policy, virtual-hub and virtual-network, plus resource-group. For resource-group, name was added to the lock and role-assignment deployment names. The PR also bumped cross-module references (private-endpoint 0.12.1, public-ip-address 0.13.0, operations-management/solution 0.3.1) and moved the telemetry Microsoft.Resources/deployments API from 2024-03-01 to 2025-04-01 in several modules.",
+ "rejected": null,
+ "shipped": "Commit 512156e merged the change. CHANGELOG entries are automation-account 0.19.2, azure-firewall 0.11.1, dns-resolver 0.5.8, firewall-policy 0.3.6, virtual-hub 0.5.1, virtual-network 0.10.1 and resource-group 0.4.4, each listing no breaking changes.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7250",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7250",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7250",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/512156ec1495ce967fd0d9b054426016bca22425",
+   "backs": "shipped"
+  }
+ ]
+}

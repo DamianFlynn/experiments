@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7373 reconciled moduleDescription in metadata.json across 606 modules to match the AVM catalog CSV descriptions. It merged without recorded reviews.",
+ "proposed": "Generated catalog-description drift needed removing so the tools workflow report surfaces only genuine CSV errors.",
+ "changed": "Before-values came from the tools workflow artifact CSVs (resource, pattern and utility), matched by ModuleName. The PR body says every changed file was diffed to confirm only moduleDescription differs, and no CSV files were modified.",
+ "rejected": null,
+ "shipped": "Description updates for 537 resource, 67 pattern and 2 utility modules (606 files) merged in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7373",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7373",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7373",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7373",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/2f7a0d23e0b2ec91df9d54c097fa1bc9ee2db2ab",
+   "backs": "shipped"
+  }
+ ]
+}

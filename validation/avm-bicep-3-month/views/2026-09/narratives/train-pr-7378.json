@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7378 replaced the generated per-module CODEOWNERS model with metadata-driven reviewer routing, with the routing automation re-homed in Azure/azure-verified-modules-tools. It merged on 2026-09-23 as a pure removal.",
+ "proposed": "Approval rights should come from repository permissions alone, with only the people and teams listed in each module's metadata.json notified through a review request. The PR body says the original routing workflow ran in this repository and needed AVM GitHub App credentials.",
+ "changed": "The PR body says the routing workflow was first triggered by pull_request_target, then reworked to a scheduled sweep, and finally moved to the tools repo so no AVM GitHub App credentials remain here. All four workflows that needed AVM_APP_CLIENT_ID / AVM_APP_PRIVATE_KEY were removed. The slice shows no review rounds.",
+ "rejected": null,
+ "shipped": "A single commit merged the removal (+61 / -2,782 per the PR body) touching .github, .github/workflows, utilities/pipelines and utilities/tests; the routing implementation lives in the tools repo.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7378",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7378",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7378",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7378",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/072801be50977affd8debc25c6dd40b7ca2a2211",
+   "backs": "shipped"
+  }
+ ]
+}

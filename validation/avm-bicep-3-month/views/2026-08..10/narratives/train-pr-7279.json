@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7279 (batch 1) added the customer-managed-key user-assigned identity to managed identities across 17 AVM resource modules. It was opened as ready for review in August and merged on 2026-09-16 after about five commented review rounds and an approval.",
+ "proposed": "Make CMK handling simpler and backwards compatible by adding the CMK's user-assigned identity to each resource's managed identities and updating the Key Vault API version used for CMK references.",
+ "changed": "In modules such as app-configuration/configuration-store the identity variable changed from !empty(managedIdentities) to also consider formattedUserAssignedIdentities, with updates to cMKKey, cMKKeyVault and cMKUserAssignedIdentity. In review, AlexanderSehr suggested updating the encr tests to drop their managedIdentities blocks and questioned removing the !isHSMManagedCMK condition because HSM tests are disabled. The author said managedIdentities was removed from only one of two CMK tests per module and added to max where otherwise untested.",
+ "rejected": null,
+ "shipped": "CMK identity handling, README and CHANGELOG changes merged for 17 modules including storage-account, services such as service-bus/namespace and event-hub/namespace, and recovery-services/vault.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7279",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7279",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7279",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7279",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/f1f4ba28698437d9a683d68bf181341ad3547e48",
+   "backs": "shipped"
+  }
+ ]
+}

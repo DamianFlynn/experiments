@@ -1,0 +1,24 @@
+trust audit: FAIL  (project=Azure repo=bicep-registry-modules)
+============================================================
+[FAIL] target  (ERROR)
+      - [ERROR] {"problem": "store holds no nodes"}
+[ok  ] referential_integrity  (ERROR)
+      - per_type_counts
+[ok  ] participant_completeness  (ERROR)
+      - all participants present
+[ok  ] provenance  (ERROR)
+      - all social/code nodes sourced
+[ok  ] no_fabrication  (ERROR)
+      - no orphans/fabrications
+[ok  ] schema_conformance  (ERROR)
+      - all edge endpoints conform
+[ok  ] meta_integrity  (ERROR)
+      - store meta of 0 gathered window(s) is well formed
+[FAIL] edge_set  (ERROR)
+      - [ERROR] {"problem": "could not self-source: store holds no nodes (project=Azure, repo=bicep-registry-modules)"}
+[FAIL] no_drift  (ERROR)
+      - [ERROR] {"problem": "could not self-source: store holds no nodes (project=Azure, repo=bicep-registry-modules)"}
+[FAIL] idempotency  (ERROR)
+      - [ERROR] {"problem": "could not self-source: store holds no nodes (project=Azure, repo=bicep-registry-modules)"}
+============================================================
+RESULT: FAIL

@@ -1,0 +1,11 @@
+flowchart LR
+    iss_6990["[AVM Module Issue]: Unable to bypass net"]
+    pr_7158["rejected: feat: Support network bypass f"]
+    pr_7280["feat: ACR - Added support to bypass netw"]
+    out_train_issue_6990_5ac32f56(["Shipped"])
+    iss_6990 --> pr_7158
+    iss_6990 --> pr_7280
+    pr_7280 --> out_train_issue_6990_5ac32f56
+    area_avm_res_container_regist_52956c8c("registry")
+    pr_7158 --> area_avm_res_container_regist_52956c8c
+    pr_7280 --> area_avm_res_container_regist_52956c8c

@@ -1,0 +1,29 @@
+{
+ "summary": "Issue 6695 asked for the avm/res/network/virtual-network module to support linking an existing virtual network to an IPAM pool. It shipped through PR 7271, which added virtual-network-level IPAM pool prefix allocations.",
+ "proposed": "The requester said the module could not link an existing vnet to an IPAM pool, which the native Bicep resource allows through addressSpace.ipamPoolPrefixAllocations. In the discussion, a commenter noted that explicit CIDR ranges and an IPAM pool configuration cannot be combined on the Bicep vnet resource.",
+ "changed": "In main.bicep, addressPrefixes became optional (string[]?), a new ipamPoolPrefixAllocations parameter was added, and a variable addressPrefixIsIpamPoolResourceId was introduced. The parameter descriptions state that ipamPoolPrefixAllocations cannot be combined with addressPrefixes, and that a pool resource ID as the first addressPrefixes entry uses the legacy single-pool syntax. A new e2e ipam test deploys a vnet with a classical prefix and then links it to the pool. In review, a comment asked for address spaces to be hardcoded in dependencies.bicep, and the author replied 'Updated'.",
+ "rejected": null,
+ "shipped": "PR 7271 merged as commit 93d9827, with a CHANGELOG entry for 0.10.2 and README updates under avm/res/network/virtual-network. It adds the ipamPoolPrefixAllocations parameter and the ipam e2e test.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/issues/6695",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7271",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7271",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/93d98270eae305be5845e13a42e7cb2d316e10f0",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7271",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7410 reconciled checked-in AVM README content with the source modules and examples. It merged after approval from jtracey93.",
+ "proposed": "Some READMEs had wrong H1 resource types, placeholder example values and stale tables compared with the module sources.",
+ "changed": "Four child-module H1 types were corrected to the canonicalType, placeholders such as VM imageReference.sku and Container Registry trustPolicyStatus were replaced with source literals, and the Virtual WAN README now lists all ten actual avm-common-types references. The PR body says no Bicep, templates, metadata, tests, generator or CI changed.",
+ "rejected": null,
+ "shipped": "README.md changes across 12 module areas, such as virtual-wan, compute/virtual-machine, container-registry/registry and operational-insights/workspace, merged in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7410",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7410",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7410",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7410",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/01b1d3a9a2e38c2447a6d13554e06b95279dd84b",
+   "backs": "shipped"
+  }
+ ]
+}

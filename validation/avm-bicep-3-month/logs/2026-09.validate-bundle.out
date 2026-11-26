@@ -1,0 +1,70 @@
+trust audit: FAIL  (project=Azure repo=bicep-registry-modules)
+============================================================
+[ok  ] target  (ERROR)
+      - 3847 node(s) stored for Azure bicep-registry-modules
+[ok  ] referential_integrity  (ERROR)
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - codeowner not a contributor
+      - per_type_counts
+[ok  ] participant_completeness  (ERROR)
+      - all participants present
+[ok  ] provenance  (ERROR)
+      - all social/code nodes sourced
+[ok  ] no_fabrication  (ERROR)
+      - no orphans/fabrications
+[ok  ] schema_conformance  (ERROR)
+      - all edge endpoints conform
+[ok  ] meta_integrity  (ERROR)
+      - store meta of 1 gathered window(s) is well formed
+[ok  ] edge_set  (ERROR)
+      - 4884 stored edge(s) of this repo compared with 4884 re-derived from its records
+[FAIL] no_drift  (ERROR)
+      - [ERROR] {"kind": "person", "login": "Ellestad1995", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "Miteshc1", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "Torrer93", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "arjenhuitema", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "ciccio9933", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "col1582", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "eberd1977-blip", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "github-actions[bot]", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": true, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "janinternet", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "krisnyl", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "kt-pieper", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "lanetgithub", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "llammila", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "nithyatsu", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "paulyuk", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "reikor0x", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "s-andersson", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "smereczynski", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "stephenjust", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "thomascoats", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "varun110032", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+      - [ERROR] {"kind": "person", "login": "wardch", "problem": "stored but not derivable", "stored": {"areas": [], "is_bot": false, "login_resolved": true, "modules": []}}
+[ok  ] idempotency  (ERROR)
+      - re-fold is a no-op
+============================================================
+RESULT: FAIL

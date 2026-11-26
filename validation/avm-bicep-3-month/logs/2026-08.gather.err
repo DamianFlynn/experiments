@@ -1,0 +1,16 @@
+note: Azure/bicep-registry-modules: base branch 'main' (the repo default branch, from the clone)
+Traceback (most recent call last):
+  File "~/Development/damianflynn/experiments/.claude/skills/activity-overview/gather.py", line 7659, in <module>
+    main()
+    ~~~~^^
+  File "~/Development/damianflynn/experiments/.claude/skills/activity-overview/gather.py", line 7637, in main
+    bundle = acquire(args, os.environ)
+  File "~/Development/damianflynn/experiments/.claude/skills/activity-overview/gather.py", line 5330, in acquire
+    raw_patch = run_git(["git", "-C", clone_dir, "log", *PATCH_WALK_ARGS])
+  File "~/Development/damianflynn/experiments/.claude/skills/activity-overview/gather.py", line 3772, in run_git
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: command failed (exit 128): git -c core.quotepath=false -C ~/activity/avm-bicep/clone log --reverse --pretty=format:%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%cI%x1f%s -p --unified=3 -M -C --no-color --no-ext-diff --no-textconv --no-show-signature --src-prefix=a/ --dst-prefix=b/
+fatal: unable to access 'https://github.com/Azure/bicep-registry-modules.git/': LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443 
+fatal: could not fetch e67b43059152351c67c55bedc1fb833bf37e4ff0 from promisor remote

@@ -1,0 +1,4 @@
+note: Azure/bicep-registry-modules: base branch 'main' (the repo default branch, from the clone)
+note: Azure/bicep-registry-modules: structure (code graph, IaC, CODEOWNERS) read at 82950838e7ce, the last 'main' commit on or before 2026-10-31 (meta.structure_as_of=window_end)
+closing issues: 172 PR(s) checked via GraphQL, 7 gained 7 closing issue(s) not in their text (source: graphql)
+folded bundle into store ~/activity/avm-bicep/stores/2026-10.db

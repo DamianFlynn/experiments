@@ -1,0 +1,86 @@
+== 2026-08 view 16:20:57
+view: 96 prs, 210 issues, 23 commits for Azure/bicep-registry-modules [2026-08-01 .. 2026-08-31] -> ~/activity/avm-bicep/views/2026-08/bundle.json
+exit=0
+== 2026-08 link 16:20:58
+linked 94 trains, 36 shipped into ~/activity/avm-bicep/views/2026-08/bundle.json
+exit=0
+== 2026-08 render 16:20:58
+error: mmdc failed to render ~/activity/avm-bicep/views/2026-08/diagrams/buckets_pie.mmd:
+
+Error: Could not find Chrome (ver. 148.0.7778.97). This can occur if either
+ 1. you did not perform an installation before running the script (e.g. `npx puppeteer browsers install chrome-headless-shell`) or
+ 2. your cache path is incorrectly configured (which is: ~/.cache/puppeteer).
+For (2), check out our guide on configuring puppeteer at https://pptr.dev/guides/configuration.
+    at ChromeLauncher.resolveExecutablePath (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/BrowserLauncher.js:307:27)
+    at ChromeLauncher.computeLaunchArguments (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/ChromeLauncher.js:86:24)
+    at async ChromeLauncher.launch (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/BrowserLauncher.js:55:28)
+    at async run (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/src/index.js:623:19)
+    at async cli (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/src/index.js:260:3)
+
+
+exit=1 16:21:01
+== 2026-09 link 16:21:01
+linked 140 trains, 83 shipped into ~/activity/avm-bicep/views/2026-09/bundle.json
+exit=0
+== 2026-09 render 16:21:01
+error: mmdc failed to render ~/activity/avm-bicep/views/2026-09/diagrams/buckets_pie.mmd:
+
+Error: Could not find Chrome (ver. 148.0.7778.97). This can occur if either
+ 1. you did not perform an installation before running the script (e.g. `npx puppeteer browsers install chrome-headless-shell`) or
+ 2. your cache path is incorrectly configured (which is: ~/.cache/puppeteer).
+For (2), check out our guide on configuring puppeteer at https://pptr.dev/guides/configuration.
+    at ChromeLauncher.resolveExecutablePath (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/BrowserLauncher.js:307:27)
+    at ChromeLauncher.computeLaunchArguments (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/ChromeLauncher.js:86:24)
+    at async ChromeLauncher.launch (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/BrowserLauncher.js:55:28)
+    at async run (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/src/index.js:623:19)
+    at async cli (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/src/index.js:260:3)
+
+
+exit=1 16:21:01
+== 2026-10 link 16:21:01
+linked 157 trains, 92 shipped into ~/activity/avm-bicep/views/2026-10/bundle.json
+exit=0
+== 2026-10 render 16:21:02
+error: mmdc failed to render ~/activity/avm-bicep/views/2026-10/diagrams/buckets_pie.mmd:
+
+Error: Could not find Chrome (ver. 148.0.7778.97). This can occur if either
+ 1. you did not perform an installation before running the script (e.g. `npx puppeteer browsers install chrome-headless-shell`) or
+ 2. your cache path is incorrectly configured (which is: ~/.cache/puppeteer).
+For (2), check out our guide on configuring puppeteer at https://pptr.dev/guides/configuration.
+    at ChromeLauncher.resolveExecutablePath (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/BrowserLauncher.js:307:27)
+    at ChromeLauncher.computeLaunchArguments (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/ChromeLauncher.js:86:24)
+    at async ChromeLauncher.launch (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/node_modules/puppeteer-core/lib/esm/puppeteer/node/BrowserLauncher.js:55:28)
+    at async run (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/src/index.js:623:19)
+    at async cli (file:///opt/homebrew/lib/node_modules/@mermaid-js/mermaid-cli/src/index.js:260:3)
+
+
+exit=1 16:21:02
+== 2026-08 render --skip-validate 16:21:25
+rendered 16 diagrams into ~/activity/avm-bicep/views/2026-08/diagrams (unvalidated)
+note: content_timeline capped: 77 of 2489 events shown
+note: module_graph capped: 120 of 829 edges shown
+exit=0 16:21:26
+== 2026-09 render --skip-validate 16:21:26
+rendered 26 diagrams into ~/activity/avm-bicep/views/2026-09/diagrams (unvalidated)
+note: content_timeline capped: 110 of 2063 events shown
+note: contributor_graph capped: 120 of 680 edges shown
+note: module_graph capped: 120 of 835 edges shown
+exit=0 16:21:29
+== 2026-10 render --skip-validate 16:21:29
+rendered 16 diagrams into ~/activity/avm-bicep/views/2026-10/diagrams (unvalidated)
+note: content_timeline capped: 112 of 745 events shown
+note: module_graph capped: 120 of 834 edges shown
+exit=0 16:21:30
+== 2026-08..10 view 16:49:29
+view: 283 prs, 283 issues, 157 commits for Azure/bicep-registry-modules [2026-08-01 .. 2026-10-31] -> ~/activity/avm-bicep/views/2026-08..10/bundle.json
+exit=0
+== 2026-08..10 link --series series-rollup.json 16:49:30
+linked 276 trains, 211 shipped into ~/activity/avm-bicep/views/2026-08..10/bundle.json
+exit=0
+== 2026-08..10 render --skip-validate 16:49:30
+rendered 33 diagrams into ~/activity/avm-bicep/views/2026-08..10/diagrams (unvalidated)
+note: content_timeline capped: 283 of 5297 events shown
+note: contributor_graph capped: 120 of 767 edges shown
+note: module_graph capped: 120 of 834 edges shown
+note: timeline_gantt capped: 200 of 283 PRs shown
+exit=0 16:49:31

@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7380 was an index update dated 22 September 2026 that merged after approval from jaredfholgate ('LGTM').",
+ "proposed": "The PR title and body say only 'index updates 22092026'; the slice states no further problem statement.",
+ "changed": "The feature deltas show DEPRECATED.md and CHANGELOG.md/README.md changes added to six avm/ptn/sa modules and ORPHANED.md files added with README changes to modules such as avm/res/compute/availability-set, proximity-placement-group, dev-center/network-connection and dev-center/project. The commit also touched .github/ISSUE_TEMPLATE and .github/workflows.",
+ "rejected": null,
+ "shipped": "Deprecation and orphan markers plus README and CHANGELOG updates for the listed modules merged in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7380",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7380",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7380",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7380",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/a2e20b1981c31420c957834fafb97c81806c63f3",
+   "backs": "shipped"
+  }
+ ]
+}

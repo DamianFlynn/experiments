@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7403 backfilled unique Bicep module telemetry prefixes by rotating all 608 existing current IDs with the merged authoring generator. It merged after approval from jtracey93.",
+ "proposed": "Telemetry prefixes needed to be unique per module and generated in the form 46d3xbcp.<res|ptn|utl>.<seven lowercase hex>.",
+ "changed": "The scaffolding requests prefixes from Avm.Authoring New-AvmTelemetryIdPrefix and fails with install guidance when it is unavailable, and each previous ID is preserved under alternativeTelemetryIdPrefixes. 543 telemetry-bearing main.json templates were regenerated, and take(..., 64) wrappers were removed from 32 telemetry deployment names because their maximum length is now 34 characters.",
+ "rejected": null,
+ "shipped": "The new prefixes, regenerated templates and the 32 deployment-name simplifications merged in one commit across 269 code areas.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7403",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7403",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7403",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7403",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/063eb890ad676ffb7202490b39b2500d0e12645e",
+   "backs": "shipped"
+  }
+ ]
+}

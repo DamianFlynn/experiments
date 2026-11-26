@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7371 reset moduleDisplayName in metadata.json for 576 AVM modules to their canonical values. It merged without recorded reviews.",
+ "proposed": "The display names had drifted from the canonical names in BicepResourceModules.csv and BicepPatternModules.csv.",
+ "changed": "Each of 576 files had exactly one line changed to the canonical value from an inventory of 579 drifted rows; three modules already had the canonical value and were left alone. The PR body reports all files parse as JSON and each new value was checked against the inventory.",
+ "rejected": null,
+ "shipped": "The moduleDisplayName corrections merged in one commit; only that field was touched.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7371",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7371",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7371",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7371",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/0fde2cff4f9d07898b5e2ba6569d08d9bbf120d7",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,14 @@
+flowchart LR
+    pr_7517["fix(ci): consolidate deployment and pack"]
+    out_train_pr_7517_12be325e(["Shipped"])
+    pr_7517 --> out_train_pr_7517_12be325e
+    area__github_actions_8ff16826("actions")
+    area__github_workflows_93d7c4b8("workflows")
+    area_utilities_e2e_template_a_f86b0186("e2e-template-assets")
+    area_utilities_pipelines_41a540c7("pipelines")
+    area_utilities_tests_666b7a91("tests")
+    pr_7517 --> area__github_actions_8ff16826
+    pr_7517 --> area__github_workflows_93d7c4b8
+    pr_7517 --> area_utilities_e2e_template_a_f86b0186
+    pr_7517 --> area_utilities_pipelines_41a540c7
+    pr_7517 --> area_utilities_tests_666b7a91

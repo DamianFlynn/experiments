@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7349 backfilled module-owned metadata.json files across the repository and guarded publishing workflows against metadata-only changes. It merged after one approval from jtracey93.",
+ "proposed": "Add initial module-owned metadata directly to this repository, allow metadata review by either engineering or module owners, and keep metadata-only changes out of automatic publishing.",
+ "changed": "The PR adds 572 metadata.json files (222 roots, 350 children) with a flat owners array and no schemaVersion or tier authored. It ends .github/CODEOWNERS with a metadata.json rule naming the engineering-owners and module-owners teams, either of which can approve, and appends !avm/**/metadata.json to all 217 per-module publishing workflows. The unpublished internal avm/ptn/ai-ml/ai-foundry/modules/project helper was excluded.",
+ "rejected": null,
+ "shipped": "The metadata files, the CODEOWNERS rule and the workflow path exclusions merged in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7349",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7349",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7349",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7349",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/d654b23520d7ed224201c9b74b0322df269dfefc",
+   "backs": "shipped"
+  }
+ ]
+}

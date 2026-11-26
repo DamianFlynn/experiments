@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7416 pinned the registry README template and added preserved Notes sidecars without regenerating any READMEs. It merged after approval from jtracey93.",
+ "proposed": "Registry-owned README assets needed preparing for review without switching the existing generator, regenerating module READMEs, changing CI or deploying resources.",
+ "changed": "The root bicepconfig.json selects docs/templates/avm-readme-v1.scriban, copied byte-for-byte from tools commit 4962cd61 with a recorded SHA-256. 53 README.notes.md sidecars were added from the comparator's Notes export, each hash-checked, and one focused render with -CheckDrift wrote no module README.",
+ "rejected": null,
+ "shipped": "The avm-readme-v1.scriban template and 53 README.notes.md files merged in one commit (54 added files).",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7416",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7416",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7416",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7416",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/5da64c520c600e3347b649e6ffda311373c25a68",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,33 @@
+{
+ "summary": "PR 7367 fixed scaffolded metadata by backfilling owners on 45 root modules and shortening telemetry prefixes. It merged after one approval.",
+ "proposed": "The metadata-only folders omitted the owners field, which avm-module-metadata.schema.json requires on root modules, so the metadata catalog failed validation on the first affected module and could not complete a run.",
+ "changed": "Owners were taken from the Primary and Secondary Module Owner columns of the Bicep module CSVs in Azure/Azure-Verified-Modules, storing only individual GitHub handles, primary first, as the existing 222 metadata files do. The PR body states every handle was verified to resolve on GitHub.",
+ "rejected": "No team handles were added, because the PR body says no metadata file in the repo stores one.",
+ "shipped": "Owners backfill and telemetry-prefix changes on the scaffolded metadata files merged in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7367",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7367",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7367",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7367",
+   "backs": "rejected"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7367",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/141f70db13b5bb86cc193d0e18bb5cb866e07da2",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,14 @@
+flowchart LR
+    pr_7339["feat: support GitHub secrets and variabl"]
+    out_train_pr_7339_f60cbb8b(["Shipped"])
+    pr_7339 --> out_train_pr_7339_f60cbb8b
+    area__github_actions_8ff16826("actions")
+    area__github_workflows_93d7c4b8("workflows")
+    area_utilities_pipelines_41a540c7("pipelines")
+    area_utilities_tests_666b7a91("tests")
+    area_utilities_tools_75c39053("tools")
+    pr_7339 --> area__github_actions_8ff16826
+    pr_7339 --> area__github_workflows_93d7c4b8
+    pr_7339 --> area_utilities_pipelines_41a540c7
+    pr_7339 --> area_utilities_tests_666b7a91
+    pr_7339 --> area_utilities_tools_75c39053

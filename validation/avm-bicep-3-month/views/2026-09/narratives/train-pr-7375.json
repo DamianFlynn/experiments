@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7375 restored abbreviated telemetryIdPrefix values on 40 scaffolded metadata-only modules. It merged without recorded reviews.",
+ "proposed": "The scaffolding in #7366 had derived fully hyphenated prefixes from module paths instead of the existing abbreviated convention, which would cause a telemetryIdPrefix diff in the next Module Metadata Catalog Sync run in the tools repo.",
+ "changed": "Prefixes were reset to the historic abbreviated values from the AVM catalog CSVs, for example 46d3xbcp.ptn.ai-ml-landing-zone became 46d3xbcp.ptn.aiml-lz. The PR body says none of the modules has published Bicep code, so shipped telemetry is unchanged.",
+ "rejected": null,
+ "shipped": "Updated telemetryIdPrefix values in the metadata of the 40 scaffold modules merged in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7375",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7375",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7375",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7375",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/0195cf769ed5b97e112037a6cf95bbd0df0cc02b",
+   "backs": "shipped"
+  }
+ ]
+}

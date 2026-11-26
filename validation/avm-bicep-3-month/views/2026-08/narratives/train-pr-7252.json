@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7252 added Dynamic Data Masking capability to the document-db/database-account module. It was approved and merged with a major-style breaking change on serverless configuration.",
+ "proposed": "The PR body states the goal as adding the ability to deploy Cosmos DB with Dynamic Data Masking.",
+ "changed": "Per the CHANGELOG diff, the Microsoft.DocumentDB/* references were updated to 2026-04-01-preview, across the parent and its child modules (for example cassandra-keyspace and gremlin-database). Serverless moved from capabilitiesToAdd to a new capacityMode property because EnableServerless is not allowed in API versions beyond 2024-05-15-preview. Review comments from the author say test locations were switched after zonal-redundant capacity errors in West US 3 and East US 2.",
+ "rejected": null,
+ "shipped": "PR 7252 merged document-db/database-account 0.21.0, with Dynamic Data Masking, the 2026-04-01-preview API update and the capacityMode breaking change. Child modules received 0.1.1 CHANGELOG entries for the API reference update.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7252",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7252",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7252",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7252",
+   "backs": "shipped"
+  }
+ ]
+}

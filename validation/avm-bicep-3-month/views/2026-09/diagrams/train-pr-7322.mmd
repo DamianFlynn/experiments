@@ -1,0 +1,12 @@
+flowchart LR
+    pr_7322["feat: add generic module workflow"]
+    out_train_pr_7322_7c175f38(["Shipped"])
+    pr_7322 --> out_train_pr_7322_7c175f38
+    area__github_workflows_93d7c4b8("workflows")
+    area_utilities_pipelines_41a540c7("pipelines")
+    area_utilities_tests_666b7a91("tests")
+    area_utilities_tools_75c39053("tools")
+    pr_7322 --> area__github_workflows_93d7c4b8
+    pr_7322 --> area_utilities_pipelines_41a540c7
+    pr_7322 --> area_utilities_tests_666b7a91
+    pr_7322 --> area_utilities_tools_75c39053

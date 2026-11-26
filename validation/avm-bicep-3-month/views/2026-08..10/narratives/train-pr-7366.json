@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7366 scaffolded metadata-only folders for 49 modules listed in module-list.md and merged after one approval.",
+ "proposed": "Create folders for the 49 new modules so each has a repository-compatible metadata.json.",
+ "changed": "Each folder contains a metadata.json with module display name, description, telemetry prefix and canonical type. The slice shows a single approved review and no revisions.",
+ "rejected": null,
+ "shipped": "The scaffold folders for the 49 modules (avm/ptn, avm/res and avm/utl paths) merged in one commit.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7366",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7366",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7366",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7366",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/0baa81fcac8ed2840b41770e754be0aefc6daf6b",
+   "backs": "shipped"
+  }
+ ]
+}

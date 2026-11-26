@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7517 consolidated approved deployment and package-recovery CI reliability fixes into one change. It merged on 2026-10-11 with no recorded review.",
+ "proposed": "The body says the approved workflow and shared CI fixes are consolidated, with the frozen source implementations and regression tests preserved, no avm/ module or fixture changes, and no issue closure requested. It was opened as a draft with a separate HCI consumer check pending.",
+ "changed": "The body lists PSRule package archive preparation with one narrow corruption recovery, recognition of the Search regional capacity error, a shared four-hour status-recovery deadline across deployment attempts, an Azure login refresh before failure cleanup, and Pester initialization before post-deployment discovery. Role-assignment cleanup deletes only the supplied validated ID through ARM. A later comment reports the HCI consumer-integration check passed with 47 checks and no failures.",
+ "rejected": null,
+ "shipped": "Merged 2026-10-11 as commit cef29e4. The recorded feature delta is a new description on the unique-resource-name function in utilities/e2e-template-assets.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7517",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7517",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7517",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/cef29e463bc25e163d07ed66944e3b99b660c557",
+   "backs": "shipped"
+  }
+ ]
+}

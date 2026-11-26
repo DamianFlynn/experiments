@@ -1,0 +1,5 @@
+== 2026-10 gather start 2026-11-26T15:42:55Z
+gather exit=0 end 2026-11-26T16:00:43Z
+validate exit=0 end 2026-11-26T16:00:44Z
+as-stored view exit=0
+validate --bundle exit=1 end 2026-11-26T16:00:46Z

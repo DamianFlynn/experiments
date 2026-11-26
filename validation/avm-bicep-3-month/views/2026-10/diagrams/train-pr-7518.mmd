@@ -1,0 +1,12 @@
+flowchart LR
+    pr_7518["feat(ci): register required resource pro"]
+    out_train_pr_7518_bef907c3(["Shipped"])
+    pr_7518 --> out_train_pr_7518_bef907c3
+    area__github_actions_8ff16826("actions")
+    area__required_resource_provi_734a0a6b(".required-resource-providers.json")
+    area_utilities_pipelines_41a540c7("pipelines")
+    area_utilities_tests_666b7a91("tests")
+    pr_7518 --> area__github_actions_8ff16826
+    pr_7518 --> area__required_resource_provi_734a0a6b
+    pr_7518 --> area_utilities_pipelines_41a540c7
+    pr_7518 --> area_utilities_tests_666b7a91

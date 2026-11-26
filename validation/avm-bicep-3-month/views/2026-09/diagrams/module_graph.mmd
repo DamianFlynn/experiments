@@ -1,0 +1,193 @@
+flowchart LR
+    m_avm_ptn_aca_lza_hosting__4ab939fd("hosting-environment")
+    m_avm_ptn_ai_ml_ai_foundry_daf72234("ai-foundry")
+    m_avm_ptn_ai_platform_base_07084010("baseline")
+    m_avm_ptn_app_container_jo_01ce6e97("container-job-toolkit")
+    m_avm_ptn_app_function_app_f7b82b6e("function-app")
+    m_avm_ptn_app_iaas_vm_cosm_17ed9f52("iaas-vm-cosmosdb-tier4")
+    m_avm_ptn_app_paas_ase_cos_e63d5137("paas-ase-cosmosdb-tier4")
+    m_avm_ptn_app_service_lza__84659e8b("hosting-environment")
+    m_avm_ptn_azd_ml_hub_depen_7db1e403("ml-hub-dependencies")
+    m_avm_ptn_data_private_ana_84eb8a13("private-analytical-workspace")
+    m_avm_ptn_dev_ops_cicd_age_4f24c142("cicd-agents-and-runners")
+    m_avm_ptn_finops_toolkit_f_cd9a94bc("finops-hub")
+    m_avm_ptn_lz_sub_vending_f17bb317("sub-vending")
+    m_avm_ptn_network_hub_netw_7d32773d("hub-networking")
+    m_avm_ptn_sa_build_your_ow_2764e7a2("build-your-own-copilot")
+    m_avm_ptn_sa_chat_with_you_4a9b94ec("chat-with-your-data")
+    m_avm_ptn_sa_content_gener_8f6c7eaa("content-generation")
+    m_avm_ptn_sa_content_proce_06399f11("content-processing")
+    m_avm_ptn_sa_conversation__ddcfeed9("conversation-knowledge-mining")
+    m_avm_ptn_sa_customer_chat_13fdab41("customer-chatbot")
+    m_avm_ptn_sa_document_know_b9b67c8f("document-knowledge-mining")
+    m_avm_ptn_sa_modernize_you_bad1b0cb("modernize-your-code")
+    m_avm_ptn_sa_multi_agent_c_81c8a268("multi-agent-custom-automation-engine")
+    m_avm_ptn_virtual_machine__7a92f31d("azure-image-builder")
+    m_avm_res_api_management_s_2b0058e5("service")
+    m_avm_res_app_configuratio_3539dbc7("configuration-store")
+    m_avm_res_app_managed_envi_98cc9200("managed-environment")
+    m_avm_res_automation_autom_b279e791("automation-account")
+    m_avm_res_batch_batch_acco_f2485b83("batch-account")
+    m_avm_res_cache_redis_8a515c1d("redis")
+    m_avm_res_cache_redis_ente_5b66bafe("redis-enterprise")
+    m_avm_res_cognitive_servic_d1b76e3a("account")
+    m_avm_res_container_regist_52956c8c("registry")
+    m_avm_res_data_factory_fac_9837c087("factory")
+    m_avm_res_databricks_works_0017da29("workspace")
+    m_avm_res_db_for_my_sql_fl_cfc83c9b("flexible-server")
+    m_avm_res_db_for_postgre_s_a07df15a("flexible-server")
+    m_avm_res_desktop_virtuali_1490ef16("host-pool")
+    m_avm_res_desktop_virtuali_7e94ef14("workspace")
+    m_avm_res_devices_iot_hub_db2d832f("iot-hub")
+    m_avm_res_digital_twins_di_ecb57856("digital-twins-instance")
+    m_avm_res_document_db_data_0a2d9e37("database-account")
+    m_avm_res_document_db_mong_87da1ee4("mongo-cluster")
+    m_avm_res_elastic_san_elas_45aab801("elastic-san")
+    m_avm_res_event_grid_domai_0bcb0751("domain")
+    m_avm_res_event_grid_names_062d9b1e("namespace")
+    m_avm_res_event_grid_topic_63b71d3f("topic")
+    m_avm_res_event_hub_namesp_2bdc75e8("namespace")
+    m_avm_res_insights_private_a2be6952("private-link-scope")
+    m_avm_res_key_vault_vault_c70f9a76("vault")
+    m_avm_res_kusto_cluster_f35c24f0("cluster")
+    m_avm_res_machine_learning_0d90c9cd("workspace")
+    m_avm_res_machine_learning_3b8de16f("registry")
+    m_avm_res_network_applicat_7ebff000("application-gateway")
+    m_avm_res_network_network__01c714d7("network-security-group")
+    m_avm_res_network_private__4589062a("private-endpoint")
+    m_avm_res_network_private__de8401c0("private-dns-zone")
+    m_avm_res_network_virtual__186ab112("virtual-network")
+    m_avm_res_purview_account_92f12cd5("account")
+    m_avm_res_recovery_service_fe1eea23("vault")
+    m_avm_res_relay_namespace_a4658b35("namespace")
+    m_avm_res_search_search_se_b0571790("search-service")
+    m_avm_res_service_bus_name_25980373("namespace")
+    m_avm_res_signal_r_service_5f12d1a6("signal-r")
+    m_avm_res_signal_r_service_94092b83("web-pub-sub")
+    m_avm_res_sql_server_37ee6d9e("server")
+    m_avm_res_storage_storage__2efc02f3("storage-account")
+    m_avm_res_synapse_private__084e0bfb("private-link-hub")
+    m_avm_res_synapse_workspac_8bec616b("workspace")
+    m_avm_res_web_site_b3ffc95b("site")
+    m_avm_res_web_static_site_e1900666("static-site")
+    m_avm_ptn_aca_lza_hosting__4ab939fd -->|"0.5.0"| m_avm_res_network_network__01c714d7
+    m_avm_ptn_aca_lza_hosting__4ab939fd -->|"0.7.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_aca_lza_hosting__4ab939fd -->|"0.8.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_aca_lza_hosting__4ab939fd -->|"0.5.2"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_aca_lza_hosting__4ab939fd -->|"0.15.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_ai_ml_ai_foundry_daf72234 -->|"0.32.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_ai_platform_base_07084010 -->|"0.3.1"| m_avm_res_network_network__01c714d7
+    m_avm_ptn_ai_platform_base_07084010 -->|"0.3.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_ai_platform_base_07084010 -->|"0.4.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_ai_platform_base_07084010 -->|"0.11.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_app_container_jo_01ce6e97 -->|"0.5.1"| m_avm_res_network_network__01c714d7
+    m_avm_ptn_app_container_jo_01ce6e97 -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_app_container_jo_01ce6e97 -->|"0.7.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_app_container_jo_01ce6e97 -->|"0.7.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_app_container_jo_01ce6e97 -->|"0.25.1"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_app_function_app_f7b82b6e -->|"0.33.1"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_app_iaas_vm_cosm_17ed9f52 -->|"0.5.1"| m_avm_res_network_network__01c714d7
+    m_avm_ptn_app_iaas_vm_cosm_17ed9f52 -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_app_iaas_vm_cosm_17ed9f52 -->|"0.7.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_app_iaas_vm_cosm_17ed9f52 -->|"0.7.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_app_iaas_vm_cosm_17ed9f52 -->|"0.25.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_app_paas_ase_cos_e63d5137 -->|"0.5.2"| m_avm_res_network_network__01c714d7
+    m_avm_ptn_app_paas_ase_cos_e63d5137 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_ptn_app_paas_ase_cos_e63d5137 -->|"0.8.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_app_paas_ase_cos_e63d5137 -->|"0.7.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_app_service_lza__84659e8b -->|"0.5.2"| m_avm_res_network_network__01c714d7
+    m_avm_ptn_app_service_lza__84659e8b -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_app_service_lza__84659e8b -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_app_service_lza__84659e8b -->|"0.7.2"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_azd_ml_hub_depen_7db1e403 -->|"0.19.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_data_private_ana_84eb8a13 -->|"0.5.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_data_private_ana_84eb8a13 -->|"0.6.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_data_private_ana_84eb8a13 -->|"0.5.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_dev_ops_cicd_age_4f24c142 -->|"0.8.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_dev_ops_cicd_age_4f24c142 -->|"0.7.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_dev_ops_cicd_age_4f24c142 -->|"0.26.2"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_finops_toolkit_f_cd9a94bc -->|"0.8.3"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_lz_sub_vending_f17bb317 -->|"0.8.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_lz_sub_vending_f17bb317 -->|"0.7.2"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_lz_sub_vending_f17bb317 -->|"0.26.2"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_network_hub_netw_7d32773d -->|"0.7.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_build_your_ow_2764e7a2 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_build_your_ow_2764e7a2 -->|"0.8.0"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_build_your_ow_2764e7a2 -->|"0.7.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_build_your_ow_2764e7a2 -->|"0.29.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_sa_chat_with_you_4a9b94ec -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_chat_with_you_4a9b94ec -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_chat_with_you_4a9b94ec -->|"0.8.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_content_gener_8f6c7eaa -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_content_gener_8f6c7eaa -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_content_gener_8f6c7eaa -->|"0.8.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_content_gener_8f6c7eaa -->|"0.32.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_sa_content_proce_06399f11 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_content_proce_06399f11 -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_content_proce_06399f11 -->|"0.7.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_content_proce_06399f11 -->|"0.33.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_sa_conversation__ddcfeed9 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_conversation__ddcfeed9 -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_conversation__ddcfeed9 -->|"0.8.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_conversation__ddcfeed9 -->|"0.32.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_sa_customer_chat_13fdab41 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_customer_chat_13fdab41 -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_customer_chat_13fdab41 -->|"0.8.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_document_know_b9b67c8f -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_document_know_b9b67c8f -->|"0.10.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_document_know_b9b67c8f -->|"0.33.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_sa_modernize_you_bad1b0cb -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_modernize_you_bad1b0cb -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_modernize_you_bad1b0cb -->|"0.8.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_modernize_you_bad1b0cb -->|"0.32.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_sa_multi_agent_c_81c8a268 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_ptn_sa_multi_agent_c_81c8a268 -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    m_avm_ptn_sa_multi_agent_c_81c8a268 -->|"0.8.1"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_sa_multi_agent_c_81c8a268 -->|"0.32.0"| m_avm_res_storage_storage__2efc02f3
+    m_avm_ptn_virtual_machine__7a92f31d -->|"0.7.0"| m_avm_res_network_virtual__186ab112
+    m_avm_ptn_virtual_machine__7a92f31d -->|"0.25.1"| m_avm_res_storage_storage__2efc02f3
+    m_avm_res_api_management_s_2b0058e5 -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_app_configuratio_3539dbc7 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_app_managed_envi_98cc9200 -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_automation_autom_b279e791 -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_batch_batch_acco_f2485b83 -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_res_cache_redis_8a515c1d -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_cache_redis_ente_5b66bafe -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_cognitive_servic_d1b76e3a -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_container_regist_52956c8c -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_data_factory_fac_9837c087 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_databricks_works_0017da29 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_db_for_my_sql_fl_cfc83c9b -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_db_for_postgre_s_a07df15a -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_desktop_virtuali_1490ef16 -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_res_desktop_virtuali_7e94ef14 -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_devices_iot_hub_db2d832f -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_digital_twins_di_ecb57856 -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_res_document_db_data_0a2d9e37 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_document_db_mong_87da1ee4 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_elastic_san_elas_45aab801 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_event_grid_domai_0bcb0751 -->|"0.10.1"| m_avm_res_network_private__4589062a
+    m_avm_res_event_grid_names_062d9b1e -->|"0.10.1"| m_avm_res_network_private__4589062a
+    m_avm_res_event_grid_topic_63b71d3f -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_event_hub_namesp_2bdc75e8 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_insights_private_a2be6952 -->|"0.10.1"| m_avm_res_network_private__4589062a
+    m_avm_res_key_vault_vault_c70f9a76 -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_kusto_cluster_f35c24f0 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_machine_learning_0d90c9cd -->|"0.10.1"| m_avm_res_network_private__4589062a
+    m_avm_res_machine_learning_3b8de16f -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_res_network_applicat_7ebff000 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_purview_account_92f12cd5 -->|"0.10.1"| m_avm_res_network_private__4589062a
+    m_avm_res_recovery_service_fe1eea23 -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_relay_namespace_a4658b35 -->|"0.10.1"| m_avm_res_network_private__4589062a
+    m_avm_res_search_search_se_b0571790 -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_service_bus_name_25980373 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_signal_r_service_5f12d1a6 -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_res_signal_r_service_94092b83 -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_res_sql_server_37ee6d9e -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_storage_storage__2efc02f3 -->|"0.11.1"| m_avm_res_network_private__4589062a
+    m_avm_res_synapse_private__084e0bfb -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_synapse_workspac_8bec616b -->|"0.11.0"| m_avm_res_network_private__4589062a
+    m_avm_res_web_site_b3ffc95b -->|"0.12.0"| m_avm_res_network_private__4589062a
+    m_avm_res_web_static_site_e1900666 -->|"0.12.1"| m_avm_res_network_private__4589062a
+    m_avm_res_web_static_site_e1900666 -->|"0.8.1"| m_avm_res_network_private__de8401c0
+    more["+715 more edges not shown"]

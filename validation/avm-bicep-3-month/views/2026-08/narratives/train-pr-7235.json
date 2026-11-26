@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7235 extracted the Microsoft.CognitiveServices/accounts/deployments resource of the cognitive-services/account module into a dedicated child module. It was approved and merged.",
+ "proposed": "The PR body says this implements a follow-up requested during review of #7199 and tracked in #7206. The aim was to move the inline deployments resource out of account/main.bicep while keeping the public deployments parameter unchanged.",
+ "changed": "A new deployment/main.bicep holds the deployments resource, and the parent's inline resource loop became a module loop calling it. The PR body says deploymentType is exported from the child and imported into the parent, and that @batchSize(1) is kept so deployments run serially. Reviewers asked for a manual test on a subscription with the required quota. A reply says the Anthropic test and update are kept separate to be troubleshot next.",
+ "rejected": null,
+ "shipped": "Commit f107022 merged the new deployment child module (main.bicep and README) and replaced the cognitiveService_deployments resource with a module in the parent. The CHANGELOG entry for 0.18.0 also records a deployments API version bump from 2025-06-01 to 2026-05-01 and lists no breaking changes.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7235",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7235",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7235",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/f1070229a704c42897f07bdc19913cba26895bae",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7464 consolidated shared CI retry, cleanup and tooling fixes into one reviewed change. It merged on 2026-10-06 after one approval.",
+ "proposed": "The body says it repairs shared cleanup and retry failures seen in a specific CI run, and is a consolidated tooling review combining the Cosmos classifier (PR 7465), the AKS classifier (PR 7467) and the twelve-file non-avm slice of PR 7374.",
+ "changed": "The body describes a missing-preflight-child rule that omits cleanup only for a failed parent's unique failed Create with matching preflight evidence and an exact 404 DeploymentNotFound, and an existing-Graph-lookup rule for ID-less successful Creates. It states the twelve transferred blobs match source commit 3eb4712 and that there are no avm/ differences from main. Feature deltas show the azureStackHCIClusterPreqs template's Key Vault resources moving from API 2023-07-01 to 2026-02-01.",
+ "rejected": null,
+ "shipped": "Merged 2026-10-06 as commit a7edc52, changing .github actions and workflows, .required-features.json, utilities/pipelines, utilities/tests and e2e template assets.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7464",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7464",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7464",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/a7edc5227f21bcb9869736150e73f393d08e3a2e",
+   "backs": "shipped"
+  }
+ ]
+}

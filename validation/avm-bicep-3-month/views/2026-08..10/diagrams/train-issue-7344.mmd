@@ -1,0 +1,32 @@
+flowchart LR
+    iss_7344["[AVM Module Issue]: Managed Instance AVM"]
+    pr_7418["fix: SQL-MI - Upgraded 'storageSizeInGB'"]
+    pr_7442["fix: CI - Fixed issue of ReadME gen scri"]
+    pr_7444["fix: SQL MI - Prepare patch release and "]
+    out_train_issue_7344_f8340e11(["Shipped"])
+    iss_7344 --> pr_7418
+    iss_7344 --> pr_7442
+    iss_7344 --> pr_7444
+    pr_7418 --> out_train_issue_7344_f8340e11
+    pr_7442 --> out_train_issue_7344_f8340e11
+    pr_7444 --> out_train_issue_7344_f8340e11
+    area__github_actions_8ff16826("actions")
+    area__github_workflows_93d7c4b8("workflows")
+    area_avm_res_sql_managed_inst_6b81e592("managed-instance")
+    area_utilities_pipelines_41a540c7("pipelines")
+    area_utilities_tests_666b7a91("tests")
+    pr_7418 --> area__github_actions_8ff16826
+    pr_7418 --> area__github_workflows_93d7c4b8
+    pr_7418 --> area_avm_res_sql_managed_inst_6b81e592
+    pr_7418 --> area_utilities_pipelines_41a540c7
+    pr_7418 --> area_utilities_tests_666b7a91
+    pr_7442 --> area__github_actions_8ff16826
+    pr_7442 --> area__github_workflows_93d7c4b8
+    pr_7442 --> area_avm_res_sql_managed_inst_6b81e592
+    pr_7442 --> area_utilities_pipelines_41a540c7
+    pr_7442 --> area_utilities_tests_666b7a91
+    pr_7444 --> area__github_actions_8ff16826
+    pr_7444 --> area__github_workflows_93d7c4b8
+    pr_7444 --> area_avm_res_sql_managed_inst_6b81e592
+    pr_7444 --> area_utilities_pipelines_41a540c7
+    pr_7444 --> area_utilities_tests_666b7a91

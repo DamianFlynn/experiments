@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7301 upgraded the avm/ptn/sa/content-processing pattern module, adding a workflow container app and a gpt-5.1 default. It also added a CI workflow for container-migration. It was approved and merged.",
+ "proposed": "The PR body describes a new GitHub Actions workflow for the container-migration module, a change to the PR labeling workflow to skip forks, and documentation of the content-processing 0.3.0 release including breaking changes.",
+ "changed": "The pattern's main.bicep bumped module references such as container-app 0.19.0 to 0.23.0 and bastion-host to 0.8.2. It added Workflow container app modules and removed the separate avmAiServices_cu account. The CHANGELOG says Content Understanding moved onto the shared aif- AIServices account to fix PDF extraction DNS failures. The container image parameters were dropped and the GPT model description now names only gpt-5.1.",
+ "rejected": null,
+ "shipped": "Commit d60585a merged the upgrade as content-processing 0.3.0. The PR body says it restricts allowed model names and versions as a breaking change, consolidates AI services, adds a workflow container app, and adds Cosmos DB redundancy.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7301",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7301",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7301",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/d60585a9c4277c8c118a6a66373a85ec46cdc166",
+   "backs": "shipped"
+  }
+ ]
+}

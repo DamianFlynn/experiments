@@ -1,0 +1,33 @@
+{
+ "summary": "PR 7399 refactored AVM modules to source telemetry prefixes from their adjacent metadata.json. It merged without recorded reviews.",
+ "proposed": "Telemetry prefixes should come from module metadata rather than being hard-coded in each main.bicep.",
+ "changed": "542 telemetry-implementing modules now use var telemetryIdPrefix = loadJsonContent('metadata.json', 'telemetryIdPrefix') and name their avmTelemetry deployment from it, with 546 main.json files regenerated. The scaffold and compliance checks were updated, and four source/metadata discrepancies (document-knowledge-mining, devcenter, network-connection, project) were reconciled to the published index identifiers, changing those four deployment names.",
+ "rejected": "Module versions and per-module changelogs were deliberately left unchanged for this mechanical backfill.",
+ "shipped": "The metadata-driven telemetry prefix change merged in one commit, with 543 changed avmTelemetry resources and 543 added telemetryIdPrefix variables in the deltas.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7399",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7399",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7399",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7399",
+   "backs": "rejected"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7399",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/65c433240fa4b6cd25f2d03286884139436dfea8",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7484 made CI initialize Pester from the Avm.Authoring configuration before Pester can autoload another version. It merged on 2026-10-07 after one approval.",
+ "proposed": "The body says VMSS, Log Analytics workspace and App Configuration static-validation jobs in one automatic run loaded Pester 5.9.0, then failed nested metadata validation because released Avm.Authoring 0.21.0 selected 5.7.1.",
+ "changed": "The body adds one shared initializer called from module static validation, the standalone metadata workflow, Test-ModuleLocally (PesterTest and PesterTestRecurse) and Test-CI. It requires Avm.Authoring 0.21.0 or later, resolves the manifest with Get-AvmTool, and runs Install-AvmTool -Name Pester only when the prerequisite is missing.",
+ "rejected": null,
+ "shipped": "Merged 2026-10-07 as commit d4731c8, changing .github actions and workflows, utilities/pipelines, utilities/tests and utilities/tools. The slice records no module file deltas.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7484",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7484",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7484",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/d4731c8c685649167a72165a924dcdc395267a97",
+   "backs": "shipped"
+  }
+ ]
+}

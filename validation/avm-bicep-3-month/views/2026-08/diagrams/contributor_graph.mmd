@@ -1,0 +1,82 @@
+flowchart LR
+    p_Abdul_Microsoft_90b16be8["Abdul-Microsoft"]
+    p_AlexanderSehr["AlexanderSehr"]
+    p_JPEasier["JPEasier"]
+    p_PadhiAjit_Microsoft_57ba92df["PadhiAjit-Microsoft"]
+    p_ReneHezser["ReneHezser"]
+    p_aniaroramsft["aniaroramsft"]
+    p_dependabot_bot__79170e47["dependabot[bot]"]
+    p_dmytroslotvinskyy["dmytroslotvinskyy"]
+    p_eriqua["eriqua"]
+    p_jaredfholgate["jaredfholgate"]
+    p_jtracey93["jtracey93"]
+    p_krbar["krbar"]
+    p_myaschmitz["myaschmitz"]
+    p_nsftwr["nsftwr"]
+    a_SUPPORT_md_1333b7d2("SUPPORT.md")
+    a__github_workflows_93d7c4b8("workflows")
+    a_avm_ptn_sa_content_gener_8f6c7eaa("content-generation")
+    a_avm_ptn_sa_content_proce_06399f11("content-processing")
+    a_avm_ptn_sa_conversation__ddcfeed9("conversation-knowledge-mining")
+    a_avm_ptn_sa_document_know_b9b67c8f("document-knowledge-mining")
+    a_avm_ptn_sa_multi_agent_c_81c8a268("multi-agent-custom-automation-engine")
+    a_avm_res_automation_autom_b279e791("automation-account")
+    a_avm_res_cognitive_servic_d1b76e3a("account")
+    a_avm_res_compute_virtual__f343f870("virtual-machine")
+    a_avm_res_container_regist_52956c8c("registry")
+    a_avm_res_document_db_data_0a2d9e37("database-account")
+    a_avm_res_network_azure_fi_cd92ec1c("azure-firewall")
+    a_avm_res_network_dns_reso_d935bf95("dns-resolver")
+    a_avm_res_network_firewall_50938f38("firewall-policy")
+    a_avm_res_network_nat_gate_a5474c3f("nat-gateway")
+    a_avm_res_network_virtual__0fe180f2("virtual-hub")
+    a_avm_res_network_virtual__186ab112("virtual-network")
+    a_avm_res_operational_insi_9a92a11e("workspace")
+    a_avm_res_resources_resour_b6d148d5("resource-group")
+    a_utilities_pipelines_41a540c7("pipelines")
+    p_Abdul_Microsoft_90b16be8 --> a_avm_ptn_sa_content_proce_06399f11
+    p_Abdul_Microsoft_90b16be8 --> a_avm_ptn_sa_multi_agent_c_81c8a268
+    p_AlexanderSehr --> a_avm_res_automation_autom_b279e791
+    p_AlexanderSehr --> a_avm_res_cognitive_servic_d1b76e3a
+    p_AlexanderSehr --> a_avm_res_compute_virtual__f343f870
+    p_AlexanderSehr --> a_avm_res_container_regist_52956c8c
+    p_AlexanderSehr --> a_avm_res_document_db_data_0a2d9e37
+    p_AlexanderSehr --> a_avm_res_network_azure_fi_cd92ec1c
+    p_AlexanderSehr --> a_avm_res_network_dns_reso_d935bf95
+    p_AlexanderSehr --> a_avm_res_network_firewall_50938f38
+    p_AlexanderSehr --> a_avm_res_network_nat_gate_a5474c3f
+    p_AlexanderSehr --> a_avm_res_network_virtual__0fe180f2
+    p_AlexanderSehr --> a_avm_res_network_virtual__186ab112
+    p_AlexanderSehr --> a_avm_res_operational_insi_9a92a11e
+    p_AlexanderSehr --> a_avm_res_resources_resour_b6d148d5
+    p_AlexanderSehr --> a_utilities_pipelines_41a540c7
+    p_JPEasier --> a_avm_res_container_regist_52956c8c
+    p_PadhiAjit_Microsoft_57ba92df --> a_avm_ptn_sa_content_gener_8f6c7eaa
+    p_PadhiAjit_Microsoft_57ba92df --> a_avm_ptn_sa_conversation__ddcfeed9
+    p_PadhiAjit_Microsoft_57ba92df --> a_avm_ptn_sa_document_know_b9b67c8f
+    p_ReneHezser --> a__github_workflows_93d7c4b8
+    p_aniaroramsft --> a_avm_ptn_sa_content_gener_8f6c7eaa
+    p_aniaroramsft --> a_avm_ptn_sa_content_proce_06399f11
+    p_aniaroramsft --> a_avm_ptn_sa_conversation__ddcfeed9
+    p_aniaroramsft --> a_avm_ptn_sa_document_know_b9b67c8f
+    p_aniaroramsft --> a_avm_ptn_sa_multi_agent_c_81c8a268
+    p_dependabot_bot__79170e47 --> a__github_workflows_93d7c4b8
+    p_dmytroslotvinskyy --> a_avm_res_cognitive_servic_d1b76e3a
+    p_eriqua --> a_avm_res_cognitive_servic_d1b76e3a
+    p_eriqua --> a_utilities_pipelines_41a540c7
+    p_jaredfholgate --> a_SUPPORT_md_1333b7d2
+    p_jtracey93 --> a_SUPPORT_md_1333b7d2
+    p_jtracey93 --> a_avm_res_cognitive_servic_d1b76e3a
+    p_jtracey93 --> a_avm_res_compute_virtual__f343f870
+    p_jtracey93 --> a_avm_res_document_db_data_0a2d9e37
+    p_krbar --> a_avm_res_automation_autom_b279e791
+    p_krbar --> a_avm_res_network_azure_fi_cd92ec1c
+    p_krbar --> a_avm_res_network_dns_reso_d935bf95
+    p_krbar --> a_avm_res_network_firewall_50938f38
+    p_krbar --> a_avm_res_network_virtual__0fe180f2
+    p_krbar --> a_avm_res_network_virtual__186ab112
+    p_krbar --> a_avm_res_operational_insi_9a92a11e
+    p_krbar --> a_avm_res_resources_resour_b6d148d5
+    p_myaschmitz --> a_SUPPORT_md_1333b7d2
+    p_myaschmitz --> a_avm_res_network_nat_gate_a5474c3f
+    p_nsftwr --> a_avm_res_document_db_data_0a2d9e37

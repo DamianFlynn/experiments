@@ -1,0 +1,29 @@
+{
+ "summary": "Issue 6990 asked for the container-registry module to expose the networkRuleBypassForTasks setting for ACR tasks. The original contributor PR 7158 was closed unmerged, and a rebase of it, PR 7280, was merged.",
+ "proposed": "The issue says the avm/res/container-registry/registry module lacked a way to set networkRuleBypassForTasks. It says that without it, tasks such as image scanning cannot bypass network rules on firewalled or vnet-restricted registries.",
+ "changed": "PR 7158 added support to bypass network rules for ACR tasks and was closed without review activity. PR 7280 was opened as a rebase of 7158 'to allow validation', keeping the original author's history. The change adds a bool parameter networkRuleBypassAllowedForTasks, default false, in main.bicep. PR 7280 shows one reopen and a dismissed review followed by an approval.",
+ "rejected": "PR 7158 was closed without being merged; the slice shows no reviews or comments on it and gives no reason.",
+ "shipped": "PR 7280 merged as commit f706d97. It adds the networkRuleBypassAllowedForTasks bool parameter (default false) to avm/res/container-registry/registry, with CHANGELOG and README updates.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/issues/6990",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7158",
+   "backs": "rejected"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7280",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7280",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/f706d972931aa9ca27895a9b33256ab14b0fa550",
+   "backs": "shipped"
+  }
+ ]
+}

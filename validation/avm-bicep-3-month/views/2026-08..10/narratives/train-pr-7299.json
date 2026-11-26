@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7299 created a new AVM pattern module for Function Apps at avm/ptn/app/function-app. It merged after a long review by AlexanderSehr with about twelve commented rounds.",
+ "proposed": "The PR body says it fixes Azure-Verified-Modules issue 2721 and adds a pattern module for Function Apps, flagged as a backwards-compatible feature with a MINOR version bump.",
+ "changed": "Reviewers asked for simplified tests (the defaults test should cover defaults, and non-consumer-relevant items removed) and questioned having both logAnalyticsWorkspaceName and logAnalyticsWorkspaceResourceId, recommending the resource ID and a simplified existing user-assigned identity block. The author simplified the changelog because much of it described mid-session changes rather than versions that exist.",
+ "rejected": null,
+ "shipped": "The new avm/ptn/app/function-app module (README, CHANGELOG, Bicep source and e2e tests) merged in one commit; symbol moves show test dependency parameters carried over from avm/res/app/managed-environment.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7299",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7299",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7299",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7299",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/e598d45191e282374fa271597318b733f23c7c0e",
+   "backs": "shipped"
+  }
+ ]
+}

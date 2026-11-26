@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7525 added source support for a reserved Azure Local test environment with shared fixtures, without activating it. It merged on 2026-10-13 after repeated ready-for-review cycles and CodeQL comments.",
+ "proposed": "The body asks for reserved test subscriptions for Azure Local modules and shared fixture infrastructure so tests need not rebuild all dependencies cold.",
+ "changed": "The body describes partitioning the subscription pool by an optional tag and seven module-root mappings in .reserved-test-subscriptions.json, failing before allocation on malformed or missing reserved pools. It adds a manual preparation workflow, serializes preparation, tests and cleanup on the shared environment, and reuses shared dependencies in fourteen non-cluster fixtures while keeping cold paths. Feature deltas show new optional test parameters described as validated persistent dependencies from reserved Azure Local CI, and a new test-key-vault.bicep template. Review activity was three bot reviews; the shown comments are CodeQL 'Excessive Secrets Exposure' warnings about toJSON(secrets).",
+ "rejected": null,
+ "shipped": "Merged 2026-10-13 as commit 806ee4c, changing workflows and actions, .reserved-test-subscriptions.json, the azure-stack-hci and hybrid-container-service test fixtures, and utilities/e2e-template-assets. The slice shows no human review before merge.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7525",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7525",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7525",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/806ee4cc0261d25acc351c1f5b9f7e30e310b8e2",
+   "backs": "shipped"
+  }
+ ]
+}

@@ -1,0 +1,25 @@
+{
+ "summary": "PR 7260 expanded the CI diff check so it also considers non-committed changes. It was approved and merged.",
+ "proposed": "The PR body says the diff check should include non-committed changes, noting this changes the default behavior because there should be no scenario in which only committed changes are considered.",
+ "changed": "The PR is under utilities/pipelines. The review comments concern the wording of the help text for an OnlyCommitted parameter and a description of modified-file paths, which suggests an OnlyCommitted switch. The slice has no diff for the change.",
+ "rejected": null,
+ "shipped": "Commit 2fdd267 merged the change under utilities/pipelines. The PR body links a pipeline run with no module changes that should pass, and one with module changes that should fail because the changelog was not updated.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7260",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7260",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7260",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/2fdd267afbd0ff3466ba34623ec9ce0810b4bd08",
+   "backs": "shipped"
+  }
+ ]
+}

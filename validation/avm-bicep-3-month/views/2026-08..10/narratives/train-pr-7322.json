@@ -1,0 +1,29 @@
+{
+ "summary": "PR 7322 added a generic module workflow, '.Module - Check and Publish', to run alongside the 217 legacy module-specific workflows during a canary period. It merged after Copilot and CodeQL review comments.",
+ "proposed": "Provide one generic workflow that handles one or several module paths with validation, release-tag preview and gated publishing, without changing the legacy workflows.",
+ "changed": "The workflow discovers all affected modules across a push range, uses a stable 'gci' prefix and namespaced 'queue: max' concurrency, previews release tags read-only with WhatIf, and gates real publishing behind createReleaseTag and the publish-approval environment. Review comments flagged overlap with legacy push workflows, concurrency that could drop pushed changes, a multi-commit range mismatch in release preview, and an unneeded id-token: write on publish-only. The author replied that the overlap is intentional for the canary period and that legacy workflows have zero final diff.",
+ "rejected": null,
+ "shipped": "The generic workflow, its separate validated-publish and publish-only workflows, tag logic and AVM toggle/rerun/issue tooling merged under .github/workflows, utilities/pipelines, utilities/tests and utilities/tools, with a new .github/workflows/README.md.",
+ "evidence": [
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7322",
+   "backs": "summary"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7322",
+   "backs": "proposed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7322",
+   "backs": "changed"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/pull/7322",
+   "backs": "shipped"
+  },
+  {
+   "url": "https://github.com/Azure/bicep-registry-modules/commit/96a1dcb69b9bbb9c56638c4f5c457914d3e8bd21",
+   "backs": "shipped"
+  }
+ ]
+}
