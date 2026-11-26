@@ -413,7 +413,9 @@ class TrustCheckKeepsFullRecords(unittest.TestCase):
         self.assertNotIn("records_as_of", sourced["meta"])
         self.assertNotIn("kim", trap["people"])       # projected: dropped
         self.assertNotIn("records_as_of", full["meta"])
-        self.assertNotIn(10, _by_number(full["prs"]))   # merged in November
+        # kept as stored (merged in November): open at the window's end, so
+        # in the window, as gather.keep_pr_for_window keeps it
+        self.assertTrue(_by_number(full["prs"])[10]["merged"])
         self.assertEqual(projected["meta"]["records_as_of"]["prs"], 2)
         self.assertFalse(_by_number(projected["prs"])[10]["merged"])
 
@@ -588,6 +590,133 @@ class FixturesUnchanged(unittest.TestCase):
                 self.assertEqual(json.dumps(as_of, sort_keys=True),
                                  json.dumps(stored, sort_keys=True))
                 self.assertNotIn("records_as_of", as_of["meta"])
+
+
+class ProjectedAnchorsSeedTheTraversal(unittest.TestCase):
+    """Review finding 1: a PR created in October and merged in November is in
+    October's projected view, but its stored timestamp (the merge) is not in
+    the window, so range_query does not seed it. What it alone reaches and
+    the store lacks (an ungathered issue it closes) must still be warned
+    about, or backfilled, like any anchor's train context."""
+
+    def _store(self):
+        bundle = _late_october()
+        pr = _pr(30, "alice", "2026-10-05T00:00:00Z", "2026-11-10T00:00:00Z",
+                 merged_at="2026-11-10T00:00:00Z", closes=[99])
+        bundle["prs"], bundle["issues"] = [pr], []
+        return _store(bundle=bundle)
+
+    def test_missing_context_is_warned(self):
+        conn = self._store()
+        warnings = []
+        try:
+            got = extract.extract(conn, "o", "r", *OCT, warn=warnings.append,
+                                  as_of_end=True)
+        finally:
+            conn.close()
+        self.assertFalse(_by_number(got["prs"])[30]["merged"])
+        self.assertTrue(any("o/r#issue-99" in w for w in warnings), warnings)
+
+    def test_missing_context_is_backfilled_and_in_the_view(self):
+        conn = self._store()
+        asked = []
+        payload = {"node": {"number": 99, "title": "the bug", "state": "closed",
+                            "state_reason": "completed",
+                            "created_at": "2026-09-01T00:00:00Z",
+                            "updated_at": "2026-11-10T00:00:00Z",
+                            "closed_at": "2026-11-10T00:00:00Z",
+                            "author": "gina", "comments_list": [],
+                            "url": URL + "/issues/99"}}
+
+        def fetch(kind, local, qid):
+            asked.append(local)
+            return payload if local == "issue-99" else None
+        try:
+            got = extract.extract(
+                conn, "o", "r", *OCT, warn=lambda _m: None, as_of_end=True,
+                backfill=lambda c, i: gather.backfill(c, i, fetch=fetch))
+        finally:
+            conn.close()
+        self.assertIn("issue-99", asked)
+        issue = _by_number(got["issues"])[99]        # read after the backfill
+        self.assertEqual((issue["state"], issue["closed_at"]), ("open", None))
+
+
+class DismissedReviewsAreNotProjected(unittest.TestCase):
+    """Review finding 2: GitHub rewrites a dismissed review's state without
+    moving its submission date, and the store keeps no dismissal date. An
+    October approval dismissed in November reads `dismissed` in October's
+    record: the decision cannot be re-derived as of the end, so the stored
+    one is kept and named in `not_projected`."""
+
+    def test_decision_with_a_dismissed_review_is_not_projected(self):
+        rec = _pr(40, "alice", "2026-10-01T00:00:00Z", "2026-11-05T00:00:00Z",
+                  reviewers=["bob", "carol"], decision="changes_requested",
+                  reviews=[_review(401, "bob", "dismissed",
+                                   "2026-10-05T00:00:00Z", 40),
+                           _review(402, "carol", "changes_requested",
+                                   "2026-11-05T00:00:00Z", 40)])
+        got = extract.record_as_of("pr", rec, "2026-10-31")
+        self.assertEqual([r["id"] for r in got["reviews"]], [401])
+        self.assertEqual(got["reviewers"], ["bob"])
+        self.assertEqual(got["review_decision"], "changes_requested")
+        marker = got[extract.AS_OF_KEY]
+        self.assertIn("review_decision", marker["not_projected"])
+        self.assertIn("review_rounds", marker["not_projected"])
+        self.assertNotIn("review_decision", marker["fields"])
+
+    def test_decision_without_a_dismissed_review_is_projected(self):
+        got = extract.record_as_of("pr", copy.deepcopy(PR10), "2026-10-31")
+        self.assertEqual(got["review_decision"], "approved")
+        self.assertNotIn("review_decision",
+                         got[extract.AS_OF_KEY]["not_projected"])
+
+
+class LateMonthBundleCrossCheck(unittest.TestCase):
+    """Review finding 3: a month gathered late keeps a PR open at its end and
+    merged since (gather.keep_pr_for_window) and an issue open at its end and
+    closed since (updated since the window's start). `view.py --as-stored`
+    must hold them, so `validate.py --bundle` on that view agrees with the
+    store; the store-only audit is green too."""
+
+    def _bundle(self):
+        # what a gather of October run on 2026-11-26 returns
+        prs = [_pr(50, "zed", "2026-10-10T00:00:00Z", "2026-11-12T00:00:00Z",
+                   merged_at="2026-11-12T00:00:00Z"),
+               copy.deepcopy(PR12)]
+        issues = [_issue(60, "gina", "2026-10-01T00:00:00Z",
+                         "2026-11-03T00:00:00Z", state="closed",
+                         closed_at="2026-11-03T00:00:00Z",
+                         state_reason="completed",
+                         comments=[_comment(6001, "yan",
+                                            "2026-10-04T00:00:00Z")])]
+        for pr in prs:
+            self.assertTrue(gather.keep_pr_for_window(pr, *OCT))
+        bundle = _late_october()
+        bundle["prs"], bundle["issues"] = prs, issues
+        return bundle
+
+    def test_as_stored_view_passes_validate_bundle(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "store.db")
+            _store(db, bundle=self._bundle()).close()
+            out = os.path.join(d, "at-gather.json")
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = view.main(["--store", db, "--from", OCT[0], "--to", OCT[1],
+                                "--as-stored", "--out", out])
+            self.assertEqual(rc, 0)
+            with open(out, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            self.assertEqual(sorted(_by_number(saved["prs"])), [12, 50])
+            self.assertEqual(sorted(_by_number(saved["issues"])), [60])
+            self.assertIn("zed", saved["people"])
+            self.assertIn("yan", saved["people"])
+            for argv in ([db], [db, "--bundle", out]):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = validate.main(argv)
+                self.assertEqual(rc, 0, (argv, buf.getvalue()))
 
 
 if __name__ == "__main__":

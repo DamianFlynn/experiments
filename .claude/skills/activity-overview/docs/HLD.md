@@ -509,10 +509,11 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
    An issue closed in the month and reopened since is closed with no `state_reason` (the
    closing's reason is not recorded); activity GitHub records nowhere in the record (a
    label change, a push to the PR branch) does not move `updated_at`; an item open then but
-   deleted or transferred since is absent. A past month's own gather collects PRs merged or
-   closed in it and those open now, so a PR open at its end that landed before the gather
-   is there only when the later month was folded into the same store. `spotlight.py` and
-   the trust check read the stored records unprojected.
+   deleted or transferred since is absent. A past month's own gather keeps the PRs open at
+   its end that landed since (`gather.keep_pr_for_window`). A review approved then and
+   dismissed later reads `dismissed` (GitHub records no dismissal date), so such a PR's
+   `review_decision` is the stored one, flagged `not_projected`. `spotlight.py` and the
+   trust check read the stored records unprojected.
 8. **Per-repo facts are per gathered window, not per day.** Each fold records its window's
    `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` and clone sha (#94), and a
    view of exactly a gathered window shows that window's. Other views are assembled from

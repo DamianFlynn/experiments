@@ -228,6 +228,20 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     #    pull that PR in (a behaviour change + backfill-budget cost vs pre-P10).
     seeds = [_train_anchor(n) for n in in_window if n["node_class"] == "social"
              and _local(n["id"]).startswith(("pr-", "issue-"))]
+    if as_of_end:
+        # Issue #97: a record projected to the window's end can be in the view
+        # although its stored timestamp is not in the window (a PR open at
+        # the end and merged since). It anchors a train of this view too, so
+        # it seeds the traversal / completion below: what it reaches but the
+        # store lacks is backfilled or warned about like any anchor's.
+        pre = graphstore.repo_nodes(conn, project, repo, node_class="social")
+        pre_as_of = _socials_as_of(pre, _social_leaves(pre), ts_to)
+        seeded = set(seeds)
+        seeds += sorted(
+            n["id"] for n in _view_socials(conn, project, repo, pre,
+                                           in_window_ids, ts_from, ts_to,
+                                           as_of=pre_as_of)
+            if n["id"] in pre_as_of and n["id"] not in seeded)
     spine = graphstore.traverse_spine(conn, seeds, max_depth=max_depth,
                                       skip_dead=True)
 
@@ -505,22 +519,39 @@ def _open_by(data, ts_to):
     return not created or graphstore.ts_in_window(created, None, ts_to)
 
 
+def _ended_after(data, ts_to):
+    """Open at the window's END though stored closed: created by the
+    window's end and merged / closed only after it (both dated, as
+    `gather.keep_pr_for_window` requires)."""
+    ended = data.get("merged_at") if data.get("merged") else data.get("closed_at")
+    if not ended or graphstore.ts_in_window(ended, None, ts_to):
+        return False
+    return graphstore.ts_in_window(data.get("created_at"), None, ts_to)
+
+
 def _pr_in_window(data, ts_from, ts_to):
-    """gather's PR rule: merged in the window, closed (unmerged) in the
-    window, or open (here: open and created by the window's end)."""
+    """gather's PR rule (`gather.keep_pr_for_window`): merged in the window,
+    closed (unmerged) in the window, open (here: open and created by the
+    window's end), or open at the window's end and merged / closed after it
+    (#97: a month gathered late keeps those)."""
     if data.get("merged"):
-        return graphstore.ts_in_window(data.get("merged_at"), ts_from, ts_to)
+        return graphstore.ts_in_window(data.get("merged_at"), ts_from, ts_to) \
+            or _ended_after(data, ts_to)
     if data.get("state") == "closed":
-        return graphstore.ts_in_window(data.get("closed_at"), ts_from, ts_to)
+        return graphstore.ts_in_window(data.get("closed_at"), ts_from, ts_to) \
+            or _ended_after(data, ts_to)
     return _open_by(data, ts_to)
 
 
 def _issue_in_window(data, ts_from, ts_to):
     """gather's issue rule (minus train context, see `_view_socials`): closed
-    or updated in the window, or open and created by the window's end."""
+    or updated in the window, open and created by the window's end, or open
+    at the window's end and closed after it (#97: gather lists every issue
+    updated since the window's start, so a month gathered late holds those)."""
     return (graphstore.ts_in_window(data.get("closed_at"), ts_from, ts_to)
             or graphstore.ts_in_window(data.get("updated_at"), ts_from, ts_to)
-            or _open_by(data, ts_to))
+            or _open_by(data, ts_to)
+            or (data.get("state") == "closed" and _ended_after(data, ts_to)))
 
 
 def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to,
@@ -753,7 +784,10 @@ def record_as_of(kind, rec, ts_to):
       none remain); `comments` / `review_comments_count` lose the dropped
       ones; `reviewers` / `review_decision` are re-derived from the
       remaining reviews (when the record has no review submissions they
-      cannot be, and are named in `not_projected`); `open_high_activity`
+      cannot be, and are named in `not_projected`; when a remaining review
+      is `dismissed` — GitHub keeps no dismissal date — the stored
+      `review_decision` is kept and it and `review_rounds` are named in
+      `not_projected`); `open_high_activity`
       is re-derived (an issue's reactions are as stored);
     - `updated_at`: the latest timestamp left at or before the end (its
       created / closed / merged time, comments, reviews, lifecycle events),
@@ -788,11 +822,24 @@ def record_as_of(kind, rec, ts_to):
                 and not isinstance(rec.get(count), bool):
             out[count] = max(0, rec[count] - dropped[lst])
     if kind == "pr":
+        # GitHub rewrites a dismissed review's state to `dismissed` and keeps
+        # its submission date; the store records no dismissal date, so such a
+        # review's state at the instant is unknown. The decision and the
+        # rounds read from those states are then not projected: the stored
+        # decision is kept and both are named (the reviewer set is not
+        # affected: the review was submitted by the instant either way).
+        dismissed = any(isinstance(r, dict)
+                        and (r.get("state") or "").lower() == "dismissed"
+                        for r in out.get("reviews") or [])
+        if dismissed:
+            not_projected.add("review_rounds")
+            if "review_decision" in rec:
+                not_projected.add("review_decision")
         if dropped.get("reviews"):
             reviewers, decision = _reviews_summary(out.get("reviews") or [],
                                                    rec.get("author"))
             out["reviewers"] = reviewers
-            if "review_decision" in rec:
+            if "review_decision" in rec and not dismissed:
                 out["review_decision"] = decision
         elif rec.get("reviewers") and not isinstance(rec.get("reviews"), list):
             not_projected.update(k for k in ("reviewers", "review_decision")

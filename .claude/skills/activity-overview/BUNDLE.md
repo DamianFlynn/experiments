@@ -226,8 +226,10 @@ the rest (engagement, code areas, trains, people/flow).
   gather collects for a window, applied to each record's state as of the window's end
   (#97, see "As of the window's end"; `extract` with `as_of_end` False, as the trust check
   uses it, applies it to the latest stored state):
-  `prs` merged in the window, closed (unmerged) in it, or open and created by its end;
-  `issues` closed or updated in it, open and created by its end, or closed / cross-referenced
+  `prs` merged in the window, closed (unmerged) in it, open and created by its end, or
+  created by its end and merged / closed after it (#97, `gather.keep_pr_for_window`);
+  `issues` closed or updated in it, open and created by its end, created by its end and
+  closed after it (#97), or closed / cross-referenced
   by one of the view's PRs (**train context**: an issue from another window can be here; a PR
   never is); `commits` dated in it and the `code_events` / `symbol_events` of those commits;
   `releases` published in it; reviews / lifecycle events with their parent; any record whose
@@ -391,6 +393,13 @@ window predicate's own rule.
   whose record has `reviewers` but no review submissions keeps them, listed in
   `not_projected`); an issue's `open_high_activity` is re-derived (its `reactions` are as
   stored). `review_rounds` / `reopen_count` are derived by `link` from what remains.
+  **Dismissed reviews:** GitHub rewrites a dismissed review's `state` to `dismissed` and
+  keeps its `submitted_at`, and the store records no dismissal date, so a review submitted
+  by the instant but dismissed later reads `dismissed` in the projected record. When a
+  remaining review is `dismissed` its state at the instant cannot be established: the
+  stored `review_decision` is kept (not re-derived) and `review_decision` and
+  `review_rounds` are listed in `not_projected` (`reviewers` is still re-derived: the
+  reviewer submitted by the instant either way).
 - **`updated_at`** becomes the latest timestamp left at or before the instant (created /
   closed / merged time, comments, review comments, reviews, lifecycle events): the item's
   last recorded activity then, so the bucket rule (`in_flight` = open and updated in the
@@ -404,8 +413,8 @@ window predicate's own rule.
   the store, so not in the view.
 - **Marker.** Each projected record carries **`as_of`**: `{"instant", "fields": [the keys
   that changed, sorted], "not_projected": [sorted: the stored fields of the list above that
-  the record has, plus `state_reason` / `reviewers` / `review_decision` when they could not
-  be projected]}`;
+  the record has, plus `state_reason` / `reviewers` / `review_decision` / `review_rounds`
+  when they could not be projected]}`;
   the view's `meta.records_as_of` counts them. A record with nothing later than the instant
   is exactly as stored and has no `as_of`; a view with none has no `meta.records_as_of`.
 
@@ -420,9 +429,11 @@ people from the **full** stored records (a PR merged after some window's end has
 `merged` edge). `spotlight.py` reads the stored graph directly and is not projected: its
 train outcomes and contribution counts are as stored, also with `--from` / `--to`.
 `view.py --as-stored` writes the records as stored (the form `validate.py --bundle` compares
-with the store). A gather of a past window collects the PRs merged / closed in it and those
-open at gather time: a PR open at the window's end and merged / closed before the gather is
-in its view only when the store also holds the later window that collected it.
+with the store). A gather of a past window keeps the PRs merged / closed in it, those open
+at gather time, and those open at the window's end and merged / closed since
+(`gather.keep_pr_for_window`); it lists every issue updated since the window's start. The
+window-scope rule agrees (both with and without `as_of_end`, and so `validate.py --bundle`):
+a PR or issue created by the window's end and merged / closed after it is in the window.
 `meta.schema_version` is unchanged (3): `as_of` and `records_as_of` are additive keys.
 
 ## Optional (omit-when-empty) keys

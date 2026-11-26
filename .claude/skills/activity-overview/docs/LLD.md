@@ -814,9 +814,11 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    collects for a window, applied to each record's state as of the window's end — its
    latest stored state without `as_of_end` — and, for a projected record, to the node
    timestamp fold would give it, `_record_ts`; every test is `ts_in_window`):
-   - `prs`: merged in the window, closed unmerged in it, or open with `created_at` by its end;
+   - `prs`: merged in the window, closed unmerged in it, open with `created_at` by its end,
+     or `created_at` by its end and merged / closed after it (#97, the rule of
+     `gather.keep_pr_for_window`; `validate --bundle` reads the same `_pr_in_window`);
    - `issues`: `closed_at` or `updated_at` in the window, open with `created_at` by its end,
-     or the target of a `closes`/`cross_ref` edge from a view PR (**train context** — what
+     `created_at` by its end and closed after it (#97), or the target of a `closes`/`cross_ref` edge from a view PR (**train context** — what
      gather fetches for a window's PRs). PRs are never pulled in as context: `link` counts
      every PR in the arrays;
    - `commits`: `date` in the window; `code_events`/`symbol_events`: the ledger rows of those
@@ -904,7 +906,8 @@ The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 > `not_projected`), `open_high_activity` re-derived; (3) `updated_at` = the latest
 > remaining timestamp; (4) `_NOT_PROJECTED` fields (title, body, labels/facets, kind,
 > milestone, assignees, base/head, closing / cross references, blocks, reactions, board
-> status, iteration) stay; (5) marker `as_of` = `{instant, fields, not_projected}`. `link`
+> status, iteration) stay — and with a remaining `dismissed` review the stored
+> `review_decision` (no dismissal date is recorded); (5) marker `as_of` = `{instant, fields, not_projected}`. `link`
 > and `derive` need no change: every train, bucket, effort, timeline, people and flow figure
 > is computed from the projected records. `digest.spine_components` is also seeded with the
 > projected records (`seeds`), whose stored node timestamp may lie after the window.
@@ -1731,7 +1734,7 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
-| Past-month views keep the latest value of what has no history | PR/issue nodes are upserted latest-wins; since #97 a report view projects state, comments, reviews, lifecycle events and `updated_at` back to the window's end from the timestamps in the record (BUNDLE.md, "As of the window's end"), but GitHub keeps no history of the rest | a month gathered or viewed late shows today's title, body, labels (and facets / kind), milestone, assignees, closing / cross references, blockers, reactions and board status / iteration; an issue closed in the window and reopened since is closed with `state_reason: null` (the closing's reason is not recorded), so it is in no shipped/rejected bucket; activity recorded nowhere else (a label change, a push) does not count towards `updated_at`; an item deleted or transferred since is absent; a PR open at the window's end and merged / closed before its gather is not collected by that window's gather (gather keeps PRs merged / closed in the window or open now), so it is in the view only when a later window holding it is folded into the same store; `spotlight.py` reads stored state; `validate --bundle` compares stored records, so its input is a `view.py --as-stored` view | per-window snapshots of the record at fold; keep the closing reason on lifecycle events at gather; gather the PRs updated since the window's start |
+| Past-month views keep the latest value of what has no history | PR/issue nodes are upserted latest-wins; since #97 a report view projects state, comments, reviews, lifecycle events and `updated_at` back to the window's end from the timestamps in the record (BUNDLE.md, "As of the window's end"), but GitHub keeps no history of the rest | a month gathered or viewed late shows today's title, body, labels (and facets / kind), milestone, assignees, closing / cross references, blockers, reactions and board status / iteration; an issue closed in the window and reopened since is closed with `state_reason: null` (the closing's reason is not recorded), so it is in no shipped/rejected bucket; activity recorded nowhere else (a label change, a push) does not count towards `updated_at`; an item deleted or transferred since is absent; a review submitted by the window's end and dismissed later reads `dismissed` (GitHub keeps the submission date and records no dismissal date), so a PR with a remaining dismissed review keeps its stored `review_decision`, and `review_decision` / `review_rounds` are named in `not_projected`; `spotlight.py` reads stored state; `validate --bundle` compares stored records, so its input is a `view.py --as-stored` view | per-window snapshots of the record at fold; keep the closing reason on lifecycle events at gather; gather the PRs updated since the window's start |
 | `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not | read the moves from the stored nodes/edges instead |
 | Wide views use one code graph | a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them (#94); the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
 | Sub-window CI statistics are not available | `workflow_stats` are counted per gathered window, not per run day | a view inside a gathered window (a week of a gathered month) or straddling two has no `workflow_stats` (`meta.facts_windows.workflow_stats_excluded` says why); a view over ungathered days sums only what was gathered (`workflow_stats_complete: false`) | store per-day run counts |
