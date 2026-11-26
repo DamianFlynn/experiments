@@ -49,7 +49,9 @@ video-script, dashboards) consume the same view. The contract:
   parts are disjoint and nobody is counted twice: the counts (`prs_authored`,
   `prs_merged`, `prs_reviewed`, `commits_authored`, `issues_opened`,
   `examples_authored`, `docs_authored`, `symbols_authored`, `authored_then_removed`,
-  `stale_owned`; `derive.PROFILE_COUNT_FIELDS`) are **summed**; `merge_rate` is
+  `stale_owned`, `own_pr_commits`, `prs_opened`; `derive.PROFILE_COUNT_FIELDS`) are
+  **summed** (a member that omits `prs_opened` contributes its `prs_authored`, which it then
+  equals; the project people carry `prs_opened` when any member does); `merge_rate` is
   recomputed from the summed `prs_merged / prs_authored`; `review_latency_days` is the
   median of **every** member's latency samples (not a median of member medians);
   `first_seen` is the earliest and `last_active` the latest; `modules` / `areas` are
@@ -63,7 +65,9 @@ video-script, dashboards) consume the same view. The contract:
   (`digest.build_project_trains`). Each is the union of the member trains (`trains[]` of
   `members[].bundle`) whose anchors fall in one connected group of the cross-repo spine
   (`closes` / `cross_ref` edges between members), plus any member PR / issue of that group
-  that has no train of its own. **Ids are qualified:** a PR is `<project>/<repo>#pr-<n>`, an
+  that has no train of its own. A `closes` edge from a member PR to an issue that PR's own
+  member train does not list (a rejected attempt's other issues, #97 final gate) is not
+  followed, so a project train of one member is exactly that member's train. **Ids are qualified:** a PR is `<project>/<repo>#pr-<n>`, an
   issue `<project>/<repo>#issue-<n>`, a commit `<project>/<repo>#<sha>`, where `<repo>` is the
   store's repo key (`owner/name` for a manifest member). `id` is `"ptrain-" +` the smallest
   qualified PR / issue id (so `ptrain-<project>/<repo>#issue-<n>` or `#pr-<n>`); the member's
@@ -184,7 +188,8 @@ the rest (engagement, code areas, trains, people/flow).
   this bundle shape is the transient view `extract` materializes from the store, not a
   produced file.)
   A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
-  to, base_branch, branches` (+ `clone_sha`, `state_as_of`, `facts_windows` when they apply),
+  to, base_branch, branches` (+ `clone_sha`, `state_as_of`, `records_as_of`, `gathered_at`,
+  `facts_windows` when they apply),
   **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).
   `period` is the window `compute_buckets` and `build_forecast` limit to (`link.window_period`:
   `period`, else `{from, to}`), so items the store holds from other windows — or old items
@@ -203,6 +208,14 @@ the rest (engagement, code areas, trains, people/flow).
   the view carry an `as_of` marker. Absent when no record holds anything later than `to`
   (a current window, or a store gathered at its end), so such a view is unchanged. A
   `digest.py` project view's `meta.records_as_of` is `{"instant", "members": [repo]}`.
+  **`gathered_at`** (validation finding 8, omit-when-absent; present only with
+  `records_as_of`) is when the view's PR / issue records were gathered: the latest
+  `fetched_at` of their store nodes (the time the fold that last wrote each one ran, at the
+  end of its gather), an ISO timestamp. What GitHub keeps no history of — title, labels,
+  milestone, board status ("Not projected", below) — is as of that time, not of the window's
+  end. A month gathered late into its own store has `records_as_of` and `gathered_at` but no
+  `state_as_of`; the report's caveat line reads both (`report-template.md`, GATHERED AFTER
+  THE WINDOW).
   **`facts_windows`** (issue #94, omit-when-absent) is present only when the store keeps
   per-window facts for the repo and the view is **not** exactly one gathered window. It names
   where the view's `workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` /
@@ -231,7 +244,7 @@ the rest (engagement, code areas, trains, people/flow).
   `issues` closed or updated in it, open and created by its end, created by its end and
   closed after it (#97), or closed / cross-referenced
   by one of the view's PRs (**train context**: an issue from another window can be here; a PR
-  never is); `commits` dated in it and the `code_events` / `symbol_events` of those commits;
+  never is; an issue created after the window's end never is, projected or `--as-stored`); `commits` dated in it and the `code_events` / `symbol_events` of those commits;
   `releases` published in it; reviews / lifecycle events with their parent; any record whose
   stored timestamp is in the window, and any undated one (it cannot be placed in a window).
   `artifacts` keep only the window's lifecycle events (an artifact with none is absent), with
@@ -244,7 +257,9 @@ the rest (engagement, code areas, trains, people/flow).
   touched in this window. The stored person node keeps the project-wide union. The per-repo
   facts `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` (and `meta.clone_sha`)
   are the gathered window's own for a view of exactly that window, else summed / picked as
-  `facts_windows` describes (#94); a store folded before #94 gives the latest gather's. Not
+  `facts_windows` describes (#94); a store folded before #94 gives the latest gather's.
+  `newcomers` is the gathered window's own, or merged over the gathered windows inside the
+  view (see "First-time contributors"). Not
   windowed: `milestones`, `sprints` — current structure, as of the latest gather. On a
   store holding only the viewed window every stored record is in the view; a view spanning
   several gathered windows is their union.
@@ -311,6 +326,16 @@ the rest (engagement, code areas, trains, people/flow).
   trains. A `closes` number that is one of the bundle's PRs is not an issue (GitHub closes no
   PR by keyword): it neither anchors nor joins a train (#110). `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
   or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.
+  **A closing reference takes effect only when its PR merges (#97 final gate).** Only merged
+  and open PRs join issues into a train and anchor it. A rejected PR that closes an issue of
+  such a train is listed in it as a rejected attempt (`prs`, `pr_outcomes`, its commits, and
+  its reviewers / participants in `effort`) but adds none of its other issues and never
+  changes the train's `root_issue`, `issues`, `kind`, `outcome`, `effort.opened_at` or
+  `effort.elapsed_days`; when its issues touch several such trains it joins the one with the
+  lowest of those issue numbers. Rejected PRs whose issues are in no merged/open train join
+  each other over their issues, as before (a `"rejected"` train). So an issue only a rejected
+  PR named beside a shipped one stays out of the shipped train (and its bucket ref carries no
+  train). The order of the records never changes the result.
   A train is anchored by its lowest closed issue — `root_issue`, id `train-issue-<n>` — or, when
   its PRs close no issue (process not followed / a forked PR), by its lowest **PR**
   (`train-pr-<n>`). `outcome`, by precedence shipped > in_flight > rejected > abandoned:
@@ -409,7 +434,9 @@ window predicate's own rule.
   `labels` / `facets`, `kind` / `issue_type`, `milestone`, `assignees`, `base` / `head`,
   `closes` / `closing_issues` / `crossref_issues` / `timeline_xrefs` / `external_refs`,
   `blocks` (and the resolved `blocking` / `blocked_by`), `reactions`, `board_status` /
-  `iteration`. An item open at the window's end but deleted or transferred since is not in
+  `iteration`, and `author_association` (GitHub's value when gathered — e.g. a
+  `FIRST_TIME_CONTRIBUTOR` then may be a `CONTRIBUTOR` now; use `newcomers` for who was new
+  in the window). An item open at the window's end but deleted or transferred since is not in
   the store, so not in the view.
 - **Marker.** Each projected record carries **`as_of`**: `{"instant", "fields": [the keys
   that changed, sorted], "not_projected": [sorted: the stored fields of the list above that
@@ -430,11 +457,61 @@ people from the **full** stored records (a PR merged after some window's end has
 train outcomes and contribution counts are as stored, also with `--from` / `--to`.
 `view.py --as-stored` writes the records as stored (the form `validate.py --bundle` compares
 with the store). A gather of a past window keeps the PRs merged / closed in it, those open
-at gather time, and those open at the window's end and merged / closed since
+at gather time and created by its end, and those open at the window's end and merged / closed since
 (`gather.keep_pr_for_window`); it lists every issue updated since the window's start. The
 window-scope rule agrees (both with and without `as_of_end`, and so `validate.py --bundle`):
 a PR or issue created by the window's end and merged / closed after it is in the window.
-`meta.schema_version` is unchanged (3): `as_of` and `records_as_of` are additive keys.
+A PR or issue created **after** the window's end is in no view of it (projected or as
+stored, not even as train context), so gather no longer keeps one from its listings
+(open PRs, open / recently updated issues; nor a closed issue last touched before the
+window's start, which the updated-since listing's last page reaches) — an issue a kept PR
+closes or cross-references is still kept as train context. A store gathered before that
+may hold such records; `validate.py --bundle` does not expect people seen only on stored
+records outside the bundle's window to be derivable from it (one INFO line), so it passes
+without a re-gather.
+`meta.schema_version` is unchanged (3): `as_of`, `records_as_of` and `gathered_at` are
+additive keys.
+
+## First-time contributors (`newcomers`)
+
+Validation finding 12: who is new this window. `people[].first_seen` cannot say it (the
+earliest activity **inside the view**), nor can `author_association` (GitHub's value when
+gathered, not projected). gather checks every author of a PR, and every reporter of an issue,
+**created in the window** (bots by `derive.is_bot_login`, and GitHub's deleted-user `ghost`,
+excluded) for any PR / issue of theirs in the repository created before the window's start,
+with the search API (`repo:O/R is:pr|is:issue author:<login> created:<<from>`, `per_page=1`,
+reading `total_count`; one call, or two when the first kind finds nothing). It is stored as a
+per-window fact (`facts:` meta, like `workflow_stats`; STORE.md) and a view carries it as the
+top-level key **`newcomers`**, omitted when no gather stored it (a store gathered before the
+check; every fixture bundle):
+
+```json
+{"collected": true, "before": "2026-09-01", "candidates": 12,
+ "new": [{"login": "octo", "first": "pr", "number": 7576,
+          "url": "https://github.com/O/R/pull/7576", "created_at": "2026-09-02T16:16:55Z"}],
+ "unknown": ["login-whose-check-failed"], "not_checked": ["login-over-the-cap"]}
+```
+
+- `before` — the window's first day: "new" means no PR / issue created before it.
+- `candidates` — how many distinct non-bot authors created a PR / issue in the window.
+- `new` — the newcomers (sorted by login), each with their **earliest** PR or issue created
+  in the window (`first` "pr" | "issue").
+- `unknown` — a check failed (an API error, a rate limit not waited out, `incomplete_results`);
+  never guessed, never counted as new or returning. After three failures in a row the rest
+  are `unknown` too.
+- `not_checked` — candidates beyond `ACTIVITY_NEWCOMERS_MAX` (default 200; the earliest are
+  checked).
+- `{"collected": false}` alone — the window was gathered with `--no-newcomers`.
+
+A view of exactly a gathered window carries the stored value verbatim (so `validate.py
+--bundle` compares it like any per-window fact). A view spanning several gathered windows
+merges those lying wholly inside it that collected one, not overlapping one another (by start
+day, the longest first): `new` keeps each login's earliest entry, `unknown` / `not_checked`
+are the unions less the logins found new, `candidates` is left out (a login can be a
+candidate in two windows), and two keys are added: `windows` (the merged windows) and
+`covers_view` (false when they leave days of the view uncovered — a newcomer in an uncovered
+day is missing). Multi-repo: per member bundle; a person new to one member may have worked in
+another. Additive and omit-when-absent: `meta.schema_version` stays 3.
 
 ## Optional (omit-when-empty) keys
 
@@ -445,7 +522,7 @@ report (the omit-when-empty rule that keeps the shape diff-stable), **not** perm
 empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
-code_graph, label_taxonomy, modules, workflow_stats, releases, milestones, sprints,
+code_graph, label_taxonomy, modules, workflow_stats, newcomers, releases, milestones, sprints,
 diagrams`.
 
 **Never in a view:** gather's in-memory bundle skeleton also reserves `workflows` (the raw
@@ -489,7 +566,9 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   `ranges` concatenated, largest `cap`).
 - **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
   `next_candidates` (one bucket per item; precedence shipped > rejected >
-  next_candidates > in_flight). Each ref may carry a `train` id. The current/next
+  next_candidates > in_flight). Each ref may carry a `train` id. An open item is a
+  next candidate when it is on the next milestone, has a priority label or is an
+  approved PR (both below, under **forecast**). The current/next
   milestones come from `select_milestones`: open milestones **with a due date** only
   (undated ones, e.g. "Backlog", are never selected; none dated → no current/next);
   current = earliest due on/after `ref_date`'s day, next = the one after; if all are
@@ -510,11 +589,28 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   it is `{}` when nothing was cut (caps and ranking keys: `docs/LLD.md` §7).
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
   train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...],
-  notes:[str,...] } ] }`
+  notes:[str,...] } ][, notes:[str,...]][, priority_patterns:[str,...]] }`
   — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
   desc. `next_milestone` is the bucket rule's next milestone (always dated; `None` when
-  there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
-  / `active in window` / `long-open`. The in-motion signal (#87) needs live work: `open PR`
+  there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` /
+  `approved, no later change request` / `open PR` or `work in progress`
+  / `active in window` / `long-open`. **Priority labels (#97 final gate):** a label is
+  high priority when it is one of `link.HIGH_PRIORITY_LABELS` (exact, case-insensitive) or
+  matches one of `link.PRIORITY_LABEL_PATTERNS` (regular expressions searched
+  case-insensitively: priority high / critical / urgent / P0 / P1, high priority, a bare
+  P0 / P1, urgent, critical (not "non-critical"), blocker), plus any
+  `link.py BUNDLE --priority-label PATTERN` (repeatable), which are then listed in
+  `forecast.priority_patterns` (absent without the flag). **Approved PR:** an open,
+  unmerged PR that is not a draft (`draft` true; gather does not record it yet, so it is
+  read when present) with an `approved` review by someone other than its author and no
+  `changes_requested` review submitted after the latest such approval, as the view's
+  `reviews` record them (`link.approved_pr`; a dismissed approval reads `dismissed`; the
+  PR's `review_decision` is today's and is not used). It needs no milestone discipline and
+  scores 3.0 (with `open PR`, 5.0: likely); next month's `series.forecast_loop` checks
+  whether it shipped. **`forecast.notes`** (absent otherwise) — when there is no
+  candidate although the view holds an open PR or issue, one plain sentence per signal
+  source saying why (no usable next milestone and the reason, no priority label, no
+  approved PR); a view with nothing open has no notes. The in-motion signal (#87) needs live work: `open PR`
   when the candidate is an open PR or an open PR `closes`/cross-references the issue;
   `work in progress` when the candidate's train (looked up in `trains` by `train`) has
   `outcome` `in_flight`. A `rejected`, `shipped` or `abandoned` train, or a `train` id that
@@ -526,14 +622,17 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
 - **series** (only with `link.py BUNDLE --series INDEX`; absent otherwise) —
-  `{ first_installment:bool, prior:{from,to,captured}|None, new:[row],
+  `{ first_installment:bool, prior:{from,to,captured}|None, new:[row], new_opened:[row],
   carried_over:[row], forecast_loop:{ landed:[loop], not_yet:[loop], dropped:[loop] } }`.
   The comparison is against the installment recorded for the window **immediately before**
   this bundle's window (`meta.period`, else `meta.from`/`meta.to`) in the index — not the
   last one appended. A `row` is `{type, id, url, bucket}` (`bucket` = this window's bucket);
   carried rows add `prior_status` (the prior board status, else `"in_flight"`). `new` = this
   window's `shipped` / `in_flight` items the prior installment did not know at all (in none
-  of its buckets nor its forecast). `carried_over` = items in the prior's `in_flight` that
+  of its buckets nor its forecast) — new to the **series**, not newly opened: an old issue
+  first touched this window is in it. `new_opened` (#97 final gate) = the rows of `new` whose
+  PR / issue `created_at` falls inside this window (by calendar day; `[]` on the first
+  installment): the work actually opened this window. `carried_over` = items in the prior's `in_flight` that
   are in **any** of this window's four buckets (so in-flight work that was rejected or
   moved to `next_candidates` is reported, with that `bucket`). A `loop` row is
   `{type, id, tier}` for each prior forecast candidate: `landed` = now in `shipped`,
@@ -894,11 +993,13 @@ across members (see "Project view: `people` and `halls`").
 
   | field | meaning |
   |-------|---------|
-  | `prs_authored` | PRs with `author == login` (int) |
+  | `prs_authored` | PRs in the view with `author == login` (int): every in-scope PR — opened in the window, or opened earlier and still open or closed in it — NOT "PRs opened this month" |
+  | `prs_opened` | of those, PRs whose `created_at` falls inside the window (`meta.period`, by calendar day) (int). Present on every person only when the view holds a PR created outside the window; absent otherwise, and then equal to `prs_authored` (#97 final gate) |
   | `prs_merged` | of those, PRs with truthy `merged` (int) |
   | `merge_rate` | `round(prs_merged/prs_authored, 3)`, `null` when 0 authored |
   | `prs_reviewed` | PRs where login is in `reviewers` (int) |
-  | `commits_authored` | commits with `author == login` (int) |
+  | `commits_authored` | commits with `author == login` (int) — the true count |
+  | `own_pr_commits` | of those, commits whose `pr` is a merged PR authored by the same login — the landing (squash) commit of their own PR (int); absent when 0 (#97 final gate) |
   | `issues_opened` | issues with `author == login` (int) |
   | `review_latency_days` | median, over reviewed PRs, of (login's earliest `reviews[].submitted_at` − `pr.created_at`) in days; `null` when no timestamped review |
   | `first_seen` / `last_active` | min / max ISO date (`YYYY-MM-DD`) across the login's activity (PRs authored/merged-by, commits, issues, reviews); `null` when none |
@@ -906,13 +1007,19 @@ across members (see "Project view: `people` and `halls`").
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
   | `stale_owned` | distinct areas in a stalled train's `code_areas` (an open train with `effort.stalled`, #112) that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
 
-  Counts are always present (ints, may be 0); `merge_rate`/`review_latency_days`/
+  Counts are always present (ints, may be 0), except `prs_opened` and `own_pr_commits`
+  (present when applicable, above); `merge_rate`/`review_latency_days`/
   `first_seen`/`last_active` are present as `null` when N/A. Deterministic.
 - **halls** `{ "fame": [ { login, score, prs_merged, prs_reviewed,
-  commits_authored, areas } ] }` (`build_halls`) — **recognition only.** `fame`
-  ranks NON-bot logins by footprint `score = prs_merged*2 + prs_reviewed +
-  commits_authored`, keeps `score > 0`, sorts by `(-score, login)`, takes the top
-  10 (else `[]`). **`halls.internal`/`shame`/`blame` are intentionally NOT built**
+  commits_authored, areas[, own_pr_commits] } ] }` (`build_halls`) — **recognition only.** `fame`
+  ranks NON-bot logins by footprint
+  `score = prs_merged*2 + prs_reviewed + (commits_authored - own_pr_commits)`
+  (`own_pr_commits` 0 when absent), keeps `score > 0`, sorts by `(-score, login)`, takes the top
+  10 (else `[]`). A commit that lands the person's own merged PR (a squash commit) already
+  scores through `prs_merged`, so it is not counted again (#97 final gate): on a squash-merge
+  repo an authored-and-merged PR scores 2 and a review 1; only commits not attributable to
+  the person's own merged PRs (direct pushes, commits on others' PRs) add to the score. An
+  entry carries `own_pr_commits` when it is not 0. No other weight changed. **`halls.internal`/`shame`/`blame` are intentionally NOT built**
   — per the "recognition, not blame" stance.
 - **issues[].blocks** — `[{ number, direction:"out"|"in" }]`, the blocking references gather
   parsed from that issue's own text (`gather.parse_blocks_refs`), in text order, deduped:

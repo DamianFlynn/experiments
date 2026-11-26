@@ -13,6 +13,7 @@ import gather
 import graphstore
 import spotlight
 import validate
+from _quiet import quiet  # noqa: E402
 
 SHA = "a" * 40
 
@@ -236,6 +237,9 @@ class ClassifyIdGrammar(unittest.TestCase):
 
 
 class ExtractLedgerGrammar(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_path_with_hash_round_trips_code_events(self):
         ev = {"commit": SHA, "author": "alice", "date": "2026-05-02",
               "change": "add", "path": "docs/C#-guide.md"}

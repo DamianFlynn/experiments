@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -36,6 +37,38 @@ HIGH_PRIORITY_LABELS = {
     "priority/high", "priority/critical", "p0", "p1", "high-priority", "critical",
 }
 
+# Label patterns that also mark an item high priority (#97 final gate):
+# regular expressions searched case-insensitively in each label, so a repo's
+# own wording ("Needs: Immediate Attention :bangbang:", "Priority: P1",
+# "Severity: Critical", "blocker") is recognised without exact names. An
+# operator adds patterns with `link.py BUNDLE --priority-label PATTERN`
+# (repeatable); they are recorded in `forecast.priority_patterns`.
+PRIORITY_LABEL_PATTERNS = (
+    r"priority\W*(?:high|critical|urgent|p0|p1)\b",
+    r"high\W?priority",
+    r"(?<![a-z0-9])p[01](?![a-z0-9])",
+    r"\burgent\b",
+    r"(?<![\w-])critical\b",
+    r"\bblocker\b",
+)
+
+
+def priority_matchers(extra=()):
+    """The compiled priority-label patterns: PRIORITY_LABEL_PATTERNS plus the
+    operator's `extra` ones. Raises re.error on an invalid pattern."""
+    return tuple(re.compile(p, re.IGNORECASE)
+                 for p in tuple(PRIORITY_LABEL_PATTERNS) + tuple(extra or ()))
+
+
+_DEFAULT_PRIORITY = None
+
+
+def _default_priority():
+    global _DEFAULT_PRIORITY
+    if _DEFAULT_PRIORITY is None:
+        _DEFAULT_PRIORITY = priority_matchers()
+    return _DEFAULT_PRIORITY
+
 
 def _in_window(ts, period):
     """True if `ts` (ISO) falls in `period`. Permissive when either is missing,
@@ -55,9 +88,43 @@ def window_period(meta):
     return meta.get("period") or {"from": meta.get("from"), "to": meta.get("to")}
 
 
-def _high_priority(item):
-    return any((lbl or "").lower() in HIGH_PRIORITY_LABELS
-               for lbl in item.get("labels", []))
+def _high_priority(item, matchers=None):
+    """True when a label of `item` is in HIGH_PRIORITY_LABELS (exact, case-
+    insensitive) or matches one of `matchers` (priority_matchers(); the
+    defaults when None)."""
+    matchers = _default_priority() if matchers is None else matchers
+    for lbl in item.get("labels") or []:
+        lbl = lbl or ""
+        if lbl.lower() in HIGH_PRIORITY_LABELS \
+                or any(m.search(lbl) for m in matchers):
+            return True
+    return False
+
+
+def approved_pr(pr):
+    """True for a "likely to land" PR (#97 final gate): open, unmerged, not a
+    draft (`draft` true), with an `approved` review by someone other than its
+    author and no `changes_requested` review submitted after the latest such
+    approval, as the view's `reviews` record them (a review later dismissed
+    reads `dismissed`, so it does not count). A PR without `reviews` is not
+    approved here: `review_decision` is today's, not the window's."""
+    if pr.get("state") != "open" or pr.get("merged") or pr.get("draft") is True:
+        return False
+    author = pr.get("author")
+    last_approval = None
+    for r in pr.get("reviews") or []:
+        if not isinstance(r, dict) or not r.get("submitted_at"):
+            continue
+        if (r.get("state") or "").lower() == "approved" and r.get("author") \
+                and r.get("author") != author:
+            if last_approval is None or r["submitted_at"] > last_approval:
+                last_approval = r["submitted_at"]
+    if last_approval is None:
+        return False
+    return not any(
+        isinstance(r, dict) and (r.get("state") or "").lower() == "changes_requested"
+        and (r.get("submitted_at") or "") > last_approval
+        for r in pr.get("reviews") or [])
 
 
 def _ms_sort_key(m):
@@ -364,7 +431,18 @@ def build_trains(bundle):
       - PRs are joined by the issues they CLOSE: a train is a connected group
         of member PRs and the issues they close, so two PRs closing the same
         issue are one train, and every issue a member PR closes is listed in
-        `issues` (sorted) and indexed to that train. A plain mention / timeline
+        `issues` (sorted) and indexed to that train. Only a PR that is merged
+        or still open joins and anchors this way (#97 final gate): a closing
+        reference takes effect only when its PR merges. A closed-unmerged
+        (`rejected`) PR that closes an issue of such a train is listed in that
+        train as a rejected attempt (`prs`, `pr_outcomes`, its commits and its
+        reviewers / participants in `effort`) but adds none of its other
+        issues and never moves the train's root issue, `issues`, kind,
+        outcome, `effort.opened_at` or `elapsed_days`. When its issues touch
+        several such trains it joins the one holding the lowest of those
+        issue numbers. Rejected PRs whose issues are in no merged/open train
+        join each other over their issues, as before, into rejected trains.
+        A plain mention / timeline
         cross-reference (`crossref_issues`) makes an issue neither a member
         nor a root. A `closes` number that is a PR of the bundle is not an
         issue (GitHub does not close a PR by keyword; issues and PRs share one
@@ -406,8 +484,11 @@ def build_trains(bundle):
                 return pk
         return "other"
 
-    def _make_train(issue_nums, prs):
-        prs = sorted(prs, key=lambda p: p["number"])
+    def _make_train(issue_nums, prs, attempts=()):
+        # `attempts`: rejected PRs attached to a merged/open train. They are
+        # members (prs, pr_outcomes, commits, evidence) but not its kind.
+        kind = _kind_for(sorted(set(issue_nums)), sorted(prs, key=lambda p: p["number"]))
+        prs = sorted(list(prs) + list(attempts), key=lambda p: p["number"])
         issue_nums = sorted(set(issue_nums))
         pr_numbers = [p["number"] for p in prs]
         pr_outcomes = {str(p["number"]): _pr_outcome(p, base_branch) for p in prs}
@@ -427,7 +508,7 @@ def build_trains(bundle):
         return {
             "id": f"train-issue-{root_issue}" if root_issue is not None
             else f"train-pr-{pr_numbers[0]}",
-            "kind": _kind_for(issue_nums, prs),
+            "kind": kind,
             "root_issue": root_issue,
             "issues": issue_nums,
             "prs": pr_numbers,
@@ -452,21 +533,45 @@ def build_trains(bundle):
             x = parent[x]
         return x
 
-    for pr in members:
-        node = _find(("pr", pr["number"]))
+    def _union(prs):
+        for pr in prs:
+            node = _find(("pr", pr["number"]))
+            for n in _closes(pr):
+                parent[_find(("issue", n))] = node
+                node = _find(node)
+
+    # 1a. Merged / open PRs: their closing references join and anchor trains.
+    landing = [p for p in members if _pr_outcome(p, base_branch) != "rejected"]
+    rejected = [p for p in members if _pr_outcome(p, base_branch) == "rejected"]
+    _union(landing)
+    issue_group = {}   # issue number -> group root, for issues a landing PR closes
+    for pr in landing:
         for n in _closes(pr):
-            parent[_find(("issue", n))] = node
-            node = _find(node)
+            issue_group[n] = _find(("issue", n))
+
+    # 1b. A rejected PR closing an issue of a landing train is an attempt in
+    #     the train of its lowest such issue; the rest join among themselves.
+    attempts_of, alone = {}, []
+    for pr in rejected:
+        hits = sorted(n for n in _closes(pr) if n in issue_group)
+        if hits:
+            attempts_of.setdefault(issue_group[hits[0]], []).append(pr)
+        else:
+            alone.append(pr)
+    _union(alone)
 
     groups = {}
-    for pr in members:
-        g = groups.setdefault(_find(("pr", pr["number"])), {"prs": [], "issues": set()})
+    for pr in landing + alone:
+        g = groups.setdefault(_find(("pr", pr["number"])),
+                              {"prs": [], "issues": set(), "attempts": []})
         g["prs"].append(pr)
         g["issues"].update(_closes(pr))
+    for root, prs in attempts_of.items():
+        groups[root]["attempts"].extend(prs)
 
     trains, train_of_pr, closed_by_member = [], {}, set()
     for g in groups.values():
-        train = _make_train(g["issues"], g["prs"])
+        train = _make_train(g["issues"], g["prs"], g["attempts"])
         trains.append(train)
         closed_by_member |= g["issues"]
         for n in train["prs"]:
@@ -497,9 +602,12 @@ def build_trains(bundle):
     return sorted(trains, key=lambda t: t["id"])
 
 
-def compute_buckets(bundle):
+def compute_buckets(bundle, matchers=None):
     """Full four-way bucketing: one bucket per item, precedence
-    shipped > rejected > next_candidates > in_flight. Refs carry their train id."""
+    shipped > rejected > next_candidates > in_flight. Refs carry their train id.
+    An open item is a next candidate when it is on the next milestone, has a
+    priority label (`_high_priority` with `matchers`) or is an approved PR
+    (`approved_pr`)."""
     meta = bundle.get("meta", {})
     period = window_period(meta)
     base_branch = meta.get("base_branch")
@@ -538,7 +646,8 @@ def compute_buckets(bundle):
         elif state == "open":
             on_next = next_title is not None and item.get("milestone") == next_title
             on_current = current_title is not None and item.get("milestone") == current_title
-            if on_next or _high_priority(item):
+            if on_next or _high_priority(item, matchers) \
+                    or (type_ == "pr" and approved_pr(item)):
                 add("next_candidates", type_, num, url)
             elif on_current or _in_window(item.get("updated_at"), period):
                 add("in_flight", type_, num, url)
@@ -620,12 +729,15 @@ TRAIN_STALL_DAYS = 21
 # that an item will land in the next release:
 #   on_next_milestone — explicitly scheduled; strongest signal (5.0)
 #   high_priority     — labelled urgent by the team (3.0)
+#   approved          — an open PR approved with no later change request
+#                       (3.0; with in_motion it clears "likely": 5.0)
 #   in_motion         — active work already underway (2.0)
 #   recent_activity   — touched inside the window (1.5)
 #   overdue           — long-open item, mild pressure to close (1.0)
 FORECAST_WEIGHTS = {
     "on_next_milestone": 5.0,
     "high_priority":     3.0,
+    "approved":          3.0,
     "in_motion":         2.0,
     "recent_activity":   1.5,
     "overdue":           1.0,
@@ -751,6 +863,10 @@ def _effort_for_train(train, pr_index, issue_index, ref_date=None,
 
     `ref_date` (the view's `meta.ref_date`, else `meta.to`) frames `idle_days`;
     `commit_index` ({sha: commit}) lets a train's commits count as activity.
+    `opened_at` is the earliest `created_at` of the train's issues and of its
+    merged / open PRs (a rejected attempt beside them does not date it; a
+    train of rejected PRs only is dated by them). Reviewers, participants and
+    commits count every PR of the train, attempts included (issue #93).
     Flags (issue #112): `stalled` only for an OPEN train (outcome `in_flight`)
     idle for more than TRAIN_STALL_DAYS days at the reference date;
     `slow_to_land` only for a SHIPPED train whose `elapsed_days` exceeds
@@ -766,8 +882,17 @@ def _effort_for_train(train, pr_index, issue_index, ref_date=None,
     train_issues = [issue_index[n] for n in issue_nums if n in issue_index]
 
     # ---- dates --------------------------------------------------------
+    # A rejected attempt in a train that also holds a merged / open PR does
+    # not date the train (#97 final gate): its time to land runs from the
+    # train's issues and its merged / open PRs. A train of rejected PRs only
+    # is dated by them.
+    outcomes = train.get("pr_outcomes") or {}
+    dating_prs = [p for p in train_prs
+                  if outcomes.get(str(p.get("number"))) != "rejected"]
+    if not dating_prs:
+        dating_prs = train_prs
     candidates = [d for d in
-                  (_parse_ts(x.get("created_at")) for x in train_issues + train_prs)
+                  (_parse_ts(x.get("created_at")) for x in train_issues + dating_prs)
                   if d is not None]
     opened_dt = min(candidates) if candidates else None
     opened_at = opened_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if opened_dt else None
@@ -1131,21 +1256,56 @@ def slice_train(bundle, train_id):
     }
 
 
-def build_forecast(bundle):
+def _empty_forecast_notes(bundle, cur_ms, next_ms, extra_patterns):
+    """Why the forecast has no candidate (#97 final gate): one plain sentence
+    per missing signal source. Only called when the view holds open items."""
+    notes = []
+    open_ms = [m for m in bundle.get("milestones") or [] if m.get("state") == "open"]
+    if next_ms is not None:
+        notes.append("no open item is on the next milestone {!r}".format(
+            next_ms.get("title")))
+    elif not open_ms:
+        notes.append("no open milestone, so no next milestone")
+    elif not any(m.get("due_on") for m in open_ms):
+        notes.append("no open milestone has a due date ({}), so none is the next "
+                     "milestone".format(", ".join(repr(m.get("title"))
+                                                  for m in open_ms)))
+    elif cur_ms is not None and (cur_ms.get("due_on") or "")[:10] < \
+            (bundle.get("meta", {}).get("ref_date")
+             or bundle.get("meta", {}).get("to") or "")[:10]:
+        notes.append("every dated open milestone is overdue (the latest, {!r}, was "
+                     "due {}), so there is no next milestone".format(
+                         cur_ms.get("title"), (cur_ms.get("due_on") or "")[:10]))
+    else:
+        notes.append("no dated open milestone is due after the current one{}, so "
+                     "there is no next milestone".format(
+                         " ({!r})".format(cur_ms.get("title")) if cur_ms else ""))
+    notes.append("no open item has a priority label (the default patterns{})"
+                 .format(" and {} operator pattern(s)".format(len(extra_patterns))
+                         if extra_patterns else ""))
+    notes.append("no open, non-draft PR has an approving review without a later "
+                 "change request")
+    return notes
+
+
+def build_forecast(bundle, matchers=None, extra_patterns=()):
     """Compute the next-release forecast over bundle['buckets']['next_candidates'].
 
     Sets bundle['forecast'] = {next_milestone, candidates}.  Each candidate
     carries a ref (type/id/url), train id, weighted score, tier, signals, and
-    non-scoring notes.  Pure aside from writing forecast onto the bundle; reads
-    buckets, milestones, prs, issues, trains, and meta.  Forward-only: no
-    predicted-vs-landed comparison.
+    non-scoring notes.  When there is no candidate although the view holds an
+    open PR or issue, `forecast.notes` says why, one sentence per signal
+    source (#97 final gate); `forecast.priority_patterns` lists the
+    operator's `extra_patterns` when there are any. Pure aside from writing
+    forecast onto the bundle; reads buckets, milestones, prs, issues, trains,
+    and meta.  Forward-only: no predicted-vs-landed comparison.
     """
     meta        = bundle.get("meta", {})
     period      = window_period(meta)
     ref_date    = meta.get("ref_date") or meta.get("to") or ""
 
     # Resolve next milestone title via the shared helper.
-    _cur_ms, next_ms = select_milestones(bundle.get("milestones", []), ref_date)
+    cur_ms, next_ms = select_milestones(bundle.get("milestones", []), ref_date)
     next_title = next_ms["title"] if next_ms else None
 
     # Build lookup indexes for issues and PRs.
@@ -1217,8 +1377,10 @@ def build_forecast(bundle):
         checks = [
             (next_title is not None and item.get("milestone") == next_title,
              "on_next_milestone", f"on milestone {next_title}"),
-            (_high_priority(item),
+            (_high_priority(item, matchers),
              "high_priority", "high-priority"),
+            (type_ == "pr" and approved_pr(item),
+             "approved", "approved, no later change request"),
             (in_motion,
              "in_motion", motion_text),
             (_in_window(item.get("updated_at"), period),
@@ -1255,6 +1417,14 @@ def build_forecast(bundle):
         "next_milestone": next_title,
         "candidates":     candidates,
     }
+    # omit-when-not-applicable: nothing open means nothing to forecast
+    has_open = any(x.get("state") == "open"
+                   for x in list(bundle.get("prs") or []) + list(bundle.get("issues") or []))
+    if not candidates and has_open:
+        bundle["forecast"]["notes"] = _empty_forecast_notes(
+            bundle, cur_ms, next_ms, tuple(extra_patterns or ()))
+    if extra_patterns:
+        bundle["forecast"]["priority_patterns"] = list(extra_patterns)
     return bundle
 
 
@@ -1298,7 +1468,7 @@ def _null_collections_to_empty(bundle):
     return bundle
 
 
-def enrich(bundle):
+def enrich(bundle, priority_patterns=()):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the window narrative projections (timeline/feature_deltas) and Phase 3b
     code-area attribution (code_area/area/modules). Label facets and `kind` are
@@ -1310,13 +1480,17 @@ def enrich(bundle):
     setdefaults below keep enrich total for callers that hand it a bundle without
     those keys (e.g. a raw fixture fed directly, not through extract): enrich
     never KeyErrors and never recomputes them. Null list/object fields on
-    PRs/issues/commits are read as empty first (`_null_collections_to_empty`)."""
+    PRs/issues/commits are read as empty first (`_null_collections_to_empty`).
+    `priority_patterns` are the operator's extra priority-label patterns
+    (`--priority-label`), added to PRIORITY_LABEL_PATTERNS."""
+    priority_patterns = tuple(priority_patterns or ())
+    matchers = priority_matchers(priority_patterns)
     _null_collections_to_empty(bundle)
     bundle.setdefault("artifacts", {})
     bundle.setdefault("people", {})
     attach_commit_prs(bundle["commits"])
     bundle["trains"] = build_trains(bundle)
-    bundle["buckets"] = compute_buckets(bundle)
+    bundle["buckets"] = compute_buckets(bundle, matchers)
     link_symbol_identity(bundle)   # Phase 3e: window-wide symbol moves over the ledger
     # build_timeline reads bundle["artifacts"] (supplied by extract / setdefault).
     bundle["timeline"] = build_timeline(bundle)
@@ -1328,7 +1502,7 @@ def enrich(bundle):
     score_train_significance(bundle)   # Phase 4a: reads code_areas populated above
     annotate_train_effort(bundle)      # Phase 4a: per-train time & effort metrics
     # Phase 4a: next-release forecast (needs buckets + milestones, placed after both).
-    build_forecast(bundle)
+    build_forecast(bundle, matchers, priority_patterns)
     build_modules(bundle, idx)
     # Phase 10 slice 1: review-round / reopen texture, derived from the
     # reviews/lifecycle that gather set (or extract resurfaces). Read-side derived
@@ -1505,7 +1679,8 @@ def _load_bundle(path):
     raise SystemExit(2)
 
 
-_USAGE = "usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json]\n"
+_USAGE = ("usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json] "
+          "[--priority-label PATTERN ...]\n")
 _HELP = _USAGE + """
 Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
 
@@ -1513,35 +1688,60 @@ Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
                        stdout; BUNDLE.json is not rewritten
   --series PATH        also compare with, and record this window in, the
                        series index at PATH
+  --priority-label PATTERN
+                       also treat a label matching this regular expression
+                       (case-insensitive search) as high priority, besides
+                       the default patterns; repeatable
   -h, --help           show this help and exit
 """
 
 
+def _parse_argv(argv):
+    """(path, slice_id, series_path, priority_patterns) of the documented
+    shapes: BUNDLE first, then at most one of `--slice ID` / `--series PATH`
+    and any number of `--priority-label PATTERN`, each flag followed by its
+    value. Anything else (an unknown flag, a missing value, a value or BUNDLE
+    that looks like a flag, `--slice` with `--series`, a pattern that is not
+    a valid regular expression) is a usage error: exit 2."""
+    if not argv or argv[0].startswith("-"):
+        return None
+    path, rest = argv[0], argv[1:]
+    slice_id = series_path = None
+    patterns = []
+    if len(rest) % 2:
+        return None
+    for flag, value in zip(rest[0::2], rest[1::2]):
+        if value.startswith("-"):
+            return None
+        if flag == "--slice" and slice_id is None and series_path is None:
+            slice_id = value
+        elif flag == "--series" and series_path is None and slice_id is None:
+            series_path = value
+        elif flag == "--priority-label":
+            try:
+                re.compile(value)
+            except re.error:
+                return None
+            patterns.append(value)
+        else:
+            return None
+    return path, slice_id, series_path, patterns
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    # Accept ONLY the documented shapes: `BUNDLE`, `BUNDLE --slice TRAIN_ID`, or
-    # `BUNDLE --series series.json`. The flag is recognized strictly as the
-    # second positional, and any other argv shape is rejected (no flag-anywhere
-    # / unknown-arg surprises). `--slice` and `--series` are mutually exclusive.
+    # Accept ONLY the documented shapes (_parse_argv): BUNDLE first, then
+    # flag/value pairs. `--slice` and `--series` are mutually exclusive.
     # `-h` / `--help` anywhere prints help (exit 0), as argparse does; a BUNDLE
     # or value that looks like a flag is an unknown flag (exit 2, usage).
     if "-h" in argv or "--help" in argv:
         sys.stdout.write(_HELP)
         raise SystemExit(0)
-    slice_id = None
-    series_path = None
-    if len(argv) == 1:
-        path = argv[0]
-    elif len(argv) == 3 and argv[1] == "--slice":
-        path, slice_id = argv[0], argv[2]
-    elif len(argv) == 3 and argv[1] == "--series":
-        path, series_path = argv[0], argv[2]
-    else:
-        path = None
-    if path is None or path.startswith("-") or (
-            (slice_id or series_path or "").startswith("-")):
+    parsed = _parse_argv(list(argv))
+    if parsed is None:
         sys.stderr.write(_USAGE)
         raise SystemExit(2)
+    path, slice_id, series_path, priority_patterns = parsed
     bundle = _load_bundle(path)
     # Load (and shape-check) the series index BEFORE any work, so a malformed
     # index stops the run with rc 2 and nothing is written.
@@ -1551,7 +1751,7 @@ def main(argv=None):
         problem = _series_bundle_problem(bundle.get("meta", {}), installments)
         if problem is not None:
             _series_refusal(series_path, problem)
-    enrich(bundle)
+    enrich(bundle, priority_patterns)
     if series_path is not None:
         # Phase 13: series continuity, idempotent by window (#86). Compare
         # against the installment immediately BEFORE this window and record

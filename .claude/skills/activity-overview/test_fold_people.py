@@ -15,6 +15,7 @@ import derive  # noqa: E402
 import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -215,6 +216,9 @@ class TestPeopleNoLeak(unittest.TestCase):
     from prefix-keyed structure/code nodes and the spine, none of which these
     touch. The contribution/owns/touches/depends_on/in_milestone edges below are
     never read by extract at all."""
+
+    def setUp(self):
+        quiet(self)
 
     # The contribution/owns/touches/depends_on/in_milestone edge types this
     # slice adds; deleting them must not change extract's output (it reads none

@@ -32,6 +32,7 @@ import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
 import view  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures")
 MAY = ("2026-05-01", "2026-05-31")
@@ -102,6 +103,7 @@ class SingleWindowBuckets(unittest.TestCase):
     """The issue's confirmed repro: one window, store path."""
 
     def setUp(self):
+        quiet(self)
         self.conn = _open()
         gather.fold_bundle(self.conn, _sample_plus_old_items())
 

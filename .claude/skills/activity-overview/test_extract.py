@@ -27,6 +27,7 @@ import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
 import validate  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -55,6 +56,9 @@ class ExtractSingletonFacts(unittest.TestCase):
     """Guard against a vacuous gate: each newly round-tripped per-repo singleton
     must be present, non-empty, and equal to the golden's value after extract
     (so _normalize is not silently dropping it and hiding a miss)."""
+
+    def setUp(self):
+        quiet(self)
 
     def _fold_extract(self, golden_name):
         golden = _load_golden(golden_name)
@@ -102,6 +106,7 @@ class ExtractRawShape(unittest.TestCase):
     """Properties of the raw bundle extract emits, independent of the goldens."""
 
     def setUp(self):
+        quiet(self)
         self.conn = graphstore.open_store(":memory:")
         graphstore.init_schema(self.conn)
         gather.fold_bundle(self.conn, copy.deepcopy(_load_golden("bundle_p3.json")))

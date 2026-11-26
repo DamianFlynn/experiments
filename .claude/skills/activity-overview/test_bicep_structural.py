@@ -28,6 +28,7 @@ import graphstore  # noqa: E402
 import manifest  # noqa: E402
 import spotlight  # noqa: E402
 import validate  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 # A bicep-registry-modules-like tree: one pattern module (ptn) consumes a resource
 # module (res) which consumes a leaf resource module, plus the scaffolding every
@@ -316,6 +317,7 @@ class TestAcquireStructuralBicep(unittest.TestCase):
     change is before the window, yet the gathered graph has every edge."""
 
     def setUp(self):
+        quiet(self)
         from test_clone_handling import GIT_TEST_ENV, _git
         self._git = _git
         self.tmp = tempfile.mkdtemp(prefix="ao-i92-")
@@ -619,6 +621,9 @@ class TestManifestBicepRegistryPrefix(unittest.TestCase):
 
 
 class TestGatherManifestThreadsPrefixes(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_fold_receives_bicep_prefixes(self):
         man = {"project": "proj", "from": "2026-01-01", "to": "2026-01-31",
                "repos": [{"owner": "Azure", "repo": "bicep-registry-modules",

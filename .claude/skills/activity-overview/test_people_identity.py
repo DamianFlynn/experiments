@@ -25,6 +25,7 @@ import gather  # noqa: E402
 import graphstore  # noqa: E402
 import validate  # noqa: E402
 import test_clone_handling as tch  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 FROM, TO = "2026-05-18", "2026-05-31"
@@ -365,6 +366,7 @@ class _IdentityRepo(tch._RepoCase):
 class TestAcquireResolvesCommitAuthors(_IdentityRepo):
     def setUp(self):
         super().setUp()
+        quiet(self)
         self.write_commit("base", "2026-03-01", "README.md", "Base", "base@corp.example")
         self.jane = self.write_commit("jane", "2026-05-20", "mod/x/main.tf",
                                       "Jane Doe", "jane@corp.example")
@@ -417,6 +419,10 @@ class TestAcquireResolvesCommitAuthors(_IdentityRepo):
 
 
 class TestAcquireNoCommitsNoCall(_IdentityRepo):
+    def setUp(self):
+        super().setUp()
+        quiet(self)
+
     def test_quiet_window_makes_no_commits_call(self):
         self.write_commit("old", "2026-03-01", "README.md", "Old", "o@corp.example")
         b = self._acquire([])

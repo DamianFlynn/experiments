@@ -630,6 +630,26 @@ class TestDigestCli(unittest.TestCase):
             self.assertFalse(os.path.exists(store))
             self.assertIn("does not exist", err.getvalue())
 
+    def test_main_empty_store_says_what_digest_could_not_do(self):
+        # Issue #97 finding 6: an empty store is "nothing gathered", not an
+        # unknown project with an empty project list.
+        import io, contextlib, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "empty.db")
+            conn = graphstore.open_store(store)
+            graphstore.init_schema(conn)
+            conn.close()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = digest.main(["--store", store, "--project", "proj",
+                                  "--from", "2026-01-01", "--to", "2026-01-31"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("the store is empty: nothing has been gathered into it "
+                      "(did the gather fail?)", err.getvalue())
+        self.assertIn("no project to digest", err.getvalue())
+        self.assertNotIn("validate", err.getvalue())
+
     _MAN = {"project": "proj", "window": {"from": "2026-01-01", "to": "2026-01-31"},
             "repos": [{"owner": "Azure", "repo": "r1"},
                       {"owner": "Azure", "repo": "r2"}],

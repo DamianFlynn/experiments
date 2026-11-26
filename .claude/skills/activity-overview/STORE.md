@@ -293,7 +293,10 @@ window was gathered with `--no-workflows`: no CI facts, as distinct from zero ru
 an entry without the key counts as collected), the per-repo facts a gathered window computed —
 `workflow_stats` (the CI runs created in that window), `code_graph` (the areas of
 the files that window changed, with their dependency edges), `code_owners` and
-`label_taxonomy` (read from that window's checkout) — each named by the SHA-256 of
+`label_taxonomy` (read from that window's checkout) and `newcomers` (the window's
+first-time contributors, from the search API; only per window, never a singleton node;
+`{"collected": false}` for a gather run with `--no-newcomers`; absent from windows
+gathered before it existed) — each named by the SHA-256 of
 its JSON text (encoded as node `data` is: sorted keys), and the clone sha the
 window was gathered against. A key is present only when the bundle's value is
 present and non-empty (the latest-wins node rule). Each value is stored once per

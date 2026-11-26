@@ -372,7 +372,7 @@ making forecasts meaningful on each target.
 | Target | Shape | How it is gathered | What you get |
 |---|---|---|---|
 | **Bicep** (`Azure/bicep`) | One product repo (the Bicep compiler and tooling, .NET) | Single repo | Shipped/trains/forecast/flow/people. Code areas by directory (`src/<project>`); no IaC edges (not an IaC repo). |
-| **AVM Bicep** (`Azure/bicep-registry-modules`) | One monorepo, 500+ resource and ~50 pattern modules | Single repo (`--structural-iac` for the whole module graph) | Areas per module (`avm/res/<svc>/<mod>`, `avm/ptn/<group>/<mod>`); `br/public:` references resolve to in-repo module areas; per-module biographies; per-module blast radius (`spotlight dependents owner/repo::<area>`). |
+| **AVM Bicep** (`Azure/bicep-registry-modules`) | One monorepo of resource, pattern and utility modules (about 220 top-level modules as of late 2026, several hundred with child modules) | Single repo (`--structural-iac` for the whole module graph) | Areas per module (`avm/res/<svc>/<mod>`, `avm/ptn/<group>/<mod>`); `br/public:` references resolve to in-repo module areas; per-module biographies; per-module blast radius (`spotlight dependents owner/repo::<area>`). |
 | **Bicep landing zone** (an enterprise repo consuming AVM Bicep) | One or more repos referencing `br/public:avm/...` | Manifest with BRM as a member declaring `bicep_registry_prefix: "avm/"` | Cross-repo `depends_on` from the landing zone's modules to the BRM modules they pin, with versions. |
 | **AVM Terraform** | One repo per module | Manifest (generated from the AVM Terraform index) | Cross-repo trains; structural cross-repo `depends_on`; blast radius per module. |
 | **AI landing zone** | TF pattern constellation + Bicep pattern module in BRM + docs/portal hub repo | TF: manifest. Bicep: the BRM store, scoped to `avm/ptn/ai-ml/landing-zone`. Hub repo: manifest member (social layer) | End-to-end view of the AI LZ: code, dependencies and community discussion. |
@@ -656,7 +656,7 @@ people's areas (a union over the windows), a difference is a WARN naming the rea
 |---|---|
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
-| Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
+| Organization-specific priority labels | `link.py --priority-label PATTERN` per run; `link.PRIORITY_LABEL_PATTERNS` / `link.HIGH_PRIORITY_LABELS` for defaults |
 | Historical record state on multi-window stores (limitation 7) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |

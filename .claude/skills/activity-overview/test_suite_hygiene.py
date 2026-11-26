@@ -9,11 +9,65 @@ this guard makes the pattern fail loudly instead of passing unnoticed.
 """
 
 import ast
+import contextlib
 import glob
+import io
 import os
+import sys
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+# --- stdout guard -----------------------------------------------------------
+# unittest writes its summary ("Ran N tests" / "OK") to stderr, so anything a
+# test lets through to stdout lands AFTER the result and `... 2>&1 | tail -1`
+# no longer shows it (issue #97, finding 3). Running the suite a second time
+# under capture would double its cost, and an AST scan for print()/main()
+# calls is guesswork, so the check is a tripwire instead: discovery imports
+# every test module (this one included) before any test runs, and importing
+# this module wraps sys.stdout once. A write that reaches the wrapper while a
+# TestCase is on the call stack registers a failing cleanup on that test, so
+# the offending test itself fails, named exactly, whatever order the modules
+# run in. It costs nothing on a quiet suite (no writes, no work), passes the
+# text through unchanged, and never raises into the code under test. A test
+# that captures its output (contextlib.redirect_stdout, or unittest -b)
+# replaces sys.stdout and so never reaches the wrapper. Output a subprocess
+# writes to file descriptor 1 directly is out of its reach; such tests capture
+# the child's output with subprocess.run(capture_output=True) anyway.
+
+def _test_on_stack(frame):
+    while frame is not None:
+        obj = frame.f_locals.get("self")
+        if isinstance(obj, unittest.TestCase):
+            return obj
+        frame = frame.f_back
+    return None
+
+
+class StdoutGuard:
+    """Pass-through stdout wrapper that fails the test that writes to it."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        if text:
+            test = _test_on_stack(sys._getframe(1))
+            if test is not None and not getattr(test, "_stdout_guard_hit", False):
+                test._stdout_guard_hit = True
+                test.addCleanup(test.fail, (
+                    "test wrote to stdout during the run: {!r}; capture it "
+                    "with contextlib.redirect_stdout and assert on it (stdout "
+                    "lands after unittest's summary)".format(text[:80])))
+        return self._stream.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+if not isinstance(sys.stdout, StdoutGuard):
+    sys.stdout = StdoutGuard(sys.stdout)
 
 
 def hygiene_violations(source, filename="<string>"):
@@ -119,3 +173,49 @@ class NoMergeConflictMarkers(unittest.TestCase):
                         if line.startswith(self._MARKERS):
                             hits.append("%s:%d" % (os.path.relpath(path, root), n))
         self.assertEqual(hits, [], "merge-conflict markers left in: %s" % hits)
+
+
+class StdoutGuardWorks(unittest.TestCase):
+    """The tripwire at the top of this file must fail exactly the test that
+    writes to stdout, and nothing else."""
+
+    @staticmethod
+    def _run(body):
+        class Dummy(unittest.TestCase):
+            def test_it(self):
+                body()
+        result = unittest.TestResult()
+        Dummy("test_it").run(result)
+        return result
+
+    def test_guard_is_installed(self):
+        # Under `unittest -b` the runner swaps in its own buffer per test.
+        self.assertIsInstance(sys.stdout, (StdoutGuard, io.StringIO))
+
+    def test_write_inside_a_test_fails_that_test_and_passes_through(self):
+        sink = io.StringIO()
+
+        def body():
+            with contextlib.redirect_stdout(StdoutGuard(sink)):
+                print('{"leaked": true}')
+        result = self._run(body)
+        self.assertEqual(len(result.failures), 1, result.failures)
+        self.assertIn("wrote to stdout", result.failures[0][1])
+        self.assertEqual(sink.getvalue(), '{"leaked": true}\n')
+
+    def test_captured_output_does_not_fail(self):
+        def body():
+            with contextlib.redirect_stdout(StdoutGuard(io.StringIO())):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    print("captured")
+        result = self._run(body)
+        self.assertTrue(result.wasSuccessful(), result.failures)
+
+    def test_write_with_no_test_on_the_stack_passes_through(self):
+        import threading
+        sink = io.StringIO()
+        guard = StdoutGuard(sink)
+        t = threading.Thread(target=guard.write, args=("x",))
+        t.start()
+        t.join()
+        self.assertEqual(sink.getvalue(), "x")

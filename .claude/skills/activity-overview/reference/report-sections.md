@@ -17,12 +17,28 @@ view, in the bundle of the member whose `repo` equals `ref.repo`). Trains have n
 use the root issue's title, else the first PR's. The reference date is `meta.ref_date`
 (every view carries it; it defaults to `meta.to`).
 
+**Length.** Lists are capped like diagrams (template rule LONG LISTS): at most 40 rows per
+list or table that renders one row per item (shipped, each code area, mention trains or each
+theme group of them, feature changes, symbol changes, content lifecycle, in flight, rejected,
+each flow group, each forecast tier), in the section's own order, and a cut list always ends
+with "Showing N of M <unit> — the full list is in the bundle (`<key>`)". A train touching more
+than 10 code areas is **cross-cutting**: it is described once, under "Cross-cutting changes",
+never repeated under each area it touches. Deep-train blocks are not cut.
+
 **State as of (#85).** When `meta.state_as_of` is present (per member in the project
 view), the view's records are as last gathered at that date, later than the view's end:
 write one caveat line under the report title saying so. Omit it when the key is absent.
 Since #97 a view projects each record's state, comments, reviews and lifecycle events to
 its end (BUNDLE.md "As of the window's end"), so the caveat covers only what has no history: titles,
 labels, milestones, board status.
+
+**Gathered after the window.** When `meta.records_as_of` is present and `meta.state_as_of`
+is absent (a window gathered after it ended — e.g. a past month caught up into its own
+store), write one caveat line under the report title, exactly: "Records are shown as of
+{meta.records_as_of.instant}, the end of this window; titles, labels, milestones and board
+status are as gathered on {meta.gathered_at}." (the date part of `meta.gathered_at`, the
+time the records were gathered). With `meta.state_as_of` present the state-as-of line
+replaces it; omit it when `meta.records_as_of` is absent.
 
 ## Executive summary
 3–5 bullets — features, releases, CI health, key risks — informed by board + call context.
@@ -33,8 +49,10 @@ Counts come from the data (shipped refs by `ref.type`, trains by `ptrain.outcome
 Present ONLY when the run was linked with `--series` and `bundle["series"]` (the member's own
 bundle view file — digest's embedded member copy has no `series`) has `first_installment`
 false. The comparison is with the installment recorded for the window just before this one.
-**New this installment** (`series.new`: shipped or in-flight items the prior installment did
-not know at all), **Carried over** (`series.carried_over`: last installment's in-flight items,
+**New to the series** (`series.new`: shipped or in-flight items the prior installment did
+not know at all — new to the report series, which includes old items first touched this
+window; it is not "newly opened". `series.new_opened` is the subset created inside this
+window: report that count as the window's new work), **Carried over** (`series.carried_over`: last installment's in-flight items,
 each citing its `ref.prior_status` and its current `ref.bucket` — shipped, still in flight,
 re-planned as a next candidate, or rejected), and the **Forecast loop**
 (`series.forecast_loop.landed` / `series.forecast_loop.not_yet` /
@@ -59,7 +77,11 @@ Merged PRs + completed issues from `buckets.shipped` (multi-repo: `view["shipped
 refs add `repo`), each titled via `item` and linked by `ref.url`. **Group by code area** in
 the "Shipped by code area" section: a ref's `ref.train` names a `train.id`, and that train's
 `train.code_areas` are `area.id` values (`code_graph.areas[].label` for display); no train or
-no area → "Unattributed". Releases are their own section (see "Releases · CI/CD health ·
+no area → "Unattributed". A shipped item whose train is cross-cutting (more than 10
+`train.code_areas`, typically a mechanical sweep across modules) is listed once under
+"Cross-cutting changes" with its area count, not under every area. Cap each list at 40 items
+(and the areas at 40, most shipped first), each cut list ending with its "Showing N of M" line
+naming `buckets.shipped`. Releases are their own section (see "Releases · CI/CD health ·
 In-flight · Rejected" below), not part of this one.
 
 ## Activity at a glance
@@ -97,6 +119,17 @@ member's train (`ptrain-<project>/<repo>#issue-<n>` ↔ member `<repo>`'s `train
   a per-train narrative (next).
 - **MENTION trains** (`train.tier` "mention") collapse to one line:
   `- {train.id} — {short title} — {train.outcome} ({count of train.prs} PR(s))`.
+- **A monorepo of independent PRs** (most trains are one PR; the largest holds one or two):
+  campaigns that run all month are dozens of trains with no closing reference between them,
+  so a flat list of 100+ lines says little. Group the mention lines by **theme** — from the
+  PR titles (conventional prefix, the module or path named) and `train.code_areas` — one bold
+  line per theme with its train count, the train lines under it. The theme names are the
+  writer's framing; every theme is backed by the train ids listed under it, and the trains
+  stay the unit of evidence. Put cross-cutting trains (more than 10 `train.code_areas`) in one
+  "Cross-cutting changes" group. When the deep tier is taken by mechanical sweeps (one PR,
+  kind chore / docs / other, hundreds of areas), give each its flowchart and effort line and a
+  short narrative — say what was swept and how widely — rather than a full arc. Cap each group
+  at 40 lines (Length rule above).
 
 `render.py <bundle> --train <id>` produces a spotlight flowchart on demand for any tier.
 
@@ -138,6 +171,25 @@ from a narrator sub-agent that reads ONLY that train's bounded slice:
    >   back the above; every claim must trace to one of them.
    > Ground every statement in the slice. If a field has no support in the slice, set it to
    > `null`/`[]` rather than guessing.
+2b. **Batched mode (many deep trains).** One narrator per train is the default. When a view
+   has many deep trains of ordinary size (a monorepo month often has 8–18, a roll-up more),
+   you MAY instead dispatch one narrator per **batch** — per view (one per month), or per N
+   trains with N at most 8 — and run the batches in parallel. The contract does not change;
+   the hand-over does:
+   - Give each train's slice to the batch as its **own block** — a heading `train <id>`
+     followed by that slice's JSON exactly as `--slice` printed it (deepened per 1b if you
+     did) — never merged into one object or summarised.
+   - Prepend to the contract above: *"You are given several train slices, each under its own
+     heading. Narrate each train from ITS OWN slice only: a fact, ref or URL from one train's
+     slice must never appear in another train's narrative. Return one JSON object keyed by
+     train id, `{"<train-id>": {summary, proposed, changed, rejected, shipped, evidence},
+     …}`, with exactly the train ids you were given."*
+   - Verify **per train** (step 3), against that train's own slice, never the batch's union:
+     every `evidence` URL of train T must be in T's slice. A train missing from the reply is
+     narrated again on its own; a key for a train you did not hand over is discarded.
+   - Keep single mode for any train whose slice is large — `feature_deltas_diff_overflow > 0`,
+     a slice you deepened in 1b, or one far longer than the rest — so it gets a narrator's
+     whole attention; batch the others.
 3. **Verify, then compose.** Drop any `evidence` ref whose URL is not in the slice (the
    sub-agent introduces no new refs; a cited commit must be one of `slice.commits`, linked
    by its `url`).
@@ -149,6 +201,13 @@ from a narrator sub-agent that reads ONLY that train's bounded slice:
 ## Next-release forecast
 `bundle["forecast"]` is a forward-only prediction over `buckets.next_candidates`.
 - Header: *"Next milestone: {forecast.next_milestone}"* (or "none identified" when null).
+- Candidates come from three signal sources: the next milestone, a priority label (default
+  patterns plus any `--priority-label` patterns, listed in `forecast.priority_patterns`) and
+  an open, non-draft PR approved with no later change request (signal
+  "approved, no later change request" — needs no milestone discipline).
+- **Empty forecast:** when `forecast.candidates` is empty, say "No forecast this installment",
+  list the reasons in `forecast.notes` (one per missing signal source), and point the reader to
+  USAGE §6.3 for what the repo would need. No `forecast.notes` means nothing was open.
 - Group candidates by `cand.tier`: **Likely** (score ≥ 5.0) → **Possible** (≥ 2.0) →
   **Longshot** (< 2.0); within each, `cand.score` descending.
 - Per candidate: the item's title (`item`, looked up from `cand.ref`) + link (`cand.ref.url`),
@@ -177,7 +236,9 @@ bucket refs; `bundle["sprints"]` holds `{id: {title, start, end}}`.
 ## Feature changes (add / drop / change)
 The `feature_deltas` ledger as a table grouped by `delta.kind`; each row cites its artifact
 (`delta.artifact`) and the commit/PR that changed it (`delta.commit`, `delta.url`,
-`delta.pr`). Embed `diagrams.deltas_bar` here — this is its one canonical place.
+`delta.pr`). Embed `diagrams.deltas_bar` here — this is its one canonical place. A month on a
+large monorepo holds thousands of deltas: show 40 rows and the "Showing N of M feature changes"
+line naming `feature_deltas` (the bar diagram still shows the whole mix).
 - **Symbol-level changes** subsection — `feature_deltas` with `subject` `symbol`/`comment` carry
   a bounded `delta.before`/`delta.after` + `delta.detail` (`<lang> <subkind> <name>`); show the
   actual change text.
@@ -189,10 +250,25 @@ The `feature_deltas` ledger as a table grouped by `delta.kind`; each row cites i
 From `artifacts` (example/doc/readme/symbol/comment; `artifact.status` comes from the last
 lifecycle event) + the `timeline` event stream; embed `diagrams.content_timeline`. PR/issue
 comment + review-comment bodies and issue reactions are in the bundle for narrative grounding.
+List at most 40 artifacts (removed / replaced first) and end a cut list with "Showing N of M
+artifacts" naming `artifacts`.
 
 ## Module dependency graph / blast radius
 A section embedding `diagrams.module_graph` from `code_graph.areas[].edges` (and, multi-repo,
 the cross-repo module graph from `view["module_edges"]`).
+
+## New contributors
+Who is new this window, from the gather's per-window `newcomers` fact — never from
+`people` (`first_seen` is only the earliest activity inside the view; `author_association`
+is GitHub's value when gathered, not as of the window). Each `newcomers.new` entry is a
+person whose first PR / issue in the repository was created in the window: `login`,
+`first` ("pr" | "issue"), `number`, `url`. Cite each entry's item. Bots are excluded by the
+gather. `newcomers.unknown` (the check failed) and `newcomers.not_checked` (over the
+gather's cap) are neither new nor returning: name them in one line. `newcomers.collected`
+false means the window was gathered with `--no-newcomers`: say it was not looked up. A
+view spanning several gathered windows merges theirs (adding `windows` and
+`covers_view`, false when they leave days of the view uncovered). Multi-repo: per member (`member.bundle.newcomers`). Omit the
+section when the key is absent.
 
 ## Module ownership & Issue kinds
 - **Module ownership** — `code_owners` (owners of the last rule matching the area directory) +
@@ -204,11 +280,18 @@ the cross-repo module graph from `view["module_edges"]`).
 Who moved the project this period — recognition, not blame — from the **deterministic** `people`
 profile + `halls.fame`, each contributor CITED to their work:
 - **Footprint ranking:** read it off `halls.fame` (score `prs_merged*2 + prs_reviewed +
-  commits_authored`, bots already excluded, highest first) — no agent-side counting. Per
+  commits_authored - own_pr_commits`, bots already excluded, highest first) — no agent-side
+  counting. `own_pr_commits` (absent when 0) are commits that land the person's own merged
+  PRs (squash commits): that work already scores through `prs_merged`, so it is not counted
+  again; `commits_authored` stays the true commit count. Per
   contributor pull detail from `people[login]`: `prs_authored`/`prs_merged`/`merge_rate`,
   `prs_reviewed`, `commits_authored`, `issues_opened`, `review_latency_days`,
   `first_seen`/`last_active`, `examples_authored`/`docs_authored`/`symbols_authored`, `areas`.
   Note responsiveness/tenure (review_latency, first→last active) only where non-null.
+  `prs_authored` is every PR of the person in the view (opened earlier and still open or
+  closed in the window included) — label it "PRs in scope", never "opened this month". PRs
+  opened inside the window are `prs_opened` (absent when every PR in the view was opened in
+  the window; it then equals `prs_authored`).
 - **Humans vs automation:** `people[login].is_bot` tags bots — list them under a separate
   "Automation" subhead. (Only the `fame` hall exists — no internal/shame/blame hall is built;
   recognition only.)
@@ -221,6 +304,10 @@ profile + `halls.fame`, each contributor CITED to their work:
 ## Stalled, blocked & pile-ups
 Flow-health from the **deterministic** `flow` + `blockers` projections (plus train-level stall),
 each item CITING its url (titles via `item`; `flow`/`blockers` entries are issue numbers):
+- **Whole backlog, not the month.** `flow` and `blockers` classify every OPEN issue the view
+  holds — the repo's whole open backlog as of the reference date, issues years old included —
+  not this month's issues. Say so in one line where flow is presented ("open backlog of the
+  whole repo as of <ref date>") and never report a flow count as this month's activity.
 - **Flow pathologies** — `bundle["flow"]` is the per-OPEN-issue classification (`blocked` /
   `upvoted_but_ignored` / `traction_then_abandoned` / `hung`; healthy omitted). Each entry
   carries `state`, `age_days`, `reactions`, `blocked_by` (OPEN blockers only),

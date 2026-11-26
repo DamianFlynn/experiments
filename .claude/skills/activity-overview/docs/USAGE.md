@@ -19,10 +19,10 @@
 | Requirement | Why | Check |
 |---|---|---|
 | Python 3.11+ (stdlib only) | runs every tool | `python3 --version` |
-| git 2.x | bounded clone + history walks | `git --version` |
+| git 2.x | bounded, partial clone + history walks (fetches file contents from GitHub while it walks: the gather needs the network for its whole run) | `git --version` |
 | Claude Code | runs the skill and authors the narrative | `claude --version` |
 | GitHub token | read API access | see §1.1 |
-| `mmdc` (mermaid-cli) — recommended | compiles/validates diagrams | `mmdc --version` |
+| `mmdc` (mermaid-cli) — recommended | compiles/validates diagrams | `python3 $AO/render.py --preflight` (below) |
 | `bicep` CLI — for Bicep repos | module dependency edges | `bicep --version` |
 | `terraform` — for Terraform repos | module dependency edges | `terraform version` |
 
@@ -43,10 +43,27 @@ curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-lin
 # terraform: follow https://developer.hashicorp.com/terraform/install for your distro
 ```
 
+**Check that mmdc can render, not just that it is installed.** `mmdc --version` succeeds
+even when mmdc cannot draw anything because the headless browser it renders with is not
+installed; `render.py` then fails on its first diagram. After the install (§2), run the
+preflight: it compiles one tiny diagram with exactly the options `render.py` uses and exits 0
+(`mmdc preflight OK: …`) or non-zero with one line naming the reason and the fix (exit 3: no
+`mmdc` on PATH; exit 1: it cannot render, e.g. "Could not find …" for the browser):
+
+```bash
+python3 $AO/render.py --preflight
+```
+
+Fix a failure by installing the browser for mermaid-cli (mmdc's message names its install
+command), or render with `--skip-validate` and say in the report that the diagrams are
+unvalidated.
+
 ### 1.1 GitHub token
 
 - **Classic PAT** with `public_repo` (public targets) or `repo` (private), plus
-  **`read:project`** if you want Projects v2 board status and sprints.
+  **`read:project`** if you want Projects v2 board status and sprints. The skill only reads
+  (REST GETs, GraphQL queries, a git clone/fetch); it never writes to GitHub, so no write
+  scope is needed.
 - **Azure org policy:** the Microsoft Open Source enterprise (which owns `Azure/*`) refuses
   any personal access token — classic or fine-grained — with a lifetime **over 8 days**
   (observed 2026-11; the 403 message states the current limit). Create a token with an
@@ -74,10 +91,24 @@ mkdir -p ~/.claude/skills ~/.claude/commands
 ln -s ~/src/experiments/.claude/skills/activity-overview ~/.claude/skills/activity-overview
 ln -s ~/.claude/skills/activity-overview/commands/activity.md ~/.claude/commands/activity.md
 
-# verify (offline, about a minute; ends "OK (skipped=6)" — the skips need a local
-# real store or a SQLite without FTS5; without mmdc the diagram tests skip too)
-python3 -m unittest discover -s ~/.claude/skills/activity-overview -p 'test_*.py'
+# verify (offline, about a minute): the result must be OK, i.e. the last line is
+# "OK" or "OK (skipped=N)"; the one-line check below prints just that line
+python3 -m unittest discover -s ~/.claude/skills/activity-overview -p 'test_*.py' 2>&1 | tail -1
 ```
+
+A passing run prints nothing on stdout (a suite test fails any test that does), so the last
+line is unittest's verdict. `FAILED (...)` means a real failure: re-run without `| tail -1` to
+read it. How many tests skip depends on the machine, so no number is promised; a test skips
+when it needs something that is not there:
+
+- **a working mermaid-cli** — `mmdc` on PATH *and* able to render (its headless browser
+  installed; `render.py --preflight` tells you, §1). Without it the diagram-compile
+  tests skip (about a dozen). Under `CI=true` they fail instead of skipping.
+- **SQLite FTS5** — present in most builds. With it, the two tests of the no-FTS5 fallback
+  skip; without it, the full-text search tests skip instead.
+- **a local real store** at `workspace/journey.db` inside the skill — absent on a fresh
+  install, so its four smoke tests skip.
+- **`git` on PATH** — required by §1 anyway; without it the clone tests skip.
 
 Symlinks mean `git -C ~/src/experiments pull` updates the skill. Set a convenience variable
 for the manual commands below:
@@ -132,7 +163,9 @@ cross-month `spotlight` queries possible.
    for everything the record dates (#97: open / closed / merged state, comments, reviews,
    reviewers, timeline events, `updated_at`; each such record carries `as_of`, the view
    `meta.records_as_of`), but with today's title, labels, milestone, assignees, closing
-   references and board status (`meta.state_as_of` names the later gather). So its
+   references and board status (`meta.state_as_of` names the later gather; a month
+   gathered late into its own store has no later gather, and `meta.gathered_at` says when
+   its records were gathered). So its
    in-flight set and train outcomes are that month's, while its next-candidates and
    forecast (milestone-driven) reflect today's milestones. Keep each month's view and
    report from the time you made them (`views/`, `reports/`) when those matter
@@ -217,6 +250,10 @@ mkdir -p $S/stores $S/views/$M $S/reports
 
 # 1 · Acquire → store (network; the only step that needs the token).
 #     gather clones into --clone-dir, or fetches it if it already holds a clone of this repo.
+#     The clone is partial (file contents are fetched while the history is walked), so keep
+#     the network up for the whole run; a dropped git connection is retried three times.
+#     It also checks each author of a PR / issue created in the window for an earlier one
+#     (first-time contributors: one or two search calls each; --no-newcomers skips it).
 python3 $AO/gather.py --owner Azure --repo bicep \
   --from $FROM --to $TO --store $DB --clone-dir $S/clone
 
@@ -294,7 +331,14 @@ flowchart TB
    directory already holds a clone of the same repo, fetches it to the window's history bound
    and checks out the head of the mainline it walks (`meta.base_branch`, below) — so last
    month's clone dir can be reused. A
-   directory that is not a clone of this repo is refused, never deleted. Build output an earlier
+   directory that is not a clone of this repo is refused, never deleted. The clone is bounded
+   (shallow, from `--from` minus the clone margin) and **partial** (`--filter=blob:none`): file
+   contents are fetched from GitHub while the history walks run, so the gather needs the network
+   for its whole run, not only at the start. A git command that loses its connection is retried
+   three times (after 2 s, 8 s and 30 s, one `note: git lost its connection …` line each); when
+   it still fails, the gather stops with git's error and folds nothing (a new store is left
+   empty) — re-run the same window into the same store once the network is back (safe:
+   idempotent). Build output an earlier
    current-month run left in the clone (untracked `.terraform/`, `.terraform.lock.hcl`) is
    removed before the checkout; nothing else of yours is. `--no-clone` never
    creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
@@ -313,6 +357,24 @@ flowchart TB
    reach it (`"head"`).
    Stores gathered before issue #84 have no stored base branch: their views warn and count
    every merged PR as shipped — re-gather them.
+
+   **What a window keeps.** The open-PR and open/updated-issue listings run to today, so a
+   month gathered late would also see items opened after it ended. gather keeps an open PR,
+   or a listed issue, only when it was created on or before `--to` (and a closed listed issue
+   only when it was touched on or after `--from`: the updated-since listing is read a page at a
+   time and its last page reaches older ones); an issue a kept PR closes or cross-references
+   is kept whatever its dates, as train context. No view of the window shows a record created
+   after its end (projected or `--as-stored`), so its people are not the window's either. For
+   a window ending today nothing changes.
+
+   **First-time contributors.** gather also checks each author of a PR, and each reporter of
+   an issue, created in the window (bots excluded) for any earlier PR / issue in the repo:
+   one search API call per candidate, two when they have no earlier item of the kind they
+   started with. The search API allows 30 requests a minute; gather waits out the limit like
+   any other. More than `ACTIVITY_NEWCOMERS_MAX` (default 200) candidates: the earliest are
+   checked and the rest listed as not checked; a check that fails is recorded as unknown,
+   never guessed. The result is the window's `newcomers` fact (BUNDLE.md); `--no-newcomers`
+   skips the calls and records that it was not looked up.
 3. **Validate.** Never publish from a store that is not `RESULT: OK`.
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
    they are what you re-link if a month's series entry needs refreshing.
@@ -347,19 +409,92 @@ flowchart TB
      is not defined when a quarter covering it is in the same index. Keep roll-ups (quarters,
      years) in their own index file, e.g. `series-quarterly.json`.
 6. **Render**, then **author**: the report's *Since last installment* section uses
-   `bundle.series` — new items, carried-over items (with prior board status and where each is
+   `bundle.series` — items new to the series (`series.new`; `series.new_opened` are the ones
+   actually created this month), carried-over items (with prior board status and where each is
    now: shipped, in flight, re-planned or rejected) and the forecast loop (last month's
    predictions landed / not yet / dropped).
+   **Empty forecast?** Check `forecast.candidates` the first time you link a repo. When it is
+   empty, `forecast.notes` says which signal source is missing (no dated next milestone, no
+   priority label, no approved open PR), and the forecast loop will stay empty every month
+   until that changes: read §6.3 now — usually a `--priority-label` pattern for the repo's own
+   wording, passed on every month's `link.py` run, is enough.
 
 ### 5.3 First installment, catching up, and roll-ups
 
 | Situation | What to do |
 |---|---|
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
-| Starting with history / catching up closed months | A month gathered late is **shown as of its end** (#97): `view.py` / `digest.py` wind every PR / issue back to the window's last second from the timestamps in its record, so what was open, merged, closed, in flight, stalled, reviewed and commented on at that month's end is that month's — an item merged since is in flight in it, an item opened since is not in it. Still **today's**: title, body, labels (and the kind / facets read from them), milestone, assignees, closing references, reactions and board status / sprint — so next-candidates and the forecast follow today's milestones; an issue closed in that month and reopened since is closed with no reason (in no shipped / rejected bucket); and an item that was open then but has since been deleted or transferred is absent. The view says what it projected (`meta.records_as_of`, each record's `as_of`). A gather of a past month also keeps the PRs open at its end that were merged or closed before the gather (`gather.keep_pr_for_window`), so each month gathered late on its own holds them, shown as they were at its end. A review approved in the month and dismissed later reads `dismissed` (GitHub records no dismissal date): that PR's `review_decision` is today's, named in its `as_of.not_projected`. Chaining caught-up months into `series.json` is fine for delivery and in-flight; don't use them to calibrate the forecast (a first month captured late is not marked `backfill`). |
+| Starting with history / catching up closed months | A month gathered late is **shown as of its end** (#97): `view.py` / `digest.py` wind every PR / issue back to the window's last second from the timestamps in its record, so what was open, merged, closed, in flight, stalled, reviewed and commented on at that month's end is that month's — an item merged since is in flight in it, an item opened since is not in it. Still **today's**: title, body, labels (and the kind / facets read from them), milestone, assignees, closing references, reactions and board status / sprint — so next-candidates and the forecast follow today's milestones; an issue closed in that month and reopened since is closed with no reason (in no shipped / rejected bucket); and an item that was open then but has since been deleted or transferred is absent. The view says what it projected (`meta.records_as_of`, each record's `as_of`) and when the records were gathered (`meta.gathered_at`; the report's caveat line under its title states both). A gather of a past month also keeps the PRs open at its end that were merged or closed before the gather (`gather.keep_pr_for_window`), so each month gathered late on its own holds them, shown as they were at its end; it does not keep the PRs and issues opened after the month (§5.2 "What a window keeps"). A review approved in the month and dismissed later reads `dismissed` (GitHub records no dismissal date): that PR's `review_decision` is today's, named in its `as_of.not_projected`. Chaining caught-up months into `series.json` is fine for delivery and in-flight; don't use them to calibrate the forecast (a first month captured late is not marked `backfill`). |
 | Missed a month | Gather it late (above): its delivery history and in-flight set are as of its end; its milestones / board status / forecast are "as of now". Note that in the report if its series comparison matters. |
-| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing. Over an accumulated store the quarter's `workflow_stats` (CI health) are the sum of its gathered months (`meta.facts_windows`; `workflow_stats_complete: false` if one is missing) and its code graph / owners are its last month's (§2.1); a quarter gathered as one window has its own. Keep quarterly installments in a separate series file: `link --series` refuses (exit 2) to record a quarter in an index that holds its months, or a month in one that holds its quarter. |
+| Quarter / year view | A **roll-up**: see *Roll-ups* below. |
 | Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
+
+#### Roll-ups (quarter, half-year, year)
+
+A roll-up is a view whose window spans several gathered months, e.g. Q3 =
+`2026-07-01`..`2026-09-30`. Every reader is window-scoped, so it is a **wider window over a
+store that holds the whole period**; a wider window over a single-month store adds nothing
+(it holds one month). What that costs depends on the layout you chose in §2.1:
+
+| Layout | What a roll-up needs | Cost |
+|---|---|---|
+| **One store per month** (`stores/YYYY-MM.db`, the default) | no store holds the quarter, and stores cannot be merged: gather the **whole period once more** into its own store (`stores/2026-Q3.db`) | one more full gather of the period: every PR, issue and commit of it is fetched again, and the clone is walked back to the period's start |
+| **One accumulating store** (`stores/<stream>.db`, every month folded into it, oldest first) | nothing to gather: view the period over the store you already have | none beyond the view; its CI statistics are the sum of the gathered months (`meta.facts_windows`; `workflow_stats_complete: false` when one is missing) and its code graph / owners are the **last** month's (§2.1 item 2). A period gathered as one window has its own |
+
+**Single repo.** The roll-up view is `view.py` over the wider window (not `digest.py`, which
+is the multi-repo project view):
+
+```bash
+S=~/activity/avm-bicep; FROM=2026-07-01; TO=2026-09-30; R=2026-Q3
+mkdir -p $S/views/$R
+# per-month layout only: the extra gather (accumulating layout: skip it, use DB=$S/stores/avm-bicep.db)
+DB=$S/stores/$R.db
+python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
+  --store $DB --clone-dir $S/clone --structural-iac
+python3 $AO/validate.py $DB --project Azure --repo bicep-registry-modules
+# the roll-up view, linked WITHOUT the monthly series
+python3 $AO/view.py --store $DB --project Azure --repo bicep-registry-modules \
+  --from $FROM --to $TO --out $S/views/$R/bundle.json
+python3 $AO/link.py $S/views/$R/bundle.json
+python3 $AO/render.py $S/views/$R/bundle.json --diagrams-dir $S/views/$R/diagrams
+python3 $AO/link.py $S/views/$R/bundle.json --slice <train-id> > $S/views/$R/<train-id>.slice.json
+```
+
+**Manifest (multi-repo).** A manifest carries its own window, so the per-month layout needs
+a copy whose `window` is the period; then gather, validate, and build the project view and
+each member's view as in §4 "Multi-repo" and §7.3, again without `--series`:
+
+```bash
+S=~/activity/avm-tf-network; P=avm-tf-network; FROM=2026-07-01; TO=2026-09-30; R=2026-Q3
+mkdir -p $S/views/$R
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); m["window"]={"from":sys.argv[2],"to":sys.argv[3]}; json.dump(m,open(sys.argv[4],"w"),indent=2)' \
+  $S/manifest.json $FROM $TO $S/manifest-$R.json
+# per-month layout only (accumulating layout: skip it, use DB=$S/stores/$P.db)
+DB=$S/stores/$R.db
+python3 $AO/gather.py --manifest $S/manifest-$R.json --store $DB --clone-dir $S/clones
+python3 $AO/validate.py $DB --project $P
+python3 $AO/digest.py --store $DB --project $P --from $FROM --to $TO > $S/views/$R/project.json
+for slug in $(python3 -c 'import json,sys; print(" ".join(r["owner"]+"/"+r["repo"] for r in json.load(open(sys.argv[1]))["repos"]))' $S/manifest-$R.json); do
+  key=${slug/\//__}
+  python3 $AO/view.py --store $DB --project $P --repo $slug --from $FROM --to $TO --out $S/views/$R/$key.json
+  python3 $AO/link.py $S/views/$R/$key.json
+  python3 $AO/render.py $S/views/$R/$key.json --diagrams-dir $S/views/$R/diagrams/$key
+done
+```
+
+**Keep it out of the monthly series.** Link a roll-up **without** `--series`: it is not the
+installment after the last month, and `link --series` refuses (exit 2) to record a quarter in
+an index that holds its months, or a month in one that holds its quarter (§5.2 item 5). With
+no `series` block the report has no *Since last installment* section. Only if you publish
+roll-ups as their own recurring series, give them their own index
+(`--series $S/series-quarterly.json`), never the monthly one.
+
+**Same report template.** A roll-up report is written from `report-template.md` and
+`reference/report-sections.md` exactly like a month: the window in `meta.period` is the
+period, every section reads the roll-up view, and the CI section states the
+`workflow_stats_complete` caveat when it applies. Narrate its deep trains from the roll-up's
+own slices: a train can span months, so a monthly narrative is reusable only when every
+evidence URL it cites is also in the roll-up slice.
 
 ### 5.4 Multi-repo streams and series
 
@@ -425,6 +560,13 @@ python3 $AO/validate.py $DB --bundle $S/views/$M/at-gather.json
 `--as-stored` writes the records as stored: a report view projects them to the window's end
 (#97), which is not what the store holds, so a projected view is not a `--bundle` input.
 
+A month gathered late passes this check too. Like the report view, the `--as-stored` view
+leaves out records created after the window's end; a store gathered before that rule may still
+hold some (open PRs and issues opened after the month, issues closed before it from the
+listing's last page), and `--bundle` does not expect their people to be derivable from the
+window: they are listed in one INFO line under `no_drift` ("seen only on stored records outside
+the --bundle's window"), not as errors. Such a store needs no re-gather.
+
 `--bundle` is a single-repo cross-check (a project-mode run ignores it with a warning; pass
 `--project P --repo owner/repo` to cross-check one member). A run with `--repo` on a
 multi-repo project checks only the people that member derives; run without `--repo` for
@@ -434,19 +576,25 @@ the full people check.
 
 ### 6.1 What it is
 
-The forecast scores **open items that are on the next milestone or carry a high-priority
-label** (`next_candidates`). Score = sum of signals:
+The forecast scores **open items that are on the next milestone, carry a high-priority
+label, or are open PRs approved with no later change request** (`next_candidates`). Score =
+sum of signals:
 
 | Signal | Points | Shown as |
 |---|---:|---|
 | On the next milestone | 5.0 | `on milestone <title>` |
 | High-priority label | 3.0 | `high-priority` |
+| Approved open PR: not a draft, an approving review by someone other than its author and no change request after it | 3.0 | `approved, no later change request` |
 | In motion: it is an open PR, an open PR closes/references it, or its train is in flight | 2.0 | `open PR` / `work in progress` |
 | Updated in the window | 1.5 | `active in window` |
 | Open ≥ 200 days | 1.0 | `long-open` |
 
-Tiers: **likely ≥ 5**, **possible ≥ 2**, **longshot < 2**. Open items that are merely active
-(not on the next milestone, not high-priority) appear under **In flight**, not in the forecast.
+Tiers: **likely ≥ 5**, **possible ≥ 2**, **longshot < 2**. An approved open PR is also an
+open PR (in motion), so it is at least **likely**: the signal needs no milestone discipline.
+Open items that are merely active (not on the next milestone, not high-priority, not an
+approved PR) appear under **In flight**, not in the forecast. When there is no candidate
+although items are open, `forecast.notes` lists why, one line per missing signal source
+(§6.3).
 
 "In motion" means live work only. An open issue whose only PR was closed unmerged, or that a
 merged PR merely references, is **not** in motion: its train is `rejected` / `shipped` (or,
@@ -471,14 +619,29 @@ calibrate how much weight readers should put on each tier; skip installments who
   count: an undated "Backlog"-style milestone is never current or next, so give release
   milestones a due date. If every dated milestone is overdue, the most recently due one is
   current and there is no next (so no `on milestone` signal).
-- **Priority labels must match.** Recognized labels (case-insensitive, exact):
-  `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`, `critical`. Check a repo
-  with `gh label list -R <owner/repo> --limit 200`. If it uses other names (for example a
-  `Priority: High` style), the high-priority signal will not fire; extend
-  `HIGH_PRIORITY_LABELS` in `link.py` (lower-case) and keep the change in your fork.
-- **No milestones and no matching labels** → the forecast is legitimately empty. The report
-  should then say "no forecast signals" and lean on *In flight*, *Stalled/blocked* and board
-  status instead of inventing predictions.
+- **Priority labels are matched by pattern.** A label counts as high priority when it is one
+  of `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`, `critical`, or
+  contains (case-insensitive) one of the default patterns: priority high / critical / urgent /
+  P0 / P1 (`Priority: High`, `priority/p1`), high priority, a bare P0 / P1, urgent, critical
+  (not "non-critical"), blocker. Triage labels that automation applies to
+  overdue items (for example `Needs: Immediate Attention :bangbang:` on
+  Azure/bicep-registry-modules, on about 60 open issues) are deliberately not defaults:
+  they would fill the forecast with old issues. Check a repo's labels with `gh label list -R <owner/repo> --limit 200`. For
+  other wording, add patterns on each run:
+  `python3 $AO/link.py $B --series $S/series.json --priority-label 'response overdue' --priority-label 'sev ?1'`
+  — each a case-insensitive regular expression, searched in each label; repeat the flag for
+  more. The patterns used are recorded in `forecast.priority_patterns`; pass the same ones
+  every month so the loop compares like with like. An invalid pattern stops `link.py` with
+  exit 2.
+- **Approved PRs work without any process.** An open, non-draft PR with an approving review
+  and no later change request is a candidate (`approved, no later change request`), so a repo
+  with no milestones and no priority labels still gets a forecast whenever reviewers approve
+  work, and next month's loop checks whether it shipped. A dismissed approval does not count.
+  (Gather does not record draft status yet; a `draft` field is honoured when present.)
+- **None of the three** → the forecast is legitimately empty and `forecast.notes` says why. The
+  report then says "no forecast this installment" with those reasons and a pointer to this
+  section, and leans on *In flight*, *Stalled/blocked* and board status instead of inventing
+  predictions.
 - **Projects v2 boards** add `board_status` to in-flight items and sprint framing; they do not
   change forecast scores.
 
@@ -513,8 +676,10 @@ python3 $AO/render.py $S/views/$M/bundle.json --diagrams-dir $S/views/$M/diagram
 
 ### 7.2 AVM Bicep — `Azure/bicep-registry-modules` (BRM)
 
-- **Shape:** a monorepo with 500+ resource modules (`avm/res/<service>/<module>`) and ~50
-  pattern modules (`avm/ptn/<group>/<module>`), e.g. `avm/ptn/ai-ml/landing-zone`,
+- **Shape:** a monorepo of resource modules (`avm/res/<service>/<module>`), pattern modules
+  (`avm/ptn/<group>/<module>`) and utility modules (`avm/utl/<group>/<module>`) — about 220
+  top-level modules as of late 2026, several hundred `main.bicep` files including their child
+  modules — e.g. `avm/ptn/ai-ml/landing-zone`,
   `avm/ptn/network/hub-networking`, `avm/ptn/alz`. Single-repo gather.
 - **Areas:** one area per module (the `avm` pattern), so shipped-by-area, module ownership and
   feature deltas are per module.
@@ -881,6 +1046,10 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `meta_integrity` | the store's markers or per-window meta were edited or damaged (each detail names the meta key); or the store mixes a window folded before #75 with later ones ("no fold evidence"), or holds per-window facts without a `current_state:` marker (a #94-era fold) | re-gather the named window, or fold any window of the repo once more; a damaged store: re-gather into a fresh store |
 | `validate` WARN `edge_set` "an edge into another member repo: no fold of this repo recorded its member set" | a manifest store folded before #113 (or whose member set changed between folds): a missing cross-repo edge cannot be proven missing | fold each member once more (any window) to make cross-repo edges exact |
 | `validate` WARN `no_fabrication` "PR/issue with no contribution edge at all … hand-built records" | a record with no author, merger, reviewer or commenter in a repo where no record of its kind has an author (hand-made data) | not a failure; a real gather always records the author |
+| `gather` stops with `RuntimeError: command failed (exit 128): git … log …` and `could not fetch … from promisor remote` / `SSL_ERROR_SYSCALL` / `RPC failed` after `note: git lost its connection …; retry 3 of 3` | the clone is partial: the history walks fetch file contents from GitHub as they go, and the connection dropped four times in a row; nothing was folded (a new store is empty, `validate` fails `target`) | re-run the same window into the same store when the network is stable (idempotent; the clone dir is reused) |
+| `gather` warning `could not tell whether N author(s) are new (search failed)` | the first-time-contributor search failed or was rate limited for those authors; they are `newcomers.unknown` (never counted as new or returning) | re-gather the window later, or report them as unknown |
+| `gather` warning `… candidate first-time contributors, more than ACTIVITY_NEWCOMERS_MAX=…` | a window with more authors than the cap; the rest are `newcomers.not_checked` | raise `ACTIVITY_NEWCOMERS_MAX` (each candidate costs one or two search calls at 30 a minute), or accept |
+| `validate --bundle FILE` INFO `no_drift` "people: N stored person(s) are seen only on stored records outside the --bundle's window" | the store holds records no view of FILE's window shows (created after its end, or closed and last updated before its start) — typical of a month gathered late before gather stopped keeping them | not a failure; nothing to do |
 | `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
 | `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
 | `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |
@@ -898,7 +1067,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | A landing-zone `br/public:avm/...` ref has no cross-repo edge | BRM is not a manifest member, or has no `bicep_registry_prefix`, or the ref goes through a private registry / alias | add BRM with `"bicep_registry_prefix": "avm/"`; private-registry refs are not resolved |
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
 | Empty board/sprint sections | token lacks `read:project`, or no maintained board | add scope or accept |
-| `render.py` fails | `mmdc` missing, or a diagram does not compile | install mmdc (`npm install -g @mermaid-js/mermaid-cli`), or add `--skip-validate` and say the diagrams are unvalidated. As root, render passes mmdc a generated `--no-sandbox` puppeteer config itself (set `ACTIVITY_MMDC_PUPPETEER_CONFIG` to use your own); keep that to throwaway environments |
+| `render.py` fails | `mmdc` missing, cannot render (`error: mmdc cannot render diagrams here: …`, the same line `render.py --preflight` prints; §1), or a diagram does not compile | install mmdc (`npm install -g @mermaid-js/mermaid-cli`), or add `--skip-validate` and say the diagrams are unvalidated. As root, render passes mmdc a generated `--no-sandbox` puppeteer config itself (set `ACTIVITY_MMDC_PUPPETEER_CONFIG` to use your own); keep that to throwaway environments |
 | `link.py --series` exits 2: "overlaps the recorded window(s)" | the index already holds a window sharing days with this one (a quarter beside its months) | record the roll-up in its own series file |
 | `link.py: error: … is not valid JSON` / `not a JSON object` / `cannot read` (exit 2) | the bundle path is wrong, or the file is not a bundle/view | point `link.py` at a `view.py` / `gather.py` JSON; nothing was written |
 | `link.py --series` warns about later installments | a month was (re-)recorded after a later one | expected; re-link the named later months' saved bundles oldest first if their comparison should reflect the change |

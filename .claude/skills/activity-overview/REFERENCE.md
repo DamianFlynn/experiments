@@ -9,15 +9,17 @@
 Copy `.claude/skills/activity-overview/` into your repo (or `~/.claude/skills/`; the
 symlinked install is in `docs/USAGE.md` §2). Requirements: Python 3.11+ (stdlib only),
 `git` on PATH, and a `GITHUB_TOKEN`
-(or `GH_TOKEN`) with `repo` scope (read access). Add **`read:project`** to ingest
+(or `GH_TOKEN`): a classic PAT with `public_repo` for public targets or `repo` for
+private ones. The skill only reads from GitHub (REST GETs, GraphQL queries, a git
+clone/fetch); it never writes. Add **`read:project`** to ingest
 Projects v2 boards (gather auto-discovers them); without it — or with
 `--no-project-board` — the board layer cleanly degrades to empty and everything
 else is unaffected.
 
 ### Token notes
 
-For public targets a classic PAT with just the `public_repo` scope is enough.
-Mind two org/enterprise policies that surface as a `403` on the first API call
+`public_repo` is enough for public targets; `repo` is only needed for private ones
+(`docs/USAGE.md` §1.1). Mind two org/enterprise policies that surface as a `403` on the first API call
 (gather now prints GitHub's own message and the deciding headers, so the cause
 is named rather than guessed):
 
@@ -221,6 +223,11 @@ under the same bound) instead of re-cloned; `--no-clone` never creates
 a clone (it fetches an existing one, or gathers API data only when there is none). A repo
 with no commits since the bound is cloned at `--depth=1` and contributes no commits.
 `meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.
+The clone is also partial (`--filter=blob:none`): file contents are fetched from GitHub
+while the history walks run, so a gather needs the network for its whole run. A git
+command that loses its connection is retried three times (2 s, 8 s, 30 s); if it still
+fails the gather stops before folding anything — re-run the same window into the same
+store.
 
 ### GitHub API knobs
 
@@ -237,6 +244,11 @@ its minimum is clamped with a warning.
 If a window has more than 1,000 workflow runs (GitHub's per-search cap) gather
 splits the query by day; a single day still over the cap is reported on stderr and
 marked in `workflow_stats._truncated`.
+
+First-time contributors (`newcomers`, BUNDLE.md): one or two search API calls per author of
+a PR / issue created in the window (the search API allows 30 requests a minute; a limit is
+waited out like any other). `ACTIVITY_NEWCOMERS_MAX` (default `200`, min `0`) caps the
+candidates checked (the rest are listed as `not_checked`); `--no-newcomers` skips the check.
 
 ### Projects v2 board knobs
 
@@ -280,6 +292,10 @@ flags) — it parses the args and defers to `SKILL.md` (gather → validate → 
 ```bash
 python3 -m unittest discover -s .claude/skills/activity-overview -p 'test_*.py' -v
 ```
+
+The result must be `OK`; how many tests skip depends on the machine (`docs/USAGE.md` §2
+says which conditions skip which tests); appending `2>&1 | tail -1` prints just the
+verdict line.
 
 The CI `spotlight` job's gate can also be run on any store:
 

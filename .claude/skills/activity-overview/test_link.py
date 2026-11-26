@@ -13,6 +13,7 @@ import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -905,6 +906,9 @@ class TestCodeAreaAttribution(unittest.TestCase):
 
 
 class TestTrainsModulesPeopleAreas(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def _bundle(self):
         return {
             "meta": {"owner": "o", "repo": "r"},
@@ -965,6 +969,9 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
 
 
 class TestPhase3bConsistency(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_attribution_preserves_artifact_and_delta_refs(self):
         b = _enrich_via_store("bundle_p3b.json")
         for d in b["feature_deltas"]:
@@ -2948,9 +2955,138 @@ class TestForecastWorkInProgress(unittest.TestCase):
         self.assertEqual(c["notes"], [])
 
 
+class TestForecastWithoutMilestones(unittest.TestCase):
+    """#97 final gate (validation finding 11): on a repo with no usable next
+    milestone and its own priority wording the forecast was empty every
+    month. An approved open PR is a candidate; priority labels are matched by
+    pattern (and operator patterns); an empty forecast says why."""
+
+    PERIOD = TestForecastWorkInProgress.PERIOD
+    _issue = TestForecastWorkInProgress._issue
+    _pr = TestForecastWorkInProgress._pr
+    _run = TestForecastWorkInProgress._run
+
+    def _review(self, author, state, at):
+        return {"author": author, "state": state, "submitted_at": at}
+
+    def _approved_pr(self, number, reviews, **kw):
+        pr = self._pr(number, "open", False, **kw)
+        pr["author"] = "alice"
+        pr["reviews"] = reviews
+        return pr
+
+    def _enriched(self, issues, prs, milestones=(), patterns=()):
+        bundle = {"meta": {"period": dict(self.PERIOD), "ref_date": "2026-05-31",
+                           "base_branch": "main"},
+                  "milestones": list(milestones), "commits": [], "prs": prs,
+                  "issues": issues}
+        return link.enrich(bundle, patterns)
+
+    def test_approved_open_pr_is_a_likely_candidate(self):
+        pr = self._approved_pr(200, [
+            self._review("bob", "changes_requested", "2026-05-02T00:00:00Z"),
+            self._review("bob", "approved", "2026-05-03T00:00:00Z"),
+            self._review("carol", "commented", "2026-05-04T00:00:00Z")])
+        cands = self._run([], [pr])
+        c = cands[("pr", 200)]
+        self.assertEqual(c["signals"],
+                         ["approved, no later change request", "open PR"])
+        self.assertEqual((c["score"], c["tier"]), (5.0, "likely"))
+
+    def test_not_approved_cases_are_not_candidates(self):
+        cases = {
+            "change requested after approval": self._approved_pr(201, [
+                self._review("bob", "approved", "2026-05-03T00:00:00Z"),
+                self._review("carol", "changes_requested", "2026-05-04T00:00:00Z")]),
+            "approval dismissed": self._approved_pr(202, [
+                self._review("bob", "dismissed", "2026-05-03T00:00:00Z")]),
+            "author's own approval": self._approved_pr(203, [
+                self._review("alice", "approved", "2026-05-03T00:00:00Z")]),
+            "draft": dict(self._approved_pr(204, [
+                self._review("bob", "approved", "2026-05-03T00:00:00Z")]),
+                draft=True),
+            "merged": dict(self._approved_pr(205, [
+                self._review("bob", "approved", "2026-05-03T00:00:00Z")]),
+                state="closed", merged=True),
+        }
+        for why, pr in cases.items():
+            with self.subTest(why):
+                self.assertEqual(self._run([], [pr]), {})
+
+    def test_repo_specific_priority_wording_is_recognised(self):
+        for label in ("Priority: P1",
+                      "priority/high", "P0", "Severity: Critical", "blocker",
+                      "urgent", "High Priority"):
+            with self.subTest(label=label):
+                cands = self._run([self._issue(7, labels=(label,))], [])
+                self.assertEqual(cands[("issue", 7)]["signals"], ["high-priority"])
+        # a triage label automation puts on overdue items is not a default: on
+        # a real repository it made 59 old issues forecast candidates
+        for label in ("Needs: Immediate Attention :bangbang:",
+                      "Status: Response Overdue :triangular_flag_on_post:",
+                      "Needs: Triage :mag:", "priority: low", "Non-Critical",
+                      "Type: AVM :a: :v: :m:"):
+            with self.subTest(label=label):
+                self.assertEqual(self._run([self._issue(7, labels=(label,))], []), {})
+
+    def test_operator_priority_pattern(self):
+        issue = self._issue(7, labels=("Status: Response Overdue",))
+        b = self._enriched([issue], [], patterns=["response overdue"])
+        self.assertEqual([c["ref"]["id"] for c in b["forecast"]["candidates"]], [7])
+        self.assertEqual(b["forecast"]["priority_patterns"], ["response overdue"])
+        self.assertNotIn("priority_patterns",
+                         self._enriched([issue], [])["forecast"])
+
+    def test_empty_forecast_says_why(self):
+        ms = [{"title": "Committed Backlog", "number": 1, "state": "open",
+               "due_on": None},
+              {"title": "SAS assistance - 2025-10", "number": 2, "state": "open",
+               "due_on": "2025-10-31T00:00:00Z"}]
+        b = self._enriched([self._issue(7, labels=("Needs: Triage :mag:",))],
+                           [self._pr(8, "open", False)], milestones=ms)
+        self.assertEqual(b["forecast"]["candidates"], [])
+        self.assertEqual(b["forecast"]["notes"], [
+            "every dated open milestone is overdue (the latest, 'SAS assistance "
+            "- 2025-10', was due 2025-10-31), so there is no next milestone",
+            "no open item has a priority label (the default patterns)",
+            "no open, non-draft PR has an approving review without a later "
+            "change request"])
+        # nothing open: nothing to forecast, no notes
+        done = self._enriched([], [self._pr(9, "closed", True)])
+        self.assertNotIn("notes", done["forecast"])
+
+    def test_cli_priority_label_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.json")
+            bundle = {"meta": {"period": dict(self.PERIOD), "ref_date": "2026-05-31",
+                               "base_branch": "main"},
+                      "milestones": [], "commits": [], "prs": [],
+                      "issues": [self._issue(7, labels=("Needs: Core Team",))]}
+            with open(path, "w") as fh:
+                json.dump(bundle, fh)
+            with contextlib.redirect_stderr(io.StringIO()):
+                link.main([path, "--priority-label", "core team",
+                           "--priority-label", "x+"])
+            with open(path) as fh:
+                fc = json.load(fh)["forecast"]
+            self.assertEqual([c["ref"]["id"] for c in fc["candidates"]], [7])
+            self.assertEqual(fc["priority_patterns"], ["core team", "x+"])
+            for argv in ([path, "--priority-label"], [path, "--priority-label", "("],
+                         [path, "--slice", "t", "--series", "s"],
+                         [path, "--bogus", "x"]):
+                with self.subTest(argv=argv[1:]):
+                    with contextlib.redirect_stderr(io.StringIO()), \
+                            self.assertRaises(SystemExit) as cm:
+                        link.main(argv)
+                    self.assertEqual(cm.exception.code, 2)
+
+
 class TestSliceCLI(unittest.TestCase):
     """`link.py BUNDLE --slice TRAIN_ID` emits one train's enriched, bounded slice
     as JSON on stdout (read-only) — the unit a Phase 4b narrator sub-agent reads."""
+
+    def setUp(self):
+        quiet(self)
 
     def _raw(self):
         # A minimal enrich-complete raw bundle: PR 100 closes issue 10 (-> one

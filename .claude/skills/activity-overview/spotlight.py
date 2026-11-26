@@ -43,7 +43,8 @@ def _detect_project(conn, project):
             "SELECT DISTINCT project FROM nodes WHERE project IS NOT NULL")
     })
     if not projects:
-        raise ValueError("empty store: no project to query")
+        raise ValueError("the store is empty: nothing has been gathered into "
+                         "it (did the gather fail?); nothing to query")
     if project is not None:
         if project not in projects:
             raise ValueError("project {!r} is not in the store (projects: "

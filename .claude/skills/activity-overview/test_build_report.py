@@ -233,6 +233,40 @@ class TestCurrentPipelineView(_Base):
         self.assertEqual(sorted(captions), sorted(
             expected + ["_Showing {} of {} edges._".format(render.GRAPH_MAX_EDGES, n)]))
 
+    def test_long_lists_are_capped_with_a_showing_line(self):
+        # validation finding 19: report-template "LONG LISTS" — at most
+        # LIST_CAP rows, then "Showing N of M ... — the full list is in ..."
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("build_report", SCRIPT)
+        br = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(br)
+        cap = br.LIST_CAP
+        view = self.fresh_view()
+        n = cap + 7
+        t0 = view["trains"][0]
+        view["trains"] = [dict(t0, id="{}-{}".format(t0["id"], i)) for i in range(n)]
+        repo = view["members"][0]["repo"]
+        row = next(r for r in view["shipped"] if r["repo"] == repo)
+        view["shipped"] = [dict(row, id=10000 + i) for i in range(n)]
+        b = view["members"][0]["bundle"]
+        b["feature_deltas"] = [dict(b["feature_deltas"][0], name="n{}".format(i))
+                               for i in range(n)]
+        out = self.render_report(self.write_view(view))
+        for unit, where in (("trains", 'view["trains"]'),
+                            ("shipped items", 'view["shipped"]'),
+                            ("feature changes",
+                             'view["members"][].bundle["feature_deltas"]')):
+            with self.subTest(unit=unit):
+                self.assertEqual(out.count(
+                    "*Showing {} of {} {} — the full list is in the view (`{}`).*"
+                    .format(cap, n, unit, where)), 1)
+        # the shipped table holds exactly LIST_CAP of the n rows
+        self.assertEqual(sum(1 for ln in out.splitlines()
+                             if ln.startswith("| [{}#100".format(row["type"]))), cap)
+        # under the cap: no line (the committed sample is unchanged)
+        self.assertNotIn("*Showing ", self.render_report(
+            self.write_view(self.fresh_view()), "small.md"))
+
     def test_byte_stable(self):
         path = self.write_view(self.fresh_view())
         self.assertEqual(self.render_report(path, "a.md"),

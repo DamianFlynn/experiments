@@ -1564,9 +1564,14 @@ class TestSliceModuleCLI(unittest.TestCase):
         self.assertIn("module", r.stdout)
 
     def test_cli_in_process_json(self):
-        rc = spotlight.main(["module", "avm/res/net/fw", "--store", self.store,
-                             "--project", "acme", "--json"])
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = spotlight.main(["module", "avm/res/net/fw", "--store", self.store,
+                                 "--project", "acme", "--json"])
         self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue())["focus"], "avm/res/net/fw")
 
 
 # --------------------------------------------------------------------------
@@ -1889,7 +1894,11 @@ class TestCLIRoughEdges(unittest.TestCase):
 
     def test_empty_store(self):
         r = self._run("person", "alice", "--store", self.empty)
-        self._usage_error(r, "no project")
+        self._usage_error(r, "the store is empty: nothing has been gathered "
+                             "into it (did the gather fail?)")
+        self.assertIn("nothing to query", r.stderr)
+        r = self._run("person", "alice", "--store", self.empty, "--project", "o")
+        self._usage_error(r, "the store is empty")
 
     def test_unknown_project_lists_projects(self):
         r = self._run("person", "alice", "--store", self.multi,

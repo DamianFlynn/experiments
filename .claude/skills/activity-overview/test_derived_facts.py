@@ -153,6 +153,48 @@ class TestProjectTrainsAreLinkTrains(unittest.TestCase):
         self.assertEqual([t["repos"] for t in view["trains"]],
                          [["Azure/a"], ["Azure/b"]])
 
+    def test_rejected_attempt_does_not_pull_another_members_issue_in(self):
+        # review finding: member A's rejected PR 3 "closes" A#5 (shipped by the
+        # merged PR 1) and, across repos, the OPEN issue B#9. Its closing
+        # references never took effect, so B#9 is not in A's shipped train.
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/a", "Azure/b"}
+        a = _raw_bundle([_pr(1, merged=True, state="closed", closes=[5]),
+                         _pr(3, state="closed", closes=[5])], [_issue(5)])
+        a["prs"][1]["body"] = "Closes https://github.com/Azure/b/issues/9"
+        for p in a["prs"]:
+            p["url"] = "https://github.com/Azure/a/pull/{}".format(p["number"])
+        bb = _raw_bundle([], [_issue(9, state="open")])
+        gather.fold_bundle(conn, a, project="p", repo="Azure/a", members=members)
+        gather.fold_bundle(conn, bb, project="p", repo="Azure/b", members=members)
+        edge = conn.execute(
+            "SELECT 1 FROM edges WHERE src_id='p/Azure/a#pr-3' AND "
+            "dst_id='p/Azure/b#issue-9' AND edge_type='closes'").fetchone()
+        self.assertIsNotNone(edge)                  # the stored cross-repo edge
+        view = digest.build_project_view(conn, "p", ["Azure/a", "Azure/b"],
+                                         "2026-01-01", "2026-01-31",
+                                         warn=lambda _m: None)
+        shipped = [t for t in view["trains"] if t["outcome"] == "shipped"]
+        self.assertEqual(len(shipped), 1)
+        self.assertEqual(shipped[0]["repos"], ["Azure/a"])
+        self.assertNotIn("p/Azure/b#issue-9", shipped[0]["issues"])
+
+    def test_merged_pr_cross_repo_close_still_joins(self):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        members = {"Azure/a", "Azure/b"}
+        a = _raw_bundle([_pr(1, merged=True, state="closed")], [])
+        a["prs"][0]["body"] = "Closes https://github.com/Azure/b/issues/9"
+        a["prs"][0]["url"] = "https://github.com/Azure/a/pull/1"
+        bb = _raw_bundle([], [_issue(9)])
+        gather.fold_bundle(conn, a, project="p", repo="Azure/a", members=members)
+        gather.fold_bundle(conn, bb, project="p", repo="Azure/b", members=members)
+        view = digest.build_project_view(conn, "p", ["Azure/a", "Azure/b"],
+                                         "2026-01-01", "2026-01-31",
+                                         warn=lambda _m: None)
+        self.assertIn(["Azure/a", "Azure/b"], [t["repos"] for t in view["trains"]])
+
     def test_pr_that_closes_a_pr_number_does_not_join(self):
         # item 7 seen from digest: "Fixes #1" where #1 is a PR is no issue, so
         # PR 1 and PR 2 stay two trains, in link and in the project view.
@@ -196,6 +238,19 @@ class TestProjectTrainsAreLinkTrains(unittest.TestCase):
                          _pr(3, state="open", closes=[4]), stacked],
                         [_issue(2), _issue(4, state="open")])
         view = _project_view(b)
+        self.assertSameTrains(view)
+
+    def test_rejected_attempt_does_not_pull_its_other_issue_in(self):
+        # #97 final gate (validation finding 13): the rejected PR 3 closes
+        # issues 5 and 2; only the merged PR 1 (closing 5) joins issues into
+        # a train, so the open issue 2 is in no project train either.
+        b = _raw_bundle([_pr(1, merged=True, state="closed", closes=[5]),
+                         _pr(3, state="closed", closes=[5, 2])],
+                        [_issue(5), _issue(2, state="open")])
+        view = _project_view(b)
+        self.assertEqual([(t["id"], t["prs"], t["issues"]) for t in view["trains"]],
+                         [("ptrain-o/r#issue-5", ["o/r#pr-1", "o/r#pr-3"],
+                           ["o/r#issue-5"])])
         self.assertSameTrains(view)
 
     def test_spine_constant_unchanged(self):

@@ -22,6 +22,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(__file__))
 import gather  # noqa: E402
 import test_clone_handling as tch  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FROM, TO = "2026-05-18", "2026-05-31"
 OLD_FILES = ["modules/a/main.tf", "modules/b/main.tf", "modules/c/main.tf",
@@ -161,6 +162,10 @@ class TestDeepenBoundaryHelper(_BoundaryRepo):
 
 
 class TestAcquireBoundary(_BoundaryRepo):
+    def setUp(self):
+        super().setUp()
+        quiet(self)
+
     def test_issue_repro_boundary_commit_is_made_real(self):
         _old, new = self.issue_repro()
         b = self._acquire()

@@ -308,6 +308,89 @@ class TestStackedParentByHeadRepo(unittest.TestCase):
         self.assertIsNone(gather.normalize_pr(raw)["head_repo"])
 
 
+class TestRejectedAttemptDoesNotJoinIssues(unittest.TestCase):
+    """#97 final gate (validation finding 13): merged PR #7264 closes #3813
+    only; the rejected PR #5163 listed #3813 and #2422. A closing reference
+    takes effect only when its PR merges, so #2422 (still open) is not pulled
+    into the shipped train, and the train is neither rooted on it nor dated
+    from it."""
+
+    def _repro(self, order=None):
+        merged = _pr(7264, "closed", True, closes=[3813])
+        merged["created_at"] = "2026-08-11T11:23:32Z"
+        merged["merged_at"] = "2026-08-11T14:32:52Z"
+        rejected = _pr(5163, "closed", False, closes=[3813, 2422])
+        rejected["created_at"] = "2025-05-07T21:45:26Z"
+        rejected["reviewers"] = ["rev"]
+        old_open = _issue(2422, "open", None, kind="bug")
+        old_open["created_at"] = "2023-11-21T15:24:32Z"
+        closed = _issue(3813, kind="feature")
+        closed["created_at"] = "2024-11-20T10:42:17Z"
+        prs, issues = [merged, rejected], [old_open, closed]
+        if order == "reversed":
+            prs, issues = prs[::-1], issues[::-1]
+        return _bundle(prs, issues)
+
+    def test_train_is_rooted_on_the_issue_the_merged_pr_closes(self):
+        for order in (None, "reversed"):
+            with self.subTest(order=order):
+                trains = _trains(self._repro(order))
+                self.assertEqual([t["id"] for t in trains], ["train-issue-3813"])
+                t = trains[0]
+                self.assertEqual(t["issues"], [3813])
+                self.assertEqual(t["prs"], [5163, 7264])
+                self.assertEqual(t["pr_outcomes"],
+                                 {"5163": "rejected", "7264": "merged"})
+                self.assertEqual(t["outcome"], "shipped")
+                self.assertEqual(t["kind"], "feature")
+
+    def test_open_issue_is_in_no_train_and_its_refs_carry_none(self):
+        got = _bucket_trains(self._repro())
+        self.assertEqual(got[("pr", 5163)], ("rejected", "train-issue-3813"))
+        idx = link.train_index(_trains(self._repro()))
+        self.assertEqual(idx[("pr", 7264)], "train-issue-3813")
+        self.assertNotIn(("issue", 2422), idx)
+
+    def test_effort_is_dated_from_the_train_not_the_attempt(self):
+        b = self._repro()
+        b["trains"] = _trains(b)
+        link.annotate_train_effort(b)
+        e = b["trains"][0]["effort"]
+        self.assertEqual(e["opened_at"], "2024-11-20T10:42:17Z")
+        self.assertEqual(e["elapsed_days"], 629)
+        # the attempt's review work still counts (issue #93)
+        self.assertEqual(e["reviewers"], 1)
+
+    def test_rejected_pr_alone_still_forms_its_own_train(self):
+        b = _bundle([_pr(5, "closed", False, closes=[2, 3]),
+                     _pr(6, "closed", False, closes=[3])],
+                    [_issue(2, "open", None), _issue(3, "open", None)])
+        trains = _trains(b)
+        self.assertEqual([(t["id"], t["outcome"], t["prs"], t["issues"])
+                          for t in trains],
+                         [("train-issue-2", "rejected", [5, 6], [2, 3])])
+
+    def test_attempt_touching_two_trains_joins_the_lowest_issue(self):
+        b = _bundle([_pr(1, "closed", True, closes=[20]),
+                     _pr(2, "open", False, closes=[10]),
+                     _pr(3, "closed", False, closes=[20, 10, 30])],
+                    [_issue(10, "open", None), _issue(20), _issue(30, "open", None)])
+        for prs in (b["prs"], b["prs"][::-1]):
+            with self.subTest(order=[p["number"] for p in prs]):
+                b2 = dict(b, prs=list(prs))
+                got = {t["id"]: (t["prs"], t["issues"]) for t in _trains(b2)}
+                self.assertEqual(got, {"train-issue-10": ([2, 3], [10]),
+                                       "train-issue-20": ([1], [20])})
+
+    def test_attempt_with_a_not_planned_issue_leaves_it_abandoned(self):
+        b = _bundle([_pr(1, "closed", True, closes=[7]),
+                     _pr(2, "closed", False, closes=[7, 9])],
+                    [_issue(7), _issue(9, state_reason="not_planned")])
+        got = {t["id"]: (t["outcome"], t["prs"], t["issues"]) for t in _trains(b)}
+        self.assertEqual(got, {"train-issue-7": ("shipped", [1, 2], [7]),
+                               "train-issue-9": ("abandoned", [], [9])})
+
+
 class TestProjectTrainsFollow(unittest.TestCase):
     def test_project_train_lists_every_member_issue(self):
         members = [{"repo": "Azure/a", "bundle": {"trains": [

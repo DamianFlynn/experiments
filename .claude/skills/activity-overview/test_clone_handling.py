@@ -15,6 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import gather  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 GIT_TEST_ENV = {
     "GIT_CONFIG_COUNT": "1",
@@ -183,6 +184,10 @@ class TestRemoteNormalisation(unittest.TestCase):
 class TestAcquireCloneStep(_RepoCase):
     """acquire() end to end with the GitHub API stubbed to empty and the remote
     URL pointed at the local file:// repo."""
+
+    def setUp(self):
+        super().setUp()
+        quiet(self)
 
     def _acquire(self, *extra):
         args = gather.parse_args([

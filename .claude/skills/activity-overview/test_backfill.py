@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 
 def _store():
@@ -109,6 +110,9 @@ class BackfillIdempotency(unittest.TestCase):
 
 
 class ExtractBackfillWiring(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_missing_spine_node_backfilled_as_out_of_window_context(self):
         conn = _store()
         gather.fold_bundle(conn, copy.deepcopy(_cross_window_bundle()))
@@ -208,6 +212,9 @@ class RollupResumeHardening(unittest.TestCase):
     """A multi-window "wider view" is a single wider range_query over the union
     of folded windows (no multi-bundle merge); overlapping re-fold is idempotent;
     resume/roll-up read structure from the latest clone_sha + gathered_windows."""
+
+    def setUp(self):
+        quiet(self)
 
     def _two_window_bundles(self):
         march = {

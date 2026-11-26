@@ -142,6 +142,7 @@ scratch store) and `backfill` respectively.
 | `--include-releases` / `--no-releases` | on | Releases in window |
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
+| `--no-newcomers` | off (check runs) | Skip the first-time-contributor search (§4.7); the window's `newcomers` fact is `{"collected": false}`. `ACTIVITY_NEWCOMERS_MAX` (default 200, min 0) caps the candidates checked |
 | `--no-iac-build` | off (builds run) | Do not run `bicep restore/build` / `terraform init/graph` (they download and run third-party code, §14.4); every area `edges_status: skipped`, `edge_extraction.disabled: true`. The structural scan still runs |
 | `--store PATH` | **required** | SQLite store |
 
@@ -195,6 +196,7 @@ sequenceDiagram
   end
   A->>GQL: closingIssuesReferences, 50 PRs per request (else keywords only)
   A->>REST: issues updated since from + all open issues + referenced issues
+  A->>A: keep_issue_for_window (created by to; touched since from unless open)
   loop each issue
     A->>REST: comments, timeline
   end
@@ -203,7 +205,11 @@ sequenceDiagram
     A->>REST: commits?sha=<walked branch head>&since&until (author.login per SHA)
     A->>A: resolve_commit_authors (API login, noreply email, else flagged git name)
   end
-  A->>REST: workflow runs, releases, milestones
+  A->>REST: workflow runs
+  opt not --no-newcomers
+    A->>REST: search/issues per candidate first-time contributor (collect_newcomers)
+  end
+  A->>REST: releases, milestones
   opt token has read:project
     A->>GQL: Projects v2 boards (maintained only), items, iterations
   end
@@ -217,7 +223,16 @@ sequenceDiagram
   former `<owner>-<repo>-clone` collided for `a-b`/`c` vs `a`/`b-c`; such a dir that is a clone
   of the member's own remote is still used while `<owner>/<repo>` does not exist) and records
   the outcome in `meta.clone_mode`:
-  - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`).
+  - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`): shallow
+    (`--shallow-since`) and **partial** (`--filter=blob:none`). File contents are not in the
+    clone: git fetches each blob from GitHub when a walk first needs it, so the patch walk
+    (`git log -p`), the structure reads and the IaC builds all use the network, and a gather
+    needs it for its whole run. `run_git` retries a git command that fails with a network
+    error (`_git_network_failure`: a reset, an SSL error, "could not fetch … from promisor
+    remote", a 502/503/504, …) three times, after `GIT_NETWORK_RETRY_DELAYS` (2 s, 8 s, 30 s),
+    one stderr note each; any other failure, a fourth network failure, and non-git tools are
+    not retried: the gather stops with git's error before anything is folded, and the
+    operator re-runs the same window into the same store (idempotent).
   - `fetched` — the dir is already a clone of the same remote (`remote.origin.url`, GitHub
     https/ssh forms compared equal): `git fetch --prune --shallow-since=…` (`build_fetch_cmd`;
     deepens or shortens to this window's bound) then `checkout -B <default branch>` at the
@@ -427,12 +442,13 @@ flowchart TB
 | Data | Endpoint(s) | Bounding |
 |---|---|---|
 | Closed PRs | `pulls?state=closed&sort=updated` | `fetch_until` stops when a page's last `updated_at` < `from` |
-| Open PRs | `pulls?state=open` | all |
+| Open PRs | `pulls?state=open` | all listed; kept when created by `to` (`keep_pr_for_window`) |
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
-| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | a referenced issue answered 404 or 410 (deleted) is skipped with a stderr note (`allow_statuses=GONE_STATUSES`); an answer that is not #N of this repo (number, `repository_url` / `html_url`, case-insensitive; a transferred issue reached through a redirect) is skipped with a note, never stored (#109) |
+| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | a listed issue is kept when created by `to` and open, or touched (`updated_at` / `closed_at`) on or after `from` (`keep_issue_for_window`: the updated-since listing's last page reaches older closed ones); an issue a kept PR closes or cross-references is kept whatever its dates (train context, though no view shows it when created after `to`); a referenced issue answered 404 or 410 (deleted) is skipped with a stderr note (`allow_statuses=GONE_STATUSES`); an answer that is not #N of this repo (number, `repository_url` / `html_url`, case-insensitive; a transferred issue reached through a redirect) is skipped with a note, never stored (#109) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
+| First-time contributors (`newcomers`) | `search/issues?q=repo:O/R is:<pr\|issue> author:<login> created:<<from>&per_page=1` → `total_count` | one call per candidate (author of a PR / reporter of an issue created in the window, bots and `ghost` excluded), a second for the other kind only when the first is 0; at most `ACTIVITY_NEWCOMERS_MAX` (200) candidates, the rest `not_checked`; a failed or `incomplete_results` answer → `unknown`; three failures in a row → the rest `unknown`; `--no-newcomers` → none (`{"collected": false}`) |
 | Closing issues (#105), GraphQL | `repository { pr<N>: pullRequest(number: N) { closingIssuesReferences(first: 25) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } } } }` | 50 kept PRs aliased per request; a PR with more than 25 closing issues is paged on its own (`first: 100, after:`) |
 | Projects v2 boards, GraphQL | §4.8 | maintained boards only, items capped |
 
@@ -572,7 +588,8 @@ fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows)
 **Per-window facts (#94).** The singleton nodes are latest-wins. In the same transaction the
 fold also calls `graphstore.set_window_facts(project, repo, from, to, bundle, clone_sha)`:
 meta `facts:{p}/{r}:{from}:{to}` = `{clone_sha, facts: {key: sha256}}` for each non-empty
-`workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy`, each value stored once per
+`workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` / `newcomers` (the
+first-time contributors, §4.7; per-window only, no singleton node), each value stored once per
 repo under `fact:{p}/{r}:{sha256}` (shared by windows with identical values; a re-fold of the
 window replaces its entry and unreferenced values are deleted). Keyed by window, not clone
 sha: the directory code graph is built from the window's changed paths, so two windows of one
@@ -827,7 +844,10 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
      node (it cannot be placed in a window);
    - `releases`: `published_at` in the window (or undated); `milestones`, `sprints`: not
      windowed (current structure).
-   A record created after the window's end is in no view (#97), not even as train context.
+   A record created after the window's end is in no view (#97), not even as train context —
+   projected or as stored (`--as-stored`, validation finding 7): `_view_socials` treats it as
+   gone either way, so the `validate --bundle` input and the report view hold the same
+   records in that respect.
    Re-attach reviews/lifecycle onto the view's parents (a review/event follows its parent,
    whatever its own timestamp; a projected record already holds its leaves up to the end);
    surface `blocks` as `blocking`/`blocked_by`; `meta.records_as_of` = `{instant, prs,
@@ -839,7 +859,14 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    overlapping one another (by start day, longest first; absent when none; a window only
    partly overlapping the view is not summed), structure = the latest gathered
    window overlapping the view (by `to`), else the latest ending before it, else the earliest;
-   no `facts:` entry for the repo (pre-#94 store) → the latest-wins singleton nodes. Window scope:
+   no `facts:` entry for the repo (pre-#94 store) → the latest-wins singleton nodes.
+   `newcomers` (top-level key, omitted when no gather stored it): exactly a gathered window →
+   its stored value verbatim; any other window → merged over the gathered windows wholly
+   inside the view that collected one, not overlapping one another (`_merged_newcomers`:
+   `new` keeps each login's earliest entry, `unknown` / `not_checked` the unions less the
+   logins found new, plus `windows` and `covers_view`). When any record was projected,
+   `meta.gathered_at` = the latest `fetched_at` of the view's PR / issue nodes (when they were
+   gathered; validation finding 8). Window scope:
    each artifact's `lifecycle` keeps the view's events (same predicate as the ledger rows) and
    an artifact with none is left out; `status`/`replaced_by`/move fields are as of the
    window's end — the stored node when the ledger holds nothing dated after `ts_to`, else
@@ -966,7 +993,9 @@ flowchart TB
   tm -- no --> sb{"merged into a member PR's head?<br/>(head_repo + head)"}
   sb -- yes --> cp["contributing_prs on that PR's train"]
   sb -- no --> nt["no train"]
-  mb --> uf["join member PRs over the issues they CLOSE<br/>(union-find; a mention does not join)"]
+  mb --> uf["join MERGED / OPEN member PRs over the issues they CLOSE<br/>(union-find; a mention does not join)"]
+  mb --> rj["a REJECTED PR closing an issue of such a train:<br/>an attempt in it (lowest such issue), no issue of its own;<br/>else rejected PRs join each other over their issues"]
+  rj --> an
   uf --> an{"group closes an issue?"}
   an -- yes --> ti["train-issue-N: N = lowest closed issue<br/>issues = every closed issue"]
   an -- no --> tp["train-pr-N: N = lowest PR"]
@@ -984,6 +1013,14 @@ issue are one train (`prs`), each with its own outcome in `pr_outcomes` (`{"<pr#
 "merged"|"open"|"rejected"}`). Member PRs and the issues they `close` are joined into connected
 groups; each group is one train, every issue it closes is in `issues` and is indexed to it by
 `train_index` (so its bucket ref carries the train id), and `root_issue` is the lowest of them.
+Only merged and open PRs' closing references join and anchor (#97 final gate: a closing
+reference takes effect only when its PR merges). A rejected PR that closes an issue of such a
+train is an attempt in it — in `prs` / `pr_outcomes`, its commits and reviewers counted — in
+the train holding the lowest of its issues that such a train has, and adds none of its other
+issues; it never changes `root_issue`, `issues`, `kind`, `outcome`, `effort.opened_at` or
+`elapsed_days`. Rejected PRs whose issues no merged/open PR closes join each other as before.
+`digest.link_components` follows the same rule: a member PR's `closes` edge to an issue its own
+link train does not list is not followed.
 `crossref_issues` (mentions, timeline cross-references, list tails such as the `#2` of
 `Fixes #1, #2`) never join or anchor: they stay spine `cross_ref` edges for `extract`'s train
 context and `spotlight` only (`digest` does not follow them, §10). A `closes` number that is a
@@ -1024,7 +1061,7 @@ flowchart TB
   r2 -- yes --> RJ
   r2 -- no --> o{"state open?"}
   o -- no --> NB["no bucket"]
-  o -- yes --> n1{"on NEXT milestone,<br/>or high-priority label?"}
+  o -- yes --> n1{"on NEXT milestone, high-priority label,<br/>or approved open PR?"}
   n1 -- yes --> NC["next_candidates"]
   n1 -- no --> i1{"on CURRENT milestone,<br/>or updated_at in window?"}
   i1 -- yes --> IF["in_flight"]
@@ -1036,8 +1073,15 @@ flowchart TB
 sorted by `(due day, number)` and compared to `ref_date[:10]` (date or ISO timestamp).
 **current** = earliest due on/after the ref day, **next** = the one after it; if every dated
 milestone is overdue, **current** = the most recently due (lowest number on a tie) and
-**next** = `None`. `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`,
-`high-priority`, `critical` (case-insensitive exact match).
+**next** = `None`. A label is high priority (`_high_priority`) when it is in
+`HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`,
+`critical` (case-insensitive exact match) or matches a regular expression of
+`PRIORITY_LABEL_PATTERNS` (searched case-insensitively: priority high / critical / urgent /
+P0 / P1, high priority, a bare P0 / P1, urgent, critical but not non-critical, blocker)
+or of the operator's `link.py --priority-label PATTERN` (repeatable,
+recorded in `forecast.priority_patterns`). An approved open PR (`approved_pr`: open, unmerged,
+not `draft`, an `approved` review by someone other than its author and no `changes_requested`
+review after the latest such approval, from the view's `reviews`) is a next candidate too.
 
 ### 6.6 Significance and effort
 
@@ -1051,7 +1095,9 @@ tier         = "deep" if rank ≤ TRAIN_SIGNIFICANCE_TOP_N (8) or significance �
 Kind weights: feature 3.0, module-request 3.0, bug 2.0, idea 1.5, docs/chore/other 1.0.
 Outcome is deliberately ignored (a rejected train's story still matters).
 
-`effort`, over every PR and issue of the train (#93): `opened_at` (earliest `created_at`),
+`effort`, over every PR and issue of the train (#93): `opened_at` (earliest `created_at` of
+the train's issues and its merged / open PRs — a rejected attempt beside them does not date
+the train, #97 final gate; a train of rejected PRs only is dated by them),
 `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
 (sum), `commits`, `participants` (distinct authors + reviewers + commenters), and the stall
 flags (#112, threshold `TRAIN_STALL_DAYS` = 21, strict `>`): for an `in_flight` train,
@@ -1072,7 +1118,8 @@ For each `next_candidates` ref:
 | Signal | Weight | Fires when |
 |---|---:|---|
 | `on_next_milestone` | 5.0 | item milestone == next milestone title |
-| `high_priority` | 3.0 | label in `HIGH_PRIORITY_LABELS` |
+| `high_priority` | 3.0 | a label in `HIGH_PRIORITY_LABELS` or matching `PRIORITY_LABEL_PATTERNS` / `--priority-label` (§6.5) |
+| `approved` | 3.0 | an open PR approved with no later change request (`approved_pr`, §6.5); signal text `approved, no later change request` |
 | `in_motion` | 2.0 | live work only (#87): it is an open PR; or an open PR `closes`/cross-refs it; or its train's `outcome` is `in_flight` |
 | `recent_activity` | 1.5 | `updated_at` in window |
 | `overdue` | 1.0 | `ref_date − created_at ≥ FORECAST_OVERDUE_DAYS` (200) |
@@ -1089,7 +1136,10 @@ shipped carries that train id and so the `linked PR already merged` note (its ow
 signal is unchanged).
 
 `tier` = likely (≥ 5.0) / possible (≥ 2.0) / longshot. Candidates sorted by `(−score, id)`.
-Output: `{next_milestone, candidates:[{ref, train, score, tier, signals, notes}]}`. Forward-only —
+Output: `{next_milestone, candidates:[{ref, train, score, tier, signals, notes}]}`, plus
+`notes` (a list of plain sentences: why there is no candidate — no usable next milestone and
+the reason, no priority label, no approved PR) when the candidates are empty although the view
+holds an open item, and `priority_patterns` when the operator passed any. Forward-only —
 verification happens in the next installment's series block.
 
 ### 6.8 Slice — `slice_train(bundle, train_id)`
@@ -1155,7 +1205,8 @@ window. Identity of items is `(type, id)`; URLs are excluded. `installment_snaps
 in_flight:[{type,id,board_status?}], next_candidates:[{type,id}], rejected:[{type,id}],
 forecast:[{type,id,tier}]}`. `compute_series`: `new` = this window's shipped/in_flight refs in
 none of the prior's lists (pre-#86 snapshots have no `next_candidates`/`rejected`, which
-then count as empty); `carried_over` = prior in_flight refs found in any of the four current
+then count as empty) — new to the series, not newly opened; `new_opened` = the `new` rows
+whose item `created_at` is inside the window (calendar day); `carried_over` = prior in_flight refs found in any of the four current
 buckets, each with `bucket` and `prior_status`; `forecast_loop` = prior forecast refs now in
 `shipped` (`landed`), in `rejected` (`dropped`) or neither (`not_yet`); `prior` =
 `{from, to, captured}` of the predecessor.
@@ -1182,8 +1233,8 @@ previous file intact, and a run that cannot write its bundle records no installm
 | `attribute_people_areas` | `people[].modules/areas` | commit files + reviewed PRs' areas |
 | `unresolved_person_key` | person key | the git name of a commit author gather could not resolve to a login, `+ " (git)"` when login-shaped, so it never equals a login (#78) |
 | `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*`; git-name forms `GitHub Actions`, `Dependabot`, `Dependabot Preview`, `Renovate`, `Renovate Bot` (case/space-insensitive), each also with the `" (git)"` suffix |
-| `annotate_people_profile` | per-login metrics | prs authored/merged/reviewed, merge rate, review latency (median), first/last active, examples/docs/symbols authored |
-| `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored`, top 10; **no shame/blame** |
+| `annotate_people_profile` | per-login metrics | prs authored (in scope) / opened in the window (`prs_opened`, when the view holds an earlier PR) / merged / reviewed, merge rate, commits and `own_pr_commits` (landing commits of their own merged PRs, when not 0), review latency (median), first/last active, examples/docs/symbols authored |
+| `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored − own_pr_commits` (a commit landing the person's own merged PR is not counted again), top 10; **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
 | `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (`blocker_graph` applies the same open-only filter, #101) |
 
@@ -1254,6 +1305,16 @@ a temporary SVG first; `--export svg` copies that checked SVG beside the `.mmd`,
 then runs mmdc again for the PNG. `ACTIVITY_MMDC_PUPPETEER_CONFIG` names a puppeteer config
 passed as `mmdc -p`; without it, a run as root gets a generated `--no-sandbox` config (Chrome
 will not start sandboxed as root). Paths are recorded in `bundle.diagrams`.
+
+**Preflight.** `render.py --preflight` (no bundle) runs `mmdc_preflight`: it compiles
+`PREFLIGHT_DIAGRAM` (a one-slice pie) through `validate_with_mmdc`, so with the same command
+line as a real render (`-q`, and the `-p` browser config above), and prints one line: exit 0 when it compiled, 3
+when `mmdc` is not on PATH, 1 when it could not render (the reason is the first line of mmdc's
+error output that says "error", stack frames dropped, plus the fix: install mermaid-cli's
+headless browser, or `--skip-validate` with the diagrams called unvalidated). When a real
+render fails, `main` runs the same preflight: if it fails too, the environment is the cause
+and the run prints the preflight's line; if it passes, the diagram is, and the run prints
+mmdc's error for that diagram as before. Exit 1 either way.
 
 ## 8. Trust — `validate.py`
 
@@ -1351,7 +1412,13 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   areas derived ⊆ stored, extra → WARN), member (`--repo` of a multi-member project, or an external
   `--bundle` on a multi-window store: derived ⊆ stored for logins and areas). A stored person that
   is not derivable gets a `hint` from `_pre78_hint` when it has no `login_resolved` flag and all its
-  contribution edges are `authored` → commits that now name another author.
+  contribution edges are `authored` → commits that now name another author. With an external
+  `--bundle` (exact mode), a stored person every one of whose contribution edges points at a
+  stored PR / issue the bundle does not hold and `_in_bundle_span` does not place in its window
+  (`_outside_window_people`: created after the window's end, or closed and last updated before
+  its start) is not expected to be derivable: no view of the window holds those records, so it
+  is listed in one INFO detail instead (validation finding 7). A person with no contribution
+  edge, or with one to a record of the window, is not excused; such a store needs no re-gather.
 - *Records (`--bundle`).* `_record_drift_details`: every PR/issue/commit of the bundle is stored
   with equal content (`external_refs` added by a manifest fold is ignored; `reviews`/`lifecycle`
   compare as sorted entries without `url`; `blocking`/`blocked_by` added by a view are ignored), so
@@ -1364,7 +1431,7 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   and non-stand-in area. Train-context issues are not required. `_window_meta_drift_details`
   (#113): for a bundle window that is exactly a gathered window, the stored `ref_date`,
   base branch / branches, `clone_sha`, clone info and each fact value the bundle carries equal
-  the bundle's.
+  the bundle's (`newcomers` included: the view carries the stored value verbatim).
 - *Meta (`meta_integrity`, #113).* `_meta_details`: the repo's `gathered_windows` entries,
   their fold evidence (`_window_evidence`: a per-window meta key, a `member_status` entry or the
   marker naming the window), the `current_state:` marker (`_marker_problem`, and `structure ==
@@ -1594,10 +1661,10 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 | `TRAIN_KIND_WEIGHTS` | feature 3, module-request 3, bug 2, idea 1.5, else 1 | link |
 | `TRAIN_SIGNIFICANCE_TOP_N` / `_FLOOR` | 8 / 20.0 | link |
 | `TRAIN_STALL_DAYS` | 21 | link |
-| `FORECAST_WEIGHTS` | 5.0 / 3.0 / 2.0 / 1.5 / 1.0 | link |
+| `FORECAST_WEIGHTS` | 5.0 / 3.0 / 3.0 (approved) / 2.0 / 1.5 / 1.0 | link |
 | `FORECAST_TIER_LIKELY_THRESHOLD` / `_POSSIBLE_` | 5.0 / 2.0 | link |
 | `FORECAST_OVERDUE_DAYS` | 200 | link |
-| `HIGH_PRIORITY_LABELS` | see §6.5 | link |
+| `HIGH_PRIORITY_LABELS` / `PRIORITY_LABEL_PATTERNS` | see §6.5 | link |
 | `SLICE_TEXT_CAP` / `SLICE_COMMENTS_KEPT` / `SLICE_DIFF_CAP` | 1500 / 6 / 6000 | link |
 | Flow thresholds | stale 30 d, upvotes 5, comments 5, hung 60 d | derive |
 | `TRAIN_FLOW_MAX_PRS` / `_AREAS` | 4 / 5 | render |
@@ -1647,7 +1714,10 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open PRs) + 4 × kept PRs
 + pages(issues since from) + pages(open issues) + 2 × issues + referenced issues + workflow/
 release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100⌉` (the last term is
-the commit-author login listing, #78; zero for a window with no commits). Because **all open PRs and issues** are included every run, busy
+the commit-author login listing, #78; zero for a window with no commits), plus 1–2 search calls
+per candidate first-time contributor (`newcomers`, capped by `ACTIVITY_NEWCOMERS_MAX`; the search
+API's own limit is 30 requests a minute, waited out like any rate limit; `--no-newcomers` skips
+them). Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (a personal token's authenticated limit is 5,000 requests/hour; the
 workflow's built-in `GITHUB_TOKEN`, which the CI live jobs use by default, has a lower limit
 that its runs in one repository share, so a live gather in CI is likelier to wait for the
@@ -1776,7 +1846,7 @@ these affect an accumulated store.
 
 ## 15. Testing and CI
 
-- 55 `test_*.py` modules (stdlib `unittest`, about 2,200 tests), fixture-driven and fully
+- About 65 `test_*.py` modules (stdlib `unittest`, about 2,500 tests in late 2026), fixture-driven and fully
   offline (fake fetch seams; no network). Notable: `test_characterization.py` (store-derived ==
   link-derived golden equivalence), `test_validate.py` / `test_validate_strict.py` (each
   check), `test_gather.py` (parsers, fold, IaC parsing incl. modern/legacy DOT),
@@ -1785,11 +1855,17 @@ these affect an accumulated store.
   stores), `test_view.py` (the `SKILL.md` / `commands/activity.md` docs contract: every
   documented command names a real script and accepted flags), `test_report_template.py`
   (template placeholders against real view output), `test_suite_hygiene.py` (every test is
-  collectable by `unittest`; no conflict markers in skill files).
+  collectable by `unittest`; no conflict markers in skill files; no test writes to stdout —
+  a pass-through `sys.stdout` wrapper installed when discovery imports the module fails
+  the test that writes, so `... 2>&1 | tail -1` is always unittest's verdict). In-process
+  CLI tests capture the diagnostics they cause (`_quiet.quiet(self)` for stderr,
+  `contextlib.redirect_stdout` for output they assert on).
 - Run: `python3 -m unittest discover -s .claude/skills/activity-overview -p 'test_*.py' -v`.
-  Six tests skip on a normal machine (four real-store smoke tests without a local real
-  store, two FTS5-absent degrade paths when FTS5 is present); the mmdc diagram tests skip
-  without `mmdc`, and fail instead under `CI=true`.
+  The result must be `OK`; how many tests skip depends on the machine (USAGE §2 lists the
+  conditions): the four real-store smoke tests without a local real store, the two
+  FTS5-absent degrade paths when FTS5 is present (the FTS5 tests instead when it is not),
+  and the mmdc diagram tests without an mmdc that can render (they fail instead under
+  `CI=true`).
 - CI (`.github/workflows/activity-overview.yml`): `tests` on every relevant push/PR (Python 3.11,
   3.12, 3.13, byte-compile of the skill, `samples/` and `examples/formatters/`, pinned mmdc, then
   the suite; 20-minute timeout); `live` on dispatch, schedule (07:00 UTC on the 1st and
@@ -1837,7 +1913,7 @@ these affect an accumulated store.
 | Change | Where | Watch out for |
 |---|---|---|
 | New repo layout → areas | add `(name, fn)` to `DEFAULT_AREA_PATTERNS` (order matters) | area ids appear in stored nodes; re-gather after changing |
-| Org priority labels | `link.HIGH_PRIORITY_LABELS` | lower-case exact match |
+| Org priority labels | `link.py --priority-label PATTERN` per run; defaults in `link.PRIORITY_LABEL_PATTERNS` / `HIGH_PRIORITY_LABELS` | patterns are case-insensitive regular expressions (searched); an invalid one is a usage error |
 | Forecast / significance tuning | constants in `link.py` | tests pin thresholds; update tests + BUNDLE.md |
 | New view field | compute in `link.enrich` or `derive` (pure) | append-only; document in BUNDLE.md; omit when empty |
 | New stored fact | `fold_bundle` + `extract` reader + `validate` conformance | must keep `no_drift` and characterization green |

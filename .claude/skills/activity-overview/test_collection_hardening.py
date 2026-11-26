@@ -14,6 +14,7 @@ Real git runs against throwaway local repos (no network); git, terraform and
 bicep are otherwise faked through the injected seams or a mocked
 subprocess.run.
 """
+import contextlib
 import io
 import os
 import shutil
@@ -730,3 +731,52 @@ class TestMemberCloneDirs(_TmpCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGitRetriesADroppedConnection(unittest.TestCase):
+    """Found by an independent run (#97): `git log -p` in the partial clone
+    fetched file contents, the connection dropped once (SSL_ERROR_SYSCALL)
+    and the gather died with nothing stored."""
+
+    def _run(self, outcomes, cmd=("git", "log", "-p")):
+        calls, sleeps = [], []
+
+        def fake(args, **kw):
+            code, out, err = outcomes[min(len(calls), len(outcomes) - 1)]
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, code, out, err)
+        err = io.StringIO()
+        with mock.patch.object(gather.subprocess, "run", fake), \
+                mock.patch.object(gather, "_sleep", sleeps.append), \
+                mock.patch.object(gather, "_git_passthrough_cache", []), \
+                contextlib.redirect_stderr(err):
+            try:
+                result = gather.run_git(list(cmd))
+            except RuntimeError as exc:
+                result = exc
+        return result, calls, sleeps, err.getvalue()
+
+    DROP = (128, "", "error: RPC failed; curl 56 LibreSSL SSL_read: "
+                     "SSL_ERROR_SYSCALL, errno 54\nfatal: could not fetch abc "
+                     "from promisor remote")
+
+    def test_one_drop_is_retried_and_succeeds(self):
+        result, calls, sleeps, err = self._run([self.DROP, (0, "LOG", "")])
+        self.assertEqual(result, "LOG")
+        self.assertEqual((len(calls), sleeps), (2, [2]))
+        self.assertIn("retry 1 of 3", err)
+
+    def test_gives_up_after_the_retries_with_the_git_error(self):
+        result, calls, sleeps, _err = self._run([self.DROP])
+        self.assertIsInstance(result, RuntimeError)
+        self.assertIn("SSL_ERROR_SYSCALL", str(result))
+        self.assertEqual((len(calls), sleeps), (4, [2, 8, 30]))
+
+    def test_other_failures_and_other_tools_are_not_retried(self):
+        result, calls, sleeps, _ = self._run(
+            [(128, "", "fatal: bad revision 'nope'")])
+        self.assertIsInstance(result, RuntimeError)
+        self.assertEqual((len(calls), sleeps), (1, []))
+        result, calls, sleeps, _ = self._run([self.DROP], cmd=("terraform", "init"))
+        self.assertIsInstance(result, RuntimeError)
+        self.assertEqual((len(calls), sleeps), (1, []))

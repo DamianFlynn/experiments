@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import sys
@@ -49,7 +51,10 @@ class TestShippedChangelogFormatter(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         with open(path, "w") as fh:
             json.dump(view, fh)
-        shipped_changelog.main([path])  # no SystemExit
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            shipped_changelog.main([path])  # no SystemExit
+        self.assertIn("[#7](u7)", buf.getvalue())
 
     def test_cli_rejects_non_view(self):
         import tempfile
@@ -58,9 +63,11 @@ class TestShippedChangelogFormatter(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         with open(path, "w") as fh:
             json.dump({"not": "a view"}, fh)
-        with self.assertRaises(SystemExit) as cm:
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err):
             shipped_changelog.main([path])
         self.assertEqual(cm.exception.code, 2)
+        self.assertIn("is not a digest view", err.getvalue())
 
 
 class TestExampleTranscript(unittest.TestCase):

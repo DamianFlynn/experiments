@@ -26,6 +26,7 @@ import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
 import view  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures")
 BUILD_REPORT = os.path.join(HERE, "samples", "build_report.py")
@@ -45,6 +46,9 @@ def _store(path=":memory:"):
 
 
 class TestViewContractVersion(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_constant_is_its_own_contract(self):
         self.assertIsInstance(extract.VIEW_CONTRACT_VERSION, int)
         # every value an earlier view carried (gather 1, digest's store 2) is

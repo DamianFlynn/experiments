@@ -155,7 +155,24 @@ class TestViewStoreErrors(_TmpCase):
         code, err = _run_main(["--store", db, "--from", "2026-05-01",
                                "--to", "2026-05-31", "--out", self.path("x.json")])
         self.assertEqual(code, 2)
-        self.assertIn("empty store", err)
+        self.assertIn("the store is empty", err)
+
+    def test_empty_store_says_what_view_could_not_do(self):
+        # Issue #97 finding 6: not the validator's "no project to validate".
+        db = self.path("empty.db")
+        _build_store(db, [])
+        for extra in ([], ["--project", "Azure"], ["--project", "Azure",
+                                                   "--repo", "bicep"]):
+            with self.subTest(extra=extra):
+                code, err = _run_main(["--store", db, "--from", "2026-05-01",
+                                       "--to", "2026-05-31",
+                                       "--out", self.path("x.json")] + extra)
+                self.assertEqual(code, 2)
+                self.assertIn("the store is empty: nothing has been gathered "
+                              "into it (did the gather fail?)", err)
+                self.assertIn("no view to write", err)
+                self.assertNotIn("validate", err)
+                self.assertFalse(os.path.exists(self.path("x.json")))
 
     def test_not_a_store_exits_2(self):
         db = self.path("junk.db")
@@ -286,8 +303,10 @@ _COMMAND_DOCS = _DOCS + (
     "REFERENCE.md", os.path.join("docs", "USAGE.md"),
     os.path.join("samples", "README.md"), os.path.join("examples", "README.md"))
 # Scripts whose argv is hand-rolled (no argparse --help to read flags from):
-# the exact flags each accepts. link.py: `BUNDLE [--slice ID | --series PATH]`.
-_HAND_ROLLED = {"link.py": {"--slice", "--series"}, "transcript.py": set(),
+# the exact flags each accepts. link.py: `BUNDLE [--slice ID | --series PATH]
+# [--priority-label PATTERN ...]`.
+_HAND_ROLLED = {"link.py": {"--slice", "--series", "--priority-label"},
+                "transcript.py": set(),
                 "examples/formatters/shipped_changelog.py": set()}
 _PY_CMD = re.compile(r"python3\s+(\S+\.py)\b([^\n]*)")
 # Where the command's own argv ends (pipe / redirect / chain / comment). `<x>`
@@ -364,9 +383,12 @@ class TestDocsContract(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(HERE, script)), where)
                 if script in _HAND_ROLLED:
                     allowed = _HAND_ROLLED[script]
-                    self.assertLessEqual(len(flags), 1, where)
+                    # at most one of --slice / --series; only link.py's
+                    # --priority-label repeats (#97 final gate)
+                    self.assertLessEqual(
+                        len([f for f in flags if f != "--priority-label"]), 1, where)
                     if flags:
-                        # link.py recognizes the flag only as the 2nd token.
+                        # link.py's flags follow BUNDLE, the 2nd token on.
                         self.assertEqual(tokens.index(flags[0]), 1, where)
                 else:
                     allowed = _argparse_flags(script)

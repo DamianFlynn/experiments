@@ -13,6 +13,7 @@ import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
 import render  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -220,6 +221,9 @@ class TestWriteDiagrams(unittest.TestCase):
 
 
 class TestMmdcValidation(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_ensure_mmdc_raises_with_hint_when_absent(self):
         with self.assertRaises(SystemExit) as ctx:
             render.ensure_mmdc(which=lambda _name: None)
@@ -458,6 +462,9 @@ class TestRenderManifestP3(unittest.TestCase):
 
 
 class TestEndToEndOfflineP3(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_link_then_render_builds_full_substrate(self):
         bundle = _enrich_via_store("bundle_p3.json")
 
@@ -571,6 +578,9 @@ class TestRenderManifestP3b(unittest.TestCase):
 
 
 class TestEndToEndOfflineP3b(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_link_then_render_attributes_areas_and_renders_six(self):
         bundle = _enrich_via_store("bundle_p3b.json")
 
@@ -1056,6 +1066,9 @@ class TestWriteDiagramsTrainFlowcharts(unittest.TestCase):
 
 
 class TestTrainSpotlightCLI(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_parse_args_accepts_train_option(self):
         args = render.parse_args(["bundle.json", "--train", "train-issue-17"])
         self.assertEqual(args.train, "train-issue-17")
@@ -1566,7 +1579,8 @@ class TestRenderCLI(unittest.TestCase):
         import io
         with tempfile.TemporaryDirectory() as d:
             path = self._write_bundle(d, _train_bundle())
-            before = open(path).read()
+            with open(path) as fh:
+                before = fh.read()
             err = io.StringIO()
             with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
                 render.main([path, "--diagrams-dir", os.path.join(d, "dg"),
@@ -1574,7 +1588,8 @@ class TestRenderCLI(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
             self.assertIn("train-nope", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
-            self.assertEqual(open(path).read(), before)        # bundle untouched
+            with open(path) as fh:
+                self.assertEqual(fh.read(), before)            # bundle untouched
             self.assertFalse(os.path.exists(os.path.join(d, "dg")))
 
     def test_unknown_train_subprocess_has_no_traceback(self):
@@ -1681,6 +1696,166 @@ class TestScaleMmdc(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(render.emit_timeline_gantt(b))
             render.validate_with_mmdc([path])
+
+
+# The error a mermaid-cli without its headless browser prints (issue #97,
+# finding 9): `mmdc --version` passes, every render fails like this.
+_NO_BROWSER = ("\nError: Could not find the headless browser (ver. 1.2.3). This "
+               "can occur if you did not install it.\n    at Resolver.resolve "
+               "(/x/node_modules/lib/launcher.js:10:5)\n    at main (/x/cli.js:2:1)\n")
+
+
+def _probe_ok_diagram_fails(stderr="Error: Parse error on line 2:\n...\n"):
+    """A fake mmdc that compiles render's preflight diagram but fails every
+    other input: the environment works, the diagram itself is bad."""
+    ok = _fake_mmdc()
+    bad = _fake_mmdc(returncode=1, stderr=stderr)
+
+    def run(cmd, **kw):
+        src = cmd[cmd.index("-i") + 1]
+        return (ok if os.path.basename(src) == "preflight.mmd" else bad)(cmd, **kw)
+    return run
+
+
+class TestMmdcPreflight(unittest.TestCase):
+    """`render.py --preflight` compiles one tiny diagram with exactly the options
+    render uses, and a render that fails because mmdc cannot render at all says
+    so in one line with the fix, instead of the raw tool error."""
+
+    WHICH = staticmethod(lambda _n: "/usr/bin/mmdc")
+
+    def _main(self, argv, runner, which=None):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                render.main(argv, runner=runner, which=which or self.WHICH)
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_preflight_ok_uses_renders_own_options(self):
+        calls = []
+        reason = render.mmdc_preflight(runner=_fake_mmdc(calls=calls),
+                                       which=self.WHICH, env={}, euid=0)
+        self.assertIsNone(reason)
+        [cmd] = calls
+        self.assertEqual(cmd[0], "/usr/bin/mmdc")
+        self.assertIn("-q", cmd)
+        self.assertIn("-p", cmd)        # root: render's no-sandbox config too
+        cfg = render.mmdc_preflight(runner=_fake_mmdc(calls=calls), which=self.WHICH,
+                                    env={render.PUPPETEER_CONFIG_ENV: "/c.json"},
+                                    euid=1000)
+        self.assertIsNone(cfg)
+        self.assertEqual(calls[-1][calls[-1].index("-p") + 1], "/c.json")
+
+    def test_preflight_failure_is_one_line_from_the_tool(self):
+        reason = render.mmdc_preflight(
+            runner=_fake_mmdc(returncode=1, stderr=_NO_BROWSER), which=self.WHICH)
+        self.assertNotIn("\n", reason)
+        self.assertIn("Could not find the headless browser", reason)
+        self.assertNotIn("Resolver.resolve", reason)
+
+    def test_preflight_catches_an_error_diagram_written_with_exit_zero(self):
+        reason = render.mmdc_preflight(
+            runner=_fake_mmdc(svg='<svg aria-roledescription="error"></svg>'),
+            which=self.WHICH)
+        self.assertIn("error diagram", reason)
+
+    def test_preflight_without_mmdc(self):
+        reason = render.mmdc_preflight(runner=_fake_mmdc(), which=lambda _n: None)
+        self.assertIn("not found on PATH", reason)
+
+    def test_cli_preflight_ok_exits_zero(self):
+        code, out, err = self._main(["--preflight"], _fake_mmdc())
+        self.assertEqual(code, 0)
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertIn("OK", out)
+        self.assertEqual(err, "")
+
+    def test_cli_preflight_failure_is_one_line_with_the_fix(self):
+        code, out, err = self._main(["--preflight"],
+                                    _fake_mmdc(returncode=1, stderr=_NO_BROWSER))
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertIn("Could not find the headless browser", err)
+        self.assertIn("install the headless browser", err)
+        self.assertIn("--skip-validate", err)
+        self.assertIn("unvalidated", err)
+
+    def test_cli_preflight_without_mmdc_exits_3(self):
+        code, _out, err = self._main(["--preflight"], _fake_mmdc(),
+                                     which=lambda _n: None)
+        self.assertEqual(code, 3)
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertIn("mermaid-cli", err)
+        self.assertIn("--skip-validate", err)
+
+    def test_cli_needs_a_bundle_unless_preflight(self):
+        code, _out, err = self._main([], _fake_mmdc())
+        self.assertEqual(code, 2)
+        self.assertIn("bundle", err)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            with open(path, "w") as fh:
+                json.dump(_train_bundle(), fh)
+            code, _out, err = self._main([path, "--preflight"], _fake_mmdc())
+        self.assertEqual(code, 2)
+        self.assertIn("--preflight", err)
+
+    def test_render_that_cannot_run_mmdc_prints_the_preflight_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            with open(path, "w") as fh:
+                json.dump(_train_bundle(), fh)
+            with open(path) as fh:
+                before = fh.read()
+            code, _pf_out, pf_err = self._main(
+                ["--preflight"], _fake_mmdc(returncode=1, stderr=_NO_BROWSER))
+            code, _out, err = self._main(
+                [path, "--diagrams-dir", os.path.join(d, "dg")],
+                _fake_mmdc(returncode=1, stderr=_NO_BROWSER))
+            with open(path) as fh:
+                self.assertEqual(fh.read(), before)        # bundle untouched
+        self.assertEqual(code, 1)
+        self.assertEqual(err, pf_err)                      # the same one line
+        self.assertNotIn("Resolver.resolve", err)
+
+    def test_a_bad_diagram_still_names_the_diagram_not_the_browser(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "b.json")
+            with open(path, "w") as fh:
+                json.dump(_train_bundle(), fh)
+            code, _out, err = self._main(
+                [path, "--diagrams-dir", os.path.join(d, "dg")],
+                _probe_ok_diagram_fails())
+        self.assertEqual(code, 1)
+        self.assertIn("mmdc failed to render", err)
+        self.assertIn("Parse error on line 2", err)
+        self.assertNotIn("headless browser", err)
+
+    def test_preflight_subprocess_with_a_fake_mmdc_on_path(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.py")
+        fake = ("#!{}\nimport sys\nargs = sys.argv[1:]\nif {}:\n"
+                "    sys.stderr.write({!r}); sys.exit(1)\n"
+                "open(args[args.index('-o') + 1], 'w').write("
+                "'<svg aria-roledescription=\"pie\"></svg>')\n")
+        for broken, rc in ((True, 1), (False, 0)):
+            with self.subTest(broken=broken), tempfile.TemporaryDirectory() as d:
+                mmdc = os.path.join(d, "mmdc")
+                with open(mmdc, "w") as fh:
+                    fh.write(fake.format(sys.executable, broken, _NO_BROWSER))
+                os.chmod(mmdc, 0o755)
+                env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
+                r = subprocess.run([sys.executable, script, "--preflight"],
+                                   capture_output=True, text=True, env=env)
+                self.assertEqual(r.returncode, rc, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(len((r.stderr if broken else r.stdout).splitlines()),
+                                 1, (r.stdout, r.stderr))
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ ROW_VARS = {
     "meta": ["bundle.meta", "view.meta", "view.members[].bundle.meta"],
     "ref": ["bundle.buckets.shipped[]", "bundle.buckets.in_flight[]",
             "bundle.buckets.rejected[]", "bundle.buckets.next_candidates[]",
-            "view.shipped[]", "bundle.series.new[]",
+            "view.shipped[]", "bundle.series.new[]", "bundle.series.new_opened[]",
             "bundle.series.carried_over[]", "bundle.forecast.candidates[].ref"],
     "loop": ["bundle.series.forecast_loop.landed[]",
              "bundle.series.forecast_loop.not_yet[]",
@@ -100,10 +100,14 @@ ROW_VARS = {
     "sym": ["module.symbols[]", "module.files[]"],
     "sev": ["module.symbols[].lifecycle[]", "module.files[].lifecycle[]"],
     "mtl": ["module.trains[].timeline[]"],
+    "newcomer": ["bundle.newcomers.new[]",
+                 "view.members[].bundle.newcomers.new[]"],
 }
 
-# Whole documents, addressable as roots.
-DOC_ROOTS = ("bundle", "view", "slice", "module")
+# Whole documents, addressable as roots. `quiet` is a second single-repo
+# bundle whose forecast is empty although items are open (`forecast.notes`,
+# #97 final gate); the main `bundle` keeps every forecast family filled.
+DOC_ROOTS = ("bundle", "view", "slice", "module", "quiet")
 
 # Placeholders that name no field: the agent writes them, by a rule the
 # template's "Placeholder rules" block documents.
@@ -352,6 +356,33 @@ def _rewindowed(bundle, frm, to):
     return b
 
 
+def _with_newcomers(bundle):
+    """The bundle with a gather's first-time-contributor fact (validation
+    finding 12): one newcomer, one author the check could not decide."""
+    b = copy.deepcopy(bundle)
+    url = "https://github.com/{}/{}".format(b["meta"]["owner"], b["meta"]["repo"])
+    b["newcomers"] = {
+        "collected": True, "before": b["meta"]["from"], "candidates": 2,
+        "new": [{"login": "alice", "first": "pr", "number": 7,
+                 "url": url + "/pull/7", "created_at": "2026-05-02T00:00:00Z"}],
+        "unknown": ["bob"], "not_checked": []}
+    return b
+
+
+def _commented_later(bundle):
+    """The bundle with a comment dated after May on its first issue: a later
+    gather of it holds a record the May view projects back to May's end
+    (meta.records_as_of / meta.gathered_at, validation finding 8)."""
+    b = copy.deepcopy(bundle)
+    issue = b["issues"][0]
+    issue["comments_list"] = list(issue.get("comments_list") or []) + [
+        {"id": 9001, "author": "alice", "author_association": "MEMBER",
+         "body": "still relevant", "created_at": "2026-06-10T00:00:00Z",
+         "url": issue["url"] + "#issuecomment-9001"}]
+    issue["updated_at"] = "2026-06-10T00:00:00Z"
+    return b
+
+
 def project_folds(ticket=None):
     """The two-member project store's folds (issue #107: both report caveats
     present). mod-a: May, then a later June gather, so its May view carries
@@ -360,13 +391,14 @@ def project_folds(ticket=None):
     the CI total partial (`workflow_stats_complete` false, one window in
     `workflow_stats_excluded`)."""
     members = {"Azure/mod-a", "Azure/mod-b"}
-    a = _rich_bundle("Azure", "mod-a", 40, edge_to="avm/res/net/pip",
-                     ticket=ticket)
-    b = _rich_bundle("Azure", "mod-b", 60, area="avm/res/net/pip",
-                     ticket=ticket)
+    a = _with_newcomers(_rich_bundle("Azure", "mod-a", 40,
+                                     edge_to="avm/res/net/pip", ticket=ticket))
+    b = _with_newcomers(_rich_bundle("Azure", "mod-b", 60,
+                                     area="avm/res/net/pip", ticket=ticket))
     kw_a = {"project": "proj", "repo": "Azure/mod-a", "members": members}
     kw_b = {"project": "proj", "repo": "Azure/mod-b", "members": members}
-    return [(a, kw_a), (_rewindowed(a, "2026-06-01", "2026-06-30"), kw_a),
+    return [(a, kw_a),
+            (_commented_later(_rewindowed(a, "2026-06-01", "2026-06-30")), kw_a),
             (_rewindowed(b, "2026-05-01", "2026-05-20"), kw_b),
             (_rewindowed(b, "2026-05-15", TO), kw_b)]
 
@@ -375,7 +407,7 @@ def build_corpus(tmp):
     """Run the documented pipeline on the fixture; return the documents."""
     # Single repo: store -> view.py -> link.py --series -> render.py.
     db = os.path.join(tmp, "journey.db")
-    _fold(db, [(_rich_bundle("o", "r", 40), {})])
+    _fold(db, [(_with_newcomers(_rich_bundle("o", "r", 40)), {})])
     bpath = os.path.join(tmp, "view", "bundle.json")
     spath = os.path.join(tmp, "series.json")
     # A prior installment, so `series` is not a first installment and every
@@ -417,8 +449,24 @@ def build_corpus(tmp):
         assert digest.main(["--store", pdb, "--project", "proj", "--from", FROM,
                             "--to", TO, "--ticket-pattern", r"ABC-\d+"]) == 0
     project_view = json.loads(out.getvalue())
+    # A quiet single repo: no milestones, no priority label, no approved open
+    # PR, so its forecast is empty and says why (`forecast.notes`); linked
+    # with an operator pattern that matches none of its labels
+    # (`forecast.priority_patterns`).
+    quiet_raw = _rich_bundle("o", "q", 40)
+    quiet_raw["milestones"] = []
+    qdb = os.path.join(tmp, "quiet.db")
+    _fold(qdb, [(quiet_raw, {})])
+    qpath = os.path.join(tmp, "quiet", "bundle.json")
+    with _quiet():
+        assert view.main(["--store", qdb, "--from", FROM, "--to", TO,
+                          "--out", qpath]) == 0
+        link.main([qpath, "--priority-label", "no such label"])
+    with open(qpath, encoding="utf-8") as fh:
+        quiet = json.load(fh)
     return {"bundle": bundle, "view": project_view, "slice": train_slice,
-            "module": module, "sprints_selected": sprints_selected}
+            "module": module, "sprints_selected": sprints_selected,
+            "quiet": quiet}
 
 
 # --------------------------------------------------------------- resolver ----
@@ -470,7 +518,7 @@ class Corpus:
     def __init__(self, docs):
         self.docs = docs
         self.top_keys = set()
-        for name in ("bundle", "view", "slice", "module"):
+        for name in DOC_ROOTS:
             self.top_keys |= set(docs[name])
 
     def _root(self, base):
@@ -565,6 +613,14 @@ class TestCorpusIsRich(_CorpusCase):
                     "artifacts", "feature_deltas", "timeline", "people"):
             self.assertTrue(b.get(key), key)
         self.assertTrue(b["forecast"]["candidates"])
+        q = self.corpus.docs["quiet"]["forecast"]
+        self.assertEqual(q["candidates"], [])
+        self.assertTrue(q["notes"])
+        self.assertEqual(q["priority_patterns"], ["no such label"])
+        # #97 final gate: the new omit-when-not-applicable keys are present
+        self.assertTrue(b["series"]["new_opened"])
+        self.assertTrue(any("prs_opened" in p for p in b["people"].values()))
+        self.assertTrue(any(f.get("own_pr_commits") for f in b["halls"]["fame"]))
         self.assertTrue(b["symbol_moves"]["links"])
         self.assertTrue(b["diagrams"]["truncated"])
         self.assertFalse(b["series"]["first_installment"])
@@ -917,6 +973,86 @@ class TestAttributionReadsLogins(_CorpusCase):
                     self.assertTrue(all(isinstance(x, str) for x in val), field)
                 else:
                     self.assertIsInstance(val, (str, type(None)), field)
+
+
+class TestFinalGateWording(unittest.TestCase):
+    """#97 final gate, validation findings 11, 14, 15, 16, 18, 19 and 21: the
+    template and the section guide say what the figures mean on a large
+    monorepo month, and cap long lists the way diagrams are capped."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tpl = _read(TEMPLATE)
+        cls.guide = _read(SECTIONS)
+        cls.tpl_sections = dict(_sections(cls.tpl))
+        cls.guide_sections = dict(_sections(cls.guide))
+
+    def test_long_lists_rule_with_a_showing_line(self):
+        # 19: a stated cap, a mandatory "Showing N of M" line and where the
+        # full list lives; the sections it names refer to it
+        rules = _rules_block(self.tpl)
+        self.assertIn("LONG LISTS", rules)
+        self.assertIn("at most 40 rows", rules)
+        self.assertIn("Showing N of M", rules)
+        self.assertIn("full list is in the bundle", rules)
+        for heading in ("Shipped this period", "Feature changes (add / drop / change)",
+                        "Content lifecycle (built / changed / dropped)",
+                        "Shipped by code area", "Decision trains"):
+            with self.subTest(section=heading):
+                self.assertRegex(self.tpl_sections[heading],
+                                 r"(LONG LISTS|Showing N of M)")
+        self.assertIn("**Length.**", self.guide)
+        self.assertIn("Showing N of M", self.guide)
+
+    def test_cross_cutting_trains_are_described_once(self):
+        # 15: a train touching more than 10 areas is summarised once
+        for text in (_rules_block(self.tpl), self.tpl_sections["Shipped by code area"],
+                     self.guide_sections["Shipped this period (+ by code area)"]):
+            self.assertIn("more than 10", text)
+            self.assertIn("Cross-cutting changes", text)
+
+    def test_monorepo_of_independent_prs_is_grouped_by_theme(self):
+        # 15
+        self.assertIn("MONOREPO OF INDEPENDENT PRS", self.tpl_sections["Decision trains"])
+        self.assertIn("**A monorepo of independent PRs**",
+                      self.guide_sections["Decision trains"])
+        for text in (self.tpl_sections["Decision trains"],
+                     self.guide_sections["Decision trains"]):
+            self.assertIn("theme", text)
+            self.assertIn("train ids", text)
+
+    def test_series_new_is_new_to_the_series(self):
+        # 18: no "first seen this window" gloss; new_opened is the window's
+        # new work
+        since = self.tpl_sections["Since last installment"]
+        self.assertNotIn("first seen this window", since)
+        self.assertIn("New to the series", since)
+        self.assertIn("`series.new_opened`", since)
+        self.assertIn("`series.new_opened`", self.guide_sections["Since last installment"])
+
+    def test_flow_is_the_whole_backlog(self):
+        # 21
+        self.assertIn("WHOLE open backlog",
+                      self.tpl_sections["Stalled, blocked & pile-ups"])
+        self.assertIn("Whole backlog, not the month",
+                      self.guide_sections["Stalled, blocked & pile-ups"])
+
+    def test_contributors_columns_and_score(self):
+        # 14 and 16
+        sec = self.tpl_sections["Contributors & community"]
+        self.assertNotIn("| Contributor | Authored |", sec)
+        self.assertIn("| Opened | PRs in scope |", sec)
+        self.assertIn("{person.prs_opened}", sec)
+        for text in (sec, self.guide_sections["Contributors & community (public)"]):
+            self.assertIn("commits_authored - own_pr_commits", text)
+
+    def test_empty_forecast_points_to_usage(self):
+        # 11 (c)
+        for text in (self.tpl_sections["Next-release forecast"],
+                     self.guide_sections["Next-release forecast"]):
+            self.assertIn("forecast.notes", text)
+            self.assertIn("USAGE §6.3", text)
+            self.assertIn("approved, no later change request", text)
 
 
 if __name__ == "__main__":

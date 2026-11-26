@@ -52,7 +52,13 @@ every train (no golden train was stalled under either rule), and so did
 in-flight `train-pr-44` of char_bundle_p2.json, whose PR was last updated
 2026-05-25T08:00:00Z: `idle_days` 6 at the reference date 2026-05-31,
 `last_activity_at` "2026-05-25T08:00:00Z", not stalled. char_bundle_p3c.json
-has no trains and did not change. Unlike test_extract, this gate
+has no trains and did not change. The #97 final gate (validation finding
+14: a commit that lands the person's own merged PR does not score again in
+the hall) re-captured char_bundle_p3b.json once, by a script that refused to
+write unless these were the only differences: `people.alice` and alice's
+`halls.fame` entry gained `own_pr_commits: 1` (commit c1 lands her merged
+PR #42) and that entry's `score` went from 3 to 2; the other four snapshots
+did not change. Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is
 canonical JSON: json.dumps(obj, sort_keys=True, indent=2).
@@ -69,6 +75,7 @@ import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -117,6 +124,9 @@ class CharacterizationGate(unittest.TestCase):
     """For each golden: assert the current enriched output reproduces the
     committed char_<name>.json snapshot exactly. The refactor in 7b-2 must keep
     this green."""
+
+    def setUp(self):
+        quiet(self)
 
     def _gate(self, golden_name):
         got = _pipeline(golden_name)

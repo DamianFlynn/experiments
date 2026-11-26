@@ -44,6 +44,21 @@ PROJECT_GRAPH = "project_module_graph"
 
 _RANK = {"shipped": 3, "in_flight": 2, "rejected": 1, "abandoned": 0}
 
+# report-template.md "LONG LISTS": a list with one row per item shows at most
+# this many rows and, when cut, ends with a "Showing N of M" line naming where
+# the full list lives (like the diagram caps).
+LIST_CAP = 40
+
+
+def capped(rows, unit, where):
+    """(the first LIST_CAP rows, the "Showing N of M" line or None)."""
+    rows = list(rows)
+    if len(rows) <= LIST_CAP:
+        return rows, None
+    return rows[:LIST_CAP], ("*Showing {} of {} {} — the full list is in the "
+                             "view (`{}`).*".format(LIST_CAP, len(rows), unit,
+                                                    where))
+
 
 def slug_dir(repo):
     return repo.replace("/", "__")
@@ -293,6 +308,19 @@ def build_report(view, texts, captions):
               "comments may be newer than the window.".format(
                   as_of, short(m["repo"]), to))
             W("")
+    # meta.records_as_of without meta.state_as_of (validation finding 8,
+    # omit-when-absent): the member's window was gathered after it ended, so
+    # what has no history is as of meta.gathered_at, not the window's end.
+    for m in members:
+        mm = member_meta(m)
+        rao = mm.get("records_as_of")
+        if rao and not mm.get("state_as_of"):
+            gathered = (mm.get("gathered_at") or "")[:10]
+            W("> **Gathered after the window** (`{}`): records are shown as of "
+              "{}, the end of this window; titles, labels, milestones and board "
+              "status are as gathered on {}.".format(
+                  short(m["repo"]), rao.get("instant"), gathered or "a later date"))
+            W("")
     W("Member repositories:")
     W("")
     for m in members:
@@ -369,6 +397,7 @@ def build_report(view, texts, captions):
     W("")
     W("| Train (anchor) | Repo | Kind | Outcome | Refs | Commits |")
     W("|---|---|---|---|---|---|")
+    trains, more = capped(trains, "trains", 'view["trains"]')
     for t in trains:
         anchor = graphstore.parse_id(t["id"][len("ptrain-"):])["local"]
         W("| `{}` — {} | {} | {} | {} | {} | {} |".format(
@@ -377,6 +406,9 @@ def build_report(view, texts, captions):
             t["kind"], t["outcome"],
             " ".join(train_refs(t)), len(t["commits"])))
     W("")
+    if more:
+        W(more)
+        W("")
     W("`related_work` (ticket-linked cross-repo clusters): {}".format(
         len(view["related_work"]) or "none"))
     W("")
@@ -396,12 +428,17 @@ def build_report(view, texts, captions):
         W("")
         W("| Item | Title | Train |")
         W("|---|---|---|")
-        for r in sorted(rows, key=lambda r: (r["type"], r["id"])):
+        rows, more = capped(sorted(rows, key=lambda r: (r["type"], r["id"])),
+                            "shipped items", 'view["shipped"]')
+        for r in rows:
             rec = by.get((r["type"], r["id"]), {})
             train = "`{}`".format(r["train"]) if r.get("train") else "—"
             W("| [{}#{}]({}) | {} | {} |".format(
                 r["type"], r["id"], r["url"], esc(rec.get("title"))[:80], train))
         W("")
+        if more:
+            W(more)
+            W("")
 
     # ============================ module ownership ============================
     W("## Module ownership")
@@ -464,6 +501,46 @@ def build_report(view, texts, captions):
         W("")
         W(mmd(sd, "timeline_gantt"))
         W("")
+        # newcomers (validation finding 12, omit-when-absent): the gather's
+        # first-time-contributor check for this member's window.
+        nc = b.get("newcomers")
+        if isinstance(nc, dict):
+            W("#### New contributors")
+            W("")
+            if not nc.get("collected"):
+                W("Not looked up for this window (gathered with --no-newcomers).")
+            elif nc.get("new"):
+                W("No PR / issue of theirs created before {}:".format(
+                    nc.get("before")))
+                W("")
+                W("| Contributor | First contribution |")
+                W("|---|---|")
+                for e in nc["new"]:
+                    W("| `{}` | {} [#{}]({}) |".format(
+                        e.get("login"), e.get("first"), e.get("number"),
+                        e.get("url")))
+            else:
+                W("No first-time contributors this window."
+                  if nc.get("covers_view", True) else
+                  "No first-time contributors in the part of this window that "
+                  "was checked.")
+            # a wider view merges its windows' facts: say so when some of the
+            # view was never checked (covers_view false)
+            if nc.get("collected") and nc.get("covers_view") is False:
+                wins = ", ".join("{} → {}".format(w.get("from"), w.get("to"))
+                                 for w in nc.get("windows") or []
+                                 if isinstance(w, dict))
+                W("")
+                W("Checked only for {}; the rest of this window was gathered "
+                  "without the check, so this list may be incomplete.".format(
+                      wins or "part of this window"))
+            undecided = sorted(set(nc.get("unknown") or [])
+                               | set(nc.get("not_checked") or []))
+            if nc.get("collected") and undecided:
+                W("")
+                W("Could not check whether these authors are new: {}.".format(
+                    ", ".join("`{}`".format(x) for x in undecided)))
+            W("")
         rels = b.get("releases", [])
         if rels:
             W("#### Releases")
@@ -539,25 +616,34 @@ def build_report(view, texts, captions):
             W("")
             W("| Kind | Subject | Detail / Name | Author | PR |")
             W("|---|---|---|---|---|")
-            for d in fd:
+            where = 'view["members"][].bundle["feature_deltas"]'
+            rows, more = capped(fd, "feature changes", where)
+            for d in rows:
                 pr = d.get("pr")
                 W("| {} | {} | {} | {} | {} |".format(
                     d.get("kind"), d.get("subject"),
                     esc(d.get("detail") or d.get("name"))[:60],
                     esc(d.get("author")) or "—", "#{}".format(pr) if pr else "—"))
             W("")
+            if more:
+                W(more)
+                W("")
             sym = [d for d in fd if d.get("subject") in ("symbol", "comment")]
             if sym:
                 W("##### Symbol-level changes")
                 W("")
                 W("| Detail | Kind | Before | After |")
                 W("|---|---|---|---|")
+                sym, more = capped(sym, "symbol-level changes", where)
                 for d in sym:
                     W("| {} | {} | `{}` | `{}` |".format(
                         esc(d.get("detail"))[:42], d.get("kind"),
                         esc(d.get("before") or "—")[:48],
                         esc(d.get("after") or "—")[:48]))
                 W("")
+                if more:
+                    W(more)
+                    W("")
             arts = b.get("artifacts", {})
             if arts:
                 W("#### Content lifecycle (built / changed / dropped)")
@@ -568,9 +654,15 @@ def build_report(view, texts, captions):
                                   if a.get("status") in ("removed", "replaced")),
                                  key=lambda a: a.get("name") or "")
                 if removed:
+                    removed, more = capped(
+                        removed, "removed / replaced artifacts",
+                        'view["members"][].bundle["artifacts"]')
                     for a in removed:
                         W("- `{}` ({}) — {}".format(
                             a.get("name"), a.get("kind"), a.get("status")))
+                    if more:
+                        W("")
+                        W(more)
                 else:
                     W("- {} artifacts, all `live` (none removed/replaced).".format(
                         len(arts)))

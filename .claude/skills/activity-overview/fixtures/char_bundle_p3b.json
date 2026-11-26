@@ -231,9 +231,10 @@
         ],
         "commits_authored": 1,
         "login": "alice",
+        "own_pr_commits": 1,
         "prs_merged": 1,
         "prs_reviewed": 0,
-        "score": 3
+        "score": 2
       },
       {
         "areas": [
@@ -390,6 +391,7 @@
       "modules": [
         "avm/res/network/firewall-policy"
       ],
+      "own_pr_commits": 1,
       "prs_authored": 1,
       "prs_merged": 1,
       "prs_reviewed": 0,
