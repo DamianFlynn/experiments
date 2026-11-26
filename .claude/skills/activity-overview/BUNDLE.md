@@ -16,17 +16,23 @@ The pipeline's **product is this structured view**, not the Markdown report — 
 report is just one renderer over it, and other formatters (changelog, social,
 video-script, dashboards) consume the same view. The contract:
 
-- **Versioned.** `meta.schema_version` (currently `1`) identifies the shape on
-  BOTH entry points — the single-repo bundle and the multi-repo project view (and
-  each `members[].bundle.meta`). A formatter should read it and refuse a version it
-  doesn't understand. Bumps are recorded here.
+- **Versioned — with a known gap.** The view shape documented here is version `1`.
+  The code does not yet stamp it consistently: the bundle `gather` assembles in memory
+  carries `meta.schema_version: 1`, but a `view.py` bundle (and so a linked/rendered one)
+  and each `members[].bundle.meta` carry **no** `meta.schema_version`, and the
+  `digest.py` project view's `meta.schema_version` is the **store** schema version
+  (`graphstore.SCHEMA_VERSION`, currently `2`), not this document's. A formatter should
+  check for the keys it needs (as `examples/formatters/shipped_changelog.py` does) rather
+  than rely on that number. Bumps are recorded here.
 - **Two entry points, same shape family.** Single-repo: the enriched bundle view
   (`extract` → `link.py`) — keys documented below. Multi-repo project: `python3
   digest.py --store <db> --project <name> --from … --to …` emits the merged
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
-  halls, modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
-  canonical JSON (`sort_keys`; `view.py` writes the raw view the same way), so output is
-  diff-stable. **Object key order carries no meaning (issue #100):** every list derived
+  halls, modules, related_work}` (each `members[].bundle` is a single-repo view; the
+  project `meta` is `{project, repos, from, to, schema_version}`). `digest.py` and
+  `view.py` write `sort_keys` JSON; `link.py` and `render.py` rewrite the bundle view with
+  `indent=2` without re-sorting keys — still deterministic, because **object key order
+  carries no meaning (issue #100):** every list derived
   from an object (`timeline`, `feature_deltas`, the content-timeline diagram) has an
   explicit, total sort key, so enriching a bundle gives the same result whatever order its
   objects' keys are in — a member taken from `digest.py` output and re-enriched equals the
@@ -99,8 +105,10 @@ as bare SHAs in `trains[].commits`.)
 Field lists below are the core shapes; the grouped sections further down document
 the rest (engagement, code areas, trains, people/flow).
 
-- `meta` — `owner, repo, from, to, branches, base_branch, clone_dir, period, prev_bundle,
-  schema_version`. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
+- `meta` — the bundle `gather` assembles in memory (and folds; never written to disk) has
+  `owner, repo, from, to, branches, base_branch, clone_dir, ref_date, clone_sha, clone_mode,
+  boundary_dropped_commits, period, prev_bundle, schema_version`; a **view** carries the
+  subset listed under "A view … carries" below. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
   from it is a stacked/fork contribution (merged into another branch, not main) — kept in `prs`
   as context but not counted as shipped-to-main (see `commits`/`date` note below and trains).
   gather takes it from `--branches` (first entry) or a manifest member's `branch`, else the
@@ -112,15 +120,19 @@ the rest (engagement, code areas, trains, people/flow).
   determine it, the overlapped windows disagree, or the store was folded before #84; `link`
   then counts every merged PR as merged into the mainline (no stacked-PR detection) and
   `extract` warns on stderr when that decides anything.
-  Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
-  It pins the exact source tree (edges are a pure function of source), which is the basis for
-  the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,
-  idempotent by identity. **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` | `none`)
-  records how gather obtained the clone (see `gather.prepare_clone`); it is in the bundle
-  `acquire` assembles and is not folded into the store. (Store-only — see `STORE.md`; this bundle shape is the
-  transient view `extract` materializes from the store, not a produced file.)
+  Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against
+  (provenance: stored per window, #94). A re-gather does not return to it: it fetches and
+  checks out the default branch's current head, so re-gathering a past window builds its
+  structure from today's tree. **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` |
+  `none`) records how gather obtained the clone (see `gather.prepare_clone`), and
+  **`boundary_dropped_commits`** lists in-window commits whose diffs were dropped at the
+  shallow-clone boundary; both are in the bundle `acquire` assembles only — they are not
+  folded into the store and never appear in a view. (Store-only — see `STORE.md`; this
+  bundle shape is the transient view `extract` materializes from the store, not a produced
+  file.)
   A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
-  to` (+ `clone_sha`), **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).
+  to, base_branch, branches` (+ `clone_sha`, `state_as_of`, `facts_windows` when they apply),
+  **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).
   `period` is the window `compute_buckets` and `build_forecast` limit to (`link.window_period`:
   `period`, else `{from, to}`), so items the store holds from other windows — or old items
   gather pulled because they were updated in the window — fall in no bucket. `ref_date` frames

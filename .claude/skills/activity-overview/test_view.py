@@ -280,9 +280,15 @@ class TestEndToEnd(_TmpCase):
 # --- docs contract -------------------------------------------------------------
 
 _DOCS = ("SKILL.md", os.path.join("commands", "activity.md"))
+# Operator docs whose command lines must also name real scripts and accepted
+# flags (issue #96); they need not walk the whole gather -> render procedure.
+_COMMAND_DOCS = _DOCS + (
+    "REFERENCE.md", os.path.join("docs", "USAGE.md"),
+    os.path.join("samples", "README.md"), os.path.join("examples", "README.md"))
 # Scripts whose argv is hand-rolled (no argparse --help to read flags from):
 # the exact flags each accepts. link.py: `BUNDLE [--slice ID | --series PATH]`.
-_HAND_ROLLED = {"link.py": {"--slice", "--series"}, "transcript.py": set()}
+_HAND_ROLLED = {"link.py": {"--slice", "--series"}, "transcript.py": set(),
+                "examples/formatters/shipped_changelog.py": set()}
 _PY_CMD = re.compile(r"python3\s+(\S+\.py)\b([^\n]*)")
 # Where the command's own argv ends (pipe / redirect / chain / comment). `<x>`
 # is a placeholder in these docs, never an input redirect.
@@ -349,7 +355,7 @@ class TestDocsContract(unittest.TestCase):
                 self.assertIn(needed, scripts, "{} lacks {}".format(doc, needed))
 
     def test_every_command_names_a_real_script_and_accepted_flags(self):
-        for doc in _DOCS:
+        for doc in _COMMAND_DOCS:
             cmds = self._cmds(doc)
             self.assertTrue(cmds, doc)
             for cmd in cmds:

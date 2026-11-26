@@ -72,11 +72,19 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    - **IaC dependency edges:** if `bicep` and/or `terraform` are on `PATH`, gather
      resolves inter-area dependency edges (build-only) into `code_graph.areas[].edges` and records
      `code_graph.edge_extraction` (`resolved`/`timeout`/`failed`/`skipped`); absent the CLIs (or
-     the module registry), edges are left empty and the rest of the run is unaffected.
-   - **Roll-up / resume are store-native.** A long view is a wider window over the store
-     (no separate roll-up artifact); a refresh re-folds the same window against the pinned
-     `meta.clone_sha` (idempotent dedup keeps it overlap-safe). The flat-bundle `--rollup` /
-     `--resume` / `--out` flags were retired with the bundle file.
+     the module registry), those build edges are left empty and the rest of the run is
+     unaffected. Add **`--structural-iac`** to also scan the whole tracked tree statically (no
+     CLI needed) for every Terraform module dir's and Bicep `<area>/main.bicep`'s direct
+     module references, so modules nobody touched in the window keep their edges (manifest
+     members always get this scan); use it on a monorepo such as
+     `Azure/bicep-registry-modules`.
+   - **Roll-up / refresh are store-native.** A long view is a wider window over a store
+     that holds its months (no separate roll-up artifact; its CI statistics are the sum of
+     the gathered windows inside it, its structure the latest one's — `meta.facts_windows`).
+     A refresh re-gathers the same window into the same store: the fold is idempotent, and
+     the clone is fetched and checked out at the default branch's current head
+     (`meta.clone_sha` records which tree; it is not re-used). gather writes no bundle file
+     (there is no `--out`); its only `--resume` is the manifest one below.
    - **Multi-repo project.** To fold several repos under one logical
      project (e.g. an Azure Verified Modules — Terraform constellation, where each
      module is its own repo), pass a **manifest** instead of `--owner/--repo/--from/--to`
@@ -122,9 +130,13 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    python3 validate.py workspace/journey.db
    ```
    Self-contained on a store (`edge_set` / `no_drift` / `idempotency` self-source their raw
-   bundle via `extract`; an external `--bundle` is an optional cross-check, never required). For a
-   multi-repo project: `python3 validate.py workspace/journey.db --project <name>` (adds a
-   project-wide people check).
+   bundle via `extract`; an external `--bundle` is an optional single-repo cross-check,
+   never required). It reports nine checks per repo — `target`, `referential_integrity`,
+   `participant_completeness`, `provenance`, `no_fabrication`, `schema_conformance`,
+   `edge_set`, `no_drift`, `idempotency` — and proves the store consistent with its own
+   records, not that the records match GitHub (`docs/USAGE.md` §5.5). For a multi-repo
+   project: `python3 validate.py workspace/journey.db --project <name>` (adds the
+   project-wide `no_drift_people` and `member_status` checks).
 3. **Materialize the bundle view** (store → `workspace/view/bundle.json`, offline):
    ```bash
    python3 view.py --store workspace/journey.db --from FROM --to TO --out workspace/view/bundle.json
@@ -178,8 +190,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    the member's own bundle view file (steps 3–5). The cross-repo module graph is
    `render.emit_project_module_graph(view["module_edges"])`.
 8. **Community-call transcript (optional).** If the user provides a
-   community-call transcript (a local file passed explicitly, or a `transcript`
-   path in `projects.json`) — no network, user-provided only — normalize it to
+   community-call transcript (a local file passed explicitly, e.g. `/activity …
+   --transcript PATH`) — no network, user-provided only — normalize it to
    clean prose first:
    ```bash
    python3 transcript.py path/to/call.vtt > workspace/view/transcript.txt

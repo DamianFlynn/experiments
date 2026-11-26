@@ -34,7 +34,7 @@ renderer over that view; changelogs, dashboards or slide decks are others.
 
 | Capability | Question it answers | Primary tool(s) |
 |---|---|---|
-| Window digest | What shipped / was rejected / is in flight in `[from, to]`? | `gather` → `link` → `render` → report |
+| Window digest | What shipped / was rejected / is in flight in `[from, to]`? | `gather` → `validate` → `view` → `link` → `render` → report |
 | Decision trains | How did an idea become a change? (issue → PR → commits → follow-ups) | `link.build_trains`, `link --slice` |
 | Next-release forecast | What is likely to land next, and on what evidence? | `link.build_forecast` |
 | Progressive series | What's new vs carried over since last month? Did last month's forecast land? | `link --series` (`series.py`) |
@@ -98,7 +98,7 @@ flowchart TB
     V["validate.py<br/>9 audits"]
   end
   subgraph L4["4 · Read and enrich (offline)"]
-    X["extract.py<br/>materialize a window view"]
+    X["extract.py + view.py<br/>materialize a window view"]
     D["derive.py<br/>pure projections"]
     K["link.py<br/>trains, buckets, forecast,<br/>series, slices"]
     DG["digest.py<br/>multi-repo merge"]
@@ -144,7 +144,7 @@ correct. The storage layer can therefore hold many windows, and since issue #85 
 scope every view to its window: one store can grow month after month and each month's view
 holds only that month's records (with continuity carried by the series file, §5.5). What a
 store holding several windows still cannot give a past month is listed in
-[§10](#10-constraints-and-known-limitations) item 8.
+[§10](#10-constraints-and-known-limitations) items 7–9.
 
 ### 5.2 Decision train
 
@@ -168,7 +168,7 @@ Each train gets an **outcome** (shipped / in_flight / rejected / abandoned), a
 A single-repo `link` train holds every attempt — rejected, shipped and still-open PRs — with
 each PR's own outcome, and every issue its PRs close; PRs and issues are joined only by
 `closes`, so a `cross_ref` (a mention) is traversal context, never membership (#93, §10
-item 17).
+item 11).
 
 ### 5.3 Buckets
 
@@ -224,7 +224,7 @@ sequenceDiagram
   participant G as gather.py
   participant S as journey.db
   participant V as validate.py
-  participant DG as digest.py
+  participant X as view.py
   participant L as link.py
   participant R as render.py
   participant N as Narrator sub-agents
@@ -234,9 +234,9 @@ sequenceDiagram
   G->>S: fold_bundle (idempotent upserts)
   C->>V: validate journey.db
   V-->>C: RESULT OK (or ERROR, then stop)
-  C->>DG: digest --store --project --from --to
-  DG->>S: extract + enrich per member
-  DG-->>C: structured view (JSON)
+  C->>X: view --store --from --to --out bundle
+  X->>S: extract the window
+  X-->>C: raw bundle view (JSON)
   C->>L: link bundle --series series.json
   L-->>C: trains, buckets, forecast, series block
   C->>R: render bundle
@@ -249,6 +249,10 @@ sequenceDiagram
   end
   C-->>Op: sourced Markdown report + store path
 ```
+
+For a multi-repo project the same steps run per member (`view.py --project P --repo
+owner/repo`), and `digest.py` adds the merged project view (cross-repo trains, merged
+shipped/people/halls/modules, `module_edges`).
 
 ## 7. Deployment views
 
@@ -265,18 +269,22 @@ flowchart LR
   subgraph ci["GitHub Actions: activity-overview.yml"]
     t["tests job<br/>offline suite, py 3.11-3.13"]
     lv["live job<br/>gather then validate<br/>schedule: 1st and 15th"]
+    sj["spotlight job<br/>pinned week: gather, validate,<br/>ci_spotlight_integration"]
   end
   gh[("GitHub")]
   py -->|read-only token| gh
-  lv -->|ACTIVITY_TEST_TOKEN| gh
+  lv -->|workflow built-in token| gh
+  sj -->|workflow built-in token| gh
 ```
 
 - **Laptop (primary).** Claude Code runs the pipeline and writes the narrative. Stores are
   ordinary files; keep one workspace per *report stream*.
 - **CI (assurance).** The bundled workflow runs the offline test suite on every change and a
   scheduled **live** trust-gate run (gather → validate, default target
-  `Azure/bicep-registry-modules`, trailing 14 days). CI stops at the trust gate; it does not
-  author narrative.
+  `Azure/bicep-registry-modules`, trailing 14 days) and a **spotlight** gate over a pinned
+  historical week. Both use the workflow's built-in token (public targets; dispatch input
+  `token_source: secret` switches to the `ACTIVITY_TEST_TOKEN` secret for private ones). CI
+  stops at the trust gate; it does not author narrative.
 
 ## 8. Usage scenarios
 
@@ -289,17 +297,17 @@ what's new vs carried over, whether last month's forecast landed, and the next f
 flowchart LR
   subgraph M1["September installment"]
     g1["gather 09-01..09-30"] --> s1[("stores/2026-09.db")]
-    s1 --> l1["validate, digest,<br/>link --series"]
+    s1 --> l1["validate, view,<br/>link --series"]
     l1 --> f1["forecast F1<br/>series: first installment"]
   end
   subgraph M2["October installment"]
     g2["gather 10-01..10-31"] --> s2[("stores/2026-10.db")]
-    s2 --> l2["validate, digest,<br/>link --series"]
+    s2 --> l2["validate, view,<br/>link --series"]
     l2 --> f2["new / carried over<br/>F1 landed vs not yet<br/>forecast F2"]
   end
   subgraph M3["November installment"]
     g3["gather 11-01..11-30"] --> s3[("stores/2026-11.db")]
-    s3 --> l3["validate, digest,<br/>link --series"]
+    s3 --> l3["validate, view,<br/>link --series"]
     l3 --> f3["new / carried over<br/>F2 landed vs not yet<br/>forecast F3"]
   end
   f1 -. snapshot .-> idx[("series.json<br/>one entry per month")]
@@ -320,8 +328,10 @@ the month before it — new vs carried over, and whether each forecast landed or
 instead of adding a second one. Each monthly store stays small and independently auditable. Two
 rules keep the chain honest: capture each installment **at month-end** (open work, milestones
 and board status are read as they are at gather time, so a past month cannot be re-created
-later), and gather a quarter or year as **its own window** when you need a roll-up (CI
-statistics and other per-repo facts describe only the window they were gathered for).
+later), and for a roll-up either gather the quarter or year as **its own window** or view it
+over a store that holds all its months (its CI statistics are then their sum, its structure
+the last month's — §10 item 8). The diagram shows one store per installment; one store
+that grows month by month works too, with the limits in §10 items 7–9 (USAGE §2.1).
 
 ### 8.2 Scenario B — forecasting from in-flight work
 
@@ -426,7 +436,7 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 | **Verifiability** | Every fact carries a `{type, id, url}` ref; narrator citations are filtered to the slice. |
 | **Determinism** | Sorted JSON, ordered range queries, pure projections; same store → byte-identical view. |
 | **Idempotency** | Identity-keyed upserts and set-semantics ledger; re-folds are no-ops. Proven by `validate.idempotency`. |
-| **Trust** | `validate.py` gates every report (read-only; a check that cannot run fails, never disappears): target exists, provenance, referential integrity, schema conformance, no fabrication, participant completeness, no drift, idempotency (+ project-wide people). |
+| **Trust** | `validate.py` gates every report (read-only; a check that cannot run fails, never disappears). Nine checks per repo, in this order: target, referential integrity, participant completeness, provenance, no fabrication, schema conformance, edge set, no drift, idempotency; plus the project-wide people and member-status checks for a multi-repo project. |
 | **Graceful degradation** | Missing CLIs, scopes, boards or FTS5 produce empty or clearly-flagged sections, not failures; IaC gaps are counted (`edge_extraction`). |
 | **Offline readers** | Only `gather` (and opt-in `--complete` backfill) touch the network; everything else replays from the store. |
 | **Security** | Read-only token; no write-back; secrets only in the environment; recognition-not-blame by default. |
@@ -434,155 +444,142 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 
 ## 10. Constraints and known limitations
 
-These are real, current limits — plan around them:
+These are real, current limits — plan around them. Stores gathered before some fixes need
+a re-gather to benefit from them (person ids, base branch, per-window facts, commit times,
+nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them once.
 
 1. **Cross-repo Bicep `depends_on` needs a declared publisher and the public registry.**
-   Since #92 a manifest member that declares `bicep_registry_prefix` (e.g. `"avm/"` on
+   A manifest member that declares `bicep_registry_prefix` (e.g. `"avm/"` on
    `Azure/bicep-registry-modules`) receives cross-repo `depends_on` edges from other members'
    `br/public:<path>:<tag>` (or `br:mcr.microsoft.com/bicep/<path>:<tag>`) references, to its
-   module area `<path>`. The registry path must equal the module's directory in that repo (true
-   for BRM). Private registries (`br:<acr>/…`), template specs, user aliases (including a
-   `bicepconfig.json` alias that points at the public registry) and public modules no member
-   declares stay unresolved. A single-repo gather never resolves across repos.
-2. **Bicep module graph is window-scoped unless the structural scan runs.** Without it, Bicep
-   edges are built only for areas changed in the window, and only with the `bicep` CLI. The
-   whole-tree structural scan (#92) runs for every manifest member and for a single-repo gather
-   given `--structural-iac`; it adds every module's **direct** edges statically. Transitive
-   Bicep edges still come only from `bicep build`. The scan reads only `<area>/main.bicep`
-   entrypoints: a module whose entry file has another name, and `import … from 'br/public:…'`
-   type imports, are not dependencies in this graph.
-3. **Forecast depends on planning hygiene.** Candidates require a next milestone or one of the
-   recognized priority labels (`priority/high`, `priority/critical`, `p0`, `p1`,
-   `high-priority`, `critical`). Repos with different label names need the constant extended.
-   "In motion" counts any open PR that references an item, however stale or draft (LLD §14.5).
-4. **Default branch only.** The commit walk covers the checked-out default branch; extra
-   `--branches` entries are recorded as provenance only. The *mainline* that "shipped" counts
-   merges into (`meta.base_branch`) is the repo's real default branch (or `--branches` / a
-   manifest member `branch`), stored per window and carried by every view (issue #84). Stores
-   gathered before #84 have none: their views warn and count every merged PR as shipped until
-   re-gathered.
+   module area `<path>` (#92). The registry path must equal the module's directory in that
+   repo (true for BRM). Private registries (`br:<acr>/…`), template specs, user aliases
+   (including a `bicepconfig.json` alias that points at the public registry) and public
+   modules no member declares stay unresolved. A single-repo gather never resolves across
+   repos.
+2. **The Bicep whole-tree graph reads `main.bicep` entrypoints only.** The structural scan
+   (#92) runs for every manifest member and for a single-repo gather given
+   `--structural-iac`; it adds every module's **direct** edges statically. Without it, Bicep
+   edges are built only for areas changed in the window, and only with the `bicep` CLI.
+   Transitive Bicep edges come only from `bicep build`. A module area is a directory with a
+   tracked `<area>/main.bicep`: a module whose entry file has another name (common in
+   landing-zone repos), and `import … from 'br/public:…'` type imports, are not in the graph.
+3. **Terraform transitive edges come from the build.** Every `module {}` block an area
+   declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
+   (`module.a.module.b`) are added as transitive only by a successful `terraform init` +
+   `graph`: calls whose module tree holds no resources are not in the graph, and without
+   init's `modules.json` a nested call's target is unknown and is not folded. Single-repo
+   gathers emit no Terraform edges without `terraform` unless given `--structural-iac`;
+   manifest gathers always get the static direct edges for every module dir.
+4. **The commit walk covers the default branch.** The clone checks out the repo's default
+   branch and the commit, file and symbol walks read it; extra `--branches` entries are
+   provenance only. The *mainline* that "shipped" counts merges into (`meta.base_branch`) is
+   the repo's real default branch, or `--branches` / a manifest member `branch` (#84),
+   stored per window and carried by every view.
 5. **Open items are fetched every run.** All open PRs/issues are pulled regardless of window
    (they feed in-flight/forecast), each with per-item review/timeline/comment calls. On very
    busy repos (e.g. BRM) a gather is API-heavy. On a rate limit, gather waits for the reset
    (announced on stderr, at most `ACTIVITY_RATE_LIMIT_MAX_WAIT`, default one hour) and
    continues; any other 403 (SSO, scope) still fails fast with GitHub's headers.
-6. **No standalone `extract` CLI.** The on-disk bundle view is obtained via `digest.py`
-   (which works for single repos too); see USAGE §4.
-7. **Narrative is not in CI.** The live CI job stops at the trust gate.
-8. **A store holding several windows shows past months with today's record state.** Views
-   are window-scoped (#75, #85): a view carries its window (`meta.period`, `meta.ref_date`)
-   and holds only the records a gather of that window collects — PRs merged/closed in it or
-   open by its end, issues closed/updated in it or open by its end or closed/cross-referenced
-   by its PRs, its commits and their code/symbol events, its releases (BUNDLE.md "Window
-   scope") — so trains, timeline, feature deltas, modules, people and halls are the window's,
-   on member bundles and the project view alike. What remains: records are stored
+6. **No historical in-flight state.** `gather` reads open PRs/issues, milestones, board
+   status and the checkout as they are *now*; re-gathering a past month reproduces its
+   delivery history, not what was open or forecastable at the time.
+7. **A store holding several windows shows past months with today's record state.** Views
+   are window-scoped (#75, #85; BUNDLE.md "Window scope"), but PR/issue records are stored
    latest-wins, so a past month's view shows each PR/issue as the latest gather saw it
-   (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when). An
-   item that was open at the end of that month but has closed since is not in its view
-   (its stored state is closed, outside the month); an item updated in that month and again
-   later is in the later month's view only. The per-repo facts are per window (item 9), so a
-   person's `modules`/`areas` in a month's view are computed with that month's code graph; a
-   view spanning several gathered windows uses the latest one's, and can still match a symbol
-   move across them (LLD §14.5).
-   **People in a multi-repo project (#88).** A member bundle lists only the people with a
-   contribution in that member's window, with that repo's areas; the project view sums each
-   person's counts across members (nobody is counted twice), combines dates and review
-   latency, qualifies areas as `<repo>::<area>` and ranks `halls.fame` on those totals. The
-   stored person node stays the project-wide union (what `validate` checks).
-9. **Per-repo facts are per gathered window, not per day.** Since #94 each fold also records
-    its window's `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` and clone sha
-    (STORE.md "Meta", `facts:`), and a view of exactly a gathered window shows that window's.
-    Other views are assembled from whole windows: CI statistics are the sum of the gathered
-    windows lying inside the view (absent for a sub-window or a straddling view, marked
-    incomplete when days are missing), and the structure is the latest overlapping window's
-    — so a quarter view attributes code areas with its last month's (window-scoped) code
-    graph. `meta.facts_windows` says which windows. Stores folded before #94 keep the
-    latest-wins values until re-gathered.
-10. **Current-state edges are retracted only on evidence.** Since #95 a fold keeps
-    `depends_on`, `owns`, `in_milestone`, `in_iteration` and `blocks` equal to what the store's
-    inputs imply (STORE.md "Current-state edges"): a removed module `source`, a CODEOWNERS
-    change, an item moved off a milestone or sprint, a blocker edited away all drop their
-    edge. What is left: a `depends_on` edge goes only when a resolved build of its area or the
-    whole-tree structural scan shows it gone (a single-repo store without `--structural-iac`
-    and without `bicep`/`terraform` keeps the edges of areas no later window rebuilt), a
-    transitive edge only on a new build, and an area's owners only when a later window lists
-    the area; the item relations follow the last-folded record, so folding an older bundle
-    after a newer one brings its older relations back. On a multi-window store `validate`
-    checks these edge types exactly once a fold since #95 has maintained them (and every
-    window has its per-window facts); people's areas, a store last folded before #95 and a
-    window without facts stay WARN.
-11. **Terraform transitive edges come from the build.** Every `module {}` block an area
-    declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
-    (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:
-    calls whose module tree holds no resources are not in the graph, and without init's
-    `modules.json` a nested call's target is unknown and is not folded. Single-repo gathers emit
-    no Terraform edges at all without `terraform` unless given `--structural-iac`; manifest
-    gathers always get the static direct edges for every module dir. A nested module dir
-    under `modules/<name>/` (`modules/sub/inner/*.tf`) is its own area since #101; stores
-    gathered earlier keep those files under `modules/<name>` until re-gathered.
-12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
-    status as they are *now*; re-gathering a past month reproduces its delivery history, not
-    what was open or forecastable at the time.
-13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
-    commit's git author to the login PR/issue/review records use (GitHub's commits listing per
-    SHA, then a `users.noreply.github.com` email), so a PR author and their commits are one
-    person. A commit whose email GitHub links to no account and that has no noreply email
-    stays a separate person keyed by its git name and flagged `login_resolved: false` — never
-    merged with a login on a guess. Stores folded before this change key commit authors by git
-    name: re-gather them into a fresh store rather than folding new windows on top.
-14. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the causal
-    spine and judges the outcome from the nodes it reached (same vocabulary as `link`, plus
-    `direct_push` for commits that landed with no PR). A closed issue without a close reason
-    counts as completed, and a file renamed away keeps its old path `alive` (the ledger records
-    the rename under the new path). An area shared by several members is unioned unless the
-    query names one (`owner/repo::area` or `--repo`).
-15. **A partial manifest gather is flagged, not completed.** One failing member no longer
-    stops a manifest gather (#77): the others are folded, gather exits 1, and each member's
-    outcome per window is kept in the store (`member_status`), so `validate` fails the
-    project and `digest`/`view` warn until `gather --resume` completes it. The digest and
-    view JSON themselves do not yet carry the incomplete members (LLD §14.5); a formatter
-    must rely on the gate.
-
-15. **Timeline order needs a re-gather for old stores.** Since #82 the view's `timeline`
-    orders code events by the commit's full committer timestamp, so a commit at 09:00 sorts
-    after a comment at 08:00 the same day. Commits folded before that change (and backfilled
-    commits) only have a day, so their events still sort before that day's comments.
-16. **Series continuity is per bundle and by bucket.** `series.json` keeps one entry per
-    window and compares each installment with the window before it (#86), but it is kept per
-    single-repo bundle (no project-view series), it only sees items that are in one of this
+   (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when).
+   An item that was open at the end of that month but has closed since is not in its view;
+   an item updated in that month and again later is in the later month's view only; its
+   in-flight, next-candidate and forecast sets reflect today's open items.
+8. **Per-repo facts are per gathered window, not per day.** Each fold records its window's
+   `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` and clone sha (#94), and a
+   view of exactly a gathered window shows that window's. Other views are assembled from
+   whole windows: CI statistics are the sum of the gathered windows lying inside the view
+   (absent for a view inside one window or straddling two; `workflow_stats_complete: false`
+   when days are missing), and the structure is the latest overlapping window's, so in a
+   quarter view files changed only in an earlier month have no code area.
+   `meta.facts_windows` says which windows.
+9. **Current-state edges are retracted only on evidence.** Each fold keeps `depends_on`,
+   `owns`, `in_milestone`, `in_iteration` and `blocks` equal to what the store's inputs imply
+   (#95; STORE.md "Current-state edges"). What is left: a `depends_on` edge goes only when a
+   resolved build of its area or the whole-tree scan shows it gone (a single-repo store
+   without `--structural-iac` and without `bicep`/`terraform` keeps the edges of areas no
+   later window rebuilt), a transitive edge only on a new build, and an area's owners only
+   when a later window lists the area. The item relations follow the last-folded record, so
+   folding an older window after a newer one brings its older relations back — fold oldest
+   first.
+10. **Forecast depends on planning hygiene.** Candidates require a next milestone (one with a
+    due date) or one of the recognized priority labels (`priority/high`, `priority/critical`,
+    `p0`, `p1`, `high-priority`, `critical`); repos with other label names need
+    `link.HIGH_PRIORITY_LABELS` extended. "In motion" counts any open PR that closes or
+    references an item, however old or draft.
+11. **Trains follow closing references.** A `link` train holds every PR that targets the
+    mainline — shipped, open or rejected — joined with the other PRs that close the same
+    issues, and lists every issue they close (#93). Only a closing keyword (`Fixes #N`,
+    `Closes #N`, … in the PR title or body) joins a PR to an issue: a mention, a timeline
+    cross-reference or a link made only in the PR's Development sidebar does not (issue
+    #105), so such a PR is its own train (`train-pr-<n>`). A PR closing several issues joins
+    every PR that closes any of them. An unmerged PR into another branch is in no train.
+12. **Series continuity is per bundle and by bucket.** `series.json` keeps one entry per
+    window and compares each installment with the window before it (#86), but it is kept
+    per single-repo bundle (no project-view series), it only sees items in one of this
     window's buckets (in-flight work that went quiet drops out of *carried over*), and
     refreshing an earlier month does not recompute the later months' already-written series
     blocks (`link` names them on stderr). A month recorded after a later one is marked
     `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
-17. **Trains follow closing references.** A `link` train holds every PR that targets the
-    mainline — shipped, open or rejected — joined with the other PRs that close the same issues,
-    and lists every issue they close (#93). Only a closing keyword (`Fixes #N`, `Closes #N`, …
-    in the PR title or body) joins a PR to an issue: a mention, a timeline cross-reference or a
-    link made only in the PR's Development sidebar does not, so such a PR is its own train
-    (`train-pr-<n>`). A PR closing several issues joins every PR that closes any of them. Stores
-    gathered before #93 have no PR head repo, so a stacked PR whose base branch name is shared
-    by two PRs' heads (forks' `patch-1`) is attached to neither until re-gathered.
+13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
+    commit's git author to the login PR/issue/review records use (GitHub's commits listing
+    per SHA, then a `users.noreply.github.com` email), so a PR author and their commits are
+    one person (#78). A commit whose email GitHub links to no account and that has no
+    noreply email stays a separate person keyed by its git name and flagged
+    `login_resolved: false` — never merged with a login on a guess. Commits fetched by
+    `spotlight --complete` backfill keep the git name and have no `committed_at`.
+14. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the
+    causal spine and judges the outcome from the nodes it reached (same vocabulary as
+    `link`, plus `direct_push` for commits that landed with no PR). A closed issue without a
+    close reason counts as completed, and a file renamed away keeps its old path `alive`
+    (the ledger records the rename under the new path). An area shared by several members
+    is unioned unless the query names one (`owner/repo::area` or `--repo`).
+15. **A partial manifest gather is flagged, not completed.** One failing member does not
+    stop a manifest gather (#77): the others are folded, gather exits 1, and each member's
+    outcome per window is kept in the store (`member_status`), so `validate` fails the
+    project and `digest`/`view` warn until `gather --resume` completes it. The digest and
+    view JSON do not carry the incomplete members; a formatter must rely on the gate.
+16. **The trust check proves consistency, not truth.** See *What the trust gate proves*
+    below: a store-only audit cannot detect a record deleted together with its edges, a
+    consistently rewritten record or a wrong change ledger. A repo gathered under a name it
+    no longer has (renamed or transferred) fails `provenance`, because GitHub returns its
+    links under the new name.
+17. **Some facts do not reach the view or the report.** `meta.boundary_dropped_commits` is
+    printed by gather but is neither stored nor carried into views. The digest project
+    view stamps `meta.schema_version` with the store version (`2`), while BUNDLE.md's view
+    version is `1` and `view.py` bundles carry none. The digest's `module_edges` drop the
+    `address` / `via` (and `ref`) of transitive Terraform edges. `report-template.md` and
+    `samples/build_report.py` show neither `meta.facts_windows` (so a quarter's partial CI
+    sum appears without its caveat) nor `meta.state_as_of`.
+18. **Narrative is not in CI.** The live CI jobs stop at the trust gate.
 
-Item 8 is what USAGE weighs when choosing between one accumulated store and one store per
-installment. Artifact folding is cumulative: each fold rebuilds the artifacts it touches from
-the whole change ledger, so a store holding several windows passes `validate.no_drift`
-whatever the fold order, and a view shows each artifact's status as of its window's end.
-Symbol moves are matched per window; on such a store `validate` checks each recorded move
-against the ledger instead of re-matching across windows, and its idempotency probe reports
-a whole-store re-match as INFO (LLD §8).
+Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
+per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it
+touches from the whole change ledger, so a store holding several windows passes
+`validate.no_drift` whatever the fold order, and a view shows each artifact's status as of
+its window's end. Symbol moves are matched per window; on such a store `validate` checks
+each recorded move against the ledger instead of re-matching across windows, and its
+idempotency probe reports a whole-store re-match as INFO (LLD §8).
 
-**What the trust gate proves (#89).** `validate` proves the store is *consistent*: every edge
-is exactly what the stored records imply (`edge_set`, both directions), people are re-derived
-from the records alone, every PR/issue/review/event cites its own GitHub link and every commit
-id is a real sha, and ids follow the grammar. It does not prove the records are what GitHub
-holds: a record deleted with all its edges, a blob rewritten consistently, or a wrong change
-ledger (artifacts are compared with the store's own ledger) leave a consistent store. A
-`--bundle` saved at gather time (a `view.py` JSON of the fresh store) catches changed or deleted
-records; the store keeps no per-fold content digest. On a store holding several windows, the
-edges and people areas that come from structure or latest-wins inputs (ownership, area
-touches, dependencies, milestones, sprints, blockers) can only be WARNed about, not proven:
-the gate re-derives them from one whole-store bundle, although since #94 the structure inputs
-are kept per window (LLD §8, §14.5).
+**What the trust gate proves (#79, #89).** `validate` proves the store is *consistent*:
+every edge is exactly what the stored records imply (`edge_set`, both directions), people
+are re-derived from the records alone, every PR/issue/review/event cites its own GitHub
+link and every commit id is a real sha, and ids follow the grammar. It does not prove the
+records are what GitHub holds: a record deleted with all its edges, a blob rewritten
+consistently, or a wrong change ledger (artifacts are compared with the store's own ledger)
+leave a consistent store. A `--bundle` saved at gather time (a `view.py` JSON of the fresh
+store) catches changed or deleted records; the store keeps no per-fold content digest. On a
+store holding several windows the current-state edges (ownership, dependencies,
+milestones, sprints, blockers) and area touches are checked exactly once a fold since #95
+has maintained them and every window has its per-window facts; otherwise, and always for
+people's areas (a union over the windows), a difference is a WARN naming the reason (LLD
+§8, §14.5).
 
 ## 11. Extension points and roadmap
 
@@ -591,7 +588,7 @@ are kept per window (LLD §8, §14.5).
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
 | Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
-| Historical record state on multi-window stores (limitation 8) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
+| Historical record state on multi-window stores (limitation 7) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |
 | New spotlight lens | Add a query + renderer in `spotlight.py` |

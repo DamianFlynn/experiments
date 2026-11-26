@@ -13,7 +13,10 @@ vertical: `gather (manifest) → store → validate → digest`.
 - **[`digest_view.json`](digest_view.json)** — **the product.** The project view
   emitted by `digest.py` (the bundle a content agent reads). Keys: `meta`,
   `members[].bundle` (per-member raw + enriched), `trains`, `module_edges`,
-  `shipped`, `people`, `modules`, `related_work`.
+  `shipped`, `people`, `modules`, `related_work`. The committed file predates two
+  later additions a fresh `digest.py` run also emits: top-level `halls` (#88) and
+  `meta.schema_version`; its member bundles also lack `meta.period` / `ref_date` /
+  `base_branch` / `branches`.
 - **[`avm-tf-aiml-lz-digest.md`](avm-tf-aiml-lz-digest.md)** — **illustration only.**
   A deterministic *structural* rendering of the bundle (metadata, summary counts,
   tables, and the validated `.mmd` diagrams — no authored prose), so a reader can

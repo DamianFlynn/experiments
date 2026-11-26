@@ -3,8 +3,8 @@ Kind: captions
 Language: en
 
 NOTE Example community-call transcript for the activity-overview skill.
-Pass it with `python3 transcript.py examples/community-call.vtt` (or via a
-projects.json `transcript` path) to fold a "Community call highlights" section
+Pass it with `python3 transcript.py examples/community-call.vtt` (or
+`/activity ... --transcript examples/community-call.vtt`) to fold a "Community call highlights" section
 into the digest. User-provided, local file — no network.
 
 00:00:01.000 --> 00:00:05.000
