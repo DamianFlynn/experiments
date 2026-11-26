@@ -141,8 +141,8 @@ class TestCleanFixturesPass(_Case):
         names = [c["name"] for c in _report(_p3b()).checks]
         self.assertEqual(names, [
             "target", "referential_integrity", "participant_completeness",
-            "provenance", "no_fabrication", "schema_conformance", "edge_set",
-            "no_drift", "idempotency"])
+            "provenance", "no_fabrication", "schema_conformance",
+            "meta_integrity", "edge_set", "no_drift", "idempotency"])
 
     def test_edge_set_reports_counts(self):
         c = _check(_report(_p3b()), "edge_set")

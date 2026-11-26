@@ -388,10 +388,11 @@ details; a check that cannot run fails, it is never dropped:
 | `referential_integrity` | an edge points at a node that does not exist (out-of-window spine links are INFO), or a per-window `facts:` entry is unreadable |
 | `participant_completeness` | a login in a record has no person node or contribution edge |
 | `provenance` | a PR/issue url is not its own repo's `…/pull/N` or `…/issues/N`, a review/event does not cite its parent, a commit id is not a real sha, an artifact cites no lifecycle commit |
-| `no_fabrication` | an orphan person, a historyless artifact, or an id outside the grammar / in the wrong scope |
+| `no_fabrication` | an orphan person, a PR/issue nobody authored, merged, reviewed or commented on (WARN only where no record of that kind in the repo has an author), a historyless artifact, or an id outside the grammar (e.g. a `comment-N` node) / in the wrong scope |
 | `schema_conformance` | an edge type or endpoint kind that is not allowed |
-| `edge_set` | a stored edge the stored records do not imply, a missing one, or different edge data |
-| `no_drift` | stored people/artifacts differ from what the records re-derive (with `--bundle`: a stored record differs from the bundle's) |
+| `meta_integrity` | the store's own markers or per-window meta are not what a fold writes: an unreadable or missing `current_state:` marker (or one contradicting the facts), a deleted `facts:` entry, a `gathered_windows` entry no fold wrote, a `fact:` value that no longer hashes to its key or sits under the wrong key, a malformed or orphan `ref_date:` / `branches:` / `clone:` / `clone_sha:` / `fold_context:` entry |
+| `edge_set` | a stored edge the stored records do not imply, a missing one, or different edge data (cross-repo edges included, once the members' folds recorded their member set and registries) |
+| `no_drift` | stored people/artifacts (lifecycle entries included) differ from what the records re-derive (with `--bundle`: a stored record differs from the bundle's, a stored record of the bundle's window is not in it, or the window's stored branches / reference date / clone provenance / facts differ from the bundle's) |
 | `idempotency` | re-folding into a scratch copy would change counts |
 | `no_drift_people` (project) | the project's people differ from the union re-derived across members |
 | `member_status` (project) | a manifest member's last gather of a window `failed` or was `not_attempted` |
@@ -405,9 +406,13 @@ windows are not failures: they name the edge type that cannot be proven exactly 
 
 **What a green gate means.** The store is consistent with its own records: every edge is
 one the records imply, people re-derive from the records, every citation is the record's
-own GitHub link. It does **not** prove the records match GitHub: a record deleted together
-with its edges, a consistently rewritten record or a wrong change ledger pass. To catch the
-first two, save the raw view right after the gather and pass it later:
+own GitHub link, and the store's markers and per-window meta are what folds write. It does
+**not** prove the records match GitHub: a record deleted together with its edges, a
+consistently rewritten record, an inserted record that is internally consistent (a PR with
+its author edge, a dated release, a milestone, an area), a fact value rewritten together
+with its key, a plausible changed base branch / reference date, or a wrong change ledger
+pass. To catch all but the last for a window, save the raw view right after the gather
+and pass it later:
 
 ```bash
 python3 $AO/view.py --store $DB --from $FROM --to $TO --out $S/views/$M/at-gather.json
@@ -856,7 +861,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate: error: store … does not exist` / `is not a journey-graph store` (exit 2) | wrong path (validate never creates a file) | point it at the store `gather --store` wrote |
 | `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
-| `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
+| `validate` ERROR `no_drift` "lifecycle drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
 | `validate` ERROR `edge_set` "stored but not derivable" / "derived from the stored records but not stored" / "edge data drift" | an edge the stored records do not imply (or a missing one): a producer defect or a hand-edited store | report it; don't publish; re-gather into a fresh store |
 | `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | the WARN names why the edge type cannot be proven: the repo was last folded before #95, a window has no per-window facts (pre-#94), `touches` across a graphify / re-mapped code graph; person areas are always a union over the windows | not a failure. Fold one window again (pre-#95) or re-gather pre-#94 windows to make the edge checks exact |
 | `validate` ERROR `edge_set` on a `depends_on`/`owns`/`touches`/`in_milestone`/`in_iteration`/`blocks` edge of a store holding several windows | since #95 these are exact on a store a current fold maintained: the edge is not what the stored records / per-window facts imply | a producer defect or a hand-edited store: report it; don't publish |
@@ -866,6 +871,10 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `provenance` "commit id … is not a 40/64-hex git sha" / ERROR `no_fabrication` id problems | a hand-made or corrupted node; gather writes only real shas and grammar ids | re-gather; never hand-edit the store |
 | `validate --repo R` of a multi-repo project passes but the project run fails `no_drift_people` | a single-member audit checks only the people that member derives (people are project-wide) | run `validate.py STORE --project P` without `--repo` for the full people check |
 | `validate --bundle FILE` ERROR `no_drift` "stored pr differs from --bundle" / "… in --bundle but not stored" | a record changed or was deleted since FILE was saved (or FILE is an older window's bundle on a store that re-fetched the record) | cross-check with a view saved right after the gather that wrote the record |
+| `validate --bundle FILE` ERROR `no_drift` "stored … of the bundle's window … not in --bundle" / "stored per-window … differs from --bundle" | the store holds a record of FILE's window that FILE lacks (an inserted record), or the window's branches / reference date / clone provenance / facts changed since FILE was saved | don't publish: the store was edited after the gather; re-gather into a fresh store |
+| `validate` ERROR `meta_integrity` | the store's markers or per-window meta were edited or damaged (each detail names the meta key); or the store mixes a window folded before #75 with later ones ("no fold evidence"), or holds per-window facts without a `current_state:` marker (a #94-era fold) | re-gather the named window, or fold any window of the repo once more; a damaged store: re-gather into a fresh store |
+| `validate` WARN `edge_set` "an edge into another member repo: no fold of this repo recorded its member set" | a manifest store folded before #113 (or whose member set changed between folds): a missing cross-repo edge cannot be proven missing | fold each member once more (any window) to make cross-repo edges exact |
+| `validate` WARN `no_fabrication` "PR/issue with no contribution edge at all … hand-built records" | a record with no author, merger, reviewer or commenter in a repo where no record of its kind has an author (hand-made data) | not a failure; a real gather always records the author |
 | `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
 | `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
 | `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |

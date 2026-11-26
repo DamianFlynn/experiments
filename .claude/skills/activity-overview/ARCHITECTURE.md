@@ -527,10 +527,10 @@ Remember the promise: *the digest must be believable*. Since the entire narrativ
 from the database, **a wrong database means a lying report.** `validate.py` is the gate
 that proves the database is consistent — run it before you trust any digest.
 
-> ⭐ **The trust gate.** `validate.py` runs **nine checks** per repo (target, referential
-> integrity, participant completeness, provenance, no fabrication, schema conformance, edge
-> set, no drift, idempotency), plus two project-wide ones for a multi-repo project (people,
-> member status). The headline ones:
+> ⭐ **The trust gate.** `validate.py` runs **ten checks** per repo (target, referential
+> integrity, participant completeness, provenance, no fabrication, schema conformance, meta
+> integrity, edge set, no drift, idempotency), plus two project-wide ones for a multi-repo
+> project (people, member status). The headline ones:
 > - **provenance** — *every* fact carries a source link, and it is the fact's own (the
 >   right repo and number on github.com; a real commit sha);
 > - **referential integrity** — every edge points at things that exist;
@@ -543,8 +543,9 @@ that proves the database is consistent — run it before you trust any digest.
 > - **idempotency** — re-folding changes nothing.
 >
 > What it cannot see from the store alone: a record deleted together with all its
-> relationships, or a record rewritten consistently. Keep the view saved right after the
-> gather and pass it as `--bundle` to catch those (`STORE.md` "Trust gate").
+> relationships, a record rewritten consistently, or a record inserted together with its
+> relationships. Keep the view saved right after the gather and pass it as `--bundle` to
+> catch those (`STORE.md` "Trust gate").
 
 > 🟦 **New here: a "CI gate".** **CI** (continuous integration) is the robot that checks
 > every change automatically. A **gate** is a check that must pass before work proceeds.

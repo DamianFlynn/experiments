@@ -438,7 +438,7 @@ in an **opt-in internal appendix** — the public digest never blames individual
 | **Verifiability** | Every fact carries a `{type, id, url}` ref; narrator citations are filtered to the slice. |
 | **Determinism** | Sorted JSON, ordered range queries, pure projections; same store → byte-identical view. |
 | **Idempotency** | Identity-keyed upserts and set-semantics ledger; re-folds are no-ops. Proven by `validate.idempotency`. |
-| **Trust** | `validate.py` gates every report (read-only; a check that cannot run fails, never disappears). Nine checks per repo, in this order: target, referential integrity, participant completeness, provenance, no fabrication, schema conformance, edge set, no drift, idempotency; plus the project-wide people and member-status checks for a multi-repo project. |
+| **Trust** | `validate.py` gates every report (read-only; a check that cannot run fails, never disappears). Ten checks per repo, in this order: target, referential integrity, participant completeness, provenance, no fabrication, schema conformance, meta integrity, edge set, no drift, idempotency; plus the project-wide people and member-status checks for a multi-repo project. |
 | **Graceful degradation** | Missing CLIs, scopes, boards or FTS5 produce empty or clearly-flagged sections, not failures; IaC gaps are counted (`edge_extraction`). |
 | **Offline readers** | Only `gather` (and opt-in `--complete` backfill) touch the network; everything else replays from the store. |
 | **Security** | Read-only token; no write-back; secrets only in the environment; recognition-not-blame by default. |
@@ -572,7 +572,9 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     view JSON do not carry the incomplete members; a formatter must rely on the gate.
 16. **The trust check proves consistency, not truth.** See *What the trust gate proves*
     below: a store-only audit cannot detect a record deleted together with its edges, a
-    consistently rewritten record or a wrong change ledger. A repo gathered under a name it
+    consistently rewritten record, an inserted record that is internally consistent, a
+    re-keyed fact value, a plausible per-window branch / reference date, or a wrong change
+    ledger. A repo gathered under a name it
     no longer has (renamed or transferred) fails `provenance`, because GitHub returns its
     links under the new name.
 17. **What a view says about its own completeness.** Since #107 a view carries the clone
@@ -607,16 +609,23 @@ its window's end. Symbol moves are matched per window; on such a store `validate
 each recorded move against the ledger instead of re-matching across windows, and its
 idempotency probe reports a whole-store re-match as INFO (LLD §8).
 
-**What the trust gate proves (#79, #89).** `validate` proves the store is *consistent*:
-every edge is exactly what the stored records imply (`edge_set`, both directions; the
-record-derived ones on every store, since a fold keeps them equal to the re-folded record,
-#111), people
-are re-derived from the records alone, every PR/issue/review/event cites its own GitHub
-link and every commit id is a real sha, and ids follow the grammar. It does not prove the
-records are what GitHub holds: a record deleted with all its edges, a blob rewritten
-consistently, or a wrong change ledger (artifacts are compared with the store's own ledger)
-leave a consistent store. A `--bundle` saved at gather time (a `view.py` JSON of the fresh
-store) catches changed or deleted records; the store keeps no per-fold content digest. On a
+**What the trust gate proves (#79, #89, #113).** `validate` proves the store is
+*consistent*: every edge is exactly what the stored records imply (`edge_set`, both
+directions; the record-derived ones on every store, since a fold keeps them equal to the
+re-folded record, #111; cross-repo ones with the member set and registries the fold
+recorded, #113), people are re-derived from the records alone, artifacts (lifecycle entries
+included) from the ledger, every PR/issue/review/event cites its own GitHub link and every
+commit id is a real sha, ids follow the grammar, no PR/issue lacks every contributor, and
+the store's markers and per-window meta are what folds write (`meta_integrity`: a forged or
+deleted marker, a ledger window no fold wrote, a changed or swapped fact value fail). It
+does not prove the records are what GitHub holds. Outside a store-only audit: a record
+deleted with all its edges, a blob rewritten consistently, an INSERTED record that is
+internally consistent (a PR or commit with its author edge, a review, a dated release, a
+milestone, an area), a fact value rewritten together with its key and ref, a plausible
+`branches:` / `ref_date:` / `clone:` value, and a wrong change ledger (artifacts are compared
+with the store's own ledger). A `--bundle` saved at gather time (a `view.py` JSON of the
+fresh store) catches, for its window, changed or deleted records, stored records it lacks
+and changed per-window meta; the store keeps no per-fold content digest. On a
 store holding several windows the current-state edges (ownership, dependencies,
 milestones, sprints, blockers) and area touches are checked exactly once a fold since #95
 has maintained them and every window has its per-window facts; otherwise, and always for

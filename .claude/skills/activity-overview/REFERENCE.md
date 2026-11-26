@@ -65,15 +65,20 @@ store's repos for one that names none) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 `validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
-error: missing or non-store path, ambiguous store, unreadable `--bundle`). It lists nine
+error: missing or non-store path, ambiguous store, unreadable `--bundle`). It lists ten
 checks per repo in this order — `target`, `referential_integrity`,
 `participant_completeness`, `provenance`, `no_fabrication`, `schema_conformance`,
-`edge_set`, `no_drift`, `idempotency` — plus `no_drift_people` and `member_status` for a
-multi-repo project. It proves the store is consistent
+`meta_integrity`, `edge_set`, `no_drift`, `idempotency` — plus `no_drift_people` and
+`member_status` for a multi-repo project. It proves the store is consistent
 with its own records — every edge is one the stored records imply (`edge_set`, both
-directions), people are re-derived from the records, every PR/issue cites its own GitHub
-link and every commit id is a real sha — but not that the records match GitHub: a record
-deleted with its edges or a consistently rewritten blob passes. To catch those, save the
+directions; cross-repo edges with the member set and registries the fold recorded),
+people and artifacts are re-derived from the records and ledger, every PR/issue cites its
+own GitHub link and has a contributor, every commit id is a real sha, and the store's
+markers and per-window meta are what folds write (`meta_integrity`) — but not that the
+records match GitHub: a record deleted with its edges, a consistently rewritten blob, an
+inserted record that is internally consistent (a PR with its author edge, a dated
+release, a milestone, an area), a fact value rewritten with its key, or a plausible
+changed base branch / reference date passes. To catch those for a window, save the
 view of the freshly gathered store (`view.py … --out view.json`, before `link.py` enriches it) and later run
 `validate.py STORE --bundle view.json` (single repo only; a project-mode run ignores
 `--bundle` with a warning). On a store holding several windows, the

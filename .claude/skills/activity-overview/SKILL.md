@@ -133,10 +133,13 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```
    Self-contained on a store (`edge_set` / `no_drift` / `idempotency` self-source their raw
    bundle via `extract`; an external `--bundle` is an optional single-repo cross-check,
-   never required). It reports nine checks per repo — `target`, `referential_integrity`,
+   never required). It reports ten checks per repo — `target`, `referential_integrity`,
    `participant_completeness`, `provenance`, `no_fabrication`, `schema_conformance`,
-   `edge_set`, `no_drift`, `idempotency` — and proves the store consistent with its own
-   records, not that the records match GitHub (`docs/USAGE.md` §5.5). For a multi-repo
+   `meta_integrity`, `edge_set`, `no_drift`, `idempotency` — and proves the store
+   consistent with its own records and its markers / per-window meta what folds write, not
+   that the records match GitHub: an inserted record that is internally consistent passes a
+   store-only audit; `--bundle` with the view saved at gather time catches it
+   (`docs/USAGE.md` §5.5). For a multi-repo
    project: `python3 validate.py workspace/journey.db --project <name>` (adds the
    project-wide `no_drift_people` and `member_status` checks).
 3. **Materialize the bundle view** (store → `workspace/view/bundle.json`, offline):

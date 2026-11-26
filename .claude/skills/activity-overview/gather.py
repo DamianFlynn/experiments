@@ -7294,7 +7294,11 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # predates #111 (no `records` in its current_state marker) but already
     # holds data is healed once, from its stored records.
     state = graphstore.get_current_state(conn, project, repo) or {}
-    heal = not state.get("records") and _repo_has_nodes(conn, project, repo)
+    had_nodes = _repo_has_nodes(conn, project, repo)
+    heal = not state.get("records") and had_nodes
+    fold_context = _next_fold_context(conn, project, repo, members,
+                                      registry_by_slug, bicep_prefix_by_slug,
+                                      had_nodes)
     with conn:
         # FTS coverage (issue #111): a store folded on a host without FTS5 has
         # records the index lacks; the first fold with FTS5 since then indexes
@@ -7395,7 +7399,43 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                                           registry_by_slug,
                                           bicep_prefix_by_slug, fetched,
                                           records=records)
+        # The member set and registries this fold derived cross-repo edges
+        # with (issue #113), so validate can resolve them exactly.
+        if fold_context is not None:
+            graphstore.set_fold_context(conn, project, repo, fold_context,
+                                        commit=False)
     return summary
+
+
+def _next_fold_context(conn, project, repo, members, registry_by_slug,
+                       bicep_prefix_by_slug, had_nodes):
+    """The fold context (graphstore.set_fold_context) this fold records, or
+    None to leave the stored one alone. A manifest fold (`members` given)
+    records its member set and registries; `members_changed` turns (and
+    stays) true when the recorded member set differs, or when the repo held
+    records before any fold recorded one. A single-repo fold of a repo that
+    has a context marks it changed: its records' cross-repo edges were not
+    derived with that member set."""
+    prior = graphstore.get_fold_context(conn, project, repo)
+    if members is None:
+        if prior is None or prior.get("members_changed") is True:
+            return None
+        return dict(prior, members_changed=True)
+    slugs = sorted(members)
+    if prior is None:
+        # records folded before (a stand-in another member's fold made for
+        # this repo is not one)
+        changed = bool(had_nodes) and not graphstore._only_standins(
+            conn, project, repo)
+    else:
+        changed = (prior.get("members_changed") is not False
+                   or prior.get("members") != slugs)
+
+    def as_map(m):
+        return None if m is None else {k: m[k] for k in sorted(m)}
+    return {"members": slugs, "registry": as_map(registry_by_slug),
+            "bicep_registry_prefix": as_map(bicep_prefix_by_slug),
+            "members_changed": changed}
 
 
 def _member_clone_dir(base_dir, owner, repo, run=None):

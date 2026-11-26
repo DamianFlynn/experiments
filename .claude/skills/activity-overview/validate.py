@@ -48,29 +48,46 @@ The invariants (each a named check; see the per-function docstrings):
                                     its own: PR/issue/review/event urls on
                                     github.com/{owner}/{repo} with the node's
                                     number, commit ids 40/64-hex shas (#89).
-    no_fabrication          ERROR  no orphan person, every artifact has history,
-                                    ids follow the grammar and their row's
-                                    project/repo, no case-variant scopes (#89).
+    no_fabrication          ERROR  no orphan person, no PR/issue nobody
+                                    contributed to (#113), every artifact has
+                                    history, ids follow the grammar (no
+                                    `comment-N`) and their row's project/repo,
+                                    no case-variant scopes (#89).
     schema_conformance      ERROR  every edge type has an endpoint rule (unknown
                                     type -> ERROR) and its endpoints match it.
+    meta_integrity          ERROR  the repo's markers and per-window meta are
+                                    what folds write: windows with fold
+                                    evidence, a readable current-state marker
+                                    agreeing with the facts, fact values that
+                                    hash to their key, well-formed refs and
+                                    per-window keys (#113).
     edge_set                ERROR  the repo's stored edges == the edges its stored
-                                    records imply, both directions (#89).
-    no_drift                ERROR  stored people/artifacts == freshly re-derived
-                                    from the bundle (self-sourced from the store
-                                    via extract); with --bundle the stored records
-                                    must also equal the bundle's.
+                                    records imply, both directions (#89), cross-
+                                    repo edges with the member set and
+                                    registries the fold recorded (#113).
+    no_drift                ERROR  stored people/artifacts (lifecycle entries
+                                    included) == freshly re-derived from the
+                                    bundle (self-sourced from the store via
+                                    extract); with --bundle the stored records,
+                                    the stored records of its window it lacks,
+                                    and its window's meta are compared too.
     idempotency             ERROR  re-folding the bundle changes no counts
                                     (bundle self-sourced from the store).
 
-What the gate proves, and what it cannot (issue #89). Self-sourced, it proves
-the store is CONSISTENT: every edge, person and artifact is exactly what the
-stored records and ledger imply, and every citation points at the node's own
-GitHub object. It cannot prove the records themselves are what GitHub holds: a
-record deleted together with its edges, a blob rewritten consistently (title,
-merged, a comment body) or a wrong ledger leave a self-consistent store. A
-`--bundle` saved when the store was gathered (a view.py JSON of the fresh store,
-or a raw bundle) catches changed or deleted records; there is no per-fold
-content digest in the store.
+What the gate proves, and what it cannot (issues #89, #113). Self-sourced, it
+proves the store is CONSISTENT: every edge, person and artifact is exactly
+what the stored records and ledger imply, every citation points at the node's
+own GitHub object, and the markers and per-window meta are what folds write.
+It cannot prove the records themselves are what GitHub holds: a record
+deleted together with its edges, a blob rewritten consistently (title, merged,
+a comment body), an INSERTED record that is internally consistent (a PR with
+its author and `authored` edge, a dated release, a milestone, an area), a
+fact value rewritten together with its key and ref, a plausible `branches:` /
+`ref_date:` / `clone:` value, or a wrong ledger leave a self-consistent store.
+A `--bundle` saved when the store was gathered (a view.py JSON of the fresh
+store, or a raw bundle) catches changed or deleted records, stored records of
+its window that it lacks, and changed per-window meta of its window; there is
+no per-fold content digest in the store.
 
 The row-level checks (referential_integrity, provenance, no_fabrication,
 schema_conformance) audit the rows the audited repo owns: a node by its
@@ -92,6 +109,7 @@ Project mode (validate_project) adds the project-wide checks:
 
 import argparse
 import copy
+import hashlib
 import json
 import re
 import sqlite3
@@ -171,14 +189,6 @@ def _edge(row):
         raise CorruptRow("{} -[{}]-> {}".format(
             row["src_id"], row["edge_type"], row["dst_id"]),
             "edge data is not valid JSON ({})".format(exc))
-
-
-def _all_node_ids(conn):
-    return {r[0] for r in conn.execute("SELECT id FROM nodes")}
-
-
-def _all_edges(conn):
-    return [_edge(r) for r in conn.execute("SELECT * FROM edges")]
 
 
 def _repo_nodes(conn, project, repo, node_class=None):
@@ -422,18 +432,60 @@ class _Scope:
         return self._covers(self.edge_owner(src, dst))
 
 
+def _unit_only(scope):
+    """True for a scope that owns one member repo's rows and nothing shared:
+    its rows are read through the indexes instead of a full-table scan
+    (issue #113 m6: project mode used to scan every row once per member)."""
+    return scope is not None and not scope.shared and scope.unit is not None
+
+
 def _scoped_nodes(conn, scope):
     """The decoded nodes `scope` owns (None: all). Rows are filtered on their
     raw columns BEFORE decoding, so a corrupt row fails only the audit that
-    owns it."""
-    return [_node(r) for r in conn.execute("SELECT * FROM nodes")
-            if scope is None or scope.has_node(r)]
+    owns it. A member-only scope reads its repo's rows by index."""
+    if _unit_only(scope):
+        rows = conn.execute("SELECT * FROM nodes WHERE project=? AND repo=?",
+                            (scope.project, scope.unit))
+    else:
+        rows = conn.execute("SELECT * FROM nodes")
+    return [_node(r) for r in rows if scope is None or scope.has_node(r)]
+
+
+def _repo_edge_rows(conn, project, repo):
+    """The edge rows whose src or dst is in the id space of (project, repo),
+    read by index range (a superset of the rows that repo owns)."""
+    lo, hi = graphstore._prefix_range(graphstore.qualify_id(project, repo, ""))
+    seen = set()
+    for sql in ("SELECT * FROM edges WHERE src_id >= ? AND src_id < ?",
+                "SELECT * FROM edges WHERE dst_id >= ? AND dst_id < ?"):
+        for r in conn.execute(sql, (lo, hi)):
+            key = (r["src_id"], r["dst_id"], r["edge_type"])
+            if key not in seen:
+                seen.add(key)
+                yield r
 
 
 def _scoped_edges(conn, scope):
-    """The decoded edges `scope` owns (None: all), filtered before decoding."""
-    return [_edge(r) for r in conn.execute("SELECT * FROM edges")
+    """The decoded edges `scope` owns (None: all), filtered before decoding.
+    A member-only scope reads its repo's edges by index."""
+    if _unit_only(scope):
+        rows = _repo_edge_rows(conn, scope.project, scope.unit)
+    else:
+        rows = conn.execute("SELECT * FROM edges")
+    return [_edge(r) for r in rows
             if scope is None or scope.has_edge(r["src_id"], r["dst_id"])]
+
+
+def _existing_ids(conn, ids):
+    """The subset of `ids` stored as nodes, looked up by primary key."""
+    ids = sorted(set(ids))
+    out = set()
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        out |= {r[0] for r in conn.execute(
+            "SELECT id FROM nodes WHERE id IN ({})".format(
+                ",".join("?" for _ in chunk)), chunk)}
+    return out
 
 
 def _store_wide(scope):
@@ -460,10 +512,11 @@ def check_referential_integrity(conn, scope=None):
     the facts index to an audit that includes the store-wide parts); None
     audits the whole store.
     """
-    ids = _all_node_ids(conn)
+    edges = _scoped_edges(conn, scope)
+    ids = _existing_ids(conn, [e[s] for e in edges for s in ("src_id", "dst_id")])
     details = []
     per_type = {}
-    for e in _scoped_edges(conn, scope):
+    for e in edges:
         et = e["edge_type"]
         per_type.setdefault(et, {"edges": 0, "dangling": 0})
         per_type[et]["edges"] += 1
@@ -544,11 +597,6 @@ def _expected_contributions(bundle):
     return out
 
 
-def _edge_set(conn):
-    return {(r[0], r[1], r[2]) for r in conn.execute(
-        "SELECT src_id, dst_id, edge_type FROM edges")}
-
-
 def check_participant_completeness(conn, project, repo, bundle):
     """For every login in any raw record assert its person node EXISTS and its
     contribution edge exists. Missing person or missing edge = ERROR, naming the
@@ -566,10 +614,17 @@ def check_participant_completeness(conn, project, repo, bundle):
     if bundle is None:
         # Fall back to scanning the embedded raw records in stored node data.
         bundle = _reconstruct_raw_from_store(conn, project, repo)
-    ids = _all_node_ids(conn)
-    edges = _edge_set(conn)
+    expected = _expected_contributions(bundle)
+    # Looked up by index (issue #113 m6): the persons named, and the edges
+    # into this repo's id space.
+    ids = _existing_ids(conn, [graphstore.qualify_person(project, x[0])
+                               for x in expected])
+    lo, hi = graphstore._prefix_range(graphstore.qualify_id(project, repo, ""))
+    edges = {(r[0], r[1], r[2]) for r in conn.execute(
+        "SELECT src_id, dst_id, edge_type FROM edges "
+        "WHERE dst_id >= ? AND dst_id < ?", (lo, hi))}
     details = []
-    for login, etype, dst_local, source in _expected_contributions(bundle):
+    for login, etype, dst_local, source in expected:
         person = graphstore.qualify_person(project, login)
         dst = graphstore.qualify_id(project, repo, dst_local)
         if person not in ids:
@@ -755,8 +810,10 @@ _CONTRIB_EDGE_TYPES = ("authored", "merged", "reviewed", "reported",
 
 # The singleton structure nodes fold writes per repo (gather.fold_bundle).
 _SINGLETON_LOCALS = ("workflowstats", "codegraph", "codeowners", "labeltaxonomy")
+# The social local forms fold writes (gather.record_rows). `comment-N` is not
+# one (issue #113 m5): comments stay embedded in their PR / issue record.
 _SOCIAL_LOCAL_RE = re.compile(
-    r"\A(?:pr-\d+|issue-\d+|review-\d+-.+|event-(?:pr|issue)-\d+-.+|comment-.+)\Z",
+    r"\A(?:pr-\d+|issue-\d+|review-\d+-.+|event-(?:pr|issue)-\d+-.+)\Z",
     re.S)
 _STRUCTURE_PREFIXES = ("area-", "milestone-", "release-", "sprint-")
 
@@ -767,8 +824,8 @@ def _id_grammar_problem(node):
     Person ids are `{project}#person-{login}` with repo column "*"; every other
     id is `{project}/{repo}#{local}` and its scope must equal the row's own
     project/repo columns; the local form must be one the writer produces for
-    the node's class (social: pr-N, issue-N, review-…, event-…, comment-…;
-    code: a 40/64-hex sha or an artifact; structure: area-/milestone-/release-/
+    the node's class (social: pr-N, issue-N, review-…, event-…; code: a
+    40/64-hex sha or an artifact; structure: area-/milestone-/release-/
     sprint-… or a singleton)."""
     nid = node["id"]
     if "#" not in nid:
@@ -807,16 +864,39 @@ def _id_grammar_problem(node):
     return None if ok else "local id {!r} is not a {} id form".format(local, cls)
 
 
-def _case_variant_details(nodes):
+def _case_fold_key(scope, owners):
+    """The key under which two spellings of one id scope collide. GitHub
+    owner and repo names are case-insensitive; manifest PROJECT names are
+    case-sensitive by design (#70), so `Acme` and `acme` are two projects
+    (issue #113 m7). A single-repo store's scope is `{owner}/{repo}` and its
+    people's `{owner}`: case-folded whole. A manifest member's scope is
+    `{project}/{owner}/{repo}`: the project kept, the rest case-folded; its
+    people's `{project}`: kept. `owners`: the case-folded first segments of
+    the store's `{owner}/{repo}` scopes."""
+    head, sep, rest = scope.partition("/")
+    if (sep and "/" not in rest) or (not sep and head.lower() in owners):
+        return (head.lower(), sep, rest.lower())
+    return (head, sep, rest.lower())
+
+
+def _case_variant_details(nodes, project=None):
     """ERROR details for id scopes stored under several case spellings (one
     repo forked into two id spaces, issue #70): every id whose scope is not the
-    most-used spelling of its case-folded scope is named."""
+    most-used spelling of its case-folded scope (_case_fold_key) is named.
+    Two manifest projects whose names differ only in case are not variants of
+    each other (issue #113 m7). `project`: only the ids that fold with that
+    project's (another project's are its own audit's)."""
+    scopes = [(n["id"], n["id"].partition("#")[0]) for n in nodes
+              if n["id"] and "#" in n["id"]]
+    owners = {sc.partition("/")[0].lower() for _i, sc in scopes
+              if sc.count("/") == 1}
+    want = _case_fold_key(project, owners)[0] if project is not None else None
     by_fold = {}
-    for n in nodes:
-        if not n["id"] or "#" not in n["id"]:
+    for nid, scope in scopes:
+        fold = _case_fold_key(scope, owners)
+        if want is not None and fold[0] != want:
             continue
-        scope = n["id"].partition("#")[0]
-        by_fold.setdefault(scope.lower(), {}).setdefault(scope, []).append(n["id"])
+        by_fold.setdefault(fold, {}).setdefault(scope, []).append(nid)
     details = []
     for fold in sorted(by_fold):
         spellings = by_fold[fold]
@@ -859,6 +939,45 @@ def _code_form_problem(node, local):
             "{!r}".format(local))
 
 
+def _item_kind(node):
+    """"pr" / "issue" for a stored PR / issue record node, else None."""
+    if node["node_class"] != "social" or not node["id"]:
+        return None
+    m = _ITEM_LOCAL_RE.match(graphstore.local_id(node["id"], node["project"],
+                                                 node["repo"]))
+    return m.group(1) if m else None
+
+
+def _contribution_sources(conn, person_ids):
+    """The subset of `person_ids` that are the src of a contribution edge,
+    looked up by index."""
+    out = set()
+    ids = sorted(set(person_ids))
+    marks = ",".join("?" for _ in _CONTRIB_EDGE_TYPES)
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        out |= {r[0] for r in conn.execute(
+            "SELECT DISTINCT src_id FROM edges WHERE src_id IN ({}) "
+            "AND edge_type IN ({})".format(",".join("?" for _ in chunk), marks),
+            chunk + list(_CONTRIB_EDGE_TYPES))}
+    return out
+
+
+def _contribution_targets(conn, record_ids):
+    """The subset of `record_ids` that are the dst of a contribution edge,
+    looked up by index."""
+    out = set()
+    ids = sorted(set(record_ids))
+    marks = ",".join("?" for _ in _CONTRIB_EDGE_TYPES)
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        out |= {r[0] for r in conn.execute(
+            "SELECT DISTINCT dst_id FROM edges WHERE dst_id IN ({}) "
+            "AND edge_type IN ({})".format(",".join("?" for _ in chunk), marks),
+            chunk + list(_CONTRIB_EDGE_TYPES))}
+    return out
+
+
 def check_no_fabrication(conn, scope=None):
     """No invented entities, no historyless artifacts, no malformed ids.
 
@@ -866,6 +985,11 @@ def check_no_fabrication(conn, scope=None):
       NO contribution edge is a contributor we invented = ERROR). `owns` alone
       does NOT count — a CODEOWNER who never contributed has no person node (the
       write path skips it), so any EXISTING person node must have earned it.
+    - Every PR / issue node is the dst of >=1 contribution edge (issue #113
+      C2): GitHub names an author for every PR and issue and fold writes its
+      edge, so a record nobody contributed to is invented — an ERROR in a
+      repo whose other records of that kind carry an author, else a WARN
+      (hand-built records without authors).
     - Every artifact `code` node (local id `art:<path>` / `<path>#…`) has >=1
       lifecycle event (artifact with no history = ERROR).
     - Every `code` node is a known form (_code_form_problem, #101): a commit
@@ -873,8 +997,9 @@ def check_no_fabrication(conn, scope=None):
       id form; anything else is an ERROR.
     - No node has an empty/None id; ids round-trip through parse_id, follow the
       id grammar and agree with the row's project/repo columns
-      (_id_grammar_problem), and no scope is stored under two case spellings
-      (issue #89; a store-wide part).
+      (_id_grammar_problem; `comment-N` is not a form fold writes, #113
+      m5), and no scope is stored under two case spellings (issue #89; a
+      store-wide part; project names are case-sensitive, #113 m7).
 
     `scope` (_Scope, issue #107) limits the audit to the nodes it owns (and
     the case-spelling check to an audit that includes the store-wide parts);
@@ -892,14 +1017,15 @@ def check_no_fabrication(conn, scope=None):
     if _store_wide(scope):
         # ids only: the raw rows, so another audit's corrupt row is not read
         details.extend(_case_variant_details(
-            conn.execute("SELECT id FROM nodes").fetchall()))
-    # contribution edges by person src
-    contrib_src = set()
-    for r in conn.execute(
-            "SELECT src_id FROM edges WHERE edge_type IN ({})".format(
-                ",".join("?" for _ in _CONTRIB_EDGE_TYPES)),
-            _CONTRIB_EDGE_TYPES):
-        contrib_src.add(r[0])
+            conn.execute("SELECT id FROM nodes").fetchall(),
+            scope.project if scope is not None else None))
+    contrib_src = _contribution_sources(conn, [
+        n["id"] for n in nodes if n["id"] and _is_person_id(n["id"])])
+    contrib_dst = _contribution_targets(conn, [
+        n["id"] for n in nodes if n["id"] and _item_kind(n) is not None])
+    authored_kinds = {(n["project"], n["repo"], _item_kind(n)) for n in nodes
+                      if n["id"] and _item_kind(n) is not None
+                      and isinstance(n["data"], dict) and n["data"].get("author")}
 
     for n in nodes:
         nid = n["id"]
@@ -921,6 +1047,23 @@ def check_no_fabrication(conn, scope=None):
                     "severity": ERROR, "id": nid, "login": login,
                     "problem": "orphan person: no contribution edge "
                                "(invented contributor)"})
+        # a PR / issue nobody contributed to (issue #113 C2): GitHub names
+        # an author for every PR and issue (a deleted account is `ghost`),
+        # gather records it, and fold writes its contribution edge. Only
+        # hand-built records lack one, so it is an ERROR in a repo whose
+        # other records of that kind carry authors, else a WARN.
+        elif nid in contrib_dst:
+            pass
+        elif _item_kind(n) is not None:
+            authored = (n["project"], n["repo"], _item_kind(n)) in authored_kinds
+            details.append({
+                "severity": ERROR if authored else WARN, "id": nid,
+                "problem": "PR/issue with no contribution edge at all: no "
+                           "author, merger, reviewer or commenter (an "
+                           "invented record)" + ("" if authored else
+                           "; WARN only: no {} of this repo records an "
+                           "author (hand-built records)".format(
+                               _item_kind(n)))})
         # code node form, and artifact with no history
         elif n["node_class"] == "code":
             local = parsed["local"]
@@ -1085,6 +1228,326 @@ def check_schema_conformance(conn, scope=None):
     return _check("schema_conformance", ERROR, details)
 
 
+# --- check 5b: the repo's store meta (issue #113 M1/M2) -----------------------
+
+# The per-window meta a fold writes for (project, repo, from, to).
+_WINDOW_META_PREFIXES = ("facts:", "ref_date:", "branches:", "clone:")
+_DAY_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}")
+_DIGEST_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_CLONE_MODES = ("fresh", "fetched", "depth1-fallback", "none")
+_STRUCTURE_AS_OF = ("window_end", "head")
+
+
+def _window_str(window):
+    """`{from}:{to}` as the per-window meta keys spell a window."""
+    return "{}:{}".format(window[0], window[1])
+
+
+def _repo_windows(conn, project, repo):
+    """(windows, problem): the distinct gathered windows [(from, to)] the meta
+    ledger records for (project, repo), or (None, why) when the ledger is
+    unreadable."""
+    try:
+        wins = graphstore.get_windows(conn)
+    except ValueError as exc:
+        return None, "gathered_windows is not valid JSON ({})".format(exc)
+    if not isinstance(wins, list) or not all(isinstance(w, dict) for w in wins):
+        return None, "gathered_windows is not a list of window objects"
+    out = []
+    for w in wins:
+        if w.get("project") == project and w.get("repo") == repo:
+            key = (w.get("from"), w.get("to"))
+            if key not in out:
+                out.append(key)
+    return out, None
+
+
+def _repo_window_meta(conn, project, repo):
+    """{prefix: {window string: (key, raw value)}} of the repo's per-window
+    meta keys (_WINDOW_META_PREFIXES), read by key range."""
+    scope = "{}/{}:".format(project, repo)
+    out = {}
+    for prefix in _WINDOW_META_PREFIXES:
+        for key, value in graphstore._meta_with_prefix(conn, prefix + scope):
+            out.setdefault(prefix, {})[key[len(prefix + scope):]] = (key, value)
+    return out
+
+
+def _window_evidence(conn, project, repo, windows, wmeta):
+    """({window: bool}, repo_has_evidence): whether a fold of each gathered
+    window left a trace beside the ledger entry — a per-window meta key, a
+    member run-status entry, or the current-state marker naming it — and
+    whether the repo has any such trace at all (a store folded before #75
+    has none for any window)."""
+    try:
+        status = {(e.get("from"), e.get("to"))
+                  for e in graphstore.get_member_status(conn, project)
+                  if isinstance(e, dict) and e.get("repo") == repo}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        status = set()
+    state = graphstore.get_current_state(conn, project, repo) or {}
+    marked = (state.get("from"), state.get("to")) if state else None
+    ev = {}
+    for w in windows:
+        s = _window_str(w)
+        ev[w] = (any(s in wmeta.get(p, {}) for p in _WINDOW_META_PREFIXES)
+                 or w in status or w == marked)
+    has = (any(ev.values()) or any(wmeta.values())
+           or graphstore.get_meta(conn, graphstore._current_state_key(
+               project, repo)) is not None)
+    return ev, has
+
+
+def _fact_signatures(value):
+    """The WINDOW_FACT_KEYS whose gather-written shape `value` has:
+    code_graph a dict with an `areas` list, label_taxonomy a dict with a
+    `source` string, code_owners a CODEOWNERS rule list, workflow_stats a
+    {workflow: {total, ...}} dict."""
+    out = set()
+    if isinstance(value, dict):
+        if isinstance(value.get("areas"), list):
+            out.add("code_graph")
+        if isinstance(value.get("source"), str):
+            out.add("label_taxonomy")
+        if value and all(isinstance(v, dict) and "total" in v
+                         for k, v in value.items()
+                         if k != gather.WORKFLOW_STATS_TRUNCATED_KEY):
+            out.add("workflow_stats")
+    elif isinstance(value, list) and value and all(
+            isinstance(r, dict) and "pattern" in r for r in value):
+        out.add("code_owners")
+    return out
+
+
+def _fact_shape_problem(key, value):
+    """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
+    or None: it is not a JSON object (code_owners: an object or a rule list),
+    or it has the gather-written shape of ANOTHER fact key and not its own
+    (two swapped refs). Hand-built values of other shapes are let through."""
+    if key == "code_owners":
+        ok = isinstance(value, (dict, list))
+    else:
+        ok = isinstance(value, dict)
+    sig = _fact_signatures(value)
+    if ok and (not sig or key in sig):
+        return None
+    return "value is not a {} (it has the shape of {}: swapped refs?)".format(
+        key, ", ".join(sorted(sig)) or "neither")
+
+
+def _branches_problem(value):
+    if not isinstance(value, dict) or set(value) != {"base_branch", "branches"}:
+        return "not {base_branch, branches}"
+    if value["base_branch"] is not None and not isinstance(value["base_branch"], str):
+        return "base_branch is not a branch name"
+    if not isinstance(value["branches"], list) or not all(
+            isinstance(b, str) for b in value["branches"]):
+        return "branches is not a list of branch names"
+    return None
+
+
+def _clone_problem(value):
+    if not isinstance(value, dict) or not {"clone_mode", "boundary_dropped_commits"} \
+            <= set(value) <= {"clone_mode", "boundary_dropped_commits",
+                              "structure_as_of"}:
+        return "not {clone_mode, boundary_dropped_commits[, structure_as_of]}"
+    if value["clone_mode"] is not None and value["clone_mode"] not in _CLONE_MODES:
+        return "clone_mode {!r} is not one gather writes".format(value["clone_mode"])
+    dropped = value["boundary_dropped_commits"]
+    if not isinstance(dropped, list) or not all(
+            isinstance(s, str) and _SHA_RE.match(s) for s in dropped) \
+            or dropped != sorted(set(dropped)):
+        return "boundary_dropped_commits is not a sorted list of commit shas"
+    if "structure_as_of" in value and value["structure_as_of"] not in _STRUCTURE_AS_OF:
+        return "structure_as_of {!r} is not window_end/head".format(
+            value["structure_as_of"])
+    return None
+
+
+def _facts_entry_problem(value):
+    if not isinstance(value, dict) or "facts" not in value or not set(value) <= {
+            "clone_sha", "facts", "ci_collected"}:
+        return "not {clone_sha, facts, ci_collected}"
+    refs = value["facts"]
+    if not isinstance(refs, dict):
+        return "facts is not a {key: sha256} map"
+    for k in sorted(refs):
+        if k not in graphstore.WINDOW_FACT_KEYS:
+            return "unknown fact key {!r}".format(k)
+        if not isinstance(refs[k], str) or not _DIGEST_RE.match(refs[k]):
+            return "{} ref {!r} is not a sha256 digest".format(k, refs[k])
+    sha = value.get("clone_sha")
+    if sha is not None and not (isinstance(sha, str) and _SHA_RE.match(sha)):
+        return "clone_sha {!r} is not a commit sha".format(sha)
+    if "ci_collected" in value and not isinstance(value["ci_collected"], bool):
+        return "ci_collected is not a boolean"
+    return None
+
+
+def _marker_problem(state, windows):
+    if not isinstance(state, dict):
+        return "not a JSON object"
+    if state.get("items") is not True:
+        return "`items` is not true (every fold since #95 writes it)"
+    if not isinstance(state.get("structure"), bool):
+        return "`structure` is not a boolean"
+    if "records" in state and state["records"] is not True:
+        return "`records` is present but not true"
+    if (state.get("from"), state.get("to")) not in windows:
+        return "names {}..{}, not a gathered window of this repo".format(
+            state.get("from"), state.get("to"))
+    return None
+
+
+def _meta_details(conn, project, repo):
+    """The ERROR details of check_meta_integrity, and an INFO summary."""
+    details = []
+
+    def err(key, problem, **kw):
+        details.append(dict({"severity": ERROR, "meta_key": key,
+                             "problem": problem}, **kw))
+    windows, problem = _repo_windows(conn, project, repo)
+    if windows is None:
+        err("gathered_windows", problem)
+        return details
+    wmeta = _repo_window_meta(conn, project, repo)
+    for frm, to in windows:
+        if (frm is None) != (to is None) or (frm is not None and not (
+                isinstance(frm, str) and isinstance(to, str)
+                and _DAY_RE.match(frm) and _DAY_RE.match(to)
+                and frm[:10] <= to[:10])):
+            err("gathered_windows", "window {!r}..{!r} is not a from <= to "
+                "pair of dates".format(frm, to))
+    ev, has = _window_evidence(conn, project, repo, windows, wmeta)
+    if has:
+        for w in windows:
+            if not ev[w]:
+                err("gathered_windows", "gathered window {}..{} has no fold "
+                    "evidence (no per-window meta, run status or marker names "
+                    "it): an entry no fold wrote, or a window folded before "
+                    "#75 in a store folded since (re-gather it)".format(*w),
+                    window=_window_str(w))
+    # the current-state marker (#95)
+    ckey = graphstore._current_state_key(project, repo)
+    raw = graphstore.get_meta(conn, ckey)
+    if raw is not None:
+        try:
+            state = json.loads(raw)
+        except ValueError:
+            state, why = None, "unreadable (not valid JSON)"
+        else:
+            why = _marker_problem(state, windows)
+        if why:
+            err(ckey, why)
+        else:
+            have_facts = gather.repo_fact_windows(conn, project, repo) is not None
+            if state["structure"] and not have_facts:
+                missing = [_window_str(w) for w in windows
+                           if _window_str(w) not in wmeta.get("facts:", {})]
+                err(ckey, "the last fold replayed every window's facts "
+                    "(`structure` true), but a gathered window has no "
+                    "per-window facts now (a deleted `facts:` entry)",
+                    windows=missing)
+            elif not state["structure"] and have_facts:
+                err(ckey, "`structure` is false, yet every gathered window "
+                    "has per-window facts: the last fold would have written "
+                    "true")
+    elif wmeta.get("facts:") or wmeta.get("clone:") or graphstore.get_meta(
+            conn, graphstore._retractions_key(project, repo)) is not None:
+        err(ckey, "missing: the repo has per-window facts / clone provenance, "
+            "and every fold that writes them also writes the current-state "
+            "marker (#95)")
+    # per-window keys name a gathered window and have the writer's shape
+    names = {_window_str(w) for w in windows}
+    checks = {"ref_date:": lambda v: None if isinstance(v, str) and _DAY_RE.match(v)
+              else "not a date",
+              "branches:": _branches_problem, "clone:": _clone_problem,
+              "facts:": _facts_entry_problem}
+    refs = {}
+    for prefix in _WINDOW_META_PREFIXES:
+        for wstr, (key, raw_value) in sorted(wmeta.get(prefix, {}).items()):
+            if wstr not in names:
+                err(key, "names no gathered window of this repo (orphan "
+                    "per-window meta)")
+            if prefix == "ref_date:":
+                value = raw_value
+            else:
+                try:
+                    value = json.loads(raw_value)
+                except ValueError:
+                    err(key, "unreadable (not valid JSON)")
+                    continue
+            why = checks[prefix](value)
+            if why:
+                err(key, why)
+            elif prefix == "facts:":
+                for fk, digest in value["facts"].items():
+                    refs.setdefault(digest, set()).add(fk)
+    # fact values: re-hashed against their key, and the shape of the refs
+    prefix = graphstore._fact_blob_prefix(project, repo)
+    for key, text in graphstore._meta_with_prefix(conn, prefix):
+        digest = key[len(prefix):]
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != digest:
+            err(key, "the stored value does not hash to its key (the value "
+                "was changed after fold wrote it)")
+            continue
+        try:
+            value = json.loads(text)
+        except ValueError:
+            err(key, "unreadable (not valid JSON)")
+            continue
+        for fk in sorted(refs.get(digest, ())):
+            why = _fact_shape_problem(fk, value)
+            if why:
+                err(key, why, fact=fk)
+    skey = graphstore._clone_sha_key(project, repo)
+    sha = graphstore.get_meta(conn, skey)
+    if sha is not None and not _SHA_RE.match(sha):
+        err(skey, "not a commit sha")
+    # the manifest context cross-repo edges are judged by (M4)
+    fkey = graphstore._fold_context_key(project, repo)
+    raw = graphstore.get_meta(conn, fkey)
+    if raw is not None:
+        try:
+            why = _fold_context_problem(json.loads(raw))
+        except ValueError:
+            why = "unreadable (not valid JSON)"
+        if why:
+            err(fkey, why)
+    return details
+
+
+def check_meta_integrity(conn, project, repo):
+    """The repo's store meta is what folds write (issue #113 M1/M2). The
+    markers decide how strict edge_set / idempotency are, and the per-window
+    meta decides what a view reads, so neither may be trusted unchecked:
+
+    - `gathered_windows` is readable; each of the repo's windows is a from <=
+      to pair of dates and, once the repo has any fold evidence, has its own
+      (a per-window meta key, a member run-status entry, or the current-state
+      marker naming it): an entry no fold wrote is an ERROR.
+    - `current_state:` is readable and well formed (`items` true, `structure`
+      a boolean, `records` true or absent, naming a gathered window), and
+      `structure` agrees with the per-window facts: true iff every gathered
+      window has them (fold writes exactly that), so a deleted `facts:`
+      entry is caught. A repo with per-window facts / clone provenance and
+      no marker is an ERROR (every fold since #95 writes both).
+    - every `facts:` / `ref_date:` / `branches:` / `clone:` key of the repo
+      names a gathered window and has the writer's shape; every `fact:`
+      value hashes to its key and has the shape of each key that references
+      it (swapped refs); `clone_sha:` is a commit sha.
+
+    Outside it (documented in STORE.md): a value changed together with its
+    key and ref, and a plausible `branches:` / `ref_date:` / `clone:` value.
+    With --bundle no_drift compares them for the bundle's window."""
+    details = _meta_details(conn, project, repo)
+    if not details:
+        windows, _ = _repo_windows(conn, project, repo)
+        details.append({"severity": INFO, "note": "store meta of {} gathered "
+                        "window(s) is well formed".format(len(windows or []))})
+    return _check("meta_integrity", ERROR, details)
+
+
 # --- check 6: edge set == re-derived from the stored records -----------------
 
 # Re-derived from the stored records alone: compared exactly in both
@@ -1127,14 +1590,17 @@ _MOVE_EDGE_TYPES = frozenset(("replaced_by", "identity_from"))
 
 def _repo_window_count(conn, project, repo):
     """How many distinct gathered windows the meta ledger records for this
-    repo (0 when none; an unreadable ledger counts as one, i.e. strict)."""
-    try:
-        wins = graphstore.get_windows(conn)
-    except ValueError:
+    repo (0 when none; an unreadable ledger counts as one, i.e. strict).
+    Once the repo has fold evidence, only windows with their own evidence
+    count (issue #113 M1): a ledger entry no fold wrote must not turn a
+    one-window store into a multi-window one, whose comparisons are looser
+    (check_meta_integrity reports the entry)."""
+    windows, _ = _repo_windows(conn, project, repo)
+    if windows is None:
         return 1
-    return len({(w.get("from"), w.get("to")) for w in wins
-                if isinstance(w, dict) and w.get("project") == project
-                and w.get("repo") == repo})
+    ev, has = _window_evidence(conn, project, repo, windows,
+                               _repo_window_meta(conn, project, repo))
+    return sum(1 for w in windows if ev[w]) if has else len(windows)
 
 
 def _owned_by_repo(src, dst, project, repo):
@@ -1147,21 +1613,31 @@ def _owned_by_repo(src, dst, project, repo):
             and dst.startswith(prefix))
 
 
-def _expected_edges(bundle, project, repo):
-    """{(src, dst, type): data} the writer derives from `bundle`: the bundle is
-    folded by gather.fold_bundle into an EMPTY in-memory store and its edges
-    read back. Single-repo semantics (members=None): cross-repo edges, which
-    need the manifest's member set and registries, are checked separately."""
+def _scratch_fold(bundle, project, repo, context=None):
+    """(node ids, {(src, dst, type): data}) the writer derives from `bundle`:
+    the bundle is folded by gather.fold_bundle into an EMPTY in-memory store
+    and its rows read back. `context` (_CrossRepoContext or None): the
+    member set and registries of a manifest fold; None folds with
+    single-repo semantics (no cross-repo edge)."""
+    kw = context.fold_kwargs() if context is not None else {}
     scratch = graphstore.open_store(":memory:")
     try:
         graphstore.init_schema(scratch)
         gather.fold_bundle(scratch, copy.deepcopy(bundle), project=project,
-                           repo=repo)
-        return {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
-                for e in (graphstore._row_to_edge(r) for r in
-                          scratch.execute("SELECT * FROM edges"))}
+                           repo=repo, **kw)
+        ids = {r[0] for r in scratch.execute("SELECT id FROM nodes")}
+        edges = {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
+                 for e in (graphstore._row_to_edge(r) for r in
+                           scratch.execute("SELECT * FROM edges"))}
+        return ids, edges
     finally:
         scratch.close()
+
+
+def _expected_edges(bundle, project, repo, context=None):
+    """{(src, dst, type): data} the writer derives from `bundle`
+    (_scratch_fold)."""
+    return _scratch_fold(bundle, project, repo, context)[1]
 
 
 def _touches_expected(windows, bundle, project, repo):
@@ -1194,7 +1670,7 @@ def _touches_expected(windows, bundle, project, repo):
     return out, None
 
 
-def _multi_window_plan(conn, project, repo, bundle):
+def _multi_window_plan(conn, project, repo, bundle, context=None):
     """How check_edge_set compares the current-state edges of a multi-window
     store (issue #95): {"expected": {type: {key: data}} for the types whose
     expected set is not the self-sourced bundle's re-fold, "exact": the types
@@ -1207,9 +1683,11 @@ def _multi_window_plan(conn, project, repo, bundle):
       sprint) is then exactly what the store holds.
     - depends_on / owns: exact once a fold since #95 replayed them over every
       window's facts (`structure`) and every gathered window still has its
-      facts; expected = the same replay (gather.StructureReplay, without the
-      manifest's registries: a cross-repo edge is checked against the code
-      graphs of the windows in effect for its source).
+      facts; expected = the same replay (gather.StructureReplay, with the
+      member set and registries the fold recorded when `context` is a
+      recorded one, issue #113 M4; else without them, and a cross-repo edge
+      is checked against the code graphs of the windows in effect for its
+      source).
     - touches: exact when every window has its facts and _touches_expected
       can merge their path indexes."""
     state = graphstore.get_current_state(conn, project, repo) or {}
@@ -1227,7 +1705,12 @@ def _multi_window_plan(conn, project, repo, bundle):
             plan["reasons"][et] = no_facts
         return plan
     if state.get("structure") is True:
-        replay = gather.StructureReplay(windows, project, repo)
+        kw = {}
+        if context is not None and context.recorded:
+            kw = {"members": context.members,
+                  "registry_by_slug": context.registry,
+                  "bicep_prefix_by_slug": context.bicep}
+        replay = gather.StructureReplay(windows, project, repo, **kw)
         plan["replay"] = replay
         want = {k: v for k, v in replay.desired().items()
                 if _owned_by_repo(k[0], k[1], project, repo)}
@@ -1255,6 +1738,74 @@ def _project_members(conn, project):
     except (ValueError, TypeError, KeyError):
         pass
     return members
+
+
+def _fold_context_problem(ctx):
+    """Why a decoded `fold_context:` entry is not the shape fold writes, or
+    None."""
+    if not isinstance(ctx, dict) or set(ctx) != {
+            "members", "registry", "bicep_registry_prefix", "members_changed"}:
+        return "not {members, registry, bicep_registry_prefix, members_changed}"
+    if not isinstance(ctx["members"], list) or not all(
+            isinstance(m, str) for m in ctx["members"]) \
+            or ctx["members"] != sorted(set(ctx["members"])):
+        return "members is not a sorted list of repo slugs"
+    for key in ("registry", "bicep_registry_prefix"):
+        m = ctx[key]
+        if m is not None and not (isinstance(m, dict) and all(
+                isinstance(v, (str, type(None))) for v in m.values())):
+            return "{} is not a {{slug: value}} map".format(key)
+    if not isinstance(ctx["members_changed"], bool):
+        return "members_changed is not a boolean"
+    return None
+
+
+class _CrossRepoContext:
+    """How check_edge_set derives and judges the edges of a repo into ANOTHER
+    member repo (issue #113 M4 / m2).
+
+    - recorded: a manifest fold recorded its member set and registries
+      (graphstore fold_context). The expected edges are derived with exactly
+      them, so a cross-repo closes / cross_ref / depends_on is compared like
+      any other edge, in both directions. `exact` is False when the member
+      set changed between the repo's folds (`members_changed`): then a
+      missing cross-repo edge is a WARN and a stored one is judged as below.
+    - not recorded (folds before the context existed): the member set is the
+      store's (stored repos plus recorded run status); closes / cross_ref
+      are derived with it and a missing one is a WARN (the member set at fold
+      time is unknown); a stored cross-repo edge is checked against the
+      stored records (_cross_repo_problem); depends_on resolution needs the
+      registries, which are unknown."""
+
+    def __init__(self, members, registry, bicep, exact, recorded):
+        self.members = set(members)
+        self.registry, self.bicep = registry, bicep
+        self.exact, self.recorded = exact, recorded
+
+    @classmethod
+    def load(cls, conn, project, repo):
+        """The context of (project, repo), or None for a repo with no other
+        member (a single-repo store: nothing crosses repos)."""
+        ctx = graphstore.get_fold_context(conn, project, repo)
+        if ctx is not None and _fold_context_problem(ctx) is None:
+            return cls(ctx["members"], ctx["registry"],
+                       ctx["bicep_registry_prefix"],
+                       not ctx["members_changed"], True)
+        members = _project_members(conn, project)
+        if not members - {repo}:
+            return None
+        return cls(members | {repo}, None, None, False, False)
+
+    def fold_kwargs(self):
+        return {"members": self.members, "registry_by_slug": self.registry,
+                "bicep_prefix_by_slug": self.bicep}
+
+
+def _crosses_repo(key, project, repo):
+    """True when an edge of this repo ends in another repo of the project."""
+    dst_scope = graphstore.parse_id(key[1])["scope"]
+    return dst_scope.startswith(project + "/") and \
+        dst_scope != "{}/{}".format(project, repo)
 
 
 def _cross_repo_dep_target(edge):
@@ -1335,13 +1886,35 @@ def _cross_repo_problem(key, data, bundle, project, repo, members,
     return "{} never crosses repos".format(et)
 
 
-def _move_problem(key, data, stored, bundle, project, repo):
-    """None when a stored symbol-move edge is supported by the repo's ledger:
-    its twin (`identity_from` <-> `replaced_by`) carries the same data, both
-    ends are the same non-comment symbol in two files of this repo, the ledger
-    holds a drop of the source (by `move_commit` when recorded) and an add of
-    the destination, and the basis/confidence pair is consistent with the
-    recorded renames. Else why not."""
+class _MoveIndex:
+    """The repo's symbol events and renames, indexed once per check (issue
+    #113 M7: _move_problem used to scan every symbol event per move edge,
+    quadratic on a store with many moves)."""
+
+    def __init__(self, bundle):
+        self.commits = {}
+        for e in bundle.get("symbol_events") or []:
+            k = (e.get("change"), e.get("path"), e.get("lang") or "",
+                 e.get("subkind"), e.get("name") or "")
+            self.commits.setdefault(k, []).append(e.get("commit"))
+        self.renames = {(e.get("old_path"), e.get("path"))
+                        for e in bundle.get("code_events") or []
+                        if e.get("change") in ("rename", "copy")}
+
+    def events(self, change, path, lang, subkind, name):
+        """The commits of the ledger's `change` events of one symbol."""
+        return self.commits.get((change, path, lang or "", subkind, name or ""),
+                                [])
+
+
+def _move_problem(key, data, stored, index, project, repo):
+    """None when a stored symbol-move edge is supported by the repo's ledger
+    (`index`, a _MoveIndex): its twin (`identity_from` <-> `replaced_by`)
+    carries the same data, both ends are the same non-comment symbol in two
+    files of this repo, the ledger holds a drop of the source (by
+    `move_commit` when recorded) and an add of the destination, and the
+    basis/confidence pair is consistent with the recorded renames. Else why
+    not."""
     src, dst, et = key
     twin_type = "identity_from" if et == "replaced_by" else "replaced_by"
     if (dst, src, twin_type) not in stored or stored[(dst, src, twin_type)] != data:
@@ -1358,23 +1931,14 @@ def _move_problem(key, data, stored, bundle, project, repo):
     if a[2] in derive._COMMENT_SUBKINDS:
         return "comments are never matched as moves"
     data = data or {}
-
-    def events(change, path):
-        return [e for e in bundle.get("symbol_events") or []
-                if e.get("change") == change and e.get("path") == path
-                and (e.get("lang") or "") == a[1] and e.get("subkind") == a[2]
-                and (e.get("name") or "") == a[3]]
-    drops = events("drop", a[0])
-    if not drops or (data.get("move_commit") and not any(
-            e.get("commit") == data["move_commit"] for e in drops)):
+    drops = index.events("drop", a[0], a[1], a[2], a[3])
+    if not drops or (data.get("move_commit")
+                     and data["move_commit"] not in drops):
         return "the ledger holds no drop of the source"
-    if not events("add", b[0]):
+    if not index.events("add", b[0], a[1], a[2], a[3]):
         return "the ledger holds no add of the destination"
-    renames = {(e.get("old_path"), e.get("path"))
-               for e in bundle.get("code_events") or []
-               if e.get("change") in ("rename", "copy")}
     basis, conf = data.get("move_basis"), data.get("move_confidence")
-    if basis == "file_rename" and conf == "high" and (a[0], b[0]) in renames:
+    if basis == "file_rename" and conf == "high" and (a[0], b[0]) in index.renames:
         return None
     if basis == "unique_name" and conf == "medium":
         return None
@@ -1396,9 +1960,13 @@ def check_edge_set(conn, project, repo, bundle):
     - derived but not stored -> ERROR; stored but not derivable -> ERROR, with
       a #78 hint when the source is a pre-#78 git-name person; same key with
       different data -> ERROR.
-    - A stored edge into ANOTHER member repo is checked against the manifest
-      derivation (_cross_repo_problem); a missing cross-repo edge is not
-      detected (it needs the manifest's registries).
+    - An edge into ANOTHER member repo (_CrossRepoContext, issue #113): when
+      the repo's folds recorded their member set and registries (meta
+      `fold_context:`) and it never changed, cross-repo closes / cross_ref /
+      depends_on are derived with exactly them and compared both ways. Else
+      a missing one (derived with the store's member set) is a WARN and a
+      stored one is checked against the stored records
+      (_cross_repo_problem).
     - Multi-window store (more than one gathered window recorded for the repo):
       each _CURRENT_STATE_EDGE_TYPES type is compared exactly when
       _multi_window_plan can prove it (depends_on / owns / touches against
@@ -1411,16 +1979,28 @@ def check_edge_set(conn, project, repo, bundle):
     the records are what GitHub holds (see no_drift's --bundle cross-check).
     """
     multi = _repo_window_count(conn, project, repo) > 1
-    expected = {k: v for k, v in _expected_edges(bundle, project, repo).items()
+    context = _CrossRepoContext.load(conn, project, repo)
+    expected = {k: v for k, v in _expected_edges(bundle, project, repo,
+                                                 context).items()
                 if _owned_by_repo(k[0], k[1], project, repo)}
-    plan = _multi_window_plan(conn, project, repo, bundle) if multi else None
+    plan = (_multi_window_plan(conn, project, repo, bundle, context)
+            if multi else None)
     if plan is not None:
         for et, want in plan["expected"].items():
             expected = {k: v for k, v in expected.items() if k[2] != et}
             expected.update(want)
+    # read by index range (issue #113 m6), not a scan of every edge
     stored = {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
-              for e in _all_edges(conn)
+              for e in (_edge(r) for r in _repo_edge_rows(conn, project, repo))
               if _owned_by_repo(e["src_id"], e["dst_id"], project, repo)}
+    exact_cross = context is not None and context.exact
+    soft_cross = (None if context is None or context.exact else
+                  " (an edge into another member repo: {}; re-fold the repo "
+                  "to make this exact)".format(
+                      "the member set changed between this repo's folds"
+                      if context.recorded else
+                      "no fold of this repo recorded its member set"))
+    move_index = None
     members = None
     hints = {}
     pre111 = None
@@ -1450,25 +2030,38 @@ def check_edge_set(conn, project, repo, bundle):
         if key in expected:
             if multi and et in _MOVE_EDGE_TYPES:
                 continue   # a cross-window re-match: no single window had it
+            # a missing edge into another member (issue #113 m2 / M4): exact
+            # with the member set the fold recorded, else only a WARN
+            soft = (soft_cross is not None and not lenient
+                    and _crosses_repo(key, project, repo))
             details.append(dict(
-                base, severity=WARN if lenient else ERROR,
+                base, severity=WARN if (lenient or soft) else ERROR,
                 problem="derived from the stored records but not stored"
-                        + (lenient_note(et) if lenient else "")))
+                        + (lenient_note(et) if lenient else "")
+                        + (soft_cross if soft else "")))
             continue
         # stored but not derivable from this repo's records
-        if members is None:
-            members = _project_members(conn, project)
-        graphs = None
         replay = plan["replay"] if plan is not None else None
-        if et == "depends_on" and replay is not None:
-            graphs = [replay.graphs[i] for i in replay.dep_in_effect(
-                src, gather._dep_is_transitive(stored[key]))]
-        cross = _cross_repo_problem(key, stored[key], bundle, project, repo,
-                                    members, graphs=graphs)
-        if cross is None:
-            continue
+        if exact_cross and _crosses_repo(key, project, repo):
+            # derived with exactly the fold's member set and registries
+            cross = ("not derived with the member set and registries this "
+                     "repo's folds recorded")
+        else:
+            if members is None:
+                members = _project_members(conn, project)
+            graphs = None
+            if et == "depends_on" and replay is not None:
+                graphs = [replay.graphs[i] for i in replay.dep_in_effect(
+                    src, gather._dep_is_transitive(stored[key]))]
+            cross = _cross_repo_problem(key, stored[key], bundle, project,
+                                        repo, members, graphs=graphs)
+            if cross is None:
+                continue
         if multi and et in _MOVE_EDGE_TYPES:
-            problem = _move_problem(key, stored[key], stored, bundle, project, repo)
+            if move_index is None:
+                move_index = _MoveIndex(bundle)
+            problem = _move_problem(key, stored[key], stored, move_index,
+                                    project, repo)
             if problem is None:
                 continue
             details.append(dict(base, severity=ERROR, data=stored[key],
@@ -1661,14 +2254,17 @@ def _people_drift_details(stored_people, want_norm, mode=PEOPLE_EXACT,
     return details
 
 
-def _derive_people_project(conn, project, repos):
+def _derive_people_project(conn, project, repos, sourced=None):
     """Re-derive the PROJECT-WIDE people aggregate: per-member enumerate (exactly as
     each fold does), unioned across members (areas/modules union, is_bot OR,
     unresolved if any member derived it unresolved) — the read-side mirror of
     the union-merge fold_bundle writes."""
     agg = {}
     for repo in repos:
-        bundle, reason = _self_source_bundle(conn, project, repo)
+        if sourced is not None and repo in sourced:
+            bundle, reason = sourced[repo]
+        else:
+            bundle, reason = _self_source_bundle(conn, project, repo)
         if bundle is None:
             raise _NotSourced("{}: {}".format(repo, reason))
         for login, rec in _derive_people(bundle).items():
@@ -1684,7 +2280,7 @@ def _derive_people_project(conn, project, repos):
             for login, v in agg.items()}
 
 
-def check_no_drift_people(conn, project, repos):
+def check_no_drift_people(conn, project, repos, sourced=None):
     """PROJECT-WIDE people no-drift: the stored project-scoped person nodes equal
     the people re-derived across ALL members and unioned (mirroring fold_bundle's
     union-merge). People are project-scoped, so this is the correct granularity — a
@@ -1692,7 +2288,8 @@ def check_no_drift_people(conn, project, repos):
     that when any member holds several gathered windows the areas compare as
     derived ⊆ stored (PEOPLE_WINDOW)."""
     try:
-        want = _norm_people(_derive_people_project(conn, project, repos))
+        want = _norm_people(_derive_people_project(conn, project, repos,
+                                                   sourced))
     except _NotSourced as exc:
         return _not_sourced("no_drift_people", str(exc))
     stored = _stored_project_people(conn, project)
@@ -1765,6 +2362,171 @@ def _record_drift_details(conn, project, repo, bundle):
     return details
 
 
+def _bundle_window(bundle):
+    """The (from, to) window a --bundle covers: its `period` (a view, or a
+    gather bundle), else meta from/to; (None, None) when it names none."""
+    meta = bundle.get("meta") or {}
+    period = meta.get("period") if isinstance(meta.get("period"), dict) else {}
+    frm = period.get("from") or meta.get("from")
+    to = period.get("to") or meta.get("to")
+    if isinstance(frm, str) and isinstance(to, str):
+        return frm, to
+    return None, None
+
+
+def _in_bundle_span(n, local, frm, to):
+    """Would gather have collected stored node `n` for the window [frm, to]?
+    The rule extract applies to a window's view (a PR merged / closed / open
+    in it, an issue closed / updated / open in it, a commit or release dated
+    in it), on the record's stored state. Undated nodes cannot be placed and
+    are left out."""
+    if not n["ts"]:
+        return False
+    if graphstore.ts_in_window(n["ts"], frm, to):
+        return True
+    data = n["data"] if isinstance(n["data"], dict) else {}
+    if local.startswith("pr-"):
+        return extract._pr_in_window(data, frm, to)
+    if local.startswith("issue-"):
+        return extract._issue_in_window(data, frm, to)
+    return False
+
+
+def _is_standin_data(data):
+    """True for a decoded depends_on stand-in node's data."""
+    return isinstance(data, dict) and \
+        data.get("synthesized") == graphstore.STANDIN_MARK
+
+
+def _bundle_span_details(conn, project, repo, bundle):
+    """With an EXTERNAL --bundle (issue #113 C2): every stored record of the
+    bundle's window that the bundle lacks is an ERROR — an invented PR /
+    issue / commit / release (even one with all its edges), or a review /
+    lifecycle event of one of the bundle's records. On a store holding only
+    that one gathered window (the bundle is then the whole store) a stored
+    milestone, sprint or area (not a depends_on stand-in) the bundle lacks
+    is one too. The bundle's rows are what fold writes for it
+    (_scratch_fold), so the ids are the writer's."""
+    frm, to = _bundle_window(bundle)
+    if frm is None:
+        return [{"severity": INFO, "note": "--bundle names no window: stored "
+                 "records it lacks are not looked for"}]
+    want, _edges = _scratch_fold(bundle, project, repo)
+    details = []
+
+    def lacks(qid, kind):
+        details.append({"severity": ERROR, "kind": "record", "id": qid,
+                        "problem": "stored {} of the bundle's window {}..{} "
+                                   "not in --bundle".format(kind, frm, to)})
+    parents = set()
+    for n in _repo_nodes(conn, project, repo):
+        local = graphstore.local_id(n["id"], project, repo)
+        if n["node_class"] == "social" and _ITEM_LOCAL_RE.match(local):
+            if n["id"] in want:
+                parents.add(local)
+            elif _in_bundle_span(n, local, frm, to):
+                lacks(n["id"], local.split("-")[0])
+        elif n["node_class"] == "code" and not graphstore.is_artifact_node(n):
+            if n["id"] not in want and _in_bundle_span(n, local, frm, to):
+                lacks(n["id"], "commit")
+        elif local.startswith("release-") and n["node_class"] == "structure":
+            if n["id"] not in want and _in_bundle_span(n, local, frm, to):
+                lacks(n["id"], "release")
+    # review / lifecycle leaves of the bundle's records
+    for n in _repo_nodes(conn, project, repo, "social"):
+        local = graphstore.local_id(n["id"], project, repo)
+        m = _REVIEW_LOCAL_RE.match(local)
+        parent = "pr-{}".format(m.group(1)) if m else None
+        m = _EVENT_LOCAL_RE.match(local)
+        if m:
+            parent = "{}-{}".format(m.group(1), m.group(2))
+        if parent in parents and n["id"] not in want:
+            lacks(n["id"], "review" if local.startswith("review-") else "event")
+    windows, _ = _repo_windows(conn, project, repo)
+    if windows == [(frm, to)] and _repo_window_count(conn, project, repo) == 1:
+        for n in _repo_nodes(conn, project, repo, "structure"):
+            local = graphstore.local_id(n["id"], project, repo)
+            if not local.startswith(("milestone-", "sprint-", "area-")) \
+                    or n["id"] in want or _is_standin_data(n["data"]):
+                continue
+            lacks(n["id"], local.split("-")[0])
+    return details
+
+
+def _window_meta_drift_details(conn, project, repo, bundle):
+    """With an EXTERNAL --bundle whose window is exactly a gathered window of
+    the repo (issue #113 M2): the per-window meta fold stored for it must be
+    what the bundle says — `ref_date`, the base branch and branches, the
+    clone provenance (clone_sha, clone_mode, boundary_dropped_commits,
+    structure_as_of) and each fact value (workflow_stats, code_graph,
+    code_owners, label_taxonomy). A key the bundle does not carry is not
+    compared (a saved view omits what it has no value for)."""
+    frm, to = _bundle_window(bundle)
+    windows, _ = _repo_windows(conn, project, repo)
+    if frm is None or not windows or (frm, to) not in windows:
+        return []
+    meta = bundle.get("meta") or {}
+    details = []
+
+    def differs(field, stored, given):
+        details.append({"severity": ERROR, "kind": "window_meta",
+                        "window": "{}..{}".format(frm, to), "field": field,
+                        "problem": "stored per-window {} differs from "
+                                   "--bundle".format(field),
+                        "stored": stored, "bundle": given})
+    stored_ref = graphstore.get_ref_date(conn, project, repo, frm, to)
+    given_ref = meta.get("ref_date") or to
+    if stored_ref is not None and stored_ref != given_ref:
+        differs("ref_date", stored_ref, given_ref)
+    if "base_branch" in meta:
+        try:
+            br = graphstore.get_branches(conn, project, repo, frm, to)
+        except ValueError:
+            br = None
+        if isinstance(br, dict):
+            if br.get("base_branch") != meta.get("base_branch"):
+                differs("base_branch", br.get("base_branch"),
+                        meta.get("base_branch"))
+            # with no base branch a view lists none (extract._resolve_branches)
+            elif br.get("base_branch") is not None and (
+                    set(br.get("branches") or []) | {br["base_branch"]}
+                    != set(meta.get("branches") or []) | {br["base_branch"]}):
+                differs("branches", br.get("branches"), meta.get("branches"))
+    try:
+        got = graphstore.get_window_facts(conn, project, repo, frm, to)
+    except (ValueError, AttributeError, TypeError):
+        got = None
+    if got is not None:
+        if meta.get("clone_sha") and got.get("clone_sha") != meta["clone_sha"]:
+            differs("clone_sha", got.get("clone_sha"), meta["clone_sha"])
+        for key in graphstore.WINDOW_FACT_KEYS:
+            if key not in bundle:
+                continue
+            given = bundle.get(key) or None
+            stored = (got.get("facts") or {}).get(key)
+            if json.dumps(stored, sort_keys=True) != json.dumps(given,
+                                                                sort_keys=True):
+                differs(key, stored, given)
+    info = graphstore.get_clone_info(conn, project, repo, frm, to)
+    if info is not None:
+        for field in ("clone_mode", "structure_as_of"):
+            if meta.get(field) and info.get(field) != meta[field]:
+                differs(field, info.get(field), meta[field])
+        # a view unions the lists of every gathered window inside it, so
+        # with another such window the stored list need only be within it
+        given = set(meta.get("boundary_dropped_commits") or [])
+        stored = set(info.get("boundary_dropped_commits") or [])
+        inner = any(w != (frm, to) and extract._contained(
+            {"from": w[0], "to": w[1]}, frm, to) for w in windows
+            if w[0] and w[1])
+        if "boundary_dropped_commits" in meta and (
+                not stored <= given if inner else stored != given):
+            differs("boundary_dropped_commits",
+                    info.get("boundary_dropped_commits"),
+                    meta.get("boundary_dropped_commits"))
+    return details
+
+
 def _derive_artifacts(conn, project, repo, bundle):
     """Re-derive the artifact projection exactly as the write path does (#76):
     derive.artifact_projection over the repo's WHOLE stored ledger, plus any
@@ -1783,6 +2545,17 @@ def _derive_artifacts(conn, project, repo, bundle):
     return derive.artifact_projection(
         {**events, "meta": bundle.get("meta", {}), "commits": commits},
         extract.recorded_moves(conn, project, repo))
+
+
+# The fields of an artifact lifecycle entry no_drift compares (issue #113 M3).
+_LIFECYCLE_FIELDS = ("event", "date", "commit", "author")
+
+
+def _lifecycle_rows(art):
+    """An artifact's lifecycle as [[event, date, commit, author], ...] in its
+    stored order."""
+    return [[e.get(f) if isinstance(e, dict) else e for f in _LIFECYCLE_FIELDS]
+            for e in (art.get("lifecycle") or [])]
 
 
 def _people_mode(conn, project, repo, external):
@@ -1816,10 +2589,15 @@ def check_no_drift(conn, project, repo, bundle, check_people=True,
     derivable carries a #78 hint when it is a pre-#78 git-name identity.
 
     Artifacts are re-derived from the store's OWN ledger plus recorded moves
-    (#76), so this proves the nodes equal their ledger, not that the ledger is
-    right. With an `external` bundle the stored PR / issue / commit records must
-    also equal the bundle's (_record_drift_details): the only way to detect a
-    deleted record or a rewritten blob.
+    (#76) and compared field by field, lifecycle entries (event, date,
+    commit, author) included (#113 M3), so this proves the nodes equal their
+    ledger, not that the ledger is right. With an `external` bundle the
+    stored PR / issue / commit records must also equal the bundle's
+    (_record_drift_details): the only way to detect a deleted record or a
+    rewritten blob; every stored record of the bundle's window must be in it
+    (_bundle_span_details, #113 C2: an inserted record); and the per-window
+    meta of its window must equal its own (_window_meta_drift_details, #113
+    M2).
 
     `check_people=False` skips the people section (validate_project audits
     them once project-wide)."""
@@ -1842,6 +2620,8 @@ def check_no_drift(conn, project, repo, bundle, check_people=True,
 
     if external:
         details.extend(_record_drift_details(conn, project, repo, bundle))
+        details.extend(_bundle_span_details(conn, project, repo, bundle))
+        details.extend(_window_meta_drift_details(conn, project, repo, bundle))
 
     # --- artifacts ---
     # The stored artifact id is `{project}/{repo}#{local}` where the SYMBOL-artifact
@@ -1873,12 +2653,15 @@ def check_no_drift(conn, project, repo, bundle, check_people=True,
                         "severity": ERROR, "kind": "artifact", "id": aid,
                         "field": f, "problem": "artifact field drift",
                         "stored": s.get(f), "expected": w.get(f)})
-            if len(s.get("lifecycle") or []) != len(w.get("lifecycle") or []):
+            # the entries themselves (issue #113 M3), not only their count
+            sl, wl = _lifecycle_rows(s), _lifecycle_rows(w)
+            if sl != wl:
                 details.append({
                     "severity": ERROR, "kind": "artifact", "id": aid,
-                    "field": "lifecycle", "problem": "lifecycle length drift",
-                    "stored": len(s.get("lifecycle") or []),
-                    "expected": len(w.get("lifecycle") or [])})
+                    "field": "lifecycle", "problem": "lifecycle drift",
+                    "stored": [e for e in sl if e not in wl][:5],
+                    "expected": [e for e in wl if e not in sl][:5],
+                    "stored_len": len(sl), "expected_len": len(wl)})
 
     if not any(d["severity"] == ERROR for d in details):
         details.append({"severity": INFO, "note": "store matches re-derived people+artifacts"})
@@ -2070,7 +2853,7 @@ def _self_source_bundle(conn, project, repo):
 
 
 def validate_repo(conn, project, repo, bundle=None, check_people=True,
-                  scope=None):
+                  scope=None, sourced=None):
     """Run all trustworthiness checks for a single (project, repo) and return a
     Report. The two real-data checks (no_drift, idempotency) need a raw bundle
     to re-derive against; when `bundle` is not passed they SELF-SOURCE it from
@@ -2087,6 +2870,10 @@ def validate_repo(conn, project, repo, bundle=None, check_people=True,
     repo's own rows plus the shared rows and store-wide parts, so another
     stored member's errors are not reported here. validate_project passes
     the member's own rows only and audits the shared part once.
+
+    `sourced` (validate_project, issue #113 m6): a {repo: (bundle, reason)}
+    cache of self-sourced bundles, so a member is self-sourced once per
+    audit.
     """
     if scope is None:
         scope = _Scope.single_repo(conn, project, repo)
@@ -2102,11 +2889,17 @@ def validate_repo(conn, project, repo, bundle=None, check_people=True,
         _guarded(check_provenance, "provenance", conn, scope),
         _guarded(check_no_fabrication, "no_fabrication", conn, scope),
         _guarded(check_schema_conformance, "schema_conformance", conn, scope),
+        _guarded(check_meta_integrity, "meta_integrity", conn, project, repo),
     ]
     # edge_set always audits the store against ITS OWN records (self-sourced),
     # also when an external bundle is passed: the bundle's job is to vouch for
     # the records themselves (no_drift's record cross-check).
-    self_bundle, self_reason = _self_source_bundle(conn, project, repo)
+    if sourced is not None and repo in sourced:
+        self_bundle, self_reason = sourced[repo]
+    else:
+        self_bundle, self_reason = _self_source_bundle(conn, project, repo)
+        if sourced is not None:
+            sourced[repo] = (self_bundle, self_reason)
     if self_bundle is None:
         checks.append(_not_sourced("edge_set", self_reason))
     else:
@@ -2124,8 +2917,11 @@ def validate_repo(conn, project, repo, bundle=None, check_people=True,
         checks.append(_guarded(check_no_drift, "no_drift",
                                conn, project, repo, drift_bundle, check_people,
                                bundle is not None))
+        # a copy: the re-fold may touch the bundle, which validate_project
+        # re-uses for its people check
         checks.append(_guarded(check_idempotency, "idempotency",
-                               conn, drift_bundle, project, repo))
+                               conn, copy.deepcopy(drift_bundle), project,
+                               repo))
     return Report(checks)
 
 
@@ -2163,11 +2959,13 @@ def validate_project(conn, project, repos):
     if not repos and not _has_member_status(conn, project):
         raise ValueError("validate_project: no repos to validate")
     member_reports = []
+    sourced = {}   # each member is self-sourced once (issue #113 m6)
     for repo in repos:
         # check_people=False: people are project-scoped; audited once below.
         # The row-level checks audit the member's own rows only (#107).
         rep = validate_repo(conn, project, repo, check_people=False,
-                            scope=_Scope(project, repos, repo, False))
+                            scope=_Scope(project, repos, repo, False),
+                            sourced=sourced)
         member_reports.append({"repo": repo, **rep.to_dict()})
     # PROJECT-WIDE checks (the ones whose unit is the project, not a member repo):
     # people drift over the cross-member union; the row-level checks over the
@@ -2176,7 +2974,7 @@ def validate_project(conn, project, repos):
     project_checks = []
     if repos:
         project_checks.append(_guarded(check_no_drift_people, "no_drift_people",
-                                       conn, project, repos))
+                                       conn, project, repos, sourced))
     else:
         # Nothing to audit is never a pass, whatever member_status says (its
         # entries can all read `ok` while the members' nodes are gone).

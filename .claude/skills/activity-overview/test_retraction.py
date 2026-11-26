@@ -746,7 +746,14 @@ class TestFirstFoldAndTrustCheck(_Case):
                                                    if k != "to"})
         conn.execute("DELETE FROM meta WHERE key LIKE 'current_state:%'")
         conn.commit()
-        report = self.assertClean(conn)
+        # Per-window facts without the marker: every fold that writes facts
+        # also writes the marker, so the store's own state is the one thing
+        # the gate rejects (issue #113 M1: a deleted marker used to downgrade
+        # real tampering); every other check still passes.
+        report = validate.validate(conn, project="o", repo="r")
+        failing = [c for c in report.checks if not c["ok"]]
+        self.assertEqual([c["name"] for c in failing], ["meta_integrity"])
+        self.assertIn("current_state:o/r", json.dumps(failing[0]["details"]))
         idem = [c for c in report.checks if c["name"] == "idempotency"][0]
         self.assertIn("#95", json.dumps(idem["details"]))
         # the next fold heals it, and logs what it retracted

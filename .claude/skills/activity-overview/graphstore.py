@@ -1345,6 +1345,42 @@ def get_current_state(conn, project, repo):
     return entry if isinstance(entry, dict) else None
 
 
+# The manifest context of a repo's folds (issue #113), meta
+# `fold_context:{project}/{repo}`: {"members": [slug, ...] (sorted),
+# "registry": {slug: Terraform registry address or null} or null,
+# "bicep_registry_prefix": {slug: prefix or null} or null,
+# "members_changed": bool}, written by every manifest fold of the repo (the
+# member set and registries it derived the cross-repo edges with).
+# `members_changed` is sticky: true once a fold of the repo used another
+# member set than the one recorded, ran without one (a single-repo fold), or
+# found records stored by a fold that recorded none — the stored records'
+# cross-repo closes / cross_ref were then not all derived with this member
+# set. validate resolves cross-repo edges exactly from it. A store whose
+# folds predate it has none (validate then checks as before, with a WARN).
+def _fold_context_key(project, repo):
+    return "fold_context:{}/{}".format(project, repo)
+
+
+def set_fold_context(conn, project, repo, entry, commit=True):
+    """Record the manifest context of the latest fold of (project, repo)
+    (see above). `commit=False`: see upsert_nodes."""
+    set_meta(conn, _fold_context_key(project, repo),
+             json.dumps(entry, sort_keys=True), commit=commit)
+
+
+def get_fold_context(conn, project, repo):
+    """The recorded fold context of (project, repo) (see above), or None when
+    no manifest fold recorded one or it is unreadable."""
+    raw = get_meta(conn, _fold_context_key(project, repo))
+    if not raw:
+        return None
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
 def record_retractions(conn, project, repo, entry, commit=True):
     """Append one fold's retractions to the repo's ledger (see above), keeping
     the newest RETRACTION_LEDGER_MAX entries. `commit=False`: see
