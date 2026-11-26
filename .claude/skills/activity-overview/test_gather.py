@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import derive  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -3800,6 +3801,9 @@ class TestStoreOnly(unittest.TestCase):
     in-memory bundle into the journey-graph store and writes NO bundle file
     (--out is gone); --store is required."""
 
+    def setUp(self):
+        quiet(self)
+
     def _run_main(self, extra_args):
         orig = gather.acquire
         gather.acquire = lambda args, env: _fold_fixture_bundle()
@@ -3977,6 +3981,9 @@ class TestFoldBundleOverride(unittest.TestCase):
 
 
 class TestManifestMain(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_member_args_clones_namespace_with_overrides(self):
         base = gather.parse_args([
             "--owner", "x", "--repo", "y", "--from", "2026-01-01", "--to", "2026-01-31",
@@ -4195,6 +4202,9 @@ class TestFoldCrossRepoEdges(unittest.TestCase):
 
 
 class TestMultiRepoIntegration(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_two_member_manifest_builds_cross_repo_train(self):
         import tempfile
         man = {
@@ -5032,6 +5042,9 @@ class TestBoardIsMaintained(unittest.TestCase):
 class TestFetchProjectBoard(unittest.TestCase):
     """The acquire-level board fetch seam: auto-discovery + pagination via an
     injected graphql callable, degrading cleanly on errors / no board."""
+
+    def setUp(self):
+        quiet(self)
 
     def test_happy_path_parses_and_paginates(self):
         # first page returns one board with hasNextPage=True; second page closes it.

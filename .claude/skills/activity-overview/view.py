@@ -114,8 +114,12 @@ def resolve_scope(conn, project, repo):
     that tells the operator what to pass. Auto-detection reuses
     `validate._detect_project_repo`; explicitly passed values are checked
     against the store so a typo never yields a silently empty view."""
+    projects = _store_projects(conn)
+    if not projects:
+        # Said in view's own terms (issue #97), not the validator's wording.
+        raise ValueError("the store is empty: nothing has been gathered into it "
+                         "(did the gather fail?); no view to write")
     if project is not None:
-        projects = _store_projects(conn)
         if project not in projects:
             raise ValueError(
                 "project {!r} is not in the store (projects: {})".format(

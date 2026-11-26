@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 import link  # noqa: E402
 import series  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 
 def _bundle(meta=None, shipped=(), in_flight=(), next_candidates=(),
@@ -153,6 +154,9 @@ class TestForecastLoop(unittest.TestCase):
 
 class TestSeriesWiring(unittest.TestCase):
     """link.py --series: round-trips + appends; no `series` key without it."""
+
+    def setUp(self):
+        quiet(self)
 
     def _write(self, bundle):
         fd, path = tempfile.mkstemp(suffix=".json")

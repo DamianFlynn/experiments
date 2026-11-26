@@ -37,6 +37,7 @@ import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures")
 SHA = "c1" * 20
@@ -74,6 +75,9 @@ def _timeline_bundle(committed_at):
 
 
 class TestCommitTimestamp(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def _record(self, *fields):
         return gather.RECORD_SEP + gather.FIELD_SEP.join(fields) + "\ndocs/a.md\n"
 

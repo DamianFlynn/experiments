@@ -732,6 +732,9 @@ def resolve_members(conn, project, repos):
     lists the project's repos (same wording as view.py). A `--repo` in any casing
     selects the stored member (#70) and is returned in the stored spelling."""
     projects = _store_projects(conn)
+    if not projects:
+        raise ValueError("the store is empty: nothing has been gathered into it "
+                         "(did the gather fail?); no project to digest")
     if project not in projects:
         raise ValueError("project {!r} is not in the store (projects: {})".format(
             project, projects))

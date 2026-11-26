@@ -75,6 +75,7 @@ import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -123,6 +124,9 @@ class CharacterizationGate(unittest.TestCase):
     """For each golden: assert the current enriched output reproduces the
     committed char_<name>.json snapshot exactly. The refactor in 7b-2 must keep
     this green."""
+
+    def setUp(self):
+        quiet(self)
 
     def _gate(self, golden_name):
         got = _pipeline(golden_name)

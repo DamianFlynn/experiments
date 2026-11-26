@@ -155,7 +155,24 @@ class TestViewStoreErrors(_TmpCase):
         code, err = _run_main(["--store", db, "--from", "2026-05-01",
                                "--to", "2026-05-31", "--out", self.path("x.json")])
         self.assertEqual(code, 2)
-        self.assertIn("empty store", err)
+        self.assertIn("the store is empty", err)
+
+    def test_empty_store_says_what_view_could_not_do(self):
+        # Issue #97 finding 6: not the validator's "no project to validate".
+        db = self.path("empty.db")
+        _build_store(db, [])
+        for extra in ([], ["--project", "Azure"], ["--project", "Azure",
+                                                   "--repo", "bicep"]):
+            with self.subTest(extra=extra):
+                code, err = _run_main(["--store", db, "--from", "2026-05-01",
+                                       "--to", "2026-05-31",
+                                       "--out", self.path("x.json")] + extra)
+                self.assertEqual(code, 2)
+                self.assertIn("the store is empty: nothing has been gathered "
+                              "into it (did the gather fail?)", err)
+                self.assertIn("no view to write", err)
+                self.assertNotIn("validate", err)
+                self.assertFalse(os.path.exists(self.path("x.json")))
 
     def test_not_a_store_exits_2(self):
         db = self.path("junk.db")

@@ -11,6 +11,10 @@ Usage:
 - `/activity --manifest PATH [options]` — a multi-repo project; the project name and
   window come from the manifest (a bare project name cannot be gathered).
 
+Token: gather reads `GITHUB_TOKEN` (else `GH_TOKEN`) — a classic PAT with `public_repo` for
+public repos, `repo` for private ones, plus `read:project` for Projects v2 boards. The skill
+only reads from GitHub; it never writes (`docs/USAGE.md` §1.1).
+
 Options:
 - `--store PATH` — the journey-graph store to write and read. Default: one store per
   window, `workspace/<FROM>_<TO>/journey.db` (e.g. `workspace/2026-11-01_2026-11-30/journey.db`),

@@ -5,6 +5,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 import transcript  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 
 VTT = """\
@@ -114,6 +115,9 @@ class TestNormalizeTranscript(unittest.TestCase):
 
 
 class TestTranscriptCli(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_cli_prints_normalized(self):
         import io
         import contextlib

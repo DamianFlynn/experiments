@@ -16,6 +16,7 @@ import unittest
 import graphstore
 import gather
 import validate
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -318,6 +319,9 @@ def _fold_participants():
 
 
 class TestAllParticipants(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_all_participants_get_person_nodes(self):
         conn, _ = _fold_participants()
         for login in _DROPPED_LOGINS:

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import manifest as manifest_mod  # noqa: E402
 import manifest_from_index as mfi  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 # A realistic slice of the AVM TerraformResourceModules.csv schema (the verbatim
 # header) plus one pattern row and an unusable row (blank RepoURL -> dropped).
@@ -150,6 +151,9 @@ class TestBuildManifest(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_main_reads_file_writes_out(self):
         with tempfile.TemporaryDirectory() as d:
             idx = os.path.join(d, "index.csv")

@@ -163,6 +163,25 @@ from a narrator sub-agent that reads ONLY that train's bounded slice:
    >   back the above; every claim must trace to one of them.
    > Ground every statement in the slice. If a field has no support in the slice, set it to
    > `null`/`[]` rather than guessing.
+2b. **Batched mode (many deep trains).** One narrator per train is the default. When a view
+   has many deep trains of ordinary size (a monorepo month often has 8–18, a roll-up more),
+   you MAY instead dispatch one narrator per **batch** — per view (one per month), or per N
+   trains with N at most 8 — and run the batches in parallel. The contract does not change;
+   the hand-over does:
+   - Give each train's slice to the batch as its **own block** — a heading `train <id>`
+     followed by that slice's JSON exactly as `--slice` printed it (deepened per 1b if you
+     did) — never merged into one object or summarised.
+   - Prepend to the contract above: *"You are given several train slices, each under its own
+     heading. Narrate each train from ITS OWN slice only: a fact, ref or URL from one train's
+     slice must never appear in another train's narrative. Return one JSON object keyed by
+     train id, `{"<train-id>": {summary, proposed, changed, rejected, shipped, evidence},
+     …}`, with exactly the train ids you were given."*
+   - Verify **per train** (step 3), against that train's own slice, never the batch's union:
+     every `evidence` URL of train T must be in T's slice. A train missing from the reply is
+     narrated again on its own; a key for a train you did not hand over is discarded.
+   - Keep single mode for any train whose slice is large — `feature_deltas_diff_overflow > 0`,
+     a slice you deepened in 1b, or one far longer than the rest — so it gets a narrator's
+     whole attention; batch the others.
 3. **Verify, then compose.** Drop any `evidence` ref whose URL is not in the slice (the
    sub-agent introduces no new refs; a cited commit must be one of `slice.commits`, linked
    by its `url`).

@@ -59,8 +59,9 @@ GitHub links (BUNDLE.md). Unknown project/repo or a bad window → exit 2.
 Store scope: a single-repo gather stores **project = OWNER, repo = REPO**; a manifest
 gather stores **project = the manifest's `project`, repo = `owner/repo`** per member.
 
-1. **Gather → store.** Run the gather CLI (requires `GITHUB_TOKEN` with `repo` scope and
-   `git` on PATH). gather auto-discovers and ingests the repo's Projects v2 board(s) when
+1. **Gather → store.** Run the gather CLI (requires `git` on PATH and `GITHUB_TOKEN`: a
+   classic PAT with `public_repo` for a public repo, `repo` for a private one — the skill
+   only **reads** from GitHub, it never writes; `docs/USAGE.md` §1.1). gather auto-discovers and ingests the repo's Projects v2 board(s) when
    the token also has `read:project`; without that scope (or with `--no-project-board`) the
    board layer cleanly degrades to empty and the rest of the run is unaffected. The
    **store is the sole output** — gather writes no bundle file:
@@ -83,6 +84,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    - **Roll-up / refresh are store-native.** A long view is a wider window over a store
      that holds its months (no separate roll-up artifact; its CI statistics are the sum of
      the gathered windows inside it, its structure the latest one's — `meta.facts_windows`).
+     With one store per month that means one more gather of the whole period into its own
+     store; link the roll-up without the monthly `--series` (`docs/USAGE.md` §5.3 *Roll-ups*).
      A refresh re-gathers the same window into the same store: the fold is idempotent, and
      the window's structure is read at its last mainline commit (`meta.clone_sha` records
      which; it is provenance, not a pin). gather writes no bundle file
@@ -168,8 +171,15 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    override; delete it to start a fresh series. For a one-off digest run
    `python3 link.py workspace/view/bundle.json` instead (no `series` key is added).
    Multi-repo: keep one series file per member (`workspace/series/<owner>__<repo>.json`).
-5. **Render diagrams** (rewrites the bundle view with `diagrams`). Preflight: `mmdc` must
-   be on PATH (install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`).
+5. **Render diagrams** (rewrites the bundle view with `diagrams`). Preflight first —
+   `mmdc --version` is not enough (it passes while the headless browser mmdc renders with
+   is missing); this compiles one tiny diagram with render's own options and exits 0, or
+   non-zero with a one-line reason and the fix:
+   ```bash
+   python3 render.py --preflight
+   ```
+   (No `mmdc` on PATH: install mermaid-cli with `npm install -g @mermaid-js/mermaid-cli`;
+   cannot render: install the browser for mermaid-cli as mmdc's message says.)
    `graphify` is **optional** (used only for its supported languages); when it is absent —
    e.g. on Bicep/Terraform repos — the **directory provider** supplies code areas.
    ```bash
@@ -179,14 +189,19 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    train) and **fails if any diagram does not compile** under `mmdc`. **`bundle.diagrams`
    paths are relative to the parent of `--diagrams-dir`** — here `workspace/`, so
    `diagrams/buckets_pie.mmd` is the file `workspace/diagrams/buckets_pie.mmd`. Only the
-   bundle view file `render.py` rewrote carries `diagrams`. If `mmdc` is unavailable, add
-   `--skip-validate` and say in the report that the diagrams are unvalidated.
+   bundle view file `render.py` rewrote carries `diagrams`. If the preflight fails and the
+   fix is not possible, add `--skip-validate` and say in the report that the diagrams are
+   unvalidated. (A render that fails because mmdc cannot render at all prints the same
+   one-line reason as the preflight; a diagram mmdc rejects is named with mmdc's error.)
 6. **Train slices** (read-only; one per train you narrate — at least every
    `tier: "deep"` train). The bounded, self-contained evidence a per-train narrator reads:
    ```bash
    python3 link.py workspace/view/bundle.json --slice <train-id> > workspace/view/<train-id>.slice.json
    ```
-   Train ids are `bundle["trains"][].id`.
+   Train ids are `bundle["trains"][].id`. Each deep train gets a narrator sub-agent; with
+   many deep trains, one narrator may take a batch of slices (one per month, or per up to
+   8 trains), each slice handed over separately and each train's cited URLs checked
+   against its own slice (`reference/report-sections.md` "Per-train narration", step 2b).
 7. **Project view** (multi-repo only; skip for a single repo):
    ```bash
    python3 digest.py --store workspace/journey.db --project <name> --from FROM --to TO > workspace/view/project.json

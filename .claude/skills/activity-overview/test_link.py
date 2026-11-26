@@ -13,6 +13,7 @@ import extract  # noqa: E402
 import gather  # noqa: E402
 import graphstore  # noqa: E402
 import link  # noqa: E402
+from _quiet import quiet  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -905,6 +906,9 @@ class TestCodeAreaAttribution(unittest.TestCase):
 
 
 class TestTrainsModulesPeopleAreas(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def _bundle(self):
         return {
             "meta": {"owner": "o", "repo": "r"},
@@ -965,6 +969,9 @@ class TestTrainsModulesPeopleAreas(unittest.TestCase):
 
 
 class TestPhase3bConsistency(unittest.TestCase):
+    def setUp(self):
+        quiet(self)
+
     def test_attribution_preserves_artifact_and_delta_refs(self):
         b = _enrich_via_store("bundle_p3b.json")
         for d in b["feature_deltas"]:
@@ -3077,6 +3084,9 @@ class TestForecastWithoutMilestones(unittest.TestCase):
 class TestSliceCLI(unittest.TestCase):
     """`link.py BUNDLE --slice TRAIN_ID` emits one train's enriched, bounded slice
     as JSON on stdout (read-only) — the unit a Phase 4b narrator sub-agent reads."""
+
+    def setUp(self):
+        quiet(self)
 
     def _raw(self):
         # A minimal enrich-complete raw bundle: PR 100 closes issue 10 (-> one

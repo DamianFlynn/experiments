@@ -1279,6 +1279,16 @@ then runs mmdc again for the PNG. `ACTIVITY_MMDC_PUPPETEER_CONFIG` names a puppe
 passed as `mmdc -p`; without it, a run as root gets a generated `--no-sandbox` config (Chrome
 will not start sandboxed as root). Paths are recorded in `bundle.diagrams`.
 
+**Preflight.** `render.py --preflight` (no bundle) runs `mmdc_preflight`: it compiles
+`PREFLIGHT_DIAGRAM` (a one-slice pie) through `validate_with_mmdc`, so with the same command
+line as a real render (`-q`, and the `-p` browser config above), and prints one line: exit 0 when it compiled, 3
+when `mmdc` is not on PATH, 1 when it could not render (the reason is the first line of mmdc's
+error output that says "error", stack frames dropped, plus the fix: install mermaid-cli's
+headless browser, or `--skip-validate` with the diagrams called unvalidated). When a real
+render fails, `main` runs the same preflight: if it fails too, the environment is the cause
+and the run prints the preflight's line; if it passes, the diagram is, and the run prints
+mmdc's error for that diagram as before. Exit 1 either way.
+
 ## 8. Trust — `validate.py`
 
 `validate.py STORE [--project P] [--repo R] [--bundle FILE] [--json]` → exit 0 when no ERROR, 1
@@ -1800,7 +1810,7 @@ these affect an accumulated store.
 
 ## 15. Testing and CI
 
-- 55 `test_*.py` modules (stdlib `unittest`, about 2,200 tests), fixture-driven and fully
+- About 65 `test_*.py` modules (stdlib `unittest`, about 2,500 tests in late 2026), fixture-driven and fully
   offline (fake fetch seams; no network). Notable: `test_characterization.py` (store-derived ==
   link-derived golden equivalence), `test_validate.py` / `test_validate_strict.py` (each
   check), `test_gather.py` (parsers, fold, IaC parsing incl. modern/legacy DOT),
@@ -1809,11 +1819,17 @@ these affect an accumulated store.
   stores), `test_view.py` (the `SKILL.md` / `commands/activity.md` docs contract: every
   documented command names a real script and accepted flags), `test_report_template.py`
   (template placeholders against real view output), `test_suite_hygiene.py` (every test is
-  collectable by `unittest`; no conflict markers in skill files).
+  collectable by `unittest`; no conflict markers in skill files; no test writes to stdout —
+  a pass-through `sys.stdout` wrapper installed when discovery imports the module fails
+  the test that writes, so `... 2>&1 | tail -1` is always unittest's verdict). In-process
+  CLI tests capture the diagnostics they cause (`_quiet.quiet(self)` for stderr,
+  `contextlib.redirect_stdout` for output they assert on).
 - Run: `python3 -m unittest discover -s .claude/skills/activity-overview -p 'test_*.py' -v`.
-  Six tests skip on a normal machine (four real-store smoke tests without a local real
-  store, two FTS5-absent degrade paths when FTS5 is present); the mmdc diagram tests skip
-  without `mmdc`, and fail instead under `CI=true`.
+  The result must be `OK`; how many tests skip depends on the machine (USAGE §2 lists the
+  conditions): the four real-store smoke tests without a local real store, the two
+  FTS5-absent degrade paths when FTS5 is present (the FTS5 tests instead when it is not),
+  and the mmdc diagram tests without an mmdc that can render (they fail instead under
+  `CI=true`).
 - CI (`.github/workflows/activity-overview.yml`): `tests` on every relevant push/PR (Python 3.11,
   3.12, 3.13, byte-compile of the skill, `samples/` and `examples/formatters/`, pinned mmdc, then
   the suite; 20-minute timeout); `live` on dispatch, schedule (07:00 UTC on the 1st and

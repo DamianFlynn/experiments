@@ -1069,9 +1069,61 @@ def validate_with_mmdc(paths, export=None, runner=subprocess.run, which=shutil.w
             os.remove(out)
 
 
+# --- preflight (issue #97, finding 9) -----------------------------------------
+# `mmdc --version` succeeds even when mmdc cannot render anything (its headless
+# browser is not installed), so the real check is to compile one tiny diagram the
+# way render does: through validate_with_mmdc, with the same command line
+# (including the `-p` browser config).
+PREFLIGHT_DIAGRAM = 'pie\n    "preflight" : 1\n'
+SKIP_HINT = ("or run render.py with --skip-validate and say in the report that "
+             "its diagrams are unvalidated")
+CANNOT_RENDER_FIX = ("Fix: install the headless browser mermaid-cli renders with "
+                     "(mmdc's message usually names the install command), "
+                     + SKIP_HINT + ".")
+
+
+def _tool_error_line(text):
+    """The one line of a tool's error output worth showing: the first that says
+    'error', else the first non-blank one (stack frames are dropped)."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for ln in lines:
+        if "error" in ln.lower():
+            return ln[:300]
+    return lines[0][:300] if lines else "no error output"
+
+
+def mmdc_preflight(runner=subprocess.run, which=shutil.which, env=None, euid=None):
+    """None when mmdc compiles PREFLIGHT_DIAGRAM with render's own options, else a
+    one-line reason."""
+    if not which("mmdc"):
+        return "`mmdc` not found on PATH"
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "preflight.mmd")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(PREFLIGHT_DIAGRAM)
+        try:
+            validate_with_mmdc([src], runner=runner, which=which, env=env, euid=euid)
+        except RuntimeError as exc:
+            head, _, rest = str(exc).partition("\n")
+            if rest.strip():
+                return _tool_error_line(rest)
+            return head.replace(src, "a one-line test diagram")
+    return None
+
+
+def _cannot_render_message(reason):
+    return (f"error: mmdc cannot render diagrams here: {reason.rstrip('. ')}. "
+            f"{CANNOT_RENDER_FIX}\n")
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Render + validate activity-overview diagrams.")
-    p.add_argument("bundle", help="Path to the enriched bundle JSON.")
+    p.add_argument("bundle", nargs="?", help="Path to the enriched bundle JSON.")
+    p.add_argument("--preflight", action="store_true",
+                   help="Check only that mmdc can render here: compile one tiny "
+                        "diagram with the options render uses, print one line "
+                        "and exit 0 (it can) or non-zero (it cannot, with the "
+                        "fix). Takes no bundle.")
     p.add_argument("--diagrams-dir", default="workspace/diagrams")
     p.add_argument("--export", choices=["svg", "png"], default=None,
                    help="Also export images beside each .mmd (needs mmdc, so it "
@@ -1081,6 +1133,12 @@ def parse_args(argv):
     p.add_argument("--train", default=None, metavar="TRAIN_ID",
                    help="Spotlight: render only this one train's flowchart (any tier).")
     args = p.parse_args(argv)
+    if args.preflight:
+        if args.bundle is not None:
+            p.error("--preflight checks mmdc only; give no bundle")
+        return args
+    if args.bundle is None:
+        p.error("the following arguments are required: bundle")
     if args.export and args.skip_validate:
         # Exporting runs mmdc, which IS the validation; silently writing no images
         # (the old behaviour) misreported the run, so reject the combination.
@@ -1094,8 +1152,22 @@ def _unknown_train_message(train_id, bundle_path, known):
             f"({len(known)} trains{': ' + listing if known else ''})\n")
 
 
-def main(argv=None):
+def main(argv=None, runner=None, which=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    runner = runner or subprocess.run
+    which = which or shutil.which
+    if args.preflight:
+        if not which("mmdc"):
+            sys.stderr.write("error: `mmdc` not found on PATH. " + INSTALL_HINT
+                             + " Then re-run the preflight, " + SKIP_HINT + ".\n")
+            raise SystemExit(3)
+        reason = mmdc_preflight(runner=runner, which=which)
+        if reason:
+            sys.stderr.write(_cannot_render_message(reason))
+            raise SystemExit(1)
+        sys.stdout.write("mmdc preflight OK: a test diagram compiled with the "
+                         "options render.py uses\n")
+        return 0
     with open(args.bundle) as fh:
         bundle = json.load(fh)
     if args.train is not None:
@@ -1107,9 +1179,14 @@ def main(argv=None):
     manifest = write_diagrams(bundle, args.diagrams_dir, train_id=args.train)
     if not args.skip_validate:
         try:
-            validate_with_mmdc(list(manifest.values()), export=args.export)
+            validate_with_mmdc(list(manifest.values()), export=args.export,
+                               runner=runner, which=which)
         except RuntimeError as exc:
-            sys.stderr.write(f"error: {exc}\n")
+            # Tell "mmdc cannot render at all" (one line + the fix, as the
+            # preflight says it) from "this diagram is bad" (the tool's error).
+            reason = mmdc_preflight(runner=runner, which=which)
+            sys.stderr.write(_cannot_render_message(reason) if reason
+                             else f"error: {exc}\n")
             raise SystemExit(1)
     tmp = args.bundle + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
