@@ -560,8 +560,10 @@ class TestMergeHelpers(unittest.TestCase):
         ]
         people = digest._merge_people(members)
         self.assertEqual(set(people), {"alice"})
-        self.assertEqual(people["alice"]["modules"], ["m1", "m2"])
-        self.assertEqual(people["alice"]["areas"], ["a1"])
+        # Issue #88: project areas/modules are repo-qualified, like the
+        # project `modules` keys (a1 in Azure/a is not a1 in Azure/b).
+        self.assertEqual(people["alice"]["modules"], ["Azure/a::m1", "Azure/b::m2"])
+        self.assertEqual(people["alice"]["areas"], ["Azure/a::a1", "Azure/b::a1"])
         self.assertEqual(people["alice"]["display_name"], "Alice")  # preserved
         # source records not mutated
         self.assertEqual(members[0]["bundle"]["people"]["alice"]["modules"], ["m1"])
@@ -770,7 +772,9 @@ class TestProjectDigestIntegration(unittest.TestCase):
         # but has NO spine link -> related_work cluster, not a merged train.
         a = {"meta": {"owner": "Azure", "repo": "mod-a", "from": "2026-01-01",
                       "to": "2026-01-31", "base_branch": "main"},
-             "prs": [{"number": 10, "url": "uA/10", "state": "closed",
+             "prs": [{"number": 10,
+                      "url": "https://github.com/Azure/mod-a/pull/10",
+                      "state": "closed",
                       "merged": True, "base": "main", "head": "hA",
                       "merged_at": "2026-01-10T00:00:00Z",
                       "created_at": "2026-01-05T00:00:00Z",
@@ -781,14 +785,18 @@ class TestProjectDigestIntegration(unittest.TestCase):
              "milestones": [], "releases": [], "code_graph": {"areas": []}}
         b = {"meta": {"owner": "Azure", "repo": "mod-b", "from": "2026-01-01",
                       "to": "2026-01-31", "base_branch": "main"},
-             "prs": [], "issues": [{"number": 3, "url": "uB/3", "state": "closed",
+             "prs": [], "issues": [{"number": 3,
+                                    "url": "https://github.com/Azure/mod-b/issues/3",
+                                    "state": "closed",
                                     "closed_at": "2026-01-08T00:00:00Z",
                                     "updated_at": "2026-01-08T00:00:00Z"}],
              "commits": [], "code_events": [], "milestones": [], "releases": [],
              "code_graph": {"areas": []}}
         c = {"meta": {"owner": "Azure", "repo": "mod-c", "from": "2026-01-01",
                       "to": "2026-01-31", "base_branch": "main"},
-             "prs": [{"number": 20, "url": "uC/20", "state": "closed",
+             "prs": [{"number": 20,
+                      "url": "https://github.com/Azure/mod-c/pull/20",
+                      "state": "closed",
                       "merged": True, "base": "main", "head": "hC",
                       "merged_at": "2026-01-12T00:00:00Z",
                       "created_at": "2026-01-06T00:00:00Z",

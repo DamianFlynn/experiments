@@ -64,7 +64,8 @@ ROW_VARS = {
             "view.shipped[]", "bundle.series.new[]",
             "bundle.series.carried_over[]", "bundle.forecast.candidates[].ref"],
     "loop": ["bundle.series.forecast_loop.landed[]",
-             "bundle.series.forecast_loop.not_yet[]"],
+             "bundle.series.forecast_loop.not_yet[]",
+             "bundle.series.forecast_loop.dropped[]"],
     "item": ["bundle.prs[]", "bundle.issues[]"],
     "pr": ["bundle.prs[]"],
     "issue": ["bundle.issues[]"],
@@ -87,7 +88,7 @@ ROW_VARS = {
     "edge": ["view.module_edges[]"],
     "module": ["bundle.modules[]", "view.modules[]"],
     "rule": ["bundle.code_owners[]"],
-    "fame": ["bundle.halls.fame[]"],
+    "fame": ["bundle.halls.fame[]", "view.halls.fame[]"],
     "person": ["bundle.people[]", "view.people[]"],
     "mod": ["module"],
     "sym": ["module.symbols[]", "module.files[]"],
@@ -327,14 +328,16 @@ def build_corpus(tmp):
     bpath = os.path.join(tmp, "view", "bundle.json")
     spath = os.path.join(tmp, "series.json")
     # A prior installment, so `series` is not a first installment and every
-    # series list (new, carried_over, forecast_loop.landed/not_yet) is filled.
+    # series list (new, carried_over, forecast_loop.landed/not_yet/dropped) is
+    # filled: issue 53 is closed not planned this window, so it is dropped.
     with open(spath, "w", encoding="utf-8") as fh:
         json.dump([{"from": "2026-04-01", "to": "2026-04-30",
                     "ref_date": "2026-04-30", "shipped": [],
                     "in_flight": [{"type": "pr", "id": 41,
                                    "board_status": "In Progress"}],
                     "forecast": [{"type": "pr", "id": 41, "tier": "likely"},
-                                 {"type": "issue", "id": 51, "tier": "possible"}]}],
+                                 {"type": "issue", "id": 51, "tier": "possible"},
+                                 {"type": "issue", "id": 53, "tier": "longshot"}]}],
                   fh)
     with _quiet():
         assert view.main(["--store", db, "--from", FROM, "--to", TO,
@@ -524,7 +527,7 @@ class TestCorpusIsRich(_CorpusCase):
         self.assertFalse(b["series"]["first_installment"])
         for key in ("new", "carried_over"):
             self.assertTrue(b["series"][key], key)
-        for key in ("landed", "not_yet"):
+        for key in ("landed", "not_yet", "dropped"):
             self.assertTrue(b["series"]["forecast_loop"][key], key)
         for key in ("buckets", "halls"):
             for sub, val in b[key].items():

@@ -24,10 +24,15 @@ Counts come from the data (shipped refs by `ref.type`, trains by `ptrain.outcome
 ## Since last installment
 Present ONLY when the run was linked with `--series` and `bundle["series"]` (the member's own
 bundle view file — digest's embedded member copy has no `series`) has `first_installment`
-false. **New this installment** (`series.new`), **Carried over** (`series.carried_over`,
-each citing its `ref.prior_status` and whether it has now shipped, `ref.bucket`), and the
-**Forecast loop** (`series.forecast_loop.landed` vs `series.forecast_loop.not_yet` — last
-installment's predictions matched against this window's shipped). Every row is a ref
+false. The comparison is with the installment recorded for the window just before this one.
+**New this installment** (`series.new`: shipped or in-flight items the prior installment did
+not know at all), **Carried over** (`series.carried_over`: last installment's in-flight items,
+each citing its `ref.prior_status` and its current `ref.bucket` — shipped, still in flight,
+re-planned as a next candidate, or rejected), and the **Forecast loop**
+(`series.forecast_loop.landed` / `series.forecast_loop.not_yet` /
+`series.forecast_loop.dropped` — last installment's predictions matched against this
+window's shipped and rejected; when `series.prior.captured` is "backfill" those predictions
+were recorded late, so keep them out of any hit rate). Every row is a ref
 without a title; forecast-loop rows (`{type, id, tier}`) have no `url` either — take both
 from `item`. Membership is deterministic and every item cites its ref; the continuity
 narrative is the agent's. Omit on the first installment.
@@ -132,7 +137,9 @@ from a narrator sub-agent that reads ONLY that train's bounded slice:
   **Longshot** (< 2.0); within each, `cand.score` descending.
 - Per candidate: the item's title (`item`, looked up from `cand.ref`) + link (`cand.ref.url`),
   its `cand.train` id if set, and the `cand.signals` list (e.g. "on milestone v1.2 ·
-  high-priority · open PR").
+  high-priority · open PR"), then any `cand.notes` (non-scoring, e.g. "previous attempt
+  rejected"). A train id alone is not work in progress: only an open PR or an `in_flight`
+  train scores "open PR" / "work in progress".
 - The predicted-vs-landed loop is NOT here — it lives in "Since last installment" (only when
   that section is present).
 
@@ -190,6 +197,10 @@ profile + `halls.fame`, each contributor CITED to their work:
   "Automation" subhead. (Only the `fame` hall exists — no internal/shame/blame hall is built;
   recognition only.)
 - **Recognition, not blame** — never attributes stalls/blockers. Omit when `people` is empty.
+- **Multi-repo:** use the project view's `halls.fame` and `people` — figures combined across
+  members (counts summed, `merge_rate` recomputed, `review_latency_days` the median of all
+  members' samples, earliest `first_seen` / latest `last_active`), `areas` as
+  `<repo>::<area>`. A member bundle's `people` are only that member's contributors.
 
 ## Stalled, blocked & pile-ups
 Flow-health from the **deterministic** `flow` + `blockers` projections (plus train-level stall),

@@ -24,8 +24,22 @@ video-script, dashboards) consume the same view. The contract:
   (`extract` → `link.py`) — keys documented below. Multi-repo project: `python3
   digest.py --store <db> --project <name> --from … --to …` emits the merged
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
-  modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
+  halls, modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
   canonical JSON (`sort_keys`), so output is diff-stable.
+- **Project view: `people` and `halls` (issue #88).** `people` is the union of the
+  members' `people` by login, each figure combined across members. A member bundle's
+  `people` hold only that member's contributors and count only its records, so the
+  parts are disjoint and nobody is counted twice: the counts (`prs_authored`,
+  `prs_merged`, `prs_reviewed`, `commits_authored`, `issues_opened`,
+  `examples_authored`, `docs_authored`, `symbols_authored`, `authored_then_removed`,
+  `stale_owned`; `derive.PROFILE_COUNT_FIELDS`) are **summed**; `merge_rate` is
+  recomputed from the summed `prs_merged / prs_authored`; `review_latency_days` is the
+  median of **every** member's latency samples (not a median of member medians);
+  `first_seen` is the earliest and `last_active` the latest; `modules` / `areas` are
+  `"<repo>::<area>"` (like the project `modules` keys, so two members' same-named areas
+  stay apart); `is_bot` is OR'd and `login_resolved: false` when any member says so.
+  `halls.fame` is rebuilt from the merged people (same rule as a bundle's), so it ranks
+  on project-wide figures.
 - **Project view: `related_work` is opt-in.** Each project train carries a
   `tickets` list and `related_work` is `[{ticket, train_ids}]` — trains that share
   an internal ticket id but have no spine link. Ticket parsing is **off by
@@ -82,6 +96,15 @@ the rest (engagement, code areas, trains, people/flow).
   schema_version`. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
   from it is a stacked/fork contribution (merged into another branch, not main) — kept in `prs`
   as context but not counted as shipped-to-main (see `commits`/`date` note below and trains).
+  gather takes it from `--branches` (first entry) or a manifest member's `branch`, else the
+  repo's default branch (the clone's `origin/HEAD`, else the GitHub API `default_branch`);
+  there is no hard-wired `main`. `branches` is the list it was given or resolved. Views carry
+  both (issue #84): fold stores them per gathered window and `extract` re-emits them —
+  the exact window's value, else the agreeing value of the gathered windows the view
+  overlaps. **`base_branch: null`** (with `branches: []`) means unknown — gather could not
+  determine it, the overlapped windows disagree, or the store was folded before #84; `link`
+  then counts every merged PR as merged into the mainline (no stacked-PR detection) and
+  `extract` warns on stderr when that decides anything.
   Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
   It pins the exact source tree (edges are a pure function of source), which is the basis for
   the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,
@@ -96,6 +119,30 @@ the rest (engagement, code areas, trains, people/flow).
   gather pulled because they were updated in the window — fall in no bucket. `ref_date` frames
   milestones, sprints, forecast age and flow staleness: the view's `--ref-date` if given, else
   the gather `--ref-date` stored for exactly this window, else `to`.
+  **`state_as_of`** (issue #85, omit-when-absent) is the `to` of the repo's latest gathered
+  window, present only when that is after the view's `to`: the view is of an earlier window
+  than the store's latest, and its PR/issue records (state, labels, milestone, `updated_at`,
+  comments) are as the latest gather saw them, not as they were at the view's `to`.
+  **Window scope** (issue #85): a view holds only its window's records — the rule mirrors what
+  gather collects for a window, applied to each record's latest stored state:
+  `prs` merged in the window, closed (unmerged) in it, or open and created by its end;
+  `issues` closed or updated in it, open and created by its end, or closed / cross-referenced
+  by one of the view's PRs (**train context**: an issue from another window can be here; a PR
+  never is); `commits` dated in it and the `code_events` / `symbol_events` of those commits;
+  `releases` published in it; reviews / lifecycle events with their parent; any record whose
+  stored timestamp is in the window, and any undated one (it cannot be placed in a window).
+  `artifacts` keep only the window's lifecycle events (an artifact with none is absent), with
+  `status` / `replaced_by` / move fields as of the window's end. `people` (issue #88) holds
+  only the logins with a contribution **in this view** — author / merger / reviewer /
+  commenter of a view PR, author / commenter of a view issue, author of a view commit — so a
+  member bundle never lists another member's people, nor someone who worked in this repo only
+  in another window. A person's `modules` / `areas` are re-derived from the view's records
+  with this repo's `code_graph` (the attribution fold applies): this repo's areas the person
+  touched in this window. The stored person node keeps the project-wide union. Not windowed:
+  `milestones`, `sprints` and the per-repo singletons `workflow_stats`, `code_graph`,
+  `code_owners`, `label_taxonomy` — current structure, as of the latest gather (#94). On a
+  store holding only the viewed window every stored record is in the view; a view spanning
+  several gathered windows is their union.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
   committed_at?, message, files, pr }]` (`pr` set by link).
   `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
@@ -193,13 +240,38 @@ docsRefs, release_train, sprints, project, diagrams`.
   id) to `{ shown:int, total:int, unit:"PRs"|"releases"|"PRs+releases"|"events"|"edges"|"kinds" }`;
   it is `{}` when nothing was cut (caps and ranking keys: `docs/LLD.md` §7).
 - **forecast** `{ next_milestone:<title|None>, candidates:[ { ref:{type,id,url},
-  train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...] } ] }`
+  train:<id|None>, score:float, tier:"likely"|"possible"|"longshot", signals:[str,...],
+  notes:[str,...] } ] }`
   — forward-only next-release forecast over `buckets.next_candidates`, sorted by score
   desc. `next_milestone` is the bucket rule's next milestone (always dated; `None` when
   there is no upcoming dated one after current). Signals: `on milestone <title>` / `high-priority` / `open PR` or `work in progress`
-  / `active in window` / `long-open`. Tunables: `FORECAST_WEIGHTS`,
+  / `active in window` / `long-open`. The in-motion signal (#87) needs live work: `open PR`
+  when the candidate is an open PR or an open PR `closes`/cross-references the issue;
+  `work in progress` when the candidate's train (looked up in `trains` by `train`) has
+  `outcome` `in_flight`. A `rejected`, `shipped` or `abandoned` train, or a `train` id that
+  names no train in the view, scores nothing. `notes` is non-scoring context (`[]` when
+  none): `previous attempt rejected` (train `rejected`) or `linked PR already merged` (train
+  `shipped`). Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
+- **series** (only with `link.py BUNDLE --series INDEX`; absent otherwise) —
+  `{ first_installment:bool, prior:{from,to,captured}|None, new:[row],
+  carried_over:[row], forecast_loop:{ landed:[loop], not_yet:[loop], dropped:[loop] } }`.
+  The comparison is against the installment recorded for the window **immediately before**
+  this bundle's window (`meta.period`, else `meta.from`/`meta.to`) in the index — not the
+  last one appended. A `row` is `{type, id, url, bucket}` (`bucket` = this window's bucket);
+  carried rows add `prior_status` (the prior board status, else `"in_flight"`). `new` = this
+  window's `shipped` / `in_flight` items the prior installment did not know at all (in none
+  of its buckets nor its forecast). `carried_over` = items in the prior's `in_flight` that
+  are in **any** of this window's four buckets (so in-flight work that was rejected or
+  moved to `next_candidates` is reported, with that `bucket`). A `loop` row is
+  `{type, id, tier}` for each prior forecast candidate: `landed` = now in `shipped`,
+  `dropped` = now in `rejected` (PR closed unmerged, issue closed not planned), `not_yet`
+  otherwise. `prior.captured` is `"backfill"` when that installment was recorded after a
+  later window (its open work and forecast are as of that run, so leave its loop out of
+  hit-rate statistics), `"in_order"` otherwise, `None` for an entry written before #86.
+  Rows sort by `(type, id)`. The index file itself (`{"version": 2, "installments": [...]}`,
+  one entry per window) is described in `docs/LLD.md` §6.9.
 
 ### Review decision & rounds
 
@@ -274,8 +346,9 @@ review's state to `DISMISSED`.
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
   carry the bounded `before`/`after`. `lifecycle` is in commit order (the commit's UTC `committed_at`
-  when known, else the local `date`; ties keep git/ledger order); a view from a store is cumulative — it holds every folded window's
-  events, not only the view's window. `status` is derived from the artifact's **last**
+  when known, else the local `date`; ties keep git/ledger order). A view from a store holds
+  only the view's window's events (issue #85; the stored node is cumulative over every folded
+  window, #76) and `status`/`replaced_by` are as of the window's end. `status` is derived from the artifact's **last**
   lifecycle event: `replaced` only when that event is a rename to a tracked path
   (`replaced_by` = that direct successor; consumers walk A→B→C); a later re-add makes
   it `live` again with `replaced_by:null`; a delete, or a rename to an untracked path,
@@ -289,8 +362,9 @@ review's state to `DISMISSED`.
   the dest, the dest carries `identity_from`, and both carry `move_confidence`/`move_basis`.
   In a store the moves are matched per folded window and the stored artifacts apply all of
   them (STORE.md, symbol-move edges); a source re-added later is `live` again. `link.enrich`
-  still re-matches over the view's whole `symbol_events`, which on a multi-window store can
-  add a move no single window had (LLD §14.5).
+  still re-matches over the view's `symbol_events`: a view of one gathered window holds only
+  that window's events (the set fold matched), but a view spanning several gathered windows
+  can add a move no single window had (LLD §14.5).
   `confidence` is `high` only when git also flags the file pair as a rename/copy. (Name-changed
   renames via body fingerprint are deferred.)
 - **timeline** `[{ ts, actor, layer:"social|code", event, ref:{type, id, url},
@@ -354,10 +428,15 @@ review's state to `DISMISSED`.
   `terraform init` wrote. A call inside a downloaded package is attributed to that package's
   module. Without the manifest, `to` and `ref` are `null`. A nested target that is already an
   edge (same area, or the same registry module ignoring `//submodule`) is not repeated: direct
-  wins. **Static edges on manifest gathers:** a multi-repo (manifest) gather also adds the
-  whole-tree structural scan. It emits the same direct edges, without `terraform`, for every
-  module dir in the clone (see STORE.md). Single-repo gathers do not run that scan and stay
-  build-gated. The `bicep` and
+  wins. **Static edges (structural scan, #92):** a multi-repo (manifest) gather, and a
+  single-repo gather given `--structural-iac`, also adds the whole-tree structural scan. It
+  emits the same direct edges, without `terraform` or `bicep`, for every Terraform module dir
+  and every Bicep module (`<area>/main.bicep`) in the clone, including modules not changed in
+  the window, which are appended as areas (see STORE.md). A Bicep scan edge is exactly a
+  build-path immediate edge (`transitive: false`, same `to`/`ref`/`version`/`local`/
+  `instances`); a public-registry ref resolves in-repo when `<path>/main.bicep` is a tracked
+  module. Transitive Bicep edges still need the build. Without the flag a single-repo gather
+  does not run the scan and stays build-gated (byte-stable). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 
@@ -416,7 +495,9 @@ review's state to `DISMISSED`.
 - **modules** `{ "<area>": { "commits", "prs", "files_changed" } }` — per-area
   activity counts across the window's commits.
 - **people[].modules / people[].areas** — the areas a person authored (their
-  commits' files) or reviewed (their reviewed PRs' areas).
+  commits' files) or reviewed (their reviewed PRs' areas), over this view's records
+  (this repo, this window; issue #88). In the project view they are
+  `"<repo>::<area>"`, unioned over members.
 - **people{}** keys are GitHub logins (see `commits[].author`). An entry keyed by an
   unresolved commit author's git name carries `login_resolved: false` (absent on every
   other entry); `is_bot` also recognises git-name forms (`GitHub Actions`, `Dependabot`,
@@ -477,8 +558,10 @@ review's state to `DISMISSED`.
 
 These are **enrich-time projections** computed by `link.enrich` over the
 materialized bundle (siblings of `forecast`/`modules`) — not stored person-node
-data. The stored `people` projection (`{modules, areas, is_bot[, login_resolved:false]}`) is unchanged;
-`enrich` MERGES the profile fields onto it.
+data. The `people` projection (`{modules, areas, is_bot[, login_resolved:false]}`, the stored
+person nodes limited to the view, see "Window scope") is what `enrich` MERGES the profile
+fields onto. Each figure counts only the bundle's own records; the project view sums them
+across members (see "Project view: `people` and `halls`").
 
 - **people[]** — each `{login: {...}}` entry, in addition to its stored
   `modules`/`areas`/`is_bot`, gains a window-derived profile

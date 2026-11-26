@@ -68,6 +68,8 @@
   },
   "issues": [],
   "meta": {
+    "base_branch": null,
+    "branches": [],
     "from": "2026-05-01",
     "owner": "o",
     "period": {

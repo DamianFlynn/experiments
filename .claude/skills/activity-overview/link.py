@@ -928,9 +928,10 @@ def build_forecast(bundle):
     """Compute the next-release forecast over bundle['buckets']['next_candidates'].
 
     Sets bundle['forecast'] = {next_milestone, candidates}.  Each candidate
-    carries a ref (type/id/url), train id, weighted score, tier, and signals.
-    Pure aside from writing forecast onto the bundle; reads buckets, milestones,
-    prs, issues, and meta.  Forward-only: no predicted-vs-landed comparison.
+    carries a ref (type/id/url), train id, weighted score, tier, signals, and
+    non-scoring notes.  Pure aside from writing forecast onto the bundle; reads
+    buckets, milestones, prs, issues, trains, and meta.  Forward-only: no
+    predicted-vs-landed comparison.
     """
     meta        = bundle.get("meta", {})
     period      = window_period(meta)
@@ -952,6 +953,11 @@ def build_forecast(bundle):
             for n in list(pr.get("closes") or []) + list(pr.get("crossref_issues") or []):
                 open_pr_for_issue[n] = True
 
+    # Train outcome by id (#87): only an `in_flight` train is live work; a
+    # rejected / shipped / abandoned train, or an id naming no train, is not.
+    train_outcome = {t.get("id"): t.get("outcome")
+                     for t in bundle.get("trains") or [] if t.get("id")}
+
     def _tier(score):
         if score >= FORECAST_TIER_LIKELY_THRESHOLD:
             return "likely"
@@ -960,7 +966,7 @@ def build_forecast(bundle):
         return "longshot"
 
     def _score_candidate(nc_ref):
-        """Return (score, signals) for one next_candidate ref."""
+        """Return (score, signals, notes) for one next_candidate ref."""
         type_ = nc_ref.get("type")
         id_   = nc_ref.get("id")
         item  = (issue_idx if type_ == "issue" else pr_idx).get(id_, {})
@@ -974,22 +980,31 @@ def build_forecast(bundle):
         ref_dt     = _parse_ts(ref_date[:10] + "T00:00:00Z") if ref_date else None
         age_days   = (ref_dt - created_dt).days if (created_dt and ref_dt) else None
 
-        # Determine in_motion:
-        #   - ref is a PR candidate (open PR is a next_candidate by definition)
-        #   - OR some open PR in the bundle references this issue
-        #   - OR the ref carries a train id
+        # Determine in_motion (#87: live work only):
+        #   - the candidate is itself an open (unmerged) PR
+        #   - OR an open PR in the bundle closes / cross-references this issue
+        #   - OR the candidate's train is `in_flight`
+        # A train that is rejected, shipped or abandoned is NOT work in
+        # progress, and neither is a train id that names no train.
+        outcome = train_outcome.get(train_id) if train_id else None
         if type_ == "pr" and item.get("state") == "open" and not item.get("merged"):
             in_motion = True
             motion_text = "open PR"
-        elif open_pr_for_issue.get(id_):
+        elif type_ == "issue" and open_pr_for_issue.get(id_):
             in_motion = True
             motion_text = "open PR"
-        elif train_id:
+        elif outcome == "in_flight":
             in_motion = True
             motion_text = "work in progress"
         else:
             in_motion = False
             motion_text = ""
+        # Non-scoring context, so a report can say why a train is not counted.
+        notes = []
+        if outcome == "rejected":
+            notes.append("previous attempt rejected")
+        elif outcome == "shipped":
+            notes.append("linked PR already merged")
 
         # Ordered list of (present_bool, weight_key, signal_text).
         checks = [
@@ -1012,17 +1027,18 @@ def build_forecast(bundle):
                 score += FORECAST_WEIGHTS[key]
                 if text:
                     signals.append(text)
-        return score, signals
+        return score, signals, notes
 
     candidates = []
     for nc in bundle.get("buckets", {}).get("next_candidates", []):
-        score, signals = _score_candidate(nc)
+        score, signals, notes = _score_candidate(nc)
         candidates.append({
             "ref":   {"type": nc["type"], "id": nc["id"], "url": nc["url"]},
             "train": nc.get("train"),
             "score": score,
             "tier":  _tier(score),
             "signals": signals,
+            "notes":   notes,
         })
 
     # Sort: score descending, then ref id ascending for determinism on ties.
@@ -1125,10 +1141,12 @@ def enrich(bundle):
 
 def _installment_problem(installments):
     """Why the reference lists series.compute_series reads from an installment
-    (`shipped`, `in_flight`, `forecast`) cannot be used, or None. Each must be a
-    list of objects when present."""
+    (`shipped`, `in_flight`, `next_candidates`, `rejected`, `forecast`) or its
+    window cannot be used, or None. Each list must be a list of objects when
+    present; `from` / `to` must be strings when present (they order the index)."""
     for n, inst in enumerate(installments):
-        for key in ("shipped", "in_flight", "forecast"):
+        for key in ("shipped", "in_flight", "next_candidates", "rejected",
+                    "forecast"):
             if key not in inst:
                 continue
             refs = inst[key]
@@ -1136,16 +1154,23 @@ def _installment_problem(installments):
                     or not all(isinstance(r, dict) for r in refs):
                 return ("installment {} has a `{}` that is not a list of "
                         "reference objects".format(n, key))
+        for key in ("from", "to"):
+            if inst.get(key) is not None and not isinstance(inst[key], str):
+                return ("installment {} has a `{}` that is not a date "
+                        "string".format(n, key))
     return None
 
 
 def _load_series_index(series_path):
-    """Read the append-only series index: a JSON list of installment objects.
-    Absent, empty or whitespace-only (a freshly `touch`ed or truncated file) is
-    the first installment ([]). Anything else that is not a list of objects
-    (invalid JSON, an object, a list holding a non-object) exits 2 with a message
-    naming the file, rather than a traceback or a crash at `installments[-1]`
-    (#82); a corrupt-but-present index is never silently discarded."""
+    """Read the series index and return its list of installment objects. The
+    file is `{"version": 2, "installments": [...]}` (#86) or the older bare
+    JSON list of installments, which is still read (and rewritten as version 2
+    by the next `--series` run). Absent, empty or whitespace-only (a freshly
+    `touch`ed or truncated file) is the first installment ([]). Anything else
+    (invalid JSON, another object or version, a list holding a non-object, a
+    malformed installment) exits 2 with a message naming the file, rather than
+    a traceback (#82); a corrupt-but-present index is never silently
+    discarded."""
     try:
         with open(series_path, encoding="utf-8") as fh:
             raw = fh.read()
@@ -1154,22 +1179,56 @@ def _load_series_index(series_path):
     if not raw.strip():
         return []
     try:
-        installments = json.loads(raw)
+        doc = json.loads(raw)
     except ValueError as exc:
         problem = "is not valid JSON ({})".format(exc)
     else:
-        if not isinstance(installments, list):
+        installments, problem = doc, None
+        if isinstance(doc, dict):
+            if "version" not in doc:
+                problem = "is a JSON object without a `version`, not a series index"
+            elif doc["version"] != series.INDEX_VERSION:
+                problem = ("has version {!r}; this link.py reads version {} (or "
+                           "the older bare list)".format(doc["version"],
+                                                         series.INDEX_VERSION))
+            else:
+                installments = doc.get("installments")
+                if not isinstance(installments, list):
+                    problem = "has no `installments` list"
+        elif not isinstance(doc, list):
             problem = "is a JSON {}, not a list of installments".format(
-                type(installments).__name__)
-        elif not all(isinstance(i, dict) for i in installments):
-            problem = "holds an entry that is not an installment object"
-        else:
-            problem = _installment_problem(installments)
-            if problem is None:
-                return installments
+                type(doc).__name__)
+        if problem is None:
+            if not all(isinstance(i, dict) for i in installments):
+                problem = "holds an entry that is not an installment object"
+            else:
+                problem = _installment_problem(installments)
+                if problem is None:
+                    return installments
+    _series_refusal(series_path, problem)
+
+
+def _series_refusal(series_path, problem):
     sys.stderr.write("link.py --series: series index {} {}; fix or remove it\n"
                      .format(series_path, problem))
     raise SystemExit(2)
+
+
+def _series_bundle_problem(meta, installments):
+    """Why this bundle cannot be recorded in this index, or None (#86): it
+    needs a window (installments are identified by it), and an index whose
+    entries name a different owner/repo is another repo's series."""
+    frm, to = series.bundle_window(meta)
+    if frm is None or to is None:
+        return ("cannot record this bundle: it has no window (meta.period or "
+                "meta.from/meta.to), and installments are identified by it")
+    mine = (meta.get("owner"), meta.get("repo"))
+    for inst in installments:
+        theirs = (inst.get("owner"), inst.get("repo"))
+        if None not in theirs and None not in mine and theirs != mine:
+            return ("belongs to {}/{}, not {}/{} (keep one series file per "
+                    "repo)".format(theirs[0], theirs[1], mine[0], mine[1]))
+    return None
 
 
 def _write_json_atomic(path, obj):
@@ -1212,17 +1271,28 @@ def main(argv=None):
         bundle = json.load(fh)
     # Load (and shape-check) the series index BEFORE any work, so a malformed
     # index stops the run with rc 2 and nothing is written.
-    installments = _load_series_index(series_path) if series_path is not None else None
+    installments = None
+    if series_path is not None:
+        installments = _load_series_index(series_path)
+        problem = _series_bundle_problem(bundle.get("meta", {}), installments)
+        if problem is not None:
+            _series_refusal(series_path, problem)
     enrich(bundle)
     if series_path is not None:
-        # Phase 13: series continuity. Compute the `series` block against the
-        # last recorded installment and append THIS installment's snapshot.
-        # Without `--series` no `series` key is added, so the standard digest
-        # stays byte-identical. The index is written AFTER the bundle (below): a
-        # run that cannot write its bundle records no installment (#82).
-        prior = installments[-1] if installments else None
-        bundle["series"] = series.compute_series(bundle, prior)
-        installments.append(series.installment_snapshot(bundle))
+        # Phase 13: series continuity, idempotent by window (#86). Compare
+        # against the installment immediately BEFORE this window and record
+        # this installment under its window, replacing an earlier run of the
+        # same window. Without `--series` no `series` key is added, so the
+        # standard digest stays byte-identical. The index is written AFTER the
+        # bundle (below): a run that cannot write its bundle records no
+        # installment (#82).
+        window = series.bundle_window(bundle.get("meta", {}))
+        later = series.later_installments(installments, window)
+        bundle["series"] = series.compute_series(
+            bundle, series.predecessor(installments, window))
+        installments = series.place_installment(
+            installments, series.installment_snapshot(
+                bundle, captured="backfill" if later else "in_order"))
     if slice_id is not None:
         # Phase 4b: emit ONE train's bounded, self-contained slice as JSON for a
         # narrator sub-agent. Read-only — the bundle file is NOT rewritten.
@@ -1237,7 +1307,16 @@ def main(argv=None):
     _write_json_atomic(path, bundle)
     if series_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(series_path)), exist_ok=True)
-        _write_json_atomic(series_path, installments)
+        _write_json_atomic(series_path, series.index_document(installments))
+        if later:
+            sys.stderr.write(
+                "link.py --series: recorded {} to {} before later installment(s) "
+                "{} (captured: backfill); their series blocks do not reflect "
+                "this record: re-run link.py --series on their bundles, oldest "
+                "first, to refresh them\n"
+                .format(window[0], window[1],
+                        ", ".join("{} to {}".format(i["from"], i["to"])
+                                  for i in later)))
     sys.stderr.write(
         f"linked {len(bundle['trains'])} trains, "
         f"{len(bundle['buckets']['shipped'])} shipped into {path}\n"

@@ -140,10 +140,11 @@ Every PR, issue, commit, review, person, code area, milestone, release and sprin
 **node**; relationships (`authored`, `closes`, `part_of`, `touches`, `depends_on`, `blocks`,
 `in_milestone`, …) are typed **edges**. Ids are qualified (`project/repo#pr-123`), so writes
 are **idempotent**: re-gathering an overlapping window changes nothing that is already
-correct. The storage layer can therefore hold many windows. Today, however, the *readers*
-assume one window per store (see [§10](#10-constraints-and-known-limitations)), so the
-recommended operating model is **one single-window store per installment**, with continuity
-carried by the series file (§5.5).
+correct. The storage layer can therefore hold many windows, and since issue #85 the readers
+scope every view to its window: one store can grow month after month and each month's view
+holds only that month's records (with continuity carried by the series file, §5.5). What a
+store holding several windows still cannot give a past month is listed in
+[§10](#10-constraints-and-known-limitations) item 8.
 
 ### 5.2 Decision train
 
@@ -180,16 +181,20 @@ Every PR/issue in scope lands in exactly one bucket, with precedence
 ### 5.4 Forecast
 
 A transparent, rule-based score over `next_candidates` (not machine learning). Signals and
-weights: on next milestone **5.0**, high-priority **3.0**, in motion (open PR / train)
-**2.0**, active in window **1.5**, long-open ≥ 200 days **1.0**. Tiers: **likely ≥ 5**,
-**possible ≥ 2**, else **longshot**. Every candidate lists the signals that produced its score.
+weights: on next milestone **5.0**, high-priority **3.0**, in motion (an open PR, or an
+in-flight train; a rejected or shipped train does not count) **2.0**, active in window
+**1.5**, long-open ≥ 200 days **1.0**. Tiers: **likely ≥ 5**, **possible ≥ 2**, else
+**longshot**. Every candidate lists the signals that produced its score, plus non-scoring
+notes such as "previous attempt rejected".
 
 ### 5.5 Series (progressive installments)
 
-A tiny append-only `series.json` records each installment's shipped / in-flight / forecast
-refs. The next installment is compared against the last: **new**, **carried over** (with its
-prior status) and the **forecast loop** (last month's predictions → *landed* vs *not yet*).
-This is what turns isolated monthly reports into a *progressive* story.
+A tiny `series.json` records each installment's bucket and forecast refs, one entry per
+window (re-running a month replaces its entry). Each installment is compared against the one
+for the window just before it: **new**, **carried over** (with its prior status and where it
+is now — shipped, still in flight, re-planned or rejected) and the **forecast loop** (last
+month's predictions → *landed*, *not yet* or *dropped*). This is what turns isolated monthly
+reports into a *progressive* story.
 
 ### 5.6 Slice
 
@@ -293,7 +298,7 @@ flowchart LR
     s3 --> l3["validate, digest,<br/>link --series"]
     l3 --> f3["new / carried over<br/>F2 landed vs not yet<br/>forecast F3"]
   end
-  f1 -. snapshot .-> idx[("series.json<br/>append-only")]
+  f1 -. snapshot .-> idx[("series.json<br/>one entry per month")]
   f2 -. snapshot .-> idx
   f3 -. snapshot .-> idx
   idx -. prior installment .-> l2
@@ -301,13 +306,14 @@ flowchart LR
 ```
 
 **What each installment contains:** executive summary; *Since last installment* (new,
-carried-over with prior board status, forecast loop); shipped by code area; deep decision
+carried-over with prior board status and current bucket, forecast loop); shipped by code area; deep decision
 trains with grounded narratives; next-release forecast (likely / possible / longshot with
 signals); feature changes; flow health; contributors; releases and CI health.
 
 **Why it compounds:** continuity comes from `series.json`, which chains each installment to
-the last — new vs carried over, and whether each forecast landed — so the monthly reports read
-as one progressing story. Each monthly store stays small and independently auditable. Two
+the month before it — new vs carried over, and whether each forecast landed or was dropped
+— so the monthly reports read as one progressing story. Re-running a month replaces its entry
+instead of adding a second one. Each monthly store stays small and independently auditable. Two
 rules keep the chain honest: capture each installment **at month-end** (open work, milestones
 and board status are read as they are at gather time, so a past month cannot be re-created
 later), and gather a quarter or year as **its own window** when you need a roll-up (CI
@@ -332,7 +338,11 @@ stateDiagram-v2
   Likely --> NotYet: still open next month
   Possible --> NotYet
   Longshot --> NotYet
+  Likely --> Dropped: closed unshipped next month
+  Possible --> Dropped
+  Longshot --> Dropped
   Landed --> [*]
+  Dropped --> [*]
   NotYet --> NextCandidate: re-scored next installment
 ```
 
@@ -347,7 +357,8 @@ making forecasts meaningful on each target.
 | Target | Shape | How it is gathered | What you get |
 |---|---|---|---|
 | **Bicep** (`Azure/bicep`) | One product repo (the Bicep compiler and tooling, .NET) | Single repo | Shipped/trains/forecast/flow/people. Code areas by directory (`src/<project>`); no IaC edges (not an IaC repo). |
-| **AVM Bicep** (`Azure/bicep-registry-modules`) | One monorepo, 500+ resource and ~50 pattern modules | Single repo | Areas per module (`avm/res/<svc>/<mod>`, `avm/ptn/<group>/<mod>`); `br/public:` references resolve to in-repo module areas; per-module biographies. |
+| **AVM Bicep** (`Azure/bicep-registry-modules`) | One monorepo, 500+ resource and ~50 pattern modules | Single repo (`--structural-iac` for the whole module graph) | Areas per module (`avm/res/<svc>/<mod>`, `avm/ptn/<group>/<mod>`); `br/public:` references resolve to in-repo module areas; per-module biographies; per-module blast radius (`spotlight dependents owner/repo::<area>`). |
+| **Bicep landing zone** (an enterprise repo consuming AVM Bicep) | One or more repos referencing `br/public:avm/...` | Manifest with BRM as a member declaring `bicep_registry_prefix: "avm/"` | Cross-repo `depends_on` from the landing zone's modules to the BRM modules they pin, with versions. |
 | **AVM Terraform** | One repo per module | Manifest (generated from the AVM Terraform index) | Cross-repo trains; structural cross-repo `depends_on`; blast radius per module. |
 | **AI landing zone** | TF pattern constellation + Bicep pattern module in BRM + docs/portal hub repo | TF: manifest. Bicep: the BRM store, scoped to `avm/ptn/ai-ml/landing-zone`. Hub repo: manifest member (social layer) | End-to-end view of the AI LZ: code, dependencies and community discussion. |
 | **Hub / platform LZ (ALZ)** | TF ALZ + connectivity pattern repos; Bicep `avm/ptn/alz`, `avm/ptn/network/hub-networking`; docs hub; ALZ-Bicep classic (archival scheduled) | TF: manifest. Bicep: BRM store scoped to those areas | Platform-LZ change tracking, blast radius of networking modules, deprecation tracking. |
@@ -420,16 +431,31 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 
 These are real, current limits — plan around them:
 
-1. **Cross-repo `depends_on` is Terraform-only.** Bicep `br/public:` references resolve to
-   areas *inside the same repo* — perfect for the BRM monorepo, but a Bicep reference from
-   another repo into BRM is not resolved across repos.
-2. **Bicep module graph is window-scoped.** Bicep edges are built only for areas changed
-   in the window; the whole-tree structural scan exists for **Terraform manifest** gathers only.
+1. **Cross-repo Bicep `depends_on` needs a declared publisher and the public registry.**
+   Since #92 a manifest member that declares `bicep_registry_prefix` (e.g. `"avm/"` on
+   `Azure/bicep-registry-modules`) receives cross-repo `depends_on` edges from other members'
+   `br/public:<path>:<tag>` (or `br:mcr.microsoft.com/bicep/<path>:<tag>`) references, to its
+   module area `<path>`. The registry path must equal the module's directory in that repo (true
+   for BRM). Private registries (`br:<acr>/…`), template specs, user aliases (including a
+   `bicepconfig.json` alias that points at the public registry) and public modules no member
+   declares stay unresolved. A single-repo gather never resolves across repos.
+2. **Bicep module graph is window-scoped unless the structural scan runs.** Without it, Bicep
+   edges are built only for areas changed in the window, and only with the `bicep` CLI. The
+   whole-tree structural scan (#92) runs for every manifest member and for a single-repo gather
+   given `--structural-iac`; it adds every module's **direct** edges statically. Transitive
+   Bicep edges still come only from `bicep build`. The scan reads only `<area>/main.bicep`
+   entrypoints: a module whose entry file has another name, and `import … from 'br/public:…'`
+   type imports, are not dependencies in this graph.
 3. **Forecast depends on planning hygiene.** Candidates require a next milestone or one of the
    recognized priority labels (`priority/high`, `priority/critical`, `p0`, `p1`,
    `high-priority`, `critical`). Repos with different label names need the constant extended.
-4. **Default branch only.** `--branches` is recorded as provenance; the commit walk covers the
-   checked-out default branch.
+   "In motion" counts any open PR that references an item, however stale or draft (LLD §14.5).
+4. **Default branch only.** The commit walk covers the checked-out default branch; extra
+   `--branches` entries are recorded as provenance only. The *mainline* that "shipped" counts
+   merges into (`meta.base_branch`) is the repo's real default branch (or `--branches` / a
+   manifest member `branch`), stored per window and carried by every view (issue #84). Stores
+   gathered before #84 have none: their views warn and count every merged PR as shipped until
+   re-gathered.
 5. **Open items are fetched every run.** All open PRs/issues are pulled regardless of window
    (they feed in-flight/forecast), each with per-item review/timeline/comment calls. On very
    busy repos (e.g. BRM) a gather is API-heavy. On a rate limit, gather waits for the reset
@@ -438,26 +464,39 @@ These are real, current limits — plan around them:
 6. **No standalone `extract` CLI.** The on-disk bundle view is obtained via `digest.py`
    (which works for single repos too); see USAGE §4.
 7. **Narrative is not in CI.** The live CI job stops at the trust gate.
-8. **Views assume a single-window store (partly fixed).** Since issue #75 a view carries its
-   window (`meta.period`, `meta.ref_date`), so shipped and rejected count only items merged or
-   closed in the view's window, and in flight only items updated in it (or on the current
-   milestone), on member bundles
-   and the project view alike, and gather's `--ref-date` is kept with the window. Still open:
-   `extract` materializes the repo's *whole* stored node set, so on a store holding several
-   windows the view's `prs`/`issues`/`commits` arrays and its trains include all stored
-   history (window-scoped arrays are a follow-up).
+8. **A store holding several windows shows past months with today's record state.** Views
+   are window-scoped (#75, #85): a view carries its window (`meta.period`, `meta.ref_date`)
+   and holds only the records a gather of that window collects — PRs merged/closed in it or
+   open by its end, issues closed/updated in it or open by its end or closed/cross-referenced
+   by its PRs, its commits and their code/symbol events, its releases (BUNDLE.md "Window
+   scope") — so trains, timeline, feature deltas, modules, people and halls are the window's,
+   on member bundles and the project view alike. What remains: records are stored
+   latest-wins, so a past month's view shows each PR/issue as the latest gather saw it
+   (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when). An
+   item that was open at the end of that month but has closed since is not in its view
+   (its stored state is closed, outside the month); an item updated in that month and again
+   later is in the later month's view only. The per-repo singletons are the latest gather's
+   (item 9), and a person's `modules`/`areas` in a view are computed with that latest code
+   graph; a view spanning several gathered windows can still match a symbol move across them
+   (LLD §14.5).
+   **People in a multi-repo project (#88).** A member bundle lists only the people with a
+   contribution in that member's window, with that repo's areas; the project view sums each
+   person's counts across members (nobody is counted twice), combines dates and review
+   latency, qualifies areas as `<repo>::<area>` and ranks `halls.fame` on those totals. The
+   stored person node stays the project-wide union (what `validate` checks).
 9. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
     `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
     latest gathered window only.
 10. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
-    `depends_on` edge in an existing store.
+    `depends_on` edge in an existing store. On a multi-window store `validate` reports such
+    stale latest-wins edges as WARN, not ERROR.
 11. **Terraform transitive edges come from the build.** Every `module {}` block an area
     declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
     (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:
     calls whose module tree holds no resources are not in the graph, and without init's
     `modules.json` a nested call's target is unknown and is not folded. Single-repo gathers emit
-    no Terraform edges at all without `terraform` (no structural scan); manifest gathers still
-    get the static direct edges for every module dir.
+    no Terraform edges at all without `terraform` unless given `--structural-iac`; manifest
+    gathers always get the static direct edges for every module dir.
 12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
@@ -485,14 +524,32 @@ These are real, current limits — plan around them:
     orders code events by the commit's full committer timestamp, so a commit at 09:00 sorts
     after a comment at 08:00 the same day. Commits folded before that change (and backfilled
     commits) only have a day, so their events still sort before that day's comments.
+16. **Series continuity is per bundle and by bucket.** `series.json` keeps one entry per
+    window and compares each installment with the window before it (#86), but it is kept per
+    single-repo bundle (no project-view series), it only sees items that are in one of this
+    window's buckets (in-flight work that went quiet drops out of *carried over*), and
+    refreshing an earlier month does not recompute the later months' already-written series
+    blocks (`link` names them on stderr). A month recorded after a later one is marked
+    `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
 
-Item 8 is why USAGE recommends one store per installment; it is a candidate for a code fix
-(window the materialized arrays in `extract`), tracked in
-[§11](#11-extension-points-and-roadmap). Artifact folding is cumulative: each fold rebuilds the
-artifacts it touches from the whole change ledger, so a store holding several windows passes
-`validate.no_drift` whatever the fold order. Symbol moves are matched per window; on such a
-store `validate`'s idempotency probe, which re-folds every window as one, can report a move
-that no single window had (LLD §14.5).
+Item 8 is what USAGE weighs when choosing between one accumulated store and one store per
+installment. Artifact folding is cumulative: each fold rebuilds the artifacts it touches from
+the whole change ledger, so a store holding several windows passes `validate.no_drift`
+whatever the fold order, and a view shows each artifact's status as of its window's end.
+Symbol moves are matched per window; on such a store `validate` checks each recorded move
+against the ledger instead of re-matching across windows, and its idempotency probe reports
+a whole-store re-match as INFO (LLD §8).
+
+**What the trust gate proves (#89).** `validate` proves the store is *consistent*: every edge
+is exactly what the stored records imply (`edge_set`, both directions), people are re-derived
+from the records alone, every PR/issue/review/event cites its own GitHub link and every commit
+id is a real sha, and ids follow the grammar. It does not prove the records are what GitHub
+holds: a record deleted with all its edges, a blob rewritten consistently, or a wrong change
+ledger (artifacts are compared with the store's own ledger) leave a consistent store. A
+`--bundle` saved at gather time (a `view.py` JSON of the fresh store) catches changed or deleted
+records; the store keeps no per-fold content digest. On a store holding several windows, the
+edges and people areas that come from latest-wins inputs (item 9) can only be WARNed about, not
+proven.
 
 ## 11. Extension points and roadmap
 
@@ -501,7 +558,7 @@ that no single window had (LLD §14.5).
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
 | Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
-| Multi-window stores (limitation 8) | `extract._materialize_meta` (+ windowed arrays) — not implemented (artifact folding is already cumulative) |
+| Historical record state on multi-window stores (limitation 8) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
-| Cross-repo Bicep dependencies | Would mirror `resolve_registry_member` for `br/public:` paths (not implemented) |
+| Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |
 | New spotlight lens | Add a query + renderer in `spotlight.py` |

@@ -320,9 +320,12 @@ jobs:
           python validate.py workspace/journey_spotlight.db
 
       - name: Spotlight integration — run all four queries against the real store
+        # --require-all: on the real week every check must verify; a check
+        # skipped for lack of input (no contributions / areas / code events /
+        # indexed text) means the gather regressed, so it fails the job.
         run: |
           cd .claude/skills/activity-overview
-          python ci_spotlight_integration.py --store workspace/journey_spotlight.db
+          python ci_spotlight_integration.py --store workspace/journey_spotlight.db --require-all
 
       - name: Upload the journey-graph store
         if: always()

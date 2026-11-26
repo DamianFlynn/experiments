@@ -979,6 +979,31 @@ def get_ref_date(conn, project, repo, frm, to):
     return get_meta(conn, _ref_date_key(project, repo, frm, to))
 
 
+def _branches_key(project, repo, frm, to):
+    return "branches:{}/{}:{}:{}".format(project, repo, frm, to)
+
+
+def set_branches(conn, project, repo, frm, to, base_branch, branches,
+                 commit=True):
+    """Record the branches a gathered window [frm, to] was analyzed against
+    (issue #84): `base_branch` (the mainline; None when gather could not
+    determine it) and `branches` (the list it was given or resolved). One value
+    per (project, repo, from, to); a re-fold of the same window replaces it.
+    `commit=False` leaves the write in the caller's open transaction."""
+    set_meta(conn, _branches_key(project, repo, frm, to),
+             json.dumps({"base_branch": base_branch,
+                         "branches": list(branches or [])}, sort_keys=True),
+             commit=commit)
+
+
+def get_branches(conn, project, repo, frm, to):
+    """Return {"base_branch", "branches"} stored for exactly this gathered
+    window, or None when that window was not folded with them (not gathered,
+    or folded before issue #84)."""
+    raw = get_meta(conn, _branches_key(project, repo, frm, to))
+    return json.loads(raw) if raw else None
+
+
 _DEAD_REFS_DDL = (
     "CREATE TABLE IF NOT EXISTS dead_refs ("
     "id TEXT PRIMARY KEY, project TEXT, reason TEXT, first_seen TEXT)"

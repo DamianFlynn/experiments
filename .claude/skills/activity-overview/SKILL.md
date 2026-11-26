@@ -39,14 +39,16 @@ the structured view).
 Every step below is one command with explicit input and output paths. Run them from
 the skill directory; `workspace/` is this run's working directory (any path works, as
 long as each step reads what the previous one wrote). Use a **new store per
-installment** (`docs/USAGE.md` §2.1 explains why).
+installment** (`docs/USAGE.md` §2.1 explains when one store that grows month by month also
+works: views are window-scoped, but a past month re-viewed later shows today's record
+state).
 
 **Two artifacts feed the report:**
 
 | Artifact | Made by | Holds | Used for |
 |---|---|---|---|
 | **Bundle view** — one repo, one window (`workspace/view/bundle.json`) | `view.py`, then enriched in place by `link.py`; `render.py` adds `diagrams` | raw facts + `trains`, `buckets`, `forecast`, `flow`, `people`/`halls`, … + `series` (with `--series`) + `diagrams` | every section of a single-repo report; the per-member sections of a multi-repo report |
-| **Project view** — multi-repo only (`workspace/view/project.json`) | `digest.py` (stdout) | merged `trains`, `shipped`, `people`, `modules`, `related_work`, `module_edges`, and `members[i].bundle` | the project-wide sections of a multi-repo report |
+| **Project view** — multi-repo only (`workspace/view/project.json`) | `digest.py` (stdout) | merged `trains`, `shipped`, `people` / `halls` (per-person totals summed across members), `modules`, `related_work`, `module_edges`, and `members[i].bundle` | the project-wide sections of a multi-repo report |
 
 `related_work` (ticket-linked trains) is **opt-in**: it stays `[]` unless you pass
 `digest.py --manifest M` with `"ticket_prefixes": ["ABC", …]` declared in the
@@ -82,9 +84,10 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
      ```bash
      python3 gather.py --manifest workspace/manifest.json --store workspace/journey.db
      ```
-     The manifest is `{project, window:{from,to}, repos:[{owner, repo, registry?}]}`
+     The manifest is `{project, window:{from,to}, repos:[{owner, repo, registry?, branch?}]}`
      (`registry` optional — an exact Terraform registry path; absent → resolved by
-     the HashiCorp naming convention).
+     the HashiCorp naming convention; `branch` optional — the member's mainline when
+     it is not the repo's default branch, which gather otherwise detects per member).
      - **Generate/refresh the manifest from the AVM index first** (recommended), so
        it tracks the current module set. The published AVM index is the source of
        truth for which member repos and registry paths exist, so regenerating before
@@ -118,8 +121,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```bash
    python3 validate.py workspace/journey.db
    ```
-   Self-contained on a store (`no_drift` / `idempotency` self-source their raw bundle via
-   `extract`; an external `--bundle` is an optional cross-check, never required). For a
+   Self-contained on a store (`edge_set` / `no_drift` / `idempotency` self-source their raw
+   bundle via `extract`; an external `--bundle` is an optional cross-check, never required). For a
    multi-repo project: `python3 validate.py workspace/journey.db --project <name>` (adds a
    project-wide people check).
 3. **Materialize the bundle view** (store → `workspace/view/bundle.json`, offline):
@@ -137,8 +140,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    use that file in steps 4–6. Keep members apart in every later step too: give each member its own bundle, series and diagrams paths — `workspace/view/<owner>__<repo>.json`, `workspace/series/<owner>__<repo>.json` (`link.py` creates the directory), `--diagrams-dir workspace/diagrams/<owner>__<repo>` — so one member never overwrites another's files or is compared with a different repo in the series; each member's `bundle.diagrams` paths resolve against the parent of ITS diagrams dir. It writes the **raw** view only (no trains/buckets yet) and
    exits 2 with a message when the scope is ambiguous, unknown or empty.
 4. **Link** (enriches the bundle view **in place**, offline). For a recurring digest pass
-   the append-only series index so this installment is framed against the last one —
-   **exactly once per installment** (each run appends):
+   the series index so this installment is framed against the previous month's — it
+   keeps one entry per window, so re-running the same window replaces that entry:
    ```bash
    python3 link.py workspace/view/bundle.json --series workspace/series.json
    ```
@@ -190,7 +193,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    Cite each fact with its `url`; do not state anything the views do not contain.
    - **Single repo:** every section reads the bundle view. Where the template says
      `view["shipped"]` read `bundle["buckets"]["shipped"]`; `view["people"]` /
-     `view["modules"]` → `bundle["people"]` / `bundle["modules"]` (keyed by area id);
+     `view["halls"]` / `view["modules"]` → `bundle["people"]` / `bundle["halls"]` /
+     `bundle["modules"]` (keyed by area id);
      `view["members"][i]["bundle"]` → the bundle view itself. There are no project
      trains: render *Decision trains* from the template's deep-train and mention-train
      blocks over `bundle["trains"]`. Omit *Related work* and *Cross-repo module
@@ -237,7 +241,9 @@ relevant slice and narrate it grounded:
   An area found in several members (a multi-repo project) is unioned and each row names its
   `repo`; write `owner/repo::<area>` (or add `--repo owner/repo`) for one member.
 - **Blast radius / dependents** of a module: `python3 spotlight.py dependents <owner/repo>
-  --store <db> --project <name>`.
+  --store <db> --project <name>` (which members depend on it), or
+  `dependents <owner/repo>::<area>` (which module areas, in-repo or in other members,
+  depend on one module — gather a single monorepo with `--structural-iac` first).
 - **One train's slice** (for narration or a spotlight): `python3 link.py <view> --slice <id>`;
   `python3 render.py <view> --train <id>` for its flowchart.
 - **Multi-repo project view** (the structured fact base other formatters consume): `python3

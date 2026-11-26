@@ -493,26 +493,26 @@ class ExtractReviewsAndLifecycle(unittest.TestCase):
             "meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
                      "to": "2026-05-31"},
             "prs": [{
-                "number": 7, "url": "https://gh/o/r/pull/7", "state": "closed",
+                "number": 7, "url": "https://github.com/o/r/pull/7", "state": "closed",
                 "merged": True, "merged_at": "2026-05-10T00:00:00Z",
                 "created_at": "2026-05-02T00:00:00Z",
                 "closed_at": "2026-05-10T00:00:00Z", "closes": [], "crossref_issues": [],
                 "reviews": [
                     {"id": 100, "author": "carol", "state": "changes_requested",
                      "submitted_at": "2026-05-03T00:00:00Z", "body": "x",
-                     "url": "https://gh/o/r/pull/7#r100"},
+                     "url": "https://github.com/o/r/pull/7#r100"},
                     {"id": 101, "author": "carol", "state": "approved",
                      "submitted_at": "2026-05-04T00:00:00Z", "body": None,
-                     "url": "https://gh/o/r/pull/7#r101"},
+                     "url": "https://github.com/o/r/pull/7#r101"},
                 ],
                 "lifecycle": [
                     {"id": 200, "actor": "dan", "event": "ready_for_review",
                      "created_at": "2026-05-03T06:00:00Z", "label": None,
-                     "url": "u200"},
+                     "url": "https://api.github.com/repos/o/r/issues/events/200"},
                 ],
             }],
             "issues": [{
-                "number": 3, "url": "https://gh/o/r/issues/3", "state": "open",
+                "number": 3, "url": "https://github.com/o/r/issues/3", "state": "open",
                 "updated_at": "2026-05-09T00:00:00Z", "closed_at": None,
                 "lifecycle": [
                     {"id": 300, "actor": "alice", "event": "reopened",
@@ -545,7 +545,7 @@ class ExtractReviewsAndLifecycle(unittest.TestCase):
                          ["reopened"])
         # synthesized provenance for the url-less issue event round-trips.
         self.assertEqual(ex["issues"][0]["lifecycle"][0]["url"],
-                         "https://gh/o/r/issues/3#event-300")
+                         "https://github.com/o/r/issues/3#event-300")
 
     def test_derived_counts_are_enrich_only(self):
         # review_rounds/reopen_count are enrich-derived (with forecast/modules),
@@ -596,7 +596,7 @@ class ExtractBlocks(unittest.TestCase):
         # #5). #4 is therefore blocked by #3 and blocks #5. #6 is unrelated.
         def iss(num, blocks):
             return {
-                "number": num, "url": "https://gh/o/r/issues/{}".format(num),
+                "number": num, "url": "https://github.com/o/r/issues/{}".format(num),
                 "state": "open", "updated_at": "2026-05-09T00:00:00Z",
                 "closed_at": None, "title": "i{}".format(num), "body": "",
                 "blocks": blocks,
@@ -638,7 +638,7 @@ class ExtractBlocks(unittest.TestCase):
         # craft an issue that blocks several others, out of numeric order.
         bundle = self._bundle()
         bundle["issues"].append({
-            "number": 9, "url": "https://gh/o/r/issues/9", "state": "open",
+            "number": 9, "url": "https://github.com/o/r/issues/9", "state": "open",
             "updated_at": "2026-05-09T00:00:00Z", "closed_at": None,
             "title": "i9", "body": "",
             "blocks": [{"number": 6, "direction": "out"},
@@ -727,7 +727,7 @@ class ExtractProjectBoardRoundTrip(unittest.TestCase):
             "meta": {"owner": "o", "repo": "r", "from": "2026-01-01",
                      "to": "2026-01-31"},
             "prs": [{
-                "number": 10, "url": "https://gh/o/r/pull/10", "state": "closed",
+                "number": 10, "url": "https://github.com/o/r/pull/10", "state": "closed",
                 "merged": True, "merged_at": "2026-01-10T00:00:00Z",
                 "created_at": "2026-01-05T00:00:00Z",
                 "closed_at": "2026-01-10T00:00:00Z", "closes": [],
@@ -735,7 +735,7 @@ class ExtractProjectBoardRoundTrip(unittest.TestCase):
                 "board_status": "In Progress", "iteration": "IT_current",
             }],
             "issues": [{
-                "number": 3, "url": "https://gh/o/r/issues/3", "state": "open",
+                "number": 3, "url": "https://github.com/o/r/issues/3", "state": "open",
                 "updated_at": "2026-01-09T00:00:00Z", "closed_at": None,
                 "board_status": "Todo",
             }],

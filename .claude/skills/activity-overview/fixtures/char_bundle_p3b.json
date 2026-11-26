@@ -206,6 +206,7 @@
   "forecast": {
     "candidates": [
       {
+        "notes": [],
         "ref": {
           "id": 18,
           "type": "issue",
@@ -333,6 +334,8 @@
     "source": "auto"
   },
   "meta": {
+    "base_branch": null,
+    "branches": [],
     "from": "2026-05-01",
     "owner": "o",
     "period": {

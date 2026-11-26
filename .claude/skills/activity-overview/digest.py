@@ -14,6 +14,7 @@ import re
 import sqlite3
 import sys
 
+import derive
 import extract as extract_mod
 import graphstore
 import link as link_mod
@@ -157,6 +158,85 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
         comps.append(frozenset(comp))
     comps.sort(key=lambda c: min(c))
     return comps
+
+
+def window_components(conn, project, members, components):
+    """`components` without the stored pr/issue anchors of a member repo that
+    are NOT in that member's view (issue #85).
+
+    traverse_spine has no window filter, so on a store holding several
+    windows a component can reach another window's PRs/issues, and
+    build_project_trains would fold them into this window's project trains as
+    orphan refs. A member's view (extract) already decides which of its
+    stored records belong to the window; this applies the same decision to
+    the components. Ids of repos that are not members, and ids the store does
+    not hold (referenced, never gathered), are kept as before. On a store
+    holding only the viewed window every stored anchor is in its member's
+    view, so nothing is removed."""
+    out_of_view = set()
+    for m in members:
+        repo, bundle = m["repo"], m["bundle"]
+        in_view = {graphstore.qualify_id(project, repo, "pr-{}".format(p["number"]))
+                   for p in bundle.get("prs", [])}
+        in_view |= {graphstore.qualify_id(project, repo,
+                                          "issue-{}".format(i["number"]))
+                    for i in bundle.get("issues", [])}
+        for n in graphstore.repo_nodes(conn, project, repo, node_class="social"):
+            local = graphstore.parse_id(n["id"])["local"]
+            if local.startswith(("pr-", "issue-")) and n["id"] not in in_view:
+                out_of_view.add(n["id"])
+    if not out_of_view:
+        return components
+    out = []
+    for comp in components:
+        kept = comp - out_of_view
+        if kept == comp:
+            out.append(comp)
+        else:
+            # An out-of-view anchor may have been the only thing joining two
+            # trains: re-split what is left by what is still connected WITHOUT
+            # passing through an out-of-view anchor.
+            out.extend(_split_without(conn, kept, out_of_view))
+    out.sort(key=lambda c: min(c) if c else "")
+    return out
+
+
+def _is_anchor(nid):
+    return graphstore.parse_id(nid)["local"].startswith(("pr-", "issue-"))
+
+
+def _split_without(conn, kept, blocked):
+    """Partition the anchors `kept` into the groups still connected over the
+    spine when the `blocked` anchors are removed. Non-anchor spine nodes
+    (commits) may still bridge; other anchors outside `kept` do not. Returns
+    frozensets ordered by smallest id (an empty `kept` yields one empty set, so
+    a component is never silently dropped from the list's shape)."""
+    if not kept:
+        return [frozenset()]
+    groups, seen = [], set()
+    for start in sorted(kept):
+        if start in seen:
+            continue
+        group, frontier, visited = {start}, [start], {start}
+        while frontier:
+            nxt = []
+            for nid in frontier:
+                for e in graphstore.get_edges(
+                        conn, nid, direction="both",
+                        edge_types=list(graphstore.SPINE_EDGE_TYPES)):
+                    other = e["dst_id"] if e["src_id"] == nid else e["src_id"]
+                    if other in visited or other in blocked:
+                        continue
+                    if _is_anchor(other) and other not in kept:
+                        continue
+                    visited.add(other)
+                    nxt.append(other)
+                    if other in kept:
+                        group.add(other)
+            frontier = nxt
+        seen |= group
+        groups.append(frozenset(group))
+    return groups
 
 
 # outcome precedence when member trains merge into one project train (mirrors
@@ -322,19 +402,61 @@ def _merge_shipped(members):
 
 
 def _merge_people(members):
-    """Union member `people` dicts by login. Person nodes are project-scoped
-    (folded once per project under the "*" sentinel), so the records are identical
-    across members; we seed from the first record seen (preserving any fields) and
-    union modules/areas + OR is_bot across members for safety."""
-    people = {}
+    """Project-wide people (issue #88): the union of the member views' people,
+    keyed by login, with each figure combined across members.
+
+    A member view holds only the people with a contribution in that member
+    (extract._view_people) and its profile counts only that member's records,
+    so a project figure is a combination of disjoint parts — nobody is counted
+    twice:
+      counts (derive.PROFILE_COUNT_FIELDS)  summed over members
+      merge_rate            prs_merged / prs_authored of the sums (3 dp)
+      review_latency_days   median of every member's latency samples
+                            (derive.review_latency_samples over the member's
+                            PRs), not a median of medians
+      first_seen / last_active   earliest / latest over members
+      modules / areas       "{repo}::{area}", like the project `modules`
+                            keys, so two members' same-named areas stay apart
+      is_bot                OR; login_resolved false when any member says so
+    Any other field is kept from the first member's record. Member records are
+    not mutated. Order: first appearance over members in `members` order."""
+    people, samples = {}, {}
     for m in members:
-        for login, rec in (m["bundle"].get("people", {}) or {}).items():
+        repo, bundle = m["repo"], m["bundle"]
+        latencies = derive.review_latency_samples(bundle.get("prs") or [])
+        for login, rec in (bundle.get("people", {}) or {}).items():
             if login not in people:
-                people[login] = dict(rec)  # copy: preserve all fields, don't alias
+                cur = dict(rec)  # copy: preserve all fields, don't alias
+                cur["modules"], cur["areas"], cur["is_bot"] = [], [], False
+                for field in derive.PROFILE_COUNT_FIELDS:
+                    if field in cur:
+                        cur[field] = 0
+                for field in ("first_seen", "last_active"):
+                    if field in cur:
+                        cur[field] = None
+                people[login] = cur
             cur = people[login]
-            cur["modules"] = sorted(set(cur.get("modules", [])) | set(rec.get("modules", [])))
-            cur["areas"] = sorted(set(cur.get("areas", [])) | set(rec.get("areas", [])))
-            cur["is_bot"] = bool(cur.get("is_bot")) or bool(rec.get("is_bot"))
+            for field in ("modules", "areas"):
+                cur[field] = sorted(set(cur[field]) | {
+                    "{}::{}".format(repo, a) for a in rec.get(field) or []})
+            for field in derive.PROFILE_COUNT_FIELDS:
+                if isinstance(rec.get(field), int):
+                    cur[field] = (cur.get(field) or 0) + rec[field]
+            for field, pick in (("first_seen", min), ("last_active", max)):
+                dates = [d for d in (cur.get(field), rec.get(field)) if d]
+                if dates:
+                    cur[field] = pick(dates)
+            cur["is_bot"] = cur["is_bot"] or bool(rec.get("is_bot"))
+            if rec.get("login_resolved") is False:
+                cur["login_resolved"] = False
+            samples.setdefault(login, []).extend(latencies.get(login, []))
+    for login, cur in people.items():
+        if "prs_authored" in cur:
+            authored = cur["prs_authored"]
+            cur["merge_rate"] = (round(cur.get("prs_merged", 0) / authored, 3)
+                                 if authored else None)
+        if "review_latency_days" in cur:
+            cur["review_latency_days"] = derive.median_latency(samples[login])
     return people
 
 
@@ -355,7 +477,8 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     Keys: meta{project,repos,from,to}, members[{repo,bundle}] (per-member raw +
     enriched, for collision-prone per-file sections), trains (project-wide, each
     with a `tickets` list), related_work (ticket clusters), shipped (repo-tagged),
-    people (merged by login), modules (repo-qualified).
+    people (merged by login, figures combined across members: _merge_people),
+    halls (`fame` ranked on the merged people), modules (repo-qualified).
 
     `ticket_pattern` (a compiled regex) opts into ticket clustering; None (the
     default) leaves every train's `tickets` and `related_work` empty.
@@ -366,10 +489,13 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     members = member_bundles(conn, project, repos, ts_from, ts_to,
                              backfill=backfill, backfill_budget=backfill_budget,
                              warn=warn, ref_date=ref_date)
-    comps = spine_components(conn, project, repos, ts_from, ts_to)
+    comps = window_components(
+        conn, project, members,
+        spine_components(conn, project, repos, ts_from, ts_to))
     trains = build_project_trains(members, comps, project)
     _attach_tickets(members, trains, project, ticket_pattern)
     related = group_related_work(trains)
+    people = _merge_people(members)
     return {
         "meta": {"project": project, "repos": list(repos),
                  "from": ts_from, "to": ts_to,
@@ -378,7 +504,8 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
         "trains": trains,
         "related_work": related,
         "shipped": _merge_shipped(members),
-        "people": _merge_people(members),
+        "people": people,
+        "halls": derive.build_halls({"people": people})["halls"],
         "modules": _merge_modules(members),
         "module_edges": project_depends_on(conn, project, repos),
     }

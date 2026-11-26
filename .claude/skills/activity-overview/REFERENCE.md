@@ -60,7 +60,26 @@ names one) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 `validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
-error: missing or non-store path, ambiguous store).
+error: missing or non-store path, ambiguous store). It proves the store is consistent
+with its own records — every edge is one the stored records imply (`edge_set`, both
+directions), people are re-derived from the records, every PR/issue cites its own GitHub
+link and every commit id is a real sha — but not that the records match GitHub: a record
+deleted with its edges or a consistently rewritten blob passes. To catch those, save the
+view of the freshly gathered store (`view.py … --out view.json`, before `link.py` enriches it) and later run
+`validate.py STORE --bundle view.json`. On a store holding several windows, edges from
+latest-wins inputs (code graph, CODEOWNERS) are WARNed, not failed; `--repo` of a multi-repo
+project checks only that member's people (the full check runs without `--repo`). See
+`STORE.md` "Trust gate".
+
+**Whole-tree module graph (`--structural-iac`).** By default a single-repo gather builds
+IaC edges only for the areas changed in the window, and only with the `bicep`/`terraform`
+CLIs. `gather.py ... --structural-iac` also scans every tracked Terraform module dir and
+Bicep `<area>/main.bicep` for its direct module references (static: no build, no CLI; one
+read per module entrypoint), so modules nobody touched in the window still appear with
+their edges — use it on a monorepo such as `Azure/bicep-registry-modules` before asking
+`spotlight.py dependents owner/repo::<area>`. Manifest members always get the scan. The
+flag adds areas and edges to the bundle, so a store gathered with it differs from one
+gathered without it.
 
 The report vertical (`view → link → render → report`) **composes from the
 store** — `view.py` (the CLI over `extract`) materializes one repo's raw bundle view,
@@ -79,7 +98,9 @@ python3 render.py workspace/view/bundle.json --diagrams-dir workspace/diagrams
 owner, repo = name; manifest: project = manifest name, repo = `owner/repo`), writes
 exactly what `extract.extract` returns (raw keys, extract's deterministic order) — with
 `meta.period` = `{F, T}` (the window `link.py` buckets to) and `meta.ref_date` = `D`, else
-gather's `--ref-date` stored for exactly this window, else `T` — does
+gather's `--ref-date` stored for exactly this window, else `T` — holds only the window's
+records (on a store holding several windows; BUNDLE.md "Window scope", with
+`meta.state_as_of` when the store also holds a later window), does
 no network backfill, and exits 2 when the scope is ambiguous, unknown or empty, or the
 store is missing. For a multi-repo project, `--repo` selects one member; the merged
 project view comes from `digest.py`. The full step-by-step procedure (and which report
@@ -104,18 +125,30 @@ python3 digest.py --store workspace/journey.db --project avm-tf-storage \
     --from 2026-03-01 --to 2026-03-31           # merged project view (JSON)
 python3 spotlight.py dependents Azure/terraform-azurerm-avm-res-keyvault-vault \
     --store workspace/journey.db --project avm-tf-storage   # blast radius
+python3 spotlight.py dependents Azure/bicep-registry-modules::avm/res/network/virtual-network \
+    --store workspace/journey.db --project contoso-lz   # consumers of one module area
 ```
 
 Manifest: `{ "project", "window": {"from","to"}, "repos": [ {"owner","repo",
-"registry"?} ], "ticket_prefixes"? }` — `ticket_prefixes` (e.g. `["ABC"]`) is
+"registry"?, "branch"?, "bicep_registry_prefix"?} ], "ticket_prefixes"? }` — `branch` (optional) is that member's
+mainline when it is not the repo's default branch (it beats a global `--branches`;
+absent, gather resolves each member's own default branch, so members with different
+defaults are fine). `ticket_prefixes` (e.g. `["ABC"]`) is
 optional and only read by `digest.py --manifest` to turn on `related_work` ticket
 clustering (off by default). `registry` is an optional exact Terraform registry path; absent,
 a member is matched by the HashiCorp naming convention
 (`namespace/name/provider` → `{namespace}/terraform-{provider}-{name}`).
+`bicep_registry_prefix` (e.g. `"avm/"` on `Azure/bicep-registry-modules`) is the
+optional module path prefix a member publishes under in the **public** Bicep
+registry: another member's `br/public:<path>:<tag>` (or
+`br:mcr.microsoft.com/bicep/<path>:<tag>`) ref under it becomes a cross-repo
+`depends_on` to that member's module area `<path>`. Private registries, template
+specs and aliases are never resolved.
 `load_manifest` rejects (with `ValueError`): non-string fields; `/` or `#` in
 `project`; dates that are not `YYYY-MM-DD` or an inverted window; owner/repo names
 GitHub would not accept; duplicate members (case-insensitive) and a `registry`
-declared twice. The full rule list is in `STORE.md` § Multi-repo project; the same
+declared twice, a malformed `bicep_registry_prefix` (lowercase registry path
+segments only, no `br/public:` scheme) or one declared twice. The full rule list is in `STORE.md` § Multi-repo project; the same
 owner/repo/date checks apply to `gather.py --owner/--repo/--from/--to`.
 `manifest_from_index.py` strips `.git`, `?query` and `#fragment` from `RepoURL`,
 dedupes members case-insensitively, exits 2 on bad/inverted dates, `--limit < 1` or
@@ -213,6 +246,17 @@ flags) — it parses the args and defers to `SKILL.md` (gather → validate → 
 ```bash
 python3 -m unittest discover -s .claude/skills/activity-overview -p 'test_*.py' -v
 ```
+
+The CI `spotlight` job's gate can also be run on any store:
+
+```bash
+python3 ci_spotlight_integration.py --store workspace/journey.db [--project P] [--require-all]
+```
+
+It discovers a person, an area, an artifact and a search term inside the project and checks
+the four spotlight answers against the store (see `docs/LLD.md` §15). Exit 0 (all verified,
+or skipped for lack of input), 1 (a check failed, or anything skipped with
+`--require-all`), 2 (usage error).
 
 ## Troubleshooting
 

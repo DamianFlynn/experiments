@@ -90,14 +90,31 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
   .tfcache/         (shared TF_PLUGIN_CACHE_DIR)
 ```
 
-> **Why one store per installment?** The store layer is idempotent and *can* accumulate many
-> windows (artifact lifecycles are cumulative, so such a store passes `no_drift` whatever the
-> fold order), but a current limitation makes an accumulated store unsuitable for monthly
-> digests (HLD §10): a view materialized from a multi-window store is only partly scoped to
-> its window — its buckets (shipped, rejected, in flight) are bounded by `meta.period`, but its
-> `prs`/`issues`/`commits` arrays and trains include all stored history. A single-window store
-> per installment — the way CI and the golden tests use it — avoids it. An optional accumulated
-> `history.db` is still useful for cross-window `spotlight` queries (§8).
+> **One store per installment, or one store that grows?** Both work. Since issue #85 every
+> view is scoped to its window (BUNDLE.md "Window scope"), so you may instead keep **one
+> store per stream** (`stores/<stream>.db`) and gather each new month into it.
+>
+> *Safe on an accumulated store:* viewing or digesting the month you have just gathered (the
+> latest window) gives exactly what that month's own single-window store gives: its PRs,
+> issues, commits, code and symbol events, releases, trains, timeline, feature deltas,
+> modules, people, halls and buckets, with artifact lifecycles limited to the month and their
+> status as of its end. A view over several gathered months (a quarter) is their union.
+>
+> *Not safe, or different:* (1) **re-viewing an earlier month later** shows each PR/issue as
+> the latest gather saw it (state, labels, milestone, comments; the view says so in
+> `meta.state_as_of`): an item open at that month's end but closed since is missing from it,
+> and its in-flight / next / forecast reflect today's open set — keep each month's view and
+> report from the time you made them (`views/`, `reports/`) and don't re-link an old month
+> into `series.json` from a grown store; (2) the per-repo facts (`workflow_stats` CI health,
+> `code_graph`, `code_owners`, label taxonomy) are the **latest** gather's in every view, so a
+> past month or a quarter shows the latest month's CI statistics (issue #94); (3) a person's
+> `modules`/`areas` in a view are the view's own (re-derived from its records, #88) but use
+> the latest month's code graph; (4) on such a store `validate` can
+> only warn about, not prove, the edges that come from latest-wins inputs (ownership,
+> dependencies, milestones); (5) edges are never retracted (a removed module `source` keeps its
+> `depends_on`, HLD §10 item 10). A single-window store per installment — the way CI and the
+> golden tests use it — has none of these, which is why the commands below still create one;
+> an accumulated `history.db` is useful for cross-window `spotlight` queries either way (§8).
 
 ## 3. Running it through Claude Code (the normal way)
 
@@ -140,7 +157,7 @@ B=$S/views/$M/bundle.json
 python3 $AO/view.py --store $DB --project Azure --repo bicep-registry-modules \
   --from $FROM --to $TO --out $B
 
-# 4 · Link with series continuity (ONCE per installment — it appends to series.json)
+# 4 · Link with series continuity (records this month in series.json; a re-run replaces it)
 python3 $AO/link.py $B --series $S/series.json
 
 # 5 · Diagrams (mmdc validates each; add --skip-validate if mmdc is unavailable).
@@ -152,8 +169,8 @@ python3 $AO/link.py $B --slice train-issue-1234 > $S/views/$M/train-issue-1234.s
 ```
 
 `view.py` writes the **raw** bundle view (`extract`); `link.py` enriches it in place and
-`render.py` adds `diagrams`, so keep `$B` — it is what you replay if the series ever needs
-rebuilding. `view.py` exits 2 with a message when `--project`/`--repo` are ambiguous, unknown, or
+`render.py` adds `diagrams`, so keep `$B` — it is what you re-link if a month's series entry
+needs refreshing. `view.py` exits 2 with a message when `--project`/`--repo` are ambiguous, unknown, or
 have no data in the store.
 
 Then ask Claude to write the report from `$B` (+ slices + diagrams) following
@@ -165,10 +182,14 @@ Then ask Claude to write the report from `$B` (+ slices + diagrams) following
 > series file (`$S/series/<owner>__<repo>.json`; `link.py` creates the directory) and diagrams dir
 > (`$S/views/$M/diagrams/<owner>__<repo>`) per member so members never overwrite each other
 > or share a series index. The merged project
-> view (cross-repo trains, merged shipped/people/modules, `related_work`, `module_edges`)
+> view (cross-repo trains, merged shipped/people/halls/modules, `related_work`, `module_edges`)
 > comes from `digest.py --store $DB --project <name> --from $FROM --to $TO`; its embedded
 > `members[i].bundle` has no `series` or `diagrams` — use the member's bundle view file for
 > those. The cross-repo module graph is `render.emit_project_module_graph(view["module_edges"])`.
+> Contributors: a member bundle's `people` / `halls` cover only that member (its own
+> contributors, its areas); the project view's `people` / `halls` are the project totals —
+> each person's counts summed across members, areas as `<repo>::<area>` (#88). Use the
+> project view for the project-wide Contributors section.
 
 ## 5. Runbook — progressive monthly updates
 
@@ -180,7 +201,7 @@ flowchart TB
   b --> c{"3 · validate OK?"}
   c -- no --> fix["fix cause (see §11), re-gather<br/>into the same monthly store"] --> b
   c -- yes --> d["4 · view.py to views/YYYY-MM/bundle.json<br/>keep the bundle"]
-  d --> e["5 · link --series (exactly once)<br/>compares with last month's snapshot"]
+  d --> e["5 · link --series<br/>compares with the previous month's entry,<br/>records (or replaces) this month's"]
   e --> f["6 · render diagrams"]
   f --> g["7 · Claude authors report<br/>reports/YYYY-MM.md"]
   g --> h["8 · review citations, publish"]
@@ -201,40 +222,59 @@ flowchart TB
    creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
    only (empty commit/code walks). A repo with no commits since `--from` minus the clone margin
    is cloned at depth 1 and has no commits in the window. `meta.clone_mode` records which
-   (`fresh`, `fetched`, `depth1-fallback`, `none`).
+   (`fresh`, `fetched`, `depth1-fallback`, `none`). "Shipped" means merged into the repo's
+   **default branch**, which gather detects (clone `origin/HEAD`, else the API) and stores
+   with the window as `meta.base_branch`; a PR merged into a feature or release branch is
+   not shipped (a stacked PR shows as `contributing_prs` on its parent's train). Pass
+   `--branches B` (or a manifest member `branch`) when the mainline is not the default.
+   Stores gathered before issue #84 have no stored base branch: their views warn and count
+   every merged PR as shipped — re-gather them.
 3. **Validate.** Never publish from a store that is not `RESULT: OK`.
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
-   they are what you replay if the series ever needs rebuilding.
-5. **Series.** `link --series series.json` compares with the *last entry* in the file and then
-   appends this installment. Each entry carries its `from`/`to`, so you can see which month it
-   belongs to. If you run it twice for the same month, the file ends with two entries for that
-   month: delete **every** entry for that month (deleting only the last leaves the month
-   compared with itself), then run `--series` once. If later months were already appended,
-   delete that suffix too and replay the saved bundles oldest → newest. `link` writes the
-   bundle and then the series file, each atomically, so an interrupted run leaves both as they
-   were (or only the bundle updated — re-run `--series` once). A series file that is not a JSON
-   list of entries stops `link` with exit code 2 and a message naming the file; nothing is
-   written until you fix or remove it.
+   they are what you re-link if a month's series entry needs refreshing.
+5. **Series.** `link --series series.json` keeps **one entry per window** (`from`/`to`) in
+   window order. It compares this month with the entry for the window just *before* it, then
+   records this month, replacing any entry already there for the same window:
+   - **Same month twice** — safe: the second run replaces the first entry and produces the
+     same `series` block (nothing to clean up).
+   - **An earlier month re-run** (e.g. October again after November is recorded) — October's
+     entry is replaced and compared with September; the entry is marked
+     `captured: "backfill"`, and `link` warns that November's bundle was linked against the
+     old October entry. Re-link the later months' saved bundles, oldest first, if their
+     *Since last installment* should reflect the refresh.
+   - **Months out of order** (e.g. September added after October) — September is inserted
+     before October and compared with August (or is the first installment), with the same
+     `backfill` mark and warning.
+
+   `link` writes the bundle and then the series file, each atomically, so an interrupted run
+   leaves both as they were (or only the bundle updated — just re-run it). The file is
+   `{"version": 2, "installments": [...]}`; an older bare-list file is read and rewritten in
+   that form (a month it holds twice collapses to the entry recorded last). A series file
+   `link` cannot use (invalid JSON, an unknown version, a malformed entry, entries for another
+   repo), or a bundle without a window, stops `link` with exit code 2 and a message naming the
+   file; nothing is written until you fix or remove it.
 6. **Render**, then **author**: the report's *Since last installment* section uses
-   `bundle.series` — new items, carried-over items (with prior board status) and the forecast
-   loop (last month's predictions landed / not yet).
+   `bundle.series` — new items, carried-over items (with prior board status and where each is
+   now: shipped, in flight, re-planned or rejected) and the forecast loop (last month's
+   predictions landed / not yet / dropped).
 
 ### 5.3 First installment, catching up, and roll-ups
 
 | Situation | What to do |
 |---|---|
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
-| Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end. |
+| Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end (a month recorded after a later one is marked `captured: "backfill"`, but a first month captured late cannot be detected). |
 | Missed a month | Gather it for delivery history; its in-flight/forecast are "as of now" (above). Keep it out of the series chain, or note in the report that the comparison spans two months. |
-| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that. A wider `digest` window over a monthly store adds nothing, and singletons such as `workflow_stats` (CI health) only describe the window they were gathered for. Keep quarterly installments in a separate series file. |
-| Refresh a month after late merges | Re-gather the same window into that month's store, then re-materialize. Don't re-run `--series` unless you first remove that month's entry (and replay any later ones). |
+| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing, and singletons such as `workflow_stats` (CI health) only describe the latest window gathered into the store. Keep quarterly installments in a separate series file. |
+| Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
 
 ### 5.4 Multi-repo streams and series
 
 `--series` works on a single bundle. For a constellation, either keep a series per key member
 (`series/<owner__repo>.json`, e.g. the pattern module) or track continuity at project level
 in the narrative from the merged `shipped`/`trains`. The project view itself has no series
-block.
+block. A series file belongs to one repo: `link` refuses (exit 2) a file whose entries name
+another `owner`/`repo`, since entries are keyed by window alone.
 
 ## 6. Forecasting — reading it and making it useful
 
@@ -247,18 +287,26 @@ label** (`next_candidates`). Score = sum of signals:
 |---|---:|---|
 | On the next milestone | 5.0 | `on milestone <title>` |
 | High-priority label | 3.0 | `high-priority` |
-| In motion (open PR, PR references it, or part of a train) | 2.0 | `open PR` / `work in progress` |
+| In motion: it is an open PR, an open PR closes/references it, or its train is in flight | 2.0 | `open PR` / `work in progress` |
 | Updated in the window | 1.5 | `active in window` |
 | Open ≥ 200 days | 1.0 | `long-open` |
 
 Tiers: **likely ≥ 5**, **possible ≥ 2**, **longshot < 2**. Open items that are merely active
 (not on the next milestone, not high-priority) appear under **In flight**, not in the forecast.
 
+"In motion" means live work only. An open issue whose only PR was closed unmerged, or that a
+merged PR merely references, is **not** in motion: its train is `rejected` / `shipped`, and
+that scores nothing. Each candidate's `notes` says so instead (`previous attempt rejected`,
+`linked PR already merged`) without changing the score, so the report can mention it. Any
+open PR still counts, however old or draft it is.
+
 ### 6.2 Verifying it next month
 
 The following installment's `series.forecast_loop` lists each previous candidate as **landed**
-(it is now in `shipped`) or **not yet**. Track a simple hit-rate per tier over time
-(landed ÷ forecast) to calibrate how much weight readers should put on each tier.
+(it is now in `shipped`), **dropped** (now in `rejected`: PR closed unmerged, issue closed not
+planned) or **not yet**. Track a simple hit-rate per tier over time (landed ÷ forecast) to
+calibrate how much weight readers should put on each tier; skip installments whose
+`series.prior.captured` is `"backfill"` (that forecast was recorded after the fact).
 
 ### 6.3 Making it meaningful on your repos
 
@@ -310,9 +358,13 @@ python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
   `avm/ptn/network/hub-networking`, `avm/ptn/alz`. Single-repo gather.
 - **Areas:** one area per module (the `avm` pattern), so shipped-by-area, module ownership and
   feature deltas are per module.
-- **Dependencies:** with the `bicep` CLI installed, `br/public:avm/res/...` references resolve
-  to the in-repo module areas (ptn → res). Edges are built for modules **changed in the
-  window**; untouched modules have no edges that month.
+- **Dependencies:** `br/public:avm/res/...` references resolve to the in-repo module areas
+  (ptn → res). Gather with **`--structural-iac`** to get the whole module graph: every
+  module's direct references are read statically from its `main.bicep` (no `bicep` CLI
+  needed, about 0.2 s per 1,000 modules), so modules nobody touched that month still have
+  their edges and their consumers. With the `bicep` CLI the in-window modules also get
+  transitive edges from the build. Without the flag, edges exist only for modules **changed
+  in the window**, and only when `bicep` is installed.
 - **Cost:** BRM is very busy and every run fetches *all* open PRs and issues with per-item
   calls. Expect a long, API-heavy gather; run it once per month, consider
   `--no-workflows` if you don't need the CI-health section, and watch for 403 rate-limit
@@ -322,8 +374,13 @@ python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
 ```bash
 S=~/activity/avm-bicep; mkdir -p $S/stores
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
-  --store $S/stores/$M.db --clone-dir $S/clone
+  --store $S/stores/$M.db --clone-dir $S/clone --structural-iac
 python3 $AO/validate.py $S/stores/$M.db --project Azure --repo bicep-registry-modules
+
+# blast radius of one module inside the monorepo: which modules consume it (direct, then
+# transitive). Needs the --structural-iac gather above.
+python3 $AO/spotlight.py dependents Azure/bicep-registry-modules::avm/res/network/virtual-network \
+  --store $S/stores/$M.db --project Azure --md
 
 # module biographies: this month's store covers this month; for longer history use a
 # history store built from ONE wide-window gather (see §8)
@@ -422,8 +479,10 @@ python3 $AO/spotlight.py module avm/ptn/ai-ml/landing-zone --store ~/activity/av
 
 Ask Claude for one *AI landing zone* report from both: the `ai-lz` project view (Terraform +
 docs/portal community activity, cross-repo trains, blast radius of the composed modules) and
-the BRM module slice (Bicep pattern changes). Remember that **cross-repo Bicep dependencies
-are not resolved** — the Bicep side's dependencies are the in-BRM ones.
+the BRM module slice (Bicep pattern changes). The Bicep side's dependencies are the in-BRM
+ones (both the pattern and the modules it composes live in BRM). Cross-repo Bicep
+dependencies are resolved only inside one manifest, from a member that references
+`br/public:` modules to a BRM member declared with `bicep_registry_prefix` (see §7.5).
 
 To refresh the Terraform member list from the index instead of hand-authoring:
 `manifest_from_index.py --avm ptn --avm res --project ai-lz --from … --to … --name-contains aiml`
@@ -463,6 +522,40 @@ python3 $AO/spotlight.py dependents Azure/terraform-azurerm-avm-res-network-azur
   --store ~/activity/hub-lz/stores/$M.db --project hub-lz --md
 ```
 
+**An enterprise Bicep landing zone consuming AVM.** Put your landing-zone repo(s) and BRM in
+one manifest and declare on BRM the path prefix it publishes under in the public registry.
+Every `br/public:avm/...:<version>` (or `br:mcr.microsoft.com/bicep/avm/...`) reference in your
+repos then becomes a cross-repo `depends_on` to the BRM module area, with the pinned version:
+
+```json
+{
+  "project": "contoso-lz",
+  "window": { "from": "2026-11-01", "to": "2026-11-30" },
+  "repos": [
+    { "owner": "Contoso", "repo": "platform-landing-zone" },
+    { "owner": "Azure", "repo": "bicep-registry-modules", "bicep_registry_prefix": "avm/" }
+  ]
+}
+```
+
+```bash
+S=~/activity/contoso-lz; mkdir -p $S/stores $S/views
+python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones
+python3 $AO/validate.py $S/stores/$M.db --project contoso-lz
+# which of our modules pin this AVM module (and BRM's own consumers of it)
+python3 $AO/spotlight.py dependents Azure/bicep-registry-modules::avm/res/key-vault/vault \
+  --store $S/stores/$M.db --project contoso-lz --md
+```
+
+Manifest members always get the whole-tree scan, so modules that did not change in the
+window are included. Limits: only the **public** registry resolves — references through a
+private ACR (`br:<acr>.azurecr.io/...`), a template spec (`ts:`) or a `bicepconfig.json`
+alias stay unresolved (`to: null`); the scan reads each module's `main.bicep` only, so
+landing-zone modules whose entry file has another name are not scanned; and including BRM
+makes the gather as API-heavy as the §7.2 one (all its open PRs and issues are fetched).
+If BRM's gather fails, the edges still resolve (the targets become stand-in anchor nodes)
+but `validate` fails the project until `gather --resume` completes it.
+
 ### 7.6 Choosing store boundaries
 
 ```mermaid
@@ -483,15 +576,16 @@ One store per stream keeps commands simple and failures isolated.
 - **Monthly stores** (`stores/YYYY-MM.db`) are small, single-window and independently
   auditable. Keep them with the month's `views/` and report — together they are the evidence
   behind a published installment.
-- **`series.json`** is the continuity record; back it up with the stores. It is a plain JSON
-  list of installment snapshots (each with `from`/`to`).
+- **`series.json`** is the continuity record; back it up with the stores. It is a JSON
+  object `{"version": 2, "installments": [...]}` holding one snapshot per window (each with
+  `from`/`to`), in window order.
 - **History store (optional).** For cross-window `spotlight` questions (module biography,
   person, grep across many months), build `history.db` from **one wide-window gather**
   (e.g. `--from 2026-01-01 --to 2026-11-30`) into a fresh file, and rebuild it — rather than
   folding month after month into it — when you need it refreshed. A single wide fold passes
-  `validate.py`. Folding month after month also passes `no_drift`, but `validate`'s
-  idempotency probe can then report two extra move edges when a symbol left one file in one
-  month and appeared in another file in a later month (LLD §14.5).
+  `validate.py`. Folding month after month passes too, with WARNs for the edges and person
+  areas that come from each month's code graph / CODEOWNERS (only the latest is kept), which
+  `validate` cannot re-derive for older months (LLD §8).
   Wide gathers of busy repos are API-heavy (§11).
 - **Inspect:** `sqlite3 stores/2026-11.db "select project, repo, count(*) from nodes group by 1,2"`;
   folded windows are in `meta.gathered_windows`.
@@ -510,7 +604,8 @@ One store per stream keeps commands simple and failures isolated.
 | One symbol's or file's lifecycle | `spotlight.py symbol <artifact-id> --store S --project P` (a file as `art:<path>` or `<path>`; a deleted file reads `removed`) |
 | Activity inside an area | `spotlight.py subsystem <area> --store S --project P --from F --to T` |
 | Full-text search | `spotlight.py grep 'breaking change' --store S --project P` (one argument: quote a multi-word phrase; it is matched literally, within `P` only) |
-| Blast radius (TF constellations) | `spotlight.py dependents <owner/repo> --store S --project P` |
+| Blast radius (members) | `spotlight.py dependents <owner/repo> --store S --project P` |
+| Blast radius (one module area, in-repo and cross-repo) | `spotlight.py dependents <owner/repo>::<area> --store S --project P` (gather single repos with `--structural-iac`) |
 | Project view for a formatter | `digest.py --store S --project P --from F --to T` (schema: `BUNDLE.md`) |
 | Ticket-linked related work | `digest.py … --manifest M` with `"ticket_prefixes": ["ABC"]` in the manifest, or `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (off by default: `related_work` is `[]`) |
 | Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`) |
@@ -542,7 +637,11 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
   Code once the data is ready, review the citations, then publish.
 - **CI assurance.** The repo's GitHub Actions workflow runs the offline tests on every change
   and a scheduled live gather → validate (1st and 15th, 07:00 UTC). Point its
-  `workflow_dispatch` inputs at one of your targets to smoke-test a window.
+  `workflow_dispatch` inputs at one of your targets to smoke-test a window. Its `spotlight`
+  job also runs `ci_spotlight_integration.py --store S --require-all`, which checks the
+  person / subsystem / symbol / grep answers against what the store holds. You can run it on
+  your own store (`--project P` when the store holds several); without `--require-all` a
+  check whose input the store lacks is reported as skipped instead of failing.
 
 ## 11. Troubleshooting
 
@@ -552,27 +651,35 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | 403 on first call with `x-github-sso` | SAML SSO not authorized | authorize the token for the org |
 | 403 with `x-ratelimit-remaining: 0` | rate limited (busy repo) | wait until `x-ratelimit-reset`, re-run (idempotent) |
 | 403 mentioning token lifetime | token lifetime over the org's limit (8 days for `Azure/*`, classic and fine-grained) | new token with an expiry inside the limit the message states |
+| `extract: base branch unknown for …` on view/digest | store gathered before #84, gather could not determine it, or a roll-up spans windows with different base branches | re-gather (with `--branches` if needed), or view each gathered window on its own |
 | `validate` → multiple projects (exit 2) | store holds several projects/repos | pass `--project` (and `--repo`) |
 | `validate: error: store … does not exist` / `is not a journey-graph store` (exit 2) | wrong path (validate never creates a file) | point it at the store `gather --store` wrote |
 | `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
 | `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
-| `validate` ERROR `idempotency` (edges +2) on a multi-window store, `no_drift` passing | the probe re-folds every window as one and matches a cross-window symbol move (LLD §14.5) | known limitation; the store is correct. Use one store per installment, or one wide gather for history |
+| `validate` ERROR `edge_set` "stored but not derivable" / "derived from the stored records but not stored" / "edge data drift" | an edge the stored records do not imply (or a missing one): a producer defect or a hand-edited store | report it; don't publish; re-gather into a fresh store |
+| `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | `owns`/`touches`/`depends_on`/`in_milestone`/`in_iteration`/`blocks` edges and person areas come from latest-wins inputs (code graph, CODEOWNERS, milestone lists) and are never retracted | expected; not a failure. A single-window store is checked exactly |
+| `validate` ERROR `provenance` "url names repo X, the node is in Y" | the repo was renamed or transferred and gathered under its old name (GitHub returns links with the new name), or the node was edited | gather under the repo's current name |
+| `validate` ERROR `provenance` "commit id … is not a 40/64-hex git sha" / ERROR `no_fabrication` id problems | a hand-made or corrupted node; gather writes only real shas and grammar ids | re-gather; never hand-edit the store |
+| `validate --repo R` of a multi-repo project passes but the project run fails `no_drift_people` | a single-member audit checks only the people that member derives (people are project-wide) | run `validate.py STORE --project P` without `--repo` for the full people check |
+| `validate --bundle FILE` ERROR `no_drift` "stored pr differs from --bundle" / "… in --bundle but not stored" | a record changed or was deleted since FILE was saved (or FILE is an older window's bundle on a store that re-fetched the record) | cross-check with a view saved right after the gather that wrote the record |
 | `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
 | `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
 | `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
-| Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was built from a store holding several months (arrays are not window-scoped, HLD §10) | rebuild the month from its own single-window store |
+| Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was made before issue #85 from a store holding several months | re-run `view`/`digest` with the current skill (views are window-scoped); a PR/issue of another month is in the view only as train context (an issue a view PR closes or cross-references) |
+| A past month's view has `meta.state_as_of` and fewer in-flight items than its report had | the store has grown since: records are stored latest-wins, so items closed after that month are not open in it (HLD §10 item 8) | use the view saved at the time; don't rebuild past months' in-flight from a grown store |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
-| A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" after upgrading | the store was folded before commit authors were resolved to logins (#78) | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
+| A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" (and `edge_set` `authored` edges) with a `hint` naming "pre-#78 identity" | the store was folded before commit authors were resolved to logins (#78); the hint names the commits' current author | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
 | A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |
 | `edge_extraction` timeouts | slow `terraform init` / registry | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |
-| No module graph on a Bicep repo | `bicep` not installed, or no modules changed in window | install bicep; graph is window-scoped |
+| No module graph on a Bicep repo | gathered without `--structural-iac`, and `bicep` not installed or no modules changed in window | re-gather with `--structural-iac` (static, no CLI) |
+| A landing-zone `br/public:avm/...` ref has no cross-repo edge | BRM is not a manifest member, or has no `bicep_registry_prefix`, or the ref goes through a private registry / alias | add BRM with `"bicep_registry_prefix": "avm/"`; private-registry refs are not resolved |
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
 | Empty board/sprint sections | token lacks `read:project`, or no maintained board | add scope or accept |
 | `render.py` fails | `mmdc` missing, or Chromium sandbox as root | install mmdc; as root use a puppeteer `--no-sandbox` config (throwaway environments only) or `--skip-validate` |
-| `link.py --series` appended twice | ran twice for one month | delete **all** entries for that month (and any later ones), then run once / replay saved bundles in order |
+| `link.py --series` warns about later installments | a month was (re-)recorded after a later one | expected; re-link the named later months' saved bundles oldest first if their comparison should reflect the change |
 | `spotlight grep` → `fts_unavailable` | SQLite built without FTS5 | use a Python with FTS5 (most do) |
 | `spotlight` → `needs_gather` | nothing stored for that focus yet | gather more windows |
 

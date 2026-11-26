@@ -20,8 +20,12 @@ vertical: `gather (manifest) → store → validate → digest`.
   eyeball the bundle's shape. The narrative a finished report carries is the
   downstream agent's judgment, authored from the bundle — not in this file.
 - **[`build_report.py`](build_report.py)** — the structural renderer that produces
-  that skeleton from `digest_view.json` + the validated diagrams. Deterministic,
-  byte-stable, **no narrative**.
+  that skeleton from a project view: `--view VIEW.json --out REPORT.md
+  [--diagrams-dir DIR] [--skip-validate]`. It renders every diagram it embeds with
+  `render.py` (per member, plus the project module graph from
+  `view["module_edges"]`) into `DIR` (default `diagrams/` next to `--out`) and
+  checks them with `mmdc` unless `--skip-validate`. The report depends only on the
+  view (no wall-clock date, no paths), so it is byte-stable. **No narrative.**
 - **[`manifest.json`](manifest.json)** — the project manifest used for the gather.
 
 ## Constellation
@@ -36,8 +40,9 @@ What the bundle contains for the window `2026-03-16 → 2026-03-22` (facts, not
 interpretation): **6** module-dependency edges — **4 cross-repo** (pattern root
 `main.tf` and `modules/example_hub_vnet` → vnet `0.16.0` and operationalinsights
 `0.4.2`, all direct) + **2 intra-repo** (vnet → subnet, peering); **21** decision
-trains (**0** cross-repo); **0** `related_work` clusters; **44** shipped items;
-`meta.boundary_dropped_commits` empty for all members.
+trains (**0** cross-repo); **0** `related_work` clusters; **44** shipped items.
+The gather's `meta.boundary_dropped_commits` was empty for all members (see "Note
+on completeness"); that key is not part of the view.
 
 **`transitive` flags re-derived for #80, not re-gathered.** The live gather marked
 14 Terraform edges `transitive: true` (including both operationalinsights
@@ -82,10 +87,29 @@ python3 digest.py --store workspace/journey.db --project avm-tf-aiml-lz \
     --from 2026-03-16 --to 2026-03-22 > workspace/digest_view.json
 
 # 4. (Illustration) render the structural skeleton from that bundle. This does NOT
-#    author narrative — it renders per-member diagrams into workspace/diagrams/<repo>/,
-#    emits the project module graph, and assembles tables + diagrams for eyeballing.
-python3 samples/build_report.py   # → samples/avm-tf-aiml-lz-digest.md
+#    author narrative — it renders each member's diagrams into
+#    workspace/diagrams/<owner>__<name>/ and the project module graph into
+#    workspace/diagrams/project_module_graph.mmd, validates them with mmdc, and
+#    assembles tables + diagrams for eyeballing. Add --skip-validate without mmdc.
+python3 samples/build_report.py --view workspace/digest_view.json \
+    --out workspace/avm-tf-aiml-lz-digest.md --diagrams-dir workspace/diagrams
 ```
+
+The committed [`avm-tf-aiml-lz-digest.md`](avm-tf-aiml-lz-digest.md) is step 4 run
+over the committed view, offline:
+
+```bash
+python3 samples/build_report.py --view samples/digest_view.json \
+    --out samples/avm-tf-aiml-lz-digest.md --diagrams-dir workspace/diagrams
+```
+
+`test_build_report.py` checks that the committed report is exactly that output.
+The committed view predates `meta.ref_date`, so the report's reference date is the
+window end. Its `code_owners` holds only a `.github/CODEOWNERS` rule (older gather,
+legacy dict form), so under GitHub's last-match rule no module area has an owner
+and the CODEOWNERS column is `—`. A view carries no
+`meta.boundary_dropped_commits` (that is gather's bundle meta, not stored), so the
+report states completeness only when a member's meta does carry it.
 
 ### mmdc as root
 
@@ -131,4 +155,5 @@ Closing the boundary gap removed that accident and the graph collapsed to only t
 in-window-built areas (2 edges) — honest but thin. The static whole-tree scan
 restores the full graph (6 edges: 4 cross-repo + 2 intra-repo) **honestly**,
 independent of churn. Single-repo gathers keep the original window-scoped behaviour
-(byte-stable golden bundle); the structural scan is gated to manifest projects.
+(byte-stable golden bundle) unless given `--structural-iac`; manifest projects always
+get the scan, which since #92 covers Bicep modules (`<area>/main.bicep`) as well.

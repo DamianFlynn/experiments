@@ -8,10 +8,12 @@
        `diagrams/x.mmd` as workspace/diagrams/x.mmd).
      * `view` = the PROJECT VIEW (multi-repo only):
        `digest.py --store <path> --project <name> --from ... --to ...`, with the
-       merged keys (trains, shipped, people, modules, related_work, module_edges).
+       merged keys (trains, shipped, people, halls, modules, related_work,
+       module_edges).
      Single-repo report: there is no `view`; read everything from `bundle`:
        view["shipped"] -> bundle["buckets"]["shipped"] (its refs carry no `repo`),
-       view["people"] -> bundle["people"], view["modules"] -> bundle["modules"]
+       view["people"] -> bundle["people"], view["halls"] -> bundle["halls"],
+       view["modules"] -> bundle["modules"]
        (keyed by area id, not "<repo>::<area>"), view["members"][i]["bundle"] ->
        bundle. There are NO project trains: render "Decision trains" from the
        deep-train and mention-train blocks over bundle["trains"] only. The title
@@ -42,7 +44,7 @@ PLACEHOLDER RULES — read before filling anything below.
   - `item` — the PR or issue a ref or number points at (LOOKUP RULE below).
   - `pr` / `issue` / `commit` — a row of bundle["prs"] / bundle["issues"] /
     bundle["commits"].
-  - `loop` — a `series.forecast_loop.landed` / `not_yet` row `{type, id, tier}`;
+  - `loop` — a `series.forecast_loop.landed` / `not_yet` / `dropped` row `{type, id, tier}`;
     it has no `url` — cite `item.url`.
   - `train` — a single-repo train, bundle["trains"][] (`id`, `kind`, `outcome`,
     `root_issue`, `prs`, `commits`, `code_areas`, `tier`, `significance`,
@@ -58,13 +60,14 @@ PLACEHOLDER RULES — read before filling anything below.
     `link.select_sprints(bundle["sprints"], <reference date>)`.
   - `flow_entry` — bundle["flow"][]. `blocker` — bundle["blockers"][]. Both are
     issues: `number` + `url` only, no title.
-  - `cand` — bundle["forecast"]["candidates"][] `{ref, train, score, tier, signals}`.
+  - `cand` — bundle["forecast"]["candidates"][] `{ref, train, score, tier, signals, notes}`.
   - `delta` — bundle["feature_deltas"][]. `move` — bundle["symbol_moves"]["links"][].
   - `artifact` — a value of bundle["artifacts"]; `ev` — one of its `lifecycle` events.
   - `area` — bundle["code_graph"]["areas"][]. `rule` — bundle["code_owners"][]
     `{pattern, owners}`. `module` — a value of `modules` (`commits`, `prs`,
     `files_changed`). `edge` — view["module_edges"][].
-  - `fame` — bundle["halls"]["fame"][]. `person` — a value of `people` (keyed by login).
+  - `fame` — bundle["halls"]["fame"][] (multi-repo: view["halls"]["fame"][]).
+    `person` — a value of `people` (keyed by login).
   - `mod` — the `spotlight.py module ... --json` slice; `sym` — one of its
     `symbols` / `files`; `sev` — one `lifecycle` event of a `sym`; `mtl` — one row
     of `mod.trains[].timeline`.
@@ -79,6 +82,11 @@ PLACEHOLDER RULES — read before filling anything below.
   `#issue-<n>`: look `<n>` up in member `<repo>`, whose own single-repo train for
   the same anchor is `train-issue-<n>` (or `train-pr-<n>`).
 * REFERENCE DATE: `meta.ref_date` (every view carries it; it defaults to `meta.to`).
+* BASE BRANCH: `meta.base_branch` is the mainline "shipped" means merged into; a
+  PR merged into any other branch is not shipped (it may appear in
+  `train.contributing_prs`). In the project view read it per member
+  (`member.bundle.meta`). When it is `null` the store did not know it, so every
+  merged PR was counted as shipped: say so in one line under the report title.
 * TRUNCATED DIAGRAMS: when `diagrams.truncated` has an entry for an embedded
   diagram, say so under it: "Showing {diagrams.truncated[].shown} of
   {diagrams.truncated[].total} {diagrams.truncated[].unit}."
@@ -122,17 +130,22 @@ placeholder-rules:end -->
 
 - [{item.title}]({ref.url}) ({ref.type} #{ref.id})
 
-**Carried over:** rows of `series.carried_over` — in flight last installment and still
-here, each with where it stood last time (`ref.prior_status`); add "now shipped" when
-`ref.bucket` is "shipped".
+**Carried over:** rows of `series.carried_over` — in flight last installment and in a
+bucket this window, each with where it stood last time (`ref.prior_status`) and where it
+is now (`ref.bucket`: "shipped", "in_flight", "next_candidates" — re-planned — or
+"rejected" — closed without shipping).
 
-- [{item.title}]({ref.url}) ({ref.type} #{ref.id}) — *was {ref.prior_status}*
+- [{item.title}]({ref.url}) ({ref.type} #{ref.id}) — *was {ref.prior_status}, now {ref.bucket}*
 
 **Forecast loop** (last installment's predictions vs. what landed) — rows of
-`series.forecast_loop.landed` and `series.forecast_loop.not_yet`:
+`series.forecast_loop.landed`, `series.forecast_loop.not_yet` and
+`series.forecast_loop.dropped`. When `series.prior.captured` is "backfill" the prior
+installment was recorded after a later month, so say its predictions were made late and
+keep them out of any hit rate:
 
 - **Landed:** predicted (tier `{loop.tier}`) and shipped this window: [{item.title}]({item.url}) ({loop.type} #{loop.id}).
 - **Not yet:** predicted (tier `{loop.tier}`) but still not shipped: [{item.title}]({item.url}) ({loop.type} #{loop.id}).
+- **Dropped:** predicted (tier `{loop.tier}`) but closed without shipping this window: [{item.title}]({item.url}) ({loop.type} #{loop.id}).
 
 ## Community call highlights
 
@@ -330,21 +343,23 @@ this is not the first installment); otherwise there is no loop to show.
 
 For each `cand` with `cand.tier` "likely" (score ≥ 5.0), `cand.score` descending:
 
-- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}*
+- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}* — {cand.notes}
 
 ### Possible
 
 For each `cand` with `cand.tier` "possible" (score ≥ 2.0):
 
-- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}*
+- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}* — {cand.notes}
 
 ### Longshot
 
 For each `cand` with `cand.tier` "longshot" (score < 2.0):
 
-- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}*
+- [{item.title}]({cand.ref.url}) ({cand.ref.type} #{cand.ref.id}) — train `{cand.train}` — *{cand.signals}* — {cand.notes}
 
-(Omit "train …" when `cand.train` is null; join `cand.signals` with " · ".)
+(Omit "train …" when `cand.train` is null; join `cand.signals` with " · ". `cand.notes` is
+non-scoring context, e.g. "previous attempt rejected": join with " · " and omit the "— …"
+part when it is empty.)
 
 ## Feature changes (add / drop / change)
 
@@ -438,7 +453,8 @@ edges resolve, the diagram is a `No module dependencies` placeholder (always pre
 
 <!-- Multi-repo: view["modules"] keys are "<repo>::<area>" — split on "::" for the
      Repo and Module columns; view["people"] logins are merged across all member
-     repos (union by login); CODEOWNERS rules are per member
+     repos (union by login; a person's `areas` / `modules` are "<repo>::<area>"
+     too); CODEOWNERS rules are per member
      (view["members"][i]["bundle"]["code_owners"]). Single repo: bundle["modules"]
      is keyed by the area id and the repo is `meta.repo`. -->
 
@@ -479,6 +495,13 @@ detail from their profile, `person` = the `people` entry for `fame.login`
 contributor's work — link a representative PR they authored (`pr.author`) or
 reviewed (`pr.reviewers`) so the footprint is grounded. Omit the whole section when
 `people` is empty.
+
+<!-- Multi-repo: rank off view["halls"]["fame"] and read `person` from
+     view["people"]: each figure is combined across the members (counts summed,
+     `merge_rate` recomputed, `review_latency_days` the median of all members'
+     samples, earliest `first_seen` / latest `last_active`) and `person.areas`
+     are "<repo>::<area>". A member's own section reads that member's bundle,
+     whose `people` are only the people with a contribution in that member. -->
 
 | Contributor | Authored | Merged | Reviewed | Commits | Areas | Evidence |
 |-------------|----------|--------|----------|---------|-------|----------|

@@ -856,6 +856,54 @@ def _iso_date(ts):
         return None
 
 
+# The per-person profile counts annotate_people_profile sets. Each counts the
+# person's records in ONE bundle (one repo), so a project total is their sum
+# over the member bundles (digest._merge_people).
+PROFILE_COUNT_FIELDS = ("prs_authored", "prs_merged", "prs_reviewed",
+                        "commits_authored", "issues_opened",
+                        "examples_authored", "docs_authored",
+                        "symbols_authored", "authored_then_removed",
+                        "stale_owned")
+
+
+def _first_reviews(pr):
+    """[(reviewer, first review date or None, latency days or None)] for each
+    entry of `pr.reviewers`: the date of the reviewer's earliest submitted
+    review on the PR, and its whole days after the PR was created (None when
+    either date is missing or the review predates the PR). Pure."""
+    created = _iso_date(pr.get("created_at"))
+    reviews = pr.get("reviews") or []
+    out = []
+    for rv in pr.get("reviewers") or []:
+        own = sorted((r for r in reviews
+                      if r.get("author") == rv and r.get("submitted_at")),
+                     key=lambda r: r["submitted_at"])
+        sub = _iso_date(own[0].get("submitted_at")) if own else None
+        latency = None
+        if sub and created and (sub - created).days >= 0:
+            latency = (sub - created).days
+        out.append((rv, sub, latency))
+    return out
+
+
+def review_latency_samples(prs):
+    """{login: [days, ...]}: every review-latency sample annotate_people_profile
+    takes the median of, per reviewer, over `prs`. A project's median is taken
+    over the samples of all its members (digest._merge_people). Pure."""
+    out = {}
+    for pr in prs or []:
+        for rv, _sub, latency in _first_reviews(pr):
+            if latency is not None:
+                out.setdefault(rv, []).append(latency)
+    return out
+
+
+def median_latency(samples):
+    """The `review_latency_days` value for `samples`: their median rounded to
+    one decimal, or None when there are none. Pure."""
+    return round(_stats.median(samples), 1) if samples else None
+
+
 def annotate_people_profile(bundle):
     """Enrich each `bundle["people"][login]` in place with window-derived metrics.
 
@@ -902,21 +950,14 @@ def annotate_people_profile(bundle):
             # the merge is the merger's activity (an author's own merge is counted
             # only when they merged it themselves, i.e. merged_by == author).
             add_date(pr.get("merged_by"), pr.get("merged_at"))
-        created = _iso_date(pr.get("created_at"))
-        reviews = pr.get("reviews") or []
-        for rv in pr.get("reviewers") or []:
+        for rv, sub, latency in _first_reviews(pr):
             if rv not in acc:
                 continue
             acc[rv]["prs_reviewed"] += 1
-            own = sorted((r for r in reviews
-                          if r.get("author") == rv and r.get("submitted_at")),
-                         key=lambda r: r["submitted_at"])
-            if own:
-                sub = _iso_date(own[0].get("submitted_at"))
-                if sub:
-                    acc[rv]["dates"].append(sub)
-                    if created and (sub - created).days >= 0:
-                        acc[rv]["latencies"].append((sub - created).days)
+            if sub:
+                acc[rv]["dates"].append(sub)
+            if latency is not None:
+                acc[rv]["latencies"].append(latency)
         # comment activity (PR conversation + review comments) counts toward
         # first_seen/last_active so a commenter isn't under-reported.
         for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
@@ -983,8 +1024,7 @@ def annotate_people_profile(bundle):
             "prs_reviewed": a["prs_reviewed"],
             "commits_authored": a["commits_authored"],
             "issues_opened": a["issues_opened"],
-            "review_latency_days": (round(_stats.median(a["latencies"]), 1)
-                                    if a["latencies"] else None),
+            "review_latency_days": median_latency(a["latencies"]),
             "first_seen": min(dates).isoformat() if dates else None,
             "last_active": max(dates).isoformat() if dates else None,
             "examples_authored": a["examples_authored"],

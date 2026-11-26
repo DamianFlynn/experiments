@@ -19,7 +19,10 @@ NORMALIZATION RULE (Agent F: reuse this verbatim). Drop only the volatile meta
 keys (`_VOLATILE_META`: generated_at, schema_version). Issue #75 made extract
 stamp `period` and `ref_date` into the view's meta, so those two are no longer
 dropped: the snapshots were re-captured once to add them (meta only; no other
-key changed). Unlike test_extract, this gate
+key changed). Issue #84 made extract stamp `base_branch` and `branches`; the
+golden bundles carry no `base_branch`, so their views report it unknown
+(`null`, `[]`) and the snapshots were re-captured once more to add those two
+meta keys (no other key changed). Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is
 canonical JSON: json.dumps(obj, sort_keys=True, indent=2).

@@ -193,19 +193,19 @@ def _lifecycle_bundle():
     return {
         "meta": {"owner": "o", "repo": "r", "from": "2026-05-01", "to": "2026-05-31"},
         "prs": [{
-            "number": 7, "url": "https://gh/o/r/pull/7", "state": "closed",
+            "number": 7, "url": "https://github.com/o/r/pull/7", "state": "closed",
             "merged": True, "merged_at": "2026-05-10T00:00:00Z",
             "created_at": "2026-05-02T00:00:00Z", "closed_at": "2026-05-10T00:00:00Z",
             "closes": [], "crossref_issues": [],
             "reviews": [{"id": 100, "author": "carol", "state": "approved",
                          "submitted_at": "2026-05-03T00:00:00Z", "body": None,
-                         "url": "https://gh/o/r/pull/7#r100"}],
+                         "url": "https://github.com/o/r/pull/7#r100"}],
             "lifecycle": [{"id": 200, "actor": "dan", "event": "ready_for_review",
                            "created_at": "2026-05-03T06:00:00Z", "label": None,
                            "url": None}],
         }],
         "issues": [{
-            "number": 3, "url": "https://gh/o/r/issues/3", "state": "open",
+            "number": 3, "url": "https://github.com/o/r/issues/3", "state": "open",
             "updated_at": "2026-05-09T00:00:00Z", "closed_at": None,
             "lifecycle": [{"id": 300, "actor": "alice", "event": "reopened",
                            "created_at": "2026-05-08T00:00:00Z", "label": None,
@@ -254,7 +254,7 @@ class TestReviewEventSocialNodes(unittest.TestCase):
         graphstore.upsert_node(conn, "o/r#review-99-1", "o", "r", "social",
                                "2026-05-03T00:00:00Z",
                                {"author": "x", "state": "approved",
-                                "url": "https://gh/o/r/pull/99#r1"})
+                                "url": "https://github.com/o/r/pull/99#r1"})
         graphstore.upsert_edge(conn, "o/r#review-99-1", "o/r#pr-99", "part_of")
         report = validate.validate(conn, project="o", repo="r")
         c = _check(report, "referential_integrity")
@@ -290,15 +290,15 @@ def _participants_bundle():
             {"number": 1, "author": "alice", "reviewers": ["reviewer-mapped"],
              "merged": True, "merged_at": "2026-05-03",
              "comments_list": [{"author": "pure-commenter", "body": "nice"}],
-             "url": "https://x/1"},
+             "url": "https://github.com/o/r/pull/1"},
             # PR 2: author's commits are out of window (no commit row here); its
             # reviewer reviews a PR with NO mapped commits.
             {"number": 2, "author": "oow-author",
              "reviewers": ["reviewer-unmapped"],
-             "merged": True, "merged_at": "2026-05-04", "url": "https://x/2"},
+             "merged": True, "merged_at": "2026-05-04", "url": "https://github.com/o/r/pull/2"},
         ],
         "issues": [
-            {"number": 7, "author": "issue-reporter", "url": "https://x/i7"},
+            {"number": 7, "author": "issue-reporter", "url": "https://github.com/o/r/issues/7"},
         ],
         "code_graph": {"areas": [
             {"id": "avm/res/x", "paths": ["avm/res/x/main.bicep"]}]},
@@ -361,7 +361,7 @@ def _symbol_artifact_bundle():
              "message": "feat (#1)", "files": ["avm/res/x/main.bicep"]},
         ],
         "prs": [{"number": 1, "author": "alice", "merged": True,
-                 "merged_at": "2026-05-03", "url": "https://x/1"}],
+                 "merged_at": "2026-05-03", "url": "https://github.com/o/r/pull/1"}],
         "issues": [],
         "symbol_events": [
             # a real symbol whose name is plain.
@@ -483,8 +483,9 @@ class TestValidateProject(unittest.TestCase):
         conn = graphstore.open_store(":memory:")
         graphstore.init_schema(conn)
         members = {"Azure/mod-a", "Azure/mod-b"}
-        def pr(n, author):
-            return {"number": n, "url": "u/%d" % n, "state": "closed", "merged": True,
+        def pr(n, author, repo):
+            return {"number": n, "url": "https://github.com/%s/pull/%d" % (repo, n),
+                    "state": "closed", "merged": True,
                     "base": "main", "head": "h%d" % n,
                     "merged_at": "2026-01-1%dT00:00:00Z" % (n % 10),
                     "created_at": "2026-01-0%dT00:00:00Z" % (n % 10),
@@ -494,7 +495,7 @@ class TestValidateProject(unittest.TestCase):
         for repo, author, num in (("Azure/mod-a", "alice", 1), ("Azure/mod-b", "bob", 2)):
             b = {"meta": {"owner": "Azure", "repo": repo.split("/")[1],
                           "from": "2026-01-01", "to": "2026-01-31", "base_branch": "main"},
-                 "prs": [pr(num, author)], "issues": [], "commits": [], "code_events": [],
+                 "prs": [pr(num, author, repo)], "issues": [], "commits": [], "code_events": [],
                  "milestones": [], "releases": [], "code_graph": {"areas": []}}
             gather.fold_bundle(conn, b, project="proj", repo=repo, members=members)
         return conn
@@ -636,7 +637,7 @@ class TestArtifactStatusRoundTrip(unittest.TestCase):
 
 EXPECTED_CHECKS = ["target", "referential_integrity", "participant_completeness",
                    "provenance", "no_fabrication", "schema_conformance",
-                   "no_drift", "idempotency"]
+                   "edge_set", "no_drift", "idempotency"]
 
 
 def _failed_names(checks):
@@ -660,7 +661,7 @@ class TestNoFalsePass(unittest.TestCase):
         self.assert_all_checks_listed(report)
         self.assertIs(report.ok, False)
         self.assertEqual(_failed_names(report.checks),
-                         ["idempotency", "no_drift", "target"])
+                         ["edge_set", "idempotency", "no_drift", "target"])
         target = _check(report, "target")
         self.assertIn("typo", json.dumps(target["details"]))
         self.assertIn("could not self-source",
@@ -693,7 +694,7 @@ class TestNoFalsePass(unittest.TestCase):
         report = validate.validate(conn, project="o", repo="r")
         self.assert_all_checks_listed(report)
         self.assertIs(report.ok, False)
-        for name in ("no_drift", "idempotency"):
+        for name in ("edge_set", "no_drift", "idempotency"):
             c = _check(report, name)
             self.assertIs(c["ok"], False, c)
             self.assertIn("could not self-source", json.dumps(c["details"]))
@@ -761,7 +762,7 @@ class TestCorruptRowsReported(unittest.TestCase):
             raise RuntimeError("boom")
         names = ["check_referential_integrity", "check_participant_completeness",
                  "check_provenance", "check_no_fabrication",
-                 "check_schema_conformance"]
+                 "check_schema_conformance", "check_edge_set"]
         for fn in names:
             orig = getattr(validate, fn)
             setattr(validate, fn, boom)
