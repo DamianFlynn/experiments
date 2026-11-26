@@ -6,6 +6,7 @@ the function API below. See STORE.md for the schema and identity rules.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -229,6 +230,65 @@ def is_symbol_local(local):
 def is_artifact_local(local):
     """True for any artifact local id: `art:<path>` (file) or a symbol id."""
     return bool(local) and (local.startswith("art:") or is_symbol_local(local))
+
+
+# Classifying a STORED node or ledger row (#101). The id-shape helpers above are
+# the fallback for a dangling id only: a stored node is classified by its class
+# and record, so a structure node whose title holds `#<token>:<token>:` (e.g.
+# `milestone-v1#a:b:c`) is never an artifact.
+SYMBOL_ARTIFACT_KINDS = ("symbol", "comment")
+
+
+def is_artifact_node(node):
+    """True for a stored artifact node: a `code` node whose record is not a
+    commit's. Every commit record carries `sha` (gather writes it); an artifact
+    record (derive.build_artifacts) never does."""
+    data = node.get("data")
+    return node.get("node_class") == "code" and not (
+        isinstance(data, dict) and "sha" in data)
+
+
+def is_symbol_node(node):
+    """True for a stored symbol/comment artifact node (record `kind` symbol or
+    comment); a file artifact has a path kind (readme/doc/example)."""
+    return is_artifact_node(node) and isinstance(node.get("data"), dict) \
+        and node["data"].get("kind") in SYMBOL_ARTIFACT_KINDS
+
+
+def ledger_row_is_symbol(local, commit_files=None):
+    """True when a `code_events` ledger row keyed by `local` is a SYMBOL row.
+
+    File rows are keyed by the bare `<path>` and have no node of their own, so
+    the stored node that decides is the row's commit: when `commit_files` (that
+    commit's stored file list, repo_commit_files) names `local` itself, the row
+    is that file's row whatever its shape (`notes#a:b:c.md`). Otherwise (the
+    commit is not stored or has no file list) the id shape decides
+    (is_symbol_local)."""
+    if commit_files and local in commit_files:
+        return False
+    return is_symbol_local(local)
+
+
+def repo_commit_files(conn, project, repo):
+    """{sha: frozenset(files)} for the repo's stored commit nodes that carry a
+    non-empty file list (input to ledger_row_is_symbol). Only `code` rows whose
+    local id has a sha's length are decoded; a row counts when its `data.sha`
+    equals that local id."""
+    prefix = qualify_id(project, repo, "")
+    lo, hi = _prefix_range(prefix)
+    out = {}
+    for nid, raw in conn.execute(
+            "SELECT id, data FROM nodes WHERE id >= ? AND id < ? "
+            "AND node_class='code' AND length(id) IN (?, ?)",
+            (lo, hi, len(prefix) + 40, len(prefix) + 64)):
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            continue
+        sha = nid[len(prefix):]
+        if isinstance(data, dict) and data.get("sha") == sha and data.get("files"):
+            out[sha] = frozenset(f for f in data["files"] if isinstance(f, str))
+    return out
 
 
 def _row_to_node(row):
@@ -1002,6 +1062,298 @@ def get_branches(conn, project, repo, frm, to):
     or folded before issue #84)."""
     raw = get_meta(conn, _branches_key(project, repo, frm, to))
     return json.loads(raw) if raw else None
+
+
+# Per-window facts (issue #94): the bundle keys a gather computes for ITS
+# window (CI runs created in it, the areas of the files it saw, the CODEOWNERS
+# and label taxonomy of its checkout). Kept per (project, repo, from, to) so a
+# view of an earlier window does not read a later gather's values.
+WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
+                    "label_taxonomy")
+
+
+def _window_facts_key(project, repo, frm, to):
+    return "facts:{}/{}:{}:{}".format(project, repo, frm, to)
+
+
+def _fact_blob_prefix(project, repo):
+    return "fact:{}/{}:".format(project, repo)
+
+
+def set_window_facts(conn, project, repo, frm, to, bundle, clone_sha=None,
+                     commit=True):
+    """Record the facts of a gathered window [frm, to] (issue #94).
+
+    `facts:{project}/{repo}:{from}:{to}` holds {"clone_sha", "facts": {key:
+    sha256}} for each WINDOW_FACT_KEYS value present and non-empty in `bundle`
+    (the same rule fold applies to the latest-wins nodes). Each value is
+    stored once per repo under `fact:{project}/{repo}:{sha256}` (its JSON
+    text, encoded as node data is), so windows with identical facts share it.
+    A re-fold of the same window replaces its entry; a value no window of the
+    repo references any more is deleted. `commit=False` leaves the writes in
+    the caller's open transaction."""
+    refs = {}
+    for key in WINDOW_FACT_KEYS:
+        value = bundle.get(key)
+        if not value:
+            continue
+        text = json.dumps(value, sort_keys=True)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        set_meta(conn, _fact_blob_prefix(project, repo) + digest, text,
+                 commit=False)
+        refs[key] = digest
+    # Whether CI runs were COLLECTED for this window, separately from what
+    # they were: a gather run with --no-workflows has no CI facts at all, while
+    # a collected window with zero runs has an (empty) result. gather records
+    # it in meta.workflows_collected; a bundle without the flag (hand-built, or
+    # gathered before the flag existed) counts as collected when it carries a
+    # workflow_stats key.
+    meta = bundle.get("meta") or {}
+    collected = meta.get("workflows_collected")
+    if collected is None:
+        collected = "workflow_stats" in bundle
+    set_meta(conn, _window_facts_key(project, repo, frm, to),
+             json.dumps({"clone_sha": clone_sha, "facts": refs,
+                         "ci_collected": bool(collected)},
+                        sort_keys=True), commit=False)
+    _prune_fact_blobs(conn, project, repo)
+    if commit:
+        conn.commit()
+
+
+def _meta_with_prefix(conn, prefix):
+    lo, hi = _prefix_range(prefix)
+    return conn.execute("SELECT key, value FROM meta WHERE key >= ? AND key < ? "
+                        "ORDER BY key", (lo, hi)).fetchall()
+
+
+def _prune_fact_blobs(conn, project, repo):
+    """Delete the repo's fact values no window entry references."""
+    used = set()
+    for _key, value in _meta_with_prefix(
+            conn, "facts:{}/{}:".format(project, repo)):
+        try:
+            used |= set((json.loads(value).get("facts") or {}).values())
+        except (ValueError, AttributeError):
+            return   # an unreadable entry: keep everything (validate reports it)
+    prefix = _fact_blob_prefix(project, repo)
+    for key, _value in _meta_with_prefix(conn, prefix):
+        if key[len(prefix):] not in used:
+            conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
+
+def get_window_facts(conn, project, repo, frm, to, keys=WINDOW_FACT_KEYS):
+    """The facts recorded for exactly this gathered window, or None when that
+    window was not folded (or was folded before issue #94):
+    {"clone_sha", "facts": {key: value}, "missing": [keys whose stored value
+    is gone], "ci_collected": bool} — `missing` is non-empty only on a damaged
+    store; `ci_collected` is False for a window gathered with --no-workflows. Only the
+    values of `keys` are read (`()` reads none: an existence probe)."""
+    raw = get_meta(conn, _window_facts_key(project, repo, frm, to))
+    if not raw:
+        return None
+    entry = json.loads(raw)
+    facts, missing = {}, []
+    for key in keys:
+        digest = (entry.get("facts") or {}).get(key)
+        if digest is None:
+            continue
+        text = get_meta(conn, _fact_blob_prefix(project, repo) + digest)
+        if text is None:
+            missing.append(key)
+        else:
+            facts[key] = json.loads(text)
+    # ci_collected: an entry written before the flag existed counts as collected
+    return {"clone_sha": entry.get("clone_sha"), "facts": facts,
+            "missing": missing,
+            "ci_collected": bool(entry.get("ci_collected", True))}
+
+
+def window_facts_problems(conn):
+    """[(meta key, problem)] for every per-window facts entry of the store
+    that is unreadable or names a value that is not stored (issue #94)."""
+    out = []
+    for key, value in _meta_with_prefix(conn, "facts:"):
+        try:
+            entry = json.loads(value)
+            refs = entry.get("facts") or {}
+            scope = key[len("facts:"):].split(":", 1)[0]
+        except (ValueError, AttributeError):
+            out.append((key, "unreadable per-window facts entry"))
+            continue
+        for fact in sorted(refs):
+            if get_meta(conn, "fact:{}:{}".format(scope, refs[fact])) is None:
+                out.append((key, "{} value {} is not stored".format(
+                    fact, refs[fact])))
+    return out
+
+
+# Current-state edges (issue #95). A fold keeps the repo's current-state edges
+# (blocks, in_milestone, in_iteration, depends_on, owns) equal to what the
+# repo's stored inputs imply, retracting the ones they no longer imply (see
+# gather.fold_bundle and STORE.md "Current-state edges").
+#
+# `current_state:{project}/{repo}` records how the LAST fold of the repo kept
+# them: {"items": true, "structure": <bool>, "from", "to"}. `items` is true
+# once a fold rebuilt the item relations (blocks / in_milestone /
+# in_iteration) from the stored records; `structure` is true when that fold
+# could replay depends_on / owns over every gathered window's facts (false
+# when a window of the repo has no per-window facts: those edges were then
+# only added, as before #95). validate reads it to decide which checks are
+# exact. `retractions:{project}/{repo}` is the ledger of what folds retracted:
+# a JSON list (oldest first, at most RETRACTION_LEDGER_MAX entries) of
+# {"from", "to", "counts": {type: n}, "edges": [[src, dst, type], ...] (at
+# most RETRACTION_LEDGER_EDGES, sorted), "standins_removed": [id, ...]}. A
+# fold that retracts nothing appends nothing, so a re-fold stays a no-op.
+RETRACTION_LEDGER_MAX = 100
+RETRACTION_LEDGER_EDGES = 200
+
+
+def _current_state_key(project, repo):
+    return "current_state:{}/{}".format(project, repo)
+
+
+def _retractions_key(project, repo):
+    return "retractions:{}/{}".format(project, repo)
+
+
+def set_current_state(conn, project, repo, entry, commit=True):
+    """Record how the last fold of (project, repo) kept its current-state
+    edges (see above). `commit=False`: see upsert_nodes."""
+    set_meta(conn, _current_state_key(project, repo),
+             json.dumps(entry, sort_keys=True), commit=commit)
+
+
+def get_current_state(conn, project, repo):
+    """The current-state record of (project, repo), or None for a repo no
+    fold since issue #95 has written (or an unreadable record)."""
+    raw = get_meta(conn, _current_state_key(project, repo))
+    if not raw:
+        return None
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def record_retractions(conn, project, repo, entry, commit=True):
+    """Append one fold's retractions to the repo's ledger (see above), keeping
+    the newest RETRACTION_LEDGER_MAX entries. `commit=False`: see
+    upsert_nodes."""
+    entries = get_retractions(conn, project, repo)
+    entries.append(entry)
+    set_meta(conn, _retractions_key(project, repo),
+             json.dumps(entries[-RETRACTION_LEDGER_MAX:], sort_keys=True),
+             commit=commit)
+
+
+def get_retractions(conn, project, repo):
+    """The repo's retraction ledger (oldest first); [] when none."""
+    raw = get_meta(conn, _retractions_key(project, repo))
+    if not raw:
+        return []
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        return []
+    return entries if isinstance(entries, list) else []
+
+
+def edges_from_prefix(conn, prefix, edge_type):
+    """{(src, dst, type): data} of the `edge_type` edges whose src id starts
+    with `prefix` (a repo's '{project}/{repo}#'), as an index range scan."""
+    lo, hi = _prefix_range(prefix)
+    rows = conn.execute(
+        "SELECT * FROM edges WHERE edge_type=? AND src_id >= ? AND src_id < ?",
+        (edge_type, lo, hi))
+    return {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
+            for e in (_row_to_edge(r) for r in rows)}
+
+
+def edges_into_prefix(conn, prefix, edge_type):
+    """{(src, dst, type): data} of the `edge_type` edges whose dst id starts
+    with `prefix`."""
+    lo, hi = _prefix_range(prefix)
+    rows = conn.execute(
+        "SELECT * FROM edges WHERE dst_id >= ? AND dst_id < ? AND edge_type=?",
+        (lo, hi, edge_type))
+    return {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
+            for e in (_row_to_edge(r) for r in rows)}
+
+
+def delete_edges(conn, keys, commit=True):
+    """Delete the edges keyed (src, dst, type) in `keys` (absent keys are a
+    no-op). `commit=False`: see upsert_nodes."""
+    rows = sorted(set(keys))
+    if rows:
+        conn.executemany(
+            "DELETE FROM edges WHERE src_id=? AND dst_id=? AND edge_type=?",
+            rows)
+        if commit:
+            conn.commit()
+
+
+def node_ids_with_prefix(conn, prefix):
+    """The ids of the nodes whose id starts with `prefix`, sorted."""
+    lo, hi = _prefix_range(prefix)
+    return [r[0] for r in conn.execute(
+        "SELECT id FROM nodes WHERE id >= ? AND id < ? ORDER BY id", (lo, hi))]
+
+
+def nodes_with_prefix(conn, prefix):
+    """[(id, data)] of the nodes whose id starts with `prefix`, sorted by id."""
+    lo, hi = _prefix_range(prefix)
+    return [(r[0], json.loads(r[1])) for r in conn.execute(
+        "SELECT id, data FROM nodes WHERE id >= ? AND id < ? ORDER BY id",
+        (lo, hi))]
+
+
+def _occurs_more(key):
+    """SQL: the JSON text `data` holds `"<key>": ` more often than
+    `"<key>": null`, i.e. some `<key>` member has a non-null value. String
+    contents never match (a `"` inside a JSON string is escaped)."""
+    k, n = '"{}": '.format(key), '"{}": null'.format(key)
+    return ("(length(data) - length(replace(data, '{k}', ''))) / {lk} > "
+            "(length(data) - length(replace(data, '{n}', ''))) / {ln}").format(
+                k=k, n=n, lk=len(k), ln=len(n))
+
+
+def item_relation_rows(conn, prefix):
+    """[(id, data)] of the PR/issue nodes under `prefix` ('{project}/{repo}#')
+    whose record may name a milestone, an iteration or a `blocks` ref, sorted
+    by id. A cheap SQL prefilter on the stored JSON text (it only ever lets
+    too many rows through; the caller reads the record itself), so a fold
+    does not decode every item of a large repo."""
+    where = "({} OR {} OR instr(data, '\"blocks\": [{{') > 0)".format(
+        _occurs_more("milestone"), _occurs_more("iteration"))
+    out = []
+    for local in ("issue-", "pr-"):
+        lo, hi = _prefix_range(prefix + local)
+        out.extend((r[0], json.loads(r[1])) for r in conn.execute(
+            "SELECT id, data FROM nodes WHERE id >= ? AND id < ? AND "
+            "node_class = 'social' AND " + where + " ORDER BY id", (lo, hi)))
+    return sorted(out, key=lambda r: r[0])
+
+
+def delete_orphan_standins(conn, ids, commit=True):
+    """Delete each id in `ids` that is a depends_on stand-in node
+    (`data.synthesized == STANDIN_MARK`) no edge references any more. Returns
+    the deleted ids, sorted. A real node is never deleted. `commit=False`: see
+    upsert_nodes."""
+    removed = []
+    for nid in sorted(set(ids)):
+        row = conn.execute("SELECT data FROM nodes WHERE id=?", (nid,)).fetchone()
+        if row is None or not _is_standin(row[0]):
+            continue
+        if conn.execute("SELECT 1 FROM edges WHERE src_id=? OR dst_id=? LIMIT 1",
+                        (nid, nid)).fetchone():
+            continue
+        conn.execute("DELETE FROM nodes WHERE id=?", (nid,))
+        removed.append(nid)
+    if removed and commit:
+        conn.commit()
+    return removed
 
 
 _DEAD_REFS_DDL = (

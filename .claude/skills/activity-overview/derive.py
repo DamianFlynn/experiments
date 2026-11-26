@@ -688,6 +688,44 @@ def link_symbol_identity(bundle):
 #     rules); a matching rule with no owners un-assigns ownership.
 
 
+# The reserved truncation key of a workflow_stats map (mirrors
+# gather.WORKFLOW_STATS_TRUNCATED_KEY; this leaf module cannot import gather).
+WORKFLOW_STATS_TRUNCATED_KEY = "_truncated"
+
+
+def sum_workflow_stats(stats_list):
+    """Sum several windows' `workflow_stats` maps (issue #94): per workflow
+    name, every integer counter is added. Truncation markers merge: `fetched`
+    is summed, `total_count` is summed (None when any is unknown), `ranges`
+    are concatenated in input order, `cap` is the largest. Keys sorted. Pure."""
+    out, truncs = {}, []
+    for stats in stats_list:
+        for name, rec in (stats or {}).items():
+            if name == WORKFLOW_STATS_TRUNCATED_KEY:
+                truncs.append(rec or {})
+                continue
+            if not isinstance(rec, dict):
+                continue
+            cur = out.setdefault(name, {})
+            for k, v in rec.items():
+                if isinstance(v, int) and not isinstance(v, bool):
+                    cur[k] = cur.get(k, 0) + v
+                else:
+                    cur.setdefault(k, v)
+    result = {name: dict(sorted(out[name].items())) for name in out}
+    if truncs:
+        totals = [t.get("total_count") for t in truncs]
+        caps = [t.get("cap") for t in truncs if isinstance(t.get("cap"), int)]
+        result[WORKFLOW_STATS_TRUNCATED_KEY] = {
+            "truncated": True,
+            "cap": max(caps) if caps else None,
+            "fetched": sum(t.get("fetched") or 0 for t in truncs),
+            "total_count": (None if any(not isinstance(t, int) for t in totals)
+                            else sum(totals)),
+            "ranges": [r for t in truncs for r in (t.get("ranges") or [])]}
+    return dict(sorted(result.items()))
+
+
 def codeowners_rules(code_owners):
     """Normalize a bundle `code_owners` value to an ordered list of
     `(pattern, [owner, ...])`.

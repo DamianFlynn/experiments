@@ -211,11 +211,11 @@ class TestViewMultiRepo(_TmpCase):
         self.assertEqual(got, json.loads(json.dumps(want)))
 
 
-class TestViewKeyOrderPreserved(_TmpCase):
-    """Regression: the view file must keep extract's key order. bundle_p3 has
-    same-timestamp artifact events whose order breaks timeline ties, so
-    `json.dump(..., sort_keys=True)` would change link's timeline and
-    feature_deltas versus enriching extract's in-memory result."""
+class TestViewFileEnrichesLikeMemory(_TmpCase):
+    """Regression: link.py on the view file equals enriching extract's
+    in-memory result. bundle_p3 has same-timestamp artifact events; since
+    issue #100 their order comes from an explicit key, so the view file is
+    written with `sort_keys=True` and still enriches identically."""
 
     def test_link_on_view_file_equals_in_memory_enrich(self):
         db = self.path("p3.db")

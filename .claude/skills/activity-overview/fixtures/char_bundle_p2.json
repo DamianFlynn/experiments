@@ -12,13 +12,12 @@
     "next_candidates": [
       {
         "id": 44,
-        "train": "train-issue-18",
+        "train": "train-pr-44",
         "type": "pr",
         "url": "https://github.com/o/r/pull/44"
       },
       {
         "id": 18,
-        "train": "train-issue-18",
         "type": "issue",
         "url": "https://github.com/o/r/issues/18"
       }
@@ -73,7 +72,7 @@
           "active in window"
         ],
         "tier": "likely",
-        "train": "train-issue-18"
+        "train": "train-pr-44"
       },
       {
         "notes": [],
@@ -89,7 +88,7 @@
           "active in window"
         ],
         "tier": "likely",
-        "train": "train-issue-18"
+        "train": null
       }
     ],
     "next_milestone": "v1.3.0"
@@ -285,49 +284,19 @@
         }
       ],
       "id": "train-issue-17",
+      "issues": [
+        17
+      ],
       "kind": "feature",
       "outcome": "shipped",
+      "pr_outcomes": {
+        "42": "merged"
+      },
       "prs": [
         42
       ],
       "root_issue": 17,
       "significance": 3.0,
-      "tier": "deep"
-    },
-    {
-      "code_areas": [],
-      "commits": [],
-      "contributing_prs": [],
-      "effort": {
-        "commits": 0,
-        "elapsed_days": null,
-        "merged_at": null,
-        "opened_at": "2026-05-20T08:00:00Z",
-        "participants": 0,
-        "review_comments": 0,
-        "reviewers": 0,
-        "stalled": false
-      },
-      "evidence": [
-        {
-          "id": 18,
-          "type": "issue",
-          "url": "https://github.com/o/r/issues/18"
-        },
-        {
-          "id": 44,
-          "type": "pr",
-          "url": "https://github.com/o/r/pull/44"
-        }
-      ],
-      "id": "train-issue-18",
-      "kind": "other",
-      "outcome": "in_flight",
-      "prs": [
-        44
-      ],
-      "root_issue": 18,
-      "significance": 1.0,
       "tier": "deep"
     },
     {
@@ -352,8 +321,12 @@
         }
       ],
       "id": "train-issue-20",
+      "issues": [
+        20
+      ],
       "kind": "other",
       "outcome": "abandoned",
+      "pr_outcomes": {},
       "prs": [],
       "root_issue": 20,
       "significance": 0.0,
@@ -381,10 +354,49 @@
         }
       ],
       "id": "train-pr-43",
+      "issues": [],
       "kind": "other",
       "outcome": "rejected",
+      "pr_outcomes": {
+        "43": "rejected"
+      },
       "prs": [
         43
+      ],
+      "root_issue": null,
+      "significance": 1.0,
+      "tier": "deep"
+    },
+    {
+      "code_areas": [],
+      "commits": [],
+      "contributing_prs": [],
+      "effort": {
+        "commits": 0,
+        "elapsed_days": null,
+        "merged_at": null,
+        "opened_at": "2026-05-20T08:00:00Z",
+        "participants": 0,
+        "review_comments": 0,
+        "reviewers": 0,
+        "stalled": false
+      },
+      "evidence": [
+        {
+          "id": 44,
+          "type": "pr",
+          "url": "https://github.com/o/r/pull/44"
+        }
+      ],
+      "id": "train-pr-44",
+      "issues": [],
+      "kind": "other",
+      "outcome": "in_flight",
+      "pr_outcomes": {
+        "44": "open"
+      },
+      "prs": [
+        44
       ],
       "root_issue": null,
       "significance": 1.0,

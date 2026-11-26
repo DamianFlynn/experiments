@@ -30,8 +30,9 @@ Every report lists EVERY check, in a fixed order (issue #79). A check that
 cannot run is a FAILED check, never an omitted one: a check that raises (e.g.
 on a corrupt row, named by its id) fails with the error, and when edge_set /
 no_drift / idempotency cannot self-source a bundle they fail with
-`could not self-source: <reason>`. WARN details (e.g. latest-wins edges on a
-multi-window store) are listed but never fail the gate.
+`could not self-source: <reason>`. WARN details (e.g. a current-state edge
+type a multi-window store cannot prove, with the reason) are listed but never
+fail the gate.
 
 The invariants (each a named check; see the per-function docstrings):
     target                  ERROR  the audited (project, repo) has stored nodes
@@ -339,6 +340,8 @@ def check_referential_integrity(conn):
     who never contributed (no person node) — that is a documented clean-store
     reality, reported INFO. A dangling NON-spine edge (e.g. an `authored` whose
     person or target is absent) is an ERROR. Counts are reported per edge type.
+    A per-window facts entry (issue #94) naming a value that is not stored, or
+    that cannot be read, is an ERROR too.
     """
     ids = _all_node_ids(conn)
     details = []
@@ -367,6 +370,12 @@ def check_referential_integrity(conn):
                          "codeowner not a contributor" if owns_codeowner else
                          "dangling non-spine edge"),
             })
+    # The per-window facts index (issue #94) must name stored values: a view
+    # of that window would otherwise silently lose its CI stats / structure.
+    for key, problem in graphstore.window_facts_problems(conn):
+        details.append({"severity": ERROR, "meta_key": key,
+                        "problem": problem,
+                        "note": "dangling per-window facts reference"})
     # summary line (INFO) so the report always shows per-type coverage
     details.append({"severity": INFO, "summary": "per_type_counts",
                     "counts": per_type})
@@ -600,7 +609,7 @@ def check_provenance(conn):
         problem = None
         if n["node_class"] == "social":
             problem = _social_provenance_problem(n, local)
-        elif graphstore.is_artifact_local(local):
+        elif graphstore.is_artifact_node(n):
             if not _has_source_ref(n):
                 problem = "no lifecycle commit ref in data"
         elif n["node_class"] == "code":
@@ -702,6 +711,33 @@ def _case_variant_details(nodes):
     return details
 
 
+def _code_form_problem(node, local):
+    """Why a stored `code` node is none of the known code-node forms, or None
+    (#101). The forms: a commit (a commit record, i.e. `data.sha`, under a
+    40/64-hex sha id); a file artifact (an artifact record under `art:<path>`,
+    `kind` not symbol/comment); a symbol/comment artifact (an artifact record
+    under `<path>#<lang>:<subkind>:<name>`, `kind` symbol or comment). Any
+    other combination is an unknown form, which no_drift cannot audit."""
+    if not graphstore.is_artifact_node(node):
+        if _SHA_RE.match(local):
+            return None
+        return ("unknown code-node form: commit record under non-sha id "
+                "{!r}".format(local))
+    symbol_kind = graphstore.is_symbol_node(node)
+    if local.startswith("art:"):
+        if not symbol_kind:
+            return None
+        return ("unknown code-node form: symbol/comment record under file "
+                "artifact id {!r}".format(local))
+    if graphstore.is_symbol_local(local):
+        if symbol_kind:
+            return None
+        return ("unknown code-node form: non-symbol record under symbol id "
+                "{!r}".format(local))
+    return ("unknown code-node form: artifact record under non-artifact id "
+            "{!r}".format(local))
+
+
 def check_no_fabrication(conn):
     """No invented entities, no historyless artifacts, no malformed ids.
 
@@ -711,6 +747,9 @@ def check_no_fabrication(conn):
       write path skips it), so any EXISTING person node must have earned it.
     - Every artifact `code` node (local id `art:<path>` / `<path>#…`) has >=1
       lifecycle event (artifact with no history = ERROR).
+    - Every `code` node is a known form (_code_form_problem, #101): a commit
+      record under a sha id, or an artifact record under the matching artifact
+      id form; anything else is an ERROR.
     - No node has an empty/None id; ids round-trip through parse_id, follow the
       id grammar and agree with the row's project/repo columns
       (_id_grammar_problem), and no scope is stored under two case spellings
@@ -753,13 +792,15 @@ def check_no_fabrication(conn):
                     "severity": ERROR, "id": nid, "login": login,
                     "problem": "orphan person: no contribution edge "
                                "(invented contributor)"})
-        # artifact with no history
+        # code node form, and artifact with no history
         elif n["node_class"] == "code":
             local = parsed["local"]
+            problem = _code_form_problem(n, local)
+            if problem:
+                details.append({"severity": ERROR, "id": nid, "problem": problem})
             # `art:<path>` file artifacts and `<path>#<lang>:<subkind>:<name>`
-            # symbol/comment artifacts (graphstore.is_artifact_local).
-            is_artifact = graphstore.is_artifact_local(local)
-            if is_artifact:
+            # symbol/comment artifacts, by record (graphstore.is_artifact_node).
+            if graphstore.is_artifact_node(n):
                 lifecycle = (n["data"] or {}).get("lifecycle") or []
                 if not lifecycle:
                     details.append({
@@ -776,13 +817,28 @@ def _id_kind(conn, qid, node_cache):
     """Classify a node id by its stored node_class + local-id form, for edge
     endpoint conformance. Returns one of: person, area, milestone, pr, issue,
     commit, artifact, social, code, structure, or '<missing>' when not stored.
+
+    A stored node is classified on its class and record first (#101): a code
+    node is an artifact or a commit by its record (graphstore.is_artifact_node),
+    and a stored non-code node is never an artifact, whatever its id holds
+    (`milestone-v1#a:b:c`). The artifact id shape is tested only for a dangling
+    id (or with no `conn`).
     """
     local = _local(qid)
+    node = None
+    if conn is not None:
+        node = node_cache.get(qid)
+        if node is None and qid not in node_cache:
+            row = conn.execute("SELECT * FROM nodes WHERE id=?", (qid,)).fetchone()
+            node = _node(row) if row else None
+            node_cache[qid] = node
+    if node is not None and node["node_class"] == "code":
+        return "artifact" if graphstore.is_artifact_node(node) else "commit"
     if _is_person_id(qid):
         return "person"
     # Artifact form first: a symbol's PATH may itself start with a prefix below
     # (`issue-templates/main.tf#terraform:…`, `release-notes/…`).
-    if graphstore.is_artifact_local(local):
+    if node is None and graphstore.is_artifact_local(local):
         return "artifact"
     if local.startswith("area-"):
         return "area"
@@ -802,15 +858,8 @@ def _id_kind(conn, qid, node_cache):
         return "pr"
     if local.startswith("issue-"):
         return "issue"
-    node = node_cache.get(qid)
-    if node is None and qid not in node_cache:
-        row = conn.execute("SELECT * FROM nodes WHERE id=?", (qid,)).fetchone()
-        node = _node(row) if row else None
-        node_cache[qid] = node
     if node is None:
         return "<missing>"
-    if node["node_class"] == "code":
-        return "commit"
     return node["node_class"]
 
 
@@ -911,13 +960,23 @@ def check_schema_conformance(conn):
 _RECORD_EDGE_TYPES = frozenset((
     "authored", "merged", "reviewed", "reported", "commented",
     "closes", "cross_ref", "part_of"))
-# Derived from latest-wins inputs (the codegraph / codeowners singletons, area
-# path lists, the milestone / sprint / blocks lists of the latest fetch): exact
-# on a one-window store; on a multi-window store an older window's edges cannot
-# be re-derived (those inputs are not kept per window, and edges are never
-# retracted, #95), so a difference there is a WARN.
+# Current-state edges (issue #95): derived from inputs that change — the
+# PR/issue records and milestone / sprint nodes (blocks, in_milestone,
+# in_iteration), the per-window code graph and CODEOWNERS facts (depends_on,
+# owns) — plus touches, derived from each window's code graph. On a one-window
+# store every one is exact. On a multi-window store each is exact when the
+# store shows it can be proven (_multi_window_plan): the item relations once a
+# fold since #95 rebuilt them, depends_on / owns once such a fold replayed
+# them over every window's facts, touches when every window's code graph is
+# stored and maps each path to one area. Otherwise a difference is a WARN
+# naming the reason.
 _CURRENT_STATE_EDGE_TYPES = frozenset((
     "owns", "touches", "depends_on", "in_milestone", "in_iteration", "blocks"))
+_ITEM_STATE_EDGE_TYPES = frozenset(("blocks", "in_milestone", "in_iteration"))
+_STRUCTURE_STATE_EDGE_TYPES = frozenset(("depends_on", "owns"))
+_PRE95_REASON = ("this repo was last folded before current-state edges were "
+                 "retracted (#95); fold any window of it once more to make "
+                 "this check exact")
 # Symbol moves, matched per fold window: exact on a one-window store; on a
 # multi-window store each stored move must be supported by the ledger
 # (_move_problem) and a cross-window re-match is not required.
@@ -963,6 +1022,88 @@ def _expected_edges(bundle, project, repo):
         scratch.close()
 
 
+def _touches_expected(windows, bundle, project, repo):
+    """(expected, reason): the touches the stored commits imply against the
+    UNION of every window's code-graph path index — each commit was folded
+    with the code graph of a window that saw its files, and a directory area
+    of a path is the same in every window — or (None, why not): a graphify
+    window (community ids are per run) or a path two windows put in different
+    areas."""
+    merged = {}
+    for frm, to, cg, _co, _sha in windows:
+        if not cg:
+            return None, ("the window {}..{} stored no code graph, so its "
+                          "commits' areas cannot be re-derived".format(frm, to))
+        if cg.get("provider") == "graphify":
+            return None, ("a window's code graph is a graphify one (its "
+                          "community ids are per run), so an older commit's "
+                          "areas cannot be re-derived")
+        for path, aid in derive.area_index(cg or {}).items():
+            if merged.setdefault(path, aid) != aid:
+                return None, ("the windows' code graphs put {} in different "
+                              "areas, so an older commit's areas cannot be "
+                              "re-derived".format(path))
+    out = {}
+    for c in bundle.get("commits") or []:
+        for aid in sorted(derive._commit_areas(c, merged)):
+            out[(graphstore.qualify_id(project, repo, c["sha"]),
+                 graphstore.qualify_id(project, repo, "area-{}".format(aid)),
+                 "touches")] = None
+    return out, None
+
+
+def _multi_window_plan(conn, project, repo, bundle):
+    """How check_edge_set compares the current-state edges of a multi-window
+    store (issue #95): {"expected": {type: {key: data}} for the types whose
+    expected set is not the self-sourced bundle's re-fold, "exact": the types
+    compared exactly, "reasons": {type: why a difference is only a WARN},
+    "replay": the gather.StructureReplay or None}.
+
+    - blocks / in_milestone / in_iteration: exact once a fold since #95
+      rebuilt them from the stored records (meta current_state `items`); the
+      re-fold of the self-sourced bundle (every stored record and milestone /
+      sprint) is then exactly what the store holds.
+    - depends_on / owns: exact once a fold since #95 replayed them over every
+      window's facts (`structure`) and every gathered window still has its
+      facts; expected = the same replay (gather.StructureReplay, without the
+      manifest's registries: a cross-repo edge is checked against the code
+      graphs of the windows in effect for its source).
+    - touches: exact when every window has its facts and _touches_expected
+      can merge their path indexes."""
+    state = graphstore.get_current_state(conn, project, repo) or {}
+    windows = gather.repo_fact_windows(conn, project, repo)
+    plan = {"expected": {}, "exact": set(), "reasons": {}, "replay": None}
+    if state.get("items") is True:
+        plan["exact"] |= _ITEM_STATE_EDGE_TYPES
+    else:
+        for et in _ITEM_STATE_EDGE_TYPES:
+            plan["reasons"][et] = _PRE95_REASON
+    no_facts = ("a gathered window of this repo has no per-window facts "
+                "(folded before #94); re-gather it to make this check exact")
+    if windows is None:
+        for et in _STRUCTURE_STATE_EDGE_TYPES | {"touches"}:
+            plan["reasons"][et] = no_facts
+        return plan
+    if state.get("structure") is True:
+        replay = gather.StructureReplay(windows, project, repo)
+        plan["replay"] = replay
+        want = {k: v for k, v in replay.desired().items()
+                if _owned_by_repo(k[0], k[1], project, repo)}
+        for et in _STRUCTURE_STATE_EDGE_TYPES:
+            plan["expected"][et] = {k: v for k, v in want.items() if k[2] == et}
+        plan["exact"] |= _STRUCTURE_STATE_EDGE_TYPES
+    else:
+        for et in _STRUCTURE_STATE_EDGE_TYPES:
+            plan["reasons"][et] = _PRE95_REASON
+    touches, why = _touches_expected(windows, bundle, project, repo)
+    if touches is None:
+        plan["reasons"]["touches"] = why
+    else:
+        plan["expected"]["touches"] = touches
+        plan["exact"].add("touches")
+    return plan
+
+
 def _project_members(conn, project):
     """Every member slug the store knows for `project`: stored repos plus the
     repos of recorded member run status (a failed member still was a member)."""
@@ -993,7 +1134,8 @@ def _cross_repo_dep_target(edge):
     return gather._ROOT_AREA_LOCAL
 
 
-def _cross_repo_problem(key, data, bundle, project, repo, members):
+def _cross_repo_problem(key, data, bundle, project, repo, members,
+                        graphs=None):
     """None when a stored edge from this repo into ANOTHER member repo is one
     the manifest fold derives from the stored records: a `closes`/`cross_ref`
     from a PR's qualified refs / timeline cross-references
@@ -1001,7 +1143,9 @@ def _cross_repo_problem(key, data, bundle, project, repo, members):
     registry edge of the source area in the stored code graph to the area that
     edge resolves to in a member (_cross_repo_dep_target: the root module for
     Terraform, the module directory for a Bicep public-registry ref). Else why
-    not (or "not cross-repo")."""
+    not (or "not cross-repo"). `graphs` (issue #95): the code graphs to look
+    in for a depends_on edge (the windows in effect for its source); default
+    the bundle's."""
     src, dst, et = key
     dst_scope = graphstore.parse_id(dst)["scope"]
     if not dst_scope.startswith(project + "/") or \
@@ -1025,7 +1169,10 @@ def _cross_repo_problem(key, data, bundle, project, repo, members):
         dst_local = graphstore.local_id(dst)
         aid = local[len("area-"):] if local.startswith("area-") else None
         wrong_target = None
-        for area in (bundle.get("code_graph") or {}).get("areas") or []:
+        if graphs is None:
+            graphs = [bundle.get("code_graph") or {}]
+        areas = [a for g in graphs for a in (g or {}).get("areas") or []]
+        for area in areas:
             if area.get("id") != aid:
                 continue
             for e in area.get("edges") or []:
@@ -1111,9 +1258,12 @@ def check_edge_set(conn, project, repo, bundle):
       derivation (_cross_repo_problem); a missing cross-repo edge is not
       detected (it needs the manifest's registries).
     - Multi-window store (more than one gathered window recorded for the repo):
-      a difference in a _CURRENT_STATE_EDGE_TYPES edge is a WARN (its inputs are
-      latest-wins), each stored move must be supported by the ledger
-      (_move_problem) and cross-window move re-matches are not required.
+      each _CURRENT_STATE_EDGE_TYPES type is compared exactly when
+      _multi_window_plan can prove it (depends_on / owns / touches against
+      their replay over the per-window facts, the item relations against the
+      re-fold), else a difference is a WARN naming why (issue #95); each
+      stored move must be supported by the ledger (_move_problem) and
+      cross-window move re-matches are not required.
 
     This proves the edges are exactly what the stored records imply, not that
     the records are what GitHub holds (see no_drift's --bundle cross-check).
@@ -1121,6 +1271,11 @@ def check_edge_set(conn, project, repo, bundle):
     multi = _repo_window_count(conn, project, repo) > 1
     expected = {k: v for k, v in _expected_edges(bundle, project, repo).items()
                 if _owned_by_repo(k[0], k[1], project, repo)}
+    plan = _multi_window_plan(conn, project, repo, bundle) if multi else None
+    if plan is not None:
+        for et, want in plan["expected"].items():
+            expected = {k: v for k, v in expected.items() if k[2] != et}
+            expected.update(want)
     stored = {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
               for e in _all_edges(conn)
               if _owned_by_repo(e["src_id"], e["dst_id"], project, repo)}
@@ -1128,6 +1283,10 @@ def check_edge_set(conn, project, repo, bundle):
     hints = {}
     details = []
     per_type = {}
+
+    def lenient_note(et):
+        return " ({}; multi-window store)".format(plan["reasons"][et])
+
     for key in sorted(set(stored) | set(expected)):
         src, dst, et = key
         per_type.setdefault(et, {"stored": 0, "derived": 0})
@@ -1136,7 +1295,8 @@ def check_edge_set(conn, project, repo, bundle):
         if key in expected:
             per_type[et]["derived"] += 1
         base = {"edge_type": et, "src": src, "dst": dst}
-        lenient = multi and et in _CURRENT_STATE_EDGE_TYPES
+        lenient = (multi and et in _CURRENT_STATE_EDGE_TYPES
+                   and et not in plan["exact"])
         if key in stored and key in expected:
             if stored[key] != expected[key] and not lenient and not (
                     multi and et in _MOVE_EDGE_TYPES):
@@ -1150,14 +1310,18 @@ def check_edge_set(conn, project, repo, bundle):
             details.append(dict(
                 base, severity=WARN if lenient else ERROR,
                 problem="derived from the stored records but not stored"
-                        + (" (latest-wins input on a multi-window store)"
-                           if lenient else "")))
+                        + (lenient_note(et) if lenient else "")))
             continue
         # stored but not derivable from this repo's records
         if members is None:
             members = _project_members(conn, project)
+        graphs = None
+        replay = plan["replay"] if plan is not None else None
+        if et == "depends_on" and replay is not None:
+            graphs = [replay.graphs[i] for i in replay.dep_in_effect(
+                src, gather._dep_is_transitive(stored[key]))]
         cross = _cross_repo_problem(key, stored[key], bundle, project, repo,
-                                    members)
+                                    members, graphs=graphs)
         if cross is None:
             continue
         if multi and et in _MOVE_EDGE_TYPES:
@@ -1168,10 +1332,19 @@ def check_edge_set(conn, project, repo, bundle):
                                 problem="move edge not supported by the "
                                         "ledger: " + problem))
             continue
-        d = dict(base, severity=WARN if lenient else ERROR,
+        # A stored depends_on / owns edge that no window's facts produce is
+        # stale only when some authoritative window says it is gone. When a
+        # re-gather replaced the facts that carried it with ones that cannot
+        # judge (failed build, no scan), fold keeps the edge and so must we:
+        # it can be warned about, not proven wrong.
+        unproven = (not lenient and replay is not None
+                    and et in ("depends_on", "owns")
+                    and not replay.retractable(key, stored[key]))
+        d = dict(base, severity=WARN if (lenient or unproven) else ERROR,
                  problem="stored but not derivable from the stored records"
-                         + (" (latest-wins input on a multi-window store; stale "
-                            "until edges are retracted, #95)" if lenient else ""))
+                         + (lenient_note(et) if lenient else "")
+                         + (" (no gathered window has authoritative input for "
+                            "it, so it is kept)" if unproven else ""))
         if cross != "not cross-repo":
             d["cross_repo"] = cross
         if _is_person_id(src):
@@ -1180,12 +1353,15 @@ def check_edge_set(conn, project, repo, bundle):
             if hints[src]:
                 d["hint"] = hints[src]
         details.append(d)
+    note = "{} stored edge(s) of this repo compared with {} re-derived from its " \
+           "records".format(len(stored), len(expected))
+    if multi:
+        note += " (multi-window store; exact: {}; WARN only: {})".format(
+            ", ".join(sorted(plan["exact"])) or "none",
+            ", ".join(sorted(_CURRENT_STATE_EDGE_TYPES - plan["exact"]))
+            or "none")
     details.append({"severity": INFO, "summary": "per_type_counts",
-                    "note": "{} stored edge(s) of this repo compared with {} "
-                            "re-derived from its records{}".format(
-                                len(stored), len(expected),
-                                " (multi-window store)" if multi else ""),
-                    "counts": per_type})
+                    "note": note, "counts": per_type})
     return _check("edge_set", ERROR, details)
 
 
@@ -1525,9 +1701,12 @@ def check_no_drift(conn, project, repo, bundle, check_people=True,
     # (mirroring how fold_bundle / extract reconstruct it).
     want_arts = _derive_artifacts(conn, project, repo, bundle)
     stored_arts = {}
+    # Every non-commit code node is audited as an artifact (#101: classified by
+    # its record, not its id shape; check_no_fabrication rejects any code node
+    # whose id form disagrees with its record).
     for n in graphstore.repo_nodes(conn, project, repo, "code"):
         local = graphstore.local_id(n["id"], project, repo)
-        if graphstore.is_artifact_local(local):
+        if graphstore.is_artifact_node(n):
             stored_arts[local] = n["data"] or {}
     art_fields = ("kind", "path", "name", "status", "replaced_by", "code_area")
     for aid in sorted(set(stored_arts) | set(want_arts)):
@@ -1583,36 +1762,52 @@ def check_idempotency(conn, bundle, project=None, repo=None):
     Multi-window store (`project`/`repo` given and more than one gathered
     window recorded for it): the self-sourced bundle holds every window as one,
     so the re-fold can match a symbol move no single window had (a drop in one
-    window, a unique add in a later one) and re-derive latest-wins edges
-    (touches/owns/depends_on/in_milestone/in_iteration/blocks) for older
-    records. Edges are keyed by (src, dst, type), so such new edges are a
+    window, a unique add in a later one) and derive current-state edges
+    (touches/owns/depends_on/...) for older records against the latest
+    window's code graph. Edges are keyed by (src, dst, type), so such new edges are a
     different derivation scope, never a duplicate: they are listed as INFO and
-    left out of the edge count (issue #89, LLD §14.5). On a one-window store
-    every change still fails.
+    left out of the edge count (issue #89, LLD §14.5). A re-fold that
+    RETRACTS current-state edges (issue #95) of a repo last folded before #95
+    is healing stale edges that fold left behind: a WARN, left out of the
+    count; on a repo folded since #95 it is a failure (the store was not what
+    its inputs imply). On a one-window store every change still fails.
     """
     multi = project is not None and _repo_window_count(conn, project, repo) > 1
     before = _counts(conn)
     keys_before = _edge_keys(conn) if multi else None
     copy_conn = graphstore.open_store(":memory:")
     conn.backup(copy_conn)
-    gather.fold_bundle(copy_conn, bundle)
+    summary = gather.fold_bundle(copy_conn, bundle) or {}
     after = _counts(copy_conn)
-    excused = []
+    excused, healed = [], []
     if multi:
+        keys_after = _edge_keys(copy_conn)
         excused = sorted(
-            k for k in _edge_keys(copy_conn) - keys_before
+            k for k in keys_after - keys_before
             if k[2] in _MOVE_EDGE_TYPES or k[2] in _CURRENT_STATE_EDGE_TYPES)
         after["edges"] -= len(excused)
+        if graphstore.get_current_state(conn, project, repo) is None:
+            healed = sorted(k for k in keys_before - keys_after
+                            if k[2] in _CURRENT_STATE_EDGE_TYPES)
+            after["edges"] += len(healed)
+            # the stand-ins those edges alone anchored go with them
+            after["nodes"] += len(summary.get("standins_removed") or [])
     copy_conn.close()
     details = []
     if excused:
         details.append({
             "severity": INFO,
             "note": "{} edge(s) a whole-store re-fold derives that no single "
-                    "window did (cross-window move re-match / latest-wins "
+                    "window did (cross-window move re-match / current-state "
                     "input on a multi-window store): not a dedup failure".format(
                         len(excused)),
             "edges": [list(k) for k in excused[:20]]})
+    if healed:
+        details.append({
+            "severity": WARN,
+            "note": "{} stale current-state edge(s) a re-fold retracts: {}"
+                    .format(len(healed), _PRE95_REASON),
+            "edges": [list(k) for k in healed[:20]]})
     for k in ("nodes", "edges", "code_events"):
         if after[k] != before[k]:
             details.append({

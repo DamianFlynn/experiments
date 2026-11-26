@@ -233,7 +233,8 @@ def emit_content_timeline(bundle, notes=None):
 
     Capped at the TIMELINE_MAX_DAYS latest periods (sorted date order; an
     `earlier : +K more events on M earlier dates` period replaces the rest) and at
-    TIMELINE_MAX_EVENTS_PER_DAY events per period (the first ones in bundle order,
+    TIMELINE_MAX_EVENTS_PER_DAY events per period (the first ones by artifact
+    id, then lifecycle position — never the key order of `artifacts`, #100 —
     then a `+K more events` event)."""
     return _fit(lambda scale, n: _content_timeline(bundle, scale, n), notes)
 
@@ -244,7 +245,9 @@ def _content_timeline(bundle, scale, notes):
              f"    title Content lifecycle ({meta.get('from','')} - {meta.get('to','')})"]
     by_date = {}
     verb = {"add": "built", "change": "changed", "remove": "dropped"}
-    for art in bundle.get("artifacts", {}).values():
+    arts = bundle.get("artifacts", {})
+    for aid in sorted(arts):
+        art = arts[aid]
         for ev in art.get("lifecycle", []):
             day = (_one_line((ev.get("date") or "")[:10]).replace(":", "-").strip()
                    or "undated")
@@ -457,11 +460,20 @@ def emit_kind_breakdown(bundle, notes=None):
     return "\n".join(lines) + "\n"
 
 
+# The PR outcome (link `train.pr_outcomes`) that decides each train outcome.
+_TRAIN_DECIDING_PR_OUTCOME = {"shipped": "merged", "in_flight": "open",
+                              "rejected": "rejected"}
+
+
 def emit_train_flowchart(bundle, train, notes=None):
     """A Mermaid `flowchart` telling the life story of one train.
 
     Outcome mapping: 'shipped' -> 'Shipped [-> <milestone>]';
     'rejected' -> 'Rejected'; anything else (open, in_flight, ...) -> 'In flight'.
+    Every PR of the train is drawn (issue #93); one whose own outcome
+    (`train.pr_outcomes`) is not the one that decided the train's is labelled
+    `<outcome>: <title>` (e.g. `rejected: ...` in a shipped train) and has no
+    edge to the outcome node.
 
     Adaptive layout:
       mode C (default): PR nodes annotated with distinct code_area nodes when
@@ -506,16 +518,28 @@ def _train_flowchart(bundle, train, scale, notes):
     shown_prs = train_prs[:pr_cap]
     omitted = len(train_prs) - len(shown_prs)
     _note(notes, len(shown_prs), len(train_prs), "PRs")
-    pr_node_ids = []
+    # A train holds every attempt (issue #93). An attempt whose own outcome is
+    # not the one that decided the train's (e.g. a rejected PR in a shipped
+    # train) is labelled with it and draws no edge to the outcome node.
+    pr_outcomes = train.get("pr_outcomes") or {}
+    deciding = _TRAIN_DECIDING_PR_OUTCOME.get(outcome)
+    pr_node_ids = []      # every shown PR node (issue -> PR edges)
+    to_outcome = []       # the PR nodes that lead to the outcome node
     for pr_num in shown_prs:
         pr = prs_by_num.get(pr_num, {})
         pr_title = pr.get("title") or f"PR #{pr_num}"
         pr_id = ids("pr", str(pr_num))
         pr_node_ids.append(pr_id)
+        own = pr_outcomes.get(str(pr_num))
+        if own and deciding and own != deciding:
+            pr_title = f"{own}: {pr_title}"
+        else:
+            to_outcome.append(pr_id)
         lines.append(f'    {pr_id}["{_flow_label(pr_title)}"]')
     if omitted:
         lines.append(_more_node(omitted, "PRs"))
         pr_node_ids.append("more")
+        to_outcome.append("more")
 
     # --- outcome node ---
     if outcome == "shipped":
@@ -547,8 +571,8 @@ def _train_flowchart(bundle, train, scale, notes):
             lines.append(f"    {issue_node_id} --> {pr_id}")
     # If PR-only train and no issue node, PRs are the start nodes (no extra edge needed)
 
-    # --- edges: PRs -> outcome ---
-    for pr_id in pr_node_ids:
+    # --- edges: PRs -> outcome (only the attempts that decided it) ---
+    for pr_id in to_outcome:
         lines.append(f"    {pr_id} --> {outcome_node_id}")
 
     # --- mode C: area annotation nodes and edges ---
@@ -638,18 +662,27 @@ def emit_blocker_graph(bundle, max_edges=BLOCKER_MAX_EDGES, notes=None):
     Each issue that participates in a dependency becomes a node labelled `#<n>`;
     every `blocks` relation draws blocker --> blocked (fold normalized the edge
     direction, and extract surfaces it as `issue["blocking"]` = the issues this one
-    blocks). Emits a `No blocked issues` placeholder when no `blocks` edges exist.
-    Bounded: at most `max_edges` (BLOCKER_MAX_EDGES) edges are drawn, the first in
-    (blocker, blocked) number order, with a `+K more blocked` node when more exist.
-    Derived solely from existing bundle fields."""
+    blocks).
+
+    Open only, the flow rule (#60, #101): a relation is drawn only when the
+    blocker AND the blocked issue are bundle issues with `state == "open"` —
+    exactly the relation `blockers[]` counts. A closed (resolved) blocker no
+    longer blocks and is omitted, as are closed dependants and issues absent from
+    the bundle (state unknown). Emits a `No blocked issues` placeholder when no
+    such relation exists. Bounded: at most `max_edges` (BLOCKER_MAX_EDGES) edges
+    are drawn, the first in (blocker, blocked) number order, with a `+K more
+    blocked` node when more exist. Derived solely from existing bundle fields."""
     issues = bundle.get("issues") or []
-    # Collect blocker->blocked pairs from the resolved `blocking` lists; sorted +
-    # deduped so the diagram is deterministic regardless of issue/edge order.
+    open_issues = {iss.get("number") for iss in issues
+                   if iss.get("state") == "open"}
+    # Collect open blocker->open blocked pairs from the resolved `blocking` lists;
+    # sorted + deduped so the diagram is deterministic regardless of order.
     edges = sorted({
         (iss["number"], blocked)
         for iss in issues
-        if iss.get("number") is not None
+        if iss.get("number") is not None and iss["number"] in open_issues
         for blocked in (iss.get("blocking") or [])
+        if blocked in open_issues
     })
     lines = ["flowchart LR"]
     if not edges:

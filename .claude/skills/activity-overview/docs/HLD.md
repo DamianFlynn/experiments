@@ -165,6 +165,10 @@ flowchart LR
 
 Each train gets an **outcome** (shipped / in_flight / rejected / abandoned), a
 **significance** score and a **tier** (`deep` → full narrative, `mention` → one line).
+A single-repo `link` train holds every attempt — rejected, shipped and still-open PRs — with
+each PR's own outcome, and every issue its PRs close; PRs and issues are joined only by
+`closes`, so a `cross_ref` (a mention) is traversal context, never membership (#93, §10
+item 17).
 
 ### 5.3 Buckets
 
@@ -391,9 +395,10 @@ Before bumping a major version of, say, `avm-res-network-virtualnetwork`, run
 `spotlight dependents Azure/terraform-azurerm-avm-res-network-virtualnetwork` against the
 constellation store: it lists every member module that depends on it (with pinned versions
 in `digest.module_edges`). On a fresh store, the structural scan means this reflects the
-module structure of the checkout gathered for that window, not just that month's churn. A
-store never retracts a `depends_on` edge, so in a store folded from several gathers the
-result is *recorded* dependencies — use a fresh store when you need the current structure.
+module structure of the checkout gathered for that window, not just that month's churn. In
+a store folded from several gathers, each fold retracts the `depends_on` edges its scan or
+build shows are gone (#95), so the result is the structure of the latest gathered window that
+speaks for each module (manifest members always carry the whole-tree scan).
 
 ### 8.5 Scenario E — module biography for release notes
 
@@ -475,28 +480,46 @@ These are real, current limits — plan around them:
    (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when). An
    item that was open at the end of that month but has closed since is not in its view
    (its stored state is closed, outside the month); an item updated in that month and again
-   later is in the later month's view only. The per-repo singletons are the latest gather's
-   (item 9), and a person's `modules`/`areas` in a view are computed with that latest code
-   graph; a view spanning several gathered windows can still match a symbol move across them
-   (LLD §14.5).
+   later is in the later month's view only. The per-repo facts are per window (item 9), so a
+   person's `modules`/`areas` in a month's view are computed with that month's code graph; a
+   view spanning several gathered windows uses the latest one's, and can still match a symbol
+   move across them (LLD §14.5).
    **People in a multi-repo project (#88).** A member bundle lists only the people with a
    contribution in that member's window, with that repo's areas; the project view sums each
    person's counts across members (nobody is counted twice), combines dates and review
    latency, qualifies areas as `<repo>::<area>` and ranks `halls.fame` on those totals. The
    stored person node stays the project-wide union (what `validate` checks).
-9. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
-    `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
-    latest gathered window only.
-10. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
-    `depends_on` edge in an existing store. On a multi-window store `validate` reports such
-    stale latest-wins edges as WARN, not ERROR.
+9. **Per-repo facts are per gathered window, not per day.** Since #94 each fold also records
+    its window's `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` and clone sha
+    (STORE.md "Meta", `facts:`), and a view of exactly a gathered window shows that window's.
+    Other views are assembled from whole windows: CI statistics are the sum of the gathered
+    windows lying inside the view (absent for a sub-window or a straddling view, marked
+    incomplete when days are missing), and the structure is the latest overlapping window's
+    — so a quarter view attributes code areas with its last month's (window-scoped) code
+    graph. `meta.facts_windows` says which windows. Stores folded before #94 keep the
+    latest-wins values until re-gathered.
+10. **Current-state edges are retracted only on evidence.** Since #95 a fold keeps
+    `depends_on`, `owns`, `in_milestone`, `in_iteration` and `blocks` equal to what the store's
+    inputs imply (STORE.md "Current-state edges"): a removed module `source`, a CODEOWNERS
+    change, an item moved off a milestone or sprint, a blocker edited away all drop their
+    edge. What is left: a `depends_on` edge goes only when a resolved build of its area or the
+    whole-tree structural scan shows it gone (a single-repo store without `--structural-iac`
+    and without `bicep`/`terraform` keeps the edges of areas no later window rebuilt), a
+    transitive edge only on a new build, and an area's owners only when a later window lists
+    the area; the item relations follow the last-folded record, so folding an older bundle
+    after a newer one brings its older relations back. On a multi-window store `validate`
+    checks these edge types exactly once a fold since #95 has maintained them (and every
+    window has its per-window facts); people's areas, a store last folded before #95 and a
+    window without facts stay WARN.
 11. **Terraform transitive edges come from the build.** Every `module {}` block an area
     declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
     (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:
     calls whose module tree holds no resources are not in the graph, and without init's
     `modules.json` a nested call's target is unknown and is not folded. Single-repo gathers emit
     no Terraform edges at all without `terraform` unless given `--structural-iac`; manifest
-    gathers always get the static direct edges for every module dir.
+    gathers always get the static direct edges for every module dir. A nested module dir
+    under `modules/<name>/` (`modules/sub/inner/*.tf`) is its own area since #101; stores
+    gathered earlier keep those files under `modules/<name>` until re-gathered.
 12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.
@@ -531,6 +554,14 @@ These are real, current limits — plan around them:
     refreshing an earlier month does not recompute the later months' already-written series
     blocks (`link` names them on stderr). A month recorded after a later one is marked
     `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
+17. **Trains follow closing references.** A `link` train holds every PR that targets the
+    mainline — shipped, open or rejected — joined with the other PRs that close the same issues,
+    and lists every issue they close (#93). Only a closing keyword (`Fixes #N`, `Closes #N`, …
+    in the PR title or body) joins a PR to an issue: a mention, a timeline cross-reference or a
+    link made only in the PR's Development sidebar does not, so such a PR is its own train
+    (`train-pr-<n>`). A PR closing several issues joins every PR that closes any of them. Stores
+    gathered before #93 have no PR head repo, so a stacked PR whose base branch name is shared
+    by two PRs' heads (forks' `patch-1`) is attached to neither until re-gathered.
 
 Item 8 is what USAGE weighs when choosing between one accumulated store and one store per
 installment. Artifact folding is cumulative: each fold rebuilds the artifacts it touches from
@@ -548,8 +579,10 @@ holds: a record deleted with all its edges, a blob rewritten consistently, or a 
 ledger (artifacts are compared with the store's own ledger) leave a consistent store. A
 `--bundle` saved at gather time (a `view.py` JSON of the fresh store) catches changed or deleted
 records; the store keeps no per-fold content digest. On a store holding several windows, the
-edges and people areas that come from latest-wins inputs (item 9) can only be WARNed about, not
-proven.
+edges and people areas that come from structure or latest-wins inputs (ownership, area
+touches, dependencies, milestones, sprints, blockers) can only be WARNed about, not proven:
+the gate re-derives them from one whole-store bundle, although since #94 the structure inputs
+are kept per window (LLD §8, §14.5).
 
 ## 11. Extension points and roadmap
 

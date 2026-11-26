@@ -96,14 +96,17 @@ class TestBuildTrains(unittest.TestCase):
         self.assertEqual(trains[0]["id"], "train-pr-42")
         self.assertIsNone(trains[0]["root_issue"])
 
-    def test_train_anchors_on_crossref_when_no_closing_keyword(self):
+    def test_crossref_without_closing_keyword_does_not_anchor(self):
+        """Issue #93: a mention / cross-reference is context, not membership;
+        only a closing reference makes an issue the train root."""
         bundle = _sample_bundle()
         bundle["prs"][0]["closes"] = []
         bundle["prs"][0]["crossref_issues"] = [17]
         link.attach_commit_prs(bundle["commits"])
         trains = link.build_trains(bundle)
-        self.assertEqual(trains[0]["id"], "train-issue-17")
-        self.assertEqual(trains[0]["root_issue"], 17)
+        self.assertEqual(trains[0]["id"], "train-pr-42")
+        self.assertIsNone(trains[0]["root_issue"])
+        self.assertEqual(trains[0]["issues"], [])
 
     def test_train_evidence_refs_are_well_formed(self):
         bundle = _sample_bundle()
@@ -2840,13 +2843,16 @@ class TestForecastWorkInProgress(unittest.TestCase):
         self.assertEqual(c["notes"], ["previous attempt rejected"])
 
     def test_issue_crossreferenced_only_by_merged_pr_is_not_in_motion(self):
+        # Since #93 a cross-reference does not anchor a train, so the issue
+        # has no train (and so no "linked PR already merged" note); the merged
+        # PR is its own `train-pr-80`.
         cands = self._run([self._issue(8)],
                           [self._pr(80, "closed", True, crossref=[8])])
         c = cands[("issue", 8)]
-        self.assertEqual(c["train"], "train-issue-8")
+        self.assertIsNone(c["train"])
         self.assertEqual(c["score"], 3.0)
         self.assertEqual(c["signals"], ["high-priority"])
-        self.assertEqual(c["notes"], ["linked PR already merged"])
+        self.assertEqual(c["notes"], [])
 
     def test_issue_closed_by_merged_pr_but_still_open_is_not_in_motion(self):
         cands = self._run([self._issue(9)],

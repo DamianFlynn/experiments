@@ -1482,6 +1482,39 @@ class TestIssueKindLabelSchemes(unittest.TestCase):
         self.assertEqual(self._kind([], title="How do I configure this?"),
                          "question")
 
+    # --- #101: "support" and "?" in titles -------------------------------------
+    def test_support_in_title_is_not_a_question(self):
+        self.assertEqual(self._kind([], title="Add support for X"), "other")
+        self.assertEqual(self._kind([], title="Feature: support private endpoints"),
+                         "feature")
+        # only the phrase "support request" makes a title a question
+        self.assertEqual(self._kind([], title="Support request: quota limits"),
+                         "question")
+
+    def test_support_as_label_or_type_is_still_a_question(self):
+        self.assertEqual(self._kind(["support"]), "question")
+        self.assertEqual(self._kind(["type: support"]), "question")
+        self.assertEqual(self._kind([], issue_type="Support", types_present=True),
+                         "question")
+
+    def test_question_mark_inside_title_is_not_a_question(self):
+        self.assertEqual(self._kind([], title="Bug: crash when name contains ?"),
+                         "bug")
+        self.assertEqual(self._kind([], title="crash when name contains ?"),
+                         "other")
+        self.assertEqual(self._kind([], title="?foo=bar query string dropped"),
+                         "other")
+
+    def test_question_by_trailing_mark_or_interrogative_start(self):
+        self.assertEqual(self._kind([], title="Private endpoints on the vnet?"),
+                         "question")
+        self.assertEqual(self._kind([], title="Is this a bug?"), "question")
+        self.assertEqual(self._kind([], title="How to pin a version? (v2)"),
+                         "question")
+        # an interrogative start alone (no `?`) is not a question
+        self.assertEqual(self._kind([], title="When deleted, outputs stay"),
+                         "other")
+
     def test_template_filenames(self):
         self.assertEqual(self._kind([], template="bug_report.yml"), "bug")
         self.assertEqual(self._kind([], template="feature_request.md"), "feature")
@@ -2814,6 +2847,45 @@ class TestIacEntrypoint(unittest.TestCase):
             read_text=lambda rel: files[rel])
         self.assertEqual([(e["to"], e["ref"]) for e in out["modules/sub"]["edges"]],
                          [("modules/peer", "../peer")])
+
+    def test_nested_tf_dir_inside_module_area_is_its_own_area(self):
+        # #101: modules/sub/inner/*.tf is a module of its own (terraform reads one
+        # directory as one module): its own module calls are reported on it, and
+        # modules/sub's `./inner` call targets it (no longer a self-edge).
+        files = {
+            "modules/sub/main.tf": 'module "inner" { source = "./inner" }\n',
+            "modules/sub/inner/main.tf": 'module "peer" { source = "../../peer" }\n',
+            "modules/peer/main.tf": "",
+        }
+        out = gather.scan_structural_terraform_areas(
+            "/clone", list_files=lambda: list(files),
+            read_text=lambda rel: files[rel])
+        self.assertEqual(set(out), {"modules/sub", "modules/sub/inner", "modules/peer"})
+        self.assertEqual(out["modules/sub"]["paths"], ["modules/sub/main.tf"])
+        self.assertEqual([(e["to"], e["ref"]) for e in out["modules/sub"]["edges"]],
+                         [("modules/sub/inner", "./inner")])
+        self.assertEqual(
+            [(e["to"], e["ref"]) for e in out["modules/sub/inner"]["edges"]],
+            [("modules/peer", "../../peer")])
+
+    def test_nested_tf_dir_area_ids_and_avm_terraform_layout(self):
+        area = lambda p: gather.classify_code_area(p, gather.DEFAULT_AREA_PATTERNS)
+        # changed: a *.tf in a nested, non-scaffold dir under modules/<name>/
+        self.assertEqual(area("modules/sub/inner/main.tf"), "modules/sub/inner")
+        self.assertEqual(area("modules/sub/a/b/x.tf"), "modules/sub/a/b")
+        # unchanged: non-.tf files there stay with the enclosing module area
+        self.assertEqual(area("modules/sub/inner/README.md"), "modules/sub")
+        self.assertEqual(area("modules/sub/templates/x.tftpl"), "modules/sub")
+        # unchanged: nested scaffolding stays with its module (and is skipped)
+        self.assertEqual(area("modules/sub/examples/x/main.tf"), "modules/sub")
+        self.assertEqual(area("modules/sub/tests/fixture/main.tf"), "modules/sub")
+        # unchanged: the AVM Terraform layout
+        self.assertEqual(area("main.tf"), "main.tf")
+        self.assertEqual(area("variables.tf"), "main.tf")
+        self.assertEqual(area("modules/x/main.tf"), "modules/x")
+        self.assertEqual(area("modules/x/README.md"), "modules/x")
+        self.assertEqual(area("examples/default/main.tf"), "examples/default")
+        self.assertEqual(area("tests/unit/main.tftest.hcl"), "tests/unit")
 
 
 class TestIacEdgeHardening(unittest.TestCase):

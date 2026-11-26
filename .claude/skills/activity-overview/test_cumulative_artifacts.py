@@ -153,8 +153,8 @@ class TestMayJuneStore(unittest.TestCase):
         _ok(self, b)
 
     def test_extract_artifacts_independent_of_fold_order(self):
-        """extract reads the stored nodes back in build_artifacts' insertion order
-        (the timeline tie-break depends on it); that order must not depend on
+        """extract keys the stored nodes in id order (issue #100: no consumer
+        depends on the key order any more); that order must not depend on
         which window was folded first."""
         def keys(conn):
             return list(extract.extract(conn, "o", "r", "2026-05-01", "2026-06-30",
@@ -166,7 +166,8 @@ class TestMayJuneStore(unittest.TestCase):
             "commit": "d0" * 20, "author": "Eve", "date": "2026-06-01",
             "change": "add", "path": "docs/june.md"})
         may_first = keys(_store(_may(), june))
-        self.assertEqual(may_first[-1], "art:docs/june.md")
+        self.assertIn("art:docs/june.md", may_first)
+        self.assertEqual(may_first, sorted(may_first))
         self.assertEqual(keys(_store(june, _may())), may_first)
 
     def test_external_bundle_cross_check_on_multi_window_store(self):

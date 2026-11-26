@@ -684,6 +684,11 @@ def normalize_pr(raw):
         # context but not counted as shipped-to-main (see link.build_trains).
         "base": (raw.get("base") or {}).get("ref"),
         "head": (raw.get("head") or {}).get("ref"),
+        # the repo the head branch lives in (a fork's full name for a fork PR;
+        # None when GitHub no longer knows it, e.g. a deleted fork) — a stacked
+        # PR's parent is matched by (head_repo, head), not the bare branch name
+        # (issue #93: two forks' `patch-1` are different branches).
+        "head_repo": (((raw.get("head") or {}).get("repo")) or {}).get("full_name"),
         "comments": raw.get("comments", 0) or 0,
         "review_comments_count": raw.get("review_comments", 0) or 0,
         "reviewers": [],
@@ -1580,7 +1585,15 @@ def _main_bicep_dir(parts):
 def _terraform_modules_dir(parts):
     # modules/<name>/... -> modules/<name>. <name> must be a directory: a file
     # directly under modules/ (modules/README.md) is not a module and falls through.
+    # A *.tf file in a NESTED non-scaffold dir (modules/<name>/inner/x.tf) is a
+    # module of its own, as terraform reads one directory as one module: its area
+    # is that dir (#101). Other files there, and nested examples/tests, stay in
+    # modules/<name>.
     if len(parts) >= 3 and parts[0] == "modules":
+        nested = "/".join(parts[:-1])
+        if len(parts) > 3 and parts[-1].endswith(".tf") \
+                and not _is_scaffold_area(nested):
+            return nested
         return "/".join(parts[:2])
     return None
 
@@ -2451,6 +2464,11 @@ def apply_structural_scan(code_graph, clone_dir, patterns=None, list_files=None,
         clone_dir, patterns, list_files=listed, read_text=read_text))
     merge_structural_areas(code_graph, scan_structural_bicep_areas(
         clone_dir, patterns, list_files=listed, read_text=read_text))
+    # The graph now holds the WHOLE tree's direct module edges: an area with no
+    # direct edge here has none in the checkout. Fold relies on this marker to
+    # retract stale direct depends_on edges (issue #95); a scan that cannot
+    # list or read the tree raises before it is set.
+    code_graph["structural_scan"] = True
     return code_graph
 
 
@@ -2775,6 +2793,18 @@ _KIND_PHRASES = (
     (("question",), "question"), (("support",), "question"),
     (("doc",), "docs"), (("docs",), "docs"), (("documentation",), "docs"),
 )
+# The title heuristic (#101) uses the same phrases, except that a bare "support"
+# in a title ("Add support for X") is not a question: only "support request" is.
+# As an issue-type / label / template value, "support" still means a question.
+_TITLE_KIND_PHRASES = tuple(
+    ((("support", "request"), "question") if phrase == ("support",) else (phrase, kind))
+    for phrase, kind in _KIND_PHRASES)
+# A title is a question when it ends with `?` written right after a word (not a
+# lone `?`, as in "name contains ?"), or starts with one of these words and
+# carries a `?` ("How to pin a version? (v2)").
+_INTERROGATIVES = frozenset((
+    "how", "what", "why", "when", "where", "which", "who", "is", "are", "can",
+    "could", "does", "do", "did", "should", "would", "will"))
 _VALID_KINDS = {"feature", "module-request", "bug", "idea", "question", "docs", "other"}
 _KIND_WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -2785,11 +2815,11 @@ def _kind_words(text):
     return tuple(_KIND_WORD_RE.findall((text or "").lower()))
 
 
-def _kind_from_token(text):
+def _kind_from_token(text, phrases=_KIND_PHRASES):
     """Map free text (issue-type name, label value, template stem, title) to a
-    kind: the first `_KIND_PHRASES` entry occurring as a whole-word sequence."""
+    kind: the first `phrases` entry occurring as a whole-word sequence."""
     words = _kind_words(text)
-    for phrase, kind in _KIND_PHRASES:
+    for phrase, kind in phrases:
         n = len(phrase)
         if any(words[i:i + n] == phrase for i in range(len(words) - n + 1)):
             return kind
@@ -2857,13 +2887,19 @@ def classify_issue_kind(issue, taxonomy, types_present):
     kind = _kind_from_token(issue.get("template"))
     if kind:
         return kind
-    # 4. title heuristic (title only: bodies mention modules, bugs, "support" ...)
-    title = issue.get("title") or ""
-    if "?" in title:
+    # 4. title heuristic (title only: bodies mention modules, bugs, "support" ...).
+    # A question-shaped title (interrogative start + `?`) is a question; else a
+    # kind phrase in the title decides ("Bug: crash when name contains ?"); else
+    # a title ending in a word followed by `?` is a question (#101).
+    title = (issue.get("title") or "").strip()
+    words = _kind_words(title)
+    if "?" in title and words and words[0] in _INTERROGATIVES:
         return "question"
-    kind = _kind_from_token(title)
+    kind = _kind_from_token(title, _TITLE_KIND_PHRASES)
     if kind:
         return kind
+    if len(title) >= 2 and title.endswith("?") and not title[-2].isspace():
+        return "question"
     return "other"
 
 
@@ -4486,6 +4522,10 @@ def acquire(args, env):
     bundle = build_bundle(meta, commits, prs, issues)
     bundle["workflows"] = workflows
     bundle["workflow_stats"] = workflow_stats
+    # Whether CI runs were collected at all (--no-workflows skips them): lets a
+    # reader tell "no runs" from "not looked at" (per-window facts, issue #94).
+    bundle["meta"]["workflows_collected"] = bool(
+        getattr(args, "include_workflows", True))
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
@@ -4973,6 +5013,388 @@ def _fold_artifacts(conn, bundle, project, repo, fetched):
     return nodes
 
 
+# --- current-state edges (issue #95) -------------------------------------------
+#
+# History edges (authored, reviewed, merged, commented, reported, closes,
+# cross_ref, part_of, touches, symbol moves) record something that happened and
+# are only ever added. CURRENT-STATE edges describe the latest known state of
+# an input that can change, so a fold keeps them equal to what the repo's
+# STORED inputs imply and retracts the ones those inputs no longer imply:
+#
+#   blocks / in_milestone / in_iteration  <- the stored PR/issue records (the
+#       record a fold upserts replaces the earlier one) and the stored
+#       milestone / sprint nodes;
+#   depends_on / owns  <- the per-window code graph and CODEOWNERS facts
+#       (graphstore.set_window_facts), replayed in window order.
+#
+# A source is only ever re-derived from input that speaks for it: a record
+# that is stored, an area that a window's build resolved, a window whose code
+# graph carries the whole-tree structural scan, an area that a window's code
+# graph lists together with that window's CODEOWNERS. Absence of evidence (a
+# window-scoped directory graph that does not mention an area, a build that
+# timed out, a member that failed) never retracts anything.
+CURRENT_STATE_EDGE_TYPES = ("blocks", "depends_on", "in_iteration",
+                            "in_milestone", "owns")
+_ITEM_RELATION_TYPES = ("blocks", "in_iteration", "in_milestone")
+
+
+def _window_order(window):
+    """Sort key of a gathered window (from, to): by end day, then start day —
+    the order extract._window_facts uses to pick the latest window."""
+    frm, to = window
+    return (to[:10], frm[:10], frm, to)
+
+
+def _owns_pairs(code_graph, code_owners, project, repo):
+    """[(person_qid, area_qid)] owns edges for one code graph + CODEOWNERS, in
+    write order: an area is owned by the owners of the LAST rule matching the
+    area directory (derive.area_owners; graphify community areas: union over
+    their files). Pure."""
+    rules = derive.compile_codeowners(code_owners)
+    out = []
+    if not rules:
+        return out
+    areas_by_id = {}
+    for area in (code_graph or {}).get("areas") or []:
+        areas_by_id[area.get("id") or area.get("name") or area.get("path")] = area
+    for aid in sorted(a for a in areas_by_id if a):
+        for login in derive.area_owners(rules, aid,
+                                        areas_by_id[aid].get("paths") or []):
+            if login:
+                out.append((graphstore.qualify_person(project, login),
+                            graphstore.qualify_id(project, repo,
+                                                  "area-{}".format(aid))))
+    return out
+
+
+def _owns_authority(code_graph, code_owners, clone_sha, project, repo):
+    """The area qids whose owners a window's facts state: every area its code
+    graph lists, when the window read a CODEOWNERS file (non-empty
+    `code_owners`) or a checkout (`clone_sha`: then a missing file means no
+    owners). Else none — a window without either says nothing. Pure."""
+    if not (code_owners or clone_sha):
+        return set()
+    out = set()
+    for area in (code_graph or {}).get("areas") or []:
+        aid = area.get("id") or area.get("name") or area.get("path")
+        if aid:
+            out.add(graphstore.qualify_id(project, repo, "area-{}".format(aid)))
+    return out
+
+
+def _dep_is_transitive(data):
+    return bool((data or {}).get("transitive"))
+
+
+class StructureReplay:
+    """depends_on / owns of one repo replayed over its gathered windows' facts
+    (issue #95). Pure: built from [(from, to, code_graph, code_owners,
+    clone_sha)] (any order; replayed in _window_order) plus the fold's member
+    set and registries (cross-repo depends_on, as _fold_depends_on).
+
+    Authority — which window speaks for a source:
+      - depends_on of area A, DIRECT edges (`transitive` false): a window whose
+        build of A resolved (`edges_status: "resolved"`), or whose code graph
+        carries the whole-tree structural scan (`structural_scan: true`; then
+        for EVERY area of the repo, listed or not);
+      - depends_on of area A, TRANSITIVE edges: only a window whose build of A
+        resolved (the scan sees direct `module` refs only);
+      - owns of area A: a window whose code graph lists A and that read a
+        CODEOWNERS file or a checkout (_owns_authority).
+    The in-effect windows of a source are its latest authoritative window and
+    every later one (all windows when none is authoritative); its edges are
+    the union of the in-effect windows' derivations, each edge carrying the
+    data of the latest window that derives it. So the result depends only on
+    the SET of windows' facts, never on the order they were folded in."""
+
+    def __init__(self, windows, project, repo, members=None,
+                 registry_by_slug=None, bicep_prefix_by_slug=None):
+        self.project, self.repo = project, repo
+        self.windows = sorted(windows, key=lambda w: _window_order(w[:2]))
+        self.dep, self.resolved, self.scan = [], [], []
+        self.owns, self.own_auth, self.graphs = [], [], []
+        for frm, to, cg, co, sha in self.windows:
+            cg = cg or {}
+            self.graphs.append(cg)
+            self.dep.append(list(_fold_depends_on(
+                {"code_graph": cg}, project, repo, members, registry_by_slug,
+                bicep_prefix_by_slug)))
+            self.resolved.append({
+                graphstore.qualify_id(project, repo, "area-{}".format(a["id"]))
+                for a in cg.get("areas") or []
+                if a.get("id") is not None and not _is_scaffold_area(a.get("id"))
+                and a.get("edges_status") == "resolved"})
+            self.scan.append(cg.get("structural_scan") is True)
+            self.owns.append(_owns_pairs(cg, co, project, repo))
+            self.own_auth.append(_owns_authority(cg, co, sha, project, repo))
+
+    def dep_latest(self, src, transitive):
+        """Index of the latest window authoritative for `src`'s direct
+        (transitive=False) or transitive depends_on edges, or None."""
+        for i in range(len(self.windows) - 1, -1, -1):
+            if src in self.resolved[i] or (not transitive and self.scan[i]):
+                return i
+        return None
+
+    def own_latest(self, area):
+        """Index of the latest window authoritative for `area`'s owners."""
+        for i in range(len(self.windows) - 1, -1, -1):
+            if area in self.own_auth[i]:
+                return i
+        return None
+
+    def dep_in_effect(self, src, transitive):
+        """The window indices whose depends_on edges of `src` (that class)
+        are in effect, oldest first."""
+        latest = self.dep_latest(src, transitive)
+        return list(range(latest or 0, len(self.windows)))
+
+    def desired(self):
+        """{(src, dst, type): data} — the repo's depends_on and owns edges."""
+        out = {}
+        dep_cache, own_cache = {}, {}
+        for i in range(len(self.windows)):
+            for src, dst, data in self.dep[i]:
+                ck = (src, _dep_is_transitive(data))
+                if ck not in dep_cache:
+                    dep_cache[ck] = self.dep_latest(*ck)
+                if dep_cache[ck] is None or i >= dep_cache[ck]:
+                    out[(src, dst, "depends_on")] = data or None
+            for person, area in self.owns[i]:
+                if area not in own_cache:
+                    own_cache[area] = self.own_latest(area)
+                if own_cache[area] is None or i >= own_cache[area]:
+                    out[(person, area, "owns")] = None
+        return out
+
+    def retractable(self, key, data):
+        """True when a stored depends_on / owns edge not in desired() has an
+        authoritative window that says it is gone."""
+        src, dst, etype = key
+        if etype == "depends_on":
+            return self.dep_latest(src, _dep_is_transitive(data)) is not None
+        if etype == "owns":
+            return self.own_latest(dst) is not None
+        return False
+
+
+def repo_fact_windows(conn, project, repo):
+    """[(from, to, code_graph, code_owners, clone_sha)] for every gathered
+    window of (project, repo), or None when one of them has no per-window
+    facts (folded before issue #94, or without a from/to): depends_on / owns
+    cannot then be replayed."""
+    try:
+        ledger = graphstore.get_windows(conn)
+    except ValueError:
+        return None
+    keys = sorted({(w.get("from"), w.get("to")) for w in ledger
+                   if isinstance(w, dict) and w.get("project") == project
+                   and w.get("repo") == repo},
+                  key=lambda k: (str(k[0]), str(k[1])))
+    out = []
+    for frm, to in keys:
+        if not frm or not to:
+            return None
+        got = graphstore.get_window_facts(conn, project, repo, frm, to,
+                                          keys=("code_graph", "code_owners"))
+        if got is None or got.get("missing"):
+            return None
+        facts = got.get("facts") or {}
+        out.append((frm, to, facts.get("code_graph"), facts.get("code_owners"),
+                    got.get("clone_sha")))
+    return out
+
+
+def item_relation_edges(conn, project, repo, bundle_milestones=(),
+                        bundle_sprints=()):
+    """{(src, dst, type): None} — the blocks / in_milestone / in_iteration
+    edges the repo's STORED PR/issue records imply (issue #95), read back
+    after a fold has upserted its records:
+
+      - in_milestone: a record's `milestone` (title, or number) names a stored
+        milestone node (the fold's own milestones first, in bundle order, as
+        before; then the stored ones by id);
+      - in_iteration: a record's `iteration` is a sprint of the fold or a
+        stored `sprint-<id>` node;
+      - blocks: an issue record's `blocks` ref names another STORED issue
+        (blocker -> blocked); an edge stands while either end's record states
+        it.
+    On a fold into an empty store this is exactly what the bundle alone
+    implies."""
+    prefix = graphstore.qualify_id(project, repo, "")
+
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+    ms_local = {}
+    for m in bundle_milestones or ():
+        local = "milestone-{}".format(m.get("number") or m.get("title"))
+        if m.get("title") is not None:
+            ms_local[m["title"]] = local
+        if m.get("number") is not None:
+            ms_local.setdefault(m["number"], local)
+    for nid, data in graphstore.nodes_with_prefix(conn, prefix + "milestone-"):
+        local = nid[len(prefix):]
+        if isinstance(data, dict):
+            if data.get("title") is not None:
+                ms_local.setdefault(data["title"], local)
+            if data.get("number") is not None:
+                ms_local.setdefault(data["number"], local)
+    sprints = set(bundle_sprints or ())
+    sprints |= {nid[len(prefix) + len("sprint-"):] for nid in
+                graphstore.node_ids_with_prefix(conn, prefix + "sprint-")}
+    issues = set(graphstore.node_ids_with_prefix(conn, prefix + "issue-"))
+    out = {}
+    for iid, rec in graphstore.item_relation_rows(conn, prefix):
+        if not isinstance(rec, dict):
+            continue
+        local = ms_local.get(rec.get("milestone"))
+        if local is not None:
+            out[(iid, qid(local), "in_milestone")] = None
+        sid = rec.get("iteration")
+        if sid is not None and sid in sprints:
+            out[(iid, qid("sprint-{}".format(sid)), "in_iteration")] = None
+        if not iid.startswith(prefix + "issue-"):
+            continue
+        for b in rec.get("blocks") or []:
+            other = qid("issue-{}".format(b["number"]))
+            if other not in issues:
+                continue
+            src, dst = (iid, other) if b["direction"] == "out" else (other, iid)
+            out[(src, dst, "blocks")] = None
+    return out
+
+
+def _standin_rows(conn, project, dsts, fetched):
+    """Stand-in `structure` node rows for the depends_on targets in `dsts`
+    that are not stored (create-if-absent: a real area node is never
+    clobbered). See fold_bundle."""
+    cand = sorted(set(dsts))
+    existing = set()
+    for i in range(0, len(cand), 500):
+        chunk = cand[i:i + 500]
+        existing |= {r[0] for r in conn.execute(
+            "SELECT id FROM nodes WHERE id IN ({})".format(
+                ",".join("?" for _ in chunk)), chunk)}
+    rows = []
+    for dst in cand:
+        if dst in existing:
+            continue
+        p = graphstore.parse_id(dst)
+        scope = p["scope"]
+        dst_repo = scope[len(project) + 1:] if scope.startswith(project + "/") else scope
+        local = p["local"]
+        area_id = local[len("area-"):] if local.startswith("area-") else local
+        rows.append((dst, project, dst_repo, "structure", None,
+                     {"id": area_id, "synthesized": graphstore.STANDIN_MARK},
+                     fetched))
+    return rows
+
+
+def _maintain_current_state(conn, bundle, project, repo, members,
+                            registry_by_slug, bicep_prefix_by_slug, fetched):
+    """Write the repo's current-state edges and retract the stale ones, inside
+    the fold's transaction, after its nodes and window facts are written.
+    Returns the fold summary {"retracted": {type: n}, "edges": [...],
+    "standins_removed": [...], "structure": bool}. See the block comment
+    above CURRENT_STATE_EDGE_TYPES and STORE.md "Current-state edges"."""
+    meta = bundle.get("meta", {})
+    prefix = graphstore.qualify_id(project, repo, "")
+    writes, retract = {}, set()
+
+    # Item relations: rebuilt from the stored records.
+    want = item_relation_edges(conn, project, repo,
+                               bundle.get("milestones") or (),
+                               bundle.get("sprints") or {})
+    for etype in _ITEM_RELATION_TYPES:
+        stored = graphstore.edges_from_prefix(conn, prefix, etype)
+        for key, data in stored.items():
+            if key not in want:
+                retract.add(key)
+        for key, data in want.items():
+            if key[2] == etype and (key not in stored or stored[key] != data):
+                writes[key] = data
+
+    # depends_on / owns: replayed over every window's facts when each has them.
+    windows = repo_fact_windows(conn, project, repo)
+    dep_dsts = set()
+    if windows is None:
+        # A window folded before #94 (or without from/to): add this bundle's
+        # edges, as every fold did before #95, and retract nothing.
+        for src, dst, data in _fold_depends_on(bundle, project, repo, members,
+                                               registry_by_slug,
+                                               bicep_prefix_by_slug):
+            writes[(src, dst, "depends_on")] = data or None
+            dep_dsts.add(dst)
+        for person, area in _owns_pairs(bundle.get("code_graph"),
+                                        bundle.get("code_owners"),
+                                        project, repo):
+            writes[(person, area, "owns")] = None
+    else:
+        replay = StructureReplay(windows, project, repo, members,
+                                 registry_by_slug, bicep_prefix_by_slug)
+        want = replay.desired()
+        stored = {k: v for k, v in graphstore.edges_from_prefix(
+                      conn, prefix, "depends_on").items()
+                  # a single-repo fold derives no cross-repo edge: leave
+                  # the ones a manifest fold wrote alone.
+                  if members is not None or k[1].startswith(prefix)}
+        person_prefix = graphstore.qualify_person(project, "")
+        stored.update({k: v for k, v in graphstore.edges_into_prefix(
+                           conn, prefix, "owns").items()
+                       if k[0].startswith(person_prefix)})
+        for key, data in stored.items():
+            if key not in want and replay.retractable(key, data):
+                retract.add(key)
+        for key, data in want.items():
+            if key not in stored or stored[key] != data:
+                writes[key] = data
+            if key[2] == "depends_on":
+                dep_dsts.add(key[1])
+
+    graphstore.delete_edges(conn, retract, commit=False)
+    graphstore.upsert_edges(
+        conn, [(k[0], k[1], k[2], None, writes[k]) for k in writes],
+        commit=False)
+    # A depends_on target that is not itself stored gets a stand-in node (see
+    # fold_bundle); one no edge references any more after a retraction goes.
+    graphstore.upsert_nodes(conn, _standin_rows(conn, project, dep_dsts,
+                                                fetched), commit=False)
+    removed = graphstore.delete_orphan_standins(
+        conn, [k[1] for k in retract if k[2] == "depends_on"], commit=False)
+
+    counts = {}
+    for key in retract:
+        counts[key[2]] = counts.get(key[2], 0) + 1
+    edges = sorted(list(k) for k in retract)
+    summary = {"retracted": counts, "edges": edges,
+               "standins_removed": removed, "structure": windows is not None}
+    if retract or removed:
+        graphstore.record_retractions(conn, project, repo, {
+            "from": meta.get("from"), "to": meta.get("to"),
+            "counts": {k: counts[k] for k in sorted(counts)},
+            "edges": edges[:graphstore.RETRACTION_LEDGER_EDGES],
+            "standins_removed": removed}, commit=False)
+    graphstore.set_current_state(conn, project, repo, {
+        "items": True, "structure": windows is not None,
+        "from": meta.get("from"), "to": meta.get("to")}, commit=False)
+    return summary
+
+
+def describe_retractions(summary, project, repo):
+    """One stderr line for a fold that retracted edges, or None."""
+    counts = (summary or {}).get("retracted") or {}
+    removed = (summary or {}).get("standins_removed") or []
+    if not counts and not removed:
+        return None
+    parts = ", ".join("{} {}".format(counts[k], k) for k in sorted(counts))
+    line = "retracted {} stale current-state edge(s) of {}/{}{}".format(
+        sum(counts.values()), project, repo,
+        " ({})".format(parts) if parts else "")
+    if removed:
+        line += "; removed {} orphaned depends_on stand-in(s)".format(len(removed))
+    return line + " (meta retractions:{}/{})".format(project, repo)
+
+
 def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                 registry_by_slug=None, bicep_prefix_by_slug=None):
     """Fold a raw bundle into the journey-graph store by stable identity:
@@ -4985,9 +5407,14 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     symbol code_events ledgers, structure (milestones/releases/areas + the
     project-scoped people nodes), the spine edges closes/cross_ref/part_of, and
     the non-spine contribution / owns / touches / depends_on / in_milestone /
-    blocks / symbol-move edges — all derived on the write path via the `derive`
-    leaf. See STORE.md for the full edge/node inventory and what remains
-    (in_iteration — needs Projects v2 acquisition).
+    in_iteration / blocks / symbol-move edges — all derived on the write path
+    via the `derive` leaf. See STORE.md for the full edge/node inventory.
+
+    Current-state edges (blocks, in_milestone, in_iteration, depends_on, owns;
+    issue #95) are written last, by _maintain_current_state, equal to what the
+    repo's stored inputs imply; the stale ones are retracted in the same
+    transaction. Returns that summary: {"retracted": {type: n}, "edges":
+    [[src, dst, type], ...], "standins_removed": [...], "structure": bool}.
     """
     meta = bundle.get("meta", {})
     # Identity override (Phase 9): a multi-repo run folds each member under one
@@ -5029,21 +5456,14 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         for n in pr.get("crossref_issues") or []:
             edges.append((pid, qid("issue-{}".format(n)), "cross_ref", None, None))
 
-    # social: issues, with `blocks` (issue->issue) relation edges. A blocks ref to
-    # an issue NOT gathered in this window is dropped rather than left dangling
-    # (referential_integrity): only edges between two gathered issues are emitted.
-    _gathered_issues = {i["number"] for i in bundle.get("issues", [])}
+    # social: issues. Their `blocks` (issue->issue, blocker -> blocked) relation
+    # edges are current-state: written by _maintain_current_state from the
+    # stored records, between two STORED issues (a ref to an issue the store
+    # does not hold is left out rather than dangling).
     for iss in bundle.get("issues", []):
         ts = iss.get("closed_at") or iss.get("updated_at")
         iid = qid("issue-{}".format(iss["number"]))
         nodes.append((iid, project, repo, "social", ts, iss, fetched))
-        for b in iss.get("blocks") or []:
-            if b["number"] not in _gathered_issues:
-                continue
-            other = qid("issue-{}".format(b["number"]))
-            # normalize to blocker -> blocked
-            src, dst = (iid, other) if b["direction"] == "out" else (other, iid)
-            edges.append((src, dst, "blocks", None, None))
 
     # code: commits, with part_of spine edge to the PR named in the subject.
     for c in bundle.get("commits", []):
@@ -5237,18 +5657,11 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # owns (person -> area): CODEOWNERS semantics via derive.area_owners — an
     # area is owned by the owners of the LAST rule matching the area directory
     # (graphify community areas: union over their files). Same matcher as
-    # derive.annotate_people_profile's stale_owned.
-    owner_rules = derive.compile_codeowners(bundle.get("code_owners"))
-    if owner_rules:
-        areas_by_id = {}
-        for area in (bundle.get("code_graph", {}) or {}).get("areas") or []:
-            areas_by_id[area.get("id") or area.get("name") or area.get("path")] = area
-        for aid in sorted(a for a in areas_by_id if a):
-            for login in derive.area_owners(owner_rules, aid,
-                                            areas_by_id[aid].get("paths") or []):
-                contrib(login, "area-{}".format(aid), "owns")
+    # derive.annotate_people_profile's stale_owned. Current-state: written by
+    # _maintain_current_state (_owns_pairs over the windows' facts).
 
     # touches (commit/pr -> area): the distinct areas a commit's files land in.
+    # History: a commit's files never change, so touches are only added.
     for c in bundle.get("commits", []):
         touched = derive._commit_areas(c, area_idx)
         for aid in sorted(touched):
@@ -5261,89 +5674,43 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # top-level edges key. A resolved-local edge -> an intra-repo depends_on; an
     # unresolved registry edge resolves to a cross-repo member only in multi-repo
     # folds (see _fold_depends_on, threaded with members + registry_by_slug and,
-    # for Bicep public-registry refs, bicep_prefix_by_slug).
-    _dep_dsts = set()
-    for src, dst, data in _fold_depends_on(bundle, project, repo, members,
-                                           registry_by_slug,
-                                           bicep_prefix_by_slug):
-        edges.append((src, dst, "depends_on", None, data or None))
-        _dep_dsts.add(dst)
-
-    # A depends_on dst is always a real module-area path resolved from a `module`
-    # source reference — an intra-repo SUB-MODULE, or a cross-repo producer's root.
-    # The directory area-provider is WINDOW-SCOPED, so a referenced module that was
-    # not itself changed in-window has no area node, leaving the edge dangling
-    # (validate.referential_integrity). This is a real-data fact, not a bug — bicep
-    # repos like avm/res/*/* reference deep sub-modules every gather; a single-repo
-    # bicep window over Azure/bicep-registry-modules produced ~30 such edges. Ensure
-    # EACH depends_on target (intra- and cross-repo) exists as a minimal `structure`
-    # area node so the dependency graph stays referentially intact and complete.
-    # Create-if-ABSENT only — never clobber a real area node, in any fold order:
-    # get_node sees prior committed folds and this fold's own area nodes are already
-    # in `nodes`; a later real fold of that area upserts over the stand-in. extract
-    # rebuilds code_graph from the `codegraph` singleton (not area-* nodes), so the
-    # stand-in is invisible to every member bundle — purely an edge anchor.
-    # Ensure each NEW depends_on target (one not already staged in `nodes`) exists.
-    # Batch the store existence check into a SINGLE query rather than a get_node per
-    # dst — depends_on fan-out can be large (a bicep repo window has dozens) — then
-    # synthesize only the truly-absent ones.
-    _have = {n[0] for n in nodes}
-    _cand = sorted(d for d in _dep_dsts if d not in _have)
-    _existing = set()
-    if _cand:
-        ph = ",".join("?" for _ in _cand)
-        _existing = {r[0] for r in conn.execute(
-            "SELECT id FROM nodes WHERE id IN ({})".format(ph), _cand)}
-    for dst in _cand:
-        if dst in _existing:
-            continue
-        p = graphstore.parse_id(dst)
-        scope = p["scope"]
-        dst_repo = scope[len(project) + 1:] if scope.startswith(project + "/") else scope
-        local = p["local"]
-        area_id = local[len("area-"):] if local.startswith("area-") else local
-        nodes.append((dst, project, dst_repo, "structure", None,
-                      {"id": area_id, "synthesized": graphstore.STANDIN_MARK},
-                      fetched))
+    # for Bicep public-registry refs, bicep_prefix_by_slug). Current-state:
+    # written by _maintain_current_state (StructureReplay over the windows'
+    # facts), together with a stand-in node per target that is not stored.
+    #
+    # Stand-ins: a depends_on dst is always a real module-area path resolved from
+    # a `module` source reference — an intra-repo SUB-MODULE, or a cross-repo
+    # producer's root. The directory area-provider is WINDOW-SCOPED, so a
+    # referenced module that was not itself changed in-window has no area node,
+    # leaving the edge dangling (validate.referential_integrity). This is a
+    # real-data fact, not a bug — bicep repos like avm/res/*/* reference deep
+    # sub-modules every gather; a single-repo bicep window over
+    # Azure/bicep-registry-modules produced ~30 such edges. EACH depends_on target
+    # (intra- and cross-repo) is ensured as a minimal `structure` area node
+    # (`synthesized: STANDIN_MARK`) so the dependency graph stays referentially
+    # intact. Create-if-ABSENT only — never clobber a real area node, in any fold
+    # order; a later real fold of that area upserts over the stand-in. extract
+    # rebuilds code_graph from the window facts / `codegraph` singleton (not
+    # area-* nodes), so the stand-in is invisible to every member bundle —
+    # purely an edge anchor. A stand-in no edge references after a retraction
+    # is deleted (issue #95).
 
     # in_milestone (social -> structure): a PR/issue's milestone title links to
     # the milestone node (keyed on number when present, else title — matching
-    # the milestone node's own local id form above).
-    ms_local = {}
-    for m in bundle.get("milestones", []):
-        local = "milestone-{}".format(m.get("number") or m.get("title"))
-        if m.get("title") is not None:
-            ms_local[m["title"]] = local
-        if m.get("number") is not None:
-            ms_local.setdefault(m["number"], local)
-    for items, pref in ((bundle.get("prs", []), "pr-"),
-                        (bundle.get("issues", []), "issue-")):
-        for it in items:
-            local = ms_local.get(it.get("milestone"))
-            if local is not None:
-                edges.append((qid("{}{}".format(pref, it["number"])),
-                              qid(local), "in_milestone", None, None))
-
-    # in_iteration (social -> structure): a PR/issue's board iteration links to its
-    # `sprint-<id>` node — the sprint sibling of in_milestone. Only emitted when the
-    # sprint was folded (a windowed-out iteration leaves no dangling edge). The
-    # item's `board_status` rides the pr/issue node data blob (stamped in acquire),
-    # so it round-trips through extract for free — no separate edge/node. Empty
-    # `sprints` (status-only / no board) emits nothing -> goldens byte-identical.
-    _sprint_ids = set(bundle.get("sprints") or {})
-    for items, pref in ((bundle.get("prs", []), "pr-"),
-                        (bundle.get("issues", []), "issue-")):
-        for it in items:
-            sid = it.get("iteration")
-            if sid is not None and sid in _sprint_ids:
-                edges.append((qid("{}{}".format(pref, it["number"])),
-                              qid("sprint-{}".format(sid)), "in_iteration",
-                              None, None))
+    # the milestone node's own local id form above). in_iteration (social ->
+    # structure): a PR/issue's board iteration links to its `sprint-<id>` node —
+    # the sprint sibling of in_milestone; only to a sprint that is stored (a
+    # windowed-out iteration leaves no dangling edge). The item's `board_status`
+    # rides the pr/issue node data blob (stamped in acquire), so it round-trips
+    # through extract for free — no separate edge/node. Both are current-state:
+    # written by _maintain_current_state from the stored records.
 
     # structure: per-repo singleton facts (whole dict round-tripped under a
     # well-known local id, NULL ts so window scans skip it, identity-keyed /
     # idempotent). Only emitted when present and non-empty so extract never
     # fabricates an empty key. See STORE.md and extract._materialize_singleton.
+    # Latest-wins: a view reads them only on a store folded before issue #94;
+    # the per-window copies are written with the window provenance below.
     for local, value in (("workflowstats", bundle.get("workflow_stats")),
                          ("codegraph", bundle.get("code_graph")),
                          ("codeowners", bundle.get("code_owners")),
@@ -5411,6 +5778,20 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         if meta.get("clone_sha"):
             graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
                                      commit=False)
+        # The window's own CI statistics and structure (issue #94): the
+        # latest-wins nodes above serve stores folded before #94; a view of
+        # this window reads these (extract._window_facts).
+        if meta.get("from") and meta.get("to"):
+            graphstore.set_window_facts(conn, project, repo, meta["from"],
+                                        meta["to"], bundle,
+                                        clone_sha=meta.get("clone_sha"),
+                                        commit=False)
+        # Current-state edges (issue #95), last: they read the records and
+        # window facts written above, and retract what those no longer imply.
+        summary = _maintain_current_state(conn, bundle, project, repo, members,
+                                          registry_by_slug,
+                                          bicep_prefix_by_slug, fetched)
+    return summary
 
 
 def _member_args(base, member, frm, to):
@@ -5487,9 +5868,13 @@ def _gather_manifest(conn, args, man):
             continue
         try:
             bundle = acquire(_member_args(args, m, frm, to), os.environ)
-            fold_bundle(conn, bundle, project=project, repo=slug,
-                        members=members, registry_by_slug=registry_by_slug,
-                        bicep_prefix_by_slug=bicep_prefix_by_slug)
+            summary = fold_bundle(conn, bundle, project=project, repo=slug,
+                                  members=members,
+                                  registry_by_slug=registry_by_slug,
+                                  bicep_prefix_by_slug=bicep_prefix_by_slug)
+            line = describe_retractions(summary, project, slug)
+            if line:
+                sys.stderr.write(line + "\n")
         except (Exception, SystemExit) as exc:  # noqa: BLE001 - per member
             reason = _failure_reason(exc)
             failures.append((slug, reason))
@@ -5528,7 +5913,11 @@ def main(argv=None):
             # Store-only single-repo path (Phase 7): acquire -> fold. A failure
             # propagates as before: there is no other member to go on with.
             bundle = acquire(args, os.environ)
-            fold_bundle(conn, bundle)
+            summary = fold_bundle(conn, bundle)
+            line = describe_retractions(summary, bundle["meta"].get("owner"),
+                                        bundle["meta"].get("repo"))
+            if line:
+                sys.stderr.write(line + "\n")
             sys.stderr.write("folded bundle into store {}\n".format(args.store))
     finally:
         conn.close()

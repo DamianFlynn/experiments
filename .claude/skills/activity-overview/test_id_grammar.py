@@ -283,5 +283,123 @@ class SpotlightKindGrammar(unittest.TestCase):
                          "o/r#" + local)
 
 
+COLON_PATH = "notes#a:b:c.md"   # a file path with the symbol-tail shape
+COLON_MILESTONE = "o/r#milestone-v1#a:b:c"
+
+
+def _colon_path_bundle():
+    b = _base(code_events=[{"commit": SHA, "author": "alice", "date": "2026-05-02",
+                            "change": "add", "path": COLON_PATH}])
+    b["commits"][0]["files"] = ["a/main.tf", "b/main.tf", COLON_PATH]
+    return b
+
+
+class StoredNodeClassification(unittest.TestCase):
+    """#101 item 3: a stored node / ledger row is classified by its class and
+    record (a ledger row by its commit's stored file list); the id shape is the
+    fallback for dangling ids only."""
+
+    def test_ledger_file_row_named_by_its_commit_is_a_file_row(self):
+        conn = _store(_colon_path_bundle())
+        self.assertEqual([e["path"] for e in
+                          extract._materialize_code_events(conn, "o", "r")],
+                         [COLON_PATH])
+        self.assertEqual(extract._materialize_symbol_events(conn, "o", "r"), [])
+        # the artifact substrate holds the file artifact, not a phantom symbol
+        self.assertIsNotNone(graphstore.get_node(conn, "o/r#art:" + COLON_PATH))
+        self.assertIsNone(graphstore.get_node(conn, "o/r#" + COLON_PATH))
+        report = validate.validate(conn, project="o", repo="r")
+        self.assertTrue(report.ok, [c for c in report.checks if not c["ok"]])
+
+    def test_ledger_row_without_commit_file_list_falls_back_to_shape(self):
+        self.assertTrue(graphstore.ledger_row_is_symbol(COLON_PATH, None))
+        self.assertTrue(graphstore.ledger_row_is_symbol(COLON_PATH, frozenset()))
+        self.assertFalse(graphstore.ledger_row_is_symbol(
+            COLON_PATH, frozenset([COLON_PATH])))
+        # a real symbol row: its commit lists the PATH, never the symbol id
+        self.assertTrue(graphstore.ledger_row_is_symbol(
+            "a/main.tf#terraform:resource:x", frozenset(["a/main.tf"])))
+
+    def test_spotlight_symbols_authored_skips_file_row(self):
+        conn = _store(_colon_path_bundle())
+        out = spotlight.person_impact(conn, "o", "alice")
+        self.assertIn("symbols_authored", out)
+        self.assertNotIn("o/r#" + COLON_PATH,
+                         [s["id"] for s in out["symbols_authored"]])
+
+    def test_stored_milestone_with_symbol_shaped_title_is_a_milestone(self):
+        conn = _store(_move_bundle())
+        graphstore.upsert_node(conn, COLON_MILESTONE, "o", "r", "structure", None,
+                               {"title": "v1#a:b:c"})
+        conn.commit()
+        self.assertEqual(validate._id_kind(conn, COLON_MILESTONE, {}), "milestone")
+        self.assertEqual(spotlight._node_kind(COLON_MILESTONE, {"title": "v1#a:b:c"},
+                                              "structure"), "milestone")
+        # dangling: only the id shape is known
+        self.assertEqual(validate._id_kind(None, COLON_MILESTONE, {}), "artifact")
+
+    def test_stored_artifact_kinds_come_from_the_record(self):
+        conn = _store(_move_bundle())
+        sym = graphstore.get_node(conn, "o/r#b/main.tf#terraform:resource:azurerm_x.this")
+        self.assertTrue(graphstore.is_symbol_node(sym))
+        self.assertEqual(spotlight._node_kind(sym["id"], sym["data"], "code"), "symbol")
+        commit = graphstore.get_node(conn, "o/r#" + SHA)
+        self.assertFalse(graphstore.is_artifact_node(commit))
+        self.assertEqual(validate._id_kind(conn, commit["id"], {}), "commit")
+
+
+class CodeNodeForms(unittest.TestCase):
+    """#101 item 4: every stored code node is a commit (sha id + commit record)
+    or an artifact (`art:` id + file record, or symbol-tail id + symbol/comment
+    record); no_drift audits every non-commit code node."""
+
+    def _fab(self, conn):
+        return validate.check_no_fabrication(conn)
+
+    def test_real_stores_have_only_known_code_node_forms(self):
+        for bundle in (_move_bundle(), _colon_path_bundle()):
+            c = self._fab(_store(bundle))
+            self.assertTrue(c["ok"], c["details"])
+
+    def _assert_form_error(self, nid, data):
+        conn = _store(_move_bundle())
+        graphstore.upsert_node(conn, nid, "o", "r", "code", "2026-05-02", data)
+        conn.commit()
+        c = self._fab(conn)
+        self.assertFalse(c["ok"])
+        self.assertTrue(any(d.get("id") == nid
+                            and "code-node form" in d.get("problem", "")
+                            for d in c["details"]), c["details"])
+
+    def test_commit_record_under_artifact_id_is_an_error(self):
+        self._assert_form_error("o/r#art:x.md", {"sha": SHA, "files": []})
+
+    def test_artifact_record_under_sha_id_is_an_error(self):
+        self._assert_form_error("o/r#" + "b" * 40,
+                                {"kind": "doc", "path": "x.md", "lifecycle": [
+                                    {"event": "add", "commit": SHA}]})
+
+    def test_symbol_kind_under_file_artifact_id_is_an_error(self):
+        self._assert_form_error("o/r#art:x.md", {"kind": "symbol", "lifecycle": [
+            {"event": "add", "commit": SHA}]})
+
+    def test_file_kind_under_symbol_id_is_an_error(self):
+        self._assert_form_error("o/r#x.md#md:h:y", {"kind": "doc", "lifecycle": [
+            {"event": "add", "commit": SHA}]})
+
+    def test_no_drift_audits_every_non_commit_code_node(self):
+        conn = _store(_move_bundle())
+        nid = "o/r#" + "c" * 40
+        graphstore.upsert_node(conn, nid, "o", "r", "code", "2026-05-02",
+                               {"kind": "doc", "path": "x.md", "lifecycle": []})
+        conn.commit()
+        c = validate.check_no_drift(conn, "o", "r", {"meta": {"owner": "o",
+                                                              "repo": "r"}},
+                                    check_people=False)
+        self.assertTrue(any(d.get("id") == "c" * 40
+                            and d.get("problem") == "stored but not derivable"
+                            for d in c["details"]), c["details"])
+
+
 if __name__ == "__main__":
     unittest.main()

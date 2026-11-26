@@ -25,7 +25,14 @@ video-script, dashboards) consume the same view. The contract:
   digest.py --store <db> --project <name> --from … --to …` emits the merged
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
   halls, modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
-  canonical JSON (`sort_keys`), so output is diff-stable.
+  canonical JSON (`sort_keys`; `view.py` writes the raw view the same way), so output is
+  diff-stable. **Object key order carries no meaning (issue #100):** every list derived
+  from an object (`timeline`, `feature_deltas`, the content-timeline diagram) has an
+  explicit, total sort key, so enriching a bundle gives the same result whatever order its
+  objects' keys are in — a member taken from `digest.py` output and re-enriched equals the
+  same member produced by `view.py` + `link.py`. (The legacy `{pattern: owners}` form of
+  `code_owners` is the one exception: its key order is the CODEOWNERS rule order; current
+  gathers write the ordered list form.)
 - **Project view: `people` and `halls` (issue #88).** `people` is the union of the
   members' `people` by login, each figure combined across members. A member bundle's
   `people` hold only that member's contributors and count only its records, so the
@@ -123,6 +130,25 @@ the rest (engagement, code areas, trains, people/flow).
   window, present only when that is after the view's `to`: the view is of an earlier window
   than the store's latest, and its PR/issue records (state, labels, milestone, `updated_at`,
   comments) are as the latest gather saw them, not as they were at the view's `to`.
+  **`facts_windows`** (issue #94, omit-when-absent) is present only when the store keeps
+  per-window facts for the repo and the view is **not** exactly one gathered window. It names
+  where the view's `workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` /
+  `clone_sha` come from: `{"structure": {from, to}, "workflow_stats": [{from, to}, ...],
+  "workflow_stats_complete": bool, "workflow_stats_excluded"?: [{from, to}, ...]}`.
+  `structure` is the gathered window whose code graph, owners, taxonomy and clone sha the view
+  carries (the latest overlapping the view, else the latest before it, else the earliest).
+  `workflow_stats` lists the gathered windows lying wholly inside the view whose CI statistics
+  are **summed** into the view's `workflow_stats` (`[]` → the key is absent).
+  Summed windows never overlap one another (taken by start day, the longest first), so no run
+  is counted twice when the store also holds a roll-up window or part of a month.
+  `workflow_stats_complete` is true only when the summed windows cover every day of the view.
+  Only windows whose CI runs were collected are summed: a window gathered with `--no-workflows`
+  (gather's `meta.workflows_collected: false`), or one whose stored CI value is missing, is
+  excluded and makes the sum incomplete; a collected window with zero runs counts.
+  `workflow_stats_excluded` lists the gathered windows overlapping the view that were not
+  summed — they overlap the view only partly (their runs cannot be split by day), overlap a
+  summed window, or have no per-window facts (folded before #94). A view of exactly a gathered window has no
+  `facts_windows`: its facts are that window's.
   **Window scope** (issue #85): a view holds only its window's records — the rule mirrors what
   gather collects for a window, applied to each record's latest stored state:
   `prs` merged in the window, closed (unmerged) in it, or open and created by its end;
@@ -138,9 +164,11 @@ the rest (engagement, code areas, trains, people/flow).
   member bundle never lists another member's people, nor someone who worked in this repo only
   in another window. A person's `modules` / `areas` are re-derived from the view's records
   with this repo's `code_graph` (the attribution fold applies): this repo's areas the person
-  touched in this window. The stored person node keeps the project-wide union. Not windowed:
-  `milestones`, `sprints` and the per-repo singletons `workflow_stats`, `code_graph`,
-  `code_owners`, `label_taxonomy` — current structure, as of the latest gather (#94). On a
+  touched in this window. The stored person node keeps the project-wide union. The per-repo
+  facts `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` (and `meta.clone_sha`)
+  are the gathered window's own for a view of exactly that window, else summed / picked as
+  `facts_windows` describes (#94); a store folded before #94 gives the latest gather's. Not
+  windowed: `milestones`, `sprints` — current structure, as of the latest gather. On a
   store holding only the viewed window every stored record is in the view; a view spanning
   several gathered windows is their union.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
@@ -164,34 +192,53 @@ the rest (engagement, code areas, trains, people/flow).
   Bundles gathered before #78 have no `author_name`/`login_resolved` and keep the git name in
   `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
-  labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
+  labels, merged, merged_by, merged_at, closed_at, state, base, head, head_repo, closes:[issue#], url }`.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
+  **`head_repo`** (#93) is the `owner/repo` the head branch lives in (a fork's name for a fork
+  PR; `null` when GitHub no longer knows it, e.g. a deleted fork, and absent from bundles
+  gathered before #93).
   PRs are de-duplicated by `number` (a PR listed twice across pages keeps its latest snapshot).
   `merged` is `merged_at != null`. GitHub's list-pulls payload omits `merged_by` and the comment
   counts, so `acquire` takes `merged_by` from the actor of the PR's issue-timeline `merged` event
   (`null` for an unmerged PR or a deleted account) — no extra per-PR call.
 - `issues` — issues in scope (PR-closing, plus open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
-- `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
-  contributing_prs:[#], significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at,
-  elapsed_days, reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
-  A train is anchored by its root **issue** (`train-issue-<n>`) or, when no issue is linked
-  (process not followed / a forked PR), by its **PR** (`train-pr-<n>`). One train per anchor, by
-  precedence shipped > in_flight > rejected > abandoned: `"shipped"` (≥1 PR merged to
-  `meta.base_branch`), `"in_flight"` (only OPEN PR(s) targeting it; in progress), `"rejected"`
-  (only CLOSED-unmerged PR(s) targeting it; change dropped), `"abandoned"` (an issue closed
-  `not_planned` with no PR train — an idea that went nowhere). **`contributing_prs`** are
-  PRs merged into another PR's branch (`base == that PR's head`) — stacked/fork contributions to
-  this train's journey-to-main, tracked but not counted as shipped.
-  `kind` derives from the typed root issue; when there is no typed root issue it falls back to
-  the anchor PRs' conventional-commit title prefix (`feat→feature`, `fix→bug`, `docs→docs`), else
+- `trains` — `[{ id, kind, root_issue, issues:[#], prs:[#], pr_outcomes:{"<pr#>": outcome},
+  commits:[sha], code_areas:[id], outcome, contributing_prs:[#], significance:float,
+  tier:"deep"|"mention", effort:{opened_at, merged_at, elapsed_days, reviewers, review_comments,
+  commits, participants, stalled}, evidence:[ref] }]`.
+  **Membership (#93).** Every PR that targets `meta.base_branch` — merged into it, open, or
+  closed unmerged — is in exactly one train, whatever its own outcome. PRs are joined by the
+  issues they **close** (`closes`): a train is a connected group of PRs and the issues they close,
+  so two PRs closing the same issue (a rejected first attempt and the reworked one that shipped)
+  are one train, and every issue a train's PRs close is in its `issues` (sorted) and carries the
+  train id on its bucket ref. A mention or timeline cross-reference (`crossref_issues`) never
+  makes an issue a member or a root: a tracking issue that mentions three PRs leaves them three
+  trains. `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
+  or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.
+  A train is anchored by its lowest closed issue — `root_issue`, id `train-issue-<n>` — or, when
+  its PRs close no issue (process not followed / a forked PR), by its lowest **PR**
+  (`train-pr-<n>`). `outcome`, by precedence shipped > in_flight > rejected > abandoned:
+  `"shipped"` (≥1 PR merged to `meta.base_branch`), `"in_flight"` (else ≥1 OPEN PR targeting it),
+  `"rejected"` (only CLOSED-unmerged PRs; change dropped), `"abandoned"` (an issue closed
+  `not_planned` that no PR closes — an idea that went nowhere; `prs: []`, `issues: [<n>]`).
+  **`contributing_prs`** are PRs merged into another PR's branch (`base` == that PR's `head`, the
+  head living in this repo: matched by `head_repo` + `head`, so a fork's same-named branch is
+  never the parent; with no `head_repo` on record a sole same-named candidate is used, several
+  are ambiguous and the PR is attached to none) — stacked/fork contributions to this train's
+  journey-to-main, tracked but not counted as shipped. A PR that targets another branch and is
+  not merged is in no train.
+  `kind` derives from the first typed issue of the train (lowest number first); when none is
+  typed it falls back to the PRs' conventional-commit title prefix (`feat→feature`, `fix→bug`,
+  `docs→docs`; lowest PR first), else
   `other` — so significance still differentiates work on repos that title PRs but rarely type issues.
   `significance = footprint × kind_weight + breadth` (footprint counts prs + commits + code_areas +
   contributing_prs); `tier` = `"deep"` for the top-N by significance ∪ any train ≥ the significance
   floor, else `"mention"`.
   `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed
   `review_comments_count` (int); `participants` = count of distinct authors + reviewers +
-  comment-authors (int);
+  comment-authors (int); all over every PR and issue of the train (`opened_at` = the earliest
+  `created_at` among them);
   `stalled` = merged but `elapsed_days > TRAIN_STALL_DAYS`. All fields degrade to null/0
   when data is thin. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
   `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`.
@@ -222,7 +269,10 @@ docsRefs, release_train, sprints, project, diagrams`.
   populated (see the schema block in the design spec). `workflow_stats` is keyed by
   workflow name, plus the reserved key `_truncated` ONLY when GitHub's 1,000-run
   search cap could not be split away: `{truncated, cap, fetched, total_count,
-  ranges}`. Consumers listing workflows skip keys starting with `_`.
+  ranges}`. Consumers listing workflows skip keys starting with `_`. A view summing several
+  gathered windows (`meta.facts_windows`) adds the counters per workflow name and merges the
+  `_truncated` markers (`fetched` / `total_count` summed — `null` if any is unknown —,
+  `ranges` concatenated, largest `cap`).
 - **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
   `next_candidates` (one bucket per item; precedence shipped > rejected >
   next_candidates > in_flight). Each ref may carry a `train` id. The current/next
@@ -251,7 +301,9 @@ docsRefs, release_train, sprints, project, diagrams`.
   `outcome` `in_flight`. A `rejected`, `shipped` or `abandoned` train, or a `train` id that
   names no train in the view, scores nothing. `notes` is non-scoring context (`[]` when
   none): `previous attempt rejected` (train `rejected`) or `linked PR already merged` (train
-  `shipped`). Tunables: `FORECAST_WEIGHTS`,
+  `shipped`; since #93 this includes an open follow-up PR whose train already shipped). An
+  issue that PRs only mention has no train (#93), so neither the train signal nor a note
+  applies to it. Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
 - **series** (only with `link.py BUNDLE --series INDEX`; absent otherwise) —
@@ -375,14 +427,18 @@ review's state to `DISMISSED`.
   `ts` is the comment's `created_at` for social events and the commit's `committed_at`
   for code events (#82), so same-day events interleave by real time; a code event whose
   commit has no `committed_at` falls back to its date (`YYYY-MM-DD`), which sorts before
-  that day's timestamped social events. Ties break on `ref.url`.
+  that day's timestamped social events. Order is `(ts, ref.url, layer)` — social before
+  code — then, for code events, artifact id and the event's position in that artifact's
+  lifecycle (social events with an equal `(ts, ref.url)` keep their list order); it never
+  depends on the key order of `artifacts` (#100).
 - **feature_deltas** `[{ area, kind:"add|drop|change", subject, name, before,
   after, detail, artifact:id, author, train:id|null, pr:num|null, commit:sha, url
   }]` — a projection over `artifacts` (add→add, remove→drop, change→change). For
   **symbol/comment** subjects `before`/`after` carry the bounded hunk
   snippet and `detail` is `"<lang> <subkind> <name>"`; file-level deltas leave them
   null. `area` is filled by area attribution. `pr`/`train` resolve best-effort via
-  the commit→PR map.
+  the commit→PR map. Ordered by event time (the commit's `committed_at`, else the
+  event's date), then `artifact`, then lifecycle position (#100).
 - **diagrams{}** now also maps `content_timeline` (Mermaid `timeline`) and
   `deltas_bar` (Mermaid `xychart-beta` bar).
 
@@ -393,7 +449,10 @@ review's state to `DISMISSED`.
   zero-dep, offline) maps each tracked file to its module directory (AVM
   `avm/res/<svc>/<module>/`, any `main.bicep` dir, Terraform `modules/<name>/` or
   any `*.tf` dir, else the top 2 segments of the file's directory — a repo-root file
-  keeps its own name); the area `id` is that directory. A file directly under an AVM
+  keeps its own name); the area `id` is that directory. A `*.tf` file in a nested,
+  non-`examples/`/`tests/` directory under `modules/<name>/` (`modules/sub/inner/x.tf`)
+  is a module of its own: its area is that directory (#101); other files there stay in
+  `modules/<name>`. A file directly under an AVM
   group (`avm/res/<svc>/README.md`) is not a module: it maps to the group area `avm/res/<svc>`.
   **graphify** is an OPTIONAL provider for its ~25 tree-sitter languages — it reads
   graphify's real `graph.json` (top keys `nodes`/`links`; each node carries an
@@ -435,8 +494,10 @@ review's state to `DISMISSED`.
   the window, which are appended as areas (see STORE.md). A Bicep scan edge is exactly a
   build-path immediate edge (`transitive: false`, same `to`/`ref`/`version`/`local`/
   `instances`); a public-registry ref resolves in-repo when `<path>/main.bicep` is a tracked
-  module. Transitive Bicep edges still need the build. Without the flag a single-repo gather
-  does not run the scan and stays build-gated (byte-stable). The `bicep` and
+  module. Transitive Bicep edges still need the build. A graph the scan ran over carries
+  `code_graph.structural_scan: true` (issue #95: it holds the whole tree's direct edges, so
+  fold may retract a stored direct `depends_on` it no longer has). Without the flag a
+  single-repo gather does not run the scan and stays build-gated (byte-stable). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 
@@ -488,7 +549,12 @@ review's state to `DISMISSED`.
   label kind (`type:`/`kind:` facet labels, then a bare label that is exactly a kind word,
   e.g. `bug`/`enhancement`/`documentation`) → template filename → **title** heuristic → other).
   Matching is on whole words, never substrings; a bare "module" is not a module request
-  (only "module request"/"module proposal" are); issue bodies are never read.
+  (only "module request"/"module proposal" are); issue bodies are never read. In the
+  title (#101) a bare "support" is not a question ("Add support for X"; only "support
+  request" is — as a type/label/template value `support` still is), and a `?` makes a
+  question only when the title starts with an interrogative (`how`, `is`, `can`, …) and
+  holds a `?`, or — when no kind phrase matched — ends with a `?` right after a word
+  ("Bug: crash when name contains ?" is a bug).
 - **artifacts[].code_area** and **feature_deltas[].area** are **populated** when the
   path resolves to a `code_graph` area; null otherwise.
 - **trains[].code_areas** — the distinct areas of a train's commits' files.
@@ -520,7 +586,7 @@ review's state to `DISMISSED`.
   ```
   {
     "train":          { id, kind, outcome, significance, tier, effort,
-                        code_areas, evidence },
+                        code_areas, evidence, issues, pr_outcomes },
     "issue":          { number, title, body*, url, labels, kind,
                         comments*:[body*], comments_overflow,
                         lifecycle:[{event, actor, created_at, label}],
@@ -551,6 +617,8 @@ review's state to `DISMISSED`.
   chars kept in one slice never exceed `SLICE_DIFF_CAP` = 6000: walking the deltas in
   order, a diff is kept only if it fits in what is left of the budget, otherwise it is
   omitted (the delta is still listed) and counted in `feature_deltas_diff_overflow`.)
+  `issue` is the train's `root_issue`; the train's other closed issues are listed by number
+  in `train.issues`, and `prs` holds every attempt (its own outcome in `train.pr_outcomes`).
   Raises `KeyError` on unknown id. Does not mutate the bundle. The key lists above are
   checked against `slice_train`'s output by `test_link_small_fixes.py`.
 
@@ -591,8 +659,8 @@ across members (see "Project view: `people` and `halls`").
   — per the "recognition, not blame" stance.
 - **Blocker state.** `issue["blocking"]` / `issue["blocked_by"]` (set by
   `extract._attach_blocks`) are the **raw stored relation**, whatever the state of
-  the issues at either end; `diagrams.blocker_graph` draws that raw relation. `flow`
-  and `blockers` apply an **open-only** filter on top, using the `state` of the
+  the issues at either end. `flow`, `blockers` and `diagrams.blocker_graph` (#101)
+  apply an **open-only** filter on top, using the `state` of the
   bundle's own issues: an issue at the other end counts only when it is in the
   bundle with `state == "open"`. A number **absent from the bundle** has **unknown**
   state; it never counts as open (gather pulls every open issue of the repo, so an

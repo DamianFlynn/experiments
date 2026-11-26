@@ -654,9 +654,9 @@ class TestBlockerGraph(unittest.TestCase):
     def test_flowchart_edges_from_blocks(self):
         # #3 blocks #4; #4 blocks #5 -> two directed edges.
         bundle = self._bundle([
-            {"number": 3, "blocking": [4]},
-            {"number": 4, "blocking": [5], "blocked_by": [3]},
-            {"number": 5, "blocked_by": [4]},
+            {"number": 3, "state": "open", "blocking": [4]},
+            {"number": 4, "state": "open", "blocking": [5], "blocked_by": [3]},
+            {"number": 5, "state": "open", "blocked_by": [4]},
         ])
         mmd = render.emit_blocker_graph(bundle)
         self.assertTrue(mmd.startswith("flowchart"))
@@ -667,12 +667,48 @@ class TestBlockerGraph(unittest.TestCase):
 
     def test_only_participating_issues_get_nodes(self):
         bundle = self._bundle([
-            {"number": 3, "blocking": [4]},
-            {"number": 4, "blocked_by": [3]},
-            {"number": 6},  # no blocks edge -> no node
+            {"number": 3, "state": "open", "blocking": [4]},
+            {"number": 4, "state": "open", "blocked_by": [3]},
+            {"number": 6, "state": "open"},  # no blocks edge -> no node
         ])
         mmd = render.emit_blocker_graph(bundle)
         self.assertNotIn("#6", mmd)
+
+    def _open_closed_bundle(self):
+        # #3 (open) blocks #4 (open): drawn. #7 (closed) blocks #4: a resolved
+        # blocker, omitted. #3 blocks #8 (closed): no longer a blocked issue,
+        # omitted. #3 blocks #9 (absent from the bundle, state unknown): omitted.
+        return self._bundle([
+            {"number": 3, "state": "open", "blocking": [4, 8, 9]},
+            {"number": 4, "state": "open", "blocked_by": [3, 7]},
+            {"number": 7, "state": "closed", "blocking": [4]},
+            {"number": 8, "state": "closed", "blocked_by": [3]},
+        ])
+
+    def test_draws_only_open_blocker_relations(self):
+        # #101 item 5: consistent with flow / blockers (#60) -- a closed blocker
+        # no longer blocks, so it is not drawn.
+        mmd = render.emit_blocker_graph(self._open_closed_bundle())
+        self.assertEqual(len(_flow_edges(mmd)), 1)
+        self.assertIn('"#3"', mmd)
+        self.assertIn('"#4"', mmd)
+        for gone in ("#7", "#8", "#9"):
+            self.assertNotIn(gone, mmd)
+
+    def test_only_closed_blockers_gives_placeholder(self):
+        bundle = self._bundle([
+            {"number": 7, "state": "closed", "blocking": [4]},
+            {"number": 4, "state": "open", "blocked_by": [7]},
+        ])
+        self.assertIn("No blocked issues", render.emit_blocker_graph(bundle))
+
+    def test_open_only_blocker_graph_compiles_with_mmdc(self):
+        _require_mmdc(self)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "blocker_graph.mmd")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(render.emit_blocker_graph(self._open_closed_bundle()))
+            render.validate_with_mmdc([path])  # raises on failure
 
     def test_placeholder_when_no_blocks(self):
         mmd = render.emit_blocker_graph(self._bundle([{"number": 1}, {"number": 2}]))
@@ -683,16 +719,18 @@ class TestBlockerGraph(unittest.TestCase):
 
     def test_deterministic(self):
         bundle = self._bundle([
-            {"number": 5, "blocking": [3]},
-            {"number": 3, "blocked_by": [5]},
-            {"number": 8, "blocking": [3]},
+            {"number": 5, "state": "open", "blocking": [3]},
+            {"number": 3, "state": "open", "blocked_by": [5]},
+            {"number": 8, "state": "open", "blocking": [3]},
         ])
         self.assertEqual(render.emit_blocker_graph(bundle),
                          render.emit_blocker_graph(bundle))
 
     def test_bounded_with_overflow_note(self):
         # many distinct edges -> capped node/edge count plus an overflow note.
-        issues = [{"number": n, "blocking": [n + 1000]} for n in range(100)]
+        issues = [{"number": n, "state": "open", "blocking": [n + 1000]}
+                  for n in range(100)]
+        issues += [{"number": n + 1000, "state": "open"} for n in range(100)]
         mmd = render.emit_blocker_graph(self._bundle(issues))
         self.assertLessEqual(mmd.count("-->"), 40)
         self.assertIn("more", mmd.lower())
@@ -1203,7 +1241,7 @@ def _scale_bundle():
                            "date": f"2026-05-{1 + (e % 30):02d}"} for e in range(30)]}
     kinds = [f"kind-{k}" for k in range(14)] + ['we"ird "quoted" kind']
     issues = [{"number": 5000 + i, "kind": kinds[i % len(kinds)],
-               "title": f"Issue {i}"} for i in range(150)]
+               "title": f"Issue {i}", "state": "open"} for i in range(150)]
     issues[0]["blocking"] = [5001 + i for i in range(60)]
     trains = [{"id": "train-issue-5000", "kind": "feature", "root_issue": 5000,
                "prs": list(range(1, 301)), "commits": [], "code_areas": [],
