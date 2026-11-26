@@ -1474,8 +1474,11 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
   `TF_PLUGIN_CACHE_DIR` and `TF_TOKEN_<host>` are honoured. Residual: a repo can still pin
   providers in its own `.terraform.lock.hcl` and commit a `.terraform/` directory; the builds
   are not sandboxed.
-- **No child process sees the token** (issue #109). gather sends the token only in HTTPS
-  headers to `https://api.github.com`. Every subprocess (git, bicep, terraform, graphify) runs
+- **No build process sees the token** (issue #109). gather sends the token only in HTTPS
+  headers to `https://api.github.com`. One exception: when the user's git config has a
+  credential helper, git (alone) keeps `GH_TOKEN` / `GITHUB_TOKEN` and the two Enterprise
+  names, because a helper such as `gh auth git-credential` reads them to clone a private repo.
+  Otherwise every subprocess (git, bicep, terraform, graphify) runs
   with `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, `GH_ENTERPRISE_TOKEN`,
   `GITHUB_ENTERPRISE_TOKEN`, `ACTIVITY_TEST_TOKEN` and every variable ending in `_TOKEN` or
   `_PAT` removed (`_child_env`); the rest of the environment (PATH, HOME, TMPDIR, proxy/TLS

@@ -261,6 +261,29 @@ class TestChildProcessesNeverSeeTheToken(_TmpCase):
         self.assertEqual(tf["TF_TOKEN_app_terraform_io"], "tfc")   # its own registry auth
         self.assertIn("TF_CLI_CONFIG_FILE", tf)
 
+    def test_git_keeps_the_token_for_a_configured_credential_helper(self):
+        # `gh auth git-credential` reads GH_TOKEN; without it a private clone
+        # that works today would fail. Only git, only with a helper configured.
+        seen = []
+
+        def fake(args, **kw):
+            seen.append((args[0], kw["env"]))
+            return subprocess.CompletedProcess(args, 0, "", "")
+        helper = [("credential.https://github.com.helper", "!gh auth git-credential")]
+        with mock.patch.dict(os.environ, self.ENV), \
+                mock.patch.object(gather, "_git_passthrough_cache", helper), \
+                mock.patch.object(gather, "_terraform_cli_config_cache", "/x.tfrc"), \
+                mock.patch.object(gather.subprocess, "run", fake):
+            gather.run_git(["git", "fetch"])
+            gather.run_git(["terraform", "init"])
+        git_env, tf_env = seen[0][1], seen[1][1]
+        self.assertEqual(git_env["GH_TOKEN"], "ghp_y")
+        self.assertEqual(git_env["GITHUB_TOKEN"], "ghp_x")
+        self.assertNotIn("NPM_TOKEN", git_env)
+        self.assertNotIn("GITHUB_PAT", git_env)
+        for name in self.SECRETS:
+            self.assertNotIn(name, tf_env)
+
     def test_extract_iac_edges_build_goes_through_the_same_environment(self):
         # The build path calls run_git (its default `run`) for terraform.
         root = os.path.join(self.tmp, "clone")

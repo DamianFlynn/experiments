@@ -3399,8 +3399,10 @@ def resolve_token(env):
 #   * Secrets removed (item 14): GITHUB_TOKEN, GH_TOKEN, GITHUB_PAT, the GitHub
 #     Enterprise token names, ACTIVITY_TEST_TOKEN and every other variable whose
 #     name ends in `_TOKEN` or `_PAT`. gather sends the token only in HTTPS
-#     headers to api.github.com; git clones the gathered repos without it and
-#     the IaC builds run third-party code that must never see it. Terraform's
+#     headers to api.github.com; the IaC builds run third-party code that
+#     must never see it, and git clones without it -- unless the user has a
+#     git credential helper configured, which may read GH_TOKEN / GITHUB_TOKEN
+#     to clone a private repo (those names are then kept for git alone). Terraform's
 #     own registry credentials (`TF_TOKEN_<host>`) do not end in `_TOKEN` and are
 #     kept, as is everything else (PATH, HOME, TMPDIR, proxy/TLS variables,
 #     TF_PLUGIN_CACHE_DIR, locale, Azure credentials a private `br:` registry
@@ -3424,6 +3426,9 @@ _SECRET_ENV_NAMES = frozenset((
     "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN", "ACTIVITY_TEST_TOKEN"))
 _SECRET_ENV_SUFFIXES = ("_TOKEN", "_PAT")
+# Kept for git (only) when the user has a credential helper configured.
+_GIT_HELPER_TOKEN_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                           "GITHUB_ENTERPRISE_TOKEN")
 
 _GIT_ISOLATION_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -3605,7 +3610,17 @@ def _child_env(args):
     if tool.endswith(".exe"):
         tool = tool[:-4]
     if tool == "git":
-        pairs = _git_passthrough_config() + _env_config_pairs(env)
+        carried = _git_passthrough_config()
+        # A configured credential helper (`gh auth git-credential`, a CI
+        # helper) is git's own child and may read the GitHub token from the
+        # environment to clone a private repo: keep those names for git then.
+        # Without a helper git has no use for them and they stay removed.
+        if any(k.lower().startswith("credential.") and k.lower().endswith(".helper")
+               or k.lower() == "credential.helper" for k, _ in carried):
+            for name in _GIT_HELPER_TOKEN_NAMES:
+                if name in os.environ:
+                    env[name] = os.environ[name]
+        pairs = carried + _env_config_pairs(env)
         for i, (key, value) in enumerate(pairs):
             env["GIT_CONFIG_KEY_%d" % i] = key
             env["GIT_CONFIG_VALUE_%d" % i] = value
