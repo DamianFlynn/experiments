@@ -692,12 +692,23 @@ def _parse_ts(ts):
         return None
 
 
+# An `updated_at` this close to an automation account's comment or review is
+# that automation's own update (its comment, then the label it adds).
+_BOT_UPDATE_SLACK_SECONDS = 120
+
+
 def _train_activity_times(train_prs, train_issues, train_commits):
     """Every activity timestamp the bundle records for a train's members (issue
     #112): each member PR's and issue's `created_at`, `updated_at`, `closed_at`,
     `merged_at`, its `comments_list[].created_at`, `review_comments[].created_at`,
     `reviews[].submitted_at` and `lifecycle[].created_at`, and each train commit's
-    `committed_at` (else its `date`). Unparseable / missing values are skipped."""
+    `committed_at` (else its `date`). Unparseable / missing values are skipped.
+
+    Automation does not count (final gate, #97): a comment or review whose
+    author is a bot (derive.is_bot_login) is not activity, and neither is an
+    `updated_at` within _BOT_UPDATE_SLACK_SECONDS of one. A reminder bot that
+    comments on every stale pull request would otherwise make none of them
+    stalled."""
     out = []
 
     def add(ts):
@@ -706,15 +717,29 @@ def _train_activity_times(train_prs, train_issues, train_commits):
             out.append(dt)
 
     for rec in list(train_prs) + list(train_issues):
-        for key in ("created_at", "updated_at", "closed_at", "merged_at"):
-            add(rec.get(key))
-        for key in ("comments_list", "review_comments", "lifecycle"):
+        bot_times = []
+        for key, ts_key in (("comments_list", "created_at"),
+                            ("review_comments", "created_at"),
+                            ("reviews", "submitted_at")):
             for row in rec.get(key) or []:
-                if isinstance(row, dict):
-                    add(row.get("created_at"))
-        for row in rec.get("reviews") or []:
+                if not isinstance(row, dict):
+                    continue
+                if derive.is_bot_login(row.get("author")):
+                    dt = _parse_ts(row.get(ts_key))
+                    if dt is not None:
+                        bot_times.append(dt)
+                else:
+                    add(row.get(ts_key))
+        for row in rec.get("lifecycle") or []:
             if isinstance(row, dict):
-                add(row.get("submitted_at"))
+                add(row.get("created_at"))
+        for key in ("created_at", "closed_at", "merged_at"):
+            add(rec.get(key))
+        updated = _parse_ts(rec.get("updated_at"))
+        if updated is not None and not any(
+                abs((updated - b).total_seconds()) <= _BOT_UPDATE_SLACK_SECONDS
+                for b in bot_times):
+            out.append(updated)
     for c in train_commits:
         add(c.get("committed_at") or c.get("date"))
     return out

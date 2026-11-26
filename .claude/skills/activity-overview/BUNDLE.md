@@ -340,6 +340,9 @@ the rest (engagement, code areas, trains, people/flow).
     `reviews[].submitted_at` and `lifecycle[].created_at`, and every train commit's
     `committed_at` (else `date`) — `null` when none is recorded. (Train commits are mainline
     commits, so a push to an open PR's branch counts through the PR's `updated_at`.)
+    Automation is not activity (#97): a comment or review by a bot account does not count,
+    nor does an `updated_at` within two minutes of one — a reminder bot that comments on
+    every stale pull request would otherwise leave none stalled.
     `idle_days` = calendar days
     from that timestamp's date to the reference date (`meta.ref_date`, else `meta.to`),
     floored at 0 (activity recorded after the reference date — a `--ref-date` before the

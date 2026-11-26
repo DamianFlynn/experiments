@@ -592,3 +592,33 @@ class FixturesUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGatherKeepsPrsOpenAtTheWindowEnd(unittest.TestCase):
+    """A month gathered late: a PR that was open at the month's end and has
+    landed since must be gathered, or the as-of view cannot show it."""
+
+    def _pr(self, **kw):
+        base = {"state": "closed", "merged": False, "merged_at": None,
+                "closed_at": None, "created_at": "2026-10-10T00:00:00Z"}
+        return {**base, **kw}
+
+    def test_keep_rule(self):
+        keep = lambda pr: gather.keep_pr_for_window(pr, "2026-10-01", "2026-10-31")
+        # as before
+        self.assertTrue(keep(self._pr(state="open", created_at="2026-11-20T00:00:00Z")))
+        self.assertTrue(keep(self._pr(merged=True, merged_at="2026-10-31T23:59:59Z",
+                                      closed_at="2026-10-31T23:59:59Z")))
+        self.assertTrue(keep(self._pr(closed_at="2026-10-05T00:00:00Z")))
+        self.assertFalse(keep(self._pr(merged=True, merged_at="2026-09-30T23:00:00Z",
+                                       closed_at="2026-09-30T23:00:00Z",
+                                       created_at="2026-09-01T00:00:00Z")))
+        # open at the window end, landed or closed since
+        self.assertTrue(keep(self._pr(merged=True, merged_at="2026-11-15T00:00:00Z",
+                                      closed_at="2026-11-15T00:00:00Z")))
+        self.assertTrue(keep(self._pr(closed_at="2026-11-02T00:00:00Z",
+                                      created_at="2026-08-01T00:00:00Z")))
+        # opened after the window and already landed: not this window's
+        self.assertFalse(keep(self._pr(merged=True, merged_at="2026-11-15T00:00:00Z",
+                                       closed_at="2026-11-15T00:00:00Z",
+                                       created_at="2026-11-03T00:00:00Z")))
