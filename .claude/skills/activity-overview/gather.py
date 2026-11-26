@@ -5635,8 +5635,8 @@ def acquire(args, env):
 #
 # The actual fetch is SEAMED behind an injectable `fetch` callable so the test
 # suite never touches the network: tests pass a fixture-backed fake; production
-# passes `make_backfill_fetcher(token)` (REST for social, local/`git fetch
-# --depth 1` for code). `fetch(kind, local, qid)` returns either None (genuinely
+# passes `make_backfill_fetcher(token)` (REST, PRs and issues only).
+# `fetch(kind, local, qid)` returns either None (genuinely
 # unfetchable) or `{"node": <raw record dict>, "edges": [(dst_local, edge_type),
 # ...]}`. backfill shapes the result into store node/edge upserts, reusing the
 # same id/edge conventions fold_bundle uses.
