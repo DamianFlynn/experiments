@@ -240,8 +240,10 @@ def link_components(conn, project, members, components):
             if local.startswith("pr-"):
                 shadow = graphstore.qualify_id(
                     project, repo, "issue-" + local[len("pr-"):])
-                if shadow not in stored:
-                    blocked.add(shadow)
+                # stored or not: a backfilled `issue-N` that is really PR N
+                # (an alias of pr-N) would otherwise join every PR that
+                # "closes" N into one train, which link never does.
+                blocked.add(shadow)
     out = []
     for comp in components:
         if comp & blocked:

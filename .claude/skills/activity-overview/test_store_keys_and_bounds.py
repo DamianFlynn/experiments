@@ -275,6 +275,22 @@ class TestFtsCoverage(unittest.TestCase):
         self.assertEqual(res["status"], "ok")
         self.assertTrue(res["delivered"])
 
+    def test_record_edited_without_fts_is_reindexed_by_the_next_fold(self):
+        # an indexed PR is re-folded with a new body on a host without FTS5:
+        # recovery must replace its old text, not only add missing nodes
+        conn = _store()
+        gather.fold_bundle(conn, self._jan())
+        graphstore._FTS5_CACHE = False
+        gather.fold_bundle(conn, _bundle(
+            "2026-01-01", "2026-01-31",
+            [_pr(1, "2026-01-10T00:00:00Z", body="gateway routes")]))
+        graphstore._FTS5_CACHE = True
+        gather.fold_bundle(conn, self._feb())
+        self.assertEqual(graphstore.fts_search(conn, "gateway"), ["o/r#pr-1"])
+        self.assertEqual(graphstore.fts_search(conn, "firewall"), [])
+        self.assertEqual(graphstore.get_meta(conn, graphstore.FTS_COVERAGE_KEY),
+                         graphstore.FTS_COMPLETE)
+
     def test_index_created_empty_on_an_older_store_is_rebuilt(self):
         conn = _store()
         gather.fold_bundle(conn, self._jan())

@@ -6859,14 +6859,18 @@ def _fts_text_of(nid, node_class, data):
     return ""
 
 
-def _backfill_fts(conn):
+def _backfill_fts(conn, refresh=False):
     """Index every stored node the FTS index lacks (issue #111): one pass
     over the social / code nodes not in fts_map, inside the fold's
-    transaction. Nodes with no text stay unindexed, as fold leaves them."""
+    transaction. With `refresh` (a fold ran without FTS5 since the index was
+    last complete) the already-indexed nodes are re-indexed too: that fold
+    may have changed their text. Nodes with no text stay unindexed, as fold
+    leaves them."""
     graphstore.index_texts(conn, [
         (nid, text) for nid, text in
         ((nid, _fts_text_of(nid, cls, data))
-         for nid, cls, data in graphstore.fts_unindexed_nodes(conn)) if text],
+         for nid, cls, data in graphstore.fts_unindexed_nodes(
+             conn, include_indexed=refresh)) if text],
         commit=False)
 
 
@@ -7309,9 +7313,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         # records the index lacks; the first fold with FTS5 since then indexes
         # every stored node the index lacks, before this fold writes anything
         # (so a fold into an empty store indexes exactly as before).
-        if graphstore.fts5_available(conn) and graphstore.get_meta(
-                conn, graphstore.FTS_COVERAGE_KEY) != graphstore.FTS_COMPLETE:
-            _backfill_fts(conn)
+        coverage = graphstore.get_meta(conn, graphstore.FTS_COVERAGE_KEY)
+        if graphstore.fts5_available(conn) and coverage != graphstore.FTS_COMPLETE:
+            _backfill_fts(conn, refresh=coverage == graphstore.FTS_PARTIAL)
         prior_files = _stored_commit_files(
             conn, project, repo, [c["sha"] for c in bundle.get("commits", [])])
         graphstore.upsert_nodes(conn, nodes, commit=False)

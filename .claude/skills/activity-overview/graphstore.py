@@ -924,21 +924,26 @@ def index_texts(conn, items, commit=True):
 # node. A fold on a host without FTS5 cannot index its records, so it sets
 # "partial"; the next fold WITH FTS5 that finds the key not "complete" (also
 # on a store that predates the key) indexes every stored node fts_map lacks
-# (gather._backfill_fts, one pass) and sets "complete".
+# -- and, after a "partial" fold, re-indexes the mapped ones too, since that
+# fold may have changed their text -- (gather._backfill_fts, one pass) and
+# sets "complete".
 FTS_COVERAGE_KEY = "fts_coverage"
 FTS_COMPLETE = "complete"
 FTS_PARTIAL = "partial"
 
 
-def fts_unindexed_nodes(conn):
+def fts_unindexed_nodes(conn, include_indexed=False):
     """[(id, node_class, data)] of the stored social / code nodes that have no
-    fts_text row (not in fts_map), sorted by id. Creates fts_map if absent
-    (writer only; needs FTS5)."""
+    fts_text row (not in fts_map), sorted by id; with `include_indexed`, every
+    stored social / code node (a record edited by a fold without FTS5 keeps
+    its OLD indexed text, so recovery re-indexes those too). Creates fts_map
+    if absent (writer only; needs FTS5)."""
     _ensure_fts_map(conn)
+    missing = "" if include_indexed else \
+        " AND id NOT IN (SELECT node_id FROM fts_map)"
     return [(r[0], r[1], json.loads(r[2]) if r[2] else None) for r in conn.execute(
         "SELECT id, node_class, data FROM nodes WHERE node_class IN "
-        "('social', 'code') AND id NOT IN (SELECT node_id FROM fts_map) "
-        "ORDER BY id")]
+        "('social', 'code')" + missing + " ORDER BY id")]
 
 
 def fts_search(conn, query):

@@ -73,10 +73,17 @@ def window_problem(window, what="window"):
 
 
 def window_key(window):
-    """The identity of a window: its calendar days `(from[:10], to[:10])`
-    (#110 item 6). Callers validate the bounds first (window_problem); the
-    key only reads their leading date."""
-    return (window[0][:10], window[1][:10])
+    """The identity of a window: its UTC calendar days (#110 item 6). A
+    timestamp bound is converted to UTC first (manifest.normalize_reader_bound),
+    so `2026-01-01T00:00:00Z` and `2025-12-31T19:00:00-05:00` are one window.
+    Callers validate the bounds first (window_problem); a bound that still
+    cannot be read keeps its leading date."""
+    def day(bound):
+        try:
+            return _manifest.normalize_reader_bound(bound)[:10]
+        except (ValueError, TypeError):
+            return str(bound)[:10]
+    return (day(window[0]), day(window[1]))
 
 
 def _inst_key(inst):

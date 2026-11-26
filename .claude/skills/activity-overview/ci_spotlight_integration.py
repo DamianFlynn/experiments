@@ -329,6 +329,10 @@ def _check_citation(label, anchor, row, node):
     be cited by its GitHub `/commit/<sha>` link; a comment row's excerpt is
     the node's body."""
     data = (node or {}).get("data") or {}
+    _require((row.get("ts") or "") == ((node or {}).get("ts") or ""),
+             "{}: train {} row {} is dated {!r} but the stored node is dated "
+             "{!r}".format(label, anchor, row["id"], row.get("ts"),
+                           (node or {}).get("ts")))
     for key in _CITE_FIELDS:
         if (key == "url" and data.get("url") is None and data.get("sha")
                 and (row.get("url") or "").endswith("/commit/" + data["sha"])):

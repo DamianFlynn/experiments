@@ -568,6 +568,17 @@ class TestMutantsFailTheGate(_GateCase):
             return res
         self._fails("person_impact", rewrite, "person", "url")
 
+    def test_timeline_dates_shifted_in_order(self):
+        # every row moved by the same amount keeps the order; the gate must
+        # still compare each date with the stored node's (review finding)
+        def shift(res):
+            for t in res["delivered"]:
+                for r in t["timeline"] + t["touchpoints"]:
+                    if r.get("ts"):
+                        r["ts"] = "1999" + r["ts"][4:]
+            return res
+        self._fails("person_impact", shift, "person", "is dated")
+
     def test_subsystem_outcome_flipped(self):
         def flip(res):
             for t in res["delivered"]:

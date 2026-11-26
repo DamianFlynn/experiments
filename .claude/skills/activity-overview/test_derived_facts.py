@@ -164,6 +164,30 @@ class TestProjectTrainsAreLinkTrains(unittest.TestCase):
                          ["ptrain-o/r#pr-1", "ptrain-o/r#pr-2", "ptrain-o/r#pr-3"])
         self.assertSameTrains(view)
 
+    def test_stored_issue_alias_of_a_pr_does_not_join(self):
+        # the same case when the store also holds `issue-1` for PR 1 (a
+        # backfilled "Closes #1" target that turned out to be a PR): the alias
+        # must not pull PR 2 and the open PR 3 into one train (review finding)
+        b = _raw_bundle([_pr(1, merged=True, state="closed"),
+                         _pr(2, merged=True, state="closed", closes=[1]),
+                         _pr(3, state="open", closes=[1])], [])
+        meta = b["meta"]
+        conn = _store(b)
+        alias = graphstore.qualify_id(meta["owner"], meta["repo"], "issue-1")
+        graphstore.upsert_node(
+            conn, alias, meta["owner"], meta["repo"], "social",
+            "2026-01-05T00:00:00Z",
+            {"number": 1, "state": "closed", "title": "pr one",
+             "url": "https://github.com/o/r/pull/1"}, graphstore.now_iso())
+        conn.commit()
+        view = digest.build_project_view(conn, meta["owner"], [meta["repo"]],
+                                         meta["from"], meta["to"],
+                                         warn=lambda _m: None)
+        self.assertEqual([t["id"] for t in view["trains"]],
+                         ["ptrain-o/r#pr-1", "ptrain-o/r#pr-2", "ptrain-o/r#pr-3"])
+        self.assertEqual([t["outcome"] for t in view["trains"]],
+                         ["shipped", "shipped", "in_flight"])
+
     def test_stacked_pr_closing_an_issue_does_not_join(self):
         # a PR merged into another PR's branch is not a train member (link adds
         # it as a contributing PR), so its closing reference joins nothing.
@@ -300,6 +324,10 @@ class TestSeriesCalendarDayKeys(_SeriesDisk):
         self.assertEqual(series.window_key(("2026-01-01T00:00:00Z",
                                             "2026-01-31T23:59:59+02:00")),
                          ("2026-01-01", "2026-01-31"))
+        # an offset that crosses midnight is the same UTC day (review finding)
+        self.assertEqual(
+            series.window_key(("2025-12-31T19:00:00-05:00", "2026-01-31")),
+            series.window_key(("2026-01-01T00:00:00Z", "2026-01-31")))
         idx = [{"from": "2026-02-01T00:00:00Z", "to": "2026-02-28T23:59:59Z"},
                {"from": "2026-01-01", "to": "2026-01-31"}]
         self.assertEqual(series.predecessor(idx, ("2026-02-01", "2026-02-28"))["from"],
