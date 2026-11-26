@@ -520,7 +520,20 @@ def build_report(view, texts, captions):
                         e.get("login"), e.get("first"), e.get("number"),
                         e.get("url")))
             else:
-                W("No first-time contributors this window.")
+                W("No first-time contributors this window."
+                  if nc.get("covers_view", True) else
+                  "No first-time contributors in the part of this window that "
+                  "was checked.")
+            # a wider view merges its windows' facts: say so when some of the
+            # view was never checked (covers_view false)
+            if nc.get("collected") and nc.get("covers_view") is False:
+                wins = ", ".join("{} → {}".format(w.get("from"), w.get("to"))
+                                 for w in nc.get("windows") or []
+                                 if isinstance(w, dict))
+                W("")
+                W("Checked only for {}; the rest of this window was gathered "
+                  "without the check, so this list may be incomplete.".format(
+                      wins or "part of this window"))
             undecided = sorted(set(nc.get("unknown") or [])
                                | set(nc.get("not_checked") or []))
             if nc.get("collected") and undecided:

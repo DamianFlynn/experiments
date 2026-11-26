@@ -642,6 +642,36 @@ class TestBuildReport(unittest.TestCase):
                       text)
         self.assertIn("Could not check whether these authors are new: `bob`.", text)
 
+    def test_partial_newcomer_coverage_is_disclosed(self):
+        # review finding: a wider view whose windows were not all checked
+        # must not present its list (or its absence) as the whole window's
+        import test_build_report as tbr
+        for new, expect in (
+                ([], "No first-time contributors in the part of this window "
+                     "that was checked."),
+                ([{"login": "zed", "first": "pr", "number": 3,
+                   "url": "https://github.com/Azure/mod-a/pull/3"}], "| `zed` |")):
+            with self.subTest(new=bool(new)), tempfile.TemporaryDirectory() as tmp:
+                pv = tbr.build_caveat_view(tmp)
+                pv["members"][0]["bundle"]["newcomers"] = {
+                    "collected": True, "before": "2026-05-01", "new": new,
+                    "unknown": [], "not_checked": [], "covers_view": False,
+                    "windows": [{"from": "2026-05-01", "to": "2026-05-15"}]}
+                path = os.path.join(tmp, "v.json")
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(pv, fh)
+                out = os.path.join(tmp, "r.md")
+                res = tbr.run_script(
+                    ["--view", path, "--out", out, "--skip-validate"], cwd=tmp)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                with open(out, encoding="utf-8") as fh:
+                    text = fh.read()
+                self.assertIn(expect, text)
+                self.assertIn("Checked only for 2026-05-01 → 2026-05-15; the rest "
+                              "of this window was gathered without the check",
+                              text)
+                self.assertNotIn("No first-time contributors this window.", text)
+
 
 if __name__ == "__main__":
     unittest.main()

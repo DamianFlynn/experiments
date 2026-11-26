@@ -266,6 +266,17 @@ def link_components(conn, project, members, components):
                     blocked_edges.add(frozenset((
                         graphstore.qualify_id(project, repo, "pr-{}".format(p["number"])),
                         graphstore.qualify_id(project, repo, "issue-{}".format(n)))))
+        # The same for a rejected PR's closing references into ANOTHER repo:
+        # they are stored as cross-repo `closes` edges, and a closed-unmerged
+        # PR's references never took effect, so none of them joins trains.
+        for p in bundle.get("prs", []):
+            if p.get("state") == "closed" and not p.get("merged"):
+                pid = graphstore.qualify_id(project, repo,
+                                            "pr-{}".format(p["number"]))
+                own_scope = graphstore.parse_id(pid)["scope"]
+                for e in graphstore.get_edges(conn, pid, "out", ("closes",)):
+                    if graphstore.parse_id(e["dst_id"])["scope"] != own_scope:
+                        blocked_edges.add(frozenset((pid, e["dst_id"])))
         in_trains = {n for t in bundle.get("trains", []) for n in t.get("prs", [])}
         for p in bundle.get("prs", []):
             if p["number"] not in in_trains:
