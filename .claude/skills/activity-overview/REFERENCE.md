@@ -67,7 +67,7 @@ link and every commit id is a real sha — but not that the records match GitHub
 deleted with its edges or a consistently rewritten blob passes. To catch those, save the
 view of the freshly gathered store (`view.py … --out view.json`, before `link.py` enriches it) and later run
 `validate.py STORE --bundle view.json`. On a store holding several windows, edges from
-latest-wins inputs (code graph, CODEOWNERS) are WARNed, not failed; `--repo` of a multi-repo
+structure or latest-wins inputs (code graph, CODEOWNERS, milestones) are WARNed, not failed; `--repo` of a multi-repo
 project checks only that member's people (the full check runs without `--repo`). See
 `STORE.md` "Trust gate".
 
@@ -100,7 +100,9 @@ exactly what `extract.extract` returns (raw keys, extract's deterministic order)
 `meta.period` = `{F, T}` (the window `link.py` buckets to) and `meta.ref_date` = `D`, else
 gather's `--ref-date` stored for exactly this window, else `T` — holds only the window's
 records (on a store holding several windows; BUNDLE.md "Window scope", with
-`meta.state_as_of` when the store also holds a later window), does
+`meta.state_as_of` when the store also holds a later window) with that window's CI
+statistics and structure (`meta.facts_windows` when the window is not exactly a gathered
+one; STORE.md "Per-window facts"), does
 no network backfill, and exits 2 when the scope is ambiguous, unknown or empty, or the
 store is missing. For a multi-repo project, `--repo` selects one member; the merged
 project view comes from `digest.py`. The full step-by-step procedure (and which report

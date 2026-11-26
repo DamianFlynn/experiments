@@ -218,6 +218,25 @@ view overlaps when their non-null values agree, else `null` / `[]` with a stderr
 their views report the base branch unknown and count every merged PR as shipped, as
 before; re-gather to get stacked / release-branch PRs told apart.
 
+`facts:{project}/{repo}:{from}:{to}` (issue #94): JSON `{"clone_sha": str|null,
+"facts": {key: sha256}}`, the per-repo facts a gathered window computed —
+`workflow_stats` (the CI runs created in that window), `code_graph` (the areas of
+the files that window changed, with their dependency edges), `code_owners` and
+`label_taxonomy` (read from that window's checkout) — each named by the SHA-256 of
+its JSON text (encoded as node `data` is: sorted keys), and the clone sha the
+window was gathered against. A key is present only when the bundle's value is
+present and non-empty (the latest-wins node rule). Each value is stored once per
+repo under `fact:{project}/{repo}:{sha256}` (its JSON text), so windows with
+identical facts (an unchanged CODEOWNERS file, the same taxonomy) share one copy.
+Written in the fold transaction whenever the bundle's `meta` has `from` and `to`;
+a re-fold of the same window replaces its entry and deletes any `fact:` value no
+window of the repo references any more — `set_window_facts`/`get_window_facts`.
+The `code_graph` is window-scoped (the directory provider only sees the window's
+changed paths), so it is keyed by window, not by clone sha: two windows gathered
+from the same checkout can hold different graphs. Stores folded before #94 have no
+`facts:` keys; their views read the latest-wins singleton nodes as before. No
+schema change. How a view picks its facts: "Roll-up / resume" below.
+
 `member_status` (issue #77; written only by a manifest gather): a JSON list of
 `{project, repo, from, to, status[, error]}`, one entry per member and window,
 sorted on `(project, repo, from, to)` — `set_member_status` / `get_member_status`
@@ -286,7 +305,11 @@ scans), identity-keyed and idempotent. A singleton node is written only when its
 source value is present and non-empty, so a reader never reconstructs a
 fabricated empty key. Node `data` is JSON-encoded with sorted keys, so
 `code_owners` is an ordered rule **list** (not a pattern-keyed dict): list order
-survives the round trip, and CODEOWNERS precedence depends on it.
+survives the round trip, and CODEOWNERS precedence depends on it. These nodes are
+latest-wins (the last fold's values); since issue #94 the same fold also records
+the window's own values under `facts:` (see "Meta"), and a view reads those. The
+nodes remain for stores folded before #94 and for code that reads the latest
+structure.
 
 **Slice 7b-1 (step 2) additionally persists the artifact substrate** (derived on
 the write path via the shared `derive.py` leaf module — `derive.build_artifacts`
@@ -787,15 +810,35 @@ So one store can grow window by window: a view of one gathered window equals the
 view of a store holding only that window (up to PR/issue records a later gather
 refreshed — nodes are upserted latest-wins, and the view then carries
 `meta.state_as_of`), and a view over `[March-start, April-end]` is the union of
-the two. Not windowed: milestones, sprints, people's `modules`/`areas` (union
-over windows) and the per-repo singletons (`workflowstats`, `codegraph`,
-`codeowners`, `labeltaxonomy`: the latest gather's structure facts, #94).
+the two. Not windowed: milestones and sprints (latest fetch); people's stored
+`modules`/`areas` are the union over windows, and a view re-derives them (#88).
+
+**Per-window facts (issue #94).** A view reads `workflow_stats`, `code_graph`,
+`code_owners`, `label_taxonomy` and `meta.clone_sha` from the `facts:` entries of
+the repo's gathered windows (`extract._window_facts`):
+
+- **Exactly a gathered window** — that window's values (and nothing else in
+  `meta`), so each month of a growing store shows its own CI statistics,
+  structure and clone sha, and its people areas / code-area attribution use its
+  own code graph.
+- **Any other window** — CI statistics are the **sum** of the gathered windows
+  lying wholly inside the view (`derive.sum_workflow_stats`: counters added per
+  workflow, truncation markers merged). Summed windows never overlap one another
+  (by start day, the longest first: a roll-up window is summed instead of the
+  months it covers, never with them). A gathered window that only partly
+  overlaps the view is not summed (its runs cannot be split by day); with no
+  gathered window inside the view `workflow_stats` is omitted. The structure
+  (code graph, owners, taxonomy, clone sha) is that of the latest gathered window
+  overlapping the view (by `to`), else the latest ending before it, else the
+  earliest. `meta.facts_windows` says which (BUNDLE.md).
+- **No `facts:` entry for the repo** (folded before #94) — the latest-wins
+  singleton nodes and the repo's latest `clone_sha`, as before.
+
 Overlapping re-folds are idempotent (identity-keyed nodes/edges, set
-semantics on the ledger, deduped `gathered_windows`), so re-extracting an
-overlapping window is byte-stable. Resume/roll-up read structure from the latest
-`clone_sha` (`set_clone_sha`/`get_clone_sha`) and the `gathered_windows` ledger
-(`record_window`/`get_windows`): the structure pin is the newest fold's
-`clone_sha`, a `WHERE`, not a merge.
+semantics on the ledger, deduped `gathered_windows`, per-window meta keys
+replaced), so re-extracting an overlapping window is byte-stable. Resume/roll-up
+read the latest `clone_sha` (`set_clone_sha`/`get_clone_sha`) and the
+`gathered_windows` ledger (`record_window`/`get_windows`), a `WHERE`, not a merge.
 
 ## Trust gate (validate.py)
 
@@ -870,11 +913,19 @@ Strictness (issue #89). Besides the checks above:
   stored); the full equality is `no_drift_people` (no `--repo`).
 
 **Multi-window stores** (more than one gathered window recorded for the repo).
-The `code_graph` / `code_owners` singletons, area path lists and the milestone /
-sprint / `blocks` lists are latest-wins and edges are never retracted (#95), so
-`owns`, `touches`, `depends_on`, `in_milestone`, `in_iteration` and `blocks`
-edges of an older window cannot be re-derived: a difference there is a WARN, and
-people's areas compare as derived ⊆ stored (an extra stored area is a WARN).
+`edge_set` and `no_drift` re-derive from ONE self-sourced bundle over the whole
+store, which carries the structure of the latest gathered window (#94); the
+milestone / sprint / `blocks` lists ride latest-wins records; and edges are never
+retracted (#95). So `owns`, `touches`, `depends_on`, `in_milestone`,
+`in_iteration` and `blocks` edges of an older window cannot all be re-derived: a
+difference there is a WARN, and people's areas compare as derived ⊆ stored (an
+extra stored area is a WARN). Since #94 the inputs of `owns`, `touches`,
+`depends_on` and people's areas (each window's code graph and CODEOWNERS) are
+kept per window, so a per-window re-derivation could make those exact; the gate
+does not do that yet (LLD §14.5). `in_milestone`, `in_iteration` and `blocks`
+come from latest-wins records and stay WARN.
+`referential_integrity` also fails a `facts:` entry that cannot be read or names
+a `fact:` value that is not stored.
 Symbol moves are matched per fold window: each stored move must be supported by
 the ledger (its twin edge, a drop of the source — by `move_commit` — and an add
 of the destination, a consistent basis), and a move only a whole-store re-match

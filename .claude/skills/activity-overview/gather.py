@@ -5375,6 +5375,8 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # well-known local id, NULL ts so window scans skip it, identity-keyed /
     # idempotent). Only emitted when present and non-empty so extract never
     # fabricates an empty key. See STORE.md and extract._materialize_singleton.
+    # Latest-wins: a view reads them only on a store folded before issue #94;
+    # the per-window copies are written with the window provenance below.
     for local, value in (("workflowstats", bundle.get("workflow_stats")),
                          ("codegraph", bundle.get("code_graph")),
                          ("codeowners", bundle.get("code_owners")),
@@ -5442,6 +5444,14 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         if meta.get("clone_sha"):
             graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
                                      commit=False)
+        # The window's own CI statistics and structure (issue #94): the
+        # latest-wins nodes above serve stores folded before #94; a view of
+        # this window reads these (extract._window_facts).
+        if meta.get("from") and meta.get("to"):
+            graphstore.set_window_facts(conn, project, repo, meta["from"],
+                                        meta["to"], bundle,
+                                        clone_sha=meta.get("clone_sha"),
+                                        commit=False)
 
 
 def _member_args(base, member, frm, to):

@@ -130,6 +130,22 @@ the rest (engagement, code areas, trains, people/flow).
   window, present only when that is after the view's `to`: the view is of an earlier window
   than the store's latest, and its PR/issue records (state, labels, milestone, `updated_at`,
   comments) are as the latest gather saw them, not as they were at the view's `to`.
+  **`facts_windows`** (issue #94, omit-when-absent) is present only when the store keeps
+  per-window facts for the repo and the view is **not** exactly one gathered window. It names
+  where the view's `workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` /
+  `clone_sha` come from: `{"structure": {from, to}, "workflow_stats": [{from, to}, ...],
+  "workflow_stats_complete": bool, "workflow_stats_excluded"?: [{from, to}, ...]}`.
+  `structure` is the gathered window whose code graph, owners, taxonomy and clone sha the view
+  carries (the latest overlapping the view, else the latest before it, else the earliest).
+  `workflow_stats` lists the gathered windows lying wholly inside the view whose CI statistics
+  are **summed** into the view's `workflow_stats` (`[]` → the key is absent).
+  Summed windows never overlap one another (taken by start day, the longest first), so no run
+  is counted twice when the store also holds a roll-up window or part of a month.
+  `workflow_stats_complete` is true only when the summed windows cover every day of the view.
+  `workflow_stats_excluded` lists the gathered windows overlapping the view that were not
+  summed — they overlap the view only partly (their runs cannot be split by day), overlap a
+  summed window, or have no per-window facts (folded before #94). A view of exactly a gathered window has no
+  `facts_windows`: its facts are that window's.
   **Window scope** (issue #85): a view holds only its window's records — the rule mirrors what
   gather collects for a window, applied to each record's latest stored state:
   `prs` merged in the window, closed (unmerged) in it, or open and created by its end;
@@ -145,9 +161,11 @@ the rest (engagement, code areas, trains, people/flow).
   member bundle never lists another member's people, nor someone who worked in this repo only
   in another window. A person's `modules` / `areas` are re-derived from the view's records
   with this repo's `code_graph` (the attribution fold applies): this repo's areas the person
-  touched in this window. The stored person node keeps the project-wide union. Not windowed:
-  `milestones`, `sprints` and the per-repo singletons `workflow_stats`, `code_graph`,
-  `code_owners`, `label_taxonomy` — current structure, as of the latest gather (#94). On a
+  touched in this window. The stored person node keeps the project-wide union. The per-repo
+  facts `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` (and `meta.clone_sha`)
+  are the gathered window's own for a view of exactly that window, else summed / picked as
+  `facts_windows` describes (#94); a store folded before #94 gives the latest gather's. Not
+  windowed: `milestones`, `sprints` — current structure, as of the latest gather. On a
   store holding only the viewed window every stored record is in the view; a view spanning
   several gathered windows is their union.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
@@ -248,7 +266,10 @@ docsRefs, release_train, sprints, project, diagrams`.
   populated (see the schema block in the design spec). `workflow_stats` is keyed by
   workflow name, plus the reserved key `_truncated` ONLY when GitHub's 1,000-run
   search cap could not be split away: `{truncated, cap, fetched, total_count,
-  ranges}`. Consumers listing workflows skip keys starting with `_`.
+  ranges}`. Consumers listing workflows skip keys starting with `_`. A view summing several
+  gathered windows (`meta.facts_windows`) adds the counters per workflow name and merges the
+  `_truncated` markers (`fetched` / `total_count` summed — `null` if any is unknown —,
+  `ranges` concatenated, largest `cap`).
 - **buckets** are fully classified: `shipped`, `rejected`, `in_flight`,
   `next_candidates` (one bucket per item; precedence shipped > rejected >
   next_candidates > in_flight). Each ref may carry a `train` id. The current/next

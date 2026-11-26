@@ -339,6 +339,8 @@ def check_referential_integrity(conn):
     who never contributed (no person node) — that is a documented clean-store
     reality, reported INFO. A dangling NON-spine edge (e.g. an `authored` whose
     person or target is absent) is an ERROR. Counts are reported per edge type.
+    A per-window facts entry (issue #94) naming a value that is not stored, or
+    that cannot be read, is an ERROR too.
     """
     ids = _all_node_ids(conn)
     details = []
@@ -367,6 +369,12 @@ def check_referential_integrity(conn):
                          "codeowner not a contributor" if owns_codeowner else
                          "dangling non-spine edge"),
             })
+    # The per-window facts index (issue #94) must name stored values: a view
+    # of that window would otherwise silently lose its CI stats / structure.
+    for key, problem in graphstore.window_facts_problems(conn):
+        details.append({"severity": ERROR, "meta_key": key,
+                        "problem": problem,
+                        "note": "dangling per-window facts reference"})
     # summary line (INFO) so the report always shows per-type coverage
     details.append({"severity": INFO, "summary": "per_type_counts",
                     "counts": per_type})

@@ -99,19 +99,26 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 > issues, commits, code and symbol events, releases, trains, timeline, feature deltas,
 > modules, people, halls and buckets, with artifact lifecycles limited to the month and their
 > status as of its end. A view over several gathered months (a quarter) is their union.
+> The per-repo facts are per month too (issue #94): **any** gathered month's view — latest or
+> earlier — carries that month's `workflow_stats` (CI health), `code_graph`, `code_owners`,
+> label taxonomy and clone sha, and its people's `modules`/`areas` use that month's code graph.
+> A quarter view over gathered months sums their CI statistics (`meta.facts_windows` lists
+> them; `workflow_stats_complete: false` when a month of the quarter was not gathered).
 >
 > *Not safe, or different:* (1) **re-viewing an earlier month later** shows each PR/issue as
 > the latest gather saw it (state, labels, milestone, comments; the view says so in
 > `meta.state_as_of`): an item open at that month's end but closed since is missing from it,
 > and its in-flight / next / forecast reflect today's open set — keep each month's view and
 > report from the time you made them (`views/`, `reports/`) and don't re-link an old month
-> into `series.json` from a grown store; (2) the per-repo facts (`workflow_stats` CI health,
-> `code_graph`, `code_owners`, label taxonomy) are the **latest** gather's in every view, so a
-> past month or a quarter shows the latest month's CI statistics (issue #94); (3) a person's
-> `modules`/`areas` in a view are the view's own (re-derived from its records, #88) but use
-> the latest month's code graph; (4) on such a store `validate` can
-> only warn about, not prove, the edges that come from latest-wins inputs (ownership,
-> dependencies, milestones); (5) edges are never retracted (a removed module `source` keeps its
+> into `series.json` from a grown store; (2) a view that is not exactly a gathered month is
+> assembled from whole months: a quarter takes its code graph, owners and taxonomy from its
+> **last** gathered month, so files changed only in an earlier month have no code area (and
+> add no person area) in it; a view inside one month or straddling two has **no**
+> `workflow_stats` (runs are counted per gathered window, not per day); (3) months gathered
+> into the store before issue #94 have no per-month facts: re-gather them, or their views
+> show the last folded month's CI statistics and structure; (4) on such a store `validate` can
+> only warn about, not prove, the edges that come from structure or latest-wins inputs
+> (ownership, area touches, dependencies, milestones); (5) edges are never retracted (a removed module `source` keeps its
 > `depends_on`, HLD §10 item 10). A single-window store per installment — the way CI and the
 > golden tests use it — has none of these, which is why the commands below still create one;
 > an accumulated `history.db` is useful for cross-window `spotlight` queries either way (§8).
@@ -265,7 +272,7 @@ flowchart TB
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
 | Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end (a month recorded after a later one is marked `captured: "backfill"`, but a first month captured late cannot be detected). |
 | Missed a month | Gather it for delivery history; its in-flight/forecast are "as of now" (above). Keep it out of the series chain, or note in the report that the comparison spans two months. |
-| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing, and singletons such as `workflow_stats` (CI health) only describe the latest window gathered into the store. Keep quarterly installments in a separate series file. |
+| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing. Over an accumulated store the quarter's `workflow_stats` (CI health) are the sum of its gathered months (`meta.facts_windows`; `workflow_stats_complete: false` if one is missing) and its code graph / owners are its last month's (§2.1); a quarter gathered as one window has its own. Keep quarterly installments in a separate series file. |
 | Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
 
 ### 5.4 Multi-repo streams and series
@@ -659,7 +666,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
 | `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
 | `validate` ERROR `edge_set` "stored but not derivable" / "derived from the stored records but not stored" / "edge data drift" | an edge the stored records do not imply (or a missing one): a producer defect or a hand-edited store | report it; don't publish; re-gather into a fresh store |
-| `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | `owns`/`touches`/`depends_on`/`in_milestone`/`in_iteration`/`blocks` edges and person areas come from latest-wins inputs (code graph, CODEOWNERS, milestone lists) and are never retracted | expected; not a failure. A single-window store is checked exactly |
+| `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | `owns`/`touches`/`depends_on`/`in_milestone`/`in_iteration`/`blocks` edges and person areas are re-derived from one whole-store bundle (latest month's code graph and CODEOWNERS, latest milestone lists) and are never retracted | expected; not a failure. A single-window store is checked exactly |
 | `validate` ERROR `provenance` "url names repo X, the node is in Y" | the repo was renamed or transferred and gathered under its old name (GitHub returns links with the new name), or the node was edited | gather under the repo's current name |
 | `validate` ERROR `provenance` "commit id … is not a 40/64-hex git sha" / ERROR `no_fabrication` id problems | a hand-made or corrupted node; gather writes only real shas and grammar ids | re-gather; never hand-edit the store |
 | `validate --repo R` of a multi-repo project passes but the project run fails `no_drift_people` | a single-member audit checks only the people that member derives (people are project-wide) | run `validate.py STORE --project P` without `--repo` for the full people check |

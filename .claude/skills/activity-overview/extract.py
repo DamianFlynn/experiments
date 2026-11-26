@@ -36,8 +36,8 @@ Materialization approach (slice 7a part 1)
    - any node whose own `ts` is in the window (range_query) and any undated
      node (it cannot be placed in a window; un-dated commits, degenerate
      fixtures).
-   Milestones, sprints and the per-repo singletons are not windowed (current
-   structure, latest gather wins). On a store holding only the viewed window
+   Milestones and sprints are not windowed (current structure, latest gather
+   wins); the per-repo facts are the window's (see below). On a store holding only the viewed window
    this selects every stored record, so single-window views are unchanged; a
    view spanning several gathered windows is their union.
 4. Reconstruct `code_events` from the ledger in insertion (rowid) order via
@@ -74,9 +74,16 @@ Per-repo singleton facts (slice 7a part 2)
 singleton dicts (aggregate facts, not arrays). fold_bundle persists each whole
 dict as a `structure` node under a well-known local id (`workflowstats` /
 `codegraph` / `codeowners` / `labeltaxonomy`) with NULL ts, identity-keyed and
-idempotent. extract reconstructs each by reading that node's `data` back, and
-emits the key ONLY when the node exists (extract never fabricates an empty key —
-fold only wrote the node when the source value was present and non-empty).
+idempotent. Those nodes are latest-wins.
+
+Per-window facts (issue #94): the same fold records the window's own values
+(`graphstore.set_window_facts`, meta `facts:` / `fact:`). `_window_facts` picks
+a view's: exactly a gathered window -> its values; otherwise CI statistics
+summed over the gathered windows inside the view and the structure of the
+latest gathered window overlapping it, named in `meta.facts_windows`. Only a
+store with no per-window facts for the repo (folded before #94) reads the
+latest-wins nodes. Either way a key is emitted ONLY when a value was stored
+(extract never fabricates an empty key — fold stores none for an empty value).
 
 symbol_events (slice 7b — the self-sourced no_drift fix)
 --------------------------------------------------------
@@ -90,6 +97,7 @@ exactly. The key is always emitted (an empty `[]` for repos with no symbol rows,
 e.g. the existing goldens). See `_materialize_symbol_events`.
 """
 
+import datetime
 import sys
 
 import graphstore
@@ -227,9 +235,26 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # 3+4. Materialize the raw arrays: the repo's stored nodes + ledger rows
     #      that belong to THIS window (issue #85; see `_view_socials`).
     branch_problems = []
+    # The repo's per-window facts for this view (issue #94); None on a store
+    # folded before #94, which reads the latest-wins singleton nodes.
+    wfacts = _window_facts(conn, project, repo, ts_from, ts_to)
+    if wfacts is None:
+        facts = {}
+        for key, local in _SINGLETON_FACTS:
+            value = _materialize_singleton(conn, project, repo, local)
+            if value is not None:
+                facts[key] = value
+    else:
+        facts = wfacts["facts"]
+        if wfacts["missing"]:
+            warn("extract: the store lost the stored value of {} for {}/{} "
+                 "[{} .. {}]; left out of the view (re-gather the window)".format(
+                     ", ".join(wfacts["missing"]), project, repo, ts_from,
+                     ts_to))
     bundle = {"meta": _materialize_meta(conn, project, repo, ts_from, ts_to,
                                         ref_date=ref_date,
-                                        problems=branch_problems)}
+                                        problems=branch_problems,
+                                        window_facts=wfacts)}
 
     socials = graphstore.repo_nodes(conn, project, repo, node_class="social")
     codes = graphstore.repo_nodes(conn, project, repo, node_class="code")
@@ -323,8 +348,7 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # stored node (the project-wide union) is not changed; its flags (`is_bot`,
     # `login_resolved`) are kept. See `_view_people`.
     bundle["people"] = _view_people(
-        _materialize_people(conn, project), bundle,
-        _materialize_singleton(conn, project, repo, "codegraph"))
+        _materialize_people(conn, project), bundle, facts.get("code_graph"))
 
     structure = graphstore.repo_nodes(conn, project, repo, node_class="structure")
     bundle["milestones"] = _by(
@@ -349,11 +373,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     if sprints:
         bundle["sprints"] = sprints
 
-    # Per-repo singleton facts: emit each key only when its node was stored.
-    for key, local in _SINGLETON_FACTS:
-        value = _materialize_singleton(conn, project, repo, local)
-        if value is not None:
-            bundle[key] = value
+    # Per-repo facts (issue #94: this window's; see `_window_facts`): emit each
+    # key only when a value was stored.
+    for key, _local_id in _SINGLETON_FACTS:
+        if key in facts:
+            bundle[key] = facts[key]
 
     return bundle
 
@@ -699,6 +723,127 @@ def _materialize_people(conn, project):
     return people
 
 
+def _day(value):
+    """A window bound's calendar day (date prefix), or None."""
+    try:
+        return datetime.date.fromisoformat(str(value)[:10]) if value else None
+    except ValueError:
+        return None
+
+
+def _contained(window, ts_from, ts_to):
+    """Is every day of the gathered window {from, to} inside the view
+    [ts_from, ts_to]? Date prefixes; a None view bound is open."""
+    w_from, w_to = (window.get("from") or "")[:10], (window.get("to") or "")[:10]
+    return bool(w_from and w_to) and (not ts_from or w_from >= ts_from[:10]) \
+        and (not ts_to or w_to <= ts_to[:10])
+
+
+def _covers(windows, ts_from, ts_to):
+    """Do `windows` together cover every day of the view [ts_from, ts_to]?"""
+    lo, hi = _day(ts_from), _day(ts_to)
+    if lo is None or hi is None:
+        return False
+    spans = sorted((_day(w["from"]), _day(w["to"])) for w in windows)
+    nxt = lo
+    for a, b in spans:
+        if a is None or b is None or a > nxt:
+            break
+        nxt = max(nxt, b + datetime.timedelta(days=1))
+    return nxt > hi
+
+
+def _neg_day(value):
+    """Sort key putting a later day first."""
+    day = _day(value)
+    return -day.toordinal() if day else 0
+
+
+def _window_facts(conn, project, repo, ts_from, ts_to):
+    """The per-repo facts (workflow_stats / code_graph / code_owners /
+    label_taxonomy) for the view [ts_from, ts_to] (issue #94).
+
+    Returns None on a store with no per-window facts for this repo (folded
+    before #94): the caller then reads the latest-wins nodes. Else
+    {"facts": {key: value}, "clone_sha", "note", "missing"}:
+
+    - a view of exactly a gathered window: that window's facts, note None;
+    - any other view: CI statistics are the sum of the gathered windows that
+      lie wholly inside it (a window that only partly overlaps it is left out:
+      its runs cannot be split by day; so is one overlapping a window already
+      summed — by start day, longest first — so no run counts twice; none
+      inside -> no workflow_stats); the
+      structure (code graph, owners, taxonomy) and clone sha are those of the
+      latest gathered window overlapping the view, else the latest ending
+      before it, else the earliest. `note` (meta.facts_windows) names them.
+    `missing` lists keys whose stored value is gone (a damaged store)."""
+    exact = graphstore.get_window_facts(conn, project, repo, ts_from, ts_to)
+    if exact is not None:
+        return dict(exact, note=None)
+    try:
+        ledger = graphstore.get_windows(conn)
+    except ValueError:
+        ledger = []
+    windows = sorted({(w.get("from"), w.get("to")) for w in ledger
+                      if isinstance(w, dict) and w.get("project") == project
+                      and w.get("repo") == repo and w.get("from") and w.get("to")})
+    recorded = {k for k in windows   # existence probe: no value is read
+                if graphstore.get_window_facts(conn, project, repo, *k,
+                                               keys=()) is not None}
+    if not recorded:
+        return None
+    structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
+                           if k != "workflow_stats")
+
+    def win(key):
+        return {"from": key[0], "to": key[1]}
+
+    def latest(keys):
+        return max(keys, key=lambda k: (k[1][:10], k[0][:10], k))
+
+    overlapping = [k for k in windows if _overlaps(win(k), ts_from, ts_to)]
+    # Sum windows that do not overlap one another, so no run is counted twice
+    # (a store can hold a month and a re-folded roll-up or part of it): by
+    # start day, the longest first; a window overlapping one taken is left out.
+    summed, last_to = [], None
+    for k in sorted((k for k in overlapping if k in recorded
+                     and _contained(win(k), ts_from, ts_to)),
+                    key=lambda k: (k[0][:10], _neg_day(k[1]), k)):
+        if last_to is None or k[0][:10] > last_to:
+            summed.append(k)
+            last_to = k[1][:10]
+    excluded = [k for k in overlapping if k not in summed]
+    candidates = [k for k in overlapping if k in recorded]
+    if not candidates and ts_from:
+        candidates = [k for k in recorded if k[1][:10] < ts_from[:10]]
+    if candidates:
+        structure = latest(candidates)
+    else:
+        structure = min(recorded, key=lambda k: (k[0][:10], k[1][:10], k))
+    chosen = graphstore.get_window_facts(conn, project, repo, *structure,
+                                         keys=structure_keys)
+    facts = dict(chosen["facts"])
+    missing = list(chosen["missing"])
+    stats = []
+    for k in summed:
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("workflow_stats",))
+        missing.extend(got["missing"])
+        if got["facts"].get("workflow_stats"):
+            stats.append(got["facts"]["workflow_stats"])
+    if stats:
+        facts["workflow_stats"] = derive.sum_workflow_stats(stats)
+    note = {"structure": win(structure),
+            "workflow_stats": [win(k) for k in summed],
+            # every day of the view is in exactly one summed window
+            "workflow_stats_complete": bool(summed)
+            and _covers([win(k) for k in summed], ts_from, ts_to)}
+    if excluded:
+        note["workflow_stats_excluded"] = [win(k) for k in excluded]
+    return {"facts": facts, "clone_sha": chosen["clone_sha"], "note": note,
+            "missing": sorted(set(missing))}
+
+
 def _materialize_singleton(conn, project, repo, local):
     """Read back a per-repo singleton fact persisted as a structure node under a
     well-known local id (workflow_stats/code_graph/code_owners/label_taxonomy).
@@ -772,7 +917,7 @@ def _resolve_branches(conn, project, repo, ts_from, ts_to):
 
 
 def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None,
-                      problems=None):
+                      problems=None, window_facts=None):
     """Reconstruct raw `meta`: owner/repo/window (+clone_sha if recorded), plus
     the view's window (issue #75):
 
@@ -786,9 +931,19 @@ def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None,
     see `_resolve_branches`) and `branches`, so `link` can tell a merge into
     the mainline from a stacked / release-branch merge. When it is unknown
     the reason is appended to `problems` (if a list is passed).
+
+    `window_facts` (issue #94, see `_window_facts`): when given, `clone_sha`
+    is the one recorded with the window whose structure the view uses (absent
+    when that gather had none) and `facts_windows` names the gathered windows
+    the view's facts come from (only when the view is not exactly one of
+    them). When None (a store folded before #94) `clone_sha` is the repo's
+    latest.
     """
     meta = {"owner": project, "repo": repo, "from": ts_from, "to": ts_to}
-    clone_sha = graphstore.get_clone_sha(conn, project, repo)
+    if window_facts is None:
+        clone_sha = graphstore.get_clone_sha(conn, project, repo)
+    else:
+        clone_sha = window_facts.get("clone_sha")
     if clone_sha:
         meta["clone_sha"] = clone_sha
     meta["base_branch"], meta["branches"], problem = _resolve_branches(
@@ -807,6 +962,8 @@ def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None,
     latest = _latest_gathered_to(conn, project, repo)
     if latest and ts_to and not graphstore.ts_in_window(latest, None, ts_to):
         meta["state_as_of"] = latest
+    if window_facts is not None and window_facts.get("note"):
+        meta["facts_windows"] = window_facts["note"]
     return meta
 
 

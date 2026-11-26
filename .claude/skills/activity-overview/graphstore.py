@@ -6,6 +6,7 @@ the function API below. See STORE.md for the schema and identity rules.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -1061,6 +1062,116 @@ def get_branches(conn, project, repo, frm, to):
     or folded before issue #84)."""
     raw = get_meta(conn, _branches_key(project, repo, frm, to))
     return json.loads(raw) if raw else None
+
+
+# Per-window facts (issue #94): the bundle keys a gather computes for ITS
+# window (CI runs created in it, the areas of the files it saw, the CODEOWNERS
+# and label taxonomy of its checkout). Kept per (project, repo, from, to) so a
+# view of an earlier window does not read a later gather's values.
+WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
+                    "label_taxonomy")
+
+
+def _window_facts_key(project, repo, frm, to):
+    return "facts:{}/{}:{}:{}".format(project, repo, frm, to)
+
+
+def _fact_blob_prefix(project, repo):
+    return "fact:{}/{}:".format(project, repo)
+
+
+def set_window_facts(conn, project, repo, frm, to, bundle, clone_sha=None,
+                     commit=True):
+    """Record the facts of a gathered window [frm, to] (issue #94).
+
+    `facts:{project}/{repo}:{from}:{to}` holds {"clone_sha", "facts": {key:
+    sha256}} for each WINDOW_FACT_KEYS value present and non-empty in `bundle`
+    (the same rule fold applies to the latest-wins nodes). Each value is
+    stored once per repo under `fact:{project}/{repo}:{sha256}` (its JSON
+    text, encoded as node data is), so windows with identical facts share it.
+    A re-fold of the same window replaces its entry; a value no window of the
+    repo references any more is deleted. `commit=False` leaves the writes in
+    the caller's open transaction."""
+    refs = {}
+    for key in WINDOW_FACT_KEYS:
+        value = bundle.get(key)
+        if not value:
+            continue
+        text = json.dumps(value, sort_keys=True)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        set_meta(conn, _fact_blob_prefix(project, repo) + digest, text,
+                 commit=False)
+        refs[key] = digest
+    set_meta(conn, _window_facts_key(project, repo, frm, to),
+             json.dumps({"clone_sha": clone_sha, "facts": refs},
+                        sort_keys=True), commit=False)
+    _prune_fact_blobs(conn, project, repo)
+    if commit:
+        conn.commit()
+
+
+def _meta_with_prefix(conn, prefix):
+    lo, hi = _prefix_range(prefix)
+    return conn.execute("SELECT key, value FROM meta WHERE key >= ? AND key < ? "
+                        "ORDER BY key", (lo, hi)).fetchall()
+
+
+def _prune_fact_blobs(conn, project, repo):
+    """Delete the repo's fact values no window entry references."""
+    used = set()
+    for _key, value in _meta_with_prefix(
+            conn, "facts:{}/{}:".format(project, repo)):
+        try:
+            used |= set((json.loads(value).get("facts") or {}).values())
+        except (ValueError, AttributeError):
+            return   # an unreadable entry: keep everything (validate reports it)
+    prefix = _fact_blob_prefix(project, repo)
+    for key, _value in _meta_with_prefix(conn, prefix):
+        if key[len(prefix):] not in used:
+            conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
+
+def get_window_facts(conn, project, repo, frm, to, keys=WINDOW_FACT_KEYS):
+    """The facts recorded for exactly this gathered window, or None when that
+    window was not folded (or was folded before issue #94):
+    {"clone_sha", "facts": {key: value}, "missing": [keys whose stored value
+    is gone]} — `missing` is non-empty only on a damaged store. Only the
+    values of `keys` are read (`()` reads none: an existence probe)."""
+    raw = get_meta(conn, _window_facts_key(project, repo, frm, to))
+    if not raw:
+        return None
+    entry = json.loads(raw)
+    facts, missing = {}, []
+    for key in keys:
+        digest = (entry.get("facts") or {}).get(key)
+        if digest is None:
+            continue
+        text = get_meta(conn, _fact_blob_prefix(project, repo) + digest)
+        if text is None:
+            missing.append(key)
+        else:
+            facts[key] = json.loads(text)
+    return {"clone_sha": entry.get("clone_sha"), "facts": facts,
+            "missing": missing}
+
+
+def window_facts_problems(conn):
+    """[(meta key, problem)] for every per-window facts entry of the store
+    that is unreadable or names a value that is not stored (issue #94)."""
+    out = []
+    for key, value in _meta_with_prefix(conn, "facts:"):
+        try:
+            entry = json.loads(value)
+            refs = entry.get("facts") or {}
+            scope = key[len("facts:"):].split(":", 1)[0]
+        except (ValueError, AttributeError):
+            out.append((key, "unreadable per-window facts entry"))
+            continue
+        for fact in sorted(refs):
+            if get_meta(conn, "fact:{}:{}".format(scope, refs[fact])) is None:
+                out.append((key, "{} value {} is not stored".format(
+                    fact, refs[fact])))
+    return out
 
 
 _DEAD_REFS_DDL = (

@@ -448,7 +448,7 @@ flowchart TB
   s7["7 · people (derive.enumerate_participants, repo = *)<br/>union across members, bots tagged"]
   s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; owns; touches; in_milestone; in_iteration"]
   s9["9 · depends_on (_fold_depends_on)<br/>+ cross-repo registry resolution"]
-  s10["10 · singletons: workflowstats, codegraph, codeowners, labeltaxonomy<br/>+ gathered_windows, clone_sha meta"]
+  s10["10 · singletons: workflowstats, codegraph, codeowners, labeltaxonomy (latest-wins)<br/>+ gathered_windows, ref_date, branches, clone_sha, per-window facts meta"]
   s1 --> s2 --> s3 --> s4 --> s5 --> s6 --> s7 --> s8 --> s9 --> s10
 ```
 
@@ -466,6 +466,15 @@ order-independent. Symbol moves stay matched per window (whole-ledger matching w
 creation `add` plus a later move `add` into an ambiguous pair); the nodes apply every recorded
 move, a source only while its last event is a remove. Cost: one read of the repo's ledger per
 fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows).
+
+**Per-window facts (#94).** The singleton nodes are latest-wins. In the same transaction the
+fold also calls `graphstore.set_window_facts(project, repo, from, to, bundle, clone_sha)`:
+meta `facts:{p}/{r}:{from}:{to}` = `{clone_sha, facts: {key: sha256}}` for each non-empty
+`workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy`, each value stored once per
+repo under `fact:{p}/{r}:{sha256}` (shared by windows with identical values; a re-fold of the
+window replaces its entry and unreferenced values are deleted). Keyed by window, not clone
+sha: the directory code graph is built from the window's changed paths, so two windows of one
+checkout differ. Written whenever `meta.from` and `meta.to` are set; no schema change.
 
 ### 4.11 Cross-repo `depends_on` resolution (Terraform, Bicep)
 
@@ -590,7 +599,7 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
 | Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
 | Text | `index_text` / `index_texts` (replace by node id via `fts_map`, no table scan), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
-| Provenance | `record_window`/`get_windows`, `set_clone_sha`/`get_clone_sha` |
+| Provenance | `record_window`/`get_windows`, `set_clone_sha`/`get_clone_sha`, `set_ref_date`/`get_ref_date` (#75), `set_branches`/`get_branches` (#84), `set_window_facts`/`get_window_facts`/`window_facts_problems` (#94) |
 | Member run status | `set_member_status`/`get_member_status`, `incomplete_members(conn, project, ts_from, ts_to)`, `incomplete_warning`, `describe_member_status` (#77) |
 | Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
 
@@ -630,12 +639,18 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
      commits (a row whose commit is not stored: its own date decides);
    - any pr/issue/commit node whose own `ts` is in the window (`range_query`), and any undated
      node (it cannot be placed in a window);
-   - `releases`: `published_at` in the window (or undated); `milestones`, `sprints` and the
-     singletons: not windowed (current structure).
+   - `releases`: `published_at` in the window (or undated); `milestones`, `sprints`: not
+     windowed (current structure).
    Re-attach reviews/lifecycle onto the view's parents (a review/event follows its parent,
    whatever its own timestamp); surface `blocks` as `blocking`/`blocked_by`.
-5. Read back `artifacts` and `people` (the write path already derived them) and the singleton
-   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`). Window scope:
+5. Read back `artifacts` and `people` (the write path already derived them) and the per-repo
+   facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`) — `_window_facts`
+   (#94): exactly a gathered window → its `facts:` entry; any other window → `workflow_stats`
+   = `derive.sum_workflow_stats` of the gathered windows wholly inside the view and not
+   overlapping one another (by start day, longest first; absent when none; a window only
+   partly overlapping the view is not summed), structure = the latest gathered
+   window overlapping the view (by `to`), else the latest ending before it, else the earliest;
+   no `facts:` entry for the repo (pre-#94 store) → the latest-wins singleton nodes. Window scope:
    each artifact's `lifecycle` keeps the view's events (same predicate as the ledger rows) and
    an artifact with none is left out; `status`/`replaced_by`/move fields are as of the
    window's end — the stored node when the ledger holds nothing dated after `ts_to`, else
@@ -645,7 +660,7 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    over them, the enumerator fold uses (commit `pr` resolved from the message on a copy, null
    lists read as empty) — so another member's people and people of another window are left
    out; each kept record's `modules`/`areas` are what that enumerator derives from the view's
-   records with this repo's stored `code_graph`, its flags (`is_bot`, `login_resolved`) are
+   records with the view's `code_graph` (above), its flags (`is_bot`, `login_resolved`) are
    the stored node's. The person node is not changed. `code_owners` is an
    ordered rule list so CODEOWNERS last-match-wins order survives the sorted-key JSON store;
    `fold_bundle` (`owns`) and `annotate_people_profile` (`stale_owned`) share one matcher,
@@ -661,7 +676,11 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    `null` / `[]` — and, when a merged PR is in the view, a `warn` saying why (windows
    disagree, gather could not determine it, or a pre-#84 store). Never a guessed `main`.
    Issue #85 adds `state_as_of` = the latest `to` of the repo's gathered windows, only when
-   that is after `ts_to` (the view's records are stored latest-wins).
+   that is after `ts_to` (the view's records are stored latest-wins). Issue #94: `clone_sha`
+   is the one recorded with the window whose structure the view carries (absent when that
+   gather had none; the repo's latest on a pre-#94 store), and `facts_windows` =
+   `{structure, workflow_stats: [windows summed], workflow_stats_complete,
+   workflow_stats_excluded?}` when the view is not exactly a gathered window (BUNDLE.md).
 
 The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 
@@ -672,8 +691,12 @@ The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 > gather refreshed; a view spanning several windows is their union. `digest` applies the same
 > decision to its spine components (`window_components`), so a project train does not fold in
 > another window's PR/issue as an orphan ref. People's `modules`/`areas` are re-derived from the
-> view's records (#88), so they are the window's too — computed with the latest stored code
-> graph. Not windowed: the per-repo singletons (latest gather, #94). See HLD §10 item 8.
+> view's records (#88), so they are the window's too — computed with the window's own code
+> graph (#94). A view of one gathered window carries that window's CI statistics, structure
+> and clone sha, so it equals a store holding only that window there too. On a single-window
+> store a view of exactly its window is unchanged; any other view of it now carries
+> `meta.facts_windows`, and a sub-window view omits `workflow_stats` (the month's runs cannot
+> be split by day). See HLD §10 item 8.
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -990,7 +1013,7 @@ over every member holding data (`project_repos`) plus the project-wide checks.
 | Check | Asserts |
 |---|---|
 | `target` | the store has nodes, the project has nodes and the repo is a stored member (case-insensitive, resolved to the stored spelling); and the member's last gather of every recorded window is `ok` (meta `member_status`, #77) |
-| `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR |
+| `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR; a per-window `facts:` meta entry that is unreadable or names a `fact:` value that is not stored is ERROR (#94, `graphstore.window_facts_problems`) |
 | `participant_completeness` | every login in any raw record has a person node and its contribution edge |
 | `provenance` | every social/code node cites its own source: a PR/issue `url` is `https://github.com/{owner}/{repo}/pull\|issues/N` for the node's repo (case-insensitive) and `data.number == N`; a review/event cites its parent (or fold's synthesized fallback, or a timeline event's `api.github.com/repos/{owner}/{repo}/` url); a commit id is a 40/64-hex sha equal to `data.sha`; an artifact cites a lifecycle commit (#89) |
 | `no_fabrication` | no orphan person, no historyless artifact; every id follows the grammar, its scope equals the row's `project`/`repo` (people: `{project}` + repo `*`) and its local form fits the node class; no scope is stored under two case spellings (#89) |
@@ -1017,12 +1040,17 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   `stored but not derivable` and `edge data drift` are ERRORs. A stored edge into another member
   repo passes when `gather._cross_repo_pr_edges` (members = stored repos, `member_status` repos
   and the dst repo) derives it from the stored PR, or, for `depends_on`, when an unresolved
-  registry edge of the source area in the `codegraph` singleton carries the edge's `data` and the
+  registry edge of the source area in the self-sourced bundle's `code_graph` carries the edge's `data` and the
   dst is a member's root area. A missing cross-repo edge is not detected.
 - *Edge classes.* Record-derived (`authored`, `merged`, `reviewed`, `reported`, `commented`,
   `closes`, `cross_ref`, `part_of`): exact on every store. Latest-wins (`owns`, `touches`,
   `depends_on`, `in_milestone`, `in_iteration`, `blocks`): exact on a one-window store, WARN on a
-  multi-window one (its inputs are not kept per window; edges are not retracted, #95). Moves
+  multi-window one: the check re-derives from ONE whole-store bundle (whose `code_graph` /
+  `code_owners` are the latest gathered window's, #94), the milestone/sprint/`blocks` inputs ride
+  latest-wins records, and edges are not retracted (#95). Since #94 the inputs of `owns`,
+  `touches`, `depends_on` (and of people's areas) are kept per window; re-deriving per gathered
+  window (fold each window's view with its own facts, union) would make those exact for stores
+  whose windows were each folded once since #94 — not done yet (§14.5). Moves
   (`replaced_by`, `identity_from`): exact on a one-window store; on a multi-window one each stored
   move must pass `_move_problem` (twin edge with equal data, same non-comment symbol in two files,
   a ledger drop of the source — by `move_commit` — and an add of the destination, basis/confidence
@@ -1248,7 +1276,8 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
   from determinism assertions.
 - Idempotency is per window: re-folding the **same** window is a no-op. Artifact nodes are
   cumulative across **different** (even overlapping) windows and independent of fold order
-  (§4.10); the views are not yet window-scoped — see §14.5.
+  (§4.10); views are window-scoped (#85) and read their window's CI statistics and structure
+  (#94); what is still latest-wins is listed in §14.5.
 
 ### 14.2 Degradation matrix
 
@@ -1294,7 +1323,9 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 |---|---|---|---|
 | Past-month views show the latest record state | PR/issue nodes are upserted latest-wins; a view is window-scoped (#85) but reads the stored record | on a store holding later windows, a past month's view shows today's state/labels/milestone/comments (`meta.state_as_of`); an item open at that month's end but closed since is not in it; an item updated in that month and again later is in the later month only | per-window snapshots of the record at fold |
 | `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; since #85 a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
-| Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | every view (a past month, a wider digest window) shows the latest gather's CI stats and structure; a view's people `modules`/`areas` (re-derived from its records since #88) are attributed with the latest code graph | store per-window singletons or aggregate (#94) |
+| Wide views use one code graph | since #94 a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them; the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
+| Sub-window CI statistics are not available | `workflow_stats` are counted per gathered window, not per run day | a view inside a gathered window (a week of a gathered month) or straddling two has no `workflow_stats` (`meta.facts_windows.workflow_stats_excluded` says why); a view over ungathered days sums only what was gathered (`workflow_stats_complete: false`) | store per-day run counts |
+| Pre-#94 stores have no per-window facts | fold writes `facts:` meta keys only since #94 | their views read the latest-wins singleton nodes: a past month shows the last folded month's CI stats and structure; a store with some pre-#94 windows lists them under `workflow_stats_excluded` in wider views | re-gather each window |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
@@ -1305,7 +1336,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Pre-#84 stores have no base branch | fold stores `branches:` meta keys only since #84 | their views carry `meta.base_branch: null`, `extract` warns, and every merged PR (stacked, release-branch) counts as shipped, as before #84 | re-gather the window |
 | One mainline per view | `link` compares a PR's `base` with one `meta.base_branch` | a roll-up spanning a default-branch rename (`master` → `main`) gets `null` (warned), so its merges are not told apart; view each gathered window on its own | carry a set of mainline names if needed |
 | Trust gate cannot see record content changes | self-sourced checks compare the store with its own records and ledger; no per-fold content digest is recorded (it would need a `fold_bundle` change) | a record deleted with all its edges, a consistently rewritten blob or a wrong ledger pass a store-only `validate` | `--bundle` with a view saved at gather time catches the first two; a fold digest in `meta` would cover the rest |
-| Multi-window stores: latest-wins edges are WARN | the inputs of `owns`/`touches`/`depends_on`/`in_milestone`/`in_iteration`/`blocks` and of people's areas are not kept per window, and edges are not retracted (#95) | on a store holding several windows a stale or tampered edge of those types, or an extra stored area, is a WARN, not an ERROR | per-window singletons (and #95 retraction) would make them exact |
+| Multi-window stores: latest-wins edges are WARN | `edge_set` / `no_drift` re-derive from one whole-store bundle carrying the latest window's structure; the inputs of `in_milestone`/`in_iteration`/`blocks` are latest-wins records; edges are not retracted (#95) | on a store holding several windows a stale or tampered edge of those types (and of `owns`/`touches`/`depends_on`), or an extra stored area, is a WARN, not an ERROR | `owns`/`touches`/`depends_on`/people areas: re-derive per gathered window from its `facts:` entry (inputs kept since #94); the rest needs #95 retraction and per-window record snapshots |
 | A renamed or transferred repo fails `provenance` | PR/issue urls must name the node's repo; the API returns the current name after a rename | gathering a repo under its old name (manifest or `--repo`) stores `html_url`s of the new name and fails `provenance` | gather under the current name |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
 | Timeline code events of older commits order by day | `committed_at` (#82) is gathered from `%cI` by the commit walk only | commits in a store folded before #82, and backfilled commits (five-field log), have no `committed_at`, so their timeline events keep the bare date and sort before that day's social events | re-gather; log `%cI` in `make_backfill_fetcher` too |

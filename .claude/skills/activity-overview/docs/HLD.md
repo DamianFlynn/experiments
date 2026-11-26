@@ -479,18 +479,24 @@ These are real, current limits — plan around them:
    (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when). An
    item that was open at the end of that month but has closed since is not in its view
    (its stored state is closed, outside the month); an item updated in that month and again
-   later is in the later month's view only. The per-repo singletons are the latest gather's
-   (item 9), and a person's `modules`/`areas` in a view are computed with that latest code
-   graph; a view spanning several gathered windows can still match a symbol move across them
-   (LLD §14.5).
+   later is in the later month's view only. The per-repo facts are per window (item 9), so a
+   person's `modules`/`areas` in a month's view are computed with that month's code graph; a
+   view spanning several gathered windows uses the latest one's, and can still match a symbol
+   move across them (LLD §14.5).
    **People in a multi-repo project (#88).** A member bundle lists only the people with a
    contribution in that member's window, with that repo's areas; the project view sums each
    person's counts across members (nobody is counted twice), combines dates and review
    latency, qualifies areas as `<repo>::<area>` and ranks `halls.fame` on those totals. The
    stored person node stays the project-wide union (what `validate` checks).
-9. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
-    `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
-    latest gathered window only.
+9. **Per-repo facts are per gathered window, not per day.** Since #94 each fold also records
+    its window's `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` and clone sha
+    (STORE.md "Meta", `facts:`), and a view of exactly a gathered window shows that window's.
+    Other views are assembled from whole windows: CI statistics are the sum of the gathered
+    windows lying inside the view (absent for a sub-window or a straddling view, marked
+    incomplete when days are missing), and the structure is the latest overlapping window's
+    — so a quarter view attributes code areas with its last month's (window-scoped) code
+    graph. `meta.facts_windows` says which windows. Stores folded before #94 keep the
+    latest-wins values until re-gathered.
 10. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
     `depends_on` edge in an existing store. On a multi-window store `validate` reports such
     stale latest-wins edges as WARN, not ERROR.
@@ -562,8 +568,10 @@ holds: a record deleted with all its edges, a blob rewritten consistently, or a 
 ledger (artifacts are compared with the store's own ledger) leave a consistent store. A
 `--bundle` saved at gather time (a `view.py` JSON of the fresh store) catches changed or deleted
 records; the store keeps no per-fold content digest. On a store holding several windows, the
-edges and people areas that come from latest-wins inputs (item 9) can only be WARNed about, not
-proven.
+edges and people areas that come from structure or latest-wins inputs (ownership, area
+touches, dependencies, milestones, sprints, blockers) can only be WARNed about, not proven:
+the gate re-derives them from one whole-store bundle, although since #94 the structure inputs
+are kept per window (LLD §8, §14.5).
 
 ## 11. Extension points and roadmap
 
