@@ -3543,6 +3543,11 @@ def _read_git_passthrough_config(env):
     such file) contributes nothing."""
     pairs = []
     for scope in ("--system", "--global"):
+        # `git config --system` reads the system file even when the user has
+        # switched it off; honour GIT_CONFIG_NOSYSTEM here.
+        if scope == "--system" and env.get("GIT_CONFIG_NOSYSTEM", "").lower() \
+                in ("1", "true", "yes", "on"):
+            continue
         try:
             proc = subprocess.run(
                 ["git", "config", scope, "--includes", "-z", "--get-regexp",
