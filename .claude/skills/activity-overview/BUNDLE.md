@@ -513,6 +513,182 @@ candidate in two windows), and two keys are added: `windows` (the merged windows
 day is missing). Multi-repo: per member bundle; a person new to one member may have worked in
 another. Additive and omit-when-absent: `meta.schema_version` stays 3.
 
+## Module changes (`module_notes` → `module_changes`)
+
+The reader's view of a window, shaped like a product's monthly release notes: which modules
+are new, what changed in existing ones, what is breaking, what was deprecated, and how much of
+the merged work was plumbing (CI, docs generation, tests). Two keys:
+
+- **`module_notes`** (raw, from the store) — what gather read from the clone for the window
+  (`gather.collect_module_notes`; a per-window fact like `newcomers`, STORE.md). Omitted when
+  no gather stored it (a store gathered before this layer; every fixture bundle; a gather
+  without the window's history on disk).
+- **`module_changes`** (added by `link.py`) — built only when the view carries
+  `module_notes` with `collected: true`, so every other bundle is unchanged.
+
+### `module_notes`
+
+```json
+{"collected": true,
+ "changelogs": [{"path": "avm/res/dev-test-lab/lab/CHANGELOG.md", "module": "avm/res/dev-test-lab/lab",
+                 "commit": "574f7d71…", "date": "2026-10-03", "change": "modify",
+                 "entries": [{"version": "0.6.0", "heading": "## 0.6.0", "sections": [
+                   {"heading": "Changes", "kind": "changed", "items": [], "placeholder": "None"},
+                   {"heading": "Breaking Changes", "kind": "breaking",
+                    "items": [{"text": "Deprecated `avm/res/dev-test-lab/lab/secret` as no longer supported by Resource Provider (…)"}]}]}]}],
+ "versions": [{"path": "avm/res/dev-test-lab/lab/version.json", "module": "avm/res/dev-test-lab/lab",
+               "commit": "574f7d71…", "date": "2026-10-03", "change": "modify", "from": "0.5", "to": "0.6"}],
+ "tags": {"collected": true, "source": "clone", "items": [
+   {"tag": "avm/res/devices/iot-hub/0.4.0", "module": "avm/res/devices/iot-hub", "version": "0.4.0",
+    "date": "2026-10-06T11:19:12Z", "date_source": "commit", "commit": "62b1f05b…", "first": false}]},
+ "unread": [{"path": "…", "commit": "…", "date": "…", "reason": "…"}]}
+```
+
+- **`changelogs`** — one row per (changelog file, commit) whose commit **added** entries. A
+  changelog is a file named `CHANGELOG.md`, `CHANGES.md`, `HISTORY.md`, `RELEASE_NOTES.md` or
+  `RELEASENOTES.md` (any case). The file is parsed at the commit and at its parent (at
+  `old_path` for a rename, so a moved module's changelog is not new) and compared
+  (`changelog_added_entries`): a version the parent lacks is added whole; items appended to
+  a version the parent already had are an entry with `amended: true`; a changelog that names
+  no version yields its new bullets as one entry with `version: null`. `new_file: true` when
+  the file did not exist before (an add or copy). Parsing is generic (`parse_changelog`): an
+  entry starts at a heading naming a version (`## 0.6.0`, `## [1.2.0] - 2026-10-14` → `date`,
+  `# v2.0.0`, `## [Unreleased]`), any heading level; deeper headings are its sections, each
+  with its verbatim `heading` and a `kind` — `breaking`, `deprecated`, `removed`, `security`,
+  `fixed`, `added`, `changed`, `other` (an unknown heading keeps its own heading) or
+  `unsectioned` (items before any section). Items are verbatim bullet or paragraph text
+  (continuation lines, nested bullets and a following fenced block included), capped at 600
+  characters with `truncated_from` the original length; more than 40 items in a section →
+  `items_omitted`, more than 12 entries per file per commit → `entries_omitted`. A section
+  holding only placeholders ("None", "N/A", "None (interface unchanged)") keeps `items: []` and
+  `placeholder` (what it said). Nothing is invented: text not in the file is never produced.
+- **`versions`** — a `version.json` whose top-level `version` moved (`from` null when the file
+  is new).
+- **`tags`** — the version tags the clone holds dated in the window: a tag whose last path
+  segment is a version; the rest is the module path it publishes (`""` = the repository
+  root, e.g. `v1.2.0`). `date` is the tagger date of an annotated tag (`date_source:
+  "tagger"`) or, for a lightweight tag (no date of its own), the committer date of the tagged
+  commit (`"commit"`). `first`: no version tag of that module in the clone is dated before
+  the window. `{"collected": false, "reason"}` when the clone holds no tag or listing them
+  failed. No network call: the tags the clone / fetch brought along.
+- **`unread`** (only when any) — file versions git could not read: a visible gap, never guessed.
+
+A view of exactly a gathered window carries the stored value verbatim (`validate.py
+--bundle` compares it). Any other view takes the items (all dated) of every gathered window
+overlapping it that fall inside it, once each, and adds `windows` and `covers_view`;
+`tags.windows_without_tags` names windows that listed none.
+
+### `module_changes`
+
+```json
+{"summary": {...}, "modules": [...], "prs": [...], "releases": [...]?, "inputs": {...}, "path_rules": [...]?}
+```
+
+**`modules[]`** — one entry per module area touched in the window (sorted by `area`); an
+area is a module when it is `avm/res|ptn|utl/<group>/<name>` (`kind` `resource` /
+`pattern` / `utility`), the Terraform root `main.tf` area or an area with a `*.tf` directly
+in it (`module`), `modules/<name>` (`submodule`), or a Bicep directory outside `avm/` with
+its own `main.bicep` (`deployment`, e.g. a landing zone's deployments). Docs, CI and other
+areas are not modules (they still count for the PR classes). Keys (empty ones omitted):
+
+- `area`, `kind`, `status` — `removed` (entry file `main.bicep` / `main.tf` deleted or moved
+  away; `structure.moved_to`) > `new` (entry file added, or the module's own changelog
+  created with entries, or its first version tag in the clone dated in the window) >
+  `deprecated` (a `DEPRECATED.md` added at the module root) > `orphaned` (an `ORPHANED.md`
+  added: no owner — **not** deprecated) > `changed` > `published` (only a version tag).
+- `first_version` (new modules: the oldest version of the new changelog, else the first
+  tag, else `version.json`), `introduced_by` (new modules: the sources of each signal).
+- `structure` — `moved_from` / `moved_to`, `lifecycle_markers` [{file, change, sources}],
+  `children` [{path, change: added | removed | moved (`from`) | modified | deprecated |
+  orphaned, markers?, interface?, sources}] for child modules (`<area>/…/main.bicep`).
+- `versions` — `version_file` {from, to, sources}, `child_version_files`, `changelog` (the
+  versions the module's own changelog gained), `published` (tags: version, tag, date,
+  date_source, commit, first, `module` when a child's), `releases` (Terraform root module:
+  the repo's GitHub releases of the window).
+- `changelog` — [{version, date?, amended?, module? (a child's changelog), sections:
+  [{heading, kind, items, placeholder?}], sources}] — the maintainers' text, verbatim.
+- `interface` — from the window's symbol events of the module's interface file
+  (`main.bicep`; for Terraform every `*.tf` directly in the module dir), net over the window
+  (added then removed = nothing): `parameters` {added [{name, declaration, required:
+  true | false | null}], removed, modified [{before, after}], moved [{from_path, to_path,
+  confidence}]}, `outputs` {added, removed, modified, moved}, `resources` {added, removed,
+  modified, `api_versions` [{name, type, from, to}]}, `dependencies` {added / removed [{name,
+  ref, target, version?, local?}], changed [{change: "version" | "target", from, to}]}.
+  `required` is true for a Bicep `param` without a default and not nullable (`?`), false
+  with either, null when the declaration snippet cannot tell (Terraform `variable` headers,
+  multi-line types). Declarations are the stored snippets (200 characters).
+- `breaking` — **`declared`**: the changelog's "Breaking Changes" items, verbatim
+  ({version, text, module?, sources}) — the maintainers' own statement. **`candidates`**:
+  derived by rule from the interface, a hint to check, never a claim: `parameter_removed`,
+  `parameter_moved`, `required_parameter_added`, `parameter_became_required`,
+  `output_removed`, `output_moved`, `child_module_removed`, `child_module_moved`,
+  `module_removed` ({rule, subject, sources}). A new module has no candidates (nobody
+  consumed it). The two lists are never merged.
+- `deprecations` — [{target, basis: "changelog" | "marker_file", version?, text?, file?,
+  sources}]: a changelog item that says "deprecat…" (or sits under a Deprecated section;
+  `target` = its first back-quoted path, else null) and every `DEPRECATED.md` added.
+- `prs` [{number, url, title, author, class, plumbing}], `authors`, `source_files_changed`.
+- `plumbing_only` — true when nothing reader-facing happened: no source file, changelog
+  entry, version move, tag, lifecycle marker, entry-file or child change (README / test /
+  CI churn only). `product_score` — 5 for a new module, 3 per declared breaking item, 2 per
+  candidate, 2 per child change, 1 per interface change, 1 per changelog item, 1 when a
+  source file changed; 0 when `plumbing_only`. It ranks by product change, never by PR count
+  or touched files.
+
+Every item carries **`sources`**: [{commit, pr?, url (the PR's, else the commit's), path}],
+so a writer can cite it.
+
+**`prs[]`** — every PR merged in the window into `meta.base_branch`: {number, url, title,
+train?, class, module_kinds?, title_signal?, sweep?, substantive_areas?, plumbing, areas}.
+`class`, by rule from the files of its commits (`path_class`; `generated` and `metadata`
+files travel with any change and are ignored): source and no CI → `module` (`module_kinds`:
+the kinds of the module areas whose source changed); source and CI → `mixed`; no source:
+only CI → `ci`, only tests → `tests-only`, only docs → `docs-only` unless a changelog or
+version file changed → `release` (a version cut with no code change); any other mix →
+`mixed`; no commit of the PR in the view → `unknown` (`plumbing: null`). `title_signal`
+(`ci` / `docs` / `tests`) is the secondary signal: a conventional-commit type (`ci`,
+`build`, `chore`, `docs`, `test`, `style`) or a title word (CI, pipeline, workflow, lint,
+readme, docs, tests). `sweep` {areas, plumbing_areas} marks a **mechanical sweep**: at least
+`SWEEP_MIN_AREAS` (5) module areas touched, half or more of them only in docs / generated /
+metadata / tests files; `substantive_areas` lists the modules whose source it did change —
+their changes stay in `modules[]` whatever the PR's class. `plumbing` = no source file (a
+`release` is not plumbing), or a sweep whose title says plumbing.
+
+**File classes** (`link.DEFAULT_PATH_CLASS_RULES`, first match wins; a rule with a `/`
+matches the path, `**` = any segments, otherwise the file name; case-insensitive):
+`ci` — `.github/**`, `.azuredevops/**`, `.azure-pipelines/**`, `.pipelines/**`,
+`pipelines/**`, `utilities/**`, `.devcontainer/**`, `.vscode/**`, `.config/**`, `Makefile`,
+`.gitignore`, `.gitattributes`, `.editorconfig`, `.pre-commit-config.yaml`, tflint configs,
+`avm` / `avm.bat` / `avm.ps1`; `metadata` — `CHANGELOG.md`, `CHANGES.md`, `HISTORY.md`,
+`RELEASE_NOTES.md`, `version.json`, `metadata.json`, `ORPHANED.md`, `DEPRECATED.md`,
+`CODEOWNERS`, `.terraform.lock.hcl`, `.terraform-docs.yml`; then `ci` — any other dot-file;
+`generated` — `main.json`; `tests` — `**/tests/**`, `**/test/**`, `**/examples/**`,
+`validation/**`, `*.test.bicep`, `*.tftest.hcl`, `*_test.go`; `docs` — `docs/**`,
+`guides/**`, `*.md`, images, `LICENSE`; anything else `source`. Override with
+`link.py BUNDLE --path-class CLASS=GLOB` (repeatable, before the defaults; recorded in
+`module_changes.path_rules`).
+
+**`summary`** — the roll-ups a writer needs first: `modules`, `by_status`, `new_modules`
+[{area, kind, first_version, introduced_by: [pr], prs}], `new_child_modules` [{area,
+child, prs}], `declared_breaking` [{area, versions, items}], `breaking_candidates` [{area,
+rules}], `deprecations` [{area, target, basis}], `orphaned`, `removed`, `most_substantive`
+(top 10 by `product_score`, ties by area; plumbing-only modules never rank) and `plumbing`
+{merged_prs, classified, plumbing_prs, share (of the classified), by_class}.
+
+**`releases`** — the window's GitHub releases {tag, name, published_at, url, prerelease}
+when any (release notes text is not gathered). **`inputs`** — `tags_collected`,
+`tags_reason`, `unread`, and for a multi-window view `windows` / `covers_view`.
+
+**What the data cannot tell:** a parameter renamed inside one file reads as one removed and
+one added (moves are only matched across files); Terraform `variable` defaults are not in
+the stored snippet (`required: null`); a module's history before the clone's bound; for a
+multi-window view, areas are mapped with the latest window's code graph (a path it lacks
+falls back to the default area rules).
+
+Window and projection: every input is dated (commits, code / symbol events, notes items),
+so the view follows `extract`'s window scoping; PR records are the as-of-end projection.
+Additive and omit-when-absent: `meta.schema_version` stays 3.
+
 ## Optional (omit-when-empty) keys
 
 These keys are reserved in the bundle skeleton and **filled when the data exists** —
@@ -522,8 +698,8 @@ report (the omit-when-empty rule that keeps the shape diff-stable), **not** perm
 empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
-code_graph, label_taxonomy, modules, workflow_stats, newcomers, releases, milestones, sprints,
-diagrams`.
+code_graph, label_taxonomy, modules, workflow_stats, newcomers, module_notes,
+module_changes, releases, milestones, sprints, diagrams`.
 
 **Never in a view:** gather's in-memory bundle skeleton also reserves `workflows` (the raw
 CI runs `workflow_stats` is counted from; never folded, so no view carries it), and

@@ -179,6 +179,7 @@ sequenceDiagram
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
   A->>A: fallback: drop unresolved boundary commits' diffs and files
+  A->>Git: rev-parse + cat-file per changed changelog / version.json (commit and parent), for-each-ref refs/tags (collect_module_notes)
   A->>Git: log --first-parent (window_end_commit)
   opt window end is not the head
     A->>Git: worktree add --detach (structure_tree; removed afterwards)
@@ -305,6 +306,59 @@ sequenceDiagram
   capped at 200 chars (`_cap_snippet`).
 - **Bounded file diffs** (`bounded_file_diff`, `FILE_DIFF_CAP`/`FILE_DIFF_LINE_CAP`) ride the
   file-level code event so narrators read real changes without a clone.
+
+### 4.4a Module change notes (`collect_module_notes`)
+
+The per-window fact `module_notes` (BUNDLE.md "Module changes") is what the maintainers wrote
+about their modules in the window, read from the clone after the walks and the boundary fallback,
+only when the window's history is on disk:
+
+- **Which files.** Only the changelog / version files the window's file-level code events name
+  (added, modified, renamed or copied; a delete adds nothing): `CHANGELOG_FILE_NAMES`
+  (`changelog.md`, `changes.md`, `history.md`, `release_notes.md`, `releasenotes.md`, any case)
+  and `VERSION_FILE_NAMES` (`version.json`). A month of Azure/bicep-registry-modules touches tens
+  of its ~550 changelogs; nothing else is read.
+- **Per commit, not from the patch walk.** A 3-line-context hunk often lacks the `## <version>`
+  heading an appended item sits under, so the file is read at the commit and at its first parent
+  (`read_blob(rev, path)`; `<sha>^` at `old_path` for a rename, none for an add or copy) and the
+  two parses are compared (`changelog_added_entries`). Each entry is attributed to the commit
+  that added it, and so to its PR. The blobs are the ones the patch walk already fetched.
+- **Parsing** (`parse_changelog`, pure): an entry starts at a heading naming a version
+  (`_changelog_version`: `0.6.0`, `v1.2.0`, `[1.2.0] - date`, `[1.2.0](url)`, `Version 1.2.0
+  (date)`, `[Unreleased]`); the first such heading sets the entry level, a later heading at or
+  above it that names no version ends the entry, deeper headings are sections
+  (`changelog_section_kind`: breaking / deprecated / removed / security / fixed / added /
+  changed / other, the heading kept verbatim). Items: bullets at the line start (continuations,
+  nested bullets and a following fenced block belong to them) or paragraphs; link reference
+  definitions are skipped; placeholders (`changelog_placeholder`: "None", "N/A", "None (…)")
+  leave `items: []` and `placeholder`. Caps: `MODULE_NOTE_TEXT_CAP` 600 characters per item
+  (`truncated_from`), `MODULE_NOTE_ITEMS_CAP` 40 per section (`items_omitted`),
+  `MODULE_NOTE_ENTRIES_CAP` 12 per file per commit (`entries_omitted`).
+- **Comparison.** A version the parent lacks is added whole; a version both have contributes
+  only the items its same-heading section did not hold (`amended: true`); a file with no version
+  heading at all contributes its new bullets as one `version: null` entry.
+- **Versions.** `parse_version_file`: the top-level `version` of `version.json` before and
+  after; recorded when it moved.
+- **Tags** (`parse_version_tags`, pure, over one local `git for-each-ref refs/tags` with
+  `TAG_LIST_FORMAT`): a tag whose last segment is a version publishes the module path before it
+  (`""` = the root). Annotated tags are dated by their tagger (`date_source: "tagger"`),
+  lightweight ones by the tagged commit's committer date (`"commit"`), in UTC; the window's tags
+  are kept with `first` (no version tag of the module dated before the window). The bounded clone
+  fetches the tags that point into its history and, observed on Azure/bicep-registry-modules,
+  every tag of the repository (3,584, dated back to 2024), so listing them costs one local call
+  and no network. No tag → `{"collected": false, "reason": "the clone holds no tags"}`.
+- **Seams and gaps.** `read_blob` and `list_tags` are injected (production `git_blob_reader`:
+  `rev-parse --verify -q <rev>:<path>` — trees are local in the partial clone, so absence is
+  answered without the network — then `cat-file blob`; `git_tag_lister`). A blob git cannot read
+  raises `BlobUnreadable` and is listed in `unread` with the commit's date; nothing is guessed.
+- **Cost** (measured on Azure/bicep-registry-modules, blobs already local as after the patch
+  walk): October 2026 (541 code events, 20 changelog updates, 8 version moves, 19 tags) 0.4 s;
+  August–October (6,128 events, 115 changelog updates) 1.5 s. With the blobs not yet fetched
+  (a cold partial clone) 3–11 s for a month.
+
+gather prints one line (`module notes: <repo>: N changelog update(s), M version change(s), K
+version tag(s) in the window`) and the bundle carries `module_notes`; fold stores it as a
+per-window fact (`graphstore.WINDOW_FACT_KEYS`, §4.10), never as a singleton node.
 
 ### 4.5 Code areas
 
@@ -589,7 +643,8 @@ fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows)
 fold also calls `graphstore.set_window_facts(project, repo, from, to, bundle, clone_sha)`:
 meta `facts:{p}/{r}:{from}:{to}` = `{clone_sha, facts: {key: sha256}}` for each non-empty
 `workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` / `newcomers` (the
-first-time contributors, §4.7; per-window only, no singleton node), each value stored once per
+first-time contributors, §4.7) / `module_notes` (§4.4a) — the last two per-window only, no
+singleton node — each value stored once per
 repo under `fact:{p}/{r}:{sha256}` (shared by windows with identical values; a re-fold of the
 window replaces its entry and unreferenced values are deleted). Keyed by window, not clone
 sha: the directory code graph is built from the window's changed paths, so two windows of one
@@ -864,7 +919,11 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    its stored value verbatim; any other window → merged over the gathered windows wholly
    inside the view that collected one, not overlapping one another (`_merged_newcomers`:
    `new` keeps each login's earliest entry, `unknown` / `not_checked` the unions less the
-   logins found new, plus `windows` and `covers_view`). When any record was projected,
+   logins found new, plus `windows` and `covers_view`). `module_notes` (top-level key, omitted
+   when no gather stored it, §4.4a): exactly a gathered window → its stored value verbatim; any
+   other window → the dated items of every gathered window overlapping the view that fall in
+   it, once each (`_merged_module_notes`: changelogs / versions / unread by (path, commit), tags
+   by name), plus `windows`, `covers_view` and `tags.windows_without_tags`. When any record was projected,
    `meta.gathered_at` = the latest `fetched_at` of the view's PR / issue nodes (when they were
    gathered; validation finding 8). Window scope:
    each artifact's `lifecycle` keeps the view's events (same predicate as the ledger rows) and
@@ -967,6 +1026,7 @@ flowchart TB
   k --> l["annotate_review_rounds + annotate_reopen_count"]
   l --> m["derive.annotate_people_profile + derive.build_halls"]
   m --> n["derive.build_flow + derive.build_blockers"]
+  n --> o["build_module_changes (only with module_notes)"]
 ```
 
 Order matters: significance needs code areas; forecast needs buckets and milestones; people
@@ -1221,6 +1281,44 @@ index whose entries name another `owner`/`repo`, and an overlapping window; noth
 written (the index is never silently discarded). The bundle is written first and the index
 second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves the
 previous file intact, and a run that cannot write its bundle records no installment.
+
+### 6.9a Module changes — `build_module_changes(bundle, path_rules=())`
+
+The last enrich step; a no-op unless the bundle carries `module_notes` with `collected: true`
+(so every fixture and every pre-existing store's view is unchanged). Pure over the bundle:
+its inputs are the view's commits, code events, symbol events, `symbol_moves` (built earlier
+in enrich), PRs, trains, releases and code graph, and the stored `module_notes` — no new
+state. Shape and rules: BUNDLE.md "Module changes". Steps:
+
+1. **Module areas.** `area_index(code_graph)` maps each path to its area (falling back to
+   `gather.classify_code_area` with the default patterns for a path the graph lacks, e.g. a
+   tag's module). `module_kind` decides which areas are modules and of what kind
+   (resource / pattern / utility from `avm/<kind>/…`; `module` for the Terraform root or a
+   dir with `*.tf`; `submodule` for `modules/<name>`; `deployment` for a Bicep dir outside
+   `avm/` with its own `main.bicep`), over every path the view saw.
+2. **Per module** (`_module_entry`): the commits' files (classes by `path_class`), the code
+   events of the entry file (`main.bicep` / `main.tf`: add → new, delete or rename away →
+   removed), of child `main.bicep` files (added / removed / moved / modified) and of
+   `DEPRECATED.md` / `ORPHANED.md` (module root → status; child dir → child row); the symbol
+   events of the interface file, netted over the window (`_net_symbols`) and summarised
+   (`_interface_summary`: parameters with `required` from the declaration, outputs, resource
+   API versions, module dependencies by ref); the notes' changelog entries, version moves and
+   tags of the area (child files under the area carry `module`).
+3. **Breaking**: `declared` = items of sections of kind `breaking`, verbatim; `candidates` by
+   rule (removed / moved parameter or output, new or newly required parameter, removed or
+   moved child module, removed module); none for a new module.
+4. **PR classes** (`classify_pr_change`) for every PR merged in the window into the base
+   branch, from the files of its commits in the view; sweep detection (`SWEEP_MIN_AREAS` = 5);
+   plumbing.
+5. **Summary** (`_module_summary`): status counts, new modules (with the PRs that introduced
+   them), new child modules, declared breaking, candidates, deprecations, orphaned, removed,
+   `most_substantive` (top `MODULE_RANK_TOP_N` = 10 by `_product_score`) and the plumbing
+   share.
+
+Sources: every item cites `{commit, pr?, url, path}` (`_ModuleCtx.source`: the PR url when
+the commit names a PR, else the commit url). Deterministic: every list has an explicit sort
+or follows the stored order; `test_module_changes.py` enriches a key-reversed bundle to prove
+key order does not matter.
 
 ### 6.10 `derive.py` projections
 
@@ -1675,6 +1773,10 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 | `TIMELINE_MAX_DAYS` / `TIMELINE_MAX_EVENTS_PER_DAY` | 40 / 8 | render |
 | `TRAIN_FLOW_MAX_PR_NODES` / `PIE_MAX_SLICES` | 60 / 10 | render |
 | `DEFAULT_AREA_PATTERNS` | §4.5 | gather |
+| `CHANGELOG_FILE_NAMES` / `VERSION_FILE_NAMES` | §4.4a | gather |
+| `MODULE_NOTE_TEXT_CAP` / `_ITEMS_CAP` / `_ENTRIES_CAP` | 600 / 40 / 12 | gather |
+| `DEFAULT_PATH_CLASS_RULES` | BUNDLE.md "Module changes" (override: `link.py --path-class CLASS=GLOB`) | link |
+| `SWEEP_MIN_AREAS` / `MODULE_RANK_TOP_N` | 5 / 10 | link |
 
 ## 14. Cross-cutting concerns
 
@@ -1733,6 +1835,8 @@ GraphQL (a separate 5,000-point/hour budget): the closing-issue read costs ⌈ke
 requests — 2 per 100 PRs — of 1 point each (50 connections of 25 nodes), plus one per extra
 page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 (A reused `--clone-dir` is fetched rather than re-cloned.)
+The module change notes (§4.4a) cost no API call: two blob reads per changed changelog /
+version file and one local tag listing, about 0.5–1.5 s on Azure/bicep-registry-modules.
 
 ### 14.4 Security
 
@@ -1852,7 +1956,9 @@ these affect an accumulated store.
   check), `test_gather.py` (parsers, fold, IaC parsing incl. modern/legacy DOT),
   `test_digest.py` (cross-repo trains, module edges), `test_series.py`,
   `test_window_scoped_views.py` / `test_window_facts.py` / `test_retraction.py` (multi-window
-  stores), `test_view.py` (the `SKILL.md` / `commands/activity.md` docs contract: every
+  stores), `test_module_notes.py` / `test_module_changes.py` (changelog parsing on fixture
+  excerpts, the git seams on a throwaway repo, window scope, the module view and PR classes on
+  a synthetic window shaped like real October 2026 data), `test_view.py` (the `SKILL.md` / `commands/activity.md` docs contract: every
   documented command names a real script and accepted flags), `test_report_template.py`
   (template placeholders against real view output), `test_suite_hygiene.py` (every test is
   collectable by `unittest`; no conflict markers in skill files; no test writes to stdout —
@@ -1914,6 +2020,7 @@ these affect an accumulated store.
 |---|---|---|
 | New repo layout → areas | add `(name, fn)` to `DEFAULT_AREA_PATTERNS` (order matters) | area ids appear in stored nodes; re-gather after changing |
 | Org priority labels | `link.py --priority-label PATTERN` per run; defaults in `link.PRIORITY_LABEL_PATTERNS` / `HIGH_PRIORITY_LABELS` | patterns are case-insensitive regular expressions (searched); an invalid one is a usage error |
+| Repo layout for product vs plumbing | `link.py --path-class CLASS=GLOB` per run (classes `source`, `tests`, `docs`, `generated`, `metadata`, `ci`); defaults in `link.DEFAULT_PATH_CLASS_RULES` | first match wins, the operator's rules first; recorded in `module_changes.path_rules`; a malformed rule is a usage error |
 | Forecast / significance tuning | constants in `link.py` | tests pin thresholds; update tests + BUNDLE.md |
 | New view field | compute in `link.enrich` or `derive` (pure) | append-only; document in BUNDLE.md; omit when empty |
 | New stored fact | `fold_bundle` + `extract` reader + `validate` conformance | must keep `no_drift` and characterization green |

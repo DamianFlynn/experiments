@@ -41,6 +41,7 @@ renderer over that view; changelogs, dashboards or slide decks are others.
 | Flow health | What is blocked, hung, upvoted-but-ignored? Who/what blocks the most? | `derive.build_flow` / `build_blockers` |
 | Recognition | Who moved the project (no blame board, by design)? | `derive.annotate_people_profile` / `build_halls` |
 | Feature ledger | Which params/outputs/resources/docs were added, changed, removed? | `code_events` + `feature_deltas` |
+| Module release notes | Which modules are new, what changed in each, what is breaking (declared vs candidate), what was deprecated, how much was plumbing? | gather `module_notes` (changelogs, version files, tags) → `link` `module_changes` |
 | Module biography | How has one module's surface evolved across all history? | `spotlight module` |
 | Blast radius | If this module changes, which modules/repos consume it? | `spotlight dependents`, `digest.module_edges` |
 | Multi-repo project | One view across a constellation of repos | `gather --manifest`, `digest` |
@@ -418,6 +419,21 @@ full-history lifecycle of every parameter/output/resource symbol (added → chan
 with before/after snippets and the driving PR). The narrator turns it into a cited
 "how this module evolved" section.
 
+### 8.5a Scenario E2 — a newsletter from the month's module changes
+
+A newsletter reader wants what a product's monthly release notes give: new modules,
+noteworthy changes per module, breaking changes, deprecations — not PR numbers. gather reads
+the changelog entries, `version.json` moves and version tags the month's commits added (from
+the clone, per touched file); `link` adds `module_changes`: one entry per module with its
+status (new / changed / deprecated / removed / orphaned), versions, the maintainers' changelog
+text and **declared** breaking items, the interface changes and rule-derived breaking
+**candidates** (kept apart), child-module moves, deprecations, the PRs and authors behind it,
+and whether its only activity was plumbing; plus roll-ups (new modules, declared breaking,
+deprecations, most substantive by product change, plumbing share of merged PRs). A README /
+CI sweep is classified as plumbing while the real module changes it carried stay on their
+modules. Works for a module monorepo (Bicep AVM), one-repo-per-module (Terraform, with the
+repo's releases) and landing-zone repos (deployments, from structure and interface).
+
 ### 8.6 Scenario F — community call fold-in
 
 Pass a `.vtt`/`.srt`/`.txt` transcript; `transcript.py` normalizes it and the report gains
@@ -618,6 +634,14 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     but active since is stalled in that view; a push to the PR branch is not dated in the
     record, so it counts only while `updated_at` is not projected.
     A shipped train is never stalled; one that took long to land is `slow_to_land`.
+20. **Module release notes are as good as the repository's own records.** `module_changes`
+    quotes the changelog verbatim (declared breaking items are the maintainers' statement)
+    and derives breaking **candidates** from the stored declaration snippets: a parameter
+    renamed within one file reads as removed + added, a Terraform variable's default is not
+    in its snippet (`required: null`), and a candidate is a hint to check, never a claim.
+    Release notes text of GitHub releases is not gathered (only tag, name, date, url).
+    Tags come from the clone (lightweight tags are dated by their commit). A window gathered
+    before this layer has no `module_notes` and no `module_changes` until re-gathered.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
 per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it
@@ -657,6 +681,7 @@ people's areas (a union over the windows), a difference is a WARN naming the rea
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
 | Organization-specific priority labels | `link.py --priority-label PATTERN` per run; `link.PRIORITY_LABEL_PATTERNS` / `link.HIGH_PRIORITY_LABELS` for defaults |
+| Repository layouts for product vs plumbing | `link.py --path-class CLASS=GLOB` per run; `link.DEFAULT_PATH_CLASS_RULES` for defaults; changelog / version file names in `gather.CHANGELOG_FILE_NAMES` / `VERSION_FILE_NAMES` |
 | Historical record state on multi-window stores (limitation 7) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |

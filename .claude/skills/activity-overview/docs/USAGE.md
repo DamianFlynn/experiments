@@ -209,6 +209,7 @@ into a **fresh** store for the first item, into the same store for the others:
 | #82 (commit times) | commits have only a day, so their timeline events sort before that day's comments | timeline order only |
 | #93 (PR head repo) | a stacked PR whose base branch is the head of two PRs (forks' `patch-1`) is attached to neither | `contributing_prs` missing |
 | #101 (nested Terraform areas) | `.tf` files in `modules/<name>/<sub>/` stay in `modules/<name>` | module counts / areas |
+| the module change notes (`module_notes` / `module_changes`, BUNDLE.md "Module changes") | no `module_notes` per-window fact, so `link.py` builds no `module_changes` (new / changed / breaking / deprecated modules, product vs plumbing) | the view has no `module_changes` key. Re-gather the window (same store is fine: a re-fold replaces that window's facts) |
 | #109 (collection review) | an issue of ANOTHER repo that mentions a PR made the same-numbered local issue a `cross_ref` of it; commits (and their code/symbol events) are windowed on the committer's local day, not the UTC day PRs and issues use | an unrelated issue in a PR's train context / forecast; a commit made near midnight UTC in the neighbouring month. Re-gather into a fresh store (a mention edge the new records no longer imply fails `validate`) |
 
 A store last folded before #95 heals its current-state edges on the next fold of any window
@@ -719,6 +720,17 @@ python3 $AO/spotlight.py module avm/res/network/virtual-network --store $S/histo
 
 - **Scoping a report to a family:** the gather covers the whole repo; scope in the narrative
   ("focus on `avm/ptn/ai-ml/*`") and with `spotlight module` / `subsystem` queries.
+- **Release-notes view (`module_changes`):** every module has a `CHANGELOG.md` (`## <version>`
+  / `### Changes` / `### Breaking Changes`) and a `version.json`, and published versions are
+  tags `avm/<kind>/<group>/<module>/<version>`. gather reads the changelogs and version files
+  the month's commits touched and the month's tags (no API call; about a second), and
+  `link.py` builds `module_changes`: new modules (with their first version and introducing
+  PR), declared breaking changes (the changelog's own words) next to rule-derived breaking
+  candidates, deprecations (`DEPRECATED.md`, changelog), orphaned modules (`ORPHANED.md`, not
+  deprecated), child module moves, interface changes, and each merged PR's class (module /
+  ci / docs-only / tests-only / release / mixed) with README / CI sweeps flagged as plumbing
+  while their real module changes stay listed per module. A writer reads
+  `module_changes.summary` first, then `modules[]`; every item cites its commit / PR.
 
 ### 7.3 AVM Terraform — one repo per module
 
@@ -786,6 +798,14 @@ python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clon
 python3 $AO/validate.py $S/stores/$M.db --project avm-tf-network
 ```
 
+- **Release-notes view per member:** each member bundle carries `module_changes` with the
+  repo root as the `module` (`main.tf` area) and `modules/<name>` as `submodule`s: variables
+  and outputs added / removed from the root `*.tf` files (a variable's default is not in the
+  stored declaration, so `required` is null), breaking candidates, the changelog when the repo
+  keeps one (Keep-a-Changelog style `## [1.2.0] - date` / `### Added` / `### Removed` parses
+  too), the version tags of the window (`v1.2.0`, module `""`) and the repo's GitHub
+  releases of the window under `versions.releases` (release notes text is not gathered).
+
   A plain re-run (without `--resume`) gathers every member again, which is also safe.
 
 ### 7.4 AI landing zone
@@ -831,6 +851,14 @@ the BRM module slice (Bicep pattern changes). The Bicep side's dependencies are 
 ones (both the pattern and the modules it composes live in BRM). Cross-repo Bicep
 dependencies are resolved only inside one manifest, from a member that references
 `br/public:` modules to a BRM member declared with `bicep_registry_prefix` (see §7.6).
+
+**Landing-zone / reference-architecture repos** (for example a Bicep solution accelerator
+with `bicep/infra/<deployment>/main.bicep`): each directory with its own `main.bicep` is a
+`deployment` in `module_changes`. With no changelog discipline the entries come from
+structure and interface: deployments added (status `new`), parameters / outputs / module
+calls changed per deployment, new required parameters, and which PR or direct commit did
+it. When the folder layout differs (a `validation/` tree that is product, docs under
+another name), adjust the classes with `link.py BUNDLE --path-class CLASS=GLOB`.
 
 To refresh the Terraform member list from the index instead of hand-authoring:
 `manifest_from_index.py --avm ptn --avm res --project ai-lz --from … --to … --name-contains aiml`

@@ -1428,6 +1428,1001 @@ def build_forecast(bundle, matchers=None, extra_patterns=()):
     return bundle
 
 
+# --- Module changes: the reader's view -------------------------------------
+#
+# `module_changes` answers what a release-notes reader asks of a window: which
+# modules are new, what changed in the existing ones, what is breaking, what
+# was deprecated, and how much of the window's merged work was plumbing (CI,
+# docs generation, tests). It is derived at view time from stored records
+# only: the view's commits / code events / symbol events / symbol moves /
+# PRs / releases / code graph, plus the gathered `module_notes` fact (the
+# changelog entries, version-file moves and version tags read from the
+# clone). It is built only when the view carries `module_notes` (a gather
+# that read them), so a bundle without them is unchanged.
+#
+# Two sources of "breaking" are kept apart on purpose:
+#   breaking.declared   — a changelog "Breaking Changes" item: the maintainers'
+#                         own statement, quoted verbatim;
+#   breaking.candidates — derived by rule from the interface (a removed or
+#                         moved parameter, a new required parameter, a removed
+#                         output, a removed or moved child module, a removed
+#                         module): a candidate a writer must check, never a
+#                         claim.
+
+# File classes, by path. First matching rule wins; `link.py --path-class
+# CLASS=GLOB` (repeatable) puts the operator's rules first. A GLOB with a `/`
+# matches the whole path (`**` any number of segments, `*` / `?` within one);
+# without one it matches the file's name. Matching ignores case. A path no
+# rule matches is `source` (deployable module code).
+PATH_CLASSES = ("source", "tests", "docs", "generated", "metadata", "ci")
+DEFAULT_PATH_CLASS_RULES = (
+    # CI, pipelines and repository tooling
+    ("ci", ".github/**"), ("ci", ".azuredevops/**"),
+    ("ci", ".azure-pipelines/**"), ("ci", ".pipelines/**"),
+    ("ci", "pipelines/**"), ("ci", "utilities/**"), ("ci", ".devcontainer/**"),
+    ("ci", ".vscode/**"), ("ci", ".config/**"), ("ci", "Makefile"),
+    ("ci", ".gitignore"), ("ci", ".gitattributes"), ("ci", ".editorconfig"),
+    ("ci", ".pre-commit-config.yaml"), ("ci", "*.tflint.hcl"),
+    ("ci", ".tflint*.hcl"), ("ci", "avm"), ("ci", "avm.bat"), ("ci", "avm.ps1"),
+    # release and ownership metadata that travels with a module
+    ("metadata", "CHANGELOG.md"), ("metadata", "CHANGES.md"),
+    ("metadata", "HISTORY.md"), ("metadata", "RELEASE_NOTES.md"),
+    ("metadata", "version.json"), ("metadata", "metadata.json"),
+    ("metadata", "ORPHANED.md"), ("metadata", "DEPRECATED.md"),
+    ("metadata", "CODEOWNERS"), ("metadata", ".terraform.lock.hcl"),
+    ("metadata", ".terraform-docs.yml"),
+    ("ci", ".*"),          # any other dot-file: repository configuration
+    # generated from the source (the compiled template next to main.bicep)
+    ("generated", "main.json"),
+    # tests and examples
+    ("tests", "**/tests/**"), ("tests", "**/test/**"), ("tests", "**/examples/**"),
+    ("tests", "validation/**"), ("tests", "*.test.bicep"),
+    ("tests", "*.tftest.hcl"), ("tests", "*_test.go"),
+    # documentation
+    ("docs", "docs/**"), ("docs", "guides/**"), ("docs", "*.md"),
+    ("docs", "*.png"), ("docs", "*.svg"), ("docs", "*.jpg"), ("docs", "*.drawio"),
+    ("docs", "LICENSE"),
+)
+# Conventional-commit types and title words that say "plumbing" (a secondary
+# signal: paths decide the class, the title only confirms a sweep is one).
+_PLUMBING_CC_TYPES = {"ci": "ci", "build": "ci", "chore": "ci", "docs": "docs",
+                      "test": "tests", "tests": "tests", "style": "docs"}
+_PLUMBING_TITLE_WORDS = (
+    (re.compile(r"\bCI\b"), "ci"),
+    (re.compile(r"\b(pipelines?|workflows?|lint(er|ing)?)\b", re.I), "ci"),
+    (re.compile(r"\b(readmes?|docs|documentation)\b", re.I), "docs"),
+    (re.compile(r"\btests?\b", re.I), "tests"),
+)
+# A PR is a mechanical sweep when it touches at least this many module areas
+# and at least half of them only in docs / generated / metadata files.
+SWEEP_MIN_AREAS = 5
+MODULE_RANK_TOP_N = 10
+_AVM_MODULE_KINDS = {"res": "resource", "ptn": "pattern", "utl": "utility"}
+_BICEP_MODULE_REF_RE = re.compile(r"^\s*module\s+\w+\s+'([^']*)'")
+_BICEP_RESOURCE_TYPE_RE = re.compile(r"'([^'@\s]+)@([^'\s]+)'")
+_BACKTICK_PATH_RE = re.compile(r"`([^`\s]+/[^`\s]+)`")
+_DEPRECATION_RE = re.compile(r"\bdeprecat", re.I)
+
+
+def _glob_regex(pattern):
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("/**", i) and i + 3 == len(pattern):
+            out.append("(?:/.*)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z", re.I)
+
+
+def path_class_rules(extra=()):
+    """[(class, glob, compiled)] of the operator's `extra` rules (each
+    "CLASS=GLOB") followed by DEFAULT_PATH_CLASS_RULES. A malformed rule or
+    an unknown class raises ValueError."""
+    rules = []
+    for spec in extra:
+        cls, sep, glob = str(spec).partition("=")
+        cls, glob = cls.strip(), glob.strip()
+        if not sep or not glob or cls not in PATH_CLASSES:
+            raise ValueError("--path-class wants CLASS=GLOB with CLASS one of "
+                             "{}, got {!r}".format(", ".join(PATH_CLASSES), spec))
+        rules.append((cls, glob))
+    rules.extend(DEFAULT_PATH_CLASS_RULES)
+    return [(cls, glob, _glob_regex(glob)) for cls, glob in rules]
+
+
+def path_class(path, rules):
+    """The class of one file path under `rules` (path_class_rules)."""
+    name = (path or "").rsplit("/", 1)[-1]
+    for cls, glob, rx in rules:
+        if rx.match(path if "/" in glob else name):
+            return cls
+    return "source"
+
+
+def _area_dir(area):
+    return "" if area in ("main.bicep", "main.tf") else area
+
+
+def _in_dir(path, d):
+    return path.startswith(d + "/") if d else True
+
+
+def module_kind(area, files=()):
+    """The module kind of a code area, or None when it is not a module:
+    `resource` / `pattern` / `utility` for `avm/res|ptn|utl/<group>/<name>`;
+    `module` for a Terraform module root (the repo-root `main.tf` area, or an
+    area with a `*.tf` file directly in it), `submodule` for
+    `modules/<name>`; `deployment` for a Bicep module directory outside
+    `avm/` (an area whose own `main.bicep` is among `files`, e.g. a landing
+    zone's deployments)."""
+    parts = (area or "").split("/")
+    if len(parts) == 4 and parts[0] == "avm" and parts[1] in _AVM_MODULE_KINDS:
+        return _AVM_MODULE_KINDS[parts[1]]
+    if parts[0] == "avm":
+        return None
+    if area == "main.tf":
+        return "module"
+    if len(parts) == 2 and parts[0] == "modules":
+        return "submodule"
+    d = _area_dir(area)
+    for f in files:
+        if not _in_dir(f, d):
+            continue
+        rest = f[len(d) + 1:] if d else f
+        if rest == "main.bicep":
+            return "deployment"
+        if "/" not in rest and rest.endswith(".tf"):
+            return "module"
+    return None
+
+
+def _entry_file(area, kind):
+    d = _area_dir(area)
+    name = "main.tf" if kind in ("module", "submodule") else "main.bicep"
+    return f"{d}/{name}" if d else name
+
+
+def _interface_file(path, area, kind):
+    """True for a file that declares the module's interface: its entry
+    `main.bicep`, or for Terraform any `*.tf` directly in the module dir."""
+    d = _area_dir(area)
+    if not _in_dir(path, d):
+        return False
+    rest = path[len(d) + 1:] if d else path
+    if kind in ("module", "submodule"):
+        return "/" not in rest and rest.endswith(".tf")
+    return rest == "main.bicep"
+
+
+def _child_dir(path, area):
+    """The child module directory a `main.bicep` path names inside `area`
+    (not the area's own entry, not under tests/ or examples/), else None."""
+    d = _area_dir(area)
+    if not path.endswith("/main.bicep") or not _in_dir(path, d):
+        return None
+    child = path[:-len("/main.bicep")]
+    if child == d or gather._is_scaffold_path(path):
+        return None
+    return child
+
+
+def _bicep_param_required(decl):
+    """True / False when a Bicep `param` declaration says whether it is
+    required (no default and not nullable `?`), None when the snippet cannot
+    tell (another language, a multi-line type, a snippet cut at its cap)."""
+    m = re.match(r"^\s*param\s+\w+\s+(.*)$", decl or "")
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    if "=" in rest:
+        return False
+    if rest.endswith("?"):
+        return False
+    if rest.endswith(("{", "[", "(")) or len(decl) >= 200:
+        return None
+    return True
+
+
+def _module_ref(decl):
+    m = _BICEP_MODULE_REF_RE.match(decl or "")
+    if not m:
+        return None
+    ref = m.group(1)
+    registry, version, local = gather._bicep_ref_parts(ref)
+    out = {"ref": ref}
+    if version:
+        out["version"] = version
+    out["target"] = registry or local or ref.rsplit(":", 1)[0]
+    if local:
+        out["local"] = True
+    return out
+
+
+def _resource_type(decl):
+    m = _BICEP_RESOURCE_TYPE_RE.search(decl or "")
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+class _ModuleCtx:
+    """What the module view reads from a bundle, indexed once."""
+
+    def __init__(self, bundle, rules):
+        self.bundle = bundle
+        self.rules = rules
+        self.period = window_period(bundle.get("meta", {}))
+        self.idx = derive.area_index(bundle.get("code_graph", {}))
+        self.commits = {c.get("sha"): c for c in bundle.get("commits", [])}
+        events = bundle.get("code_events", [])
+        # every path the view saw: decides which areas are modules
+        self.seen_files = sorted(
+            {f for c in bundle.get("commits", []) for f in c.get("files") or []}
+            | {e.get("path") for e in events if e.get("path")}
+            | {e.get("old_path") for e in events if e.get("old_path")})
+        self._kinds = {}
+        self.prs = {p.get("number"): p for p in bundle.get("prs", [])}
+        self.train_of = {}
+        for t in bundle.get("trains", []):
+            for n in t.get("prs") or []:
+                self.train_of.setdefault(n, t.get("id"))
+
+    def kind(self, area):
+        """module_kind of an area over every path of the view (memoised)."""
+        if area not in self._kinds:
+            self._kinds[area] = module_kind(area, self.seen_files) \
+                if area else None
+        return self._kinds[area]
+
+    def area_of(self, path):
+        area = self.idx.get(path)
+        if area is None and path:
+            area = gather.classify_code_area(path, gather.DEFAULT_AREA_PATTERNS)
+        return area
+
+    def source(self, sha, path=None):
+        """{commit, [pr], url, [path]} citing one commit (its PR when known)."""
+        c = self.commits.get(sha) or {}
+        out = {"commit": sha}
+        pr = c.get("pr")
+        if pr is not None:
+            out["pr"] = pr
+            out["url"] = (self.prs.get(pr) or {}).get("url") or \
+                derive._commit_url(self.bundle, sha)
+        else:
+            out["url"] = derive._commit_url(self.bundle, sha)
+        if path:
+            out["path"] = path
+        return out
+
+
+def _dedupe_sources(sources):
+    seen, out = set(), []
+    for s in sources:
+        key = (s.get("commit"), s.get("path"))
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+def _net_symbols(events):
+    """Net change per symbol over the window's events (oldest first):
+    added (absent before, present after), removed, or modified (present on
+    both ends with a different declaration). An add-then-drop is nothing."""
+    by_key = {}
+    for e in events:
+        by_key.setdefault((e.get("path"), e.get("subkind"), e.get("name")),
+                          []).append(e)
+    out = []
+    for (path, subkind, name), evs in by_key.items():
+        first, last = evs[0], evs[-1]
+        before = first.get("change") != "add"
+        after = last.get("change") != "drop"
+        if before and after:
+            b, a = first.get("before"), last.get("after")
+            if b == a:
+                continue
+            change = "modified"
+        elif after:
+            change, b, a = "added", None, last.get("after")
+        elif before:
+            change, b, a = "removed", first.get("before"), None
+        else:
+            continue
+        out.append({"path": path, "subkind": subkind, "name": name,
+                    "change": change, "before": b, "after": a, "events": evs})
+    return sorted(out, key=lambda s: (s["path"] or "", s["subkind"] or "",
+                                      s["name"] or ""))
+
+
+def _interface_summary(ctx, events, moves):
+    """{parameters, outputs, resources, dependencies} of one module file set
+    (empty groups omitted) and its breaking candidates."""
+    groups, candidates = {}, []
+
+    def put(group, change, row):
+        groups.setdefault(group, {}).setdefault(change, []).append(row)
+
+    # a symbol a move fact accounts for is reported as moved, not as a
+    # removal here plus an addition there
+    moved = {(m.get("from_path"), m.get("subkind"), m.get("name")) for m in moves} \
+        | {(m.get("to_path"), m.get("subkind"), m.get("name")) for m in moves}
+    for s in _net_symbols(events):
+        if s["change"] != "modified" and (s["path"], s["subkind"], s["name"]) in moved:
+            continue
+        sources = _dedupe_sources(ctx.source(e.get("commit"), s["path"])
+                                  for e in s["events"])
+        sub, name = s["subkind"], s["name"]
+        if sub in ("param", "variable"):
+            row = {"name": name, "sources": sources}
+            if s["change"] == "added":
+                req = _bicep_param_required(s["after"]) if sub == "param" else None
+                row.update(declaration=s["after"], required=req)
+                put("parameters", "added", row)
+                if req:
+                    candidates.append({"rule": "required_parameter_added",
+                                       "subject": name, "sources": sources})
+            elif s["change"] == "removed":
+                row["declaration"] = s["before"]
+                put("parameters", "removed", row)
+                candidates.append({"rule": "parameter_removed", "subject": name,
+                                   "sources": sources})
+            else:
+                row.update(before=s["before"], after=s["after"])
+                put("parameters", "modified", row)
+                if sub == "param" and _bicep_param_required(s["before"]) is False \
+                        and _bicep_param_required(s["after"]) is True:
+                    candidates.append({"rule": "parameter_became_required",
+                                       "subject": name, "sources": sources})
+        elif sub == "output":
+            row = {"name": name, "sources": sources}
+            if s["change"] == "modified":
+                row.update(before=s["before"], after=s["after"])
+            else:
+                row["declaration"] = s["after"] or s["before"]
+            put("outputs", s["change"], row)
+            if s["change"] == "removed":
+                candidates.append({"rule": "output_removed", "subject": name,
+                                   "sources": sources})
+        elif sub == "resource":
+            row = {"name": name, "sources": sources}
+            if s["change"] == "modified":
+                bt, bv = _resource_type(s["before"])
+                at, av = _resource_type(s["after"])
+                if bt and at and bt == at and bv != av:
+                    put("resources", "api_versions",
+                        dict(row, type=at, **{"from": bv, "to": av}))
+                    continue
+                row.update(before=s["before"], after=s["after"])
+            else:
+                row["declaration"] = s["after"] or s["before"]
+            put("resources", s["change"], row)
+        elif sub == "module":
+            row = {"name": name, "sources": sources}
+            if s["change"] == "modified":
+                b, a = _module_ref(s["before"]), _module_ref(s["after"])
+                if b and a and b["target"] == a["target"]:
+                    row.update(change="version", target=a["target"],
+                               **{"from": b.get("version"), "to": a.get("version")})
+                elif b and a:
+                    row.update(change="target", **{"from": b["ref"], "to": a["ref"]})
+                else:
+                    row.update(before=s["before"], after=s["after"])
+                put("dependencies", "changed", row)
+            else:
+                ref = _module_ref(s["after"] or s["before"])
+                if ref:
+                    row.update(ref)
+                else:
+                    row["declaration"] = s["after"] or s["before"]
+                put("dependencies", s["change"], row)
+    for m in moves:
+        group = "parameters" if m.get("subkind") in ("param", "variable") \
+            else "outputs" if m.get("subkind") == "output" else None
+        if group is None:
+            continue
+        sources = _dedupe_sources(
+            ctx.source(e.get("commit"), e.get("path")) for e in events
+            if e.get("name") == m.get("name") and e.get("change") in ("drop", "add")
+            and e.get("path") in (m.get("from_path"), m.get("to_path")))
+        row = {"name": m.get("name"), "from_path": m.get("from_path"),
+               "to_path": m.get("to_path"), "confidence": m.get("confidence"),
+               "sources": sources}
+        put(group, "moved", row)
+        if m.get("leaves"):
+            candidates.append({"rule": "{}_moved".format(
+                "parameter" if group == "parameters" else "output"),
+                "subject": m.get("name"), "sources": sources})
+    return groups, candidates
+
+
+def _changelog_items(entry):
+    for s in entry.get("sections") or []:
+        for item in s.get("items") or []:
+            yield s, item
+
+
+def _deprecation_target(text):
+    m = _BACKTICK_PATH_RE.search(text or "")
+    return m.group(1) if m else None
+
+
+def classify_pr_change(pr, ctx):
+    """The product-vs-plumbing class of one PR, by rule from the files of
+    its commits in the view (the title is a secondary signal).
+
+    File classes come from `path_class`. Ignoring `generated` and
+    `metadata` (they travel with any change): source and no ci -> `module`
+    (`module_kinds` names the kinds of the module areas whose source
+    changed); source and ci -> `mixed`; no source: only ci -> `ci`, only
+    tests -> `tests-only`, only docs or nothing else -> `docs-only`, unless
+    a changelog or version file changed -> `release` (a version cut with
+    no code change); any other mix -> `mixed`. No commit of the PR in the view -> `unknown`.
+    `title_signal` (ci / docs / tests) comes from a conventional-commit
+    type (ci, build, chore, docs, test, style) or a title word (CI,
+    pipeline, workflow, lint, readme, docs, tests). `sweep` when the PR
+    touches at least SWEEP_MIN_AREAS module areas and half or more of them
+    only in docs / generated / metadata / tests files; `substantive_areas`
+    are the module areas whose source it did change. `plumbing`: no source
+    file (a `release` is not plumbing), or a sweep whose title says
+    plumbing."""
+    number = pr.get("number")
+    files = sorted({f for c in ctx.bundle.get("commits", [])
+                    if c.get("pr") == number for f in c.get("files") or []})
+    row = {"number": number, "url": pr.get("url"), "title": pr.get("title")}
+    if ctx.train_of.get(number):
+        row["train"] = ctx.train_of[number]
+    if not files:
+        row.update({"class": "unknown", "plumbing": None})
+        return row
+    classes, areas, source_areas = set(), set(), set()
+    kinds = {}
+    for f in files:
+        cls = path_class(f, ctx.rules)
+        classes.add(cls)
+        area = ctx.area_of(f)
+        kind = ctx.kind(area)
+        if kind is None:
+            continue
+        areas.add(area)
+        if cls == "source":
+            source_areas.add(area)
+            kinds[area] = kind
+    real = classes - {"generated", "metadata"}
+    release = any(gather._note_file_kind(f) for f in files)
+    if "source" in real:
+        cls = "mixed" if "ci" in real else "module"
+    elif real == {"ci"}:
+        cls = "ci"
+    elif real == {"tests"}:
+        cls = "tests-only"
+    elif real <= {"docs"} and release:
+        cls = "release"
+    elif real <= {"docs"}:
+        cls = "docs-only"
+    else:
+        cls = "mixed"
+    row["class"] = cls
+    if kinds:
+        row["module_kinds"] = sorted(set(kinds.values()))
+    title = pr.get("title") or ""
+    signal = None
+    cc = gather._CC_PREFIX_RE.match(title.strip().lower())
+    if cc and cc.group(1) in _PLUMBING_CC_TYPES:
+        signal = _PLUMBING_CC_TYPES[cc.group(1)]
+    else:
+        for rx, sig in _PLUMBING_TITLE_WORDS:
+            if rx.search(title):
+                signal = sig
+                break
+    if signal:
+        row["title_signal"] = signal
+    sweep = len(areas) >= SWEEP_MIN_AREAS and \
+        2 * len(areas - source_areas) >= len(areas)
+    if sweep:
+        row["sweep"] = {"areas": len(areas),
+                        "plumbing_areas": len(areas - source_areas)}
+        row["substantive_areas"] = sorted(source_areas)
+    row["plumbing"] = ("source" not in real and cls != "release") \
+        or bool(sweep and signal)
+    row["areas"] = sorted(areas)
+    return row
+
+
+def _merged_in_window(pr, ctx):
+    if not pr.get("merged") or not _in_window(pr.get("merged_at"), ctx.period):
+        return False
+    base = ctx.bundle.get("meta", {}).get("base_branch")
+    return base is None or pr.get("base") in (None, base)
+
+
+def build_module_changes(bundle, path_rules=()):
+    """bundle["module_changes"] (BUNDLE.md "module_changes"), when the bundle
+    carries `module_notes`; otherwise nothing is added. Pure over the
+    bundle (in place). `path_rules` are the operator's `--path-class`
+    rules, recorded in `module_changes.path_rules`."""
+    notes = bundle.get("module_notes")
+    if not isinstance(notes, dict) or not notes.get("collected"):
+        return bundle
+    ctx = _ModuleCtx(bundle, path_class_rules(path_rules))
+    commits = bundle.get("commits", [])
+    kind = ctx.kind
+
+    mods = {}
+
+    def mod(area):
+        if area not in mods:
+            mods[area] = {"area": area, "kind": kind(area), "_commits": set(),
+                          "_source": False, "_classes": set(), "_events": [],
+                          "_symbols": [], "_children": {}, "_markers": [],
+                          "_changelog": [], "_versions": [], "_tags": [],
+                          "_entry": []}
+        return mods[area]
+
+    # 1. Commit files: which module areas were touched, by which class.
+    for c in commits:
+        for f in c.get("files") or []:
+            area = ctx.area_of(f)
+            if not kind(area):
+                continue
+            m = mod(area)
+            m["_commits"].add(c.get("sha"))
+            cls = path_class(f, ctx.rules)
+            m["_classes"].add(cls)
+            if cls == "source":
+                m["_source"] = True
+                m.setdefault("_source_files", set()).add(f)
+
+    # 2. File events: entry files, child modules, lifecycle markers.
+    for e in bundle.get("code_events", []):
+        path, change, old = e.get("path") or "", e.get("change"), e.get("old_path")
+        for p, role in ((path, "new"), (old, "old")):
+            if not p:
+                continue
+            area = ctx.area_of(p)
+            if not kind(area):
+                continue
+            m = mod(area)
+            m["_commits"].add(e.get("commit"))
+            k = kind(area)
+            entry = _entry_file(area, k)
+            base = p.rsplit("/", 1)[-1]
+            d = p.rpartition("/")[0]
+            src = ctx.source(e.get("commit"), p)
+            if p == entry:
+                m["_entry"].append({"change": change, "role": role, "path": p,
+                                    "old_path": old, "new_path": path,
+                                    "source": src})
+            child = _child_dir(p, area)
+            if child:
+                ch = m["_children"].setdefault(child, {"path": child, "events": []})
+                ch["events"].append({"change": change, "role": role,
+                                     "other": path if role == "old" else old,
+                                     "source": src})
+            if base in ("DEPRECATED.md", "ORPHANED.md") and role == "new" \
+                    and change in ("add", "delete", "rename", "copy"):
+                m["_markers"].append({"file": base, "change": change, "dir": d,
+                                      "source": src})
+
+    # 3. Symbol events of interface files (the module's and its children's).
+    for e in bundle.get("symbol_events", []):
+        if e.get("subkind") in ("comment", "todo", "var"):
+            continue
+        path = e.get("path") or ""
+        area = ctx.area_of(path)
+        if not kind(area):
+            continue
+        k = kind(area)
+        if _interface_file(path, area, k):
+            mod(area)["_symbols"].append(e)
+        else:
+            child = _child_dir(path, area)
+            if child:
+                ch = mod(area)["_children"].setdefault(
+                    child, {"path": child, "events": []})
+                ch.setdefault("symbols", []).append(e)
+    moves = (bundle.get("symbol_moves") or {}).get("links") or []
+
+    # 4. The gathered notes: changelog entries, version moves, tags.
+    for rec in notes.get("changelogs") or []:
+        area = ctx.area_of(rec.get("path"))
+        if kind(area):
+            mod(area)["_changelog"].append(rec)
+    for rec in notes.get("versions") or []:
+        area = ctx.area_of(rec.get("path"))
+        if kind(area):
+            mod(area)["_versions"].append(rec)
+    tags = notes.get("tags") or {}
+    for t in tags.get("items") or []:
+        module = t.get("module") or ""
+        area = ctx.area_of(module + "/main.bicep") if module else None
+        if module and not kind(area):
+            area = ctx.area_of(module + "/main.tf")
+        if area is None and not module:
+            area = "main.tf" if kind("main.tf") else None
+        if area and kind(area):
+            mod(area)["_tags"].append(t)
+
+    entries = [_module_entry(ctx, m, moves, bundle) for m in mods.values()]
+    entries = [e for e in entries if e is not None]
+    entries.sort(key=lambda e: e["area"])
+
+    # 5. Merged PRs: product vs plumbing.
+    pr_rows = [classify_pr_change(p, ctx) for p in bundle.get("prs", [])
+               if _merged_in_window(p, ctx)]
+    pr_rows.sort(key=lambda r: r["number"] if isinstance(r["number"], int) else -1)
+    pr_class = {r["number"]: r for r in pr_rows}
+    for e in entries:
+        for p in e.get("prs", []):
+            r = pr_class.get(p["number"])
+            if r is not None:
+                p["class"] = r["class"]
+                p["plumbing"] = r["plumbing"]
+
+    out = {"summary": _module_summary(entries, pr_rows), "modules": entries,
+           "prs": pr_rows}
+    releases = [{"tag": r.get("tag_name"), "name": r.get("name"),
+                 "published_at": r.get("published_at"), "url": r.get("url"),
+                 "prerelease": r.get("prerelease")}
+                for r in bundle.get("releases", [])]
+    if releases:
+        out["releases"] = releases
+    inputs = {"tags_collected": bool(tags.get("collected"))}
+    if not tags.get("collected") and tags.get("reason"):
+        inputs["tags_reason"] = tags["reason"]
+    if notes.get("unread"):
+        inputs["unread"] = notes["unread"]
+    if notes.get("windows"):
+        inputs["windows"] = notes["windows"]
+        inputs["covers_view"] = notes.get("covers_view")
+    out["inputs"] = inputs
+    if path_rules:
+        out["path_rules"] = list(path_rules)
+    bundle["module_changes"] = out
+    return bundle
+
+
+def _children_summary(ctx, m):
+    rows, candidates, deprecations = [], [], []
+    for path in sorted(m["_children"]):
+        ch = m["_children"][path]
+        evs = ch["events"]
+        change = None
+        row = {"path": path}
+        for ev in evs:
+            if ev["change"] == "rename" and ev["role"] == "old":
+                change = "moved"
+                row["to"] = ev["other"].rpartition("/")[0]
+            elif ev["change"] == "rename" and ev["role"] == "new":
+                change = "moved"
+                row["from"] = (ev["other"] or "").rpartition("/")[0]
+            elif ev["change"] in ("add", "copy") and change is None:
+                change = "added"
+            elif ev["change"] == "delete":
+                change = "removed"
+        row["change"] = change or "modified"
+        row["sources"] = _dedupe_sources(ev["source"] for ev in evs)
+        if ch.get("symbols"):
+            iface, _cands = _interface_summary(ctx, ch["symbols"], [])
+            if iface:
+                row["interface"] = iface
+        if row["change"] == "moved" and "to" in row and "from" not in row:
+            continue          # reported once, under the destination path
+        rows.append(row)
+        if row["change"] == "removed":
+            candidates.append({"rule": "child_module_removed", "subject": path,
+                               "sources": row["sources"]})
+        elif row["change"] == "moved":
+            candidates.append({"rule": "child_module_moved",
+                               "subject": "{} -> {}".format(row.get("from"), path),
+                               "sources": row["sources"]})
+    for mk in m["_markers"]:
+        if mk["dir"] == _area_dir(m["area"]):
+            continue
+        key = "deprecated" if mk["file"] == "DEPRECATED.md" else "orphaned"
+        if mk["change"] in ("add", "rename", "copy"):
+            match = next((r for r in rows if r["path"] == mk["dir"]), None)
+            if match is None:
+                match = {"path": mk["dir"], "change": key, "sources": []}
+                rows.append(match)
+            match.setdefault("markers", []).append(mk["file"])
+            match["sources"] = _dedupe_sources(match["sources"] + [mk["source"]])
+            if key == "deprecated":
+                deprecations.append({"target": mk["dir"], "basis": "marker_file",
+                                     "file": mk["file"], "sources": [mk["source"]]})
+    rows.sort(key=lambda r: r["path"])
+    return rows, candidates, deprecations
+
+
+def _module_entry(ctx, m, moves, bundle):
+    area, kind = m["area"], m["kind"]
+    d = _area_dir(area)
+    entry = {"area": area, "kind": kind}
+    # lifecycle of the module itself
+    status = None
+    moved_to = moved_from = None
+    introduced = []
+    for ev in m["_entry"]:
+        if ev["role"] == "new" and ev["change"] in ("add", "copy"):
+            status = status or "new"
+            introduced.append(ev["source"])
+        elif ev["role"] == "new" and ev["change"] == "delete":
+            status = "removed"
+        elif ev["role"] == "old" and ev["change"] == "rename":
+            status, moved_to = "removed", ev["new_path"]
+        elif ev["role"] == "new" and ev["change"] == "rename":
+            moved_from = ev["old_path"]
+    markers = [mk for mk in m["_markers"] if mk["dir"] == d]
+    lifecycle = []
+    for mk in markers:
+        lifecycle.append({"file": mk["file"], "change": mk["change"],
+                          "sources": [mk["source"]]})
+    marker_status = None
+    if any(mk["file"] == "DEPRECATED.md" and mk["change"] != "delete"
+           for mk in markers):
+        marker_status = "deprecated"
+    elif any(mk["file"] == "ORPHANED.md" and mk["change"] != "delete"
+             for mk in markers):
+        marker_status = "orphaned"
+    # changelog
+    changelog, declared, deprecations = [], [], []
+    first_version = None
+    for rec in m["_changelog"]:
+        src = ctx.source(rec.get("commit"), rec.get("path"))
+        module = rec.get("module")
+        if rec.get("new_file") and rec.get("change") == "add" and module == d \
+                and rec.get("entries"):
+            status = status or "new"
+            introduced.append(src)
+            first_version = first_version or rec["entries"][-1].get("version")
+        for e in rec.get("entries") or []:
+            row = {"version": e.get("version"), "sections": [
+                {k: s[k] for k in ("heading", "kind", "items", "placeholder",
+                                   "items_omitted") if k in s}
+                for s in e.get("sections") or []], "sources": [src]}
+            if module != d:
+                row["module"] = module
+            for k in ("date", "amended"):
+                if e.get(k):
+                    row[k] = e[k]
+            changelog.append(row)
+            for s, item in _changelog_items(e):
+                if s.get("kind") == "breaking":
+                    b = {"version": e.get("version"), "text": item["text"],
+                         "sources": [src]}
+                    if "truncated_from" in item:
+                        b["truncated_from"] = item["truncated_from"]
+                    if module != d:
+                        b["module"] = module
+                    declared.append(b)
+                if s.get("kind") == "deprecated" or _DEPRECATION_RE.search(
+                        item["text"]):
+                    deprecations.append({
+                        "target": _deprecation_target(item["text"]),
+                        "basis": "changelog", "version": e.get("version"),
+                        "text": item["text"], "sources": [src]})
+    # versions
+    versions = {}
+    own_versions = [v for v in m["_versions"] if v.get("module") == d]
+    if own_versions:
+        versions["version_file"] = {
+            "from": own_versions[0].get("from"), "to": own_versions[-1].get("to"),
+            "sources": [ctx.source(v.get("commit"), v.get("path"))
+                        for v in own_versions]}
+    child_versions = [v for v in m["_versions"] if v.get("module") != d]
+    if child_versions:
+        versions["child_version_files"] = [
+            {"module": v.get("module"), "from": v.get("from"), "to": v.get("to"),
+             "sources": [ctx.source(v.get("commit"), v.get("path"))]}
+            for v in child_versions]
+    cl_versions = [c["version"] for c in changelog
+                   if c.get("version") and "module" not in c]
+    if cl_versions:
+        versions["changelog"] = cl_versions
+    if m["_tags"]:
+        published = []
+        for t in m["_tags"]:
+            row = {"version": t.get("version"), "tag": t.get("tag"),
+                   "date": t.get("date"), "date_source": t.get("date_source"),
+                   "commit": t.get("commit"), "first": t.get("first")}
+            if (t.get("module") or "") != d:
+                row["module"] = t.get("module")
+            published.append(row)
+            if t.get("first") and (t.get("module") or "") == d:
+                status = status or "new"
+                introduced.append(ctx.source(t.get("commit"),
+                                             "refs/tags/" + (t.get("tag") or "")))
+                first_version = first_version or t.get("version")
+        versions["published"] = published
+    if kind in ("module",) and area == "main.tf":
+        rel = [{"tag": r.get("tag_name"), "published_at": r.get("published_at"),
+                "url": r.get("url")} for r in bundle.get("releases", [])]
+        if rel:
+            versions["releases"] = rel
+    if status == "new" and first_version is None and own_versions:
+        first_version = own_versions[-1].get("to")
+    # interface
+    own_moves = []
+    for mv in moves:
+        f_in = _interface_file(mv.get("from_path") or "", area, kind)
+        t_in = _interface_file(mv.get("to_path") or "", area, kind)
+        if f_in or t_in:
+            own_moves.append(dict(mv, leaves=f_in and not t_in))
+    iface, candidates = _interface_summary(ctx, m["_symbols"], own_moves)
+    children, child_cands, child_deps = _children_summary(ctx, m)
+    candidates += child_cands
+    deprecations += child_deps
+    if status == "removed":
+        candidates.append({"rule": "module_removed", "subject": area,
+                           "sources": [ev["source"] for ev in m["_entry"]]})
+    if status is None:
+        status = marker_status
+    if status == "new":
+        # nobody consumes a module that did not exist before the window
+        candidates = []
+    if status is None:
+        status = "changed" if (m["_commits"] or changelog or own_versions) \
+            or not m["_tags"] else "published"
+    entry["status"] = status
+    if first_version:
+        entry["first_version"] = first_version
+    if status == "new" and introduced:
+        entry["introduced_by"] = _dedupe_sources(introduced)
+    structure = {}
+    if moved_to:
+        structure["moved_to"] = moved_to
+    if moved_from:
+        structure["moved_from"] = moved_from
+    if lifecycle:
+        structure["lifecycle_markers"] = lifecycle
+    if children:
+        structure["children"] = children
+    if structure:
+        entry["structure"] = structure
+    if versions:
+        entry["versions"] = versions
+    if changelog:
+        entry["changelog"] = changelog
+    if iface:
+        entry["interface"] = iface
+    breaking = {}
+    if declared:
+        breaking["declared"] = declared
+    if candidates:
+        breaking["candidates"] = candidates
+    if breaking:
+        entry["breaking"] = breaking
+    if deprecations:
+        entry["deprecations"] = deprecations
+    # PRs and people behind it
+    prs, authors = set(), set()
+    for sha in m["_commits"]:
+        c = ctx.commits.get(sha) or {}
+        if c.get("pr") is not None:
+            prs.add(c["pr"])
+        if c.get("author"):
+            authors.add(c["author"])
+    for rec in m["_changelog"] + m["_versions"]:
+        c = ctx.commits.get(rec.get("commit")) or {}
+        if c.get("pr") is not None:
+            prs.add(c["pr"])
+    pr_rows = []
+    for n in sorted(prs, key=lambda x: (not isinstance(x, int), x)):
+        p = ctx.prs.get(n) or {}
+        row = {"number": n}
+        for k in ("url", "title", "author"):
+            if p.get(k):
+                row[k] = p[k]
+        if p.get("author"):
+            authors.add(p["author"])
+        pr_rows.append(row)
+    if m.get("_source_files"):
+        entry["source_files_changed"] = len(m["_source_files"])
+    if pr_rows:
+        entry["prs"] = pr_rows
+    if authors:
+        entry["authors"] = sorted(authors, key=str)
+    product = bool(m["_source"] or changelog or own_versions or m["_tags"]
+                   or markers or m["_entry"] or children)
+    entry["plumbing_only"] = not product
+    entry["product_score"] = _product_score(entry)
+    return entry
+
+
+def _product_score(entry):
+    """How much a reader-facing change this module carries (not PR count or
+    touched files): 5 for a new module, 3 per declared breaking item, 2 per
+    breaking candidate, 2 per child module change, 1 per interface change
+    (parameter / output / resource / API version / dependency), 1 per
+    changelog item, and 1 when any of its source files changed (a change
+    inside the module that touches no declaration). 0 for a module whose
+    only activity was plumbing."""
+    if entry.get("plumbing_only"):
+        return 0
+    score = 5 if entry.get("status") == "new" else 0
+    score += 1 if entry.get("source_files_changed") else 0
+    b = entry.get("breaking") or {}
+    score += 3 * len(b.get("declared") or []) + 2 * len(b.get("candidates") or [])
+    score += 2 * len((entry.get("structure") or {}).get("children") or [])
+    for group in (entry.get("interface") or {}).values():
+        for rows in group.values():
+            score += len(rows)
+    for c in entry.get("changelog") or []:
+        for s in c.get("sections") or []:
+            score += len(s.get("items") or [])
+    return score
+
+
+def _module_summary(entries, pr_rows):
+    by_status = {}
+    for e in entries:
+        by_status[e["status"]] = by_status.get(e["status"], 0) + 1
+    new = [{"area": e["area"], "kind": e["kind"],
+            "first_version": e.get("first_version"),
+            "introduced_by": sorted({s["pr"] for s in e.get("introduced_by", [])
+                                     if s.get("pr") is not None}),
+            "prs": [p["number"] for p in e.get("prs", [])]}
+           for e in entries if e["status"] == "new"]
+    new_children = [{"area": e["area"], "child": ch["path"],
+                     "prs": sorted({s["pr"] for s in ch.get("sources", [])
+                                    if s.get("pr") is not None})}
+                    for e in entries
+                    for ch in (e.get("structure") or {}).get("children", [])
+                    if ch.get("change") == "added"]
+    declared = []
+    for e in entries:
+        items = (e.get("breaking") or {}).get("declared") or []
+        if items:
+            versions = []
+            for b in items:
+                if b.get("version") not in versions:
+                    versions.append(b.get("version"))
+            declared.append({"area": e["area"], "versions": versions,
+                             "items": len(items)})
+    candidates = [{"area": e["area"], "rules": sorted({c["rule"] for c in (
+        e.get("breaking") or {}).get("candidates") or []})}
+        for e in entries if (e.get("breaking") or {}).get("candidates")]
+    deprecations = [{"area": e["area"], "target": d.get("target"),
+                     "basis": d.get("basis")}
+                    for e in entries for d in e.get("deprecations") or []]
+    ranked = sorted((e for e in entries if e["product_score"] > 0),
+                    key=lambda e: (-e["product_score"], e["area"]))
+    merged = len(pr_rows)
+    known = [r for r in pr_rows if r["class"] != "unknown"]
+    plumbing = sum(1 for r in known if r.get("plumbing"))
+    by_class = {}
+    for r in pr_rows:
+        by_class[r["class"]] = by_class.get(r["class"], 0) + 1
+    return {
+        "modules": len(entries), "by_status": by_status,
+        "new_modules": new, "new_child_modules": new_children,
+        "declared_breaking": declared,
+        "breaking_candidates": candidates, "deprecations": deprecations,
+        "orphaned": [e["area"] for e in entries if e["status"] == "orphaned"],
+        "removed": [e["area"] for e in entries if e["status"] == "removed"],
+        "most_substantive": [{"area": e["area"], "status": e["status"],
+                              "score": e["product_score"]}
+                             for e in ranked[:MODULE_RANK_TOP_N]],
+        "plumbing": {"merged_prs": merged, "classified": len(known),
+                     "plumbing_prs": plumbing,
+                     "share": round(plumbing / len(known), 3) if known else None,
+                     "by_class": by_class},
+    }
+
+
 # Item fields that hold a list or an object. A JSON null in one of them (a
 # hand-edited view, a REST object with `"labels": null`, an older store) would
 # raise TypeError deep in enrich; `_null_collections_to_empty` reads it as empty.
@@ -1468,7 +2463,7 @@ def _null_collections_to_empty(bundle):
     return bundle
 
 
-def enrich(bundle, priority_patterns=()):
+def enrich(bundle, priority_patterns=(), path_rules=()):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the window narrative projections (timeline/feature_deltas) and Phase 3b
     code-area attribution (code_area/area/modules). Label facets and `kind` are
@@ -1482,7 +2477,9 @@ def enrich(bundle, priority_patterns=()):
     never KeyErrors and never recomputes them. Null list/object fields on
     PRs/issues/commits are read as empty first (`_null_collections_to_empty`).
     `priority_patterns` are the operator's extra priority-label patterns
-    (`--priority-label`), added to PRIORITY_LABEL_PATTERNS."""
+    (`--priority-label`), added to PRIORITY_LABEL_PATTERNS. `path_rules` are
+    the operator's `--path-class CLASS=GLOB` rules for `module_changes`,
+    which is built only when the bundle carries `module_notes`."""
     priority_patterns = tuple(priority_patterns or ())
     matchers = priority_matchers(priority_patterns)
     _null_collections_to_empty(bundle)
@@ -1517,6 +2514,10 @@ def enrich(bundle, priority_patterns=()):
     # projections over issues/prs; placed after halls).
     derive.build_flow(bundle)
     derive.build_blockers(bundle)
+    # The reader's module view (new / changed / breaking / deprecated, product
+    # vs plumbing): only for a bundle that carries the gathered module_notes,
+    # so every other bundle is unchanged. Reads trains / symbol_moves above.
+    build_module_changes(bundle, path_rules)
     return bundle
 
 
@@ -1680,7 +2681,7 @@ def _load_bundle(path):
 
 
 _USAGE = ("usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json] "
-          "[--priority-label PATTERN ...]\n")
+          "[--priority-label PATTERN ...] [--path-class CLASS=GLOB ...]\n")
 _HELP = _USAGE + """
 Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
 
@@ -1692,22 +2693,28 @@ Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
                        also treat a label matching this regular expression
                        (case-insensitive search) as high priority, besides
                        the default patterns; repeatable
+  --path-class CLASS=GLOB
+                       classify files matching GLOB as CLASS (source, tests,
+                       docs, generated, metadata, ci) in module_changes,
+                       before the default rules; repeatable
   -h, --help           show this help and exit
 """
 
 
 def _parse_argv(argv):
-    """(path, slice_id, series_path, priority_patterns) of the documented
-    shapes: BUNDLE first, then at most one of `--slice ID` / `--series PATH`
-    and any number of `--priority-label PATTERN`, each flag followed by its
-    value. Anything else (an unknown flag, a missing value, a value or BUNDLE
-    that looks like a flag, `--slice` with `--series`, a pattern that is not
-    a valid regular expression) is a usage error: exit 2."""
+    """(path, slice_id, series_path, priority_patterns, path_rules) of the
+    documented shapes: BUNDLE first, then at most one of `--slice ID` /
+    `--series PATH` and any number of `--priority-label PATTERN` and
+    `--path-class CLASS=GLOB`, each flag followed by its value. Anything else
+    (an unknown flag, a missing value, a value or BUNDLE that looks like a
+    flag, `--slice` with `--series`, a pattern that is not a valid regular
+    expression, a path rule that is not CLASS=GLOB with a known class) is a
+    usage error: exit 2."""
     if not argv or argv[0].startswith("-"):
         return None
     path, rest = argv[0], argv[1:]
     slice_id = series_path = None
-    patterns = []
+    patterns, path_rules = [], []
     if len(rest) % 2:
         return None
     for flag, value in zip(rest[0::2], rest[1::2]):
@@ -1723,9 +2730,15 @@ def _parse_argv(argv):
             except re.error:
                 return None
             patterns.append(value)
+        elif flag == "--path-class":
+            try:
+                path_class_rules([value])
+            except ValueError:
+                return None
+            path_rules.append(value)
         else:
             return None
-    return path, slice_id, series_path, patterns
+    return path, slice_id, series_path, patterns, path_rules
 
 
 def main(argv=None):
@@ -1741,7 +2754,7 @@ def main(argv=None):
     if parsed is None:
         sys.stderr.write(_USAGE)
         raise SystemExit(2)
-    path, slice_id, series_path, priority_patterns = parsed
+    path, slice_id, series_path, priority_patterns, path_rules = parsed
     bundle = _load_bundle(path)
     # Load (and shape-check) the series index BEFORE any work, so a malformed
     # index stops the run with rc 2 and nothing is written.
@@ -1751,7 +2764,7 @@ def main(argv=None):
         problem = _series_bundle_problem(bundle.get("meta", {}), installments)
         if problem is not None:
             _series_refusal(series_path, problem)
-    enrich(bundle, priority_patterns)
+    enrich(bundle, priority_patterns, path_rules)
     if series_path is not None:
         # Phase 13: series continuity, idempotent by window (#86). Compare
         # against the installment immediately BEFORE this window and record

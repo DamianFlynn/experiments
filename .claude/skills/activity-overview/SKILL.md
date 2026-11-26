@@ -167,7 +167,10 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```
    This adds `trains`, the four `buckets` (`shipped`, `rejected`, `in_flight`,
    `next_candidates`), `forecast`, `flow`, … and `series` (`new` / `carried_over` /
-   `forecast_loop`). The series file is a thin convenience index over the store — never an
+   `forecast_loop`), and — when the gather read the module change notes (changelogs,
+   version files, tags) — `module_changes`: new / changed / deprecated / removed /
+   orphaned modules, declared vs candidate breaking changes and product vs plumbing
+   (BUNDLE.md "Module changes"; `--path-class CLASS=GLOB` adjusts the file classes). The series file is a thin convenience index over the store — never an
    override; delete it to start a fresh series. For a one-off digest run
    `python3 link.py workspace/view/bundle.json` instead (no `series` key is added).
    Multi-repo: keep one series file per member (`workspace/series/<owner>__<repo>.json`).

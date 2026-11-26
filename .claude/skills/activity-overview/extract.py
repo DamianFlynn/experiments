@@ -128,8 +128,8 @@ VIEW_CONTRACT_VERSION = 3
 # derived projections fold persists into nodes (artifacts, people).
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
-             "code_owners", "label_taxonomy", "newcomers", "artifacts",
-             "people")
+             "code_owners", "label_taxonomy", "newcomers", "module_notes",
+             "artifacts", "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
 # (not the raw symbol `change`). build_artifacts only uses `change` to recompute
@@ -447,6 +447,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_merged_newcomers`); absent when no gather collected it.
     if "newcomers" in facts:
         bundle["newcomers"] = facts["newcomers"]
+    # Module change notes (per-window only): the gathered window's fact as
+    # stored, or the items of the windows overlapping the view dated in it
+    # (`_merged_module_notes`); absent when no gather collected them.
+    if "module_notes" in facts:
+        bundle["module_notes"] = facts["module_notes"]
 
     return bundle
 
@@ -1220,7 +1225,8 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     # Windows whose CI runs were collected: only these can be summed.
     with_ci = {k for k in recorded if probes[k]["ci_collected"]}
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
-                           if k not in ("workflow_stats", "newcomers"))
+                           if k not in ("workflow_stats", "newcomers",
+                                        "module_notes"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1271,6 +1277,10 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
         ts_from, ts_to)
     if newcomers is not None:
         facts["newcomers"] = newcomers
+    notes = _merged_module_notes(conn, project, repo, overlapping, recorded,
+                                 ts_from, ts_to)
+    if notes is not None:
+        facts["module_notes"] = notes
     note = {"structure": win(structure),
             "workflow_stats": [win(k) for k in summed],
             # every day of the view is in exactly one summed window
@@ -1324,6 +1334,77 @@ def _merged_newcomers(conn, project, repo, inside, ts_from, ts_to):
             "unknown": sorted(unknown), "not_checked": sorted(not_checked),
             "windows": windows,
             "covers_view": _covers(windows, ts_from, ts_to)}
+
+
+def _merged_module_notes(conn, project, repo, overlapping, recorded, ts_from,
+                         ts_to):
+    """The `module_notes` of a view that is not exactly one gathered window.
+
+    Every item of the fact is dated (a changelog entry, a version move and
+    an unread file by its commit's day, a tag by its date), so a view takes
+    the items of every gathered window overlapping it (`overlapping`, those
+    with a facts entry: `recorded`) that are dated inside the view, once
+    each (changelogs / versions / unread by (path, commit), tags by name).
+    A window only partly inside the view contributes its items that fall in
+    it, so a sub-window or a roll-up reads exactly its own days. Returns
+    {"collected": True, "changelogs", "versions", "tags", ["unread"],
+    "windows": [{from, to}], "covers_view"} — or None when no overlapping
+    window collected module notes. `tags.collected` is true when any of
+    those windows listed tags; the windows that did not are named in
+    `tags.windows_without_tags`."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("module_notes",))
+        value = (got or {}).get("facts", {}).get("module_notes")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+
+    def inside(item):
+        return isinstance(item, dict) and graphstore.ts_in_window(
+            item.get("date"), ts_from, ts_to)
+
+    merged = {"changelogs": {}, "versions": {}, "unread": {}}
+    tags, tagless, tag_source = {}, [], None
+    for k, v in values.items():
+        for field in merged:
+            for item in v.get(field) or []:
+                if inside(item):
+                    merged[field].setdefault(
+                        (item.get("path") or "", item.get("commit") or ""), item)
+        t = v.get("tags") or {}
+        if t.get("collected"):
+            tag_source = tag_source or t.get("source")
+            for item in t.get("items") or []:
+                if inside(item):
+                    tags.setdefault(item.get("tag"), item)
+        else:
+            tagless.append({"from": k[0], "to": k[1]})
+
+    def ordered(items):
+        return sorted(items, key=lambda i: (str(i.get("date") or ""),
+                                            str(i.get("path") or ""),
+                                            str(i.get("commit") or "")))
+    out = {"collected": True,
+           "changelogs": ordered(merged["changelogs"].values()),
+           "versions": ordered(merged["versions"].values())}
+    if len(tagless) == len(values):
+        out["tags"] = {"collected": False,
+                       "reason": "no gathered window of the view listed tags"}
+    else:
+        out["tags"] = {"collected": True, "source": tag_source or "clone",
+                       "items": sorted(tags.values(), key=lambda i: (
+                           str(i.get("date") or ""), str(i.get("tag") or "")))}
+        if tagless:
+            out["tags"]["windows_without_tags"] = tagless
+    if merged["unread"]:
+        out["unread"] = ordered(merged["unread"].values())
+    windows = [{"from": k[0], "to": k[1]} for k in sorted(values)]
+    out["windows"] = windows
+    out["covers_view"] = _covers(windows, ts_from, ts_to)
+    return out
 
 
 def _materialize_singleton(conn, project, repo, local):

@@ -1782,6 +1782,471 @@ def attach_file_diffs(code_events, file_diffs):
     return code_events
 
 
+# --- Module change notes (per-window fact `module_notes`) ---------------------
+#
+# What the maintainers themselves wrote about a module, read from the clone:
+# the changelog entries a window's commits ADDED, the version-file movement
+# (`version.json` of a Bicep AVM module) and the version tags created in the
+# window. Work is per changed file: only the changelog / version files the
+# window's file-level code events name are read (two blob reads per changed
+# file: the commit's version and its parent's), never the whole tree.
+#
+# Why per commit and not from the patch walk: a unified diff with 3 lines of
+# context often lacks the `## <version>` heading an added item sits under (an
+# item appended to an existing section), so the hunk alone cannot say which
+# version or section it belongs to. Parsing the file at the commit and at its
+# parent and comparing the two is exact, attributes each entry to the commit
+# (and so the PR) that added it, and costs the same blobs the patch walk
+# already fetched. A rename (git `R`) reads the parent at the old path, so a
+# moved module's changelog is not mistaken for a new one.
+#
+# Everything network- or git-facing goes through two seams: `read_blob(rev,
+# path)` and `list_tags()` (production: git_blob_reader / git_tag_lister).
+
+# Changelog files, matched on the lower-cased basename.
+CHANGELOG_FILE_NAMES = ("changelog.md", "changes.md", "history.md",
+                        "release_notes.md", "releasenotes.md")
+# Version files: a JSON object with a top-level "version" (Bicep AVM).
+VERSION_FILE_NAMES = ("version.json",)
+MODULE_NOTE_TEXT_CAP = 600       # characters kept of one changelog item
+MODULE_NOTE_ITEMS_CAP = 40       # items kept per section
+MODULE_NOTE_ENTRIES_CAP = 12     # entries kept per changelog file per commit
+# An item that only says "nothing here" (the AVM template writes `- None`).
+CHANGELOG_PLACEHOLDERS = frozenset(("none", "none.", "n/a", "na", "-", "—"))
+# ... also when such a word opens the item and only an aside follows it
+# ("None (external interface unchanged)", "N/A - docs only").
+_PLACEHOLDER_LEAD_RE = re.compile(r"^(?:none|n/a|na)\s*(?:[.:(—–-]|$)", re.I)
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
+_MD_LINK_RE = re.compile(r"^\[([^\]]+)\](?:\([^)]*\)|\[[^\]]*\])?")
+_CHANGELOG_VERSION_RE = re.compile(
+    r"^(?:version|release)?[ \t]*v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.+-]*)?)"
+    r"(?=$|[\s\]\)(:,-])", re.IGNORECASE)
+_ISO_DAY_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+# a Markdown link reference definition (`[1.2.0]: https://...`), not text
+_MD_LINK_DEF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:\s*\S")
+_MD_BULLET_RE = re.compile(r"^( {0,1})(?:[-*+]|\d{1,3}[.)])[ \t]+(.*)$")
+_VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.+-]*)?$")
+TAG_LIST_FORMAT = ("%(refname:strip=2)%1f%(objecttype)%1f"
+                   "%(creatordate:iso-strict)%1f%(objectname)%1f%(*objectname)")
+
+
+def changelog_placeholder(text):
+    """True for a changelog item that only says there is nothing ("None",
+    "N/A", "None (interface unchanged)"). Pure."""
+    t = (text or "").strip()
+    return t.lower() in CHANGELOG_PLACEHOLDERS or bool(_PLACEHOLDER_LEAD_RE.match(t))
+
+
+class BlobUnreadable(RuntimeError):
+    """A file version that exists but could not be read (a git error)."""
+
+
+def _changelog_version(title):
+    """(version, date) of a changelog heading that names a version, else
+    None. Accepts `1.2.0`, `v1.2.0`, `[1.2.0] - 2024-01-31`, `[1.2.0](url)`,
+    `Version 1.2.0 (2024-01-31)` and `[Unreleased]` (version "Unreleased").
+    Pure."""
+    text = title.strip()
+    m = _MD_LINK_RE.match(text)
+    if m:                       # `[1.2.0](url) - date` / `[Unreleased]`
+        inner, rest = m.group(1).strip(), text[m.end():]
+    else:
+        inner, rest = text, ""
+    if inner.lower() == "unreleased":
+        return "Unreleased", None
+    v = _CHANGELOG_VERSION_RE.match(inner)
+    if not v:
+        return None
+    day = _ISO_DAY_RE.search(inner[v.end():] + " " + rest)
+    return v.group(1), (day.group(1) if day else None)
+
+
+def changelog_section_kind(heading):
+    """The kind of a changelog section heading: breaking, deprecated,
+    removed, security, fixed, added, changed or other (an unknown heading is
+    kept under its own heading with kind `other`). Pure."""
+    h = (heading or "").lower()
+    if "breaking" in h:
+        return "breaking"
+    if "deprecat" in h:
+        return "deprecated"
+    if re.search(r"\bremov", h):
+        return "removed"
+    if re.search(r"\bsecurity\b", h):
+        return "security"
+    if re.search(r"\bfix|\bbug", h):
+        return "fixed"
+    if re.search(r"\b(added|adds|new|features?)\b", h):
+        return "added"
+    if re.search(r"\b(changes?|changed|updates?|updated|improvements?|"
+                 r"enhancements?)\b", h):
+        return "changed"
+    return "other"
+
+
+def _cap_item(text):
+    if len(text) <= MODULE_NOTE_TEXT_CAP:
+        return {"text": text}
+    return {"text": text[:MODULE_NOTE_TEXT_CAP], "truncated_from": len(text)}
+
+
+def _new_section(heading):
+    return {"heading": heading, "kind": changelog_section_kind(heading)
+            if heading is not None else "unsectioned", "items": []}
+
+
+def parse_changelog(text):
+    """The version entries of a changelog, in file order. Pure.
+
+    An entry starts at a heading naming a version (`_changelog_version`);
+    the first one sets the entry heading level, and a later heading at that
+    level or above that names no version (a title, a footer) ends the entry.
+    Deeper headings inside an entry are its sections (`### Changes`, `###
+    Breaking Changes`, `### Added`, ... — any heading, kept verbatim with a
+    `kind`); items before any section go to a section with heading None.
+    An item is a list bullet at the line start (its continuation lines and
+    nested bullets belong to it) or a paragraph; fenced code is kept inside
+    the item it follows; link reference definitions (`[1.2.0]: url`) are
+    not text. Item text is verbatim (lines joined with a newline,
+    stripped; a fenced block right after an item, even past a blank line,
+    is part of it) and capped at MODULE_NOTE_TEXT_CAP characters
+    (`truncated_from` keeps the original length). A section whose only
+    items are placeholders (`changelog_placeholder`: "None", "N/A") keeps
+    no items and records `placeholder` (the text it said). Entry: {"version", "heading",
+    ["date"], "sections": [{"heading", "kind", "items": [{"text",
+    ["truncated_from"]}], ["placeholder"], ["items_omitted"]}]}."""
+    entries, level = [], None
+    entry = section = None
+    item_lines, item_open, in_code = None, False, False
+
+    def flush():
+        nonlocal item_lines
+        if item_lines is not None and section is not None:
+            body = "\n".join(item_lines).strip()
+            if body:
+                section["items"].append(body)
+        item_lines = None
+
+    for raw in (text or "").replace("\r\n", "\n").split("\n"):
+        line = raw.rstrip("\r")
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            if not in_code and item_lines is None and section is not None \
+                    and section["items"]:
+                # a fenced block after a blank line belongs to the item
+                # before it ("Before:" followed by an example)
+                item_lines = [section["items"].pop()]
+            in_code = not in_code
+            if item_lines is not None:
+                item_lines.append(line)
+            continue
+        if in_code:
+            if item_lines is not None:
+                item_lines.append(line)
+            continue
+        m = _MD_HEADING_RE.match(line)
+        if m:
+            flush()
+            item_open = False
+            depth, title = len(m.group(1)), m.group(2).strip()
+            ver = _changelog_version(title)
+            if ver is not None and (level is None or depth <= level):
+                level = depth
+                entry = {"version": ver[0], "heading": line.strip(),
+                         "sections": []}
+                if ver[1]:
+                    entry["date"] = ver[1]
+                entries.append(entry)
+                section = None
+            elif entry is not None and level is not None and depth > level:
+                section = _new_section(title)
+                entry["sections"].append(section)
+            elif level is not None and depth <= level:
+                entry = section = None          # a heading that ends the entry
+            continue
+        if entry is None or _MD_LINK_DEF_RE.match(line):
+            continue
+        if not stripped:
+            flush()
+            item_open = False
+            continue
+        bullet = _MD_BULLET_RE.match(line)
+        if bullet:
+            flush()
+            if section is None:
+                section = _new_section(None)
+                entry["sections"].append(section)
+            item_lines, item_open = [bullet.group(2)], True
+        elif item_open and item_lines is not None:
+            item_lines.append(stripped)          # continuation / nested bullet
+        else:
+            flush()
+            if section is None:
+                section = _new_section(None)
+                entry["sections"].append(section)
+            item_lines, item_open = [stripped], True   # a paragraph
+    flush()
+    for e in entries:
+        for s in e["sections"]:
+            texts = s.pop("items")
+            real = [t for t in texts if not changelog_placeholder(t)]
+            if texts and not real:
+                s["placeholder"] = texts[0]
+            s["items"] = [_cap_item(t) for t in real[:MODULE_NOTE_ITEMS_CAP]]
+            if len(real) > MODULE_NOTE_ITEMS_CAP:
+                s["items_omitted"] = len(real) - MODULE_NOTE_ITEMS_CAP
+    return entries
+
+
+def _entry_key(entry):
+    v = (entry.get("version") or "").lower()
+    return v[1:] if v.startswith("v") else v
+
+
+def _changelog_bullets(text):
+    """The top-level bullet texts of a changelog that names no version, in
+    order (the fallback of changelog_added_entries)."""
+    out, cur = [], None
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        bullet = _MD_BULLET_RE.match(line)
+        if bullet:
+            if cur is not None:
+                out.append("\n".join(cur).strip())
+            cur = [bullet.group(2)]
+        elif cur is not None and line.strip() and not _MD_HEADING_RE.match(line):
+            cur.append(line.strip())
+        elif cur is not None:
+            out.append("\n".join(cur).strip())
+            cur = None
+    if cur is not None:
+        out.append("\n".join(cur).strip())
+    return [t for t in out if t and not changelog_placeholder(t)]
+
+
+def changelog_added_entries(before, after):
+    """The changelog entries `after` adds to `before` (either None when the
+    file is absent), in `after`'s order. Pure.
+
+    A version `before` does not have is added whole. A version both have
+    is added with only the items `before`'s same section (same heading) did
+    not hold, marked `amended: true` (an item appended to a version not yet
+    released); nothing new -> not listed. A changelog that names no version
+    at all: its new top-level bullets, as one entry with version None.
+    Removed entries are not reported (the file's history keeps them)."""
+    new = parse_changelog(after)
+    old = parse_changelog(before) if before else []
+    if not new and not old:
+        # compared on the capped text, as the versioned path compares items
+        known = {_cap_item(t)["text"] for t in _changelog_bullets(before)} \
+            if before else set()
+        items = [t for t in _changelog_bullets(after)
+                 if _cap_item(t)["text"] not in known]
+        if not items:
+            return []
+        return [{"version": None, "heading": None, "sections": [
+            {"heading": None, "kind": "unsectioned",
+             "items": [_cap_item(t) for t in items[:MODULE_NOTE_ITEMS_CAP]]}]}]
+    old_by_key = {}
+    for e in old:
+        old_by_key.setdefault(_entry_key(e), e)
+    out = []
+    for e in new:
+        prior = old_by_key.get(_entry_key(e))
+        if prior is None:
+            out.append(e)
+            continue
+        seen = {}
+        for s in prior["sections"]:
+            seen.setdefault((s["heading"] or "").lower(), set()).update(
+                i["text"] for i in s["items"])
+        sections = []
+        for s in e["sections"]:
+            known = seen.get((s["heading"] or "").lower(), set())
+            items = [i for i in s["items"] if i["text"] not in known]
+            if items:
+                kept = {k: v for k, v in s.items()
+                        if k not in ("items", "placeholder")}
+                kept["items"] = items
+                sections.append(kept)
+        if sections:
+            out.append(dict(e, sections=sections, amended=True))
+    return out
+
+
+def parse_version_file(text):
+    """The `version` of a version.json text, or None. Pure."""
+    try:
+        doc = json.loads(text) if text else None
+    except ValueError:
+        return None
+    if isinstance(doc, dict) and isinstance(doc.get("version"), (str, int, float)) \
+            and not isinstance(doc.get("version"), bool):
+        return str(doc["version"])
+    return None
+
+
+def parse_version_tags(raw, from_date, to_date):
+    """The window's version tags from `git for-each-ref` output in
+    TAG_LIST_FORMAT. Pure.
+
+    A version tag's last path segment is a version (`v1.2.0`, `0.6.0`); the
+    rest is the module path it publishes (`avm/res/x/y/0.6.0` -> module
+    `avm/res/x/y`; `v1.2.0` -> module "" = the repository root). Its date is
+    the tagger date of an annotated tag (`date_source: "tagger"`), else the
+    committer date of the tagged commit (`"commit"`: a lightweight tag holds
+    no date of its own), as a UTC timestamp. Tags dated in [from, to] are
+    returned, each with `first`: no version tag of the same module in the
+    clone is dated before `from`. -> {"items": [...], "undated": n}."""
+    rows = []
+    undated = 0
+    for line in (raw or "").split("\n"):
+        cols = line.split("\x1f")
+        if len(cols) < 5 or not cols[0]:
+            continue
+        name, otype, created, oid, peeled = cols[:5]
+        module, _, last = name.rpartition("/")
+        if not _VERSION_TAG_RE.match(last):
+            continue
+        stamp = _utc_timestamp(created) if created else None
+        if stamp is None:
+            undated += 1
+            continue
+        rows.append({"tag": name, "module": module, "version": last,
+                     "date": stamp,
+                     "date_source": "tagger" if otype == "tag" else "commit",
+                     "commit": peeled or oid})
+    earlier = {r["module"] for r in rows
+               if not in_window(r["date"], from_date, None)}
+    items = [dict(r, first=r["module"] not in earlier) for r in rows
+             if in_window(r["date"], from_date, to_date)]
+    items.sort(key=lambda r: (r["date"], r["tag"]))
+    return {"items": items, "undated": undated}
+
+
+def git_blob_reader(clone_dir, run=None):
+    """The production `read_blob(rev, path)` seam: the text of `path` at
+    `rev`, None when the commit has no such file (or `rev` does not resolve:
+    a root commit's parent), BlobUnreadable when the file is there but git
+    could not read it. Trees are local in the partial clone, so the lookup
+    never needs the network; the blob may be fetched (the patch walk usually
+    fetched it already)."""
+    run = run or run_git
+
+    def read(rev, path):
+        if "\n" in path:
+            return None
+        try:
+            oid = run(["git", "-C", clone_dir, "rev-parse", "--verify", "-q",
+                       f"{rev}:{path}"]).strip()
+        except RuntimeError:
+            return None
+        if not oid:
+            return None
+        try:
+            return run(["git", "-C", clone_dir, "cat-file", "blob", oid])
+        except RuntimeError as exc:
+            raise BlobUnreadable(str(exc).splitlines()[0]) from None
+    return read
+
+
+def git_tag_lister(clone_dir, run=None):
+    """The production `list_tags()` seam: one local `git for-each-ref
+    refs/tags` (no network: the tags the clone/fetch brought along)."""
+    run = run or run_git
+    return lambda: run(["git", "-C", clone_dir, "for-each-ref", "refs/tags",
+                        f"--format={TAG_LIST_FORMAT}"])
+
+
+def _note_file_kind(path):
+    base = (path or "").rsplit("/", 1)[-1].lower()
+    if base in CHANGELOG_FILE_NAMES:
+        return "changelog"
+    if base in VERSION_FILE_NAMES:
+        return "version"
+    return None
+
+
+def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
+    """The window's `module_notes` fact. Pure given its two seams.
+
+    For every file-level code event (the window's, boundary commits already
+    dropped) of a changelog or version file that was added, modified,
+    renamed or copied: the file at the commit and at its first parent (at
+    `old_path` for a rename; none for an add or copy) are compared.
+    - `changelogs`: [{path, module (the file's directory, "" at the root),
+      commit, date, change, [old_path], [new_file], entries
+      (changelog_added_entries, at most MODULE_NOTE_ENTRIES_CAP),
+      [entries_omitted]}] — only commits that added something;
+    - `versions`: [{path, module, commit, date, change, [old_path], from,
+      to}] — version.json `version` before -> after, when it moved (or the
+      file was added with one);
+    - `tags`: {"collected": true, "source": "clone", "items", ["undated"]}
+      (parse_version_tags), or {"collected": false, "reason"} when the clone
+      holds no tag or listing them failed;
+    - `unread` (only when any): [{path, commit, date, reason}] file versions git
+      could not read (with the commit date) — a visible gap, never guessed.
+    Deleted files add nothing (the code events record the deletion)."""
+    changelogs, versions, unread = [], [], []
+    for ev in code_events:
+        path, change = ev.get("path"), ev.get("change")
+        kind = _note_file_kind(path)
+        if kind is None or change not in ("add", "modify", "rename", "copy"):
+            continue
+        sha, old_path = ev.get("commit"), ev.get("old_path")
+        try:
+            after = read_blob(sha, path)
+            before = None if change in ("add", "copy") else \
+                read_blob(f"{sha}^", old_path or path)
+        except BlobUnreadable as exc:
+            unread.append({"path": path, "commit": sha, "date": ev.get("date"),
+                           "reason": str(exc)})
+            continue
+        if after is None:
+            unread.append({"path": path, "commit": sha, "date": ev.get("date"),
+                           "reason": "the file is not in the commit"})
+            continue
+        rec = {"path": path, "module": path.rpartition("/")[0],
+               "commit": sha, "date": ev.get("date"), "change": change}
+        if old_path:
+            rec["old_path"] = old_path
+        if kind == "changelog":
+            entries = changelog_added_entries(before, after)
+            if not entries:
+                continue
+            if before is None:
+                rec["new_file"] = True
+            rec["entries"] = entries[:MODULE_NOTE_ENTRIES_CAP]
+            if len(entries) > MODULE_NOTE_ENTRIES_CAP:
+                rec["entries_omitted"] = len(entries) - MODULE_NOTE_ENTRIES_CAP
+            changelogs.append(rec)
+        else:
+            vb = parse_version_file(before) if before is not None else None
+            va = parse_version_file(after)
+            if va is not None and va != vb:
+                versions.append(dict(rec, **{"from": vb, "to": va}))
+    try:
+        raw_tags = list_tags() if list_tags is not None else None
+    except RuntimeError as exc:
+        tags = {"collected": False,
+                "reason": "listing tags failed: {}".format(
+                    str(exc).splitlines()[0] if str(exc) else "error")}
+    else:
+        if not (raw_tags or "").strip():
+            tags = {"collected": False, "reason": "the clone holds no tags"}
+        else:
+            parsed = parse_version_tags(raw_tags, from_date, to_date)
+            tags = {"collected": True, "source": "clone",
+                    "items": parsed["items"]}
+            if parsed["undated"]:
+                tags["undated"] = parsed["undated"]
+    notes = {"collected": True, "changelogs": changelogs,
+             "versions": versions, "tags": tags}
+    if unread:
+        notes["unread"] = unread
+    return notes
+
+
 # Ordered code-area patterns for the directory provider (primary, zero-dep).
 # Each entry is (name, predicate(parts) -> area_id_or_None) tried in order; the
 # first match wins. `parts` is path.split("/"). Patterns are directory-first and
@@ -5591,6 +6056,25 @@ def acquire(args, env):
             f"(ACTIVITY_CLONE_MARGIN_DAYS, default {CLONE_MARGIN_DAYS}) and re-gather "
             f"to recover: {_boundary_dropped}\n")
 
+    # Module change notes (per-window fact `module_notes`): the changelog
+    # entries, version.json moves and version tags of the window, read from
+    # the clone for the changelog / version files the code events name only
+    # (collect_module_notes). Needs the window's history on disk.
+    module_notes = None
+    if walk_clone:
+        module_notes = collect_module_notes(
+            code_events, git_blob_reader(clone_dir), git_tag_lister(clone_dir),
+            frm, to)
+        sys.stderr.write(
+            f"module notes: {owner}/{repo}: {len(module_notes['changelogs'])} "
+            f"changelog update(s), {len(module_notes['versions'])} version "
+            f"change(s), " + (
+                f"{len(module_notes['tags']['items'])} version tag(s) in the "
+                f"window" if module_notes["tags"].get("collected")
+                else f"tags not collected ({module_notes['tags']['reason']})")
+            + (f", {len(module_notes['unread'])} file version(s) unreadable"
+               if module_notes.get("unread") else "") + "\n")
+
     # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
     # from the code-event walk + the commit file lists (local, zero-token).
     area_paths = sorted(
@@ -5914,6 +6398,9 @@ def acquire(args, env):
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["newcomers"] = newcomers
+    # Omitted when the window's history was not on disk (nothing was read).
+    if module_notes is not None:
+        bundle["module_notes"] = module_notes
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph

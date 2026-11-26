@@ -482,6 +482,11 @@ candidates — the full list is in the bundle (`forecast.candidates`)".)
 
 ## Feature changes (add / drop / change)
 
+<!-- Pointer: module-level release notes (new / changed / breaking / deprecated modules,
+     declared vs candidate breaking changes, product vs plumbing) are in the view's module
+     changes structure when the gather read the module change notes; BUNDLE.md "Module
+     changes" documents it. A newsletter layout over it is designed separately. -->
+
 The `feature_deltas` ledger as a table grouped by `delta.kind`. Each row cites its
 artifact (`delta.artifact`) and the commit/PR that changed it. `delta.area` is the
 code area when the path resolves to one, else null.
