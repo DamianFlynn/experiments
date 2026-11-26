@@ -650,12 +650,13 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--from` / `--to` | — | window (YYYY-MM-DD) |
 | `--ref-date` | `--to` | reference point for milestone/sprint/forecast/flow framing; stored with the window, read back by `view.py`/`digest.py` |
 | `--branches` | repo default | mainline(s); first is `base_branch`. Unset: manifest member `branch`, else the repo's default branch (clone `origin/HEAD`, else API) |
-| `--clone-dir` | `workspace/<repo>-clone` | clone location; an existing clone of the same repo is fetched, not re-cloned (manifest: parent of per-member `<owner>-<repo>-clone` dirs) |
+| `--clone-dir` | `workspace/<repo>-clone` | clone location; an existing clone of the same repo is fetched, not re-cloned (manifest: parent of per-member `<owner>/<repo>` dirs; a former `<owner>-<repo>-clone` of the same remote is reused) |
 | `--no-clone` | off | never create a clone: fetch an existing one, or gather API data only |
 | `--no-workflows` / `--include-workflows` | on | CI workflow-run stats |
 | `--no-releases` / `--include-releases` | on | releases in window |
 | `--no-project-board` / `--project-board` | on | Projects v2 board ingest (auto-discovered) |
 | `--structural-iac` | off (on for manifest members) | whole-tree static Terraform + Bicep dependency scan |
+| `--no-iac-build` | off | skip the `bicep`/`terraform` builds (they run third-party code; use for untrusted repos); areas `edges_status: skipped` |
 | `--resume` | off | manifest only: gather just the members not `ok` for the window |
 | `--store PATH` | **required** | the SQLite store to fold into |
 

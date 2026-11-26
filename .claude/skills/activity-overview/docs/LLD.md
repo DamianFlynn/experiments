@@ -135,12 +135,13 @@ scratch store) and `backfill` respectively.
 | `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
 | `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing (`YYYY-MM-DD` or full ISO timestamp, `manifest.check_ref_date`). Stored per window at fold (`ref_date:` meta key) and read back into the view's `meta.ref_date` (§6.1) |
 | `--branches` | repo default | Comma list; first is `meta.base_branch`. Unset: a manifest member's `branch`, else the clone's `origin/HEAD`, else the API `default_branch` (`resolve_branches`); unresolved → `null` + stderr warning. Stored per window at fold (`branches:` meta key). The walk uses the checked-out default branch |
-| `--clone-dir` | `workspace/<repo>-clone` | Clone location (manifest: the parent of per-member `<owner>-<repo>-clone` dirs) |
+| `--clone-dir` | `workspace/<repo>-clone` | Clone location (manifest: the parent of per-member `<owner>/<repo>` dirs; an existing clone of the same remote in the former `<owner>-<repo>-clone` layout is reused) |
 | `--no-clone` | off | Never create a clone: fetch an existing one, or gather API data only (`clone_mode: none`) |
 | `--include-workflows` / `--no-workflows` | on | CI run stats |
 | `--include-releases` / `--no-releases` | on | Releases in window |
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
+| `--no-iac-build` | off (builds run) | Do not run `bicep restore/build` / `terraform init/graph` (they download and run third-party code, §14.4); every area `edges_status: skipped`, `edge_extraction.disabled: true`. The structural scan still runs |
 | `--store PATH` | **required** | SQLite store |
 
 Single-repo folds use `project = owner`, `repo = <name>`. Manifest folds use
@@ -211,13 +212,20 @@ sequenceDiagram
 ### 4.3 Clone and windowing
 
 - `acquire` calls `prepare_clone` on `--clone-dir` (default `workspace/<repo>-clone`; for
-  manifests `--clone-dir` is the parent of per-member `<owner>-<repo>-clone` dirs) and records
+  manifests `--clone-dir` is the parent of per-member `<owner>/<repo>` dirs, issue #109 — the
+  former `<owner>-<repo>-clone` collided for `a-b`/`c` vs `a`/`b-c`; such a dir that is a clone
+  of the member's own remote is still used while `<owner>/<repo>` does not exist) and records
   the outcome in `meta.clone_mode`:
   - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`).
   - `fetched` — the dir is already a clone of the same remote (`remote.origin.url`, GitHub
     https/ssh forms compared equal): `git fetch --prune --shallow-since=…` (`build_fetch_cmd`;
     deepens or shortens to this window's bound) then `checkout -B <default branch>` at the
-    fetched `origin/<default branch>`. Applies with and without `--no-clone`.
+    fetched `origin/<default branch>`. Applies with and without `--no-clone`. Before that
+    checkout (and `checkout_base_branch`'s) `reset_build_byproducts` removes what an earlier
+    current-month run's in-place IaC build left (issue #109): untracked `.terraform/` dirs and
+    `.terraform.lock.hcl` files (`git clean` limited to those pathspecs) and a tracked
+    `.terraform.lock.hcl` that `terraform init` rewrote (restored). Nothing else is touched: a
+    user's own untracked file in the way still stops the checkout.
   - `depth1-fallback` — `--shallow-since` selected no commits (git: "no commits selected for
     shallow requests", a quiet repo): the clone/fetch is retried with `--depth=1` so HEAD exists
     for IaC edges / CODEOWNERS / the structural scan; the three git walks are skipped (empty).
@@ -566,8 +574,10 @@ repo's edges of those types equal to what its stored inputs imply and deletes th
   registries) and `owns` (`_owns_pairs`) for every gathered window from its `facts:` entry,
   in `_window_order` (end day, then start day). Authority: a direct `depends_on` of area A —
   a window whose build of A resolved, or whose code graph has `structural_scan: true` (set by
-  `apply_structural_scan`; whole tree, so every area); a transitive one — a resolved build
-  only; `owns` of A — a window listing A that read CODEOWNERS or a checkout. A source's edges
+  `apply_structural_scan`; whole tree, so every area except those in its
+  `structural_scan_unread`, issue #109); a transitive one — a resolved build only; `owns` of
+  A — a window listing A that read CODEOWNERS or a checkout (not one whose code graph has
+  `codeowners_unread`). A source's edges
   are the union over its in-effect windows (its latest authoritative window and every later
   one; all when none), data from the latest. A stored edge not in that set is retracted only
   when its source has an authoritative window (`retractable`). With members None, cross-repo
@@ -1451,6 +1461,49 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 - Read-only token; nothing is written to GitHub; the token is read from the environment only.
 - Clones and stores contain repository content — treat workspaces as you would a clone.
 - `mmdc` as root requires `--no-sandbox`; restrict that to throwaway environments.
+- **The IaC builds download and run third-party code** (issue #109). `bicep restore` and
+  `terraform init` fetch the modules and providers the gathered repo names, and
+  `terraform init` / `graph` execute those providers on the gathering host. Use the builds only
+  on repos you trust; `--no-iac-build` skips them (every area `edges_status: skipped`,
+  `code_graph.edge_extraction.disabled: true`; the structural scan, which only parses source,
+  still runs). The default is unchanged (CI relies on the builds). terraform always runs with a
+  generated `TF_CLI_CONFIG_FILE` holding an explicit `provider_installation { direct {} }`
+  block (plus the user's own config and `~/.terraform.d/plugins` when present), which disables
+  terraform's implied local mirrors — in particular a `terraform.d/plugins` shipped inside the
+  repo; a user config that already has its own `provider_installation` block is used as is.
+  `TF_PLUGIN_CACHE_DIR` and `TF_TOKEN_<host>` are honoured. Residual: a repo can still pin
+  providers in its own `.terraform.lock.hcl` and commit a `.terraform/` directory; the builds
+  are not sandboxed.
+- **No child process sees the token** (issue #109). gather sends the token only in HTTPS
+  headers to `https://api.github.com`. Every subprocess (git, bicep, terraform, graphify) runs
+  with `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`, `ACTIVITY_TEST_TOKEN` and every variable ending in `_TOKEN` or
+  `_PAT` removed (`_child_env`); the rest of the environment (PATH, HOME, TMPDIR, proxy/TLS
+  variables, `TF_PLUGIN_CACHE_DIR`, `TF_TOKEN_<host>`, locale, Azure credentials) is kept.
+- **git is isolated from the user's config** (issue #109). gather's git processes run with
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_PAGER=cat` and `LC_ALL=C`, so `color.ui`, `diff.noprefix`, `diff.mnemonicPrefix`,
+  `log.showSignature`, `diff.renames`, `clone.defaultRemoteName`, LFS filters, … cannot change
+  the walks; the walks also pass `--no-color --no-ext-diff --no-textconv --no-show-signature`
+  (`-M` on the commit walk, `--src-prefix=a/ --dst-prefix=b/` on the patch walk). From the
+  user's system and global config only network/auth routing is carried over, through
+  `GIT_CONFIG_COUNT` (never argv): `http.*` / `http.<url>.*` `proxy`, `proxyAuthMethod`,
+  `proxySSLCAInfo`, `sslCAInfo`, `sslCAPath`, `sslVerify`, `sslBackend`, `sslVersion`,
+  `sslCipherList`, `schannelCheckRevoke`, `schannelUseSSLCAInfo`, `version`, `postBuffer`,
+  `lowSpeedLimit`, `lowSpeedTime`, `followRedirects`, `curloptResolve`, `maxRequests`,
+  `minSessions`, `noEPSV`, `emptyAuth`; `url.<base>.insteadOf`; `credential.helper` /
+  `.username` / `.useHttpPath`; `safe.directory`; `protocol.*.allow`; `core.sshCommand`.
+  Dropped: everything else, including `http.extraHeader`, `http.sslCert` / `sslKey`,
+  `http.cookieFile`. Proxy and TLS environment variables (`HTTPS_PROXY`, `GIT_SSL_CAINFO`,
+  `SSL_CERT_FILE`, …) pass unchanged. Needs git ≥ 2.32 for `GIT_CONFIG_GLOBAL`; older git
+  reads the global config as before (the walk flags still pin the output).
+- **Repo files are never read through a symlink that leaves the checkout** (issue #109):
+  CODEOWNERS, `.tf` / `.bicep` sources, `modules.json` and graphify's `graph.json` are read only
+  when their real path is inside the clone / structure worktree (`_read_text_file(path,
+  root)`); otherwise skipped with one warning. Text is decoded with a BOM-selected codec, else
+  UTF-8 with replacement, so an undecodable byte never fails the member; an unread module file
+  puts its area in `code_graph.structural_scan_unread` and an unread CODEOWNERS sets
+  `code_graph.codeowners_unread`, so neither is taken as evidence for retraction (#95).
 - Recognition-not-blame: `halls` has no shame list; people attribution of stalls is an opt-in
   report appendix.
 

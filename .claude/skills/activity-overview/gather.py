@@ -4,6 +4,7 @@ The only component that touches the network. Produces a schema-complete bundle;
 later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
+import atexit
 import concurrent.futures
 import contextlib
 import copy
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -149,12 +151,19 @@ CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
 # commit's `committed_at` so the timeline orders same-day events by real time
 # (#82).
 COMMIT_LOG_FORMAT = CODE_LOG_FORMAT + "%x1f%ae%x1f%cI"
+# Belt and braces to run_git's config isolation (issue #109): flags that pin
+# what user config could otherwise change -- colour escapes, an external diff
+# or textconv driver, signature lines, rename detection (`-M` is git's default
+# `diff.renames=true`) and the `a/` / `b/` patch prefixes the diff parser reads.
+_WALK_PIN_ARGS = ("--no-color", "--no-ext-diff", "--no-textconv",
+                  "--no-show-signature")
 COMMIT_WALK_ARGS = (f"--pretty=format:{COMMIT_LOG_FORMAT}", "--date=short",
-                    "--name-only")
+                    "--name-only", "-M") + _WALK_PIN_ARGS
 CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-                  "--name-status", "-M", "-C")
+                  "--name-status", "-M", "-C") + _WALK_PIN_ARGS
 PATCH_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-                   "-p", "--unified=3", "-M", "-C")
+                   "-p", "--unified=3", "-M", "-C") + _WALK_PIN_ARGS + (
+                   "--src-prefix=a/", "--dst-prefix=b/")
 
 _STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
                      "R": "rename", "C": "copy", "T": "modify"}
@@ -404,6 +413,8 @@ def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
         depth1 = _shallow_or_depth1(
             run, lambda d1: build_fetch_cmd(clone_dir, from_date, d1))
         branch = _default_branch(clone_dir, run)
+        # An earlier current-month run built IaC in place (issue #109).
+        reset_build_byproducts(clone_dir, run)
         run(["git", "-C", clone_dir, "checkout", "-q", "-B", branch,
              f"refs/remotes/origin/{branch}"])
         return "depth1-fallback" if depth1 else "fetched"
@@ -414,6 +425,34 @@ def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
     depth1 = _shallow_or_depth1(
         run, lambda d1: build_clone_cmd(repo_url, from_date, clone_dir, d1))
     return "depth1-fallback" if depth1 else "fresh"
+
+
+# What gather's own IaC builds leave in a checkout (issue #109): `terraform
+# init` writes `.terraform/` and `.terraform.lock.hcl` in each module dir it
+# builds (bicep restore/build write nothing there: restore caches under
+# ~/.bicep, build prints to stdout). For the current month the builds run in
+# the clone itself (structure_tree yields the clone), so these are left behind.
+_BUILD_BYPRODUCT_PATHSPECS = (":(glob)**/.terraform/**", ":(glob)**/.terraform.lock.hcl")
+
+
+def reset_build_byproducts(clone_dir, run=None):
+    """Remove an earlier run's IaC build output so the next branch switch
+    cannot be blocked by it (issue #109): untracked `.terraform/` dirs and
+    untracked `.terraform.lock.hcl` files anywhere in the clone are deleted
+    (`git clean`, restricted to those pathspecs), and a TRACKED
+    `.terraform.lock.hcl` that `terraform init` rewrote is restored to its
+    committed content. Nothing else is touched: a user's own untracked or
+    modified files keep blocking a checkout exactly as before, never
+    silently deleted. Ignored files under those paths are cleaned too (-x):
+    a repo's `.gitignore` normally lists `.terraform/`."""
+    run = run or run_git
+    run(["git", "-C", clone_dir, "clean", "-f", "-d", "-x", "-q", "--",
+         *_BUILD_BYPRODUCT_PATHSPECS])
+    changed = [unquote_git_path(ln) for ln in run(
+        ["git", "-C", clone_dir, "ls-files", "-m", "--",
+         _BUILD_BYPRODUCT_PATHSPECS[1]]).splitlines() if ln]
+    if changed:
+        run(["git", "-C", clone_dir, "checkout", "-q", "--", *changed])
 
 
 class MissingBranchError(RuntimeError):
@@ -452,6 +491,7 @@ def checkout_base_branch(clone_dir, branch, from_date, run=None):
             raise MissingBranchError(
                 f"base branch {branch!r} does not exist on the remote") from None
         raise
+    reset_build_byproducts(clone_dir, run)
     run(["git", "-C", clone_dir, "checkout", "-q", "-B", branch,
          f"refs/remotes/origin/{branch}"])
     return depth1
@@ -1826,7 +1866,11 @@ def parse_graphify_graph(graph_json):
     return {"provider": "graphify", "areas": areas}
 
 
-def _read_json_file(path):
+def _read_json_file(path, root=None):
+    """JSON from a file; with `root`, refused when the file resolves outside it
+    (as _read_text_file, issue #109)."""
+    if root is not None and not _inside_root(path, root):
+        raise RepoFileRefused("{} resolves outside {}".format(path, root))
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -1844,6 +1888,9 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if run is None:
         run = run_git
+    if read_json is _read_json_file:
+        def read_json(path):
+            return _read_json_file(path, root=clone_dir)
     directory = build_directory_areas(paths, patterns)
     if not which("graphify"):
         return directory
@@ -1861,8 +1908,94 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
 # Phase 3c: IaC dependency-edge extraction (build-only). The edge object is
 # {to, kind, ref, version, transitive, provider, resolved}; see BUNDLE.md.
 
+# Matched on a Bicep "mask" of the source (_bicep_mask: comments and string
+# contents blanked at the same offsets, top-level quotes kept), so a `module`
+# inside a comment or a string never matches (issue #109). The keyword must
+# start a statement: the start of a line after whitespace, optionally after
+# decorators on the same line (decorators on earlier lines are their own
+# lines). The ref's text is read from the original source at the match span.
 _BICEP_MODULE_RE = re.compile(
-    r"module\s+\w+\s+'(?P<ref>[^']+)'(?:\s*=\s*(?P<open>[\[{]))?")
+    r"(?m)^[ \t]*(?:@[\w.]+(?:\((?:[^()\n]|\([^()\n]*\))*\))?[ \t]+)*"
+    r"module\s+\w+\s+'(?P<ref>[^'\n]*)'(?:\s*=\s*(?P<open>[\[{]))?")
+
+
+def _bicep_mask(text):
+    """Return Bicep `text` with comments and string-literal contents replaced
+    by spaces (newlines kept), so offsets are unchanged -- the Bicep
+    counterpart of _hcl_mask.
+
+    Handles `//` line comments, `/* */` block comments, `'...'` strings with
+    `\\` escapes and `${...}` interpolation (nested braces, nested strings and
+    comments inside the expression), and `'''...'''` multi-line strings (no
+    escapes, no interpolation; blanked whole, quotes included). The quote
+    characters of a top-level single-quoted string are kept so a module ref's
+    span can be located. An unterminated string ends at the newline; an
+    unterminated block comment or multi-line string runs to the end. Pure."""
+    out = list(text)
+    n = len(text)
+
+    def blank(a, b):
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    stack = []          # "str" | [interp_brace_depth]; empty = code context
+    i = 0
+    while i < n:
+        c = text[i]
+        if stack and stack[-1] == "str":
+            if c == "\\":
+                blank(i, i + 2)
+                i += 2
+            elif text.startswith("${", i):
+                blank(i, i + 2)
+                stack.append([0])
+                i += 2
+            elif c == "'" or (c == "\n" and len(stack) == 1):
+                stack.pop()
+                if stack and c == "'":
+                    blank(i, i + 1)                     # nested string's quote
+                i += 1
+            else:
+                blank(i, i + 1)
+                i += 1
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+            continue
+        if text.startswith("'''", i):
+            j = text.find("'''", i + 3)
+            j = n if j < 0 else j + 3
+            blank(i, j)
+            i = j
+            continue
+        if stack:                                       # inside an interpolation
+            top = stack[-1]
+            if c == "'":
+                stack.append("str")
+            elif c == "{":
+                top[0] += 1
+            elif c == "}":
+                if top[0]:
+                    top[0] -= 1
+                else:
+                    stack.pop()
+            blank(i, i + 1)
+            i += 1
+            continue
+        if c == "'":
+            stack.append("str")
+        i += 1
+    return "".join(out)
 
 
 # A non-local Bicep reference scheme: `br:` / `ts:` or an alias `br/<a>:` / `ts/<a>:`.
@@ -1917,10 +2050,14 @@ def parse_bicep_module_refs(source_text):
     its path says nothing about this repo, so only the raw `ref` (+ `version`) is
     kept. A ref with no scheme is a `local_path`. `instances` is `"many"` when the
     module is instantiated as an array (`= [for ...]`), `"one"` for a single
-    `= {`, else None. Pure."""
+    `= {`, else None. A `module` inside a comment or a string is not a
+    reference (matched on _bicep_mask; issue #109). Pure."""
     refs = []
-    for m in _BICEP_MODULE_RE.finditer(source_text or ""):
-        ref = m.group("ref")
+    text = source_text or ""
+    for m in _BICEP_MODULE_RE.finditer(_bicep_mask(text)):
+        ref = text[m.start("ref"):m.end("ref")]
+        if not ref:
+            continue
         open_ch = m.group("open")
         instances = "many" if open_ch == "[" else "one" if open_ch == "{" else None
         registry_path, version, local_path = _bicep_ref_parts(ref)
@@ -2448,14 +2585,17 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
     DIRECT edge (no DOT transitivity), shaped exactly like build_terraform_edges'
     output. Scaffold areas (examples/tests) are skipped. Returns
     {area_id: {"paths": [...], "edges": [...]}}. `list_files`/`read_text` are
-    injectable for offline tests; defaults list tracked *.tf via git + read disk."""
+    injectable for offline tests; defaults list tracked *.tf via git + read disk.
+
+    A module file that cannot be read (outside the checkout, dangling, not
+    readable; `read_text` raising OSError) is skipped with one warning and its
+    area carries `"unread": True` (issue #109): its edges come from the files
+    that were read, and apply_structural_scan records it as not scanned."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if list_files is None:
         def list_files():
             return git_ls_files(clone_dir)
-    if read_text is None:
-        def read_text(rel):
-            return _read_text_file(os.path.join(clone_dir, rel))
+    read_text = _guarded_reader(clone_dir, read_text)
 
     by_area = {}
     for rel in list_files():
@@ -2475,9 +2615,29 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
         # module); a nested dir is only used when the area dir itself has no *.tf.
         mod_dir = _tf_module_dir(aid, paths)
         own = [p for p in paths if os.path.dirname(p) == mod_dir]
-        text = "\n".join(read_text(p) for p in own)
+        texts = [read_text(p) for p in own]
+        text = "\n".join(t for t in texts if t is not None)
         out[aid] = {"paths": paths, "edges": _tf_direct_edges(text, mod_dir, patterns)}
+        if any(t is None for t in texts):
+            out[aid]["unread"] = True
     return out
+
+
+def _guarded_reader(clone_dir, read_text=None):
+    """`rel -> text | None` for the structural scans: the injected `read_text`
+    (OSError -> one warning, None) or, by default, _read_repo_text under
+    `clone_dir` (never outside it)."""
+    if read_text is None:
+        return lambda rel: _read_repo_text(clone_dir, rel)
+
+    def guarded(rel):
+        try:
+            return read_text(rel)
+        except OSError as exc:
+            sys.stderr.write("warning: skipped {}: {} (not read)\n".format(
+                rel, exc.strerror or exc))
+            return None
+    return guarded
 
 
 def merge_structural_areas(code_graph, structural):
@@ -2525,14 +2685,14 @@ def scan_structural_bicep_areas(clone_dir, patterns=None, list_files=None,
     Cost: one pass over the listing, one read per module entrypoint; no other
     file is opened. Returns {area_id: {"paths": [the area's non-scaffold .bicep
     files], "edges": [...]}}. `list_files`/`read_text` are injectable for offline
-    tests; defaults list tracked files via git and read from disk."""
+    tests; defaults list tracked files via git and read from disk. An entry
+    file that cannot be read (as in scan_structural_terraform_areas) gives
+    its area no edges and `"unread": True` (issue #109)."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if list_files is None:
         def list_files():
             return git_ls_files(clone_dir)
-    if read_text is None:
-        def read_text(rel):
-            return _read_text_file(os.path.join(clone_dir, rel))
+    read_text = _guarded_reader(clone_dir, read_text)
 
     by_area, entry = {}, {}
     for rel in list_files():
@@ -2548,7 +2708,11 @@ def scan_structural_bicep_areas(clone_dir, patterns=None, list_files=None,
     modules = {aid for aid in entry if not _is_avm_group_area(aid)}
     out = {}
     for aid in sorted(modules):
-        edges = build_bicep_edges(read_text(entry[aid]), None, entry[aid],
+        src = read_text(entry[aid])
+        if src is None:
+            out[aid] = {"paths": sorted(by_area[aid]), "edges": [], "unread": True}
+            continue
+        edges = build_bicep_edges(src, None, entry[aid],
                                   modules, patterns,
                                   module_exists=modules.__contains__)
         out[aid] = {"paths": sorted(by_area[aid]), "edges": edges}
@@ -2569,15 +2733,20 @@ def apply_structural_scan(code_graph, clone_dir, patterns=None, list_files=None,
 
     def listed():
         return files
-    merge_structural_areas(code_graph, scan_structural_terraform_areas(
-        clone_dir, patterns, list_files=listed, read_text=read_text))
-    merge_structural_areas(code_graph, scan_structural_bicep_areas(
-        clone_dir, patterns, list_files=listed, read_text=read_text))
+    unread = set()
+    for scan in (scan_structural_terraform_areas, scan_structural_bicep_areas):
+        found = scan(clone_dir, patterns, list_files=listed, read_text=read_text)
+        unread.update(aid for aid, info in found.items() if info.get("unread"))
+        merge_structural_areas(code_graph, found)
     # The graph now holds the WHOLE tree's direct module edges: an area with no
     # direct edge here has none in the checkout. Fold relies on this marker to
     # retract stale direct depends_on edges (issue #95); a scan that cannot
-    # list or read the tree raises before it is set.
+    # list the tree raises before it is set. An area with a module file the
+    # scan could not read (issue #109) is listed in `structural_scan_unread`
+    # and is NOT spoken for by the marker (StructureReplay).
     code_graph["structural_scan"] = True
+    if unread:
+        code_graph["structural_scan_unread"] = sorted(unread)
     return code_graph
 
 
@@ -2626,9 +2795,61 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None,
                   key=lambda e: (str(e["to"]), str(e["ref"]), e.get("address", "")))
 
 
-def _read_text_file(path):
-    with open(path, encoding="utf-8") as fh:
-        return fh.read()
+class RepoFileRefused(OSError):
+    """A repo file gather will not read: its real path leaves the clone."""
+
+
+def _inside_root(path, root):
+    """True when `path`, all symlinks resolved, is `root` or below it (root's
+    own symlinks resolved too)."""
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(path)
+    return real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def _decode_text(data):
+    """Bytes of a repo text file -> str. A UTF-16 / UTF-32 BOM selects that
+    codec, a UTF-8 BOM is dropped; anything else is UTF-8 with undecodable
+    bytes replaced (U+FFFD), so one latin-1 byte never fails a member. Line
+    ends are translated as text-mode `open` does (`\\r\\n` / `\\r` -> `\\n`)."""
+    text = None
+    for bom, codec in ((b"\xef\xbb\xbf", "utf-8-sig"),
+                       (b"\xff\xfe\x00\x00", "utf-32"), (b"\x00\x00\xfe\xff", "utf-32"),
+                       (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16")):
+        if data.startswith(bom):
+            text = data.decode(codec, "replace")
+            break
+    if text is None:
+        text = data.decode("utf-8", "replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_text_file(path, root=None):
+    """Read one repo text file (issue #109). With `root` (the clone or the
+    structure worktree), a path whose real location -- symlinks resolved --
+    is outside `root` is refused with RepoFileRefused and never opened: a
+    tracked symlink must not make gather read a file of the machine it runs
+    on. A symlink that stays inside the tree is followed. Decoding never
+    fails (_decode_text). A missing file or dangling symlink raises OSError
+    as before; callers that must not fail catch it (_read_repo_text)."""
+    if root is not None and not _inside_root(path, root):
+        raise RepoFileRefused("{} resolves outside {}".format(path, root))
+    with open(path, "rb") as fh:
+        return _decode_text(fh.read())
+
+
+def _read_repo_text(root, rel, warn=None):
+    """`_read_text_file(<root>/<rel>, root)`, or None after ONE stderr warning
+    naming the file when it is refused (outside the tree) or cannot be read
+    (dangling symlink, permission, a directory)."""
+    try:
+        return _read_text_file(os.path.join(root, rel), root=root)
+    except OSError as exc:
+        reason = ("it resolves outside the checkout" if isinstance(exc, RepoFileRefused)
+                  else exc.strerror or type(exc).__name__)
+        (warn or sys.stderr.write)(
+            "warning: skipped {}: {} (not read)\n".format(rel, reason))
+        return None
 
 
 # The area ids the directory provider gives to REPO-ROOT IaC files: `_main_bicep_dir`
@@ -3107,6 +3328,13 @@ def parse_args(argv):
                         "module dependencies (static, no build), so modules not "
                         "changed in the window still appear with their direct "
                         "edges; always on for --manifest members")
+    p.add_argument("--no-iac-build", dest="no_iac_build", action="store_true",
+                   help="do not run `bicep restore/build` or `terraform init/"
+                        "graph` (they download and run third-party modules and "
+                        "providers chosen by the gathered repo); every area is "
+                        "recorded edges_status=skipped. The structural scan "
+                        "(source parsing) still runs. Use it for repos you do "
+                        "not trust.")
     p.add_argument("--store", required=True,
                    help="path to the SQLite journey-graph store to fold into "
                         "(the sole gather deliverable)")
@@ -3163,6 +3391,233 @@ def resolve_token(env):
     return token
 
 
+# --- Child-process environment (issue #109) -----------------------------------
+#
+# Every subprocess gather starts (git, bicep, terraform, graphify) goes through
+# run_git and gets the environment `_child_env` builds from os.environ:
+#
+#   * Secrets removed (item 14): GITHUB_TOKEN, GH_TOKEN, GITHUB_PAT, the GitHub
+#     Enterprise token names, ACTIVITY_TEST_TOKEN and every other variable whose
+#     name ends in `_TOKEN` or `_PAT`. gather sends the token only in HTTPS
+#     headers to api.github.com; git clones the gathered repos without it and
+#     the IaC builds run third-party code that must never see it. Terraform's
+#     own registry credentials (`TF_TOKEN_<host>`) do not end in `_TOKEN` and are
+#     kept, as is everything else (PATH, HOME, TMPDIR, proxy/TLS variables,
+#     TF_PLUGIN_CACHE_DIR, locale, Azure credentials a private `br:` registry
+#     restore needs).
+#   * git only (item 2): the user's global and system config are not read
+#     (GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1), so `color.ui`,
+#     `diff.noprefix`, `diff.mnemonicPrefix`, `log.showSignature`,
+#     `diff.renames`, `clone.defaultRemoteName`, `i18n.logOutputEncoding` and
+#     the like cannot change what the walks print; GIT_TERMINAL_PROMPT=0 (fail,
+#     never prompt), GIT_PAGER=cat, and LC_ALL=C so the git messages matched
+#     below ("couldn't find remote ref", "no commits selected for shallow
+#     requests") are the English ones. What a clone/fetch legitimately needs
+#     from that config is read ONCE (`_git_passthrough_config`) and re-applied
+#     through GIT_CONFIG_COUNT (never argv, so no value appears in a process
+#     listing or in run_git's error text): see _GIT_PASSTHROUGH_HTTP_VARS.
+#   * terraform only (item 10): TF_CLI_CONFIG_FILE names a CLI config with an
+#     explicit `provider_installation` block (`_terraform_cli_config`), which
+#     turns off terraform's implied local mirrors, in particular a
+#     `terraform.d/plugins` directory shipped inside the gathered repo.
+_SECRET_ENV_NAMES = frozenset((
+    "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN", "ACTIVITY_TEST_TOKEN"))
+_SECRET_ENV_SUFFIXES = ("_TOKEN", "_PAT")
+
+_GIT_ISOLATION_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_PAGER": "cat",
+    "LC_ALL": "C",
+}
+
+# The user's global/system git config is read for these keys only: settings
+# that route or authorise the network connection and never change git's
+# output. `http.*` / `http.<url>.*` variables are kept when named here; the
+# others (`extraHeader`, `sslCert`, `sslKey`, `proxySSLCert`, `proxySSLKey`,
+# `cookieFile`, `userAgent`, ...) are dropped, as is every key outside the
+# sections below (`include*` is followed while reading, not copied).
+_GIT_PASSTHROUGH_HTTP_VARS = frozenset((
+    "proxy", "proxyauthmethod", "proxysslcainfo", "sslcainfo", "sslcapath",
+    "sslverify", "sslbackend", "sslversion", "sslcipherlist",
+    "schannelcheckrevoke", "schannelusesslcainfo", "version", "postbuffer",
+    "lowspeedlimit", "lowspeedtime", "followredirects", "curloptresolve",
+    "maxrequests", "minsessions", "noepsv", "emptyauth"))
+_GIT_PASSTHROUGH_REGEXP = (r"^(http|https|url|credential|safe|protocol)\."
+                           r"|^core\.sshcommand$")
+_git_passthrough_cache = None
+_terraform_cli_config_cache = None
+_child_env_lock = threading.Lock()
+
+
+def _is_secret_env(name):
+    up = name.upper()
+    return up in _SECRET_ENV_NAMES or up.endswith(_SECRET_ENV_SUFFIXES)
+
+
+def _git_passthrough_key(key):
+    """True when a global/system git config key is carried over (see
+    _GIT_PASSTHROUGH_HTTP_VARS)."""
+    low = key.lower()
+    section, _, rest = low.partition(".")
+    var = low.rsplit(".", 1)[-1]
+    if section in ("http", "https"):
+        return var in _GIT_PASSTHROUGH_HTTP_VARS
+    if section == "url":
+        return bool(rest) and var == "insteadof"
+    if section == "credential":
+        return var in ("helper", "username", "usehttppath")
+    if section == "safe":
+        return low == "safe.directory"
+    if section == "protocol":
+        return var == "allow"
+    return low == "core.sshcommand"
+
+
+def _read_git_passthrough_config(env):
+    """[(key, value)] from the user's system then global git config (includes
+    followed), filtered by _git_passthrough_key. Reads with `env` as given
+    (the caller's, without the isolation), so GIT_CONFIG_GLOBAL /
+    GIT_CONFIG_NOSYSTEM set by the user are honoured. Any failure (no git, no
+    such file) contributes nothing."""
+    pairs = []
+    for scope in ("--system", "--global"):
+        try:
+            proc = subprocess.run(
+                ["git", "config", scope, "--includes", "-z", "--get-regexp",
+                 _GIT_PASSTHROUGH_REGEXP],
+                capture_output=True, env=env, cwd=tempfile.gettempdir(),
+                timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        for entry in proc.stdout.decode("utf-8", "replace").split("\0"):
+            if not entry:
+                continue
+            key, nl, value = entry.partition("\n")
+            if _git_passthrough_key(key):
+                pairs.append((key, value if nl else "true"))
+    return pairs
+
+
+def _git_passthrough_config():
+    """The carried-over git config pairs, read once per process."""
+    global _git_passthrough_cache
+    with _child_env_lock:
+        if _git_passthrough_cache is None:
+            env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
+            _git_passthrough_cache = _read_git_passthrough_config(env)
+        return list(_git_passthrough_cache)
+
+
+def _env_config_pairs(env):
+    """The GIT_CONFIG_COUNT / GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> pairs
+    already in `env`, removed from it."""
+    try:
+        count = int(env.pop("GIT_CONFIG_COUNT", "0") or 0)
+    except ValueError:
+        count = 0
+    pairs = []
+    for i in range(max(count, 0)):
+        key = env.pop("GIT_CONFIG_KEY_%d" % i, None)
+        value = env.pop("GIT_CONFIG_VALUE_%d" % i, "")
+        if key:
+            pairs.append((key, value))
+    return pairs
+
+
+def _terraform_user_config_path(env):
+    """The CLI config terraform would read on its own: TF_CLI_CONFIG_FILE, else
+    ~/.terraformrc (%APPDATA%/terraform.rc on Windows). None when absent."""
+    path = env.get("TF_CLI_CONFIG_FILE")
+    if not path:
+        if os.name == "nt":
+            path = os.path.join(env.get("APPDATA", ""), "terraform.rc")
+        else:
+            path = os.path.join(os.path.expanduser("~"), ".terraformrc")
+    return path if os.path.isfile(path) else None
+
+
+_TF_PROVIDER_INSTALLATION_RE = re.compile(r"(?m)^[ \t]*provider_installation[ \t]*\{")
+
+
+def _terraform_cli_config_text(user_text, home):
+    """The CLI config gather runs terraform with: the user's own config (kept:
+    credentials, host blocks, plugin_cache_dir) plus an explicit
+    `provider_installation` block that installs providers directly from their
+    registries -- and from the user's own `~/.terraform.d/plugins` when it
+    exists -- so no implied mirror, in particular a repo-shipped
+    `terraform.d/plugins`, is ever consulted. TF_PLUGIN_CACHE_DIR still
+    applies. Pure."""
+    lines = ["", "# added by activity-overview gather (issue #109)",
+             "provider_installation {"]
+    user_plugins = os.path.join(home, ".terraform.d", "plugins") if home else None
+    if user_plugins and os.path.isdir(user_plugins):
+        lines.append("  filesystem_mirror {")
+        lines.append("    path = %s" % json.dumps(user_plugins))
+        lines.append("  }")
+    lines += ["  direct {}", "}", ""]
+    return (user_text or "") + "\n".join(lines)
+
+
+def _terraform_cli_config():
+    """Path of the TF_CLI_CONFIG_FILE every terraform command gets (created
+    once per process, removed at exit). A user config that already has its
+    own `provider_installation` block disables the implied mirrors itself and
+    is used as it is."""
+    global _terraform_cli_config_cache
+    with _child_env_lock:
+        if _terraform_cli_config_cache is not None:
+            return _terraform_cli_config_cache
+        user = _terraform_user_config_path(os.environ)
+        user_text = ""
+        if user:
+            try:
+                with open(user, encoding="utf-8", errors="replace") as fh:
+                    user_text = fh.read()
+            except OSError:
+                user_text = ""
+            if _TF_PROVIDER_INSTALLATION_RE.search(user_text):
+                _terraform_cli_config_cache = user
+                return user
+        fd, path = tempfile.mkstemp(prefix="activity-terraform-", suffix=".tfrc")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_terraform_cli_config_text(user_text, os.path.expanduser("~")))
+        atexit.register(_remove_quietly, path)
+        _terraform_cli_config_cache = path
+        return path
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _child_env(args):
+    """The environment for one subprocess (see the section comment above)."""
+    env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
+    tool = os.path.basename(args[0]).lower() if args else ""
+    if tool.endswith(".exe"):
+        tool = tool[:-4]
+    if tool == "git":
+        pairs = _git_passthrough_config() + _env_config_pairs(env)
+        for i, (key, value) in enumerate(pairs):
+            env["GIT_CONFIG_KEY_%d" % i] = key
+            env["GIT_CONFIG_VALUE_%d" % i] = value
+        if pairs:
+            env["GIT_CONFIG_COUNT"] = str(len(pairs))
+        env.pop("LANGUAGE", None)
+        env.update(_GIT_ISOLATION_ENV)
+    elif tool == "terraform":
+        env["TF_CLI_CONFIG_FILE"] = _terraform_cli_config()
+    return env
+
+
 def run_git(args, cwd=None, timeout=None):
     """Thin wrapper around git. Its live git interaction is integration-only,
     but the non-UTF-8 decode path below is covered by TestRunGitDecoding.
@@ -3180,13 +3635,20 @@ def run_git(args, cwd=None, timeout=None):
     it so non-ASCII paths print verbatim instead of as C-quoted octal escapes
     (`"docs/caf\\303\\251.md"`). Paths with a quote, backslash, TAB or newline are
     still C-quoted by git; the path parsers undo that via unquote_git_path.
-    Non-git commands routed through here (bicep, terraform, graphify) are passed
-    through untouched."""
+    Non-git commands routed through here (bicep, terraform, graphify) get no
+    extra arguments.
+
+    Every command runs with the environment `_child_env` builds (issue #109):
+    no GitHub token or other `*_TOKEN` variable, git isolated from the user's
+    global and system config (only network/auth routing settings are carried
+    over), and terraform pointed at a CLI config that never uses a repo-local
+    plugin mirror."""
     args = list(args)
     if args and os.path.basename(args[0]) == "git":
         args = [args[0], "-c", "core.quotepath=false"] + args[1:]
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+                          encoding="utf-8", errors="replace", timeout=timeout,
+                          env=_child_env(args))
     if proc.returncode != 0:
         raise RuntimeError(
             f"command failed (exit {proc.returncode}): {' '.join(args)}\n"
@@ -3241,7 +3703,10 @@ def structure_tree(clone_dir, sha, run=None):
     also when a read raises. The clone's HEAD, branch, index and working tree
     are never touched, so a reused clone stays on its branch for the next run
     and by-products of the IaC builds (a `.terraform/`, a lock file) cannot
-    block a checkout in either direction."""
+    block a checkout in either direction. For the head the builds run in the
+    clone itself (no second full checkout of a large repo); the next run's
+    prepare_clone / checkout_base_branch remove their output first
+    (reset_build_byproducts, issue #109)."""
     run = run or run_git
     if not sha or sha == clone_head_sha(clone_dir, run):
         yield clone_dir
@@ -3420,6 +3885,12 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
     `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
+    # The default reader never follows a symlink out of the tree (issue #109):
+    # a refused / unreadable file fails that area's build (`failed`), never
+    # the member.
+    if read_text is _read_text_file:
+        def read_text(path):
+            return _read_text_file(path, root=clone_dir)
     # None -> the env-overridable defaults (read now, not at import). An explicit
     # max_workers is still clamped so ThreadPoolExecutor never sees a value < 1.
     env_timeout, env_workers, env_retries = _iac_settings()
@@ -4720,7 +5191,19 @@ def acquire(args, env):
         # edges stay [] when bicep/terraform or the registry are unavailable).
         # No-op without a clone on disk.
         if not args.no_clone or os.path.isdir(clone_dir):
-            code_graph = extract_iac_edges(code_graph, tree, **area_kw)
+            # --no-iac-build (issue #109): the builds run third-party code
+            # (bicep restore / terraform init download modules and providers);
+            # skip them and record every area as `edges_status: skipped`. The
+            # structural scan below is source parsing only and still runs.
+            if getattr(args, "no_iac_build", False):
+                sys.stderr.write(
+                    f"note: {owner}/{repo}: --no-iac-build: bicep/terraform "
+                    f"builds skipped (edges_status=skipped)\n")
+                code_graph = extract_iac_edges(code_graph, tree,
+                                               which=lambda _name: None, **area_kw)
+                code_graph["edge_extraction"]["disabled"] = True
+            else:
+                code_graph = extract_iac_edges(code_graph, tree, **area_kw)
             # Multi-repo (project) gathers -- and a single-repo gather given
             # `--structural-iac` -- additionally fold the WHOLE module tree's
             # static Terraform `source` and Bicep `module` deps (no terraform
@@ -4733,13 +5216,21 @@ def acquire(args, env):
                     list_files=(lambda: tracked) if tracked is not None else None,
                     **area_kw)
 
-        # CODEOWNERS from the tree (local file; try the conventional locations).
+        # CODEOWNERS from the tree (local file; try the conventional locations;
+        # the first one present is used). Read through _read_repo_text (issue
+        # #109): never through a symlink that leaves the tree, never failing
+        # the member on an undecodable byte; a file that is there but cannot
+        # be read is skipped with a warning and recorded so the replay does
+        # not take it as "no owners".
         code_owners = {}
         for rel in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
             p = os.path.join(tree, rel)
             if os.path.isfile(p):
-                with open(p, encoding="utf-8") as fh:
-                    code_owners = parse_codeowners(fh.read())
+                text = _read_repo_text(tree, rel)
+                if text is None:
+                    code_graph["codeowners_unread"] = rel
+                else:
+                    code_owners = parse_codeowners(text)
                 break
 
     get_page = _paginated(token)
@@ -5503,8 +5994,12 @@ def _owns_authority(code_graph, code_owners, clone_sha, project, repo):
     """The area qids whose owners a window's facts state: every area its code
     graph lists, when the window read a CODEOWNERS file (non-empty
     `code_owners`) or a checkout (`clone_sha`: then a missing file means no
-    owners). Else none — a window without either says nothing. Pure."""
+    owners). Else none — a window without either says nothing, nor does one
+    whose CODEOWNERS file was there but could not be read (`code_graph`
+    carries `codeowners_unread`, issue #109). Pure."""
     if not (code_owners or clone_sha):
+        return set()
+    if (code_graph or {}).get("codeowners_unread"):
         return set()
     out = set()
     for area in (code_graph or {}).get("areas") or []:
@@ -5528,7 +6023,8 @@ class StructureReplay:
       - depends_on of area A, DIRECT edges (`transitive` false): a window whose
         build of A resolved (`edges_status: "resolved"`), or whose code graph
         carries the whole-tree structural scan (`structural_scan: true`; then
-        for EVERY area of the repo, listed or not);
+        for EVERY area of the repo, listed or not, except the areas in its
+        `structural_scan_unread`, whose module files it could not read);
       - depends_on of area A, TRANSITIVE edges: only a window whose build of A
         resolved (the scan sees direct `module` refs only);
       - owns of area A: a window whose code graph lists A and that read a
@@ -5543,7 +6039,7 @@ class StructureReplay:
                  registry_by_slug=None, bicep_prefix_by_slug=None):
         self.project, self.repo = project, repo
         self.windows = sorted(windows, key=lambda w: _window_order(w[:2]))
-        self.dep, self.resolved, self.scan = [], [], []
+        self.dep, self.resolved, self.scan, self.scan_unread = [], [], [], []
         self.owns, self.own_auth, self.graphs = [], [], []
         for frm, to, cg, co, sha in self.windows:
             cg = cg or {}
@@ -5557,6 +6053,11 @@ class StructureReplay:
                 if a.get("id") is not None and not _is_scaffold_area(a.get("id"))
                 and a.get("edges_status") == "resolved"})
             self.scan.append(cg.get("structural_scan") is True)
+            # Areas whose module files that scan could not read (issue #109):
+            # the scan does not speak for them.
+            self.scan_unread.append({
+                graphstore.qualify_id(project, repo, "area-{}".format(aid))
+                for aid in cg.get("structural_scan_unread") or ()})
             self.owns.append(_owns_pairs(cg, co, project, repo))
             self.own_auth.append(_owns_authority(cg, co, sha, project, repo))
 
@@ -5564,7 +6065,8 @@ class StructureReplay:
         """Index of the latest window authoritative for `src`'s direct
         (transitive=False) or transitive depends_on edges, or None."""
         for i in range(len(self.windows) - 1, -1, -1):
-            if src in self.resolved[i] or (not transitive and self.scan[i]):
+            if src in self.resolved[i] or (not transitive and self.scan[i]
+                                           and src not in self.scan_unread[i]):
                 return i
         return None
 
@@ -6238,16 +6740,40 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     return summary
 
 
+def _member_clone_dir(base_dir, owner, repo, run=None):
+    """A manifest member's clone dir: `{base}/{owner}/{repo}` (issue #109). A
+    GitHub owner or repo name never contains `/`, so two members can never
+    share a dir -- the former `{base}/{owner}-{repo}-clone` did for `a-b`/`c`
+    and `a`/`b-c`. A dir in that former layout that is a clone of THIS member's
+    remote is still used (no re-clone for existing users) as long as the new
+    dir does not exist yet."""
+    new = "{}/{}/{}".format(base_dir, owner, repo)
+    if os.path.exists(new):
+        return new
+    old = "{}/{}-{}-clone".format(base_dir, owner, repo)
+    if os.path.isdir(os.path.join(old, ".git")):
+        try:
+            have = (run or run_git)(["git", "-C", old, "config", "--get",
+                                     "remote.origin.url"]).strip()
+        except RuntimeError:
+            have = ""
+        if have and _normalize_remote(have) == _normalize_remote(
+                _github_remote_url(owner, repo)):
+            return old
+    return new
+
+
 def _member_args(base, member, frm, to):
     """Clone the CLI args for one manifest member: same flags, but owner/repo and
     the window come from the manifest, and clone_dir is re-derived PER MEMBER as
-    `{base}/{owner}-{repo}-clone`. Including the owner (not just the repo, which is
-    acquire's single-repo default) keeps two members that share a repo name under
-    different owners from colliding on the same checkout. A `--clone-dir` on the
-    base args is treated as the parent directory; otherwise it defaults to
-    `workspace`."""
+    `{base}/{owner}/{repo}` (_member_clone_dir; an existing clone in the former
+    `{base}/{owner}-{repo}-clone` layout is reused). Including the owner (not
+    just the repo, which is acquire's single-repo default) keeps two members
+    that share a repo name under different owners from colliding on the same
+    checkout. A `--clone-dir` on the base args is treated as the parent
+    directory; otherwise it defaults to `workspace`."""
     base_dir = (base.clone_dir or "workspace").rstrip("/")
-    clone_dir = "{}/{}-{}-clone".format(base_dir, member["owner"], member["repo"])
+    clone_dir = _member_clone_dir(base_dir, member["owner"], member["repo"])
     fields = {**vars(base), "owner": member["owner"], "repo": member["repo"],
               "clone_dir": clone_dir}
     # A member's own `branch` (issue #84) beats a global --branches; with

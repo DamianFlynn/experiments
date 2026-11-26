@@ -277,7 +277,9 @@ flowchart TB
    into the same store is safe (idempotent). `gather` clones into `--clone-dir`, or, when that
    directory already holds a clone of the same repo, fetches it to the window's history bound
    and checks out the default branch head — so last month's clone dir can be reused. A
-   directory that is not a clone of this repo is refused, never deleted. `--no-clone` never
+   directory that is not a clone of this repo is refused, never deleted. Build output an earlier
+   current-month run left in the clone (untracked `.terraform/`, `.terraform.lock.hcl`) is
+   removed before the checkout; nothing else of yours is. `--no-clone` never
    creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
    only (empty commit/code walks). A repo with no commits since `--from` minus the clone margin
    is cloned at depth 1 and has no commits in the window. `meta.clone_mode` records which
@@ -536,7 +538,7 @@ python3 $AO/manifest_from_index.py --avm res --avm ptn \
 
 ```bash
 export TF_PLUGIN_CACHE_DIR=~/activity/.tfcache && mkdir -p "$TF_PLUGIN_CACHE_DIR"
-mkdir -p $S/stores $S/views/$M                       # manifest: --clone-dir is the PARENT dir
+mkdir -p $S/stores $S/views/$M                       # manifest: --clone-dir is the PARENT dir (clones in $S/clones/<owner>/<repo>)
 python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones
 python3 $AO/validate.py $S/stores/$M.db --project avm-tf-network
 python3 $AO/digest.py --store $S/stores/$M.db --project avm-tf-network --from $FROM --to $TO > $S/views/$M/project.json
@@ -858,3 +860,19 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
   opt-in — only request it for internal audiences.
 - Always publish from a store that passed `validate.py`, and spot-check citations: every
   claim in the report must link to a GitHub record.
+- **The IaC builds download and run third-party code.** With `bicep` / `terraform` on PATH,
+  `gather` runs `bicep restore/build` and `terraform init/graph` in the clone: they fetch the
+  modules and providers the gathered repo names and execute the providers on your machine.
+  Gather with the builds only repos you trust; for any other repo pass **`--no-iac-build`**
+  (builds skipped, every area `edges_status: skipped`; the static `--structural-iac` scan still
+  works). terraform never uses a `terraform.d/plugins` mirror shipped in the repo (gather gives
+  it a CLI config with an explicit `provider_installation` block; your `~/.terraformrc`,
+  `TF_PLUGIN_CACHE_DIR` and `TF_TOKEN_<host>` still apply). LLD §14.4 has the details.
+- Child processes never see the token: git, bicep, terraform and graphify run without
+  `GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_PAT` or any other `*_TOKEN` / `*_PAT` variable.
+- gather's git ignores your global and system git config (colour, diff prefixes, signatures,
+  pager, … cannot corrupt the walks). Only proxy/TLS (`http.proxy`, `http.sslCAInfo`, …),
+  `url.<base>.insteadOf`, credential helpers and `safe.directory` are carried over; proxy and
+  TLS environment variables (`HTTPS_PROXY`, `GIT_SSL_CAINFO`, …) work as before.
+- Repo files reached through a symlink that leaves the clone (CODEOWNERS, `.tf`, `.bicep`)
+  are never read: gather warns and skips them.

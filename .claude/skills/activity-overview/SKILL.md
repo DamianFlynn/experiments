@@ -77,7 +77,9 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
      CLI needed) for every Terraform module dir's and Bicep `<area>/main.bicep`'s direct
      module references, so modules nobody touched in the window keep their edges (manifest
      members always get this scan); use it on a monorepo such as
-     `Azure/bicep-registry-modules`.
+     `Azure/bicep-registry-modules`. The builds download and run the modules/providers the
+     repo names: on a repo you do not trust pass **`--no-iac-build`** (builds skipped and
+     recorded `skipped`; the static scan still runs).
    - **Roll-up / refresh are store-native.** A long view is a wider window over a store
      that holds its months (no separate roll-up artifact; its CI statistics are the sum of
      the gathered windows inside it, its structure the latest one's — `meta.facts_windows`).

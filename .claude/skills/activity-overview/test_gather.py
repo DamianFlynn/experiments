@@ -3937,8 +3937,9 @@ class TestManifestMain(unittest.TestCase):
         self.assertEqual(getattr(member, "from"), "2026-03-01")
         self.assertEqual(member.to, "2026-03-31")
         # clone_dir is re-derived per member and includes the owner so members
-        # sharing a repo name across owners don't collide on disk.
-        self.assertEqual(member.clone_dir, "workspace/Azure-mod-a-clone")
+        # sharing a repo name across owners don't collide on disk; one dir per
+        # owner, then the repo (issue #109: no `-` join that can collide).
+        self.assertEqual(member.clone_dir, "workspace/Azure/mod-a")
         self.assertTrue(member.no_clone)               # other flags carried through
 
     def test_member_args_clone_dirs_distinct_for_same_repo_name(self):
@@ -3949,8 +3950,8 @@ class TestManifestMain(unittest.TestCase):
         b = gather._member_args(
             base, {"owner": "Contoso", "repo": "mod", "registry": None}, "x", "y")
         self.assertNotEqual(a.clone_dir, b.clone_dir)
-        self.assertEqual(a.clone_dir, "workspace/Azure-mod-clone")
-        self.assertEqual(b.clone_dir, "workspace/Contoso-mod-clone")
+        self.assertEqual(a.clone_dir, "workspace/Azure/mod")
+        self.assertEqual(b.clone_dir, "workspace/Contoso/mod")
 
     def test_main_folds_each_member_under_logical_project(self):
         import tempfile

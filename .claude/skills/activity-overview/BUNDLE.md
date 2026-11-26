@@ -553,7 +553,11 @@ review's state to `DISMISSED`.
   `instances`); a public-registry ref resolves in-repo when `<path>/main.bicep` is a tracked
   module. Transitive Bicep edges still need the build. A graph the scan ran over carries
   `code_graph.structural_scan: true` (issue #95: it holds the whole tree's direct edges, so
-  fold may retract a stored direct `depends_on` it no longer has). Without the flag a
+  fold may retract a stored direct `depends_on` it no longer has). A module file the scan
+  could not read (its real path leaves the checkout, a dangling symlink, unreadable; issue
+  #109) is skipped with one stderr warning and its area is listed in
+  `code_graph.structural_scan_unread` (sorted area ids; absent when every file was read):
+  the scan does not speak for those areas. Without the flag a
   single-repo gather does not run the scan and stays build-gated (byte-stable). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
@@ -571,14 +575,18 @@ review's state to `DISMISSED`.
   per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
   genuinely hung process) and retried once. Each area carries `edges_status` ∈
   `{resolved, timeout, failed, skipped}` and `code_graph.edge_extraction` carries the aggregate
-  `{ "resolved", "timeout", "failed", "skipped" }` counts — so a build that timed out or failed
+  `{ "resolved", "timeout", "failed", "skipped" }` counts (plus `"disabled": true` when gathered
+  with `--no-iac-build`, which skips every build) — so a build that timed out or failed
   is a **visible, counted gap**, never mistaken for a module with no dependencies. `resolved`
   with an empty `edges` list genuinely means "no inter-area dependencies"; `timeout`/`failed`
   mean "not determined" (re-run to resolve). The integration gate reds when the unresolved rate
   is non-trivial, so an incomplete graph is re-run rather than silently shipped.
 - **code_owners** `[ { "pattern": "<path|glob>", "owners": ["login", ...] }, ... ]` —
   parsed from the clone's CODEOWNERS (`.github/`/root/`docs/`), one rule per line **in
-  file order** (duplicates kept). `@org/team` and `@user` are kept as logins (the `@`
+  file order** (duplicates kept). A CODEOWNERS whose real path leaves the checkout (a
+  symlink) or that cannot be read is skipped with one warning: `code_owners` stays empty and
+  `code_graph.codeowners_unread` names the file, so the fold does not treat it as "no
+  owners" (issue #109); undecodable bytes are replaced, never fatal. `@org/team` and `@user` are kept as logins (the `@`
   stripped), emails as-is. Blank/`#` lines, inline `# comments` and GitLab `[Section]`
   headers are dropped; a pattern with no owners is kept with `owners: []` (it
   un-assigns ownership). Matching follows GitHub's CODEOWNERS rules
