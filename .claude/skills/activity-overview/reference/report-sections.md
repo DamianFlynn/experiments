@@ -32,6 +32,14 @@ Since #97 a view projects each record's state, comments, reviews and lifecycle e
 its end (BUNDLE.md "As of the window's end"), so the caveat covers only what has no history: titles,
 labels, milestones, board status.
 
+**Gathered after the window.** When `meta.records_as_of` is present and `meta.state_as_of`
+is absent (a window gathered after it ended — e.g. a past month caught up into its own
+store), write one caveat line under the report title, exactly: "Records are shown as of
+{meta.records_as_of.instant}, the end of this window; titles, labels, milestones and board
+status are as gathered on {meta.gathered_at}." (the date part of `meta.gathered_at`, the
+time the records were gathered). With `meta.state_as_of` present the state-as-of line
+replaces it; omit it when `meta.records_as_of` is absent.
+
 ## Executive summary
 3–5 bullets — features, releases, CI health, key risks — informed by board + call context.
 Counts come from the data (shipped refs by `ref.type`, trains by `ptrain.outcome` /
@@ -248,6 +256,19 @@ artifacts" naming `artifacts`.
 ## Module dependency graph / blast radius
 A section embedding `diagrams.module_graph` from `code_graph.areas[].edges` (and, multi-repo,
 the cross-repo module graph from `view["module_edges"]`).
+
+## New contributors
+Who is new this window, from the gather's per-window `newcomers` fact — never from
+`people` (`first_seen` is only the earliest activity inside the view; `author_association`
+is GitHub's value when gathered, not as of the window). Each `newcomers.new` entry is a
+person whose first PR / issue in the repository was created in the window: `login`,
+`first` ("pr" | "issue"), `number`, `url`. Cite each entry's item. Bots are excluded by the
+gather. `newcomers.unknown` (the check failed) and `newcomers.not_checked` (over the
+gather's cap) are neither new nor returning: name them in one line. `newcomers.collected`
+false means the window was gathered with `--no-newcomers`: say it was not looked up. A
+view spanning several gathered windows merges theirs (adding `windows` and
+`covers_view`, false when they leave days of the view uncovered). Multi-repo: per member (`member.bundle.newcomers`). Omit the
+section when the key is absent.
 
 ## Module ownership & Issue kinds
 - **Module ownership** — `code_owners` (owners of the last rule matching the area directory) +

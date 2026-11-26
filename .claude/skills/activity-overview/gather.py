@@ -606,10 +606,22 @@ def in_window(ts, from_date, to_date):
     return graphstore.ts_in_window(ts, from_date, to_date)
 
 
+def created_by_end(record, to_date):
+    """True when a PR / issue record existed at the window's end: created on
+    or before `to_date` (a record with no `created_at` cannot be placed and
+    counts as existing). Pure."""
+    created = record.get("created_at")
+    return not created or in_window(created, None, to_date)
+
+
 def keep_pr_for_window(pr, from_date, to_date):
     """True when a window's gather keeps PR `pr` (a normalized record):
       - merged in the window, or closed unmerged in the window;
-      - open now;
+      - open now and created on or before `to_date`. A PR opened after the
+        window's end is in no view of the window (extract leaves out a record
+        created after it), so storing it only stored people no view of the
+        window can derive and failed `validate --bundle` (USAGE §5.5) on a
+        month gathered late. For a window ending today nothing changes;
       - open at the window's END: created on or before `to_date` and merged /
         closed only after it. A month gathered late needs these: the report
         view shows each record as of the window's end (extract.record_as_of),
@@ -618,12 +630,33 @@ def keep_pr_for_window(pr, from_date, to_date):
         already reaches them (it runs back to `from_date` by update time).
     Pure."""
     if pr.get("state") == "open":
-        return True
+        return created_by_end(pr, to_date)
     ended = pr.get("merged_at") if pr.get("merged") else pr.get("closed_at")
     if in_window(ended, from_date, to_date):
         return True
     return bool(ended) and not in_window(ended, None, to_date) \
         and in_window(pr.get("created_at"), None, to_date)
+
+
+def keep_issue_for_window(issue, from_date, to_date):
+    """True when a window's gather keeps an issue from its LISTINGS (every
+    open issue, and every issue updated since `from_date`):
+      - created on or before `to_date` (an issue opened after the window's
+        end is in no view of it, like a PR: see keep_pr_for_window), and
+      - open now, or updated (closed, commented on, ...) on or after
+        `from_date`. The updated-since listing is read a whole page at a
+        time, so its last page also holds issues closed and last touched
+        before the window: no view of the window holds one, and storing it
+        stored its people with nothing to derive them from.
+    An issue a kept PR closes or cross-references is train context and is
+    kept whatever its dates (acquire); a view of the window still leaves it
+    out when it was created after the window's end. Pure."""
+    if not created_by_end(issue, to_date):
+        return False
+    if issue.get("state") == "open":
+        return True
+    return in_window(issue.get("updated_at"), from_date, None) \
+        or in_window(issue.get("closed_at"), from_date, None)
 
 
 def window_records(records, from_date, to_date):
@@ -3405,6 +3438,12 @@ def parse_args(argv):
     p.add_argument("--include-releases", dest="include_releases",
                    action="store_true", default=True)
     p.add_argument("--no-releases", dest="include_releases", action="store_false")
+    p.add_argument("--no-newcomers", dest="newcomers", action="store_false",
+                   default=True,
+                   help="skip the first-time-contributor check (one or two "
+                        "search API calls per author of a PR / issue created "
+                        "in the window); the window's `newcomers` fact then "
+                        "says it was not collected")
     # Phase 12: auto-discover + ingest the repo's Projects v2 board (its single-
     # select Status, plus sprint/iteration nodes when the board defines them). On
     # by default; degrades to empty on any error (no board / missing read:project
@@ -4162,6 +4201,7 @@ def validate_env_knobs(env=None):
     any clone or API call (SystemExit naming the variable)."""
     _http_settings(env)
     _iac_settings(env)
+    _newcomers_max(env)
 
 
 def _auth_allowed(url):
@@ -5203,6 +5243,158 @@ def _runs_page(get_page, api, frm, to):
     return fetch_workflow_runs(get_page, api, frm, to)[0]
 
 
+# --- First-time contributors (per-window fact `newcomers`) --------------------
+#
+# Who is new this window: an author of a PR created in the window, or the
+# reporter of an issue created in it, with no PR / issue of theirs in the repo
+# created before the window's start. `people[].first_seen` cannot say it (it
+# is the earliest activity inside the view) and `author_association` is
+# GitHub's value at gather time. The answer comes from the issue search API,
+# `repo:O/R is:<kind> author:<login> created:<<from>` with `per_page=1`,
+# reading `total_count`: one call for a candidate with an earlier item of the
+# kind they started with in the window, two (the other kind too) for one
+# without. Search has its own rate limit (30 requests a minute with a token);
+# the calls go through the gather's GitHub client, which waits out a rate
+# limit and retries transient errors. A candidate whose check fails is
+# "unknown", never guessed; after NEWCOMER_FAILURE_STOP failures in a row the
+# rest are "unknown" too. Bots (derive.is_bot_login) and the deleted-user
+# placeholder `ghost` are not candidates. More than ACTIVITY_NEWCOMERS_MAX
+# candidates: the earliest are checked, the rest listed as `not_checked`.
+#
+# The fetch is behind the `search(login, kind)` seam (find_newcomers) so the
+# test suite never touches the network.
+
+NEWCOMERS_MAX = 200          # candidates checked per window (ACTIVITY_NEWCOMERS_MAX, min 0)
+NEWCOMER_FAILURE_STOP = 3    # consecutive failed checks before giving up
+_GHOST_LOGIN = "ghost"       # GitHub's placeholder for a deleted account
+SEARCH_ISSUES_URL = "https://api.github.com/search/issues"
+
+
+def _newcomers_max(env=None):
+    return _env_int("ACTIVITY_NEWCOMERS_MAX", NEWCOMERS_MAX, 0, env)
+
+
+def newcomer_candidates(prs, issues, from_date, to_date):
+    """The candidate first-time contributors of a window: one entry per login
+    that authored a PR or reported an issue CREATED in [from_date, to_date],
+    {"login", "first": "pr" | "issue", "number", "url", "created_at"} for the
+    earliest such item, sorted by (created_at, login). Bots and `ghost` are
+    left out. Pure."""
+    first = {}
+    for kind, items in (("pr", prs), ("issue", issues)):
+        for it in items:
+            login = it.get("author")
+            created = it.get("created_at")
+            if not login or login == _GHOST_LOGIN or derive.is_bot_login(login):
+                continue
+            if not in_window(created, from_date, to_date):
+                continue
+            entry = {"login": login, "first": kind, "number": it.get("number"),
+                     "url": it.get("url"), "created_at": created}
+            cur = first.get(login)
+            if cur is None or (created, kind, entry["number"] or 0) < (
+                    cur["created_at"], cur["first"], cur["number"] or 0):
+                first[login] = entry
+    return sorted(first.values(), key=lambda e: (e["created_at"], e["login"]))
+
+
+def newcomer_search_url(owner, repo, login, before, kind):
+    """The search URL counting `login`'s `kind` ("pr" | "issue") items in
+    owner/repo created before `before` (the window's first day). Pure."""
+    q = "repo:{}/{} is:{} author:{} created:<{}".format(owner, repo, kind,
+                                                        login, before)
+    return "{}?{}".format(SEARCH_ISSUES_URL,
+                          urllib.parse.urlencode({"q": q, "per_page": 1}))
+
+
+def search_total_count(page):
+    """`total_count` of one search response, or None when it cannot be trusted
+    (not a search response, or GitHub flags it `incomplete_results`). Pure."""
+    if not isinstance(page, dict) or page.get("incomplete_results"):
+        return None
+    count = page.get("total_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
+def find_newcomers(candidates, search, before, max_candidates=NEWCOMERS_MAX,
+                   stop_after=NEWCOMER_FAILURE_STOP):
+    """Decide which `candidates` (newcomer_candidates) are new before `before`.
+
+    `search(login, kind)` returns how many `kind` items `login` created in the
+    repo before `before`, or None (or raises) when it cannot tell. A candidate
+    is checked for the kind they started with first and, only when that count
+    is 0, for the other kind. Returns the per-window fact value:
+    {"collected": True, "before", "candidates": n, "new": [{"login", "first",
+    "number", "url", "created_at"}] (by login), "unknown": [login],
+    "not_checked": [login]} — `unknown`: a check failed (never guessed);
+    `not_checked`: beyond `max_candidates`. Network-free given `search`."""
+    checked = candidates[:max_candidates]
+    not_checked = sorted(c["login"] for c in candidates[max_candidates:])
+    new, unknown = [], []
+    failures = 0
+    for i, cand in enumerate(checked):
+        if failures >= stop_after:
+            unknown.extend(c["login"] for c in checked[i:])
+            break
+        total = 0
+        for kind in (cand["first"], "issue" if cand["first"] == "pr" else "pr"):
+            try:
+                count = search(cand["login"], kind)
+            except (Exception, SystemExit):   # a failed call: http_get_json exits
+                count = None
+            if count is None:
+                total = None
+                break
+            total += count
+            if total:
+                break
+        if total is None:
+            unknown.append(cand["login"])
+            failures += 1
+            continue
+        failures = 0
+        if total == 0:
+            new.append(dict(cand))
+    return {"collected": True, "before": before, "candidates": len(candidates),
+            "new": sorted(new, key=lambda e: e["login"]),
+            "unknown": sorted(unknown), "not_checked": not_checked}
+
+
+def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
+                      max_candidates=None):
+    """The window's `newcomers` fact, searched through `get_page` (the
+    gather's GitHub client: (json, next_url) per URL). One stderr line says
+    what it cost and found; another names candidates left unknown or
+    unchecked."""
+    cands = newcomer_candidates(prs, issues, from_date, to_date)
+    cap = _newcomers_max() if max_candidates is None else max_candidates
+    calls = [0]
+
+    def search(login, kind):
+        calls[0] += 1
+        page, _next = get_page(newcomer_search_url(owner, repo, login,
+                                                   from_date, kind))
+        return search_total_count(page)
+    if len(cands) > cap:
+        sys.stderr.write(
+            f"warning: {owner}/{repo}: {len(cands)} candidate first-time "
+            f"contributors, more than ACTIVITY_NEWCOMERS_MAX={cap}; the earliest "
+            f"{cap} are checked, the rest are listed in newcomers.not_checked\n")
+    result = find_newcomers(cands, search, from_date, max_candidates=cap)
+    sys.stderr.write(
+        f"newcomers: {owner}/{repo}: {len(cands)} candidate author(s), "
+        f"{calls[0]} search call(s), {len(result['new'])} with no PR / issue "
+        f"before {from_date}\n")
+    if result["unknown"]:
+        sys.stderr.write(
+            f"warning: {owner}/{repo}: could not tell whether "
+            f"{len(result['unknown'])} author(s) are new (search failed); "
+            f"recorded as newcomers.unknown: {', '.join(result['unknown'])}\n")
+    return result
+
+
 def _attach_timeline_xrefs(pr, timeline, current_slug):
     """Set pr['timeline_xrefs'] to the cross-repo timeline refs, but ONLY when
     there are any (conditional key: a PR with no cross-repo refs keeps its exact
@@ -5515,7 +5707,8 @@ def acquire(args, env):
         prs, _graphql_client(token), owner, repo)
 
     # Issue set: every issue a kept PR closes or cross-references, plus open and
-    # recently-closed issues (for in_flight / next_candidates / rejected buckets).
+    # recently-closed issues (for in_flight / next_candidates / rejected buckets)
+    # that existed at the window's end (keep_issue_for_window).
     wanted = set()
     for pr in prs:
         wanted.update(pr["closes"])
@@ -5540,8 +5733,14 @@ def acquire(args, env):
         if raw["number"] in seen:
             continue
         issue = normalize_issue(raw)
+        seen.add(issue["number"])     # listed: never fetched again below
+        # Not the window's (created after its end, or closed and untouched
+        # since before its start: keep_issue_for_window), unless a kept PR
+        # closes or cross-references it (train context).
+        if issue["number"] not in wanted \
+                and not keep_issue_for_window(issue, frm, to):
+            continue
         raw_by_num[raw["number"]] = raw
-        seen.add(issue["number"])
         issues.append(issue)
     for n in sorted(wanted - seen):
         # A closed/cross-referenced issue can be gone: 404 (a number that is not
@@ -5627,6 +5826,13 @@ def acquire(args, env):
         workflow_stats = mark_workflow_stats_truncated(
             aggregate_workflow_stats(workflows), runs_truncation)
 
+    # First-time contributors (per-window fact `newcomers`): see
+    # collect_newcomers. --no-newcomers records that it was not looked at.
+    if getattr(args, "newcomers", True):
+        newcomers = collect_newcomers(prs, issues, owner, repo, frm, to, get_page)
+    else:
+        newcomers = {"collected": False}
+
     releases = []
     if getattr(args, "include_releases", True):
         raw_releases = fetch_all(get_page, f"{api}/releases?per_page=100")
@@ -5707,6 +5913,7 @@ def acquire(args, env):
         bundle["meta"]["project_board_truncated"] = board_truncated
     bundle["releases"] = releases
     bundle["milestones"] = milestones
+    bundle["newcomers"] = newcomers
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph

@@ -19,7 +19,7 @@
 | Requirement | Why | Check |
 |---|---|---|
 | Python 3.11+ (stdlib only) | runs every tool | `python3 --version` |
-| git 2.x | bounded clone + history walks | `git --version` |
+| git 2.x | bounded, partial clone + history walks (fetches file contents from GitHub while it walks: the gather needs the network for its whole run) | `git --version` |
 | Claude Code | runs the skill and authors the narrative | `claude --version` |
 | GitHub token | read API access | see §1.1 |
 | `mmdc` (mermaid-cli) — recommended | compiles/validates diagrams | `python3 $AO/render.py --preflight` (below) |
@@ -163,7 +163,9 @@ cross-month `spotlight` queries possible.
    for everything the record dates (#97: open / closed / merged state, comments, reviews,
    reviewers, timeline events, `updated_at`; each such record carries `as_of`, the view
    `meta.records_as_of`), but with today's title, labels, milestone, assignees, closing
-   references and board status (`meta.state_as_of` names the later gather). So its
+   references and board status (`meta.state_as_of` names the later gather; a month
+   gathered late into its own store has no later gather, and `meta.gathered_at` says when
+   its records were gathered). So its
    in-flight set and train outcomes are that month's, while its next-candidates and
    forecast (milestone-driven) reflect today's milestones. Keep each month's view and
    report from the time you made them (`views/`, `reports/`) when those matter
@@ -248,6 +250,10 @@ mkdir -p $S/stores $S/views/$M $S/reports
 
 # 1 · Acquire → store (network; the only step that needs the token).
 #     gather clones into --clone-dir, or fetches it if it already holds a clone of this repo.
+#     The clone is partial (file contents are fetched while the history is walked), so keep
+#     the network up for the whole run; a dropped git connection is retried three times.
+#     It also checks each author of a PR / issue created in the window for an earlier one
+#     (first-time contributors: one or two search calls each; --no-newcomers skips it).
 python3 $AO/gather.py --owner Azure --repo bicep \
   --from $FROM --to $TO --store $DB --clone-dir $S/clone
 
@@ -325,7 +331,14 @@ flowchart TB
    directory already holds a clone of the same repo, fetches it to the window's history bound
    and checks out the head of the mainline it walks (`meta.base_branch`, below) — so last
    month's clone dir can be reused. A
-   directory that is not a clone of this repo is refused, never deleted. Build output an earlier
+   directory that is not a clone of this repo is refused, never deleted. The clone is bounded
+   (shallow, from `--from` minus the clone margin) and **partial** (`--filter=blob:none`): file
+   contents are fetched from GitHub while the history walks run, so the gather needs the network
+   for its whole run, not only at the start. A git command that loses its connection is retried
+   three times (after 2 s, 8 s and 30 s, one `note: git lost its connection …` line each); when
+   it still fails, the gather stops with git's error and folds nothing (a new store is left
+   empty) — re-run the same window into the same store once the network is back (safe:
+   idempotent). Build output an earlier
    current-month run left in the clone (untracked `.terraform/`, `.terraform.lock.hcl`) is
    removed before the checkout; nothing else of yours is. `--no-clone` never
    creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
@@ -344,6 +357,24 @@ flowchart TB
    reach it (`"head"`).
    Stores gathered before issue #84 have no stored base branch: their views warn and count
    every merged PR as shipped — re-gather them.
+
+   **What a window keeps.** The open-PR and open/updated-issue listings run to today, so a
+   month gathered late would also see items opened after it ended. gather keeps an open PR,
+   or a listed issue, only when it was created on or before `--to` (and a closed listed issue
+   only when it was touched on or after `--from`: the updated-since listing is read a page at a
+   time and its last page reaches older ones); an issue a kept PR closes or cross-references
+   is kept whatever its dates, as train context. No view of the window shows a record created
+   after its end (projected or `--as-stored`), so its people are not the window's either. For
+   a window ending today nothing changes.
+
+   **First-time contributors.** gather also checks each author of a PR, and each reporter of
+   an issue, created in the window (bots excluded) for any earlier PR / issue in the repo:
+   one search API call per candidate, two when they have no earlier item of the kind they
+   started with. The search API allows 30 requests a minute; gather waits out the limit like
+   any other. More than `ACTIVITY_NEWCOMERS_MAX` (default 200) candidates: the earliest are
+   checked and the rest listed as not checked; a check that fails is recorded as unknown,
+   never guessed. The result is the window's `newcomers` fact (BUNDLE.md); `--no-newcomers`
+   skips the calls and records that it was not looked up.
 3. **Validate.** Never publish from a store that is not `RESULT: OK`.
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
    they are what you re-link if a month's series entry needs refreshing.
@@ -393,7 +424,7 @@ flowchart TB
 | Situation | What to do |
 |---|---|
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
-| Starting with history / catching up closed months | A month gathered late is **shown as of its end** (#97): `view.py` / `digest.py` wind every PR / issue back to the window's last second from the timestamps in its record, so what was open, merged, closed, in flight, stalled, reviewed and commented on at that month's end is that month's — an item merged since is in flight in it, an item opened since is not in it. Still **today's**: title, body, labels (and the kind / facets read from them), milestone, assignees, closing references, reactions and board status / sprint — so next-candidates and the forecast follow today's milestones; an issue closed in that month and reopened since is closed with no reason (in no shipped / rejected bucket); and an item that was open then but has since been deleted or transferred is absent. The view says what it projected (`meta.records_as_of`, each record's `as_of`). A gather of a past month also keeps the PRs open at its end that were merged or closed before the gather (`gather.keep_pr_for_window`), so each month gathered late on its own holds them, shown as they were at its end. A review approved in the month and dismissed later reads `dismissed` (GitHub records no dismissal date): that PR's `review_decision` is today's, named in its `as_of.not_projected`. Chaining caught-up months into `series.json` is fine for delivery and in-flight; don't use them to calibrate the forecast (a first month captured late is not marked `backfill`). |
+| Starting with history / catching up closed months | A month gathered late is **shown as of its end** (#97): `view.py` / `digest.py` wind every PR / issue back to the window's last second from the timestamps in its record, so what was open, merged, closed, in flight, stalled, reviewed and commented on at that month's end is that month's — an item merged since is in flight in it, an item opened since is not in it. Still **today's**: title, body, labels (and the kind / facets read from them), milestone, assignees, closing references, reactions and board status / sprint — so next-candidates and the forecast follow today's milestones; an issue closed in that month and reopened since is closed with no reason (in no shipped / rejected bucket); and an item that was open then but has since been deleted or transferred is absent. The view says what it projected (`meta.records_as_of`, each record's `as_of`) and when the records were gathered (`meta.gathered_at`; the report's caveat line under its title states both). A gather of a past month also keeps the PRs open at its end that were merged or closed before the gather (`gather.keep_pr_for_window`), so each month gathered late on its own holds them, shown as they were at its end; it does not keep the PRs and issues opened after the month (§5.2 "What a window keeps"). A review approved in the month and dismissed later reads `dismissed` (GitHub records no dismissal date): that PR's `review_decision` is today's, named in its `as_of.not_projected`. Chaining caught-up months into `series.json` is fine for delivery and in-flight; don't use them to calibrate the forecast (a first month captured late is not marked `backfill`). |
 | Missed a month | Gather it late (above): its delivery history and in-flight set are as of its end; its milestones / board status / forecast are "as of now". Note that in the report if its series comparison matters. |
 | Quarter / year view | A **roll-up**: see *Roll-ups* below. |
 | Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
@@ -528,6 +559,13 @@ python3 $AO/validate.py $DB --bundle $S/views/$M/at-gather.json
 
 `--as-stored` writes the records as stored: a report view projects them to the window's end
 (#97), which is not what the store holds, so a projected view is not a `--bundle` input.
+
+A month gathered late passes this check too. Like the report view, the `--as-stored` view
+leaves out records created after the window's end; a store gathered before that rule may still
+hold some (open PRs and issues opened after the month, issues closed before it from the
+listing's last page), and `--bundle` does not expect their people to be derivable from the
+window: they are listed in one INFO line under `no_drift` ("seen only on stored records outside
+the --bundle's window"), not as errors. Such a store needs no re-gather.
 
 `--bundle` is a single-repo cross-check (a project-mode run ignores it with a warning; pass
 `--project P --repo owner/repo` to cross-check one member). A run with `--repo` on a
@@ -1008,6 +1046,10 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `meta_integrity` | the store's markers or per-window meta were edited or damaged (each detail names the meta key); or the store mixes a window folded before #75 with later ones ("no fold evidence"), or holds per-window facts without a `current_state:` marker (a #94-era fold) | re-gather the named window, or fold any window of the repo once more; a damaged store: re-gather into a fresh store |
 | `validate` WARN `edge_set` "an edge into another member repo: no fold of this repo recorded its member set" | a manifest store folded before #113 (or whose member set changed between folds): a missing cross-repo edge cannot be proven missing | fold each member once more (any window) to make cross-repo edges exact |
 | `validate` WARN `no_fabrication` "PR/issue with no contribution edge at all … hand-built records" | a record with no author, merger, reviewer or commenter in a repo where no record of its kind has an author (hand-made data) | not a failure; a real gather always records the author |
+| `gather` stops with `RuntimeError: command failed (exit 128): git … log …` and `could not fetch … from promisor remote` / `SSL_ERROR_SYSCALL` / `RPC failed` after `note: git lost its connection …; retry 3 of 3` | the clone is partial: the history walks fetch file contents from GitHub as they go, and the connection dropped four times in a row; nothing was folded (a new store is empty, `validate` fails `target`) | re-run the same window into the same store when the network is stable (idempotent; the clone dir is reused) |
+| `gather` warning `could not tell whether N author(s) are new (search failed)` | the first-time-contributor search failed or was rate limited for those authors; they are `newcomers.unknown` (never counted as new or returning) | re-gather the window later, or report them as unknown |
+| `gather` warning `… candidate first-time contributors, more than ACTIVITY_NEWCOMERS_MAX=…` | a window with more authors than the cap; the rest are `newcomers.not_checked` | raise `ACTIVITY_NEWCOMERS_MAX` (each candidate costs one or two search calls at 30 a minute), or accept |
+| `validate --bundle FILE` INFO `no_drift` "people: N stored person(s) are seen only on stored records outside the --bundle's window" | the store holds records no view of FILE's window shows (created after its end, or closed and last updated before its start) — typical of a month gathered late before gather stopped keeping them | not a failure; nothing to do |
 | `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
 | `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
 | `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |

@@ -308,6 +308,19 @@ def build_report(view, texts, captions):
               "comments may be newer than the window.".format(
                   as_of, short(m["repo"]), to))
             W("")
+    # meta.records_as_of without meta.state_as_of (validation finding 8,
+    # omit-when-absent): the member's window was gathered after it ended, so
+    # what has no history is as of meta.gathered_at, not the window's end.
+    for m in members:
+        mm = member_meta(m)
+        rao = mm.get("records_as_of")
+        if rao and not mm.get("state_as_of"):
+            gathered = (mm.get("gathered_at") or "")[:10]
+            W("> **Gathered after the window** (`{}`): records are shown as of "
+              "{}, the end of this window; titles, labels, milestones and board "
+              "status are as gathered on {}.".format(
+                  short(m["repo"]), rao.get("instant"), gathered or "a later date"))
+            W("")
     W("Member repositories:")
     W("")
     for m in members:
@@ -488,6 +501,33 @@ def build_report(view, texts, captions):
         W("")
         W(mmd(sd, "timeline_gantt"))
         W("")
+        # newcomers (validation finding 12, omit-when-absent): the gather's
+        # first-time-contributor check for this member's window.
+        nc = b.get("newcomers")
+        if isinstance(nc, dict):
+            W("#### New contributors")
+            W("")
+            if not nc.get("collected"):
+                W("Not looked up for this window (gathered with --no-newcomers).")
+            elif nc.get("new"):
+                W("No PR / issue of theirs created before {}:".format(
+                    nc.get("before")))
+                W("")
+                W("| Contributor | First contribution |")
+                W("|---|---|")
+                for e in nc["new"]:
+                    W("| `{}` | {} [#{}]({}) |".format(
+                        e.get("login"), e.get("first"), e.get("number"),
+                        e.get("url")))
+            else:
+                W("No first-time contributors this window.")
+            undecided = sorted(set(nc.get("unknown") or [])
+                               | set(nc.get("not_checked") or []))
+            if nc.get("collected") and undecided:
+                W("")
+                W("Could not check whether these authors are new: {}.".format(
+                    ", ".join("`{}`".format(x) for x in undecided)))
+            W("")
         rels = b.get("releases", [])
         if rels:
             W("#### Releases")

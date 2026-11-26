@@ -96,6 +96,11 @@ class TestCurrentMonthUnchanged(GitRepoCase):
         # where `closes` came from. Not part of what this gate pins.
         self.assertIn(got["meta"].pop("closing_refs_source"),
                       ("graphql", "keywords"))
+        # Added by the first-time-contributor check after the golden was
+        # captured: this repo has no PR / issue, so no candidate and no call.
+        self.assertEqual(got.pop("newcomers"), {
+            "collected": True, "before": CURRENT_FROM, "candidates": 0,
+            "new": [], "unknown": [], "not_checked": []})
         # The view contract version is now stamped on gather's bundle too
         # (one version everywhere); the golden was captured when it was 1.
         golden = json.loads(json.dumps(self._golden()[key]))

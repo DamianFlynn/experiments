@@ -27,7 +27,8 @@ Materialization approach (slice 7a part 1)
    leak the others into the view). The rule mirrors what gather collects for a
    window, applied to each record's latest stored state — or, for a report view
    (`as_of_end`, issue #97; view.py and digest.py), to the record as it was at
-   the window's end (`record_as_of`; a record created after it is in no view):
+   the window's end (`record_as_of`). A record created after the window's end
+   is in no view of it, projected or as stored:
    - a PR merged in the window, closed (unmerged) in the window, or open and
      created by the window's end;
    - an issue closed or updated in the window, open and created by the
@@ -88,6 +89,9 @@ latest gathered window overlapping it, named in `meta.facts_windows`. Only a
 store with no per-window facts for the repo (folded before #94) reads the
 latest-wins nodes. Either way a key is emitted ONLY when a value was stored
 (extract never fabricates an empty key — fold stores none for an empty value).
+`newcomers` (the window's first-time contributors) is a per-window fact only:
+a view of exactly a gathered window carries it as stored, any other view the
+merge of the gathered windows inside it (`_merged_newcomers`).
 
 symbol_events (slice 7b — the self-sourced no_drift fix)
 --------------------------------------------------------
@@ -124,7 +128,8 @@ VIEW_CONTRACT_VERSION = 3
 # derived projections fold persists into nodes (artifacts, people).
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
-             "code_owners", "label_taxonomy", "artifacts", "people")
+             "code_owners", "label_taxonomy", "newcomers", "artifacts",
+             "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
 # (not the raw symbol `change`). build_artifacts only uses `change` to recompute
@@ -340,6 +345,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     if any(projected.values()):
         bundle["meta"]["records_as_of"] = dict(
             projected, instant=as_of_instant(ts_to))
+        # When the records were gathered (finding 8): what has no history
+        # (title, labels, milestone, board status) is as of this instant.
+        gathered = _gathered_at(view_socials)
+        if gathered:
+            bundle["meta"]["gathered_at"] = gathered
 
     # Phase 11 slice 1: surface the store's `blocks` issue->issue edges as resolved
     # numbers (issue["blocking"] / issue["blocked_by"]) for the report + blocker_graph.
@@ -432,6 +442,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     for key, _local_id in _SINGLETON_FACTS:
         if key in facts:
             bundle[key] = facts[key]
+    # First-time contributors (per-window only, finding 12): the gathered
+    # window's fact as stored, or merged over the windows inside the view
+    # (`_merged_newcomers`); absent when no gather collected it.
+    if "newcomers" in facts:
+        bundle["newcomers"] = facts["newcomers"]
 
     return bundle
 
@@ -571,16 +586,24 @@ def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to,
 
     `as_of` (issue #97, `_socials_as_of`): the records projected to the
     window's end. The rule then reads a projected record, and the timestamp
-    fold would give it (`_record_ts`), instead of the stored one; a record
-    created after the window's end (None) is in no view, not even as context.
-    A record `as_of` does not name is read as stored."""
+    fold would give it (`_record_ts`), instead of the stored one. A record
+    `as_of` does not name is read as stored.
+
+    A record created after the window's end (None in `as_of`; read as stored,
+    a `created_at` after the end) is in no view, not even as context: the
+    report view and an `--as-stored` view of a window hold the same records
+    in that respect, and `validate.py --bundle` leaves such stored records
+    (and people seen only on them) out on both sides."""
     as_of = as_of or {}
 
     def data(n):
         return as_of[n["id"]] if n["id"] in as_of else n["data"]
 
     def gone(n):
-        return n["id"] in as_of and as_of[n["id"]] is None
+        if n["id"] in as_of:
+            return as_of[n["id"]] is None
+        rec = n["data"] if isinstance(n["data"], dict) else {}
+        return _after(rec.get("created_at"), ts_to)
 
     def dated_in(n):
         if not n["ts"]:
@@ -611,6 +634,18 @@ def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to,
                     or _issue_in_window(data(n), ts_from, ts_to)):
                 out.append(n)
     return out
+
+
+def _gathered_at(view_socials):
+    """When the view's PR / issue records were gathered: the latest
+    `fetched_at` of their nodes (the time the fold that last wrote each one
+    ran, at the end of its gather), or None when none is recorded. Their
+    fields with no history (title, labels, milestone, board status) are as
+    of that gather, not of the window's end."""
+    times = [n.get("fetched_at") for n in view_socials
+             if _local(n["id"]).startswith(("pr-", "issue-"))]
+    times = [t for t in times if isinstance(t, str) and t]
+    return max(times) if times else None
 
 
 # ---------------------------------------------------------------------------
@@ -1185,7 +1220,7 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     # Windows whose CI runs were collected: only these can be summed.
     with_ci = {k for k in recorded if probes[k]["ci_collected"]}
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
-                           if k != "workflow_stats")
+                           if k not in ("workflow_stats", "newcomers"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1230,6 +1265,12 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
         excluded = [k for k in overlapping if k not in summed]
     if stats:
         facts["workflow_stats"] = derive.sum_workflow_stats(stats)
+    newcomers = _merged_newcomers(
+        conn, project, repo,
+        [k for k in recorded if _contained(win(k), ts_from, ts_to)],
+        ts_from, ts_to)
+    if newcomers is not None:
+        facts["newcomers"] = newcomers
     note = {"structure": win(structure),
             "workflow_stats": [win(k) for k in summed],
             # every day of the view is in exactly one summed window
@@ -1239,6 +1280,50 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
         note["workflow_stats_excluded"] = [win(k) for k in excluded]
     return {"facts": facts, "clone_sha": chosen["clone_sha"], "note": note,
             "missing": sorted(set(missing))}
+
+
+def _merged_newcomers(conn, project, repo, inside, ts_from, ts_to):
+    """The `newcomers` of a view that is not exactly one gathered window:
+    merged from the gathered windows lying wholly inside it (`inside`) that
+    collected one, taken by start day, the longest first, leaving out a
+    window overlapping one taken (as CI statistics are). A login new in one
+    of them is new to the view too (no item before that window's start, so
+    none before the view's); `new` keeps each login's earliest entry,
+    `unknown` / `not_checked` are the unions less the logins found new.
+    Returns {"collected": True, "before", "new", "unknown", "not_checked",
+    "windows": [{from, to}], "covers_view": every day of the view is in one
+    of them} — or None when no window inside the view collected newcomers.
+    `candidates` is not merged (a login can be a candidate in two windows)."""
+    values = {}
+    for k in inside:
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("newcomers",))
+        value = (got or {}).get("facts", {}).get("newcomers")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    taken, last_to = [], None
+    for k in sorted(values, key=lambda k: (k[0][:10], _neg_day(k[1]), k)):
+        if last_to is None or k[0][:10] > last_to:
+            taken.append(k)
+            last_to = k[1][:10]
+    if not taken:
+        return None
+    new, unknown, not_checked = {}, set(), set()
+    for k in taken:                      # earliest window first
+        v = values[k]
+        for e in v.get("new") or []:
+            if isinstance(e, dict) and e.get("login") not in new:
+                new[e.get("login")] = e
+        unknown |= set(v.get("unknown") or [])
+        not_checked |= set(v.get("not_checked") or [])
+    unknown -= set(new)
+    not_checked -= set(new) | unknown
+    windows = [{"from": k[0], "to": k[1]} for k in taken]
+    return {"collected": True, "before": values[taken[0]].get("before"),
+            "new": [new[login] for login in sorted(new, key=str)],
+            "unknown": sorted(unknown), "not_checked": sorted(not_checked),
+            "windows": windows,
+            "covers_view": _covers(windows, ts_from, ts_to)}
 
 
 def _materialize_singleton(conn, project, repo, local):

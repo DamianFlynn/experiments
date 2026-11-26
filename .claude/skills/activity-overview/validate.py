@@ -2208,11 +2208,13 @@ def _pre78_hint(conn, project, person_qid):
 
 
 def _people_drift_details(stored_people, want_norm, mode=PEOPLE_EXACT,
-                          conn=None, project=None):
+                          conn=None, project=None, outside=()):
     """The details for any divergence between stored and re-derived people,
     under `mode` (PEOPLE_EXACT / PEOPLE_WINDOW / PEOPLE_MEMBER, see above). A
     stored person that is not derivable carries a #78 hint when it is a
-    pre-#78 git-name identity (needs `conn`/`project`)."""
+    pre-#78 git-name identity (needs `conn`/`project`). The logins in
+    `outside` (_outside_window_people: seen only on stored records outside
+    an external --bundle's window) are not expected to be derivable."""
     details = []
     for login in sorted(set(stored_people) | set(want_norm)):
         if login not in stored_people:
@@ -2220,8 +2222,9 @@ def _people_drift_details(stored_people, want_norm, mode=PEOPLE_EXACT,
                             "problem": "derived but not stored", "expected": want_norm[login]})
             continue
         if login not in want_norm:
-            if mode == PEOPLE_MEMBER:
-                continue   # another member's person: audited project-wide
+            if mode == PEOPLE_MEMBER or login in outside:
+                continue   # another member's person: audited project-wide;
+                # or one whose records are all outside the --bundle's window
             d = {"severity": ERROR, "kind": "person", "login": login,
                  "problem": "stored but not derivable", "stored": stored_people[login]}
             if conn is not None:
@@ -2390,6 +2393,47 @@ def _in_bundle_span(n, local, frm, to):
     if local.startswith("issue-"):
         return extract._issue_in_window(data, frm, to)
     return False
+
+
+def _outside_window_people(conn, project, repo, bundle, logins):
+    """Of the stored people `logins` an EXTERNAL --bundle does not derive,
+    those seen only on stored records outside its window: every contribution
+    edge of theirs points at a stored PR / issue of this repo that the
+    bundle does not hold and that `_in_bundle_span` (the rule that decides
+    which stored records the bundle must hold) does not place in its window
+    — a record created after the window's end (an open PR or issue gathered
+    late, an issue a later PR or comment references), or one closed and last
+    updated before its start. A view of the window leaves those records out
+    (extract._view_socials), so their people cannot be derived from it, and
+    a stored record the bundle must hold is never one of them. A person
+    with no contribution edge, or with one to anything else, is not."""
+    frm, to = _bundle_window(bundle)
+    if frm is None or not logins:
+        return set()
+    held = {graphstore.qualify_id(project, repo, "{}-{}".format(kind, r.get("number")))
+            for kind, key in (("pr", "prs"), ("issue", "issues"))
+            for r in bundle.get(key) or [] if isinstance(r, dict)}
+    prefix = graphstore.qualify_id(project, repo, "")
+    verdict = {}
+
+    def outside(qid):
+        if qid not in verdict:
+            local = qid[len(prefix):] if qid.startswith(prefix) else None
+            row = None
+            if local is not None and _ITEM_LOCAL_RE.match(local) and qid not in held:
+                row = conn.execute("SELECT * FROM nodes WHERE id=?", (qid,)).fetchone()
+            verdict[qid] = row is not None and not _in_bundle_span(
+                _node(row), local, frm, to)
+        return verdict[qid]
+    out = set()
+    for login in logins:
+        dsts = [dst for dst, et in conn.execute(
+            "SELECT dst_id, edge_type FROM edges WHERE src_id=?",
+            (graphstore.qualify_person(project, login),))
+            if et in _CONTRIB_EDGE_TYPES]
+        if dsts and all(outside(d) for d in dsts):
+            out.add(login)
+    return out
 
 
 def _is_standin_data(data):
@@ -2609,8 +2653,25 @@ def check_no_drift(conn, project, repo, bundle, check_people=True,
         want_norm = _norm_people(_derive_people(bundle))
         stored_people = _stored_project_people(conn, project)
         mode = _people_mode(conn, project, repo, external)
+        # An external --bundle covers its window: people seen only on stored
+        # records outside it are not derivable from it, on either side.
+        outside = _outside_window_people(
+            conn, project, repo, bundle,
+            set(stored_people) - set(want_norm)) \
+            if external and mode != PEOPLE_MEMBER else set()
         details.extend(_people_drift_details(stored_people, want_norm, mode,
-                                             conn, project))
+                                             conn, project, outside=outside))
+        if outside:
+            names = sorted(outside)
+            shown = ", ".join(names[:20]) + (
+                ", and {} more".format(len(names) - 20) if len(names) > 20 else "")
+            details.append({"severity": INFO, "note": (
+                "people: {} stored person(s) are seen only on stored records "
+                "outside the --bundle's window {}..{} (e.g. created after its "
+                "end, or closed and last updated before its start), which no view "
+                "of the window holds; not expected to be derivable from "
+                "it: {}".format(len(names), *_bundle_window(bundle), shown)),
+                "logins": names})
         if mode == PEOPLE_MEMBER:
             details.append({"severity": INFO, "note": (
                 "people: the {} derived from this {} are stored with at least "

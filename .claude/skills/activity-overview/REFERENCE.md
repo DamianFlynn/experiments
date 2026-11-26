@@ -223,6 +223,11 @@ under the same bound) instead of re-cloned; `--no-clone` never creates
 a clone (it fetches an existing one, or gathers API data only when there is none). A repo
 with no commits since the bound is cloned at `--depth=1` and contributes no commits.
 `meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.
+The clone is also partial (`--filter=blob:none`): file contents are fetched from GitHub
+while the history walks run, so a gather needs the network for its whole run. A git
+command that loses its connection is retried three times (2 s, 8 s, 30 s); if it still
+fails the gather stops before folding anything — re-run the same window into the same
+store.
 
 ### GitHub API knobs
 
@@ -239,6 +244,11 @@ its minimum is clamped with a warning.
 If a window has more than 1,000 workflow runs (GitHub's per-search cap) gather
 splits the query by day; a single day still over the cap is reported on stderr and
 marked in `workflow_stats._truncated`.
+
+First-time contributors (`newcomers`, BUNDLE.md): one or two search API calls per author of
+a PR / issue created in the window (the search API allows 30 requests a minute; a limit is
+waited out like any other). `ACTIVITY_NEWCOMERS_MAX` (default `200`, min `0`) caps the
+candidates checked (the rest are listed as `not_checked`); `--no-newcomers` skips the check.
 
 ### Projects v2 board knobs
 

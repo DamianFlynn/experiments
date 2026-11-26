@@ -112,6 +112,24 @@ PLACEHOLDER RULES — read before filling anything below.
   (Open/closed state, comments and reviews are as of {meta.to} when the view
   projected its records to its end, issue #97; BUNDLE.md "As of the window's
   end".) Omit the line when the key is absent.
+* GATHERED AFTER THE WINDOW: when `meta.records_as_of` is present and
+  `meta.state_as_of` is absent (a window gathered after it ended, e.g. a month
+  caught up late into its own store; in the project view read both per member,
+  `member.bundle.meta`), say so in one line under the report title: "Records
+  are shown as of {meta.records_as_of.instant}, the end of this window; titles,
+  labels, milestones and board status are as gathered on {meta.gathered_at}."
+  (write the date part of `meta.gathered_at`). When `meta.state_as_of` is
+  present the STATE AS OF line says it instead; omit this line when
+  `meta.records_as_of` is absent.
+* NEW CONTRIBUTORS: the row variable `newcomer` is one entry of
+  bundle["newcomers"]["new"] (`login`, `first` "pr" | "issue", `number`, `url`,
+  `created_at`): a person whose first PR / issue in the repository was created
+  in the window. It is the gather's own check (no PR / issue of theirs created
+  before `newcomers.before`), never inferred from `people` (`person.first_seen`
+  is only the earliest activity inside the view, and `author_association` is
+  GitHub's value when gathered). Multi-repo: read it per member,
+  `member.bundle.newcomers` (a person new to one member may not be new to the
+  project).
 * TRUNCATED DIAGRAMS: when `diagrams.truncated` has an entry for an embedded
   diagram, say so under it: "Showing {diagrams.truncated[].shown} of
   {diagrams.truncated[].total} {diagrams.truncated[].unit}."
@@ -584,6 +602,28 @@ Embed `diagrams.contributor_graph` (people ↔ code-area edges) here, once:
 ```mermaid
 {contents of diagrams.contributor_graph}
 ```
+
+## New contributors
+
+<!-- From bundle["newcomers"] (multi-repo: once per member, from
+     `member.bundle.newcomers`). OMIT the section when the key is absent (a store
+     gathered before the check existed). When `newcomers.collected` is false write
+     only: "Not looked up for this window (gathered with --no-newcomers)." -->
+
+People whose first PR or issue in this repository was created this window (none of
+theirs was created before {newcomers.before}; bots excluded):
+
+| Contributor | First contribution |
+|-------------|--------------------|
+| `{newcomer.login}` | {newcomer.first} [#{newcomer.number}]({newcomer.url}) |
+
+When `newcomers.new` is empty write "No first-time contributors this window."
+instead of the table. When `newcomers.unknown` or `newcomers.not_checked` is
+non-empty add one line naming those logins: "Could not check whether these authors
+are new: …" (the check failed, or there were more candidates than the gather's cap);
+never count them as new or returning. A view spanning several gathered windows
+merges theirs and names them in `newcomers` (its `windows`); when its `covers_view` is
+false say which days of the view no window covers.
 
 ## Issue kinds
 

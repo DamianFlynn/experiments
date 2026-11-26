@@ -142,6 +142,7 @@ scratch store) and `backfill` respectively.
 | `--include-releases` / `--no-releases` | on | Releases in window |
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
+| `--no-newcomers` | off (check runs) | Skip the first-time-contributor search (§4.7); the window's `newcomers` fact is `{"collected": false}`. `ACTIVITY_NEWCOMERS_MAX` (default 200, min 0) caps the candidates checked |
 | `--no-iac-build` | off (builds run) | Do not run `bicep restore/build` / `terraform init/graph` (they download and run third-party code, §14.4); every area `edges_status: skipped`, `edge_extraction.disabled: true`. The structural scan still runs |
 | `--store PATH` | **required** | SQLite store |
 
@@ -195,6 +196,7 @@ sequenceDiagram
   end
   A->>GQL: closingIssuesReferences, 50 PRs per request (else keywords only)
   A->>REST: issues updated since from + all open issues + referenced issues
+  A->>A: keep_issue_for_window (created by to; touched since from unless open)
   loop each issue
     A->>REST: comments, timeline
   end
@@ -203,7 +205,11 @@ sequenceDiagram
     A->>REST: commits?sha=<walked branch head>&since&until (author.login per SHA)
     A->>A: resolve_commit_authors (API login, noreply email, else flagged git name)
   end
-  A->>REST: workflow runs, releases, milestones
+  A->>REST: workflow runs
+  opt not --no-newcomers
+    A->>REST: search/issues per candidate first-time contributor (collect_newcomers)
+  end
+  A->>REST: releases, milestones
   opt token has read:project
     A->>GQL: Projects v2 boards (maintained only), items, iterations
   end
@@ -217,7 +223,16 @@ sequenceDiagram
   former `<owner>-<repo>-clone` collided for `a-b`/`c` vs `a`/`b-c`; such a dir that is a clone
   of the member's own remote is still used while `<owner>/<repo>` does not exist) and records
   the outcome in `meta.clone_mode`:
-  - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`).
+  - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`): shallow
+    (`--shallow-since`) and **partial** (`--filter=blob:none`). File contents are not in the
+    clone: git fetches each blob from GitHub when a walk first needs it, so the patch walk
+    (`git log -p`), the structure reads and the IaC builds all use the network, and a gather
+    needs it for its whole run. `run_git` retries a git command that fails with a network
+    error (`_git_network_failure`: a reset, an SSL error, "could not fetch … from promisor
+    remote", a 502/503/504, …) three times, after `GIT_NETWORK_RETRY_DELAYS` (2 s, 8 s, 30 s),
+    one stderr note each; any other failure, a fourth network failure, and non-git tools are
+    not retried: the gather stops with git's error before anything is folded, and the
+    operator re-runs the same window into the same store (idempotent).
   - `fetched` — the dir is already a clone of the same remote (`remote.origin.url`, GitHub
     https/ssh forms compared equal): `git fetch --prune --shallow-since=…` (`build_fetch_cmd`;
     deepens or shortens to this window's bound) then `checkout -B <default branch>` at the
@@ -427,12 +442,13 @@ flowchart TB
 | Data | Endpoint(s) | Bounding |
 |---|---|---|
 | Closed PRs | `pulls?state=closed&sort=updated` | `fetch_until` stops when a page's last `updated_at` < `from` |
-| Open PRs | `pulls?state=open` | all |
+| Open PRs | `pulls?state=open` | all listed; kept when created by `to` (`keep_pr_for_window`) |
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
-| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | a referenced issue answered 404 or 410 (deleted) is skipped with a stderr note (`allow_statuses=GONE_STATUSES`); an answer that is not #N of this repo (number, `repository_url` / `html_url`, case-insensitive; a transferred issue reached through a redirect) is skipped with a note, never stored (#109) |
+| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | a listed issue is kept when created by `to` and open, or touched (`updated_at` / `closed_at`) on or after `from` (`keep_issue_for_window`: the updated-since listing's last page reaches older closed ones); an issue a kept PR closes or cross-references is kept whatever its dates (train context, though no view shows it when created after `to`); a referenced issue answered 404 or 410 (deleted) is skipped with a stderr note (`allow_statuses=GONE_STATUSES`); an answer that is not #N of this repo (number, `repository_url` / `html_url`, case-insensitive; a transferred issue reached through a redirect) is skipped with a note, never stored (#109) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
+| First-time contributors (`newcomers`) | `search/issues?q=repo:O/R is:<pr\|issue> author:<login> created:<<from>&per_page=1` → `total_count` | one call per candidate (author of a PR / reporter of an issue created in the window, bots and `ghost` excluded), a second for the other kind only when the first is 0; at most `ACTIVITY_NEWCOMERS_MAX` (200) candidates, the rest `not_checked`; a failed or `incomplete_results` answer → `unknown`; three failures in a row → the rest `unknown`; `--no-newcomers` → none (`{"collected": false}`) |
 | Closing issues (#105), GraphQL | `repository { pr<N>: pullRequest(number: N) { closingIssuesReferences(first: 25) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } } } }` | 50 kept PRs aliased per request; a PR with more than 25 closing issues is paged on its own (`first: 100, after:`) |
 | Projects v2 boards, GraphQL | §4.8 | maintained boards only, items capped |
 
@@ -572,7 +588,8 @@ fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows)
 **Per-window facts (#94).** The singleton nodes are latest-wins. In the same transaction the
 fold also calls `graphstore.set_window_facts(project, repo, from, to, bundle, clone_sha)`:
 meta `facts:{p}/{r}:{from}:{to}` = `{clone_sha, facts: {key: sha256}}` for each non-empty
-`workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy`, each value stored once per
+`workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` / `newcomers` (the
+first-time contributors, §4.7; per-window only, no singleton node), each value stored once per
 repo under `fact:{p}/{r}:{sha256}` (shared by windows with identical values; a re-fold of the
 window replaces its entry and unreferenced values are deleted). Keyed by window, not clone
 sha: the directory code graph is built from the window's changed paths, so two windows of one
@@ -827,7 +844,10 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
      node (it cannot be placed in a window);
    - `releases`: `published_at` in the window (or undated); `milestones`, `sprints`: not
      windowed (current structure).
-   A record created after the window's end is in no view (#97), not even as train context.
+   A record created after the window's end is in no view (#97), not even as train context —
+   projected or as stored (`--as-stored`, validation finding 7): `_view_socials` treats it as
+   gone either way, so the `validate --bundle` input and the report view hold the same
+   records in that respect.
    Re-attach reviews/lifecycle onto the view's parents (a review/event follows its parent,
    whatever its own timestamp; a projected record already holds its leaves up to the end);
    surface `blocks` as `blocking`/`blocked_by`; `meta.records_as_of` = `{instant, prs,
@@ -839,7 +859,14 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    overlapping one another (by start day, longest first; absent when none; a window only
    partly overlapping the view is not summed), structure = the latest gathered
    window overlapping the view (by `to`), else the latest ending before it, else the earliest;
-   no `facts:` entry for the repo (pre-#94 store) → the latest-wins singleton nodes. Window scope:
+   no `facts:` entry for the repo (pre-#94 store) → the latest-wins singleton nodes.
+   `newcomers` (top-level key, omitted when no gather stored it): exactly a gathered window →
+   its stored value verbatim; any other window → merged over the gathered windows wholly
+   inside the view that collected one, not overlapping one another (`_merged_newcomers`:
+   `new` keeps each login's earliest entry, `unknown` / `not_checked` the unions less the
+   logins found new, plus `windows` and `covers_view`). When any record was projected,
+   `meta.gathered_at` = the latest `fetched_at` of the view's PR / issue nodes (when they were
+   gathered; validation finding 8). Window scope:
    each artifact's `lifecycle` keeps the view's events (same predicate as the ledger rows) and
    an artifact with none is left out; `status`/`replaced_by`/move fields are as of the
    window's end — the stored node when the ledger holds nothing dated after `ts_to`, else
@@ -1385,7 +1412,13 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   areas derived ⊆ stored, extra → WARN), member (`--repo` of a multi-member project, or an external
   `--bundle` on a multi-window store: derived ⊆ stored for logins and areas). A stored person that
   is not derivable gets a `hint` from `_pre78_hint` when it has no `login_resolved` flag and all its
-  contribution edges are `authored` → commits that now name another author.
+  contribution edges are `authored` → commits that now name another author. With an external
+  `--bundle` (exact mode), a stored person every one of whose contribution edges points at a
+  stored PR / issue the bundle does not hold and `_in_bundle_span` does not place in its window
+  (`_outside_window_people`: created after the window's end, or closed and last updated before
+  its start) is not expected to be derivable: no view of the window holds those records, so it
+  is listed in one INFO detail instead (validation finding 7). A person with no contribution
+  edge, or with one to a record of the window, is not excused; such a store needs no re-gather.
 - *Records (`--bundle`).* `_record_drift_details`: every PR/issue/commit of the bundle is stored
   with equal content (`external_refs` added by a manifest fold is ignored; `reviews`/`lifecycle`
   compare as sorted entries without `url`; `blocking`/`blocked_by` added by a view are ignored), so
@@ -1398,7 +1431,7 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   and non-stand-in area. Train-context issues are not required. `_window_meta_drift_details`
   (#113): for a bundle window that is exactly a gathered window, the stored `ref_date`,
   base branch / branches, `clone_sha`, clone info and each fact value the bundle carries equal
-  the bundle's.
+  the bundle's (`newcomers` included: the view carries the stored value verbatim).
 - *Meta (`meta_integrity`, #113).* `_meta_details`: the repo's `gathered_windows` entries,
   their fold evidence (`_window_evidence`: a per-window meta key, a `member_status` entry or the
   marker naming the window), the `current_state:` marker (`_marker_problem`, and `structure ==
@@ -1681,7 +1714,10 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open PRs) + 4 × kept PRs
 + pages(issues since from) + pages(open issues) + 2 × issues + referenced issues + workflow/
 release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100⌉` (the last term is
-the commit-author login listing, #78; zero for a window with no commits). Because **all open PRs and issues** are included every run, busy
+the commit-author login listing, #78; zero for a window with no commits), plus 1–2 search calls
+per candidate first-time contributor (`newcomers`, capped by `ACTIVITY_NEWCOMERS_MAX`; the search
+API's own limit is 30 requests a minute, waited out like any rate limit; `--no-newcomers` skips
+them). Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (a personal token's authenticated limit is 5,000 requests/hour; the
 workflow's built-in `GITHUB_TOKEN`, which the CI live jobs use by default, has a lower limit
 that its runs in one repository share, so a live gather in CI is likelier to wait for the

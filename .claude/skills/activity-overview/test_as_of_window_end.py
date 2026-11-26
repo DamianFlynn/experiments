@@ -737,8 +737,11 @@ class TestGatherKeepsPrsOpenAtTheWindowEnd(unittest.TestCase):
 
     def test_keep_rule(self):
         keep = lambda pr: gather.keep_pr_for_window(pr, "2026-10-01", "2026-10-31")
+        # open now: kept when it existed at the window's end; one opened
+        # after it is in no view of the window (validation finding 7)
+        self.assertTrue(keep(self._pr(state="open", created_at="2026-10-31T23:59:59Z")))
+        self.assertFalse(keep(self._pr(state="open", created_at="2026-11-20T00:00:00Z")))
         # as before
-        self.assertTrue(keep(self._pr(state="open", created_at="2026-11-20T00:00:00Z")))
         self.assertTrue(keep(self._pr(merged=True, merged_at="2026-10-31T23:59:59Z",
                                       closed_at="2026-10-31T23:59:59Z")))
         self.assertTrue(keep(self._pr(closed_at="2026-10-05T00:00:00Z")))

@@ -1155,10 +1155,12 @@ def get_clone_info(conn, project, repo, frm, to):
 
 # Per-window facts (issue #94): the bundle keys a gather computes for ITS
 # window (CI runs created in it, the areas of the files it saw, the CODEOWNERS
-# and label taxonomy of its checkout). Kept per (project, repo, from, to) so a
-# view of an earlier window does not read a later gather's values.
+# and label taxonomy of its checkout, and the first-time contributors of its
+# PRs / issues). Kept per (project, repo, from, to) so a view of an earlier
+# window does not read a later gather's values. `newcomers` is per-window only
+# (no latest-wins node), and stored only by a gather that computed it.
 WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
-                    "label_taxonomy")
+                    "label_taxonomy", "newcomers")
 
 
 def _window_facts_key(project, repo, frm, to):
