@@ -45,9 +45,10 @@ BRM_FILES = {
         "module plan 'br/public:avm/res/web/serverfarm:0.2.0' = {\n"
         "  name: 'plan'\n}\n"
         "module slot 'slot/main.bicep' = [for s in slots: {\n  name: s\n}]\n"),
-    # a private child module: classified to its parent area, never read itself
+    # a private child module: part of its parent area; its own references are
+    # the area's references too (followed since the final-gate fix, #97)
     "avm/res/web/site/slot/main.bicep": (
-        "module never 'br/public:avm/res/never/read:9.9.9' = {\n  name: 'n'\n}\n"),
+        "module inner 'br/public:avm/res/child/dep:9.9.9' = {\n  name: 'n'\n}\n"),
     "avm/res/web/site/tests/e2e/defaults/main.test.bicep": (
         "module testDeployment '../../../main.bicep' = {\n  name: 't'\n}\n"),
     "avm/res/web/site/README.md": "# site\n",
@@ -77,13 +78,15 @@ LZ_FILES = {
 }
 
 
-def _scan(files, reads=None):
+def _scan(files, reads=None, patterns=None):
     def read_text(rel):
         if reads is not None:
             reads.append(rel)
+        if rel not in files:
+            raise FileNotFoundError(rel)
         return files[rel]
     return gather.scan_structural_bicep_areas(
-        "/clone", list_files=lambda: list(files), read_text=read_text)
+        "/clone", patterns, list_files=lambda: list(files), read_text=read_text)
 
 
 def _edge_set(edges):
@@ -109,7 +112,10 @@ class TestStructuralBicepScan(unittest.TestCase):
             (None, "br:contoso.azurecr.io/bicep/modules/x:1.0", "1.0", False, False),
         })
         site = {e["to"]: e for e in out[SITE]["edges"]}
-        self.assertEqual(set(site), {FARM, SITE + "/slot"})
+        # the child's own reference (a module this repo does not hold) is the
+        # area's too
+        self.assertEqual(set(site), {FARM, SITE + "/slot", None})
+        self.assertEqual(site[None]["ref"], "br/public:avm/res/child/dep:9.9.9")
         self.assertEqual(site[FARM]["version"], "0.2.0")
         self.assertTrue(site[FARM]["resolved"])
         # the private child keeps the build path's naming and markers
@@ -128,11 +134,14 @@ class TestStructuralBicepScan(unittest.TestCase):
                                               "avm/res/web/site/slot/main.bicep"])
         self.assertEqual(out[PTN]["paths"], ["avm/ptn/app/web/main.bicep"])
 
-    def test_reads_each_entrypoint_once_and_nothing_else(self):
+    def test_reads_each_module_file_once_and_nothing_else(self):
+        # each entry file, plus the files of the same area it references
+        # (the private child); never scaffolding, never twice
         reads = []
         _scan(BRM_FILES, reads)
         self.assertEqual(sorted(reads), sorted(
-            a + "/main.bicep" for a in (PTN, SITE, FARM, UTL)))
+            [a + "/main.bicep" for a in (PTN, SITE, FARM, UTL)]
+            + [SITE + "/slot/main.bicep"]))
 
     def test_root_entrypoint_and_local_module_dirs(self):
         out = _scan(LZ_FILES)
@@ -143,6 +152,31 @@ class TestStructuralBicepScan(unittest.TestCase):
         })
         self.assertTrue(all(e["to"] is None for e in out["modules/hub"]["edges"]))
         self.assertEqual(len(out["modules/hub"]["edges"]), 4)
+
+    def test_sibling_file_is_followed_and_is_not_a_self_edge(self):
+        # the live landing-zone case (#97): main.bicep only calls
+        # ./resources.bicep, which holds the real module calls
+        files = {
+            "infra/main.bicep": "module res './resources.bicep' = {\n  name: 'r'\n}\n",
+            "infra/resources.bicep": (
+                "module apim './modules/apim/apim.bicep' = {\n  name: 'a'\n}\n"
+                "module kv 'modules/keyvault/kv.bicep' = {\n  name: 'k'\n}\n"
+                "module again './resources.bicep' = {\n  name: 'loop'\n}\n"),
+            "infra/modules/apim/apim.bicep": (
+                "module pe '../networking/pe.bicep' = {\n  name: 'p'\n}\n"),
+            "infra/modules/keyvault/kv.bicep": "param n string\n",
+            "infra/modules/networking/pe.bicep": "param n string\n",
+            "infra/sub/main.bicep": (
+                "module shared '../modules/keyvault/kv.bicep' = {\n  name: 's'\n}\n"),
+        }
+        pat = gather.module_area_patterns(gather.bicep_module_dirs(list(files)))
+        out = _scan(files, patterns=pat)
+        self.assertEqual(sorted({e["to"] for e in out["infra"]["edges"]}),
+                         ["infra/modules/apim", "infra/modules/keyvault",
+                          "infra/modules/networking"])
+        self.assertNotIn("infra", {e["to"] for e in out["infra"]["edges"]})
+        # another deployment using the root's shared module depends on the root area
+        self.assertEqual({e["to"] for e in out["infra/sub"]["edges"]}, {"infra"})
 
     def test_deterministic(self):
         rev = dict(reversed(list(BRM_FILES.items())))
@@ -158,7 +192,8 @@ class TestStructuralBicepScan(unittest.TestCase):
             entry = aid + "/main.bicep"
             built = gather.build_bicep_edges(
                 BRM_FILES[entry], {}, entry, {aid}, gather.DEFAULT_AREA_PATTERNS,
-                module_exists=modules.__contains__)
+                module_exists=modules.__contains__,
+                read_local=BRM_FILES.get)
             self.assertEqual(built, scanned[aid]["edges"], aid)
 
 
