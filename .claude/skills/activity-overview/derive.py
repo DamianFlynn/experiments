@@ -857,9 +857,10 @@ def area_owners(rules, area_id, paths=()):
     """Owners of a code area. A directory area (the id is its directory path, e.g.
     `avm/res/network/virtual-network`) is owned by the owners of the last rule
     that matches the area directory itself (`<area>/`) — so a rule that only
-    matches some files inside it (`*.tf`) does not make its owners own the area.
-    A graphify `community:<n>` area has no directory: it is owned by the union of
-    the owners of its `paths`, sorted. The repo-root module (`main.tf` /
+    matches some files inside it (`*.tf`) does not make its owners own the area;
+    `<area>/**` owns the area like `<area>/` (_directory_owners). A graphify
+    `community:<n>` area has no directory: it is owned by the union of the
+    owners of its `paths`, sorted. The repo-root module (`main.tf` /
     `main.bicep`) is owned by the last catch-all rule only. Pure."""
     if not area_id:
         return []
@@ -872,7 +873,32 @@ def area_owners(rules, area_id, paths=()):
         # owned by the last catch-all rule — one that matches an arbitrary
         # top-level directory (`*`, `**`, `/**`) — and by nothing more specific.
         return codeowners_owners(rules, _ROOT_PROBE, is_dir=True)
-    return codeowners_owners(rules, area_id, is_dir=True)
+    return _directory_owners(rules, area_id)
+
+
+def _directory_owners(rules, directory):
+    """Owners of a directory area: the owners of the LAST rule that matches
+    the directory itself, where a rule written `<dir>/**` counts as matching
+    `<dir>` (issue #110 item 9). GitHub gives `docs/**` and `docs/` the same
+    files — everything under `docs` — so both make their owners own area
+    `docs`; codeowners_owners matches `docs/**` only below `docs`, which is
+    right for a file and too strict for the area. `docs/*` owns only the
+    files directly in `docs` (not its subdirectories), so it owns no area."""
+    parts = [s for s in directory.split("/") if s]
+    if not parts:
+        return []
+    full = "/".join(parts)
+    ancestors = ["/".join(parts[:k]) for k in range(1, len(parts))]
+    child = full + "/" + _ROOT_PROBE
+    owners = []
+    for pattern, rule_owners, compiled in rules:
+        if not compiled:
+            continue
+        if _codeowners_rule_matches(compiled, full, ancestors, True) or (
+                (pattern or "").strip().rstrip("/").endswith("/**")
+                and compiled[0].match(child)):
+            owners = rule_owners
+    return list(owners)
 
 
 # ---------------------------------------------------------------------------

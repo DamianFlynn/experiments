@@ -913,8 +913,11 @@ issue are one train (`prs`), each with its own outcome in `pr_outcomes` (`{"<pr#
 groups; each group is one train, every issue it closes is in `issues` and is indexed to it by
 `train_index` (so its bucket ref carries the train id), and `root_issue` is the lowest of them.
 `crossref_issues` (mentions, timeline cross-references, list tails such as the `#2` of
-`Fixes #1, #2`) never join or anchor: they stay spine `cross_ref` edges for `extract`/`digest`
-traversal only. A stacked PR's parent is the member PR whose `head` is the stacked PR's `base`
+`Fixes #1, #2`) never join or anchor: they stay spine `cross_ref` edges for `extract`'s train
+context and `spotlight` only (`digest` does not follow them, §10). A `closes` number that is a
+PR of the bundle (GitHub numbers issues and PRs from one sequence and closes no PR by keyword)
+is ignored: it neither anchors a `train-issue-<n>` nor joins the two PRs' trains (#110); a PR
+that "fixes" another PR is a separate train. A stacked PR's parent is the member PR whose `head` is the stacked PR's `base`
 **and** whose `head_repo` is the stacked PR's repo (from its url), so a fork's same-named
 `patch-1` is never the parent; a candidate without `head_repo` (pre-#93 stores, deleted forks) is
 used only when it is the sole candidate.
@@ -1050,10 +1053,18 @@ flowchart TB
 ```
 
 **Idempotent by window (#86).** An installment is identified by its window `(from, to)`
-(`series.bundle_window`: `meta.period`, else `meta.from`/`meta.to`). `link.main`:
+(`series.bundle_window`: `meta.period`, else `meta.from`/`meta.to`), normalised to calendar
+days: `series.window_key` = `(from[:10], to[:10])` after `series.window_problem` has checked
+each bound is a date or an ISO timestamp (`manifest.check_reader_window`) (#110). The key is
+used for identity, ordering, replacing and the predecessor lookup; the recorded `from`/`to`
+keep the spelling they were given. `link.main`:
 
-- compares against `series.predecessor` — the installment whose window sorts immediately
-  before this one by `(from, to)` (plain string order, so use the same date form throughout);
+- refuses (exit 2, nothing written) a window that `series.overlapping` finds sharing a day
+  with a recorded window of other days — a quarter beside its months, a month inside a
+  recorded quarter — naming both: "the installment before" is not defined in such an index
+  (keep roll-ups in a separate index, USAGE §5.2);
+- compares against `series.predecessor` — the installment whose window key sorts immediately
+  before this one;
 - records the new snapshot with `series.place_installment`: an entry for the same window is
   **replaced**, and the index is kept in window order. Running the same window twice
   therefore leaves one entry and produces the same `series` block; re-running an earlier
@@ -1081,8 +1092,9 @@ The index file is `{"version": 2, "installments": [...]}`; the older bare list i
 and is rewritten as version 2 on the next run (an older `link.py` cannot read version 2). It
 is read and shape-checked before enrich: invalid JSON, an object without `version`, another
 version, an entry that is not an object, a reference list that is not a list of objects, or a
-non-string `from`/`to` exits 2 with `link.py --series: series index <path> …`, as do a
-bundle with no window and an index whose entries name another `owner`/`repo`; nothing is
+non-string `from`/`to` or one that is not a date / ISO timestamp exits 2 with
+`link.py --series: series index <path> …`, as do a bundle with no (or an unusable) window, an
+index whose entries name another `owner`/`repo`, and an overlapping window; nothing is
 written (the index is never silently discarded). The bundle is written first and the index
 second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves the
 previous file intact, and a run that cannot write its bundle records no installment.
@@ -1135,6 +1147,25 @@ emitter re-renders with all its caps scaled by 0.75 until the text fits `DIAGRAM
 Caps are deterministic: the same bundle always yields the same diagram. What was cut is
 recorded in `bundle.diagrams.truncated` (`{name|train-id: {shown, total, unit}}`, `{}` when
 nothing was cut) and printed as `note: … capped` lines, so the report can say so.
+
+**Labels (#110).** Every untrusted text (PR / issue titles, release names, milestones, area
+ids and paths, logins and unresolved git names, kind / label names, repo slugs, versions,
+outcomes) goes through ONE sanitiser, `_mermaid_text`, before it reaches any diagram: one line
+(CR, LF, TAB, control characters and U+0085/2028/2029 become spaces); every run of `%`
+collapses to one, so no `%%{…}%%` directive (which Mermaid extracts from anywhere in the source
+and which changes the diagram's configuration, or fails the run) and no `%%` comment can be
+formed; `"` and backticks become `'`; `<` / `>` become `‹` / `›`; an entity code `#name;` gets
+a fullwidth `＃`. The per-kind helpers add only what their type needs: `_flow_label` (node and
+edge labels, 40 chars), `_subgraph_label` (uncapped), `_pie_label` (60), `_gantt_label` and
+`_timeline_text` (also `:` → ` -`, 60). A gantt row never starts with free text — the gantt
+lexer reads a line starting with `section`, `title`, `dateFormat`, `excludes`, `todayMarker`,
+`click`, `accTitle`, … (any case) as that statement and one starting with `%` / `x%` as a
+comment — so PR rows start `#<n> `, release rows `Release ` and marker rows with fixed text; a
+PR whose state is not merged / closed / open gets no status tag. A timeline period is the
+event's `YYYY-MM-DD` day or `undated`, never free text. `emit_train_flowchart` labels the
+outcome node `Shipped [→ <milestone>]`, `In flight`, `Rejected` or `Abandoned (not planned)`;
+any other value is drawn as itself (`Unknown outcome` when empty), and when no PR leads to the
+outcome (an abandoned train) the issue node does.
 
 **Node ids** come from `_stable_node_id(prefix, text)`: `<prefix>_<text>` when the text is
 1–32 ASCII letters/digits (`p_alice`, `pr_42`), else `<prefix>_<sanitised head ≤ 24>_<sha1[:8]>`,
@@ -1332,9 +1363,10 @@ stay the fold's union, which `validate`'s `no_drift_people` checks.
 
 ```mermaid
 flowchart TB
-  mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>connected components across repos"]
+  mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>components across repos over<br/>closes + part_of (TRAIN_EDGE_TYPES)"]
   sc --> wc["window_components:<br/>drop stored member anchors<br/>not in that member's view (#85)"]
-  wc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
+  wc --> lc["link_components:<br/>drop PRs in no member train and<br/>issue-N ids that are PRs (#110)"]
+  lc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
   bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (opt-in: manifest ticket_prefixes<br/>or --ticket-pattern) cluster into related_work"]
   mb --> mg["_merge_shipped / _merge_people (sums, halls) / _merge_modules"]
   pd["project_depends_on: edges_by_type depends_on"] --> me["module_edges<br/>src_repo, src_area, dst_repo, dst_area,<br/>version, transitive, cross_repo"]
@@ -1342,6 +1374,17 @@ flowchart TB
   mg --> view
   me --> view["project view<br/>meta, members[].bundle, trains, related_work,<br/>shipped, people, halls, modules, module_edges"]
 ```
+
+Project trains are built over the edges that make `link` trains (#110):
+`digest.TRAIN_EDGE_TYPES` = `closes` (same-repo and cross-repo) and `part_of`, passed to
+`graphstore.traverse_spine` and to the re-split. A `cross_ref` (a mention) never joins two
+trains, and neither do `spun_off` / `duplicate_of` (link has no such join);
+`graphstore.SPINE_EDGE_TYPES` keeps all five for `extract`'s train context and `spotlight`.
+`link_components` then removes, and re-splits around, the anchors that join no link train: a
+member's in-view PR that is in none of its trains (a stacked PR, a `contributing_prs` entry)
+and `issue-N` where the store holds `pr-N` (a `Fixes #N` naming a PR, §6.4). So the project
+trains of a single-member project are exactly that member's link trains (same grouping, same
+outcomes) — up to the `max_depth` caveat below.
 
 `window_components` (issue #85) removes from each component the stored PR/issue anchors of a
 member repo that its window-scoped view left out, so on a store holding several windows a
@@ -1550,6 +1593,8 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
   install time; `--ignore-scripts` would skip the Chrome download mmdc needs, and a lockfile
   for it is not kept. The mmdc install runs only in the offline `tests` job, which holds no
   secret.
+- Diagram text is untrusted (anyone can title a PR or name a release): `render._mermaid_text`
+  keeps a label from forming a Mermaid directive, comment, statement or HTML (§7, #110).
 - Recognition-not-blame: `halls` has no shame list; people attribution of stalls is an opt-in
   report appendix, and only open trains are ever "stalled" (#112).
 
@@ -1561,7 +1606,7 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 | `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not | read the moves from the stored nodes/edges instead |
 | Wide views use one code graph | a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them (#94); the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
 | Sub-window CI statistics are not available | `workflow_stats` are counted per gathered window, not per run day | a view inside a gathered window (a week of a gathered month) or straddling two has no `workflow_stats` (`meta.facts_windows.workflow_stats_excluded` says why); a view over ungathered days sums only what was gathered (`workflow_stats_complete: false`) | store per-day run counts |
-| Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner | per-file ownership facts if needed |
+| Area ownership is directory-level | `derive.area_owners` matches the area directory: `<area>/` and `<area>/**` own it (#110), `<area>/*` (direct files only) and file rules do not | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) or by `<area>/*` do not make that owner an area owner | per-file ownership facts if needed |
 | Item relations follow the last-folded record | `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records (#95), which are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record and its milestone / iteration / blockers (consistent with the store, but older); a record not re-gathered since a change keeps its old relations | fold windows oldest first; per-window record snapshots |
 | A window's structure is the head when its end is not in the clone | since #107 the code graph / IaC / CODEOWNERS of a window are read at its last mainline commit on or before `to`; when the bounded clone does not hold that commit (no commit in the window or its 14-day margin, only later ones) the head is read (`meta.structure_as_of: "head"`); `structure_as_of` is a bundle field, not stored per window; windows gathered before #107 carry the tree of their gather day | such a window's structure is newer than the window; the `depends_on` / `owns` replay (#95) still orders windows by their dates | widen `ACTIVITY_CLONE_MARGIN_DAYS` to reach the window end; re-gather pre-#107 windows |
 | Pre-#107 stores and Bicep module areas | since #107 every file below a non-AVM `main.bicep` dir is in that module's area; `touches` are only ever added | re-gathering, into a store folded before #107, a window that changed such a file (one area id changes: e.g. `infra/modules/x.bicep` `infra/modules` → `infra`, `a/b/c/README.md` `a/b` → `a/b/c`) leaves the old `touches` and people areas beside the new ones: `validate` fails a one-window store with them; on a multi-window store whose windows map the path differently they are WARNs | re-gather into a fresh store |

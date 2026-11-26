@@ -294,7 +294,8 @@ the rest (engagement, code areas, trains, people/flow).
   train id on its bucket ref (a Development-sidebar link counts once gather read it from
   GitHub, #105). A mention or timeline cross-reference (`crossref_issues`) never
   makes an issue a member or a root: a tracking issue that mentions three PRs leaves them three
-  trains. `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
+  trains. A `closes` number that is one of the bundle's PRs is not an issue (GitHub closes no
+  PR by keyword): it neither anchors nor joins a train (#110). `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
   or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.
   A train is anchored by its lowest closed issue — `root_issue`, id `train-issue-<n>` — or, when
   its PRs close no issue (process not followed / a forked PR), by its lowest **PR**
@@ -461,8 +462,18 @@ records every review-thread reply as a `COMMENTED` review, and rewrites a dismis
 review's state to `DISMISSED`.
 
 - **`prs[].reviewers`** (`gather.summarize_reviews`) — sorted logins with at least
-  one submitted review (`APPROVED`/`CHANGES_REQUESTED`/`COMMENTED`/`DISMISSED`).
-- **`prs[].review_decision`** (`gather.summarize_reviews`) — per reviewer, the
+  one submitted review (`APPROVED`/`CHANGES_REQUESTED`/`COMMENTED`/`DISMISSED`),
+  **never the PR author** (#110): the author's own replies in a review thread are
+  `COMMENTED` reviews, and they are left out of `reviewers` and of
+  `review_decision`, the same rule as review rounds. So `people[].prs_reviewed`,
+  review latency, the halls and `trains[].effort.reviewers` (all read from
+  `reviewers`) never count an author reviewing their own PR, and the fold writes
+  no `reviewed` edge from the author to their PR. A PR whose only reviews are the
+  author's has `reviewers: []` and `review_decision: "none"`. The rule applies at
+  gather time: a store gathered before it keeps the author in `reviewers` until
+  that window is gathered again.
+- **`prs[].review_decision`** (`gather.summarize_reviews`) — per reviewer (the PR
+  author excluded, above), the
   *effective state* is their latest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`
   review (chronological by `submitted_at`, then review id); a later `COMMENTED`
   review never overrides it. A reviewer with none of those three is `commented`. An

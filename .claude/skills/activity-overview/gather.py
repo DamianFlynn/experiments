@@ -883,11 +883,15 @@ def _review_order_key(index, r):
             index)
 
 
-def summarize_reviews(raw_reviews):
+def summarize_reviews(raw_reviews, author=None):
     """Reduce raw PR reviews to {reviewers, decision}. Pure.
 
     `reviewers`: sorted logins with at least one SUBMITTED review (PENDING
-    drafts and unknown states are ignored).
+    drafts and unknown states are ignored). The PR's `author` is never a
+    reviewer of their own PR (issue #110 item 5): GitHub records the author's
+    reply in a review thread as a COMMENTED review, and those are left out of
+    `reviewers` and of the decision, as review rounds already leave them out.
+    With only the author's own reviews the decision is `none`.
 
     `decision` (issue #63): each reviewer's effective state is their latest
     APPROVED / CHANGES_REQUESTED / DISMISSED review — a later COMMENTED review
@@ -900,7 +904,7 @@ def summarize_reviews(raw_reviews):
     effective = {}  # login -> effective state
     for _, r in indexed:
         login = (r.get("user") or {}).get("login")
-        if not login:
+        if not login or (author is not None and login == author):
             continue
         state = (r.get("state") or "").lower()
         if state not in _SUBMITTED_REVIEW_STATES:
@@ -5140,7 +5144,7 @@ def enrich_pr(pr, get_page, api, current_slug):
     from the lengths of the fully-paginated comment lists."""
     num = pr["number"]
     reviews = fetch_all(get_page, f"{api}/pulls/{num}/reviews?per_page=100")
-    summary = summarize_reviews(reviews)
+    summary = summarize_reviews(reviews, author=pr.get("author"))
     pr["reviewers"] = summary["reviewers"]
     pr["review_decision"] = summary["decision"]
     # Phase 10 slice 1: KEEP the individual review submissions (fold persists

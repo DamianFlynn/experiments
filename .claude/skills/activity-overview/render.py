@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -91,12 +92,48 @@ def _cap(limit, scale):
     return max(1, int(limit * scale))
 
 
+_LINE_BREAKS = "\u0085\u2028\u2029"   # NEL and the Unicode line/paragraph separators
+
+
 def _one_line(text):
-    """Replace CR, LF, CRLF, TAB and other control characters with one space each.
-    Mermaid ends a statement at a line break, and a bare CR breaks gantt parsing."""
+    """Replace CR, LF, CRLF, TAB, other control characters and the Unicode line
+    separators with one space each. Mermaid ends a statement at a line break,
+    and a bare CR breaks gantt parsing."""
     text = "" if text is None else str(text)
-    return "".join(" " if (ord(ch) < 32 or ord(ch) == 127) else ch
-                   for ch in text.replace("\r\n", "\n"))
+    return "".join(" " if (ord(ch) < 32 or ord(ch) == 127 or ch in _LINE_BREAKS)
+                   else ch for ch in text.replace("\r\n", "\n"))
+
+
+# Characters an untrusted label may not carry into ANY diagram: a `"` ends a
+# quoted flowchart / pie label; a backtick right after the opening quote turns
+# a label into a Markdown string; `<` and `>` would be read as HTML by
+# flowchart labels (DOMPurify strips scripts, but not every tag).
+_LABEL_CHARS = str.maketrans({'"': "'", "`": "'", "<": "\u2039", ">": "\u203a"})
+# Mermaid entity codes (`#quot;`, `#60;`) are decoded inside labels; the `#` of
+# such a sequence is replaced with a fullwidth `＃` so the text shows as typed.
+_ENTITY_RE = re.compile(r"#(?=[A-Za-z0-9]+;)")
+
+
+def _mermaid_text(text):
+    """THE sanitiser for untrusted label text (#110 item 3): every emitter and
+    every label kind (node labels, subgraph titles, edge labels, pie slices and
+    titles, gantt task and title text, timeline events) goes through it, and
+    the per-kind helpers below only add what their diagram type needs on top
+    (gantt / timeline replace `:`, caps).
+
+    - one line (_one_line);
+    - no `%%`: any run of `%` collapses to one, so neither a `%%{...}%%`
+      directive (which Mermaid extracts from ANYWHERE in the source and which
+      changes the diagram's configuration, or fails the render) nor a `%%`
+      comment can be formed; a single `%` (`50% done`) stays;
+    - `"` and backticks become `'`, `<` / `>` become `‹` / `›`;
+    - an entity-code `#name;` keeps its text but cannot be decoded.
+    Words, digits and non-ASCII text are kept, so a label stays readable.
+    Surrounding whitespace is stripped; the result may be empty."""
+    clean = _one_line(text)
+    clean = re.sub(r"%{2,}", "%", clean)
+    clean = _ENTITY_RE.sub("\uff03", clean.translate(_LABEL_CHARS))
+    return clean.strip()
 
 
 _PIE_ROWS = [
@@ -111,7 +148,9 @@ def emit_buckets_pie(bundle):
     """A Mermaid `pie` of bucket counts. Zero-count slices are dropped."""
     meta = bundle.get("meta", {})
     buckets = bundle.get("buckets", {})
-    lines = ["pie showData", f"    title Work by status ({meta.get('from','')} → {meta.get('to','')})"]
+    lines = ["pie showData",
+             "    title Work by status ({} → {})".format(
+                 _mermaid_text(meta.get("from")), _mermaid_text(meta.get("to")))]
     any_slice = False
     for label, key in _PIE_ROWS:
         count = len(buckets.get(key, []))
@@ -128,12 +167,16 @@ def _day(ts, default):
 
 
 def _gantt_label(text):
-    """Mermaid gantt task names cannot contain ':' (the field separator) or
-    line breaks (CR or LF), and `%%` starts a comment. Sanitise and trim."""
-    clean = _one_line(text).replace(":", " -")
-    while "%%" in clean:  # collapse any run of '%' down so no comment marker survives
-        clean = clean.replace("%%", "%")
-    return clean.strip()[:60] or "item"
+    """A gantt task name: the shared sanitiser (_mermaid_text) plus ':' (the
+    field separator) replaced. Capped at 60 characters.
+
+    A task line must not START with free text: the gantt lexer reads a line
+    beginning with a keyword (`section`, `title`, `dateFormat`, `excludes`,
+    `todayMarker`, `click`, `accTitle`, ... — case-insensitive) as that
+    statement, and one beginning with `%` or `x%` as a comment. Every row
+    therefore starts with a fixed prefix: `#<n> ` for a PR, `Release ` for a
+    release (#110 item 4), and the fixed texts of the marker rows."""
+    return _mermaid_text(text).replace(":", " -").strip()[:60] or "item"
 
 
 def _pr_created(p):
@@ -161,7 +204,7 @@ def _gantt(bundle, scale, notes):
     to = meta.get("to") or frm
     lines = [
         "gantt",
-        f"    title Timeline ({frm} → {to})",
+        "    title Timeline ({} → {})".format(_mermaid_text(frm), _mermaid_text(to)),
         "    dateFormat YYYY-MM-DD",
         "    axisFormat %m-%d",
     ]
@@ -192,14 +235,18 @@ def _gantt(bundle, scale, notes):
             end = _day(p.get("merged_at") or p.get("closed_at"), to)
             if end < start:
                 end = start
+            # merged / closed unmerged / open; a PR whose state is unknown
+            # gets no status tag rather than falling through to "active".
             if p.get("merged"):
-                status = "done"
+                status = "done, "
             elif p.get("state") == "closed":
-                status = "crit"
+                status = "crit, "
+            elif p.get("state") == "open":
+                status = "active, "
             else:
-                status = "active"
+                status = ""
             label = _gantt_label(f"#{p.get('number', '?')} {p.get('title') or ''}")
-            lines.append(f"    {label} :{status}, {start}, {end}")
+            lines.append(f"    {label} :{status}{start}, {end}")
         if pr_omitted:
             lines.append(f"    +{pr_omitted} more PRs not shown :active, "
                          f"{_day(frm, '1970-01-01')}, {_day(to, frm)}")
@@ -207,7 +254,10 @@ def _gantt(bundle, scale, notes):
         lines.append("    section Releases")
         for r in releases:
             day = _day(r.get("published_at"), to)
-            label = _gantt_label(r.get("name") or r.get("tag_name") or "release")
+            # `Release ` prefix: a release name is free text and must never be
+            # read as a gantt keyword (#110 item 4).
+            label = _gantt_label("Release {}".format(
+                r.get("name") or r.get("tag_name") or "(unnamed)"))
             lines.append(f"    {label} :milestone, {day}, 0d")
         if rel_omitted:
             lines.append(f"    +{rel_omitted} more releases not shown :milestone, "
@@ -219,12 +269,21 @@ def _gantt(bundle, scale, notes):
 
 
 def _timeline_text(text):
-    """Mermaid `timeline` event text cannot contain ':' (section/event separator)
-    or line breaks (CR or LF). Sanitise like the gantt labels."""
-    clean = _one_line(text).replace(":", " -")
-    while "%%" in clean:
-        clean = clean.replace("%%", "%")
-    return clean.strip()[:60] or "event"
+    """A `timeline` event: the shared sanitiser (_mermaid_text) plus ':' (the
+    period / event separator) replaced. Capped at 60 characters. An event
+    follows `: ` on its period's line, so it never starts a statement."""
+    return _mermaid_text(text).replace(":", " -").strip()[:60] or "event"
+
+
+_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _timeline_period(date):
+    """A timeline period label: the event's `YYYY-MM-DD` day, else `undated`.
+    A period starts its line, where the timeline lexer reads `#` and `%` as
+    comments, so free text is never used here."""
+    day = (date or "")[:10] if isinstance(date, str) else ""
+    return day if _DAY_RE.fullmatch(day) else "undated"
 
 
 def emit_content_timeline(bundle, notes=None):
@@ -242,22 +301,23 @@ def emit_content_timeline(bundle, notes=None):
 def _content_timeline(bundle, scale, notes):
     meta = bundle.get("meta", {})
     lines = ["timeline",
-             f"    title Content lifecycle ({meta.get('from','')} - {meta.get('to','')})"]
+             "    title Content lifecycle ({} - {})".format(
+                 _mermaid_text(meta.get("from")), _mermaid_text(meta.get("to")))]
     by_date = {}
     verb = {"add": "built", "change": "changed", "remove": "dropped"}
     arts = bundle.get("artifacts", {})
     for aid in sorted(arts):
         art = arts[aid]
         for ev in art.get("lifecycle", []):
-            day = (_one_line((ev.get("date") or "")[:10]).replace(":", "-").strip()
-                   or "undated")
+            day = _timeline_period(ev.get("date"))
             evt = ev.get("event", "")
             label = _timeline_text(
                 f"{verb.get(evt, evt)} {art.get('name', '?')} "
                 f"({art.get('kind', '?')}) by {ev.get('author') or '?'}")
             by_date.setdefault(day, []).append(label)
     if not by_date:
-        lines.append(f"    {meta.get('from') or '—'} : no content events")
+        lines.append("    {} : no content events".format(
+            _timeline_period(meta.get("from")) if meta.get("from") else "—"))
         return "\n".join(lines) + "\n"
     total = sum(len(v) for v in by_date.values())
     days = sorted(by_date)
@@ -359,18 +419,17 @@ def _area_tail(area):
 
 
 def _flow_label(text):
-    """Sanitise a flowchart label: drop quotes/line breaks that would break the node."""
-    clean = _one_line(text).replace('"', "'")
-    return clean.strip()[:40] or "?"
+    """A flowchart node or edge label (drawn inside `"..."`): the shared
+    sanitiser (_mermaid_text), capped at 40 characters."""
+    return _mermaid_text(text)[:40] or "?"
 
 
 def _subgraph_label(text):
-    """Sanitise a subgraph TITLE. Unlike _flow_label this is UNCAPPED by design:
-    a subgraph title is a repo identity (e.g.
-    'Azure/terraform-azurerm-avm-res-keyvault-vault', 46 chars) and truncating it
-    would hide which member the blast radius points at. Repo slugs carry no
-    newlines, so only quotes need escaping."""
-    return _one_line(text).replace('"', "'")
+    """A subgraph TITLE: the shared sanitiser (_mermaid_text). Unlike
+    _flow_label this is UNCAPPED by design: a subgraph title is a repo identity
+    (e.g. 'Azure/terraform-azurerm-avm-res-keyvault-vault', 46 chars) and
+    truncating it would hide which member the blast radius points at."""
+    return _mermaid_text(text) or "?"
 
 
 def _more_node(omitted, what="edges"):
@@ -429,9 +488,10 @@ def _contributor_graph(bundle, scale, notes):
 
 
 def _pie_label(text):
-    """A pie slice label sits inside `"..."`; a `"` in it (or a line break) makes
-    mmdc emit a 'Syntax error' SVG with exit 0, so replace/collapse them."""
-    return _one_line(str(text)).replace('"', "'").strip()[:60] or "?"
+    """A pie slice label (inside `"..."`; a `"` or a line break in it makes mmdc
+    emit a 'Syntax error' SVG with exit 0): the shared sanitiser
+    (_mermaid_text), capped at 60 characters."""
+    return _mermaid_text(text)[:60] or "?"
 
 
 def emit_kind_breakdown(bundle, notes=None):
@@ -464,12 +524,22 @@ def emit_kind_breakdown(bundle, notes=None):
 _TRAIN_DECIDING_PR_OUTCOME = {"shipped": "merged", "in_flight": "open",
                               "rejected": "rejected"}
 
+# The outcome node's label for each train outcome link.build_trains sets
+# ("shipped" adds its milestone). Any other value is drawn as itself, never
+# as one of these (#110 item 2).
+_TRAIN_OUTCOME_LABEL = {"shipped": "Shipped", "in_flight": "In flight",
+                        "rejected": "Rejected",
+                        "abandoned": "Abandoned (not planned)"}
+
 
 def emit_train_flowchart(bundle, train, notes=None):
     """A Mermaid `flowchart` telling the life story of one train.
 
-    Outcome mapping: 'shipped' -> 'Shipped [-> <milestone>]';
-    'rejected' -> 'Rejected'; anything else (open, in_flight, ...) -> 'In flight'.
+    Outcome mapping (#110 item 2): 'shipped' -> 'Shipped [-> <milestone>]';
+    'in_flight' -> 'In flight'; 'rejected' -> 'Rejected'; 'abandoned' ->
+    'Abandoned (not planned)'; any other value is drawn as its own text
+    ('Unknown outcome' when empty), never as one of these. When no PR node leads
+    to the outcome (an abandoned train has no PRs), the issue node does.
     Every PR of the train is drawn (issue #93); one whose own outcome
     (`train.pr_outcomes`) is not the one that decided the train's is labelled
     `<outcome>: <title>` (e.g. `rejected: ...` in a shipped train) and has no
@@ -557,10 +627,10 @@ def _train_flowchart(bundle, train, scale, notes):
             outcome_label = f"Shipped → {milestone}"
         else:
             outcome_label = "Shipped"
-    elif outcome == "rejected":
-        outcome_label = "Rejected"
+    elif outcome in _TRAIN_OUTCOME_LABEL:
+        outcome_label = _TRAIN_OUTCOME_LABEL[outcome]
     else:
-        outcome_label = "In flight"
+        outcome_label = str(outcome) if outcome else "Unknown outcome"
 
     outcome_node_id = ids("out", train.get("id", "train"))
     lines.append(f'    {outcome_node_id}(["{_flow_label(outcome_label)}"])')
@@ -571,9 +641,12 @@ def _train_flowchart(bundle, train, scale, notes):
             lines.append(f"    {issue_node_id} --> {pr_id}")
     # If PR-only train and no issue node, PRs are the start nodes (no extra edge needed)
 
-    # --- edges: PRs -> outcome (only the attempts that decided it) ---
+    # --- edges: PRs -> outcome (only the attempts that decided it); with no
+    # such PR (an abandoned train has none) the issue leads to the outcome ---
     for pr_id in to_outcome:
         lines.append(f"    {pr_id} --> {outcome_node_id}")
+    if not to_outcome and issue_node_id:
+        lines.append(f"    {issue_node_id} --> {outcome_node_id}")
 
     # --- mode C: area annotation nodes and edges ---
     if mode_c and distinct_areas:

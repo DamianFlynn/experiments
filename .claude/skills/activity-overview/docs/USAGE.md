@@ -302,8 +302,11 @@ flowchart TB
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
    they are what you re-link if a month's series entry needs refreshing.
 5. **Series.** `link --series series.json` keeps **one entry per window** (`from`/`to`) in
-   window order. It compares this month with the entry for the window just *before* it, then
-   records this month, replacing any entry already there for the same window:
+   window order. A window is identified by its calendar days, so `2026-01-01`..`2026-01-31`
+   and `2026-01-01T00:00:00Z`..`2026-01-31T23:59:59Z` are the same month (the entry keeps the
+   spelling it was recorded with). It compares this month with the entry for the window just
+   *before* it, then records this month, replacing any entry already there for the same
+   window:
    - **Same month twice** — safe: the second run replaces the first entry and produces the
      same `series` block (nothing to clean up).
    - **An earlier month re-run** (e.g. October again after November is recorded) — October's
@@ -319,9 +322,15 @@ flowchart TB
    leaves both as they were (or only the bundle updated — just re-run it). The file is
    `{"version": 2, "installments": [...]}`; an older bare-list file is read and rewritten in
    that form (a month it holds twice collapses to the entry recorded last). A series file
-   `link` cannot use (invalid JSON, an unknown version, a malformed entry, entries for another
-   repo), or a bundle without a window, stops `link` with exit code 2 and a message naming the
-   file; nothing is written until you fix or remove it.
+   `link` cannot use (invalid JSON, an unknown version, a malformed entry, a `from`/`to` that
+   is not a date or ISO timestamp, entries for another repo), or a bundle without a window,
+   stops `link` with exit code 2 and a message naming the file; nothing is written until you
+   fix or remove it.
+   - **One index, windows that do not overlap.** A window that shares a day with a recorded
+     window of other days (a quarter in an index of months, or a month inside a recorded
+     quarter) is refused with exit 2, naming both windows: "the installment before" a month
+     is not defined when a quarter covering it is in the same index. Keep roll-ups (quarters,
+     years) in their own index file, e.g. `series-quarterly.json`.
 6. **Render**, then **author**: the report's *Since last installment* section uses
    `bundle.series` — new items, carried-over items (with prior board status and where each is
    now: shipped, in flight, re-planned or rejected) and the forecast loop (last month's
@@ -334,7 +343,7 @@ flowchart TB
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
 | Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end (a month recorded after a later one is marked `captured: "backfill"`, but a first month captured late cannot be detected). |
 | Missed a month | Gather it for delivery history; its in-flight/forecast are "as of now" (above). Keep it out of the series chain, or note in the report that the comparison spans two months. |
-| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing. Over an accumulated store the quarter's `workflow_stats` (CI health) are the sum of its gathered months (`meta.facts_windows`; `workflow_stats_complete: false` if one is missing) and its code graph / owners are its last month's (§2.1); a quarter gathered as one window has its own. Keep quarterly installments in a separate series file. |
+| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing. Over an accumulated store the quarter's `workflow_stats` (CI health) are the sum of its gathered months (`meta.facts_windows`; `workflow_stats_complete: false` if one is missing) and its code graph / owners are its last month's (§2.1); a quarter gathered as one window has its own. Keep quarterly installments in a separate series file: `link --series` refuses (exit 2) to record a quarter in an index that holds its months, or a month in one that holds its quarter. |
 | Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
 
 ### 5.4 Multi-repo streams and series
@@ -850,6 +859,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
 | Empty board/sprint sections | token lacks `read:project`, or no maintained board | add scope or accept |
 | `render.py` fails | `mmdc` missing, or a diagram does not compile | install mmdc (`npm install -g @mermaid-js/mermaid-cli`), or add `--skip-validate` and say the diagrams are unvalidated. As root, render passes mmdc a generated `--no-sandbox` puppeteer config itself (set `ACTIVITY_MMDC_PUPPETEER_CONFIG` to use your own); keep that to throwaway environments |
+| `link.py --series` exits 2: "overlaps the recorded window(s)" | the index already holds a window sharing days with this one (a quarter beside its months) | record the roll-up in its own series file |
+| `link.py: error: … is not valid JSON` / `not a JSON object` / `cannot read` (exit 2) | the bundle path is wrong, or the file is not a bundle/view | point `link.py` at a `view.py` / `gather.py` JSON; nothing was written |
 | `link.py --series` warns about later installments | a month was (re-)recorded after a later one | expected; re-link the named later months' saved bundles oldest first if their comparison should reflect the change |
 | `spotlight grep` → `fts_unavailable` | SQLite built without FTS5 | use a Python with FTS5 (most do) |
 | `spotlight` → `needs_gather` | nothing stored for that focus yet | gather more windows |

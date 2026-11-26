@@ -366,7 +366,10 @@ def build_trains(bundle):
         issue are one train, and every issue a member PR closes is listed in
         `issues` (sorted) and indexed to that train. A plain mention / timeline
         cross-reference (`crossref_issues`) makes an issue neither a member
-        nor a root.
+        nor a root. A `closes` number that is a PR of the bundle is not an
+        issue (GitHub does not close a PR by keyword; issues and PRs share one
+        number sequence): it neither anchors a train nor joins one, and the
+        two PRs stay in their own trains (#110 item 7).
       - Anchor: the lowest closed issue number (`root_issue`, id
         `train-issue-<n>`), else the lowest PR number (`train-pr-<n>`).
     `outcome`, by precedence: `shipped` (any member PR merged into the
@@ -383,6 +386,11 @@ def build_trains(bundle):
     issues_by_num = {i["number"]: i for i in bundle["issues"]}
     base_branch = bundle.get("meta", {}).get("base_branch")
     prs_all = bundle["prs"]
+    pr_numbers = {p["number"] for p in prs_all}
+
+    def _closes(pr):
+        # the issues `pr` closes: a number that is a PR is ignored (#110 item 7)
+        return [n for n in pr.get("closes") or [] if n not in pr_numbers]
 
     def _kind_for(issue_nums, prs):
         # The first typed issue (lowest number first), else the PRs'
@@ -446,7 +454,7 @@ def build_trains(bundle):
 
     for pr in members:
         node = _find(("pr", pr["number"]))
-        for n in pr.get("closes") or []:
+        for n in _closes(pr):
             parent[_find(("issue", n))] = node
             node = _find(node)
 
@@ -454,7 +462,7 @@ def build_trains(bundle):
     for pr in members:
         g = groups.setdefault(_find(("pr", pr["number"])), {"prs": [], "issues": set()})
         g["prs"].append(pr)
-        g["issues"].update(pr.get("closes") or [])
+        g["issues"].update(_closes(pr))
 
     trains, train_of_pr, closed_by_member = [], {}, set()
     for g in groups.values():
@@ -1330,6 +1338,13 @@ def _installment_problem(installments):
             if inst.get(key) is not None and not isinstance(inst[key], str):
                 return ("installment {} has a `{}` that is not a date "
                         "string".format(n, key))
+        window = series.installment_window(inst)
+        if window is not None:
+            # installments are keyed and ordered by their calendar days
+            # (#110 item 6), so each bound must be a date or ISO timestamp
+            bad = series.window_problem(window, "installment {}".format(n))
+            if bad is not None:
+                return "has an unusable window: {}".format(bad)
     return None
 
 
@@ -1388,18 +1403,35 @@ def _series_refusal(series_path, problem):
 
 def _series_bundle_problem(meta, installments):
     """Why this bundle cannot be recorded in this index, or None (#86): it
-    needs a window (installments are identified by it), and an index whose
-    entries name a different owner/repo is another repo's series."""
+    needs a window (installments are identified by it) whose bounds are dates
+    or ISO timestamps, an index whose entries name a different owner/repo is
+    another repo's series, and a recorded window that overlaps this one
+    without being the same calendar days (a quarter beside its months, #110
+    items 6 and 10) leaves "the installment before this one" undefined."""
     frm, to = series.bundle_window(meta)
     if frm is None or to is None:
         return ("cannot record this bundle: it has no window (meta.period or "
                 "meta.from/meta.to), and installments are identified by it")
+    if not (isinstance(frm, str) and isinstance(to, str)):
+        return ("cannot record this bundle: its window {!r} to {!r} is not "
+                "two date strings".format(frm, to))
+    bad = series.window_problem((frm, to), "bundle window")
+    if bad is not None:
+        return "cannot record this bundle: {}".format(bad)
     mine = (meta.get("owner"), meta.get("repo"))
     for inst in installments:
         theirs = (inst.get("owner"), inst.get("repo"))
         if None not in theirs and None not in mine and theirs != mine:
             return ("belongs to {}/{}, not {}/{} (keep one series file per "
                     "repo)".format(theirs[0], theirs[1], mine[0], mine[1]))
+    clash = series.overlapping(installments, (frm, to))
+    if clash:
+        return ("cannot record the window {} to {}: it overlaps the recorded "
+                "window(s) {}, and one index holds windows that do not overlap "
+                "(keep a separate series file for a roll-up such as a "
+                "quarter)".format(
+                    frm, to, ", ".join("{} to {}".format(i["from"], i["to"])
+                                       for i in clash)))
     return None
 
 
@@ -1419,6 +1451,31 @@ def _write_json_atomic(path, obj):
         except OSError:
             pass
         raise
+
+
+def _load_bundle(path):
+    """The bundle object at `path`. A missing or unreadable file, invalid JSON
+    or a JSON value that is not an object is a usage-style error (#110 item 8):
+    a message on stderr, exit 2, nothing written."""
+    problem = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        problem = "cannot read {} ({})".format(path, exc.strerror or exc)
+    else:
+        try:
+            bundle = json.loads(raw)
+        except ValueError as exc:
+            problem = "{} is not valid JSON ({})".format(path, exc)
+        else:
+            if isinstance(bundle, dict):
+                return bundle
+            problem = "{} is a JSON {}, not a JSON object (a bundle)".format(
+                path, "null" if bundle is None else type(bundle).__name__)
+    sys.stderr.write("link.py: error: {}\n".format(problem))
+    sys.stderr.write(_USAGE)
+    raise SystemExit(2)
 
 
 _USAGE = "usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json]\n"
@@ -1458,8 +1515,7 @@ def main(argv=None):
             (slice_id or series_path or "").startswith("-")):
         sys.stderr.write(_USAGE)
         raise SystemExit(2)
-    with open(path, encoding="utf-8") as fh:
-        bundle = json.load(fh)
+    bundle = _load_bundle(path)
     # Load (and shape-check) the series index BEFORE any work, so a malformed
     # index stops the run with rc 2 and nothing is written.
     installments = None

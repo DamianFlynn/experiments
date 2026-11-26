@@ -63,6 +63,9 @@ PLACEHOLDER RULES — read before filling anything below.
     `prs`, `issues`, `commits`, `code_areas`, `tickets`, `evidence`). It has no
     `tier`, `effort`, `root_issue` or title. `ptrain.code_areas` are
     "<repo>::<area>" (the member trains' areas, like view["modules"] keys).
+    Member trains join into one ptrain only through closing references
+    (cross-repo ones included), never through a mention, so a ptrain of one
+    repo is exactly that member's train.
   - `member` — view["members"][] `{repo, bundle}`.
   - `related` — view["related_work"][] `{ticket, train_ids}`.
   - `release` — bundle["releases"][]. `stats` — one value of
@@ -222,7 +225,8 @@ keep them out of any hit rate:
      diagrams.train_flowcharts[train.id] in the member's bundle view (inline it).
      {effort line}: shipped trains — "landed in {train.effort.elapsed_days} days ·
      {train.effort.reviewers} reviewers · {train.effort.participants} contributors"
-     (`train.effort.reviewers` / `train.effort.participants` are COUNTS); when
+     (`train.effort.reviewers` / `train.effort.participants` are COUNTS; a PR's
+     author is never counted as its reviewer); when
      `train.effort.slow_to_land` is true write "slow to land ({train.effort.elapsed_days}
      days)" instead of "landed in … days" — never "stalled" for shipped work. Open
      trains (`train.effort.merged_at` is null) — "open N days" from
@@ -251,7 +255,7 @@ keep them out of any hit rate:
 <!-- Source: view["related_work"] — `{ticket, train_ids}` objects. Each entry is
      two or more project trains that share an internal ticket reference
      (Jira/ADO-style, e.g. ABC-1234) but are NOT connected by any GitHub
-     closes/cross_ref edge. Opt-in: always [] unless digest.py ran with a
+     closing reference. Opt-in: always [] unless digest.py ran with a
      manifest declaring `ticket_prefixes` or with `--ticket-pattern`.
      Omit the section entirely when view["related_work"] is empty. -->
 

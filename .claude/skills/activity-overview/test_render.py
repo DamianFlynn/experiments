@@ -839,16 +839,19 @@ class TestEmitTrainFlowchart(unittest.TestCase):
         self.assertNotIn("Shipped", mmd)
         self.assertNotIn("In flight", mmd)
 
-    def test_outcome_open_becomes_in_flight(self):
+    def test_outcome_open_is_not_a_train_outcome(self):
+        # "open" is a PR outcome, not a train outcome: it is drawn as its own
+        # label, never silently as "In flight" (#110 item 2).
         b = _train_bundle()
         train = dict(b["trains"][0])
         train["outcome"] = "open"
         mmd = render.emit_train_flowchart(b, train)
-        self.assertIn("In flight", mmd)
+        self.assertIn('(["open"])', mmd)
+        self.assertNotIn("In flight", mmd)
         self.assertNotIn("Shipped", mmd)
         self.assertNotIn("Rejected", mmd)
 
-    def test_outcome_unknown_becomes_in_flight(self):
+    def test_outcome_in_flight_label(self):
         b = _train_bundle()
         train = dict(b["trains"][0])
         train["outcome"] = "in_flight"

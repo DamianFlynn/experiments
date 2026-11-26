@@ -168,7 +168,8 @@ Each train gets an **outcome** (shipped / in_flight / rejected / abandoned), a
 A single-repo `link` train holds every attempt — rejected, shipped and still-open PRs — with
 each PR's own outcome, and every issue its PRs close; PRs and issues are joined only by
 `closes`, so a `cross_ref` (a mention) is traversal context, never membership (#93, §10
-item 11).
+item 11). The digest's project trains follow the same rule (`closes` and `part_of` only,
+#110).
 
 ### 5.3 Buckets
 
@@ -529,20 +530,29 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     on stderr; `meta.closing_refs_source: keywords`) only the keywords count. Stores gathered
     before #105 keep keyword-only `closes` until re-gathered. A PR closing several issues
     joins every PR that closes any of them. An unmerged PR into another branch is in no train.
+    `Fixes #N` where #N is a PR closes nothing: it neither anchors nor joins a train (#110).
+    The digest's project trains join member trains through the same edges (closing
+    references, cross-repo ones included), never through a mention, so a single-member
+    project's trains are that member's `link` trains (#110).
 12. **Series continuity is per bundle and by bucket.** `series.json` keeps one entry per
     window and compares each installment with the window before it (#86), but it is kept
     per single-repo bundle (no project-view series), it only sees items in one of this
     window's buckets (in-flight work that went quiet drops out of *carried over*), and
     refreshing an earlier month does not recompute the later months' already-written series
     blocks (`link` names them on stderr). A month recorded after a later one is marked
-    `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
+    `captured: "backfill"`; leave its forecast loop out of hit-rate statistics. Windows are
+    identified by their calendar days (dates and full timestamps name the same month), and
+    one index holds windows that do not overlap: a quarter and its months need two series
+    files (`link` refuses the overlap, #110).
 13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
     commit's git author to the login PR/issue/review records use (GitHub's commits listing
     per SHA, then a `users.noreply.github.com` email), so a PR author and their commits are
     one person (#78). A commit whose email GitHub links to no account and that has no
     noreply email stays a separate person keyed by its git name and flagged
     `login_resolved: false` — never merged with a login on a guess. Commits fetched by
-    `spotlight --complete` backfill keep the git name and have no `committed_at`.
+    `spotlight --complete` backfill keep the git name and have no `committed_at`. A PR's
+    author is never one of its reviewers (their review-thread replies are not reviews,
+    #110); a store gathered before that keeps them in `reviewers` until re-gathered.
 14. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the
     causal spine and judges the outcome from the nodes it reached (same vocabulary as
     `link`, plus `direct_push` for commits that landed with no PR). A closed issue without a

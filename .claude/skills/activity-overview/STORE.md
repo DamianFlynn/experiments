@@ -149,7 +149,10 @@ from a root issue over the *spine* edge allowlist:
 `traverse_spine(seed_ids, max_depth, edge_types)` walks these **undirected**
 (both directions), depth-capped, and returns `{reached: {id: depth}, missing:
 [id]}`. `missing` ids are spine nodes referenced but not yet stored (e.g. an
-out-of-window issue a PR closes) — what a reader backfills.
+out-of-window issue a PR closes) — what a reader backfills. `extract` (train
+context) and `spotlight` walk the whole allowlist; `digest` builds project trains
+over `closes` and `part_of` only (`digest.TRAIN_EDGE_TYPES`, #110), the edges that
+make `link` trains, so a mention never merges two trains.
 
 Where the spine edges come from (gather, #62). `closes` follows GitHub's own
 closing-keyword rule: `close[sd]`/`fix(e[sd])`/`resolve[sd]` (any case), optional
