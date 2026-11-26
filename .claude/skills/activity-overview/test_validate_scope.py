@@ -206,3 +206,48 @@ class TestSingleRepoReportUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOtherProjectsAreOutsideTheAudit(unittest.TestCase):
+    """A store can hold several projects. A broken record of project `other`
+    must not fail the audit of project `proj`, in project mode or single-repo
+    mode; `other`'s own audit still fails."""
+
+    def _store(self):
+        conn = _two_member_store()
+        bundle = {"meta": {"owner": "Else", "repo": "x", "from": "2026-01-01",
+                           "to": "2026-01-31", "base_branch": "main"},
+                  "prs": [_pr(7, "zed", "Else/x")], "issues": [], "commits": [],
+                  "code_events": [], "milestones": [], "releases": [],
+                  "code_graph": {"areas": []}}
+        gather.fold_bundle(conn, bundle, project="other", repo="Else/x",
+                           members={"Else/x"})
+        # break project `other`: wrong link, and a dangling edge from its PR
+        pr_id = graphstore.qualify_id("other", "Else/x", "pr-7")
+        data = json.loads(conn.execute(
+            "SELECT data FROM nodes WHERE id=?", (pr_id,)).fetchone()[0])
+        data["url"] = "https://github.com/Else/elsewhere/pull/7"
+        conn.execute("UPDATE nodes SET data=? WHERE id=?",
+                     (json.dumps(data), pr_id))
+        conn.execute("INSERT INTO edges (src_id, dst_id, edge_type, ts, data) "
+                     "VALUES (?, ?, 'in_milestone', NULL, NULL)",
+                     (pr_id, graphstore.qualify_id("other", "Else/x",
+                                                   "milestone-gone")))
+        conn.commit()
+        return conn
+
+    def test_project_mode_ignores_the_other_project(self):
+        conn = self._store()
+        agg = validate.validate_project(conn, "proj", [A, B])
+        self.assertTrue(agg["ok"], json.dumps(agg, indent=1, default=str)[:2500])
+
+    def test_single_repo_mode_ignores_the_other_project(self):
+        conn = self._store()
+        self.assertTrue(validate.validate(conn, project="proj", repo=B).ok)
+
+    def test_the_other_projects_own_audit_still_fails(self):
+        conn = self._store()
+        report = validate.validate(conn, project="other", repo="Else/x")
+        failed = {c["name"] for c in report.checks if not c["ok"]}
+        self.assertIn("provenance", failed)
+        self.assertIn("referential_integrity", failed)

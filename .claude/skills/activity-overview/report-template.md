@@ -277,7 +277,7 @@ counts are a sum over the gathered windows in `meta.facts_windows.workflow_stats
 when `meta.facts_windows.workflow_stats_complete` is false the total is partial,
 and `meta.facts_windows.workflow_stats_excluded` lists the windows left out. The
 code graph and owners are those of the window `meta.facts_windows.structure`.
-Omit the line when the key is absent.
+Omit the line when the key is absent. State this caveat even when the view has no CI rows (a sub-window, a window gathered without workflows, or zero runs).
 
 > CI counts summed over the gathered windows inside this view; partial when not every day is covered — not counted: {meta.facts_windows.workflow_stats_excluded[].from} → {meta.facts_windows.workflow_stats_excluded[].to}. Code graph and owners as of the {meta.facts_windows.structure.from} → {meta.facts_windows.structure.to} gather.
 

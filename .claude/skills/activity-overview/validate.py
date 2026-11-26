@@ -337,6 +337,11 @@ def _is_person_id(qid):
 
 # --- audit scope (issue #107) -------------------------------------------------
 
+# Owner of a row that belongs to ANOTHER project stored in the same file: no
+# audit of this project covers it (its own project's audit does).
+_FOREIGN = object()
+
+
 class _Scope:
     """Which stored rows a row-level check (referential_integrity, provenance,
     no_fabrication, schema_conformance) audits.
@@ -344,8 +349,10 @@ class _Scope:
     Every row has one owner. A node is owned by the member repo its
     project/repo columns name; an edge by the member repo of its src, a
     person's edge by the member repo of its dst (as check_edge_set assigns
-    them, _owned_by_repo). A row no member owns (people, a non-member repo's
-    stand-ins, a row whose columns or ids name no member) is SHARED, and so
+    them, _owned_by_repo). A row of ANOTHER project in the same store is
+    outside the audit altogether. A row of this project no member owns (people,
+    a non-member repo's stand-ins) or a malformed row that names no project is
+    SHARED, and so
     are the genuinely store-wide parts (the per-window facts index, scopes
     stored under several case spellings).
 
@@ -375,19 +382,37 @@ class _Scope:
     def _owner_of_id(self, qid):
         return self._scopes.get((qid or "").partition("#")[0])
 
+    def _in_project(self, scope):
+        """Does an id scope (`{project}` or `{project}/{owner}/{repo}`) belong
+        to the audited project? An empty scope (a malformed id) is not placed."""
+        return scope == self.project or scope.startswith(self.project + "/")
+
     def node_owner(self, n):
+        if self.project is not None and n["project"] is not None \
+                and n["project"] != self.project:
+            return _FOREIGN        # another project's row: not ours to audit
         if n["project"] != self.project:
-            return None
+            return None            # no project column: malformed, shared
         return self._owner_of_id("{}/{}#".format(n["project"], n["repo"]))
 
     def edge_owner(self, src, dst):
         owner = self._owner_of_id(src)
-        if owner is None and _is_person_id(src or "") \
+        if owner is not None:
+            return owner
+        scope = (src or "").partition("#")[0] if "#" in (src or "") else ""
+        if self.project is not None and scope and not self._in_project(scope):
+            dscope = (dst or "").partition("#")[0] if "#" in (dst or "") else ""
+            if dscope and not self._in_project(dscope):
+                return _FOREIGN    # both ends are another project's: not ours
+            return None            # reaches INTO this project: shared, audited
+        if _is_person_id(src or "") \
                 and graphstore.parse_id(src)["scope"] == self.project:
             owner = self._owner_of_id(dst)
         return owner
 
     def _covers(self, owner):
+        if owner is _FOREIGN:
+            return False
         return owner == self.unit if owner is not None else self.shared
 
     def has_node(self, n):

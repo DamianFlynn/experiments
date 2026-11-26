@@ -431,13 +431,19 @@ def build_report(view, texts, captions):
             W("")
         ws = {k: v for k, v in (b.get("workflow_stats") or {}).items()
               if not k.startswith("_")}       # `_truncated` etc. are metadata
-        if ws:
+        caveat = ci_caveat(b.get("meta") or {})
+        if ws or caveat:
             W("#### CI/CD health")
             W("")
-            caveat = ci_caveat(b.get("meta") or {})
-            if caveat:
-                W(caveat)
-                W("")
+        if caveat:
+            # shown even with no CI rows: a sub-window, a window gathered
+            # without workflows or with zero runs still has a coverage caveat
+            W(caveat)
+            W("")
+        if not ws and caveat:
+            W("No CI runs are recorded for this view.")
+            W("")
+        if ws:
             W("| Workflow | Success | Failure | Cancelled | Total |")
             W("|---|---|---|---|---|")
             for name, s in sorted(ws.items()):

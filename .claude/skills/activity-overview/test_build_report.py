@@ -293,6 +293,20 @@ class TestReportCaveats(_Base):
                       "2026-05-15 → 2026-05-31 gather.", out)
         self.assertNotIn("**partial**", out)
 
+    def test_caveat_is_shown_even_with_no_ci_rows(self):
+        # a sub-window, a window gathered without workflows, or zero runs: the
+        # view has a coverage caveat but no CI rows. The caveat must not vanish.
+        view = copy.deepcopy(self.view)
+        view["members"][1]["bundle"].pop("workflow_stats", None)
+        out = self.render_report(self.write_view(view))
+        member_b = out.split("### `Azure/mod-b`", 1)[1]
+        self.assertIn("#### CI/CD health", member_b)
+        ci = member_b.split("#### CI/CD health", 1)[1].split("####", 1)[0]
+        self.assertIn("> CI counts are the sum of the gathered windows", ci)
+        self.assertIn("**partial**", ci)
+        self.assertIn("No CI runs are recorded for this view.", ci)
+        self.assertNotIn("| Workflow |", ci)
+
     def test_without_the_keys_no_caveat(self):
         view = copy.deepcopy(self.view)
         for m in view["members"]:
