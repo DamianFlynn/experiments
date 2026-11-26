@@ -45,8 +45,9 @@ Helpers: `qualify_id`, `qualify_person`, `parse_id`, `local_id`,
   exactly `{project}/{repo}#` when both are given). Never `rpartition` on `#` —
   that truncates `<path>#<lang>:<subkind>:<name>` to `<lang>:<subkind>:<name>`
   (and to an empty local for a comment named `#### networking ####`).
-- **Local forms.** `pr-N`, `issue-N`, `comment-…`, `review-…`, `event-…`
-  (social); a bare `<sha>` (commit); `art:<path>` (file artifact; the path may
+- **Local forms.** `pr-N`, `issue-N`, `review-…`, `event-…` (social;
+  comments stay embedded in their PR / issue record — no fold writes a
+  `comment-…` node, and the trust check rejects one, #113); a bare `<sha>` (commit); `art:<path>` (file artifact; the path may
   contain `#`); `<path>#<lang>:<subkind>:<name>` (symbol/comment artifact; both
   `path` and `name` may contain `#`, `name` may contain `:` or be empty, `lang`
   may be empty); `area-…`, `milestone-…`, `release-…`, `sprint-…`, `person-…`
@@ -105,17 +106,33 @@ Python predicate `graphstore.ts_in_window(ts, from, to)` that `complete`,
 `spotlight`, `gather.in_window` and `link._in_window` delegate to — applies one
 rule: each bound is compared at the **coarser** granularity of the pair, so a
 date-only `ts` or bound covers its whole day; only datetime-vs-datetime is
-compared exactly. Both ends are inclusive, either bound may be None. So a PR
+compared exactly — to the second: two datetimes compare on their first 19
+characters (`YYYY-MM-DDTHH:MM:SS`), so a stored ts with fractional seconds
+(GitHub sends none) counts as its whole second rather than sorting before it
+(issue #111). Both ends are inclusive, either bound may be None. So a PR
 merged `2026-05-31T15:00:00Z` is inside `--to 2026-05-31`, and a commit dated
 `2026-03-01` is inside `from=2026-03-01T00:00:00Z`.
+
+Stored datetimes are UTC (`…Z`, as GitHub sends them), so a bound must be too:
+every reader (`view.py`, `digest.py`, `spotlight.py`) passes its `--from` /
+`--to` through `manifest.check_reader_window`, which validates them and returns
+them **normalised** (`normalize_reader_bound`): a `YYYY-MM-DD` date as given, a
+timestamp with `Z` or a numeric offset and optional fractional seconds as UTC
+`YYYY-MM-DDTHH:MM:SSZ` with the fraction dropped (issue #111). Two spellings of
+one instant (`2026-01-10T01:00:00+01:00`, `2026-01-10T00:00:00.000Z`) give the
+same view.
 
 ## Edges (`edges` table)
 
 `(src_id, dst_id, edge_type, ts, data)`, PK `(src,dst,type)`. Re-upsert
-unions, never appends. History edges are only ever added; the current-state
-edges (`blocks`, `in_milestone`, `in_iteration`, `depends_on`, `owns`) are kept
-equal to what the stored inputs imply and stale ones are deleted (see
-*Current-state edges* below, #95). Edge types:
+unions, never appends. The record-derived edges (`closes`, `cross_ref`,
+`part_of` from a commit, and the contribution edges) are exactly what the
+current content of the stored record they come from implies (see
+*Record-derived edges* below, #111); the current-state edges (`blocks`,
+`in_milestone`, `in_iteration`, `depends_on`, `owns`) are kept equal to what
+the stored inputs imply and stale ones are deleted (see *Current-state edges*
+below, #95); `touches`, review/event `part_of` and the symbol moves are only
+added. Edge types:
 
 `closes` (pr→issue), `part_of` (commit/review/event→pr/issue), `cross_ref`
 (pr→issue/pr), `duplicate_of`/`spun_off` (issue→issue), `touches` (commit→area),
@@ -124,7 +141,12 @@ equal to what the stored inputs imply and stale ones are deleted (see
 `data`), `replaced_by`/`identity_from` (artifact→artifact), `blocks`
 (issue→issue), `in_milestone`/`in_iteration` (social→structure). These are
 the endpoint rules `validate` enforces (`schema_conformance`, #89); any other
-edge type is an error. Both ends of an edge are in one project, and `touches`,
+edge type is an error. **Allowed is not written** (#112): `reacted` is allowed but
+never written (reactions are stored as counts on the issue record, see below);
+`duplicate_of` / `spun_off` are never written by the fold — only `backfill` would
+write one, when its fetch seam reports it, and the production fetcher
+(`make_backfill_fetcher`) reports only `closes` and `part_of`. Every other type above
+is written by the fold. Both ends of an edge are in one project, and `touches`,
 `part_of`, `blocks`, `in_milestone`, `in_iteration`, `replaced_by`,
 `identity_from`, `spun_off` and `duplicate_of` stay inside one repo.
 
@@ -144,7 +166,10 @@ from a root issue over the *spine* edge allowlist:
 `traverse_spine(seed_ids, max_depth, edge_types)` walks these **undirected**
 (both directions), depth-capped, and returns `{reached: {id: depth}, missing:
 [id]}`. `missing` ids are spine nodes referenced but not yet stored (e.g. an
-out-of-window issue a PR closes) — what a reader backfills.
+out-of-window issue a PR closes) — what a reader backfills. `extract` (train
+context) and `spotlight` walk the whole allowlist; `digest` builds project trains
+over `closes` and `part_of` only (`digest.TRAIN_EDGE_TYPES`, #110), the edges that
+make `link` trains, so a mention never merges two trains.
 
 Where the spine edges come from (gather, #62). `closes` follows GitHub's own
 closing-keyword rule: `close[sd]`/`fix(e[sd])`/`resolve[sd]` (any case), optional
@@ -153,7 +178,10 @@ Each closed issue needs its own keyword — `Fixes #1, #2` closes only #1 (#2 is
 kept as a same-repo cross-reference in `crossref_issues`), while `Fixes #1, fixes
 #2` closes both. A same-repo qualified ref or URL is a same-repo `closes`; a
 cross-repo one goes to the cross-repo edge path below; a keyword before a
-`/pull/` URL is a `cross_ref`, never a close. Keywords are matched in code blocks
+`/pull/` URL is a `cross_ref`, never a close. A timeline `cross-referenced` /
+`connected` event joins `crossref_issues` only when its source issue is in this repo
+(#109; another repo's issue is a cross-repo ref only), and a `connected` link later
+`disconnected` does not. Keywords are matched in code blocks
 too (no Markdown parsing). GitHub's own list (#105) is merged in at gather time: the
 issues `closingIssuesReferences` reports (keywords AND manual Development-sidebar links)
 join the PR's `closes` (same repo; removed from `crossref_issues`) and, when anything is
@@ -169,11 +197,16 @@ request #N`, then the last `(#N)`.
 
 One row per artifact lifecycle event: `(artifact_id, event, commit_sha,
 author, date, hunk, ref, before, after, detail)`, PK `(artifact, commit,
-event)` → set semantics (re-seeing a commit is a no-op). The ledger keeps every
+event)`: re-seeing a commit never adds a row, and its other columns take the
+values of the latest fold of that commit (`ON CONFLICT … DO UPDATE`, issue
+#111), so a commit whose author resolution changed (#78) re-credits its rows and
+the artifact nodes rebuilt from them; within one batch the first row of a key
+wins, as `INSERT OR IGNORE` did. The ledger keeps every
 folded window, and it is the source of truth for the artifact nodes: an
 artifact's `lifecycle[]` is all of its ledger rows in commit order: by the commit's UTC
 committer time (`committed_at` on the commit node) when it is stored, else by the
-event's `date`, the committer's local day (ties keep ledger order). File-level rows are
+event's `date`, the commit's UTC committer day (the committer's local day for windows
+gathered before #109; ties keep ledger order). File-level rows are
 keyed by the bare `<path>` (not the `art:<path>` node id) and keep git's change verb
 (`add`/`modify`/`delete`/`rename`/`copy`); symbol rows carry the mapped event
 (`add`/`change`/`remove`). A reader maps `art:<path>` to `<path>` before reading the
@@ -203,6 +236,15 @@ authors+bodies; commit `code` nodes index the commit message. The call is
 FTS5-gated (skipped silently when the build lacks FTS5 — the store stays valid)
 and idempotent (re-indexing a node id replaces its text, so re-folding an
 overlapping window re-indexes cleanly without duplicates).
+
+**Coverage (#111).** meta `fts_coverage` says whether the index holds every
+indexable stored node: a fold on a host without FTS5 sets `partial` (it could
+not index its records); a fold with FTS5 that finds it not `complete` (also on
+a store that predates the key, or whose index was created empty) first indexes
+every stored PR / issue / commit node `fts_map` lacks, in one pass inside the
+fold transaction (`gather._backfill_fts`), then sets `complete`. So a store
+folded once on a host without FTS5 and later on one with it searches all of its
+records, not only the later folds'.
 
 `fts_search` passes `query` straight to the FTS5 `MATCH` operator, so the
 argument must be a **valid FTS5 query**. Callers searching user-derived terms
@@ -273,6 +315,31 @@ edges* below); a code graph from the whole-tree scan carries
 how the repo's last fold kept its current-state edges, and the ledger of what
 folds retracted — see *Current-state edges* below.
 
+`fold_context:{project}/{repo}` (issue #113; written only by a manifest fold):
+`{members: [slug, ...] (sorted), registry: {slug: address|null}|null,
+bicep_registry_prefix: {slug: prefix|null}|null, members_changed: bool}` — the
+member set and registries the repo's latest manifest fold derived its
+cross-repo `closes` / `cross_ref` / `depends_on` with
+(`set_fold_context` / `get_fold_context`), so the trust check resolves them
+exactly. `members_changed` turns true (and stays true) when a fold of the repo
+used a different member set, when a single-repo fold re-folded it, or when the
+repo already held records no fold had recorded a context for (a store folded
+before #113): its stored records' cross-repo edges were then not all derived
+with this member set, and a missing one is only a WARN. Single-repo stores
+have no `fold_context:` key; existing manifest stores get it on the next fold
+of each member (until then the trust check treats them as before, with a WARN
+for a missing cross-repo edge).
+
+**Parsing the per-window keys (#111).** `facts:`, `ref_date:`, `branches:` and
+`clone:` keys are `{prefix}{project}/{repo}:{from}:{to}`. A project name may
+contain `:` (`check_project` refuses only `/`, `#` and surrounding whitespace)
+and a window bound may be a timestamp, so a key is never split on its first
+`:`. Readers look keys up from a known `(project, repo, from, to)`; the one
+place that parses them (`window_facts_problems`, for validate) uses
+`graphstore.split_window_key`: the project ends at the first `/` and the repo
+(`name` or `owner/name`, GitHub's alphabet, no `:`) at the next `:`. Existing
+stores need nothing.
+
 `member_status` (issue #77; written only by a manifest gather): a JSON list of
 `{project, repo, from, to, status[, error]}`, one entry per member and window,
 sorted on `(project, repo, from, to)` — `set_member_status` / `get_member_status`
@@ -321,7 +388,7 @@ Code older than v2 writing into a v2 store would add `fts_text` rows without
 edges (including the retraction of stale current-state edges and orphaned
 stand-ins, #95), code events, the FTS index, `gathered_windows`, `ref_date`,
 `branches`, `clone_sha`, the window facts and the `current_state:` /
-`retractions:` meta commit together, and any exception rolls all of them back, so readers never see a
+`retractions:` / `fold_context:` meta commit together, and any exception rolls all of them back, so readers never see a
 half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
 `add_code_events`, `index_text(s)`, `set_meta`, `record_window`,
 `set_clone_sha`) take `commit=True` by default and `commit=False` to join the
@@ -475,11 +542,17 @@ follows it, and extract reads none of them.
 ### Current-state edges (#95)
 
 A store is kept across months, so an edge must not outlive the input it was
-derived from. Edges fall in two classes:
+derived from. Edges fall in three classes:
 
-- **History** — `authored`, `merged`, `reviewed`, `reported`, `commented`,
-  `closes`, `cross_ref`, `part_of`, `touches` (a commit's files never change)
-  and the symbol moves `replaced_by` / `identity_from`. Only ever added.
+- **Record-derived** — `closes`, `cross_ref`, `part_of` (commit → PR) and the
+  contribution edges `authored`, `merged`, `reviewed`, `commented`,
+  `reported`: a function of ONE stored record's current content, kept equal to
+  it (*Record-derived edges (#111)* below).
+- **History** — `touches` (a commit's files and the code graph), the
+  review / lifecycle-event `part_of` edges (their own nodes) and the symbol
+  moves `replaced_by` / `identity_from` (the ledger). Only ever added (a
+  commit's `touches` are re-derived only when its own file list changed, see
+  below).
 - **Current state** — `blocks`, `in_milestone`, `in_iteration`, `depends_on`,
   `owns` (`gather.CURRENT_STATE_EDGE_TYPES`). Each fold, inside its
   transaction and after its nodes and window facts are written,
@@ -492,9 +565,9 @@ derived from. Edges fall in two classes:
 | `in_milestone` | the stored PR/issue record's `milestone` → a stored milestone node (the fold's own milestones first, in bundle order as before, then the stored ones by id) | the stored record; a fold replaces it when its bundle holds the item |
 | `in_iteration` | the stored record's `iteration` → a sprint of the fold or a stored `sprint-<id>` node | the stored record |
 | `blocks` | the `blocks` refs of the stored issue records, between two STORED issues; an edge stands while either end's record states it | both ends' stored records |
-| `depends_on`, direct (`transitive` false) | the code graph of the source area's latest authoritative window and of every later window | a window whose build of the area resolved (`edges_status: "resolved"`), or whose code graph carries the whole-tree structural scan (`structural_scan: true`, set by `apply_structural_scan`; then for every area of the repo, listed or not) |
+| `depends_on`, direct (`transitive` false) | the code graph of the source area's latest authoritative window and of every later window | a window whose build of the area resolved (`edges_status: "resolved"`), or whose code graph carries the whole-tree structural scan (`structural_scan: true`, set by `apply_structural_scan`; then for every area of the repo, listed or not, except the areas in `structural_scan_unread`: module files the scan could not read, issue #109) |
 | `depends_on`, transitive | as above | only a window whose build of the area resolved (the scan sees direct `module` refs only) |
-| `owns` | `_owns_pairs` over the code graph + CODEOWNERS of the area's latest authoritative window and of every later one | a window whose code graph lists the area and that read a CODEOWNERS file (non-empty `code_owners`) or a checkout (`clone_sha`; then a missing CODEOWNERS means no owners) |
+| `owns` | `_owns_pairs` over the code graph + CODEOWNERS of the area's latest authoritative window and of every later one | a window whose code graph lists the area and that read a CODEOWNERS file (non-empty `code_owners`) or a checkout (`clone_sha`; then a missing CODEOWNERS means no owners), unless its code graph has `codeowners_unread` (the file was there but could not be read, issue #109) |
 
 For `depends_on` / `owns` the windows are the repo's gathered windows
 (`gathered_windows`) with their `facts:` entries (#94), replayed in window
@@ -513,7 +586,7 @@ leaves the ones a manifest fold wrote alone. When a gathered window of the
 repo has **no `facts:` entry** (folded before #94, or a bundle without
 `from`/`to`), the replay is skipped: the fold adds this bundle's `depends_on` /
 `owns` edges as before #95 and retracts none (`current_state.structure`
-false). History edges are never touched.
+false). History and record-derived edges are not touched by this step.
 
 **Stand-ins.** Every `depends_on` target the fold keeps that is not stored gets
 the stand-in node (create-if-absent). After a retraction, a stand-in
@@ -535,13 +608,70 @@ its own tree; only when the bounded clone does not reach that commit
 `retracted N stale current-state edge(s) of P/R (…) (meta retractions:P/R)` to
 stderr) and in the meta ledger `retractions:{project}/{repo}`: a JSON list
 (oldest first, at most 100 entries) of `{from, to, counts: {type: n}, edges:
-[[src, dst, type], …] (first 200, sorted), standins_removed: [id, …]}`. A fold
+[[src, dst, type], …] (first 200, sorted), standins_removed: [id, …], people_removed: [id, …] (#111)}`. A fold
 that retracts nothing appends nothing, so a re-fold stays a no-op.
-`current_state:{project}/{repo}` = `{items: true, structure: <bool>, from, to}`
+`current_state:{project}/{repo}` = `{items: true, structure: <bool>, records: true, from, to}`
 records how the last fold kept the repo's current-state edges; `validate`
 reads it (*Multi-window stores* below). The first fold since #95 into an older
 store heals it: stale edges earlier folds left are retracted on the same rules
 (and logged).
+
+### Record-derived edges (#111)
+
+A PR / issue / commit record is upserted latest-wins, so the edges derived from
+it must follow it. After a fold upserts a record, inside the same transaction
+(`gather._maintain_record_edges`, after the fold's nodes and edges are written),
+that record's record-derived edges are exactly what its NEW content implies;
+the ones it no longer implies are deleted:
+
+| Edge | Endpoint that is the record | Derived from |
+|---|---|---|
+| `closes`, `cross_ref` | src = the PR | its `closes` / `crossref_issues`; in a manifest fold also its cross-repo refs (`_cross_repo_pr_edges`: qualified body refs, timeline xrefs, `closing_issues`) |
+| `part_of` | src = the commit | the PR its message names (`resolve_commit_pr`) |
+| `authored`, `merged`, `reviewed`, `commented` | dst = the PR | `author`, `merged_by`, `reviewers`, comment / review-comment authors |
+| `reported`, `commented` | dst = the issue | `author`, comment authors |
+| `authored` | dst = the commit | `author` (the login, or the git-name key when unresolved, #78) |
+| `touches` | src = the commit | only when the commit's stored `files` changed: its touches are then this fold's derivation (the files over this bundle's code graph); otherwise only added, as they also depend on the code graph |
+
+- **Only records the bundle carries are touched.** A record a bundle does not
+  hold keeps its edges: absence from a bundle is not evidence.
+- **Cross-repo.** A single-repo fold (`members` None) derives no cross-repo
+  edge, so it leaves the cross-repo `closes` / `cross_ref` a manifest fold
+  wrote alone; a manifest fold applies the rule to them.
+- **People.** A person node no contribution edge (`authored`, `merged`,
+  `reviewed`, `commented`, `reported`, `reacted`) has as its source any more is
+  deleted (`delete_orphan_people`). People are project-scoped, so an edge into
+  any member keeps the node; an `owns` edge does not (a CODEOWNER need not be a
+  participant, and `validate` derives people from contributions only). A
+  remaining person's `modules` / `areas` are unioned with the stored ones as
+  before, except when the fold re-folds the project's ONLY gathered window
+  (one repo, one `(from, to)` in `gathered_windows`): the bundle is then
+  everything the store knows, so its derivation replaces the stored one (a
+  commit re-attributed to someone else takes its areas along).
+- **Ledger.** The code-event ledger updates `author` / `hunk` / … of an
+  existing `(artifact, commit, event)` row (*Code-event ledger* above), so the
+  artifact nodes `_fold_artifacts` rebuilds re-credit the commit.
+- **Not covered:** symbol-move edges and artifact nodes (ledger-derived);
+  review / event nodes and their `part_of` (a review dropped from a PR's
+  `reviews` keeps its node); ledger rows of an event a later gather of the
+  commit no longer reports.
+- **Logged** with the current-state retractions: the fold summary's `retracted`
+  counts and `edges`, `people_removed`, one entry in `retractions:{p}/{r}`
+  (`{from, to, counts, edges, standins_removed, people_removed}`) and the
+  stderr line (`retracted N edge(s) of P/R that the re-folded records no longer
+  imply (…); removed K person node(s) no contribution references any more`).
+  A re-fold of the same bundle retracts and appends nothing.
+- **Order.** A record is last-fold-wins, so the store ends in the state of
+  the last-folded copy of each record, and its edges with it (re-folding an
+  older window after a newer one restores the older record's edges).
+- **First fold into an empty store** writes exactly the bundle's derivation.
+  `current_state:{p}/{r}` carries `records: true` after any fold since #111.
+  The first fold since #111 of a repo that already holds data (no `records`
+  in its marker) **heals** it once: every stored PR / issue / commit record of
+  the repo gets the rule above from its STORED content (touches excepted) —
+  one pass over the repo's records and their edges (about 2 s extra at 96k
+  nodes). Nothing is retracted for a record's absence: only for what its
+  stored content does not imply, which is what `validate` re-derives.
 
 **Slice 7b-2 — reader contract: `extract` materializes `artifacts` + `people`
 from the stored nodes; `link.enrich` shrank.** Because the write path now derives
@@ -608,16 +738,15 @@ already matched `validate.check_schema_conformance`'s allowlist.
 
 `in_iteration` (social→sprint) is written when the gather read a Projects v2
 board (Phase 12; the `read:project` scope). The
-`fts_text` FTS5 index IS populated on fold (see *Text index* above). See
-`docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
+`fts_text` FTS5 index IS populated on fold (see *Text index* above).
 
 ## Backfill on a traversal miss (slice 7c)
 
 A reader (`extract`) traversing a decision train over the spine edges can hit a
 `missing` id — a spine edge pointing at a node never gathered (e.g. a windowed PR
 `closes` an issue opened/closed *before* the window). `gather.backfill(conn, id,
-fetch=…)` closes that gap on demand: it fetches THAT ONE node + its cheap
-immediate spine edges and upserts them by identity. It is the **only** network
+fetch=…)` closes that gap on demand: it fetches THAT ONE PR or issue and writes it
+exactly as a fold writes a record (issue #113). It is the **only** network
 call outside the main Acquire pass, so it lives in `gather.py` (`extract` never
 fetches itself — it calls in via an injected `backfill` callable).
 
@@ -625,17 +754,34 @@ fetches itself — it calls in via an injected `backfill` callable).
   if the node already exists it returns `{"fetched": False, …}` WITHOUT fetching.
   The fetched node is **durable** (upserted), so it persists for the next window
   and a re-run is a no-op — the backfilled node appears exactly once.
+- **PRs and issues only.** A spine traversal can only miss the dst of a
+  `closes` / `cross_ref` / `part_of` edge — a `pr-<n>` or `issue-<n>`; any other
+  id is never fetched (`fetched: False`). Commits are not backfilled: no spine
+  edge points at one, and a commit written on demand would lack the author
+  resolution, `committed_at`, file list and `touches` a gather derives.
+- **Written as a fold writes it.** The record goes through `gather.record_rows`,
+  the function `fold_bundle` uses for every PR / issue: its `social` node, its
+  `closes` / `cross_ref` (and, in a project store, cross-repo) spine edges, its
+  contribution edges (`authored` / `merged` / `reviewed` / `commented` /
+  `reported`) and its review / lifecycle leaves with their `part_of` edges; plus
+  the person nodes of its logins (`derive.enumerate_participants` and the fold's
+  union, a PR reviewer inheriting the areas of stored commits `part_of` the PR
+  under the latest window's code graph), its FTS text, and the `blocks` /
+  `in_milestone` / `in_iteration` edges `item_relation_edges` derives that touch
+  it — in one transaction. A backfilled record is therefore indistinguishable,
+  for `validate`'s participant_completeness / edge_set / no_drift /
+  idempotency, from a folded one. A record is stored under its id's kind: an
+  `issue-N` whose #N is a PR (the seam follows the thread and returns the PR,
+  with its /pull/ url) is an issue record to `extract` and to `validate`, so it
+  gets an issue's edges (its own `closes` are not written). A record whose
+  `number` differs from the id's is not written.
 - **Injectable network seam.** The actual fetch goes through a `fetch(kind,
-  local, qid)` callable (`None` == unfetchable; `{"node": raw, "edges":
-  [(dst_local, edge_type), …]}` == fetched). `classify_id` derives `kind`
-  (social `pr-`/`issue-`/`comment-`, code bare-`<sha>`, else structure) from the
-  local id form. Production wires `gather.make_backfill_fetcher(token,
-  clone_dir)` (REST `normalize_pr`/`normalize_issue` for social — re-deriving the
-  same `closes` spine edges fold does; bounded `git fetch --depth 1 <sha>` +
-  one-commit log for code; structure not backfilled on demand). The test suite
-  passes a **fixture-backed fake** — NO network. Only spine edge types from the
-  seam are honored (backfill closes a traversal gap, it does not re-derive the
-  non-spine substrate).
+  local, qid)` callable (`None` == unfetchable; `ABSENT` == a 404, tombstoned in
+  `dead_refs`; `{"node": raw, …}` == fetched — any `edges` it lists are ignored,
+  edges are derived from the record). `classify_id` derives `kind` from the
+  local id form. Production wires `gather.make_backfill_fetcher(token)` (REST
+  `normalize_pr` / `normalize_issue`). The test suite passes a
+  **fixture-backed fake** — NO network.
 - **Reader wiring + budget.** `extract.extract(…, backfill=None,
   backfill_budget=50)`: when `backfill` is injected and traversal yields
   `missing` ids, extract calls it per id under the per-window budget ceiling, then
@@ -650,7 +796,7 @@ fetches itself — it calls in via an injected `backfill` callable).
   `spotlight.py --complete` wires a fetcher (`gather.make_backfill_fetcher`, through
   `complete.complete_train`); `view.py`, `digest.py` and `validate.py` call
   `extract` with `backfill=None` (offline, warn-only). `make_backfill_fetcher`'s live
-  REST/git paths are therefore only exercisable against a real repo, not by the
+  REST path is therefore only exercisable against a real repo, not by the
   offline suite.
 
 ## Train completion + dead-ref memory
@@ -682,8 +828,7 @@ re-surfacing pruned phantoms. The fetch seam grows a third outcome to make this
 possible: `fetched payload` | `ABSENT` (definitive 404 → prune + record dead) |
 `None` (transient/unreachable → an `unreachable` gap). The tombstone is additive,
 ignored by the trust gate, and `first_seen` is excluded from determinism asserts
-(like `fetched_at`). See
-`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`.
+(like `fetched_at`).
 
 ## Multi-repo project (the constellation)
 
@@ -1008,11 +1153,19 @@ Strictness (issue #89). Besides the checks above:
   `gather.fold_bundle` into an empty scratch store and its edges compared with
   the stored ones (an edge belongs to the repo of its src; a person's edge to
   the repo of its dst). An extra edge, a missing one, or different edge `data`
-  is an ERROR. A stored edge into another member repo (manifest `closes` /
-  `cross_ref` from a PR's qualified refs, or a registry `depends_on` to a
-  member's root area) must be one the manifest fold derives from the stored PR
-  / code graph; a *missing* cross-repo edge is not detected (it needs the
-  manifest's registries).
+  is an ERROR. An edge into another member repo (manifest `closes` /
+  `cross_ref` from a PR's qualified refs and timeline, or a registry
+  `depends_on` to a member's root area / a Bicep publisher's module area, #113):
+  when the repo's folds recorded their member set and registries
+  (`fold_context:`) and the member set never changed, the scratch fold uses
+  exactly them, so these edges are compared like any other, in both
+  directions — an edge re-pointed to another member's root or to a
+  non-publisher with the same module path, and a *missing* one, are ERRORs.
+  Otherwise (a store folded before #113, or `members_changed`) a missing one
+  — derived with the store's member set (stored repos plus run status) — is a
+  WARN, and a stored one must be one the manifest fold derives from the stored
+  PR / code graph (a `depends_on` is then matched on its target's local id
+  only: the registries are unknown).
 - **`provenance`** — a PR / issue cites `https://github.com/{owner}/{repo}/pull|issues/N`
   of its own repo (case-insensitive) and number, and `data.number == N`; a
   review / event cites its parent (or fold's synthesized fallback, or a
@@ -1020,7 +1173,16 @@ Strictness (issue #89). Besides the checks above:
   a 40/64-hex sha equal to `data.sha`.
 - **`no_fabrication`** — ids follow the grammar above, their scope equals the
   row's `project`/`repo` (people: `{project}` with repo `*`), the local form
-  fits the node class, and no scope is stored under two case spellings. Every
+  fits the node class (`comment-…` is not a form fold writes, #113), and no
+  scope is stored under two case spellings (an `{owner}/{repo}` scope and its
+  people's `{owner}` case-folded whole; a manifest member's
+  `{project}/{owner}/{repo}` with the project kept as written — project names
+  are case-sensitive, #70, so `Acme` and `acme` are two projects, #113). A PR /
+  issue that is the dst of no contribution edge (no author, merger, reviewer
+  or commenter) is invented: GitHub names an author for every PR and issue
+  (`ghost` for a deleted account) and fold writes its edge — an ERROR when
+  another record of that kind in the repo carries an author, else a WARN
+  (hand-built records without authors, as in the fixtures). Every
   `code` node is one of exactly three forms (#101): a commit record (`sha`)
   under a 40/64-hex sha id, a file-artifact record (`kind` not symbol/comment)
   under `art:<path>`, or a symbol/comment record under
@@ -1033,11 +1195,55 @@ Strictness (issue #89). Besides the checks above:
   that is a pre-#78 git-name identity gets a hint naming the commits' current
   author and "re-gather into a fresh store". `validate --repo <member>` of a
   multi-member project checks only the people that member derives (derived ⊆
-  stored); the full equality is `no_drift_people` (no `--repo`).
+  stored); the full equality is `no_drift_people` (no `--repo`). Artifacts
+  compare `kind`, `path`, `name`, `status`, `replaced_by`, `code_area` and
+  every lifecycle entry's `event`, `date`, `commit` and `author` (#113; before,
+  only the lifecycle's length).
+- **`meta_integrity`** (#113) — the repo's markers and per-window meta are what
+  folds write, so they cannot be forged to loosen the gate or change a view:
+  - `gathered_windows` is readable and each of the repo's windows is a
+    `from <= to` pair of dates. Once the repo has any fold evidence, each
+    window must have its own — a `facts:` / `ref_date:` / `branches:` /
+    `clone:` key, a `member_status` entry, or the `current_state:` marker
+    naming it: an entry no fold wrote is an ERROR, and is not counted as a
+    window (it would otherwise make a one-window store multi-window, whose
+    comparisons are looser). A store folded before #75 has no evidence for
+    any window and is not affected; a store that mixes such a window with
+    later ones fails until that window is re-gathered.
+  - `current_state:` is readable JSON with `items: true`, a boolean
+    `structure`, `records` true or absent, and names a gathered window; its
+    `structure` equals "every gathered window has its facts"
+    (`gather.repo_fact_windows`), which is exactly what the last fold wrote —
+    so a deleted `facts:` entry, or a `structure` flipped to false, is an
+    ERROR. A repo with `facts:` / `clone:` / `retractions:` keys and no marker
+    is an ERROR (every fold since #95 writes both).
+  - every `facts:`, `ref_date:`, `branches:`, `clone:` key names a gathered
+    window and has the writer's shape (`ref_date` a date; `branches`
+    `{base_branch, branches}`; `clone` `{clone_mode, boundary_dropped_commits[,
+    structure_as_of]}` with a mode gather writes (fresh / fetched /
+    depth1-fallback / none / null) and sorted shas; `facts` `{clone_sha,
+    facts: {key: sha256}, ci_collected}` with known keys); every `fact:` value
+    re-hashes to its key and has the shape of each key that references it, as
+    far as gather's shapes tell them apart (a code graph's `areas`, a
+    taxonomy's `source`, a CODEOWNERS rule list, CI `{workflow: {total, …}}`),
+    so swapped refs fail; `clone_sha:` is a commit sha; `fold_context:` has
+    the writer's shape.
+
+  Outside a store-only audit: a fact value rewritten together with its key
+  and ref, and a plausible `branches:` / `ref_date:` / `clone:` value (a
+  different base branch changes what counts as shipped). `--bundle` compares
+  them for its window (below).
 
 **Multi-window stores** (more than one gathered window recorded for the repo).
 `edge_set` and `no_drift` re-derive from ONE self-sourced bundle over the whole
 store (every stored record; the structure of the latest gathered window, #94).
+The record-derived edge types (`authored`, `merged`, `reviewed`, `reported`,
+`commented`, `closes`, `cross_ref`, `part_of`) are compared **exactly** on
+every store, single- or multi-window: a fold keeps them equal to the stored
+records (*Record-derived edges (#111)*). On a repo last folded before #111 (no
+`records` in `current_state`) a stale one is still an ERROR — views follow it —
+with the hint "fold any window of it once more"; that fold heals every record,
+and the idempotency probe reports the edges it would retract as a WARN.
 The current-state edge types are compared **exactly** (ERROR) when the store
 shows they can be proven (`validate._multi_window_plan`, #95); otherwise a
 difference is a WARN that names why:
@@ -1045,13 +1251,14 @@ difference is a WARN that names why:
 | Edge type | Exact (ERROR) when | Expected set |
 |---|---|---|
 | `blocks`, `in_milestone`, `in_iteration` | the repo's last fold was since #95 (`current_state.items`) | the re-fold of the self-sourced bundle (every stored record, milestone and sprint) |
-| `depends_on`, `owns` | the last fold replayed them (`current_state.structure`) and every gathered window still has its `facts:` entry | `gather.StructureReplay` over the windows' facts, without the manifest's registries; a stored cross-repo `depends_on` must match an unresolved registry edge of its source in a window in effect for it |
+| `depends_on`, `owns` | the last fold replayed them (`current_state.structure`) and every gathered window still has its `facts:` entry | `gather.StructureReplay` over the windows' facts, with the member set and registries of `fold_context:` (#113); without one, cross-repo `depends_on` are left out and a stored one must match an unresolved registry edge of its source in a window in effect for it |
 | `touches` | every gathered window has a stored code graph, none is a graphify one, and no path is in two different areas across windows | each stored commit's files against the union of the windows' path indexes |
 
 The WARN stays for a repo last folded before #95 (fold any window once more), a
 window without facts (re-gather it), and for `touches` a graphify window or a
-path re-mapped between windows. A missing cross-repo `depends_on` is not
-detected (it needs the manifest's registries). People's areas compare as
+path re-mapped between windows. A missing cross-repo `depends_on` is detected
+when the repo's folds recorded their registries (`fold_context:`, see
+`edge_set` above). People's areas compare as
 derived ⊆ stored (an extra stored area is a WARN): a person's areas are a union
 over every window's activity — history, never retracted — and re-deriving them
 exactly would need each window's own view (LLD §14.5).
@@ -1069,12 +1276,20 @@ a one-window store all of this is exact.
 
 **What the gate proves, and what it does not.** Self-sourced, it proves the
 store is *consistent*: every edge, person and artifact is exactly what the
-stored records and ledger imply, and every citation points at the node's own
-GitHub object. It does **not** prove the records are what GitHub holds:
+stored records and ledger imply, every citation points at the node's own
+GitHub object, and the markers and per-window meta are what folds write. It
+does **not** prove the records are what GitHub holds:
 
 - a record deleted together with its edges (and a person left with no other
   edge), or a blob rewritten consistently (title, `merged`, a comment body, a
   reviewer dropped with its edge), leaves a consistent store;
+- an INSERTED record that is internally consistent is invisible to a
+  store-only audit: a PR or commit with its author and contribution edge, a
+  review with its `part_of` edge, a dated release, a milestone, an area. What
+  store-only CAN flag is flagged: a PR / issue nobody contributed to, a node
+  form fold never writes (`comment-…`);
+- a fact value rewritten together with its `fact:` key and its `facts:` ref,
+  and a plausible `branches:` / `ref_date:` / `clone:` value;
 - the artifact part of `no_drift` re-derives artifacts from the store's own
   ledger plus recorded moves (#76), so a wrong ledger (rows missing or invented)
   yields matching nodes — the check proves nodes == ledger, not ledger == git.
@@ -1083,7 +1298,18 @@ Pass `--bundle` with a bundle saved when the store was gathered — a `view.py`
 JSON of the fresh store, or a raw bundle — to catch changed or deleted records:
 every PR / issue / commit in it must be stored with the same content (reviews and
 lifecycle compare without the synthesized `url`). It must hold the latest fetch of
-its records. The store keeps no per-fold content digest.
+its records. Since #113 it also catches inserted and changed rows of its
+window (`meta.period`, else `meta.from`/`to`): every stored PR / issue / commit
+/ release gather would have collected for that window (the rule a view of it
+applies, on the record's stored state) and every review / lifecycle event of
+one of its records must be in the bundle (as `fold_bundle` would write it); on
+a store holding only that window, so must every stored milestone, sprint and
+area (not a stand-in); and when its window is exactly a gathered window, the
+stored `ref_date`, base branch and branches, clone provenance (`clone_sha`,
+`clone_mode`, `boundary_dropped_commits`, `structure_as_of`) and each fact
+value the bundle carries must equal its own. An issue pulled in only as train
+context of the window's PRs is not required (a later backfill may have stored
+it). The store keeps no per-fold content digest.
 
 Exit codes: 0 no ERROR; 1 an ERROR check failed (a report is printed); 2 usage
 error with no report (the store path does not exist or is not a store, several

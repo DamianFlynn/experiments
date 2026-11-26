@@ -75,9 +75,11 @@ def parse_args(argv):
     args = p.parse_args(argv)
     # Shared reader-window rules (manifest.check_reader_window): each bound is a
     # real YYYY-MM-DD date or a full ISO timestamp, validated in FULL (no junk
-    # after the date), and from <= to as instants.
+    # after the date), and from <= to as instants; a timestamp comes back as
+    # UTC `...Z` (issue #111), the form the store compares.
     try:
-        manifest.check_reader_window(args.ts_from, args.ts_to, "--from", "--to")
+        args.ts_from, args.ts_to = manifest.check_reader_window(
+            args.ts_from, args.ts_to, "--from", "--to")
     except ValueError as exc:
         p.error("{} (given --from {!r}, --to {!r})".format(
             exc, args.ts_from, args.ts_to))

@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 9 Multi-Repo Project — Implementation Plan (Part 3: cross-repo Terraform `depends_on` + blast radius, S4)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

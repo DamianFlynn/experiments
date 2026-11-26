@@ -13,9 +13,9 @@ it, extend it, and debug it.
 > actually operating it.
 
 Companion docs (deeper, narrower): `SKILL.md` (the operating procedure), `STORE.md` (the
-database schema), `BUNDLE.md` (the data contract), `REFERENCE.md` (install/usage). The
-whole thing is framed by the original design spec,
-`docs/superpowers/specs/2026-06-01-activity-overview-design.md`.
+database schema), `BUNDLE.md` (the data contract), `REFERENCE.md` (install/usage). Those
+documents are the current contract; the dated design and plan documents under
+`docs/superpowers/` are historical and superseded by them.
 
 ---
 
@@ -527,10 +527,10 @@ Remember the promise: *the digest must be believable*. Since the entire narrativ
 from the database, **a wrong database means a lying report.** `validate.py` is the gate
 that proves the database is consistent — run it before you trust any digest.
 
-> ⭐ **The trust gate.** `validate.py` runs **nine checks** per repo (target, referential
-> integrity, participant completeness, provenance, no fabrication, schema conformance, edge
-> set, no drift, idempotency), plus two project-wide ones for a multi-repo project (people,
-> member status). The headline ones:
+> ⭐ **The trust gate.** `validate.py` runs **ten checks** per repo (target, referential
+> integrity, participant completeness, provenance, no fabrication, schema conformance, meta
+> integrity, edge set, no drift, idempotency), plus two project-wide ones for a multi-repo
+> project (people, member status). The headline ones:
 > - **provenance** — *every* fact carries a source link, and it is the fact's own (the
 >   right repo and number on github.com; a real commit sha);
 > - **referential integrity** — every edge points at things that exist;
@@ -543,8 +543,9 @@ that proves the database is consistent — run it before you trust any digest.
 > - **idempotency** — re-folding changes nothing.
 >
 > What it cannot see from the store alone: a record deleted together with all its
-> relationships, or a record rewritten consistently. Keep the view saved right after the
-> gather and pass it as `--bundle` to catch those (`STORE.md` "Trust gate").
+> relationships, a record rewritten consistently, or a record inserted together with its
+> relationships. Keep the view saved right after the gather and pass it as `--bundle` to
+> catch those (`STORE.md` "Trust gate").
 
 > 🟦 **New here: a "CI gate".** **CI** (continuous integration) is the robot that checks
 > every change automatically. A **gate** is a check that must pass before work proceeds.
@@ -650,12 +651,13 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--from` / `--to` | — | window (YYYY-MM-DD) |
 | `--ref-date` | `--to` | reference point for milestone/sprint/forecast/flow framing; stored with the window, read back by `view.py`/`digest.py` |
 | `--branches` | repo default | mainline(s); first is `base_branch`. Unset: manifest member `branch`, else the repo's default branch (clone `origin/HEAD`, else API) |
-| `--clone-dir` | `workspace/<repo>-clone` | clone location; an existing clone of the same repo is fetched, not re-cloned (manifest: parent of per-member `<owner>-<repo>-clone` dirs) |
+| `--clone-dir` | `workspace/<repo>-clone` | clone location; an existing clone of the same repo is fetched, not re-cloned (manifest: parent of per-member `<owner>/<repo>` dirs; a former `<owner>-<repo>-clone` of the same remote is reused) |
 | `--no-clone` | off | never create a clone: fetch an existing one, or gather API data only |
 | `--no-workflows` / `--include-workflows` | on | CI workflow-run stats |
 | `--no-releases` / `--include-releases` | on | releases in window |
 | `--no-project-board` / `--project-board` | on | Projects v2 board ingest (auto-discovered) |
 | `--structural-iac` | off (on for manifest members) | whole-tree static Terraform + Bicep dependency scan |
+| `--no-iac-build` | off | skip the `bicep`/`terraform` builds (they run third-party code; use for untrusted repos); areas `edges_status: skipped` |
 | `--resume` | off | manifest only: gather just the members not `ok` for the window |
 | `--store PATH` | **required** | the SQLite store to fold into |
 
@@ -703,7 +705,9 @@ or `--ticket-pattern`; unknown project/repo or a bad window exits 2.
 `ACTIVITY_MMDC_PUPPETEER_CONFIG` (puppeteer config for `mmdc -p`).
 A non-integer value for an integer knob is an error; one below its minimum is clamped.
 
-**Tunable constants (in code):** trains — top-N=8, significance floor=20.0, stall=21 days;
+**Tunable constants (in code):** trains — top-N=8, significance floor=20.0, stall=21 days
+(an open train idle that long is `stalled`; a shipped train that took that long is
+`slow_to_land`);
 forecast — likely ≥5.0, possible ≥2.0, overdue=200 days; slices — text cap 1500, comments
 kept 6, diff cap 6000 chars; flow — stale 30 days, upvote min 5, traction min 5, hung 60 days.
 

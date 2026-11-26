@@ -327,7 +327,7 @@ class BackfillAbsent(unittest.TestCase):
         fetch = gather.make_backfill_fetcher("tok")
         orig = gather.http_get_json
 
-        def fake(url, token, allow_404=False):
+        def fake(url, token, allow_404=False, **_kw):
             if "/issues/" in url:
                 return ({"number": 8, "pull_request": {"url": "u"}}, None)
             if "/pulls/" in url:

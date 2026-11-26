@@ -265,11 +265,14 @@
       "effort": {
         "commits": 0,
         "elapsed_days": 8,
+        "idle_days": null,
+        "last_activity_at": null,
         "merged_at": "2026-05-10T12:00:00Z",
         "opened_at": "2026-05-02T08:00:00Z",
         "participants": 0,
         "review_comments": 0,
         "reviewers": 0,
+        "slow_to_land": false,
         "stalled": false
       },
       "evidence": [
@@ -307,11 +310,14 @@
       "effort": {
         "commits": 0,
         "elapsed_days": null,
+        "idle_days": null,
+        "last_activity_at": null,
         "merged_at": null,
         "opened_at": null,
         "participants": 0,
         "review_comments": 0,
         "reviewers": 0,
+        "slow_to_land": false,
         "stalled": false
       },
       "evidence": [
@@ -340,11 +346,14 @@
       "effort": {
         "commits": 0,
         "elapsed_days": null,
+        "idle_days": null,
+        "last_activity_at": null,
         "merged_at": null,
         "opened_at": "2026-05-05T08:00:00Z",
         "participants": 0,
         "review_comments": 0,
         "reviewers": 0,
+        "slow_to_land": false,
         "stalled": false
       },
       "evidence": [
@@ -375,11 +384,14 @@
       "effort": {
         "commits": 0,
         "elapsed_days": null,
+        "idle_days": 6,
+        "last_activity_at": "2026-05-25T08:00:00Z",
         "merged_at": null,
         "opened_at": "2026-05-20T08:00:00Z",
         "participants": 0,
         "review_comments": 0,
         "reviewers": 0,
+        "slow_to_land": false,
         "stalled": false
       },
       "evidence": [

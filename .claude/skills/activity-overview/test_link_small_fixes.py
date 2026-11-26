@@ -81,16 +81,15 @@ class TestCommitTimestamp(unittest.TestCase):
         self.assertIn("%cI", " ".join(gather.COMMIT_WALK_ARGS))
 
     def test_committed_at_is_normalised_to_utc(self):
-        raw = self._record(SHA, "", "Alice", "2026-05-10", "docs",
-                           "a@example.invalid", "2026-05-10T10:30:00+02:00")
+        raw = self._record(SHA, "", "Alice", "a@example.invalid",
+                           "2026-05-10T10:30:00+02:00", "docs")
         (c,) = gather.parse_git_log(raw)
-        self.assertEqual(c["date"], "2026-05-10")          # windowing day kept
+        self.assertEqual(c["date"], "2026-05-10")          # its UTC day
         self.assertEqual(c["committed_at"], "2026-05-10T08:30:00Z")
 
     def test_unparseable_or_absent_timestamp_adds_no_key(self):
-        for fields in ((SHA, "", "Alice", "2026-05-10", "docs"),
-                       (SHA, "", "Alice", "2026-05-10", "docs", "a@x", "garbage"),
-                       (SHA, "", "Alice", "2026-05-10", "docs", "a@x", "")):
+        for fields in ((SHA, "", "Alice", "a@x", "garbage", "docs"),
+                       (SHA, "", "Alice", "a@x", "", "docs")):
             (c,) = gather.parse_git_log(self._record(*fields))
             self.assertNotIn("committed_at", c, fields)
 
@@ -266,7 +265,7 @@ class TestEnrichNoneTypedFields(unittest.TestCase):
         # normalize_issue): REST objects with null labels/assignees/user.
         fetch = gather.make_backfill_fetcher("tok")
 
-        def fake(url, token, allow_404=False):
+        def fake(url, token, allow_404=False, **_kw):
             if "/pulls/" in url:
                 return ({"number": 5, "title": "PR 5", "user": None, "labels": None,
                          "body": None, "merged_at": "2026-05-10T10:00:00Z",

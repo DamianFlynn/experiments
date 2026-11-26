@@ -15,7 +15,17 @@ Installments are identified by their window `(from, to)` (#86): recording a
 window that is already in the index replaces that entry, the index is kept in
 window order, and an installment is compared against the one immediately
 before its window — not against whatever was appended last.
+
+A window is identified by its calendar days (#110 item 6): `window_key` is
+`(from[:10], to[:10])`, so January written as `2026-01-01..2026-01-31` and as
+full ISO timestamps is ONE installment. The recorded `from` / `to` keep the
+spelling they were given. One index holds windows that do not overlap
+(`overlapping`): with a quarter and its months in one index "the installment
+before this window" is not defined, so link.py refuses to record such a window
+(a roll-up gets its own index file).
 """
+
+import manifest as _manifest
 
 INDEX_VERSION = 2
 
@@ -50,26 +60,57 @@ def installment_window(inst):
     return (frm, to)
 
 
+def window_problem(window, what="window"):
+    """Why `window` (from, to) cannot identify an installment, or None: each
+    bound must be a date `YYYY-MM-DD` or a full ISO timestamp, and from <= to
+    (manifest.check_reader_window, the readers' window rule)."""
+    frm, to = window
+    try:
+        _manifest.check_reader_window(frm, to, what + " from", what + " to")
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def window_key(window):
+    """The identity of a window: its UTC calendar days (#110 item 6). A
+    timestamp bound is converted to UTC first (manifest.normalize_reader_bound),
+    so `2026-01-01T00:00:00Z` and `2025-12-31T19:00:00-05:00` are one window.
+    Callers validate the bounds first (window_problem); a bound that still
+    cannot be read keeps its leading date."""
+    def day(bound):
+        try:
+            return _manifest.normalize_reader_bound(bound)[:10]
+        except (ValueError, TypeError):
+            return str(bound)[:10]
+    return (day(window[0]), day(window[1]))
+
+
+def _inst_key(inst):
+    w = installment_window(inst)
+    return None if w is None else window_key(w)
+
+
 def _order_key(inst):
     # Windowless entries sort before every window (they cannot be placed, and
     # the legacy list form only ever appended them before newer months).
-    w = installment_window(inst)
-    return (0, "", "") if w is None else (1, w[0], w[1])
+    k = _inst_key(inst)
+    return (0, "", "") if k is None else (1, k[0], k[1])
 
 
 def normalize_installments(installments):
-    """The index in window order with one entry per window. A window recorded
-    more than once (a pre-#86 double run) keeps the entry recorded last;
-    windowless entries keep their relative order, ahead of every window.
-    Entries are returned unchanged (no field is rewritten)."""
+    """The index in window order with one entry per window (by window_key).
+    A window recorded more than once (a pre-#86 double run, or one run with
+    dates and one with timestamps) keeps the entry recorded last; windowless
+    entries keep their relative order, ahead of every window. Entries are
+    returned unchanged (no field is rewritten)."""
     last_at = {}
     for n, inst in enumerate(installments):
-        w = installment_window(inst)
-        if w is not None:
-            last_at[w] = n
+        k = _inst_key(inst)
+        if k is not None:
+            last_at[k] = n
     kept = [inst for n, inst in enumerate(installments)
-            if installment_window(inst) is None
-            or last_at[installment_window(inst)] == n]
+            if _inst_key(inst) is None or last_at[_inst_key(inst)] == n]
     return sorted(kept, key=_order_key)  # stable: windowless keep their order
 
 
@@ -77,7 +118,8 @@ def predecessor(installments, window):
     """The installment immediately before `window` in window order (None when
     there is none). A windowless legacy entry counts as earlier than any
     window."""
-    target = (1, window[0], window[1])
+    k = window_key(window)
+    target = (1, k[0], k[1])
     before = [i for i in normalize_installments(installments)
               if _order_key(i) < target]
     return before[-1] if before else None
@@ -85,16 +127,32 @@ def predecessor(installments, window):
 
 def later_installments(installments, window):
     """Recorded installments whose window sorts after `window`."""
-    target = (1, window[0], window[1])
+    k = window_key(window)
+    target = (1, k[0], k[1])
     return [i for i in normalize_installments(installments)
             if _order_key(i) > target]
 
 
+def overlapping(installments, window):
+    """The recorded installments whose window shares at least one calendar
+    day with `window` without being the same window (#110 items 6, 10), in
+    window order. Such an entry makes "the installment before `window`"
+    undefined, so link.py refuses to record `window` in that index."""
+    lo, hi = window_key(window)
+    out = []
+    for inst in normalize_installments(installments):
+        k = _inst_key(inst)
+        if k is not None and k != (lo, hi) and k[0] <= hi and lo <= k[1]:
+            out.append(inst)
+    return out
+
+
 def place_installment(installments, snapshot):
     """The index with `snapshot` recorded under its window: an entry for the
-    same window is replaced, everything is kept in window order."""
-    w = installment_window(snapshot)
-    rest = [i for i in installments if installment_window(i) != w]
+    same window (by window_key) is replaced, everything is kept in window
+    order."""
+    k = _inst_key(snapshot)
+    rest = [i for i in installments if _inst_key(i) != k]
     return normalize_installments(rest + [snapshot])
 
 

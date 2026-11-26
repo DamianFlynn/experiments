@@ -5,7 +5,7 @@ longer a produced file — `gather` folds its facts into the journey-graph store
 (see `STORE.md`), and the reader stage materializes this bundle shape as a
 **transient view** via `extract`. This document remains the contract for that
 view: the **gather**/fold path supplies `meta`, `commits`, `prs`, `issues`,
-`workflows`, `workflow_stats`, `releases`, `milestones`; the **link** step
+`workflow_stats`, `releases`, `milestones`, `sprints`; the **link** step
 (`link.py`) then fills `trains` and `buckets`; the **render** step
 (`render.py`) fills `diagrams`. (The grouped sections below document everything
 beyond the core keys.)
@@ -57,6 +57,26 @@ video-script, dashboards) consume the same view. The contract:
   stay apart); `is_bot` is OR'd and `login_resolved: false` when any member says so.
   `halls.fame` is rebuilt from the merged people (same rule as a bundle's), so it ranks
   on project-wide figures.
+- **Project view: `trains` (project trains).** `view["trains"]` is
+  `[{ id, kind, outcome, repos:[repo], prs:[qid], issues:[qid], commits:[qid],
+  code_areas:["<repo>::<area>"], tickets:[str], evidence:[ref + repo] }]`, sorted by `id`
+  (`digest.build_project_trains`). Each is the union of the member trains (`trains[]` of
+  `members[].bundle`) whose anchors fall in one connected group of the cross-repo spine
+  (`closes` / `cross_ref` edges between members), plus any member PR / issue of that group
+  that has no train of its own. **Ids are qualified:** a PR is `<project>/<repo>#pr-<n>`, an
+  issue `<project>/<repo>#issue-<n>`, a commit `<project>/<repo>#<sha>`, where `<repo>` is the
+  store's repo key (`owner/name` for a manifest member). `id` is `"ptrain-" +` the smallest
+  qualified PR / issue id (so `ptrain-<project>/<repo>#issue-<n>` or `#pr-<n>`); the member's
+  own single-repo train for that anchor is `train-issue-<n>` (or `train-pr-<n>`). `repos` are
+  the sorted repo keys the train reaches (it can name a member outside a `--repo` subset when a
+  spine edge reaches it). `outcome` is the best member-train outcome (shipped > in_flight >
+  rejected > abandoned); `kind` is that of the member train with the lowest anchor among those
+  with a root issue (else among all). `code_areas` (#112) is the sorted union of the member
+  trains' `code_areas`, each qualified `"<repo>::<area>"` like the project `modules` keys and
+  people `areas`. `evidence` is the member trains' evidence refs in member order, each with
+  `repo` added. `tickets` is described under `related_work` below (`[]` unless ticket parsing
+  is on). A project train has **no** `tier`, `significance`, `effort`, `root_issue`,
+  `pr_outcomes` or `contributing_prs`: read those from the member train.
 - **Project view: `related_work` is opt-in.** Each project train carries a
   `tickets` list and `related_work` is `[{ticket, train_ids}]` — trains that share
   an internal ticket id but have no spine link. Ticket parsing is **off by
@@ -108,7 +128,9 @@ Every provenance reference is `{ "type": "pr|issue|commit", "id": <number|sha>,
 "url": "https://..." }`. Every narrative-bearing fact (a train, a bucket entry)
 resolves to at least one such ref. To fact-check any claim in a report, follow its
 ref `url` to GitHub. (`pr` and `issue` refs are emitted directly; commits appear
-as bare SHAs in `trains[].commits`.)
+as bare SHAs in `trains[].commits`; a train slice's `commits[]` rows and every
+`feature_deltas[]` row carry the commit's `url`,
+`https://github.com/<meta.owner>/<meta.repo>/commit/<sha>`.)
 
 ## Top-level keys
 
@@ -136,8 +158,8 @@ the rest (engagement, code areas, trains, people/flow).
   remote does not have stops the gather (a manifest member is recorded failed).
   Plus **`clone_sha`** — the commit the structure (`code_graph` and its edges, the structural
   scan, CODEOWNERS) was read at, and **`structure_as_of`** (issue #107): `"window_end"` when
-  that commit is the last commit of the walked branch (first-parent) whose committer date is
-  on or before `to` — the current month's head, or for a past window re-gathered later the
+  that commit is the last commit of the walked branch (first-parent) whose committer day (UTC)
+  is on or before `to` — the current month's head, or for a past window re-gathered later the
   mainline as it was then (read from a temporary worktree; the clone stays on its branch
   head) — or `"head"` when the bounded clone does not hold that commit (a window with no
   commit in it or its margin, before later ones), so the structure is the head's; both `null`
@@ -153,7 +175,12 @@ the rest (engagement, code areas, trains, people/flow).
   the view, omitted when empty. **`closing_refs_source`** (`graphql` | `keywords`, issue
   #105) is bundle-only: where the PRs' `closes` came from — GitHub's
   `closingIssuesReferences` merged with the closing keywords, or the keywords alone because
-  GraphQL was unavailable (gather prints which on stderr). (Store-only — see `STORE.md`;
+  GraphQL was unavailable (gather prints which on stderr). **`project_board_truncated`**
+  (#109, bundle-only, present only when it applies) lists each Projects v2 board whose items
+  were cut short: `[{board, kept, max_items, reason}]`, `reason` one of `item_cap`
+  (`ACTIVITY_BOARD_MAX_ITEMS`), `page_guard` (200 pages), `error` (a page request failed),
+  `empty_page` (a page claimed more items but held none) or `no_board_id`; items past `kept`
+  carry no `board_status` / `iteration`. (Store-only — see `STORE.md`;
   this bundle shape is the transient view `extract` materializes from the store, not a
   produced file.)
   A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
@@ -211,11 +238,15 @@ the rest (engagement, code areas, trains, people/flow).
   several gathered windows is their union.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
   committed_at?, message, files, pr }]` (`pr` set by link).
-  `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
-  (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
-  across committer timezones. `committed_at` (#82) is the full committer timestamp (`%cI`)
-  in UTC, `YYYY-MM-DDTHH:MM:SSZ`; it orders the `timeline` only (windowing stays on `date`).
-  It is absent on commits gathered before #82 and on backfilled commits.
+  `date` is the **UTC calendar day of the committer timestamp** (#109; before it, the
+  committer's local day, `%cd`), so commits are windowed on the same UTC calendar as PRs and
+  issues: a commit at `2026-10-31T20:00-08:00` is dated `2026-11-01`, in November with the PR
+  merged at that instant. The walk windows in Python on it (`window_records`) rather than via
+  git `--since/--until`, which prunes valid in-window commits across committer timezones.
+  `code_events[].date` and `symbol_events[].date` are the same day of the same commit, so every
+  record of one commit lands in one window. `committed_at` (#82) is the full committer
+  timestamp (`%cI`) in UTC, `YYYY-MM-DDTHH:MM:SSZ`; it orders the `timeline`. It is absent on
+  commits gathered before #82 (commits are never backfilled, #113).
   **People identity (#78):** `author` is the author's **GitHub login** — the same key PR, issue,
   review and comment records use — so one person is one `people` entry. `gather.resolve_commit_authors`
   resolves it from real data, in order: the commits-list API's `author.login` for that SHA
@@ -253,7 +284,8 @@ the rest (engagement, code areas, trains, people/flow).
 - `trains` — `[{ id, kind, root_issue, issues:[#], prs:[#], pr_outcomes:{"<pr#>": outcome},
   commits:[sha], code_areas:[id], outcome, contributing_prs:[#], significance:float,
   tier:"deep"|"mention", effort:{opened_at, merged_at, elapsed_days, reviewers, review_comments,
-  commits, participants, stalled}, evidence:[ref] }]`.
+  commits, participants, stalled, idle_days, last_activity_at, slow_to_land},
+  evidence:[ref] }]`.
   **Membership (#93).** Every PR that targets `meta.base_branch` — merged into it, open, or
   closed unmerged — is in exactly one train, whatever its own outcome. PRs are joined by the
   issues they **close** (`closes`): a train is a connected group of PRs and the issues they close,
@@ -262,7 +294,8 @@ the rest (engagement, code areas, trains, people/flow).
   train id on its bucket ref (a Development-sidebar link counts once gather read it from
   GitHub, #105). A mention or timeline cross-reference (`crossref_issues`) never
   makes an issue a member or a root: a tracking issue that mentions three PRs leaves them three
-  trains. `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
+  trains. A `closes` number that is one of the bundle's PRs is not an issue (GitHub closes no
+  PR by keyword): it neither anchors nor joins a train (#110). `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
   or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.
   A train is anchored by its lowest closed issue — `root_issue`, id `train-issue-<n>` — or, when
   its PRs close no issue (process not followed / a forked PR), by its lowest **PR**
@@ -286,10 +319,30 @@ the rest (engagement, code areas, trains, people/flow).
   `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed
   `review_comments_count` (int); `participants` = count of distinct authors + reviewers +
   comment-authors (int); all over every PR and issue of the train (`opened_at` = the earliest
-  `created_at` among them);
-  `stalled` = merged but `elapsed_days > TRAIN_STALL_DAYS`. All fields degrade to null/0
-  when data is thin. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
-  `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`.
+  `created_at` among them; `merged_at` = the latest `merged_at` of its merged PRs, else
+  `null`; `elapsed_days` = whole days from `opened_at` to `merged_at`, else `null`).
+  **Stall flags (#112), by `outcome`** (threshold `TRAIN_STALL_DAYS` = 21, strict `>`):
+  - `in_flight` — `last_activity_at` is the latest activity timestamp recorded for the
+    train: over every member PR and issue, its `created_at`, `updated_at`, `closed_at`,
+    `merged_at`, `comments_list[].created_at`, `review_comments[].created_at`,
+    `reviews[].submitted_at` and `lifecycle[].created_at`, and every train commit's
+    `committed_at` (else `date`) — `null` when none is recorded. (Train commits are mainline
+    commits, so a push to an open PR's branch counts through the PR's `updated_at`.)
+    `idle_days` = calendar days
+    from that timestamp's date to the reference date (`meta.ref_date`, else `meta.to`),
+    floored at 0 (activity recorded after the reference date — a view of an earlier window
+    whose records are newer, `meta.state_as_of` — is not idleness); `null` without a
+    timestamp or a reference date. `stalled` = `idle_days > TRAIN_STALL_DAYS`.
+    `slow_to_land` is `false`.
+  - `shipped` — `slow_to_land` = `elapsed_days > TRAIN_STALL_DAYS` (it took long to land);
+    `stalled` is `false` and `idle_days` / `last_activity_at` are `null`, even when an open
+    follow-up PR is idle.
+  - `rejected` / `abandoned` — `stalled` and `slow_to_land` are `false`, `idle_days` /
+    `last_activity_at` `null`.
+  A train without `outcome` (hand-built) is treated as `shipped` when a PR merged, else as
+  `in_flight` when a PR is open. All fields degrade to null/0/false when data is thin.
+  Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`, `TRAIN_SIGNIFICANCE_FLOOR`,
+  `TRAIN_STALL_DAYS`.
 - `buckets` — `{ shipped:[ref], in_flight:[ref], rejected:[ref], next_candidates:[ref] }`
   (all four buckets are classified — see below).
 
@@ -302,8 +355,12 @@ report (the omit-when-empty rule that keeps the shape diff-stable), **not** perm
 empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
-code_graph, label_taxonomy, modules, workflow_stats, workflows, releases, milestones,
-docsRefs, release_train, sprints, project, diagrams`.
+code_graph, label_taxonomy, modules, workflow_stats, releases, milestones, sprints,
+diagrams`.
+
+**Never in a view:** gather's in-memory bundle skeleton also reserves `workflows` (the raw
+CI runs `workflow_stats` is counted from; never folded, so no view carries it), and
+`docsRefs`, `release_train` and `project`, which nothing fills. Do not read them.
 
 ## Engagement, buckets, diagrams & forecast fields
 
@@ -313,8 +370,27 @@ docsRefs, release_train, sprints, project, diagrams`.
   *Review decision & rounds* below for the exact rules.
 - **issues[]** gain `milestone`, `updated_at`, `comments`. Open and
   not-planned-closed issues are now included, not just PR-closing issues.
-- **workflows[]**, **workflow_stats{}**, **releases[]**, **milestones[]** are
-  populated (see the schema block in the design spec). `workflow_stats` is keyed by
+- **Projects v2 board** (only when gather read a board — the token's `read:project` scope;
+  absent otherwise): **prs[] / issues[]** gain **`board_status`** — the item's Status
+  single-select value on the board (e.g. `"Todo"`, `"In Progress"`, `"Done"`), present only
+  when the item is on a board and has a status — and **`iteration`** — the id of the board
+  iteration (sprint) the item is in, a key of `sprints`, present only when that sprint
+  overlaps the gathered window. **sprints** — `{ "<iteration id>": { title, start, end } }`
+  (`start` the iteration's `YYYY-MM-DD` start date, `end` its last day, from the start date
+  and duration), the board's iterations (current and completed) that overlap the gathered
+  window; `{}` on a status-only board. `link.select_sprints(sprints, ref_date)` returns the
+  `(previous, current, next)` `{id, title, start, end}` dicts (or `None`).
+- **releases[]** — `[{ tag_name, name, published_at, prerelease:bool, url }]` (the GitHub
+  release's tag, title, publish timestamp, prerelease flag and `html_url`), the releases
+  published in the view's window, sorted by `tag_name` (else `name`).
+- **milestones[]** — `[{ title, number, state:"open"|"closed", due_on, open_issues,
+  closed_issues, url }]` (`due_on` an ISO timestamp or `null` for an undated milestone; the
+  issue counts as GitHub reported them at the latest gather). Not windowed (see "Window
+  scope"). `select_milestones` (below) picks current / next from them.
+- **workflow_stats{}** — `{ "<workflow name>": { total, success, failure, cancelled, other } }`
+  (ints): the window's CI runs per workflow name by `conclusion`; `other` counts every other
+  conclusion (skipped, neutral, timed out, still running, …), so `total = success + failure +
+  cancelled + other`. `workflow_stats` is keyed by
   workflow name, plus the reserved key `_truncated` ONLY when GitHub's 1,000-run
   search cap could not be split away: `{truncated, cap, fetched, total_count,
   ranges}`. Consumers listing workflows skip keys starting with `_`. A view summing several
@@ -328,7 +404,12 @@ docsRefs, release_train, sprints, project, diagrams`.
   (undated ones, e.g. "Backlog", are never selected; none dated → no current/next);
   current = earliest due on/after `ref_date`'s day, next = the one after; if all are
   overdue, current = the most recently due and next = none. Ties break by number.
-- **diagrams{}** maps `buckets_pie` / `timeline_gantt` to their `.mmd` paths,
+- **diagrams{}** (only on a bundle view file `render.py` rewrote) — `{ buckets_pie,
+  timeline_gantt, content_timeline, deltas_bar, contributor_graph, kind_breakdown,
+  module_graph, blocker_graph: "<path>.mmd", train_flowcharts: {"<train-id>": "<path>.mmd"},
+  truncated: {"<name or train-id>": {shown, total, unit}} }`. Every flat key is always written
+  (an empty input gives a placeholder diagram, e.g. `No module dependencies`); paths are
+  relative to the parent of `--diagrams-dir`. `buckets_pie` / `timeline_gantt` are
   written and mmdc-validated by `render.py`. **`diagrams.train_flowcharts`** is a nested
   map `{ "<train-id>": "diagrams/<train-id>.mmd" }` written by `render.py` (one adaptive
   Mermaid `flowchart` per DEEP train; mode C with code-area annotation nodes when
@@ -381,8 +462,18 @@ records every review-thread reply as a `COMMENTED` review, and rewrites a dismis
 review's state to `DISMISSED`.
 
 - **`prs[].reviewers`** (`gather.summarize_reviews`) — sorted logins with at least
-  one submitted review (`APPROVED`/`CHANGES_REQUESTED`/`COMMENTED`/`DISMISSED`).
-- **`prs[].review_decision`** (`gather.summarize_reviews`) — per reviewer, the
+  one submitted review (`APPROVED`/`CHANGES_REQUESTED`/`COMMENTED`/`DISMISSED`),
+  **never the PR author** (#110): the author's own replies in a review thread are
+  `COMMENTED` reviews, and they are left out of `reviewers` and of
+  `review_decision`, the same rule as review rounds. So `people[].prs_reviewed`,
+  review latency, the halls and `trains[].effort.reviewers` (all read from
+  `reviewers`) never count an author reviewing their own PR, and the fold writes
+  no `reviewed` edge from the author to their PR. A PR whose only reviews are the
+  author's has `reviewers: []` and `review_decision: "none"`. The rule applies at
+  gather time: a store gathered before it keeps the author in `reviewers` until
+  that window is gathered again.
+- **`prs[].review_decision`** (`gather.summarize_reviews`) — per reviewer (the PR
+  author excluded, above), the
   *effective state* is their latest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`
   review (chronological by `submitted_at`, then review id); a later `COMMENTED`
   review never overrides it. A reviewer with none of those three is `commented`. An
@@ -446,7 +537,7 @@ review's state to `DISMISSED`.
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
   carry the bounded `before`/`after`. `lifecycle` is in commit order (the commit's UTC `committed_at`
-  when known, else the local `date`; ties keep git/ledger order). A view from a store holds
+  when known, else its `date`; ties keep git/ledger order). A view from a store holds
   only the view's window's events (issue #85; the stored node is cumulative over every folded
   window, #76) and `status`/`replaced_by` are as of the window's end. `status` is derived from the artifact's **last**
   lifecycle event: `replaced` only when that event is a rename to a tracked path
@@ -487,8 +578,8 @@ review's state to `DISMISSED`.
   null. `area` is filled by area attribution. `pr`/`train` resolve best-effort via
   the commit→PR map. Ordered by event time (the commit's `committed_at`, else the
   event's date), then `artifact`, then lifecycle position (#100).
-- **diagrams{}** now also maps `content_timeline` (Mermaid `timeline`) and
-  `deltas_bar` (Mermaid `xychart-beta` bar).
+- **diagrams{}**: `content_timeline` (Mermaid `timeline`) and `deltas_bar` (Mermaid
+  `xychart-beta` bar).
 
 ## Code-area & label-facet fields
 
@@ -553,7 +644,11 @@ review's state to `DISMISSED`.
   `instances`); a public-registry ref resolves in-repo when `<path>/main.bicep` is a tracked
   module. Transitive Bicep edges still need the build. A graph the scan ran over carries
   `code_graph.structural_scan: true` (issue #95: it holds the whole tree's direct edges, so
-  fold may retract a stored direct `depends_on` it no longer has). Without the flag a
+  fold may retract a stored direct `depends_on` it no longer has). A module file the scan
+  could not read (its real path leaves the checkout, a dangling symlink, unreadable; issue
+  #109) is skipped with one stderr warning and its area is listed in
+  `code_graph.structural_scan_unread` (sorted area ids; absent when every file was read):
+  the scan does not speak for those areas. Without the flag a
   single-repo gather does not run the scan and stays build-gated (byte-stable). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
@@ -571,14 +666,18 @@ review's state to `DISMISSED`.
   per-subprocess timeout (a healthy build finishes well under it; the bound only trips a
   genuinely hung process) and retried once. Each area carries `edges_status` ∈
   `{resolved, timeout, failed, skipped}` and `code_graph.edge_extraction` carries the aggregate
-  `{ "resolved", "timeout", "failed", "skipped" }` counts — so a build that timed out or failed
+  `{ "resolved", "timeout", "failed", "skipped" }` counts (plus `"disabled": true` when gathered
+  with `--no-iac-build`, which skips every build) — so a build that timed out or failed
   is a **visible, counted gap**, never mistaken for a module with no dependencies. `resolved`
   with an empty `edges` list genuinely means "no inter-area dependencies"; `timeout`/`failed`
   mean "not determined" (re-run to resolve). The integration gate reds when the unresolved rate
   is non-trivial, so an incomplete graph is re-run rather than silently shipped.
 - **code_owners** `[ { "pattern": "<path|glob>", "owners": ["login", ...] }, ... ]` —
   parsed from the clone's CODEOWNERS (`.github/`/root/`docs/`), one rule per line **in
-  file order** (duplicates kept). `@org/team` and `@user` are kept as logins (the `@`
+  file order** (duplicates kept). A CODEOWNERS whose real path leaves the checkout (a
+  symlink) or that cannot be read is skipped with one warning: `code_owners` stays empty and
+  `code_graph.codeowners_unread` names the file, so the fold does not treat it as "no
+  owners" (issue #109); undecodable bytes are replaced, never fatal. `@org/team` and `@user` are kept as logins (the `@`
   stripped), emails as-is. Blank/`#` lines, inline `# comments` and GitLab `[Section]`
   headers are dropped; a pattern with no owners is kept with `owners: []` (it
   un-assigns ownership). Matching follows GitHub's CODEOWNERS rules
@@ -614,7 +713,8 @@ review's state to `DISMISSED`.
   ("Bug: crash when name contains ?" is a bug).
 - **artifacts[].code_area** and **feature_deltas[].area** are **populated** when the
   path resolves to a `code_graph` area; null otherwise.
-- **trains[].code_areas** — the distinct areas of a train's commits' files.
+- **trains[].code_areas** — the distinct areas of a train's commits' files, sorted. (A
+  project train's `code_areas` are these, repo-qualified: see "Project view: `trains`".)
 - **modules** `{ "<area>": { "commits", "prs", "files_changed" } }` — per-area
   activity counts across the window's commits.
 - **people[].modules / people[].areas** — the areas a person authored (their
@@ -625,8 +725,11 @@ review's state to `DISMISSED`.
   unresolved commit author's git name carries `login_resolved: false` (absent on every
   other entry); `is_bot` also recognises git-name forms (`GitHub Actions`, `Dependabot`,
   `Renovate Bot`, a `[bot]` name, and those with the `" (git)"` suffix).
-- **diagrams{}** now also maps `contributor_graph` (Mermaid `flowchart`,
-  people↔code-area edges) and `kind_breakdown` (Mermaid `pie`, issues by kind).
+- **diagrams{}**: `contributor_graph` (Mermaid `flowchart`, people↔code-area edges),
+  `kind_breakdown` (Mermaid `pie`, issues by kind) and `module_graph` (Mermaid `flowchart` of
+  the resolved `code_graph.areas[].edges`: area → area labelled with the pinned `version`, else
+  `transitive`, or `child` / `child[]` for a local child module; an unresolved edge (`to:
+  null`) is not drawn; a `No module dependencies` placeholder when none resolve).
 - **Symbol/comment artifacts** carry `before`/`after`/`detail` on feature_deltas
   (see `symbol_events` above), diff-local from a `git log -p` walk.
 - **Deferred:** resource-level `dependsOn` edges.
@@ -657,7 +760,7 @@ review's state to `DISMISSED`.
                           reviews_overflow,
                           lifecycle:[{event, actor, created_at, label}],
                           lifecycle_overflow, reopen_count } ],
-    "commits":        [ { sha, message*, author, date } ],
+    "commits":        [ { sha, message*, author, date, url } ],
     "feature_deltas": [ ...this train's deltas only... ],
     "feature_deltas_diff_overflow": <int>,
     "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ]
@@ -676,6 +779,8 @@ review's state to `DISMISSED`.
   omitted (the delta is still listed) and counted in `feature_deltas_diff_overflow`.)
   `issue` is the train's `root_issue`; the train's other closed issues are listed by number
   in `train.issues`, and `prs` holds every attempt (its own outcome in `train.pr_outcomes`).
+  A commit row's `url` is `https://github.com/<meta.owner>/<meta.repo>/commit/<sha>` (built
+  like `feature_deltas[].url`), so a narrator can cite a commit by link.
   Raises `KeyError` on unknown id. Does not mutate the bundle. The key lists above are
   checked against `slice_train`'s output by `test_link_small_fixes.py`.
 
@@ -704,7 +809,7 @@ across members (see "Project view: `people` and `halls`").
   | `first_seen` / `last_active` | min / max ISO date (`YYYY-MM-DD`) across the login's activity (PRs authored/merged-by, commits, issues, reviews); `null` when none |
   | `examples_authored` / `docs_authored` / `symbols_authored` | distinct artifacts with an `add` lifecycle event by this login, bucketed by `kind` (example; doc+readme; symbol) (int) |
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
-  | `stale_owned` | distinct areas in a stalled train's `code_areas` that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
+  | `stale_owned` | distinct areas in a stalled train's `code_areas` (an open train with `effort.stalled`, #112) that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
 
   Counts are always present (ints, may be 0); `merge_rate`/`review_latency_days`/
   `first_seen`/`last_active` are present as `null` when N/A. Deterministic.
@@ -714,8 +819,14 @@ across members (see "Project view: `people` and `halls`").
   commits_authored`, keeps `score > 0`, sorts by `(-score, login)`, takes the top
   10 (else `[]`). **`halls.internal`/`shame`/`blame` are intentionally NOT built**
   — per the "recognition, not blame" stance.
-- **Blocker state.** `issue["blocking"]` / `issue["blocked_by"]` (set by
-  `extract._attach_blocks`) are the **raw stored relation**, whatever the state of
+- **issues[].blocks** — `[{ number, direction:"out"|"in" }]`, the blocking references gather
+  parsed from that issue's own text (`gather.parse_blocks_refs`), in text order, deduped:
+  `"out"` = this issue blocks `#number` ("blocks #N"), `"in"` = this issue is blocked by
+  `#number` ("blocked by" / "depends on #N"). Present only on an issue whose text has one.
+- **Blocker state.** `issue["blocking"]` / `issue["blocked_by"]` (sorted issue numbers, absent
+  when empty, set by `extract._attach_blocks` from the stored `blocks` edges in both directions, so an issue
+  named by another issue's text carries them too) are the **raw stored relation**, whatever
+  the state of
   the issues at either end. `flow`, `blockers` and `diagrams.blocker_graph` (#101)
   apply an **open-only** filter on top, using the `state` of the
   bundle's own issues: an issue at the other end counts only when it is in the

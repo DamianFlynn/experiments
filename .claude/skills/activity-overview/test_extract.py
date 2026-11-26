@@ -348,7 +348,7 @@ class ExtractFileDiffRoundTrip(unittest.TestCase):
 
 
 class ExtractArtifactsKeyNoCollision(unittest.TestCase):
-    """Regression (Copilot review on #13): extract keyed bundle["artifacts"] via
+    """Regression (review finding on #13): extract keyed bundle["artifacts"] via
     `_local` (parse_id rpartitions the LAST `#`), truncating a symbol artifact's
     `<path>#<lang>:<subkind>:<name>` id down to `<lang>:<subkind>:<name>`. Two
     files sharing a symbol of the same lang:subkind:name then collided to one key,

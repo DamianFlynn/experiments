@@ -354,7 +354,7 @@ class TestTimelineConnected(unittest.TestCase):
                {"event": "connected", "subject": {"number": "7"}},
                {"event": "connected", "subject": {"number": True}},
                {"event": "connected", "subject": {"number": 19}}]
-        self.assertEqual(gather.parse_timeline_crossrefs(raw), [19])
+        self.assertEqual(gather.parse_timeline_crossrefs(raw, "o/r"), [19])
 
 
 class TestAcquireRecordsTheSource(unittest.TestCase):

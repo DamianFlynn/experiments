@@ -14,7 +14,9 @@
        view["shipped"] -> bundle["buckets"]["shipped"] (its refs carry no `repo`),
        view["people"] -> bundle["people"], view["halls"] -> bundle["halls"],
        view["modules"] -> bundle["modules"]
-       (keyed by area id, not "<repo>::<area>"), view["members"][i]["bundle"] ->
+       (keyed by area id, not "<repo>::<area>"), view["trains"] ->
+       bundle["trains"] (count `train.outcome` where the template counts
+       `ptrain.outcome`), view["members"][i]["bundle"] ->
        bundle. There are NO project trains: render "Decision trains" from the
        deep-train and mention-train blocks over bundle["trains"] only. The title
        uses `meta.owner`/`meta.repo` (a bundle `meta` has no `project`). Omit
@@ -49,12 +51,21 @@ PLACEHOLDER RULES — read before filling anything below.
   - `train` — a single-repo train, bundle["trains"][] (`id`, `kind`, `outcome`,
     `root_issue`, `issues`, `prs`, `pr_outcomes`, `commits`, `code_areas`, `tier`,
     `significance`, `effort`, `evidence`). It has no `title` and no `repos`.
+    `train.effort.stalled` is true only for an OPEN train (`train.outcome`
+    "in_flight") with no activity for more than 21 days at the reference date
+    (`train.effort.idle_days`, last activity `train.effort.last_activity_at`);
+    a shipped train is never stalled — `train.effort.slow_to_land` marks one
+    that took more than 21 days to land (`train.effort.elapsed_days`).
     `train.prs` holds every attempt (rejected, merged, still open); each PR's own
     outcome is `train.pr_outcomes["<pr number>"]` ("merged" / "open" / "rejected").
     `train.issues` is every issue its PRs close; `train.root_issue` is the lowest.
   - `ptrain` — a project train, view["trains"][] (`id`, `repos`, `kind`, `outcome`,
     `prs`, `issues`, `commits`, `code_areas`, `tickets`, `evidence`). It has no
-    `tier`, `effort`, `root_issue` or title.
+    `tier`, `effort`, `root_issue` or title. `ptrain.code_areas` are
+    "<repo>::<area>" (the member trains' areas, like view["modules"] keys).
+    Member trains join into one ptrain only through closing references
+    (cross-repo ones included), never through a mention, so a ptrain of one
+    repo is exactly that member's train.
   - `member` — view["members"][] `{repo, bundle}`.
   - `related` — view["related_work"][] `{ticket, train_ids}`.
   - `release` — bundle["releases"][]. `stats` — one value of
@@ -105,6 +116,8 @@ PLACEHOLDER RULES — read before filling anything below.
     else of its first PR (`train.prs`). For a project train, the same rule on the
     anchor `<n>` in its id.
   - {effort line} — see the deep-train block under "Decision trains".
+  - {uncovered span} — the days of `meta.period` that no window in
+    `meta.facts_windows.workflow_stats` covers (CI/CD health caveat).
   - {workflow} — the bundle["workflow_stats"] key the `stats` row sits under.
   - {owners} — the `rule.owners` of the LAST `code_owners` rule whose
     `rule.pattern` matches the area directory `<area id>/` (GitHub CODEOWNERS
@@ -210,11 +223,15 @@ keep them out of any hit rate:
 
 <!-- Deep-train block (`train.tier` "deep"). Flowchart = the file named by
      diagrams.train_flowcharts[train.id] in the member's bundle view (inline it).
-     {effort line}: merged trains — "landed in {train.effort.elapsed_days} days ·
+     {effort line}: shipped trains — "landed in {train.effort.elapsed_days} days ·
      {train.effort.reviewers} reviewers · {train.effort.participants} contributors"
-     (`train.effort.reviewers` / `train.effort.participants` are COUNTS); add
-     "stalled" when `train.effort.stalled`. Open trains (`train.effort.merged_at` is
-     null) — "open N days" from `train.effort.opened_at` to the reference date. Then
+     (`train.effort.reviewers` / `train.effort.participants` are COUNTS; a PR's
+     author is never counted as its reviewer); when
+     `train.effort.slow_to_land` is true write "slow to land ({train.effort.elapsed_days}
+     days)" instead of "landed in … days" — never "stalled" for shipped work. Open
+     trains (`train.effort.merged_at` is null) — "open N days" from
+     `train.effort.opened_at` to the reference date; when `train.effort.stalled` add
+     "· stalled: no activity for {train.effort.idle_days} days". Then
      "· K review rounds" (sum `pr.review_rounds.count` over the train's PRs) and
      "· reopened M×" (sum `pr.reopen_count` / `issue.reopen_count` over its PRs and
      root issue); omit each when zero or absent. The narrative slot below is
@@ -238,7 +255,7 @@ keep them out of any hit rate:
 <!-- Source: view["related_work"] — `{ticket, train_ids}` objects. Each entry is
      two or more project trains that share an internal ticket reference
      (Jira/ADO-style, e.g. ABC-1234) but are NOT connected by any GitHub
-     closes/cross_ref edge. Opt-in: always [] unless digest.py ran with a
+     closing reference. Opt-in: always [] unless digest.py ran with a
      manifest declaring `ticket_prefixes` or with `--ticket-pattern`.
      Omit the section entirely when view["related_work"] is empty. -->
 
@@ -275,11 +292,14 @@ When `meta.facts_windows` is present (the view is not exactly one gathered windo
 per member in the project view), add one caveat line under this heading: the
 counts are a sum over the gathered windows in `meta.facts_windows.workflow_stats`;
 when `meta.facts_windows.workflow_stats_complete` is false the total is partial,
-and `meta.facts_windows.workflow_stats_excluded` lists the windows left out. The
+and `meta.facts_windows.workflow_stats_excluded` lists the windows left out. When it
+is false and there is no `meta.facts_windows.workflow_stats_excluded`, the missing days
+were simply never gathered: name them — the view's period (`meta.period`) minus the
+summed windows — as "no gather covers {uncovered span}". The
 code graph and owners are those of the window `meta.facts_windows.structure`.
 Omit the line when the key is absent. State this caveat even when the view has no CI rows (a sub-window, a window gathered without workflows, or zero runs).
 
-> CI counts summed over the gathered windows inside this view; partial when not every day is covered — not counted: {meta.facts_windows.workflow_stats_excluded[].from} → {meta.facts_windows.workflow_stats_excluded[].to}. Code graph and owners as of the {meta.facts_windows.structure.from} → {meta.facts_windows.structure.to} gather.
+> CI counts summed over the gathered windows inside this view; partial when not every day is covered — not counted: {meta.facts_windows.workflow_stats_excluded[].from} → {meta.facts_windows.workflow_stats_excluded[].to} (with no excluded window: no gather covers {uncovered span}). Code graph and owners as of the {meta.facts_windows.structure.from} → {meta.facts_windows.structure.to} gather.
 
 - **{workflow}** — {stats.success}/{stats.total} succeeded ({stats.failure} failed, {stats.cancelled} cancelled).
 
@@ -317,9 +337,11 @@ not planned.
 
 ## Stalled, blocked & pile-ups
 
-Where flow is stuck this period. **Flow signals, not blame** — the public digest
+Where flow is stuck at the reference date. **Flow signals, not blame** — the public digest
 never attributes a stall/blocker to a person (that is the gated internal appendix).
 Omit the whole section when `flow`/`blockers` are empty and there are no stalled trains.
+Shipped work is never listed here: a train that took long to land
+(`train.effort.slow_to_land`) is not stuck.
 
 **Flow pathologies** — the per-issue classification in bundle["flow"] (deterministic;
 each `flow_entry` carries `state`, `age_days`, `reactions`, `blocked_by` (open
@@ -346,11 +368,13 @@ bundle["blockers"] counts:
 {contents of diagrams.blocker_graph}
 ```
 
-**Stalled trains** — trains with `train.effort.stalled` true (train-level, distinct
-from the issue-level flow above), longest `train.effort.elapsed_days` first; cite the
-root issue's url (`item.url` of `train.root_issue`), else the first PR's:
+**Stalled trains** — OPEN trains with `train.effort.stalled` true: no activity on any
+of their PRs or issues (updates, comments, reviews, timeline events, commits) for more
+than 21 days at the reference date (train-level, distinct from the issue-level flow
+above). Longest `train.effort.idle_days` first; cite the root issue's url (`item.url` of
+`train.root_issue`), else the first PR's:
 
-- `{train.id}` — {short title} — stalled {train.effort.elapsed_days}d — [source]({item.url})
+- `{train.id}` — {short title} — no activity for {train.effort.idle_days}d (last {train.effort.last_activity_at}) — [source]({item.url})
 
 ## Next-release forecast
 
@@ -585,11 +609,13 @@ default flip, a breaking rename):
      holds COUNTS of reviewers and participants, not names — never read logins
      from it. -->
 
-**Stalled trains** — for each stalled `train`: the `pr.author` and `pr.reviewers` of
+**Stalled trains** — for each OPEN `train` whose `train.effort.stalled` is true (the
+same trains as the public "Stalled trains" list; shipped work is never attributed a
+stall here, however long it took to land): the `pr.author` and `pr.reviewers` of
 its PRs (`train.prs`), and the `issue.author` and `issue.assignees` of its root issue
 (`train.root_issue`), each with that role:
 
-- `{pr.author}` (PR author) — stalled train `{train.id}` ({train.effort.elapsed_days}d) — [#{pr.number}]({pr.url})
+- `{pr.author}` (PR author) — stalled train `{train.id}` (no activity for {train.effort.idle_days}d) — [#{pr.number}]({pr.url})
 - `{issue.author}` (opened the root issue) — stalled train `{train.id}` — [#{issue.number}]({issue.url})
 
 **Blocked issues** — for each `flow_entry` with `flow_entry.state` "blocked": the

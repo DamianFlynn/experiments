@@ -25,6 +25,7 @@ not on PATH (pass `--skip-validate` to render without it).
 """
 import argparse
 import copy
+import datetime
 import json
 import os
 import sys
@@ -119,12 +120,50 @@ def _span(window):
     return "{} → {}".format(window.get("from"), window.get("to"))
 
 
+def _day(text):
+    try:
+        return datetime.date.fromisoformat(str(text)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def uncovered_spans(meta):
+    """The days of the view's period (`meta.period`, else `meta.from`/`to`) that
+    no summed CI window (`meta.facts_windows.workflow_stats`) covers, as sorted
+    `[{from, to}]` spans of whole days. [] when the period is unknown."""
+    period = meta.get("period") or {}
+    start = _day(period.get("from") or meta.get("from"))
+    end = _day(period.get("to") or meta.get("to"))
+    if start is None or end is None or end < start:
+        return []
+    windows = sorted(
+        (a, b) for a, b in (
+            (_day(w.get("from")), _day(w.get("to")))
+            for w in (meta.get("facts_windows") or {}).get("workflow_stats") or [])
+        if a is not None and b is not None)
+    out, cur, one = [], start, datetime.timedelta(days=1)
+    for a, b in windows:
+        if b < cur:
+            continue
+        if a > cur:
+            out.append({"from": cur.isoformat(),
+                        "to": min(a - one, end).isoformat()})
+        cur = max(cur, b + one)
+        if cur > end:
+            break
+    if cur <= end:
+        out.append({"from": cur.isoformat(), "to": end.isoformat()})
+    return [w for w in out if w["from"] <= w["to"]]
+
+
 def ci_caveat(meta):
     """The CI/CD-health caveat line for a member view whose meta carries
     `facts_windows` (#94): its CI counts are a sum over gathered windows,
     partial when `workflow_stats_complete` is false (the windows left out are
-    `workflow_stats_excluded`); `structure` names the window the code graph
-    and owners come from. None when the key is absent."""
+    `workflow_stats_excluded`; with none left out, the days no gather covers —
+    the view period minus the summed windows, `uncovered_spans`); `structure`
+    names the window the code graph and owners come from. None when the key is
+    absent."""
     fw = meta.get("facts_windows")
     if not isinstance(fw, dict):
         return None
@@ -136,6 +175,11 @@ def ci_caveat(meta):
         if excluded:
             line += " (not counted: {})".format(
                 ", ".join(_span(w) for w in excluded))
+        else:
+            # no window was left out: the days are simply not gathered (#112)
+            gaps = uncovered_spans(meta)
+            line += " (no gather covers the rest of the window{})".format(
+                ": " + ", ".join(_span(w) for w in gaps) if gaps else "")
     line += "."
     if isinstance(fw.get("structure"), dict):
         line += " Code graph and owners from the {} gather.".format(

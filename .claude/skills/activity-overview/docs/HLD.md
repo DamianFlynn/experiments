@@ -168,7 +168,8 @@ Each train gets an **outcome** (shipped / in_flight / rejected / abandoned), a
 A single-repo `link` train holds every attempt — rejected, shipped and still-open PRs — with
 each PR's own outcome, and every issue its PRs close; PRs and issues are joined only by
 `closes`, so a `cross_ref` (a mention) is traversal context, never membership (#93, §10
-item 11).
+item 11). The digest's project trains follow the same rule (`closes` and `part_of` only,
+#110).
 
 ### 5.3 Buckets
 
@@ -426,8 +427,9 @@ Pass a `.vtt`/`.srt`/`.txt` transcript; `transcript.py` normalizes it and the re
 
 The deterministic `flow` classifier (blocked / upvoted-but-ignored / traction-then-abandoned
 / hung) and `blockers` ranking show where work is stuck; `halls.fame` recognizes
-contributors. Attribution of stalls to people exists only in an **opt-in internal appendix**
-— the public digest never blames individuals.
+contributors. A train is "stalled" only while it is open and idle (#112); shipped work
+that took long is "slow to land", never stalled. Attribution of stalls to people exists only
+in an **opt-in internal appendix** — the public digest never blames individuals.
 
 ## 9. Quality attributes
 
@@ -436,7 +438,7 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 | **Verifiability** | Every fact carries a `{type, id, url}` ref; narrator citations are filtered to the slice. |
 | **Determinism** | Sorted JSON, ordered range queries, pure projections; same store → byte-identical view. |
 | **Idempotency** | Identity-keyed upserts and set-semantics ledger; re-folds are no-ops. Proven by `validate.idempotency`. |
-| **Trust** | `validate.py` gates every report (read-only; a check that cannot run fails, never disappears). Nine checks per repo, in this order: target, referential integrity, participant completeness, provenance, no fabrication, schema conformance, edge set, no drift, idempotency; plus the project-wide people and member-status checks for a multi-repo project. |
+| **Trust** | `validate.py` gates every report (read-only; a check that cannot run fails, never disappears). Ten checks per repo, in this order: target, referential integrity, participant completeness, provenance, no fabrication, schema conformance, meta integrity, edge set, no drift, idempotency; plus the project-wide people and member-status checks for a multi-repo project. |
 | **Graceful degradation** | Missing CLIs, scopes, boards or FTS5 produce empty or clearly-flagged sections, not failures; IaC gaps are counted (`edge_extraction`). |
 | **Offline readers** | Only `gather` (and opt-in `--complete` backfill) touch the network; everything else replays from the store. |
 | **Security** | Read-only token; no write-back; secrets only in the environment; recognition-not-blame by default. |
@@ -446,7 +448,8 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 
 These are real, current limits — plan around them. Stores gathered before some fixes need
 a re-gather to benefit from them (person ids, base branch, per-window facts, commit times,
-nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them once.
+nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
+[`USAGE.md`](USAGE.md) §2.2 lists them once.
 
 1. **Cross-repo Bicep `depends_on` needs a declared publisher and the public registry.**
    A manifest member that declares `bicep_registry_prefix` (e.g. `"avm/"` on
@@ -511,7 +514,13 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
    later window rebuilt), a transitive edge only on a new build, and an area's owners only
    when a later window lists the area. The item relations follow the last-folded record, so
    folding an older window after a newer one brings its older relations back — fold oldest
-   first.
+   first. The same holds for the record-derived edges (#111): after a fold re-gathers a PR,
+   issue or commit, its closing references, commit → PR link and contribution edges are what
+   its new content implies (a closing reference edited away, a deleted comment, a removed
+   reviewer or a commit author resolved to a login on a later gather leave nothing behind),
+   and a person no contribution references any more is deleted; a record the fold does not
+   carry keeps its edges. Review / event nodes and ledger rows a re-gather no longer reports
+   stay (LLD §14.5).
 10. **Forecast depends on planning hygiene.** Candidates require a next milestone (one with a
     due date) or one of the recognized priority labels (`priority/high`, `priority/critical`,
     `p0`, `p1`, `high-priority`, `critical`); repos with other label names need
@@ -527,20 +536,29 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
     on stderr; `meta.closing_refs_source: keywords`) only the keywords count. Stores gathered
     before #105 keep keyword-only `closes` until re-gathered. A PR closing several issues
     joins every PR that closes any of them. An unmerged PR into another branch is in no train.
+    `Fixes #N` where #N is a PR closes nothing: it neither anchors nor joins a train (#110).
+    The digest's project trains join member trains through the same edges (closing
+    references, cross-repo ones included), never through a mention, so a single-member
+    project's trains are that member's `link` trains (#110).
 12. **Series continuity is per bundle and by bucket.** `series.json` keeps one entry per
     window and compares each installment with the window before it (#86), but it is kept
     per single-repo bundle (no project-view series), it only sees items in one of this
     window's buckets (in-flight work that went quiet drops out of *carried over*), and
     refreshing an earlier month does not recompute the later months' already-written series
     blocks (`link` names them on stderr). A month recorded after a later one is marked
-    `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
+    `captured: "backfill"`; leave its forecast loop out of hit-rate statistics. Windows are
+    identified by their calendar days (dates and full timestamps name the same month), and
+    one index holds windows that do not overlap: a quarter and its months need two series
+    files (`link` refuses the overlap, #110).
 13. **People are GitHub logins; some commit authors cannot be resolved.** gather maps each
     commit's git author to the login PR/issue/review records use (GitHub's commits listing
     per SHA, then a `users.noreply.github.com` email), so a PR author and their commits are
     one person (#78). A commit whose email GitHub links to no account and that has no
     noreply email stays a separate person keyed by its git name and flagged
-    `login_resolved: false` — never merged with a login on a guess. Commits fetched by
-    `spotlight --complete` backfill keep the git name and have no `committed_at`.
+    `login_resolved: false` — never merged with a login on a guess. `spotlight --complete`
+    backfills PRs and issues only, never commits (#113). A PR's
+    author is never one of its reviewers (their review-thread replies are not reviews,
+    #110); a store gathered before that keeps them in `reviewers` until re-gathered.
 14. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the
     causal spine and judges the outcome from the nodes it reached (same vocabulary as
     `link`, plus `direct_push` for commits that landed with no PR). A closed issue without a
@@ -554,7 +572,9 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
     view JSON do not carry the incomplete members; a formatter must rely on the gate.
 16. **The trust check proves consistency, not truth.** See *What the trust gate proves*
     below: a store-only audit cannot detect a record deleted together with its edges, a
-    consistently rewritten record or a wrong change ledger. A repo gathered under a name it
+    consistently rewritten record, an inserted record that is internally consistent, a
+    re-keyed fact value, a plausible per-window branch / reference date, or a wrong change
+    ledger. A repo gathered under a name it
     no longer has (renamed or transferred) fails `provenance`, because GitHub returns its
     links under the new name.
 17. **What a view says about its own completeness.** Since #107 a view carries the clone
@@ -568,7 +588,18 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
     (`meta.structure_as_of`: `window_end` or `head`). Not carried:
     `meta.closing_refs_source` is in gather's bundle only, and a view narrower than a gathered
     window does not repeat that window's dropped commits.
-18. **Narrative is not in CI.** The live CI jobs stop at the trust gate.
+18. **Narrative is not in CI.** The `live` CI job runs the deterministic report path on the
+    real store (view → link → render, asserting non-empty shipped items, trains and timeline,
+    #112); no narrative is authored or checked there, and its diagrams are not compiled (mmdc
+    runs only in the offline tests).
+19. **"Stalled" sees only recorded activity.** An open train is `stalled` when none of its
+    PRs / issues / commits shows activity (updates, comments, reviews, timeline events,
+    commits) for more than 21 days at the reference date (#112). The bundle holds mainline
+    commits only, so a push to an open PR's branch counts only through the PR's `updated_at`
+    (which GitHub moves on a push); discussion elsewhere does not count; and on a view of an
+    earlier window (`meta.state_as_of`) the
+    records are newer than the window, so a train idle then but active since is not stalled.
+    A shipped train is never stalled; one that took long to land is `slow_to_land`.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
 per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it
@@ -578,14 +609,23 @@ its window's end. Symbol moves are matched per window; on such a store `validate
 each recorded move against the ledger instead of re-matching across windows, and its
 idempotency probe reports a whole-store re-match as INFO (LLD §8).
 
-**What the trust gate proves (#79, #89).** `validate` proves the store is *consistent*:
-every edge is exactly what the stored records imply (`edge_set`, both directions), people
-are re-derived from the records alone, every PR/issue/review/event cites its own GitHub
-link and every commit id is a real sha, and ids follow the grammar. It does not prove the
-records are what GitHub holds: a record deleted with all its edges, a blob rewritten
-consistently, or a wrong change ledger (artifacts are compared with the store's own ledger)
-leave a consistent store. A `--bundle` saved at gather time (a `view.py` JSON of the fresh
-store) catches changed or deleted records; the store keeps no per-fold content digest. On a
+**What the trust gate proves (#79, #89, #113).** `validate` proves the store is
+*consistent*: every edge is exactly what the stored records imply (`edge_set`, both
+directions; the record-derived ones on every store, since a fold keeps them equal to the
+re-folded record, #111; cross-repo ones with the member set and registries the fold
+recorded, #113), people are re-derived from the records alone, artifacts (lifecycle entries
+included) from the ledger, every PR/issue/review/event cites its own GitHub link and every
+commit id is a real sha, ids follow the grammar, no PR/issue lacks every contributor, and
+the store's markers and per-window meta are what folds write (`meta_integrity`: a forged or
+deleted marker, a ledger window no fold wrote, a changed or swapped fact value fail). It
+does not prove the records are what GitHub holds. Outside a store-only audit: a record
+deleted with all its edges, a blob rewritten consistently, an INSERTED record that is
+internally consistent (a PR or commit with its author edge, a review, a dated release, a
+milestone, an area), a fact value rewritten together with its key and ref, a plausible
+`branches:` / `ref_date:` / `clone:` value, and a wrong change ledger (artifacts are compared
+with the store's own ledger). A `--bundle` saved at gather time (a `view.py` JSON of the
+fresh store) catches, for its window, changed or deleted records, stored records it lacks
+and changed per-window meta; the store keeps no per-fold content digest. On a
 store holding several windows the current-state edges (ownership, dependencies,
 milestones, sprints, blockers) and area touches are checked exactly once a fold since #95
 has maintained them and every window has its per-window facts; otherwise, and always for

@@ -59,19 +59,26 @@ window's end; `STORE.md`). A single store *can* hold **multiple** projects/repos
 but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
 `spotlight.py`) error asking for `--project` (and `--repo` when a project spans several;
 `spotlight.py` instead unions an area across members unless `--repo` or `owner/repo::area`
-names one) —
+names one; `dependents`, `subsystem` and `module` take a repo as `owner/repo` in any case or
+`repo` alone when unambiguous, on a single-repo or a project store, and exit 2 listing the
+store's repos for one that names none) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 `validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
-error: missing or non-store path, ambiguous store, unreadable `--bundle`). It lists nine
+error: missing or non-store path, ambiguous store, unreadable `--bundle`). It lists ten
 checks per repo in this order — `target`, `referential_integrity`,
 `participant_completeness`, `provenance`, `no_fabrication`, `schema_conformance`,
-`edge_set`, `no_drift`, `idempotency` — plus `no_drift_people` and `member_status` for a
-multi-repo project. It proves the store is consistent
+`meta_integrity`, `edge_set`, `no_drift`, `idempotency` — plus `no_drift_people` and
+`member_status` for a multi-repo project. It proves the store is consistent
 with its own records — every edge is one the stored records imply (`edge_set`, both
-directions), people are re-derived from the records, every PR/issue cites its own GitHub
-link and every commit id is a real sha — but not that the records match GitHub: a record
-deleted with its edges or a consistently rewritten blob passes. To catch those, save the
+directions; cross-repo edges with the member set and registries the fold recorded),
+people and artifacts are re-derived from the records and ledger, every PR/issue cites its
+own GitHub link and has a contributor, every commit id is a real sha, and the store's
+markers and per-window meta are what folds write (`meta_integrity`) — but not that the
+records match GitHub: a record deleted with its edges, a consistently rewritten blob, an
+inserted record that is internally consistent (a PR with its author edge, a dated
+release, a milestone, an area), a fact value rewritten with its key, or a plausible
+changed base branch / reference date passes. To catch those for a window, save the
 view of the freshly gathered store (`view.py … --out view.json`, before `link.py` enriches it) and later run
 `validate.py STORE --bundle view.json` (single repo only; a project-mode run ignores
 `--bundle` with a warning). On a store holding several windows, the
@@ -86,8 +93,10 @@ project checks only that member's people (the full check runs without `--repo`).
 inputs imply and deletes the ones they no longer imply — a removed module reference, a
 CODEOWNERS change, an item moved off a milestone or sprint, a blocker edited away — only
 where the input speaks for that source (a resolved build or the whole-tree scan for a
-dependency; never a window that simply does not mention it). History edges are never
-deleted. `gather` prints what it retracted and keeps it in `meta.retractions:<project>/<repo>`
+dependency; never a window that simply does not mention it). A re-gathered PR / issue /
+commit's closing references, commit → PR link and contribution edges are made what its new
+content implies, and a person no contribution references any more is deleted (#111;
+`STORE.md` "Record-derived edges"). `touches` and symbol moves are never deleted. `gather` prints what it retracted and keeps it in `meta.retractions:<project>/<repo>`
 (`STORE.md` "Current-state edges").
 
 **Whole-tree module graph (`--structural-iac`).** By default a single-repo gather builds
@@ -278,7 +287,10 @@ python3 ci_spotlight_integration.py --store workspace/journey.db [--project P] [
 ```
 
 It discovers a person, an area, an artifact and a search term inside the project and checks
-the four spotlight answers against the store (see `docs/LLD.md` §15). Exit 0 (all verified,
+the four spotlight answers against the store, not against spotlight's own output: the
+person's trains and roles against their contribution edges, every train outcome against one
+computed from the stored records, every citation against its node, each lifecycle row
+against its ledger row, each grep mention against the stored text (see `docs/LLD.md` §15). Exit 0 (all verified,
 or skipped for lack of input), 1 (a check failed, or anything skipped with
 `--require-all`), 2 (usage error).
 

@@ -77,7 +77,9 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
      CLI needed) for every Terraform module dir's and Bicep `<area>/main.bicep`'s direct
      module references, so modules nobody touched in the window keep their edges (manifest
      members always get this scan); use it on a monorepo such as
-     `Azure/bicep-registry-modules`.
+     `Azure/bicep-registry-modules`. The builds download and run the modules/providers the
+     repo names: on a repo you do not trust pass **`--no-iac-build`** (builds skipped and
+     recorded `skipped`; the static scan still runs).
    - **Roll-up / refresh are store-native.** A long view is a wider window over a store
      that holds its months (no separate roll-up artifact; its CI statistics are the sum of
      the gathered windows inside it, its structure the latest one's — `meta.facts_windows`).
@@ -131,10 +133,13 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```
    Self-contained on a store (`edge_set` / `no_drift` / `idempotency` self-source their raw
    bundle via `extract`; an external `--bundle` is an optional single-repo cross-check,
-   never required). It reports nine checks per repo — `target`, `referential_integrity`,
+   never required). It reports ten checks per repo — `target`, `referential_integrity`,
    `participant_completeness`, `provenance`, `no_fabrication`, `schema_conformance`,
-   `edge_set`, `no_drift`, `idempotency` — and proves the store consistent with its own
-   records, not that the records match GitHub (`docs/USAGE.md` §5.5). For a multi-repo
+   `meta_integrity`, `edge_set`, `no_drift`, `idempotency` — and proves the store
+   consistent with its own records and its markers / per-window meta what folds write, not
+   that the records match GitHub: an inserted record that is internally consistent passes a
+   store-only audit; `--bundle` with the view saved at gather time catches it
+   (`docs/USAGE.md` §5.5). For a multi-repo
    project: `python3 validate.py workspace/journey.db --project <name>` (adds the
    project-wide `no_drift_people` and `member_status` checks).
 3. **Materialize the bundle view** (store → `workspace/view/bundle.json`, offline):
@@ -206,7 +211,7 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    - **Single repo:** every section reads the bundle view. Where the template says
      `view["shipped"]` read `bundle["buckets"]["shipped"]`; `view["people"]` /
      `view["halls"]` / `view["modules"]` → `bundle["people"]` / `bundle["halls"]` /
-     `bundle["modules"]` (keyed by area id);
+     `bundle["modules"]` (keyed by area id); `view["trains"]` → `bundle["trains"]`;
      `view["members"][i]["bundle"]` → the bundle view itself. There are no project
      trains: render *Decision trains* from the template's deep-train and mention-train
      blocks over `bundle["trains"]`. Omit *Related work* and *Cross-repo module
@@ -251,7 +256,8 @@ relevant slice and narrate it grounded:
 - **Module biography** (how one module evolved across ALL history): `python3 spotlight.py
   module <area> --store <db> --project <name> --json` → narrate per `reference/report-sections.md`.
   An area found in several members (a multi-repo project) is unioned and each row names its
-  `repo`; write `owner/repo::<area>` (or add `--repo owner/repo`) for one member.
+  `repo`; write `owner/repo::<area>` (or add `--repo owner/repo`) for one member. A repo is
+  `owner/repo` (any case) or `repo` alone when unambiguous, on any store.
 - **Blast radius / dependents** of a module: `python3 spotlight.py dependents <owner/repo>
   --store <db> --project <name>` (which members depend on it), or
   `dependents <owner/repo>::<area>` (which module areas, in-repo or in other members,

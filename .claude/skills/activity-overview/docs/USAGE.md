@@ -120,7 +120,11 @@ cross-month `spotlight` queries possible.
   `modules`/`areas` computed with that month's code graph (#94);
 - `validate` on the whole store: dependency, ownership, area-touch, milestone, sprint and
   blocker edges are proven exactly (ERROR on a stale or missing one) once a fold since #95
-  has run and every month has its per-month facts.
+  has run and every month has its per-month facts; closing-reference, commit → PR and
+  contribution edges (and the people they name) always, because each fold makes them what
+  the re-gathered PR / issue / commit now says (#111): a PR open in one month and merged the
+  next with an edited body, a deleted comment or a removed reviewer, or a commit whose
+  author resolves to a login on a later gather, leaves no stale edge or person.
 
 **Not exact, or different:**
 
@@ -142,14 +146,18 @@ cross-month `spotlight` queries possible.
    `--structural-iac` for a single repo) shows it gone — so **pass `--structural-iac` on a
    single-repo accumulated store** — a transitive dependency only on a new build, an owner
    only when a later month's code graph lists the area (HLD §10 item 9).
-4. **Fold months oldest first.** Milestone / sprint / blocker edges follow the last-folded
-   copy of each PR/issue, so re-folding an older month after a newer one brings its older
-   relations back. A month's structure is read at that month's last
+4. **Fold months oldest first.** Milestone / sprint / blocker edges, closing references,
+   contribution edges and people follow the last-folded copy of each PR/issue/commit, so
+   re-folding an older month after a newer one brings its older relations back. A month's structure is read at that month's last
    mainline commit, so a past month gathered late still reads its own tree (unless the
    bounded clone does not reach it: `meta.structure_as_of: "head"`).
 5. **Some `validate` results stay WARN:** person areas (a union over the months by design),
    and any current-state edge type while the store was last folded before #95 (fold one
-   month again) or holds a month gathered before #94 (re-gather it; §2.2).
+   month again) or holds a month gathered before #94 (re-gather it; §2.2). A store last
+   folded before #111 that holds stale closing / contribution edges FAILS `edge_set` with
+   the hint "fold any window of it once more": the next fold of any month heals every
+   record (gather prints `retracted N edge(s) of P/R that the re-folded records no longer
+   imply`).
 
 ### 2.2 Upgrading the skill: which stores to re-gather
 
@@ -165,9 +173,14 @@ into a **fresh** store for the first item, into the same store for the others:
 | #82 (commit times) | commits have only a day, so their timeline events sort before that day's comments | timeline order only |
 | #93 (PR head repo) | a stacked PR whose base branch is the head of two PRs (forks' `patch-1`) is attached to neither | `contributing_prs` missing |
 | #101 (nested Terraform areas) | `.tf` files in `modules/<name>/<sub>/` stay in `modules/<name>` | module counts / areas |
+| #109 (collection review) | an issue of ANOTHER repo that mentions a PR made the same-numbered local issue a `cross_ref` of it; commits (and their code/symbol events) are windowed on the committer's local day, not the UTC day PRs and issues use | an unrelated issue in a PR's train context / forecast; a commit made near midnight UTC in the neighbouring month. Re-gather into a fresh store (a mention edge the new records no longer imply fails `validate`) |
 
 A store last folded before #95 heals its current-state edges on the next fold of any window
-(gather prints `retracted N stale current-state edge(s) …`).
+(gather prints `retracted N stale current-state edge(s) …`). A store last folded before #111
+heals its record-derived edges (closing references, commit → PR links, contribution edges)
+and drops the people only they named on the next fold of any window, and a store folded
+on a host without SQLite FTS5 gets its whole text index on the next fold on a host with it;
+nothing to re-gather.
 
 ## 3. Running it through Claude Code (the normal way)
 
@@ -276,14 +289,18 @@ flowchart TB
 2. **Gather into this month's own store** (`stores/YYYY-MM.db`). Re-running the same window
    into the same store is safe (idempotent). `gather` clones into `--clone-dir`, or, when that
    directory already holds a clone of the same repo, fetches it to the window's history bound
-   and checks out the default branch head — so last month's clone dir can be reused. A
-   directory that is not a clone of this repo is refused, never deleted. `--no-clone` never
+   and checks out the head of the mainline it walks (`meta.base_branch`, below) — so last
+   month's clone dir can be reused. A
+   directory that is not a clone of this repo is refused, never deleted. Build output an earlier
+   current-month run left in the clone (untracked `.terraform/`, `.terraform.lock.hcl`) is
+   removed before the checkout; nothing else of yours is. `--no-clone` never
    creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
    only (empty commit/code walks). A repo with no commits since `--from` minus the clone margin
    is cloned at depth 1 and has no commits in the window. `meta.clone_mode` records which
-   (`fresh`, `fetched`, `depth1-fallback`, `none`). "Shipped" means merged into the repo's
-   **default branch**, which gather detects (clone `origin/HEAD`, else the API) and stores
-   with the window as `meta.base_branch`; a PR merged into a feature or release branch is
+   (`fresh`, `fetched`, `depth1-fallback`, `none`). "Shipped" means merged into the analyzed
+   **mainline**, stored with the window as `meta.base_branch`: the repo's default branch, which
+   gather detects (clone `origin/HEAD`, else the API), unless `--branches B` or a manifest
+   member `branch` names another; a PR merged into any other branch (feature, release) is
    not shipped (a stacked PR shows as `contributing_prs` on its parent's train). Pass
    `--branches B` (or a manifest member `branch`) when the mainline is not the default: gather
    then fetches and walks `B` (commits, code areas, CODEOWNERS all come from it; a stderr note
@@ -297,8 +314,11 @@ flowchart TB
 4. **Materialize** the view for the month and **keep the bundle files** (`views/YYYY-MM/`) —
    they are what you re-link if a month's series entry needs refreshing.
 5. **Series.** `link --series series.json` keeps **one entry per window** (`from`/`to`) in
-   window order. It compares this month with the entry for the window just *before* it, then
-   records this month, replacing any entry already there for the same window:
+   window order. A window is identified by its calendar days, so `2026-01-01`..`2026-01-31`
+   and `2026-01-01T00:00:00Z`..`2026-01-31T23:59:59Z` are the same month (the entry keeps the
+   spelling it was recorded with). It compares this month with the entry for the window just
+   *before* it, then records this month, replacing any entry already there for the same
+   window:
    - **Same month twice** — safe: the second run replaces the first entry and produces the
      same `series` block (nothing to clean up).
    - **An earlier month re-run** (e.g. October again after November is recorded) — October's
@@ -314,9 +334,15 @@ flowchart TB
    leaves both as they were (or only the bundle updated — just re-run it). The file is
    `{"version": 2, "installments": [...]}`; an older bare-list file is read and rewritten in
    that form (a month it holds twice collapses to the entry recorded last). A series file
-   `link` cannot use (invalid JSON, an unknown version, a malformed entry, entries for another
-   repo), or a bundle without a window, stops `link` with exit code 2 and a message naming the
-   file; nothing is written until you fix or remove it.
+   `link` cannot use (invalid JSON, an unknown version, a malformed entry, a `from`/`to` that
+   is not a date or ISO timestamp, entries for another repo), or a bundle without a window,
+   stops `link` with exit code 2 and a message naming the file; nothing is written until you
+   fix or remove it.
+   - **One index, windows that do not overlap.** A window that shares a day with a recorded
+     window of other days (a quarter in an index of months, or a month inside a recorded
+     quarter) is refused with exit 2, naming both windows: "the installment before" a month
+     is not defined when a quarter covering it is in the same index. Keep roll-ups (quarters,
+     years) in their own index file, e.g. `series-quarterly.json`.
 6. **Render**, then **author**: the report's *Since last installment* section uses
    `bundle.series` — new items, carried-over items (with prior board status and where each is
    now: shipped, in flight, re-planned or rejected) and the forecast loop (last month's
@@ -329,7 +355,7 @@ flowchart TB
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
 | Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end (a month recorded after a later one is marked `captured: "backfill"`, but a first month captured late cannot be detected). |
 | Missed a month | Gather it for delivery history; its in-flight/forecast are "as of now" (above). Keep it out of the series chain, or note in the report that the comparison spans two months. |
-| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing. Over an accumulated store the quarter's `workflow_stats` (CI health) are the sum of its gathered months (`meta.facts_windows`; `workflow_stats_complete: false` if one is missing) and its code graph / owners are its last month's (§2.1); a quarter gathered as one window has its own. Keep quarterly installments in a separate series file. |
+| Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing. Over an accumulated store the quarter's `workflow_stats` (CI health) are the sum of its gathered months (`meta.facts_windows`; `workflow_stats_complete: false` if one is missing) and its code graph / owners are its last month's (§2.1); a quarter gathered as one window has its own. Keep quarterly installments in a separate series file: `link --series` refuses (exit 2) to record a quarter in an index that holds its months, or a month in one that holds its quarter. |
 | Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
 
 ### 5.4 Multi-repo streams and series
@@ -362,10 +388,11 @@ details; a check that cannot run fails, it is never dropped:
 | `referential_integrity` | an edge points at a node that does not exist (out-of-window spine links are INFO), or a per-window `facts:` entry is unreadable |
 | `participant_completeness` | a login in a record has no person node or contribution edge |
 | `provenance` | a PR/issue url is not its own repo's `…/pull/N` or `…/issues/N`, a review/event does not cite its parent, a commit id is not a real sha, an artifact cites no lifecycle commit |
-| `no_fabrication` | an orphan person, a historyless artifact, or an id outside the grammar / in the wrong scope |
+| `no_fabrication` | an orphan person, a PR/issue nobody authored, merged, reviewed or commented on (WARN only where no record of that kind in the repo has an author), a historyless artifact, or an id outside the grammar (e.g. a `comment-N` node) / in the wrong scope |
 | `schema_conformance` | an edge type or endpoint kind that is not allowed |
-| `edge_set` | a stored edge the stored records do not imply, a missing one, or different edge data |
-| `no_drift` | stored people/artifacts differ from what the records re-derive (with `--bundle`: a stored record differs from the bundle's) |
+| `meta_integrity` | the store's own markers or per-window meta are not what a fold writes: an unreadable or missing `current_state:` marker (or one contradicting the facts), a deleted `facts:` entry, a `gathered_windows` entry no fold wrote, a `fact:` value that no longer hashes to its key or sits under the wrong key, a malformed or orphan `ref_date:` / `branches:` / `clone:` / `clone_sha:` / `fold_context:` entry |
+| `edge_set` | a stored edge the stored records do not imply, a missing one, or different edge data (cross-repo edges included, once the members' folds recorded their member set and registries) |
+| `no_drift` | stored people/artifacts (lifecycle entries included) differ from what the records re-derive (with `--bundle`: a stored record differs from the bundle's, a stored record of the bundle's window is not in it, or the window's stored branches / reference date / clone provenance / facts differ from the bundle's) |
 | `idempotency` | re-folding into a scratch copy would change counts |
 | `no_drift_people` (project) | the project's people differ from the union re-derived across members |
 | `member_status` (project) | a manifest member's last gather of a window `failed` or was `not_attempted` |
@@ -379,9 +406,13 @@ windows are not failures: they name the edge type that cannot be proven exactly 
 
 **What a green gate means.** The store is consistent with its own records: every edge is
 one the records imply, people re-derive from the records, every citation is the record's
-own GitHub link. It does **not** prove the records match GitHub: a record deleted together
-with its edges, a consistently rewritten record or a wrong change ledger pass. To catch the
-first two, save the raw view right after the gather and pass it later:
+own GitHub link, and the store's markers and per-window meta are what folds write. It does
+**not** prove the records match GitHub: a record deleted together with its edges, a
+consistently rewritten record, an inserted record that is internally consistent (a PR with
+its author edge, a dated release, a milestone, an area), a fact value rewritten together
+with its key, a plausible changed base branch / reference date, or a wrong change ledger
+pass. To catch all but the last for a window, save the raw view right after the gather
+and pass it later:
 
 ```bash
 python3 $AO/view.py --store $DB --from $FROM --to $TO --out $S/views/$M/at-gather.json
@@ -536,7 +567,7 @@ python3 $AO/manifest_from_index.py --avm res --avm ptn \
 
 ```bash
 export TF_PLUGIN_CACHE_DIR=~/activity/.tfcache && mkdir -p "$TF_PLUGIN_CACHE_DIR"
-mkdir -p $S/stores $S/views/$M                       # manifest: --clone-dir is the PARENT dir
+mkdir -p $S/stores $S/views/$M                       # manifest: --clone-dir is the PARENT dir (clones in $S/clones/<owner>/<repo>)
 python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones
 python3 $AO/validate.py $S/stores/$M.db --project avm-tf-network
 python3 $AO/digest.py --store $S/stores/$M.db --project avm-tf-network --from $FROM --to $TO > $S/views/$M/project.json
@@ -767,11 +798,21 @@ One store per stream keeps commands simple and failures isolated.
 | Blast radius (one module area, in-repo and cross-repo) | `spotlight.py dependents <owner/repo>::<area> --store S --project P` (gather single repos with `--structural-iac`) |
 | Project view for a formatter | `digest.py --store S --project P --from F --to T` (schema: `BUNDLE.md`) |
 | Ticket-linked related work | `digest.py … --manifest M` with `"ticket_prefixes": ["ABC"]` in the manifest, or `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (off by default: `related_work` is `[]`) |
-| Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`) |
+| Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`). It fetches missing PRs/issues only (never commits) and writes each exactly as a gather would — person nodes, contribution edges, reviews/events, search text — so `validate.py` still passes afterwards |
+
+A repo is named the same way in every query (`dependents`, `subsystem`, `module`, the
+`<repo>::<area>` qualifier and `--repo`), on a single-repo store (project = owner) or a
+project store: `owner/repo` in any case, or `repo` alone when exactly one stored member has
+that name (`dependents Azure/bicep-registry-modules`, `module bicep-registry-modules::avm/res/network/virtual-network`).
+`module` reads the area index of every gathered window's code graph, so an area an earlier
+window listed is found whatever order the windows were folded in. `--md` escapes every
+stored or typed value (titles, excerpts, logins, paths, area ids, the focus, the phrase) so
+none can add markdown structure or HTML; `--json` is raw.
 
 `spotlight.py` exits 2 with usage for a wrong argument count, a flag the query does not take,
 a bad `--from/--to`, a missing or empty store, a store with several projects and no
-`--project` (the error lists them) and an unknown `--repo`. Train outcomes are `shipped`,
+`--project` (the error lists them) and a repo argument (member, `<repo>::` qualifier or
+`--repo`) that names no single stored repo (the error lists them). Train outcomes are `shipped`,
 `in_flight`, `rejected`, `abandoned` (an issue closed not-planned/duplicate) and
 `direct_push` (commits with no PR) — see LLD §9.
 
@@ -795,10 +836,15 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 - **Narrative.** Run `/activity` (or the manual §4 steps 4–6 + "write the report") in Claude
   Code once the data is ready, review the citations, then publish.
 - **CI assurance.** The repo's GitHub Actions workflow runs the offline tests on every change
-  and a scheduled live gather → validate (1st and 15th, 07:00 UTC). Point its
+  and a scheduled live gather → validate → view → link → render (1st and 15th, 07:00 UTC),
+  failing on an empty store or an enriched bundle with no shipped items, trains or timeline;
+  its three live jobs run one at a time, each with a 120-minute timeout, because a gather that
+  waits for the API limit can take over an hour (LLD §15). Point its
   `workflow_dispatch` inputs at one of your targets to smoke-test a window. Its `spotlight`
   job also runs `ci_spotlight_integration.py --store S --require-all`, which checks the
-  person / subsystem / symbol / grep answers against what the store holds. You can run it on
+  person / subsystem / symbol / grep answers against what the store holds (contribution
+  edges, stored records and outcomes, ledger rows, indexed text — not spotlight's own
+  answer). You can run it on
   your own store (`--project P` when the store holds several); without `--require-all` a
   check whose input the store lacks is reported as skipped instead of failing.
 
@@ -815,15 +861,20 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate: error: store … does not exist` / `is not a journey-graph store` (exit 2) | wrong path (validate never creates a file) | point it at the store `gather --store` wrote |
 | `validate` ERROR `target` | `--project`/`--repo` mistyped, or the store is empty | check the names the error lists under `stored_projects` / `stored_repos` |
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
-| `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
+| `validate` ERROR `no_drift` "lifecycle drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
 | `validate` ERROR `edge_set` "stored but not derivable" / "derived from the stored records but not stored" / "edge data drift" | an edge the stored records do not imply (or a missing one): a producer defect or a hand-edited store | report it; don't publish; re-gather into a fresh store |
 | `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | the WARN names why the edge type cannot be proven: the repo was last folded before #95, a window has no per-window facts (pre-#94), `touches` across a graphify / re-mapped code graph; person areas are always a union over the windows | not a failure. Fold one window again (pre-#95) or re-gather pre-#94 windows to make the edge checks exact |
 | `validate` ERROR `edge_set` on a `depends_on`/`owns`/`touches`/`in_milestone`/`in_iteration`/`blocks` edge of a store holding several windows | since #95 these are exact on a store a current fold maintained: the edge is not what the stored records / per-window facts imply | a producer defect or a hand-edited store: report it; don't publish |
 | `gather` stderr `retracted N stale current-state edge(s) of P/R (…)` | the fold found edges its inputs no longer imply (a removed module reference, a CODEOWNERS change, an item moved off a milestone/sprint, a blocker edited away), or healed an older store | expected; the edges are listed in `meta.retractions:P/R` |
+| `gather` stderr `retracted N edge(s) of P/R that the re-folded records no longer imply (…)`, `removed K person node(s) no contribution references any more` | a re-gathered PR / issue / commit no longer states a closing reference, commit → PR link, author, merger, reviewer or commenter it stated before (#111), or the first fold since #111 healed an older store | expected; listed in `meta.retractions:P/R` |
 | `validate` ERROR `provenance` "url names repo X, the node is in Y" | the repo was renamed or transferred and gathered under its old name (GitHub returns links with the new name), or the node was edited | gather under the repo's current name |
 | `validate` ERROR `provenance` "commit id … is not a 40/64-hex git sha" / ERROR `no_fabrication` id problems | a hand-made or corrupted node; gather writes only real shas and grammar ids | re-gather; never hand-edit the store |
 | `validate --repo R` of a multi-repo project passes but the project run fails `no_drift_people` | a single-member audit checks only the people that member derives (people are project-wide) | run `validate.py STORE --project P` without `--repo` for the full people check |
 | `validate --bundle FILE` ERROR `no_drift` "stored pr differs from --bundle" / "… in --bundle but not stored" | a record changed or was deleted since FILE was saved (or FILE is an older window's bundle on a store that re-fetched the record) | cross-check with a view saved right after the gather that wrote the record |
+| `validate --bundle FILE` ERROR `no_drift` "stored … of the bundle's window … not in --bundle" / "stored per-window … differs from --bundle" | the store holds a record of FILE's window that FILE lacks (an inserted record), or the window's branches / reference date / clone provenance / facts changed since FILE was saved | don't publish: the store was edited after the gather; re-gather into a fresh store |
+| `validate` ERROR `meta_integrity` | the store's markers or per-window meta were edited or damaged (each detail names the meta key); or the store mixes a window folded before #75 with later ones ("no fold evidence"), or holds per-window facts without a `current_state:` marker (a #94-era fold) | re-gather the named window, or fold any window of the repo once more; a damaged store: re-gather into a fresh store |
+| `validate` WARN `edge_set` "an edge into another member repo: no fold of this repo recorded its member set" | a manifest store folded before #113 (or whose member set changed between folds): a missing cross-repo edge cannot be proven missing | fold each member once more (any window) to make cross-repo edges exact |
+| `validate` WARN `no_fabrication` "PR/issue with no contribution edge at all … hand-built records" | a record with no author, merger, reviewer or commenter in a repo where no record of its kind has an author (hand-made data) | not a failure; a real gather always records the author |
 | `gather: N of M member(s) failed for project …` (exit 1) | those members' gather failed (reason listed per member); the others are folded | fix the cause (token, SSO, clone), then `gather.py --manifest … --resume` |
 | `validate` ERROR `member_status` (and `target` for that repo): "member gather did not complete" | a manifest member's last gather of that window `failed` or was `not_attempted` (an interrupted run) | `gather.py --manifest … --resume`; the error names the member, window and reason |
 | `digest.py`/`view.py` warning: project … is incomplete | same as above, for a window overlapping the one read | the view lacks those members: don't publish it; resume the gather |
@@ -842,6 +893,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | Empty forecast | no next milestone and no recognized priority labels | expected; see §6.3 |
 | Empty board/sprint sections | token lacks `read:project`, or no maintained board | add scope or accept |
 | `render.py` fails | `mmdc` missing, or a diagram does not compile | install mmdc (`npm install -g @mermaid-js/mermaid-cli`), or add `--skip-validate` and say the diagrams are unvalidated. As root, render passes mmdc a generated `--no-sandbox` puppeteer config itself (set `ACTIVITY_MMDC_PUPPETEER_CONFIG` to use your own); keep that to throwaway environments |
+| `link.py --series` exits 2: "overlaps the recorded window(s)" | the index already holds a window sharing days with this one (a quarter beside its months) | record the roll-up in its own series file |
+| `link.py: error: … is not valid JSON` / `not a JSON object` / `cannot read` (exit 2) | the bundle path is wrong, or the file is not a bundle/view | point `link.py` at a `view.py` / `gather.py` JSON; nothing was written |
 | `link.py --series` warns about later installments | a month was (re-)recorded after a later one | expected; re-link the named later months' saved bundles oldest first if their comparison should reflect the change |
 | `spotlight grep` → `fts_unavailable` | SQLite built without FTS5 | use a Python with FTS5 (most do) |
 | `spotlight` → `needs_gather` | nothing stored for that focus yet | gather more windows |
@@ -851,6 +904,11 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 - The token is **read-only** in effect — the skill never writes to GitHub — but treat it as a
   secret: environment/keychain only, never in manifests, scripts or reports; create short-lived
   tokens (the Azure org accepts 8 days at most).
+- **IaC builds run code the gathered repository chooses.** With `bicep` / `terraform` on PATH,
+  gather runs `bicep restore`/`build` and `terraform init`/`graph` in the clone; they download
+  and run third-party modules and provider plugins that the repository names. Gather only
+  repositories you would build yourself, preferably on a disposable machine, and keep other
+  credentials out of that environment (LLD §14.4). Without the CLIs on PATH no build runs.
 - Stores and clones contain repository content and contributor logins (and commit author
   names; author emails are read to resolve logins but never stored); keep them in your
   workspace, not in shared folders.
@@ -858,3 +916,21 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
   opt-in — only request it for internal audiences.
 - Always publish from a store that passed `validate.py`, and spot-check citations: every
   claim in the report must link to a GitHub record.
+- **The IaC builds download and run third-party code.** With `bicep` / `terraform` on PATH,
+  `gather` runs `bicep restore/build` and `terraform init/graph` in the clone: they fetch the
+  modules and providers the gathered repo names and execute the providers on your machine.
+  Gather with the builds only repos you trust; for any other repo pass **`--no-iac-build`**
+  (builds skipped, every area `edges_status: skipped`; the static `--structural-iac` scan still
+  works). terraform never uses a `terraform.d/plugins` mirror shipped in the repo (gather gives
+  it a CLI config with an explicit `provider_installation` block; your `~/.terraformrc`,
+  `TF_PLUGIN_CACHE_DIR` and `TF_TOKEN_<host>` still apply). LLD §14.4 has the details.
+- The builds never see the token: bicep, terraform and graphify run without
+  `GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_PAT` or any other `*_TOKEN` / `*_PAT` variable, and so
+  does git unless you have a git credential helper configured (it may need `GH_TOKEN` /
+  `GITHUB_TOKEN` to clone a private repo).
+- gather's git ignores your global and system git config (colour, diff prefixes, signatures,
+  pager, … cannot corrupt the walks). Only proxy/TLS (`http.proxy`, `http.sslCAInfo`, …),
+  `url.<base>.insteadOf`, credential helpers and `safe.directory` are carried over; proxy and
+  TLS environment variables (`HTTPS_PROXY`, `GIT_SSL_CAINFO`, …) work as before.
+- Repo files reached through a symlink that leaves the clone (CODEOWNERS, `.tf`, `.bicep`)
+  are never read: gather warns and skips them.

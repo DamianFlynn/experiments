@@ -43,7 +43,16 @@ the bundle/view contract version (`meta.schema_version` =
 extract.VIEW_CONTRACT_VERSION, 3) and took it off the volatile list, so the
 version is pinned: all five snapshots were re-captured once to add that one
 meta key, by a script that refused to write unless it was the only
-difference. Unlike test_extract, this gate
+difference. Issue #112 (train effort flags) re-captured four of them once
+more, by a script that refused to write unless every difference was inside
+`trains[].effort`: every train's effort gained `idle_days`, `last_activity_at`
+and `slow_to_land`, and no other key changed — `stalled` kept its value on
+every train (no golden train was stalled under either rule), and so did
+`people[].stale_owned`. Values: `false` / `null` / `null` everywhere except the
+in-flight `train-pr-44` of char_bundle_p2.json, whose PR was last updated
+2026-05-25T08:00:00Z: `idle_days` 6 at the reference date 2026-05-31,
+`last_activity_at` "2026-05-25T08:00:00Z", not stalled. char_bundle_p3c.json
+has no trains and did not change. Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is
 canonical JSON: json.dumps(obj, sort_keys=True, indent=2).

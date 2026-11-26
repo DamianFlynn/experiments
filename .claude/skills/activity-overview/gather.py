@@ -4,6 +4,7 @@ The only component that touches the network. Produces a schema-complete bundle;
 later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
+import atexit
 import concurrent.futures
 import contextlib
 import copy
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -75,46 +77,76 @@ def build_bundle(meta, commits, prs, issues):
     }
 
 
-def parse_git_log(raw):
-    """Parse `git log` output formatted with RECORD_SEP/FIELD_SEP separators.
+def _log_records(raw):
+    """Split `git log --pretty=format:<LOG_FORMAT>` output into records, each a
+    list of lines: [header, body line, ...]. A record starts with RECORD_SEP at
+    the start of the output or of a line (git puts every separator there), so a
+    RECORD_SEP inside a subject (mid-line) does not start a new record. Lines
+    are split on "\\n" only: `str.splitlines()` also splits on U+2028/U+2029,
+    U+0085, form feed, vertical tab and the separator control characters,
+    which can appear unquoted in a subject or (non-ASCII with
+    core.quotepath=false) a path (#109)."""
+    for chunk in re.split("(?:^|\n)" + RECORD_SEP, raw or ""):
+        if chunk.strip():
+            yield chunk.split("\n")
 
-    Each record: <sha>\x1f<parents>\x1f<author>\x1f<date>\x1f<subject> followed by
-    newline-separated file paths. Returns a list of commit dicts. When the record
-    carries a sixth field (the author email, `%ae`, COMMIT_WALK_ARGS) it is kept as
-    a TRANSIENT `author_email` key: `resolve_commit_authors` reads it to find the
-    author's GitHub login and removes it, so no email reaches the bundle (#78).
-    A seventh field (the strict-ISO committer timestamp, `%cI`) becomes
-    `committed_at`, normalised to UTC `YYYY-MM-DDTHH:MM:SSZ` (the GitHub API's
-    form) so it sorts against comment timestamps; `date` stays the day used for
-    windowing. An empty or unparseable timestamp adds no key (#82).
+
+def _parse_log_header(line):
+    """The header line of a LOG_FORMAT record as a dict {sha, parents, author,
+    author_email, committed_at?, date, subject}, or None when it has too few
+    fields. The subject is the LAST field, so a FIELD_SEP inside it stays in it.
+    `committed_at` is the strict-ISO committer timestamp (`%cI`) normalised to
+    UTC `YYYY-MM-DDTHH:MM:SSZ` (absent when unparseable); `date` is its UTC
+    calendar day, the day every record of the commit is windowed on (#109:
+    PRs and issues are windowed in UTC too). Only an unparseable timestamp
+    falls back to its own first ten characters."""
+    fields = line.split(FIELD_SEP, 5)
+    if len(fields) < 6:
+        return None
+    sha, parents, author, email, stamp = (f.strip() for f in fields[:5])
+    head = {"sha": sha, "parents": parents.split(), "author": author,
+            "author_email": email, "subject": fields[5].strip(" \t\r")}
+    committed_at = _utc_timestamp(stamp)
+    if committed_at:
+        head["committed_at"] = committed_at
+    head["date"] = committed_at[:10] if committed_at else stamp[:10]
+    return head
+
+
+def parse_git_log(raw):
+    """Parse `git log` output formatted with LOG_FORMAT (COMMIT_WALK_ARGS).
+
+    Each record: the LOG_FORMAT header followed by newline-separated file paths
+    (`--name-only`). Returns a list of commit dicts. The author email (`%ae`)
+    is kept as a TRANSIENT `author_email` key: `resolve_commit_authors` reads
+    it to find the author's GitHub login and removes it, so no email reaches
+    the bundle (#78). `committed_at` is the committer timestamp in UTC
+    `YYYY-MM-DDTHH:MM:SSZ` (the GitHub API's form) so it sorts against comment
+    timestamps (#82); `date` is its UTC day, used for windowing (#109). An
+    empty email adds no `author_email`, an unparseable timestamp no
+    `committed_at`.
     """
     commits = []
-    for chunk in raw.split(RECORD_SEP):
-        if not chunk.strip():
+    for lines in _log_records(raw):
+        head = _parse_log_header(lines[0])
+        if head is None:
             continue
-        lines = chunk.splitlines()
-        fields = lines[0].split(FIELD_SEP)
-        if len(fields) < 5:
-            continue
-        sha, parents, author, date, subject = (f.strip() for f in fields[:5])
         # `--name-only` paths: C-quoted ones (quote/backslash/control chars, or
         # non-ASCII without core.quotepath=false) are unquoted.
-        files = [unquote_git_path(ln) for ln in lines[1:] if ln.strip()]
+        files = [unquote_git_path(ln) for ln in lines[1:] if ln]
         commit = {
-            "sha": sha,
-            "parents": parents.split() if parents.strip() else [],
-            "author": author,
-            "date": date,
-            "message": subject,
+            "sha": head["sha"],
+            "parents": head["parents"],
+            "author": head["author"],
+            "date": head["date"],
+            "message": head["subject"],
             "files": files,
             "pr": None,  # resolved in link.py
         }
-        if len(fields) > 5:
-            commit["author_email"] = fields[5].strip()
-        if len(fields) > 6:
-            committed_at = _utc_timestamp(fields[6].strip())
-            if committed_at:
-                commit["committed_at"] = committed_at
+        if head["author_email"]:
+            commit["author_email"] = head["author_email"]
+        if "committed_at" in head:
+            commit["committed_at"] = head["committed_at"]
         commits.append(commit)
     return commits
 
@@ -132,29 +164,36 @@ def _utc_timestamp(value):
     return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# git log format for the full-window code-event walk (Phase 3a). Same RECORD_SEP/
-# FIELD_SEP header as parse_git_log, but the BODY is `--name-status` lines so each
-# changed path carries its change type (and rename/copy detection via -M -C gives
-# `R###`/`C###` with old+new paths).
-CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
+# The one `git log` format of every walk (#109): sha, parents, author name,
+# author email, strict-ISO committer timestamp, subject. The subject is free
+# text, so it is LAST: nothing can follow it on the header line. The body after
+# the header depends on the walk (`--name-only` paths, `--name-status` lines or
+# a `-p` patch). The committer timestamp (`%cI`) gives every record of a commit
+# (the commit, its code events, its symbol events) the same UTC day, the day
+# PRs and issues are windowed on too. The author email is only used to resolve
+# the commit author's GitHub login and is never stored (#78); the code-event
+# and patch parsers ignore it.
+LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%cI%x1f%s"
 
 # `git log` arguments (after `git -C <clone> log`) for acquire()'s three walks,
 # shared with the real-repo tests so they exercise the exact commands. Paths in
 # their output are made comparable by run_git (core.quotepath=false) plus
-# unquote_git_path in each parser.
-# The commit walk alone also asks for the author email (`%ae`, appended LAST so the
-# shared five-field header parses unchanged); it is only used to resolve the
-# author's GitHub login and is never stored (#78). After it comes the strict-ISO
-# committer timestamp (`%cI`, unaffected by `--date=short`), stored as the
-# commit's `committed_at` so the timeline orders same-day events by real time
-# (#82).
-COMMIT_LOG_FORMAT = CODE_LOG_FORMAT + "%x1f%ae%x1f%cI"
-COMMIT_WALK_ARGS = (f"--pretty=format:{COMMIT_LOG_FORMAT}", "--date=short",
-                    "--name-only")
-CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-                  "--name-status", "-M", "-C")
-PATCH_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
-                   "-p", "--unified=3", "-M", "-C")
+# unquote_git_path in each parser. The code-event walk's body is
+# `--name-status` lines so each changed path carries its change type (and
+# rename/copy detection via -M -C gives `R###`/`C###` with old+new paths).
+# Belt and braces to run_git's config isolation (issue #109): flags that pin
+# what user config could otherwise change -- colour escapes, an external diff
+# or textconv driver, signature lines, rename detection (`-M` is git's default
+# `diff.renames=true`) and the `a/` / `b/` patch prefixes the diff parser reads.
+_WALK_PIN_ARGS = ("--no-color", "--no-ext-diff", "--no-textconv",
+                  "--no-show-signature")
+COMMIT_WALK_ARGS = (f"--pretty=format:{LOG_FORMAT}",
+                    "--name-only", "-M") + _WALK_PIN_ARGS
+CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{LOG_FORMAT}",
+                  "--name-status", "-M", "-C") + _WALK_PIN_ARGS
+PATCH_WALK_ARGS = ("--reverse", f"--pretty=format:{LOG_FORMAT}",
+                   "-p", "--unified=3", "-M", "-C") + _WALK_PIN_ARGS + (
+                   "--src-prefix=a/", "--dst-prefix=b/")
 
 _STATUS_TO_CHANGE = {"A": "add", "M": "modify", "D": "delete",
                      "R": "rename", "C": "copy", "T": "modify"}
@@ -168,14 +207,11 @@ def parse_code_events(raw):
     path in `old_path` and the new path in `path`. Pure; permissive on junk lines.
     """
     events = []
-    for chunk in raw.split(RECORD_SEP):
-        if not chunk.strip():
+    for lines in _log_records(raw):
+        head = _parse_log_header(lines[0])
+        if head is None:
             continue
-        lines = chunk.splitlines()
-        fields = lines[0].split(FIELD_SEP)
-        if len(fields) < 5:
-            continue
-        sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
+        sha, author, date = head["sha"], head["author"], head["date"]
         for ln in lines[1:]:
             if not ln.strip():
                 continue
@@ -404,6 +440,8 @@ def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
         depth1 = _shallow_or_depth1(
             run, lambda d1: build_fetch_cmd(clone_dir, from_date, d1))
         branch = _default_branch(clone_dir, run)
+        # An earlier current-month run built IaC in place (issue #109).
+        reset_build_byproducts(clone_dir, run)
         run(["git", "-C", clone_dir, "checkout", "-q", "-B", branch,
              f"refs/remotes/origin/{branch}"])
         return "depth1-fallback" if depth1 else "fetched"
@@ -414,6 +452,34 @@ def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
     depth1 = _shallow_or_depth1(
         run, lambda d1: build_clone_cmd(repo_url, from_date, clone_dir, d1))
     return "depth1-fallback" if depth1 else "fresh"
+
+
+# What gather's own IaC builds leave in a checkout (issue #109): `terraform
+# init` writes `.terraform/` and `.terraform.lock.hcl` in each module dir it
+# builds (bicep restore/build write nothing there: restore caches under
+# ~/.bicep, build prints to stdout). For the current month the builds run in
+# the clone itself (structure_tree yields the clone), so these are left behind.
+_BUILD_BYPRODUCT_PATHSPECS = (":(glob)**/.terraform/**", ":(glob)**/.terraform.lock.hcl")
+
+
+def reset_build_byproducts(clone_dir, run=None):
+    """Remove an earlier run's IaC build output so the next branch switch
+    cannot be blocked by it (issue #109): untracked `.terraform/` dirs and
+    untracked `.terraform.lock.hcl` files anywhere in the clone are deleted
+    (`git clean`, restricted to those pathspecs), and a TRACKED
+    `.terraform.lock.hcl` that `terraform init` rewrote is restored to its
+    committed content. Nothing else is touched: a user's own untracked or
+    modified files keep blocking a checkout exactly as before, never
+    silently deleted. Ignored files under those paths are cleaned too (-x):
+    a repo's `.gitignore` normally lists `.terraform/`."""
+    run = run or run_git
+    run(["git", "-C", clone_dir, "clean", "-f", "-d", "-x", "-q", "--",
+         *_BUILD_BYPRODUCT_PATHSPECS])
+    changed = [unquote_git_path(ln) for ln in run(
+        ["git", "-C", clone_dir, "ls-files", "-m", "--",
+         _BUILD_BYPRODUCT_PATHSPECS[1]]).splitlines() if ln]
+    if changed:
+        run(["git", "-C", clone_dir, "checkout", "-q", "--", *changed])
 
 
 class MissingBranchError(RuntimeError):
@@ -452,6 +518,7 @@ def checkout_base_branch(clone_dir, branch, from_date, run=None):
             raise MissingBranchError(
                 f"base branch {branch!r} does not exist on the remote") from None
         raise
+    reset_build_byproducts(clone_dir, run)
     run(["git", "-C", clone_dir, "checkout", "-q", "-B", branch,
          f"refs/remotes/origin/{branch}"])
     return depth1
@@ -499,8 +566,7 @@ def _in_window_boundary_on_head(clone_dir, from_date, to_date, run):
     boundary = shallow_boundary_shas(clone_dir)
     if not boundary:
         return []
-    raw = run(["git", "-C", clone_dir, "log", f"--pretty=format:{CODE_LOG_FORMAT}",
-               "--date=short"])
+    raw = run(["git", "-C", clone_dir, "log", f"--pretty=format:{LOG_FORMAT}"])
     head = window_records(parse_git_log(raw), from_date, to_date)
     return in_window_boundary_commits(boundary, head)
 
@@ -541,10 +607,11 @@ def in_window(ts, from_date, to_date):
 
 
 def window_records(records, from_date, to_date):
-    """Keep only commits/events whose `date` (committer/landing date) falls in
-    [from,to] inclusive. Pure. Used instead of git's `--since/--until`, which
-    silently prunes valid in-window commits when commit dates are non-monotonic
-    across committer timezones (and excludes the upper boundary day)."""
+    """Keep only commits/events whose `date` (the UTC day of the commit's
+    committer timestamp, #109) falls in [from,to] inclusive. Pure. Used instead
+    of git's `--since/--until`, which silently prunes valid in-window commits
+    when commit dates are non-monotonic across committer timezones (and
+    excludes the upper boundary day)."""
     return [r for r in records if in_window(r.get("date"), from_date, to_date)]
 
 
@@ -816,11 +883,15 @@ def _review_order_key(index, r):
             index)
 
 
-def summarize_reviews(raw_reviews):
+def summarize_reviews(raw_reviews, author=None):
     """Reduce raw PR reviews to {reviewers, decision}. Pure.
 
     `reviewers`: sorted logins with at least one SUBMITTED review (PENDING
-    drafts and unknown states are ignored).
+    drafts and unknown states are ignored). The PR's `author` is never a
+    reviewer of their own PR (issue #110 item 5): GitHub records the author's
+    reply in a review thread as a COMMENTED review, and those are left out of
+    `reviewers` and of the decision, as review rounds already leave them out.
+    With only the author's own reviews the decision is `none`.
 
     `decision` (issue #63): each reviewer's effective state is their latest
     APPROVED / CHANGES_REQUESTED / DISMISSED review — a later COMMENTED review
@@ -833,7 +904,7 @@ def summarize_reviews(raw_reviews):
     effective = {}  # login -> effective state
     for _, r in indexed:
         login = (r.get("user") or {}).get("login")
-        if not login:
+        if not login or (author is not None and login == author):
             continue
         state = (r.get("state") or "").lower()
         if state not in _SUBMITTED_REVIEW_STATES:
@@ -1040,28 +1111,55 @@ def remap_event_authors(events, by_sha):
     return events
 
 
-def parse_timeline_crossrefs(raw_timeline):
-    """Issue numbers cross-referenced/connected to a PR via timeline events.
+def _payload_in_repo(repository, current):
+    """True when a timeline payload's `repository` object names the repo
+    `current` (lower-case 'owner/repo'), compared case-insensitively (#70).
+    A payload with no repository name at all counts as the current repo, so
+    older fixtures and partial payloads keep parsing (#109)."""
+    full = ((repository or {}).get("full_name")) or ""
+    return not full or full.lower() == current
 
-    De-duplicated, order-preserving. Skips cross-refs whose source is itself a
-    pull request (we only want issue links). Pure."""
-    out = []
+
+def parse_timeline_crossrefs(raw_timeline, current_slug):
+    """Issue numbers of the repo `current_slug` ('owner/repo') cross-referenced
+    or connected to a PR via timeline events.
+
+    De-duplicated, order-preserving (first appearance). Skips cross-refs whose
+    source is itself a pull request (we only want issue links) and, since #109,
+    events whose source / subject issue lives in another repo (its
+    `repository.full_name`, compared case-insensitively): their number is not
+    an issue of this repo (parse_timeline_xrefs keeps them as cross-repo refs,
+    so each `cross-referenced` event is counted by exactly one of the two).
+    Events are read in order: a `connected` link later undone by a
+    `disconnected` event for the same issue does not count (a reconnect counts
+    again); a disconnect never cancels a cross-reference (a mention). Pure."""
+    current = (current_slug or "").lower()
+    order, mentioned, connected = [], set(), set()
     for ev in raw_timeline or []:
         kind = ev.get("event")
         num = None
         if kind == "cross-referenced":
             issue = (ev.get("source") or {}).get("issue") or {}
-            if issue.get("pull_request") is None:
+            if issue.get("pull_request") is None \
+                    and _payload_in_repo(issue.get("repository"), current):
                 num = issue.get("number")
-        elif kind == "connected":
+                if num is not None:
+                    mentioned.add(num)
+        elif kind in ("connected", "disconnected"):
             # Tolerant: an event without a usable issue number (no subject,
             # a null / non-integer number) is not a link (issue #105).
-            num = (ev.get("subject") or {}).get("number")
-            if not isinstance(num, int) or isinstance(num, bool):
+            subject = ev.get("subject") or {}
+            num = subject.get("number")
+            if not isinstance(num, int) or isinstance(num, bool) \
+                    or not _payload_in_repo(subject.get("repository"), current):
                 num = None
-        if num is not None and num not in out:
-            out.append(num)
-    return out
+            elif kind == "connected":
+                connected.add(num)
+            else:
+                connected.discard(num)
+        if num is not None and num not in order:
+            order.append(num)
+    return [n for n in order if n in mentioned or n in connected]
 
 
 def parse_timeline_xrefs(raw_timeline, current_slug):
@@ -1510,17 +1608,13 @@ def _iter_patch_files(raw):
     parse_unified_diff entry ({path, old_path, hunks}). Merge commits (no patch)
     yield nothing. Pure; the shared walk behind the parsers below + parse_patch_events
     (so acquire can extract both symbol events and file diffs in one pass)."""
-    for chunk in (raw or "").split(RECORD_SEP):
-        if not chunk.strip():
+    for lines in _log_records(raw):
+        head = _parse_log_header(lines[0])
+        if head is None:
             continue
-        lines = chunk.split("\n")
-        fields = lines[0].split(FIELD_SEP)
-        if len(fields) < 5:
-            continue
-        sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
         body = "\n".join(lines[1:])
         for f in parse_unified_diff(body):
-            yield sha, author, date, f
+            yield head["sha"], head["author"], head["date"], f
 
 
 def _symbol_events_for(sha, author, date, f):
@@ -1826,7 +1920,11 @@ def parse_graphify_graph(graph_json):
     return {"provider": "graphify", "areas": areas}
 
 
-def _read_json_file(path):
+def _read_json_file(path, root=None):
+    """JSON from a file; with `root`, refused when the file resolves outside it
+    (as _read_text_file, issue #109)."""
+    if root is not None and not _inside_root(path, root):
+        raise RepoFileRefused("{} resolves outside {}".format(path, root))
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -1844,6 +1942,9 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if run is None:
         run = run_git
+    if read_json is _read_json_file:
+        def read_json(path):
+            return _read_json_file(path, root=clone_dir)
     directory = build_directory_areas(paths, patterns)
     if not which("graphify"):
         return directory
@@ -1861,8 +1962,94 @@ def select_code_area_provider(paths, clone_dir, which=shutil.which,
 # Phase 3c: IaC dependency-edge extraction (build-only). The edge object is
 # {to, kind, ref, version, transitive, provider, resolved}; see BUNDLE.md.
 
+# Matched on a Bicep "mask" of the source (_bicep_mask: comments and string
+# contents blanked at the same offsets, top-level quotes kept), so a `module`
+# inside a comment or a string never matches (issue #109). The keyword must
+# start a statement: the start of a line after whitespace, optionally after
+# decorators on the same line (decorators on earlier lines are their own
+# lines). The ref's text is read from the original source at the match span.
 _BICEP_MODULE_RE = re.compile(
-    r"module\s+\w+\s+'(?P<ref>[^']+)'(?:\s*=\s*(?P<open>[\[{]))?")
+    r"(?m)^[ \t]*(?:@[\w.]+(?:\((?:[^()\n]|\([^()\n]*\))*\))?[ \t]+)*"
+    r"module\s+\w+\s+'(?P<ref>[^'\n]*)'(?:\s*=\s*(?P<open>[\[{]))?")
+
+
+def _bicep_mask(text):
+    """Return Bicep `text` with comments and string-literal contents replaced
+    by spaces (newlines kept), so offsets are unchanged -- the Bicep
+    counterpart of _hcl_mask.
+
+    Handles `//` line comments, `/* */` block comments, `'...'` strings with
+    `\\` escapes and `${...}` interpolation (nested braces, nested strings and
+    comments inside the expression), and `'''...'''` multi-line strings (no
+    escapes, no interpolation; blanked whole, quotes included). The quote
+    characters of a top-level single-quoted string are kept so a module ref's
+    span can be located. An unterminated string ends at the newline; an
+    unterminated block comment or multi-line string runs to the end. Pure."""
+    out = list(text)
+    n = len(text)
+
+    def blank(a, b):
+        for k in range(a, min(b, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    stack = []          # "str" | [interp_brace_depth]; empty = code context
+    i = 0
+    while i < n:
+        c = text[i]
+        if stack and stack[-1] == "str":
+            if c == "\\":
+                blank(i, i + 2)
+                i += 2
+            elif text.startswith("${", i):
+                blank(i, i + 2)
+                stack.append([0])
+                i += 2
+            elif c == "'" or (c == "\n" and len(stack) == 1):
+                stack.pop()
+                if stack and c == "'":
+                    blank(i, i + 1)                     # nested string's quote
+                i += 1
+            else:
+                blank(i, i + 1)
+                i += 1
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+            continue
+        if text.startswith("'''", i):
+            j = text.find("'''", i + 3)
+            j = n if j < 0 else j + 3
+            blank(i, j)
+            i = j
+            continue
+        if stack:                                       # inside an interpolation
+            top = stack[-1]
+            if c == "'":
+                stack.append("str")
+            elif c == "{":
+                top[0] += 1
+            elif c == "}":
+                if top[0]:
+                    top[0] -= 1
+                else:
+                    stack.pop()
+            blank(i, i + 1)
+            i += 1
+            continue
+        if c == "'":
+            stack.append("str")
+        i += 1
+    return "".join(out)
 
 
 # A non-local Bicep reference scheme: `br:` / `ts:` or an alias `br/<a>:` / `ts/<a>:`.
@@ -1917,10 +2104,14 @@ def parse_bicep_module_refs(source_text):
     its path says nothing about this repo, so only the raw `ref` (+ `version`) is
     kept. A ref with no scheme is a `local_path`. `instances` is `"many"` when the
     module is instantiated as an array (`= [for ...]`), `"one"` for a single
-    `= {`, else None. Pure."""
+    `= {`, else None. A `module` inside a comment or a string is not a
+    reference (matched on _bicep_mask; issue #109). Pure."""
     refs = []
-    for m in _BICEP_MODULE_RE.finditer(source_text or ""):
-        ref = m.group("ref")
+    text = source_text or ""
+    for m in _BICEP_MODULE_RE.finditer(_bicep_mask(text)):
+        ref = text[m.start("ref"):m.end("ref")]
+        if not ref:
+            continue
         open_ch = m.group("open")
         instances = "many" if open_ch == "[" else "one" if open_ch == "{" else None
         registry_path, version, local_path = _bicep_ref_parts(ref)
@@ -2448,14 +2639,17 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
     DIRECT edge (no DOT transitivity), shaped exactly like build_terraform_edges'
     output. Scaffold areas (examples/tests) are skipped. Returns
     {area_id: {"paths": [...], "edges": [...]}}. `list_files`/`read_text` are
-    injectable for offline tests; defaults list tracked *.tf via git + read disk."""
+    injectable for offline tests; defaults list tracked *.tf via git + read disk.
+
+    A module file that cannot be read (outside the checkout, dangling, not
+    readable; `read_text` raising OSError) is skipped with one warning and its
+    area carries `"unread": True` (issue #109): its edges come from the files
+    that were read, and apply_structural_scan records it as not scanned."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if list_files is None:
         def list_files():
             return git_ls_files(clone_dir)
-    if read_text is None:
-        def read_text(rel):
-            return _read_text_file(os.path.join(clone_dir, rel))
+    read_text = _guarded_reader(clone_dir, read_text)
 
     by_area = {}
     for rel in list_files():
@@ -2475,9 +2669,29 @@ def scan_structural_terraform_areas(clone_dir, patterns=None, list_files=None,
         # module); a nested dir is only used when the area dir itself has no *.tf.
         mod_dir = _tf_module_dir(aid, paths)
         own = [p for p in paths if os.path.dirname(p) == mod_dir]
-        text = "\n".join(read_text(p) for p in own)
+        texts = [read_text(p) for p in own]
+        text = "\n".join(t for t in texts if t is not None)
         out[aid] = {"paths": paths, "edges": _tf_direct_edges(text, mod_dir, patterns)}
+        if any(t is None for t in texts):
+            out[aid]["unread"] = True
     return out
+
+
+def _guarded_reader(clone_dir, read_text=None):
+    """`rel -> text | None` for the structural scans: the injected `read_text`
+    (OSError -> one warning, None) or, by default, _read_repo_text under
+    `clone_dir` (never outside it)."""
+    if read_text is None:
+        return lambda rel: _read_repo_text(clone_dir, rel)
+
+    def guarded(rel):
+        try:
+            return read_text(rel)
+        except OSError as exc:
+            sys.stderr.write("warning: skipped {}: {} (not read)\n".format(
+                rel, exc.strerror or exc))
+            return None
+    return guarded
 
 
 def merge_structural_areas(code_graph, structural):
@@ -2525,14 +2739,14 @@ def scan_structural_bicep_areas(clone_dir, patterns=None, list_files=None,
     Cost: one pass over the listing, one read per module entrypoint; no other
     file is opened. Returns {area_id: {"paths": [the area's non-scaffold .bicep
     files], "edges": [...]}}. `list_files`/`read_text` are injectable for offline
-    tests; defaults list tracked files via git and read from disk."""
+    tests; defaults list tracked files via git and read from disk. An entry
+    file that cannot be read (as in scan_structural_terraform_areas) gives
+    its area no edges and `"unread": True` (issue #109)."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     if list_files is None:
         def list_files():
             return git_ls_files(clone_dir)
-    if read_text is None:
-        def read_text(rel):
-            return _read_text_file(os.path.join(clone_dir, rel))
+    read_text = _guarded_reader(clone_dir, read_text)
 
     by_area, entry = {}, {}
     for rel in list_files():
@@ -2548,7 +2762,11 @@ def scan_structural_bicep_areas(clone_dir, patterns=None, list_files=None,
     modules = {aid for aid in entry if not _is_avm_group_area(aid)}
     out = {}
     for aid in sorted(modules):
-        edges = build_bicep_edges(read_text(entry[aid]), None, entry[aid],
+        src = read_text(entry[aid])
+        if src is None:
+            out[aid] = {"paths": sorted(by_area[aid]), "edges": [], "unread": True}
+            continue
+        edges = build_bicep_edges(src, None, entry[aid],
                                   modules, patterns,
                                   module_exists=modules.__contains__)
         out[aid] = {"paths": sorted(by_area[aid]), "edges": edges}
@@ -2569,15 +2787,20 @@ def apply_structural_scan(code_graph, clone_dir, patterns=None, list_files=None,
 
     def listed():
         return files
-    merge_structural_areas(code_graph, scan_structural_terraform_areas(
-        clone_dir, patterns, list_files=listed, read_text=read_text))
-    merge_structural_areas(code_graph, scan_structural_bicep_areas(
-        clone_dir, patterns, list_files=listed, read_text=read_text))
+    unread = set()
+    for scan in (scan_structural_terraform_areas, scan_structural_bicep_areas):
+        found = scan(clone_dir, patterns, list_files=listed, read_text=read_text)
+        unread.update(aid for aid, info in found.items() if info.get("unread"))
+        merge_structural_areas(code_graph, found)
     # The graph now holds the WHOLE tree's direct module edges: an area with no
     # direct edge here has none in the checkout. Fold relies on this marker to
     # retract stale direct depends_on edges (issue #95); a scan that cannot
-    # list or read the tree raises before it is set.
+    # list the tree raises before it is set. An area with a module file the
+    # scan could not read (issue #109) is listed in `structural_scan_unread`
+    # and is NOT spoken for by the marker (StructureReplay).
     code_graph["structural_scan"] = True
+    if unread:
+        code_graph["structural_scan_unread"] = sorted(unread)
     return code_graph
 
 
@@ -2626,9 +2849,61 @@ def build_terraform_edges(tf_text, dot_text, base_path, area_ids, patterns=None,
                   key=lambda e: (str(e["to"]), str(e["ref"]), e.get("address", "")))
 
 
-def _read_text_file(path):
-    with open(path, encoding="utf-8") as fh:
-        return fh.read()
+class RepoFileRefused(OSError):
+    """A repo file gather will not read: its real path leaves the clone."""
+
+
+def _inside_root(path, root):
+    """True when `path`, all symlinks resolved, is `root` or below it (root's
+    own symlinks resolved too)."""
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(path)
+    return real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def _decode_text(data):
+    """Bytes of a repo text file -> str. A UTF-16 / UTF-32 BOM selects that
+    codec, a UTF-8 BOM is dropped; anything else is UTF-8 with undecodable
+    bytes replaced (U+FFFD), so one latin-1 byte never fails a member. Line
+    ends are translated as text-mode `open` does (`\\r\\n` / `\\r` -> `\\n`)."""
+    text = None
+    for bom, codec in ((b"\xef\xbb\xbf", "utf-8-sig"),
+                       (b"\xff\xfe\x00\x00", "utf-32"), (b"\x00\x00\xfe\xff", "utf-32"),
+                       (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16")):
+        if data.startswith(bom):
+            text = data.decode(codec, "replace")
+            break
+    if text is None:
+        text = data.decode("utf-8", "replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_text_file(path, root=None):
+    """Read one repo text file (issue #109). With `root` (the clone or the
+    structure worktree), a path whose real location -- symlinks resolved --
+    is outside `root` is refused with RepoFileRefused and never opened: a
+    tracked symlink must not make gather read a file of the machine it runs
+    on. A symlink that stays inside the tree is followed. Decoding never
+    fails (_decode_text). A missing file or dangling symlink raises OSError
+    as before; callers that must not fail catch it (_read_repo_text)."""
+    if root is not None and not _inside_root(path, root):
+        raise RepoFileRefused("{} resolves outside {}".format(path, root))
+    with open(path, "rb") as fh:
+        return _decode_text(fh.read())
+
+
+def _read_repo_text(root, rel, warn=None):
+    """`_read_text_file(<root>/<rel>, root)`, or None after ONE stderr warning
+    naming the file when it is refused (outside the tree) or cannot be read
+    (dangling symlink, permission, a directory)."""
+    try:
+        return _read_text_file(os.path.join(root, rel), root=root)
+    except OSError as exc:
+        reason = ("it resolves outside the checkout" if isinstance(exc, RepoFileRefused)
+                  else exc.strerror or type(exc).__name__)
+        (warn or sys.stderr.write)(
+            "warning: skipped {}: {} (not read)\n".format(rel, reason))
+        return None
 
 
 # The area ids the directory provider gives to REPO-ROOT IaC files: `_main_bicep_dir`
@@ -3107,6 +3382,13 @@ def parse_args(argv):
                         "module dependencies (static, no build), so modules not "
                         "changed in the window still appear with their direct "
                         "edges; always on for --manifest members")
+    p.add_argument("--no-iac-build", dest="no_iac_build", action="store_true",
+                   help="do not run `bicep restore/build` or `terraform init/"
+                        "graph` (they download and run third-party modules and "
+                        "providers chosen by the gathered repo); every area is "
+                        "recorded edges_status=skipped. The structural scan "
+                        "(source parsing) still runs. Use it for repos you do "
+                        "not trust.")
     p.add_argument("--store", required=True,
                    help="path to the SQLite journey-graph store to fold into "
                         "(the sole gather deliverable)")
@@ -3163,6 +3445,253 @@ def resolve_token(env):
     return token
 
 
+# --- Child-process environment (issue #109) -----------------------------------
+#
+# Every subprocess gather starts (git, bicep, terraform, graphify) goes through
+# run_git and gets the environment `_child_env` builds from os.environ:
+#
+#   * Secrets removed (item 14): GITHUB_TOKEN, GH_TOKEN, GITHUB_PAT, the GitHub
+#     Enterprise token names, ACTIVITY_TEST_TOKEN and every other variable whose
+#     name ends in `_TOKEN` or `_PAT`. gather sends the token only in HTTPS
+#     headers to api.github.com; the IaC builds run third-party code that
+#     must never see it, and git clones without it -- unless the user has a
+#     git credential helper configured, which may read GH_TOKEN / GITHUB_TOKEN
+#     to clone a private repo (those names are then kept for git alone). Terraform's
+#     own registry credentials (`TF_TOKEN_<host>`) do not end in `_TOKEN` and are
+#     kept, as is everything else (PATH, HOME, TMPDIR, proxy/TLS variables,
+#     TF_PLUGIN_CACHE_DIR, locale, Azure credentials a private `br:` registry
+#     restore needs).
+#   * git only (item 2): the user's global and system config are not read
+#     (GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1), so `color.ui`,
+#     `diff.noprefix`, `diff.mnemonicPrefix`, `log.showSignature`,
+#     `diff.renames`, `clone.defaultRemoteName`, `i18n.logOutputEncoding` and
+#     the like cannot change what the walks print; GIT_TERMINAL_PROMPT=0 (fail,
+#     never prompt), GIT_PAGER=cat, and LC_ALL=C so the git messages matched
+#     below ("couldn't find remote ref", "no commits selected for shallow
+#     requests") are the English ones. What a clone/fetch legitimately needs
+#     from that config is read ONCE (`_git_passthrough_config`) and re-applied
+#     through GIT_CONFIG_COUNT (never argv, so no value appears in a process
+#     listing or in run_git's error text): see _GIT_PASSTHROUGH_HTTP_VARS.
+#   * terraform only (item 10): TF_CLI_CONFIG_FILE names a CLI config with an
+#     explicit `provider_installation` block (`_terraform_cli_config`), which
+#     turns off terraform's implied local mirrors, in particular a
+#     `terraform.d/plugins` directory shipped inside the gathered repo.
+_SECRET_ENV_NAMES = frozenset((
+    "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN", "ACTIVITY_TEST_TOKEN"))
+_SECRET_ENV_SUFFIXES = ("_TOKEN", "_PAT")
+# Kept for git (only) when the user has a credential helper configured.
+_GIT_HELPER_TOKEN_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                           "GITHUB_ENTERPRISE_TOKEN")
+
+_GIT_ISOLATION_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_PAGER": "cat",
+    "LC_ALL": "C",
+}
+
+# The user's global/system git config is read for these keys only: settings
+# that route or authorise the network connection and never change git's
+# output. `http.*` / `http.<url>.*` variables are kept when named here; the
+# others (`extraHeader`, `sslCert`, `sslKey`, `proxySSLCert`, `proxySSLKey`,
+# `cookieFile`, `userAgent`, ...) are dropped, as is every key outside the
+# sections below (`include*` is followed while reading, not copied).
+_GIT_PASSTHROUGH_HTTP_VARS = frozenset((
+    "proxy", "proxyauthmethod", "proxysslcainfo", "sslcainfo", "sslcapath",
+    "sslverify", "sslbackend", "sslversion", "sslcipherlist",
+    "schannelcheckrevoke", "schannelusesslcainfo", "version", "postbuffer",
+    "lowspeedlimit", "lowspeedtime", "followredirects", "curloptresolve",
+    "maxrequests", "minsessions", "noepsv", "emptyauth"))
+_GIT_PASSTHROUGH_REGEXP = (r"^(http|https|url|credential|safe|protocol)\."
+                           r"|^core\.sshcommand$")
+_git_passthrough_cache = None
+_terraform_cli_config_cache = None
+_child_env_lock = threading.Lock()
+
+
+def _is_secret_env(name):
+    up = name.upper()
+    return up in _SECRET_ENV_NAMES or up.endswith(_SECRET_ENV_SUFFIXES)
+
+
+def _git_passthrough_key(key):
+    """True when a global/system git config key is carried over (see
+    _GIT_PASSTHROUGH_HTTP_VARS)."""
+    low = key.lower()
+    section, _, rest = low.partition(".")
+    var = low.rsplit(".", 1)[-1]
+    if section in ("http", "https"):
+        return var in _GIT_PASSTHROUGH_HTTP_VARS
+    if section == "url":
+        return bool(rest) and var == "insteadof"
+    if section == "credential":
+        return var in ("helper", "username", "usehttppath")
+    if section == "safe":
+        return low == "safe.directory"
+    if section == "protocol":
+        return var == "allow"
+    return low == "core.sshcommand"
+
+
+def _read_git_passthrough_config(env):
+    """[(key, value)] from the user's system then global git config (includes
+    followed), filtered by _git_passthrough_key. Reads with `env` as given
+    (the caller's, without the isolation), so GIT_CONFIG_GLOBAL /
+    GIT_CONFIG_NOSYSTEM set by the user are honoured. Any failure (no git, no
+    such file) contributes nothing."""
+    pairs = []
+    for scope in ("--system", "--global"):
+        # `git config --system` reads the system file even when the user has
+        # switched it off; honour GIT_CONFIG_NOSYSTEM here.
+        if scope == "--system" and env.get("GIT_CONFIG_NOSYSTEM", "").lower() \
+                in ("1", "true", "yes", "on"):
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "config", scope, "--includes", "-z", "--get-regexp",
+                 _GIT_PASSTHROUGH_REGEXP],
+                capture_output=True, env=env, cwd=tempfile.gettempdir(),
+                timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        for entry in proc.stdout.decode("utf-8", "replace").split("\0"):
+            if not entry:
+                continue
+            key, nl, value = entry.partition("\n")
+            if _git_passthrough_key(key):
+                pairs.append((key, value if nl else "true"))
+    return pairs
+
+
+def _git_passthrough_config():
+    """The carried-over git config pairs, read once per process."""
+    global _git_passthrough_cache
+    with _child_env_lock:
+        if _git_passthrough_cache is None:
+            env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
+            _git_passthrough_cache = _read_git_passthrough_config(env)
+        return list(_git_passthrough_cache)
+
+
+def _env_config_pairs(env):
+    """The GIT_CONFIG_COUNT / GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> pairs
+    already in `env`, removed from it."""
+    try:
+        count = int(env.pop("GIT_CONFIG_COUNT", "0") or 0)
+    except ValueError:
+        count = 0
+    pairs = []
+    for i in range(max(count, 0)):
+        key = env.pop("GIT_CONFIG_KEY_%d" % i, None)
+        value = env.pop("GIT_CONFIG_VALUE_%d" % i, "")
+        if key:
+            pairs.append((key, value))
+    return pairs
+
+
+def _terraform_user_config_path(env):
+    """The CLI config terraform would read on its own: TF_CLI_CONFIG_FILE, else
+    ~/.terraformrc (%APPDATA%/terraform.rc on Windows). None when absent."""
+    path = env.get("TF_CLI_CONFIG_FILE")
+    if not path:
+        if os.name == "nt":
+            path = os.path.join(env.get("APPDATA", ""), "terraform.rc")
+        else:
+            path = os.path.join(os.path.expanduser("~"), ".terraformrc")
+    return path if os.path.isfile(path) else None
+
+
+_TF_PROVIDER_INSTALLATION_RE = re.compile(r"(?m)^[ \t]*provider_installation[ \t]*\{")
+
+
+def _terraform_cli_config_text(user_text, home):
+    """The CLI config gather runs terraform with: the user's own config (kept:
+    credentials, host blocks, plugin_cache_dir) plus an explicit
+    `provider_installation` block that installs providers directly from their
+    registries -- and from the user's own `~/.terraform.d/plugins` when it
+    exists -- so no implied mirror, in particular a repo-shipped
+    `terraform.d/plugins`, is ever consulted. TF_PLUGIN_CACHE_DIR still
+    applies. Pure."""
+    lines = ["", "# added by activity-overview gather (issue #109)",
+             "provider_installation {"]
+    user_plugins = os.path.join(home, ".terraform.d", "plugins") if home else None
+    if user_plugins and os.path.isdir(user_plugins):
+        lines.append("  filesystem_mirror {")
+        lines.append("    path = %s" % json.dumps(user_plugins))
+        lines.append("  }")
+    lines += ["  direct {}", "}", ""]
+    return (user_text or "") + "\n".join(lines)
+
+
+def _terraform_cli_config():
+    """Path of the TF_CLI_CONFIG_FILE every terraform command gets (created
+    once per process, removed at exit). A user config that already has its
+    own `provider_installation` block disables the implied mirrors itself and
+    is used as it is."""
+    global _terraform_cli_config_cache
+    with _child_env_lock:
+        if _terraform_cli_config_cache is not None:
+            return _terraform_cli_config_cache
+        user = _terraform_user_config_path(os.environ)
+        user_text = ""
+        if user:
+            try:
+                with open(user, encoding="utf-8", errors="replace") as fh:
+                    user_text = fh.read()
+            except OSError:
+                user_text = ""
+            if _TF_PROVIDER_INSTALLATION_RE.search(user_text):
+                _terraform_cli_config_cache = user
+                return user
+        fd, path = tempfile.mkstemp(prefix="activity-terraform-", suffix=".tfrc")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_terraform_cli_config_text(user_text, os.path.expanduser("~")))
+        atexit.register(_remove_quietly, path)
+        _terraform_cli_config_cache = path
+        return path
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _child_env(args):
+    """The environment for one subprocess (see the section comment above)."""
+    env = {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
+    tool = os.path.basename(args[0]).lower() if args else ""
+    if tool.endswith(".exe"):
+        tool = tool[:-4]
+    if tool == "git":
+        carried = _git_passthrough_config()
+        # A configured credential helper (`gh auth git-credential`, a CI
+        # helper) is git's own child and may read the GitHub token from the
+        # environment to clone a private repo: keep those names for git then.
+        # Without a helper git has no use for them and they stay removed.
+        if any(k.lower().startswith("credential.") and k.lower().endswith(".helper")
+               or k.lower() == "credential.helper" for k, _ in carried):
+            for name in _GIT_HELPER_TOKEN_NAMES:
+                if name in os.environ:
+                    env[name] = os.environ[name]
+        pairs = carried + _env_config_pairs(env)
+        for i, (key, value) in enumerate(pairs):
+            env["GIT_CONFIG_KEY_%d" % i] = key
+            env["GIT_CONFIG_VALUE_%d" % i] = value
+        if pairs:
+            env["GIT_CONFIG_COUNT"] = str(len(pairs))
+        env.pop("LANGUAGE", None)
+        env.update(_GIT_ISOLATION_ENV)
+    elif tool == "terraform":
+        env["TF_CLI_CONFIG_FILE"] = _terraform_cli_config()
+    return env
+
+
 def run_git(args, cwd=None, timeout=None):
     """Thin wrapper around git. Its live git interaction is integration-only,
     but the non-UTF-8 decode path below is covered by TestRunGitDecoding.
@@ -3180,13 +3709,20 @@ def run_git(args, cwd=None, timeout=None):
     it so non-ASCII paths print verbatim instead of as C-quoted octal escapes
     (`"docs/caf\\303\\251.md"`). Paths with a quote, backslash, TAB or newline are
     still C-quoted by git; the path parsers undo that via unquote_git_path.
-    Non-git commands routed through here (bicep, terraform, graphify) are passed
-    through untouched."""
+    Non-git commands routed through here (bicep, terraform, graphify) get no
+    extra arguments.
+
+    Every command runs with the environment `_child_env` builds (issue #109):
+    no GitHub token or other `*_TOKEN` variable, git isolated from the user's
+    global and system config (only network/auth routing settings are carried
+    over), and terraform pointed at a CLI config that never uses a repo-local
+    plugin mirror."""
     args = list(args)
     if args and os.path.basename(args[0]) == "git":
         args = [args[0], "-c", "core.quotepath=false"] + args[1:]
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout)
+                          encoding="utf-8", errors="replace", timeout=timeout,
+                          env=_child_env(args))
     if proc.returncode != 0:
         raise RuntimeError(
             f"command failed (exit {proc.returncode}): {' '.join(args)}\n"
@@ -3218,13 +3754,13 @@ def clone_head_sha(clone_dir, run=run_git):
 
 def window_end_commit(clone_dir, to_date, run=None):
     """The mainline as of the window's end (issue #107): the newest commit on
-    the checked-out branch's first-parent chain whose committer date (the
-    `date` the walks window on) is on or before `to_date`, or None when the
-    bounded clone holds no such commit. First-parent, so a topic branch merged
-    after `to_date` is not counted as on the mainline before its merge."""
+    the checked-out branch's first-parent chain whose committer day (the UTC
+    `date` the walks window on, #109) is on or before `to_date`, or None when
+    the bounded clone holds no such commit. First-parent, so a topic branch
+    merged after `to_date` is not counted as on the mainline before its merge."""
     run = run or run_git
     raw = run(["git", "-C", clone_dir, "log", "--first-parent",
-               f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short"])
+               f"--pretty=format:{LOG_FORMAT}"])
     for rec in parse_git_log(raw):
         if in_window(rec.get("date"), None, to_date):
             return rec["sha"]
@@ -3241,7 +3777,10 @@ def structure_tree(clone_dir, sha, run=None):
     also when a read raises. The clone's HEAD, branch, index and working tree
     are never touched, so a reused clone stays on its branch for the next run
     and by-products of the IaC builds (a `.terraform/`, a lock file) cannot
-    block a checkout in either direction."""
+    block a checkout in either direction. For the head the builds run in the
+    clone itself (no second full checkout of a large repo); the next run's
+    prepare_clone / checkout_base_branch remove their output first
+    (reset_build_byproducts, issue #109)."""
     run = run or run_git
     if not sha or sha == clone_head_sha(clone_dir, run):
         yield clone_dir
@@ -3420,6 +3959,12 @@ def extract_iac_edges(code_graph, clone_dir, which=shutil.which, run=run_git,
     `code_graph["edge_extraction"]` counts resolved/timeout/failed/skipped. Injectable
     `which`/`run`/`read_text` keep it offline-testable. Mutates and returns code_graph."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
+    # The default reader never follows a symlink out of the tree (issue #109):
+    # a refused / unreadable file fails that area's build (`failed`), never
+    # the member.
+    if read_text is _read_text_file:
+        def read_text(path):
+            return _read_text_file(path, root=clone_dir)
     # None -> the env-overridable defaults (read now, not at import). An explicit
     # max_workers is still clamped so ThreadPoolExecutor never sees a value < 1.
     env_timeout, env_workers, env_retries = _iac_settings()
@@ -3620,9 +4165,10 @@ def _wait_for_rate_limit(kind, wait, url, waits, max_wait, sleep, clock, diagnos
 
 
 def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
-                 rate_limited=None):
+                 rate_limited=None, allow_statuses=()):
     """Send `req` with timeout, retries and rate-limit back-off. Returns
-    (headers, body_bytes), or (None, 404) for a 404 when allow_404. Raises
+    (headers, body_bytes), or (None, status) for a 404 when allow_404 or for
+    an HTTP status listed in `allow_statuses` (neither retried). Raises
     GitHubAPIError on any other failure.
 
     `rate_limited(headers, body)` optionally reports a rate limit signalled in a
@@ -3647,8 +4193,8 @@ def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
             with opener.open(req, timeout=timeout) as resp:
                 headers, body = resp.headers, resp.read()
         except urllib.error.HTTPError as err:
-            if allow_404 and err.code == 404:
-                return None, 404
+            if (allow_404 and err.code == 404) or err.code in allow_statuses:
+                return None, err.code
             try:
                 body = err.read()
             except Exception:
@@ -3692,7 +4238,50 @@ def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
         return headers, body
 
 
-def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=None):
+# HTTP statuses for a single issue / PR that is not (or no longer) in the repo:
+# 404 (never existed, or not visible) and 410 (deleted). A caller fetching
+# one referenced item by number skips it on either, instead of failing the
+# whole gather on one dangling reference (#109).
+GONE_STATUSES = (404, 410)
+
+
+def _repo_of_url(url):
+    """'owner/repo' (lower-case) named by a GitHub API `repository_url`
+    (`…/repos/{owner}/{repo}`) or web `html_url`
+    (`https://github.com/{owner}/{repo}/…`), or None. Pure."""
+    parts = [p for p in urllib.parse.urlparse(url or "").path.split("/") if p]
+    if len(parts) >= 3 and parts[0] == "repos":
+        parts = parts[1:]
+    elif urllib.parse.urlparse(url or "").netloc.startswith("api."):
+        return None
+    if len(parts) < 2:
+        return None
+    return "{}/{}".format(parts[0], parts[1]).lower()
+
+
+def fetched_item_mismatch(raw, slug, number):
+    """Why a REST issue / PR object fetched as #`number` of `slug`
+    ('owner/repo') is NOT that item, or None when it is (#109). GitHub answers
+    a transferred issue through a redirect to its new home, so the object
+    must carry the requested `number`, and its `repository_url` and `html_url`
+    (whichever it has; compared case-insensitively) must name `slug`. A
+    payload with neither URL is not rejected for it (it cannot be checked).
+    Pure."""
+    if not isinstance(raw, dict):
+        return "not an object"
+    if raw.get("number") != number:
+        return "it is #{}".format(raw.get("number"))
+    want = (slug or "").lower()
+    for key in ("repository_url", "html_url"):
+        if raw.get(key):
+            got = _repo_of_url(raw[key])
+            if got != want:
+                return "{} names {}".format(key, got or raw[key])
+    return None
+
+
+def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=None,
+                  allow_statuses=()):
     """GET a GitHub API URL → (parsed_json, next_url).
 
     Timeouts, retries, rate-limit back-off and redirect auth-stripping come from
@@ -3701,17 +4290,21 @@ def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=No
     SAML SSO vs. token scope); `_format_http_error` surfaces both.
 
     With allow_404=True a 404 returns (None, 404) instead of raising, so the
-    backfill seam can map a definitively-absent ref to ABSENT. All other
-    failures raise SystemExit with the diagnostic (fail fast).
+    backfill seam can map a definitively-absent ref to ABSENT; each HTTP status
+    in `allow_statuses` (e.g. GONE_STATUSES: 404 and 410, a deleted issue)
+    likewise returns (None, status). Only the statuses a caller names are
+    tolerated: all other failures raise SystemExit with the diagnostic (fail
+    fast).
     """
     req = urllib.request.Request(url, headers=_github_headers(url, token))
     try:
         headers, body = _github_open(req, url, allow_404=allow_404, opener=opener,
-                                     sleep=sleep, clock=clock)
+                                     sleep=sleep, clock=clock,
+                                     allow_statuses=allow_statuses)
     except GitHubAPIError as err:
         raise SystemExit(str(err)) from None
-    if headers is None and body == 404:
-        return None, 404
+    if headers is None:
+        return None, body
     return json.loads(body.decode()), _next_link(headers.get("Link", ""))
 
 
@@ -4054,16 +4647,30 @@ def board_is_maintained(board, ref_date=None, stale_days=None):
     return upd_d >= cutoff
 
 
-def _paginate_board_items(graphql, board, owner, repo, max_items):
+# Page guard of _paginate_board_items: at most this many item pages per board
+# after the discovery page (each up to 100 items), whatever `max_items` says.
+BOARD_MAX_PAGES = 200
+
+
+def _paginate_board_items(graphql, board, owner, repo, max_items,
+                          truncations=None):
     """Collect ONE board's item nodes: seed from the discovery page, then page the
     rest by NODE ID (PROJECT_BOARD_ITEMS_QUERY — a cursor that belongs to this
-    board's connection), capped at `max_items`. Warns on truncation so lost
-    coverage is visible. Returns the (capped) list of item nodes."""
+    board's connection), capped at `max_items` items and BOARD_MAX_PAGES pages.
+    Returns the (capped) list of item nodes.
+
+    Whenever items are left behind — more pages remain when the loop stops (the
+    item cap, the page guard, a failed or empty page, no board id) or the last
+    page overshot the cap — it warns on stderr naming the reason and, when
+    `truncations` is a list, appends {board, kept, max_items, reason} to it
+    (acquire records them as `meta.project_board_truncated`, #109), so lost
+    coverage is visible in the data, not only on stderr."""
     nodes = list(((board.get("items") or {}).get("nodes") or []))
     info = (board.get("items") or {}).get("pageInfo") or {}
     cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
-    board_id, guard = board.get("id"), 0
-    while has_next and board_id and len(nodes) < max_items and guard < 200:
+    board_id, guard, reason = board.get("id"), 0, None
+    while has_next and board_id and len(nodes) < max_items \
+            and guard < BOARD_MAX_PAGES:
         guard += 1
         try:
             page = graphql(PROJECT_BOARD_ITEMS_QUERY,
@@ -4075,23 +4682,47 @@ def _paginate_board_items(graphql, board, owner, repo, max_items):
             sys.stderr.write(
                 "warning: partial Projects v2 board #{} for {}/{}: {}\n".format(
                     board.get("number"), owner, repo, err))
+            reason = "error"
             break
         items = ((page or {}).get("node") or {}).get("items") or {}
         page_nodes = items.get("nodes") or []
         if not page_nodes:
+            reason = "empty_page"
             break
         nodes.extend(page_nodes)
         info = items.get("pageInfo") or {}
         cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
-    if has_next and len(nodes) >= max_items:
+    if not has_next and len(nodes) <= max_items:
+        return nodes
+    if len(nodes) >= max_items:
+        reason = "item_cap"
+    elif reason is None:
+        reason = "page_guard" if guard >= BOARD_MAX_PAGES else "no_board_id"
+    kept = nodes[:max_items]
+    if reason != "error":   # an error was warned about above
         sys.stderr.write(
             "warning: Projects v2 board #{} for {}/{} truncated at {} items "
-            "(raise ACTIVITY_BOARD_MAX_ITEMS for full coverage).\n".format(
-                board.get("number"), owner, repo, max_items))
-    return nodes[:max_items]
+            "({}; raise ACTIVITY_BOARD_MAX_ITEMS for full coverage when it is "
+            "the item cap); recorded in meta.project_board_truncated.\n".format(
+                board.get("number"), owner, repo, len(kept),
+                _BOARD_TRUNCATION_REASONS[reason]))
+    if truncations is not None:
+        truncations.append({"board": board.get("number"), "kept": len(kept),
+                            "max_items": max_items, "reason": reason})
+    return kept
 
 
-def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
+_BOARD_TRUNCATION_REASONS = {
+    "item_cap": "the item cap was reached",
+    "page_guard": "the page guard of {} pages was reached".format(BOARD_MAX_PAGES),
+    "empty_page": "a page claimed more items but returned none",
+    "no_board_id": "the board has no id to page by",
+    "error": "a page request failed",
+}
+
+
+def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None,
+                        truncations=None):
     """Auto-discover + fetch EVERY maintained Projects v2 board the repo links, via
     the injected `graphql(query, variables)` callable, returning
     `(sprints, items_by_ref)` (see parse_project_board, which merges items across
@@ -4099,7 +4730,8 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     skipped with a warning so a deprecated-but-not-removed board can't pollute the
     result. Each kept board's items are paginated by NODE ID and capped per board
     at `max_items`. `ref_date` (the window's ref/`to` date) anchors the staleness
-    check.
+    check. A board whose items were cut short is appended to the optional
+    `truncations` list (see _paginate_board_items).
 
     Degrades CLEANLY to ({}, {}) on any error (a GitHubAPIError / SystemExit, a
     network failure, a null repository, or no linked/maintained board) — a board
@@ -4150,7 +4782,8 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     # Fetch each maintained board fully (per-board node-id pagination), then merge.
     full_boards = []
     for b in kept:
-        nodes = _paginate_board_items(graphql, b, owner, repo, max_items)
+        nodes = _paginate_board_items(graphql, b, owner, repo, max_items,
+                                      truncations)
         fb = dict(b)
         fb["items"] = {"pageInfo": {"hasNextPage": False, "endCursor": None},
                        "nodes": nodes}
@@ -4516,7 +5149,7 @@ def enrich_pr(pr, get_page, api, current_slug):
     from the lengths of the fully-paginated comment lists."""
     num = pr["number"]
     reviews = fetch_all(get_page, f"{api}/pulls/{num}/reviews?per_page=100")
-    summary = summarize_reviews(reviews)
+    summary = summarize_reviews(reviews, author=pr.get("author"))
     pr["reviewers"] = summary["reviewers"]
     pr["review_decision"] = summary["decision"]
     # Phase 10 slice 1: KEEP the individual review submissions (fold persists
@@ -4530,7 +5163,8 @@ def enrich_pr(pr, get_page, api, current_slug):
     # in "Fixes #1, #2": mentioned, not closed) and add the timeline's, in order.
     seeded = list(pr.get("crossref_issues") or [])
     pr["crossref_issues"] = seeded + [
-        n for n in parse_timeline_crossrefs(timeline) if n not in seeded]
+        n for n in parse_timeline_crossrefs(timeline, current_slug)
+        if n not in seeded]
     _attach_timeline_xrefs(pr, timeline, current_slug)
     # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
     # ready_for_review). Omit-when-empty for byte stability.
@@ -4720,7 +5354,19 @@ def acquire(args, env):
         # edges stay [] when bicep/terraform or the registry are unavailable).
         # No-op without a clone on disk.
         if not args.no_clone or os.path.isdir(clone_dir):
-            code_graph = extract_iac_edges(code_graph, tree, **area_kw)
+            # --no-iac-build (issue #109): the builds run third-party code
+            # (bicep restore / terraform init download modules and providers);
+            # skip them and record every area as `edges_status: skipped`. The
+            # structural scan below is source parsing only and still runs.
+            if getattr(args, "no_iac_build", False):
+                sys.stderr.write(
+                    f"note: {owner}/{repo}: --no-iac-build: bicep/terraform "
+                    f"builds skipped (edges_status=skipped)\n")
+                code_graph = extract_iac_edges(code_graph, tree,
+                                               which=lambda _name: None, **area_kw)
+                code_graph["edge_extraction"]["disabled"] = True
+            else:
+                code_graph = extract_iac_edges(code_graph, tree, **area_kw)
             # Multi-repo (project) gathers -- and a single-repo gather given
             # `--structural-iac` -- additionally fold the WHOLE module tree's
             # static Terraform `source` and Bicep `module` deps (no terraform
@@ -4733,13 +5379,21 @@ def acquire(args, env):
                     list_files=(lambda: tracked) if tracked is not None else None,
                     **area_kw)
 
-        # CODEOWNERS from the tree (local file; try the conventional locations).
+        # CODEOWNERS from the tree (local file; try the conventional locations;
+        # the first one present is used). Read through _read_repo_text (issue
+        # #109): never through a symlink that leaves the tree, never failing
+        # the member on an undecodable byte; a file that is there but cannot
+        # be read is skipped with a warning and recorded so the replay does
+        # not take it as "no owners".
         code_owners = {}
         for rel in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
             p = os.path.join(tree, rel)
             if os.path.isfile(p):
-                with open(p, encoding="utf-8") as fh:
-                    code_owners = parse_codeowners(fh.read())
+                text = _read_repo_text(tree, rel)
+                if text is None:
+                    code_graph["codeowners_unread"] = rel
+                else:
+                    code_owners = parse_codeowners(text)
                 break
 
     get_page = _paginated(token)
@@ -4804,11 +5458,25 @@ def acquire(args, env):
         seen.add(issue["number"])
         issues.append(issue)
     for n in sorted(wanted - seen):
-        # A closed/cross-referenced issue can 404 — deleted, transferred to another
-        # repo, or a cross-ref number that is not an issue in THIS repo. Tolerate it
-        # (skip) rather than aborting the whole gather on one dangling reference.
-        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token, allow_404=True)
-        if raw_issue is None or raw_issue.get("pull_request"):
+        # A closed/cross-referenced issue can be gone: 404 (a number that is not
+        # an issue in THIS repo) or 410 (deleted). Tolerate it (skip, one note)
+        # rather than aborting the whole gather on one dangling reference. A
+        # transferred issue is answered through a redirect to its new repo: an
+        # object that is not #n of this repo is skipped too, never stored as
+        # this repo's issue (#109).
+        raw_issue, status = http_get_json(f"{api}/issues/{n}", token,
+                                          allow_statuses=GONE_STATUSES)
+        if raw_issue is None:
+            sys.stderr.write(f"note: {owner}/{repo}: referenced issue #{n} "
+                             f"skipped (HTTP {status})\n")
+            continue
+        why = fetched_item_mismatch(raw_issue, f"{owner}/{repo}", n)
+        if why:
+            sys.stderr.write(f"note: {owner}/{repo}: referenced issue #{n} "
+                             f"skipped: the API answered with another item "
+                             f"({why}; transferred?)\n")
+            continue
+        if raw_issue.get("pull_request"):
             continue
         raw_by_num[raw_issue["number"]] = raw_issue
         issues.append(normalize_issue(raw_issue))
@@ -4888,13 +5556,15 @@ def acquire(args, env):
     # missing read:project scope NEVER hard-fails the run; --no-project-board skips
     # the query entirely.
     sprints = {}
+    board_truncated = []
     if getattr(args, "project_board", True):
         _graphql = _graphql_client(token)
         # ref_date (the window's reference point) anchors the board staleness
         # check; it is finalized below but resolves to the same value here.
         sprints, items_by_ref = fetch_project_board(
             _graphql, owner, repo, max_items=_board_max_items(),
-            ref_date=getattr(args, "ref_date", None) or to)
+            ref_date=getattr(args, "ref_date", None) or to,
+            truncations=board_truncated)
         # Window-bound iterations to [frm, to] by date: keep a sprint that overlaps
         # the window at all (start <= to and end >= frm). A sprint with no dates is
         # kept (can't exclude it). Drop the iteration stamp on items whose sprint
@@ -4945,6 +5615,10 @@ def acquire(args, env):
     # Where `closes` came from (issue #105): "graphql" (keywords + GitHub's
     # closingIssuesReferences) or "keywords" (GraphQL unavailable).
     bundle["meta"]["closing_refs_source"] = closing_refs_source
+    # Boards whose items were cut short (item cap / page guard / failed page,
+    # #109): present only when one was, so a complete board changes nothing.
+    if board_truncated:
+        bundle["meta"]["project_board_truncated"] = board_truncated
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
@@ -4966,8 +5640,8 @@ def acquire(args, env):
 #
 # The actual fetch is SEAMED behind an injectable `fetch` callable so the test
 # suite never touches the network: tests pass a fixture-backed fake; production
-# passes `make_backfill_fetcher(token)` (REST for social, local/`git fetch
-# --depth 1` for code). `fetch(kind, local, qid)` returns either None (genuinely
+# passes `make_backfill_fetcher(token)` (REST, PRs and issues only).
+# `fetch(kind, local, qid)` returns either None (genuinely
 # unfetchable) or `{"node": <raw record dict>, "edges": [(dst_local, edge_type),
 # ...]}`. backfill shapes the result into store node/edge upserts, reusing the
 # same id/edge conventions fold_bundle uses.
@@ -5010,93 +5684,200 @@ def classify_id(qid):
 ABSENT = object()
 
 
+def _backfill_record_kind(local):
+    """"pr" / "issue" for a `pr-<n>` / `issue-<n>` local id (the only ids a
+    spine traversal can miss: the dst of closes / cross_ref / part_of), else
+    None. Returns (kind, number)."""
+    for kind in ("pr", "issue"):
+        head = kind + "-"
+        if local.startswith(head) and local[len(head):].isdigit():
+            return kind, int(local[len(head):])
+    return None, None
+
+
+def _latest_code_graph(conn, project, repo):
+    """The code graph of the repo's latest gathered window by date (#94
+    per-window facts) — the one a view spanning the store reads — else the
+    latest-wins `codegraph` singleton (a store folded before #94), else {}."""
+    try:
+        ledger = graphstore.get_windows(conn)
+    except ValueError:
+        ledger = []
+    windows = sorted({(w.get("from"), w.get("to")) for w in ledger
+                      if isinstance(w, dict) and w.get("project") == project
+                      and w.get("repo") == repo and w.get("from") and w.get("to")})
+    for frm, to in reversed(windows):
+        wf = graphstore.get_window_facts(conn, project, repo, frm, to,
+                                         keys=("code_graph",))
+        if wf is not None:
+            return (wf.get("facts") or {}).get("code_graph") or {}
+    node = graphstore.get_node(conn, graphstore.qualify_id(project, repo,
+                                                           "codegraph"))
+    return ((node or {}).get("data") or {}) if node else {}
+
+
+def _backfill_people(conn, kind, record, project, repo, rid):
+    """The person records for the logins of ONE backfilled PR / issue, derived
+    as fold_bundle derives them (derive.enumerate_participants, after
+    attach_commit_prs): a PR reviewer inherits the areas of the stored commits
+    that are `part_of` the PR, under the repo's latest code graph. Only the
+    record's own logins are returned (commit authors were folded already)."""
+    view = {"prs": [record]} if kind == "pr" else {"issues": [record]}
+    logins = set(derive.enumerate_participants(view, {}))
+    commits = []
+    if kind == "pr":
+        for e in graphstore.get_edges(conn, rid, direction="in",
+                                      edge_types=["part_of"]):
+            node = graphstore.get_node(conn, e["src_id"])
+            data = (node or {}).get("data") or {}
+            if node and node["node_class"] == "code" and "sha" in data:
+                commits.append(copy.deepcopy(data))
+    attach_commit_prs(commits)
+    idx = derive.area_index(_latest_code_graph(conn, project, repo))
+    people = derive.enumerate_participants({**view, "commits": commits}, idx)
+    return {login: people[login] for login in sorted(logins)}
+
+
+def _backfill_members(conn, project, repo):
+    """The member set a manifest fold would pass for a project store (the
+    stored repos plus those with recorded member run status, as
+    validate._project_members reads it), or None for a single-repo store
+    (repo without an owner/ part)."""
+    if "/" not in repo:
+        return None
+    members = set(graphstore.project_repos(conn, project))
+    try:
+        members |= {e["repo"] for e in graphstore.get_member_status(conn, project)}
+    except (ValueError, TypeError, KeyError):
+        pass
+    members.add(repo)
+    return members
+
+
 def backfill(conn, id, fetch=None):
-    """Fetch and upsert ONE missing spine node + its cheap immediate edges.
+    """Fetch and upsert ONE missing PR / issue, written exactly as a fold
+    writes a record (issue #113).
 
     Idempotent: if `get_node(id)` already returns a node, this is a no-op and
-    NOTHING is fetched. Otherwise it classifies `id`, calls the injected `fetch`
-    seam for that one node, and (when the fetch yields a record) upserts the node
-    plus any immediate spine edges the seam returned.
+    NOTHING is fetched. Only a `pr-<n>` / `issue-<n>` id is fetched — the only
+    ids a spine traversal can miss (the dst of closes / cross_ref / part_of);
+    any other id returns fetched=False without calling the seam (a commit,
+    artifact, review or structure node written from a seam alone would be a
+    row the trust check rejects).
 
     `fetch(kind, local, qid)` is the network seam with THREE outcomes:
-      - a dict `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched;
+      - a dict `{"node": raw, ...}` == fetched (any `edges` the seam returns
+        are ignored: the edges are derived from the record, below);
       - `gather.ABSENT` == the id DEFINITIVELY does not exist (a 404) —
         `backfill` tombstones it via `graphstore.record_dead_ref` so it is
         pruned and never re-chased;
       - `None` == transient/unreachable (could not be resolved this run).
     Tests pass a fixture-backed fake; production passes `make_backfill_fetcher`.
 
-    Returns `{"fetched": bool, "absent": bool, "id": id, "edges_added": int}` —
-    `absent=True` only on the ABSENT outcome.
-    """
-    if graphstore.get_node(conn, id) is not None:
-        return {"fetched": False, "absent": False, "id": id,
-                "edges_added": 0}  # already present
+    A fetched record is written through the fold's own derivation, in one
+    transaction: `record_rows` (the record node, its closes / cross_ref and
+    — in a project store — cross-repo spine edges, its contribution edges,
+    its review / lifecycle leaves), the person nodes of its logins
+    (`_backfill_people` + `_person_rows`, the fold's union), its FTS text,
+    and the item-relation edges (blocks / in_milestone / in_iteration) that
+    `item_relation_edges` derives for the stored records and that touch it.
+    The store's other rows are left alone. A record is stored under its id's
+    kind: an `issue-N` whose #N is a PR (the seam follows the thread and
+    returns the PR) is an issue record to every reader and to the trust
+    check, so it gets an issue's edges. A record whose `number` differs from
+    the id's is not written (fetched=False); a record without one takes it.
 
-    info = classify_id(id)
-    parsed = graphstore.parse_id(id)
-    # The scope is `{project}/{repo}`; recover project/repo so the upsert lands
-    # in the same identity columns fold_bundle uses.
-    project, _, repo = parsed["scope"].partition("/")
+    Returns `{"fetched": bool, "absent": bool, "id": id, "edges_added": int}` —
+    `absent=True` only on the ABSENT outcome; `edges_added` counts the edges
+    derived for the record.
+    """
+    miss = {"fetched": False, "absent": False, "id": id, "edges_added": 0}
+    if graphstore.get_node(conn, id) is not None:
+        return miss  # already present
 
     if fetch is None:
         raise ValueError("backfill needs a `fetch` seam (production: "
                          "make_backfill_fetcher(token); tests: a fake)")
+    info = classify_id(id)
+    kind, number = _backfill_record_kind(info["local"])
+    if kind is None:
+        return miss  # not a record a traversal can miss: never fetched
+    # The scope is `{project}/{repo}`; recover project/repo so the upsert lands
+    # in the same identity columns fold_bundle uses.
+    project, _, repo = graphstore.parse_id(id)["scope"].partition("/")
 
     result = fetch(info["kind"], info["local"], id)
     if result is ABSENT:
         graphstore.record_dead_ref(conn, id)  # only gather writes
-        return {"fetched": False, "absent": True, "id": id, "edges_added": 0}
+        return dict(miss, absent=True)
     if not result or not result.get("node"):
-        return {"fetched": False, "absent": False, "id": id,
-                "edges_added": 0}  # unreachable / transient
+        return miss  # unreachable / transient
 
-    raw = result["node"]
+    raw = dict(result["node"])
+    if raw.get("number") is None:
+        raw["number"] = number
+    elif raw["number"] != number:
+        return miss  # not the record this id names
     fetched_at = graphstore.now_iso()
-    # ts mirrors fold_bundle's choice per class: social PR -> merged/closed/
-    # created; social issue -> closed/updated; commit -> date; structure -> NULL.
-    if info["kind"] == "social" and info["local"].startswith("pr-"):
-        ts = raw.get("merged_at") or raw.get("closed_at") or raw.get("created_at")
-    elif info["kind"] == "social" and info["local"].startswith("issue-"):
-        ts = raw.get("closed_at") or raw.get("updated_at")
-    elif info["kind"] == "code":
-        ts = raw.get("date")
-    else:
-        ts = raw.get("published_at")  # release; milestone/area stay None
-
-    graphstore.upsert_node(
-        conn, id, project, repo, info["node_class"], ts, raw, fetched_at)
-
-    # Cheap immediate spine edges the seam surfaced (e.g. issue#7 spun_off #5).
-    # Only spine edge types are honored — backfill closes a TRAVERSAL gap, it does
-    # not re-derive the whole non-spine substrate. Edges to still-absent nodes are
-    # fine (a later traversal surfaces them as `missing` for another backfill).
-    edges = []
-    for dst_local, edge_type in result.get("edges") or []:
-        if edge_type not in graphstore.SPINE_EDGE_TYPES:
-            continue
-        edges.append((id, graphstore.qualify_id(project, repo, dst_local),
-                      edge_type, None, None))
-    if edges:
-        graphstore.upsert_edges(conn, edges)
-    return {"fetched": True, "absent": False, "id": id, "edges_added": len(edges)}
+    rows = record_rows(kind, raw, project, repo, fetched_at,
+                       _backfill_members(conn, project, repo))
+    people = _backfill_people(conn, kind, raw, project, repo, id)
+    comments = (raw.get("comments_list") or []) + (
+        (raw.get("review_comments") or []) if kind == "pr" else [])
+    text = _social_text(raw, comments)
+    with conn:
+        graphstore.upsert_nodes(
+            conn, rows["nodes"] + _person_rows(conn, project, people, fetched_at),
+            commit=False)
+        graphstore.upsert_edges(conn, rows["edges"], commit=False)
+        if text and graphstore.fts5_available(conn):
+            graphstore.index_texts(conn, [(id, text)], commit=False)
+        # Item relations now implied for (or by another stored record towards)
+        # this record; a fold rebuilds the whole set, backfill only adds these.
+        relations = [(k[0], k[1], k[2], None, v) for k, v in sorted(
+            item_relation_edges(conn, project, repo).items(),
+            key=lambda kv: kv[0]) if id in (k[0], k[1])]
+        graphstore.upsert_edges(conn, relations, commit=False)
+    return {"fetched": True, "absent": False, "id": id,
+            "edges_added": len(rows["edges"]) + len(relations)}
 
 
-def make_backfill_fetcher(token, clone_dir=None):
-    """Production `fetch` seam for `backfill`: resolves one node by REST (social)
-    or local git (code). Returns a `fetch(kind, local, qid)` callable.
+def _backfilled_is(raw, slug, num, qid):
+    """True when the REST object fetched for backfill id `qid` really is
+    #`num` of `slug` (fetched_item_mismatch); else one stderr note and False,
+    so the node stays a warned gap rather than storing another repo's item
+    under this id (a transferred issue answers through a redirect, #109)."""
+    try:
+        number = int(num)
+    except (TypeError, ValueError):
+        number = num
+    why = fetched_item_mismatch(raw, slug, number)
+    if why:
+        sys.stderr.write(f"note: backfill {qid}: the API answered with another "
+                         f"item ({why}; transferred?); not stored\n")
+        return False
+    return True
+
+
+def make_backfill_fetcher(token):
+    """Production `fetch` seam for `backfill`: resolves one PR / issue by
+    GitHub REST (normalize_pr / normalize_issue). Returns a `fetch(kind, local,
+    qid)` callable.
 
     NOT unit-tested (it is the live-network edge); the suite exercises backfill
-    with a fixture-backed fake instead. social -> GitHub REST (normalize_pr /
-    normalize_issue, plus the same `closes` spine edges fold derives); code -> a
-    bounded `git fetch --depth 1 <sha>` into the clone then a one-commit log;
-    structure -> not backfilled on demand (graphify/whole-dict facts come from
-    Acquire), so it returns None and the node stays a warned gap.
+    with a fixture-backed fake instead. Only social PR / issue ids are
+    resolved; anything else returns None and stays an honest gap. Commits are
+    not backfilled (#113 m4): a commit is never the dst of a spine edge, so no
+    traversal misses one, and a commit written on demand would lack the
+    author resolution, `committed_at`, file list and touches a gather derives.
 
     A `Closes #N` whose #N resolves to a PR (issues + PRs share one number
     space) is followed to the real PR and returned as a node — the thread is
-    traversed, not dropped. Outcomes: a fetched dict, `ABSENT` (a genuine 404),
-    or `None` (transient / not resolvable this run, e.g. a code sha with no clone).
+    traversed, not dropped. Outcomes: a fetched dict, `ABSENT` (a genuine 404,
+    or 410 for a deleted issue), or `None` (transient / not resolvable this
+    run, or an answer that is not the requested item of this repo: a
+    transferred issue reached through a redirect, #109). The returned `edges`
+    are empty: backfill derives a record's edges itself (record_rows).
     """
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
@@ -5110,9 +5891,12 @@ def make_backfill_fetcher(token, clone_dir=None):
         api = f"https://api.github.com/repos/{slug}"
         if kind == "social" and local.startswith("issue-"):
             num = local[len("issue-"):]
-            raw, nxt = http_get_json(f"{api}/issues/{num}", token, allow_404=True)
-            if raw is None and nxt == 404:
+            raw, nxt = http_get_json(f"{api}/issues/{num}", token,
+                                     allow_statuses=GONE_STATUSES)
+            if raw is None:
                 return ABSENT
+            if not _backfilled_is(raw, slug, num, qid):
+                return None
             if raw.get("pull_request"):
                 # #N is actually a PR (issues + PRs share one number space). The
                 # parsed `issue-N` is gather's mis-classification, not a phantom:
@@ -5122,40 +5906,23 @@ def make_backfill_fetcher(token, clone_dir=None):
                 # and anchor the train's headline to in-window work, so an ancient
                 # cross-ref is traversed as context without hijacking the title.
                 pr_raw, pnxt = http_get_json(f"{api}/pulls/{num}", token,
-                                             allow_404=True)
-                if pr_raw is None and pnxt == 404:
+                                             allow_statuses=GONE_STATUSES)
+                if pr_raw is None:
                     return ABSENT
-                pr = normalize_pr(pr_raw)
-                edges = [("issue-{}".format(n), "closes")
-                         for n in pr.get("closes") or []]
-                return {"node": pr, "edges": edges}
+                if not _backfilled_is(pr_raw, slug, num, qid):
+                    return None
+                return {"node": normalize_pr(pr_raw), "edges": []}
             return {"node": normalize_issue(raw), "edges": []}
         if kind == "social" and local.startswith("pr-"):
             num = local[len("pr-"):]
-            raw, nxt = http_get_json(f"{api}/pulls/{num}", token, allow_404=True)
-            if raw is None and nxt == 404:
+            raw, nxt = http_get_json(f"{api}/pulls/{num}", token,
+                                     allow_statuses=GONE_STATUSES)
+            if raw is None:
                 return ABSENT
-            pr = normalize_pr(raw)
-            edges = [("issue-{}".format(n), "closes") for n in pr.get("closes") or []]
-            return {"node": pr, "edges": edges}
-        if kind == "code" and clone_dir:
-            sha = local
-            try:
-                run_git(["git", "-C", clone_dir, "fetch", "--depth", "1",
-                         "origin", sha])
-                raw = run_git(["git", "-C", clone_dir, "log", "-1",
-                               f"--pretty=format:{CODE_LOG_FORMAT}",
-                               "--date=short", "--name-only", sha])
-            except Exception:
+            if not _backfilled_is(raw, slug, num, qid):
                 return None
-            commits = parse_git_log(raw)
-            if not commits:
-                return None
-            c = commits[0]
-            prn = resolve_commit_pr(c.get("message", ""))
-            edges = [("pr-{}".format(prn), "part_of")] if prn is not None else []
-            return {"node": c, "edges": edges}
-        return None  # structure / unfetchable on demand
+            return {"node": normalize_pr(raw), "edges": []}
+        return None  # commit / structure / artifact: not fetched on demand
 
     return fetch
 
@@ -5404,6 +6171,123 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
     }
 
 
+def record_rows(kind, record, project, repo, fetched, members=None):
+    """The store rows ONE PR (`kind` "pr") or issue (`kind` "issue") record
+    implies, as fold_bundle writes them — shared by fold_bundle and
+    gather.backfill so a backfilled record is written exactly as a folded one
+    (issue #113). Pure. Returns {"nodes": [node rows], "edges": [edge rows]}:
+
+      - the record's `social` node (`pr-<n>` / `issue-<n>`; ts = merged/closed/
+        created for a PR, closed/updated for an issue). In a multi-repo project
+        (`members` given) a PR's qualified refs and repo-aware timeline xrefs
+        also yield CROSS-repo spine edges (to member repos) or honest
+        `external_refs` on the record (to non-members) — see
+        _cross_repo_pr_edges; `members=None` (single repo) skips that;
+      - a PR's `closes` / `cross_ref` spine edges to its issues;
+      - the contribution edges (person -> record): PR authored / merged /
+        reviewed / commented, issue reported / commented. Absent logins are
+        skipped; the person NODES are the caller's (_person_rows, over
+        derive.enumerate_participants);
+      - Phase 10: PR review submissions and PR/issue lifecycle events as
+        `social` leaves with a `part_of` spine edge to the record (a review
+        without a url gets a stable `<pr url>#pullrequestreview-<id>`, an event
+        `_lifecycle_event_data`'s). Leaves have no onward spine edge, so they
+        ride into the record's train but cannot bridge it to anything else.
+    Current-state edges (blocks / in_milestone / in_iteration) are not here:
+    they need the stored milestones / sprints / issues (item_relation_edges)."""
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+    nodes, edges = [], []
+    num = record["number"]
+    local = "{}-{}".format(kind, num)
+    rid = qid(local)
+
+    def contrib(login, etype):
+        if login:
+            edges.append((graphstore.qualify_person(project, login), rid, etype,
+                          None, None))
+
+    if kind == "pr":
+        ts = record.get("merged_at") or record.get("closed_at") \
+            or record.get("created_at")
+        stored = record
+        if members is not None:
+            external, xedges = _cross_repo_pr_edges(record, project, repo, members)
+            if external:
+                stored = {**record, "external_refs": external}
+            edges.extend(xedges)
+        nodes.append((rid, project, repo, "social", ts, stored, fetched))
+        for n in record.get("closes") or []:
+            edges.append((rid, qid("issue-{}".format(n)), "closes", None, None))
+        for n in record.get("crossref_issues") or []:
+            edges.append((rid, qid("issue-{}".format(n)), "cross_ref", None, None))
+        contrib(record.get("author"), "authored")
+        contrib(record.get("merged_by"), "merged")
+        for reviewer in record.get("reviewers") or []:
+            contrib(reviewer, "reviewed")
+        for c in (record.get("comments_list") or []) \
+                + (record.get("review_comments") or []):
+            contrib(c.get("author"), "commented")
+        for rv in record.get("reviews") or []:
+            rvid = rv.get("id")
+            data = rv
+            if not rv.get("url"):
+                base = record.get("url") or local
+                data = {**rv, "url": "{}#pullrequestreview-{}".format(base, rvid)}
+            leaf = qid("review-{}-{}".format(num, rvid))
+            nodes.append((leaf, project, repo, "social", rv.get("submitted_at"),
+                          data, fetched))
+            edges.append((leaf, rid, "part_of", None, None))
+    elif kind == "issue":
+        ts = record.get("closed_at") or record.get("updated_at")
+        nodes.append((rid, project, repo, "social", ts, record, fetched))
+        contrib(record.get("author"), "reported")
+        for c in record.get("comments_list") or []:
+            contrib(c.get("author"), "commented")
+    else:
+        raise ValueError("record_rows: kind must be 'pr' or 'issue', got "
+                         "{!r}".format(kind))
+    for ev in record.get("lifecycle") or []:
+        data = _lifecycle_event_data(ev, record.get("url"), local)
+        leaf = qid("event-{}-{}".format(local, ev.get("id")))
+        nodes.append((leaf, project, repo, "social", ev.get("created_at"), data,
+                      fetched))
+        edges.append((leaf, rid, "part_of", None, None))
+    return {"nodes": nodes, "edges": edges}
+
+
+def _person_rows(conn, project, people, fetched, replace=False):
+    """People `structure` node rows (project-scoped) for `people` ({login:
+    {modules, areas, is_bot, ...}} from derive.enumerate_participants), as
+    fold_bundle and gather.backfill write them. The `repo` column is the
+    project sentinel "*" so the SAME login folded from another repo in the
+    project upserts the identical id (the sentinel keeps the row out of any
+    single repo's repo_nodes view). NULL ts -> excluded from window scans.
+
+    Project-scoped people aggregate across members: a later fold UNIONs its
+    attribution with what is already stored — a plain upsert would OVERWRITE,
+    so the last member folded (e.g. one where the person has no area
+    attribution) would erase another member's. Union keeps the person node the
+    true project-wide aggregate, independent of fold order and idempotent
+    (re-folding unions a subset -> no change). `replace` (a re-fold of the
+    project's only gathered window, #111) writes this derivation as it is."""
+    rows = []
+    for login, rec in people.items():
+        if not login:
+            continue
+        pid = graphstore.qualify_person(project, login)
+        data = {"login": login, **rec}
+        prior = None if replace else conn.execute(
+            "SELECT data FROM nodes WHERE id=?", (pid,)).fetchone()
+        if prior and prior[0]:
+            pd = json.loads(prior[0])
+            data["areas"] = sorted(set(rec.get("areas") or []) | set(pd.get("areas") or []))
+            data["modules"] = sorted(set(rec.get("modules") or []) | set(pd.get("modules") or []))
+            data["is_bot"] = bool(rec.get("is_bot")) or bool(pd.get("is_bot"))
+        rows.append((pid, project, "*", "structure", None, data, fetched))
+    return rows
+
+
 def _fold_artifacts(conn, bundle, project, repo, fetched):
     """Artifact `code` node rows for one fold, rebuilt from the repo's WHOLE
     stored ledger (#76). Call inside the fold's transaction, after this bundle's
@@ -5447,9 +6331,11 @@ def _fold_artifacts(conn, bundle, project, repo, fetched):
 
 # --- current-state edges (issue #95) -------------------------------------------
 #
-# History edges (authored, reviewed, merged, commented, reported, closes,
-# cross_ref, part_of, touches, symbol moves) record something that happened and
-# are only ever added. CURRENT-STATE edges describe the latest known state of
+# History edges (touches, review / event part_of, symbol moves) record
+# something that happened and are only ever added; the record-derived ones
+# (authored, reviewed, merged, commented, reported, closes, cross_ref, commit
+# part_of) follow the record they come from (issue #111, "record-derived
+# edges" below). CURRENT-STATE edges describe the latest known state of
 # an input that can change, so a fold keeps them equal to what the repo's
 # STORED inputs imply and retracts the ones those inputs no longer imply:
 #
@@ -5503,8 +6389,12 @@ def _owns_authority(code_graph, code_owners, clone_sha, project, repo):
     """The area qids whose owners a window's facts state: every area its code
     graph lists, when the window read a CODEOWNERS file (non-empty
     `code_owners`) or a checkout (`clone_sha`: then a missing file means no
-    owners). Else none — a window without either says nothing. Pure."""
+    owners). Else none — a window without either says nothing, nor does one
+    whose CODEOWNERS file was there but could not be read (`code_graph`
+    carries `codeowners_unread`, issue #109). Pure."""
     if not (code_owners or clone_sha):
+        return set()
+    if (code_graph or {}).get("codeowners_unread"):
         return set()
     out = set()
     for area in (code_graph or {}).get("areas") or []:
@@ -5528,7 +6418,8 @@ class StructureReplay:
       - depends_on of area A, DIRECT edges (`transitive` false): a window whose
         build of A resolved (`edges_status: "resolved"`), or whose code graph
         carries the whole-tree structural scan (`structural_scan: true`; then
-        for EVERY area of the repo, listed or not);
+        for EVERY area of the repo, listed or not, except the areas in its
+        `structural_scan_unread`, whose module files it could not read);
       - depends_on of area A, TRANSITIVE edges: only a window whose build of A
         resolved (the scan sees direct `module` refs only);
       - owns of area A: a window whose code graph lists A and that read a
@@ -5543,7 +6434,7 @@ class StructureReplay:
                  registry_by_slug=None, bicep_prefix_by_slug=None):
         self.project, self.repo = project, repo
         self.windows = sorted(windows, key=lambda w: _window_order(w[:2]))
-        self.dep, self.resolved, self.scan = [], [], []
+        self.dep, self.resolved, self.scan, self.scan_unread = [], [], [], []
         self.owns, self.own_auth, self.graphs = [], [], []
         for frm, to, cg, co, sha in self.windows:
             cg = cg or {}
@@ -5557,6 +6448,11 @@ class StructureReplay:
                 if a.get("id") is not None and not _is_scaffold_area(a.get("id"))
                 and a.get("edges_status") == "resolved"})
             self.scan.append(cg.get("structural_scan") is True)
+            # Areas whose module files that scan could not read (issue #109):
+            # the scan does not speak for them.
+            self.scan_unread.append({
+                graphstore.qualify_id(project, repo, "area-{}".format(aid))
+                for aid in cg.get("structural_scan_unread") or ()})
             self.owns.append(_owns_pairs(cg, co, project, repo))
             self.own_auth.append(_owns_authority(cg, co, sha, project, repo))
 
@@ -5564,7 +6460,8 @@ class StructureReplay:
         """Index of the latest window authoritative for `src`'s direct
         (transitive=False) or transitive depends_on edges, or None."""
         for i in range(len(self.windows) - 1, -1, -1):
-            if src in self.resolved[i] or (not transitive and self.scan[i]):
+            if src in self.resolved[i] or (not transitive and self.scan[i]
+                                           and src not in self.scan_unread[i]):
                 return i
         return None
 
@@ -5696,6 +6593,303 @@ def item_relation_edges(conn, project, repo, bundle_milestones=(),
     return out
 
 
+# --- record-derived edges (issue #111) -------------------------------------------
+#
+# A PR / issue / commit record is stored latest-wins: the record a fold upserts
+# replaces the earlier one. The edges derived from ONE record are a function of
+# its current content, so after a fold upserts a record they must be exactly
+# what the new content implies:
+#
+#   closes / cross_ref  src = the PR      <- its `closes` / `crossref_issues`
+#                                            (+ cross-repo refs in a manifest
+#                                            fold, _cross_repo_pr_edges)
+#   part_of             src = the commit  <- its message (resolve_commit_pr)
+#   authored / merged / reviewed / commented / reported
+#                       dst = the PR / issue / commit, src = a person
+#                                         <- its author / merged_by /
+#                                            reviewers / comment authors
+#   touches             src = the commit  <- its files AND the code graph:
+#                                            re-derived only when the commit's
+#                                            stored file list changed
+#
+# Only the records the bundle carries are touched (absence from a bundle is not
+# evidence). A single-repo fold derives no cross-repo edge, so it leaves the
+# cross-repo `closes` / `cross_ref` a manifest fold wrote alone. Review / event
+# `part_of` edges (src: their own nodes), symbol moves and artifact nodes are
+# ledger- or node-derived and not covered here. A person node no contribution
+# edge references any more is deleted (people are project-scoped: an edge of
+# any member keeps it).
+RECORD_EDGE_TYPES = ("authored", "closes", "commented", "cross_ref", "merged",
+                     "part_of", "reported", "reviewed")
+CONTRIBUTION_EDGE_TYPES = ("authored", "commented", "merged", "reported",
+                           "reviewed")
+# Every edge type a person node is a contribution source of (validate's
+# _CONTRIB_EDGE_TYPES): a person with none of these is not a participant.
+_PERSON_KEEPING_TYPES = CONTRIBUTION_EDGE_TYPES + ("reacted",)
+_SQL_CHUNK = 500
+
+
+def _pr_spine_edges(pr, qid):
+    """A PR's same-repo `closes` / `cross_ref` edge rows. Pure."""
+    pid = qid("pr-{}".format(pr["number"]))
+    out = [(pid, qid("issue-{}".format(n)), "closes", None, None)
+           for n in pr.get("closes") or []]
+    out += [(pid, qid("issue-{}".format(n)), "cross_ref", None, None)
+            for n in pr.get("crossref_issues") or []]
+    return out
+
+
+def _commit_part_of(c, qid):
+    """A commit's `part_of` edge row to the PR its subject names. Pure."""
+    prn = resolve_commit_pr(c.get("message", ""))
+    if prn is None:
+        return []
+    return [(qid(c["sha"]), qid("pr-{}".format(prn)), "part_of", None, None)]
+
+
+def _contribution_edges(prs, issues, commits, qid, qperson):
+    """The person -> record contribution edge rows of the RAW records, in write
+    order; absent logins/fields are skipped. Pure."""
+    out = []
+
+    def contrib(login, dst_local, etype):
+        if login:
+            out.append((qperson(login), qid(dst_local), etype, None, None))
+    for pr in prs:
+        prlocal = "pr-{}".format(pr["number"])
+        contrib(pr.get("author"), prlocal, "authored")
+        contrib(pr.get("merged_by"), prlocal, "merged")
+        for reviewer in pr.get("reviewers") or []:
+            contrib(reviewer, prlocal, "reviewed")
+        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
+            contrib(c.get("author"), prlocal, "commented")
+    for iss in issues:
+        isslocal = "issue-{}".format(iss["number"])
+        contrib(iss.get("author"), isslocal, "reported")
+        for c in iss.get("comments_list") or []:
+            contrib(c.get("author"), isslocal, "commented")
+    for c in commits:
+        contrib(c.get("author"), c["sha"], "authored")
+    return out
+
+
+def record_edge_keys(prs, issues, commits, project, repo, members):
+    """{(src, dst, type)} of the record-derived edges (RECORD_EDGE_TYPES) the
+    given records imply — what fold_bundle writes for them, through the same
+    helpers. Cross-repo `closes` / `cross_ref` only when `members` is given.
+    Pure."""
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+
+    def qperson(login):
+        return graphstore.qualify_person(project, login)
+    rows = []
+    for pr in prs:
+        if members is not None:
+            rows.extend(_cross_repo_pr_edges(pr, project, repo, members)[1])
+        rows.extend(_pr_spine_edges(pr, qid))
+    for c in commits:
+        rows.extend(_commit_part_of(c, qid))
+    rows.extend(_contribution_edges(prs, issues, commits, qid, qperson))
+    return {r[:3] for r in rows}
+
+
+def _chunks(ids):
+    ids = sorted(set(ids))
+    for i in range(0, len(ids), _SQL_CHUNK):
+        yield ids[i:i + _SQL_CHUNK]
+
+
+def _edges_where(conn, column, ids, types):
+    """{(src, dst, type)} of the edges whose `column` (src_id / dst_id) is in
+    `ids` and whose type is in `types`: chunked IN lists on the (column,
+    edge_type) index, so the cost is linear in len(ids)."""
+    out = set()
+    tph = ",".join("?" for _ in types)
+    for chunk in _chunks(ids):
+        sql = ("SELECT src_id, dst_id, edge_type FROM edges WHERE {} IN ({}) "
+               "AND edge_type IN ({})").format(
+                   column, ",".join("?" for _ in chunk), tph)
+        out.update(tuple(r) for r in conn.execute(sql, list(chunk) + list(types)))
+    return out
+
+
+def stored_record_edges(conn, project, repo, members, pr_ids=(), issue_ids=(),
+                        commit_ids=(), touch_ids=()):
+    """{(src, dst, type)} of the stored record-derived edges of the given
+    record ids: `closes` / `cross_ref` from the PRs (same-repo targets only
+    when `members` is None), `part_of` from the commits, `touches` from the
+    commits in `touch_ids`, and the contribution edges from a person of the
+    project into any of them."""
+    prefix = graphstore.qualify_id(project, repo, "")
+    person_prefix = graphstore.qualify_person(project, "")
+    out = {k for k in _edges_where(conn, "src_id", pr_ids, ("closes", "cross_ref"))
+           if members is not None or k[1].startswith(prefix)}
+    out |= _edges_where(conn, "src_id", commit_ids, ("part_of",))
+    out |= _edges_where(conn, "src_id", touch_ids, ("touches",))
+    out |= {k for k in _edges_where(conn, "dst_id",
+                                    set(pr_ids) | set(issue_ids) | set(commit_ids),
+                                    CONTRIBUTION_EDGE_TYPES)
+            if k[0].startswith(person_prefix)}
+    return out
+
+
+def delete_orphan_people(conn, ids):
+    """Delete each person node in `ids` that no contribution edge
+    (_PERSON_KEEPING_TYPES) has as its source any more, in any repo of the
+    project. Returns the deleted ids, sorted. Call inside the fold's
+    transaction."""
+    removed = []
+    tph = ",".join("?" for _ in _PERSON_KEEPING_TYPES)
+    for pid in sorted(set(ids)):
+        if conn.execute("SELECT 1 FROM edges WHERE src_id=? AND edge_type IN "
+                        "({}) LIMIT 1".format(tph),
+                        [pid] + list(_PERSON_KEEPING_TYPES)).fetchone():
+            continue
+        if conn.execute("DELETE FROM nodes WHERE id=?", (pid,)).rowcount:
+            removed.append(pid)
+    return removed
+
+
+def _stored_commit_files(conn, project, repo, shas):
+    """{sha: files} of the stored commit records among `shas` (absent ones
+    left out), read by id before a fold replaces them."""
+    out = {}
+    ids = {graphstore.qualify_id(project, repo, s): s for s in shas}
+    for chunk in _chunks(ids):
+        for nid, raw in conn.execute(
+                "SELECT id, data FROM nodes WHERE id IN ({}) AND "
+                "node_class='code'".format(",".join("?" for _ in chunk)), chunk):
+            try:
+                data = json.loads(raw) if raw else None
+            except ValueError:
+                continue
+            if isinstance(data, dict) and data.get("sha") == ids[nid]:
+                out[ids[nid]] = list(data.get("files") or [])
+    return out
+
+
+def _stored_records(conn, project, repo):
+    """(prs, issues, commits): every stored PR / issue / commit record of the
+    repo (for the one-time heal of a repo last folded before #111)."""
+    prefix = graphstore.qualify_id(project, repo, "")
+    lo, hi = graphstore._prefix_range(prefix)
+    prs, issues, commits = [], [], []
+    for local, sink in (("pr-", prs), ("issue-", issues)):
+        for nid, data in graphstore.nodes_with_prefix(conn, prefix + local):
+            if isinstance(data, dict) and str(data.get("number")) == \
+                    nid[len(prefix) + len(local):]:
+                sink.append(data)
+    for nid, raw in conn.execute(
+            "SELECT id, data FROM nodes WHERE id >= ? AND id < ? AND "
+            "node_class='code' AND length(id) IN (?, ?) ORDER BY id",
+            (lo, hi, len(prefix) + 40, len(prefix) + 64)):
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("sha") == nid[len(prefix):]:
+            commits.append(data)
+    return prs, issues, commits
+
+
+def _maintain_record_edges(conn, bundle, project, repo, members, written,
+                           prior_files, heal):
+    """Delete the record-derived edges of the bundle's records that their new
+    content no longer implies, then the person nodes left without a
+    contribution edge. Inside the fold's transaction, after its nodes and
+    edges are written. `written`: every edge key the fold wrote;
+    `prior_files`: the stored file lists of the bundle's commits before the
+    fold; `heal` (a repo last folded before #111): apply the rule once to
+    every stored record of the repo, from its stored content. Returns
+    (retracted keys, removed person ids)."""
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+    prs = bundle.get("prs") or []
+    issues = bundle.get("issues") or []
+    commits = bundle.get("commits") or []
+    touch = [c["sha"] for c in commits if c["sha"] in prior_files
+             and list(c.get("files") or []) != prior_files[c["sha"]]]
+    stored = stored_record_edges(
+        conn, project, repo, members,
+        pr_ids=[qid("pr-{}".format(p["number"])) for p in prs],
+        issue_ids=[qid("issue-{}".format(i["number"])) for i in issues],
+        commit_ids=[qid(c["sha"]) for c in commits],
+        touch_ids=[qid(sha) for sha in touch])
+    retract = stored - set(written)
+    if heal:
+        s_prs, s_issues, s_commits = _stored_records(conn, project, repo)
+        want = record_edge_keys(s_prs, s_issues, s_commits, project, repo,
+                                members)
+        retract |= stored_record_edges(
+            conn, project, repo, members,
+            pr_ids=[qid("pr-{}".format(p["number"])) for p in s_prs],
+            issue_ids=[qid("issue-{}".format(i["number"])) for i in s_issues],
+            commit_ids=[qid(c["sha"]) for c in s_commits]) - want
+    graphstore.delete_edges(conn, retract, commit=False)
+    person_prefix = graphstore.qualify_person(project, "")
+    removed = delete_orphan_people(
+        conn, [k[0] for k in retract if k[0].startswith(person_prefix)])
+    return retract, removed
+
+
+def _repo_has_nodes(conn, project, repo):
+    """True when any node id of (project, repo) is stored."""
+    lo, hi = graphstore._prefix_range(graphstore.qualify_id(project, repo, ""))
+    return conn.execute("SELECT 1 FROM nodes WHERE id >= ? AND id < ? LIMIT 1",
+                        (lo, hi)).fetchone() is not None
+
+
+def _fts_text_of(nid, node_class, data):
+    """The text fold_bundle indexes for a STORED node (see its fts_text
+    block): a PR / issue social record's title + body + embedded comments, a
+    commit's message; "" for anything else."""
+    if not isinstance(data, dict):
+        return ""
+    local = graphstore.parse_id(nid)["local"]
+    for kind in ("pr-", "issue-"):
+        if (node_class == "social" and local.startswith(kind)
+                and str(data.get("number")) == local[len(kind):]):
+            comments = list(data.get("comments_list") or [])
+            if kind == "pr-":
+                comments += data.get("review_comments") or []
+            return _social_text(data, comments)
+    if node_class == "code" and data.get("sha") == local:
+        return data.get("message") or ""
+    return ""
+
+
+def _backfill_fts(conn, refresh=False):
+    """Index every stored node the FTS index lacks (issue #111): one pass
+    over the social / code nodes not in fts_map, inside the fold's
+    transaction. With `refresh` (a fold ran without FTS5 since the index was
+    last complete) the already-indexed nodes are re-indexed too: that fold
+    may have changed their text. Nodes with no text stay unindexed, as fold
+    leaves them."""
+    graphstore.index_texts(conn, [
+        (nid, text) for nid, text in
+        ((nid, _fts_text_of(nid, cls, data))
+         for nid, cls, data in graphstore.fts_unindexed_nodes(
+             conn, include_indexed=refresh)) if text],
+        commit=False)
+
+
+def _is_sole_window(conn, project, repo, meta):
+    """True when the bundle re-folds the ONLY window the store has gathered
+    for any repo of `project` (gathered_windows holds exactly this repo's
+    (from, to)). False without from/to or with an unreadable ledger."""
+    frm, to = meta.get("from"), meta.get("to")
+    if not frm or not to:
+        return False
+    try:
+        wins = graphstore.get_windows(conn)
+    except ValueError:
+        return False
+    mine = {(w.get("repo"), w.get("from"), w.get("to")) for w in wins
+            if isinstance(w, dict) and w.get("project") == project}
+    return mine == {(repo, frm, to)}
+
+
 def _standin_rows(conn, project, dsts, fetched):
     """Stand-in `structure` node rows for the depends_on targets in `dsts`
     that are not stored (create-if-absent: a real area node is never
@@ -5723,12 +6917,17 @@ def _standin_rows(conn, project, dsts, fetched):
 
 
 def _maintain_current_state(conn, bundle, project, repo, members,
-                            registry_by_slug, bicep_prefix_by_slug, fetched):
+                            registry_by_slug, bicep_prefix_by_slug, fetched,
+                            records=None):
     """Write the repo's current-state edges and retract the stale ones, inside
     the fold's transaction, after its nodes and window facts are written.
+    `records` is _maintain_record_edges' (retracted keys, removed people) of
+    the same fold (issue #111), logged with these in one ledger entry.
     Returns the fold summary {"retracted": {type: n}, "edges": [...],
-    "standins_removed": [...], "structure": bool}. See the block comment
-    above CURRENT_STATE_EDGE_TYPES and STORE.md "Current-state edges"."""
+    "standins_removed": [...], "people_removed": [...], "structure": bool}.
+    See the block comment above CURRENT_STATE_EDGE_TYPES and STORE.md
+    "Current-state edges"."""
+    record_retract, people_removed = records or (set(), [])
     meta = bundle.get("meta", {})
     prefix = graphstore.qualify_id(project, repo, "")
     writes, retract = {}, set()
@@ -5794,20 +6993,28 @@ def _maintain_current_state(conn, bundle, project, repo, members,
     removed = graphstore.delete_orphan_standins(
         conn, [k[1] for k in retract if k[2] == "depends_on"], commit=False)
 
+    retract = retract | set(record_retract)
     counts = {}
-    for key in retract:
+    for key in sorted(retract):
         counts[key[2]] = counts.get(key[2], 0) + 1
+    counts = {k: counts[k] for k in sorted(counts)}
     edges = sorted(list(k) for k in retract)
+    people_removed = sorted(people_removed)
     summary = {"retracted": counts, "edges": edges,
-               "standins_removed": removed, "structure": windows is not None}
-    if retract or removed:
+               "standins_removed": removed, "people_removed": people_removed,
+               "structure": windows is not None}
+    if retract or removed or people_removed:
         graphstore.record_retractions(conn, project, repo, {
             "from": meta.get("from"), "to": meta.get("to"),
             "counts": {k: counts[k] for k in sorted(counts)},
             "edges": edges[:graphstore.RETRACTION_LEDGER_EDGES],
-            "standins_removed": removed}, commit=False)
+            "standins_removed": removed,
+            "people_removed": people_removed}, commit=False)
+    # `records` (issue #111): every stored record's record-derived edges are
+    # what its content implies (this fold's records, and every other record
+    # once a fold since #111 healed the repo).
     graphstore.set_current_state(conn, project, repo, {
-        "items": True, "structure": windows is not None,
+        "items": True, "structure": windows is not None, "records": True,
         "from": meta.get("from"), "to": meta.get("to")}, commit=False)
     return summary
 
@@ -5816,15 +7023,31 @@ def describe_retractions(summary, project, repo):
     """One stderr line for a fold that retracted edges, or None."""
     counts = (summary or {}).get("retracted") or {}
     removed = (summary or {}).get("standins_removed") or []
-    if not counts and not removed:
+    people = (summary or {}).get("people_removed") or []
+    if not counts and not removed and not people:
         return None
-    parts = ", ".join("{} {}".format(counts[k], k) for k in sorted(counts))
-    line = "retracted {} stale current-state edge(s) of {}/{}{}".format(
-        sum(counts.values()), project, repo,
-        " ({})".format(parts) if parts else "")
+
+    def described(types):
+        sub = {k: counts[k] for k in counts if k in types}
+        parts = ", ".join("{} {}".format(sub[k], k) for k in sorted(sub))
+        return sum(sub.values()), " ({})".format(parts) if parts else ""
+    clauses = []
+    n, parts = described(CURRENT_STATE_EDGE_TYPES)
+    if n:
+        clauses.append("retracted {} stale current-state edge(s) of {}/{}{}"
+                       .format(n, project, repo, parts))
+    n, parts = described(set(counts) - set(CURRENT_STATE_EDGE_TYPES))
+    if n:
+        clauses.append("retracted {} edge(s) of {}/{} that the re-folded "
+                       "records no longer imply{}".format(n, project, repo,
+                                                          parts))
     if removed:
-        line += "; removed {} orphaned depends_on stand-in(s)".format(len(removed))
-    return line + " (meta retractions:{}/{})".format(project, repo)
+        clauses.append("removed {} orphaned depends_on stand-in(s)".format(
+            len(removed)))
+    if people:
+        clauses.append("removed {} person node(s) no contribution references "
+                       "any more".format(len(people)))
+    return "; ".join(clauses) + " (meta retractions:{}/{})".format(project, repo)
 
 
 def fold_bundle(conn, bundle, project=None, repo=None, members=None,
@@ -5845,8 +7068,12 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     Current-state edges (blocks, in_milestone, in_iteration, depends_on, owns;
     issue #95) are written last, by _maintain_current_state, equal to what the
     repo's stored inputs imply; the stale ones are retracted in the same
-    transaction. Returns that summary: {"retracted": {type: n}, "edges":
-    [[src, dst, type], ...], "standins_removed": [...], "structure": bool}.
+    transaction. Before them, the record-derived edges of the bundle's records
+    that their new content no longer implies are deleted, with the person
+    nodes left without a contribution edge (_maintain_record_edges, issue
+    #111). Returns the summary of both: {"retracted": {type: n}, "edges":
+    [[src, dst, type], ...], "standins_removed": [...], "people_removed":
+    [...], "structure": bool}.
     """
     meta = bundle.get("meta", {})
     # Identity override (Phase 9): a multi-repo run folds each member under one
@@ -5869,41 +7096,26 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     def qid(local):
         return graphstore.qualify_id(project, repo, local)
 
-    # social: PRs, with closes/cross_ref spine edges to their issues. In a
-    # multi-repo project (members given) a PR's qualified refs + repo-aware
-    # timeline xrefs also yield CROSS-repo spine edges (to member repos) or
-    # honest external_refs (to non-members) — see _cross_repo_pr_edges. Gated on
-    # `members is not None` so single-repo folds are byte-identical.
+    # social: PRs and issues — each record's node, its spine edges, its
+    # contribution edges and its review / lifecycle leaves, derived by
+    # record_rows (shared with gather.backfill, so a backfilled record is
+    # written exactly as a folded one). An issue's `blocks` (issue->issue)
+    # relation edges are current-state: written by _maintain_current_state
+    # from the stored records, between two STORED issues.
     for pr in bundle.get("prs", []):
-        pid = qid("pr-{}".format(pr["number"]))
-        ts = pr.get("merged_at") or pr.get("closed_at") or pr.get("created_at")
-        if members is not None:
-            external, xedges = _cross_repo_pr_edges(pr, project, repo, members)
-            if external:
-                pr = {**pr, "external_refs": external}
-            edges.extend(xedges)
-        nodes.append((pid, project, repo, "social", ts, pr, fetched))
-        for n in pr.get("closes") or []:
-            edges.append((pid, qid("issue-{}".format(n)), "closes", None, None))
-        for n in pr.get("crossref_issues") or []:
-            edges.append((pid, qid("issue-{}".format(n)), "cross_ref", None, None))
-
-    # social: issues. Their `blocks` (issue->issue, blocker -> blocked) relation
-    # edges are current-state: written by _maintain_current_state from the
-    # stored records, between two STORED issues (a ref to an issue the store
-    # does not hold is left out rather than dangling).
+        rows = record_rows("pr", pr, project, repo, fetched, members)
+        nodes.extend(rows["nodes"])
+        edges.extend(rows["edges"])
     for iss in bundle.get("issues", []):
-        ts = iss.get("closed_at") or iss.get("updated_at")
-        iid = qid("issue-{}".format(iss["number"]))
-        nodes.append((iid, project, repo, "social", ts, iss, fetched))
+        rows = record_rows("issue", iss, project, repo, fetched, members)
+        nodes.extend(rows["nodes"])
+        edges.extend(rows["edges"])
 
     # code: commits, with part_of spine edge to the PR named in the subject.
     for c in bundle.get("commits", []):
         cid = qid(c["sha"])
         nodes.append((cid, project, repo, "code", c.get("date"), c, fetched))
-        prn = resolve_commit_pr(c.get("message", ""))
-        if prn is not None:
-            edges.append((cid, qid("pr-{}".format(prn)), "part_of", None, None))
+        edges.extend(_commit_part_of(c, qid))
 
     # code: file-level code-event ledger (rename/copy source -> detail).
     for ev in bundle.get("code_events", []):
@@ -5998,93 +7210,21 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # and auditor can never diverge.
     people = derive.enumerate_participants(people_view, area_idx)
 
-    def qperson(login):
-        return graphstore.qualify_person(project, login)
+    # People `structure` nodes (project-scoped), unioned with what an earlier
+    # member already stored: see _person_rows.
+    # A re-fold of the project's ONLY gathered window (issue #111): this bundle
+    # is then everything the store knows about its people, so its derivation
+    # REPLACES the stored one instead of being unioned with it — a commit
+    # re-attributed by a later gather of the window takes its areas along.
+    nodes.extend(_person_rows(conn, project, people, fetched,
+                              replace=_is_sole_window(conn, project, repo, meta)))
 
-    # People `structure` nodes (project-scoped). The `repo` column is the
-    # project sentinel "*" so the SAME login folded from another repo in the
-    # project upserts the identical id (idempotency is by the project-scoped id;
-    # the sentinel keeps the row out of any single repo's repo_nodes view, an
-    # extra no-leak guard). NULL ts -> excluded from window scans.
-    for login, rec in people.items():
-        if not login:
-            continue
-        data = {"login": login, **rec}
-        # Project-scoped people aggregate across members. A later member's fold must
-        # UNION its attribution with what an earlier member already stored — a plain
-        # upsert would OVERWRITE, so the last member folded (e.g. one where the
-        # person has no area attribution) would erase another member's. Union keeps
-        # the person node the true project-wide aggregate, independent of fold order
-        # and idempotent (re-folding a member unions a subset -> no change).
-        prior = conn.execute("SELECT data FROM nodes WHERE id=?",
-                             (qperson(login),)).fetchone()
-        if prior and prior[0]:
-            pd = json.loads(prior[0])
-            data["areas"] = sorted(set(rec.get("areas") or []) | set(pd.get("areas") or []))
-            data["modules"] = sorted(set(rec.get("modules") or []) | set(pd.get("modules") or []))
-            data["is_bot"] = bool(rec.get("is_bot")) or bool(pd.get("is_bot"))
-        nodes.append((qperson(login), project, "*", "structure", None, data, fetched))
-
-    def contrib(login, dst_local, etype):
-        if login:
-            edges.append((qperson(login), qid(dst_local), etype, None, None))
-
-    # Contribution edges from the RAW records (person -> node). Idempotent by
-    # (src,dst,type); absent logins/fields are skipped cleanly.
-    for pr in bundle.get("prs", []):
-        prlocal = "pr-{}".format(pr["number"])
-        contrib(pr.get("author"), prlocal, "authored")
-        contrib(pr.get("merged_by"), prlocal, "merged")
-        for reviewer in pr.get("reviewers") or []:
-            contrib(reviewer, prlocal, "reviewed")
-        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
-            contrib(c.get("author"), prlocal, "commented")
-    for iss in bundle.get("issues", []):
-        isslocal = "issue-{}".format(iss["number"])
-        contrib(iss.get("author"), isslocal, "reported")
-        for c in iss.get("comments_list") or []:
-            contrib(c.get("author"), isslocal, "commented")
+    # Contribution edges of a commit's author (person -> commit); a PR's and an
+    # issue's contribution edges came with their record_rows above.
     for c in bundle.get("commits", []):
-        contrib(c.get("author"), c["sha"], "authored")
-
-    # Phase 10 slice 1: PR review submissions + lifecycle events as first-class
-    # `social` nodes with a `part_of` spine edge to their parent. Folded by stable
-    # id from the raw records (idempotent); review/event nodes are spine LEAVES
-    # (no onward spine edge), so they ride into the PR/issue train when
-    # traverse_spine walks it but can't bridge it to anything unrelated. Emitted
-    # only when the data is present, so a bundle with no reviews/events stays
-    # byte-identical (no fabricated nodes/edges).
-    for pr in bundle.get("prs", []):
-        prlocal = "pr-{}".format(pr["number"])
-        prid = qid(prlocal)
-        for rv in pr.get("reviews") or []:
-            rid = rv.get("id")
-            local = "review-{}-{}".format(pr["number"], rid)
-            # Provenance: reviews normally carry an html_url, but synthesize a
-            # stable `<pr url>#pullrequestreview-<id>` ref if one is absent (same
-            # contract as lifecycle events) so check_provenance never fails.
-            data = rv
-            if not rv.get("url"):
-                base = pr.get("url") or prlocal
-                data = {**rv, "url": "{}#pullrequestreview-{}".format(base, rid)}
-            nodes.append((qid(local), project, repo, "social",
-                          rv.get("submitted_at"), data, fetched))
-            edges.append((qid(local), prid, "part_of", None, None))
-        for ev in pr.get("lifecycle") or []:
-            data = _lifecycle_event_data(ev, pr.get("url"), prlocal)
-            local = "event-{}-{}".format(prlocal, ev.get("id"))
-            nodes.append((qid(local), project, repo, "social",
-                          ev.get("created_at"), data, fetched))
-            edges.append((qid(local), prid, "part_of", None, None))
-    for iss in bundle.get("issues", []):
-        isslocal = "issue-{}".format(iss["number"])
-        issid = qid(isslocal)
-        for ev in iss.get("lifecycle") or []:
-            data = _lifecycle_event_data(ev, iss.get("url"), isslocal)
-            local = "event-{}-{}".format(isslocal, ev.get("id"))
-            nodes.append((qid(local), project, repo, "social",
-                          ev.get("created_at"), data, fetched))
-            edges.append((qid(local), issid, "part_of", None, None))
+        if c.get("author"):
+            edges.append((graphstore.qualify_person(project, c["author"]),
+                          qid(c["sha"]), "authored", None, None))
 
     # owns (person -> area): CODEOWNERS semantics via derive.area_owners — an
     # area is owned by the owners of the LAST rule matching the area directory
@@ -6093,7 +7233,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # _maintain_current_state (_owns_pairs over the windows' facts).
 
     # touches (commit/pr -> area): the distinct areas a commit's files land in.
-    # History: a commit's files never change, so touches are only added.
+    # History: only added (they also depend on the code graph), except that a
+    # commit whose stored file list changed gets this fold's touches (#111,
+    # _maintain_record_edges).
     for c in bundle.get("commits", []):
         touched = derive._commit_areas(c, area_idx)
         for aid in sorted(touched):
@@ -6156,9 +7298,31 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # `with conn:` commits on success and rolls back on any exception, so a crash
     # mid-fold never leaves a half-folded store for readers to serve. (A caller's
     # own uncommitted writes on this connection join the same transaction.)
+    # Record-derived edges (issue #111): read what the fold needs to know about
+    # the records it replaces before it writes them. A repo whose last fold
+    # predates #111 (no `records` in its current_state marker) but already
+    # holds data is healed once, from its stored records.
+    state = graphstore.get_current_state(conn, project, repo) or {}
+    had_nodes = _repo_has_nodes(conn, project, repo)
+    heal = not state.get("records") and had_nodes
+    fold_context = _next_fold_context(conn, project, repo, members,
+                                      registry_by_slug, bicep_prefix_by_slug,
+                                      had_nodes)
     with conn:
+        # FTS coverage (issue #111): a store folded on a host without FTS5 has
+        # records the index lacks; the first fold with FTS5 since then indexes
+        # every stored node the index lacks, before this fold writes anything
+        # (so a fold into an empty store indexes exactly as before).
+        coverage = graphstore.get_meta(conn, graphstore.FTS_COVERAGE_KEY)
+        if graphstore.fts5_available(conn) and coverage != graphstore.FTS_COMPLETE:
+            _backfill_fts(conn, refresh=coverage == graphstore.FTS_PARTIAL)
+        prior_files = _stored_commit_files(
+            conn, project, repo, [c["sha"] for c in bundle.get("commits", [])])
         graphstore.upsert_nodes(conn, nodes, commit=False)
         graphstore.upsert_edges(conn, edges, commit=False)
+        records = _maintain_record_edges(
+            conn, bundle, project, repo, members, {e[:3] for e in edges},
+            prior_files, heal)
         graphstore.add_code_events(conn, events, commit=False)
         graphstore.upsert_nodes(
             conn, _fold_artifacts(conn, bundle, project, repo, fetched),
@@ -6174,6 +7338,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         #   - issue social nodes: title + body + embedded comment authors+bodies
         #   - commit code nodes: the commit message
         # Empty text is skipped: it indexes nothing useful.
+        # Coverage (issue #111): the index now holds every stored record (the
+        # back-fill above ran first when it did not); a fold without FTS5
+        # marks it partial.
         if graphstore.fts5_available(conn):
             texts = []
             for pr in bundle.get("prs", []):
@@ -6188,6 +7355,11 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             graphstore.index_texts(
                 conn, [(qid(local), text) for local, text in texts if text],
                 commit=False)
+            graphstore.set_meta(conn, graphstore.FTS_COVERAGE_KEY,
+                                graphstore.FTS_COMPLETE, commit=False)
+        else:
+            graphstore.set_meta(conn, graphstore.FTS_COVERAGE_KEY,
+                                graphstore.FTS_PARTIAL, commit=False)
 
         graphstore.record_window(conn, project, repo, meta.get("from"),
                                  meta.get("to"), commit=False)
@@ -6234,20 +7406,81 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         # window facts written above, and retract what those no longer imply.
         summary = _maintain_current_state(conn, bundle, project, repo, members,
                                           registry_by_slug,
-                                          bicep_prefix_by_slug, fetched)
+                                          bicep_prefix_by_slug, fetched,
+                                          records=records)
+        # The member set and registries this fold derived cross-repo edges
+        # with (issue #113), so validate can resolve them exactly.
+        if fold_context is not None:
+            graphstore.set_fold_context(conn, project, repo, fold_context,
+                                        commit=False)
     return summary
+
+
+def _next_fold_context(conn, project, repo, members, registry_by_slug,
+                       bicep_prefix_by_slug, had_nodes):
+    """The fold context (graphstore.set_fold_context) this fold records, or
+    None to leave the stored one alone. A manifest fold (`members` given)
+    records its member set and registries; `members_changed` turns (and
+    stays) true when the recorded member set differs, or when the repo held
+    records before any fold recorded one. A single-repo fold of a repo that
+    has a context marks it changed: its records' cross-repo edges were not
+    derived with that member set."""
+    prior = graphstore.get_fold_context(conn, project, repo)
+    if members is None:
+        if prior is None or prior.get("members_changed") is True:
+            return None
+        return dict(prior, members_changed=True)
+    slugs = sorted(members)
+    if prior is None:
+        # records folded before (a stand-in another member's fold made for
+        # this repo is not one)
+        changed = bool(had_nodes) and not graphstore._only_standins(
+            conn, project, repo)
+    else:
+        changed = (prior.get("members_changed") is not False
+                   or prior.get("members") != slugs)
+
+    def as_map(m):
+        return None if m is None else {k: m[k] for k in sorted(m)}
+    return {"members": slugs, "registry": as_map(registry_by_slug),
+            "bicep_registry_prefix": as_map(bicep_prefix_by_slug),
+            "members_changed": changed}
+
+
+def _member_clone_dir(base_dir, owner, repo, run=None):
+    """A manifest member's clone dir: `{base}/{owner}/{repo}` (issue #109). A
+    GitHub owner or repo name never contains `/`, so two members can never
+    share a dir -- the former `{base}/{owner}-{repo}-clone` did for `a-b`/`c`
+    and `a`/`b-c`. A dir in that former layout that is a clone of THIS member's
+    remote is still used (no re-clone for existing users) as long as the new
+    dir does not exist yet."""
+    new = "{}/{}/{}".format(base_dir, owner, repo)
+    if os.path.exists(new):
+        return new
+    old = "{}/{}-{}-clone".format(base_dir, owner, repo)
+    if os.path.isdir(os.path.join(old, ".git")):
+        try:
+            have = (run or run_git)(["git", "-C", old, "config", "--get",
+                                     "remote.origin.url"]).strip()
+        except RuntimeError:
+            have = ""
+        if have and _normalize_remote(have) == _normalize_remote(
+                _github_remote_url(owner, repo)):
+            return old
+    return new
 
 
 def _member_args(base, member, frm, to):
     """Clone the CLI args for one manifest member: same flags, but owner/repo and
     the window come from the manifest, and clone_dir is re-derived PER MEMBER as
-    `{base}/{owner}-{repo}-clone`. Including the owner (not just the repo, which is
-    acquire's single-repo default) keeps two members that share a repo name under
-    different owners from colliding on the same checkout. A `--clone-dir` on the
-    base args is treated as the parent directory; otherwise it defaults to
-    `workspace`."""
+    `{base}/{owner}/{repo}` (_member_clone_dir; an existing clone in the former
+    `{base}/{owner}-{repo}-clone` layout is reused). Including the owner (not
+    just the repo, which is acquire's single-repo default) keeps two members
+    that share a repo name under different owners from colliding on the same
+    checkout. A `--clone-dir` on the base args is treated as the parent
+    directory; otherwise it defaults to `workspace`."""
     base_dir = (base.clone_dir or "workspace").rstrip("/")
-    clone_dir = "{}/{}-{}-clone".format(base_dir, member["owner"], member["repo"])
+    clone_dir = _member_clone_dir(base_dir, member["owner"], member["repo"])
     fields = {**vars(base), "owner": member["owner"], "repo": member["repo"],
               "clone_dir": clone_dir}
     # A member's own `branch` (issue #84) beats a global --branches; with

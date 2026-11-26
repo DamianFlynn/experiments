@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 7 — full graph substrate (extract + persisted derived facts) — design
 
 **Status: IMPLEMENTED (slices 7a–7c + trust gate + store-only wrap-up).**

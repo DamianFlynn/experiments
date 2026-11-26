@@ -200,7 +200,7 @@ class TestMayJuneStore(unittest.TestCase):
         report = validate.validate(conn, project="o", repo="r")
         nd = [c for c in report.checks if c["name"] == "no_drift"][0]
         self.assertFalse(nd["ok"])
-        self.assertIn("lifecycle length drift",
+        self.assertIn("lifecycle drift",
                       {d.get("problem") for d in nd["details"]})
 
 

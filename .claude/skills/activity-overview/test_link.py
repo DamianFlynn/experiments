@@ -1526,9 +1526,11 @@ class TestTrainEffort(unittest.TestCase):
     # stalled boundary: just over vs under TRAIN_STALL_DAYS
     # ------------------------------------------------------------------
 
-    def test_stalled_true_when_elapsed_exceeds_threshold(self):
-        """A merged train whose elapsed_days exceeds TRAIN_STALL_DAYS is stalled."""
-        # Use 22 days apart — should be over any reasonable threshold (>21)
+    def test_slow_to_land_not_stalled_when_elapsed_exceeds_threshold(self):
+        """A merged train whose elapsed_days exceeds TRAIN_STALL_DAYS is
+        `slow_to_land`, never `stalled` (issue #112: `stalled` is for open
+        trains idle beyond the threshold — see test_train_effort_flags.py)."""
+        # Use 22 days apart — over the threshold (>21)
         pr = self._pr(50, "alice", "2026-05-01T00:00:00Z",
                       merged=True, merged_at="2026-05-23T00:00:00Z")
         train = self._train("train-pr-50", None, [50], [])
@@ -1536,9 +1538,10 @@ class TestTrainEffort(unittest.TestCase):
         link.annotate_train_effort(bundle)
         eff = train["effort"]
         self.assertEqual(eff["elapsed_days"], 22)
-        # Only stalled if elapsed > TRAIN_STALL_DAYS (e.g. >21 -> True for 22)
-        self.assertEqual(eff["stalled"], eff["elapsed_days"] > link.TRAIN_STALL_DAYS)
-        self.assertTrue(eff["stalled"])
+        self.assertEqual(eff["slow_to_land"],
+                         eff["elapsed_days"] > link.TRAIN_STALL_DAYS)
+        self.assertTrue(eff["slow_to_land"])
+        self.assertFalse(eff["stalled"])
 
     def test_stalled_false_when_elapsed_under_threshold(self):
         """A merged train whose elapsed_days is well below TRAIN_STALL_DAYS is not stalled."""
@@ -1551,6 +1554,7 @@ class TestTrainEffort(unittest.TestCase):
         eff = train["effort"]
         self.assertEqual(eff["elapsed_days"], 5)
         self.assertFalse(eff["stalled"])
+        self.assertFalse(eff["slow_to_land"])
 
     def test_stalled_false_at_exact_boundary(self):
         """elapsed_days == TRAIN_STALL_DAYS is NOT stalled (strict >)."""
@@ -1563,6 +1567,7 @@ class TestTrainEffort(unittest.TestCase):
         eff = train["effort"]
         self.assertEqual(eff["elapsed_days"], link.TRAIN_STALL_DAYS)
         self.assertFalse(eff["stalled"])
+        self.assertFalse(eff["slow_to_land"])
 
     # ------------------------------------------------------------------
     # Distinctness: same login in multiple roles counts once
@@ -1635,7 +1640,8 @@ class TestTrainEffort(unittest.TestCase):
             eff = t["effort"]
             for field in ("opened_at", "merged_at", "elapsed_days",
                           "reviewers", "review_comments", "commits",
-                          "participants", "stalled"):
+                          "participants", "stalled", "idle_days",
+                          "last_activity_at", "slow_to_land"):
                 self.assertIn(field, eff, f"train {t['id']} effort missing '{field}'")
 
     def test_effort_after_significance_in_enrich(self):

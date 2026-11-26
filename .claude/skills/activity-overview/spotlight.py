@@ -21,6 +21,7 @@ Stdlib only (sqlite3, argparse, json). Python 3.
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 
@@ -64,11 +65,61 @@ def _project_repos(conn, project):
 _AREA_REPO_SEP = "::"
 
 
+def _store_repos(conn, project):
+    """Every repo of `project` that holds a stored node (the members, and a
+    repo only another member's depends_on stand-ins created), sorted — the
+    repos a reader can name."""
+    return sorted(r[0] for r in conn.execute(
+        "SELECT DISTINCT repo FROM nodes WHERE project=? AND repo != '*'",
+        (project,)))
+
+
+def resolve_repo_arg(conn, project, name):
+    """The stored repo a reader's repo argument names, or None (issue #113
+    m3). One rule for every query (`dependents`, `subsystem`, `module`, the
+    `owner/repo::area` qualifier and `--repo`), on any store:
+
+      - the stored spelling in any case (`Az/A` for `az/a`), as
+        graphstore.resolve_repo;
+      - `owner/repo` on a single-repo store, which is keyed project=<owner>,
+        repo=<name>: the owner must equal the project (any case);
+      - `repo` alone, when exactly one stored `owner/repo` has that name.
+    No match, or several, is None: the library answers needs_gather and the
+    CLI exits 2 listing the repos it knows."""
+    if not name:
+        return None
+    repos = _store_repos(conn, project)
+
+    def match(cand):
+        if cand in repos:
+            return cand
+        hits = [r for r in repos if r.lower() == cand.lower()]
+        return hits[0] if len(hits) == 1 else None
+
+    hit = match(name)
+    if hit is not None:
+        return hit
+    owner, sep, rest = name.partition("/")
+    if sep and rest and "/" not in rest and owner.lower() == project.lower():
+        hit = match(rest)
+        if hit is not None:
+            return hit
+    if not sep:
+        hits = [r for r in repos
+                if "/" in r and r.split("/", 1)[1].lower() == name.lower()]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
 def _split_area_arg(area):
-    """(repo or None, area) for an area argument; `owner/repo::area` names the
-    member repo. Only a head with exactly one '/' counts as a repo."""
+    """(repo or None, area) for an area argument: `<repo>::<area>` names the
+    repo (`owner/repo`, or `repo` alone — see resolve_repo_arg). The text
+    before the first `::` is the qualifier, returned as written (resolve it
+    with resolve_repo_arg); an area id itself containing `::` is therefore
+    named qualified (`owner/repo::a::b`)."""
     head, sep, tail = area.partition(_AREA_REPO_SEP)
-    if sep and head.count("/") == 1 and tail:
+    if sep and head and tail:
         return head, tail
     return None, area
 
@@ -76,24 +127,24 @@ def _split_area_arg(area):
 def _area_scope(conn, project, area, repo=None):
     """Resolve an area argument to (repos, area). `area` may be qualified as
     `owner/repo::area`; `repo` (CLI `--repo`) narrows the same way. Both name a
-    member in any case (resolved via graphstore.resolve_repo). Unqualified, the
-    area is looked up in EVERY project repo and the results are unioned — the
-    same area id (a root area such as `main.tf`, `docs`) is common across the
-    members of a multi-repo project. An unknown repo yields `[]` (the caller
-    answers needs_gather); a `repo` that disagrees with the qualifier raises
+    repo by resolve_repo_arg's rule (any case, `repo` alone where unambiguous,
+    `owner/repo` on a single-repo store). Unqualified, the area is looked up
+    in EVERY project repo and the results are unioned — the same area id (a
+    root area such as `main.tf`, `docs`) is common across the members of a
+    multi-repo project. An unknown repo yields `[]` (the caller answers
+    needs_gather); a `repo` that disagrees with the qualifier raises
     ValueError."""
     qual, area = _split_area_arg(area)
-    if qual is not None:
-        if repo is not None and (graphstore.resolve_repo(conn, project, repo)
-                                 != graphstore.resolve_repo(conn, project, qual)):
+    if qual is not None and repo is not None:
+        if (resolve_repo_arg(conn, project, qual) or qual) != (
+                resolve_repo_arg(conn, project, repo) or repo):
             raise ValueError("--repo {} disagrees with the area qualifier "
                              "{}".format(repo, qual))
-        repo = qual
-    repos = _project_repos(conn, project)
-    if repo is not None:
-        stored = graphstore.resolve_repo(conn, project, repo)
-        repos = [stored] if stored in repos else []
-    return repos, area
+    name = qual if qual is not None else repo
+    if name is None:
+        return _project_repos(conn, project), area
+    stored = resolve_repo_arg(conn, project, name)
+    return ([stored] if stored is not None else []), area
 
 
 # Contribution edge types, in the deterministic group order person-impact emits.
@@ -1020,6 +1071,53 @@ def subsystem_split(conn, project, area, ts_from=None, ts_to=None,
     )
 
 
+def _repo_windows(conn, project, repo):
+    """The repo's gathered windows, (from, to) sorted by date."""
+    try:
+        ledger = graphstore.get_windows(conn)
+    except ValueError:
+        ledger = []
+    return sorted({(w.get("from"), w.get("to")) for w in ledger
+                   if isinstance(w, dict) and w.get("project") == project
+                   and w.get("repo") == repo and w.get("from") and w.get("to")})
+
+
+def _code_graphs(conn, project, repo):
+    """Every stored code graph of `repo`, for a reader that spans all history
+    (issue #113 M6): the code graph of each gathered window that carries #94
+    per-window facts, in window-date order, plus the latest-wins `codegraph`
+    singleton when the store has none or some gathered window has no facts
+    entry (folded before #94). Never depends on fold order."""
+    graphs, legacy = [], False
+    windows = _repo_windows(conn, project, repo)
+    for frm, to in windows:
+        wf = graphstore.get_window_facts(conn, project, repo, frm, to,
+                                         keys=("code_graph",))
+        if wf is None:
+            legacy = True
+            continue
+        cg = (wf.get("facts") or {}).get("code_graph")
+        if cg:
+            graphs.append(cg)
+    if legacy or not windows:
+        node = graphstore.get_node(
+            conn, graphstore.qualify_id(project, repo, "codegraph"))
+        if node is not None and node.get("data"):
+            graphs.append(node["data"])
+    return graphs
+
+
+def _area_paths(conn, project, repo):
+    """{path: {area ids}} — the union of the area index (derive.area_index)
+    over every stored code graph of `repo` (_code_graphs). A path two windows
+    put in different areas (a re-organised tree, a graphify run) is in both."""
+    out = {}
+    for cg in _code_graphs(conn, project, repo):
+        for path, aid in derive.area_index(cg).items():
+            out.setdefault(path, set()).add(aid)
+    return out
+
+
 def _slice_cap_text(s):
     """Bound a lifecycle row's before/after/diff text to _SLICE_TEXT_CAP chars,
     appending an overflow marker when cut (mirrors link._cap_text). Pure."""
@@ -1057,11 +1155,14 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None,
     gathered windows, with the change detail), plus the trains that touched it —
     a bounded "module biography". Reads the store only; never writes/networks.
 
-    Resolution: read the stored `codegraph` singleton (`area_index`/
-    `_area_for_path`) and keep `code` artifact nodes whose `path` maps to the
-    requested area. An unknown/empty area (no matching codegraph area in any repo)
+    Resolution: the union of the area index over EVERY stored code graph of
+    the repo (`_area_paths`: each gathered window's #94 per-window code graph,
+    plus the latest-wins `codegraph` singleton on a store folded before #94),
+    so the answer never depends on fold order (issue #113); keep `code`
+    artifact nodes whose `path` some window's graph puts in the requested
+    area. An unknown/empty area (no stored code graph lists it in any repo)
     yields the shared `needs_gather` envelope. Repo scope as in subsystem_split:
-    union across every repo whose codegraph has the area (listed in `repos`),
+    union across every repo whose code graphs have the area (listed in `repos`),
     or one member via `owner/repo::area` / `repo=`. Every symbol and file row
     carries its `repo` (the same path in two members is two rows).
 
@@ -1084,14 +1185,10 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None,
     # --- resolve the area per repo (NEVER merge indexes: a path string can map to
     #     different areas in different repos, so match each artifact against ITS OWN
     #     repo's codegraph) ---
-    area_idx_by_repo = {}
-    for r in repos:
-        cg = graphstore.get_node(
-            conn, graphstore.qualify_id(project, r, "codegraph"))
-        if cg is not None:
-            area_idx_by_repo[r] = derive.area_index(cg["data"] or {})
+    area_idx_by_repo = {r: _area_paths(conn, project, r) for r in repos}
     area_repos = [r for r in repos
-                  if area in area_idx_by_repo.get(r, {}).values()]
+                  if any(area in areas
+                         for areas in area_idx_by_repo[r].values())]
     if not area_repos:
         return {
             "query": "module",
@@ -1118,7 +1215,7 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None,
             if "sha" in data:
                 continue
             path = data.get("path")
-            if path is None or derive._area_for_path(path, idx) != area:
+            if path is None or area not in idx.get(path, ()):
                 continue
             artifacts[node["id"]] = node
 
@@ -1438,10 +1535,67 @@ _OUTCOME_BADGE = {
 }
 
 
+# Untrusted text in `--md` (issue #113 m1). Titles, bodies, logins, paths, area
+# ids, the focus and the grep phrase come from GitHub or the user, so each is
+# rendered through _md: control characters (newlines included) collapse to a
+# space, so a value can never start a new markdown block; in running text the
+# markdown / HTML syntax characters are backslash-escaped or written as
+# entities (`<` `>` `&`), and a leading block marker before a space (`#`,
+# `-`, `+`, `=`, `1.`) is escaped, so a value cannot add a heading, a quote,
+# a list, a link, an image, raw HTML or a table cell; inside a code span the
+# span's fence is longer than any backtick run in the value, so it cannot be
+# broken. `--json` stays raw (it is data).
+_MD_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+_MD_ESCAPED = "\\`*_[]|~"
+_MD_BLOCK_START = re.compile(r"^(\s*)(?:([#]+|[-+=]+)(?=\s|$)|(\d+)([.)])(?=\s|$))")
+
+
+def _md(value, code=False):
+    """`value` as safe markdown text — or, with `code`, as a code span. The one
+    escaping helper every --md renderer uses for a value read from the store
+    or the command line. Readable: nothing is deleted, only escaped."""
+    text = _MD_CONTROL.sub(" ", "" if value is None else str(value))
+    if code:
+        runs = re.findall("`+", text)
+        fence = "`" * (max((len(r) for r in runs), default=0) + 1)
+        pad = " " if (text[:1] == "`" or text[-1:] == "`"
+                      or (text[:1] == " " and text[-1:] == " ")) else ""
+        return "{0}{1}{2}{1}{0}".format(fence, pad, text)
+    out = []
+    for ch in text:
+        if ch in _MD_ESCAPED:
+            out.append("\\" + ch)
+        elif ch == "&":
+            out.append("&amp;")
+        elif ch == "<":
+            out.append("&lt;")
+        elif ch == ">":
+            out.append("&gt;")
+        else:
+            out.append(ch)
+    text = "".join(out)
+    m = _MD_BLOCK_START.match(text)
+    if m:
+        if m.group(2):
+            text = m.group(1) + "\\" + text[len(m.group(1)):]
+        else:
+            cut = m.end(3)
+            text = text[:cut] + "\\" + text[cut:]
+    return text
+
+
+def _mermaid_label(value):
+    """A value as the text of a quoted mermaid node label: one line, its quote
+    and angle brackets as mermaid entity codes."""
+    text = _MD_CONTROL.sub(" ", "" if value is None else str(value))
+    return (text.replace("#", "#35;").replace('"', "#quot;")
+            .replace("<", "#lt;").replace(">", "#gt;").replace("`", "#96;"))
+
+
 def _scope_label(scope):
     if scope == "all-history":
         return "all-history"
-    return "{}..{}".format(scope.get("from") or "", scope.get("to") or "")
+    return "{}..{}".format(_md(scope.get("from") or ""), _md(scope.get("to") or ""))
 
 
 def member_dependents(conn, project, member):
@@ -1452,10 +1606,11 @@ def member_dependents(conn, project, member):
     Unlike the train-oriented queries this returns a FLAT `dependents` list (no
     `summary`/`delivered`) and is time-independent (`scope` carries no window). A
     member with no area nodes (ungathered/unknown slug) yields a needs_gather
-    result, mirroring the sibling queries. `member` may be written in any case:
-    it resolves to the stored spelling (issue #70), which `focus` reports.
-    Deterministic."""
-    member = graphstore.resolve_repo(conn, project, member)
+    result, mirroring the sibling queries. `member` is named by
+    resolve_repo_arg's rule (any case, issue #70; `repo` alone where
+    unambiguous; `owner/repo` on a single-repo store, #113) and resolves to
+    the stored spelling, which `focus` reports. Deterministic."""
+    member = resolve_repo_arg(conn, project, member) or member
     seed_areas = [n["id"] for n in graphstore.repo_nodes(
         conn, project, member, "structure")
         if graphstore.parse_id(n["id"])["local"].startswith("area-")]
@@ -1491,22 +1646,6 @@ def member_dependents(conn, project, member):
     }
 
 
-def _stored_area_repo(conn, project, qual):
-    """The stored repo a `owner/repo` area qualifier names, or None. A project
-    store keeps members as `owner/repo`; a single-repo store keeps project=owner
-    and repo=name, so `owner/repo` there names (project, name). Any case."""
-    repos = _project_repos(conn, project)
-    stored = graphstore.resolve_repo(conn, project, qual)
-    if stored in repos:
-        return stored
-    owner, _, name = qual.partition("/")
-    if owner.lower() == project.lower():
-        stored = graphstore.resolve_repo(conn, project, name)
-        if stored in repos:
-            return stored
-    return None
-
-
 def _area_label_of(project, node_id):
     """`owner/repo::area` for an area node id (single-repo or project store)."""
     p = graphstore.parse_id(node_id)
@@ -1526,7 +1665,7 @@ def area_dependents(conn, project, area):
     with an edge straight to it). Time-independent, like member_dependents. An
     unknown repo or an area with no node is a needs_gather answer. Deterministic."""
     qual, local = _split_area_arg(area)
-    stored = _stored_area_repo(conn, project, qual) if qual else None
+    stored = resolve_repo_arg(conn, project, qual) if qual else None
     seed = (graphstore.qualify_id(project, stored, "area-" + local)
             if stored is not None else None)
     if seed is None or graphstore.get_node(conn, seed) is None:
@@ -1568,41 +1707,43 @@ def area_dependents(conn, project, area):
 
 def _render_train_md(t):
     """One delivery train as deterministic markdown: outcome badge + the
-    focus's touchpoints, then the cited spine timeline."""
+    focus's touchpoints, then the cited spine timeline. Every stored value
+    goes through _md."""
     lines = []
-    badge = _OUTCOME_BADGE.get(t["outcome"], "[{}]".format(t["outcome"]))
-    title = t.get("title") or t["anchor"]
-    head = "#### {} {}".format(badge, title)
+    badge = _OUTCOME_BADGE.get(t["outcome"]) or "[{}]".format(_md(t["outcome"]))
+    head = "#### {} {}".format(badge, _md(t.get("title") or t["anchor"]))
     if t.get("roles"):
-        head += " ({})".format(", ".join(t["roles"]))
+        head += " ({})".format(", ".join(_md(r) for r in t["roles"]))
     lines.append(head)
     if t.get("repos"):
-        lines.append("- repos: {}".format(", ".join(t["repos"])))
+        lines.append("- repos: {}".format(", ".join(_md(r) for r in t["repos"])))
     if t.get("areas"):
-        lines.append("- areas: {}".format(", ".join(t["areas"])))
+        lines.append("- areas: {}".format(", ".join(_md(a) for a in t["areas"])))
     if t["touchpoints"]:
         lines.append("- touchpoints:")
         for tp in t["touchpoints"]:
             ref = tp.get("url") or tp.get("sha") or tp["id"]
             extra = ""
             if tp.get("excerpt"):
-                extra = " — \"{}\"".format(tp["excerpt"])
+                extra = " — \"{}\"".format(_md(tp["excerpt"]))
             lines.append("  - [{}] {} — {}{}".format(
-                tp.get("role") or "?", tp.get("title") or tp["id"], ref, extra))
+                _md(tp.get("role") or "?"), _md(tp.get("title") or tp["id"]),
+                _md(ref), extra))
     lines.append("- timeline:")
     for r in t["timeline"]:
         ref = r.get("url") or r.get("sha") or r["id"]
         when = r.get("ts") or "?"
         kind = r.get("kind") or "?"
-        ev = " {}".format(r["event"]) if r.get("event") else ""
-        excerpt = " — \"{}\"".format(r["excerpt"]) if r.get("excerpt") else ""
-        lines.append("  - {} {}{} — {}{}".format(when, kind, ev, ref, excerpt))
+        ev = " {}".format(_md(r["event"])) if r.get("event") else ""
+        excerpt = " — \"{}\"".format(_md(r["excerpt"])) if r.get("excerpt") else ""
+        lines.append("  - {} {}{} — {}{}".format(_md(when), _md(kind), ev,
+                                                _md(ref), excerpt))
     gaps = t.get("gaps") or []
     if gaps:
         counts = {}
         for g in gaps:
             counts[g["reason"]] = counts.get(g["reason"], 0) + 1
-        parts = ["{} {}".format(counts[r], r.replace("_", "-"))
+        parts = ["{} {}".format(counts[r], _md(r.replace("_", "-")))
                  for r in sorted(counts)]
         lines.append("> ⚠ {} gaps: {}".format(len(gaps), ", ".join(parts)))
     return "\n".join(lines)
@@ -1616,20 +1757,26 @@ def _render_delivered_md(res):
     return lines
 
 
+def _needs_gather_md(label, res):
+    return "## spotlight: {} {}\n\n_needs gather:_ {}".format(
+        label, _md(res["focus"], code=True), _md(res.get("guidance", "")))
+
+
 def _render_person_md(res):
     if res["status"] == "needs_gather":
-        return "## spotlight: person `{}`\n\n_needs gather:_ {}".format(
-            res["focus"], res["guidance"])
+        return _needs_gather_md("person", res)
     if res["status"] == "fts_unavailable":
         return "## spotlight\n\n_FTS unavailable:_ {}".format(
-            res.get("guidance", ""))
+            _md(res.get("guidance", "")))
     s = res["summary"]
-    lines = ["## spotlight: person `{}`{}".format(
-        res["focus"], " (bot)" if res["is_bot"] else "")]
+    lines = ["## spotlight: person {}{}".format(
+        _md(res["focus"], code=True), " (bot)" if res["is_bot"] else "")]
     lines.append("")
     lines.append("- scope: {}".format(_scope_label(res["scope"])))
-    lines.append("- modules: {}".format(", ".join(res["modules"]) or "—"))
-    lines.append("- areas: {}".format(", ".join(res["areas"]) or "—"))
+    lines.append("- modules: {}".format(
+        ", ".join(_md(m) for m in res["modules"]) or "—"))
+    lines.append("- areas: {}".format(
+        ", ".join(_md(a) for a in res["areas"]) or "—"))
     lines.append("- summary: {} trains touched, {} shipped".format(
         s.get("trains_touched", 0), s.get("shipped", 0)))
     roles = ", ".join("{} {}".format(s[r], r) for r in _CONTRIB_TYPES
@@ -1644,22 +1791,21 @@ def _render_person_md(res):
 
 def _render_symbol_md(res):
     if res["status"] == "needs_gather":
-        return "## spotlight: symbol `{}`\n\n_needs gather:_ {}".format(
-            res["focus"], res["guidance"])
+        return _needs_gather_md("symbol", res)
     s = res["summary"]
-    lines = ["## spotlight: symbol `{}`".format(res["focus"]), ""]
+    lines = ["## spotlight: symbol {}".format(_md(res["focus"], code=True)), ""]
     lines.append("- scope: {}".format(_scope_label(res["scope"])))
     lines.append("- summary: {} events, outcome {}".format(
-        s.get("events", 0), s.get("outcome", "?")))
+        s.get("events", 0), _md(s.get("outcome", "?"))))
     lines.append("")
     chain = res["identity_chain"]
     lines.append("### identity chain ({})".format(len(chain)))
     for c in chain:
         if c.get("confidence"):
             lines.append("- {} ({} / {})".format(
-                c["id"], c.get("confidence"), c.get("basis")))
+                _md(c["id"]), _md(c.get("confidence")), _md(c.get("basis"))))
         else:
-            lines.append("- {}".format(c["id"]))
+            lines.append("- {}".format(_md(c["id"])))
     # Mermaid only where it adds signal: a multi-link rename/move chain reads
     # better as a left-to-right graph than as a flat list.
     if len(chain) > 1:
@@ -1667,7 +1813,7 @@ def _render_symbol_md(res):
         lines.append("```mermaid")
         lines.append("graph LR")
         for i, c in enumerate(chain):
-            lines.append('  n{}["{}"]'.format(i, c["id"]))
+            lines.append('  n{}["{}"]'.format(i, _mermaid_label(c["id"])))
         for i in range(len(chain) - 1):
             lines.append("  n{} --> n{}".format(i, i + 1))
         lines.append("```")
@@ -1677,41 +1823,44 @@ def _render_symbol_md(res):
 
 def _render_subsystem_md(res):
     if res["status"] == "needs_gather":
-        return "## spotlight: subsystem `{}`\n\n_needs gather:_ {}".format(
-            res["focus"], res["guidance"])
+        return _needs_gather_md("subsystem", res)
     s = res["summary"]
-    lines = ["## spotlight: subsystem `{}`".format(res["focus"]), ""]
+    lines = ["## spotlight: subsystem {}".format(_md(res["focus"], code=True)), ""]
     lines.append("- scope: {}".format(_scope_label(res["scope"])))
     if res.get("repos"):
-        lines.append("- repos: {}".format(", ".join(res["repos"])))
+        lines.append("- repos: {}".format(", ".join(_md(r) for r in res["repos"])))
     lines.append("- summary: {} trains, {} shipped, {} contributors".format(
         s.get("trains", 0), s.get("shipped", 0), s.get("contributors", 0)))
     lines.append("")
     lines.append("### contributors ({})".format(len(res["contributors"])))
     for c in res["contributors"]:
-        where = "; {}".format(", ".join(c["repos"])) if c.get("repos") else ""
-        lines.append("- {} ({}{})".format(c["login"], c["relation"], where))
+        where = "; {}".format(", ".join(_md(r) for r in c["repos"])) \
+            if c.get("repos") else ""
+        lines.append("- {} ({}{})".format(_md(c["login"]), _md(c["relation"]),
+                                          where))
     lines.append("")
     deps = res["depends_on"]
     lines.append("### depends_on blast radius (out {} / in {})".format(
         len(deps["out"]), len(deps["in"])))
+
     def _dep_suffix(d):
         bits = []
         if d.get("version") is not None:
-            bits.append("v{}".format(d["version"]))
+            bits.append("v{}".format(_md(d["version"])))
         if d.get("transitive"):
             bits.append("transitive")
         return " ({})".format(", ".join(bits)) if bits else ""
+
     def _dep_repo(d):
-        return "[{}] ".format(d["repo"]) if d.get("repo") else ""
+        return "[{}] ".format(_md(d["repo"])) if d.get("repo") else ""
 
     def _dep_target(d):
         # name the other end's repo when it is not the row's own repo
         scope = graphstore.parse_id(d.get("id") or "")["scope"]
         other = scope.split("/", 1)[1] if "/" in scope else None
         if d.get("repo") and other and other != d["repo"]:
-            return "{} in {}".format(d["area"], other)
-        return d["area"]
+            return "{} in {}".format(_md(d["area"]), _md(other))
+        return _md(d["area"])
     for d in deps["out"]:
         lines.append("- {}depends on {}{}".format(
             _dep_repo(d), _dep_target(d), _dep_suffix(d)))
@@ -1724,10 +1873,10 @@ def _render_subsystem_md(res):
 
 def _render_grep_md(res):
     if res["status"] == "fts_unavailable":
-        return "## spotlight: grep `{}`\n\n_FTS unavailable:_ {}".format(
-            res["focus"], res.get("guidance", ""))
+        return "## spotlight: grep {}\n\n_FTS unavailable:_ {}".format(
+            _md(res["focus"], code=True), _md(res.get("guidance", "")))
     s = res["summary"]
-    lines = ["## spotlight: grep `{}`".format(res["focus"]), ""]
+    lines = ["## spotlight: grep {}".format(_md(res["focus"], code=True)), ""]
     lines.append("- scope: {}".format(_scope_label(res["scope"])))
     lines.append("- summary: {} matches across {} trains".format(
         s.get("matches", 0), s.get("trains", 0)))
@@ -1737,42 +1886,46 @@ def _render_grep_md(res):
 
 def _render_dependents_md(res):
     if res["status"] == "needs_gather":
-        return "## spotlight: blast radius `{}`\n\n_needs gather:_ {}".format(
-            res["focus"], res["guidance"])
+        return "## spotlight: blast radius {}\n\n_needs gather:_ {}".format(
+            _md(res["focus"], code=True), _md(res.get("guidance", "")))
     deps = res.get("dependents") or []
-    head = "## spotlight: blast radius `{}`\n".format(res["focus"])
+    head = "## spotlight: blast radius {}\n".format(_md(res["focus"], code=True))
     if res.get("focus_kind") == "area":
         if not deps:
             return head + "\nNothing in the store depends on this area.\n"
         direct = set(res.get("direct") or [])
         return head + "\nAreas that depend on it (direct, then transitive):\n\n" \
-            + "\n".join("- `{}`{}".format(d, "" if d in direct else " (transitive)")
+            + "\n".join("- {}{}".format(_md(d, code=True),
+                                        "" if d in direct else " (transitive)")
                         for d in sorted(deps, key=lambda d: (d not in direct, d))) \
             + "\n"
     if not deps:
         return head + "\nNothing in the project depends on this member.\n"
     return head + "\nMembers that (transitively) depend on it:\n\n" + "\n".join(
-        "- `{}`".format(d) for d in deps) + "\n"
+        "- {}".format(_md(d, code=True)) for d in deps) + "\n"
 
 
 def _render_module_md(res):
     if res["status"] == "needs_gather":
-        return "## spotlight: module `{}`\n\n_needs gather:_ {}".format(
-            res["focus"], res["guidance"])
+        return _needs_gather_md("module", res)
     s = res["summary"]
     tr = res["time_range"]
-    lines = ["## spotlight: module `{}`".format(res["focus"]), ""]
+    lines = ["## spotlight: module {}".format(_md(res["focus"], code=True)), ""]
     lines.append("- scope: {}".format(_scope_label(res["scope"])))
     lines.append("- time range: {} → {}".format(
-        tr.get("first") or "—", tr.get("last") or "—"))
+        _md(tr.get("first") or "—"), _md(tr.get("last") or "—")))
     lines.append("- summary: {} symbols, {} files, {} trains".format(
         s.get("symbols", 0), s.get("files", 0), s.get("trains", 0)))
 
     def _ev_suffix(r):
         bits = []
         if r.get("pr"):
-            bits.append(r["pr"])
+            bits.append(_md(r["pr"]))
         return " ({})".format(", ".join(bits)) if bits else ""
+
+    def _event_line(r):
+        return "  - {} {} {}{}".format(_md(r["date"]), _md(r["event"]),
+                                       _md(r["commit"]), _ev_suffix(r))
 
     lines.append("")
     lines.append("### symbols ({}{})".format(
@@ -1780,10 +1933,10 @@ def _render_module_md(res):
         ", +{} more".format(res["symbols_overflow"])
         if res["symbols_overflow"] else ""))
     for sym in res["symbols"]:
-        lines.append("- `{}` [{}]".format(sym["id"], sym.get("status") or "?"))
+        lines.append("- {} [{}]".format(_md(sym["id"], code=True),
+                                            _md(sym.get("status") or "?")))
         for r in sym["lifecycle"]:
-            lines.append("  - {} {} {}{}".format(
-                r["date"], r["event"], r["commit"], _ev_suffix(r)))
+            lines.append(_event_line(r))
         if sym["lifecycle_overflow"]:
             lines.append("  - …(+{} more events)".format(
                 sym["lifecycle_overflow"]))
@@ -1794,10 +1947,9 @@ def _render_module_md(res):
         ", +{} more".format(res["files_overflow"])
         if res["files_overflow"] else ""))
     for f in res["files"]:
-        lines.append("- `{}` ({})".format(f["path"], f["repo"]))
+        lines.append("- {} ({})".format(_md(f["path"], code=True), _md(f["repo"])))
         for r in f["lifecycle"]:
-            lines.append("  - {} {} {}{}".format(
-                r["date"], r["event"], r["commit"], _ev_suffix(r)))
+            lines.append(_event_line(r))
         if f["lifecycle_overflow"]:
             lines.append("  - …(+{} more events)".format(f["lifecycle_overflow"]))
 
@@ -1852,8 +2004,9 @@ def main(argv=None):
     parser.add_argument("--project", default=None,
                         help="project (auto-detected when the store holds one)")
     parser.add_argument("--repo", default=None,
-                        help="subsystem/module: only this member (owner/repo, "
-                             "any case); same as the argument owner/repo::area")
+                        help="subsystem/module: only this repo (owner/repo in "
+                             "any case, or repo alone when unambiguous); same "
+                             "as the argument <repo>::<area>")
     parser.add_argument("--from", dest="ts_from", default=None,
                         help="bound the delivery train at/after this ts "
                              "(person: train key date; symbol: lifecycle "
@@ -1862,9 +2015,10 @@ def main(argv=None):
                         help="bound the delivery train at/before this ts "
                              "(see --from)")
     parser.add_argument("--complete", action="store_true",
-                        help="fetch missing cross-window spine anchors via the "
-                             "GitHub API (needs GITHUB_TOKEN); default is "
-                             "offline/honest-only. Train queries only: "
+                        help="fetch missing cross-window PRs/issues via the "
+                             "GitHub API (needs GITHUB_TOKEN) and write them as "
+                             "a gather would; default is offline/honest-only. "
+                             "Train queries only: "
                              + ", ".join(_TRAIN_QUERIES))
     parser.add_argument("--complete-budget", dest="complete_budget", type=int,
                         default=50,
@@ -1895,9 +2049,11 @@ def main(argv=None):
                      "(it is time-independent)")
     try:
         if args.ts_from is not None:
-            manifest.check_reader_window(args.ts_from, args.ts_to or args.ts_from)
+            args.ts_from = manifest.check_reader_window(
+                args.ts_from, args.ts_to or args.ts_from)[0]
         if args.ts_to is not None:
-            manifest.check_reader_window(args.ts_from or args.ts_to, args.ts_to)
+            args.ts_to = manifest.check_reader_window(
+                args.ts_from or args.ts_to, args.ts_to)[1]
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -1914,16 +2070,25 @@ def main(argv=None):
         else:
             conn = graphstore.open_store_readonly(args.store)
         project = _detect_project(conn, args.project)
-        if args.query in _AREA_QUERIES:
+        # Every repo the arguments name resolves by one rule
+        # (resolve_repo_arg); an unknown or ambiguous one is a usage error
+        # listing the repos the store knows, for every query alike (#113 m3).
+        named = []
+        if args.query in _AREA_QUERIES or args.query == "dependents":
             qual = _split_area_arg(arg)[0]
-            for name, value in (("--repo", args.repo), ("area qualifier", qual)):
-                if value is None:
-                    continue
-                known = _project_repos(conn, project)
-                if graphstore.resolve_repo(conn, project, value) not in known:
-                    raise ValueError("{} {!r} has no nodes in project {!r} "
-                                     "(repos: {})".format(name, value, project,
-                                                          known))
+            if qual is not None:
+                named.append(("area qualifier", qual))
+            elif args.query == "dependents":
+                named.append(("member", arg))
+            if args.repo is not None:
+                named.append(("--repo", args.repo))
+        for name, value in named:
+            if resolve_repo_arg(conn, project, value) is None:
+                raise ValueError(
+                    "{} {!r} names no single repo of project {!r} "
+                    "(repos: {})".format(name, value, project,
+                                         _store_repos(conn, project)))
+        if args.query in _AREA_QUERIES:
             _area_scope(conn, project, arg, args.repo)  # --repo vs qualifier
     except sqlite3.DatabaseError as exc:
         parser.error("cannot read store {!r}: {}".format(args.store, exc))
@@ -1964,7 +2129,7 @@ def main(argv=None):
                            repo=args.repo,
                            backfill=backfill, complete_budget=cb)
     elif args.query == "dependents":
-        if _split_area_arg(arg)[0] is not None:     # owner/repo::area (#92)
+        if _split_area_arg(arg)[0] is not None:   # repo::area
             res = area_dependents(conn, project, arg)
         else:
             res = member_dependents(conn, project, arg)

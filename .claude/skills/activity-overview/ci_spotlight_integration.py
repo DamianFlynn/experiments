@@ -13,9 +13,14 @@ Query arguments are *discovered* from the store, scoped to the project (the
 most-active person, the most-touched area, the artifact with the richest
 lifecycle, a search term with hits), so the gate verifies real behaviour without
 hard-coding brittle ids. Each answer is then checked against what the store
-itself holds: every lifecycle event is present and the outcome follows the last
-one, every grep match is delivered and nothing outside the project is, outcomes
-come from spotlight's vocabulary, train repos are project members.
+itself holds, never against spotlight's own answer (issue #113): a person's trains
+are exactly the trains of their contribution edges, each touchpoint carrying the
+role its edge implies; every train's outcome equals the one the gate computes
+from the stored member records (_store_outcome, LLD §9's rule written out here,
+not imported); every timeline row and touchpoint cites what its stored node
+holds; every symbol lifecycle row equals its ledger row and the outcome follows
+the last ledger row; every grep match is delivered, nothing outside the project
+is, and each mention's title and excerpt are the stored node's own text.
 
 A check whose input the store does not hold (no contributions, no area, no code
 events, no indexed text) is reported as SKIPPED with the reason. Without
@@ -55,6 +60,16 @@ _TRAIN_OUTCOMES = ("shipped", "in_flight", "rejected", "direct_push", "abandoned
 _LIFECYCLE_OUTCOMES = ("alive", "removed")
 # ledger events that end an artifact: a symbol's `remove`, a file's `delete`
 _REMOVAL_EVENTS = ("remove", "delete")
+# A contribution edge's type -> the role its touchpoint carries (LLD §9).
+_ROLE_OF = {"authored": "author", "reviewed": "reviewer", "merged": "merger",
+            "reported": "reporter", "commented": "commenter"}
+# Spotlight groups trains over the CAUSAL spine: every spine edge type but
+# `cross_ref` (a mention is not causality).
+_CAUSAL = tuple(t for t in graphstore.SPINE_EDGE_TYPES if t != "cross_ref")
+# Issue close reasons that mean "not done" (GitHub `state_reason`).
+_DROPPED = ("not_planned", "duplicate")
+# Citation fields a timeline row / touchpoint copies from its stored node.
+_CITE_FIELDS = ("number", "sha", "url", "title")
 
 
 class CheckError(AssertionError):
@@ -92,6 +107,81 @@ def _range(prefix):
     case-sensitively and with no LIKE wildcards (`_`/`%` in a project name are
     literal)."""
     return graphstore._prefix_range(prefix)
+
+
+def _norm(text):
+    """Whitespace-collapsed text (how spotlight bounds an excerpt)."""
+    return " ".join(str(text or "").split())
+
+
+def _member_kind(node):
+    """A stored train member's kind for the outcome rule: "release", "pr",
+    "issue", "commit" or None (review / lifecycle leaves, artifacts, areas).
+    A `pr-<n>` record is a PR; so is an `issue-<n>` record carrying a /pull/
+    url (a `Closes #N` whose #N is a PR, backfilled under the issue id)."""
+    local = graphstore.local_id(node["id"])
+    data = node.get("data") or {}
+    if local.startswith("release-"):
+        return "release"
+    if node.get("node_class") == "social":
+        if local.startswith("pr-"):
+            return "pr"
+        if local.startswith("issue-"):
+            return "pr" if "/pull/" in (data.get("url") or "") else "issue"
+        return None
+    if node.get("node_class") == "code" and "sha" in data \
+            and not graphstore.is_artifact_local(local):
+        return "commit"
+    return None
+
+
+def _store_outcome(nodes):
+    """A decision train's outcome from its stored member records — the gate's
+    own statement of LLD §9's rule, so a wrong spotlight label cannot pass:
+      1. any release -> shipped;
+      2. with PRs: any merged -> shipped; else any not closed -> in_flight;
+         else (all closed unmerged) -> rejected;
+      3. no PR: any issue not closed -> in_flight; else any closed issue
+         whose state_reason is not not_planned / duplicate (none counts as
+         completed) -> shipped;
+      4. else commits -> direct_push; else issues (all dropped) -> abandoned;
+         else in_flight."""
+    prs, issues, commits = [], [], False
+    for node in nodes:
+        kind = _member_kind(node)
+        data = node.get("data") or {}
+        if kind == "release":
+            return "shipped"
+        if kind == "pr":
+            prs.append(data)
+        elif kind == "issue":
+            issues.append(data)
+        elif kind == "commit":
+            commits = True
+    if prs:
+        if any(p.get("merged") for p in prs):
+            return "shipped"
+        if any(p.get("state") != "closed" for p in prs):
+            return "in_flight"
+        return "rejected"
+    if any(i.get("state") != "closed" for i in issues):
+        return "in_flight"
+    if any(i.get("state_reason") not in _DROPPED for i in issues):
+        return "shipped"
+    if commits:
+        return "direct_push"
+    return "abandoned" if issues else "in_flight"
+
+
+def _fts_text(conn, node_id):
+    """The indexed text of `node_id` ('' when none / no index)."""
+    try:
+        row = conn.execute(
+            "SELECT t.text FROM fts_map m JOIN fts_text t ON t.rowid = m.fts_rowid "
+            "WHERE m.node_id = ?", (node_id,)).fetchone()
+    except sqlite3.DatabaseError:
+        return ""
+    return (row[0] if row else "") or ""
 
 
 # --------------------------------------------------------------------------
@@ -194,7 +284,9 @@ def _grep_term(conn, project):
 def _check_trains(conn, project, label, delivered):
     """Every delivered train: an outcome from spotlight's vocabulary; `repos`
     non-empty and all project members; a (ts, id)-ordered timeline whose ids
-    are all in the project; touchpoints all in the project."""
+    are all in the project and stored; touchpoints all in the project; every
+    row and touchpoint citing what its stored node holds (_check_citation);
+    and the outcome the stored member records give (_store_outcome)."""
     members = set(graphstore.project_repos(conn, project))
     for t in delivered:
         a = t.get("anchor")
@@ -215,6 +307,44 @@ def _check_trains(conn, project, label, delivered):
                        if not _in_project(r["id"], project))
         _require(not stray, "{}: train {} carries ids outside project {}: "
                  "{}".format(label, a, project, stray[:3]))
+        nodes = []
+        for r in tl:
+            node = graphstore.get_node(conn, r["id"])
+            _require(node is not None, "{}: train {} timeline cites {}, which "
+                     "the store does not hold".format(label, a, r["id"]))
+            nodes.append(node)
+            _check_citation(label, a, r, node)
+        for tp in t.get("touchpoints", []):
+            _check_citation(label, a, tp, graphstore.get_node(conn, tp["id"]))
+        want = _store_outcome(nodes)
+        _require(t.get("outcome") == want,
+                 "{}: train {} has outcome {!r} but its stored records give "
+                 "{!r}".format(label, a, t.get("outcome"), want))
+
+
+def _check_citation(label, anchor, row, node):
+    """A timeline row / touchpoint cites what its stored node holds: each of
+    number / sha / url / title present exactly when the node's data has it,
+    with the same value — except that a commit whose record stores no url may
+    be cited by its GitHub `/commit/<sha>` link; a comment row's excerpt is
+    the node's body."""
+    data = (node or {}).get("data") or {}
+    _require((row.get("ts") or "") == ((node or {}).get("ts") or ""),
+             "{}: train {} row {} is dated {!r} but the stored node is dated "
+             "{!r}".format(label, anchor, row["id"], row.get("ts"),
+                           (node or {}).get("ts")))
+    for key in _CITE_FIELDS:
+        if (key == "url" and data.get("url") is None and data.get("sha")
+                and (row.get("url") or "").endswith("/commit/" + data["sha"])):
+            continue
+        _require(row.get(key) == data.get(key),
+                 "{}: train {} row {} cites {}={!r} but the stored node holds "
+                 "{!r}".format(label, anchor, row["id"], key, row.get(key),
+                               data.get(key)))
+    if row.get("kind") == "comment" and "excerpt" in row:
+        _require(_norm(row["excerpt"]) in _norm(data.get("body")),
+                 "{}: train {} comment {} excerpt is not its stored body".format(
+                     label, anchor, row["id"]))
 
 
 def _check_shipped_count(label, res, total_key):
@@ -232,6 +362,70 @@ def _check_shipped_count(label, res, total_key):
 # per-query checks
 # --------------------------------------------------------------------------
 
+def _shallow(conn, nid):
+    """True when the causal-spine train of `nid` is one piece from wherever it
+    is entered: each of its members reaches the whole train within
+    graphstore.traverse_spine's default depth. A deeper train can be entered
+    at two ends whose depth-capped reaches differ, so a reader may then list
+    one record in two trains."""
+    def reach(x, **kw):
+        return set(graphstore.traverse_spine(conn, [x], edge_types=_CAUSAL,
+                                             skip_dead=True, **kw)["reached"])
+    whole = reach(nid, max_depth=64)
+    return all(reach(m) == whole for m in sorted(whole))
+
+
+def _check_person_touchpoints(conn, project, login, label, res):
+    """The person's trains are exactly the trains of their contribution edges
+    in the store: every (target, role) pair a contribution edge implies is a
+    touchpoint of a delivered train and every touchpoint is such a pair; a
+    target sits in exactly one train (in at least one when its train is
+    deeper than the traversal cap, see _shallow); every delivered train holds
+    a touchpoint; each summary role count equals the touchpoints of that role
+    (an all-history query delivers every train)."""
+    person = graphstore.qualify_person(project, login)
+    edges = graphstore.get_edges(conn, person, direction="out",
+                                 edge_types=list(_CONTRIB))
+    want = {(e["dst_id"], _ROLE_OF[e["edge_type"]]) for e in edges}
+    got, trains_of = set(), {}
+    for t in res["delivered"]:
+        tps = t.get("touchpoints") or []
+        _require(tps, "{}: train {} holds no touchpoint of {} — no contribution "
+                 "edge leads to it".format(label, t.get("anchor"), login))
+        for tp in tps:
+            got.add((tp["id"], tp.get("role")))
+            trains_of.setdefault(tp["id"], set()).add(t.get("anchor"))
+            if tp.get("role") == "commenter" and tp.get("excerpt"):
+                data = (graphstore.get_node(conn, tp["id"]) or {}).get("data") or {}
+                bodies = [_norm(c.get("body")) for c in
+                          (data.get("comments_list") or [])
+                          + (data.get("review_comments") or [])
+                          if c.get("author") == login]
+                _require(any(_norm(tp["excerpt"]) in b for b in bodies),
+                         "{}: comment excerpt on {} is not one of {}'s stored "
+                         "comments".format(label, tp["id"], login))
+    _require(got == want,
+             "{}: touchpoints differ from the contribution edges in the store: "
+             "missing {} extra {}".format(label, sorted(want - got)[:3],
+                                          sorted(got - want)[:3]))
+    for dst in sorted({d for d, _ in want}):
+        n = len(trains_of.get(dst, ()))
+        if n > 1 and not _shallow(conn, dst):
+            continue
+        _require(n == 1, "{}: contribution target {} is in {} delivered trains, "
+                 "not exactly one".format(label, dst, n))
+    # each role count is the touchpoints of that role over the delivered
+    # trains: the store's edges of that type once each, as the target of an
+    # edge is in exactly one train (bar the deep-train case above)
+    for etype in _CONTRIB:
+        count = sum(1 for t in res["delivered"] for tp in t["touchpoints"]
+                    if tp.get("role") == _ROLE_OF[etype])
+        _require(res["summary"].get(etype, 0) == count,
+                 "{}: summary.{}={} but the delivered trains hold {} {} "
+                 "touchpoints".format(label, etype, res["summary"].get(etype, 0),
+                                      count, _ROLE_OF[etype]))
+
+
 def check_person(conn, project):
     login = _most_active_person(conn, project)
     if login is None:
@@ -243,6 +437,7 @@ def check_person(conn, project):
     _require(len(res["delivered"]) > 0, "{}: no delivered trains".format(label))
     _check_trains(conn, project, label, res["delivered"])
     _check_shipped_count(label, res, "trains_touched")
+    _check_person_touchpoints(conn, project, login, label, res)
     _require(any(_train_has_cited_timeline(t) for t in res["delivered"]),
              "{}: no train carries a cited timeline".format(label))
     _require(any(_is_cited(tp) for t in res["delivered"] for tp in t["touchpoints"]),
@@ -321,16 +516,25 @@ def check_symbol(conn, project):
     _require([(r["ts"], r["sha"]) for r in tl]
              == sorted((r["ts"], r["sha"]) for r in tl),
              "{}: lifecycle is not in (date, commit) order".format(label))
+    # row for row, the ledger's own event / date / commit / author (the
+    # ledger in (date, commit) order, stable over graphstore's read order)
+    rows = sorted(ledger, key=lambda e: (e["date"] or "", e["commit_sha"]))
+    for i, (r, e) in enumerate(zip(tl, rows)):
+        got = (r.get("event"), r.get("ts"), r.get("sha"), r.get("author"))
+        exp = (e["event"], e["date"] or "", e["commit_sha"], e["author"])
+        _require(got == exp, "{}: lifecycle row {} is {} but the ledger row is "
+                 "{}".format(label, i, got, exp))
     _require(all(r.get("id") == aid for r in tl),
              "{}: a lifecycle row names another artifact".format(label))
     _require(all("kind" in r for r in tl), "{}: a lifecycle row lacks 'kind'".format(
         label))
     _require(all(_is_cited(r) for r in tl),
              "{}: a lifecycle row lacks a commit citation".format(label))
-    want = "removed" if tl and tl[-1]["event"] in _REMOVAL_EVENTS else "alive"
+    last = rows[-1]["event"] if rows else None
+    want = "removed" if last in _REMOVAL_EVENTS else "alive"
     _require(train["outcome"] in _LIFECYCLE_OUTCOMES and train["outcome"] == want,
-             "{}: outcome {!r} but the last event is {!r} (expected {!r})".format(
-                 label, train["outcome"], tl[-1]["event"] if tl else None, want))
+             "{}: outcome {!r} but the last ledger event is {!r} (expected "
+             "{!r})".format(label, train["outcome"], last, want))
     # the artifact sits somewhere in its identity chain — at the head only when
     # it is not the destination of a move
     chain = [c["id"] for c in res.get("identity_chain") or []]
@@ -366,6 +570,23 @@ def check_grep(conn, project):
     _require(mentions == set(hits),
              "{}: delivered mentions {} but the project's matches are {}".format(
                  label, sorted(mentions)[:3], hits[:3]))
+    for t in res["delivered"]:
+        for tp in t["touchpoints"]:
+            if tp.get("role") != "mention":
+                continue
+            node = graphstore.get_node(conn, tp["id"]) or {}
+            data = node.get("data") or {}
+            _require(tp.get("title") == data.get("title"),
+                     "{}: mention {} has title {!r} but the stored node's is "
+                     "{!r}".format(label, tp["id"], tp.get("title"),
+                                   data.get("title")))
+            excerpt = _norm(tp.get("excerpt"))
+            sources = [data.get(k) for k in ("body", "message", "title")]
+            sources.append(_fts_text(conn, tp["id"]))
+            _require(any(excerpt in _norm(src) for src in sources if src)
+                     or not (excerpt or any(sources)),
+                     "{}: mention {} excerpt {!r} is not in the stored "
+                     "text".format(label, tp["id"], excerpt[:60]))
     _require(res["summary"]["matches"] == len(hits),
              "{}: summary.matches={} for {} matches".format(
                  label, res["summary"]["matches"], len(hits)))

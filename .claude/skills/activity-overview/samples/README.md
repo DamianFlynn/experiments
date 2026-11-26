@@ -16,7 +16,10 @@ vertical: `gather (manifest) → store → validate → digest`.
   `shipped`, `people`, `modules`, `related_work`. The committed file predates two
   later additions a fresh `digest.py` run also emits: top-level `halls` (#88) and
   `meta.schema_version`; its member bundles also lack `meta.period` / `ref_date` /
-  `base_branch` / `branches`.
+  `base_branch` / `branches`, its project trains' `code_areas` are empty (filled from the
+  member trains since #112), and its member trains' `effort` blocks predate
+  `idle_days` / `last_activity_at` / `slow_to_land` (#112; their `stalled` used the old
+  "took more than 21 days to merge" rule).
 - **[`avm-tf-aiml-lz-digest.md`](avm-tf-aiml-lz-digest.md)** — **illustration only.**
   A deterministic *structural* rendering of the bundle (metadata, summary counts,
   tables, and the validated `.mmd` diagrams — no authored prose), so a reader can

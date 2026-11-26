@@ -106,11 +106,14 @@
       "effort": {
         "commits": 2,
         "elapsed_days": null,
+        "idle_days": null,
+        "last_activity_at": null,
         "merged_at": null,
         "opened_at": null,
         "participants": 0,
         "review_comments": 0,
         "reviewers": 0,
+        "slow_to_land": false,
         "stalled": false
       },
       "evidence": [

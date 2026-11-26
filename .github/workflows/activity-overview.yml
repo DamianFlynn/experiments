@@ -2,19 +2,23 @@ name: activity-overview
 
 # One end-to-end pipeline for the activity-overview skill:
 #   tests (offline, every push/PR)  ->  live (real gather -> journey-graph
-#   store -> trust audit, on demand / scheduled / on a push to the default
-#   branch). The journey-graph store is the deliverable; `validate.py` is the
-#   gate that proves the graph is trustworthy. The live job intentionally stops
-#   at the trust gate (gather -> validate); the offline report vertical
-#   (extract -> link -> render) is covered by the test suite, which needs mmdc
-#   (installed, pinned, in the `tests` job; under CI=true the mmdc diagram
-#   tests fail rather than skip if it is missing), so it is not re-run live here.
+#   store -> trust audit -> view -> link -> render, on demand / scheduled / on a
+#   push to the default branch). The journey-graph store is the deliverable;
+#   `validate.py` is the gate that proves the graph is consistent, and the live
+#   job then asserts the store is not trivially incomplete (minimum node / edge
+#   counts) and runs the report path (view -> link -> render) on the real store
+#   (#112). Diagrams are compiled with mmdc only in the `tests` job (installed,
+#   pinned; under CI=true the mmdc diagram tests fail rather than skip if it is
+#   missing); the live job renders with --skip-validate.
 #
-# Hardening (#72): no `${{ ... }}` expression appears inside any `run:` body —
-# untrusted values (dispatch inputs) reach the shell only through `env:` and are
-# validated with strict regexes before use; third-party actions are pinned to
-# full commit SHAs (tag noted in a trailing comment); downloaded tool binaries
-# are checksum-verified.
+# Hardening (#72, #112): no `${{ ... }}` expression appears inside any `run:`
+# body — untrusted values (dispatch inputs) reach the shell only through `env:`
+# and are validated with strict regexes before use; third-party actions are
+# pinned to full commit SHAs (tag noted in a trailing comment); downloaded tool
+# binaries are checked against pinned sha256 values; every checkout drops its
+# credential (`persist-credentials: false`); every job has a timeout. The IaC
+# builds in the live jobs (`bicep restore` / `terraform init`) download and run
+# third-party code chosen by the gathered repository (docs/LLD.md 14.4).
 
 on:
   push:
@@ -61,6 +65,7 @@ permissions:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -70,6 +75,9 @@ jobs:
       MERMAID_CLI_VERSION: 12.2.0
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Nothing later pushes or calls git with this credential (#112).
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -83,7 +91,8 @@ jobs:
           shopt -s failglob
           python -m py_compile \
             .claude/skills/activity-overview/*.py \
-            .claude/skills/activity-overview/samples/*.py
+            .claude/skills/activity-overview/samples/*.py \
+            .claude/skills/activity-overview/examples/formatters/*.py
 
       - name: Set up Node (for mermaid-cli)
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -144,8 +153,22 @@ jobs:
       github.event_name == 'schedule' ||
       (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    # A gather that waits for the hourly API limit can legitimately take over an
+    # hour (three overlapping runs were observed at 60+ minutes).
+    timeout-minutes: 120
+    # The three live jobs share one API budget, so they run one at a time: they
+    # are chained with `needs` inside a run, and share this group across runs
+    # (queue, never cancel a running gather). GitHub keeps at most ONE pending
+    # job per group: when runs overlap, a newer pending job replaces an older
+    # pending one (that job is cancelled before it starts; re-dispatch it).
+    concurrency:
+      group: activity-overview-live-gathers
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Nothing later pushes or calls git with this credential (#112).
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -238,9 +261,14 @@ jobs:
             --store workspace/journey.db
 
       - name: Store sanity (gather produced a non-trivial graph)
+        # The store holds exactly the live window (a fresh store per run), so
+        # every count is the window's. Minimums are > 0, not tuned numbers: a
+        # two-week window of the default target always has each kind; a zero
+        # means a gather layer silently produced nothing (#112).
         run: |
           cd .claude/skills/activity-overview
           python - <<'PY'
+          import json
           import graphstore
           c = graphstore.open_store("workspace/journey.db")
           n = c.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
@@ -248,6 +276,21 @@ jobs:
           ce = c.execute("SELECT COUNT(*) FROM code_events").fetchone()[0]
           print(f"store: nodes={n} edges={e} code_events={ce}")
           assert n > 0 and e > 0, "empty graph — gather produced nothing"
+          kinds = {"pr": 0, "issue": 0, "commit": 0}
+          for nid, cls, data in c.execute(
+                  "SELECT id, node_class, data FROM nodes"):
+              local = graphstore.local_id(nid)
+              if cls == "social" and local.startswith("pr-"):
+                  kinds["pr"] += 1
+              elif cls == "social" and local.startswith("issue-"):
+                  kinds["issue"] += 1
+              elif cls == "code" and "sha" in json.loads(data):
+                  kinds["commit"] += 1
+          edges = {t: c.execute("SELECT COUNT(*) FROM edges WHERE edge_type = ?",
+                                (t,)).fetchone()[0] for t in ("closes", "touches")}
+          print("nodes by kind: {}  edges: {}".format(kinds, edges))
+          missing = [k for k, v in list(kinds.items()) + list(edges.items()) if v <= 0]
+          assert not missing, "store has no {} for the live window".format(missing)
           PY
 
       - name: Trust gate — audit the real journey-graph
@@ -257,12 +300,38 @@ jobs:
           # exits non-zero on any ERROR-severity trust violation.
           python validate.py workspace/journey.db
 
-      - name: Upload the journey-graph store
+      - name: Report path on the live store (view -> link -> render)
+        # The same commands SKILL.md gives (steps 3-5). mmdc is not installed in
+        # this job, so diagrams are written but not compiled (--skip-validate).
+        env:
+          FROM: ${{ steps.cfg.outputs.from }}
+          TO: ${{ steps.cfg.outputs.to }}
+        run: |
+          set -euo pipefail
+          cd .claude/skills/activity-overview
+          python view.py --store workspace/journey.db --from "$FROM" --to "$TO" \
+            --out workspace/view/bundle.json
+          python link.py workspace/view/bundle.json
+          python render.py workspace/view/bundle.json \
+            --diagrams-dir workspace/diagrams --skip-validate
+          python - <<'PY'
+          import json
+          b = json.load(open("workspace/view/bundle.json", encoding="utf-8"))
+          counts = {"buckets.shipped": len(b["buckets"]["shipped"]),
+                    "trains": len(b["trains"]), "timeline": len(b["timeline"])}
+          print("enriched bundle: {}".format(counts))
+          empty = [k for k, v in counts.items() if not v]
+          assert not empty, "enriched bundle has empty {}".format(empty)
+          PY
+
+      - name: Upload the journey-graph store and the enriched bundle
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: journey-graph
-          path: .claude/skills/activity-overview/workspace/journey.db
+          path: |
+            .claude/skills/activity-overview/workspace/journey.db
+            .claude/skills/activity-overview/workspace/view/bundle.json
           if-no-files-found: warn
 
   spotlight:
@@ -270,21 +339,31 @@ jobs:
     # queries against it — "query it exactly as real execution would", not a mock
     # and not a crafted fixture. The window is pinned (early March 2026): historical
     # data does not change, so the gathered graph is stable and the gate is
-    # reproducible run to run. Heavy (clone + API) and needs the ACTIVITY_TEST_TOKEN
-    # secret, so it is gated like `live` — on demand, on schedule, or on a push to
-    # the default branch, never on a feature/fork PR.
-    needs: tests
+    # reproducible run to run. Heavy (clone + API) and uses a token (the built-in
+    # one by default, the ACTIVITY_TEST_TOKEN secret with `token_source: secret`),
+    # so it is gated like `live` — on demand, on schedule, or on a push to the
+    # default branch, never on a feature/fork PR. It runs after `live` (whatever
+    # live's result) so the two gathers never share the API budget at once.
+    needs: [tests, live]
     if: >-
+      needs.tests.result == 'success' && !cancelled() && (
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
-      (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
+      (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch))
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: activity-overview-live-gathers
+      cancel-in-progress: false
     env:
       # Pinned historical week. Bump deliberately (and re-confirm assertions hold).
       SPOTLIGHT_FROM: "2026-03-02"
       SPOTLIGHT_TO: "2026-03-08"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Nothing later pushes or calls git with this credential (#112).
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -345,15 +424,21 @@ jobs:
     # `terraform graph` DOT extraction runs on real modules (parity with the bicep
     # live/spotlight gates); the static whole-tree source scan still backstops the
     # cross-repo edge if a heavy `init` times out. Pinned historical window ->
-    # reproducible. Heavy (2 clones + API + terraform init) + needs the token, so
-    # gated like live/spotlight: on demand, on schedule, or on a default-branch
-    # push — never on a feature/fork PR.
-    needs: tests
+    # reproducible. Heavy (2 clones + API + terraform init) + uses a token (as
+    # `spotlight`), so gated like live/spotlight: on demand, on schedule, or on a
+    # default-branch push — never on a feature/fork PR. Runs after `spotlight`
+    # (whatever its result) for the shared API budget.
+    needs: [tests, spotlight]
     if: >-
+      needs.tests.result == 'success' && !cancelled() && (
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'schedule' ||
-      (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch)
+      (github.event_name == 'push' && github.ref_name == github.event.repository.default_branch))
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: activity-overview-live-gathers
+      cancel-in-progress: false
     env:
       PROJECT: avm-tf-ci-constellation
       # Pinned historical week (stable, reproducible). Bump deliberately.
@@ -361,6 +446,9 @@ jobs:
       C_TO: "2026-03-22"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Nothing later pushes or calls git with this credential (#112).
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -373,17 +461,20 @@ jobs:
           # silently change graph output. Bump deliberately. Raw binary (no wrapper)
           # so `terraform graph` DOT reaches the extractor unmodified.
           TERRAFORM_VERSION: 1.15.5
+          # sha256 of terraform_${TERRAFORM_VERSION}_linux_amd64.zip, pinned here
+          # (#112) instead of trusting a SHA256SUMS file fetched from the same host
+          # at run time. Taken from the official terraform_1.15.5_SHA256SUMS after
+          # checking its detached signature (SHA256SUMS.sig) against the HashiCorp
+          # release key (fingerprint C874 011F 0AB4 0511 0D02 1055 3436 5D94 72D7
+          # 468F). Bump together with the version, re-verifying the signature.
+          TERRAFORM_SHA256: 702b2136af6728c8ff037f843dd2dbce2b7ad88786b7381d1d72aefa250f601c
         run: |
           base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"
           set -euo pipefail
           zip="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
-          # Keep the official file name: `sha256sum -c` looks the file up by the
-          # name recorded in SHA256SUMS (saving it as tf.zip made the check fail
-          # with "No such file" on every run).
           curl -sSLo "$zip" "${base}/${zip}"
-          curl -sSLo tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
-          # Verify the official checksum before unpacking (supply-chain integrity).
-          grep " ${zip}$" tf.sums | sha256sum -c -
+          # Verify against the pinned checksum before unpacking.
+          echo "${TERRAFORM_SHA256}  ${zip}" | sha256sum -c -
           unzip -o "$zip" terraform
           sudo mv terraform /usr/local/bin/terraform
           installed="$(terraform version | head -1)"

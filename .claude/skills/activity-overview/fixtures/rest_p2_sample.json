@@ -35,7 +35,8 @@
     "42": [],
     "43": [],
     "44": [{"event": "cross-referenced",
-            "source": {"issue": {"number": 18, "pull_request": null}}}]
+            "source": {"issue": {"number": 18, "pull_request": null,
+                                 "repository": {"full_name": "o/r"}}}}]
   },
   "issues": {
     "17": {"number": 17, "title": "Support policy param", "body": "",

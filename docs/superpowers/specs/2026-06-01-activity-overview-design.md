@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # activity-overview skill — design
 
 **Date:** 2026-06-01

@@ -637,7 +637,7 @@ class TestArtifactStatusRoundTrip(unittest.TestCase):
 
 EXPECTED_CHECKS = ["target", "referential_integrity", "participant_completeness",
                    "provenance", "no_fabrication", "schema_conformance",
-                   "edge_set", "no_drift", "idempotency"]
+                   "meta_integrity", "edge_set", "no_drift", "idempotency"]
 
 
 def _failed_names(checks):

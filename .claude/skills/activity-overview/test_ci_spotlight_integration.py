@@ -355,6 +355,358 @@ class TestChecksBite(_GateCase):
         self.assertTrue(self.line(out, "grep").startswith("✗"), out)
 
 
+def _rich_bundle():
+    """One window where the most-active person (alice) touches trains of
+    several outcomes in several roles, an area is touched, a file has a
+    lifecycle ending in a delete, and the text is searchable."""
+    url = "https://github.com/acme/r1/{}/{}"
+    path = "avm/res/net/fw/main.bicep"
+    doc = "avm/res/net/fw/README.md"
+    commits = [
+        {"sha": "a" * 40, "author": "alice", "date": "2026-03-05",
+         "message": "Add the firewall module (#10)", "files": [path, doc]},
+        {"sha": "b" * 40, "author": "alice", "date": "2026-03-06",
+         "message": "Tune the firewall module directly", "files": [path, doc]},
+        {"sha": "c" * 40, "author": "bob", "date": "2026-03-07",
+         "message": "Drop the firewall readme (#11)", "files": [doc]},
+    ]
+    return {
+        "meta": {"owner": "acme", "repo": "r1", "from": "2026-03-01",
+                 "to": "2026-03-31"},
+        "prs": [
+            {"number": 10, "title": "Firewall module", "author": "alice",
+             "merged": True, "state": "closed", "merged_by": "bob",
+             "merged_at": "2026-03-05T00:00:00Z", "closes": [7],
+             "reviewers": ["carol"], "url": url.format("pull", 10),
+             "body": "Adds the firewall module.",
+             "comments_list": [{"author": "carol", "body": "firewall looks fine"}]},
+            {"number": 11, "title": "Readme cleanup", "author": "bob",
+             "state": "open", "created_at": "2026-03-07T00:00:00Z",
+             "url": url.format("pull", 11), "body": "firewall readme",
+             "comments_list": [{"author": "alice",
+                                "body": "please keep the firewall notes"}]},
+            {"number": 12, "title": "Rejected firewall idea", "author": "alice",
+             "state": "closed", "merged": False,
+             "closed_at": "2026-03-08T00:00:00Z", "url": url.format("pull", 12),
+             "body": "an idea"},
+        ],
+        "issues": [
+            {"number": 7, "title": "Need a firewall module", "author": "dave",
+             "state": "closed", "state_reason": "completed",
+             "closed_at": "2026-03-05T00:00:00Z", "url": url.format("issues", 7),
+             "body": "Please add one.",
+             "comments_list": [{"author": "alice", "body": "on the firewall now"}]},
+            {"number": 8, "title": "Firewall docs?", "author": "alice",
+             "state": "closed", "state_reason": "not_planned",
+             "closed_at": "2026-03-09T00:00:00Z", "url": url.format("issues", 8),
+             "body": "docs for the firewall"},
+        ],
+        "commits": commits,
+        "code_events": [
+            {"path": doc, "change": "add", "commit": "a" * 40, "author": "alice",
+             "date": "2026-03-05"},
+            {"path": doc, "change": "modify", "commit": "b" * 40,
+             "author": "alice", "date": "2026-03-06"},
+            {"path": doc, "change": "delete", "commit": "c" * 40, "author": "bob",
+             "date": "2026-03-07"},
+        ],
+        "code_graph": {"provider": "directory", "areas": [
+            {"id": "avm/res/net/fw", "paths": [path, doc]}]},
+        "milestones": [], "releases": [],
+    }
+
+
+class TestMutantsFailTheGate(_GateCase):
+    """Issue #113 M8: the gate compares spotlight's answers with the STORE, so
+    a spotlight that is wrong — even one internally consistent — fails it.
+    The first four are the reviewer's mutants (each passed before, with
+    --require-all); the rest guard the other comparisons."""
+
+    def setUp(self):
+        super().setUp()
+        self.build([(_rich_bundle(), None, None)])
+
+    def _with(self, name, fn):
+        real = getattr(spotlight, name)
+
+        def wrapped(*a, **k):
+            return fn(real(*a, **k))
+        with mock.patch.object(spotlight, name, wrapped):
+            return self.run_gate("--require-all")
+
+    def _fails(self, name, fn, check, needle=None):
+        code, out, _ = self._with(name, fn)
+        self.assertEqual(code, 1, out)
+        ln = self.line(out, check)
+        self.assertTrue(ln.startswith("✗"), out)
+        if needle:
+            self.assertIn(needle, ln)
+
+    def test_correct_store_passes_with_require_all(self):
+        code, out, _ = self.run_gate("--require-all")
+        self.assertEqual(code, 0, out)
+        self.assertIn("person `alice`", out)
+        conn = graphstore.open_store_readonly(self.db)
+        try:
+            res = spotlight.person_impact(conn, "acme", "alice")
+        finally:
+            conn.close()
+        outcomes = sorted(t["outcome"] for t in res["delivered"])
+        # several trains of several outcomes: the mutants below have teeth
+        self.assertEqual(outcomes, ["abandoned", "direct_push", "in_flight",
+                                    "rejected", "shipped"])
+
+    # --- the reviewer's four mutants ---------------------------------------
+    def test_person_drops_a_train(self):
+        def drop(res):
+            gone = res["delivered"].pop()
+            res["summary"]["trains_touched"] -= 1
+            res["summary"]["shipped"] -= gone["outcome"] == "shipped"
+            for tp in gone["touchpoints"]:
+                etype = {"author": "authored", "reviewer": "reviewed",
+                         "merger": "merged", "reporter": "reported",
+                         "commenter": "commented"}[tp["role"]]
+                res["summary"][etype] -= 1
+            return res
+        self._fails("person_impact", drop, "person", "touchpoints differ")
+
+    def test_person_relabels_shipped_as_rejected(self):
+        def relabel(res):
+            for t in res["delivered"]:
+                if t["outcome"] == "shipped":
+                    t["outcome"] = "rejected"
+                    res["summary"]["shipped"] -= 1
+            return res
+        self._fails("person_impact", relabel, "person", "stored records give")
+
+    def test_symbol_rewrites_every_event_and_author(self):
+        def rewrite(res):
+            for r in res["delivered"][0]["timeline"]:
+                r["event"] = "add"
+                r["author"] = "mallory"
+            res["delivered"][0]["outcome"] = "alive"
+            res["summary"]["outcome"] = "alive"
+            return res
+        self._fails("pattern_evolution", rewrite, "symbol", "ledger row")
+
+    def test_grep_fabricates_titles_and_excerpts(self):
+        def fabricate(res):
+            for t in res["delivered"]:
+                for tp in t["touchpoints"]:
+                    tp["title"] = "Totally unrelated"
+                    tp["excerpt"] = "words nobody wrote"
+            return res
+        self._fails("text_mining", fabricate, "grep")
+
+    # --- more mutants --------------------------------------------------------
+    def test_grep_fabricates_only_the_excerpt(self):
+        def fabricate(res):
+            for t in res["delivered"]:
+                for tp in t["touchpoints"]:
+                    tp["excerpt"] = "words nobody wrote"
+            return res
+        self._fails("text_mining", fabricate, "grep", "excerpt")
+
+    def test_person_swaps_a_role(self):
+        def swap(res):
+            for t in res["delivered"]:
+                for tp in t["touchpoints"]:
+                    if tp["role"] == "author":
+                        tp["role"] = "reviewer"
+                        return res
+            return res
+        self._fails("person_impact", swap, "person", "touchpoints differ")
+
+    def test_person_lists_a_target_in_two_trains(self):
+        def dup(res):
+            res["delivered"][1]["touchpoints"].append(
+                dict(res["delivered"][0]["touchpoints"][0]))
+            return res
+        self._fails("person_impact", dup, "person", "exactly one")
+
+    def test_person_invents_a_train(self):
+        def invent(res):
+            fake = copy.deepcopy(res["delivered"][0])
+            fake["anchor"] = fake["anchor"] + "-copy"
+            fake["touchpoints"] = []
+            res["delivered"].append(fake)
+            res["summary"]["trains_touched"] += 1
+            res["summary"]["shipped"] += fake["outcome"] == "shipped"
+            return res
+        self._fails("person_impact", invent, "person", "no touchpoint")
+
+    def test_person_miscounts_a_role(self):
+        def miscount(res):
+            res["summary"]["commented"] = res["summary"].get("commented", 0) + 1
+            return res
+        self._fails("person_impact", miscount, "person", "summary.commented")
+
+    def test_person_fabricates_a_comment_excerpt(self):
+        def fabricate(res):
+            for t in res["delivered"]:
+                for tp in t["touchpoints"]:
+                    if tp["role"] == "commenter":
+                        tp["excerpt"] = "I never said this"
+            return res
+        self._fails("person_impact", fabricate, "person", "comment excerpt")
+
+    def test_timeline_title_fabricated(self):
+        def fabricate(res):
+            for t in res["delivered"]:
+                for r in t["timeline"]:
+                    if r.get("title"):
+                        r["title"] = "Something else"
+            return res
+        self._fails("subsystem_split", fabricate, "subsystem", "title")
+
+    def test_timeline_url_rewritten(self):
+        def rewrite(res):
+            for t in res["delivered"]:
+                for r in t["timeline"]:
+                    if r.get("url"):
+                        r["url"] = "https://elsewhere.invalid/x"
+            return res
+        self._fails("person_impact", rewrite, "person", "url")
+
+    def test_timeline_dates_shifted_in_order(self):
+        # every row moved by the same amount keeps the order; the gate must
+        # still compare each date with the stored node's (review finding)
+        def shift(res):
+            for t in res["delivered"]:
+                for r in t["timeline"] + t["touchpoints"]:
+                    if r.get("ts"):
+                        r["ts"] = "1999" + r["ts"][4:]
+            return res
+        self._fails("person_impact", shift, "person", "is dated")
+
+    def test_subsystem_outcome_flipped(self):
+        def flip(res):
+            for t in res["delivered"]:
+                t["outcome"] = "in_flight" if t["outcome"] == "shipped" \
+                    else "shipped"
+            res["summary"]["shipped"] = sum(
+                t["outcome"] == "shipped" for t in res["delivered"])
+            return res
+        self._fails("subsystem_split", flip, "subsystem", "stored records give")
+
+    def test_symbol_shifts_a_date(self):
+        def shift(res):
+            res["delivered"][0]["timeline"][0]["ts"] = "2020-01-01"
+            return res
+        self._fails("pattern_evolution", shift, "symbol")
+
+    def test_symbol_outcome_ignores_last_ledger_row(self):
+        def alive(res):
+            res["delivered"][0]["timeline"][-1]["event"] = "modify"
+            res["delivered"][0]["outcome"] = "alive"
+            return res
+        self._fails("pattern_evolution", alive, "symbol")
+
+
+class TestStoreOutcomeRule(unittest.TestCase):
+    """The gate's own outcome rule (LLD §9) on the precedence cases, and its
+    agreement with spotlight's on each: the live gate must not fail a correct
+    store because the two rules read a mixed train differently."""
+
+    @staticmethod
+    def _n(local, cls="social", **data):
+        return {"id": "o/r#" + local, "node_class": cls, "data": data}
+
+    CASES = [
+        ("merged PR beats an open one", ["pr-1:merged", "pr-2:open"], "shipped"),
+        ("open PR beats a rejected one", ["pr-1:open", "pr-2:rejected"],
+         "in_flight"),
+        ("all PRs closed unmerged", ["pr-1:rejected", "pr-2:rejected"],
+         "rejected"),
+        ("PR outcome beats issues", ["pr-1:rejected", "issue-1:open"], "rejected"),
+        ("no PR: an open issue beats a completed one",
+         ["issue-1:open", "issue-2:completed"], "in_flight"),
+        ("no PR: completed issue", ["issue-1:completed"], "shipped"),
+        ("no PR: closed issue without a reason reads completed",
+         ["issue-1:closed"], "shipped"),
+        ("dropped issue plus commits", ["issue-1:not_planned", "commit"],
+         "direct_push"),
+        ("only dropped issues", ["issue-1:duplicate", "issue-2:not_planned"],
+         "abandoned"),
+        ("commits only", ["commit"], "direct_push"),
+        ("an issue id holding a merged PR is a PR",
+         ["issue-9:pullmerged", "issue-1:open"], "shipped"),
+        ("release", ["release-v1", "pr-1:open"], "shipped"),
+        ("leaves only", ["review-1-2"], "in_flight"),
+    ]
+
+    def _nodes(self, specs):
+        out = []
+        for spec in specs:
+            local, _, how = spec.partition(":")
+            if spec == "commit":
+                out.append(self._n("f" * 40, "code", sha="f" * 40))
+            elif local.startswith("release-"):
+                out.append(self._n(local, "structure", tag_name="v1"))
+            elif local.startswith("pr-"):
+                out.append(self._n(local, merged=how == "merged",
+                                   state="open" if how == "open" else "closed"))
+            elif how == "pullmerged":
+                out.append(self._n(local, merged=True, state="closed",
+                                   url="https://github.com/o/r/pull/9"))
+            elif local.startswith("issue-"):
+                data = {"state": "open" if how == "open" else "closed"}
+                if how in ("completed", "not_planned", "duplicate"):
+                    data["state_reason"] = how
+                out.append(self._n(local, **data))
+            else:
+                out.append(self._n(local))
+        return out
+
+    def test_precedence_cases(self):
+        for name, specs, want in self.CASES:
+            nodes = self._nodes(specs)
+            self.assertEqual(gate._store_outcome(nodes), want, name)
+            self.assertEqual(spotlight._outcome(nodes), want, name)
+
+
+class TestDeepTrainIsNotAFalseFailure(_GateCase):
+    """A causal chain deeper than the traversal cap (eight PRs each closing
+    the previous PR's issue) entered at both ends and the middle: spotlight
+    may then list one record in two trains. That is the reader's documented
+    depth cap, not a wrong answer, so the gate's 'exactly one train' rule is
+    relaxed there (and only there) to 'at least one'."""
+
+    def setUp(self):
+        super().setUp()
+        url = "https://github.com/acme/r1/{}/{}"
+        prs, issues = [], []
+        for k in range(1, 9):
+            prs.append({"number": 100 + k, "title": "step {}".format(k),
+                        "author": "alice" if k in (1, 4, 5, 8) else "bob",
+                        "merged": True, "state": "closed",
+                        "merged_at": "2026-03-{:02d}T00:00:00Z".format(k),
+                        "closes": [k - 1, k] if k > 1 else [k],
+                        "url": url.format("pull", 100 + k)})
+            issues.append({"number": k, "title": "issue {}".format(k),
+                           "author": "alice", "state": "closed",
+                           "closed_at": "2026-03-{:02d}T00:00:00Z".format(k),
+                           "url": url.format("issues", k)})
+        self.build([({"meta": {"owner": "acme", "repo": "r1",
+                               "from": "2026-03-01", "to": "2026-03-31"},
+                      "prs": prs, "issues": issues, "commits": [],
+                      "code_events": [], "milestones": [], "releases": []},
+                     None, None)])
+
+    def test_gate_passes(self):
+        conn = graphstore.open_store_readonly(self.db)
+        try:
+            res = spotlight.person_impact(conn, "acme", "alice")
+        finally:
+            conn.close()
+        seen = [tp["id"] for t in res["delivered"] for tp in t["touchpoints"]]
+        self.assertGreater(len(seen), len(set(seen)))   # the relaxed case occurs
+        code, out, _ = self.run_gate()
+        self.assertTrue(self.line(out, "person").startswith("✓ person `alice`"),
+                        out)
+        self.assertEqual(code, 0, out)
+
+
 class TestCli(_GateCase):
     def test_unknown_project_is_usage_error(self):
         self.build([(_load("bundle_p3b.json"), None, None)])

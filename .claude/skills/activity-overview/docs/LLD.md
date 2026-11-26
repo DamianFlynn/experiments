@@ -37,7 +37,8 @@
   no I/O. All network and git I/O is in `gather.py`; the store write path is
   `gather.fold_bundle` (and `gather.backfill`).
 - **Window.** `[from, to]` are inclusive `YYYY-MM-DD` dates. Windowing of commits is done in
-  Python on the committer date (`window_records`), not with git `--since/--until`.
+  Python on the UTC day of the committer timestamp (`window_records`, #109), the same UTC
+  calendar that windows PRs and issues, not with git `--since/--until`.
 - **Ref convention.** `{type: "pr"|"issue"|"commit", id, url}` on every narrative-bearing fact.
 - **Determinism.** `view.py`, `digest.py` and `spotlight.py --json` write JSON with
   `sort_keys=True`; `link.py` and `render.py` rewrite the bundle with `indent=2` only, which
@@ -135,12 +136,13 @@ scratch store) and `backfill` respectively.
 | `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
 | `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing (`YYYY-MM-DD` or full ISO timestamp, `manifest.check_ref_date`). Stored per window at fold (`ref_date:` meta key) and read back into the view's `meta.ref_date` (§6.1) |
 | `--branches` | repo default | Comma list; first is `meta.base_branch`. Unset: a manifest member's `branch`, else the clone's `origin/HEAD`, else the API `default_branch` (`resolve_branches`); unresolved → `null` + stderr warning. Stored per window at fold (`branches:` meta key). The walk uses the checked-out default branch |
-| `--clone-dir` | `workspace/<repo>-clone` | Clone location (manifest: the parent of per-member `<owner>-<repo>-clone` dirs) |
+| `--clone-dir` | `workspace/<repo>-clone` | Clone location (manifest: the parent of per-member `<owner>/<repo>` dirs; an existing clone of the same remote in the former `<owner>-<repo>-clone` layout is reused) |
 | `--no-clone` | off | Never create a clone: fetch an existing one, or gather API data only (`clone_mode: none`) |
 | `--include-workflows` / `--no-workflows` | on | CI run stats |
 | `--include-releases` / `--no-releases` | on | Releases in window |
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
+| `--no-iac-build` | off (builds run) | Do not run `bicep restore/build` / `terraform init/graph` (they download and run third-party code, §14.4); every area `edges_status: skipped`, `edge_extraction.disabled: true`. The structural scan still runs |
 | `--store PATH` | **required** | SQLite store |
 
 Single-repo folds use `project = owner`, `repo = <name>`. Manifest folds use
@@ -211,13 +213,20 @@ sequenceDiagram
 ### 4.3 Clone and windowing
 
 - `acquire` calls `prepare_clone` on `--clone-dir` (default `workspace/<repo>-clone`; for
-  manifests `--clone-dir` is the parent of per-member `<owner>-<repo>-clone` dirs) and records
+  manifests `--clone-dir` is the parent of per-member `<owner>/<repo>` dirs, issue #109 — the
+  former `<owner>-<repo>-clone` collided for `a-b`/`c` vs `a`/`b-c`; such a dir that is a clone
+  of the member's own remote is still used while `<owner>/<repo>` does not exist) and records
   the outcome in `meta.clone_mode`:
   - `fresh` — no (or an empty) dir: `git clone` (`build_clone_cmd`).
   - `fetched` — the dir is already a clone of the same remote (`remote.origin.url`, GitHub
     https/ssh forms compared equal): `git fetch --prune --shallow-since=…` (`build_fetch_cmd`;
     deepens or shortens to this window's bound) then `checkout -B <default branch>` at the
-    fetched `origin/<default branch>`. Applies with and without `--no-clone`.
+    fetched `origin/<default branch>`. Applies with and without `--no-clone`. Before that
+    checkout (and `checkout_base_branch`'s) `reset_build_byproducts` removes what an earlier
+    current-month run's in-place IaC build left (issue #109): untracked `.terraform/` dirs and
+    `.terraform.lock.hcl` files (`git clean` limited to those pathspecs) and a tracked
+    `.terraform.lock.hcl` that `terraform init` rewrote (restored). Nothing else is touched: a
+    user's own untracked file in the way still stops the checkout.
   - `depth1-fallback` — `--shallow-since` selected no commits (git: "no commits selected for
     shallow requests", a quiet repo): the clone/fetch is retried with `--depth=1` so HEAD exists
     for IaC edges / CODEOWNERS / the structural scan; the three git walks are skipped (empty).
@@ -238,7 +247,7 @@ sequenceDiagram
   `MissingBranchError`, which `acquire` turns into `SystemExit` naming it (a manifest member is
   recorded `failed`). A reused clone is put back on the default by the next `prepare_clone`.
 - Structure is read as of the window's end (issue #107). `window_end_commit` takes the newest
-  commit of the walked branch's first-parent chain whose committer date is on or before `to`;
+  commit of the walked branch's first-parent chain whose committer day (UTC) is on or before `to`;
   when it is the head (the current month) the clone is read in place, otherwise
   `structure_tree` adds a temporary detached `git worktree` of it, reads the code graph, IaC
   entrypoints/builds, structural scan and CODEOWNERS there, and removes it (also on error), so
@@ -259,8 +268,15 @@ sequenceDiagram
   `area_paths`, module counts, `touches` edges and train `code_areas` are not inflated. Any
   **in-window** commit handled this way is recorded in `meta.boundary_dropped_commits` and a
   warning is printed — widen the margin and re-gather to recover it.
-- Commit dates use the committer date; filtering is `window_records` in Python to avoid git's
-  timezone-sensitive pruning.
+- Commit dates are the UTC calendar day of the committer timestamp (#109): all three walks use
+  one format, `LOG_FORMAT` = sha, parents, author name, author email, `%cI`, subject (the
+  free-text subject LAST, so nothing can follow it), and every record of one commit (the
+  commit, its code events, its symbol events) gets the same `date`, so a commit at
+  `2026-10-31T20:00-08:00` is in November with the PR merged at that instant. Filtering is
+  `window_records` in Python to avoid git's timezone-sensitive pruning. The parsers split
+  records on a `RECORD_SEP` at the start of a line and lines on `\n` only (`str.splitlines()`
+  would also split on U+2028/U+2029, U+0085, form feed, vertical tab and the separator control
+  characters, which can appear in a subject or a non-ASCII path).
 
 ### 4.4 Code-event and symbol extraction
 
@@ -413,7 +429,7 @@ flowchart TB
 | Closed PRs | `pulls?state=closed&sort=updated` | `fetch_until` stops when a page's last `updated_at` < `from` |
 | Open PRs | `pulls?state=open` | all |
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
-| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | referenced 404s tolerated (`allow_404`) |
+| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | a referenced issue answered 404 or 410 (deleted) is skipped with a stderr note (`allow_statuses=GONE_STATUSES`); an answer that is not #N of this repo (number, `repository_url` / `html_url`, case-insensitive; a transferred issue reached through a redirect) is skipped with a note, never stored (#109) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
@@ -434,7 +450,14 @@ text (source: graphql)` or `closing issues: GraphQL unavailable (<reason>), usin
 keywords only`; `meta.closing_refs_source` records `graphql` | `keywords` (bundle only, not
 views). The timeline `connected` event is still filed under `crossref_issues` when it names
 an issue number (an event without a usable number is ignored); whether the REST payload
-carries one is unverified.
+carries one is unverified. Since #109 `parse_timeline_crossrefs(timeline, slug)` reads the
+events in order: a `connected` link later undone by `disconnected` (same number) is dropped,
+and a `cross-referenced` / `connected` event whose source / subject issue names another repo
+(`repository.full_name`, case-insensitive) is not an issue of this repo — the cross-repo side
+is `parse_timeline_xrefs`, so each event is counted by exactly one of the two (an event with no
+repository name counts as this repo's). GitHub's closing list agrees: a disconnected sidebar
+link is no longer in `closingIssuesReferences`, and other-repo closing issues never enter
+`crossref_issues`.
 
 Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
 goes through `_github_open` (injectable `opener`/`sleep`/`clock`, so tests never sleep or touch
@@ -469,7 +492,9 @@ the network):
 
 `fetch_project_board` (GraphQL) auto-discovers the boards a repo links, keeps those
 `board_is_maintained` (open, touched within `ACTIVITY_BOARD_STALE_DAYS` = 365 of the ref date),
-paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 (warns when truncated) and
+paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 and `BOARD_MAX_PAGES` = 200 pages per
+board (a board cut short by either, by a failed or empty page or with no id to page by is
+warned on stderr and listed in `meta.project_board_truncated`, #109) and
 `parse_project_board` yields per-item `status` and `iteration`. Items are keyed per repo
 `(slug, number)` so a foreign repo's status never leaks. Gathered PRs/issues are stamped with
 `board_status` / `iteration`; iterations become `sprint-<id>` structure nodes with
@@ -520,14 +545,17 @@ flowchart TB
   s5["5 · symbol code_events + replaced_by / identity_from (moves matched in this window)<br/>+ artifact code nodes rebuilt from the WHOLE ledger (_fold_artifacts)"]
   s6["6 · structure: milestones, areas, releases, sprints"]
   s7["7 · people (derive.enumerate_participants, repo = *)<br/>union across members, bots tagged"]
-  s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; touches"]
+  s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; touches<br/>+ record-derived edges of the re-folded records retracted,<br/>orphan people deleted (_maintain_record_edges, #111)"]
   s9["9 · singletons: workflowstats, codegraph, codeowners, labeltaxonomy (latest-wins)<br/>+ gathered_windows, ref_date, branches, clone_sha, per-window facts meta"]
   s10["10 · current-state edges (_maintain_current_state, #95):<br/>blocks / in_milestone / in_iteration from the stored records;<br/>depends_on (+ cross-repo resolution) / owns replayed over the windows' facts;<br/>stale ones retracted, stand-ins created / orphans deleted, ledger"]
   s1 --> s2 --> s3 --> s4 --> s5 --> s6 --> s7 --> s8 --> s9 --> s10
 ```
 
 (The exact statement order inside the function differs slightly; the grouping above is the
-logical sequence. FTS text is indexed as PR/issue/commit nodes are written (FTS5-gated).)
+logical sequence. FTS text is indexed as PR/issue/commit nodes are written (FTS5-gated); when
+meta `fts_coverage` is not `complete` (a fold without FTS5 set it `partial`, or the store
+predates the key) the fold first indexes every stored node `fts_map` lacks
+(`gather._backfill_fts`, one pass, #111).)
 
 **Artifact nodes are cumulative (#76).** Inside the fold's transaction, after the ledger rows
 and move edges are written, `_fold_artifacts` reads the repo's whole ledger back
@@ -550,8 +578,28 @@ window replaces its entry and unreferenced values are deleted). Keyed by window,
 sha: the directory code graph is built from the window's changed paths, so two windows of one
 checkout differ. Written whenever `meta.from` and `meta.to` are set; no schema change.
 
-**Current-state edges (#95).** History edges (contribution, `closes`, `cross_ref`, `part_of`,
-`touches`, symbol moves) are only added. The current-state types
+**Record-derived edges (#111).** `closes` / `cross_ref` (src: the PR), commit `part_of` (src:
+the commit) and the contribution edges (dst: the PR / issue / commit) are a function of one
+stored record, which the fold upserts latest-wins. Right after its nodes and edges are written,
+`_maintain_record_edges` reads the stored edges of the bundle's records (`stored_record_edges`:
+chunked `IN` lists on `idx_edges_src` / `idx_edges_dst`, linear in the bundle; cross-repo
+`closes` / `cross_ref` only with `members`) and deletes those the fold did not just write;
+a commit's `touches` join in only when its stored `files` (read before the upsert,
+`_stored_commit_files`) changed. `delete_orphan_people` then deletes each person whose
+contribution edge was retracted and who is the source of no contribution edge any more (any
+member). A repo with data whose `current_state` lacks `records` (last folded before #111) is
+healed once: `_stored_records` + `record_edge_keys` (the same `_pr_spine_edges` /
+`_commit_part_of` / `_contribution_edges` helpers the fold writes with) re-derive every stored
+record's edges and the rest are retracted. A remaining person's `modules` / `areas` union with
+the stored node as before, unless `_is_sole_window` (the bundle re-folds the project's only
+gathered window): then its derivation replaces it. The code-event ledger upserts
+(`graphstore.add_code_events`: `ON CONFLICT DO UPDATE` of `author`, `date`, `hunk`, `ref`,
+`before`, `after`, `detail`; first row of a key within a batch wins), so `_fold_artifacts`
+re-credits a commit whose author resolution changed. Retractions go into the same summary,
+ledger entry and stderr line as the current-state ones (below).
+
+**Current-state edges (#95).** History edges (`touches`, review / event `part_of`, symbol moves)
+are only added. The current-state types
 (`gather.CURRENT_STATE_EDGE_TYPES`: `blocks`, `in_milestone`, `in_iteration`, `depends_on`,
 `owns`) are written last in the transaction by `_maintain_current_state`, which makes the
 repo's edges of those types equal to what its stored inputs imply and deletes the rest:
@@ -566,8 +614,10 @@ repo's edges of those types equal to what its stored inputs imply and deletes th
   registries) and `owns` (`_owns_pairs`) for every gathered window from its `facts:` entry,
   in `_window_order` (end day, then start day). Authority: a direct `depends_on` of area A —
   a window whose build of A resolved, or whose code graph has `structural_scan: true` (set by
-  `apply_structural_scan`; whole tree, so every area); a transitive one — a resolved build
-  only; `owns` of A — a window listing A that read CODEOWNERS or a checkout. A source's edges
+  `apply_structural_scan`; whole tree, so every area except those in its
+  `structural_scan_unread`, issue #109); a transitive one — a resolved build only; `owns` of
+  A — a window listing A that read CODEOWNERS or a checkout (not one whose code graph has
+  `codeowners_unread`). A source's edges
   are the union over its in-effect windows (its latest authoritative window and every later
   one; all when none), data from the latest. A stored edge not in that set is retracted only
   when its source has an authoritative window (`retractable`). With members None, cross-repo
@@ -576,18 +626,23 @@ repo's edges of those types equal to what its stored inputs imply and deletes th
   bundle's `depends_on` / `owns` are added as before.
 - `depends_on` targets that are not stored get stand-ins (`_standin_rows`, create-if-absent);
   `graphstore.delete_orphan_standins` deletes a stand-in left with no edge after a retraction.
-- `graphstore.record_retractions` appends `{from, to, counts, edges, standins_removed}` to
-  meta `retractions:{p}/{r}` when anything was retracted; `set_current_state` writes
-  `current_state:{p}/{r}` = `{items: true, structure, from, to}`. `fold_bundle` returns the
-  summary and `gather` prints `describe_retractions` on stderr.
+- `graphstore.record_retractions` appends `{from, to, counts, edges, standins_removed,
+  people_removed}` to meta `retractions:{p}/{r}` when anything was retracted (record-derived
+  edges and orphan people included, #111); `set_current_state` writes
+  `current_state:{p}/{r}` = `{items: true, structure, records: true, from, to}`. `fold_bundle`
+  returns the summary and `gather` prints `describe_retractions` on stderr.
 
 Properties: idempotent (a re-fold of an unchanged window retracts nothing and logs nothing);
 deterministic; `depends_on` / `owns` are a function of the SET of windows' facts (any fold
 order converges); the item relations follow the stored record, which is upserted
 last-fold-wins, so re-folding an older bundle after a newer one restores the older record
-and its edges. A failed fold rolls back with its retractions. Cost: one prefiltered pass over
+and its edges; record-derived edges and people likewise follow the last-folded copy of each
+record. A failed fold rolls back with its retractions. Cost: one prefiltered pass over
 the repo's PR/issue nodes plus one read of every window's code graph and CODEOWNERS per fold
-(about 0.4 s for 20,000 stored issues of 3 KB).
+(about 0.4 s for 20,000 stored issues of 3 KB); the record-derived step adds indexed lookups
+linear in the bundle (synthetic 12-month store, 89k nodes / 165k edges / 274k ledger rows:
+the 12th monthly fold took 4.4 s before and 4.5–5.0 s after, within run-to-run noise) and,
+once per repo, the heal pass (the 13th fold into the store built before: 4.9 s → 7.0 s).
 
 ### 4.11 Cross-repo `depends_on` resolution (Terraform, Bicep)
 
@@ -627,11 +682,18 @@ flowchart TB
 
 ### 4.12 Backfill seam
 
-`gather.backfill(conn, id, fetch)` fetches one missing spine node plus its immediate spine
-edges. `fetch(kind, local, qid)` returns a payload, `ABSENT` (definitive 404 → recorded in
-`dead_refs`, pruned forever) or `None` (transient → reported as an `unreachable` gap).
-Production wiring: `make_backfill_fetcher(token, clone_dir)`. Only `gather` writes, so readers
-receive backfill as an **injected callable**.
+`gather.backfill(conn, id, fetch)` fetches one missing PR or issue (`pr-<n>` / `issue-<n>`;
+any other id is not fetched, commits included) and writes it through `record_rows` — the
+function `fold_bundle` uses for each PR/issue (record node, closes/cross_ref and cross-repo
+spine edges, contribution edges, review/lifecycle leaves) — plus its logins' person nodes
+(`enumerate_participants`, the fold's union), its FTS text and the item-relation edges that
+touch it, so the trust check accepts the store afterwards (#113). `fetch(kind, local, qid)`
+returns a payload (`edges` in it are ignored), `ABSENT` (definitive 404, or 410 for a
+deleted item → recorded in `dead_refs`, pruned forever) or `None` (transient, or an answer
+that is not the requested item of this repo — a transferred issue, #109 → reported as an
+`unreachable` gap).
+Production wiring: `make_backfill_fetcher(token)` (REST only). Only `gather` writes, so
+readers receive backfill as an **injected callable**.
 
 ## 5. Persist — `graphstore.py`
 
@@ -710,6 +772,8 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 | Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` (repos with nodes, minus stand-in-only repos with no gathered window, #77) |
 | Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)`, `edges_from_prefix` / `edges_into_prefix(conn, prefix, edge_type)`, `delete_edges` (#95) |
 | Current state (#95) | `item_relation_rows(conn, prefix)` (SQL-prefiltered PR/issue records), `node_ids_with_prefix`, `nodes_with_prefix`, `delete_orphan_standins`, `set_current_state`/`get_current_state`, `record_retractions`/`get_retractions` |
+| Window keys (#111) | `split_window_key(key, prefix)` → `(scope, window)`: the project ends at the first `/`, the repo at the next `:` (a project may contain `:`, a bound may be a timestamp) |
+| FTS coverage (#111) | meta `fts_coverage` (`FTS_COMPLETE` / `FTS_PARTIAL`), `fts_unindexed_nodes(conn)` |
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
 | Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
 | Text | `index_text` / `index_texts` (replace by node id via `fts_map`, no table scan), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
@@ -718,7 +782,8 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 | Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
 
 **Semantics.** Identity columns are immutable; `ts`/`data`/`fetched_at` refresh on re-upsert.
-Edges union; only `gather._maintain_current_state` deletes edges (stale current-state ones,
+Edges union; only `gather._maintain_record_edges` (record-derived edges a re-folded record no
+longer implies, and orphan people, #111) and `gather._maintain_current_state` delete edges (stale current-state ones,
 #95). `range_query` orders by `(ts, id)` and excludes NULL-`ts` structure nodes.
 Window bounds are granularity-safe: node `ts` mixes date-only (commits, artifacts) and ISO
 datetimes (PRs, issues, reviews, events), and bounds may be either. `range_query` and the
@@ -884,8 +949,11 @@ issue are one train (`prs`), each with its own outcome in `pr_outcomes` (`{"<pr#
 groups; each group is one train, every issue it closes is in `issues` and is indexed to it by
 `train_index` (so its bucket ref carries the train id), and `root_issue` is the lowest of them.
 `crossref_issues` (mentions, timeline cross-references, list tails such as the `#2` of
-`Fixes #1, #2`) never join or anchor: they stay spine `cross_ref` edges for `extract`/`digest`
-traversal only. A stacked PR's parent is the member PR whose `head` is the stacked PR's `base`
+`Fixes #1, #2`) never join or anchor: they stay spine `cross_ref` edges for `extract`'s train
+context and `spotlight` only (`digest` does not follow them, §10). A `closes` number that is a
+PR of the bundle (GitHub numbers issues and PRs from one sequence and closes no PR by keyword)
+is ignored: it neither anchors a `train-issue-<n>` nor joins the two PRs' trains (#110); a PR
+that "fixes" another PR is a separate train. A stacked PR's parent is the member PR whose `head` is the stacked PR's `base`
 **and** whose `head_repo` is the stacked PR's repo (from its url), so a fork's same-named
 `patch-1` is never the parent; a candidate without `head_repo` (pre-#93 stores, deleted forks) is
 used only when it is the sole candidate.
@@ -949,8 +1017,14 @@ Outcome is deliberately ignored (a rejected train's story still matters).
 
 `effort`, over every PR and issue of the train (#93): `opened_at` (earliest `created_at`),
 `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
-(sum), `commits`, `participants` (distinct authors + reviewers + commenters), `stalled`
-(merged and `elapsed_days > TRAIN_STALL_DAYS` = 21). Review rounds and reopen counts are added
+(sum), `commits`, `participants` (distinct authors + reviewers + commenters), and the stall
+flags (#112, threshold `TRAIN_STALL_DAYS` = 21, strict `>`): for an `in_flight` train,
+`last_activity_at` = the latest of its members' `created_at` / `updated_at` / `closed_at` /
+`merged_at`, comment and review-comment `created_at`, review `submitted_at`, lifecycle
+`created_at` and its commits' `committed_at` (else `date`); `idle_days` = calendar days from it
+to `meta.ref_date` (else `meta.to`), floored at 0; `stalled` = `idle_days > 21`. For a
+`shipped` train `slow_to_land` = `elapsed_days > 21` and `stalled` is false; `rejected` /
+`abandoned` trains have neither (BUNDLE.md `trains`). Review rounds and reopen counts are added
 by `annotate_review_rounds` / `annotate_reopen_count`. Review rounds ignore `PENDING` reviews
 and the PR author's own reviews; the exact round and `review_decision` rules are in
 `BUNDLE.md` → *Review decision & rounds*.
@@ -987,7 +1061,8 @@ verification happens in the next installment's series block.
 Pure, read-only, raises `KeyError` on an unknown id. Returns `{train, issue, prs, commits,
 feature_deltas, symbol_moves}` plus review rounds, capped reviews/lifecycle and reopen counts.
 `issue` is the root issue; `train.issues` lists every closed issue and `prs` every attempt,
-whose own outcome is in `train.pr_outcomes` (#93).
+whose own outcome is in `train.pr_outcomes` (#93). Each `commits` row carries its commit `url`
+(`derive._commit_url`, as on `feature_deltas`, #112).
 Caps: text `SLICE_TEXT_CAP` = 1500 chars (with `…[+N chars]`), `SLICE_COMMENTS_KEPT` = 6 per list
 (overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars: walking the train's
 deltas in order, a `diff` is kept only if `used + len(diff) <= SLICE_DIFF_CAP` (#82), so the kept
@@ -1014,10 +1089,18 @@ flowchart TB
 ```
 
 **Idempotent by window (#86).** An installment is identified by its window `(from, to)`
-(`series.bundle_window`: `meta.period`, else `meta.from`/`meta.to`). `link.main`:
+(`series.bundle_window`: `meta.period`, else `meta.from`/`meta.to`), normalised to calendar
+days: `series.window_key` = `(from[:10], to[:10])` after `series.window_problem` has checked
+each bound is a date or an ISO timestamp (`manifest.check_reader_window`) (#110). The key is
+used for identity, ordering, replacing and the predecessor lookup; the recorded `from`/`to`
+keep the spelling they were given. `link.main`:
 
-- compares against `series.predecessor` — the installment whose window sorts immediately
-  before this one by `(from, to)` (plain string order, so use the same date form throughout);
+- refuses (exit 2, nothing written) a window that `series.overlapping` finds sharing a day
+  with a recorded window of other days — a quarter beside its months, a month inside a
+  recorded quarter — naming both: "the installment before" is not defined in such an index
+  (keep roll-ups in a separate index, USAGE §5.2);
+- compares against `series.predecessor` — the installment whose window key sorts immediately
+  before this one;
 - records the new snapshot with `series.place_installment`: an entry for the same window is
   **replaced**, and the index is kept in window order. Running the same window twice
   therefore leaves one entry and produces the same `series` block; re-running an earlier
@@ -1045,8 +1128,9 @@ The index file is `{"version": 2, "installments": [...]}`; the older bare list i
 and is rewritten as version 2 on the next run (an older `link.py` cannot read version 2). It
 is read and shape-checked before enrich: invalid JSON, an object without `version`, another
 version, an entry that is not an object, a reference list that is not a list of objects, or a
-non-string `from`/`to` exits 2 with `link.py --series: series index <path> …`, as do a
-bundle with no window and an index whose entries name another `owner`/`repo`; nothing is
+non-string `from`/`to` or one that is not a date / ISO timestamp exits 2 with
+`link.py --series: series index <path> …`, as do a bundle with no (or an unusable) window, an
+index whose entries name another `owner`/`repo`, and an overlapping window; nothing is
 written (the index is never silently discarded). The bundle is written first and the index
 second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves the
 previous file intact, and a run that cannot write its bundle records no installment.
@@ -1100,6 +1184,25 @@ Caps are deterministic: the same bundle always yields the same diagram. What was
 recorded in `bundle.diagrams.truncated` (`{name|train-id: {shown, total, unit}}`, `{}` when
 nothing was cut) and printed as `note: … capped` lines, so the report can say so.
 
+**Labels (#110).** Every untrusted text (PR / issue titles, release names, milestones, area
+ids and paths, logins and unresolved git names, kind / label names, repo slugs, versions,
+outcomes) goes through ONE sanitiser, `_mermaid_text`, before it reaches any diagram: one line
+(CR, LF, TAB, control characters and U+0085/2028/2029 become spaces); every run of `%`
+collapses to one, so no `%%{…}%%` directive (which Mermaid extracts from anywhere in the source
+and which changes the diagram's configuration, or fails the run) and no `%%` comment can be
+formed; `"` and backticks become `'`; `<` / `>` become `‹` / `›`; an entity code `#name;` gets
+a fullwidth `＃`. The per-kind helpers add only what their type needs: `_flow_label` (node and
+edge labels, 40 chars), `_subgraph_label` (uncapped), `_pie_label` (60), `_gantt_label` and
+`_timeline_text` (also `:` → ` -`, 60). A gantt row never starts with free text — the gantt
+lexer reads a line starting with `section`, `title`, `dateFormat`, `excludes`, `todayMarker`,
+`click`, `accTitle`, … (any case) as that statement and one starting with `%` / `x%` as a
+comment — so PR rows start `#<n> `, release rows `Release ` and marker rows with fixed text; a
+PR whose state is not merged / closed / open gets no status tag. A timeline period is the
+event's `YYYY-MM-DD` day or `undated`, never free text. `emit_train_flowchart` labels the
+outcome node `Shipped [→ <milestone>]`, `In flight`, `Rejected` or `Abandoned (not planned)`;
+any other value is drawn as itself (`Unknown outcome` when empty), and when no PR leads to the
+outcome (an abandoned train) the issue node does.
+
 **Node ids** come from `_stable_node_id(prefix, text)`: `<prefix>_<text>` when the text is
 1–32 ASCII letters/digits (`p_alice`, `pr_42`), else `<prefix>_<sanitised head ≤ 24>_<sha1[:8]>`,
 so `a-b` / `a/b` / `a_b` and long paths sharing a prefix stay distinct; a per-diagram
@@ -1132,11 +1235,12 @@ then ignored with a stderr warning (it is single-repo by nature).
 | `referential_integrity` | every edge endpoint resolves to a node; dangling **spine** edges (out-of-window threads) and CODEOWNER-only `owns` endpoints are INFO, any other dangling edge is ERROR; a per-window `facts:` meta entry that is unreadable or names a `fact:` value that is not stored is ERROR (#94, `graphstore.window_facts_problems`) |
 | `participant_completeness` | every login in any raw record has a person node and its contribution edge |
 | `provenance` | every social/code node cites its own source: a PR/issue `url` is `https://github.com/{owner}/{repo}/pull\|issues/N` for the node's repo (case-insensitive) and `data.number == N`; a review/event cites its parent (or fold's synthesized fallback, or a timeline event's `api.github.com/repos/{owner}/{repo}/` url); a commit id is a 40/64-hex sha equal to `data.sha`; an artifact cites a lifecycle commit (#89) |
-| `no_fabrication` | no orphan person, no historyless artifact; every id follows the grammar, its scope equals the row's `project`/`repo` (people: `{project}` + repo `*`) and its local form fits the node class; no scope is stored under two case spellings (#89) |
+| `no_fabrication` | no orphan person, no historyless artifact; no PR/issue that is the dst of no contribution edge (ERROR when another record of that kind in the repo carries an author, else WARN; #113); every id follows the grammar (no `comment-N`, #113), its scope equals the row's `project`/`repo` (people: `{project}` + repo `*`) and its local form fits the node class; no scope is stored under two case spellings (owner/repo case-folded, a manifest project name exact, #89, #113) |
 | `schema_conformance` | every edge type has an explicit endpoint rule (an unknown type is an ERROR); endpoint kinds match it; both ends are in one project; same-repo types stay in one repo (#89) |
-| `edge_set` | the repo's stored edges == the edges `gather.fold_bundle` writes for its self-sourced bundle in an empty scratch store, in both directions and with equal `data`; cross-repo edges are checked against the manifest derivation (#89); on a multi-window store `depends_on` / `owns` / `touches` compare with their replay over the per-window facts and each current-state type is exact when `_multi_window_plan` can prove it, else WARN (#95) |
-| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (people from the records alone, with `login_resolved`; artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves); with `--bundle`, the stored PR/issue/commit records == the bundle's |
-| `idempotency` | re-folding into a scratch copy changes no counts (on a multi-window store, cross-window move re-matches and current-state edges it adds are INFO, not counted; current-state edges it retracts are a WARN, not counted, on a repo last folded before #95) |
+| `meta_integrity` | the repo's markers and per-window meta are what folds write (#113): `gathered_windows` readable, each window a `from <= to` date pair with fold evidence of its own once the repo has any; `current_state:` readable and well formed, its `structure` equal to "every window has facts"; a repo with facts / clone provenance and no marker fails; per-window keys name a gathered window and have the writer's shape; `fact:` values re-hash to their key and fit the keys that reference them; `clone_sha:` / `fold_context:` well formed |
+| `edge_set` | the repo's stored edges == the edges `gather.fold_bundle` writes for its self-sourced bundle in an empty scratch store, in both directions and with equal `data`; cross-repo edges are derived with the member set and registries the fold recorded (`fold_context:`, #113) and compared both ways, else a missing one is a WARN and a stored one is checked against the manifest derivation (#89); on a multi-window store `depends_on` / `owns` / `touches` compare with their replay over the per-window facts and each current-state type is exact when `_multi_window_plan` can prove it, else WARN (#95) |
+| `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (people from the records alone, with `login_resolved`; artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves; lifecycle entries compared, #113); with `--bundle`, the stored PR/issue/commit records == the bundle's, every stored record of the bundle's window is in it, and the window's per-window meta == the bundle's (#113) |
+| `idempotency` | re-folding into a scratch copy changes no counts (on a multi-window store, cross-window move re-matches and current-state edges it adds are INFO, not counted; current-state edges it retracts are a WARN, not counted, on a repo last folded before #95; record-derived edges it retracts and people it deletes are a WARN, not counted, on a repo last folded before #111) |
 | `no_drift_people` (project) | project-scoped people == union re-derived across all members (areas derived ⊆ stored when a member holds several windows) |
 | `referential_integrity`, `provenance`, `no_fabrication`, `schema_conformance` (project) | the same checks over the rows no member owns (people, non-member rows) and the store-wide parts (the `facts:` index, case-variant scopes), once for the project (#107) |
 | `member_status` (project) | every manifest member's last gather of every recorded window is `ok`; a `failed` / `not_attempted` member is an ERROR naming the repo, window and reason, also when it holds no node and so is not an audited member (#77). Passes (INFO) on a store with no recorded status |
@@ -1160,17 +1264,30 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
 **Strictness rules (#89).**
 
 - *Edge set.* `_expected_edges` folds the self-sourced bundle into an empty in-memory store
-  (single-repo semantics, `members=None`) and reads its edges back; `_owned_by_repo` assigns an
-  edge to the repo of its src (a person's edge to the repo of its dst). `derived but not stored`,
-  `stored but not derivable` and `edge data drift` are ERRORs. A stored edge into another member
-  repo passes when `gather._cross_repo_pr_edges` (members = stored repos, `member_status` repos
-  and the dst repo) derives it from the stored PR, or, for `depends_on`, when an unresolved
-  registry edge of the source area in the self-sourced bundle's `code_graph` (on a multi-window
-  store whose structure is exact: in the code graphs of the windows in effect for the source,
-  `StructureReplay.dep_in_effect`) carries the edge's `data` and the dst is a member's root area
-  (Bicep: the publisher's module area). A missing cross-repo edge is not detected.
+  (`_scratch_fold`) and reads its edges back; `_owned_by_repo` assigns an edge to the repo of its
+  src (a person's edge to the repo of its dst). `derived but not stored`, `stored but not
+  derivable` and `edge data drift` are ERRORs. Edges into another member repo follow
+  `_CrossRepoContext` (#113): when the repo's manifest folds recorded `fold_context:` and its
+  member set never changed, the scratch fold (and `StructureReplay` on a multi-window store) runs
+  with exactly that member set and those registries, so cross-repo `closes` / `cross_ref` /
+  `depends_on` are compared both ways like any other edge (an edge re-pointed to another
+  member's root or to a non-publisher, or a missing one, is an ERROR). Otherwise (no context, a
+  pre-#113 manifest store, or `members_changed`) the scratch fold uses the store's member set
+  (stored repos plus `member_status` repos) without registries: a missing cross-repo edge is a
+  WARN, and a stored one passes when `gather._cross_repo_pr_edges` derives it from the stored PR,
+  or, for `depends_on`, when an unresolved registry edge of the source area in the self-sourced
+  bundle's `code_graph` (on a multi-window store whose structure is exact: in the code graphs of
+  the windows in effect for the source, `StructureReplay.dep_in_effect`) carries the edge's
+  `data` and the dst's local id is a member's root area (Bicep: the module area of the ref's
+  path) — which member is not checked without the registries.
 - *Edge classes.* Record-derived (`authored`, `merged`, `reviewed`, `reported`, `commented`,
-  `closes`, `cross_ref`, `part_of`): exact on every store. Current-state (`owns`, `touches`,
+  `closes`, `cross_ref`, `part_of`): exact (ERROR both ways) on every store, single- or
+  multi-window, because a fold keeps each re-folded record's edges equal to its new content and
+  the first fold since #111 of a repo heals every stored record (§4.10, #111). On a repo whose
+  `current_state` lacks `records` (last folded before #111) a stored edge its record does not
+  imply stays an ERROR (a view follows it) and carries `_PRE111_HINT` ("fold any window of it
+  once more"); `idempotency` reports the edges such a re-fold retracts, and the people it
+  deletes, as a WARN left out of the count. Current-state (`owns`, `touches`,
   `depends_on`, `in_milestone`, `in_iteration`, `blocks`): exact on a one-window store. On a
   multi-window one `_multi_window_plan` decides per type (#95): `blocks` / `in_milestone` /
   `in_iteration` are exact when the repo's last fold was since #95 (meta `current_state.items`:
@@ -1186,8 +1303,11 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   (`replaced_by`, `identity_from`): exact on a one-window store; on a multi-window one each stored
   move must pass `_move_problem` (twin edge with equal data, same non-comment symbol in two files,
   a ledger drop of the source — by `move_commit` — and an add of the destination, basis/confidence
-  consistent with the renames) and whole-store re-matches are not required. A repo is
-  multi-window when `gathered_windows` records more than one `(from, to)` for it.
+  consistent with the renames; checked against a `_MoveIndex` of the ledger built once per check,
+  #113 — it used to scan every symbol event per move) and whole-store re-matches are not
+  required. A repo is multi-window when `gathered_windows` records more than one `(from, to)` for
+  it — counting, once the repo has any fold evidence, only the windows with their own
+  (`meta_integrity`, #113).
 - *People.* `_derive_people` seeds `enumerate_participants` with `people: {}`: a self-sourced
   bundle's `people` is read from the stored person nodes, and the enumerator only adds to its
   seed, so seeding with it made the areas check tautological. Modes (`_people_mode`): exact
@@ -1200,13 +1320,39 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   with equal content (`external_refs` added by a manifest fold is ignored; `reviews`/`lifecycle`
   compare as sorted entries without `url`; `blocking`/`blocked_by` added by a view are ignored), so
   a saved `view.py` JSON of the freshly gathered store works as the bundle.
+  `_bundle_span_details` (#113): every stored PR / issue / commit / release that gather would
+  collect for the bundle's window (`meta.period`, else `meta.from`/`to`; extract's
+  `_pr_in_window` / `_issue_in_window` on the stored state, or its `ts` in the window) and every
+  review / lifecycle event of one of the bundle's records must be among the rows `fold_bundle`
+  writes for the bundle; on a store holding only that window, so must every milestone, sprint
+  and non-stand-in area. Train-context issues are not required. `_window_meta_drift_details`
+  (#113): for a bundle window that is exactly a gathered window, the stored `ref_date`,
+  base branch / branches, `clone_sha`, clone info and each fact value the bundle carries equal
+  the bundle's.
+- *Meta (`meta_integrity`, #113).* `_meta_details`: the repo's `gathered_windows` entries,
+  their fold evidence (`_window_evidence`: a per-window meta key, a `member_status` entry or the
+  marker naming the window), the `current_state:` marker (`_marker_problem`, and `structure ==
+  (gather.repo_fact_windows(...) is not None)`, both directions), the per-window keys
+  (`_branches_problem`, `_clone_problem`, `_facts_entry_problem`, a date for `ref_date:`;
+  orphans), the `fact:` values (sha256 of the stored text == the key suffix;
+  `_fact_shape_problem` for each referencing key), `clone_sha:` and `fold_context:`
+  (`_fold_context_problem`).
+- *Project mode cost (#113 m6).* A member-only `_Scope` reads its rows by index
+  (`nodes` by `project, repo`; edges by the src / dst id range), endpoint and contribution
+  lookups are by primary key / index, and each member is self-sourced once (`sourced` cache
+  shared by `validate_repo` and `check_no_drift_people`). The `idempotency` re-fold still copies
+  the whole store once per member.
 
-**What it proves.** Self-sourced: the store is consistent with its own records and ledger, and
-every citation is the node's own GitHub object. Not provable from the store alone: a record
-deleted with all its edges, a blob rewritten consistently, or a wrong ledger (the artifact part
-of `no_drift` compares nodes with the store's own ledger since #76, so a ledger with missing or
-invented rows yields matching nodes). `--bundle` covers the first two; nothing in the store
-covers the third (no per-fold content digest is recorded).
+**What it proves.** Self-sourced: the store is consistent with its own records and ledger,
+every citation is the node's own GitHub object, and the markers and per-window meta are what
+folds write. Not provable from the store alone: a record deleted with all its edges, a blob
+rewritten consistently, an inserted record that is internally consistent (a PR or commit with
+its contribution edge, a review with its `part_of`, a dated release, a milestone, an area), a
+fact value rewritten with its key and ref, a plausible `branches:` / `ref_date:` / `clone:`
+value, or a wrong ledger (the artifact part of `no_drift` compares nodes with the store's own
+ledger since #76, so a ledger with missing or invented rows yields matching nodes). `--bundle`
+covers all but the last for its window; nothing in the store covers the ledger (no per-fold
+content digest is recorded).
 Every check runs under `_guarded`: an exception — e.g. `CorruptRow` for data that is not valid
 JSON or a social/code/person blob that is not an object — becomes a failed ERROR check carrying
 the error and the row id, so text and `--json` reports are always produced.
@@ -1245,8 +1391,20 @@ Rules (issue #81):
   A NUL byte in a phrase is read as a space.
 - **Areas across repos.** `subsystem`/`module` look the area up in **every** project repo
   and union the results (the same area id — `main.tf`, `docs` — is common across members);
-  `owner/repo::area` or `--repo` (any case, `graphstore.resolve_repo`) narrows to one
-  member. Every row names its repo: envelope `repos` (members whose area answered),
+  `owner/repo::area` or `--repo` narrows to one member.
+- **Naming a repo** (#113). `dependents`, `subsystem`, `module`, the `<repo>::<area>`
+  qualifier and `--repo` resolve a repo by one rule (`resolve_repo_arg`): the stored
+  spelling in any case; `owner/repo` on a single-repo store (project = owner, repo = name);
+  `repo` alone when exactly one stored `owner/repo` has that name. No match or several:
+  `needs_gather` from the library, exit 2 listing the store's repos from the CLI.
+- **Module areas across windows** (#113). `module` unions the area index of every gathered
+  window's #94 code graph (plus the `codegraph` singleton on a store folded before #94), so
+  the answer does not depend on fold order. No other spotlight query reads a per-repo
+  singleton (`code_owners` / `workflow_stats` are not read).
+- **`--md` escaping** (#113). Every stored or typed value goes through `_md`: control
+  characters collapse to a space; in text, markdown/HTML syntax is backslash-escaped or
+  written as an entity and a leading block marker is escaped; a code span's fence is longer
+  than any backtick run inside it. `--json` stays raw. Every row names its repo: envelope `repos` (members whose area answered),
   contributor `repos`, depends_on `repo` (the member whose area node the edge hangs off),
   module symbol/file `repo` (files sort by `(path, repo)`), and every train's `repos`.
 - **Symbol query and file artifacts.** The file-level ledger is keyed by the bare path;
@@ -1254,15 +1412,19 @@ Rules (issue #81):
   `slice_module`). A lifecycle ending in `remove` (symbol) or `delete` (file, git's verb)
   is `removed`. A local id is qualified only against known `{project}/{repo}#` prefixes,
   so a path that starts with the project name (`avm/res/…`) still resolves.
-- **Train outcome** (`_outcome`, the `link.build_trains` vocabulary and precedence):
-  `shipped` (release, merged PR, or — no PR — an issue closed as completed; a closed issue
-  without `state_reason` counts as completed) > `in_flight` (open PR, or — no PR — open
-  issue) > `rejected` (PRs, all closed unmerged) > `direct_push` (no PR, no open/completed
-  issue, but commits) > `abandoned` (only issues closed `not_planned`/`duplicate`);
-  anything else `in_flight`. Rendered badges: `[direct-push]`, `[abandoned]`.
+- **Train outcome** (`_outcome`, the `link.build_trains` vocabulary), over the train's
+  stored members, in this order: (1) any release → `shipped`; (2) with PRs (a `pr-<n>`
+  record, or an `issue-<n>` record carrying a /pull/ url): any merged → `shipped`, else any
+  not closed → `in_flight`, else `rejected`; (3) no PR: any issue not closed → `in_flight`,
+  else any closed issue whose `state_reason` is not `not_planned`/`duplicate` (none counts as
+  completed) → `shipped`; (4) else commits → `direct_push`, else issues (all dropped) →
+  `abandoned`, else `in_flight`. So a no-PR train with an open and a completed issue is
+  `in_flight`. Rendered badges: `[direct-push]`, `[abandoned]`. Trains group over the causal
+  spine (every spine type but `cross_ref`), depth-capped as `traverse_spine`.
 - **CLI.** Exactly one query argument; `--complete` only for the train queries
   (`person`, `subsystem`, `grep`, `module`); `--repo` only for `subsystem`/`module`;
-  `--from/--to` not for `dependents` and validated by `manifest.check_reader_window`. A
+  `--from/--to` not for `dependents` and validated and normalised by `manifest.check_reader_window`
+(UTC `…Z`, #111). A
   missing (never created) or unreadable store, an empty store, an unknown `--project` or,
   with several projects, no `--project` (the message lists the store's projects), and an
   unknown `--repo`/qualifier (lists the project's repos) all exit 2 with usage.
@@ -1280,7 +1442,9 @@ the store's projects) or `--repo` (lists the project's repos). Ticket clustering
 opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
 `--ticket-pattern` (wins); otherwise `tickets`/`related_work` are `[]`. Each
 `members[].bundle.meta` gains `project`, `slug`, `repo_owner`, `repo_name`
-(`meta.owner` stays the project scope).
+(`meta.owner` stays the project scope). A project train's `code_areas` (#112) is the sorted
+union of its member trains' `code_areas`, each as `"<repo>::<area>"` (BUNDLE.md "Project
+view: `trains`").
 
 People and totals (issue #88). A member bundle's `people` are that member's contributors in
 the window (§6.1 step 5) and their profile counts only its records, so `_merge_people`
@@ -1294,9 +1458,10 @@ stay the fold's union, which `validate`'s `no_drift_people` checks.
 
 ```mermaid
 flowchart TB
-  mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>connected components across repos"]
+  mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>components across repos over<br/>closes + part_of (TRAIN_EDGE_TYPES)"]
   sc --> wc["window_components:<br/>drop stored member anchors<br/>not in that member's view (#85)"]
-  wc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
+  wc --> lc["link_components:<br/>drop PRs in no member train and<br/>issue-N ids that are PRs (#110)"]
+  lc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
   bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (opt-in: manifest ticket_prefixes<br/>or --ticket-pattern) cluster into related_work"]
   mb --> mg["_merge_shipped / _merge_people (sums, halls) / _merge_modules"]
   pd["project_depends_on: edges_by_type depends_on"] --> me["module_edges<br/>src_repo, src_area, dst_repo, dst_area,<br/>version, transitive, cross_repo"]
@@ -1304,6 +1469,17 @@ flowchart TB
   mg --> view
   me --> view["project view<br/>meta, members[].bundle, trains, related_work,<br/>shipped, people, halls, modules, module_edges"]
 ```
+
+Project trains are built over the edges that make `link` trains (#110):
+`digest.TRAIN_EDGE_TYPES` = `closes` (same-repo and cross-repo) and `part_of`, passed to
+`graphstore.traverse_spine` and to the re-split. A `cross_ref` (a mention) never joins two
+trains, and neither do `spun_off` / `duplicate_of` (link has no such join);
+`graphstore.SPINE_EDGE_TYPES` keeps all five for `extract`'s train context and `spotlight`.
+`link_components` then removes, and re-splits around, the anchors that join no link train: a
+member's in-view PR that is in none of its trains (a stacked PR, a `contributing_prs` entry)
+and `issue-N` where the store holds `pr-N` (a `Fixes #N` naming a PR, §6.4). So the project
+trains of a single-member project are exactly that member's link trains (same grouping, same
+outcomes) — up to the `max_depth` caveat below.
 
 `window_components` (issue #85) removes from each component the stored PR/issue anchors of a
 member repo that its window-scoped view left out, so on a store holding several windows a
@@ -1411,7 +1587,8 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
   (§4.10); views are window-scoped (#85) and read their window's CI statistics and structure
   (#94); current-state edges follow their stored inputs and stale ones are retracted (#95,
   §4.10: `depends_on` / `owns` independent of fold order, item relations follow the
-  last-folded record); what is still latest-wins is listed in §14.5.
+  last-folded record); record-derived edges and people follow the last-folded copy of their
+  record (#111); what is still latest-wins is listed in §14.5.
 
 ### 14.2 Degradation matrix
 
@@ -1435,11 +1612,16 @@ Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open 
 + pages(issues since from) + pages(open issues) + 2 × issues + referenced issues + workflow/
 release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100⌉` (the last term is
 the commit-author login listing, #78; zero for a window with no commits). Because **all open PRs and issues** are included every run, busy
-repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
+repos dominate the budget (a personal token's authenticated limit is 5,000 requests/hour; the
+workflow's built-in `GITHUB_TOKEN`, which the CI live jobs use by default, has a lower limit
+that its runs in one repository share, so a live gather in CI is likelier to wait for the
+reset). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
 off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
-`ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
+`ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7);
+in CI that wait can push a job past an hour, so the live jobs run one at a time (chained, one
+concurrency group) with a 120-minute timeout (§15).
 A window with more than 1,000 workflow runs costs a few extra requests for the day-splits.
 GraphQL (a separate 5,000-point/hour budget): the closing-issue read costs ⌈kept PRs / 50⌉
 requests — 2 per 100 PRs — of 1 point each (50 connections of 25 nodes), plus one per extra
@@ -1451,8 +1633,66 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 - Read-only token; nothing is written to GitHub; the token is read from the environment only.
 - Clones and stores contain repository content — treat workspaces as you would a clone.
 - `mmdc` as root requires `--no-sandbox`; restrict that to throwaway environments.
+- **The IaC builds download and run third-party code** (issue #109). `bicep restore` and
+  `terraform init` fetch the modules and providers the gathered repo names, and
+  `terraform init` / `graph` execute those providers on the gathering host. Use the builds only
+  on repos you trust; `--no-iac-build` skips them (every area `edges_status: skipped`,
+  `code_graph.edge_extraction.disabled: true`; the structural scan, which only parses source,
+  still runs). The default is unchanged (CI relies on the builds). terraform always runs with a
+  generated `TF_CLI_CONFIG_FILE` holding an explicit `provider_installation { direct {} }`
+  block (plus the user's own config and `~/.terraform.d/plugins` when present), which disables
+  terraform's implied local mirrors — in particular a `terraform.d/plugins` shipped inside the
+  repo; a user config that already has its own `provider_installation` block is used as is.
+  `TF_PLUGIN_CACHE_DIR` and `TF_TOKEN_<host>` are honoured. Residual: a repo can still pin
+  providers in its own `.terraform.lock.hcl` and commit a `.terraform/` directory; the builds
+  are not sandboxed. Gather only repositories you would build yourself, on a disposable host
+  or runner. The CI workflow checks out with `persist-credentials: false` (#112), so no
+  repository credential is left in the runner's git config.
+- **No build process sees the token** (issue #109). gather sends the token only in HTTPS
+  headers to `https://api.github.com`. One exception: when the user's git config has a
+  credential helper, git (alone) keeps `GH_TOKEN` / `GITHUB_TOKEN` and the two Enterprise
+  names, because a helper such as `gh auth git-credential` reads them to clone a private repo.
+  Otherwise every subprocess (git, bicep, terraform, graphify) runs
+  with `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`, `ACTIVITY_TEST_TOKEN` and every variable ending in `_TOKEN` or
+  `_PAT` removed (`_child_env`); the rest of the environment (PATH, HOME, TMPDIR, proxy/TLS
+  variables, `TF_PLUGIN_CACHE_DIR`, `TF_TOKEN_<host>`, locale, Azure credentials) is kept.
+- **git is isolated from the user's config** (issue #109). gather's git processes run with
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_PAGER=cat` and `LC_ALL=C`, so `color.ui`, `diff.noprefix`, `diff.mnemonicPrefix`,
+  `log.showSignature`, `diff.renames`, `clone.defaultRemoteName`, LFS filters, … cannot change
+  the walks; the walks also pass `--no-color --no-ext-diff --no-textconv --no-show-signature`
+  (`-M` on the commit walk, `--src-prefix=a/ --dst-prefix=b/` on the patch walk). From the
+  user's system and global config only network/auth routing is carried over, through
+  `GIT_CONFIG_COUNT` (never argv): `http.*` / `http.<url>.*` `proxy`, `proxyAuthMethod`,
+  `proxySSLCAInfo`, `sslCAInfo`, `sslCAPath`, `sslVerify`, `sslBackend`, `sslVersion`,
+  `sslCipherList`, `schannelCheckRevoke`, `schannelUseSSLCAInfo`, `version`, `postBuffer`,
+  `lowSpeedLimit`, `lowSpeedTime`, `followRedirects`, `curloptResolve`, `maxRequests`,
+  `minSessions`, `noEPSV`, `emptyAuth`; `url.<base>.insteadOf`; `credential.helper` /
+  `.username` / `.useHttpPath`; `safe.directory`; `protocol.*.allow`; `core.sshCommand`.
+  Dropped: everything else, including `http.extraHeader`, `http.sslCert` / `sslKey`,
+  `http.cookieFile`. Proxy and TLS environment variables (`HTTPS_PROXY`, `GIT_SSL_CAINFO`,
+  `SSL_CERT_FILE`, …) pass unchanged. Needs git ≥ 2.32 for `GIT_CONFIG_GLOBAL`; older git
+  reads the global config as before (the walk flags still pin the output).
+- **Repo files are never read through a symlink that leaves the checkout** (issue #109):
+  CODEOWNERS, `.tf` / `.bicep` sources, `modules.json` and graphify's `graph.json` are read only
+  when their real path is inside the clone / structure worktree (`_read_text_file(path,
+  root)`); otherwise skipped with one warning. Text is decoded with a BOM-selected codec, else
+  UTF-8 with replacement, so an undecodable byte never fails the member; an unread module file
+  puts its area in `code_graph.structural_scan_unread` and an unread CODEOWNERS sets
+  `code_graph.codeowners_unread`, so neither is taken as evidence for retraction (#95).
+- CI supply chain: actions are pinned to commit SHAs; the bicep binary and the Terraform zip
+  are checked against sha256 values pinned in the workflow (Terraform's was taken from the
+  release's SHA256SUMS after verifying its signature with the HashiCorp release key, #112).
+  **Residual risk:** `@mermaid-js/mermaid-cli` is pinned at the top level only — its
+  dependency tree (puppeteer and its Chrome download, run by an install script) is resolved at
+  install time; `--ignore-scripts` would skip the Chrome download mmdc needs, and a lockfile
+  for it is not kept. The mmdc install runs only in the offline `tests` job, which holds no
+  secret.
+- Diagram text is untrusted (anyone can title a PR or name a release): `render._mermaid_text`
+  keeps a label from forming a Mermaid directive, comment, statement or HTML (§7, #110).
 - Recognition-not-blame: `halls` has no shame list; people attribution of stalls is an opt-in
-  report appendix.
+  report appendix, and only open trains are ever "stalled" (#112).
 
 ### 14.5 Known issues (verified, not yet fixed)
 
@@ -1462,23 +1702,26 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 | `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not | read the moves from the stored nodes/edges instead |
 | Wide views use one code graph | a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them (#94); the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
 | Sub-window CI statistics are not available | `workflow_stats` are counted per gathered window, not per run day | a view inside a gathered window (a week of a gathered month) or straddling two has no `workflow_stats` (`meta.facts_windows.workflow_stats_excluded` says why); a view over ungathered days sums only what was gathered (`workflow_stats_complete: false`) | store per-day run counts |
-| Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner | per-file ownership facts if needed |
-| Item relations follow the last-folded record | `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records (#95), which are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record and its milestone / iteration / blockers (consistent with the store, but older); a record not re-gathered since a change keeps its old relations | fold windows oldest first; per-window record snapshots |
-| A window's structure is the head when its end is not in the clone | since #107 the code graph / IaC / CODEOWNERS of a window are read at its last mainline commit on or before `to`; when the bounded clone does not hold that commit (no commit in the window or its 14-day margin, only later ones) the head is read (`meta.structure_as_of: "head"`); `structure_as_of` is a bundle field, not stored per window; windows gathered before #107 carry the tree of their gather day | such a window's structure is newer than the window; the `depends_on` / `owns` replay (#95) still orders windows by their dates | widen `ACTIVITY_CLONE_MARGIN_DAYS` to reach the window end; re-gather pre-#107 windows |
+| Area ownership is directory-level | `derive.area_owners` matches the area directory: `<area>/` and `<area>/**` own it (#110), `<area>/*` (direct files only) and file rules do not | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) or by `<area>/*` do not make that owner an area owner | per-file ownership facts if needed |
+| Item relations and record-derived edges follow the last-folded record | `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records (#95), and each re-folded record's `closes` / `cross_ref` / `part_of` / contribution edges and people follow its new content (#111); records are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record with its milestone / iteration / blockers, closing references, commenters and reviewers (consistent with the store, but older); a record not re-gathered since a change keeps its old edges | fold windows oldest first; per-window record snapshots |
+| A reviewer added on a re-gather gets no areas from earlier windows' commits | person areas are derived per fold from that bundle's commits (`attribute_people_areas`) and unioned; `validate` re-derives them from every stored commit | a reviewer first named on a later gather of a PR whose commits were folded in an earlier window lacks those commits' areas: `no_drift` ERROR "person drift" (missing areas) on a multi-window store (seen on a synthetic store; independent of #111) | derive a person's areas from the stored commits of the PRs they review |
+| Review / event nodes and dropped ledger rows outlive their record | review and lifecycle-event nodes (and their `part_of`) are their own records, and the ledger keys rows by `(artifact, commit, event)` (#111 updates their columns, never deletes) | a review GitHub no longer lists on a re-gathered PR, or a file event a re-gather of a commit no longer reports, stays in the store and its views (`validate` cannot see it: the self-sourced bundle reads them back) | re-gather into a fresh store; a per-record replace of review/event nodes if it proves common |
+| A window's structure is the head when its end is not in the clone | since #107 the code graph / IaC / CODEOWNERS of a window are read at its last mainline commit on or before `to`; when the bounded clone does not hold that commit (no commit in the window or its 14-day margin, only later ones) the head is read (`meta.structure_as_of: "head"`, stored per window in the `clone:` meta entry and stamped on a view of exactly that window); windows gathered before #107 carry the tree of their gather day | such a window's structure is newer than the window; the `depends_on` / `owns` replay (#95) still orders windows by their dates | widen `ACTIVITY_CLONE_MARGIN_DAYS` to reach the window end; re-gather pre-#107 windows |
 | Pre-#107 stores and Bicep module areas | since #107 every file below a non-AVM `main.bicep` dir is in that module's area; `touches` are only ever added | re-gathering, into a store folded before #107, a window that changed such a file (one area id changes: e.g. `infra/modules/x.bicep` `infra/modules` → `infra`, `a/b/c/README.md` `a/b` → `a/b/c`) leaves the old `touches` and people areas beside the new ones: `validate` fails a one-window store with them; on a multi-window store whose windows map the path differently they are WARNs | re-gather into a fresh store |
 | Some stale structure edges are not provable | `depends_on` is retracted only where a resolved build or the whole-tree scan speaks for the source area, transitive edges only by a resolved build; `owns` only for areas a window's code graph lists (#95) | on a single-repo store without `--structural-iac` and without a working `bicep`/`terraform`, edges of areas no later window rebuilt stay; a transitive edge stays until the area is built again; owners of an area no later window lists stay | `--structural-iac`; the IaC toolchain on the gathering host |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
 | IaC edges are build-gated on single-repo gathers by default | the structural scan is opt-in for single repos (`--structural-iac`, #92) to keep golden bundles byte-stable | without the flag and without `terraform`/`bicep` (or with a failed build), a single-repo bundle has no IaC edges; scan edges do not change an area's `edges_status` | pass `--structural-iac`; a scan-specific `edges_status` if needed |
 | Bicep structural scan reads `main.bicep` entrypoints only | a module area is one with a tracked `<area>/main.bicep` (#66 entrypoint rule); only `module` statements are parsed | modules whose entry file has another name (common in landing-zone repos, e.g. `hubNetworking.bicep`) are not scanned; `import … from 'br/public:…'` type imports and child-module refs are not edges; Bicep transitive edges still need `bicep build` | a configurable entrypoint pattern; parse `import` |
 | Cross-repo Bicep resolution is public-registry only | `resolve_bicep_registry_member` (#92) honours `br/public:` / `br:mcr.microsoft.com/bicep/` only and assumes the registry path is the publisher's module directory | refs through a private ACR, a template spec or a `bicepconfig.json` alias never become cross-repo edges; a publisher whose published path differs from its directory gets a stand-in at the registry path | a private-registry prefix + path mapping in the manifest |
-| The commit walk reads the default branch | `prepare_clone` checks out the remote's default branch; `--branches` / a member `branch` set `meta.base_branch` only | with a mainline that is not the default branch, commits, code and symbol events come from the default branch while buckets and trains use the named mainline | check out `meta.base_branch` for the walks |
 | One mainline per view | `link` compares a PR's `base` with one `meta.base_branch` | a roll-up spanning a default-branch rename (`master` → `main`) gets `null` (warned), so its merges are not told apart; view each gathered window on its own | carry a set of mainline names if needed |
-| Stores gathered before a fix | the fold writes `ref_date:` (#75), `branches:` (#84), `facts:` (#94) meta, login-keyed commit authors (#78), `committed_at` (#82), PR `head_repo` (#93) and nested Terraform areas (#101) only since those issues | an older store's views warn about an unknown base branch and count every merged PR as shipped, show the last folded window's CI stats/structure for every month, keep a person per git name beside the login (and fail `validate` people/`authored` with a "pre-#78 identity" hint), sort commit events before same-day comments, cannot attach a stacked PR whose base names two heads, and keep nested `.tf` files under `modules/<name>` | re-gather into a fresh store (USAGE §2.2) |
-| Trust gate cannot see record content changes | self-sourced checks compare the store with its own records and ledger; no per-fold content digest is recorded (it would need a `fold_bundle` change) | a record deleted with all its edges, a consistently rewritten blob or a wrong ledger pass a store-only `validate` | `--bundle` with a view saved at gather time catches the first two; a fold digest in `meta` would cover the rest |
-| Multi-window stores: some checks stay WARN | `_multi_window_plan` makes the current-state edge types exact on a multi-window store when it can prove them (§8, #95); it cannot for a repo last folded before #95, a window without `facts:` (pre-#94), `touches` with a graphify window or a path re-mapped between windows, people's areas (a union over every window's activity), or a missing cross-repo `depends_on` (needs the manifest's registries) | on such a store a stale or tampered edge of those types, or an extra stored area, is a WARN naming the reason, not an ERROR | fold once more (pre-#95); re-gather pre-#94 windows; people areas: re-derive each window's view and union |
+| Stores gathered before a fix | the fold writes `ref_date:` (#75), `branches:` (#84), `facts:` (#94) meta, login-keyed commit authors (#78), `committed_at` (#82), PR `head_repo` (#93), nested Terraform areas (#101), same-repo-only timeline cross-references and UTC commit days (#109) only since those issues | an older store's views warn about an unknown base branch and count every merged PR as shipped, show the last folded window's CI stats/structure for every month, keep a person per git name beside the login (and fail `validate` people/`authored` with a "pre-#78 identity" hint), sort commit events before same-day comments, cannot attach a stacked PR whose base names two heads, keep nested `.tf` files under `modules/<name>`, can link a PR to a local issue whose number another repo's issue mentioned it from, and put a commit made near midnight UTC in the committer's local month | re-gather into a fresh store (USAGE §2.2) |
+| Trust gate cannot see record content changes | self-sourced checks compare the store with its own records, ledger and meta; no per-fold content digest is recorded (it would need a `fold_bundle` change) | a record deleted with all its edges, a consistently rewritten blob, an inserted internally consistent record (PR / commit with its contribution edge, review, dated release, milestone, area), a fact value rewritten with its key and ref, a plausible `branches:` / `ref_date:` / `clone:` value, or a wrong ledger pass a store-only `validate` (#113 flags what can be: a PR / issue nobody contributed to, a `comment-N` node, a forged marker, a re-keyed or swapped fact) | `--bundle` with a view saved at gather time catches all but the ledger for its window; a fold digest in `meta` would cover the rest |
+| Multi-window stores: some checks stay WARN | `_multi_window_plan` makes the current-state edge types exact on a multi-window store when it can prove them (§8, #95); it cannot for a repo last folded before #95, a window without `facts:` (pre-#94; `meta_integrity` makes sure such a window is real: the marker's `structure` must say so), `touches` with a graphify window or a path re-mapped between windows, or people's areas (a union over every window's activity) | on such a store a stale or tampered edge of those types, or an extra stored area, is a WARN naming the reason, not an ERROR | fold once more (pre-#95); re-gather pre-#94 windows; people areas: re-derive each window's view and union |
+| Cross-repo edges of manifest stores folded before #113 | the member set and registries a fold used are recorded (`fold_context:`) only since #113, and `members_changed` once a member set changed | until each member is folded again, and on a member whose member set changed, a missing cross-repo edge is a WARN and a stored `depends_on` is matched on its target's local id only (which member is not checked) | fold each member once more (a re-gather of any window); a stable manifest member set |
+| Mixed-era stores fail `meta_integrity` | per-window meta exists since #75, the marker since #95 | a store that holds a window folded before #75 beside later ones (that window has no fold evidence), or per-window facts without a `current_state:` marker (a #94-era fold not followed by any later one), fails `meta_integrity` | re-gather the evidence-less window; fold any window of the repo once more |
 | A renamed or transferred repo fails `provenance` | PR/issue urls must name the node's repo; the API returns the current name after a rename | gathering a repo under its old name (manifest or `--repo`) stores `html_url`s of the new name and fails `provenance` | gather under the current name |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
-| Backfilled commits are thin | `make_backfill_fetcher` (`spotlight --complete`) logs one commit with the five-field format | a backfilled commit node's `author` is the git name and it has no `committed_at` (its timeline events sort before that day's social events); no person node or edge is written for it | log `%cI` and resolve via the commits API there too |
+| Backfilled commits are thin | `make_backfill_fetcher` (`spotlight --complete`) logs one commit with the walks' format (it carries `committed_at` since #109) but does not resolve the author | a backfilled commit node's `author` is the git name; no person node or edge is written for it | resolve via the commits API there too |
 | Incomplete members are not in the digest JSON | #77 surfaces a failed / not-attempted member through gather's exit code, `validate` and a `digest.py`/`view.py` stderr warning only | a formatter reading only the digest/view JSON cannot tell the project is partial | add the incomplete members to the view `meta` (BUNDLE.md change) |
 | Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
 | Any open PR counts as in motion | `in_motion` needs an open PR or an `in_flight` train (#87), but it does not look at the PR's age, draft state or base branch | an open PR untouched for a year, or a draft, still scores `open PR` (+2.0) for the issue it references | weigh PR recency (e.g. `updated_at` in window) if stale open PRs prove common |
@@ -1490,7 +1733,6 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 | Nested Terraform module dirs split files by extension | a `*.tf` in a non-scaffold dir below `modules/<name>/` maps to its own dir (#101); `classify_code_area` is per path, so a non-`.tf` file there (README, `.tftpl`) still maps to `modules/<name>` | that module dir's docs/templates count towards the enclosing module's area | a set-aware classifier (needs the tree listing) |
 | `main.bicep` siblings are not in its area | the `main_bicep` pattern maps the `main.bicep` file itself to its directory; other files there fall through to `topn` (unless an AVM path) | outside `avm/`, a module's README or child `.bicep` files count towards a two-segment area, not the module's | a set-aware classifier, as above |
 | Ledger rows of a commit with no file list | `graphstore.ledger_row_is_symbol` (#101) reads the row's commit's stored `files`; a shallow-boundary commit (#68) has an empty list and a merge commit lists none | a file row of such a commit whose path has the `#<token>:<token>:` symbol tail is still read as a symbol row | a row-kind column in `code_events` (schema change) |
-| `link.py` / `transcript.py` have no `--help` | both parse `argv` by hand | `--help` is read as a file name: `link.py` ends in a traceback (exit 1), `transcript.py` in "cannot read transcript" (exit 2) | print the usage line for `-h`/`--help` |
 
 The operating guidance in USAGE §2.1 (one single-window store per installment, or one
 accumulated store viewed month by month as it grows; series file for continuity) says which of
@@ -1498,7 +1740,7 @@ these affect an accumulated store.
 
 ## 15. Testing and CI
 
-- 46 `test_*.py` modules (stdlib `unittest`, about 2,000 tests), fixture-driven and fully
+- 55 `test_*.py` modules (stdlib `unittest`, about 2,200 tests), fixture-driven and fully
   offline (fake fetch seams; no network). Notable: `test_characterization.py` (store-derived ==
   link-derived golden equivalence), `test_validate.py` / `test_validate_strict.py` (each
   check), `test_gather.py` (parsers, fold, IaC parsing incl. modern/legacy DOT),
@@ -1513,24 +1755,42 @@ these affect an accumulated store.
   store, two FTS5-absent degrade paths when FTS5 is present); the mmdc diagram tests skip
   without `mmdc`, and fail instead under `CI=true`.
 - CI (`.github/workflows/activity-overview.yml`): `tests` on every relevant push/PR (Python 3.11,
-  3.12, 3.13, byte-compile, pinned mmdc, then the suite); `live` on dispatch, schedule (07:00 UTC on the 1st and
-  15th) or default-branch push — real gather into a store (pinned bicep CLI) then
-  `validate.py`, with the workflow's built-in token (`token_source: secret` on a dispatch
-  uses the `ACTIVITY_TEST_TOKEN` secret instead, for private targets).
+  3.12, 3.13, byte-compile of the skill, `samples/` and `examples/formatters/`, pinned mmdc, then
+  the suite; 20-minute timeout); `live` on dispatch, schedule (07:00 UTC on the 1st and
+  15th) or default-branch push — real gather into a store (pinned bicep CLI), minimum counts
+  (PR, issue and commit nodes, `closes` and `touches` edges each > 0), `validate.py`, then
+  `view.py` → `link.py` → `render.py --skip-validate` on the store with non-empty
+  `buckets.shipped`, `trains` and `timeline` asserted; the store and the enriched bundle are
+  uploaded (#112). It uses the workflow's built-in token (`token_source: secret` on a dispatch
+  uses the `ACTIVITY_TEST_TOKEN` secret instead, for private targets). The three live jobs
+  (`live` → `spotlight` → `constellation`, chained with `needs`, each running whatever the
+  previous one's result) share the concurrency group `activity-overview-live-gathers` with
+  `cancel-in-progress: false` and a 120-minute timeout, so gathers queue instead of starving
+  each other's API budget. GitHub keeps at most one pending job per group: when two runs
+  overlap, a newer pending job replaces an older pending one, which is cancelled before it
+  starts. Every checkout uses `persist-credentials: false`.
 - CI `spotlight` job (same triggers): gathers a pinned historical week of
   `Azure/bicep-registry-modules`, runs `validate.py`, then
   `ci_spotlight_integration.py --store … --require-all`. The gate discovers its query
   arguments from the store, scoped to the project by a case-sensitive id-prefix range (no
   `LIKE`, so `_`/`%` in a project name are literal): the most-active person, the most-touched
   area (with its repo), the code_events key with the most ledger rows, and a term with hits in
-  the project. It then checks each answer against the store: `person` — trains with outcomes
-  from spotlight's vocabulary, member `repos`, chronological project-only timelines, summary
-  counts equal to the delivered trains, citations, determinism; `subsystem` (narrowed with
-  `repo=`) — `repos`, contributor and `depends_on` rows name that member, and every commit/PR
-  that `touches` the area is a touchpoint; `symbol` — one lifecycle row per ledger event in
-  (date, commit) order, outcome `removed` exactly when the last event is `remove`/`delete`, and
-  the artifact somewhere in its identity chain (a move destination is not the chain head);
-  `grep` — the delivered mentions are exactly the project's FTS matches. A check whose input the
+  the project. It then checks each answer against the store, never against spotlight's own
+  output (#113). Every train of every query: member `repos`, a chronological project-only
+  timeline whose rows and touchpoints cite exactly what their stored nodes hold
+  (number/sha/url/title; a comment's excerpt is its body), and an outcome equal to the one the
+  gate computes from the stored member records (`_store_outcome`, the §9 rule written out
+  in the gate, not imported). `person` — the (target, role) touchpoints equal the person's
+  contribution edges (role from the edge type), each target in exactly one train (at least
+  one when its causal train is deeper than the traversal cap, where spotlight may list it
+  twice), no train without a touchpoint, a commenter excerpt from the person's own comment,
+  summary counts consistent; determinism; `subsystem` (narrowed with `repo=`) — `repos`,
+  contributor and `depends_on` rows name that member, and every commit/PR that `touches` the
+  area is a touchpoint; `symbol` — each lifecycle row's event, date, commit and author equal
+  its ledger row in (date, commit) order, outcome `removed` exactly when the last ledger row
+  is `remove`/`delete`, and the artifact somewhere in its identity chain (a move destination
+  is not the chain head); `grep` — the delivered mentions are exactly the project's FTS
+  matches, each with the stored title and an excerpt found in the stored text. A check whose input the
   store lacks is reported as skipped; it fails the run only under `--require-all`. Exit 0 / 1
   (a check failed, or a skip under `--require-all`) / 2 (usage: missing store, unknown or
   unnamed `--project`). `test_ci_spotlight_integration.py` runs the gate offline on stores

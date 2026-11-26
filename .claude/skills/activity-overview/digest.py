@@ -118,12 +118,23 @@ def _member_identity(project, repo):
             "repo_owner": repo_owner, "repo_name": repo_name}
 
 
+# The spine edges that MAKE a decision train (issue #110 item 1): a closing
+# reference (`closes`, same-repo and cross-repo) and `part_of` (commit -> PR,
+# review/event -> parent). link.build_trains joins PRs only through the issues
+# they close, so a plain mention (`cross_ref`) joins nothing here either, and
+# neither do `spun_off` / `duplicate_of` (link has no such join). The wider
+# graphstore.SPINE_EDGE_TYPES stays the allowlist of extract's train context
+# and spotlight, which follow mentions on purpose.
+TRAIN_EDGE_TYPES = ("closes", "part_of")
+
+
 def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
     """Connected components of the project-wide spine, seeded by in-window social
-    nodes across `repos`. Each returned frozenset of qualified node ids is one
-    decision train (possibly spanning members — the store's cross-repo
-    closes/cross_ref edges join them). Deterministic: components are ordered by
-    their lexicographically smallest member id.
+    nodes across `repos`, over TRAIN_EDGE_TYPES only. Each returned frozenset of
+    qualified node ids is one decision train (possibly spanning members — the
+    store's cross-repo `closes` edges join them; a mention never does).
+    Deterministic: components are ordered by their lexicographically smallest
+    member id.
 
     Three behaviours to know:
     - Reachability is capped at `max_depth` hops (matching extract), so a single
@@ -146,7 +157,8 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
         if sid in seen:
             continue
         reached = graphstore.traverse_spine(
-            conn, [sid], max_depth=max_depth, skip_dead=True)["reached"]
+            conn, [sid], max_depth=max_depth, edge_types=TRAIN_EDGE_TYPES,
+            skip_dead=True)["reached"]
         # keep reached SOCIAL anchors (issues/prs); commits/areas reached are train
         # members but trains are keyed off social anchors.
         comp = {nid for nid in reached
@@ -201,16 +213,59 @@ def window_components(conn, project, members, components):
     return out
 
 
+def link_components(conn, project, members, components):
+    """`components` without the anchors that join no link train (issue #110
+    items 1 and 7), so a project train of one member is exactly that member's
+    link train:
+      - a member's PR that is in its view but in none of its trains (a stacked
+        PR, merged into another PR's branch: link lists it as a contributing
+        PR, and its closing references join nothing);
+      - `issue-N` of a member repo whose `pr-N` the store holds: "Fixes #N"
+        where #N is a PR closes nothing (GitHub numbers issues and PRs from one
+        sequence, so it is not an issue), and link ignores it.
+    What is left is re-split, as window_components does, by what is still
+    connected without them."""
+    blocked = set()
+    for m in members:
+        repo, bundle = m["repo"], m["bundle"]
+        in_trains = {n for t in bundle.get("trains", []) for n in t.get("prs", [])}
+        for p in bundle.get("prs", []):
+            if p["number"] not in in_trains:
+                blocked.add(graphstore.qualify_id(
+                    project, repo, "pr-{}".format(p["number"])))
+        stored = {n["id"] for n in graphstore.repo_nodes(conn, project, repo,
+                                                         node_class="social")}
+        for nid in stored:
+            local = graphstore.parse_id(nid)["local"]
+            if local.startswith("pr-"):
+                shadow = graphstore.qualify_id(
+                    project, repo, "issue-" + local[len("pr-"):])
+                # stored or not: a backfilled `issue-N` that is really PR N
+                # (an alias of pr-N) would otherwise join every PR that
+                # "closes" N into one train, which link never does.
+                blocked.add(shadow)
+    out = []
+    for comp in components:
+        if comp & blocked:
+            out.extend(g for g in _split_without(conn, comp - blocked, blocked)
+                       if g)
+        else:
+            out.append(comp)
+    out.sort(key=lambda c: min(c) if c else "")
+    return out
+
+
 def _is_anchor(nid):
     return graphstore.parse_id(nid)["local"].startswith(("pr-", "issue-"))
 
 
 def _split_without(conn, kept, blocked):
     """Partition the anchors `kept` into the groups still connected over the
-    spine when the `blocked` anchors are removed. Non-anchor spine nodes
-    (commits) may still bridge; other anchors outside `kept` do not. Returns
-    frozensets ordered by smallest id (an empty `kept` yields one empty set, so
-    a component is never silently dropped from the list's shape)."""
+    train edges (TRAIN_EDGE_TYPES) when the `blocked` anchors are removed.
+    Non-anchor nodes (commits) may still bridge; other anchors outside `kept`
+    do not. Returns frozensets ordered by smallest id (an empty `kept` yields
+    one empty set, so a component is never silently dropped from the list's
+    shape)."""
     if not kept:
         return [frozenset()]
     groups, seen = [], set()
@@ -223,7 +278,7 @@ def _split_without(conn, kept, blocked):
             for nid in frontier:
                 for e in graphstore.get_edges(
                         conn, nid, direction="both",
-                        edge_types=list(graphstore.SPINE_EDGE_TYPES)):
+                        edge_types=list(TRAIN_EDGE_TYPES)):
                     other = e["dst_id"] if e["src_id"] == nid else e["src_id"]
                     if other in visited or other in blocked:
                         continue
@@ -297,6 +352,7 @@ def build_project_trains(members, components, project):
     out = []
     for key, items in groups.items():
         prs, issues, commits, evidence, repos = [], [], [], [], []
+        code_areas = set()
         outcome = "abandoned"
         best_rank = -1
         for repo, tr in items:
@@ -315,6 +371,11 @@ def build_project_trains(members, components, project):
                     project, repo, "issue-{}".format(n)))
             for sha in tr.get("commits", []):
                 commits.append(graphstore.qualify_id(project, repo, sha))
+            # issue #112: the member trains' areas, repo-qualified like the
+            # project `modules` keys and people areas ("<repo>::<area>").
+            for area in tr.get("code_areas") or []:
+                if area:
+                    code_areas.add("{}::{}".format(repo, area))
             for ev in tr.get("evidence", []):
                 evidence.append({**ev, "repo": repo})
             rank = _OUTCOME_RANK.get(tr["outcome"], 0)
@@ -369,7 +430,7 @@ def build_project_trains(members, components, project):
             "issues": sorted(set(issues)),
             "commits": sorted(set(commits)),
             "evidence": evidence,
-            "code_areas": [],
+            "code_areas": sorted(code_areas),
         })
     out.sort(key=lambda t: t["id"])
     return out
@@ -495,9 +556,9 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     members = member_bundles(conn, project, repos, ts_from, ts_to,
                              backfill=backfill, backfill_budget=backfill_budget,
                              warn=warn, ref_date=ref_date)
-    comps = window_components(
+    comps = link_components(conn, project, members, window_components(
         conn, project, members,
-        spine_components(conn, project, repos, ts_from, ts_to))
+        spine_components(conn, project, repos, ts_from, ts_to)))
     trains = build_project_trains(members, comps, project)
     _attach_tickets(members, trains, project, ticket_pattern)
     related = group_related_work(trains)
@@ -641,7 +702,8 @@ def main(argv=None):
     unknown project or repo. Nothing is written to stdout on exit 2."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        manifest_mod.check_reader_window(args.ts_from, args.ts_to, "--from", "--to")
+        args.ts_from, args.ts_to = manifest_mod.check_reader_window(
+            args.ts_from, args.ts_to, "--from", "--to")
         if args.ref_date is not None:
             manifest_mod.check_ref_date(args.ref_date, "--ref-date")
     except ValueError as exc:

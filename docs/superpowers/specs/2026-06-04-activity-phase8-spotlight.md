@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 8 — spotlight (substrate analytics reader) — design
 
 **Status: PROPOSED.** Detailed design for **Phase 8** of the journey-graph substrate

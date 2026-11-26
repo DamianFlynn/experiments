@@ -423,8 +423,9 @@ class ProjectDigestTwoMonths(unittest.TestCase):
                                        warn=lambda _m: None)
         refs = sorted(r for t in pv["trains"] for r in t["prs"] + t["issues"])
         self.assertNotIn("o/r#pr-1", refs)
-        self.assertEqual(refs, ["o/r#issue-1017", "o/r#issue-17",
-                                "o/r#pr-1001", "o/r#pr-2"])
+        # issue 17 is only MENTIONED by PR 1001: a mention joins no train
+        # (#110 item 1), so it is in no project train, as in link's trains.
+        self.assertEqual(refs, ["o/r#issue-1017", "o/r#pr-1001", "o/r#pr-2"])
         member = pv["members"][0]["bundle"]
         self.assertEqual(_nums(member["prs"]), [2, 1001])
         self.assertNotIn("alice", pv["people"])

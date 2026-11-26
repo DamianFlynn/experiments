@@ -42,7 +42,8 @@ SQL_HUNK_DIFF = (
 
 
 def _record(diff, sha=SHA):
-    header = gather.FIELD_SEP.join([sha, "p", "Alice", "2026-05-03", "subj"])
+    header = gather.FIELD_SEP.join([sha, "p", "Alice", "a@x",
+                                    "2026-05-03T12:00:00Z", "subj"])
     return gather.RECORD_SEP + header + "\n" + diff
 
 
@@ -156,7 +157,7 @@ class TestQuotedPathsInParsers(unittest.TestCase):
         self.assertEqual(f["hunks"], [])
 
     def test_name_status_quoted(self):
-        raw = ("\x1e" + SHA + "\x1f\x1fEve\x1f2026-05-20\x1fs\n"
+        raw = ("\x1e" + SHA + "\x1f\x1fEve\x1fe@x\x1f2026-05-20T12:00:00Z\x1fs\n"
                'M\t"docs/caf\\303\\251.md"\n'
                "A\tdocs/with space.md\n"
                'R097\t"docs/old-na\\303\\257ve.md"\t"docs/na\\303\\257ve.md"\n')
@@ -167,7 +168,7 @@ class TestQuotedPathsInParsers(unittest.TestCase):
                           ("rename", "docs/old-naïve.md", "docs/naïve.md")])
 
     def test_name_only_quoted(self):
-        raw = ("\x1e" + SHA + "\x1f\x1fEve\x1f2026-05-20\x1fs\n"
+        raw = ("\x1e" + SHA + "\x1f\x1fEve\x1fe@x\x1f2026-05-20T12:00:00Z\x1fs\n"
                '"docs/caf\\303\\251.md"\ndocs/with space.md\n')
         self.assertEqual(gather.parse_git_log(raw)[0]["files"],
                          ["docs/café.md", "docs/with space.md"])

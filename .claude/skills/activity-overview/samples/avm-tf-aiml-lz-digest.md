@@ -320,7 +320,7 @@ gantt
     #84 fix - resolve 7 open issues — AppGW routing, APIM zones, :active, 2026-04-09, 2026-04-09
     #105 V0.5.0 :active, 2026-06-05, 2026-06-05
     section Releases
-    v0.4.1 :milestone, 2026-03-21, 0d
+    Release v0.4.1 :milestone, 2026-03-21, 0d
 ```
 
 #### Releases
@@ -567,7 +567,7 @@ gantt
     dateFormat YYYY-MM-DD
     axisFormat %m-%d
     section Pull requests
-    #115 Update Terraform required_version from ~>1.5 to ~>1.9 a :active, 2025-08-02, 2026-03-22
+    #115 Update Terraform required_version from ~›1.5 to ~›1.9 a :active, 2025-08-02, 2026-03-22
     #127 chore - pre-commit updates :done, 2026-03-18, 2026-03-18
     #129 fix(outputs) - avoid deprecated azurerm provider attrib :active, 2026-05-20, 2026-05-20
     #130 Role assignment principal_type was not being passed. :active, 2026-05-21, 2026-05-21

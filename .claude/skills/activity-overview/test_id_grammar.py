@@ -218,16 +218,21 @@ class ClassifyIdGrammar(unittest.TestCase):
 
         def fetch(kind, local, qid):
             seen.append((kind, local))
-            return {"node": {"name": "f"}, "edges": []}
+            return {"node": {"title": "f", "author": "a"}, "edges": []}
 
+        # backfill only writes PR / issue records (#113): an artifact or a
+        # review id is never fetched, so it can never land under a bad repo.
         for qid in ("P/o/r#src/a.py#python:function:f", "P/o/r#art:C#.md",
                     "P/o/r#review-5-99"):
+            gather.backfill(conn, qid, fetch=fetch)
+            self.assertIsNone(graphstore.get_node(conn, qid), qid)
+        for qid in ("P/o/r#pr-5", "P/o/r#issue-6"):
             gather.backfill(conn, qid, fetch=fetch)
             node = graphstore.get_node(conn, qid)
             self.assertEqual((node["project"], node["repo"]), ("P", "o/r"), qid)
         self.assertNotIn("#", "".join(
             r[0] for r in conn.execute("SELECT repo FROM nodes")))
-        self.assertIn(("artifact", "src/a.py#python:function:f"), seen)
+        self.assertEqual(seen, [("social", "pr-5"), ("social", "issue-6")])
 
 
 class ExtractLedgerGrammar(unittest.TestCase):

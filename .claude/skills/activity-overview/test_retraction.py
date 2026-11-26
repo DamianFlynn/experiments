@@ -5,8 +5,10 @@ across months kept every dependency, owner, milestone, iteration and blocker
 any earlier gather had seen. The rules (gather.py "current-state edges",
 STORE.md "Current-state edges"):
 
-- history edges (authored, reviewed, merged, commented, reported, closes,
-  cross_ref, part_of, touches, symbol moves) are only ever added;
+- history edges (touches, symbol moves) are only ever added; the
+  record-derived ones (authored, reviewed, merged, commented, reported,
+  closes, cross_ref, part_of) follow the record that implies them since
+  issue #111 (test_record_edges.py);
 - blocks / in_milestone / in_iteration are what the STORED PR/issue records
   and milestone / sprint nodes imply (a record a fold upserts replaces the
   earlier one, and its edges follow);
@@ -676,7 +678,7 @@ class TestFirstFoldAndTrustCheck(_Case):
                          [(_q("area-" + A), _q("area-" + B)),
                           (_q("area-" + C), _q("area-" + B))])
         self.assertEqual(graphstore.get_current_state(conn, "o", "r"),
-                         {"items": True, "structure": True,
+                         {"items": True, "structure": True, "records": True,
                           "from": JAN[0], "to": JAN[1]})
 
     def _multi(self):
@@ -744,7 +746,14 @@ class TestFirstFoldAndTrustCheck(_Case):
                                                    if k != "to"})
         conn.execute("DELETE FROM meta WHERE key LIKE 'current_state:%'")
         conn.commit()
-        report = self.assertClean(conn)
+        # Per-window facts without the marker: every fold that writes facts
+        # also writes the marker, so the store's own state is the one thing
+        # the gate rejects (issue #113 M1: a deleted marker used to downgrade
+        # real tampering); every other check still passes.
+        report = validate.validate(conn, project="o", repo="r")
+        failing = [c for c in report.checks if not c["ok"]]
+        self.assertEqual([c["name"] for c in failing], ["meta_integrity"])
+        self.assertIn("current_state:o/r", json.dumps(failing[0]["details"]))
         idem = [c for c in report.checks if c["name"] == "idempotency"][0]
         self.assertIn("#95", json.dumps(idem["details"]))
         # the next fold heals it, and logs what it retracted
