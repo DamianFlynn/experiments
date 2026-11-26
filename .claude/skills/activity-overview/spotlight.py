@@ -1905,8 +1905,14 @@ def main(argv=None):
     if not os.path.isfile(args.store):
         parser.error("store {!r} does not exist (run gather.py first)".format(
             args.store))
+    # Only a live --complete backfill (with a token) writes fetched anchors
+    # into the store; every other query opens it read-only (#107).
+    token = os.environ.get("GITHUB_TOKEN") if args.complete else None
     try:
-        conn = graphstore.open_store(args.store)
+        if token:
+            conn = graphstore.open_store(args.store)
+        else:
+            conn = graphstore.open_store_readonly(args.store)
         project = _detect_project(conn, args.project)
         if args.query in _AREA_QUERIES:
             qual = _split_area_arg(arg)[0]
@@ -1928,7 +1934,6 @@ def main(argv=None):
     # we stay offline/honest-only rather than failing.
     backfill = None
     if args.complete:
-        token = os.environ.get("GITHUB_TOKEN")
         if token:
             fetch = gather.make_backfill_fetcher(token)
             backfill = lambda c, mid: gather.backfill(c, mid, fetch=fetch)  # noqa: E731

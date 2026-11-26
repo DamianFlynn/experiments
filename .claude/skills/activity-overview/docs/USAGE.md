@@ -132,8 +132,8 @@ cross-month `spotlight` queries possible.
    a grown store (HLD §10 item 7).
 2. **A view that is not exactly one gathered month** is assembled from whole months: a
    quarter sums its gathered months' CI statistics (`meta.facts_windows` lists them;
-   `workflow_stats_complete: false` when one is missing — the report template does not show
-   this caveat, so state it yourself) and takes its code graph, owners and taxonomy from its
+   `workflow_stats_complete: false` when one is missing — the report template states this
+   caveat under the CI section) and takes its code graph, owners and taxonomy from its
    **last** month, so files changed only in an earlier month have no code area (and add no
    person area) in it. A view inside one month or straddling two has **no**
    `workflow_stats` (runs are counted per gathered window, not per day).

@@ -320,6 +320,31 @@ def _fold(db, folds):
     conn.close()
 
 
+def _rewindowed(bundle, frm, to):
+    b = copy.deepcopy(bundle)
+    b["meta"].update({"from": frm, "to": to})
+    return b
+
+
+def project_folds(ticket=None):
+    """The two-member project store's folds (issue #107: both report caveats
+    present). mod-a: May, then a later June gather, so its May view carries
+    `meta.state_as_of`. mod-b: two overlapping gathers inside May, so its May
+    view is no single gathered window and carries `meta.facts_windows`, with
+    the CI total partial (`workflow_stats_complete` false, one window in
+    `workflow_stats_excluded`)."""
+    members = {"Azure/mod-a", "Azure/mod-b"}
+    a = _rich_bundle("Azure", "mod-a", 40, edge_to="avm/res/net/pip",
+                     ticket=ticket)
+    b = _rich_bundle("Azure", "mod-b", 60, area="avm/res/net/pip",
+                     ticket=ticket)
+    kw_a = {"project": "proj", "repo": "Azure/mod-a", "members": members}
+    kw_b = {"project": "proj", "repo": "Azure/mod-b", "members": members}
+    return [(a, kw_a), (_rewindowed(a, "2026-06-01", "2026-06-30"), kw_a),
+            (_rewindowed(b, "2026-05-01", "2026-05-20"), kw_b),
+            (_rewindowed(b, "2026-05-15", TO), kw_b)]
+
+
 def build_corpus(tmp):
     """Run the documented pipeline on the fixture; return the documents."""
     # Single repo: store -> view.py -> link.py --series -> render.py.
@@ -360,15 +385,7 @@ def build_corpus(tmp):
 
     # Multi-repo: two members -> digest.py (ticket clustering switched on).
     pdb = os.path.join(tmp, "project.db")
-    members = {"Azure/mod-a", "Azure/mod-b"}
-    _fold(pdb, [
-        (_rich_bundle("Azure", "mod-a", 40, edge_to="avm/res/net/pip",
-                      ticket="ABC-1"),
-         {"project": "proj", "repo": "Azure/mod-a", "members": members}),
-        (_rich_bundle("Azure", "mod-b", 60, area="avm/res/net/pip",
-                      ticket="ABC-1"),
-         {"project": "proj", "repo": "Azure/mod-b", "members": members}),
-    ])
+    _fold(pdb, project_folds(ticket="ABC-1"))
     out = io.StringIO()
     with _quiet(), contextlib.redirect_stdout(out):
         assert digest.main(["--store", pdb, "--project", "proj", "--from", FROM,
@@ -536,6 +553,14 @@ class TestCorpusIsRich(_CorpusCase):
         self.assertTrue(any(p.get("review_rounds") for p in b["prs"]))
         self.assertTrue(v["related_work"])
         self.assertTrue(v["module_edges"])
+        # both report caveats (issue #107) are in the corpus
+        metas = {m["repo"]: m["bundle"]["meta"] for m in v["members"]}
+        self.assertEqual(metas["Azure/mod-a"].get("state_as_of"), "2026-06-30")
+        fw = metas["Azure/mod-b"].get("facts_windows") or {}
+        self.assertIs(fw.get("workflow_stats_complete"), False)
+        self.assertTrue(fw.get("workflow_stats"))
+        self.assertTrue(fw.get("workflow_stats_excluded"))
+        self.assertTrue(fw.get("structure"))
         self.assertTrue(self.corpus.docs["sprints_selected"])
         self.assertTrue(self.corpus.docs["module"]["symbols"])
 
@@ -681,6 +706,42 @@ class TestNarrativeSlotAndStaleNotes(_CorpusCase):
         text = self.docs["report-template.md"]
         self.assertNotIn("later slice", text)
         self.assertNotIn("lands with graphify", text)
+
+
+class TestReportCaveats(_CorpusCase):
+    """Issue #107 item 10: both documents tell the author to state the two
+    caveats a view can carry — `meta.state_as_of` under the title,
+    `meta.facts_windows` (a partial CI total) under CI/CD health — only when
+    the key is present."""
+
+    def _section(self, name, heading):
+        for head, body in _sections(self.docs[name]):
+            if head.lower().startswith(heading):
+                return body
+        self.fail("{} has no '{}' section".format(name, heading))
+
+    def test_template_rules_state_as_of_under_the_title(self):
+        rules = _rules_block(self.docs["report-template.md"])
+        self.assertIn("`meta.state_as_of`", rules)
+        self.assertIn("{meta.state_as_of}", rules)
+        self.assertRegex(rules, r"STATE AS OF:.*present")
+        self.assertIn("under the report title", rules.split("STATE AS OF:")[1])
+
+    def test_ci_section_states_the_facts_windows_caveat(self):
+        body = self._section("report-template.md", "ci/cd health")
+        for path in ("meta.facts_windows", "meta.facts_windows.workflow_stats",
+                     "meta.facts_windows.workflow_stats_complete",
+                     "meta.facts_windows.workflow_stats_excluded",
+                     "meta.facts_windows.structure"):
+            self.assertIn("`{}`".format(path), body, path)
+        self.assertIn("present", body)
+
+    def test_sections_guide_states_both(self):
+        guide = self.docs["reference/report-sections.md"]
+        self.assertIn("`meta.state_as_of`", guide.split("## Executive summary")[0])
+        ci = self._section("reference/report-sections.md", "releases")
+        self.assertIn("`meta.facts_windows`", ci)
+        self.assertIn("`meta.facts_windows.workflow_stats_complete`", ci)
 
 
 class TestAttributionReadsLogins(_CorpusCase):

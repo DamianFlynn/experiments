@@ -45,7 +45,8 @@ interpretation): **6** module-dependency edges — **4 cross-repo** (pattern roo
 `0.4.2`, all direct) + **2 intra-repo** (vnet → subnet, peering); **21** decision
 trains (**0** cross-repo); **0** `related_work` clusters; **44** shipped items.
 The gather's `meta.boundary_dropped_commits` was empty for all members (see "Note
-on completeness"); that key is not part of the view.
+on completeness"); that key was not part of a view when this sample was made (it is
+since #107, when non-empty).
 
 **`transitive` flags re-derived for #80, not re-gathered.** The live gather marked
 14 Terraform edges `transitive: true` (including both operationalinsights
@@ -110,9 +111,10 @@ python3 samples/build_report.py --view samples/digest_view.json \
 The committed view predates `meta.ref_date`, so the report's reference date is the
 window end. Its `code_owners` holds only a `.github/CODEOWNERS` rule (older gather,
 legacy dict form), so under GitHub's last-match rule no module area has an owner
-and the CODEOWNERS column is `—`. A view carries no
-`meta.boundary_dropped_commits` (that is gather's bundle meta, not stored), so the
-report states completeness only when a member's meta does carry it.
+and the CODEOWNERS column is `—`. This committed view
+carries no `meta.boundary_dropped_commits` (it predates #107, which stores the key and
+puts it in views when non-empty), so the report warns only when a member's meta carries
+it and never claims completeness from its absence.
 
 ### mmdc as root
 

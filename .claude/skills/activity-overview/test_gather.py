@@ -41,7 +41,9 @@ class TestBuildBundle(unittest.TestCase):
             bundle["buckets"],
             {"shipped": [], "in_flight": [], "rejected": [], "next_candidates": []},
         )
-        self.assertEqual(bundle["meta"]["schema_version"], 1)
+        # the bundle/view contract version (issue #107), not the store's
+        self.assertEqual(bundle["meta"]["schema_version"],
+                         gather.extract.VIEW_CONTRACT_VERSION)
 
 
 class TestRunGitDecoding(unittest.TestCase):

@@ -26,7 +26,9 @@ import extract
 import graphstore
 import manifest as manifest_mod
 
-SCHEMA_VERSION = 1
+# The bundle carries the bundle/view contract version (issue #107); the
+# store's own schema version is graphstore.SCHEMA_VERSION.
+SCHEMA_VERSION = extract.VIEW_CONTRACT_VERSION
 RECORD_SEP = "\x1e"
 FIELD_SEP = "\x1f"
 
@@ -6208,6 +6210,16 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         if meta.get("clone_sha"):
             graphstore.set_clone_sha(conn, project, repo, meta["clone_sha"],
                                      commit=False)
+        # The window's clone provenance (issue #107): how the clone was made
+        # and the in-window commits whose diffs the shallow boundary dropped,
+        # so a view can say its code history is incomplete. A bundle without
+        # either key (hand-built, pre-#107) stores nothing.
+        if meta.get("from") and meta.get("to") and (
+                "clone_mode" in meta or "boundary_dropped_commits" in meta):
+            graphstore.set_clone_info(conn, project, repo, meta["from"],
+                                      meta["to"], meta.get("clone_mode"),
+                                      meta.get("boundary_dropped_commits"),
+                                      commit=False)
         # The window's own CI statistics and structure (issue #94): the
         # latest-wins nodes above serve stores folded before #94; a view of
         # this window reads these (extract._window_facts).

@@ -16,7 +16,8 @@ normalization below; capture was run twice and confirmed byte-identical, so the
 snapshots carry no nondeterministic data.
 
 NORMALIZATION RULE (Agent F: reuse this verbatim). Drop only the volatile meta
-keys (`_VOLATILE_META`: generated_at, schema_version). Issue #75 made extract
+keys (`_VOLATILE_META`: generated_at; schema_version until issue #107, see
+below). Issue #75 made extract
 stamp `period` and `ref_date` into the view's meta, so those two are no longer
 dropped: the snapshots were re-captured once to add them (meta only; no other
 key changed). Issue #84 made extract stamp `base_branch` and `branches`; the
@@ -37,7 +38,12 @@ them once more: every train gained `issues` and `pr_outcomes`, and in
 `char_bundle_p2.json` the open PR #44, which only cross-references issue #18
 (no closing keyword), is now `train-pr-44` instead of `train-issue-18` — its
 bucket / forecast refs name `train-pr-44`, issue #18's refs carry no train
-(scores unchanged); no other key changed. Unlike test_extract, this gate
+(scores unchanged); no other key changed. Issue #107 made every view carry
+the bundle/view contract version (`meta.schema_version` =
+extract.VIEW_CONTRACT_VERSION, 3) and took it off the volatile list, so the
+version is pinned: all five snapshots were re-captured once to add that one
+meta key, by a script that refused to write unless it was the only
+difference. Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is
 canonical JSON: json.dumps(obj, sort_keys=True, indent=2).
@@ -60,7 +66,9 @@ FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 # Volatile meta keys, dropped before comparison. `ref_date` and `period` were
 # dropped here too until issue #75; extract now stamps them (the view's window
 # and reference date), so the snapshots pin them as part of the view contract.
-_VOLATILE_META = ("generated_at", "schema_version")
+# `schema_version` was dropped until issue #107; it is now the view contract
+# version (extract.VIEW_CONTRACT_VERSION) and pinned too.
+_VOLATILE_META = ("generated_at",)
 
 
 def _load(name):

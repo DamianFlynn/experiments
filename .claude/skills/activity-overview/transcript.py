@@ -97,10 +97,24 @@ def _squeeze(text):
     return "\n".join(result)
 
 
+_USAGE = "usage: transcript.py PATH\n"
+_HELP = _USAGE + """
+Normalize a community-call transcript (WebVTT, SRT, .txt or .md) at PATH to
+plain prose on stdout.
+
+  -h, --help   show this help and exit
+"""
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 1:
-        sys.stderr.write("usage: transcript.py PATH\n")
+    # `-h` / `--help` anywhere prints help (exit 0); any other flag-like token
+    # is an unknown flag (exit 2, usage), never read as a path.
+    if "-h" in argv or "--help" in argv:
+        sys.stdout.write(_HELP)
+        raise SystemExit(0)
+    if len(argv) != 1 or argv[0].startswith("-"):
+        sys.stderr.write(_USAGE)
         raise SystemExit(2)
     try:
         with open(argv[0], encoding="utf-8", errors="replace") as fh:

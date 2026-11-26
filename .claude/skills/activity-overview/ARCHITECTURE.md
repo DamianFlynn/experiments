@@ -742,6 +742,5 @@ whether a train gets a full write-up · **slice** = one train's bounded, self-co
 evidence for the narrator · **flow** = an open issue's stuck-ness pathology ·
 **halls.fame** = the recognition ranking · **blast radius** = the set of repos that depend
 on a given one · **idempotent** = re-running changes nothing · **provenance** = the source
-link attached to every fact · **schema_version** = the store's `meta.schema_version` is `2` (STORE.md); the view shape in
-BUNDLE.md is version `1`, but only gather's in-memory bundle stamps it (`view.py` bundles
-carry none and the digest view carries the store's `2` — BUNDLE.md "Versioned").
+link attached to every fact · **schema_version** = `3` on the bundle view (`extract.VIEW_CONTRACT_VERSION`, BUNDLE.md);
+the store's `meta.schema_version` is `2` (STORE.md).

@@ -24,6 +24,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+import extract  # noqa: E402
 import gather  # noqa: E402
 from test_walked_branch import GitRepoCase, git, owners  # noqa: E402
 
@@ -95,8 +96,15 @@ class TestCurrentMonthUnchanged(GitRepoCase):
         # where `closes` came from. Not part of what this gate pins.
         self.assertIn(got["meta"].pop("closing_refs_source"),
                       ("graphql", "keywords"))
+        # The view contract version is now stamped on gather's bundle too
+        # (one version everywhere); the golden was captured when it was 1.
+        golden = json.loads(json.dumps(self._golden()[key]))
+        self.assertEqual(golden["meta"]["schema_version"], 1)
+        self.assertEqual(got["meta"].pop("schema_version"),
+                         extract.VIEW_CONTRACT_VERSION)
+        golden["meta"].pop("schema_version")
         self.assertEqual(got["meta"]["clone_sha"], self.rev("HEAD"))
-        self.assertEqual(got, self._golden()[key])
+        self.assertEqual(got, golden)
         self.assertEqual(self.checked_out(), ("main", self.rev("HEAD")))
         self.assertNotIn("remote default", err)
         self.assertNotIn("structure", err)

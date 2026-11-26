@@ -557,13 +557,15 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
     consistently rewritten record or a wrong change ledger. A repo gathered under a name it
     no longer has (renamed or transferred) fails `provenance`, because GitHub returns its
     links under the new name.
-17. **Some facts do not reach the view or the report.** `meta.boundary_dropped_commits` is
-    printed by gather but is neither stored nor carried into views. The digest project
-    view stamps `meta.schema_version` with the store version (`2`), while BUNDLE.md's view
-    version is `1` and `view.py` bundles carry none. The digest's `module_edges` drop the
-    `address` / `via` (and `ref`) of transitive Terraform edges. `report-template.md` and
-    `samples/build_report.py` show neither `meta.facts_windows` (so a quarter's partial CI
-    sum appears without its caveat) nor `meta.state_as_of`.
+17. **What a view says about its own completeness.** Since #107 a view carries the clone
+    facts of its window (`meta.clone_mode`, `meta.boundary_dropped_commits` when commits were
+    dropped at the shallow boundary), one contract version (`meta.schema_version` = 3 on
+    every view; the store's own schema version stays in the store), and the digest's
+    `module_edges` keep `ref` / `address` / `via`. The report template and the sample
+    builder state `meta.facts_windows` (a wider view's CI total may be partial) and
+    `meta.state_as_of` (a past month viewed from a later gather). Not carried:
+    `meta.structure_as_of` and `meta.closing_refs_source` are in gather's bundle only, and a
+    view narrower than a gathered window does not repeat that window's dropped commits.
 18. **Narrative is not in CI.** The live CI jobs stop at the trust gate.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store

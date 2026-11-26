@@ -104,6 +104,18 @@ import graphstore
 import derive
 import complete
 
+# The bundle/view CONTRACT version (BUNDLE.md), stamped as `meta.schema_version`
+# in gather's in-memory bundle, every extract / view.py view, each digest member
+# bundle and the digest project view (issue #107). It versions the JSON shape
+# formatters read, and is NOT the store schema (`graphstore.SCHEMA_VERSION`,
+# kept in the store's meta only). History: 1 was declared for the bundle but
+# extract views carried no version and digest stamped the store's 2, while the
+# shape changed incompatibly (project people areas `repo::area`, series v2,
+# train `issues` / `pr_outcomes`). 3 is the first value no earlier view ever
+# carried, so an old view never reads as this contract. Bump it on every
+# incompatible view change and record the bump in BUNDLE.md.
+VIEW_CONTRACT_VERSION = 3
+
 # Keys this reader materializes from the store: the raw substrate plus the two
 # derived projections fold persists into nodes (artifacts, people).
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
@@ -928,6 +940,42 @@ def _resolve_branches(conn, project, repo, ts_from, ts_to):
     return None, [], problem
 
 
+def _clone_meta(conn, project, repo, ts_from, ts_to):
+    """The view's clone provenance (issue #107): {clone_mode?,
+    boundary_dropped_commits?}.
+
+    - `clone_mode`: the one fold stored for exactly this (project, repo,
+      from, to) window; absent for any other view (it describes one clone).
+    - `boundary_dropped_commits`: the sorted union of the lists stored for
+      the gathered windows of this repo that lie wholly inside the view (a
+      window that only partly overlaps it is left out, as for CI statistics:
+      its dropped commits cannot be placed by day); absent when empty.
+    Nothing is returned for a window folded before #107."""
+    out = {}
+    exact = graphstore.get_clone_info(conn, project, repo, ts_from, ts_to)
+    if exact is not None and exact.get("clone_mode"):
+        out["clone_mode"] = exact["clone_mode"]
+    try:
+        ledger = graphstore.get_windows(conn)
+    except ValueError:
+        ledger = []
+    windows = {(w.get("from"), w.get("to")) for w in ledger
+               if isinstance(w, dict) and w.get("project") == project
+               and w.get("repo") == repo
+               and _contained(w, ts_from, ts_to)}
+    if exact is not None:
+        windows.add((ts_from, ts_to))
+    dropped = set()
+    for frm, to in windows:
+        info = graphstore.get_clone_info(conn, project, repo, frm, to)
+        if info is not None:
+            dropped.update(s for s in info.get("boundary_dropped_commits") or []
+                           if isinstance(s, str))
+    if dropped:
+        out["boundary_dropped_commits"] = sorted(dropped)
+    return out
+
+
 def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None,
                       problems=None, window_facts=None):
     """Reconstruct raw `meta`: owner/repo/window (+clone_sha if recorded), plus
@@ -950,14 +998,21 @@ def _materialize_meta(conn, project, repo, ts_from, ts_to, ref_date=None,
     the view's facts come from (only when the view is not exactly one of
     them). When None (a store folded before #94) `clone_sha` is the repo's
     latest.
+
+    and the clone provenance (issue #107, see `_clone_meta`): `clone_mode`
+    for a view of exactly a gathered window, `boundary_dropped_commits` when
+    a gathered window inside the view dropped any (omit-when-absent, so a
+    store folded before #107 gives the same view as before).
     """
-    meta = {"owner": project, "repo": repo, "from": ts_from, "to": ts_to}
+    meta = {"owner": project, "repo": repo, "from": ts_from, "to": ts_to,
+            "schema_version": VIEW_CONTRACT_VERSION}
     if window_facts is None:
         clone_sha = graphstore.get_clone_sha(conn, project, repo)
     else:
         clone_sha = window_facts.get("clone_sha")
     if clone_sha:
         meta["clone_sha"] = clone_sha
+    meta.update(_clone_meta(conn, project, repo, ts_from, ts_to))
     meta["base_branch"], meta["branches"], problem = _resolve_branches(
         conn, project, repo, ts_from, ts_to)
     if problem and problems is not None:

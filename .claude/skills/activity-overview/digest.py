@@ -505,7 +505,7 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
     return {
         "meta": {"project": project, "repos": list(repos),
                  "from": ts_from, "to": ts_to,
-                 "schema_version": graphstore.SCHEMA_VERSION},
+                 "schema_version": extract_mod.VIEW_CONTRACT_VERSION},
         "members": members,
         "trains": trains,
         "related_work": related,
@@ -533,8 +533,15 @@ def _area_of(qid):
 
 def project_depends_on(conn, project, repos):
     """The project's module-dependency edges as render-ready rows:
-    [{src_repo, src_area, dst_repo, dst_area, version, transitive, cross_repo}, ...]
-    sorted by (src_id, dst_id). Reads resolved depends_on edges from the store."""
+    [{src_repo, src_area, dst_repo, dst_area, version, transitive, cross_repo,
+      ref[, address, via]}, ...]
+    sorted by (src_id, dst_id). Reads resolved depends_on edges from the store.
+
+    `ref` is the edge's module source (None when it has none); `address` /
+    `via` (a nested `module.a.module.b` call and the call it goes through) are
+    present only when stored (issue #107). depends_on is a current-state edge:
+    these rows are the edges as of the latest fold (#95), not scoped to the
+    view's window (BUNDLE.md)."""
     repo_set = set(repos)
     out = []
     for e in graphstore.edges_by_type(conn, "depends_on", project):
@@ -543,12 +550,17 @@ def project_depends_on(conn, project, repos):
         if src_repo not in repo_set:
             continue
         d = e["data"] or {}
-        out.append({
+        row = {
             "src_repo": src_repo, "src_area": src_area,
             "dst_repo": dst_repo, "dst_area": dst_area,
             "version": d.get("version"), "transitive": d.get("transitive"),
             "cross_repo": bool(d.get("cross_repo")) or src_repo != dst_repo,
-        })
+            "ref": d.get("ref"),
+        }
+        for key in ("address", "via"):
+            if d.get(key) is not None:
+                row[key] = d[key]
+        out.append(row)
     return out
 
 
@@ -664,8 +676,12 @@ def main(argv=None):
     if not os.path.isfile(args.store):
         return _fail("store {!r} does not exist (run gather.py first)".format(
             args.store))
+    # Read-only (#107): a digest never writes to the store.
     try:
-        conn = graphstore.open_store(args.store)
+        conn = graphstore.open_store_readonly(args.store)
+    except FileNotFoundError:
+        return _fail("store {!r} does not exist (run gather.py first)".format(
+            args.store))
     except sqlite3.DatabaseError as exc:
         return _fail("cannot read store {!r}: {}".format(args.store, exc))
     try:

@@ -374,5 +374,64 @@ class TestDocsContract(unittest.TestCase):
                     self.assertIn(flag, allowed, where)
 
 
+# Every command-line entry point the skill ships (issue #107 item 2).
+_CLIS = ("gather.py", "view.py", "link.py", "render.py", "digest.py",
+         "validate.py", "spotlight.py", "transcript.py",
+         "manifest_from_index.py", "ci_spotlight_integration.py",
+         os.path.join("samples", "build_report.py"),
+         os.path.join("examples", "formatters", "shipped_changelog.py"))
+
+
+class TestHelpAndUnknownFlags(unittest.TestCase):
+    """`--help` prints usage on stdout and exits 0; an unknown flag exits 2
+    with usage on stderr — for every CLI, hand-rolled argv included (#107)."""
+
+    def test_every_cli_help_exits_zero_with_usage(self):
+        for script in _CLIS:
+            for flag in ("--help", "-h"):
+                r = _cli(script, flag)
+                where = "{} {}".format(script, flag)
+                self.assertEqual(r.returncode, 0, (where, r.stderr))
+                self.assertIn("usage:", r.stdout, where)
+                self.assertNotIn("Traceback", r.stderr, where)
+
+    def test_every_cli_unknown_flag_exits_two_with_usage_on_stderr(self):
+        for script in _CLIS:
+            r = _cli(script, "--no-such-flag")
+            self.assertEqual(r.returncode, 2, (script, r.stderr))
+            self.assertIn("usage:", r.stderr, script)
+            self.assertNotIn("Traceback", r.stderr, script)
+
+    def test_hand_rolled_unknown_flag_in_any_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "b.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+            for args in ((path, "--bogus", "x"), (path, "--slice"),
+                         ("--slice", "x", path)):
+                r = _cli("link.py", *args)
+                self.assertEqual(r.returncode, 2, (args, r.stderr))
+                self.assertIn("usage:", r.stderr, args)
+                with open(path, encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), "{}", args)   # nothing written
+            # As with argparse, `--help` anywhere asks for help.
+            for args in ((path, "--help"), (path, "--slice", "-h")):
+                r = _cli("link.py", *args)
+                self.assertEqual(r.returncode, 0, (args, r.stderr))
+                self.assertIn("usage:", r.stdout, args)
+            for args in ((path, "--bogus"), ("--bogus",)):
+                r = _cli("transcript.py", *args)
+                self.assertEqual(r.returncode, 2, (args, r.stderr))
+                self.assertIn("usage:", r.stderr, args)
+
+    def test_transcript_still_reads_a_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("hello\n")
+            r = _cli("transcript.py", path)
+            self.assertEqual((r.returncode, r.stdout), (0, "hello\n"), r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

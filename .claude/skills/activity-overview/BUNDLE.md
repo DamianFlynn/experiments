@@ -16,14 +16,18 @@ The pipeline's **product is this structured view**, not the Markdown report — 
 report is just one renderer over it, and other formatters (changelog, social,
 video-script, dashboards) consume the same view. The contract:
 
-- **Versioned — with a known gap.** The view shape documented here is version `1`.
-  The code does not yet stamp it consistently: the bundle `gather` assembles in memory
-  carries `meta.schema_version: 1`, but a `view.py` bundle (and so a linked/rendered one)
-  and each `members[].bundle.meta` carry **no** `meta.schema_version`, and the
-  `digest.py` project view's `meta.schema_version` is the **store** schema version
-  (`graphstore.SCHEMA_VERSION`, currently `2`), not this document's. A formatter should
-  check for the keys it needs (as `examples/formatters/shipped_changelog.py` does) rather
-  than rely on that number. Bumps are recorded here.
+- **Versioned.** `meta.schema_version` (currently `3`,
+  `extract.VIEW_CONTRACT_VERSION`) identifies the shape on BOTH entry points — the
+  single-repo bundle and the multi-repo project view (and each
+  `members[].bundle.meta`); gather's in-memory bundle carries it too. A formatter
+  should read it and refuse a version it doesn't understand (`samples/build_report.py`
+  refuses a newer one). It is the view contract only: the store's own schema
+  version is `graphstore.SCHEMA_VERSION`, kept in the store's meta (STORE.md).
+  Bumps are recorded here: `1` was declared while extract views carried no version
+  and digest stamped the store's `2`; `3` (#107) is the first version every view
+  carries, covering the incompatible changes since `1` (project people areas
+  `repo::area`, series v2, train `issues` / `pr_outcomes`), and no earlier view ever
+  carried it. A view without the key predates #107.
 - **Two entry points, same shape family.** Single-repo: the enriched bundle view
   (`extract` → `link.py`) — keys documented below. Multi-repo project: `python3
   digest.py --store <db> --project <name> --from … --to …` emits the merged
@@ -62,6 +66,12 @@ video-script, dashboards) consume the same view. The contract:
   with `digest.py --manifest M` when the manifest declares `"ticket_prefixes":
   ["ABC", "PLAT"]` (pattern `\b(?:ABC|PLAT)-\d+\b`), or with `--ticket-pattern RE`
   (wins over the manifest).
+- **Project view: `module_edges` (#107).** One row per stored `depends_on` edge out
+  of a member: `{src_repo, src_area, dst_repo, dst_area, version, transitive,
+  cross_repo, ref}`, plus `address` and `via` only on a nested `module.a.module.b`
+  call. **Window rule:** `depends_on` is a current-state edge, kept as of the latest
+  fold (#95); `module_edges` lists the edges as of the store's latest gather, not
+  the edges of the view's `--from`/`--to` window.
 - **Project view: member `meta` identity.** In `members[].bundle.meta`, `owner` is
   the store's **project scope** and `repo` the store's repo key — for a manifest
   member `owner` is the project name and `repo` is already `owner/name`, so never
@@ -133,16 +143,18 @@ the rest (engagement, code areas, trains, people/flow).
   commit in it or its margin, before later ones), so the structure is the head's; both `null`
   without a clone. `clone_sha` is provenance only: nothing checks it out again or rebuilds
   from it.
-  **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` |
-  `none`) records how gather obtained the clone (see `gather.prepare_clone`), and
-  **`boundary_dropped_commits`** lists in-window commits whose diffs were dropped at the
-  shallow-clone boundary; both are in the bundle `acquire` assembles only — they are not
-  folded into the store and never appear in a view.   **`closing_refs_source`** (`graphql` | `keywords`, issue #105) is likewise bundle-only:
-  where the PRs' `closes` came from — GitHub's `closingIssuesReferences` merged with the
-  closing keywords, or the keywords alone because GraphQL was unavailable (gather prints
-  which on stderr). (Store-only — see `STORE.md`; this
-  bundle shape is the transient view `extract` materializes from the store, not a produced
-  file.)
+  **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` | `none`) records how gather
+  obtained the clone (see `gather.prepare_clone`), and **`boundary_dropped_commits`** lists
+  the in-window commit shas whose diffs the shallow boundary dropped (the code history is
+  incomplete for them). Since #107 fold stores both per gathered window and a view carries
+  them (omit-when-absent): `clone_mode` only for a view of exactly one gathered window,
+  `boundary_dropped_commits` as the sorted union over the gathered windows wholly inside
+  the view, omitted when empty. **`closing_refs_source`** (`graphql` | `keywords`, issue
+  #105) is bundle-only: where the PRs' `closes` came from — GitHub's
+  `closingIssuesReferences` merged with the closing keywords, or the keywords alone because
+  GraphQL was unavailable (gather prints which on stderr). (Store-only — see `STORE.md`;
+  this bundle shape is the transient view `extract` materializes from the store, not a
+  produced file.)
   A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
   to, base_branch, branches` (+ `clone_sha`, `state_as_of`, `facts_windows` when they apply),
   **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).

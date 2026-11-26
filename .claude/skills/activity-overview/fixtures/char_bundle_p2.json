@@ -159,6 +159,7 @@
     },
     "ref_date": "2026-05-31",
     "repo": "r",
+    "schema_version": 3,
     "to": "2026-05-31"
   },
   "milestones": [

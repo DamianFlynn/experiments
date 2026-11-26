@@ -6,6 +6,13 @@ Readers, writers, and downstream renderer authors rely on this file as the
 contract. `graphstore.py` owns the schema and the core read/write API; callers
 use that API (a couple of readers also run their own read-only queries).
 
+**Readers open the store read-only (#107).** `view.py`, `digest.py`,
+`spotlight.py` and `ci_spotlight_integration.py` open it with
+`graphstore.open_store_readonly` (never creates a file; any write raises), so
+the store's bytes are unchanged after a read. The one exception is
+`spotlight.py --complete` with a `GITHUB_TOKEN`, which writes the anchors it
+backfills and opens the store read-write.
+
 > **Store-only.** This trustworthy graph IS the deliverable.
 > `gather --store` writes it and nothing else — there is no longer a flat bundle
 > JSON artifact. The bundle is a **transient view** that `extract` materializes
@@ -228,6 +235,16 @@ view overlaps when their non-null values agree, else `null` / `[]` with a stderr
 their views report the base branch unknown and count every merged PR as shipped, as
 before; re-gather to get stacked / release-branch PRs told apart.
 
+`clone:{project}/{repo}:{from}:{to}` (issue #107): JSON `{"clone_mode": str|null,
+"boundary_dropped_commits": [sha]}` (sorted), how a gathered window's clone was made
+and the in-window commits whose diffs its shallow boundary dropped; a re-fold of the
+same window replaces it — `set_clone_info`/`get_clone_info`. Written in the fold
+transaction when the bundle's `meta` has `from`, `to` and either key (every gather).
+`extract` stamps `meta.clone_mode` for a view of exactly that window and
+`meta.boundary_dropped_commits` as the union over the gathered windows wholly inside
+the view (each omitted when absent or empty). Stores folded before #107 have no
+`clone:` keys and their views carry neither.
+
 `facts:{project}/{repo}:{from}:{to}` (issue #94): JSON `{"clone_sha": str|null,
 "facts": {key: sha256}, "ci_collected": bool}` (`ci_collected` is false when the
 window was gathered with `--no-workflows`: no CI facts, as distinct from zero runs;
@@ -284,6 +301,11 @@ stays listed even if it holds only stand-ins.
 `graphstore.SCHEMA_VERSION` is **2**. `init_schema` creates a new store at the
 current version and migrates an older one **in place**; every step is additive
 and idempotent, and the stored version is raised, never lowered.
+
+This versions the STORE only and lives only in the store's meta. Views carry a
+separate bundle/view contract version, `meta.schema_version` =
+`extract.VIEW_CONTRACT_VERSION` (BUNDLE.md, #107); the two are bumped
+independently.
 
 | Version | Change | Migration from the previous version |
 |---|---|---|

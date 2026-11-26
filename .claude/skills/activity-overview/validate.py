@@ -72,8 +72,19 @@ merged, a comment body) or a wrong ledger leave a self-consistent store. A
 or a raw bundle) catches changed or deleted records; there is no per-fold
 content digest in the store.
 
-Project mode (validate_project) adds two project-wide checks:
+The row-level checks (referential_integrity, provenance, no_fabrication,
+schema_conformance) audit the rows the audited repo owns: a node by its
+project/repo columns, an edge by the repo of its src (a person's edge by the
+repo of its dst), as edge_set assigns them. Rows no member repo owns (people,
+non-member rows) and the store-wide parts (the per-window facts index,
+case-variant scopes) are audited with them in a single-repo report, and once,
+project-wide, in project mode (issue #107).
+
+Project mode (validate_project) adds the project-wide checks:
     no_drift_people         ERROR  project people == union re-derived over members.
+    referential_integrity, provenance, no_fabrication, schema_conformance
+                            ERROR  the same checks over the shared rows and the
+                                    store-wide parts, once for the project.
     member_status           ERROR  every manifest member's last gather of every
                                     recorded window is ok (#77); a failed member
                                     with no node at all is reported here.
@@ -164,10 +175,6 @@ def _edge(row):
 
 def _all_node_ids(conn):
     return {r[0] for r in conn.execute("SELECT id FROM nodes")}
-
-
-def _all_nodes(conn):
-    return [_node(r) for r in conn.execute("SELECT * FROM nodes")]
 
 
 def _all_edges(conn):
@@ -328,9 +335,90 @@ def _is_person_id(qid):
     return local.startswith("person-") and not graphstore.is_artifact_local(local)
 
 
+# --- audit scope (issue #107) -------------------------------------------------
+
+class _Scope:
+    """Which stored rows a row-level check (referential_integrity, provenance,
+    no_fabrication, schema_conformance) audits.
+
+    Every row has one owner. A node is owned by the member repo its
+    project/repo columns name; an edge by the member repo of its src, a
+    person's edge by the member repo of its dst (as check_edge_set assigns
+    them, _owned_by_repo). A row no member owns (people, a non-member repo's
+    stand-ins, a row whose columns or ids name no member) is SHARED, and so
+    are the genuinely store-wide parts (the per-window facts index, scopes
+    stored under several case spellings).
+
+    `members`: the member repos of `project`; `unit`: the member repo whose
+    rows are audited (None: none); `shared`: also audit the shared rows and
+    the store-wide parts. A single-repo audit takes its repo plus the shared
+    part (on a one-repo store that is every row); project mode audits each
+    member's own rows in its report and the shared part once, project-wide.
+    """
+
+    def __init__(self, project, members, unit, shared):
+        self.project = project
+        self.unit = unit
+        self.shared = shared
+        self._scopes = {"{}/{}".format(project, r): r for r in members}
+
+    @classmethod
+    def single_repo(cls, conn, project, repo):
+        """The audit of one repo: its own rows and the shared part, where the
+        other stored member repos of the project own theirs."""
+        members = set(graphstore.project_repos(conn, project)) \
+            if project is not None else set()
+        if repo is not None:
+            members.add(repo)
+        return cls(project, members, repo, True)
+
+    def _owner_of_id(self, qid):
+        return self._scopes.get((qid or "").partition("#")[0])
+
+    def node_owner(self, n):
+        if n["project"] != self.project:
+            return None
+        return self._owner_of_id("{}/{}#".format(n["project"], n["repo"]))
+
+    def edge_owner(self, src, dst):
+        owner = self._owner_of_id(src)
+        if owner is None and _is_person_id(src or "") \
+                and graphstore.parse_id(src)["scope"] == self.project:
+            owner = self._owner_of_id(dst)
+        return owner
+
+    def _covers(self, owner):
+        return owner == self.unit if owner is not None else self.shared
+
+    def has_node(self, n):
+        return self._covers(self.node_owner(n))
+
+    def has_edge(self, src, dst):
+        return self._covers(self.edge_owner(src, dst))
+
+
+def _scoped_nodes(conn, scope):
+    """The decoded nodes `scope` owns (None: all). Rows are filtered on their
+    raw columns BEFORE decoding, so a corrupt row fails only the audit that
+    owns it."""
+    return [_node(r) for r in conn.execute("SELECT * FROM nodes")
+            if scope is None or scope.has_node(r)]
+
+
+def _scoped_edges(conn, scope):
+    """The decoded edges `scope` owns (None: all), filtered before decoding."""
+    return [_edge(r) for r in conn.execute("SELECT * FROM edges")
+            if scope is None or scope.has_edge(r["src_id"], r["dst_id"])]
+
+
+def _store_wide(scope):
+    """True when the audit includes the store-wide parts (no scope: all)."""
+    return scope is None or scope.shared
+
+
 # --- check 1: referential integrity ------------------------------------------
 
-def check_referential_integrity(conn):
+def check_referential_integrity(conn, scope=None):
     """Every edge's src_id and dst_id resolves to a stored node.
 
     EXCEPT spine edges (SPINE_EDGE_TYPES) may legitimately point at a
@@ -341,12 +429,16 @@ def check_referential_integrity(conn):
     reality, reported INFO. A dangling NON-spine edge (e.g. an `authored` whose
     person or target is absent) is an ERROR. Counts are reported per edge type.
     A per-window facts entry (issue #94) naming a value that is not stored, or
-    that cannot be read, is an ERROR too.
+    that cannot be read, is an ERROR too (a store-wide part).
+
+    `scope` (_Scope, issue #107) limits the audit to the edges it owns (and
+    the facts index to an audit that includes the store-wide parts); None
+    audits the whole store.
     """
     ids = _all_node_ids(conn)
     details = []
     per_type = {}
-    for e in _all_edges(conn):
+    for e in _scoped_edges(conn, scope):
         et = e["edge_type"]
         per_type.setdefault(et, {"edges": 0, "dangling": 0})
         per_type[et]["edges"] += 1
@@ -372,7 +464,8 @@ def check_referential_integrity(conn):
             })
     # The per-window facts index (issue #94) must name stored values: a view
     # of that window would otherwise silently lose its CI stats / structure.
-    for key, problem in graphstore.window_facts_problems(conn):
+    for key, problem in (graphstore.window_facts_problems(conn)
+                         if _store_wide(scope) else []):
         details.append({"severity": ERROR, "meta_key": key,
                         "problem": problem,
                         "note": "dangling per-window facts reference"})
@@ -584,7 +677,7 @@ def _social_provenance_problem(node, local):
     return None if _has_source_ref(node) else "no url/number/sha in data"
 
 
-def check_provenance(conn):
+def check_provenance(conn, scope=None):
     """Every social/code node cites a source that is ITS OWN (issue #89):
 
     - a PR (`pr-N`) / issue (`issue-N`) carries `number == N` and a `url` that
@@ -600,9 +693,12 @@ def check_provenance(conn):
     schema gives them no url and they are not narrated as sourced facts. This
     proves a citation points at the right object, not that the object's
     content is what GitHub says: that needs --bundle (see no_drift).
+
+    `scope` (_Scope, issue #107) limits the audit to the nodes it owns; None
+    audits the whole store.
     """
     details = []
-    for n in _all_nodes(conn):
+    for n in _scoped_nodes(conn, scope):
         if n["node_class"] == "structure" or not n["id"]:
             continue
         local = graphstore.local_id(n["id"], n["project"], n["repo"])
@@ -738,7 +834,7 @@ def _code_form_problem(node, local):
             "{!r}".format(local))
 
 
-def check_no_fabrication(conn):
+def check_no_fabrication(conn, scope=None):
     """No invented entities, no historyless artifacts, no malformed ids.
 
     - Every person node is referenced by >=1 contribution edge (a person with
@@ -753,17 +849,25 @@ def check_no_fabrication(conn):
     - No node has an empty/None id; ids round-trip through parse_id, follow the
       id grammar and agree with the row's project/repo columns
       (_id_grammar_problem), and no scope is stored under two case spellings
-      (issue #89).
+      (issue #89; a store-wide part).
+
+    `scope` (_Scope, issue #107) limits the audit to the nodes it owns (and
+    the case-spelling check to an audit that includes the store-wide parts);
+    None audits the whole store. A person's contribution edges count in any
+    repo.
     """
     details = []
-    nodes = _all_nodes(conn)
+    nodes = _scoped_nodes(conn, scope)
     for n in nodes:
         if n["id"]:
             problem = _id_grammar_problem(n)
             if problem:
                 details.append({"severity": ERROR, "id": n["id"],
                                 "problem": problem})
-    details.extend(_case_variant_details(nodes))
+    if _store_wide(scope):
+        # ids only: the raw rows, so another audit's corrupt row is not read
+        details.extend(_case_variant_details(
+            conn.execute("SELECT id FROM nodes").fetchall()))
     # contribution edges by person src
     contrib_src = set()
     for r in conn.execute(
@@ -904,7 +1008,7 @@ def _id_project(qid):
     return scope if _is_person_id(qid) else scope.split("/", 1)[0]
 
 
-def check_schema_conformance(conn):
+def check_schema_conformance(conn, scope=None):
     """Each edge type's endpoints match STORE.md semantics: `authored` src is a
     person and dst a pr/commit; `touches` commit->area; `owns` person->area;
     `cross_ref` pr->issue/pr; `in_milestone` dst is a milestone; etc. A STORED
@@ -913,10 +1017,13 @@ def check_schema_conformance(conn):
     in _EDGE_SCHEMA is an ERROR (issue #89: unknown types used to be skipped).
     Both endpoints of an edge belong to one project, and the types in
     _SAME_REPO_EDGE_TYPES stay inside one repo.
+
+    `scope` (_Scope, issue #107) limits the audit to the edges it owns; None
+    audits the whole store.
     """
     cache = {}
     details = []
-    for e in _all_edges(conn):
+    for e in _scoped_edges(conn, scope):
         et = e["edge_type"]
         rule = _EDGE_SCHEMA.get(et)
         if rule is None:
@@ -1901,7 +2008,8 @@ def _self_source_bundle(conn, project, repo):
         return None, "extract failed: {}: {}".format(type(exc).__name__, exc)
 
 
-def validate_repo(conn, project, repo, bundle=None, check_people=True):
+def validate_repo(conn, project, repo, bundle=None, check_people=True,
+                  scope=None):
     """Run all trustworthiness checks for a single (project, repo) and return a
     Report. The two real-data checks (no_drift, idempotency) need a raw bundle
     to re-derive against; when `bundle` is not passed they SELF-SOURCE it from
@@ -1912,18 +2020,27 @@ def validate_repo(conn, project, repo, bundle=None, check_people=True):
     `check_people=False` (set by validate_project) drops no_drift's people section
     here: project-scoped people are audited once project-wide by
     check_no_drift_people, not per member.
+
+    The row-level checks (referential_integrity, provenance, no_fabrication,
+    schema_conformance) audit `scope` (_Scope, issue #107): by default this
+    repo's own rows plus the shared rows and store-wide parts, so another
+    stored member's errors are not reported here. validate_project passes
+    the member's own rows only and audits the shared part once.
     """
+    if scope is None:
+        scope = _Scope.single_repo(conn, project, repo)
     # Every check is _guarded: the auditor must never crash on a bad store. A
     # check that raises (a corrupt row, a re-derive/re-fold failure) is a failed
     # ERROR check naming the error, and every check is always listed (#79).
     checks = [
         _guarded(check_target, "target", conn, project, repo),
-        _guarded(check_referential_integrity, "referential_integrity", conn),
+        _guarded(check_referential_integrity, "referential_integrity",
+                 conn, scope),
         _guarded(check_participant_completeness, "participant_completeness",
                  conn, project, repo, bundle),
-        _guarded(check_provenance, "provenance", conn),
-        _guarded(check_no_fabrication, "no_fabrication", conn),
-        _guarded(check_schema_conformance, "schema_conformance", conn),
+        _guarded(check_provenance, "provenance", conn, scope),
+        _guarded(check_no_fabrication, "no_fabrication", conn, scope),
+        _guarded(check_schema_conformance, "schema_conformance", conn, scope),
     ]
     # edge_set always audits the store against ITS OWN records (self-sourced),
     # also when an external bundle is passed: the bundle's job is to vouch for
@@ -1987,10 +2104,14 @@ def validate_project(conn, project, repos):
     member_reports = []
     for repo in repos:
         # check_people=False: people are project-scoped; audited once below.
-        rep = validate_repo(conn, project, repo, check_people=False)
+        # The row-level checks audit the member's own rows only (#107).
+        rep = validate_repo(conn, project, repo, check_people=False,
+                            scope=_Scope(project, repos, repo, False))
         member_reports.append({"repo": repo, **rep.to_dict()})
     # PROJECT-WIDE checks (the ones whose unit is the project, not a member repo):
-    # people drift over the cross-member union; the manifest members' run status.
+    # people drift over the cross-member union; the row-level checks over the
+    # rows no member owns (people, non-member rows) and the store-wide parts,
+    # once (#107); the manifest members' run status.
     project_checks = []
     if repos:
         project_checks.append(_guarded(check_no_drift_people, "no_drift_people",
@@ -2001,6 +2122,14 @@ def validate_project(conn, project, repos):
         project_checks.append(_check("target", ERROR, [{
             "severity": ERROR, "project": project,
             "problem": "project has no member repo with stored nodes"}]))
+    shared = _Scope(project, repos, None, True)
+    project_checks.extend([
+        _guarded(check_referential_integrity, "referential_integrity",
+                 conn, shared),
+        _guarded(check_provenance, "provenance", conn, shared),
+        _guarded(check_no_fabrication, "no_fabrication", conn, shared),
+        _guarded(check_schema_conformance, "schema_conformance", conn, shared),
+    ])
     project_checks.append(_guarded(check_member_status, "member_status",
                                    conn, project))
     ok = (all(r["ok"] for r in member_reports)

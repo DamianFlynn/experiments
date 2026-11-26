@@ -1348,12 +1348,29 @@ def _write_json_atomic(path, obj):
         raise
 
 
+_USAGE = "usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json]\n"
+_HELP = _USAGE + """
+Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
+
+  --slice TRAIN_ID     print one train's self-contained slice as JSON on
+                       stdout; BUNDLE.json is not rewritten
+  --series PATH        also compare with, and record this window in, the
+                       series index at PATH
+  -h, --help           show this help and exit
+"""
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     # Accept ONLY the documented shapes: `BUNDLE`, `BUNDLE --slice TRAIN_ID`, or
     # `BUNDLE --series series.json`. The flag is recognized strictly as the
     # second positional, and any other argv shape is rejected (no flag-anywhere
     # / unknown-arg surprises). `--slice` and `--series` are mutually exclusive.
+    # `-h` / `--help` anywhere prints help (exit 0), as argparse does; a BUNDLE
+    # or value that looks like a flag is an unknown flag (exit 2, usage).
+    if "-h" in argv or "--help" in argv:
+        sys.stdout.write(_HELP)
+        raise SystemExit(0)
     slice_id = None
     series_path = None
     if len(argv) == 1:
@@ -1363,8 +1380,10 @@ def main(argv=None):
     elif len(argv) == 3 and argv[1] == "--series":
         path, series_path = argv[0], argv[2]
     else:
-        sys.stderr.write(
-            "usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json]\n")
+        path = None
+    if path is None or path.startswith("-") or (
+            (slice_id or series_path or "").startswith("-")):
+        sys.stderr.write(_USAGE)
         raise SystemExit(2)
     with open(path, encoding="utf-8") as fh:
         bundle = json.load(fh)
