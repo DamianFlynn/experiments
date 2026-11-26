@@ -3737,6 +3737,30 @@ def _child_env(args):
     return env
 
 
+# Seconds to wait before each retry of a git command that failed on the
+# network (three retries). Read-only and fetch commands are safe to repeat.
+GIT_NETWORK_RETRY_DELAYS = (2, 8, 30)
+_GIT_NETWORK_ERRORS = (
+    "SSL_ERROR_SYSCALL", "SSL_read", "RPC failed", "early EOF",
+    "Connection reset", "Connection timed out", "Could not resolve host",
+    "unexpected disconnect", "The remote end hung up unexpectedly",
+    "could not fetch", "Failed to connect", "HTTP 502", "HTTP 503", "HTTP 504",
+    "error: 502", "error: 503", "error: 504", "TLS connection was non-properly terminated",
+    "gnutls_handshake", "Operation timed out",
+)
+
+
+def _git_network_failure(stderr):
+    """The marker of a transient network failure found in git's stderr, or
+    None. LC_ALL=C (see _child_env) keeps these messages in English."""
+    text = stderr or ""
+    return next((m for m in _GIT_NETWORK_ERRORS if m in text), None)
+
+
+def _sleep(seconds):
+    time.sleep(seconds)
+
+
 def run_git(args, cwd=None, timeout=None):
     """Thin wrapper around git. Its live git interaction is integration-only,
     but the non-UTF-8 decode path below is covered by TestRunGitDecoding.
@@ -3765,15 +3789,32 @@ def run_git(args, cwd=None, timeout=None):
     args = list(args)
     if args and os.path.basename(args[0]) == "git":
         args = [args[0], "-c", "core.quotepath=false"] + args[1:]
-    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=timeout,
-                          env=_child_env(args))
-    if proc.returncode != 0:
+    is_git = bool(args) and os.path.basename(args[0]) == "git"
+    attempt = 0
+    while True:
+        proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              env=_child_env(args))
+        if proc.returncode == 0:
+            return proc.stdout
+        # A dropped connection is retried (git only): the clone is partial
+        # (`--filter=blob:none`), so even a local-looking `git log -p` fetches
+        # file contents from the remote while it runs, and one reset used to
+        # end a gather after minutes of work with nothing stored.
+        if is_git and attempt < len(GIT_NETWORK_RETRY_DELAYS) \
+                and _git_network_failure(proc.stderr):
+            delay = GIT_NETWORK_RETRY_DELAYS[attempt]
+            attempt += 1
+            sys.stderr.write(
+                "note: git lost its connection ({}); retry {} of {} in {}s\n".format(
+                    _git_network_failure(proc.stderr), attempt,
+                    len(GIT_NETWORK_RETRY_DELAYS), delay))
+            _sleep(delay)
+            continue
         raise RuntimeError(
             f"command failed (exit {proc.returncode}): {' '.join(args)}\n"
             f"{proc.stderr.strip()}"
         )
-    return proc.stdout
 
 
 def git_ls_files(clone_dir, run=None):
