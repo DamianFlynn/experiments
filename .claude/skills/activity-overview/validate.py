@@ -1303,11 +1303,15 @@ def _fact_signatures(value):
     code_graph a dict with an `areas` list, label_taxonomy a dict with a
     `source` string, code_owners a CODEOWNERS rule list, workflow_stats a
     {workflow: {total, ...}} dict, module_notes a dict with a `changelogs`
-    list, pr_history a dict with a `prs` list and a `base`."""
+    list, pr_history a dict with a `prs` list and a `base`, affiliations a
+    dict with a `home_orgs` list and a `people` map."""
     out = set()
     if isinstance(value, dict):
         if isinstance(value.get("areas"), list):
             out.add("code_graph")
+        if isinstance(value.get("home_orgs"), list) and \
+                isinstance(value.get("people"), dict):
+            out.add("affiliations")
         if isinstance(value.get("changelogs"), list):
             out.add("module_notes")
         if isinstance(value.get("prs"), list) and "base" in value:
@@ -1324,6 +1328,49 @@ def _fact_signatures(value):
     return out
 
 
+# What an `affiliations` person entry may hold (gather decide_affiliation):
+# the label, the signal name, its strength and the email-domain boolean —
+# never profile text, a company or an email (the privacy contract).
+_AFFILIATION_ENTRY_KEYS = {"affiliation", "signal", "strength",
+                           "home_email_domain"}
+_AFFILIATION_FACT_KEYS = {"collected", "home_orgs", "home_names",
+                          "home_email_domains", "people", "unknown",
+                          "not_checked", "groups_unresolved", "windows",
+                          "covers_view"}
+
+
+def _affiliations_problem(value):
+    """Why a stored `affiliations` value is not one gather writes (an entry
+    carrying anything but the label, the signal, its strength and the
+    email-domain boolean; an unknown label / signal / strength), or None."""
+    if value.get("collected") is False and set(value) == {"collected"}:
+        return None
+    extra = sorted(set(value) - _AFFILIATION_FACT_KEYS)
+    if extra:
+        return "affiliations carries unexpected key(s) {}".format(", ".join(extra))
+    people = value.get("people")
+    if not isinstance(people, dict):
+        return "affiliations.people is not a {login: entry} map"
+    for login in sorted(people):
+        e = people[login]
+        if not isinstance(e, dict) or not set(e) <= _AFFILIATION_ENTRY_KEYS:
+            return "affiliations.people[{!r}] holds more than the label, signal, " \
+                   "strength and home_email_domain".format(login)
+        if e.get("affiliation") not in gather.AFFILIATIONS:
+            return "affiliations.people[{!r}].affiliation {!r} is not one gather " \
+                   "writes".format(login, e.get("affiliation"))
+        if e.get("signal") not in gather.AFFILIATION_SIGNALS:
+            return "affiliations.people[{!r}].signal {!r} is not one gather " \
+                   "writes".format(login, e.get("signal"))
+        if "strength" in e and e["strength"] not in gather.AFFILIATION_STRENGTHS:
+            return "affiliations.people[{!r}].strength {!r} is not one gather " \
+                   "writes".format(login, e["strength"])
+        if "home_email_domain" in e and e["home_email_domain"] is not True:
+            return "affiliations.people[{!r}].home_email_domain is not true".format(
+                login)
+    return None
+
+
 def _fact_shape_problem(key, value):
     """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
     or None: it is not a JSON object (code_owners: an object or a rule list),
@@ -1333,6 +1380,10 @@ def _fact_shape_problem(key, value):
         ok = isinstance(value, (dict, list))
     else:
         ok = isinstance(value, dict)
+    if ok and key == "affiliations":
+        why = _affiliations_problem(value)
+        if why:
+            return why
     sig = _fact_signatures(value)
     if ok and (not sig or key in sig):
         return None

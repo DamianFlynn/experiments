@@ -250,6 +250,14 @@ a PR / issue created in the window (the search API allows 30 requests a minute; 
 waited out like any other). `ACTIVITY_NEWCOMERS_MAX` (default `200`, min `0`) caps the
 candidates checked (the rest are listed as `not_checked`); `--no-newcomers` skips the check.
 
+Contributor affiliation (`affiliations`, BUNDLE.md "The people layer"): for each person not
+decided by the operator's override list or `author_association`, one
+`orgs/{org}/public_members/{login}` call per home organisation and one `users/{login}` call,
+cached for the run. `ACTIVITY_AFFILIATION_MAX` (default `300`, min `0`) caps the people looked
+up (the rest are `not_checked`); `--no-affiliation` skips the check. Settings: `--home-org`,
+`--home-name`, `--home-email-domain`, `--affiliation LOGIN=…` / `@org/team=…` (repeatable), or
+a manifest `affiliation` object.
+
 ### Projects v2 board knobs
 
 When a repo links Projects v2 boards, gather ingests **every maintained** board it

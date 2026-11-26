@@ -1154,7 +1154,8 @@ def commits_api_url(api, head_sha, frm, to):
     return f"{api}/commits?{query}"
 
 
-def resolve_commit_authors(commits, api_logins, known_logins=()):
+def resolve_commit_authors(commits, api_logins, known_logins=(),
+                           home_domains=(), home_email=None):
     """Resolve each commit's `author` to a GitHub login, in place (#78).
 
     Sets `author` (the login, or the unresolved person key), `author_name` (the
@@ -1162,7 +1163,10 @@ def resolve_commit_authors(commits, api_logins, known_logins=()):
     transient `author_email`. A noreply-email login takes the spelling of a
     `known_logins` entry that differs only in case (GitHub logins are
     case-insensitive). Returns {sha: author} so the code/symbol events of the
-    same commits can be re-keyed (`remap_event_authors`). Deterministic."""
+    same commits can be re-keyed (`remap_event_authors`). Deterministic.
+    With `home_domains`, the resolved login of a commit whose email is in one
+    of them (email_domain_is_home) is added to the set `home_email`: the only
+    trace of the email that survives (the affiliation signal)."""
     by_lower = {}
     for login in sorted(k for k in known_logins if k):
         by_lower.setdefault(login.lower(), login)
@@ -1180,6 +1184,8 @@ def resolve_commit_authors(commits, api_logins, known_logins=()):
             c["author"] = login
             c["login_resolved"] = True
             c["login_source"] = source
+            if home_email is not None and email_domain_is_home(email, home_domains):
+                home_email.add(login)
         else:
             c["author"] = derive.unresolved_person_key(name)
             c["login_resolved"] = False
@@ -4179,6 +4185,32 @@ def parse_args(argv):
                         "search API calls per author of a PR / issue created "
                         "in the window); the window's `newcomers` fact then "
                         "says it was not collected")
+    p.add_argument("--no-affiliation", dest="affiliation_enabled",
+                   action="store_false", default=True,
+                   help="skip the contributor affiliation check (up to one "
+                        "public-membership call per home organisation and "
+                        "one profile call per person not decided by the "
+                        "override list or author_association); the window's "
+                        "`affiliations` fact then says it was not collected")
+    p.add_argument("--home-org", action="append", default=[], metavar="ORG",
+                   help="a GitHub organisation whose members count as the "
+                        "maintainers (repeatable; the repo's owner always "
+                        "does). Also matched against profile companies.")
+    p.add_argument("--home-name", action="append", default=[], metavar="NAME",
+                   help="another company name meaning a home organisation in "
+                        "a profile (repeatable; compared after normalisation, "
+                        "e.g. 'Microsoft' matches '@microsoft' and 'Microsoft "
+                        "Corporation')")
+    p.add_argument("--home-email-domain", action="append", default=[],
+                   metavar="DOMAIN",
+                   help="a commit email domain meaning a home organisation "
+                        "(repeatable; checked at gather time, only a boolean "
+                        "is kept)")
+    p.add_argument("--affiliation", action="append", default=[],
+                   metavar="LOGIN=AFFILIATION",
+                   help="operator override, highest priority: LOGIN or "
+                        "@org/team mapped to maintainer_org, community or "
+                        "unknown (repeatable)")
     p.add_argument("--no-pr-history", dest="pr_history", action="store_false",
                    default=True,
                    help="skip the PR-internal history: fetching every window "
@@ -4256,6 +4288,10 @@ def parse_args(argv):
         # Stored with the window at fold and read back by every view (#75).
         if args.ref_date is not None:
             manifest_mod.check_ref_date(args.ref_date, "--ref-date")
+        for text in args.affiliation:
+            parse_affiliation_override(text)
+        for org in args.home_org:
+            manifest_mod.check_owner(org, "--home-org")
     except ValueError as exc:
         p.error(str(exc))
     return args
@@ -4945,6 +4981,7 @@ def validate_env_knobs(env=None):
     _http_settings(env)
     _iac_settings(env)
     _newcomers_max(env)
+    _affiliation_max(env)
 
 
 def _auth_allowed(url):
@@ -5870,9 +5907,29 @@ def _next_link(link_header):
     return None
 
 
+_PUBLIC_MEMBER_RE = re.compile(r"^https://api\.github\.com/orgs/[^/?#]+/public_members/[^/?#]+$")
+
+
+def public_member_probe(url, token, opener=None, sleep=None, clock=None):
+    """GET /orgs/{org}/public_members/{login} -> ({"public_member": bool},
+    None): GitHub answers 204 (a public member) or 404 (not one, or the
+    membership is private). Any other failure raises SystemExit, as
+    http_get_json does."""
+    req = urllib.request.Request(url, headers=_github_headers(url, token))
+    try:
+        headers, _body = _github_open(req, url, opener=opener, sleep=sleep,
+                                      clock=clock, allow_statuses=(404,))
+    except GitHubAPIError as err:
+        raise SystemExit(str(err)) from None
+    return {"public_member": headers is not None}, None
+
+
 def _paginated(token):
-    """Adapter: turn http_get_json into the (items, next) shape fetch_all wants."""
+    """Adapter: turn http_get_json into the (items, next) shape fetch_all wants.
+    A public-membership probe (no JSON body) answers {"public_member": bool}."""
     def get_page(url):
+        if _PUBLIC_MEMBER_RE.match(url or ""):
+            return public_member_probe(url, token)
         return http_get_json(url, token)
     return get_page
 
@@ -6043,11 +6100,62 @@ def newcomer_candidates(prs, issues, from_date, to_date):
 
 def newcomer_search_url(owner, repo, login, before, kind):
     """The search URL counting `login`'s `kind` ("pr" | "issue") items in
-    owner/repo created before `before` (the window's first day). Pure."""
+    owner/repo created before `before` (the window's first day), newest
+    first, so the one item returned (`per_page=1`) is the most recent
+    earlier one: its `created_at` is `last_seen_before`. Pure."""
     q = "repo:{}/{} is:{} author:{} created:<{}".format(owner, repo, kind,
                                                         login, before)
-    return "{}?{}".format(SEARCH_ISSUES_URL,
-                          urllib.parse.urlencode({"q": q, "per_page": 1}))
+    return "{}?{}".format(SEARCH_ISSUES_URL, urllib.parse.urlencode(
+        {"q": q, "sort": "created", "order": "desc", "per_page": 1}))
+
+
+def search_latest_created(page):
+    """`created_at` of the first item of one search response (sorted by
+    created, newest first: the most recent earlier item), or None. Pure."""
+    if not isinstance(page, dict):
+        return None
+    items = page.get("items")
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return None
+    created = items[0].get("created_at")
+    return created if isinstance(created, str) and created else None
+
+
+# Returning contributors: a candidate whose most recent earlier PR / issue is
+# more than RETURNING_GAP_DAYS[0] days before their first item of the window
+# is `returning`, bucketed by the largest threshold the gap exceeds (a month
+# counted as 30 days); anyone else with earlier activity is `regular`.
+RETURNING_GAP_DAYS = (90, 180, 270)
+RETURNING_GAP_BUCKETS = {90: "over_3_months", 180: "over_6_months",
+                         270: "over_9_months"}
+
+
+def _gap_days(earlier, later):
+    a, b = derive._iso_date(earlier), derive._iso_date(later)
+    if a is None or b is None:
+        return None
+    return (b - a).days
+
+
+def gap_bucket(gap_days):
+    """The RETURNING_GAP_BUCKETS label of a gap, or None when it is not more
+    than the smallest threshold (or unknown). Pure."""
+    if not isinstance(gap_days, int):
+        return None
+    hit = [t for t in RETURNING_GAP_DAYS if gap_days > t]
+    return RETURNING_GAP_BUCKETS[max(hit)] if hit else None
+
+
+def _search_answer(answer):
+    """(count, latest created_at) of a `search` seam answer: an int count
+    (no date), a {"count", "latest"} dict, or None (cannot tell)."""
+    if isinstance(answer, dict):
+        count, latest = answer.get("count"), answer.get("latest")
+    else:
+        count, latest = answer, None
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None, None
+    return count, latest if count else None
 
 
 def search_total_count(page):
@@ -6066,43 +6174,89 @@ def find_newcomers(candidates, search, before, max_candidates=NEWCOMERS_MAX,
     """Decide which `candidates` (newcomer_candidates) are new before `before`.
 
     `search(login, kind)` returns how many `kind` items `login` created in the
-    repo before `before`, or None (or raises) when it cannot tell. A candidate
-    is checked for the kind they started with first and, only when that count
-    is 0, for the other kind. Returns the per-window fact value:
+    repo before `before` — an int, or {"count", "latest"} with the most
+    recent such item's `created_at` — or None (or raises) when it cannot
+    tell. A candidate is checked for the kind they started with first and,
+    when that count is 0, for the other kind; when it is not 0 and its
+    latest date is more than RETURNING_GAP_DAYS[0] days before the
+    candidate's first item, the other kind is checked too (a more recent
+    item of that kind would make the gap shorter), so `last_seen_before` is
+    the most recent earlier PR or issue. Returns the per-window fact value:
     {"collected": True, "before", "candidates": n, "new": [{"login", "first",
     "number", "url", "created_at"}] (by login), "unknown": [login],
     "not_checked": [login]} — `unknown`: a check failed (never guessed);
-    `not_checked`: beyond `max_candidates`. Network-free given `search`."""
+    `not_checked`: beyond `max_candidates`. When the seam answers dates, also
+    "returning": [candidate + {"last_seen_before", "gap_days",
+    "gap_bucket"}] (`gap_upper_bound: true` when the second kind's check
+    failed), "regular": [{"login", "last_seen_before", "gap_days"}],
+    "earlier_undated" (only when any: earlier activity, no date) and
+    "gap_thresholds_days". Network-free given `search`."""
     checked = candidates[:max_candidates]
     not_checked = sorted(c["login"] for c in candidates[max_candidates:])
-    new, unknown = [], []
+    new, unknown, returning, regular, undated = [], [], [], [], []
+    dated = False
     failures = 0
+
+    def ask(login, kind):
+        try:
+            return _search_answer(search(login, kind))
+        except (Exception, SystemExit):   # a failed call: http_get_json exits
+            return None, None
     for i, cand in enumerate(checked):
         if failures >= stop_after:
             unknown.extend(c["login"] for c in checked[i:])
             break
-        total = 0
-        for kind in (cand["first"], "issue" if cand["first"] == "pr" else "pr"):
-            try:
-                count = search(cand["login"], kind)
-            except (Exception, SystemExit):   # a failed call: http_get_json exits
-                count = None
-            if count is None:
-                total = None
-                break
-            total += count
-            if total:
-                break
-        if total is None:
+        first = cand["first"]
+        other = "issue" if first == "pr" else "pr"
+        count, latest = ask(cand["login"], first)
+        if count is None:
             unknown.append(cand["login"])
             failures += 1
             continue
+        dated = dated or latest is not None
+        upper_bound = False
+        gap = _gap_days(latest, cand["created_at"]) if latest else None
+        if count == 0 or (gap is not None and gap > RETURNING_GAP_DAYS[0]):
+            count2, latest2 = ask(cand["login"], other)
+            if count2 is None:
+                if count == 0:
+                    unknown.append(cand["login"])
+                    failures += 1
+                    continue
+                upper_bound = True
+            else:
+                dated = dated or latest2 is not None
+                count += count2
+                if latest2 and (latest is None or latest2 > latest):
+                    latest = latest2
         failures = 0
-        if total == 0:
+        if count == 0:
             new.append(dict(cand))
-    return {"collected": True, "before": before, "candidates": len(candidates),
-            "new": sorted(new, key=lambda e: e["login"]),
-            "unknown": sorted(unknown), "not_checked": not_checked}
+            continue
+        if latest is None:
+            undated.append(cand["login"])
+            continue
+        gap = _gap_days(latest, cand["created_at"])
+        bucket = gap_bucket(gap)
+        if bucket:
+            row = dict(cand, last_seen_before=latest, gap_days=gap,
+                       gap_bucket=bucket)
+            if upper_bound:
+                row["gap_upper_bound"] = True
+            returning.append(row)
+        else:
+            regular.append({"login": cand["login"], "last_seen_before": latest,
+                            "gap_days": gap})
+    out = {"collected": True, "before": before, "candidates": len(candidates),
+           "new": sorted(new, key=lambda e: e["login"]),
+           "unknown": sorted(unknown), "not_checked": not_checked}
+    if dated:
+        out["returning"] = sorted(returning, key=lambda e: e["login"])
+        out["regular"] = sorted(regular, key=lambda e: e["login"])
+        out["gap_thresholds_days"] = list(RETURNING_GAP_DAYS)
+    if undated:
+        out["earlier_undated"] = sorted(undated)
+    return out
 
 
 def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
@@ -6119,7 +6273,10 @@ def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
         calls[0] += 1
         page, _next = get_page(newcomer_search_url(owner, repo, login,
                                                    from_date, kind))
-        return search_total_count(page)
+        count = search_total_count(page)
+        if count is None:
+            return None
+        return {"count": count, "latest": search_latest_created(page)}
     if len(cands) > cap:
         sys.stderr.write(
             f"warning: {owner}/{repo}: {len(cands)} candidate first-time "
@@ -6129,12 +6286,385 @@ def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
     sys.stderr.write(
         f"newcomers: {owner}/{repo}: {len(cands)} candidate author(s), "
         f"{calls[0]} search call(s), {len(result['new'])} with no PR / issue "
-        f"before {from_date}\n")
+        f"before {from_date}, {len(result.get('returning') or [])} returning "
+        f"after more than {RETURNING_GAP_DAYS[0]} days\n")
     if result["unknown"]:
         sys.stderr.write(
             f"warning: {owner}/{repo}: could not tell whether "
             f"{len(result['unknown'])} author(s) are new (search failed); "
             f"recorded as newcomers.unknown: {', '.join(result['unknown'])}\n")
+    return result
+
+
+# --- Contributor affiliation (per-window fact `affiliations`) -----------------
+#
+# For each human person of the window (PR / issue authors, mergers, reviewers,
+# commenters, resolved commit authors): is that person with the organisation
+# that maintains the repository (`maintainer_org`: the repo's owner, plus any
+# organisation the operator names as home), `community`, or `unknown`? The
+# first signal that decides wins, in this order, and the fact records which
+# signal it was and how strong:
+#   1. the operator's override list (`--affiliation LOGIN=…`, `@org/team=…`,
+#      or the manifest's `affiliation.overrides`)               strength operator
+#   2. `author_association` on the person's own records in the window: OWNER /
+#      MEMBER (of the organisation that owns the repo, GitHub's value when
+#      gathered) -> strong, COLLABORATOR -> medium; never decides community
+#   3. public membership of a home organisation:
+#      GET /orgs/{org}/public_members/{login}, 204 = member        strong
+#   4. the public profile's `company` (GET /users/{login}), normalised
+#      (normalize_company) and compared with the home names: a match ->
+#      maintainer_org (medium); a non-empty company that does not match ->
+#      community (weak); empty -> no signal
+#   5. a commit author email in a home email domain, read at gather time and
+#      kept only as a boolean                                      medium
+#   6. nothing -> unknown (never community by default).
+# A failed lookup never lets a weaker signal decide `community` (that person
+# is `unknown`, signal `lookup_failed`). Signals 3 and 4 cost up to one call
+# per home organisation plus one per person, through the gather's GitHub
+# client (rate-limit waits, retries); answers are cached per URL for the run
+# (a manifest's members share it). Only the label, the signal name and its
+# strength are stored: never the company text, profile fields or an email.
+
+AFFILIATIONS = manifest_mod.AFFILIATION_VALUES
+AFFILIATION_SIGNALS = ("override", "author_association", "public_membership",
+                       "profile_company", "commit_email_domain", "none",
+                       "lookup_failed")
+AFFILIATION_STRENGTHS = ("operator", "strong", "medium", "weak")
+AFFILIATION_MAX = 300             # people looked up per window (ACTIVITY_AFFILIATION_MAX)
+AFFILIATION_FAILURE_STOP = 3      # people in a row whose lookups failed
+_HOME_ASSOCIATIONS = {"OWNER": "strong", "MEMBER": "strong",
+                      "COLLABORATOR": "medium"}
+_ASSOCIATION_RANK = {"OWNER": 3, "MEMBER": 2, "COLLABORATOR": 1}
+_COMPANY_SUFFIXES = ("corporation", "corp", "incorporated", "inc", "limited",
+                     "ltd", "llc", "gmbh", "plc")
+USERS_API = "https://api.github.com/users/"
+ORGS_API = "https://api.github.com/orgs/"
+NOREPLY_EMAIL_DOMAIN = "users.noreply.github.com"
+_GROUP_RE = manifest_mod._GROUP_RE      # `@org/team`
+
+
+def _affiliation_max(env=None):
+    return _env_int("ACTIVITY_AFFILIATION_MAX", AFFILIATION_MAX, 0, env)
+
+
+def normalize_company(text):
+    """A profile company (or a home name) in the form they are compared in:
+    lower case, a leading `@` dropped, `.` `,` and surrounding punctuation
+    removed, whitespace collapsed, and trailing legal suffixes
+    (_COMPANY_SUFFIXES: "Corporation", "Corp", "Inc", "Ltd", "LLC", "GmbH",
+    …) removed. "@microsoft", "Microsoft", "Microsoft Corporation" and
+    "Microsoft Corp." all give "microsoft". Pure."""
+    s = (text or "").strip().lower()
+    s = s.lstrip("@").strip()
+    s = re.sub(r"[.,;:!()\[\]\"']", " ", s)
+    words = s.split()
+    while len(words) > 1 and words[-1] in _COMPANY_SUFFIXES:
+        words.pop()
+    return " ".join(words)
+
+
+def company_matches(company, home_names):
+    """True when the profile `company` names a home organisation, False when
+    it names something else, None when it is empty. Matches are exact after
+    normalize_company, on the whole text or on any `@handle` in it ("@Azure
+    @microsoft"); `home_names` are already normalised. Pure."""
+    whole = normalize_company(company)
+    if not whole:
+        return None
+    names = set(home_names or ())
+    if whole in names:
+        return True
+    handles = {normalize_company(t) for t in re.split(r"[\s,/|;]+", company or "")
+               if t.startswith("@")}
+    return bool(handles & names)
+
+
+def email_domain_is_home(email, domains):
+    """True when `email`'s domain is one of `domains` (or a subdomain of
+    one); `users.noreply.github.com` never is. Only this boolean leaves the
+    function: the address is not kept. Pure."""
+    if not email or "@" not in email or not domains:
+        return False
+    domain = email.rsplit("@", 1)[1].strip().lower()
+    if not domain or domain == NOREPLY_EMAIL_DOMAIN \
+            or domain.endswith("." + NOREPLY_EMAIL_DOMAIN):
+        return False
+    return any(domain == d or domain.endswith("." + d) for d in domains)
+
+
+def _check_affiliation_value(value, what):
+    if value not in AFFILIATIONS:
+        raise ValueError("{} must be one of {}, got {!r}".format(
+            what, ", ".join(AFFILIATIONS), value))
+    return value
+
+
+def parse_affiliation_override(text):
+    """`LOGIN=AFFILIATION` or `@org/team=AFFILIATION` -> (key, affiliation);
+    raises ValueError. Pure."""
+    key, sep, value = (text or "").partition("=")
+    key, value = key.strip(), value.strip()
+    if not sep or not key:
+        raise ValueError("--affiliation takes LOGIN=AFFILIATION or "
+                         "@org/team=AFFILIATION, got {!r}".format(text))
+    _check_affiliation_value(value, "--affiliation {}".format(key))
+    if key.startswith("@"):
+        if not _GROUP_RE.fullmatch(key):
+            raise ValueError("--affiliation group must be @org/team, got "
+                             "{!r}".format(key))
+    else:
+        manifest_mod.check_owner(key, "--affiliation login")
+    return key, value
+
+
+def affiliation_config(owner, home_orgs=(), home_names=(), email_domains=(),
+                       overrides=None):
+    """The resolved affiliation settings of one repository: {"home_orgs"
+    (the repo's owner first, then the operator's, de-duplicated without
+    regard to case), "home_names" (normalised: the home orgs and the
+    operator's extra names), "home_email_domains" (lower case), "overrides"
+    {login: affiliation}, "groups" {"@org/team": affiliation}}. Pure."""
+    orgs, seen = [], set()
+    for org in [owner] + list(home_orgs or ()):
+        if org and org.lower() not in seen:
+            seen.add(org.lower())
+            orgs.append(org)
+    names = sorted({normalize_company(n) for n in orgs + list(home_names or ())
+                    if normalize_company(n)})
+    domains = sorted({d.strip().lower().lstrip("@") for d in email_domains or ()
+                      if d and d.strip()})
+    logins, groups = {}, {}
+    for key, value in (overrides or {}).items():
+        (groups if key.startswith("@") else logins)[key] = value
+    return {"home_orgs": orgs, "home_names": names,
+            "home_email_domains": domains, "overrides": logins,
+            "groups": groups}
+
+
+def affiliation_people(prs, issues, commits):
+    """The window's human people and what the records say of them: ([logins
+    by (-activity, login)], {login: best home author_association}). Bots,
+    `ghost` and commit authors gather could not resolve to a login are left
+    out. Activity counts PRs and issues authored, merges, reviews, comments
+    and commits. Pure."""
+    weight, assoc = {}, {}
+
+    def add(login, n=1, association=None):
+        if not login or login == _GHOST_LOGIN or derive.is_bot_login(login):
+            return
+        weight[login] = weight.get(login, 0) + n
+        if association in _ASSOCIATION_RANK and _ASSOCIATION_RANK[association] > \
+                _ASSOCIATION_RANK.get(assoc.get(login), 0):
+            assoc[login] = association
+    for it in list(prs or []) + list(issues or []):
+        add(it.get("author"), association=it.get("author_association"))
+        if it.get("merged_by"):
+            add(it.get("merged_by"))
+        for rv in it.get("reviewers") or []:
+            add(rv)
+        for c in (it.get("comments_list") or []) + (it.get("review_comments") or []):
+            add(c.get("author"), association=c.get("author_association"))
+    for c in commits or []:
+        if c.get("login_resolved") is not False:
+            add(c.get("author"))
+    order = sorted(weight, key=lambda k: (-weight[k], k))
+    return order, assoc
+
+
+def resolve_affiliation_groups(groups, get_page, cache=None):
+    """Expand `@org/team` override groups to logins through the team members
+    listing (GET /orgs/{org}/teams/{team}/members: the token must be able
+    to see the team). Returns ({login: affiliation}, [unresolved groups]).
+    A later group in sorted order does not replace an earlier one's login."""
+    cache = {} if cache is None else cache
+    out, unresolved = {}, []
+    for group in sorted(groups or {}):
+        m = _GROUP_RE.fullmatch(group)
+        if not m:
+            unresolved.append(group)
+            continue
+        url = "{}{}/teams/{}/members?per_page=100".format(ORGS_API, m.group(1),
+                                                          m.group(2))
+        if url not in cache:
+            try:
+                members = fetch_all(get_page, url)
+                cache[url] = sorted({(u or {}).get("login") for u in members
+                                     if isinstance(u, dict) and u.get("login")})
+            except (Exception, SystemExit):
+                cache[url] = None
+        if cache[url] is None:
+            unresolved.append(group)
+            continue
+        for login in cache[url]:
+            out.setdefault(login, groups[group])
+    return out, unresolved
+
+
+def make_affiliation_lookup(get_page, cache=None):
+    """The network seam of find_affiliations over the gather's GitHub client
+    (`get_page`): lookup("public_member", login, org) -> True / False / None
+    (cannot tell), lookup("company", login) -> the profile company text ("" for
+    none) or None. The company text is handed to the classifier and never
+    returned anywhere else. Answers are cached per URL in `cache`."""
+    cache = {} if cache is None else cache
+
+    def lookup(kind, login, org=None):
+        if kind == "public_member":
+            url = "{}{}/public_members/{}".format(ORGS_API, org, login)
+        else:
+            url = USERS_API + login
+        if url in cache:
+            return cache[url]
+        try:
+            page, _next = get_page(url)
+        except (Exception, SystemExit):
+            return None              # not cached: a later window may retry
+        if kind == "public_member":
+            got = page.get("public_member") if isinstance(page, dict) else None
+            answer = got if isinstance(got, bool) else None
+        elif isinstance(page, dict) and page.get("login"):
+            company = page.get("company")
+            answer = company if isinstance(company, str) else ""
+        else:
+            answer = None
+        if answer is not None:
+            cache[url] = answer
+        return answer
+    return lookup
+
+
+def decide_affiliation(login, config, association=None, email_home=False,
+                       lookup=None):
+    """(entry, looked_up, failed) for one person: `entry` {"affiliation",
+    "signal"[, "strength"][, "home_email_domain": true]} by the rule in the
+    section comment; `looked_up` when the API seam was asked; `failed` when
+    a lookup could not tell. `lookup` None: only the free signals."""
+    def entry(aff, signal, strength=None):
+        e = {"affiliation": aff, "signal": signal}
+        if strength:
+            e["strength"] = strength
+        if email_home:
+            e["home_email_domain"] = True
+        return e
+    if login in config["overrides"]:
+        return entry(config["overrides"][login], "override", "operator"), False, False
+    if association in _HOME_ASSOCIATIONS:
+        return (entry("maintainer_org", "author_association",
+                      _HOME_ASSOCIATIONS[association]), False, False)
+    if lookup is None:
+        return None, False, False
+    failed = False
+    for org in config["home_orgs"]:
+        member = lookup("public_member", login, org)
+        if member is True:
+            return entry("maintainer_org", "public_membership", "strong"), True, False
+        if member is None:
+            failed = True
+    company = lookup("company", login)
+    if company is None:
+        failed = True
+    else:
+        match = company_matches(company, config["home_names"])
+        if match is True:
+            return entry("maintainer_org", "profile_company", "medium"), True, failed
+        if match is False and not failed:
+            return entry("community", "profile_company", "weak"), True, False
+    if email_home:
+        return entry("maintainer_org", "commit_email_domain", "medium"), True, failed
+    return entry("unknown", "lookup_failed" if failed else "none"), True, failed
+
+
+def find_affiliations(people, config, associations=None, email_home=(),
+                      lookup=None, max_lookups=AFFILIATION_MAX,
+                      stop_after=AFFILIATION_FAILURE_STOP):
+    """The `affiliations` fact value for `people` (logins, most active
+    first). The free signals (override, author_association) apply to
+    everyone; the looked-up ones to at most `max_lookups` people, and none
+    after `stop_after` people in a row whose lookups failed: those are
+    `not_checked` (no entry, counted unknown). Returns {"collected": True,
+    "home_orgs", "home_names", "home_email_domains", "people": {login:
+    entry}, "unknown": [login], "not_checked": [login]}. Network-free given
+    `lookup`."""
+    associations = associations or {}
+    email_home = set(email_home or ())
+    out, not_checked = {}, []
+    looked, failures = 0, 0
+    for login in people:
+        e, _l, _f = decide_affiliation(login, config, associations.get(login),
+                                       login in email_home, lookup=None)
+        if e is not None:
+            out[login] = e
+            continue
+        if lookup is None or looked >= max_lookups or failures >= stop_after:
+            not_checked.append(login)
+            continue
+        e, was_looked, failed = decide_affiliation(
+            login, config, associations.get(login), login in email_home,
+            lookup=lookup)
+        looked += was_looked
+        failures = failures + 1 if failed else 0
+        out[login] = e
+    unknown = sorted([k for k, e in out.items() if e["affiliation"] == "unknown"]
+                     + not_checked)
+    return {"collected": True, "home_orgs": list(config["home_orgs"]),
+            "home_names": list(config["home_names"]),
+            "home_email_domains": list(config["home_email_domains"]),
+            "people": {k: out[k] for k in sorted(out)},
+            "unknown": unknown, "not_checked": sorted(not_checked)}
+
+
+def args_affiliation_config(args, owner):
+    """affiliation_config from the CLI (`--home-org`, `--home-name`,
+    `--home-email-domain`, `--affiliation`) and, for a manifest member, the
+    manifest's `affiliation` object (`args.affiliation_manifest`): lists are
+    joined; a CLI override beats the manifest's for the same key."""
+    man = getattr(args, "affiliation_manifest", None) or {}
+    overrides = dict(man.get("overrides") or {})
+    for text in getattr(args, "affiliation", None) or []:
+        key, value = parse_affiliation_override(text)
+        overrides[key] = value
+    return affiliation_config(
+        owner,
+        list(man.get("home_orgs") or []) + list(getattr(args, "home_org", None) or []),
+        list(man.get("home_names") or []) + list(getattr(args, "home_name", None) or []),
+        list(man.get("home_email_domains") or [])
+        + list(getattr(args, "home_email_domain", None) or []),
+        overrides)
+
+
+def collect_affiliations(prs, issues, commits, owner, repo, get_page, config,
+                         email_home=(), cache=None, max_people=None):
+    """The window's `affiliations` fact, looked up through `get_page` (the
+    gather's GitHub client). One stderr line says what it cost and found."""
+    cache = {} if cache is None else cache
+    people, assoc = affiliation_people(prs, issues, commits)
+    calls = [0]
+
+    def counted(url):
+        calls[0] += 1
+        return get_page(url)
+    group_logins, unresolved = resolve_affiliation_groups(
+        config.get("groups"), counted, cache)
+    cfg = dict(config, overrides={**group_logins, **config["overrides"]})
+    cap = _affiliation_max() if max_people is None else max_people
+    result = find_affiliations(people, cfg, assoc, email_home,
+                               make_affiliation_lookup(counted, cache),
+                               max_lookups=cap)
+    if unresolved:
+        result["groups_unresolved"] = unresolved
+    by = {}
+    for e in result["people"].values():
+        by[e["affiliation"]] = by.get(e["affiliation"], 0) + 1
+    sys.stderr.write(
+        "affiliation: {}/{}: {} person(s), {} API call(s) (cached answers "
+        "reused): {} maintainer_org, {} community, {} unknown ({} not "
+        "checked)\n".format(owner, repo, len(people), calls[0],
+                            by.get("maintainer_org", 0), by.get("community", 0),
+                            len(result["unknown"]), len(result["not_checked"])))
+    if unresolved:
+        sys.stderr.write("warning: {}/{}: affiliation group(s) not resolved "
+                         "(team not visible to the token?): {}\n".format(
+                             owner, repo, ", ".join(unresolved)))
     return result
 
 
@@ -6587,7 +7117,12 @@ def acquire(args, env):
     # login PR/issue/review records use, so one person is one key. One paginated
     # commits-list listing (ceil(commits / 100) REST calls, none for an empty
     # window) joined on SHA; then the noreply email; else flagged unresolved.
-    # Code/symbol events are re-keyed to the same author.
+    # Code/symbol events are re-keyed to the same author. The same pass
+    # notes, as a boolean per login, a commit email in a home domain (the
+    # affiliation signal); the email itself is dropped.
+    want_affiliation = getattr(args, "affiliation_enabled", True)
+    aff_config = args_affiliation_config(args, owner) if want_affiliation else None
+    email_home = set()
     if commits:
         # from the walked branch's head (the clone is back on it by now)
         api_items = fetch_all(get_page, commits_api_url(api, walk_head, frm, to)) \
@@ -6601,7 +7136,9 @@ def acquire(args, env):
                 known.add(c.get("author"))
         known.discard(None)
         by_sha = resolve_commit_authors(
-            commits, commit_logins_from_api(api_items), known)
+            commits, commit_logins_from_api(api_items), known,
+            home_domains=(aff_config or {}).get("home_email_domains") or (),
+            home_email=email_home)
         remap_event_authors(code_events, by_sha)
         remap_event_authors(symbol_events, by_sha)
 
@@ -6619,6 +7156,16 @@ def acquire(args, env):
         newcomers = collect_newcomers(prs, issues, owner, repo, frm, to, get_page)
     else:
         newcomers = {"collected": False}
+
+    # Contributor affiliation (per-window fact `affiliations`): see
+    # collect_affiliations. --no-affiliation records that it was not looked at.
+    if want_affiliation:
+        cache = getattr(args, "affiliation_cache", None)
+        affiliations = collect_affiliations(
+            prs, issues, commits, owner, repo, get_page, aff_config,
+            email_home=email_home, cache={} if cache is None else cache)
+    else:
+        affiliations = {"collected": False}
 
     releases = []
     if getattr(args, "include_releases", True):
@@ -6701,6 +7248,7 @@ def acquire(args, env):
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["newcomers"] = newcomers
+    bundle["affiliations"] = affiliations
     # Omitted when the window's history was not on disk (nothing was read).
     if module_notes is not None:
         bundle["module_notes"] = module_notes
@@ -8616,6 +9164,9 @@ def _gather_manifest(conn, args, man):
                 if e["from"] == frm and e["to"] == to
                 and e["status"] == graphstore.MEMBER_OK}
     todo = [s for s in slugs if s not in done]
+    # One affiliation answer cache for the whole run: a person active in
+    # several members is looked up once.
+    affiliation_cache = {}
     if not todo:
         sys.stderr.write("nothing to resume: every member of project '{}' is "
                          "ok for {}..{}\n".format(project, frm, to))
@@ -8629,7 +9180,10 @@ def _gather_manifest(conn, args, man):
         if slug not in todo:
             continue
         try:
-            bundle = acquire(_member_args(args, m, frm, to), os.environ)
+            member_args = _member_args(args, m, frm, to)
+            member_args.affiliation_manifest = man.get("affiliation")
+            member_args.affiliation_cache = affiliation_cache
+            bundle = acquire(member_args, os.environ)
             summary = fold_bundle(conn, bundle, project=project, repo=slug,
                                   members=members,
                                   registry_by_slug=registry_by_slug,

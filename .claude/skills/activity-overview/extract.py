@@ -129,7 +129,8 @@ VIEW_CONTRACT_VERSION = 3
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
              "code_owners", "label_taxonomy", "newcomers", "module_notes",
-             "pr_history", "artifacts", "people")
+             "pr_history", "affiliations", "prior_activity", "artifacts",
+             "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
 # (not the raw symbol `change`). build_artifacts only uses `change` to recompute
@@ -457,6 +458,19 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_merged_pr_history`); absent when no gather collected it.
     if "pr_history" in facts:
         bundle["pr_history"] = facts["pr_history"]
+    # Contributor affiliation (per-window only): the gathered window's fact
+    # as stored, or each person's latest decision over the windows
+    # overlapping the view (`_merged_affiliations`); absent when no gather
+    # collected it.
+    if "affiliations" in facts:
+        bundle["affiliations"] = facts["affiliations"]
+    # What the store holds of the window's newcomers / returning
+    # contributors before the window (`_prior_activity`); only when the view
+    # names any.
+    prior = _prior_activity(conn, project, repo, socials,
+                            bundle.get("newcomers"))
+    if prior is not None:
+        bundle["prior_activity"] = prior
 
     return bundle
 
@@ -1231,7 +1245,8 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     with_ci = {k for k in recorded if probes[k]["ci_collected"]}
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
                            if k not in ("workflow_stats", "newcomers",
-                                        "module_notes", "pr_history"))
+                                        "module_notes", "pr_history",
+                                        "affiliations"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1289,6 +1304,10 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     history = _merged_pr_history(conn, project, repo, overlapping, recorded)
     if history is not None:
         facts["pr_history"] = history
+    affiliations = _merged_affiliations(conn, project, repo, overlapping,
+                                        recorded, ts_from, ts_to)
+    if affiliations is not None:
+        facts["affiliations"] = affiliations
     note = {"structure": win(structure),
             "workflow_stats": [win(k) for k in summed],
             # every day of the view is in exactly one summed window
@@ -1327,21 +1346,46 @@ def _merged_newcomers(conn, project, repo, inside, ts_from, ts_to):
     if not taken:
         return None
     new, unknown, not_checked = {}, set(), set()
+    returning, regular, undated, dated = {}, {}, set(), None
     for k in taken:                      # earliest window first
         v = values[k]
         for e in v.get("new") or []:
             if isinstance(e, dict) and e.get("login") not in new:
                 new[e.get("login")] = e
+        if "returning" in v:
+            dated = v.get("gap_thresholds_days")
+        for e in v.get("returning") or []:
+            if isinstance(e, dict) and e.get("login") not in returning:
+                returning[e.get("login")] = e
+        for e in v.get("regular") or []:
+            if isinstance(e, dict) and e.get("login") not in regular:
+                regular[e.get("login")] = e
+        undated |= set(v.get("earlier_undated") or [])
         unknown |= set(v.get("unknown") or [])
         not_checked |= set(v.get("not_checked") or [])
-    unknown -= set(new)
-    not_checked -= set(new) | unknown
+    # the earliest class wins: a login new (or returning) in an earlier
+    # window is that to the view, whatever a later window said
+    for login in list(returning):
+        if login in new:
+            del returning[login]
+    first_seen = set(new) | set(returning)
+    regular = {k: e for k, e in regular.items() if k not in first_seen}
+    undated -= first_seen | set(regular)
+    unknown -= first_seen | set(regular) | undated
+    not_checked -= first_seen | set(regular) | undated | unknown
     windows = [{"from": k[0], "to": k[1]} for k in taken]
-    return {"collected": True, "before": values[taken[0]].get("before"),
-            "new": [new[login] for login in sorted(new, key=str)],
-            "unknown": sorted(unknown), "not_checked": sorted(not_checked),
-            "windows": windows,
-            "covers_view": _covers(windows, ts_from, ts_to)}
+    out = {"collected": True, "before": values[taken[0]].get("before"),
+           "new": [new[login] for login in sorted(new, key=str)],
+           "unknown": sorted(unknown), "not_checked": sorted(not_checked),
+           "windows": windows,
+           "covers_view": _covers(windows, ts_from, ts_to)}
+    if dated is not None:
+        out["returning"] = [returning[k] for k in sorted(returning, key=str)]
+        out["regular"] = [regular[k] for k in sorted(regular, key=str)]
+        out["gap_thresholds_days"] = dated
+    if undated:
+        out["earlier_undated"] = sorted(undated)
+    return out
 
 
 def _merged_module_notes(conn, project, repo, overlapping, recorded, ts_from,
@@ -1448,6 +1492,103 @@ def _merged_pr_history(conn, project, repo, overlapping, recorded):
     if limits is not None:
         out["limits"] = limits
     return out
+
+
+def _merged_affiliations(conn, project, repo, overlapping, recorded, ts_from,
+                         ts_to):
+    """The `affiliations` of a view that is not exactly one gathered window.
+
+    A label is the answer GitHub (and the operator) gave when a window was
+    gathered, so the view takes, per person, the entry of the LATEST
+    gathered window overlapping it that collected one (by end day, then
+    start day); `unknown` / `not_checked` are recomputed over the merged
+    people (a person not checked in one window but decided in another is
+    decided). Returns {"collected": True, "home_orgs", "home_names",
+    "home_email_domains" (the latest window's), "people", "unknown",
+    "not_checked", "windows": [{from, to}], "covers_view"} or None when no
+    overlapping window collected affiliations."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("affiliations",))
+        value = (got or {}).get("facts", {}).get("affiliations")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+    people, not_checked, latest = {}, set(), None
+    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
+        v = values[k]                      # later windows replace earlier ones
+        latest = v
+        for login, e in (v.get("people") or {}).items():
+            if isinstance(e, dict):
+                people[login] = e
+        not_checked |= set(v.get("not_checked") or [])
+    not_checked -= set(people)
+    unknown = {k for k, e in people.items() if e.get("affiliation") == "unknown"}
+    windows = [{"from": k[0], "to": k[1]} for k in sorted(values)]
+    return {"collected": True,
+            "home_orgs": list(latest.get("home_orgs") or []),
+            "home_names": list(latest.get("home_names") or []),
+            "home_email_domains": list(latest.get("home_email_domains") or []),
+            "people": {k: people[k] for k in sorted(people)},
+            "unknown": sorted(unknown | not_checked),
+            "not_checked": sorted(not_checked),
+            "windows": windows, "covers_view": _covers(windows, ts_from, ts_to)}
+
+
+def _prior_activity(conn, project, repo, socials, newcomers):
+    """What the STORE holds of each newcomer / returning contributor of the
+    view before the view's newcomer boundary (`newcomers.before`), from
+    stored records only: {"before", "store_from" (the earliest gathered
+    window start of the repo: activity before it is mostly not stored),
+    "people": {login: {"prs", "issues", "reviews", "comments", "earliest"}}}
+    — PRs / issues they authored, reviews they submitted and comments (PR
+    conversation, review and issue comments) they wrote, dated before
+    `before`. Only records the store holds count: the PRs / issues of its
+    gathered windows (and the older ones those windows reached), so 0 means
+    "none in the store", not "none ever". None when the view names no
+    newcomer or returning contributor."""
+    if not isinstance(newcomers, dict) or not newcomers.get("collected"):
+        return None
+    logins = sorted({e.get("login") for key in ("new", "returning")
+                     for e in newcomers.get(key) or [] if isinstance(e, dict)
+                     and e.get("login")})
+    before = newcomers.get("before")
+    if not logins or not before:
+        return None
+    wanted = set(logins)
+    acc = {login: {"prs": 0, "issues": 0, "reviews": 0, "comments": 0,
+                   "earliest": None} for login in logins}
+
+    def seen(login, field, ts):
+        if login not in wanted or not ts or str(ts)[:10] >= str(before)[:10]:
+            return
+        a = acc[login]
+        a[field] += 1
+        day = str(ts)[:10]
+        if a["earliest"] is None or day < a["earliest"]:
+            a["earliest"] = day
+    for n in socials:
+        local = _local(n["id"])
+        d = n.get("data") or {}
+        if local.startswith(("pr-", "issue-")):
+            seen(d.get("author"), "prs" if local.startswith("pr-") else "issues",
+                 d.get("created_at"))
+            for c in (d.get("comments_list") or []) + (d.get("review_comments") or []):
+                if isinstance(c, dict):
+                    seen(c.get("author"), "comments", c.get("created_at"))
+        elif local.startswith("review-"):
+            seen(d.get("author"), "reviews", d.get("submitted_at"))
+    try:
+        ledger = graphstore.get_windows(conn)
+    except ValueError:
+        ledger = []
+    starts = sorted(w.get("from") for w in ledger if isinstance(w, dict)
+                    and w.get("project") == project and w.get("repo") == repo
+                    and w.get("from"))
+    return {"before": before, "store_from": starts[0] if starts else None,
+            "people": acc}
 
 
 def _materialize_singleton(conn, project, repo, local):

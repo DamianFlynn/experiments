@@ -657,6 +657,8 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--no-releases` / `--include-releases` | on | releases in window |
 | `--no-project-board` / `--project-board` | on | Projects v2 board ingest (auto-discovered) |
 | `--no-newcomers` | off (check runs) | skip the first-time-contributor search (one or two search API calls per author of a PR / issue created in the window); the window's `newcomers` fact says it was not collected |
+| `--no-affiliation` | off (check runs) | skip the contributor affiliation check (public-membership and profile calls per person not decided by the override list or `author_association`); the window's `affiliations` fact says it was not collected |
+| `--home-org` / `--home-name` / `--home-email-domain` / `--affiliation` | repo owner only | affiliation settings (repeatable): home orgs, company names, commit email domains, `LOGIN=` / `@org/team=` overrides (`maintainer_org` / `community` / `unknown`) |
 | `--structural-iac` | off (on for manifest members) | whole-tree static Terraform + Bicep dependency scan |
 | `--no-iac-build` | off | skip the `bicep`/`terraform` builds (they run third-party code; use for untrusted repos); areas `edges_status: skipped` |
 | `--resume` | off | manifest only: gather just the members not `ok` for the window |

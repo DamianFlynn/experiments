@@ -1163,10 +1163,12 @@ def get_clone_info(conn, project, repo, frm, to):
 # tags the window's commits added, read from the clone: gather
 # collect_module_notes), and `pr_history` (each window PR's own commits from
 # refs/pull/<N>/head and the comment / parameter changes between them: gather
-# collect_pr_history).
+# collect_pr_history), and `affiliations` (each window person's
+# maintainer_org / community / unknown label with the deciding signal:
+# gather collect_affiliations).
 WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
                     "label_taxonomy", "newcomers", "module_notes",
-                    "pr_history")
+                    "pr_history", "affiliations")
 
 
 def _window_facts_key(project, repo, frm, to):

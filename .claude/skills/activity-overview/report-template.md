@@ -689,6 +689,22 @@ latency {person.review_latency_days}d · active {person.first_seen} →
 
 **Automation:** the `people` logins whose `person.is_bot` is true.
 
+<!-- People layer — pointer only; the newsletter layout for these facts comes later.
+     When the view carries `contributors` (BUNDLE.md "The people layer"):
+     - `contributors.affiliation`: people, merged PRs and reviews by
+       maintainer_org / community / unknown (counts and shares; unknown is its own
+       bucket — never fold it into community);
+     - `contributors.community`: community PRs merged, first-timers, returning
+       contributors, modules that received a community contribution;
+     - `contributors.newcomers[]`: first_ever / returning (`gap_bucket`), what the
+       store saw of them before (`seen_in_store_before`), and `contributed.prs[]`
+       (`headline` new_module / module_change / plumbing / release, modules with
+       kind and status, changelog items verbatim, PR links);
+     - `contributors.hall[]`: the same for each `halls.fame` entry, plus `reviewed`;
+     - `halls.community` / `halls.maintainer_org`: the fame ranking within a label.
+     Labels come from public signals (`person.affiliation_signal`); prefer counts
+     and shares to naming a person's label, and say what `unknown` means. -->
+
 The people ↔ code-area relationships are shown by `diagrams.contributor_graph`, embedded
 once under **Module ownership** above (do not repeat the Mermaid block here).
 

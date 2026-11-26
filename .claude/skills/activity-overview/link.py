@@ -3499,6 +3499,9 @@ def enrich(bundle, priority_patterns=(), path_rules=()):
     # Phase 11 slice 1: people profile + recognition halls (read-side projections
     # over the materialized bundle; need people/prs/commits/artifacts/trains above).
     derive.annotate_people_profile(bundle)
+    # affiliation labels from the gathered `affiliations` fact (only when the
+    # view carries it), before the halls rank people within each label
+    derive.annotate_people_affiliation(bundle)
     derive.build_halls(bundle)
     # Phase 11 slice 2: flow pathology classifier + blockers in-degree (read-side
     # projections over issues/prs; placed after halls).
@@ -3514,6 +3517,292 @@ def enrich(bundle, priority_patterns=(), path_rules=()):
     # where no train qualifies, are unchanged.
     annotate_train_discussion(bundle)
     select_story_trains(bundle)
+    # The people layer: affiliation shares, community counts, newcomers /
+    # returning contributors and the hall with what each person's work was
+    # about (module layer). Only when the view carries the gathered
+    # `affiliations` or `newcomers` facts (omit-when-absent).
+    build_contributors(bundle, path_rules)
+    return bundle
+
+
+# --- The people layer: `contributors` ---------------------------------------
+#
+# Facts, not prose: who contributed (by affiliation), who is new or back after
+# a gap, and what each of them landed, read off the module layer
+# (`module_changes`: module, kind, status, PR class, changelog items). Built
+# from the view's records and gathered facts only; no call is made.
+
+CONTRIBUTION_PRS_MAX = 10           # PRs listed per person
+CONTRIBUTION_MODULES_MAX = 5        # modules listed per PR
+CONTRIBUTION_ITEMS_MAX = 5          # changelog items listed per module entry
+_HEADLINE_BY_CLASS = {"ci": "plumbing", "docs-only": "plumbing",
+                      "tests-only": "plumbing", "release": "release",
+                      "unknown": "unknown"}
+
+
+def _module_layer(bundle, path_rules):
+    """(module_changes, source): the view's own `module_changes`, or — for a
+    view without the gathered `module_notes` — the same build over the
+    view's commits and file events alone (source `code_events_only`: status
+    `new` only from an added entry file, no changelog, no tags). The
+    fallback is built on a shallow copy: the view is not changed."""
+    mc = bundle.get("module_changes")
+    if isinstance(mc, dict):
+        return mc, "module_changes"
+    shadow = dict(bundle)
+    shadow["module_notes"] = {"collected": True, "changelogs": [],
+                              "versions": [], "tags": {"collected": False}}
+    build_module_changes(shadow, path_rules)
+    return shadow.get("module_changes") or {}, "code_events_only"
+
+
+def _contribution_index(mc):
+    """({pr number: [module rows]}, {pr number: [changelog rows]}) of a
+    module_changes value: per PR, each module it touched with the module's
+    kind and status and whether this PR introduced it, and the changelog
+    entries the PR's commits added."""
+    by_pr, logs = {}, {}
+    for m in mc.get("modules") or []:
+        introduced = {s.get("pr") for s in m.get("introduced_by") or []}
+        for p in m.get("prs") or []:
+            n = p.get("number")
+            row = {"area": m.get("area"), "kind": m.get("kind"),
+                   "status": m.get("status")}
+            if m.get("status") == "new" and n in introduced:
+                row["role"] = "introduced"
+                if m.get("first_version"):
+                    row["first_version"] = m["first_version"]
+            else:
+                row["role"] = "changed"
+            by_pr.setdefault(n, []).append(row)
+        for entry in m.get("changelog") or []:
+            items = [item.get("text") for s in entry.get("sections") or []
+                     for item in s.get("items") or [] if isinstance(item, dict)]
+            for n in sorted({s.get("pr") for s in entry.get("sources") or []
+                             if s.get("pr") is not None}):
+                row = {"module": entry.get("module") or m.get("area"),
+                       "version": entry.get("version"),
+                       "items": items[:CONTRIBUTION_ITEMS_MAX]}
+                if len(items) > CONTRIBUTION_ITEMS_MAX:
+                    row["items_omitted"] = len(items) - CONTRIBUTION_ITEMS_MAX
+                logs.setdefault(n, []).append(row)
+    return by_pr, logs
+
+
+def _pr_contribution(pr, row, modules, changelog):
+    """One PR as a contribution fact: {number, url, title, state, class?,
+    headline, modules?, modules_omitted?, sweep?, changelog?}. `headline`:
+    `new_module` (the PR introduced a module that is new in the window),
+    `module_change`, `plumbing` (CI / docs / tests only: `class` says
+    which), `release` (a version cut), `unknown` (no commit of it in the
+    view, e.g. an open PR)."""
+    out = {"number": pr.get("number"), "url": pr.get("url"),
+           "title": pr.get("title"),
+           "state": "merged" if pr.get("merged") else (pr.get("state") or None)}
+    cls = (row or {}).get("class")
+    if cls:
+        out["class"] = cls
+    mods = list(modules or [])
+    if row and row.get("sweep"):
+        keep = set(row.get("substantive_areas") or [])
+        mods = [m for m in mods if m["area"] in keep]
+        out["sweep"] = row["sweep"]
+    mods.sort(key=lambda m: (m["role"] != "introduced", m["area"] or ""))
+    if any(m["role"] == "introduced" for m in mods):
+        headline = "new_module"
+    elif cls in _HEADLINE_BY_CLASS:
+        headline = _HEADLINE_BY_CLASS[cls]
+    elif cls in ("module", "mixed"):
+        headline = "module_change"
+    else:
+        headline = "unknown"
+    out["headline"] = headline
+    if mods:
+        out["modules"] = mods[:CONTRIBUTION_MODULES_MAX]
+        if len(mods) > CONTRIBUTION_MODULES_MAX:
+            out["modules_omitted"] = len(mods) - CONTRIBUTION_MODULES_MAX
+    if changelog:
+        out["changelog"] = changelog
+    return out
+
+
+def person_contributions(login, bundle, rows, by_pr, logs):
+    """What `login`'s work in the view was about: their PRs merged in the
+    window (module layer facts), then their open PRs, newest number first
+    within each, at most CONTRIBUTION_PRS_MAX (`prs_omitted` the rest).
+    Pure."""
+    merged, open_ = [], []
+    for pr in bundle.get("prs") or []:
+        if pr.get("author") != login:
+            continue
+        n = pr.get("number")
+        if n in rows:
+            merged.append(_pr_contribution(pr, rows[n], by_pr.get(n), logs.get(n)))
+        elif pr.get("state") == "open" and not pr.get("merged"):
+            open_.append(_pr_contribution(pr, None, None, None))
+    items = sorted(merged, key=lambda c: -(c["number"] or 0)) + \
+        sorted(open_, key=lambda c: -(c["number"] or 0))
+    out = {"prs": items[:CONTRIBUTION_PRS_MAX]}
+    if len(items) > CONTRIBUTION_PRS_MAX:
+        out["prs_omitted"] = len(items) - CONTRIBUTION_PRS_MAX
+    return out
+
+
+def person_reviews(login, bundle, rows):
+    """{prs, modules}: how many of the view's PRs `login` reviewed and the
+    module areas of those that merged in the window (module layer). Pure."""
+    count, areas = 0, set()
+    for pr in bundle.get("prs") or []:
+        if login in (pr.get("reviewers") or []):
+            count += 1
+            row = rows.get(pr.get("number")) or {}
+            areas.update(row.get("substantive_areas") if row.get("sweep")
+                         else row.get("areas") or [])
+    return {"prs": count, "modules": sorted(areas)}
+
+
+def _share(part, total):
+    return round(part / total, 3) if total else None
+
+
+def _affiliation_summary(bundle, rows, people):
+    """Counts and shares by affiliation of the view's people, of its PRs
+    merged in the window (by author) and of its reviews (reviewer-PR pairs),
+    with `unknown` separate; bots are left out."""
+    fact = bundle["affiliations"]
+    labels = ("maintainer_org", "community", "unknown")
+    aff = {login: p.get("affiliation") for login, p in people.items()
+           if not p.get("is_bot") and p.get("affiliation")}
+    counts = {k: 0 for k in labels}
+    signals = {}
+    for login, a in aff.items():
+        counts[a] = counts.get(a, 0) + 1
+        sig = people[login].get("affiliation_signal")
+        signals[sig] = signals.get(sig, 0) + 1
+
+    def split(logins):
+        tally = {k: 0 for k in labels}
+        excluded = 0
+        for login in logins:
+            if login in aff:
+                tally[aff[login]] += 1
+            else:
+                excluded += 1        # a bot, or no person record
+        total = sum(tally.values())
+        return dict({k: {"count": tally[k], "share": _share(tally[k], total)}
+                     for k in labels}, total=total, bots_excluded=excluded)
+    merged_authors = [pr.get("author") for pr in bundle.get("prs") or []
+                      if pr.get("number") in rows]
+    reviewers = [rv for pr in bundle.get("prs") or []
+                 for rv in sorted(set(pr.get("reviewers") or []))]
+    out = {"home_orgs": list(fact.get("home_orgs") or []),
+           "people": counts,
+           "signals": {k: signals[k] for k in sorted(signals, key=str)},
+           "merged_prs": split(merged_authors),
+           "reviews": split(reviewers)}
+    if fact.get("windows"):
+        out["windows"] = fact["windows"]
+        out["covers_view"] = fact.get("covers_view")
+    return out
+
+
+def _community_summary(bundle, rows, people, newcomer_rows):
+    """Community-specific counts: people, PRs merged in the window, reviews,
+    first-timers and returning contributors labelled `community`, and the
+    module areas that received a community PR merged in the window. People
+    whose affiliation is `unknown` are never counted here."""
+    community = {login for login, p in people.items()
+                 if not p.get("is_bot") and p.get("affiliation") == "community"}
+    author = {p.get("number"): p.get("author") for p in bundle.get("prs") or []}
+    merged = sorted(n for n in rows if author.get(n) in community)
+    areas = set()
+    for n in merged:
+        r = rows[n]
+        areas.update(r.get("substantive_areas") if r.get("sweep")
+                     else r.get("areas") or [])
+    reviews = sum(1 for pr in bundle.get("prs") or []
+                  for rv in set(pr.get("reviewers") or []) if rv in community)
+    return {"people": len(community), "prs_merged": len(merged),
+            "prs_merged_numbers": merged, "reviews": reviews,
+            "first_timers": sorted(r["login"] for r in newcomer_rows
+                                   if r["class"] == "first_ever"
+                                   and r["login"] in community),
+            "returning": sorted(r["login"] for r in newcomer_rows
+                                if r["class"] == "returning"
+                                and r["login"] in community),
+            "modules": sorted(areas)}
+
+
+def build_contributors(bundle, path_rules=()):
+    """bundle["contributors"] (BUNDLE.md "The people layer"), when the view
+    carries a collected `affiliations` or `newcomers` fact; otherwise
+    nothing is added. Keys (each only when its input exists):
+    `affiliation` (_affiliation_summary), `community`
+    (_community_summary), `newcomers` [{login, class: first_ever |
+    returning, first, gap_days?, gap_bucket?, last_seen_before?,
+    seen_in_store_before?, affiliation?, affiliation_signal?,
+    contributed}], `hall` [{login, score, affiliation?, contributed,
+    reviewed}] for each `halls.fame` entry, and `inputs` {module_layer:
+    module_changes | code_events_only}. Pure over the bundle (in place)."""
+    aff_fact = bundle.get("affiliations")
+    nc = bundle.get("newcomers")
+    has_aff = isinstance(aff_fact, dict) and bool(aff_fact.get("collected"))
+    has_nc = isinstance(nc, dict) and bool(nc.get("collected"))
+    if not has_aff and not has_nc:
+        return bundle
+    people = bundle.get("people") or {}
+    mc, source = _module_layer(bundle, path_rules)
+    rows = {r.get("number"): r for r in mc.get("prs") or []}
+    by_pr, logs = _contribution_index(mc)
+    prior = (bundle.get("prior_activity") or {}).get("people") or {}
+
+    def labels(login, row):
+        p = people.get(login) or {}
+        if "affiliation" in p:
+            row["affiliation"] = p["affiliation"]
+            row["affiliation_signal"] = p.get("affiliation_signal")
+        return row
+    newcomer_rows = []
+    if has_nc:
+        entries = [("first_ever", e) for e in nc.get("new") or []] + \
+            [("returning", e) for e in nc.get("returning") or []]
+        for cls, e in sorted(entries, key=lambda t: str(t[1].get("login"))):
+            login = e.get("login")
+            row = {"login": login, "class": cls,
+                   "first": {k: e.get(k) for k in ("first", "number", "url",
+                                                   "created_at")}}
+            for k in ("last_seen_before", "gap_days", "gap_bucket",
+                      "gap_upper_bound"):
+                if k in e:
+                    row[k] = e[k]
+            if login in prior:
+                row["seen_in_store_before"] = prior[login]
+            labels(login, row)
+            row["contributed"] = person_contributions(login, bundle, rows,
+                                                      by_pr, logs)
+            newcomer_rows.append(row)
+    out = {}
+    if has_aff:
+        out["affiliation"] = _affiliation_summary(bundle, rows, people)
+        out["community"] = _community_summary(bundle, rows, people,
+                                              newcomer_rows)
+    if has_nc:
+        out["newcomers"] = newcomer_rows
+        if "returning" in nc:
+            out["gap_thresholds_days"] = nc.get("gap_thresholds_days")
+        if "prior_activity" in bundle:
+            out["store_from"] = bundle["prior_activity"].get("store_from")
+    hall = []
+    for h in (bundle.get("halls") or {}).get("fame") or []:
+        login = h.get("login")
+        row = labels(login, {"login": login, "score": h.get("score")})
+        row["contributed"] = person_contributions(login, bundle, rows, by_pr,
+                                                  logs)
+        row["reviewed"] = person_reviews(login, bundle, rows)
+        hall.append(row)
+    out["hall"] = hall
+    out["inputs"] = {"module_layer": source}
+    bundle["contributors"] = out
     return bundle
 
 

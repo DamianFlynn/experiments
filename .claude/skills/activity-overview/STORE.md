@@ -308,7 +308,15 @@ discussed PRs — `gather.collect_pr_history`, BUNDLE.md "The story layer"; only
 from windows gathered before it existed. A per-window fact rather than a field on the PR
 record because it is what the head ref held when that window was gathered — dated
 gather-time evidence like `newcomers`, read under the as-of rule — while PR records are
-latest-wins and compared field by field by the trust check) — each named by the SHA-256 of
+latest-wins and compared field by field by the trust check) and `affiliations` (each
+window person's `maintainer_org` / `community` / `unknown` label with the name and
+strength of the signal that decided it — `gather.collect_affiliations`, BUNDLE.md "The
+people layer"; only per window, because it is GitHub's and the profile's answer when the
+window was gathered; `{"collected": false}` for a gather run with `--no-affiliation`;
+absent from windows gathered before it existed. It holds no profile text, company or
+email: `validate.py`'s meta integrity refuses an entry with any key beyond `affiliation`,
+`signal`, `strength` and `home_email_domain`, or a label / signal / strength gather does
+not write) — each named by the SHA-256 of
 its JSON text (encoded as node `data` is: sorted keys), and the clone sha the
 window was gathered against. A key is present only when the bundle's value is
 present and non-empty (the latest-wins node rule). Each value is stored once per

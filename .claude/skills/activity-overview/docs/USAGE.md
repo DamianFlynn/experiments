@@ -255,7 +255,8 @@ mkdir -p $S/stores $S/views/$M $S/reports
 #     The clone is partial (file contents are fetched while the history is walked), so keep
 #     the network up for the whole run; a dropped git connection is retried three times.
 #     It also checks each author of a PR / issue created in the window for an earlier one
-#     (first-time contributors: one or two search calls each; --no-newcomers skips it).
+#     (first-time contributors: one or two search calls each; --no-newcomers skips it),
+#     and labels each person maintainer_org / community / unknown (§5.7; --no-affiliation).
 python3 $AO/gather.py --owner Azure --repo bicep \
   --from $FROM --to $TO --store $DB --clone-dir $S/clone
 
@@ -595,6 +596,65 @@ commits, notes for 40 PRs, a 1.1 MB fact; October 2026 into the same clone, 160 
 `fetch_failed`; neither stops the gather. `--no-pr-history` skips all of it and records
 `{"collected": false}`. The refs stay in the clone (`refs/remotes/pr/*`); a refresh fetches
 only what moved.
+
+### 5.7 People: affiliation, newcomers and what they contributed
+
+gather labels each human person of the window `maintainer_org` (the organisation that owns
+the repository, or one you name as home), `community`, or `unknown`, and records which signal
+decided and how strongly (BUNDLE.md "The people layer"). It never defaults to community: a
+person with no signal is `unknown`, and the view reports unknown as its own bucket.
+
+**Settings.** The repo's owner is always a home organisation. For Azure/* repositories,
+whose maintainers are Microsoft people, name Microsoft too:
+
+```bash
+python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
+  --store $DB --home-org microsoft --home-name Microsoft --home-email-domain microsoft.com \
+  --affiliation some-login=community --affiliation @Azure/some-team=maintainer_org
+```
+
+or, for a manifest, an `affiliation` object (every key optional; CLI flags add to it and a
+CLI override beats the manifest's for the same key):
+
+```json
+"affiliation": {"home_orgs": ["microsoft"], "home_names": ["Microsoft"],
+                "home_email_domains": ["microsoft.com"],
+                "overrides": {"some-login": "community", "@Azure/some-team": "maintainer_org"}}
+```
+
+The override list is the highest-priority signal: use it to correct a label you know is
+wrong (a vendor, a contractor, someone whose profile is stale) and to name team members
+whose membership is private. An `@org/team` entry is expanded through the team's member
+listing, which the token must be able to see (otherwise it is listed in
+`affiliations.groups_unresolved` and a warning names it).
+
+**Cost.** People decided by the override list or by `author_association` (OWNER / MEMBER /
+COLLABORATOR of the repo's owner on their own records) cost nothing. Everyone else costs one
+`orgs/{org}/public_members/{login}` call per home organisation (until one says member) and
+one `users/{login}` call: with two home orgs, up to three core-API calls per person. A
+September of Azure/bicep-registry-modules has about 230 people; most are not decided for free,
+so the check costs up to about 660 calls (of the 5,000 an hour a personal token has).
+`ACTIVITY_AFFILIATION_MAX` (default 300) caps the people looked up, most active first; three
+people in a row whose lookups fail stop the lookups for the window. Answers are cached for
+the run (a manifest's members share them), not across runs: each window asks again, because
+the answer is GitHub's at gather time. `--no-affiliation` skips the whole check and records
+`{"collected": false}`.
+
+**Returning contributors.** The first-time-contributor search now reads the date of each
+candidate's most recent earlier PR / issue from the same call (sorted newest first) and tells
+first-ever, returning (after more than 3, 6 or 9 months) and regular contributors apart. A
+possible returning contributor costs one more search call (the other kind is checked so the
+gap is to the most recent earlier PR or issue). A view also says what the store holds of each
+newcomer before the window (reviews, comments: a long-time reviewer's first PR is not a true
+first-timer), within the limits of what the store gathered.
+
+**Privacy.** Every signal is public data, but the result labels named people in a public
+newsletter. gather stores only the label, the signal's name, its strength and, for a commit
+email in a home domain, a `home_email_domain: true` boolean. It never stores the profile
+company or any other profile text, an email address, or the domain of a non-home address;
+the trust check refuses a stored entry that holds anything else. Before publishing, prefer
+counts and shares over per-person labels, and check every person you name with the override
+list. To turn the feature off: `--no-affiliation` (no calls, nothing labelled).
 
 ## 6. Forecasting — reading it and making it useful
 

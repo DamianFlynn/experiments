@@ -40,6 +40,7 @@ renderer over that view; changelogs, dashboards or slide decks are others.
 | Progressive series | What's new vs carried over since last month? Did last month's forecast land? | `link --series` (`series.py`) |
 | Flow health | What is blocked, hung, upvoted-but-ignored? Who/what blocks the most? | `derive.build_flow` / `build_blockers` |
 | Recognition | Who moved the project (no blame board, by design)? | `derive.annotate_people_profile` / `build_halls` |
+| People and community | How much came from the maintaining organisation and how much from the community? Who is new, or back after 3 / 6 / 9 months, and what did their work land (a new module, a pattern, a change, plumbing)? | gather `affiliations` + `newcomers` → extract `prior_activity` → `link` `contributors`, halls by affiliation |
 | Feature ledger | Which params/outputs/resources/docs were added, changed, removed? | `code_events` + `feature_deltas` |
 | Module release notes | Which modules are new, what changed in each, what is breaking (declared vs candidate), what was deprecated, how much was plumbing? | gather `module_notes` (changelogs, version files, tags) → `link` `module_changes` |
 | Stories | Which work had the most to tell (a debate, a change request and the rework after it, a long silence), and what was said along the way, in order? | gather `pr_history` (PR head refs) → `link` `discussion` / `stories` / slice `conversation` |
@@ -652,6 +653,14 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     said outside GitHub; a rewritten commit is flagged by its dates, not reconstructed.
     Story selection is a ranking by rule (`story_score`), not a judgement of importance, and
     the narrator brief forbids characterising people.
+22. **An affiliation is a label from public signals, and unknown is an answer.** gather
+    labels a person `maintainer_org` only on a stated signal (the operator's list, GitHub's
+    `author_association` on their records, public org membership, a matching profile company,
+    a home commit email domain) and `community` only on the operator's list or a stated
+    non-matching company; anything else is `unknown`, never community. It cannot see private
+    org membership, an unstated or stale employer, or a vendor relationship; the label is
+    GitHub's answer when the window was gathered. Only the label and the signal are stored —
+    no profile text, company or email — and `--no-affiliation` turns it off.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
 per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it

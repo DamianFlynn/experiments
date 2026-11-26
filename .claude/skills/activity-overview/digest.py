@@ -538,6 +538,8 @@ def _merge_people(members):
       modules / areas       "{repo}::{area}", like the project `modules`
                             keys, so two members' same-named areas stay apart
       is_bot                OR; login_resolved false when any member says so
+      affiliation / affiliation_signal   the member record with the most
+                            decisive signal (derive.affiliation_rank)
     Any other field is kept from the first member's record. Member records are
     not mutated. Order: first appearance over members in `members` order."""
     people, samples, opened = {}, {}, {}
@@ -574,6 +576,13 @@ def _merge_people(members):
             cur["is_bot"] = cur["is_bot"] or bool(rec.get("is_bot"))
             if rec.get("login_resolved") is False:
                 cur["login_resolved"] = False
+            # affiliation: the member whose signal is the most decisive wins
+            # (derive.affiliation_rank; a known label beats unknown)
+            if "affiliation" in rec and ("affiliation" not in cur or
+                                         derive.affiliation_rank(rec)
+                                         < derive.affiliation_rank(cur)):
+                cur["affiliation"] = rec["affiliation"]
+                cur["affiliation_signal"] = rec.get("affiliation_signal")
             samples.setdefault(login, []).extend(latencies.get(login, []))
     for login, cur in people.items():
         if any(seen for seen, _total in opened.values()):

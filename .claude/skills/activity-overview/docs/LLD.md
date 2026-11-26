@@ -143,6 +143,9 @@ scratch store) and `backfill` respectively.
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
 | `--no-newcomers` | off (check runs) | Skip the first-time-contributor search (§4.7); the window's `newcomers` fact is `{"collected": false}`. `ACTIVITY_NEWCOMERS_MAX` (default 200, min 0) caps the candidates checked |
+| `--no-affiliation` | off (check runs) | Skip the contributor affiliation check (§4.7a); the window's `affiliations` fact is `{"collected": false}`. `ACTIVITY_AFFILIATION_MAX` (default 300, min 0) caps the people looked up |
+| `--home-org ORG`, `--home-name NAME`, `--home-email-domain DOMAIN` | the repo's owner only | Repeatable: extra home organisations (public membership, and a company name), extra company names, home commit email domains (§4.7a); a manifest's `affiliation` object adds the same lists |
+| `--affiliation LOGIN=A` / `@org/team=A` | none | Repeatable operator override (`maintainer_org` / `community` / `unknown`), highest priority; beats a manifest `affiliation.overrides` entry for the same key |
 | `--no-iac-build` | off (builds run) | Do not run `bicep restore/build` / `terraform init/graph` (they download and run third-party code, §14.4); every area `edges_status: skipped`, `edge_extraction.disabled: true`. The structural scan still runs |
 | `--store PATH` | **required** | SQLite store |
 
@@ -209,6 +212,9 @@ sequenceDiagram
   A->>REST: workflow runs
   opt not --no-newcomers
     A->>REST: search/issues per candidate first-time contributor (collect_newcomers)
+  end
+  opt not --no-affiliation
+    A->>REST: orgs/{org}/public_members/{login}, users/{login} per person not decided for free (collect_affiliations)
   end
   A->>REST: releases, milestones
   opt token has read:project
@@ -544,7 +550,8 @@ flowchart TB
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
-| First-time contributors (`newcomers`) | `search/issues?q=repo:O/R is:<pr\|issue> author:<login> created:<<from>&per_page=1` → `total_count` | one call per candidate (author of a PR / reporter of an issue created in the window, bots and `ghost` excluded), a second for the other kind only when the first is 0; at most `ACTIVITY_NEWCOMERS_MAX` (200) candidates, the rest `not_checked`; a failed or `incomplete_results` answer → `unknown`; three failures in a row → the rest `unknown`; `--no-newcomers` → none (`{"collected": false}`) |
+| First-time contributors (`newcomers`) | `search/issues?q=repo:O/R is:<pr\|issue> author:<login> created:<<from>&sort=created&order=desc&per_page=1` → `total_count` and the first item's `created_at` (`last_seen_before`) | one call per candidate (author of a PR / reporter of an issue created in the window, bots and `ghost` excluded), a second for the other kind only when the first is 0 or its latest item is more than 90 days before the candidate's first item (a possible returning contributor); at most `ACTIVITY_NEWCOMERS_MAX` (200) candidates, the rest `not_checked`; a failed or `incomplete_results` answer → `unknown`; three failures in a row → the rest `unknown`; `--no-newcomers` → none (`{"collected": false}`) |
+| Contributor affiliation (`affiliations`, §4.7a) | `orgs/{org}/teams/{team}/members` per `@org/team` override; per person not decided by the override list or `author_association`: `orgs/{org}/public_members/{login}` per home org (204 / 404, `public_member_probe`), then `users/{login}` | at most `ACTIVITY_AFFILIATION_MAX` (300) people looked up, most active first, the rest `not_checked`; three people in a row whose lookups failed → the rest `not_checked`; answers cached per URL for the run (shared by a manifest's members); `--no-affiliation` → none |
 | Closing issues (#105), GraphQL | `repository { pr<N>: pullRequest(number: N) { closingIssuesReferences(first: 25) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } } } }` | 50 kept PRs aliased per request; a PR with more than 25 closing issues is paged on its own (`first: 100, after:`) |
 | Projects v2 boards, GraphQL | §4.8 | maintained boards only, items capped |
 
@@ -599,6 +606,46 @@ the network):
   range is split by day and re-queried. A single day still at the cap is left truncated: a
   stderr warning, and `workflow_stats._truncated = {truncated, cap, fetched, total_count,
   ranges}` (a reserved key, present only then).
+
+### 4.7a Contributor affiliation and returning contributors
+
+**Affiliation (`collect_affiliations`, per-window fact `affiliations`).** `affiliation_people`
+lists the window's human people from the kept records (PR / issue authors, mergers,
+reviewers, comment authors, commit authors resolved to a login; bots, `ghost` and
+unresolved git names out), most active first, with the best home `author_association` seen on
+their own records. `affiliation_config` resolves the settings: home orgs = the repo's owner
+plus `--home-org` / manifest `affiliation.home_orgs`; home names = those orgs plus
+`--home-name` / `home_names`, normalised by `normalize_company`; home email domains;
+overrides (logins, and `@org/team` groups expanded by `resolve_affiliation_groups` through
+the team members listing; a group the token cannot list is `groups_unresolved`).
+`decide_affiliation` takes the first signal that decides: override (`operator`) →
+`author_association` OWNER / MEMBER (`strong`) / COLLABORATOR (`medium`) → public membership
+of a home org (`strong`) → profile company: a match `maintainer_org` (`medium`), a non-empty
+non-match `community` (`weak`) → home commit email domain (`medium`) → `unknown` (`none`, or
+`lookup_failed`). A failed lookup blocks a `community` decision from a weaker signal.
+`find_affiliations` applies the free signals to everyone and the looked-up ones to at most
+`ACTIVITY_AFFILIATION_MAX` people (`not_checked` beyond, and after
+`AFFILIATION_FAILURE_STOP` = 3 people in a row whose lookups failed). The network seam is
+`make_affiliation_lookup(get_page, cache)` over the gather's client: `lookup("public_member",
+login, org)` → bool / None and `lookup("company", login)` → text / None; the company text
+goes to `company_matches` and nowhere else. `_paginated` routes
+`orgs/{org}/public_members/{login}` to `public_member_probe` (no JSON body: 204 → member, 404
+→ not). Answers are cached per URL in `args.affiliation_cache` (one dict per gather run;
+`_gather_manifest` shares it across members, so a person active in several members is looked
+up once). There is no cross-run cache: a later window asks again, because the answer is
+GitHub's at gather time. The commit email is read in `resolve_commit_authors`
+(`home_domains`, `home_email`): only the resolved login of a commit whose email is in a home
+domain is noted; the email is dropped as before. Cost per person not decided for free: one
+call per home org (until one answers 204) plus one profile call. The entry stored per person
+is `{affiliation, signal[, strength][, home_email_domain: true]}`.
+
+**Returning contributors (`find_newcomers`).** The search URL sorts by `created` descending,
+so `search_latest_created` reads the most recent earlier item from the same `per_page=1`
+answer. A candidate whose first-kind latest item is more than `RETURNING_GAP_DAYS[0]` (90)
+days before their first window item gets the other kind searched too (the gap is to the most
+recent earlier PR or issue); otherwise the call count is unchanged. Classes: `new` (none),
+`returning` (`gap_days` > 90; `gap_bucket` by `RETURNING_GAP_BUCKETS`: over 3 / 6 / 9 months;
+`gap_upper_bound` when the second search failed), `regular`, `earlier_undated`.
 
 ### 4.8 Projects v2 boards
 
@@ -961,7 +1008,15 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    its stored value verbatim; any other window → merged over the gathered windows wholly
    inside the view that collected one, not overlapping one another (`_merged_newcomers`:
    `new` keeps each login's earliest entry, `unknown` / `not_checked` the unions less the
-   logins found new, plus `windows` and `covers_view`). `module_notes` (top-level key, omitted
+   logins found new, `returning` / `regular` with the earliest window's class winning, plus
+   `windows` and `covers_view`). `affiliations` (omitted when no gather stored it, §4.7a):
+   exactly a gathered window → verbatim; any other → `_merged_affiliations`, per person the
+   latest overlapping window's entry, `unknown` / `not_checked` recomputed, plus `windows` /
+   `covers_view`. `prior_activity` (only when the view's `newcomers` names a first-ever or
+   returning contributor): `_prior_activity` counts, from every stored social record of the
+   repo, the PRs / issues they authored, reviews they submitted and comments they wrote dated
+   before `newcomers.before`, with `store_from` (the earliest gathered window start).
+   `module_notes` (top-level key, omitted
    when no gather stored it, §4.4a): exactly a gathered window → its stored value verbatim; any
    other window → the dated items of every gathered window overlapping the view that fall in
    it, once each (`_merged_module_notes`: changelogs / versions / unread by (path, commit), tags
@@ -1404,6 +1459,23 @@ the commit names a PR, else the commit url). Deterministic: every list has an ex
 or follows the stored order; `test_module_changes.py` enriches a key-reversed bundle to prove
 key order does not matter.
 
+### 6.9b The people layer — `build_contributors(bundle, path_rules=())`
+
+Last step of `enrich`, only when the view carries a collected `affiliations` or `newcomers`
+fact (BUNDLE.md "The people layer"). `_module_layer` takes the view's `module_changes`, or
+builds the same over a shallow copy with an empty `module_notes` (`code_events_only`: status
+`new` from an added entry file only). `_contribution_index` maps each PR to the modules it
+touched (area, kind, status, `role` introduced / changed, `first_version`) and to the
+changelog entries its commits added (items verbatim, at most 5). `person_contributions`:
+the person's PRs merged in the window (rows of `module_changes.prs`: class, sweep), newest
+first, then their open PRs (`headline: unknown`: no file list), at most 10. `headline` =
+`new_module` when a module row is `introduced`, else from the PR class (`ci` / `docs-only` /
+`tests-only` → `plumbing`, `release`, `module` / `mixed` → `module_change`, `unknown`).
+`person_reviews`: PRs reviewed and the module areas of the merged ones.
+`_affiliation_summary`: people per label, signals, merged PRs by author label and reviews
+(reviewer-PR pairs) by reviewer label, with shares of the human total, `unknown` separate and
+`bots_excluded`. `_community_summary`: `community`-labelled people only. Pure; no call.
+
 ### 6.10 `derive.py` projections
 
 | Function | Output | Rule highlights |
@@ -1416,7 +1488,8 @@ key order does not matter.
 | `unresolved_person_key` | person key | the git name of a commit author gather could not resolve to a login, `+ " (git)"` when login-shaped, so it never equals a login (#78) |
 | `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*`; git-name forms `GitHub Actions`, `Dependabot`, `Dependabot Preview`, `Renovate`, `Renovate Bot` (case/space-insensitive), each also with the `" (git)"` suffix |
 | `annotate_people_profile` | per-login metrics | prs authored (in scope) / opened in the window (`prs_opened`, when the view holds an earlier PR) / merged / reviewed, merge rate, commits and `own_pr_commits` (landing commits of their own merged PRs, when not 0), review latency (median), first/last active, examples/docs/symbols authored |
-| `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored − own_pr_commits` (a commit landing the person's own merged PR is not counted again), top 10; **no shame/blame** |
+| `annotate_people_affiliation` | `people[].affiliation` / `affiliation_signal` | only with a collected `affiliations` fact: the fact's entry, else `unknown` with `not_checked` / `not_looked_up`; bots untouched |
+| `build_halls` | `halls.fame` (+ `community`, `maintainer_org`, `unranked_unknown`) | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored − own_pr_commits` (`hall_score`; a commit landing the person's own merged PR is not counted again), top 10; when people carry `affiliation`, the same ranking within `community` and within `maintainer_org`, and how many scoring people are `unknown` (never ranked); **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
 | `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (`blocker_graph` applies the same open-only filter, #101) |
 
@@ -1737,7 +1810,9 @@ combines disjoint parts: counts (`derive.PROFILE_COUNT_FIELDS`) are summed; `mer
 recomputed from the sums; `review_latency_days` is the median of every member's samples
 (`derive.review_latency_samples` over each member's PRs, the samples
 `annotate_people_profile` takes the median of); `first_seen`/`last_active` are the min/max;
-`modules`/`areas` become `"<repo>::<area>"`; `is_bot` is OR'd, `login_resolved: false` wins.
+`modules`/`areas` become `"<repo>::<area>"`; `is_bot` is OR'd, `login_resolved: false` wins;
+`affiliation` / `affiliation_signal` come from the member record with the most decisive
+signal (`derive.affiliation_rank`: `AFFILIATION_SIGNAL_ORDER`, a known label before unknown).
 `halls` is `derive.build_halls` over the merged people. Nothing is stored: the person nodes
 stay the fold's union, which `validate`'s `no_drift_people` checks.
 
@@ -1827,6 +1902,7 @@ diff-stable.
 | `ACTIVITY_HTTP_RETRIES` | 3 | Extra attempts on timeout / connection error / 5xx |
 | `ACTIVITY_RATE_LIMIT_MAX_WAIT` | 3600 | Longest single rate-limit wait in seconds (`0` = fail instead of waiting) |
 | `TF_PLUGIN_CACHE_DIR` | unset | Shared terraform provider cache (enables serial pre-warm) |
+| `ACTIVITY_AFFILIATION_MAX` | 300 | People looked up for the affiliation check per window (min 0; the rest `not_checked`) |
 | `ACTIVITY_BOARD_STALE_DAYS` | 365 | Board treated as deprecated beyond this |
 | `ACTIVITY_BOARD_MAX_ITEMS` | 5000 | Per-board item cap |
 | `ACTIVITY_MMDC_PUPPETEER_CONFIG` | unset | Puppeteer config file passed to `mmdc -p` (as root without it: generated `--no-sandbox` config) |
@@ -1909,7 +1985,12 @@ release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100�
 the commit-author login listing, #78; zero for a window with no commits), plus 1–2 search calls
 per candidate first-time contributor (`newcomers`, capped by `ACTIVITY_NEWCOMERS_MAX`; the search
 API's own limit is 30 requests a minute, waited out like any rate limit; `--no-newcomers` skips
-them). Because **all open PRs and issues** are included every run, busy
+them; a possible returning contributor costs one more), plus, for the affiliation check
+(§4.7a), per person not decided by the override list or `author_association`: one
+public-membership call per home org (until one answers 204) and one profile call, capped by
+`ACTIVITY_AFFILIATION_MAX` and cached per URL for the run (`--no-affiliation` skips them; a
+September of Azure/bicep-registry-modules has about 230 people: with two home orgs and no
+free signal for most, up to about 660 core-API calls). Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (a personal token's authenticated limit is 5,000 requests/hour; the
 workflow's built-in `GITHUB_TOKEN`, which the CI live jobs use by default, has a lower limit
 that its runs in one repository share, so a live gather in CI is likelier to wait for the

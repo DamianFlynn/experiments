@@ -503,6 +503,29 @@ check; every fixture bundle):
   checked).
 - `{"collected": false}` alone — the window was gathered with `--no-newcomers`.
 
+**First ever, returning or regular.** The search is sorted by creation date, newest first
+(`sort=created&order=desc`, still `per_page=1`), so the one item it returns is the
+candidate's most recent earlier PR / issue of that kind: its `created_at` is
+`last_seen_before`. When that is more than `RETURNING_GAP_DAYS[0]` (90) days before the
+candidate's first item of the window, the other kind is searched too (a more recent item of
+that kind would shorten the gap), so the gap is measured to the most recent earlier PR **or**
+issue; a regular contributor still costs one call. Each checked candidate is then one of:
+
+- `new` (first ever: no PR / issue authored in the repo before `before`; the shape above);
+- `returning` — `{login, first, number, url, created_at, last_seen_before, gap_days,
+  gap_bucket}`: `gap_days` (whole days from `last_seen_before` to `created_at`) is more than
+  90; `gap_bucket` is `over_3_months` (> 90 days), `over_6_months` (> 180) or
+  `over_9_months` (> 270) — `gather.RETURNING_GAP_DAYS`, a month counted as 30 days;
+  `gap_upper_bound: true` when the second kind's search failed (the true gap may be
+  shorter);
+- `regular` — `{login, last_seen_before, gap_days}` (gap of 90 days or less);
+- `earlier_undated` (only when any) — earlier items exist but the answer carried no date.
+
+`returning`, `regular` and `gap_thresholds_days` ([90, 180, 270]) are present on facts
+gathered with this rule; a fact gathered before it has only `new` (its candidates with
+earlier activity are not classified). "First" always means first PR or issue **authored**;
+reviews and comments are not searched (see `prior_activity` below for what the store holds).
+
 A view of exactly a gathered window carries the stored value verbatim (so `validate.py
 --bundle` compares it like any per-window fact). A view spanning several gathered windows
 merges those lying wholly inside it that collected one, not overlapping one another (by start
@@ -510,8 +533,167 @@ day, the longest first): `new` keeps each login's earliest entry, `unknown` / `n
 are the unions less the logins found new, `candidates` is left out (a login can be a
 candidate in two windows), and two keys are added: `windows` (the merged windows) and
 `covers_view` (false when they leave days of the view uncovered — a newcomer in an uncovered
-day is missing). Multi-repo: per member bundle; a person new to one member may have worked in
+day is missing). `returning` / `regular` merge the same way, the earliest window's class
+winning (a login new in August and returning in September is new to the quarter).
+Multi-repo: per member bundle; a person new to one member may have worked in
 another. Additive and omit-when-absent: `meta.schema_version` stays 3.
+
+## The people layer (`affiliations`, `prior_activity`, `contributors`)
+
+Who contributed — the maintaining organisation or the community — who is new or back after
+a gap, and what each of them landed. Three keys, each omitted when its input is absent (a
+store gathered before this layer; every fixture bundle), so other views are unchanged;
+`meta.schema_version` stays 3.
+
+### `affiliations` (raw, from the store)
+
+The per-window fact gather writes (`gather.collect_affiliations`; STORE.md). For each human
+person of the window — PR / issue authors, mergers, reviewers, commenters and commit authors
+resolved to a login (bots, `ghost` and unresolved git names left out):
+
+```json
+{"collected": true, "home_orgs": ["Azure", "microsoft"], "home_names": ["azure", "microsoft"],
+ "home_email_domains": ["microsoft.com"],
+ "people": {"octo": {"affiliation": "maintainer_org", "signal": "author_association", "strength": "strong"},
+            "mona": {"affiliation": "community", "signal": "profile_company", "strength": "weak"},
+            "hubot": {"affiliation": "unknown", "signal": "none"}},
+ "unknown": ["hubot", "login-over-the-cap"], "not_checked": ["login-over-the-cap"],
+ "groups_unresolved": ["@org/secret-team"]}
+```
+
+- `affiliation` — `maintainer_org` (the organisation that owns the repository, or an
+  organisation the operator lists as home), `community`, or `unknown`. **Never defaulted to
+  community**: no signal means `unknown`.
+- `signal` / `strength` — the first signal that decided, in this order:
+  1. `override` (`operator`) — the operator's list (`--affiliation LOGIN=…`,
+     `--affiliation @org/team=…`, manifest `affiliation.overrides`);
+  2. `author_association` — GitHub's value on the person's own PR / issue / comment records of
+     the window, **at gather time**: `OWNER` / `MEMBER` (`strong`), `COLLABORATOR`
+     (`medium`). `MEMBER` means a member of the organisation that **owns the repository**
+     (e.g. `Azure` for Azure/bicep-registry-modules), not of any other home organisation.
+     `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR` and `NONE` decide nothing;
+  3. `public_membership` (`strong`) — `GET /orgs/{org}/public_members/{login}` answered 204
+     for a home organisation (404: not a public member — private membership is invisible);
+  4. `profile_company` — the public profile's `company`, normalised (lower case, leading `@`
+     dropped, punctuation removed, trailing "Corporation" / "Corp" / "Inc" / "Ltd" / "LLC" /
+     "GmbH" / "PLC" removed: "@microsoft", "Microsoft", "Microsoft Corporation" all read
+     "microsoft") and compared exactly with the home names (or any `@handle` in it): a match →
+     `maintainer_org` (`medium`); a non-empty company that does not match → `community`
+     (`weak`: self-declared and possibly stale); empty → no signal;
+  5. `commit_email_domain` (`medium`) — a commit email of theirs in a home email domain
+     (`users.noreply.github.com` never counts);
+  6. none → `unknown` with signal `none`, or `lookup_failed` when a lookup could not answer.
+     A failed lookup never lets a weaker signal decide `community` (a home-org public
+     membership might have been missed); a weaker signal may still decide `maintainer_org`.
+- `home_email_domain: true` — on any entry whose commit email was in a home domain (the only
+  trace of an email that is kept).
+- `unknown` — every person labelled unknown, plus `not_checked`.
+- `not_checked` — people the API was not asked about: beyond `ACTIVITY_AFFILIATION_MAX`
+  (default 300, the most active first) or after three people in a row whose lookups failed.
+  They have no entry and count as unknown.
+- `groups_unresolved` — `@org/team` overrides whose members the token could not list.
+- `{"collected": false}` alone — gathered with `--no-affiliation`.
+
+**What is stored about a person:** the login (already in every record), the label, the
+signal name, its strength and the `home_email_domain` boolean. Never the profile company or
+any other profile text, never an email address or a domain of a non-home address.
+`validate.py` refuses a stored `affiliations` value whose entries carry anything else.
+
+A view of exactly a gathered window carries the stored value verbatim (`validate.py
+--bundle` compares it). A wider view takes, per person, the entry of the latest gathered
+window overlapping it (the label is the answer when that window was gathered), recomputes
+`unknown` / `not_checked` and adds `windows` and `covers_view`.
+
+### `prior_activity` (raw, from the store)
+
+Only when the view's `newcomers` names a first-ever or returning contributor: what the
+store holds of each of them dated before `newcomers.before`:
+
+```json
+{"before": "2026-10-01", "store_from": "2026-08-01",
+ "people": {"octo": {"prs": 0, "issues": 0, "reviews": 1, "comments": 0, "earliest": "2026-08-31"}}}
+```
+
+`reviews` (review submissions), `comments` (PR conversation, review and issue comments),
+`prs` / `issues` authored. It tells a long-time reviewer's first PR from a true first-timer.
+**What the store can know:** only the records of its gathered windows (PRs and issues
+updated in them, the open ones, and older ones those reached), so `0` means "none in the
+store", not "none ever"; activity before `store_from` (the repo's earliest gathered window)
+is mostly invisible.
+
+### `contributors` (derived by `link.py`)
+
+Built when the view carries a collected `affiliations` or `newcomers` fact. Facts, not
+prose; every PR carries its URL.
+
+```json
+{"affiliation": {"home_orgs": [...], "people": {"maintainer_org": 8, "community": 0, "unknown": 222},
+                 "signals": {"author_association": 8, "none": 221, "not_looked_up": 1},
+                 "merged_prs": {"maintainer_org": {"count": 38, "share": 0.594}, "community": {...},
+                                "unknown": {"count": 26, "share": 0.406}, "total": 64, "bots_excluded": 5},
+                 "reviews": {...same shape...}},
+ "community": {"people": 0, "prs_merged": 0, "prs_merged_numbers": [], "reviews": 0,
+               "first_timers": [], "returning": [], "modules": []},
+ "newcomers": [{"login": "mona", "class": "first_ever",
+                "first": {"first": "pr", "number": 7558, "url": "…/pull/7558", "created_at": "…"},
+                "seen_in_store_before": {"prs": 0, "issues": 0, "reviews": 0, "comments": 0, "earliest": null},
+                "affiliation": "community", "affiliation_signal": "profile_company",
+                "contributed": {"prs": [{"number": 7558, "url": "…", "title": "feat: add privatelink.redis.azure.net",
+                                         "state": "merged", "class": "module", "headline": "module_change",
+                                         "modules": [{"area": "avm/ptn/network/private-link-private-dns-zones",
+                                                      "kind": "pattern", "status": "changed", "role": "changed"}],
+                                         "changelog": [{"module": "…", "version": "0.7.4",
+                                                        "items": ["Added Redis zone `privatelink.redis.azure.net`"]}]}]}}],
+ "gap_thresholds_days": [90, 180, 270], "store_from": "2026-08-01",
+ "hall": [{"login": "…", "score": 82, "affiliation": "…", "affiliation_signal": "…",
+           "contributed": {"prs": [...], "prs_omitted": 29}, "reviewed": {"prs": 6, "modules": [...]}}],
+ "inputs": {"module_layer": "module_changes"}}
+```
+
+- **`affiliation`** (with `affiliations`) — people per label, the deciding signals, and the
+  window's PRs merged into the mainline (`module_changes.prs`) by their author's label and
+  its reviews (each reviewer once per PR) by the reviewer's label; `share` is of `total`
+  (the human-authored ones), `unknown` always its own bucket, `bots_excluded` the rest. A
+  wider view adds `windows` / `covers_view`.
+- **`community`** (with `affiliations`) — only people labelled `community` (never
+  `unknown`): how many, their merged PRs (and numbers), reviews, the first-timers and
+  returning contributors among them, and the module areas that received a community PR
+  merged in the window.
+- **`newcomers`** (with `newcomers`) — one row per first-ever or returning contributor
+  (sorted by login): `class`, their first item of the window, the gap fields for a
+  returning one, `seen_in_store_before` (`prior_activity`), their label, and `contributed`.
+- **`hall`** — for each `halls.fame` entry: label, `contributed`, and `reviewed` {prs: how
+  many of the view's PRs they reviewed, modules: the module areas of those merged in the
+  window}.
+- **`contributed`** — their PRs merged in the window (newest first), then their open ones;
+  at most 10 (`prs_omitted`). Each: `state`, `class` (the module layer's PR class), and
+  `headline`: `new_module` (the PR introduced a module that is new in the window; its row
+  has `role: "introduced"` and `first_version` — e.g. a first PR ever that lands the new
+  pattern module `avm/ptn/app/function-app` 0.1.0), `module_change`, `plumbing` (CI, docs
+  or tests only: `class` says which), `release` (a version cut with no code change) or
+  `unknown` (no commit of it in the view — an open PR: the store holds no file list for an
+  open PR's commits). `modules` (at most 5, introduced first): area, kind (resource /
+  pattern / utility / module / submodule / deployment), the module's status in the window,
+  the PR's role; for a mechanical sweep only the modules whose source it changed, with
+  `sweep`. `changelog`: the entries the PR's commits added to module changelogs, items
+  verbatim (at most 5 per entry, `items_omitted`).
+- **`inputs.module_layer`** — `module_changes` (the view's own, built from the gathered
+  `module_notes`), or `code_events_only` for a view without them: the same build over the
+  commits and file events alone (a module is `new` only from an added entry file; no
+  changelog items, no tags).
+
+**Halls by affiliation.** When the people carry `affiliation`, `halls` adds `community` and
+`maintainer_org` — the same people ranked the same way as `fame` (top 10 each) within one
+label — and `unranked_unknown` (how many people with a positive score are `unknown`). `fame`
+is unchanged. **people[]** rows gain `affiliation` and `affiliation_signal` (non-bots; a
+person the fact does not name is `unknown` with `not_checked` or `not_looked_up`). The
+project view (digest) keeps, per person, the member's label with the most decisive signal
+(`derive.AFFILIATION_SIGNAL_ORDER`) and ranks the halls on the merged people.
+
+**What the data cannot tell:** private org membership; an employer the profile does not
+state (or states stale); vendors and contractors (a company that does not match is
+`community`); activity before the store's first window; what an open PR changes. The label
+is GitHub's and the profile's answer when the window was gathered, not as of the window.
 
 ## Module changes (`module_notes` → `module_changes`)
 
@@ -921,7 +1103,8 @@ empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, newcomers, module_notes,
-module_changes, pr_history, stories, releases, milestones, sprints, diagrams`.
+module_changes, pr_history, affiliations, prior_activity, contributors, stories, releases,
+milestones, sprints, diagrams`.
 
 **Never in a view:** gather's in-memory bundle skeleton also reserves `workflows` (the raw
 CI runs `workflow_stats` is counted from; never folded, so no view carries it), and
@@ -1415,6 +1598,7 @@ across members (see "Project view: `people` and `halls`").
   | `examples_authored` / `docs_authored` / `symbols_authored` | distinct artifacts with an `add` lifecycle event by this login, bucketed by `kind` (example; doc+readme; symbol) (int) |
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
   | `stale_owned` | distinct areas in a stalled train's `code_areas` (an open train with `effort.stalled`, #112) that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
+  | `affiliation` / `affiliation_signal` | only when the view carries a collected `affiliations` fact, on non-bots: `maintainer_org` / `community` / `unknown` and the deciding signal ("The people layer") |
 
   Counts are always present (ints, may be 0), except `prs_opened` and `own_pr_commits`
   (present when applicable, above); `merge_rate`/`review_latency_days`/
