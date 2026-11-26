@@ -108,7 +108,8 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 > into `series.json` from a grown store; (2) the per-repo facts (`workflow_stats` CI health,
 > `code_graph`, `code_owners`, label taxonomy) are the **latest** gather's in every view, so a
 > past month or a quarter shows the latest month's CI statistics (issue #94); (3) a person's
-> `modules`/`areas` are the union over all stored months; (4) on such a store `validate` can
+> `modules`/`areas` in a view are the view's own (re-derived from its records, #88) but use
+> the latest month's code graph; (4) on such a store `validate` can
 > only warn about, not prove, the edges that come from latest-wins inputs (ownership,
 > dependencies, milestones); (5) edges are never retracted (a removed module `source` keeps its
 > `depends_on`, HLD §10 item 10). A single-window store per installment — the way CI and the
@@ -181,10 +182,14 @@ Then ask Claude to write the report from `$B` (+ slices + diagrams) following
 > series file (`$S/series/<owner>__<repo>.json`; `link.py` creates the directory) and diagrams dir
 > (`$S/views/$M/diagrams/<owner>__<repo>`) per member so members never overwrite each other
 > or share a series index. The merged project
-> view (cross-repo trains, merged shipped/people/modules, `related_work`, `module_edges`)
+> view (cross-repo trains, merged shipped/people/halls/modules, `related_work`, `module_edges`)
 > comes from `digest.py --store $DB --project <name> --from $FROM --to $TO`; its embedded
 > `members[i].bundle` has no `series` or `diagrams` — use the member's bundle view file for
 > those. The cross-repo module graph is `render.emit_project_module_graph(view["module_edges"])`.
+> Contributors: a member bundle's `people` / `halls` cover only that member (its own
+> contributors, its areas); the project view's `people` / `halls` are the project totals —
+> each person's counts summed across members, areas as `<repo>::<area>` (#88). Use the
+> project view for the project-wide Contributors section.
 
 ## 5. Runbook — progressive monthly updates
 

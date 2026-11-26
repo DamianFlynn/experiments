@@ -560,8 +560,10 @@ class TestMergeHelpers(unittest.TestCase):
         ]
         people = digest._merge_people(members)
         self.assertEqual(set(people), {"alice"})
-        self.assertEqual(people["alice"]["modules"], ["m1", "m2"])
-        self.assertEqual(people["alice"]["areas"], ["a1"])
+        # Issue #88: project areas/modules are repo-qualified, like the
+        # project `modules` keys (a1 in Azure/a is not a1 in Azure/b).
+        self.assertEqual(people["alice"]["modules"], ["Azure/a::m1", "Azure/b::m2"])
+        self.assertEqual(people["alice"]["areas"], ["Azure/a::a1", "Azure/b::a1"])
         self.assertEqual(people["alice"]["display_name"], "Alice")  # preserved
         # source records not mutated
         self.assertEqual(members[0]["bundle"]["people"]["alice"]["modules"], ["m1"])

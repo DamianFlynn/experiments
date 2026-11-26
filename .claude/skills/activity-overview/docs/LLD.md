@@ -638,9 +638,13 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    an artifact with none is left out; `status`/`replaced_by`/move fields are as of the
    window's end — the stored node when the ledger holds nothing dated after `ts_to`, else
    `derive.artifact_projection` over the ledger up to `ts_to` with the recorded moves, laid
-   over the stored record (`_artifacts_as_of`). `people` drops the logins that contribute to
-   this repo's stored records but to none of the view's (`_window_people`, same enumerator
-   as fold); logins with no contribution to this repo are untouched (#88). `code_owners` is an
+   over the stored record (`_artifacts_as_of`). `people` (`_view_people`, #85/#88) keeps only
+   the stored people with a contribution in the view's records — `derive.enumerate_participants`
+   over them, the enumerator fold uses (commit `pr` resolved from the message on a copy, null
+   lists read as empty) — so another member's people and people of another window are left
+   out; each kept record's `modules`/`areas` are what that enumerator derives from the view's
+   records with this repo's stored `code_graph`, its flags (`is_bot`, `login_resolved`) are
+   the stored node's. The person node is not changed. `code_owners` is an
    ordered rule list so CODEOWNERS last-match-wins order survives the sorted-key JSON store;
    `fold_bundle` (`owns`) and `annotate_people_profile` (`stale_owned`) share one matcher,
    `derive.compile_codeowners`/`area_owners` (area = last rule matching `<area>/`).
@@ -665,8 +669,9 @@ The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 > gathered window equals the view of a store holding only that window, up to records a later
 > gather refreshed; a view spanning several windows is their union. `digest` applies the same
 > decision to its spine components (`window_components`), so a project train does not fold in
-> another window's PR/issue as an orphan ref. Not windowed: the per-repo singletons (latest
-> gather, #94) and people's `modules`/`areas` (union over windows). See HLD §10 item 8.
+> another window's PR/issue as an orphan ref. People's `modules`/`areas` are re-derived from the
+> view's records (#88), so they are the window's too — computed with the latest stored code
+> graph. Not windowed: the per-repo singletons (latest gather, #94). See HLD §10 item 8.
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -1079,17 +1084,27 @@ opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
 `members[].bundle.meta` gains `project`, `slug`, `repo_owner`, `repo_name`
 (`meta.owner` stays the project scope).
 
+People and totals (issue #88). A member bundle's `people` are that member's contributors in
+the window (§6.1 step 5) and their profile counts only its records, so `_merge_people`
+combines disjoint parts: counts (`derive.PROFILE_COUNT_FIELDS`) are summed; `merge_rate` is
+recomputed from the sums; `review_latency_days` is the median of every member's samples
+(`derive.review_latency_samples` over each member's PRs, the samples
+`annotate_people_profile` takes the median of); `first_seen`/`last_active` are the min/max;
+`modules`/`areas` become `"<repo>::<area>"`; `is_bot` is OR'd, `login_resolved: false` wins.
+`halls` is `derive.build_halls` over the merged people. Nothing is stored: the person nodes
+stay the fold's union, which `validate`'s `no_drift_people` checks.
+
 ```mermaid
 flowchart TB
   mb["member_bundles: per member<br/>extract + link.enrich"] --> sc["spine_components:<br/>connected components across repos"]
   sc --> wc["window_components:<br/>drop stored member anchors<br/>not in that member's view (#85)"]
   wc --> bt["build_project_trains:<br/>member trains sharing a component merge;<br/>orphan social nodes fold in; solo otherwise"]
   bt --> tk["_attach_tickets: trains sharing only an<br/>internal ticket (opt-in: manifest ticket_prefixes<br/>or --ticket-pattern) cluster into related_work"]
-  mb --> mg["_merge_shipped / _merge_people / _merge_modules"]
+  mb --> mg["_merge_shipped / _merge_people (sums, halls) / _merge_modules"]
   pd["project_depends_on: edges_by_type depends_on"] --> me["module_edges<br/>src_repo, src_area, dst_repo, dst_area,<br/>version, transitive, cross_repo"]
   tk --> view
   mg --> view
-  me --> view["project view<br/>meta, members[].bundle, trains, related_work,<br/>shipped, people, modules, module_edges"]
+  me --> view["project view<br/>meta, members[].bundle, trains, related_work,<br/>shipped, people, halls, modules, module_edges"]
 ```
 
 `window_components` (issue #85) removes from each component the stored PR/issue anchors of a
@@ -1241,7 +1256,7 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 |---|---|---|---|
 | Past-month views show the latest record state | PR/issue nodes are upserted latest-wins; a view is window-scoped (#85) but reads the stored record | on a store holding later windows, a past month's view shows today's state/labels/milestone/comments (`meta.state_as_of`); an item open at that month's end but closed since is not in it; an item updated in that month and again later is in the later month only | per-window snapshots of the record at fold |
 | `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; since #85 a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
-| Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | every view (a past month, a wider digest window) shows the latest gather's CI stats and structure | store per-window singletons or aggregate (#94) |
+| Singletons latest-wins | `workflowstats`/`codegraph`/`codeowners`/`labeltaxonomy` upserted per gather | every view (a past month, a wider digest window) shows the latest gather's CI stats and structure; a view's people `modules`/`areas` (re-derived from its records since #88) are attributed with the latest code graph | store per-window singletons or aggregate (#94) |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
 | No edge retraction | edges are unioned | removed `source` refs persist as `depends_on` | per-gather edge sets keyed by `clone_sha` |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |

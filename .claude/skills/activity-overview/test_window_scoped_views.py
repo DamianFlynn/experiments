@@ -16,8 +16,8 @@ state —
 - a commit dated in the window; the ledger rows and artifact lifecycle events
   of those commits; a release published in the window;
 - every node whose own timestamp is in the window, and every undated node;
-- the stored people minus the logins that worked in this repo only outside
-  the window.
+- the stored people with a contribution in the view's records (issue #88:
+  their modules / areas re-derived from those records).
 
 Scenario: May and June folded into one store (in both orders). PR 2 and
 issue 18 stay open across both months and are re-gathered unchanged in June;

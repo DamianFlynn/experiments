@@ -475,9 +475,15 @@ These are real, current limits — plan around them:
    (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when). An
    item that was open at the end of that month but has closed since is not in its view
    (its stored state is closed, outside the month); an item updated in that month and again
-   later is in the later month's view only. People's `modules`/`areas` are the union over every
-   window; the per-repo singletons are the latest gather's (item 9); a view spanning several
-   gathered windows can still match a symbol move across them (LLD §14.5).
+   later is in the later month's view only. The per-repo singletons are the latest gather's
+   (item 9), and a person's `modules`/`areas` in a view are computed with that latest code
+   graph; a view spanning several gathered windows can still match a symbol move across them
+   (LLD §14.5).
+   **People in a multi-repo project (#88).** A member bundle lists only the people with a
+   contribution in that member's window, with that repo's areas; the project view sums each
+   person's counts across members (nobody is counted twice), combines dates and review
+   latency, qualifies areas as `<repo>::<area>` and ranks `halls.fame` on those totals. The
+   stored person node stays the project-wide union (what `validate` checks).
 9. **Per-repo singletons are latest-wins.** `workflow_stats`, `code_graph`, `code_owners` and
     `label_taxonomy` are stored once per repo and replaced by each gather, so they describe the
     latest gathered window only.

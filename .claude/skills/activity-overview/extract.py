@@ -7,7 +7,8 @@ out and reconstructs the raw bundle (`meta`, `prs`, `issues`, `commits`,
 already materialized into nodes — `artifacts` (the per-file lifecycle ledger) and
 `people` (the per-login modules/areas). Slice 7b-2 moved those two out of
 `link.enrich` and into the store: extract READS the stored nodes (it does NOT
-re-derive via build_artifacts / attribute_people_areas), and `link.enrich`
+re-derive via build_artifacts; a person's modules/areas are the one exception,
+taken from the view's own records since issue #88), and `link.enrich`
 shrank to the remaining window projections (trains/buckets/timeline/
 feature_deltas/modules/forecast/code-area attribution).
 
@@ -60,8 +61,9 @@ Materialization approach (slice 7a part 1)
 6. `artifacts`: the stored artifact nodes with each lifecycle limited to the
    view's events (an artifact with none is left out) and status /
    replaced_by / move fields as of the window's end; `people`: the stored
-   project people minus logins that worked in this repo only outside the
-   window. See `_artifacts_as_of` / `_window_people`.
+   project people with a contribution in this view (this member, this
+   window), their modules / areas re-derived from the view's records (issue
+   #88). See `_artifacts_as_of` / `_view_people`.
 
 Deterministic ordering matches the golden bundles: prs/issues by number, commits
 by sha, milestones by number, releases by tag/name, code_events by source order.
@@ -314,22 +316,18 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     bundle["artifacts"] = _order_artifacts(arts, bundle["code_events"],
                                            derive.commit_times(bundle))
 
-    # people: the per-login modules/areas fold persisted as project-scoped person
-    # `structure` nodes (repo sentinel "*", local id `person-<login>`). Read them
-    # back into the dict keyed by login, dropping the redundant stored `login`
-    # field so the shape matches attribute_people_areas' output. Materialized from
-    # the store, NOT re-derived. Window scope (issue #85): a login that worked in
-    # THIS repo only outside the window is left out (`_window_people`); people
-    # who never worked in this repo are untouched (the per-member scoping of
-    # project people is issue #88's).
-    bundle["people"] = _window_people(
-        _materialize_people(conn, project),
-        all_records={"prs": [n["data"] for n in socials
-                             if _local(n["id"]).startswith("pr-")],
-                     "issues": [n["data"] for n in socials
-                                if _local(n["id"]).startswith("issue-")],
-                     "commits": [n["data"] for n in commit_nodes]},
-        view_records=bundle)
+    # people: the project-scoped person `structure` nodes fold persisted (repo
+    # sentinel "*", local id `person-<login>`), read back into the dict keyed by
+    # login (the redundant stored `login` field dropped). Member scope (issue
+    # #88) and window scope (issue #85): only the logins with a contribution in
+    # THIS view are kept, and their `modules` / `areas` are re-derived from the
+    # view's records with this repo's code graph (the attribution fold applies),
+    # so a person's areas name this repo's areas touched in this window. The
+    # stored node (the project-wide union) is not changed; its flags (`is_bot`,
+    # `login_resolved`) are kept. See `_view_people`.
+    bundle["people"] = _view_people(
+        _materialize_people(conn, project), bundle,
+        _materialize_singleton(conn, project, repo, "codegraph"))
 
     structure = graphstore.repo_nodes(conn, project, repo, node_class="structure")
     bundle["milestones"] = _by(
@@ -609,40 +607,56 @@ def _window_lifecycles(arts, keep):
     return out
 
 
-def _participants(records):
-    """The logins with a contribution edge in `records` ({prs, issues,
-    commits}): the SAME enumerator fold uses to write person nodes, fed only
-    the login-bearing fields (null lists read as empty; no file lists, so no
-    area attribution is computed — only the keys are used)."""
+def _contribution_records(view):
+    """The login- and file-bearing fields of the view's PR / issue / commit
+    records, null lists read as empty (link reads them so, #82), with each
+    commit's `pr` resolved from its message on the copy — exactly the input
+    fold hands the shared enumerator (it runs attach_commit_prs on a copy)."""
+    import gather  # deferred: gather imports extract
+
     def lst(value):
         return list(value or [])
     prs = [{"number": p.get("number"), "author": p.get("author"),
             "merged_by": p.get("merged_by"), "reviewers": lst(p.get("reviewers")),
             "comments_list": lst(p.get("comments_list")),
             "review_comments": lst(p.get("review_comments"))}
-           for p in records.get("prs") or []]
+           for p in view.get("prs") or []]
     issues = [{"author": i.get("author"),
                "comments_list": lst(i.get("comments_list"))}
-              for i in records.get("issues") or []]
-    commits = [{"sha": c.get("sha"), "author": c.get("author")}
-               for c in records.get("commits") or []]
-    return set(derive.enumerate_participants(
-        {"prs": prs, "issues": issues, "commits": commits}))
+              for i in view.get("issues") or []]
+    commits = [{"sha": c.get("sha"), "author": c.get("author"),
+                "login_resolved": c.get("login_resolved"),
+                "message": c.get("message") or "", "files": lst(c.get("files"))}
+               for c in view.get("commits") or []]
+    gather.attach_commit_prs(commits)
+    return {"prs": prs, "issues": issues, "commits": commits, "people": {}}
 
 
-def _window_people(people, all_records, view_records):
-    """The stored project people minus the logins that contribute to this
-    repo's stored records but to none of the view's: someone who worked here
-    only in another window is not one of this window's people. Logins with no
-    contribution to this repo at all are kept unchanged (project people in a
-    member bundle are issue #88's to scope). Records are the stored ones
-    (modules / areas: the project-wide union over every folded window)."""
-    repo_logins = _participants(all_records)
-    view_logins = _participants(view_records)
-    if repo_logins <= view_logins:
-        return people
-    return {login: rec for login, rec in people.items()
-            if login in view_logins or login not in repo_logins}
+def _view_people(people, view, code_graph):
+    """The stored project `people` limited to this view (issues #85, #88).
+
+    A login is kept when it has a contribution edge in the view's records
+    (PR author / merger / reviewer / commenter, issue author / commenter,
+    commit author: `derive.enumerate_participants`, the enumerator fold uses
+    to write person nodes). Another member's people, and people who worked in
+    this repo only in another window, are left out. Each kept record's
+    `modules` / `areas` are replaced by what that enumerator derives from the
+    view's records with `code_graph` (this repo's stored code graph): the
+    areas of the files in the person's commits here, plus the areas of the
+    view PRs they reviewed. Every other stored field (`is_bot`,
+    `login_resolved`) is kept as stored. On a one-window, one-repo store the
+    view holds every stored record, so this equals the stored people."""
+    derived = derive.enumerate_participants(
+        _contribution_records(view), derive.area_index(code_graph or {}))
+    out = {}
+    for login, rec in people.items():
+        mine = derived.get(login)
+        if mine is None:
+            continue
+        rec["modules"] = mine["modules"]
+        rec["areas"] = mine["areas"]
+        out[login] = rec
+    return out
 
 
 def _latest_gathered_to(conn, project, repo):

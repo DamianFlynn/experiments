@@ -405,8 +405,15 @@ RAW-only view — it additionally reconstructs:
   reproduce byte-for-byte.
 - **`people`** by reading the project-scoped person `structure` nodes (repo
   sentinel `"*"`, local id `person-<login>`), keyed by login (the redundant stored
-  `login` field is dropped). Because fold now persists ALL participants, this
-  naturally returns the full set (each record carries `modules`/`areas`/`is_bot`).
+  `login` field is dropped). Because fold now persists ALL participants, the
+  stored set is complete (each record carries `modules`/`areas`/`is_bot`). The
+  view keeps only the logins with a contribution in the view's own records (this
+  repo, this window; issues #85, #88) and replaces each kept record's
+  `modules`/`areas` with what `derive.enumerate_participants` derives from those
+  records with this repo's stored `code_graph` (`extract._view_people`). The
+  person node itself is never changed by a read: it stays the project-wide union.
+  On a one-window, one-repo store the view holds every stored record, so the
+  view's people equal the stored ones.
 - **`symbol_events`** by splitting the shared `code_events` ledger: the
   SYMBOL-keyed rows (local id `<path>#<lang>:<subkind>:<name>` — a SECOND `#` past
   the repo prefix, with `before`/`after`) reconstruct one symbol_event dict each
@@ -422,7 +429,9 @@ RAW-only view — it additionally reconstructs:
   `symbol_events`); it also un-forces the previously always-empty `symbol_moves`.
 
 extract READS these — it does NOT re-derive via `build_artifacts` /
-`attribute_people_areas`. Correspondingly `link.enrich` removed its
+`attribute_people_areas` (the one exception, since #88: a view's people keep the
+stored record but take `modules`/`areas` from the view's own records, see
+`people` above). Correspondingly `link.enrich` removed its
 `build_artifacts` + `attribute_people_areas` calls and now CONSUMES
 `bundle["artifacts"]`/`bundle["people"]` (with defensive
 `setdefault("artifacts", {})` / `setdefault("people", {})` so a raw bundle fed
@@ -713,12 +722,20 @@ Each per-member fold **unions** a person's `areas`/`modules` (and ORs `is_bot`)
 with the already-stored node — a plain upsert would overwrite, so a member where a
 contributor has no attribution would erase another's. The aggregate is fold-order
 independent and idempotent (re-folding a member unions a subset → no change).
+The node is the project-wide union over members and windows, and it is what
+`validate`'s `no_drift_people` checks; it is **not** what a view shows. Area ids
+are repo-local (two members can both have a `core` or `main.tf` area), so the
+union cannot say which repo an area belongs to: a member view re-derives a
+person's areas from its own records, and the project view qualifies them as
+`"<repo>::<area>"` (issue #88; BUNDLE.md "Project view: `people` and `halls`").
 
 **Readers + validate aggregate the member set.** `digest.py` is the project
 aggregation layer above `extract` (per-member extract+enrich, then merge:
 spine-linked trains stitched across members; trains sharing only an internal ticket
 clustered into `related_work` — opt-in, only with the manifest's `ticket_prefixes`
-(`digest.py --manifest`) or `--ticket-pattern`, else `[]`; Shipped/people/modules merged; cross-repo
+(`digest.py --manifest`) or `--ticket-pattern`, else `[]`; Shipped/modules merged;
+people merged with each figure summed / combined across members and `halls.fame` rebuilt
+from them (#88); cross-repo
 `module_edges` for the project-wide blast-radius graph). `spotlight dependents
 <owner/repo>` answers the reverse-dependency (blast-radius) question per member;
 `spotlight dependents <owner/repo>::<area>` answers it per module area (direct and

@@ -24,8 +24,22 @@ video-script, dashboards) consume the same view. The contract:
   (`extract` → `link.py`) — keys documented below. Multi-repo project: `python3
   digest.py --store <db> --project <name> --from … --to …` emits the merged
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
-  modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
+  halls, modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
   canonical JSON (`sort_keys`), so output is diff-stable.
+- **Project view: `people` and `halls` (issue #88).** `people` is the union of the
+  members' `people` by login, each figure combined across members. A member bundle's
+  `people` hold only that member's contributors and count only its records, so the
+  parts are disjoint and nobody is counted twice: the counts (`prs_authored`,
+  `prs_merged`, `prs_reviewed`, `commits_authored`, `issues_opened`,
+  `examples_authored`, `docs_authored`, `symbols_authored`, `authored_then_removed`,
+  `stale_owned`; `derive.PROFILE_COUNT_FIELDS`) are **summed**; `merge_rate` is
+  recomputed from the summed `prs_merged / prs_authored`; `review_latency_days` is the
+  median of **every** member's latency samples (not a median of member medians);
+  `first_seen` is the earliest and `last_active` the latest; `modules` / `areas` are
+  `"<repo>::<area>"` (like the project `modules` keys, so two members' same-named areas
+  stay apart); `is_bot` is OR'd and `login_resolved: false` when any member says so.
+  `halls.fame` is rebuilt from the merged people (same rule as a bundle's), so it ranks
+  on project-wide figures.
 - **Project view: `related_work` is opt-in.** Each project train carries a
   `tickets` list and `related_work` is `[{ticket, train_ids}]` — trains that share
   an internal ticket id but have no spine link. Ticket parsing is **off by
@@ -118,10 +132,13 @@ the rest (engagement, code areas, trains, people/flow).
   `releases` published in it; reviews / lifecycle events with their parent; any record whose
   stored timestamp is in the window, and any undated one (it cannot be placed in a window).
   `artifacts` keep only the window's lifecycle events (an artifact with none is absent), with
-  `status` / `replaced_by` / move fields as of the window's end. `people` drops a login whose
-  contribution to this repo lies only outside the window (people with no contribution to this
-  repo are not filtered here — a member bundle still lists the project's other people, #88);
-  `modules` / `areas` on a person are the store's union over every window. Not windowed:
+  `status` / `replaced_by` / move fields as of the window's end. `people` (issue #88) holds
+  only the logins with a contribution **in this view** — author / merger / reviewer /
+  commenter of a view PR, author / commenter of a view issue, author of a view commit — so a
+  member bundle never lists another member's people, nor someone who worked in this repo only
+  in another window. A person's `modules` / `areas` are re-derived from the view's records
+  with this repo's `code_graph` (the attribution fold applies): this repo's areas the person
+  touched in this window. The stored person node keeps the project-wide union. Not windowed:
   `milestones`, `sprints` and the per-repo singletons `workflow_stats`, `code_graph`,
   `code_owners`, `label_taxonomy` — current structure, as of the latest gather (#94). On a
   store holding only the viewed window every stored record is in the view; a view spanning
@@ -478,7 +495,9 @@ review's state to `DISMISSED`.
 - **modules** `{ "<area>": { "commits", "prs", "files_changed" } }` — per-area
   activity counts across the window's commits.
 - **people[].modules / people[].areas** — the areas a person authored (their
-  commits' files) or reviewed (their reviewed PRs' areas).
+  commits' files) or reviewed (their reviewed PRs' areas), over this view's records
+  (this repo, this window; issue #88). In the project view they are
+  `"<repo>::<area>"`, unioned over members.
 - **people{}** keys are GitHub logins (see `commits[].author`). An entry keyed by an
   unresolved commit author's git name carries `login_resolved: false` (absent on every
   other entry); `is_bot` also recognises git-name forms (`GitHub Actions`, `Dependabot`,
@@ -539,8 +558,10 @@ review's state to `DISMISSED`.
 
 These are **enrich-time projections** computed by `link.enrich` over the
 materialized bundle (siblings of `forecast`/`modules`) — not stored person-node
-data. The stored `people` projection (`{modules, areas, is_bot[, login_resolved:false]}`) is unchanged;
-`enrich` MERGES the profile fields onto it.
+data. The `people` projection (`{modules, areas, is_bot[, login_resolved:false]}`, the stored
+person nodes limited to the view, see "Window scope") is what `enrich` MERGES the profile
+fields onto. Each figure counts only the bundle's own records; the project view sums them
+across members (see "Project view: `people` and `halls`").
 
 - **people[]** — each `{login: {...}}` entry, in addition to its stored
   `modules`/`areas`/`is_bot`, gains a window-derived profile

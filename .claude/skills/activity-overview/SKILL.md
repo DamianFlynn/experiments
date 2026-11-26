@@ -48,7 +48,7 @@ state).
 | Artifact | Made by | Holds | Used for |
 |---|---|---|---|
 | **Bundle view** — one repo, one window (`workspace/view/bundle.json`) | `view.py`, then enriched in place by `link.py`; `render.py` adds `diagrams` | raw facts + `trains`, `buckets`, `forecast`, `flow`, `people`/`halls`, … + `series` (with `--series`) + `diagrams` | every section of a single-repo report; the per-member sections of a multi-repo report |
-| **Project view** — multi-repo only (`workspace/view/project.json`) | `digest.py` (stdout) | merged `trains`, `shipped`, `people`, `modules`, `related_work`, `module_edges`, and `members[i].bundle` | the project-wide sections of a multi-repo report |
+| **Project view** — multi-repo only (`workspace/view/project.json`) | `digest.py` (stdout) | merged `trains`, `shipped`, `people` / `halls` (per-person totals summed across members), `modules`, `related_work`, `module_edges`, and `members[i].bundle` | the project-wide sections of a multi-repo report |
 
 `related_work` (ticket-linked trains) is **opt-in**: it stays `[]` unless you pass
 `digest.py --manifest M` with `"ticket_prefixes": ["ABC", …]` declared in the
@@ -193,7 +193,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    Cite each fact with its `url`; do not state anything the views do not contain.
    - **Single repo:** every section reads the bundle view. Where the template says
      `view["shipped"]` read `bundle["buckets"]["shipped"]`; `view["people"]` /
-     `view["modules"]` → `bundle["people"]` / `bundle["modules"]` (keyed by area id);
+     `view["halls"]` / `view["modules"]` → `bundle["people"]` / `bundle["halls"]` /
+     `bundle["modules"]` (keyed by area id);
      `view["members"][i]["bundle"]` → the bundle view itself. There are no project
      trains: render *Decision trains* from the template's deep-train and mention-train
      blocks over `bundle["trains"]`. Omit *Related work* and *Cross-repo module

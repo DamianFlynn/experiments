@@ -172,8 +172,8 @@ class TestFailingMemberDoesNotStopTheRun(unittest.TestCase):
 
     def test_validate_on_a_healthy_member_is_not_failed_by_the_other(self):
         # Per-member audit as validate --project runs it (people are audited
-        # project-wide there; a single --repo audit of one member of a
-        # multi-member store has its own people issue, #88).
+        # project-wide there; a single --repo audit of one member checks only
+        # the people that member derives).
         rep = validate.validate_repo(self.run.conn(), PROJECT, A,
                                      check_people=False)
         self.assertIs(rep.ok, True, [c for c in rep.checks if not c["ok"]])

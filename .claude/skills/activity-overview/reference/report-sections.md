@@ -197,6 +197,10 @@ profile + `halls.fame`, each contributor CITED to their work:
   "Automation" subhead. (Only the `fame` hall exists — no internal/shame/blame hall is built;
   recognition only.)
 - **Recognition, not blame** — never attributes stalls/blockers. Omit when `people` is empty.
+- **Multi-repo:** use the project view's `halls.fame` and `people` — figures combined across
+  members (counts summed, `merge_rate` recomputed, `review_latency_days` the median of all
+  members' samples, earliest `first_seen` / latest `last_active`), `areas` as
+  `<repo>::<area>`. A member bundle's `people` are only that member's contributors.
 
 ## Stalled, blocked & pile-ups
 Flow-health from the **deterministic** `flow` + `blockers` projections (plus train-level stall),

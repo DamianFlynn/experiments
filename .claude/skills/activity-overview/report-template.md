@@ -8,10 +8,12 @@
        `diagrams/x.mmd` as workspace/diagrams/x.mmd).
      * `view` = the PROJECT VIEW (multi-repo only):
        `digest.py --store <path> --project <name> --from ... --to ...`, with the
-       merged keys (trains, shipped, people, modules, related_work, module_edges).
+       merged keys (trains, shipped, people, halls, modules, related_work,
+       module_edges).
      Single-repo report: there is no `view`; read everything from `bundle`:
        view["shipped"] -> bundle["buckets"]["shipped"] (its refs carry no `repo`),
-       view["people"] -> bundle["people"], view["modules"] -> bundle["modules"]
+       view["people"] -> bundle["people"], view["halls"] -> bundle["halls"],
+       view["modules"] -> bundle["modules"]
        (keyed by area id, not "<repo>::<area>"), view["members"][i]["bundle"] ->
        bundle. There are NO project trains: render "Decision trains" from the
        deep-train and mention-train blocks over bundle["trains"] only. The title
@@ -64,7 +66,8 @@ PLACEHOLDER RULES — read before filling anything below.
   - `area` — bundle["code_graph"]["areas"][]. `rule` — bundle["code_owners"][]
     `{pattern, owners}`. `module` — a value of `modules` (`commits`, `prs`,
     `files_changed`). `edge` — view["module_edges"][].
-  - `fame` — bundle["halls"]["fame"][]. `person` — a value of `people` (keyed by login).
+  - `fame` — bundle["halls"]["fame"][] (multi-repo: view["halls"]["fame"][]).
+    `person` — a value of `people` (keyed by login).
   - `mod` — the `spotlight.py module ... --json` slice; `sym` — one of its
     `symbols` / `files`; `sev` — one `lifecycle` event of a `sym`; `mtl` — one row
     of `mod.trains[].timeline`.
@@ -450,7 +453,8 @@ edges resolve, the diagram is a `No module dependencies` placeholder (always pre
 
 <!-- Multi-repo: view["modules"] keys are "<repo>::<area>" — split on "::" for the
      Repo and Module columns; view["people"] logins are merged across all member
-     repos (union by login); CODEOWNERS rules are per member
+     repos (union by login; a person's `areas` / `modules` are "<repo>::<area>"
+     too); CODEOWNERS rules are per member
      (view["members"][i]["bundle"]["code_owners"]). Single repo: bundle["modules"]
      is keyed by the area id and the repo is `meta.repo`. -->
 
@@ -491,6 +495,13 @@ detail from their profile, `person` = the `people` entry for `fame.login`
 contributor's work — link a representative PR they authored (`pr.author`) or
 reviewed (`pr.reviewers`) so the footprint is grounded. Omit the whole section when
 `people` is empty.
+
+<!-- Multi-repo: rank off view["halls"]["fame"] and read `person` from
+     view["people"]: each figure is combined across the members (counts summed,
+     `merge_rate` recomputed, `review_latency_days` the median of all members'
+     samples, earliest `first_seen` / latest `last_active`) and `person.areas`
+     are "<repo>::<area>". A member's own section reads that member's bundle,
+     whose `people` are only the people with a contribution in that member. -->
 
 | Contributor | Authored | Merged | Reviewed | Commits | Areas | Evidence |
 |-------------|----------|--------|----------|---------|-------|----------|

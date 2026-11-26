@@ -88,7 +88,7 @@ ROW_VARS = {
     "edge": ["view.module_edges[]"],
     "module": ["bundle.modules[]", "view.modules[]"],
     "rule": ["bundle.code_owners[]"],
-    "fame": ["bundle.halls.fame[]"],
+    "fame": ["bundle.halls.fame[]", "view.halls.fame[]"],
     "person": ["bundle.people[]", "view.people[]"],
     "mod": ["module"],
     "sym": ["module.symbols[]", "module.files[]"],
