@@ -39,52 +39,70 @@
 - **Window.** `[from, to]` are inclusive `YYYY-MM-DD` dates. Windowing of commits is done in
   Python on the committer date (`window_records`), not with git `--since/--until`.
 - **Ref convention.** `{type: "pr"|"issue"|"commit", id, url}` on every narrative-bearing fact.
-- **Determinism.** JSON is written with `sort_keys=True`; collections are sorted before
-  emission; ties are broken by id.
+- **Determinism.** `view.py`, `digest.py` and `spotlight.py --json` write JSON with
+  `sort_keys=True`; `link.py` and `render.py` rewrite the bundle with `indent=2` only, which
+  is still deterministic because object key order carries no meaning (§6.3, #100).
+  Collections are sorted before emission; ties are broken by id.
 
 ## 2. Code map and dependency graph
 
 | Module | LOC | Role | Network | Writes store |
 |---|---:|---|:---:|:---:|
-| `gather.py` | 3,547 | CLI; clone, git walks, REST/GraphQL, IaC build, normalization, `fold_bundle`, `backfill` | ✅ | ✅ |
-| `graphstore.py` | 594 | SQLite property-graph schema + read/write API | — | (API) |
-| `extract.py` | 544 | Materialize a raw bundle *view* for one repo + window | (via injected backfill) | — |
-| `complete.py` | 138 | Train-completion policy over the spine (honest gaps) | (via injected backfill) | — |
-| `derive.py` | 738 | Pure projections shared by write and read paths (artifacts, people, flow, halls) | — | — |
-| `link.py` | 1,116 | `enrich`: trains, buckets, timeline, deltas, areas, significance, effort, forecast; `--slice`, `--series` | — | — |
+| `gather.py` | 5,933 | CLI; clone, git walks, REST/GraphQL, IaC build + structural scan, normalization, `fold_bundle` (incl. per-window facts and current-state retraction), `backfill` | ✅ | ✅ |
+| `graphstore.py` | 1,418 | SQLite property-graph schema + read/write API, provenance meta | — | (API) |
+| `extract.py` | 1,122 | Materialize a window-scoped raw bundle *view* for one repo + window | (via injected backfill) | — |
+| `view.py` | 180 | CLI over `extract`: writes one repo's raw bundle view (`sort_keys` JSON) | — | — |
+| `complete.py` | 132 | Train-completion policy over the spine (honest gaps) | (via injected backfill) | — |
+| `derive.py` | 1,249 | Pure projections shared by write and read paths (artifacts, people, flow, halls, CI-stat sums) | — | — |
+| `link.py` | 1,427 | `enrich`: trains, buckets, timeline, deltas, areas, significance, effort, forecast; `--slice`, `--series` | — | — |
 | `series.py` | 236 | Pure installment snapshot, comparison and window-ordered index | — | — |
-| `render.py` | 1,010 | Mermaid emitters (size-capped) + `mmdc` validation | — | — |
-| `validate.py` | 907 | Trust gate (audits) | — | — |
-| `spotlight.py` | 1,875 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
-| `digest.py` | 414 | Multi-repo project view | — | — |
-| `manifest.py` / `manifest_from_index.py` | 195 / 278 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
+| `render.py` | 1,058 | Mermaid emitters (size-capped) + `mmdc` validation | — | — |
+| `validate.py` | 2,157 | Trust gate (nine per-repo checks + two project-wide checks) | — | — |
+| `spotlight.py` | 1,976 | Cross-window queries (person, symbol, subsystem, grep, module, dependents) | (opt-in `--complete`) | — |
+| `digest.py` | 692 | Multi-repo project view | — | — |
+| `manifest.py` / `manifest_from_index.py` | 389 / 278 | Manifest validation / generation from the AVM Terraform index | (index fetch) | — |
 | `transcript.py` | 116 | VTT/SRT/TXT normalization | — | — |
+| `ci_spotlight_integration.py` | 436 | CI gate: four spotlight answers checked against a real store | — | — |
 
 ```mermaid
 flowchart LR
   gather --> graphstore
   gather --> derive
   gather --> manifest
+  gather --> extract
   extract --> graphstore
   extract --> derive
   extract --> complete
+  extract -.-> gather
   complete --> graphstore
+  view --> extract
+  view --> graphstore
+  view --> manifest
+  view --> validate
   link --> derive
   link --> gather
+  link --> graphstore
   link --> series
   validate --> graphstore
   validate --> extract
   validate --> derive
-  validate --> gather
+  validate -.-> gather
   spotlight --> graphstore
   spotlight --> complete
   spotlight --> derive
   spotlight --> gather
+  spotlight --> manifest
   digest --> extract
   digest --> link
+  digest --> derive
   digest --> graphstore
+  digest --> manifest
+  ci_spotlight_integration --> spotlight
+  ci_spotlight_integration --> graphstore
 ```
 
+Dotted arrows are imports deferred into a function (`extract` imports `gather` lazily
+because `gather` imports `extract`; `validate` imports `gather` only to re-fold).
 `derive.py` is a deliberate **leaf** (imports none of the others): both the write path
 (`fold_bundle`) and the read path (`extract` + `link.enrich`) call the same functions, which is
 what makes the `no_drift` audit meaningful. `link` imports `gather` only for pure helpers
@@ -117,11 +135,12 @@ scratch store) and `backfill` respectively.
 | `--from`, `--to` | — | Window (`YYYY-MM-DD`, `from ≤ to`; owner/repo/dates checked in `parse_args` with the shared `manifest.py` validators) |
 | `--ref-date` | `--to` | Reference date for milestone/sprint/forecast/flow framing (`YYYY-MM-DD` or full ISO timestamp, `manifest.check_ref_date`). Stored per window at fold (`ref_date:` meta key) and read back into the view's `meta.ref_date` (§6.1) |
 | `--branches` | repo default | Comma list; first is `meta.base_branch`. Unset: a manifest member's `branch`, else the clone's `origin/HEAD`, else the API `default_branch` (`resolve_branches`); unresolved → `null` + stderr warning. Stored per window at fold (`branches:` meta key). The walk uses the checked-out default branch |
-| `--clone-dir` | `workspace/<repo>-clone` | Clone location |
-| `--no-clone` | off | Reuse an existing clone |
+| `--clone-dir` | `workspace/<repo>-clone` | Clone location (manifest: the parent of per-member `<owner>-<repo>-clone` dirs) |
+| `--no-clone` | off | Never create a clone: fetch an existing one, or gather API data only (`clone_mode: none`) |
 | `--include-workflows` / `--no-workflows` | on | CI run stats |
 | `--include-releases` / `--no-releases` | on | Releases in window |
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
+| `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
 | `--store PATH` | **required** | SQLite store |
 
 Single-repo folds use `project = owner`, `repo = <name>`. Manifest folds use
@@ -149,11 +168,19 @@ sequenceDiagram
   participant REST as GitHub REST
   participant GQL as GitHub GraphQL
   A->>Git: clone --shallow-since=(from - margin)
+  opt base branch is not the remote default
+    A->>Git: fetch --shallow-since origin/<base>, checkout -B <base>
+  end
   A->>Git: fetch --deepen=n while an in-window commit is on the boundary (bounded)
   A->>Git: log (commits, full walk) then window_records
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
   A->>A: fallback: drop unresolved boundary commits' diffs and files
+  A->>Git: log --first-parent (window_end_commit)
+  opt window end is not the head
+    A->>Git: worktree add --detach (structure_tree; removed afterwards)
+  end
+  A->>Git: ls-files (module dirs; shared with the structural scan)
   A->>A: select_code_area_provider (directory or graphify)
   A->>IaC: extract_iac_edges (parallel restore+build / init+graph)
   opt manifest gather, or --structural-iac
@@ -164,13 +191,14 @@ sequenceDiagram
   loop each kept PR
     A->>REST: reviews, timeline, review comments, issue comments
   end
+  A->>GQL: closingIssuesReferences, 50 PRs per request (else keywords only)
   A->>REST: issues updated since from + all open issues + referenced issues
   loop each issue
     A->>REST: comments, timeline
   end
   A->>A: detect_label_taxonomy, apply_facets, classify_issue_kind
   opt window has commits
-    A->>REST: commits?sha=HEAD&since&until (author.login per SHA)
+    A->>REST: commits?sha=<walked branch head>&since&until (author.login per SHA)
     A->>A: resolve_commit_authors (API login, noreply email, else flagged git name)
   end
   A->>REST: workflow runs, releases, milestones
@@ -201,6 +229,23 @@ sequenceDiagram
   (or the manifest member's `branch`), else the clone's `origin/HEAD` (else its checked-out
   branch), else one `GET /repos/{o}/{r}` for `default_branch` (only when there is no clone),
   else `null` with a stderr warning. Never a hard-wired `main`.
+- The walked branch is the base branch (issue #107). `prepare_clone` checks out the remote
+  default (it needs no branch name, so the same clone answers `resolve_branches`); when
+  `base_branch` differs, `checkout_base_branch` fetches `+refs/heads/<base>:refs/remotes/origin/<base>`
+  under the same `--shallow-since` bound (`--depth=1` when that branch is quiet: `clone_mode`
+  `depth1-fallback`) and runs `checkout -q -B <base>`, before deepening, the walks and every
+  structure read; one stderr note names both branches. A base branch the remote lacks raises
+  `MissingBranchError`, which `acquire` turns into `SystemExit` naming it (a manifest member is
+  recorded `failed`). A reused clone is put back on the default by the next `prepare_clone`.
+- Structure is read as of the window's end (issue #107). `window_end_commit` takes the newest
+  commit of the walked branch's first-parent chain whose committer date is on or before `to`;
+  when it is the head (the current month) the clone is read in place, otherwise
+  `structure_tree` adds a temporary detached `git worktree` of it, reads the code graph, IaC
+  entrypoints/builds, structural scan and CODEOWNERS there, and removes it (also on error), so
+  the clone never leaves its branch. `meta.clone_sha` is that commit and
+  `meta.structure_as_of` is `window_end`; when the clone does not hold such a commit (no
+  commit in the window or its margin, only later ones) the head is read and it is `head`.
+  The commits-API listing starts at the branch head either way.
 - The clone/fetch uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
   margin keeps each in-window commit's real parent in the clone.
 - If the margin holds no earlier commit, the first in-window commit is a shallow-boundary
@@ -241,7 +286,8 @@ order (graphify does not parse Bicep/HCL, so IaC repos always land here):
 | Order | Pattern | Maps | Example |
 |---:|---|---|---|
 | 1 | `avm` (`_avm_area`) | `avm/{res,ptn,utl}/<a>/<b>/…` → 4-segment module subtree; a file directly under the group (`avm/res/<a>/README.md`) → group area `avm/res/<a>` (not a module) | `avm/ptn/ai-ml/landing-zone` |
-| 2 | `main_bicep` | any dir containing `main.bicep` → that dir | `infra/hub/main.bicep` → `infra/hub` |
+| 1a | `bicep_module_dir` (only with module dirs, #107) | a non-`*.tf` file at or below a Bicep module dir (`bicep_module_dirs`: a tracked or changed non-scaffold `main.bicep` outside `avm/` and the root) → the deepest such dir; a file under an `examples/`/`tests/` subtree of it falls through | `infra/modules/net.bicep` → `infra` |
+| 2 | `main_bicep` | a `main.bicep` file → its dir (other files in that dir are claimed by rule 1a when module dirs are known, else fall through) | `infra/hub/main.bicep` → `infra/hub` |
 | 3 | `terraform_modules` | `modules/<name>/…` (`<name>` a dir; `modules/README.md` falls through) | `modules/subnet` |
 | 4 | `tf_dir` | any `*.tf` dir; **repo-root `*.tf` collapse to one `main.tf` area** | `main.networking.tf` → `main.tf` |
 | 5 | `topn` | fallback: top 2 segments of the file's **directory** (`docs/README.md` → `docs`); a repo-root file keeps its own name | `src/Bicep.Core` |
@@ -255,6 +301,16 @@ read or built as that module.
 
 Area `paths` are the in-window **changed** files (including deleted ones), so they are not
 used to pick what to build; the entrypoint is resolved on disk (§4.6).
+
+Rule 1a needs the set of module directories, which a single path cannot show: `acquire`
+derives it with `bicep_module_dirs` from the changed paths plus one `git ls-files` of the
+structure tree (passed to the structural scan as its listing), or from the changed paths alone
+without a clone, and passes `module_area_patterns(module_dirs)` as `patterns` to the provider,
+`extract_iac_edges` and `apply_structural_scan`. With no module dir the calls are unchanged.
+`classify_code_area(path, patterns, module_dirs=None)` keeps today's per-path result without
+the set. A local Bicep ref to a file inside the module (`./modules/net.bicep` from
+`infra/main.bicep`) now resolves to the module itself, so `build_bicep_edges` records it as a
+private child (`to: infra/modules`, `local: true`).
 
 ### 4.6 IaC dependency edges (`extract_iac_edges`)
 
@@ -361,6 +417,24 @@ flowchart TB
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
+| Closing issues (#105), GraphQL | `repository { pr<N>: pullRequest(number: N) { closingIssuesReferences(first: 25) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } } } }` | 50 kept PRs aliased per request; a PR with more than 25 closing issues is paged on its own (`first: 100, after:`) |
+| Projects v2 boards, GraphQL | §4.8 | maintained boards only, items capped |
+
+**Closing issues (#105).** `resolve_closing_issues` reads GitHub's own list of the issues each
+kept PR will close / closed — closing keywords AND manual Development-sidebar links, which
+leave no keyword in the text — through the same injectable `graphql` callable as the board
+layer (`_graphql_client`). Same-repo ones join `closes` after the keyword refs (ascending) and
+leave `crossref_issues`; when GitHub reports anything the keywords miss the PR stores the whole
+list as `closing_issues`, whose other-repo entries `_cross_repo_pr_edges` turns into `closes`
+refs (a mention of the same issue is then not a `cross_ref`). Any failure — an error, a null
+repository, a PR object without the field, no client — leaves every PR as the keywords made it
+(never half an answer) and never fails the gather. One stderr line per repo says which:
+`closing issues: <A> PR(s) checked via GraphQL, <B> gained <C> closing issue(s) not in their
+text (source: graphql)` or `closing issues: GraphQL unavailable (<reason>), using closing
+keywords only`; `meta.closing_refs_source` records `graphql` | `keywords` (bundle only, not
+views). The timeline `connected` event is still filed under `crossref_issues` when it names
+an issue number (an event without a usable number is ignored); whether the REST payload
+carries one is unverified.
 
 Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
 goes through `_github_open` (injectable `opener`/`sleep`/`clock`, so tests never sleep or touch
@@ -737,7 +811,7 @@ The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 > and clone sha, so it equals a store holding only that window there too. On a single-window
 > store a view of exactly its window is unchanged; any other view of it now carries
 > `meta.facts_windows`, and a sub-window view omits `workflow_stats` (the month's runs cannot
-> be split by day). See HLD §10 item 8.
+> be split by day). See HLD §10 items 7 and 8.
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -1049,7 +1123,8 @@ otherwise; exit 2 (usage error, no report) when the path does not exist or is no
 when several projects (or repos) are stored and none is named, or when `--bundle` cannot be
 read. When the store (or `--project`) spans several repos, or a manifest gather recorded
 member run status for the project, and no `--repo` is given, it runs `validate_project`
-over every member holding data (`project_repos`) plus the project-wide checks.
+over every member holding data (`project_repos`) plus the project-wide checks; `--bundle` is
+then ignored with a stderr warning (it is single-repo by nature).
 
 | Check | Asserts |
 |---|---|
@@ -1063,9 +1138,18 @@ over every member holding data (`project_repos`) plus the project-wide checks.
 | `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (people from the records alone, with `login_resolved`; artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves); with `--bundle`, the stored PR/issue/commit records == the bundle's |
 | `idempotency` | re-folding into a scratch copy changes no counts (on a multi-window store, cross-window move re-matches and current-state edges it adds are INFO, not counted; current-state edges it retracts are a WARN, not counted, on a repo last folded before #95) |
 | `no_drift_people` (project) | project-scoped people == union re-derived across all members (areas derived ⊆ stored when a member holds several windows) |
+| `referential_integrity`, `provenance`, `no_fabrication`, `schema_conformance` (project) | the same checks over the rows no member owns (people, non-member rows) and the store-wide parts (the `facts:` index, case-variant scopes), once for the project (#107) |
 | `member_status` (project) | every manifest member's last gather of every recorded window is `ok`; a `failed` / `not_attempted` member is an ERROR naming the repo, window and reason, also when it holds no node and so is not an audited member (#77). Passes (INFO) on a store with no recorded status |
 
 Every report lists every check in this order (issue #79); none is ever dropped.
+
+**Audit scope (#107).** `referential_integrity`, `provenance`, `no_fabrication` and
+`schema_conformance` audit the rows the audited repo owns (`validate._Scope`): a node by its
+`project`/`repo` columns, an edge by the repo of its src, a person's edge by the repo of its dst
+(as `edge_set` assigns them). The rows no member repo owns and the store-wide parts go into a
+single-repo report too (on a one-repo store the report covers every row, as before); in project
+mode each member's report holds its own rows only and the shared part runs once as project checks,
+so one member's error is never repeated in every member's report.
 `edge_set`/`no_drift`/`idempotency` self-source their bundle via `extract` over the span of the
 repo's timestamped nodes; a repo with only structure nodes (a quiet member) uses its recorded
 gathered windows instead; `--bundle` is an optional cross-check (`edge_set` always uses the
@@ -1257,7 +1341,7 @@ member, so emitted `repos` may exceed the requested set.
 | Artifact | Contract | Producer → consumer |
 |---|---|---|
 | `journey.db` | `STORE.md` (`meta.schema_version`) | gather → everything |
-| Bundle view | `BUNDLE.md` (`meta.schema_version` = 1) | extract/link/digest → render, narrator, formatters |
+| Bundle view | `BUNDLE.md` (`meta.schema_version` = 3, `extract.VIEW_CONTRACT_VERSION`) | extract/view/link/digest → render, narrator, formatters |
 | Project view | `BUNDLE.md` § output contract | digest → narrator, formatters |
 | `series.json` | `{"version": 2, "installments": [installment_snapshot]}`, one per window, in window order; legacy bare list read (6.9) | link `--series` → link `--series` |
 | Slice | `slice_train` shape (6.8) | link `--slice` → narrator sub-agent |
@@ -1357,6 +1441,9 @@ dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigati
 off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
 `ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
 A window with more than 1,000 workflow runs costs a few extra requests for the day-splits.
+GraphQL (a separate 5,000-point/hour budget): the closing-issue read costs ⌈kept PRs / 50⌉
+requests — 2 per 100 PRs — of 1 point each (50 connections of 25 nodes), plus one per extra
+page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 (A reused `--clone-dir` is fetched rather than re-cloned.)
 
 ### 14.4 Security
@@ -1372,40 +1459,38 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
 | Past-month views show the latest record state | PR/issue nodes are upserted latest-wins; a view is window-scoped (#85) but reads the stored record | on a store holding later windows, a past month's view shows today's state/labels/milestone/comments (`meta.state_as_of`); an item open at that month's end but closed since is not in it; an item updated in that month and again later is in the later month only | per-window snapshots of the record at fold |
-| `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; since #85 a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not (same case as above) | read the moves from the stored nodes/edges instead |
-| Wide views use one code graph | since #94 a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them; the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
+| `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not | read the moves from the stored nodes/edges instead |
+| Wide views use one code graph | a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them (#94); the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
 | Sub-window CI statistics are not available | `workflow_stats` are counted per gathered window, not per run day | a view inside a gathered window (a week of a gathered month) or straddling two has no `workflow_stats` (`meta.facts_windows.workflow_stats_excluded` says why); a view over ungathered days sums only what was gathered (`workflow_stats_complete: false`) | store per-day run counts |
-| Pre-#94 stores have no per-window facts | fold writes `facts:` meta keys only since #94 | their views read the latest-wins singleton nodes: a past month shows the last folded month's CI stats and structure; a store with some pre-#94 windows lists them under `workflow_stats_excluded` in wider views | re-gather each window |
-| Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner; a pre-#65 store keeps `code_owners` as a key-sorted dict, so its rule order is lost until re-gathered | per-file ownership facts if needed; re-gather old stores |
-| Item relations follow the last-folded record | since #95 `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records, which are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record and its milestone / iteration / blockers (consistent with the store, but older); a record not re-gathered since a change keeps its old relations | fold windows oldest first; per-window record snapshots |
-| A window's structure is the checkout at gather time | the code graph / CODEOWNERS of a window come from the clone's HEAD when it was gathered; the `depends_on` / `owns` replay (#95) orders windows by their dates | a month re-gathered after a later month carries a newer tree than the later month, yet the later month still wins for the areas both speak for | re-gather months oldest first; order by gather time if that proves common |
+| Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner | per-file ownership facts if needed |
+| Item relations follow the last-folded record | `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records (#95), which are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record and its milestone / iteration / blockers (consistent with the store, but older); a record not re-gathered since a change keeps its old relations | fold windows oldest first; per-window record snapshots |
+| A window's structure is the head when its end is not in the clone | since #107 the code graph / IaC / CODEOWNERS of a window are read at its last mainline commit on or before `to`; when the bounded clone does not hold that commit (no commit in the window or its 14-day margin, only later ones) the head is read (`meta.structure_as_of: "head"`); `structure_as_of` is a bundle field, not stored per window; windows gathered before #107 carry the tree of their gather day | such a window's structure is newer than the window; the `depends_on` / `owns` replay (#95) still orders windows by their dates | widen `ACTIVITY_CLONE_MARGIN_DAYS` to reach the window end; re-gather pre-#107 windows |
+| Pre-#107 stores and Bicep module areas | since #107 every file below a non-AVM `main.bicep` dir is in that module's area; `touches` are only ever added | re-gathering, into a store folded before #107, a window that changed such a file (one area id changes: e.g. `infra/modules/x.bicep` `infra/modules` → `infra`, `a/b/c/README.md` `a/b` → `a/b/c`) leaves the old `touches` and people areas beside the new ones: `validate` fails a one-window store with them; on a multi-window store whose windows map the path differently they are WARNs | re-gather into a fresh store |
 | Some stale structure edges are not provable | `depends_on` is retracted only where a resolved build or the whole-tree scan speaks for the source area, transitive edges only by a resolved build; `owns` only for areas a window's code graph lists (#95) | on a single-repo store without `--structural-iac` and without a working `bicep`/`terraform`, edges of areas no later window rebuilt stay; a transitive edge stays until the area is built again; owners of an area no later window lists stay | `--structural-iac`; the IaC toolchain on the gathering host |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
 | IaC edges are build-gated on single-repo gathers by default | the structural scan is opt-in for single repos (`--structural-iac`, #92) to keep golden bundles byte-stable | without the flag and without `terraform`/`bicep` (or with a failed build), a single-repo bundle has no IaC edges; scan edges do not change an area's `edges_status` | pass `--structural-iac`; a scan-specific `edges_status` if needed |
 | Bicep structural scan reads `main.bicep` entrypoints only | a module area is one with a tracked `<area>/main.bicep` (#66 entrypoint rule); only `module` statements are parsed | modules whose entry file has another name (common in landing-zone repos, e.g. `hubNetworking.bicep`) are not scanned; `import … from 'br/public:…'` type imports and child-module refs are not edges; Bicep transitive edges still need `bicep build` | a configurable entrypoint pattern; parse `import` |
 | Cross-repo Bicep resolution is public-registry only | `resolve_bicep_registry_member` (#92) honours `br/public:` / `br:mcr.microsoft.com/bicep/` only and assumes the registry path is the publisher's module directory | refs through a private ACR, a template spec or a `bicepconfig.json` alias never become cross-repo edges; a publisher whose published path differs from its directory gets a stand-in at the registry path | a private-registry prefix + path mapping in the manifest |
-| Pre-#78 stores key commit authors by git name | before #78 gather stored `commit.author` = `%an`; person ids are now logins | folding a post-#78 bundle into an older store leaves the old `person-<git name>` nodes and their `authored` edges beside the login-keyed ones (two people again), and `validate` then reports them as people "stored but not derivable" | re-gather into a fresh store (STORE.md "Identity (#78)") |
-| Pre-#84 stores have no base branch | fold stores `branches:` meta keys only since #84 | their views carry `meta.base_branch: null`, `extract` warns, and every merged PR (stacked, release-branch) counts as shipped, as before #84 | re-gather the window |
+| The commit walk reads the default branch | `prepare_clone` checks out the remote's default branch; `--branches` / a member `branch` set `meta.base_branch` only | with a mainline that is not the default branch, commits, code and symbol events come from the default branch while buckets and trains use the named mainline | check out `meta.base_branch` for the walks |
 | One mainline per view | `link` compares a PR's `base` with one `meta.base_branch` | a roll-up spanning a default-branch rename (`master` → `main`) gets `null` (warned), so its merges are not told apart; view each gathered window on its own | carry a set of mainline names if needed |
+| Stores gathered before a fix | the fold writes `ref_date:` (#75), `branches:` (#84), `facts:` (#94) meta, login-keyed commit authors (#78), `committed_at` (#82), PR `head_repo` (#93) and nested Terraform areas (#101) only since those issues | an older store's views warn about an unknown base branch and count every merged PR as shipped, show the last folded window's CI stats/structure for every month, keep a person per git name beside the login (and fail `validate` people/`authored` with a "pre-#78 identity" hint), sort commit events before same-day comments, cannot attach a stacked PR whose base names two heads, and keep nested `.tf` files under `modules/<name>` | re-gather into a fresh store (USAGE §2.2) |
 | Trust gate cannot see record content changes | self-sourced checks compare the store with its own records and ledger; no per-fold content digest is recorded (it would need a `fold_bundle` change) | a record deleted with all its edges, a consistently rewritten blob or a wrong ledger pass a store-only `validate` | `--bundle` with a view saved at gather time catches the first two; a fold digest in `meta` would cover the rest |
-| Multi-window stores: some checks stay WARN | since #95 `_multi_window_plan` makes the current-state edge types exact on a multi-window store when it can prove them (§8); it cannot for a repo last folded before #95, a window without `facts:` (pre-#94), `touches` with a graphify window or a path re-mapped between windows, people's areas (a union over every window's activity), or a missing cross-repo `depends_on` (needs the manifest's registries) | on such a store a stale or tampered edge of those types, or an extra stored area, is a WARN naming the reason, not an ERROR | fold once more (pre-#95); re-gather pre-#94 windows; people areas: re-derive each window's view and union |
+| Multi-window stores: some checks stay WARN | `_multi_window_plan` makes the current-state edge types exact on a multi-window store when it can prove them (§8, #95); it cannot for a repo last folded before #95, a window without `facts:` (pre-#94), `touches` with a graphify window or a path re-mapped between windows, people's areas (a union over every window's activity), or a missing cross-repo `depends_on` (needs the manifest's registries) | on such a store a stale or tampered edge of those types, or an extra stored area, is a WARN naming the reason, not an ERROR | fold once more (pre-#95); re-gather pre-#94 windows; people areas: re-derive each window's view and union |
 | A renamed or transferred repo fails `provenance` | PR/issue urls must name the node's repo; the API returns the current name after a rename | gathering a repo under its old name (manifest or `--repo`) stores `html_url`s of the new name and fails `provenance` | gather under the current name |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
-| Timeline code events of older commits order by day | `committed_at` (#82) is gathered from `%cI` by the commit walk only | commits in a store folded before #82, and backfilled commits (five-field log), have no `committed_at`, so their timeline events keep the bare date and sort before that day's social events | re-gather; log `%cI` in `make_backfill_fetcher` too |
-| Backfilled commits are not login-resolved | `make_backfill_fetcher` logs one commit with the five-field format | a backfilled commit node's `author` is the git name (no person node or edge is written for it) | resolve via the commits API there too if backfilled commits ever gain contribution edges |
+| Backfilled commits are thin | `make_backfill_fetcher` (`spotlight --complete`) logs one commit with the five-field format | a backfilled commit node's `author` is the git name and it has no `committed_at` (its timeline events sort before that day's social events); no person node or edge is written for it | log `%cI` and resolve via the commits API there too |
 | Incomplete members are not in the digest JSON | #77 surfaces a failed / not-attempted member through gather's exit code, `validate` and a `digest.py`/`view.py` stderr warning only | a formatter reading only the digest/view JSON cannot tell the project is partial | add the incomplete members to the view `meta` (BUNDLE.md change) |
 | Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
-| Any open PR counts as in motion | since #87 `in_motion` needs an open PR or an `in_flight` train, but it does not look at the PR's age, draft state or base branch | an open PR untouched for a year, or a draft, still scores `open PR` (+2.0) for the issue it references | weigh PR recency (e.g. `updated_at` in window) if stale open PRs prove common |
+| Any open PR counts as in motion | `in_motion` needs an open PR or an `in_flight` train (#87), but it does not look at the PR's age, draft state or base branch | an open PR untouched for a year, or a draft, still scores `open PR` (+2.0) for the issue it references | weigh PR recency (e.g. `updated_at` in window) if stale open PRs prove common |
 | Spotlight CI gate covers four queries | `ci_spotlight_integration.py` runs `person` / `subsystem` / `symbol` / `grep` only | `module` and `dependents` are exercised by the unit suite but not against the live store | add discovered-argument checks for both (a single-repo store has no cross-repo `depends_on`, so `dependents` belongs on the constellation store) |
 | Series compares bucket membership only | `series.compute_series` (#86) matches the prior snapshot against this window's four buckets | an item in flight last time that is still open but neither updated in the window nor on the current milestone (no bucket) leaves `carried_over` silently; a forecast item that shipped or was closed in a month missing from the index is `not_yet`; refreshing an earlier window does not recompute the later bundles' `series` blocks (stderr names them) | report "went quiet" items from the open item records; recompute later installments on request |
 | No series for a project view | `link.py --series` keys installments per bundle and items by `(type, id)` | a multi-repo constellation keeps one series per member bundle (USAGE §5.4) | key items by `repo` + type + id and accept the digest view |
-| Sidebar-linked issues do not anchor a train | since #93 only `closes` (closing keywords in the PR title/body) joins and anchors trains; gather files the timeline `connected` event (a link made in the PR's Development sidebar) under `crossref_issues` with mentions, and the REST payload of that event may not name the issue at all | a PR linked to its issue only through the sidebar forms its own `train-pr-<n>`; the issue's bucket ref carries no train | gather the PR's closing issues (GraphQL `closingIssuesReferences`) into `closes` |
 | Trains join through shared closed issues | member PRs are grouped transitively over the issues they close (#93) | a PR that closes several issues pulls every other PR closing any of them into one train, so an umbrella "closes #1 … #9" PR yields one large train | none needed while closing references are deliberate; split by a cap if it proves noisy |
-| Pre-#93 stores have no `head_repo` | gather stores the PR head repo since #93 | a stacked PR whose base branch name is the head of two or more member PRs (e.g. forks' `patch-1`) is attached to none of them until the window is re-gathered | re-gather the window |
 | Unmerged PRs into other branches have no train | trains hold mainline-targeting PRs; stacked PRs count only once merged (as `contributing_prs`) | an open or closed-unmerged PR into a feature / release branch is in no train and its bucket ref has no train id | attach it to its parent as a pending contribution if needed |
-| Nested Terraform module dirs split files by extension | since #101 a `*.tf` in a non-scaffold dir below `modules/<name>/` maps to its own dir; `classify_code_area` is per path, so a non-`.tf` file there (README, `.tftpl`) still maps to `modules/<name>` | that module dir's docs/templates count towards the enclosing module's area; stores gathered before #101 keep `modules/<name>` for the nested `.tf` files until re-gathered, and its old self-edge until a resolved build or the structural scan speaks for that area (#95) | a set-aware classifier (needs the tree listing) |
+| Nested Terraform module dirs split files by extension | a `*.tf` in a non-scaffold dir below `modules/<name>/` maps to its own dir (#101); `classify_code_area` is per path, so a non-`.tf` file there (README, `.tftpl`) still maps to `modules/<name>` | that module dir's docs/templates count towards the enclosing module's area | a set-aware classifier (needs the tree listing) |
+| `main.bicep` siblings are not in its area | the `main_bicep` pattern maps the `main.bicep` file itself to its directory; other files there fall through to `topn` (unless an AVM path) | outside `avm/`, a module's README or child `.bicep` files count towards a two-segment area, not the module's | a set-aware classifier, as above |
 | Ledger rows of a commit with no file list | `graphstore.ledger_row_is_symbol` (#101) reads the row's commit's stored `files`; a shallow-boundary commit (#68) has an empty list and a merge commit lists none | a file row of such a commit whose path has the `#<token>:<token>:` symbol tail is still read as a symbol row | a row-kind column in `code_events` (schema change) |
-| Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
+| `link.py` / `transcript.py` have no `--help` | both parse `argv` by hand | `--help` is read as a file name: `link.py` ends in a traceback (exit 1), `transcript.py` in "cannot read transcript" (exit 2) | print the usage line for `-h`/`--help` |
 
 The operating guidance in USAGE §2.1 (one single-window store per installment, or one
 accumulated store viewed month by month as it grows; series file for continuity) says which of
@@ -1413,15 +1498,25 @@ these affect an accumulated store.
 
 ## 15. Testing and CI
 
-- 18 `test_*.py` modules (stdlib `unittest`), fixture-driven and fully offline (fake fetch
-  seams; no network). Notable: `test_characterization.py` (store-derived == link-derived golden
-  equivalence), `test_validate.py` (each audit), `test_gather.py` (parsers, fold, IaC parsing
-  incl. modern/legacy DOT), `test_digest.py` (cross-repo trains, module edges), `test_series.py`.
+- 46 `test_*.py` modules (stdlib `unittest`, about 2,000 tests), fixture-driven and fully
+  offline (fake fetch seams; no network). Notable: `test_characterization.py` (store-derived ==
+  link-derived golden equivalence), `test_validate.py` / `test_validate_strict.py` (each
+  check), `test_gather.py` (parsers, fold, IaC parsing incl. modern/legacy DOT),
+  `test_digest.py` (cross-repo trains, module edges), `test_series.py`,
+  `test_window_scoped_views.py` / `test_window_facts.py` / `test_retraction.py` (multi-window
+  stores), `test_view.py` (the `SKILL.md` / `commands/activity.md` docs contract: every
+  documented command names a real script and accepted flags), `test_report_template.py`
+  (template placeholders against real view output), `test_suite_hygiene.py` (every test is
+  collectable by `unittest`; no conflict markers in skill files).
 - Run: `python3 -m unittest discover -s .claude/skills/activity-overview -p 'test_*.py' -v`.
+  Six tests skip on a normal machine (four real-store smoke tests without a local real
+  store, two FTS5-absent degrade paths when FTS5 is present); the mmdc diagram tests skip
+  without `mmdc`, and fail instead under `CI=true`.
 - CI (`.github/workflows/activity-overview.yml`): `tests` on every relevant push/PR (Python 3.11,
-  3.12, 3.13, byte-compile + suite); `live` on dispatch, schedule (07:00 UTC on the 1st and
+  3.12, 3.13, byte-compile, pinned mmdc, then the suite); `live` on dispatch, schedule (07:00 UTC on the 1st and
   15th) or default-branch push — real gather into a store (pinned bicep CLI) then
-  `validate.py`, using the `ACTIVITY_TEST_TOKEN` secret.
+  `validate.py`, with the workflow's built-in token (`token_source: secret` on a dispatch
+  uses the `ACTIVITY_TEST_TOKEN` secret instead, for private targets).
 - CI `spotlight` job (same triggers): gathers a pinned historical week of
   `Azure/bicep-registry-modules`, runs `validate.py`, then
   `ci_spotlight_integration.py --store … --require-all`. The gate discovers its query
@@ -1451,5 +1546,5 @@ these affect an accumulated store.
 | New view field | compute in `link.enrich` or `derive` (pure) | append-only; document in BUNDLE.md; omit when empty |
 | New stored fact | `fold_bundle` + `extract` reader + `validate` conformance | must keep `no_drift` and characterization green |
 | New spotlight query | function + `_RENDERERS` entry + dispatch in `main` | envelope shape; exit 0 for "no data" statuses |
-| New formatter | consume the view (see `examples/formatters/`) | read `meta.schema_version` |
+| New formatter | consume the view (see `examples/formatters/`) | read `meta.schema_version` (3; refuse a newer one) and check the keys you need |
 | Cross-repo Bicep deps from other registries | `resolve_bicep_registry_member` + `manifest.check_bicep_registry_prefix` (#92) | keep it manifest-gated; never route Bicep edges through the Terraform resolver |

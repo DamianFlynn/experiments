@@ -16,6 +16,10 @@ view, in the bundle of the member whose `repo` equals `ref.repo`). Trains have n
 use the root issue's title, else the first PR's. The reference date is `meta.ref_date`
 (every view carries it; it defaults to `meta.to`).
 
+**State as of (#85).** When `meta.state_as_of` is present (per member in the project
+view), the view's records are as last gathered at that date, later than the view's end:
+write one caveat line under the report title saying so. Omit it when the key is absent.
+
 ## Executive summary
 3–5 bullets — features, releases, CI health, key risks — informed by board + call context.
 Counts come from the data (shipped refs by `ref.type`, trains by `ptrain.outcome` /
@@ -266,4 +270,9 @@ judgmental. When not explicitly opted in, omit entirely.
 ## Releases · CI/CD health · In-flight · Rejected
 Standard sections from `releases`, `workflow_stats` (skip keys starting `_`),
 `buckets.in_flight`, and `buckets.rejected`/abandoned respectively — each item cited (titles
-via `item`); omit when empty.
+via `item`); omit when empty. **CI caveat (#94):** when `meta.facts_windows` is present, the
+CI counts are a sum over the gathered windows it lists (`meta.facts_windows.workflow_stats`);
+when `meta.facts_windows.workflow_stats_complete` is false the total is partial and
+`meta.facts_windows.workflow_stats_excluded` names the windows left out; the code graph and
+owners come from `meta.facts_windows.structure`. Say so in one line under CI/CD health;
+omit it when the key is absent.

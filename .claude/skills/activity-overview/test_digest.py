@@ -868,6 +868,38 @@ class TestProjectDependsOn(unittest.TestCase):
         self.assertEqual(edges[0]["transitive"], True)
         self.assertEqual(edges[0]["src_area"], "modules/app")
 
+    def test_ref_address_and_via_are_carried(self):
+        """Issue #107: the stored edge's `ref` (always present in a row, None
+        when the edge has none) and a nested call's `address` / `via` (only
+        when stored) reach module_edges."""
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        graphstore.upsert_edges(conn, [
+            ("proj/Azure/a#area-main.tf", "proj/Azure/b#area-main.tf",
+             "depends_on", None,
+             {"ref": "Azure/avm-b/azurerm", "version": "1.0.0",
+              "cross_repo": True, "transitive": True,
+              "address": "module.x.module.y", "via": "module.x"}),
+            ("proj/Azure/a#area-main.tf", "proj/Azure/a#area-modules/sub",
+             "depends_on", None, {"ref": "./modules/sub", "transitive": False}),
+            ("proj/Azure/a#area-modules/sub", "proj/Azure/a#area-modules/z",
+             "depends_on", None, None),
+        ])
+        edges = digest.project_depends_on(conn, "proj", ["Azure/a", "Azure/b"])
+        by_dst = {(e["src_area"], e["dst_repo"], e["dst_area"]): e for e in edges}
+        nested = by_dst[("main.tf", "Azure/b", "main.tf")]
+        self.assertEqual((nested["ref"], nested["address"], nested["via"]),
+                         ("Azure/avm-b/azurerm", "module.x.module.y", "module.x"))
+        local = by_dst[("main.tf", "Azure/a", "modules/sub")]
+        self.assertEqual(local["ref"], "./modules/sub")
+        self.assertNotIn("address", local)
+        self.assertNotIn("via", local)
+        bare = by_dst[("modules/sub", "Azure/a", "modules/z")]
+        self.assertEqual(sorted(bare), ["cross_repo", "dst_area", "dst_repo",
+                                        "ref", "src_area", "src_repo",
+                                        "transitive", "version"])
+        self.assertIsNone(bare["ref"])
+
 
 class TestS4Gate(unittest.TestCase):
     def test_cross_repo_depends_on_render_and_blast_radius(self):

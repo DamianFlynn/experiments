@@ -16,17 +16,27 @@ The pipeline's **product is this structured view**, not the Markdown report — 
 report is just one renderer over it, and other formatters (changelog, social,
 video-script, dashboards) consume the same view. The contract:
 
-- **Versioned.** `meta.schema_version` (currently `1`) identifies the shape on
-  BOTH entry points — the single-repo bundle and the multi-repo project view (and
-  each `members[].bundle.meta`). A formatter should read it and refuse a version it
-  doesn't understand. Bumps are recorded here.
+- **Versioned.** `meta.schema_version` (currently `3`,
+  `extract.VIEW_CONTRACT_VERSION`) identifies the shape on BOTH entry points — the
+  single-repo bundle and the multi-repo project view (and each
+  `members[].bundle.meta`); gather's in-memory bundle carries it too. A formatter
+  should read it and refuse a version it doesn't understand (`samples/build_report.py`
+  refuses a newer one). It is the view contract only: the store's own schema
+  version is `graphstore.SCHEMA_VERSION`, kept in the store's meta (STORE.md).
+  Bumps are recorded here: `1` was declared while extract views carried no version
+  and digest stamped the store's `2`; `3` (#107) is the first version every view
+  carries, covering the incompatible changes since `1` (project people areas
+  `repo::area`, series v2, train `issues` / `pr_outcomes`), and no earlier view ever
+  carried it. A view without the key predates #107.
 - **Two entry points, same shape family.** Single-repo: the enriched bundle view
   (`extract` → `link.py`) — keys documented below. Multi-repo project: `python3
   digest.py --store <db> --project <name> --from … --to …` emits the merged
   **project view** `{meta, members[].bundle, trains, module_edges, shipped, people,
-  halls, modules, related_work}` (each `members[].bundle` is a single-repo view). Both are
-  canonical JSON (`sort_keys`; `view.py` writes the raw view the same way), so output is
-  diff-stable. **Object key order carries no meaning (issue #100):** every list derived
+  halls, modules, related_work}` (each `members[].bundle` is a single-repo view; the
+  project `meta` is `{project, repos, from, to, schema_version}`). `digest.py` and
+  `view.py` write `sort_keys` JSON; `link.py` and `render.py` rewrite the bundle view with
+  `indent=2` without re-sorting keys — still deterministic, because **object key order
+  carries no meaning (issue #100):** every list derived
   from an object (`timeline`, `feature_deltas`, the content-timeline diagram) has an
   explicit, total sort key, so enriching a bundle gives the same result whatever order its
   objects' keys are in — a member taken from `digest.py` output and re-enriched equals the
@@ -56,6 +66,12 @@ video-script, dashboards) consume the same view. The contract:
   with `digest.py --manifest M` when the manifest declares `"ticket_prefixes":
   ["ABC", "PLAT"]` (pattern `\b(?:ABC|PLAT)-\d+\b`), or with `--ticket-pattern RE`
   (wins over the manifest).
+- **Project view: `module_edges` (#107).** One row per stored `depends_on` edge out
+  of a member: `{src_repo, src_area, dst_repo, dst_area, version, transitive,
+  cross_repo, ref}`, plus `address` and `via` only on a nested `module.a.module.b`
+  call. **Window rule:** `depends_on` is a current-state edge, kept as of the latest
+  fold (#95); `module_edges` lists the edges as of the store's latest gather, not
+  the edges of the view's `--from`/`--to` window.
 - **Project view: member `meta` identity.** In `members[].bundle.meta`, `owner` is
   the store's **project scope** and `repo` the store's repo key — for a manifest
   member `owner` is the project name and `repo` is already `owner/name`, so never
@@ -99,8 +115,10 @@ as bare SHAs in `trains[].commits`.)
 Field lists below are the core shapes; the grouped sections further down document
 the rest (engagement, code areas, trains, people/flow).
 
-- `meta` — `owner, repo, from, to, branches, base_branch, clone_dir, period, prev_bundle,
-  schema_version`. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
+- `meta` — the bundle `gather` assembles in memory (and folds; never written to disk) has
+  `owner, repo, from, to, branches, base_branch, clone_dir, ref_date, clone_sha, clone_mode,
+  boundary_dropped_commits, period, prev_bundle, schema_version`; a **view** carries the
+  subset listed under "A view … carries" below. **`base_branch`** is the analyzed mainline branch: a PR whose `base` differs
   from it is a stacked/fork contribution (merged into another branch, not main) — kept in `prs`
   as context but not counted as shipped-to-main (see `commits`/`date` note below and trains).
   gather takes it from `--branches` (first entry) or a manifest member's `branch`, else the
@@ -111,16 +129,36 @@ the rest (engagement, code areas, trains, people/flow).
   overlaps. **`base_branch: null`** (with `branches: []`) means unknown — gather could not
   determine it, the overlapped windows disagree, or the store was folded before #84; `link`
   then counts every merged PR as merged into the mainline (no stacked-PR detection) and
-  `extract` warns on stderr when that decides anything.
-  Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against.
-  It pins the exact source tree (edges are a pure function of source), which is the basis for
-  the store-native resume: a refresh re-folds the same window against the pinned `clone_sha`,
-  idempotent by identity. **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` | `none`)
-  records how gather obtained the clone (see `gather.prepare_clone`); it is in the bundle
-  `acquire` assembles and is not folded into the store. (Store-only — see `STORE.md`; this bundle shape is the
-  transient view `extract` materializes from the store, not a produced file.)
+  `extract` warns on stderr when that decides anything. The walked branch IS `base_branch`
+  (issue #107): when it is not the remote default, gather fetches `origin/<base_branch>` under
+  the same shallow bound and checks it out, so `commits`, `code_events`, `symbol_events`, the
+  code graph and CODEOWNERS all describe it (one stderr note says so); a `base_branch` the
+  remote does not have stops the gather (a manifest member is recorded failed).
+  Plus **`clone_sha`** — the commit the structure (`code_graph` and its edges, the structural
+  scan, CODEOWNERS) was read at, and **`structure_as_of`** (issue #107): `"window_end"` when
+  that commit is the last commit of the walked branch (first-parent) whose committer date is
+  on or before `to` — the current month's head, or for a past window re-gathered later the
+  mainline as it was then (read from a temporary worktree; the clone stays on its branch
+  head) — or `"head"` when the bounded clone does not hold that commit (a window with no
+  commit in it or its margin, before later ones), so the structure is the head's; both `null`
+  without a clone. `clone_sha` is provenance only: nothing checks it out again or rebuilds
+  from it.
+  **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` | `none`) records how gather
+  obtained the clone (see `gather.prepare_clone`), and **`boundary_dropped_commits`** lists
+  the in-window commit shas whose diffs the shallow boundary dropped (the code history is
+  incomplete for them). Since #107 fold stores both per gathered window and a view carries
+  them (omit-when-absent): `clone_mode` and `structure_as_of` only for a view of exactly one
+  gathered window,
+  `boundary_dropped_commits` as the sorted union over the gathered windows wholly inside
+  the view, omitted when empty. **`closing_refs_source`** (`graphql` | `keywords`, issue
+  #105) is bundle-only: where the PRs' `closes` came from — GitHub's
+  `closingIssuesReferences` merged with the closing keywords, or the keywords alone because
+  GraphQL was unavailable (gather prints which on stderr). (Store-only — see `STORE.md`;
+  this bundle shape is the transient view `extract` materializes from the store, not a
+  produced file.)
   A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
-  to` (+ `clone_sha`), **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).
+  to, base_branch, branches` (+ `clone_sha`, `state_as_of`, `facts_windows` when they apply),
+  **`period`** = the requested `{from, to}` and **`ref_date`** (issue #75).
   `period` is the window `compute_buckets` and `build_forecast` limit to (`link.window_period`:
   `period`, else `{from, to}`), so items the store holds from other windows — or old items
   gather pulled because they were updated in the window — fall in no bucket. `ref_date` frames
@@ -193,6 +231,15 @@ the rest (engagement, code areas, trains, people/flow).
   `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, head_repo, closes:[issue#], url }`.
+  **`closes`** (#62, #105) = the same-repo issues the PR closes: the closing keywords in its
+  title/body, in text order, then — when `meta.closing_refs_source` is `graphql` — every other
+  same-repo issue GitHub reports in `closingIssuesReferences` (a manual **Development**-sidebar
+  link leaves no keyword), ascending. Such an issue is removed from `crossref_issues` (it was
+  only a mention there). When GitHub reports anything the keywords miss, the PR also carries
+  **`closing_issues`**: GitHub's whole list as `[{owner, repo, number}]`, sorted by owner/repo
+  (case-insensitive) then number; its other-repo entries are cross-repo `closes` refs, like a
+  keyword `Fixes owner/repo#N` (see `STORE.md`, multi-repo). Absent otherwise, so a PR whose
+  closing issues are all keyword ones is unchanged.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
   **`head_repo`** (#93) is the `owner/repo` the head branch lives in (a fork's name for a fork
   PR; `null` when GitHub no longer knows it, e.g. a deleted fork, and absent from bundles
@@ -212,7 +259,8 @@ the rest (engagement, code areas, trains, people/flow).
   issues they **close** (`closes`): a train is a connected group of PRs and the issues they close,
   so two PRs closing the same issue (a rejected first attempt and the reworked one that shipped)
   are one train, and every issue a train's PRs close is in its `issues` (sorted) and carries the
-  train id on its bucket ref. A mention or timeline cross-reference (`crossref_issues`) never
+  train id on its bucket ref (a Development-sidebar link counts once gather read it from
+  GitHub, #105). A mention or timeline cross-reference (`crossref_issues`) never
   makes an issue a member or a root: a tracking issue that mentions three PRs leaves them three
   trains. `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
   or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.
@@ -454,6 +502,15 @@ review's state to `DISMISSED`.
   is a module of its own: its area is that directory (#101); other files there stay in
   `modules/<name>`. A file directly under an AVM
   group (`avm/res/<svc>/README.md`) is not a module: it maps to the group area `avm/res/<svc>`.
+  A **Bicep module directory** (issue #107) — one holding a tracked or changed `main.bicep`,
+  outside the AVM layout, the repo root and `examples/`/`tests/` — is the area of every
+  non-`*.tf` file in it and below it, down to the next such directory; files under an
+  `examples/`/`tests/` subtree keep the rules above. So `infra/modules/net.bicep` next to
+  `infra/main.bicep` is in `infra` (was `infra/modules`) and `a/b/c/README.md` next to
+  `a/b/c/main.bicep` is in `a/b/c` (was `a/b`); a two-segment module dir
+  (`platform/hub/README.md`) and the AVM / Terraform layouts are unchanged. gather knows the
+  module directories from the window's changed paths plus the tracked files of the structure
+  commit; without a clone, from the changed paths alone.
   **graphify** is an OPTIONAL provider for its ~25 tree-sitter languages — it reads
   graphify's real `graph.json` (top keys `nodes`/`links`; each node carries an
   integer `community` + `source_file`; **no** top-level `communities` list; edges

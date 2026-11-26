@@ -6,6 +6,13 @@ Readers, writers, and downstream renderer authors rely on this file as the
 contract. `graphstore.py` owns the schema and the core read/write API; callers
 use that API (a couple of readers also run their own read-only queries).
 
+**Readers open the store read-only (#107).** `view.py`, `digest.py`,
+`spotlight.py` and `ci_spotlight_integration.py` open it with
+`graphstore.open_store_readonly` (never creates a file; any write raises), so
+the store's bytes are unchanged after a read. The one exception is
+`spotlight.py --complete` with a `GITHUB_TOKEN`, which writes the anchors it
+backfills and opens the store read-write.
+
 > **Store-only.** This trustworthy graph IS the deliverable.
 > `gather --store` writes it and nothing else — there is no longer a flat bundle
 > JSON artifact. The bundle is a **transient view** that `extract` materializes
@@ -147,7 +154,14 @@ kept as a same-repo cross-reference in `crossref_issues`), while `Fixes #1, fixe
 #2` closes both. A same-repo qualified ref or URL is a same-repo `closes`; a
 cross-repo one goes to the cross-repo edge path below; a keyword before a
 `/pull/` URL is a `cross_ref`, never a close. Keywords are matched in code blocks
-too (no Markdown parsing). `part_of` uses the commit subject's **trailing**
+too (no Markdown parsing). GitHub's own list (#105) is merged in at gather time: the
+issues `closingIssuesReferences` reports (keywords AND manual Development-sidebar links)
+join the PR's `closes` (same repo; removed from `crossref_issues`) and, when anything is
+new, are stored on the PR record as `closing_issues` (`[{owner, repo, number}]`), whose
+other-repo entries the multi-repo fold turns into cross-repo `closes` edges. Both fields
+are on the stored record, so the trust check re-derives these edges store-only. With
+GraphQL unavailable gather keeps the keywords alone (`meta.closing_refs_source:
+keywords`). `part_of` uses the commit subject's **trailing**
 `(#N)` first (so `Revert "x (#4012)" (#4020)` → PR 4020), then `Merge pull
 request #N`, then the last `(#N)`.
 
@@ -200,8 +214,8 @@ significant and otherwise raise `OperationalError`.
 
 Key/value provenance: `schema_version` (see below); `gathered_windows` (JSON list of
 folded `{project,repo,from,to}`, deduped — `record_window`/`get_windows`);
-`clone_sha:{project}/{repo}` (the tree a repo was last gathered against, for
-deterministic resume/roll-up — `set_clone_sha`/`get_clone_sha`);
+`clone_sha:{project}/{repo}` (the commit the structure of the repo's latest fold was
+read at — its window's end, issue #107 — provenance only; `set_clone_sha`/`get_clone_sha`);
 `ref_date:{project}/{repo}:{from}:{to}` (the reference date a gathered window was
 folded with: gather `--ref-date`, else the window's `to`; a re-fold of the same
 window replaces it — `set_ref_date`/`get_ref_date`). `extract` stamps it into the
@@ -220,6 +234,16 @@ view overlaps when their non-null values agree, else `null` / `[]` with a stderr
 (when a merged PR is in the view). Stores folded before #84 have no `branches:` keys, so
 their views report the base branch unknown and count every merged PR as shipped, as
 before; re-gather to get stacked / release-branch PRs told apart.
+
+`clone:{project}/{repo}:{from}:{to}` (issue #107): JSON `{"clone_mode": str|null,
+"boundary_dropped_commits": [sha]}` (sorted), how a gathered window's clone was made
+and the in-window commits whose diffs its shallow boundary dropped; a re-fold of the
+same window replaces it — `set_clone_info`/`get_clone_info`. Written in the fold
+transaction when the bundle's `meta` has `from`, `to` and either key (every gather).
+`extract` stamps `meta.clone_mode` for a view of exactly that window and
+`meta.boundary_dropped_commits` as the union over the gathered windows wholly inside
+the view (each omitted when absent or empty). Stores folded before #107 have no
+`clone:` keys and their views carry neither.
 
 `facts:{project}/{repo}:{from}:{to}` (issue #94): JSON `{"clone_sha": str|null,
 "facts": {key: sha256}, "ci_collected": bool}` (`ci_collected` is false when the
@@ -278,6 +302,11 @@ stays listed even if it holds only stand-ins.
 current version and migrates an older one **in place**; every step is additive
 and idempotent, and the stored version is raised, never lowered.
 
+This versions the STORE only and lives only in the store's meta. Views carry a
+separate bundle/view contract version, `meta.schema_version` =
+`extract.VIEW_CONTRACT_VERSION` (BUNDLE.md, #107); the two are bumped
+independently.
+
 | Version | Change | Migration from the previous version |
 |---|---|---|
 | 1 | initial schema | — |
@@ -306,8 +335,9 @@ between the two leaves the member `not_attempted` (re-folding it is idempotent).
 `gather --store PATH` (required) folds its in-memory assembled bundle into the
 store via `gather.fold_bundle(conn, bundle)` — the store is the **sole output**
 (no bundle file is written), idempotent by identity (re-folding an overlapping
-window mutates nothing already correct, so roll-up = a wider window re-fold and
-resume = a re-fold against the pinned `clone_sha`). P6
+window mutates nothing already correct, so a refresh is a re-gather of the same window (its structure is read at the
+window's end, issue #107);
+a roll-up is a wider view over the folded windows, or a wider gather). P6
 writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
 `data` blob), `code` (commits) + the file-level `code_events` ledger,
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
@@ -434,7 +464,7 @@ edges** (all derived on the write path via the shared `derive.py` leaf —
   `code_owners`). Rules are not unioned; an owner-less last match emits no edge.
   `stale_owned` uses the same matcher. **`touches` (commit→area)** from
   `derive._commit_areas` (a commit's files → the areas they land in). **`depends_on`
-  (area→area)** from `code_graph["edges"]`, carrying `{version,transitive,…}` in
+  (area→area)** from `code_graph.areas[].edges`, carrying `{version,transitive,…}` in
   the edge `data`. **`in_milestone` (social→structure)** from a PR/issue's
   `milestone` title → the milestone node (keyed on number when present).
 
@@ -497,8 +527,9 @@ record, which is upserted last-fold-wins, so re-folding an OLDER bundle after
 a newer one brings back the older record and with it its milestone, iteration
 and blockers (the store stays consistent with its records either way; order
 matters exactly as it already did for the record). A window's structure is
-read from the checkout at gather time, so a window re-gathered later carries a
-newer tree than its dates say; the replay still orders it by its dates.
+read at its last mainline commit (issue #107), so a window re-gathered later reads
+its own tree; only when the bounded clone does not reach that commit
+(`meta.structure_as_of: "head"`) does it carry a newer tree than its dates say.
 
 **What was retracted** is in the summary `fold_bundle` returns (`gather` prints
 `retracted N stale current-state edge(s) of P/R (…) (meta retractions:P/R)` to
@@ -615,11 +646,12 @@ fetches itself — it calls in via an injected `backfill` callable).
   before — `missing` ids are only warned about.
 - **Context-only (documented gap).** A backfilled node is pulled into the bundle
   as out-of-window **context** (it was reached via the spine but is outside the
-  range query), so it does NOT count toward in-window activity. The read pipeline
-  that wires `backfill=gather.backfill` in production is not landed yet (extract
-  is still read only by tests today); `make_backfill_fetcher`'s live REST/git
-  paths are therefore only exercisable against a real repo (relevant to the
-  upcoming trust gate), not by the offline suite.
+  range query), so it does NOT count toward in-window activity. In production only
+  `spotlight.py --complete` wires a fetcher (`gather.make_backfill_fetcher`, through
+  `complete.complete_train`); `view.py`, `digest.py` and `validate.py` call
+  `extract` with `backfill=None` (offline, warn-only). `make_backfill_fetcher`'s live
+  REST/git paths are therefore only exercisable against a real repo, not by the
+  offline suite.
 
 ## Train completion + dead-ref memory
 
@@ -717,7 +749,9 @@ byte-unchanged (`project = owner`, `repo = <name>`).
   `github.com/.../issues|pull/N` URL) or a repo-aware timeline cross-ref to a
   **member** repo emits a `closes`/`cross_ref` spine edge across the repo boundary
   (`traverse_spine` walks it unchanged); a ref to a **non-member** repo is recorded
-  on the node's `external_refs` (honest, not a fetchable gap).
+  on the node's `external_refs` (honest, not a fetchable gap). An other-repo entry of
+  the PR's stored `closing_issues` (GitHub-reported, #105) is a `closes` ref the same
+  way, and an issue mention it also closes is not a separate `cross_ref`.
 - **Cross-repo `depends_on` (Terraform).** `build_terraform_edges` keeps a registry
   source as `to=None, ref=<src>`; `fold_bundle` resolves it to the member that
   publishes that module — **exact** (a member whose manifest `registry` equals the
@@ -880,11 +914,12 @@ audited once project-wide, not per member.
 
 ## Roll-up / resume (slice 7c)
 
-A multi-window "wider view" is a **single wider `range_query`** over the union of
-folded windows — a `WHERE ts BETWEEN …`, NOT a multi-bundle merge. Folding two
-adjacent windows (March, April) then range-querying `[March-start, April-end]`
-returns the union of their in-window nodes; each narrow window still returns only
-its own.
+A multi-window "wider view" is a view over a wider window of the same store — the
+window rule below applied to the union of folded windows, NOT a multi-bundle merge.
+Folding two adjacent windows (March, April) then viewing `[March-start, April-end]`
+gives the union of their records; each narrow window still gives only its own.
+(The manifest `gather --resume` flag is a different thing: it re-attempts the members
+whose last gather of the window did not complete — see `member_status` above.)
 
 **Window-scoped views (issue #85).** `extract` builds a view from the records of
 its window only, not from the repo's whole node set: PRs merged/closed in the
@@ -924,9 +959,9 @@ the repo's gathered windows (`extract._window_facts`):
 
 Overlapping re-folds are idempotent (identity-keyed nodes/edges, set
 semantics on the ledger, deduped `gathered_windows`, per-window meta keys
-replaced), so re-extracting an overlapping window is byte-stable. Resume/roll-up
-read the latest `clone_sha` (`set_clone_sha`/`get_clone_sha`) and the
-`gathered_windows` ledger (`record_window`/`get_windows`), a `WHERE`, not a merge.
+replaced), so re-extracting an overlapping window is byte-stable. A roll-up view
+reads the `gathered_windows` ledger (`record_window`/`get_windows`) and the windows'
+`facts:` entries; nothing is merged.
 
 ## Trust gate (validate.py)
 

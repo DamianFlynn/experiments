@@ -6,8 +6,9 @@
 
 ## Install
 
-Copy `.claude/skills/activity-overview/` into your repo (or `~/.claude/skills/`).
-Requirements: Python 3 (stdlib only), `git` on PATH, and a `GITHUB_TOKEN`
+Copy `.claude/skills/activity-overview/` into your repo (or `~/.claude/skills/`; the
+symlinked install is in `docs/USAGE.md` §2). Requirements: Python 3.11+ (stdlib only),
+`git` on PATH, and a `GITHUB_TOKEN`
 (or `GH_TOKEN`) with `repo` scope (read access). Add **`read:project`** to ingest
 Projects v2 boards (gather auto-discovers them); without it — or with
 `--no-project-board` — the board layer cleanly degrades to empty and everything
@@ -47,12 +48,14 @@ python3 gather.py --owner OWNER --repo REPO --from 2026-05-01 --to 2026-05-31 \
 python3 validate.py workspace/journey.db
 ```
 
-**The store persists and grows.** `--store workspace/journey.db` is a normal SQLite
-file on disk — reuse the **same path** for a project across windows (and across its
-member repos) and gather folds into it **idempotently** (re-running an overlapping
-window never double-counts), so the journey graph accretes over time. It's a local,
-rebuildable cache; delete the file to start fresh, or re-gather to refresh against the
-pinned clone SHA (see `STORE.md`). A single store *can* hold **multiple** projects/repos,
+**The store persists and can grow.** `--store workspace/journey.db` is a normal SQLite
+file on disk. gather folds into it **idempotently** (re-running an overlapping window
+never double-counts), so you can either start a new store per report installment (the
+simplest, fully exact choice) or reuse the **same path** across windows and let it grow:
+views are window-scoped, with the limits `docs/USAGE.md` §2.1 lists (a past month
+re-viewed later shows today's record state). It's a local, rebuildable file; delete it to
+start fresh, or re-gather a window to refresh it (its structure is read as of the
+window's end; `STORE.md`). A single store *can* hold **multiple** projects/repos,
 but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
 `spotlight.py`) error asking for `--project` (and `--repo` when a project spans several;
 `spotlight.py` instead unions an area across members unless `--repo` or `owner/repo::area`
@@ -60,13 +63,18 @@ names one) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 `validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
-error: missing or non-store path, ambiguous store). It proves the store is consistent
+error: missing or non-store path, ambiguous store, unreadable `--bundle`). It lists nine
+checks per repo in this order — `target`, `referential_integrity`,
+`participant_completeness`, `provenance`, `no_fabrication`, `schema_conformance`,
+`edge_set`, `no_drift`, `idempotency` — plus `no_drift_people` and `member_status` for a
+multi-repo project. It proves the store is consistent
 with its own records — every edge is one the stored records imply (`edge_set`, both
 directions), people are re-derived from the records, every PR/issue cites its own GitHub
 link and every commit id is a real sha — but not that the records match GitHub: a record
 deleted with its edges or a consistently rewritten blob passes. To catch those, save the
 view of the freshly gathered store (`view.py … --out view.json`, before `link.py` enriches it) and later run
-`validate.py STORE --bundle view.json`. On a store holding several windows, the
+`validate.py STORE --bundle view.json` (single repo only; a project-mode run ignores
+`--bundle` with a warning). On a store holding several windows, the
 dependency, ownership, touch, milestone, sprint and blocker edges are checked exactly
 once a fold since #95 maintained them and every window has its per-window facts
 (otherwise, and for person areas, a difference is a WARN naming why); `--repo` of a multi-repo
@@ -193,11 +201,13 @@ commit (common on quiet per-module repos), the first in-window commit lands on t
 shallow boundary; gather then deepens the clone (`git fetch --deepen`, at most four
 bounded attempts) until that commit's parent is present, so its diff and file list
 are real. Only if deepening fails is the commit recorded in
-`meta.boundary_dropped_commits`, with its diffs dropped **and** its `files` cleared
-(no whole-tree inflation of areas/modules); widen this knob and re-gather to recover it.
+`meta.boundary_dropped_commits` (printed as a warning; it is not stored, so views do not
+carry it), with its diffs dropped **and** its `files` cleared (no whole-tree inflation of
+areas/modules); widen this knob and re-gather to recover it.
 
 An existing `--clone-dir` that is a clone of the same repo is **fetched** to that bound
-(and the default branch head checked out) instead of re-cloned; `--no-clone` never creates
+(and the base branch head checked out: the default, or `--branches`' first entry fetched
+under the same bound) instead of re-cloned; `--no-clone` never creates
 a clone (it fetches an existing one, or gathers API data only when there is none). A repo
 with no commits since the bound is cloned at `--depth=1` and contributes no commits.
 `meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.

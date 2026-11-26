@@ -35,6 +35,7 @@ SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL_ROOT)
 
 import derive  # noqa: E402  (CODEOWNERS rules + area matching)
+import extract  # noqa: E402  (VIEW_CONTRACT_VERSION)
 import graphstore  # noqa: E402  (qualify/parse ids, same as digest.py)
 import render  # noqa: E402  (diagram emitters + mmdc validation)
 
@@ -112,6 +113,34 @@ def write_diagrams(view, diagrams_dir):
     captions = {k: "Showing {} of {} {}.".format(n["shown"], n["total"], n["unit"])
                 for k, n in captions.items()}
     return texts, captions, paths
+
+
+def _span(window):
+    return "{} → {}".format(window.get("from"), window.get("to"))
+
+
+def ci_caveat(meta):
+    """The CI/CD-health caveat line for a member view whose meta carries
+    `facts_windows` (#94): its CI counts are a sum over gathered windows,
+    partial when `workflow_stats_complete` is false (the windows left out are
+    `workflow_stats_excluded`); `structure` names the window the code graph
+    and owners come from. None when the key is absent."""
+    fw = meta.get("facts_windows")
+    if not isinstance(fw, dict):
+        return None
+    summed = ", ".join(_span(w) for w in fw.get("workflow_stats") or []) or "none"
+    line = "> CI counts are the sum of the gathered windows {}".format(summed)
+    if not fw.get("workflow_stats_complete"):
+        line += "; **partial**: not every day of the window is covered"
+        excluded = fw.get("workflow_stats_excluded") or []
+        if excluded:
+            line += " (not counted: {})".format(
+                ", ".join(_span(w) for w in excluded))
+    line += "."
+    if isinstance(fw.get("structure"), dict):
+        line += " Code graph and owners from the {} gather.".format(
+            _span(fw["structure"]))
+    return line
 
 
 def build_report(view, texts, captions):
@@ -210,6 +239,16 @@ def build_report(view, texts, captions):
         clones.append("`{}`@`{}`".format(short(m["repo"]), (sha or "?")[:9]))
     W("| **Pinned clones** | {} |".format("; ".join(clones)))
     W("")
+    # meta.state_as_of (#85, omit-when-absent): the member's records are as its
+    # latest gather saw them, after this window's end. Stated per member.
+    for m in members:
+        as_of = member_meta(m).get("state_as_of")
+        if as_of:
+            W("> **Records as of {}** (`{}`): as last gathered on that date, after "
+              "this window's end ({}); open/closed state, labels, milestones and "
+              "comments may be newer than the window.".format(
+                  as_of, short(m["repo"]), to))
+            W("")
     W("Member repositories:")
     W("")
     for m in members:
@@ -218,9 +257,9 @@ def build_report(view, texts, captions):
         slug = member_meta(m).get("slug") or m["repo"]
         W("- [`{}`](https://github.com/{})".format(slug, slug))
     W("")
-    # meta.boundary_dropped_commits is gather's bundle meta; views materialized
-    # from the store do not carry it. Warn when a member has one; never claim
-    # completeness from its absence.
+    # meta.boundary_dropped_commits: views carry it since #107 (omitted when
+    # empty, and absent from views of older stores). Warn when a member has
+    # one; never claim completeness from its absence.
     with_gap = {m["repo"]: member_meta(m)["boundary_dropped_commits"]
                 for m in members if member_meta(m).get("boundary_dropped_commits")}
     if with_gap:
@@ -392,9 +431,19 @@ def build_report(view, texts, captions):
             W("")
         ws = {k: v for k, v in (b.get("workflow_stats") or {}).items()
               if not k.startswith("_")}       # `_truncated` etc. are metadata
-        if ws:
+        caveat = ci_caveat(b.get("meta") or {})
+        if ws or caveat:
             W("#### CI/CD health")
             W("")
+        if caveat:
+            # shown even with no CI rows: a sub-window, a window gathered
+            # without workflows or with zero runs still has a coverage caveat
+            W(caveat)
+            W("")
+        if not ws and caveat:
+            W("No CI runs are recorded for this view.")
+            W("")
+        if ws:
             W("| Workflow | Success | Failure | Cancelled | Total |")
             W("|---|---|---|---|---|")
             for name, s in sorted(ws.items()):
@@ -510,6 +559,13 @@ def main(argv=None):
         return _fail("{} is not a digest.py project view (need meta.project, "
                      "members, trains, shipped, people, modules, module_edges, "
                      "related_work); see BUNDLE.md".format(args.view))
+    version = view["meta"].get("schema_version")
+    if isinstance(version, int) and version > extract.VIEW_CONTRACT_VERSION:
+        # A newer view contract than this formatter knows (BUNDLE.md). An
+        # unversioned view is an older gather and still renders.
+        return _fail("{} has meta.schema_version {}; this formatter reads "
+                     "views up to {}".format(args.view, version,
+                                             extract.VIEW_CONTRACT_VERSION))
     diagrams_dir = args.diagrams_dir or os.path.join(
         os.path.dirname(os.path.abspath(args.out)), "diagrams")
     texts, captions, paths = write_diagrams(view, diagrams_dir)

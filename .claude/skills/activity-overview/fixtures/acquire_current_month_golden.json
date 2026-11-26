@@ -1,0 +1,581 @@
+{
+ "structural": {
+  "artifacts": {},
+  "blockers": [],
+  "buckets": {
+   "in_flight": [],
+   "next_candidates": [],
+   "rejected": [],
+   "shipped": []
+  },
+  "code_events": [
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n param name string\n+param loc string",
+    "path": "avm/res/net/vnet/main.bicep"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n-guide\n+guide v2",
+    "path": "docs/guide.md"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n module \"x\" {\n   source = \"../net\"\n }\n+# v2",
+    "path": "modules/storage/main.tf"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n-hub\n+hub v2",
+    "path": "platform/hub/README.md"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "hunk": "@@ +1 @@\n * @core\n-/platform/ @platform-team\n+/platform/ @hub-team",
+    "path": ".github/CODEOWNERS"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "hunk": "@@ +1 @@\n-repo\n+repo v2",
+    "path": "README.md"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "hunk": "@@ +1 @@\n module vnet 'br/public:avm/res/net/vnet:0.1.0' = {\n   name: 'vnet'\n }\n+// v2",
+    "path": "platform/hub/main.bicep"
+   }
+  ],
+  "code_graph": {
+   "areas": [
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": ".github",
+     "label": ".github",
+     "paths": [
+      ".github/CODEOWNERS"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "README.md",
+     "label": "README.md",
+     "paths": [
+      "README.md"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "avm/res/net/vnet",
+     "label": "vnet",
+     "paths": [
+      "avm/res/net/vnet/main.bicep"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "docs",
+     "label": "docs",
+     "paths": [
+      "docs/guide.md"
+     ]
+    },
+    {
+     "edges": [
+      {
+       "kind": "module",
+       "provider": "terraform",
+       "ref": "../net",
+       "resolved": true,
+       "to": "modules/net",
+       "transitive": false,
+       "version": null
+      }
+     ],
+     "edges_status": "skipped",
+     "id": "modules/storage",
+     "label": "storage",
+     "paths": [
+      "modules/storage/main.tf"
+     ]
+    },
+    {
+     "edges": [
+      {
+       "kind": "module",
+       "provider": "bicep",
+       "ref": "br/public:avm/res/net/vnet:0.1.0",
+       "resolved": true,
+       "to": "avm/res/net/vnet",
+       "transitive": false,
+       "version": "0.1.0"
+      }
+     ],
+     "edges_status": "skipped",
+     "id": "platform/hub",
+     "label": "hub",
+     "paths": [
+      "platform/hub/README.md",
+      "platform/hub/main.bicep"
+     ]
+    },
+    {
+     "edges": [],
+     "id": "modules/net",
+     "label": "net",
+     "paths": [
+      "modules/net/main.tf"
+     ]
+    }
+   ],
+   "edge_extraction": {
+    "failed": 0,
+    "resolved": 0,
+    "skipped": 6,
+    "timeout": 0
+   },
+   "provider": "directory",
+   "structural_scan": true
+  },
+  "code_owners": [
+   {
+    "owners": [
+     "core"
+    ],
+    "pattern": "*"
+   },
+   {
+    "owners": [
+     "hub-team"
+    ],
+    "pattern": "/platform/"
+   }
+  ],
+  "commits": [
+   {
+    "author": "Test (git)",
+    "author_name": "Test",
+    "committed_at": "2026-05-20T12:00:00Z",
+    "date": "2026-05-20",
+    "files": [
+     ".github/CODEOWNERS",
+     "README.md",
+     "platform/hub/main.bicep"
+    ],
+    "login_resolved": false,
+    "message": "c 2026-05-20",
+    "parents": [
+     "a64dc164d31198235971c07c5e2a09f8d069b101"
+    ],
+    "pr": null,
+    "sha": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e"
+   },
+   {
+    "author": "Test (git)",
+    "author_name": "Test",
+    "committed_at": "2026-05-05T12:00:00Z",
+    "date": "2026-05-05",
+    "files": [
+     "avm/res/net/vnet/main.bicep",
+     "docs/guide.md",
+     "modules/storage/main.tf",
+     "platform/hub/README.md"
+    ],
+    "login_resolved": false,
+    "message": "c 2026-05-05",
+    "parents": [
+     "482a7726ca7ef110a10a856df9fc5b36db9d3cb9"
+    ],
+    "pr": null,
+    "sha": "a64dc164d31198235971c07c5e2a09f8d069b101"
+   }
+  ],
+  "diagrams": {},
+  "docsRefs": [],
+  "feature_deltas": [],
+  "flow": [],
+  "halls": {},
+  "issues": [],
+  "label_taxonomy": {
+   "source": "auto"
+  },
+  "meta": {
+   "base_branch": "main",
+   "boundary_dropped_commits": [],
+   "branches": [
+    "main"
+   ],
+   "clone_dir": "<clone>",
+   "clone_mode": "fresh",
+   "clone_sha": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+   "from": "2026-05-01",
+   "owner": "o",
+   "period": {
+    "from": "2026-05-01",
+    "to": "2026-05-31"
+   },
+   "prev_bundle": null,
+   "ref_date": "2026-05-31",
+   "repo": "r",
+   "schema_version": 1,
+   "to": "2026-05-31",
+   "workflows_collected": false
+  },
+  "milestones": [],
+  "modules": {},
+  "people": {},
+  "project": {},
+  "prs": [],
+  "release_train": {},
+  "releases": [],
+  "sprints": {},
+  "symbol_events": [
+   {
+    "after": "param loc string",
+    "author": "Test (git)",
+    "before": null,
+    "change": "add",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "lang": "bicep",
+    "name": "loc",
+    "path": "avm/res/net/vnet/main.bicep",
+    "subkind": "param"
+   },
+   {
+    "after": "# v2",
+    "author": "Test (git)",
+    "before": null,
+    "change": "add",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "lang": "terraform",
+    "name": "# v2",
+    "path": "modules/storage/main.tf",
+    "subkind": "comment"
+   },
+   {
+    "after": "// v2",
+    "author": "Test (git)",
+    "before": null,
+    "change": "add",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "lang": "bicep",
+    "name": "// v2",
+    "path": "platform/hub/main.bicep",
+    "subkind": "comment"
+   }
+  ],
+  "symbol_moves": {
+   "by_confidence": {
+    "high": 0,
+    "medium": 0
+   },
+   "links": []
+  },
+  "timeline": [],
+  "trains": [],
+  "workflow_stats": {},
+  "workflows": []
+ },
+ "window": {
+  "artifacts": {},
+  "blockers": [],
+  "buckets": {
+   "in_flight": [],
+   "next_candidates": [],
+   "rejected": [],
+   "shipped": []
+  },
+  "code_events": [
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n param name string\n+param loc string",
+    "path": "avm/res/net/vnet/main.bicep"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n-guide\n+guide v2",
+    "path": "docs/guide.md"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n module \"x\" {\n   source = \"../net\"\n }\n+# v2",
+    "path": "modules/storage/main.tf"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "hunk": "@@ +1 @@\n-hub\n+hub v2",
+    "path": "platform/hub/README.md"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "hunk": "@@ +1 @@\n * @core\n-/platform/ @platform-team\n+/platform/ @hub-team",
+    "path": ".github/CODEOWNERS"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "hunk": "@@ +1 @@\n-repo\n+repo v2",
+    "path": "README.md"
+   },
+   {
+    "author": "Test (git)",
+    "change": "modify",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "hunk": "@@ +1 @@\n module vnet 'br/public:avm/res/net/vnet:0.1.0' = {\n   name: 'vnet'\n }\n+// v2",
+    "path": "platform/hub/main.bicep"
+   }
+  ],
+  "code_graph": {
+   "areas": [
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": ".github",
+     "label": ".github",
+     "paths": [
+      ".github/CODEOWNERS"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "README.md",
+     "label": "README.md",
+     "paths": [
+      "README.md"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "avm/res/net/vnet",
+     "label": "vnet",
+     "paths": [
+      "avm/res/net/vnet/main.bicep"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "docs",
+     "label": "docs",
+     "paths": [
+      "docs/guide.md"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "modules/storage",
+     "label": "storage",
+     "paths": [
+      "modules/storage/main.tf"
+     ]
+    },
+    {
+     "edges": [],
+     "edges_status": "skipped",
+     "id": "platform/hub",
+     "label": "hub",
+     "paths": [
+      "platform/hub/README.md",
+      "platform/hub/main.bicep"
+     ]
+    }
+   ],
+   "edge_extraction": {
+    "failed": 0,
+    "resolved": 0,
+    "skipped": 6,
+    "timeout": 0
+   },
+   "provider": "directory"
+  },
+  "code_owners": [
+   {
+    "owners": [
+     "core"
+    ],
+    "pattern": "*"
+   },
+   {
+    "owners": [
+     "hub-team"
+    ],
+    "pattern": "/platform/"
+   }
+  ],
+  "commits": [
+   {
+    "author": "Test (git)",
+    "author_name": "Test",
+    "committed_at": "2026-05-20T12:00:00Z",
+    "date": "2026-05-20",
+    "files": [
+     ".github/CODEOWNERS",
+     "README.md",
+     "platform/hub/main.bicep"
+    ],
+    "login_resolved": false,
+    "message": "c 2026-05-20",
+    "parents": [
+     "a64dc164d31198235971c07c5e2a09f8d069b101"
+    ],
+    "pr": null,
+    "sha": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e"
+   },
+   {
+    "author": "Test (git)",
+    "author_name": "Test",
+    "committed_at": "2026-05-05T12:00:00Z",
+    "date": "2026-05-05",
+    "files": [
+     "avm/res/net/vnet/main.bicep",
+     "docs/guide.md",
+     "modules/storage/main.tf",
+     "platform/hub/README.md"
+    ],
+    "login_resolved": false,
+    "message": "c 2026-05-05",
+    "parents": [
+     "482a7726ca7ef110a10a856df9fc5b36db9d3cb9"
+    ],
+    "pr": null,
+    "sha": "a64dc164d31198235971c07c5e2a09f8d069b101"
+   }
+  ],
+  "diagrams": {},
+  "docsRefs": [],
+  "feature_deltas": [],
+  "flow": [],
+  "halls": {},
+  "issues": [],
+  "label_taxonomy": {
+   "source": "auto"
+  },
+  "meta": {
+   "base_branch": "main",
+   "boundary_dropped_commits": [],
+   "branches": [
+    "main"
+   ],
+   "clone_dir": "<clone>",
+   "clone_mode": "fresh",
+   "clone_sha": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+   "from": "2026-05-01",
+   "owner": "o",
+   "period": {
+    "from": "2026-05-01",
+    "to": "2026-05-31"
+   },
+   "prev_bundle": null,
+   "ref_date": "2026-05-31",
+   "repo": "r",
+   "schema_version": 1,
+   "to": "2026-05-31",
+   "workflows_collected": false
+  },
+  "milestones": [],
+  "modules": {},
+  "people": {},
+  "project": {},
+  "prs": [],
+  "release_train": {},
+  "releases": [],
+  "sprints": {},
+  "symbol_events": [
+   {
+    "after": "param loc string",
+    "author": "Test (git)",
+    "before": null,
+    "change": "add",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "lang": "bicep",
+    "name": "loc",
+    "path": "avm/res/net/vnet/main.bicep",
+    "subkind": "param"
+   },
+   {
+    "after": "# v2",
+    "author": "Test (git)",
+    "before": null,
+    "change": "add",
+    "commit": "a64dc164d31198235971c07c5e2a09f8d069b101",
+    "date": "2026-05-05",
+    "lang": "terraform",
+    "name": "# v2",
+    "path": "modules/storage/main.tf",
+    "subkind": "comment"
+   },
+   {
+    "after": "// v2",
+    "author": "Test (git)",
+    "before": null,
+    "change": "add",
+    "commit": "16711a74f66ca1ffe1d788866a4c3e41855f9b1e",
+    "date": "2026-05-20",
+    "lang": "bicep",
+    "name": "// v2",
+    "path": "platform/hub/main.bicep",
+    "subkind": "comment"
+   }
+  ],
+  "symbol_moves": {
+   "by_confidence": {
+    "high": 0,
+    "medium": 0
+   },
+   "links": []
+  },
+  "timeline": [],
+  "trains": [],
+  "workflow_stats": {},
+  "workflows": []
+ }
+}

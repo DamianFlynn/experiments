@@ -91,6 +91,12 @@ PLACEHOLDER RULES — read before filling anything below.
   `train.contributing_prs`). In the project view read it per member
   (`member.bundle.meta`). When it is `null` the store did not know it, so every
   merged PR was counted as shipped: say so in one line under the report title.
+* STATE AS OF: when `meta.state_as_of` is present (the view is of an earlier
+  window than the store's latest gather; in the project view read it per member,
+  `member.bundle.meta`), say so in one line under the report title: "Records are
+  as last gathered on {meta.state_as_of}, after this report's end ({meta.to}):
+  open/closed state, labels, milestones and comments may be newer than the
+  window." Omit the line when the key is absent.
 * TRUNCATED DIAGRAMS: when `diagrams.truncated` has an entry for an embedded
   diagram, say so under it: "Showing {diagrams.truncated[].shown} of
   {diagrams.truncated[].total} {diagrams.truncated[].unit}."
@@ -264,6 +270,16 @@ For each `release` in bundle["releases"] (newest first); flag a prerelease when
 For each `stats` row of bundle["workflow_stats"]: total runs and success/failure
 split. Skip the reserved `_truncated` key; when it is present, say the counts are
 partial (GitHub's 1,000-run search cap).
+
+When `meta.facts_windows` is present (the view is not exactly one gathered window;
+per member in the project view), add one caveat line under this heading: the
+counts are a sum over the gathered windows in `meta.facts_windows.workflow_stats`;
+when `meta.facts_windows.workflow_stats_complete` is false the total is partial,
+and `meta.facts_windows.workflow_stats_excluded` lists the windows left out. The
+code graph and owners are those of the window `meta.facts_windows.structure`.
+Omit the line when the key is absent. State this caveat even when the view has no CI rows (a sub-window, a window gathered without workflows, or zero runs).
+
+> CI counts summed over the gathered windows inside this view; partial when not every day is covered — not counted: {meta.facts_windows.workflow_stats_excluded[].from} → {meta.facts_windows.workflow_stats_excluded[].to}. Code graph and owners as of the {meta.facts_windows.structure.from} → {meta.facts_windows.structure.to} gather.
 
 - **{workflow}** — {stats.success}/{stats.total} succeeded ({stats.failure} failed, {stats.cancelled} cancelled).
 
@@ -440,7 +456,8 @@ edges resolve, the diagram is a `No module dependencies` placeholder (always pre
 ## Cross-repo module dependency graph
 
 <!-- Source: view["module_edges"] (each `edge` is {src_repo, src_area, dst_repo,
-     dst_area, version, transitive, cross_repo}) and the diagram
+     dst_area, version, transitive, cross_repo, ref}, plus address and via on
+     a nested module call; the edges as of the latest gather, not windowed) and the diagram
      render.emit_project_module_graph(view["module_edges"]). Lead with the
      cross-repo edges (`edge.cross_repo` true): a member's module depending on
      another member's published module. For "if member X changes, who is

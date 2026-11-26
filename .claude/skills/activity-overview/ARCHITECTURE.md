@@ -296,9 +296,9 @@ Finally `gather` **folds** everything into the database. The key word is **idemp
 > you can safely gather the same period twice, or extend a window — the database simply
 > **converges** to the truth and **grows over time**.
 
-> 🔎 **Under the hood: resume.** `gather` can also **backfill** — fetch just specific
-> missing facts on a later run — and it remembers refs proven not to exist (`dead_refs`)
-> so it never re-chases a 404.
+> 🔎 **Under the hood: backfill.** `gather` can also **backfill** — fetch just specific
+> missing facts later (`spotlight.py --complete` uses it) — and it remembers refs proven
+> not to exist (`dead_refs`) so it never re-chases a 404.
 
 We'll see the database itself in the next chapter.
 
@@ -423,8 +423,10 @@ reader that rebuilds that shape from the graph.
 
 **What/why/how.** *What:* `extract(owner, repo, from, to)` → a bundle view. *Why:* it
 re-presents the relevant slice of the graph as the familiar bundle so `link`/`render` can
-work without touching the database directly. *How:* it range-queries the nodes/edges in
-the window and reassembles PRs, issues, commits, people, areas, milestones, sprints, etc.
+work without touching the database directly. *How:* it selects the records that belong to
+the window (BUNDLE.md "Window scope") and reassembles PRs, issues, commits, people, areas,
+milestones, sprints, etc. Its command-line front end is **`view.py`** (`--store`, `--from`,
+`--to`, `--out`), which writes that view to a file for `link`/`render`.
 
 > ⭐ **The "golden" guarantee.** There's a test that proves `gather → extract → enrich`
 > reproduces the original end-to-end output **byte-for-byte**. Translation: *reading the
@@ -525,8 +527,10 @@ Remember the promise: *the digest must be believable*. Since the entire narrativ
 from the database, **a wrong database means a lying report.** `validate.py` is the gate
 that proves the database is consistent — run it before you trust any digest.
 
-> ⭐ **The trust gate.** `validate.py` runs **nine audits** over the store. The headline
-> ones:
+> ⭐ **The trust gate.** `validate.py` runs **nine checks** per repo (target, referential
+> integrity, participant completeness, provenance, no fabrication, schema conformance, edge
+> set, no drift, idempotency), plus two project-wide ones for a multi-repo project (people,
+> member status). The headline ones:
 > - **provenance** — *every* fact carries a source link, and it is the fact's own (the
 >   right repo and number on github.com; a real commit sha);
 > - **referential integrity** — every edge points at things that exist;
@@ -646,12 +650,19 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--from` / `--to` | — | window (YYYY-MM-DD) |
 | `--ref-date` | `--to` | reference point for milestone/sprint/forecast/flow framing; stored with the window, read back by `view.py`/`digest.py` |
 | `--branches` | repo default | mainline(s); first is `base_branch`. Unset: manifest member `branch`, else the repo's default branch (clone `origin/HEAD`, else API) |
-| `--clone-dir` | auto | clone location (reuse to enable `--no-clone`) |
-| `--no-clone` | off | reuse an existing clone (still runs `git log`) |
+| `--clone-dir` | `workspace/<repo>-clone` | clone location; an existing clone of the same repo is fetched, not re-cloned (manifest: parent of per-member `<owner>-<repo>-clone` dirs) |
+| `--no-clone` | off | never create a clone: fetch an existing one, or gather API data only |
 | `--no-workflows` / `--include-workflows` | on | CI workflow-run stats |
 | `--no-releases` / `--include-releases` | on | releases in window |
 | `--no-project-board` / `--project-board` | on | Projects v2 board ingest (auto-discovered) |
+| `--structural-iac` | off (on for manifest members) | whole-tree static Terraform + Bicep dependency scan |
+| `--resume` | off | manifest only: gather just the members not `ok` for the window |
 | `--store PATH` | **required** | the SQLite store to fold into |
+
+### `view.py` — materialize a bundle view (offline)
+`view.py --store STORE --from F --to T --out PATH [--project P] [--repo R] [--ref-date D]`;
+`--project`/`--repo` auto-detected when the store holds one; ambiguous, unknown or empty
+scope → exit 2.
 
 ### `link.py` — enrich (offline)
 `link.py BUNDLE.json` (enrich in place) · `--slice TRAIN_ID` (emit one train's slice) ·
@@ -688,7 +699,8 @@ or `--ticket-pattern`; unknown project/repo or a bad window exits 2.
 (14) · `ACTIVITY_BOARD_STALE_DAYS` (365) · `ACTIVITY_BOARD_MAX_ITEMS` (5000) ·
 `ACTIVITY_IAC_BUILD_TIMEOUT` (300s) · `ACTIVITY_IAC_MAX_WORKERS` (8) ·
 `ACTIVITY_IAC_RETRIES` (1) · `ACTIVITY_HTTP_TIMEOUT` (60s) · `ACTIVITY_HTTP_RETRIES` (3) ·
-`ACTIVITY_RATE_LIMIT_MAX_WAIT` (3600s) · `TF_PLUGIN_CACHE_DIR` (shared terraform cache).
+`ACTIVITY_RATE_LIMIT_MAX_WAIT` (3600s) · `TF_PLUGIN_CACHE_DIR` (shared terraform cache) ·
+`ACTIVITY_MMDC_PUPPETEER_CONFIG` (puppeteer config for `mmdc -p`).
 A non-integer value for an integer knob is an error; one below its minimum is clamped.
 
 **Tunable constants (in code):** trains — top-N=8, significance floor=20.0, stall=21 days;
@@ -708,7 +720,7 @@ kept 6, diff cap 6000 chars; flow — stale 30 days, upvote min 5, traction min 
 | `403` on the first call | SAML SSO / PAT lifetime policy | authorize SSO; use a token within the org's lifetime limit (8 days for Azure, classic and fine-grained) |
 | Empty "shipped" | nothing merged in window, or merged into a branch other than `meta.base_branch` | widen `--from/--to`; check `meta.base_branch` (pass `--branches` or a manifest member `branch` if the mainline is not the repo default) |
 | Board section empty | no `read:project`, or no/closed/stale board | add the scope; the layer degrades cleanly |
-| `meta.boundary_dropped_commits` non-empty | a commit sat on the shallow graft | raise `ACTIVITY_CLONE_MARGIN_DAYS`, re-gather |
+| gather warns of boundary-dropped commits (`meta.boundary_dropped_commits`; on stderr only, not stored) | a commit sat on the shallow graft and deepening failed | raise `ACTIVITY_CLONE_MARGIN_DAYS`, re-gather |
 | IaC `edge_extraction: timeout` | slow `terraform init` | set `TF_PLUGIN_CACHE_DIR`; raise `ACTIVITY_IAC_BUILD_TIMEOUT` |
 | render fails | `mmdc` missing / a real diagram bug | install `@mermaid-js/mermaid-cli`, or `--skip-validate` |
 | `validate`: "multiple projects" | one store, many projects | pass `--project` (and `--repo`) |
@@ -730,5 +742,5 @@ whether a train gets a full write-up · **slice** = one train's bounded, self-co
 evidence for the narrator · **flow** = an open issue's stuck-ness pathology ·
 **halls.fame** = the recognition ranking · **blast radius** = the set of repos that depend
 on a given one · **idempotent** = re-running changes nothing · **provenance** = the source
-link attached to every fact · **schema_version** = `1` on the bundle view; the store's `meta.schema_version` is `2`
-(STORE.md).
+link attached to every fact · **schema_version** = `3` on the bundle view (`extract.VIEW_CONTRACT_VERSION`, BUNDLE.md);
+the store's `meta.schema_version` is `2` (STORE.md).

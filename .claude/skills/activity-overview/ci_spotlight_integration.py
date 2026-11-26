@@ -397,7 +397,11 @@ def main(argv=None):
     # sqlite3.connect would silently CREATE a missing file; refuse instead.
     if not os.path.isfile(args.store):
         ap.error("store {!r} does not exist".format(args.store))
-    conn = graphstore.open_store(args.store)
+    # Read-only (#107): the gate only queries the store.
+    try:
+        conn = graphstore.open_store_readonly(args.store)
+    except FileNotFoundError:
+        ap.error("store {!r} does not exist".format(args.store))
     try:
         project = spotlight._detect_project(conn, args.project)
     except (ValueError, sqlite3.DatabaseError) as exc:

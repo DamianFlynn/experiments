@@ -58,10 +58,17 @@ def render(view):
     return "\n".join(lines).rstrip() + "\n"
 
 
+_USAGE = "usage: shipped_changelog.py DIGEST_VIEW.json\n"
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 1:
-        sys.stderr.write("usage: shipped_changelog.py DIGEST_VIEW.json\n")
+    if "-h" in argv or "--help" in argv:
+        sys.stdout.write(_USAGE + "\nRender a digest view's shipped list as a "
+                         "Markdown changelog on stdout.\n")
+        raise SystemExit(0)
+    if len(argv) != 1 or argv[0].startswith("-"):
+        sys.stderr.write(_USAGE)
         raise SystemExit(2)
     with open(argv[0], encoding="utf-8") as fh:
         view = json.load(fh)

@@ -63,6 +63,19 @@ def build_project_view(tmp):
     return json.loads(out.getvalue())
 
 
+def build_caveat_view(tmp):
+    """digest.py over test_report_template's caveat store (issue #107): mod-a
+    carries meta.state_as_of, mod-b meta.facts_windows with a partial CI
+    total."""
+    db = os.path.join(tmp, "caveats.db")
+    trt._fold(db, trt.project_folds())
+    out = io.StringIO()
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(out):
+        assert digest.main(["--store", db, "--project", "proj",
+                            "--from", trt.FROM, "--to", trt.TO]) == 0
+    return json.loads(out.getvalue())
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
@@ -154,8 +167,9 @@ class TestCurrentPipelineView(_Base):
         self.assertIn("| **Reference date** | 2026-05-20 |", out)
 
     def test_no_completeness_claim_without_the_field(self):
-        """No view carries meta.boundary_dropped_commits (gather-only), so the
-        report must not claim the ledgers are complete."""
+        """This view carries no meta.boundary_dropped_commits (its fixture
+        bundles record none; since #107 a view has it only when non-empty), so
+        the report must not claim the ledgers are complete."""
         view = self.fresh_view()
         self.assertFalse(any("boundary_dropped_commits" in m["bundle"]["meta"]
                              for m in view["members"]))
@@ -223,6 +237,84 @@ class TestCurrentPipelineView(_Base):
         path = self.write_view(self.fresh_view())
         self.assertEqual(self.render_report(path, "a.md"),
                          self.render_report(path, "b.md"))
+
+
+class TestReportCaveats(_Base):
+    """Issue #107 item 10: the two caveats a view can carry are stated, each
+    only when its key is present (the committed sample has neither, so its
+    report is unchanged: TestCommittedSample)."""
+
+    STATE = ("> **Records as of 2026-06-30** (`mod-a`): as last gathered on "
+             "that date, after this window's end (2026-05-31); open/closed "
+             "state, labels, milestones and comments may be newer than the "
+             "window.")
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmp:
+            cls.view = build_caveat_view(tmp)
+
+    def test_view_carries_both_keys(self):
+        metas = {m["repo"]: m["bundle"]["meta"] for m in self.view["members"]}
+        self.assertEqual(metas["Azure/mod-a"]["state_as_of"], "2026-06-30")
+        self.assertNotIn("state_as_of", metas["Azure/mod-b"])
+        fw = metas["Azure/mod-b"]["facts_windows"]
+        self.assertIs(fw["workflow_stats_complete"], False)
+        self.assertNotIn("facts_windows", metas["Azure/mod-a"])
+
+    def test_state_as_of_line_under_the_title(self):
+        out = self.render_report(self.write_view(copy.deepcopy(self.view)))
+        lines = out.splitlines()
+        self.assertEqual(lines.count(self.STATE), 1, out[:3000])
+        self.assertLess(lines.index(self.STATE), lines.index("## Summary"))
+        self.assertNotIn("(`mod-b`): as last gathered", out)
+
+    def test_facts_windows_caveat_under_ci_health(self):
+        out = self.render_report(self.write_view(copy.deepcopy(self.view)))
+        member_b = out.split("### `Azure/mod-b`", 1)[1]
+        ci = member_b.split("#### CI/CD health", 1)[1].split("####", 1)[0]
+        self.assertIn("> CI counts are the sum of the gathered windows "
+                      "2026-05-01 → 2026-05-20; **partial**: not every day of "
+                      "the window is covered (not counted: 2026-05-15 → "
+                      "2026-05-31). Code graph and owners from the 2026-05-15 "
+                      "→ 2026-05-31 gather.", ci)
+        member_a = out.split("### `Azure/mod-a`", 1)[1].split(
+            "### `Azure/mod-b`", 1)[0]
+        self.assertNotIn("CI counts are the sum", member_a)
+
+    def test_complete_sum_is_not_called_partial(self):
+        view = copy.deepcopy(self.view)
+        meta = view["members"][1]["bundle"]["meta"]
+        meta["facts_windows"]["workflow_stats_complete"] = True
+        meta["facts_windows"].pop("workflow_stats_excluded")
+        out = self.render_report(self.write_view(view))
+        self.assertIn("> CI counts are the sum of the gathered windows "
+                      "2026-05-01 → 2026-05-20. Code graph and owners from the "
+                      "2026-05-15 → 2026-05-31 gather.", out)
+        self.assertNotIn("**partial**", out)
+
+    def test_caveat_is_shown_even_with_no_ci_rows(self):
+        # a sub-window, a window gathered without workflows, or zero runs: the
+        # view has a coverage caveat but no CI rows. The caveat must not vanish.
+        view = copy.deepcopy(self.view)
+        view["members"][1]["bundle"].pop("workflow_stats", None)
+        out = self.render_report(self.write_view(view))
+        member_b = out.split("### `Azure/mod-b`", 1)[1]
+        self.assertIn("#### CI/CD health", member_b)
+        ci = member_b.split("#### CI/CD health", 1)[1].split("####", 1)[0]
+        self.assertIn("> CI counts are the sum of the gathered windows", ci)
+        self.assertIn("**partial**", ci)
+        self.assertIn("No CI runs are recorded for this view.", ci)
+        self.assertNotIn("| Workflow |", ci)
+
+    def test_without_the_keys_no_caveat(self):
+        view = copy.deepcopy(self.view)
+        for m in view["members"]:
+            m["bundle"]["meta"].pop("state_as_of", None)
+            m["bundle"]["meta"].pop("facts_windows", None)
+        out = self.render_report(self.write_view(view))
+        self.assertNotIn("Records as of", out)
+        self.assertNotIn("CI counts are the sum", out)
 
 
 class TestCli(_Base):

@@ -15,8 +15,9 @@ golden bundles the suite runs against.
 | [`community-call.vtt`](community-call.vtt) | A community-call transcript (WebVTT) with header metadata, `<v>` speaker tags, cue timings, and a rolling-caption duplicate — exercises every strip path. | `python3 transcript.py examples/community-call.vtt` → the **Community call highlights** report section. |
 | [`series.json`](series.json) | A two-installment series index (version 2: one entry per window, in window order). | `python3 link.py <view> --series examples/series.json` → the **Since last installment** section. |
 
-For per-project config (owner/repo, branches, clone dir, an optional `transcript`
-path), see [`../projects.example.json`](../projects.example.json).
+There is no per-project config file: owner/repo, `--branches`, `--clone-dir` and the
+store path are gather flags (or manifest fields), and a transcript is passed explicitly
+(`/activity … --transcript PATH`, or `transcript.py PATH`).
 
 ## Output → other formatters
 

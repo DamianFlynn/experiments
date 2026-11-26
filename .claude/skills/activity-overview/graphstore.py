@@ -138,16 +138,22 @@ def get_meta(conn, key, default=None):
 
 def fts5_available(conn):
     """True if this SQLite build supports FTS5. Probed once, then cached
-    (availability is a build property, so it can't change between calls)."""
+    (availability is a build property, so it can't change between calls).
+
+    The probe runs on a scratch in-memory connection, never on `conn`: on a
+    read-only reader connection (open_store_readonly) the probe's CREATE
+    would fail and FTS5 would wrongly read as absent (issue #107)."""
     global _FTS5_CACHE
     if _FTS5_CACHE is not None:
         return _FTS5_CACHE
+    probe = sqlite3.connect(":memory:")
     try:
-        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_probe USING fts5(x)")
-        conn.execute("DROP TABLE IF EXISTS _fts5_probe")
+        probe.execute("CREATE VIRTUAL TABLE _fts5_probe USING fts5(x)")
         _FTS5_CACHE = True
     except sqlite3.OperationalError:
         _FTS5_CACHE = False
+    finally:
+        probe.close()
     return _FTS5_CACHE
 
 
@@ -1062,6 +1068,42 @@ def get_branches(conn, project, repo, frm, to):
     or folded before issue #84)."""
     raw = get_meta(conn, _branches_key(project, repo, frm, to))
     return json.loads(raw) if raw else None
+
+
+def _clone_info_key(project, repo, frm, to):
+    return "clone:{}/{}:{}:{}".format(project, repo, frm, to)
+
+
+def set_clone_info(conn, project, repo, frm, to, clone_mode,
+                   boundary_dropped_commits, structure_as_of=None, commit=True):
+    """Record how a gathered window [frm, to] was cloned (issue #107):
+    `clone_mode` (gather.prepare_clone: fresh / fetched / depth1-fallback /
+    none; None when the bundle did not say) and `boundary_dropped_commits`
+    (the in-window commit shas whose diffs the shallow boundary dropped,
+    stored sorted). One value per (project, repo, from, to); a re-fold of the
+    same window replaces it. `commit=False` leaves the write in the caller's
+    open transaction."""
+    info = {"clone_mode": clone_mode,
+            "boundary_dropped_commits": sorted(
+                set(boundary_dropped_commits or []))}
+    # Which tree the window's structure was read at: "window_end" (its last
+    # mainline commit) or "head" (the bounded clone did not reach it).
+    if structure_as_of is not None:
+        info["structure_as_of"] = structure_as_of
+    set_meta(conn, _clone_info_key(project, repo, frm, to),
+             json.dumps(info, sort_keys=True), commit=commit)
+
+
+def get_clone_info(conn, project, repo, frm, to):
+    """Return {"clone_mode", "boundary_dropped_commits"} stored for exactly
+    this gathered window, or None when that window was not folded with them
+    (not gathered, folded before issue #107, or an unreadable entry)."""
+    raw = get_meta(conn, _clone_info_key(project, repo, frm, to))
+    try:
+        info = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return info if isinstance(info, dict) else None
 
 
 # Per-window facts (issue #94): the bundle keys a gather computes for ITS

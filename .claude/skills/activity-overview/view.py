@@ -149,8 +149,13 @@ def main(argv=None):
     if not os.path.isfile(args.store):
         return _fail("store {!r} does not exist (run gather.py first)".format(
             args.store))
+    # Read-only (#107): a view never writes, so the store's bytes stay as
+    # they are (open_store would also switch a rollback-journal store to WAL).
     try:
-        conn = graphstore.open_store(args.store)
+        conn = graphstore.open_store_readonly(args.store)
+    except FileNotFoundError:
+        return _fail("store {!r} does not exist (run gather.py first)".format(
+            args.store))
     except sqlite3.DatabaseError as exc:
         return _fail("cannot read store {!r}: {}".format(args.store, exc))
     try:

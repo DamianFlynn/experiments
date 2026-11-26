@@ -317,7 +317,9 @@ class TestAcquireBaseBranch(_RepoCase):
                                   lambda paths, d: real_provider(
                                       paths, d, which=lambda _n: None)), \
                 mock.patch.object(gather, "extract_iac_edges", lambda g, d: g), \
+                mock.patch.object(gather, "_graphql_client", lambda token: None), \
                 contextlib.redirect_stderr(err):
+            # no GraphQL client: the closing-issue read (#105) stays offline
             bundle = gather.acquire(args, {"GITHUB_TOKEN": "dummy"})
         return bundle, err.getvalue()
 
@@ -332,6 +334,8 @@ class TestAcquireBaseBranch(_RepoCase):
         self.assertEqual(_branch_warnings(warnings), [])
 
     def test_explicit_branches_still_override(self):
+        # the named mainline must exist on the remote (#107: it is walked)
+        _git("branch", "main", cwd=self.src)
         b, _ = self._acquire("--branches", "main")
         self.assertEqual(b["meta"]["base_branch"], "main")
         view, _ = _view(_store(b), frm="2026-05-18", to="2026-05-31")
