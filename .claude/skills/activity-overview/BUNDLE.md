@@ -263,7 +263,9 @@ the rest (engagement, code areas, trains, people/flow).
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, head_repo, closes:[issue#], url }`.
   **`closes`** (#62, #105) = the same-repo issues the PR closes: the closing keywords in its
-  title/body, in text order, then — when `meta.closing_refs_source` is `graphql` — every other
+  title/body (text inside an HTML comment `<!-- … -->` is not read: PR templates carry
+  examples such as `Fixes #123` there, #97; a store gathered before that needs a re-gather to
+  drop them), in text order, then — when `meta.closing_refs_source` is `graphql` — every other
   same-repo issue GitHub reports in `closingIssuesReferences` (a manual **Development**-sidebar
   link leaves no keyword), ascending. Such an issue is removed from `crossref_issues` (it was
   only a mention there). When GitHub reports anything the keywords miss, the PR also carries
@@ -627,8 +629,10 @@ review's state to `DISMISSED`.
   (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned
   working tree. When the CLI or registry is unavailable, or a build fails, that area's `edges`
   stays `[]`. Immediate (`transitive:false`) edges are fully identified (area-id + version) from
-  source. Bicep transitive edges connect to *other areas in the repo* (deep external-module
-  internals are not fabricated into edges). **Terraform (#80):** the direct edges are the area's
+  source. **Bicep has no transitive edges**: they used to be guessed from the names of nested
+  ARM deployments and were mostly wrong on real repositories (final-gate finding, #97); what a
+  module reaches indirectly is the closure of the direct edges. A store gathered before this
+  drops its guessed edges of an area the next time that area's build resolves. **Terraform (#80):** the direct edges are the area's
   own `module {}` blocks, parsed from source, so a module nobody consumes still has its edge. The
   build only adds nested calls. Each nested call is `transitive:true` with `address`/`via`, and
   its target (`to`/`ref`/`version`) comes from the `.terraform/modules/modules.json` that the same
