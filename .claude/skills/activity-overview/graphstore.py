@@ -1075,7 +1075,7 @@ def _clone_info_key(project, repo, frm, to):
 
 
 def set_clone_info(conn, project, repo, frm, to, clone_mode,
-                   boundary_dropped_commits, commit=True):
+                   boundary_dropped_commits, structure_as_of=None, commit=True):
     """Record how a gathered window [frm, to] was cloned (issue #107):
     `clone_mode` (gather.prepare_clone: fresh / fetched / depth1-fallback /
     none; None when the bundle did not say) and `boundary_dropped_commits`
@@ -1083,12 +1083,15 @@ def set_clone_info(conn, project, repo, frm, to, clone_mode,
     stored sorted). One value per (project, repo, from, to); a re-fold of the
     same window replaces it. `commit=False` leaves the write in the caller's
     open transaction."""
+    info = {"clone_mode": clone_mode,
+            "boundary_dropped_commits": sorted(
+                set(boundary_dropped_commits or []))}
+    # Which tree the window's structure was read at: "window_end" (its last
+    # mainline commit) or "head" (the bounded clone did not reach it).
+    if structure_as_of is not None:
+        info["structure_as_of"] = structure_as_of
     set_meta(conn, _clone_info_key(project, repo, frm, to),
-             json.dumps({"clone_mode": clone_mode,
-                         "boundary_dropped_commits": sorted(
-                             set(boundary_dropped_commits or []))},
-                        sort_keys=True),
-             commit=commit)
+             json.dumps(info, sort_keys=True), commit=commit)
 
 
 def get_clone_info(conn, project, repo, frm, to):

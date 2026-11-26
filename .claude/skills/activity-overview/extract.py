@@ -942,7 +942,10 @@ def _resolve_branches(conn, project, repo, ts_from, ts_to):
 
 def _clone_meta(conn, project, repo, ts_from, ts_to):
     """The view's clone provenance (issue #107): {clone_mode?,
-    boundary_dropped_commits?}.
+    structure_as_of?, boundary_dropped_commits?}.
+
+    - `structure_as_of` ("window_end" | "head"): like `clone_mode`, only for a
+      view of exactly one gathered window.
 
     - `clone_mode`: the one fold stored for exactly this (project, repo,
       from, to) window; absent for any other view (it describes one clone).
@@ -955,6 +958,9 @@ def _clone_meta(conn, project, repo, ts_from, ts_to):
     exact = graphstore.get_clone_info(conn, project, repo, ts_from, ts_to)
     if exact is not None and exact.get("clone_mode"):
         out["clone_mode"] = exact["clone_mode"]
+    if exact is not None and exact.get("structure_as_of"):
+        # which tree this window's code graph / owners were read at
+        out["structure_as_of"] = exact["structure_as_of"]
     try:
         ledger = graphstore.get_windows(conn)
     except ValueError:

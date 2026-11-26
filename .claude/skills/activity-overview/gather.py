@@ -6215,10 +6215,12 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         # so a view can say its code history is incomplete. A bundle without
         # either key (hand-built, pre-#107) stores nothing.
         if meta.get("from") and meta.get("to") and (
-                "clone_mode" in meta or "boundary_dropped_commits" in meta):
+                "clone_mode" in meta or "boundary_dropped_commits" in meta
+                or "structure_as_of" in meta):
             graphstore.set_clone_info(conn, project, repo, meta["from"],
                                       meta["to"], meta.get("clone_mode"),
                                       meta.get("boundary_dropped_commits"),
+                                      structure_as_of=meta.get("structure_as_of"),
                                       commit=False)
         # The window's own CI statistics and structure (issue #94): the
         # latest-wins nodes above serve stores folded before #94; a view of

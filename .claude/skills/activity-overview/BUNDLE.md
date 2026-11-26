@@ -147,7 +147,8 @@ the rest (engagement, code areas, trains, people/flow).
   obtained the clone (see `gather.prepare_clone`), and **`boundary_dropped_commits`** lists
   the in-window commit shas whose diffs the shallow boundary dropped (the code history is
   incomplete for them). Since #107 fold stores both per gathered window and a view carries
-  them (omit-when-absent): `clone_mode` only for a view of exactly one gathered window,
+  them (omit-when-absent): `clone_mode` and `structure_as_of` only for a view of exactly one
+  gathered window,
   `boundary_dropped_commits` as the sorted union over the gathered windows wholly inside
   the view, omitted when empty. **`closing_refs_source`** (`graphql` | `keywords`, issue
   #105) is bundle-only: where the PRs' `closes` came from — GitHub's

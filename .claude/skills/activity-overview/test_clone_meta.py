@@ -160,3 +160,36 @@ class TestTrustCheckStaysGreen(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StructureAsOfReachesTheView(unittest.TestCase):
+    """gather records whether a window's structure was read at its own last
+    mainline commit or at the head; a view of exactly that window says so."""
+
+    def _bundle(self, value):
+        b = {"meta": {"owner": "o", "repo": "r", "from": "2026-05-01",
+                      "to": "2026-05-31", "clone_mode": "fetched"},
+             "prs": [], "issues": [], "commits": [], "code_events": [],
+             "symbol_events": [], "milestones": [], "releases": []}
+        if value is not None:
+            b["meta"]["structure_as_of"] = value
+        return b
+
+    def _view_meta(self, value, window=("2026-05-01", "2026-05-31")):
+        conn = graphstore.open_store(":memory:")
+        graphstore.init_schema(conn)
+        gather.fold_bundle(conn, self._bundle(value))
+        return extract.extract(conn, "o", "r", *window,
+                               warn=lambda _m: None)["meta"]
+
+    def test_exact_window_view_carries_it(self):
+        self.assertEqual(self._view_meta("head")["structure_as_of"], "head")
+        self.assertEqual(self._view_meta("window_end")["structure_as_of"],
+                         "window_end")
+
+    def test_absent_when_the_bundle_did_not_say(self):
+        self.assertNotIn("structure_as_of", self._view_meta(None))
+
+    def test_other_views_do_not_carry_it(self):
+        meta = self._view_meta("head", window=("2026-05-01", "2026-06-30"))
+        self.assertNotIn("structure_as_of", meta)

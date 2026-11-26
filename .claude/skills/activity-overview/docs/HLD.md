@@ -563,9 +563,11 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
     every view; the store's own schema version stays in the store), and the digest's
     `module_edges` keep `ref` / `address` / `via`. The report template and the sample
     builder state `meta.facts_windows` (a wider view's CI total may be partial) and
-    `meta.state_as_of` (a past month viewed from a later gather). Not carried:
-    `meta.structure_as_of` and `meta.closing_refs_source` are in gather's bundle only, and a
-    view narrower than a gathered window does not repeat that window's dropped commits.
+    `meta.state_as_of` (a past month viewed from a later gather). A view of exactly
+    one gathered window also says which tree its structure was read at
+    (`meta.structure_as_of`: `window_end` or `head`). Not carried:
+    `meta.closing_refs_source` is in gather's bundle only, and a view narrower than a gathered
+    window does not repeat that window's dropped commits.
 18. **Narrative is not in CI.** The live CI jobs stop at the trust gate.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
