@@ -867,3 +867,36 @@ class TestVersionGaps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuietThreadsAreNotThisWindowsStory(unittest.TestCase):
+    """Real case: an 88-comment thread ranked first two months running
+    although its last comment was six months earlier."""
+
+    def _bundle(self, in_window, outcome="in_flight"):
+        d = {"comments": 10, "review_comments": 0, "participants": 3,
+             "reviews": {"approved": 0, "changes_requested": 1, "commented": 0,
+                         "dismissed": 0},
+             "review_rounds": 1, "reopens": 0, "text_chars": 4000,
+             "in_window": in_window, "change_requests": 1, "bot_comments": 0}
+        return {"meta": {"from": "2026-09-01", "to": "2026-09-30"},
+                "prs": [], "issues": [],
+                "trains": [{"id": "train-pr-1", "prs": [1], "issues": [],
+                            "outcome": outcome, "kind": "feature",
+                            "effort": {"idle_days": 198}, "discussion": d}]}
+
+    def test_silent_in_flight_thread_is_listed_as_quiet(self):
+        b = link.select_story_trains(self._bundle(0))
+        self.assertEqual(b["stories"]["selected"], [])
+        self.assertEqual([q["id"] for q in b["stories"]["quiet"]], ["train-pr-1"])
+        self.assertEqual(b["stories"]["quiet"][0]["idle_days"], 198)
+        self.assertNotIn("story", b["trains"][0])
+
+    def test_a_turn_in_the_window_makes_it_a_story(self):
+        b = link.select_story_trains(self._bundle(1))
+        self.assertEqual([s["id"] for s in b["stories"]["selected"]], ["train-pr-1"])
+        self.assertNotIn("quiet", b["stories"])
+
+    def test_work_that_landed_needs_no_turn_in_the_window(self):
+        b = link.select_story_trains(self._bundle(0, outcome="shipped"))
+        self.assertEqual([s["id"] for s in b["stories"]["selected"]], ["train-pr-1"])

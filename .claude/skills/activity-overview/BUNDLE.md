@@ -783,6 +783,12 @@ be deep and a story, either, or neither.
 | declared breaking items / breaking candidates from its PRs (at most 3 each) | 2 / 1 each |
 | in flight (often where the debate still is) | 1 |
 
+A train still **in flight** with no conversation turn inside the window
+(`discussion.in_window` below `STORY_MIN_IN_WINDOW`, 1) is not a story of this window however
+long its thread: it is listed in `stories.quiet` (`{id, score, idle_days}`, omitted when
+empty) — work with history that nobody touched this window. A train that landed or was closed
+in the window needs no in-window turn.
+
 A train **qualifies** when it has a `discussion` with at least `STORY_MIN_EXCHANGES` (3)
 turns (comments + review comments + counted reviews) and at least 2 participants, scores at
 least `STORY_MIN_SCORE` (8), and — when its work is plumbing (`module_changes.prs` marks
@@ -797,7 +803,7 @@ other train touching more than 10 areas) — its discussion points alone reach
 
 The view gets **`stories`** (absent when no train qualifies): `{selected: [{id, rank,
 score}], more: [{id, score}] (the trains that qualified beyond the cap — "N more had
-notable discussion"), rule: {min_exchanges, min_score, top_n, plumbing_min,
+notable discussion"), rule: {min_exchanges, min_in_window, min_score, top_n, plumbing_min,
 silence_days}}`.
 
 ### Slice `conversation` (the story material)

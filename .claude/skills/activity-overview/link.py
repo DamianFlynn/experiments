@@ -2500,6 +2500,12 @@ def _module_summary(entries, pr_rows):
 # Conversation turns (human comments, review comments, reviews with text or a
 # verdict) a train needs before it can be a story: a back-and-forth.
 STORY_MIN_EXCHANGES = 3
+# A train still in flight is a story of THIS window only when somebody spoke
+# in it: a long thread that has been silent since before the window is listed
+# under `stories.quiet` instead (the 88-comment thread that ranked first two
+# months running had its last comment six months earlier). A train that landed
+# or was closed in the window needs no in-window turn: its ending is the news.
+STORY_MIN_IN_WINDOW = 1
 # Minimum story_score to be selected at all.
 STORY_MIN_SCORE = 8.0
 # At most this many trains are selected per view (like the deep tier's top 8);
@@ -2883,7 +2889,7 @@ def select_story_trains(bundle):
     trains = bundle.get("trains", [])
     pr_index = {p["number"]: p for p in bundle.get("prs", [])}
     mc = bundle.get("module_changes")
-    eligible = []
+    eligible, quiet = [], []
     for t in trains:
         d = t.get("discussion")
         if not d:
@@ -2896,8 +2902,19 @@ def select_story_trains(bundle):
             continue
         if _train_plumbing(t, mc) and disc < STORY_PLUMBING_MIN:
             continue
+        if t.get("outcome") == "in_flight" \
+                and (d.get("in_window") or 0) < STORY_MIN_IN_WINDOW:
+            quiet.append((round(total, 1), t))
+            continue
         eligible.append((round(total, 1), t, reasons))
+    quiet.sort(key=lambda e: (-e[0], e[1]["id"]))
+    quiet_rows = [{"id": t["id"], "score": s,
+                   "idle_days": (t.get("effort") or {}).get("idle_days")}
+                  for s, t in quiet]
     if not eligible:
+        if quiet_rows:
+            bundle["stories"] = {"selected": [], "more": [], "quiet": quiet_rows,
+                                 "rule": _story_rule()}
         return bundle
     eligible.sort(key=lambda e: (-e[0], e[1]["id"]))
     selected = []
@@ -2910,12 +2927,19 @@ def select_story_trains(bundle):
     bundle["stories"] = {
         "selected": selected,
         "more": [{"id": t["id"], "score": s} for s, t, _ in eligible[STORY_TOP_N:]],
-        "rule": {"min_exchanges": STORY_MIN_EXCHANGES,
-                 "min_score": STORY_MIN_SCORE, "top_n": STORY_TOP_N,
-                 "plumbing_min": STORY_PLUMBING_MIN,
-                 "silence_days": STORY_SILENCE_DAYS},
+        "rule": _story_rule(),
     }
+    if quiet_rows:
+        bundle["stories"]["quiet"] = quiet_rows
     return bundle
+
+
+def _story_rule():
+    return {"min_exchanges": STORY_MIN_EXCHANGES,
+            "min_in_window": STORY_MIN_IN_WINDOW,
+            "min_score": STORY_MIN_SCORE, "top_n": STORY_TOP_N,
+            "plumbing_min": STORY_PLUMBING_MIN,
+            "silence_days": STORY_SILENCE_DAYS}
 
 
 # --- code notes: comments, parameter descriptions, interface lines -------
