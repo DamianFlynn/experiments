@@ -72,8 +72,8 @@ re-gathering; they depend only on the project and member names.)
 
 ## How it was produced
 
-Requires `git`, `terraform` (1.15.5 used here), a `GITHUB_TOKEN` with `repo` scope
-for the gather, and `mmdc` (`@mermaid-js/mermaid-cli`) for diagram validation.
+Requires `git`, `terraform` (1.15.5 used here), a read-only `GITHUB_TOKEN` (`public_repo` is enough for
+these public repositories) for the gather, and `mmdc` (`@mermaid-js/mermaid-cli`) for diagram validation.
 
 ```bash
 cd .claude/skills/activity-overview

@@ -656,7 +656,7 @@ people's areas (a union over the windows), a difference is a WARN naming the rea
 |---|---|
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
-| Organization-specific priority labels | `link.HIGH_PRIORITY_LABELS` |
+| Organization-specific priority labels | `link.py --priority-label PATTERN` per run; `link.PRIORITY_LABEL_PATTERNS` / `link.HIGH_PRIORITY_LABELS` for defaults |
 | Historical record state on multi-window stores (limitation 7) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |
