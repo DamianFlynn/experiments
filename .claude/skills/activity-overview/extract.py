@@ -787,11 +787,18 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     windows = sorted({(w.get("from"), w.get("to")) for w in ledger
                       if isinstance(w, dict) and w.get("project") == project
                       and w.get("repo") == repo and w.get("from") and w.get("to")})
-    recorded = {k for k in windows   # existence probe: no value is read
-                if graphstore.get_window_facts(conn, project, repo, *k,
-                                               keys=()) is not None}
+    probes = {k: graphstore.get_window_facts(conn, project, repo, *k, keys=())
+              for k in windows}       # existence probe: no value is read
+    recorded = {k for k, p in probes.items() if p is not None}
     if not recorded:
         return None
+    if (ts_from, ts_to) in windows:
+        # A gathered window that has no facts entry of its own (folded before
+        # per-window facts existed) keeps reading the latest-wins nodes, as it
+        # did before another window was added to the store.
+        return None
+    # Windows whose CI runs were collected: only these can be summed.
+    with_ci = {k for k in recorded if probes[k]["ci_collected"]}
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
                            if k != "workflow_stats")
 
@@ -806,7 +813,7 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     # (a store can hold a month and a re-folded roll-up or part of it): by
     # start day, the longest first; a window overlapping one taken is left out.
     summed, last_to = [], None
-    for k in sorted((k for k in overlapping if k in recorded
+    for k in sorted((k for k in overlapping if k in with_ci
                      and _contained(win(k), ts_from, ts_to)),
                     key=lambda k: (k[0][:10], _neg_day(k[1]), k)):
         if last_to is None or k[0][:10] > last_to:
@@ -824,13 +831,18 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
                                          keys=structure_keys)
     facts = dict(chosen["facts"])
     missing = list(chosen["missing"])
-    stats = []
+    stats, lost = [], []
     for k in summed:
         got = graphstore.get_window_facts(conn, project, repo, *k,
                                           keys=("workflow_stats",))
         missing.extend(got["missing"])
-        if got["facts"].get("workflow_stats"):
+        if got["missing"]:
+            lost.append(k)        # its stored CI value is gone: not summed
+        elif got["facts"].get("workflow_stats"):
             stats.append(got["facts"]["workflow_stats"])
+    if lost:
+        summed = [k for k in summed if k not in lost]
+        excluded = [k for k in overlapping if k not in summed]
     if stats:
         facts["workflow_stats"] = derive.sum_workflow_stats(stats)
     note = {"structure": win(structure),

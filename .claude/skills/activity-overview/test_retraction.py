@@ -178,6 +178,24 @@ class TestDependsOnRetraction(_Case):
             conn, "o", "o/r::" + B)["dependents"], [])
         self.assertNoCurrentStateWarn(self.assertClean(conn))
 
+    def test_regather_that_cannot_judge_keeps_the_edge_as_a_warning(self):
+        # January is folded with a resolved build (A -> B), February touches
+        # something else. January is then re-gathered with a FAILED build and
+        # no scan: its new facts no longer carry the edge, but nothing
+        # authoritative says the edge is gone, so fold keeps it. The trust
+        # check must agree: a warning, not a failure.
+        conn = _store()
+        _fold(conn, _bundle(JAN, [_area(A, [_edge(B)]), _area(B)]),
+              _bundle(FEB, [_area(C)]))
+        _fold(conn, _bundle(JAN, [_area(A, [], status="failed"), _area(B)]))
+        self.assertEqual(_edges(conn, "depends_on"),
+                         [(_q("area-" + A), _q("area-" + B))])
+        report = self.assertClean(conn)
+        es = [c for c in report.checks if c["name"] == "edge_set"][0]
+        warns = [d for d in es["details"] if d.get("severity") == "WARN"
+                 and d.get("edge_type") == "depends_on"]
+        self.assertTrue(warns, json.dumps(es["details"], indent=1, default=str))
+
     def test_history_edges_are_untouched(self):
         conn = _store()
         jan = _bundle(JAN, [_area(A, [_edge(B)]), _area(B)],

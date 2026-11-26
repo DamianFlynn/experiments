@@ -222,7 +222,9 @@ their views report the base branch unknown and count every merged PR as shipped,
 before; re-gather to get stacked / release-branch PRs told apart.
 
 `facts:{project}/{repo}:{from}:{to}` (issue #94): JSON `{"clone_sha": str|null,
-"facts": {key: sha256}}`, the per-repo facts a gathered window computed —
+"facts": {key: sha256}, "ci_collected": bool}` (`ci_collected` is false when the
+window was gathered with `--no-workflows`: no CI facts, as distinct from zero runs;
+an entry without the key counts as collected), the per-repo facts a gathered window computed —
 `workflow_stats` (the CI runs created in that window), `code_graph` (the areas of
 the files that window changed, with their dependency edges), `code_owners` and
 `label_taxonomy` (read from that window's checkout) — each named by the SHA-256 of

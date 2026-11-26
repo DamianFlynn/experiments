@@ -1102,8 +1102,19 @@ def set_window_facts(conn, project, repo, frm, to, bundle, clone_sha=None,
         set_meta(conn, _fact_blob_prefix(project, repo) + digest, text,
                  commit=False)
         refs[key] = digest
+    # Whether CI runs were COLLECTED for this window, separately from what
+    # they were: a gather run with --no-workflows has no CI facts at all, while
+    # a collected window with zero runs has an (empty) result. gather records
+    # it in meta.workflows_collected; a bundle without the flag (hand-built, or
+    # gathered before the flag existed) counts as collected when it carries a
+    # workflow_stats key.
+    meta = bundle.get("meta") or {}
+    collected = meta.get("workflows_collected")
+    if collected is None:
+        collected = "workflow_stats" in bundle
     set_meta(conn, _window_facts_key(project, repo, frm, to),
-             json.dumps({"clone_sha": clone_sha, "facts": refs},
+             json.dumps({"clone_sha": clone_sha, "facts": refs,
+                         "ci_collected": bool(collected)},
                         sort_keys=True), commit=False)
     _prune_fact_blobs(conn, project, repo)
     if commit:
@@ -1135,7 +1146,8 @@ def get_window_facts(conn, project, repo, frm, to, keys=WINDOW_FACT_KEYS):
     """The facts recorded for exactly this gathered window, or None when that
     window was not folded (or was folded before issue #94):
     {"clone_sha", "facts": {key: value}, "missing": [keys whose stored value
-    is gone]} — `missing` is non-empty only on a damaged store. Only the
+    is gone], "ci_collected": bool} — `missing` is non-empty only on a damaged
+    store; `ci_collected` is False for a window gathered with --no-workflows. Only the
     values of `keys` are read (`()` reads none: an existence probe)."""
     raw = get_meta(conn, _window_facts_key(project, repo, frm, to))
     if not raw:
@@ -1151,8 +1163,10 @@ def get_window_facts(conn, project, repo, frm, to, keys=WINDOW_FACT_KEYS):
             missing.append(key)
         else:
             facts[key] = json.loads(text)
+    # ci_collected: an entry written before the flag existed counts as collected
     return {"clone_sha": entry.get("clone_sha"), "facts": facts,
-            "missing": missing}
+            "missing": missing,
+            "ci_collected": bool(entry.get("ci_collected", True))}
 
 
 def window_facts_problems(conn):

@@ -142,6 +142,9 @@ the rest (engagement, code areas, trains, people/flow).
   Summed windows never overlap one another (taken by start day, the longest first), so no run
   is counted twice when the store also holds a roll-up window or part of a month.
   `workflow_stats_complete` is true only when the summed windows cover every day of the view.
+  Only windows whose CI runs were collected are summed: a window gathered with `--no-workflows`
+  (gather's `meta.workflows_collected: false`), or one whose stored CI value is missing, is
+  excluded and makes the sum incomplete; a collected window with zero runs counts.
   `workflow_stats_excluded` lists the gathered windows overlapping the view that were not
   summed — they overlap the view only partly (their runs cannot be split by day), overlap a
   summed window, or have no per-window facts (folded before #94). A view of exactly a gathered window has no

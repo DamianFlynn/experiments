@@ -1332,9 +1332,19 @@ def check_edge_set(conn, project, repo, bundle):
                                 problem="move edge not supported by the "
                                         "ledger: " + problem))
             continue
-        d = dict(base, severity=WARN if lenient else ERROR,
+        # A stored depends_on / owns edge that no window's facts produce is
+        # stale only when some authoritative window says it is gone. When a
+        # re-gather replaced the facts that carried it with ones that cannot
+        # judge (failed build, no scan), fold keeps the edge and so must we:
+        # it can be warned about, not proven wrong.
+        unproven = (not lenient and replay is not None
+                    and et in ("depends_on", "owns")
+                    and not replay.retractable(key, stored[key]))
+        d = dict(base, severity=WARN if (lenient or unproven) else ERROR,
                  problem="stored but not derivable from the stored records"
-                         + (lenient_note(et) if lenient else ""))
+                         + (lenient_note(et) if lenient else "")
+                         + (" (no gathered window has authoritative input for "
+                            "it, so it is kept)" if unproven else ""))
         if cross != "not cross-repo":
             d["cross_repo"] = cross
         if _is_person_id(src):

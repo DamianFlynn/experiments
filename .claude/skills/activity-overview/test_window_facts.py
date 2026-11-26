@@ -438,3 +438,54 @@ class TrustCheckSeesTheFactsIndex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFollowUps(unittest.TestCase):
+    def test_gathered_window_without_facts_keeps_the_legacy_read(self):
+        # May was folded before per-window facts existed, June after. Reading
+        # May must not change because June was added: it still reads the
+        # latest-wins nodes, not June's structure with no CI statistics.
+        conn = _store(_may(), _june())
+        conn.execute("DELETE FROM meta WHERE key LIKE ?",
+                     ("facts:o/r:{}:{}".format(*MAY),))
+        conn.commit()
+        b = _raw(conn, MAY)
+        self.assertEqual(b["workflow_stats"], JUNE_STATS)   # latest-wins node
+        self.assertEqual(b["code_graph"], JUNE_GRAPH)
+        self.assertNotIn("facts_windows", b["meta"])
+        # June, which has its own facts, is unaffected
+        self.assertEqual(_raw(conn, JUNE)["workflow_stats"], JUNE_STATS)
+
+    def test_window_gathered_without_ci_is_not_summed_as_complete(self):
+        june = _june()
+        june["workflow_stats"] = {}
+        june["meta"]["workflows_collected"] = False     # gather --no-workflows
+        conn = _store(_may(), june)
+        b = _raw(conn, SPAN)
+        self.assertEqual(b["workflow_stats"], MAY_STATS)
+        note = b["meta"]["facts_windows"]
+        self.assertEqual(note["workflow_stats"], [_w(MAY)])
+        self.assertFalse(note["workflow_stats_complete"])
+        self.assertEqual(note["workflow_stats_excluded"], [_w(JUNE)])
+
+    def test_collected_window_with_zero_runs_still_counts(self):
+        june = _june()
+        june["workflow_stats"] = {}
+        june["meta"]["workflows_collected"] = True      # looked, found none
+        conn = _store(_may(), june)
+        note = _raw(conn, SPAN)["meta"]["facts_windows"]
+        self.assertEqual(note["workflow_stats"], [_w(MAY), _w(JUNE)])
+        self.assertTrue(note["workflow_stats_complete"])
+
+    def test_window_whose_ci_value_is_lost_is_not_counted(self):
+        conn = _store(_may(), _june())
+        entry = json.loads(graphstore.get_meta(
+            conn, "facts:o/r:{}:{}".format(*JUNE)))
+        conn.execute("DELETE FROM meta WHERE key = ?",
+                     ("fact:o/r:" + entry["facts"]["workflow_stats"],))
+        conn.commit()
+        b = _raw(conn, SPAN)
+        note = b["meta"]["facts_windows"]
+        self.assertEqual(note["workflow_stats"], [_w(MAY)])
+        self.assertFalse(note["workflow_stats_complete"])
+        self.assertEqual(b["workflow_stats"], MAY_STATS)

@@ -4522,6 +4522,10 @@ def acquire(args, env):
     bundle = build_bundle(meta, commits, prs, issues)
     bundle["workflows"] = workflows
     bundle["workflow_stats"] = workflow_stats
+    # Whether CI runs were collected at all (--no-workflows skips them): lets a
+    # reader tell "no runs" from "not looked at" (per-window facts, issue #94).
+    bundle["meta"]["workflows_collected"] = bool(
+        getattr(args, "include_workflows", True))
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
