@@ -127,7 +127,10 @@ the rest (engagement, code areas, trains, people/flow).
   `none`) records how gather obtained the clone (see `gather.prepare_clone`), and
   **`boundary_dropped_commits`** lists in-window commits whose diffs were dropped at the
   shallow-clone boundary; both are in the bundle `acquire` assembles only — they are not
-  folded into the store and never appear in a view. (Store-only — see `STORE.md`; this
+  folded into the store and never appear in a view.   **`closing_refs_source`** (`graphql` | `keywords`, issue #105) is likewise bundle-only:
+  where the PRs' `closes` came from — GitHub's `closingIssuesReferences` merged with the
+  closing keywords, or the keywords alone because GraphQL was unavailable (gather prints
+  which on stderr). (Store-only — see `STORE.md`; this
   bundle shape is the transient view `extract` materializes from the store, not a produced
   file.)
   A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
@@ -205,6 +208,15 @@ the rest (engagement, code areas, trains, people/flow).
   `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, head_repo, closes:[issue#], url }`.
+  **`closes`** (#62, #105) = the same-repo issues the PR closes: the closing keywords in its
+  title/body, in text order, then — when `meta.closing_refs_source` is `graphql` — every other
+  same-repo issue GitHub reports in `closingIssuesReferences` (a manual **Development**-sidebar
+  link leaves no keyword), ascending. Such an issue is removed from `crossref_issues` (it was
+  only a mention there). When GitHub reports anything the keywords miss, the PR also carries
+  **`closing_issues`**: GitHub's whole list as `[{owner, repo, number}]`, sorted by owner/repo
+  (case-insensitive) then number; its other-repo entries are cross-repo `closes` refs, like a
+  keyword `Fixes owner/repo#N` (see `STORE.md`, multi-repo). Absent otherwise, so a PR whose
+  closing issues are all keyword ones is unchanged.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
   **`head_repo`** (#93) is the `owner/repo` the head branch lives in (a fork's name for a fork
   PR; `null` when GitHub no longer knows it, e.g. a deleted fork, and absent from bundles
@@ -224,7 +236,8 @@ the rest (engagement, code areas, trains, people/flow).
   issues they **close** (`closes`): a train is a connected group of PRs and the issues they close,
   so two PRs closing the same issue (a rejected first attempt and the reworked one that shipped)
   are one train, and every issue a train's PRs close is in its `issues` (sorted) and carries the
-  train id on its bucket ref. A mention or timeline cross-reference (`crossref_issues`) never
+  train id on its bucket ref (a Development-sidebar link counts once gather read it from
+  GitHub, #105). A mention or timeline cross-reference (`crossref_issues`) never
   makes an issue a member or a root: a tracking issue that mentions three PRs leaves them three
   trains. `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
   or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.

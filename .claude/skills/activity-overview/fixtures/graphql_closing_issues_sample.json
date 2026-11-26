@@ -1,0 +1,49 @@
+{
+  "_provenance": "CONSTRUCTED, not a captured response (issue #105). Shaped like the `data` member GitHub's GraphQL API returns for gather.closing_issues_query: one aliased `pullRequest(number:)` per PR under `repository`, each with `closingIssuesReferences { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } }` as documented for the PullRequest object (the issues the PR will close or closed, from closing keywords AND manual Development-sidebar links). `pr4` is null, as GitHub returns (with an error, kept as partial data by graphql_post) for a number that is not a pull request. `page_2_pr5` is the follow-up page of PR 5's connection (gather.PR_CLOSING_ISSUES_PAGE_QUERY).",
+  "pulls": [
+    {"number": 1, "title": "Add the widget", "body": "Implements the widget; see the linked issue.",
+     "user": {"login": "alice"}, "state": "closed",
+     "merged_at": "2026-05-10T00:00:00Z", "closed_at": "2026-05-10T00:00:00Z",
+     "created_at": "2026-05-02T00:00:00Z", "updated_at": "2026-05-10T00:00:00Z",
+     "base": {"ref": "main", "repo": {"full_name": "o/r"}}, "head": {"ref": "widget"},
+     "html_url": "https://github.com/o/r/pull/1"},
+    {"number": 2, "title": "Fix the gadget", "body": "Fixes #8",
+     "user": {"login": "bob"}, "state": "closed",
+     "merged_at": "2026-05-11T00:00:00Z", "closed_at": "2026-05-11T00:00:00Z",
+     "created_at": "2026-05-03T00:00:00Z", "updated_at": "2026-05-11T00:00:00Z",
+     "base": {"ref": "main", "repo": {"full_name": "o/r"}}, "head": {"ref": "gadget"},
+     "html_url": "https://github.com/o/r/pull/2"},
+    {"number": 3, "title": "Rework the sprocket", "body": "Fixes #9\n\nAlso see https://github.com/O/Other/issues/4",
+     "user": {"login": "carol"}, "state": "closed",
+     "merged_at": "2026-05-12T00:00:00Z", "closed_at": "2026-05-12T00:00:00Z",
+     "created_at": "2026-05-04T00:00:00Z", "updated_at": "2026-05-12T00:00:00Z",
+     "base": {"ref": "main", "repo": {"full_name": "o/r"}}, "head": {"ref": "sprocket"},
+     "html_url": "https://github.com/o/r/pull/3"}
+  ],
+  "response": {
+    "repository": {
+      "pr1": {"number": 1, "closingIssuesReferences": {
+        "nodes": [{"number": 7, "repository": {"nameWithOwner": "o/r"}}],
+        "pageInfo": {"hasNextPage": false, "endCursor": "Y3Vyc29yOjE="}}},
+      "pr2": {"number": 2, "closingIssuesReferences": {
+        "nodes": [{"number": 8, "repository": {"nameWithOwner": "o/r"}}],
+        "pageInfo": {"hasNextPage": false, "endCursor": "Y3Vyc29yOjE="}}},
+      "pr3": {"number": 3, "closingIssuesReferences": {
+        "nodes": [{"number": 9, "repository": {"nameWithOwner": "o/r"}},
+                  {"number": 5, "repository": {"nameWithOwner": "O/R"}},
+                  {"number": 4, "repository": {"nameWithOwner": "o/other"}}],
+        "pageInfo": {"hasNextPage": false, "endCursor": "Y3Vyc29yOjM="}}},
+      "pr4": null,
+      "pr5": {"number": 5, "closingIssuesReferences": {
+        "nodes": [{"number": 11, "repository": {"nameWithOwner": "o/r"}}],
+        "pageInfo": {"hasNextPage": true, "endCursor": "Y3Vyc29yOjE="}}}
+    }
+  },
+  "page_2_pr5": {
+    "repository": {
+      "pullRequest": {"closingIssuesReferences": {
+        "nodes": [{"number": 12, "repository": {"nameWithOwner": "o/r"}}],
+        "pageInfo": {"hasNextPage": false, "endCursor": "Y3Vyc29yOjI="}}}
+    }
+  }
+}

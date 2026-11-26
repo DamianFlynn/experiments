@@ -183,6 +183,7 @@ sequenceDiagram
   loop each kept PR
     A->>REST: reviews, timeline, review comments, issue comments
   end
+  A->>GQL: closingIssuesReferences, 50 PRs per request (else keywords only)
   A->>REST: issues updated since from + all open issues + referenced issues
   loop each issue
     A->>REST: comments, timeline
@@ -380,6 +381,24 @@ flowchart TB
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
+| Closing issues (#105), GraphQL | `repository { pr<N>: pullRequest(number: N) { closingIssuesReferences(first: 25) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } } } }` | 50 kept PRs aliased per request; a PR with more than 25 closing issues is paged on its own (`first: 100, after:`) |
+| Projects v2 boards, GraphQL | §4.8 | maintained boards only, items capped |
+
+**Closing issues (#105).** `resolve_closing_issues` reads GitHub's own list of the issues each
+kept PR will close / closed — closing keywords AND manual Development-sidebar links, which
+leave no keyword in the text — through the same injectable `graphql` callable as the board
+layer (`_graphql_client`). Same-repo ones join `closes` after the keyword refs (ascending) and
+leave `crossref_issues`; when GitHub reports anything the keywords miss the PR stores the whole
+list as `closing_issues`, whose other-repo entries `_cross_repo_pr_edges` turns into `closes`
+refs (a mention of the same issue is then not a `cross_ref`). Any failure — an error, a null
+repository, a PR object without the field, no client — leaves every PR as the keywords made it
+(never half an answer) and never fails the gather. One stderr line per repo says which:
+`closing issues: <A> PR(s) checked via GraphQL, <B> gained <C> closing issue(s) not in their
+text (source: graphql)` or `closing issues: GraphQL unavailable (<reason>), using closing
+keywords only`; `meta.closing_refs_source` records `graphql` | `keywords` (bundle only, not
+views). The timeline `connected` event is still filed under `crossref_issues` when it names
+an issue number (an event without a usable number is ignored); whether the REST payload
+carries one is unverified.
 
 Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
 goes through `_github_open` (injectable `opener`/`sleep`/`clock`, so tests never sleep or touch
@@ -1377,6 +1396,9 @@ dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigati
 off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
 `ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
 A window with more than 1,000 workflow runs costs a few extra requests for the day-splits.
+GraphQL (a separate 5,000-point/hour budget): the closing-issue read costs ⌈kept PRs / 50⌉
+requests — 2 per 100 PRs — of 1 point each (50 connections of 25 nodes), plus one per extra
+page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 (A reused `--clone-dir` is fetched rather than re-cloned.)
 
 ### 14.4 Security
@@ -1420,7 +1442,6 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Spotlight CI gate covers four queries | `ci_spotlight_integration.py` runs `person` / `subsystem` / `symbol` / `grep` only | `module` and `dependents` are exercised by the unit suite but not against the live store | add discovered-argument checks for both (a single-repo store has no cross-repo `depends_on`, so `dependents` belongs on the constellation store) |
 | Series compares bucket membership only | `series.compute_series` (#86) matches the prior snapshot against this window's four buckets | an item in flight last time that is still open but neither updated in the window nor on the current milestone (no bucket) leaves `carried_over` silently; a forecast item that shipped or was closed in a month missing from the index is `not_yet`; refreshing an earlier window does not recompute the later bundles' `series` blocks (stderr names them) | report "went quiet" items from the open item records; recompute later installments on request |
 | No series for a project view | `link.py --series` keys installments per bundle and items by `(type, id)` | a multi-repo constellation keeps one series per member bundle (USAGE §5.4) | key items by `repo` + type + id and accept the digest view |
-| Sidebar-linked issues do not anchor a train | only `closes` (closing keywords in the PR title/body) joins and anchors trains (#93); gather files the timeline `connected` event (a link made in the PR's Development sidebar) under `crossref_issues` with mentions, and the REST payload of that event may not name the issue at all | a PR linked to its issue only through the sidebar forms its own `train-pr-<n>`; the issue's bucket ref carries no train (issue #105) | gather the PR's closing issues (GraphQL `closingIssuesReferences`) into `closes` |
 | Trains join through shared closed issues | member PRs are grouped transitively over the issues they close (#93) | a PR that closes several issues pulls every other PR closing any of them into one train, so an umbrella "closes #1 … #9" PR yields one large train | none needed while closing references are deliberate; split by a cap if it proves noisy |
 | Unmerged PRs into other branches have no train | trains hold mainline-targeting PRs; stacked PRs count only once merged (as `contributing_prs`) | an open or closed-unmerged PR into a feature / release branch is in no train and its bucket ref has no train id | attach it to its parent as a pending contribution if needed |
 | Nested Terraform module dirs split files by extension | a `*.tf` in a non-scaffold dir below `modules/<name>/` maps to its own dir (#101); `classify_code_area` is per path, so a non-`.tf` file there (README, `.tftpl`) still maps to `modules/<name>` | that module dir's docs/templates count towards the enclosing module's area | a set-aware classifier (needs the tree listing) |

@@ -147,7 +147,14 @@ kept as a same-repo cross-reference in `crossref_issues`), while `Fixes #1, fixe
 #2` closes both. A same-repo qualified ref or URL is a same-repo `closes`; a
 cross-repo one goes to the cross-repo edge path below; a keyword before a
 `/pull/` URL is a `cross_ref`, never a close. Keywords are matched in code blocks
-too (no Markdown parsing). `part_of` uses the commit subject's **trailing**
+too (no Markdown parsing). GitHub's own list (#105) is merged in at gather time: the
+issues `closingIssuesReferences` reports (keywords AND manual Development-sidebar links)
+join the PR's `closes` (same repo; removed from `crossref_issues`) and, when anything is
+new, are stored on the PR record as `closing_issues` (`[{owner, repo, number}]`), whose
+other-repo entries the multi-repo fold turns into cross-repo `closes` edges. Both fields
+are on the stored record, so the trust check re-derives these edges store-only. With
+GraphQL unavailable gather keeps the keywords alone (`meta.closing_refs_source:
+keywords`). `part_of` uses the commit subject's **trailing**
 `(#N)` first (so `Revert "x (#4012)" (#4020)` → PR 4020), then `Merge pull
 request #N`, then the last `(#N)`.
 
@@ -720,7 +727,9 @@ byte-unchanged (`project = owner`, `repo = <name>`).
   `github.com/.../issues|pull/N` URL) or a repo-aware timeline cross-ref to a
   **member** repo emits a `closes`/`cross_ref` spine edge across the repo boundary
   (`traverse_spine` walks it unchanged); a ref to a **non-member** repo is recorded
-  on the node's `external_refs` (honest, not a fetchable gap).
+  on the node's `external_refs` (honest, not a fetchable gap). An other-repo entry of
+  the PR's stored `closing_issues` (GitHub-reported, #105) is a `closes` ref the same
+  way, and an issue mention it also closes is not a separate `cross_ref`.
 - **Cross-repo `depends_on` (Terraform).** `build_terraform_edges` keeps a registry
   source as `to=None, ref=<src>`; `fold_bundle` resolves it to the member that
   publishes that module — **exact** (a member whose manifest `registry` equals the

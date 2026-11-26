@@ -1009,7 +1009,11 @@ def parse_timeline_crossrefs(raw_timeline):
             if issue.get("pull_request") is None:
                 num = issue.get("number")
         elif kind == "connected":
+            # Tolerant: an event without a usable issue number (no subject,
+            # a null / non-integer number) is not a link (issue #105).
             num = (ev.get("subject") or {}).get("number")
+            if not isinstance(num, int) or isinstance(num, bool):
+                num = None
         if num is not None and num not in out:
             out.append(num)
     return out
@@ -3999,6 +4003,197 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     return parse_project_board(full_boards)
 
 
+# --- Closing issues as GitHub reports them (issue #105) ------------------------
+#
+# `PullRequest.closingIssuesReferences` lists the issues a PR will close / closed,
+# from closing keywords AND from manual "Development" sidebar links (which leave
+# no keyword in the text). One request aliases CLOSING_ISSUES_BATCH PRs of the
+# repo, each with its first CLOSING_ISSUES_FIRST closing issues; a PR with more
+# is paged on its own (PR_CLOSING_ISSUES_PAGE_QUERY). 100 PRs = 2 requests (plus
+# one per page of a PR with more than CLOSING_ISSUES_FIRST closing issues), each
+# 1 point of the GraphQL rate limit (50 connections of 25 nodes, well under 100
+# requests per query).
+CLOSING_ISSUES_BATCH = 50
+CLOSING_ISSUES_FIRST = 25
+
+_CLOSING_ISSUES_FIELDS = (
+    "nodes { number repository { nameWithOwner } } "
+    "pageInfo { hasNextPage endCursor }")
+
+PR_CLOSING_ISSUES_PAGE_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      closingIssuesReferences(first: 100, after: $cursor) { %s }
+    }
+  }
+}
+""".strip() % _CLOSING_ISSUES_FIELDS
+
+
+def closing_issues_query(numbers):
+    """The GraphQL query reading `closingIssuesReferences` for every PR number
+    in `numbers` (ascending), one `pr<N>: pullRequest(number: N)` alias each.
+    The numbers are ints written into the query text. Pure."""
+    lines = ["query($owner:String!, $repo:String!) {",
+             "  repository(owner:$owner, name:$repo) {"]
+    for n in sorted({int(n) for n in numbers}):
+        lines.append(
+            "    pr{0}: pullRequest(number: {0}) {{ number "
+            "closingIssuesReferences(first: {1}) {{ {2} }} }}".format(
+                n, CLOSING_ISSUES_FIRST, _CLOSING_ISSUES_FIELDS))
+    lines += ["  }", "}"]
+    return "\n".join(lines)
+
+
+def _closing_refs_of(conn_obj):
+    """[{owner, repo, number}] from one closingIssuesReferences page, in
+    GitHub's order; nodes without a number or repository are skipped."""
+    out = []
+    for node in (conn_obj or {}).get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        num = node.get("number")
+        full = ((node.get("repository") or {}).get("nameWithOwner")) or ""
+        owner, _, repo = full.partition("/")
+        if isinstance(num, int) and not isinstance(num, bool) and owner and repo:
+            out.append({"owner": owner, "repo": repo, "number": num})
+    return out
+
+
+def fetch_closing_issues(graphql, owner, repo, numbers):
+    """GitHub's closing issues of the PRs `numbers` of owner/repo, through the
+    injected `graphql(query, variables)` callable. Returns (refs, reason):
+    refs = {pr_number: [{owner, repo, number}, ...]} (GitHub's order, deduped
+    case-insensitively) for every PR GitHub answered; a PR it returned null for
+    (not a pull request) is left out. reason is None on success, else why the
+    whole answer is unusable (an error, a null repository, a PR object without
+    `closingIssuesReferences`); then refs is {} — never half an answer."""
+    numbers = sorted({int(n) for n in numbers})
+    refs = {}
+    try:
+        for i in range(0, len(numbers), CLOSING_ISSUES_BATCH):
+            batch = numbers[i:i + CLOSING_ISSUES_BATCH]
+            data = graphql(closing_issues_query(batch),
+                           {"owner": owner, "repo": repo})
+            repo_obj = (data or {}).get("repository")
+            if not isinstance(repo_obj, dict):
+                return {}, "repository {}/{} not found".format(owner, repo)
+            for n in batch:
+                pr_obj = repo_obj.get("pr{}".format(n))
+                if pr_obj is None:
+                    continue
+                conn_obj = pr_obj.get("closingIssuesReferences") \
+                    if isinstance(pr_obj, dict) else None
+                if not isinstance(conn_obj, dict):
+                    return {}, "no closingIssuesReferences for PR #{}".format(n)
+                got = _closing_refs_of(conn_obj)
+                info = conn_obj.get("pageInfo") or {}
+                guard = 0
+                while info.get("hasNextPage") and info.get("endCursor") \
+                        and guard < 100:
+                    guard += 1
+                    page = graphql(PR_CLOSING_ISSUES_PAGE_QUERY, {
+                        "owner": owner, "repo": repo, "number": n,
+                        "cursor": info["endCursor"]})
+                    conn_obj = ((((page or {}).get("repository") or {})
+                                 .get("pullRequest") or {})
+                                .get("closingIssuesReferences"))
+                    if not isinstance(conn_obj, dict):
+                        return {}, "no closingIssuesReferences for PR #{}".format(n)
+                    got += _closing_refs_of(conn_obj)
+                    info = conn_obj.get("pageInfo") or {}
+                seen, refs[n] = set(), []
+                for r in got:
+                    key = (r["owner"].lower(), r["repo"].lower(), r["number"])
+                    if key not in seen:
+                        seen.add(key)
+                        refs[n].append(r)
+    except (SystemExit, Exception) as err:  # noqa: BLE001 — degrade, never hard-fail
+        # SystemExit too: an injected/legacy graphql callable may signal an
+        # HTTP error that way (see _paginate_board_items).
+        return {}, str(err) or type(err).__name__
+    return refs, None
+
+
+def apply_closing_issues(pr, refs, current_slug):
+    """Merge GitHub's closing issues `refs` ([{owner, repo, number}]) into a PR
+    record (mutates `pr`); returns how many it adds beyond the text's closing
+    keywords. Same-repo issues (slug compared case-insensitively) not already
+    in `closes` are appended to it in ascending order after the keyword ones
+    (which keep their text order), and leave `crossref_issues` (they were only
+    mentions there). Other-repo issues that are not keyword-closed in the text
+    are new too; `_cross_repo_pr_edges` turns them into `closes` refs. When
+    anything is new the full GitHub list is stored as `closing_issues`
+    (sorted by owner/repo, case-insensitively, then number), so fold derives
+    the same edges from the stored record alone. Nothing new -> the record is
+    left exactly as it was (existing bundles stay byte-identical)."""
+    current = (current_slug or "").lower()
+    closes = list(pr.get("closes") or [])
+    keyword_cross = {
+        (r["owner"].lower(), r["repo"].lower(), r["number"])
+        for r in parse_qualified_refs(_pr_text(pr)) if r["kind"] == "closes"}
+    new_same, new_cross = set(), 0
+    for r in refs or []:
+        slug = "{}/{}".format(r["owner"], r["repo"]).lower()
+        if slug == current:
+            if r["number"] not in closes:
+                new_same.add(r["number"])
+        elif (r["owner"].lower(), r["repo"].lower(), r["number"]) \
+                not in keyword_cross:
+            new_cross += 1
+    if not new_same and not new_cross:
+        return 0
+    pr["closes"] = closes + sorted(new_same)
+    pr["crossref_issues"] = [n for n in pr.get("crossref_issues") or []
+                             if n not in new_same]
+    pr["closing_issues"] = sorted(
+        ({"owner": r["owner"], "repo": r["repo"], "number": r["number"]}
+         for r in refs),
+        key=lambda r: (r["owner"].lower(), r["repo"].lower(), r["number"]))
+    return len(new_same) + new_cross
+
+
+def resolve_closing_issues(prs, graphql, owner, repo):
+    """Read GitHub's closing issues for every PR in `prs` and merge them in
+    (apply_closing_issues). Writes ONE stderr summary line and returns the
+    source for `meta.closing_refs_source`: "graphql", or "keywords" when
+    `graphql` is None or the answer is unusable (fetch_closing_issues) — then
+    no PR is changed and the gather carries on with the closing keywords."""
+    if graphql is None:
+        refs, reason = {}, "no GraphQL client"
+    else:
+        refs, reason = fetch_closing_issues(
+            graphql, owner, repo, [pr["number"] for pr in prs])
+    if reason is not None:
+        sys.stderr.write("closing issues: GraphQL unavailable ({}), using "
+                         "closing keywords only\n".format(reason))
+        return "keywords"
+    slug = "{}/{}".format(owner, repo)
+    checked = gainers = gained = 0
+    for pr in prs:
+        if pr["number"] not in refs:
+            continue
+        checked += 1
+        n = apply_closing_issues(pr, refs[pr["number"]], slug)
+        if n:
+            gainers += 1
+            gained += n
+    sys.stderr.write(
+        "closing issues: {} PR(s) checked via GraphQL, {} gained {} closing "
+        "issue(s) not in their text (source: graphql)\n".format(
+            checked, gainers, gained))
+    return "graphql"
+
+
+def _graphql_client(token):
+    """The `graphql(query, variables)` callable acquire hands to the GraphQL
+    readers (a seam so tests inject fixtures instead of the network)."""
+    def _graphql(query, variables=None):
+        return graphql_post(token, query, variables)
+    return _graphql
+
+
 def _next_link(link_header):
     """Parse a GitHub Link header, returning the rel="next" url or None."""
     for part in (link_header or "").split(","):
@@ -4359,6 +4554,11 @@ def acquire(args, env):
             continue
         enrich_pr(pr, get_page, api, f"{owner}/{repo}")
         prs.append(pr)
+    # GitHub's own closing-issue list (keywords AND Development-sidebar links,
+    # issue #105): batched GraphQL over the kept PRs; on any failure the closing
+    # keywords stand alone (one stderr line either way, meta.closing_refs_source).
+    closing_refs_source = resolve_closing_issues(
+        prs, _graphql_client(token), owner, repo)
 
     # Issue set: every issue a kept PR closes or cross-references, plus open and
     # recently-closed issues (for in_flight / next_candidates / rejected buckets).
@@ -4468,15 +4668,14 @@ def acquire(args, env):
     raw_milestones = fetch_all(get_page, f"{api}/milestones?state=all&per_page=100")
     milestones = [normalize_milestone(m) for m in raw_milestones]
 
-    # Phase 12: Projects v2 board. Auto-discover via GraphQL (the only GraphQL call
-    # in gather), stamp each gathered pr/issue with its board_status + iteration,
+    # Phase 12: Projects v2 board. Auto-discover via GraphQL (with the closing-issue
+    # read above, one of gather's two GraphQL uses), stamp each gathered pr/issue with its board_status + iteration,
     # and surface the (date-windowed) sprints. Degrades to empty on any error so a
     # missing read:project scope NEVER hard-fails the run; --no-project-board skips
     # the query entirely.
     sprints = {}
     if getattr(args, "project_board", True):
-        def _graphql(query, variables=None):
-            return graphql_post(token, query, variables)
+        _graphql = _graphql_client(token)
         # ref_date (the window's reference point) anchors the board staleness
         # check; it is finalized below but resolves to the same value here.
         sprints, items_by_ref = fetch_project_board(
@@ -4526,6 +4725,9 @@ def acquire(args, env):
     # reader tell "no runs" from "not looked at" (per-window facts, issue #94).
     bundle["meta"]["workflows_collected"] = bool(
         getattr(args, "include_workflows", True))
+    # Where `closes` came from (issue #105): "graphql" (keywords + GitHub's
+    # closingIssuesReferences) or "keywords" (GraphQL unavailable).
+    bundle["meta"]["closing_refs_source"] = closing_refs_source
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
@@ -4766,16 +4968,29 @@ def _cross_repo_pr_edges(pr, project, current_repo, members):
     Repo slugs compare case-insensitively (issue #70): a ref in any spelling of
     the current repo is same-repo, and a member ref's edge targets the member's
     CANONICAL (manifest) spelling, so ids never fork into two id spaces.
-    External refs keep the spelling they were written with. Pure."""
+    External refs keep the spelling they were written with.
+
+    GitHub-reported closing issues stored on the PR (`closing_issues`, issue
+    #105: keywords AND Development-sidebar links) are `closes` refs like a
+    keyword-closed `owner/repo#N`, and an issue mention they also close is
+    not a separate cross_ref. Pure."""
     pid = graphstore.qualify_id(project, current_repo, "pr-{}".format(pr["number"]))
     text = (pr.get("title", "") or "") + "\n" + (pr.get("body") or "")
-    refs = parse_qualified_refs(text) + list(pr.get("timeline_xrefs") or [])
+    closing = [dict(r, kind="closes", is_pr=False)
+               for r in pr.get("closing_issues") or []]
+    closed = {(r["owner"].lower(), r["repo"].lower(), r["number"])
+              for r in closing}
+    refs = parse_qualified_refs(text) + list(pr.get("timeline_xrefs") or []) \
+        + closing
     index = manifest_mod.slug_index(members)
     current = (current_repo or "").lower()
     edges, external, seen = [], [], set()
     for r in refs:
         slug = "{}/{}".format(r["owner"], r["repo"])
         if slug.lower() == current:
+            continue
+        if (r["kind"] == "cross_ref" and not r.get("is_pr")
+                and (r["owner"].lower(), r["repo"].lower(), r["number"]) in closed):
             continue
         local = ("pr-" if r.get("is_pr") else "issue-") + str(r["number"])
         key = (slug.lower(), local, r["kind"])

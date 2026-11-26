@@ -515,11 +515,14 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
     references an item, however old or draft.
 11. **Trains follow closing references.** A `link` train holds every PR that targets the
     mainline — shipped, open or rejected — joined with the other PRs that close the same
-    issues, and lists every issue they close (#93). Only a closing keyword (`Fixes #N`,
-    `Closes #N`, … in the PR title or body) joins a PR to an issue: a mention, a timeline
-    cross-reference or a link made only in the PR's Development sidebar does not (issue
-    #105), so such a PR is its own train (`train-pr-<n>`). A PR closing several issues joins
-    every PR that closes any of them. An unmerged PR into another branch is in no train.
+    issues, and lists every issue they close (#93). Only a closing reference joins a PR to an
+    issue: a closing keyword (`Fixes #N`, `Closes #N`, … in the PR title or body) or a link
+    made in the PR's Development sidebar, which gather reads from GitHub's GraphQL
+    `closingIssuesReferences` (#105). A mention or a timeline cross-reference does not, so
+    such a PR is its own train (`train-pr-<n>`). When GraphQL is unavailable (gather says so
+    on stderr; `meta.closing_refs_source: keywords`) only the keywords count. Stores gathered
+    before #105 keep keyword-only `closes` until re-gathered. A PR closing several issues
+    joins every PR that closes any of them. An unmerged PR into another branch is in no train.
 12. **Series continuity is per bundle and by bucket.** `series.json` keeps one entry per
     window and compares each installment with the window before it (#86), but it is kept
     per single-repo bundle (no project-view series), it only sees items in one of this
