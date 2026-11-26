@@ -86,8 +86,10 @@ project checks only that member's people (the full check runs without `--repo`).
 inputs imply and deletes the ones they no longer imply — a removed module reference, a
 CODEOWNERS change, an item moved off a milestone or sprint, a blocker edited away — only
 where the input speaks for that source (a resolved build or the whole-tree scan for a
-dependency; never a window that simply does not mention it). History edges are never
-deleted. `gather` prints what it retracted and keeps it in `meta.retractions:<project>/<repo>`
+dependency; never a window that simply does not mention it). A re-gathered PR / issue /
+commit's closing references, commit → PR link and contribution edges are made what its new
+content implies, and a person no contribution references any more is deleted (#111;
+`STORE.md` "Record-derived edges"). `touches` and symbol moves are never deleted. `gather` prints what it retracted and keeps it in `meta.retractions:<project>/<repo>`
 (`STORE.md` "Current-state edges").
 
 **Whole-tree module graph (`--structural-iac`).** By default a single-repo gather builds

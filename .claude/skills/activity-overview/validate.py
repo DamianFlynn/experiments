@@ -1087,8 +1087,14 @@ def check_schema_conformance(conn, scope=None):
 
 # --- check 6: edge set == re-derived from the stored records -----------------
 
-# Re-derived from the stored records alone (record blobs refresh, never go
-# stale): compared exactly in both directions on every store.
+# Re-derived from the stored records alone: compared exactly in both
+# directions on every store. A fold keeps them exact (issue #111): after it
+# upserts a PR / issue / commit record, that record's edges of these types are
+# what its new content implies, and the first fold since #111 of a repo that
+# already held data heals every stored record once. A stored edge that is not
+# derivable on a repo whose last fold predates #111 (no `records` in its
+# current_state marker) is still an ERROR — views follow it — and carries
+# _PRE111_HINT.
 _RECORD_EDGE_TYPES = frozenset((
     "authored", "merged", "reviewed", "reported", "commented",
     "closes", "cross_ref", "part_of"))
@@ -1109,6 +1115,10 @@ _STRUCTURE_STATE_EDGE_TYPES = frozenset(("depends_on", "owns"))
 _PRE95_REASON = ("this repo was last folded before current-state edges were "
                  "retracted (#95); fold any window of it once more to make "
                  "this check exact")
+_PRE111_HINT = ("this repo was last folded before a fold retracted the "
+                "record-derived edges a re-folded record no longer implies "
+                "(#111); fold any window of it once more to heal every stored "
+                "record")
 # Symbol moves, matched per fold window: exact on a one-window store; on a
 # multi-window store each stored move must be supported by the ledger
 # (_move_problem) and a cross-window re-match is not required.
@@ -1413,6 +1423,7 @@ def check_edge_set(conn, project, repo, bundle):
               if _owned_by_repo(e["src_id"], e["dst_id"], project, repo)}
     members = None
     hints = {}
+    pre111 = None
     details = []
     per_type = {}
 
@@ -1484,6 +1495,12 @@ def check_edge_set(conn, project, repo, bundle):
                 hints[src] = _pre78_hint(conn, project, src)
             if hints[src]:
                 d["hint"] = hints[src]
+        if et in _RECORD_EDGE_TYPES and "hint" not in d:
+            if pre111 is None:
+                pre111 = not (graphstore.get_current_state(
+                    conn, project, repo) or {}).get("records")
+            if pre111:
+                d["hint"] = _PRE111_HINT
         details.append(d)
     note = "{} stored edge(s) of this repo compared with {} re-derived from its " \
            "records".format(len(stored), len(expected))
@@ -1902,18 +1919,31 @@ def check_idempotency(conn, bundle, project=None, repo=None):
     RETRACTS current-state edges (issue #95) of a repo last folded before #95
     is healing stale edges that fold left behind: a WARN, left out of the
     count; on a repo folded since #95 it is a failure (the store was not what
-    its inputs imply). On a one-window store every change still fails.
+    its inputs imply). Likewise, on any store, a re-fold that retracts
+    record-derived edges (and deletes the people only they referenced) of a
+    repo last folded before #111 is a WARN left out of the count (edge_set
+    reports those edges as ERRORs); since #111 it is a failure. Otherwise, on
+    a one-window store every change fails.
     """
     multi = project is not None and _repo_window_count(conn, project, repo) > 1
+    pre111 = project is not None and not (graphstore.get_current_state(
+        conn, project, repo) or {}).get("records")
     before = _counts(conn)
-    keys_before = _edge_keys(conn) if multi else None
+    keys_before = _edge_keys(conn) if (multi or pre111) else None
     copy_conn = graphstore.open_store(":memory:")
     conn.backup(copy_conn)
     summary = gather.fold_bundle(copy_conn, bundle) or {}
     after = _counts(copy_conn)
-    excused, healed = [], []
+    excused, healed, healed_records = [], [], []
+    keys_after = _edge_keys(copy_conn) if keys_before is not None else None
+    if pre111:
+        # The first fold since #111 of a repo heals its stale record-derived
+        # edges and the people only they referenced; edge_set reports them.
+        healed_records = sorted(k for k in keys_before - keys_after
+                                if k[2] in _RECORD_EDGE_TYPES)
+        after["edges"] += len(healed_records)
+        after["nodes"] += len(summary.get("people_removed") or [])
     if multi:
-        keys_after = _edge_keys(copy_conn)
         excused = sorted(
             k for k in keys_after - keys_before
             if k[2] in _MOVE_EDGE_TYPES or k[2] in _CURRENT_STATE_EDGE_TYPES)
@@ -1940,6 +1970,12 @@ def check_idempotency(conn, bundle, project=None, repo=None):
             "note": "{} stale current-state edge(s) a re-fold retracts: {}"
                     .format(len(healed), _PRE95_REASON),
             "edges": [list(k) for k in healed[:20]]})
+    if healed_records:
+        details.append({
+            "severity": WARN,
+            "note": "{} stale record-derived edge(s) a re-fold retracts: {}"
+                    .format(len(healed_records), _PRE111_HINT),
+            "edges": [list(k) for k in healed_records[:20]]})
     for k in ("nodes", "edges", "code_events"):
         if after[k] != before[k]:
             details.append({

@@ -700,7 +700,8 @@ def main(argv=None):
     unknown project or repo. Nothing is written to stdout on exit 2."""
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        manifest_mod.check_reader_window(args.ts_from, args.ts_to, "--from", "--to")
+        args.ts_from, args.ts_to = manifest_mod.check_reader_window(
+            args.ts_from, args.ts_to, "--from", "--to")
         if args.ref_date is not None:
             manifest_mod.check_ref_date(args.ref_date, "--ref-date")
     except ValueError as exc:

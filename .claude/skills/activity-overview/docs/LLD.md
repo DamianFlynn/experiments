@@ -545,14 +545,17 @@ flowchart TB
   s5["5 · symbol code_events + replaced_by / identity_from (moves matched in this window)<br/>+ artifact code nodes rebuilt from the WHOLE ledger (_fold_artifacts)"]
   s6["6 · structure: milestones, areas, releases, sprints"]
   s7["7 · people (derive.enumerate_participants, repo = *)<br/>union across members, bots tagged"]
-  s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; touches"]
+  s8["8 · contribution edges authored / merged / reviewed /<br/>reported / commented; touches<br/>+ record-derived edges of the re-folded records retracted,<br/>orphan people deleted (_maintain_record_edges, #111)"]
   s9["9 · singletons: workflowstats, codegraph, codeowners, labeltaxonomy (latest-wins)<br/>+ gathered_windows, ref_date, branches, clone_sha, per-window facts meta"]
   s10["10 · current-state edges (_maintain_current_state, #95):<br/>blocks / in_milestone / in_iteration from the stored records;<br/>depends_on (+ cross-repo resolution) / owns replayed over the windows' facts;<br/>stale ones retracted, stand-ins created / orphans deleted, ledger"]
   s1 --> s2 --> s3 --> s4 --> s5 --> s6 --> s7 --> s8 --> s9 --> s10
 ```
 
 (The exact statement order inside the function differs slightly; the grouping above is the
-logical sequence. FTS text is indexed as PR/issue/commit nodes are written (FTS5-gated).)
+logical sequence. FTS text is indexed as PR/issue/commit nodes are written (FTS5-gated); when
+meta `fts_coverage` is not `complete` (a fold without FTS5 set it `partial`, or the store
+predates the key) the fold first indexes every stored node `fts_map` lacks
+(`gather._backfill_fts`, one pass, #111).)
 
 **Artifact nodes are cumulative (#76).** Inside the fold's transaction, after the ledger rows
 and move edges are written, `_fold_artifacts` reads the repo's whole ledger back
@@ -575,8 +578,28 @@ window replaces its entry and unreferenced values are deleted). Keyed by window,
 sha: the directory code graph is built from the window's changed paths, so two windows of one
 checkout differ. Written whenever `meta.from` and `meta.to` are set; no schema change.
 
-**Current-state edges (#95).** History edges (contribution, `closes`, `cross_ref`, `part_of`,
-`touches`, symbol moves) are only added. The current-state types
+**Record-derived edges (#111).** `closes` / `cross_ref` (src: the PR), commit `part_of` (src:
+the commit) and the contribution edges (dst: the PR / issue / commit) are a function of one
+stored record, which the fold upserts latest-wins. Right after its nodes and edges are written,
+`_maintain_record_edges` reads the stored edges of the bundle's records (`stored_record_edges`:
+chunked `IN` lists on `idx_edges_src` / `idx_edges_dst`, linear in the bundle; cross-repo
+`closes` / `cross_ref` only with `members`) and deletes those the fold did not just write;
+a commit's `touches` join in only when its stored `files` (read before the upsert,
+`_stored_commit_files`) changed. `delete_orphan_people` then deletes each person whose
+contribution edge was retracted and who is the source of no contribution edge any more (any
+member). A repo with data whose `current_state` lacks `records` (last folded before #111) is
+healed once: `_stored_records` + `record_edge_keys` (the same `_pr_spine_edges` /
+`_commit_part_of` / `_contribution_edges` helpers the fold writes with) re-derive every stored
+record's edges and the rest are retracted. A remaining person's `modules` / `areas` union with
+the stored node as before, unless `_is_sole_window` (the bundle re-folds the project's only
+gathered window): then its derivation replaces it. The code-event ledger upserts
+(`graphstore.add_code_events`: `ON CONFLICT DO UPDATE` of `author`, `date`, `hunk`, `ref`,
+`before`, `after`, `detail`; first row of a key within a batch wins), so `_fold_artifacts`
+re-credits a commit whose author resolution changed. Retractions go into the same summary,
+ledger entry and stderr line as the current-state ones (below).
+
+**Current-state edges (#95).** History edges (`touches`, review / event `part_of`, symbol moves)
+are only added. The current-state types
 (`gather.CURRENT_STATE_EDGE_TYPES`: `blocks`, `in_milestone`, `in_iteration`, `depends_on`,
 `owns`) are written last in the transaction by `_maintain_current_state`, which makes the
 repo's edges of those types equal to what its stored inputs imply and deletes the rest:
@@ -603,18 +626,23 @@ repo's edges of those types equal to what its stored inputs imply and deletes th
   bundle's `depends_on` / `owns` are added as before.
 - `depends_on` targets that are not stored get stand-ins (`_standin_rows`, create-if-absent);
   `graphstore.delete_orphan_standins` deletes a stand-in left with no edge after a retraction.
-- `graphstore.record_retractions` appends `{from, to, counts, edges, standins_removed}` to
-  meta `retractions:{p}/{r}` when anything was retracted; `set_current_state` writes
-  `current_state:{p}/{r}` = `{items: true, structure, from, to}`. `fold_bundle` returns the
-  summary and `gather` prints `describe_retractions` on stderr.
+- `graphstore.record_retractions` appends `{from, to, counts, edges, standins_removed,
+  people_removed}` to meta `retractions:{p}/{r}` when anything was retracted (record-derived
+  edges and orphan people included, #111); `set_current_state` writes
+  `current_state:{p}/{r}` = `{items: true, structure, records: true, from, to}`. `fold_bundle`
+  returns the summary and `gather` prints `describe_retractions` on stderr.
 
 Properties: idempotent (a re-fold of an unchanged window retracts nothing and logs nothing);
 deterministic; `depends_on` / `owns` are a function of the SET of windows' facts (any fold
 order converges); the item relations follow the stored record, which is upserted
 last-fold-wins, so re-folding an older bundle after a newer one restores the older record
-and its edges. A failed fold rolls back with its retractions. Cost: one prefiltered pass over
+and its edges; record-derived edges and people likewise follow the last-folded copy of each
+record. A failed fold rolls back with its retractions. Cost: one prefiltered pass over
 the repo's PR/issue nodes plus one read of every window's code graph and CODEOWNERS per fold
-(about 0.4 s for 20,000 stored issues of 3 KB).
+(about 0.4 s for 20,000 stored issues of 3 KB); the record-derived step adds indexed lookups
+linear in the bundle (synthetic 12-month store, 89k nodes / 165k edges / 274k ledger rows:
+the 12th monthly fold took 4.4 s before and 4.5–5.0 s after, within run-to-run noise) and,
+once per repo, the heal pass (the 13th fold into the store built before: 4.9 s → 7.0 s).
 
 ### 4.11 Cross-repo `depends_on` resolution (Terraform, Bicep)
 
@@ -739,6 +767,8 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 | Nodes | `upsert_node`, `upsert_nodes`, `get_node`, `repo_nodes`, `range_query(conn, project, repos, ts_from, ts_to, node_class=None)`, `project_repos` (repos with nodes, minus stand-in-only repos with no gathered window, #77) |
 | Edges | `upsert_edge`, `upsert_edges`, `get_edges(direction, edge_types)`, `edges_by_type(conn, edge_type, project)`, `edges_from_prefix` / `edges_into_prefix(conn, prefix, edge_type)`, `delete_edges` (#95) |
 | Current state (#95) | `item_relation_rows(conn, prefix)` (SQL-prefiltered PR/issue records), `node_ids_with_prefix`, `nodes_with_prefix`, `delete_orphan_standins`, `set_current_state`/`get_current_state`, `record_retractions`/`get_retractions` |
+| Window keys (#111) | `split_window_key(key, prefix)` → `(scope, window)`: the project ends at the first `/`, the repo at the next `:` (a project may contain `:`, a bound may be a timestamp) |
+| FTS coverage (#111) | meta `fts_coverage` (`FTS_COMPLETE` / `FTS_PARTIAL`), `fts_unindexed_nodes(conn)` |
 | Ledger | `add_code_event(s)`, `get_code_events`, `repo_code_events` |
 | Spine | `traverse_spine(conn, seed_ids, max_depth=6, edge_types=SPINE_EDGE_TYPES, skip_dead=…)` → `{reached:{id:depth}, missing:[id]}` |
 | Text | `index_text` / `index_texts` (replace by node id via `fts_map`, no table scan), `fts_search` (raw FTS5 `MATCH`; callers must escape) |
@@ -747,7 +777,8 @@ see STORE.md "Parsing grammar"), and callers split the scope on its first `/`, s
 | Tombstones | `record_dead_ref`, `is_dead_ref`, `get_dead_refs` |
 
 **Semantics.** Identity columns are immutable; `ts`/`data`/`fetched_at` refresh on re-upsert.
-Edges union; only `gather._maintain_current_state` deletes edges (stale current-state ones,
+Edges union; only `gather._maintain_record_edges` (record-derived edges a re-folded record no
+longer implies, and orphan people, #111) and `gather._maintain_current_state` delete edges (stale current-state ones,
 #95). `range_query` orders by `(ts, id)` and excludes NULL-`ts` structure nodes.
 Window bounds are granularity-safe: node `ts` mixes date-only (commits, artifacts) and ISO
 datetimes (PRs, issues, reviews, events), and bounds may be either. `range_query` and the
@@ -1203,7 +1234,7 @@ then ignored with a stderr warning (it is single-repo by nature).
 | `schema_conformance` | every edge type has an explicit endpoint rule (an unknown type is an ERROR); endpoint kinds match it; both ends are in one project; same-repo types stay in one repo (#89) |
 | `edge_set` | the repo's stored edges == the edges `gather.fold_bundle` writes for its self-sourced bundle in an empty scratch store, in both directions and with equal `data`; cross-repo edges are checked against the manifest derivation (#89); on a multi-window store `depends_on` / `owns` / `touches` compare with their replay over the per-window facts and each current-state type is exact when `_multi_window_plan` can prove it, else WARN (#95) |
 | `no_drift` | stored people/artifacts == freshly re-derived from the self-sourced bundle (people from the records alone, with `login_resolved`; artifacts: the whole ledger plus any not-yet-folded events of a passed bundle, with the recorded moves); with `--bundle`, the stored PR/issue/commit records == the bundle's |
-| `idempotency` | re-folding into a scratch copy changes no counts (on a multi-window store, cross-window move re-matches and current-state edges it adds are INFO, not counted; current-state edges it retracts are a WARN, not counted, on a repo last folded before #95) |
+| `idempotency` | re-folding into a scratch copy changes no counts (on a multi-window store, cross-window move re-matches and current-state edges it adds are INFO, not counted; current-state edges it retracts are a WARN, not counted, on a repo last folded before #95; record-derived edges it retracts and people it deletes are a WARN, not counted, on a repo last folded before #111) |
 | `no_drift_people` (project) | project-scoped people == union re-derived across all members (areas derived ⊆ stored when a member holds several windows) |
 | `referential_integrity`, `provenance`, `no_fabrication`, `schema_conformance` (project) | the same checks over the rows no member owns (people, non-member rows) and the store-wide parts (the `facts:` index, case-variant scopes), once for the project (#107) |
 | `member_status` (project) | every manifest member's last gather of every recorded window is `ok`; a `failed` / `not_attempted` member is an ERROR naming the repo, window and reason, also when it holds no node and so is not an audited member (#77). Passes (INFO) on a store with no recorded status |
@@ -1237,7 +1268,13 @@ row, or social/code nodes with no `ts` at all) the three checks FAIL with
   `StructureReplay.dep_in_effect`) carries the edge's `data` and the dst is a member's root area
   (Bicep: the publisher's module area). A missing cross-repo edge is not detected.
 - *Edge classes.* Record-derived (`authored`, `merged`, `reviewed`, `reported`, `commented`,
-  `closes`, `cross_ref`, `part_of`): exact on every store. Current-state (`owns`, `touches`,
+  `closes`, `cross_ref`, `part_of`): exact (ERROR both ways) on every store, single- or
+  multi-window, because a fold keeps each re-folded record's edges equal to its new content and
+  the first fold since #111 of a repo heals every stored record (§4.10, #111). On a repo whose
+  `current_state` lacks `records` (last folded before #111) a stored edge its record does not
+  imply stays an ERROR (a view follows it) and carries `_PRE111_HINT` ("fold any window of it
+  once more"); `idempotency` reports the edges such a re-fold retracts, and the people it
+  deletes, as a WARN left out of the count. Current-state (`owns`, `touches`,
   `depends_on`, `in_milestone`, `in_iteration`, `blocks`): exact on a one-window store. On a
   multi-window one `_multi_window_plan` decides per type (#95): `blocks` / `in_milestone` /
   `in_iteration` are exact when the repo's last fold was since #95 (meta `current_state.items`:
@@ -1329,7 +1366,8 @@ Rules (issue #81):
   anything else `in_flight`. Rendered badges: `[direct-push]`, `[abandoned]`.
 - **CLI.** Exactly one query argument; `--complete` only for the train queries
   (`person`, `subsystem`, `grep`, `module`); `--repo` only for `subsystem`/`module`;
-  `--from/--to` not for `dependents` and validated by `manifest.check_reader_window`. A
+  `--from/--to` not for `dependents` and validated and normalised by `manifest.check_reader_window`
+(UTC `…Z`, #111). A
   missing (never created) or unreadable store, an empty store, an unknown `--project` or,
   with several projects, no `--project` (the message lists the store's projects), and an
   unknown `--repo`/qualifier (lists the project's repos) all exit 2 with usage.
@@ -1492,7 +1530,8 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
   (§4.10); views are window-scoped (#85) and read their window's CI statistics and structure
   (#94); current-state edges follow their stored inputs and stale ones are retracted (#95,
   §4.10: `depends_on` / `owns` independent of fold order, item relations follow the
-  last-folded record); what is still latest-wins is listed in §14.5.
+  last-folded record); record-derived edges and people follow the last-folded copy of their
+  record (#111); what is still latest-wins is listed in §14.5.
 
 ### 14.2 Degradation matrix
 
@@ -1607,8 +1646,10 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 | Wide views use one code graph | a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them (#94); the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
 | Sub-window CI statistics are not available | `workflow_stats` are counted per gathered window, not per run day | a view inside a gathered window (a week of a gathered month) or straddling two has no `workflow_stats` (`meta.facts_windows.workflow_stats_excluded` says why); a view over ungathered days sums only what was gathered (`workflow_stats_complete: false`) | store per-day run counts |
 | Area ownership is directory-level | `derive.area_owners` matches the area directory: `<area>/` and `<area>/**` own it (#110), `<area>/*` (direct files only) and file rules do not | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) or by `<area>/*` do not make that owner an area owner | per-file ownership facts if needed |
-| Item relations follow the last-folded record | `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records (#95), which are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record and its milestone / iteration / blockers (consistent with the store, but older); a record not re-gathered since a change keeps its old relations | fold windows oldest first; per-window record snapshots |
-| A window's structure is the head when its end is not in the clone | since #107 the code graph / IaC / CODEOWNERS of a window are read at its last mainline commit on or before `to`; when the bounded clone does not hold that commit (no commit in the window or its 14-day margin, only later ones) the head is read (`meta.structure_as_of: "head"`); `structure_as_of` is a bundle field, not stored per window; windows gathered before #107 carry the tree of their gather day | such a window's structure is newer than the window; the `depends_on` / `owns` replay (#95) still orders windows by their dates | widen `ACTIVITY_CLONE_MARGIN_DAYS` to reach the window end; re-gather pre-#107 windows |
+| Item relations and record-derived edges follow the last-folded record | `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records (#95), and each re-folded record's `closes` / `cross_ref` / `part_of` / contribution edges and people follow its new content (#111); records are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record with its milestone / iteration / blockers, closing references, commenters and reviewers (consistent with the store, but older); a record not re-gathered since a change keeps its old edges | fold windows oldest first; per-window record snapshots |
+| A reviewer added on a re-gather gets no areas from earlier windows' commits | person areas are derived per fold from that bundle's commits (`attribute_people_areas`) and unioned; `validate` re-derives them from every stored commit | a reviewer first named on a later gather of a PR whose commits were folded in an earlier window lacks those commits' areas: `no_drift` ERROR "person drift" (missing areas) on a multi-window store (seen on a synthetic store; independent of #111) | derive a person's areas from the stored commits of the PRs they review |
+| Review / event nodes and dropped ledger rows outlive their record | review and lifecycle-event nodes (and their `part_of`) are their own records, and the ledger keys rows by `(artifact, commit, event)` (#111 updates their columns, never deletes) | a review GitHub no longer lists on a re-gathered PR, or a file event a re-gather of a commit no longer reports, stays in the store and its views (`validate` cannot see it: the self-sourced bundle reads them back) | re-gather into a fresh store; a per-record replace of review/event nodes if it proves common |
+| A window's structure is the head when its end is not in the clone | since #107 the code graph / IaC / CODEOWNERS of a window are read at its last mainline commit on or before `to`; when the bounded clone does not hold that commit (no commit in the window or its 14-day margin, only later ones) the head is read (`meta.structure_as_of: "head"`, stored per window in the `clone:` meta entry and stamped on a view of exactly that window); windows gathered before #107 carry the tree of their gather day | such a window's structure is newer than the window; the `depends_on` / `owns` replay (#95) still orders windows by their dates | widen `ACTIVITY_CLONE_MARGIN_DAYS` to reach the window end; re-gather pre-#107 windows |
 | Pre-#107 stores and Bicep module areas | since #107 every file below a non-AVM `main.bicep` dir is in that module's area; `touches` are only ever added | re-gathering, into a store folded before #107, a window that changed such a file (one area id changes: e.g. `infra/modules/x.bicep` `infra/modules` → `infra`, `a/b/c/README.md` `a/b` → `a/b/c`) leaves the old `touches` and people areas beside the new ones: `validate` fails a one-window store with them; on a multi-window store whose windows map the path differently they are WARNs | re-gather into a fresh store |
 | Some stale structure edges are not provable | `depends_on` is retracted only where a resolved build or the whole-tree scan speaks for the source area, transitive edges only by a resolved build; `owns` only for areas a window's code graph lists (#95) | on a single-repo store without `--structural-iac` and without a working `bicep`/`terraform`, edges of areas no later window rebuilt stay; a transitive edge stays until the area is built again; owners of an area no later window lists stay | `--structural-iac`; the IaC toolchain on the gathering host |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |

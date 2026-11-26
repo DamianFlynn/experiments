@@ -6144,9 +6144,11 @@ def _fold_artifacts(conn, bundle, project, repo, fetched):
 
 # --- current-state edges (issue #95) -------------------------------------------
 #
-# History edges (authored, reviewed, merged, commented, reported, closes,
-# cross_ref, part_of, touches, symbol moves) record something that happened and
-# are only ever added. CURRENT-STATE edges describe the latest known state of
+# History edges (touches, review / event part_of, symbol moves) record
+# something that happened and are only ever added; the record-derived ones
+# (authored, reviewed, merged, commented, reported, closes, cross_ref, commit
+# part_of) follow the record they come from (issue #111, "record-derived
+# edges" below). CURRENT-STATE edges describe the latest known state of
 # an input that can change, so a fold keeps them equal to what the repo's
 # STORED inputs imply and retracts the ones those inputs no longer imply:
 #
@@ -6404,6 +6406,299 @@ def item_relation_edges(conn, project, repo, bundle_milestones=(),
     return out
 
 
+# --- record-derived edges (issue #111) -------------------------------------------
+#
+# A PR / issue / commit record is stored latest-wins: the record a fold upserts
+# replaces the earlier one. The edges derived from ONE record are a function of
+# its current content, so after a fold upserts a record they must be exactly
+# what the new content implies:
+#
+#   closes / cross_ref  src = the PR      <- its `closes` / `crossref_issues`
+#                                            (+ cross-repo refs in a manifest
+#                                            fold, _cross_repo_pr_edges)
+#   part_of             src = the commit  <- its message (resolve_commit_pr)
+#   authored / merged / reviewed / commented / reported
+#                       dst = the PR / issue / commit, src = a person
+#                                         <- its author / merged_by /
+#                                            reviewers / comment authors
+#   touches             src = the commit  <- its files AND the code graph:
+#                                            re-derived only when the commit's
+#                                            stored file list changed
+#
+# Only the records the bundle carries are touched (absence from a bundle is not
+# evidence). A single-repo fold derives no cross-repo edge, so it leaves the
+# cross-repo `closes` / `cross_ref` a manifest fold wrote alone. Review / event
+# `part_of` edges (src: their own nodes), symbol moves and artifact nodes are
+# ledger- or node-derived and not covered here. A person node no contribution
+# edge references any more is deleted (people are project-scoped: an edge of
+# any member keeps it).
+RECORD_EDGE_TYPES = ("authored", "closes", "commented", "cross_ref", "merged",
+                     "part_of", "reported", "reviewed")
+CONTRIBUTION_EDGE_TYPES = ("authored", "commented", "merged", "reported",
+                           "reviewed")
+# Every edge type a person node is a contribution source of (validate's
+# _CONTRIB_EDGE_TYPES): a person with none of these is not a participant.
+_PERSON_KEEPING_TYPES = CONTRIBUTION_EDGE_TYPES + ("reacted",)
+_SQL_CHUNK = 500
+
+
+def _pr_spine_edges(pr, qid):
+    """A PR's same-repo `closes` / `cross_ref` edge rows. Pure."""
+    pid = qid("pr-{}".format(pr["number"]))
+    out = [(pid, qid("issue-{}".format(n)), "closes", None, None)
+           for n in pr.get("closes") or []]
+    out += [(pid, qid("issue-{}".format(n)), "cross_ref", None, None)
+            for n in pr.get("crossref_issues") or []]
+    return out
+
+
+def _commit_part_of(c, qid):
+    """A commit's `part_of` edge row to the PR its subject names. Pure."""
+    prn = resolve_commit_pr(c.get("message", ""))
+    if prn is None:
+        return []
+    return [(qid(c["sha"]), qid("pr-{}".format(prn)), "part_of", None, None)]
+
+
+def _contribution_edges(prs, issues, commits, qid, qperson):
+    """The person -> record contribution edge rows of the RAW records, in write
+    order; absent logins/fields are skipped. Pure."""
+    out = []
+
+    def contrib(login, dst_local, etype):
+        if login:
+            out.append((qperson(login), qid(dst_local), etype, None, None))
+    for pr in prs:
+        prlocal = "pr-{}".format(pr["number"])
+        contrib(pr.get("author"), prlocal, "authored")
+        contrib(pr.get("merged_by"), prlocal, "merged")
+        for reviewer in pr.get("reviewers") or []:
+            contrib(reviewer, prlocal, "reviewed")
+        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
+            contrib(c.get("author"), prlocal, "commented")
+    for iss in issues:
+        isslocal = "issue-{}".format(iss["number"])
+        contrib(iss.get("author"), isslocal, "reported")
+        for c in iss.get("comments_list") or []:
+            contrib(c.get("author"), isslocal, "commented")
+    for c in commits:
+        contrib(c.get("author"), c["sha"], "authored")
+    return out
+
+
+def record_edge_keys(prs, issues, commits, project, repo, members):
+    """{(src, dst, type)} of the record-derived edges (RECORD_EDGE_TYPES) the
+    given records imply — what fold_bundle writes for them, through the same
+    helpers. Cross-repo `closes` / `cross_ref` only when `members` is given.
+    Pure."""
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+
+    def qperson(login):
+        return graphstore.qualify_person(project, login)
+    rows = []
+    for pr in prs:
+        if members is not None:
+            rows.extend(_cross_repo_pr_edges(pr, project, repo, members)[1])
+        rows.extend(_pr_spine_edges(pr, qid))
+    for c in commits:
+        rows.extend(_commit_part_of(c, qid))
+    rows.extend(_contribution_edges(prs, issues, commits, qid, qperson))
+    return {r[:3] for r in rows}
+
+
+def _chunks(ids):
+    ids = sorted(set(ids))
+    for i in range(0, len(ids), _SQL_CHUNK):
+        yield ids[i:i + _SQL_CHUNK]
+
+
+def _edges_where(conn, column, ids, types):
+    """{(src, dst, type)} of the edges whose `column` (src_id / dst_id) is in
+    `ids` and whose type is in `types`: chunked IN lists on the (column,
+    edge_type) index, so the cost is linear in len(ids)."""
+    out = set()
+    tph = ",".join("?" for _ in types)
+    for chunk in _chunks(ids):
+        sql = ("SELECT src_id, dst_id, edge_type FROM edges WHERE {} IN ({}) "
+               "AND edge_type IN ({})").format(
+                   column, ",".join("?" for _ in chunk), tph)
+        out.update(tuple(r) for r in conn.execute(sql, list(chunk) + list(types)))
+    return out
+
+
+def stored_record_edges(conn, project, repo, members, pr_ids=(), issue_ids=(),
+                        commit_ids=(), touch_ids=()):
+    """{(src, dst, type)} of the stored record-derived edges of the given
+    record ids: `closes` / `cross_ref` from the PRs (same-repo targets only
+    when `members` is None), `part_of` from the commits, `touches` from the
+    commits in `touch_ids`, and the contribution edges from a person of the
+    project into any of them."""
+    prefix = graphstore.qualify_id(project, repo, "")
+    person_prefix = graphstore.qualify_person(project, "")
+    out = {k for k in _edges_where(conn, "src_id", pr_ids, ("closes", "cross_ref"))
+           if members is not None or k[1].startswith(prefix)}
+    out |= _edges_where(conn, "src_id", commit_ids, ("part_of",))
+    out |= _edges_where(conn, "src_id", touch_ids, ("touches",))
+    out |= {k for k in _edges_where(conn, "dst_id",
+                                    set(pr_ids) | set(issue_ids) | set(commit_ids),
+                                    CONTRIBUTION_EDGE_TYPES)
+            if k[0].startswith(person_prefix)}
+    return out
+
+
+def delete_orphan_people(conn, ids):
+    """Delete each person node in `ids` that no contribution edge
+    (_PERSON_KEEPING_TYPES) has as its source any more, in any repo of the
+    project. Returns the deleted ids, sorted. Call inside the fold's
+    transaction."""
+    removed = []
+    tph = ",".join("?" for _ in _PERSON_KEEPING_TYPES)
+    for pid in sorted(set(ids)):
+        if conn.execute("SELECT 1 FROM edges WHERE src_id=? AND edge_type IN "
+                        "({}) LIMIT 1".format(tph),
+                        [pid] + list(_PERSON_KEEPING_TYPES)).fetchone():
+            continue
+        if conn.execute("DELETE FROM nodes WHERE id=?", (pid,)).rowcount:
+            removed.append(pid)
+    return removed
+
+
+def _stored_commit_files(conn, project, repo, shas):
+    """{sha: files} of the stored commit records among `shas` (absent ones
+    left out), read by id before a fold replaces them."""
+    out = {}
+    ids = {graphstore.qualify_id(project, repo, s): s for s in shas}
+    for chunk in _chunks(ids):
+        for nid, raw in conn.execute(
+                "SELECT id, data FROM nodes WHERE id IN ({}) AND "
+                "node_class='code'".format(",".join("?" for _ in chunk)), chunk):
+            try:
+                data = json.loads(raw) if raw else None
+            except ValueError:
+                continue
+            if isinstance(data, dict) and data.get("sha") == ids[nid]:
+                out[ids[nid]] = list(data.get("files") or [])
+    return out
+
+
+def _stored_records(conn, project, repo):
+    """(prs, issues, commits): every stored PR / issue / commit record of the
+    repo (for the one-time heal of a repo last folded before #111)."""
+    prefix = graphstore.qualify_id(project, repo, "")
+    lo, hi = graphstore._prefix_range(prefix)
+    prs, issues, commits = [], [], []
+    for local, sink in (("pr-", prs), ("issue-", issues)):
+        for nid, data in graphstore.nodes_with_prefix(conn, prefix + local):
+            if isinstance(data, dict) and str(data.get("number")) == \
+                    nid[len(prefix) + len(local):]:
+                sink.append(data)
+    for nid, raw in conn.execute(
+            "SELECT id, data FROM nodes WHERE id >= ? AND id < ? AND "
+            "node_class='code' AND length(id) IN (?, ?) ORDER BY id",
+            (lo, hi, len(prefix) + 40, len(prefix) + 64)):
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("sha") == nid[len(prefix):]:
+            commits.append(data)
+    return prs, issues, commits
+
+
+def _maintain_record_edges(conn, bundle, project, repo, members, written,
+                           prior_files, heal):
+    """Delete the record-derived edges of the bundle's records that their new
+    content no longer implies, then the person nodes left without a
+    contribution edge. Inside the fold's transaction, after its nodes and
+    edges are written. `written`: every edge key the fold wrote;
+    `prior_files`: the stored file lists of the bundle's commits before the
+    fold; `heal` (a repo last folded before #111): apply the rule once to
+    every stored record of the repo, from its stored content. Returns
+    (retracted keys, removed person ids)."""
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+    prs = bundle.get("prs") or []
+    issues = bundle.get("issues") or []
+    commits = bundle.get("commits") or []
+    touch = [c["sha"] for c in commits if c["sha"] in prior_files
+             and list(c.get("files") or []) != prior_files[c["sha"]]]
+    stored = stored_record_edges(
+        conn, project, repo, members,
+        pr_ids=[qid("pr-{}".format(p["number"])) for p in prs],
+        issue_ids=[qid("issue-{}".format(i["number"])) for i in issues],
+        commit_ids=[qid(c["sha"]) for c in commits],
+        touch_ids=[qid(sha) for sha in touch])
+    retract = stored - set(written)
+    if heal:
+        s_prs, s_issues, s_commits = _stored_records(conn, project, repo)
+        want = record_edge_keys(s_prs, s_issues, s_commits, project, repo,
+                                members)
+        retract |= stored_record_edges(
+            conn, project, repo, members,
+            pr_ids=[qid("pr-{}".format(p["number"])) for p in s_prs],
+            issue_ids=[qid("issue-{}".format(i["number"])) for i in s_issues],
+            commit_ids=[qid(c["sha"]) for c in s_commits]) - want
+    graphstore.delete_edges(conn, retract, commit=False)
+    person_prefix = graphstore.qualify_person(project, "")
+    removed = delete_orphan_people(
+        conn, [k[0] for k in retract if k[0].startswith(person_prefix)])
+    return retract, removed
+
+
+def _repo_has_nodes(conn, project, repo):
+    """True when any node id of (project, repo) is stored."""
+    lo, hi = graphstore._prefix_range(graphstore.qualify_id(project, repo, ""))
+    return conn.execute("SELECT 1 FROM nodes WHERE id >= ? AND id < ? LIMIT 1",
+                        (lo, hi)).fetchone() is not None
+
+
+def _fts_text_of(nid, node_class, data):
+    """The text fold_bundle indexes for a STORED node (see its fts_text
+    block): a PR / issue social record's title + body + embedded comments, a
+    commit's message; "" for anything else."""
+    if not isinstance(data, dict):
+        return ""
+    local = graphstore.parse_id(nid)["local"]
+    for kind in ("pr-", "issue-"):
+        if (node_class == "social" and local.startswith(kind)
+                and str(data.get("number")) == local[len(kind):]):
+            comments = list(data.get("comments_list") or [])
+            if kind == "pr-":
+                comments += data.get("review_comments") or []
+            return _social_text(data, comments)
+    if node_class == "code" and data.get("sha") == local:
+        return data.get("message") or ""
+    return ""
+
+
+def _backfill_fts(conn):
+    """Index every stored node the FTS index lacks (issue #111): one pass
+    over the social / code nodes not in fts_map, inside the fold's
+    transaction. Nodes with no text stay unindexed, as fold leaves them."""
+    graphstore.index_texts(conn, [
+        (nid, text) for nid, text in
+        ((nid, _fts_text_of(nid, cls, data))
+         for nid, cls, data in graphstore.fts_unindexed_nodes(conn)) if text],
+        commit=False)
+
+
+def _is_sole_window(conn, project, repo, meta):
+    """True when the bundle re-folds the ONLY window the store has gathered
+    for any repo of `project` (gathered_windows holds exactly this repo's
+    (from, to)). False without from/to or with an unreadable ledger."""
+    frm, to = meta.get("from"), meta.get("to")
+    if not frm or not to:
+        return False
+    try:
+        wins = graphstore.get_windows(conn)
+    except ValueError:
+        return False
+    mine = {(w.get("repo"), w.get("from"), w.get("to")) for w in wins
+            if isinstance(w, dict) and w.get("project") == project}
+    return mine == {(repo, frm, to)}
+
+
 def _standin_rows(conn, project, dsts, fetched):
     """Stand-in `structure` node rows for the depends_on targets in `dsts`
     that are not stored (create-if-absent: a real area node is never
@@ -6431,12 +6726,17 @@ def _standin_rows(conn, project, dsts, fetched):
 
 
 def _maintain_current_state(conn, bundle, project, repo, members,
-                            registry_by_slug, bicep_prefix_by_slug, fetched):
+                            registry_by_slug, bicep_prefix_by_slug, fetched,
+                            records=None):
     """Write the repo's current-state edges and retract the stale ones, inside
     the fold's transaction, after its nodes and window facts are written.
+    `records` is _maintain_record_edges' (retracted keys, removed people) of
+    the same fold (issue #111), logged with these in one ledger entry.
     Returns the fold summary {"retracted": {type: n}, "edges": [...],
-    "standins_removed": [...], "structure": bool}. See the block comment
-    above CURRENT_STATE_EDGE_TYPES and STORE.md "Current-state edges"."""
+    "standins_removed": [...], "people_removed": [...], "structure": bool}.
+    See the block comment above CURRENT_STATE_EDGE_TYPES and STORE.md
+    "Current-state edges"."""
+    record_retract, people_removed = records or (set(), [])
     meta = bundle.get("meta", {})
     prefix = graphstore.qualify_id(project, repo, "")
     writes, retract = {}, set()
@@ -6502,20 +6802,28 @@ def _maintain_current_state(conn, bundle, project, repo, members,
     removed = graphstore.delete_orphan_standins(
         conn, [k[1] for k in retract if k[2] == "depends_on"], commit=False)
 
+    retract = retract | set(record_retract)
     counts = {}
-    for key in retract:
+    for key in sorted(retract):
         counts[key[2]] = counts.get(key[2], 0) + 1
+    counts = {k: counts[k] for k in sorted(counts)}
     edges = sorted(list(k) for k in retract)
+    people_removed = sorted(people_removed)
     summary = {"retracted": counts, "edges": edges,
-               "standins_removed": removed, "structure": windows is not None}
-    if retract or removed:
+               "standins_removed": removed, "people_removed": people_removed,
+               "structure": windows is not None}
+    if retract or removed or people_removed:
         graphstore.record_retractions(conn, project, repo, {
             "from": meta.get("from"), "to": meta.get("to"),
             "counts": {k: counts[k] for k in sorted(counts)},
             "edges": edges[:graphstore.RETRACTION_LEDGER_EDGES],
-            "standins_removed": removed}, commit=False)
+            "standins_removed": removed,
+            "people_removed": people_removed}, commit=False)
+    # `records` (issue #111): every stored record's record-derived edges are
+    # what its content implies (this fold's records, and every other record
+    # once a fold since #111 healed the repo).
     graphstore.set_current_state(conn, project, repo, {
-        "items": True, "structure": windows is not None,
+        "items": True, "structure": windows is not None, "records": True,
         "from": meta.get("from"), "to": meta.get("to")}, commit=False)
     return summary
 
@@ -6524,15 +6832,31 @@ def describe_retractions(summary, project, repo):
     """One stderr line for a fold that retracted edges, or None."""
     counts = (summary or {}).get("retracted") or {}
     removed = (summary or {}).get("standins_removed") or []
-    if not counts and not removed:
+    people = (summary or {}).get("people_removed") or []
+    if not counts and not removed and not people:
         return None
-    parts = ", ".join("{} {}".format(counts[k], k) for k in sorted(counts))
-    line = "retracted {} stale current-state edge(s) of {}/{}{}".format(
-        sum(counts.values()), project, repo,
-        " ({})".format(parts) if parts else "")
+
+    def described(types):
+        sub = {k: counts[k] for k in counts if k in types}
+        parts = ", ".join("{} {}".format(sub[k], k) for k in sorted(sub))
+        return sum(sub.values()), " ({})".format(parts) if parts else ""
+    clauses = []
+    n, parts = described(CURRENT_STATE_EDGE_TYPES)
+    if n:
+        clauses.append("retracted {} stale current-state edge(s) of {}/{}{}"
+                       .format(n, project, repo, parts))
+    n, parts = described(set(counts) - set(CURRENT_STATE_EDGE_TYPES))
+    if n:
+        clauses.append("retracted {} edge(s) of {}/{} that the re-folded "
+                       "records no longer imply{}".format(n, project, repo,
+                                                          parts))
     if removed:
-        line += "; removed {} orphaned depends_on stand-in(s)".format(len(removed))
-    return line + " (meta retractions:{}/{})".format(project, repo)
+        clauses.append("removed {} orphaned depends_on stand-in(s)".format(
+            len(removed)))
+    if people:
+        clauses.append("removed {} person node(s) no contribution references "
+                       "any more".format(len(people)))
+    return "; ".join(clauses) + " (meta retractions:{}/{})".format(project, repo)
 
 
 def fold_bundle(conn, bundle, project=None, repo=None, members=None,
@@ -6553,8 +6877,12 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     Current-state edges (blocks, in_milestone, in_iteration, depends_on, owns;
     issue #95) are written last, by _maintain_current_state, equal to what the
     repo's stored inputs imply; the stale ones are retracted in the same
-    transaction. Returns that summary: {"retracted": {type: n}, "edges":
-    [[src, dst, type], ...], "standins_removed": [...], "structure": bool}.
+    transaction. Before them, the record-derived edges of the bundle's records
+    that their new content no longer implies are deleted, with the person
+    nodes left without a contribution edge (_maintain_record_edges, issue
+    #111). Returns the summary of both: {"retracted": {type: n}, "edges":
+    [[src, dst, type], ...], "standins_removed": [...], "people_removed":
+    [...], "structure": bool}.
     """
     meta = bundle.get("meta", {})
     # Identity override (Phase 9): a multi-repo run folds each member under one
@@ -6591,10 +6919,7 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
                 pr = {**pr, "external_refs": external}
             edges.extend(xedges)
         nodes.append((pid, project, repo, "social", ts, pr, fetched))
-        for n in pr.get("closes") or []:
-            edges.append((pid, qid("issue-{}".format(n)), "closes", None, None))
-        for n in pr.get("crossref_issues") or []:
-            edges.append((pid, qid("issue-{}".format(n)), "cross_ref", None, None))
+        edges.extend(_pr_spine_edges(pr, qid))
 
     # social: issues. Their `blocks` (issue->issue, blocker -> blocked) relation
     # edges are current-state: written by _maintain_current_state from the
@@ -6609,9 +6934,7 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     for c in bundle.get("commits", []):
         cid = qid(c["sha"])
         nodes.append((cid, project, repo, "code", c.get("date"), c, fetched))
-        prn = resolve_commit_pr(c.get("message", ""))
-        if prn is not None:
-            edges.append((cid, qid("pr-{}".format(prn)), "part_of", None, None))
+        edges.extend(_commit_part_of(c, qid))
 
     # code: file-level code-event ledger (rename/copy source -> detail).
     for ev in bundle.get("code_events", []):
@@ -6714,6 +7037,11 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # project upserts the identical id (idempotency is by the project-scoped id;
     # the sentinel keeps the row out of any single repo's repo_nodes view, an
     # extra no-leak guard). NULL ts -> excluded from window scans.
+    # A re-fold of the project's ONLY gathered window (issue #111): this bundle
+    # is then everything the store knows about its people, so its derivation
+    # REPLACES the stored one instead of being unioned with it — a commit
+    # re-attributed by a later gather of the window takes its areas along.
+    sole_window = _is_sole_window(conn, project, repo, meta)
     for login, rec in people.items():
         if not login:
             continue
@@ -6724,8 +7052,8 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         # person has no area attribution) would erase another member's. Union keeps
         # the person node the true project-wide aggregate, independent of fold order
         # and idempotent (re-folding a member unions a subset -> no change).
-        prior = conn.execute("SELECT data FROM nodes WHERE id=?",
-                             (qperson(login),)).fetchone()
+        prior = None if sole_window else conn.execute(
+            "SELECT data FROM nodes WHERE id=?", (qperson(login),)).fetchone()
         if prior and prior[0]:
             pd = json.loads(prior[0])
             data["areas"] = sorted(set(rec.get("areas") or []) | set(pd.get("areas") or []))
@@ -6733,27 +7061,11 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             data["is_bot"] = bool(rec.get("is_bot")) or bool(pd.get("is_bot"))
         nodes.append((qperson(login), project, "*", "structure", None, data, fetched))
 
-    def contrib(login, dst_local, etype):
-        if login:
-            edges.append((qperson(login), qid(dst_local), etype, None, None))
-
     # Contribution edges from the RAW records (person -> node). Idempotent by
     # (src,dst,type); absent logins/fields are skipped cleanly.
-    for pr in bundle.get("prs", []):
-        prlocal = "pr-{}".format(pr["number"])
-        contrib(pr.get("author"), prlocal, "authored")
-        contrib(pr.get("merged_by"), prlocal, "merged")
-        for reviewer in pr.get("reviewers") or []:
-            contrib(reviewer, prlocal, "reviewed")
-        for c in (pr.get("comments_list") or []) + (pr.get("review_comments") or []):
-            contrib(c.get("author"), prlocal, "commented")
-    for iss in bundle.get("issues", []):
-        isslocal = "issue-{}".format(iss["number"])
-        contrib(iss.get("author"), isslocal, "reported")
-        for c in iss.get("comments_list") or []:
-            contrib(c.get("author"), isslocal, "commented")
-    for c in bundle.get("commits", []):
-        contrib(c.get("author"), c["sha"], "authored")
+    edges.extend(_contribution_edges(bundle.get("prs", []),
+                                     bundle.get("issues", []),
+                                     bundle.get("commits", []), qid, qperson))
 
     # Phase 10 slice 1: PR review submissions + lifecycle events as first-class
     # `social` nodes with a `part_of` spine edge to their parent. Folded by stable
@@ -6801,7 +7113,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # _maintain_current_state (_owns_pairs over the windows' facts).
 
     # touches (commit/pr -> area): the distinct areas a commit's files land in.
-    # History: a commit's files never change, so touches are only added.
+    # History: only added (they also depend on the code graph), except that a
+    # commit whose stored file list changed gets this fold's touches (#111,
+    # _maintain_record_edges).
     for c in bundle.get("commits", []):
         touched = derive._commit_areas(c, area_idx)
         for aid in sorted(touched):
@@ -6864,9 +7178,27 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # `with conn:` commits on success and rolls back on any exception, so a crash
     # mid-fold never leaves a half-folded store for readers to serve. (A caller's
     # own uncommitted writes on this connection join the same transaction.)
+    # Record-derived edges (issue #111): read what the fold needs to know about
+    # the records it replaces before it writes them. A repo whose last fold
+    # predates #111 (no `records` in its current_state marker) but already
+    # holds data is healed once, from its stored records.
+    state = graphstore.get_current_state(conn, project, repo) or {}
+    heal = not state.get("records") and _repo_has_nodes(conn, project, repo)
     with conn:
+        # FTS coverage (issue #111): a store folded on a host without FTS5 has
+        # records the index lacks; the first fold with FTS5 since then indexes
+        # every stored node the index lacks, before this fold writes anything
+        # (so a fold into an empty store indexes exactly as before).
+        if graphstore.fts5_available(conn) and graphstore.get_meta(
+                conn, graphstore.FTS_COVERAGE_KEY) != graphstore.FTS_COMPLETE:
+            _backfill_fts(conn)
+        prior_files = _stored_commit_files(
+            conn, project, repo, [c["sha"] for c in bundle.get("commits", [])])
         graphstore.upsert_nodes(conn, nodes, commit=False)
         graphstore.upsert_edges(conn, edges, commit=False)
+        records = _maintain_record_edges(
+            conn, bundle, project, repo, members, {e[:3] for e in edges},
+            prior_files, heal)
         graphstore.add_code_events(conn, events, commit=False)
         graphstore.upsert_nodes(
             conn, _fold_artifacts(conn, bundle, project, repo, fetched),
@@ -6882,6 +7214,9 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         #   - issue social nodes: title + body + embedded comment authors+bodies
         #   - commit code nodes: the commit message
         # Empty text is skipped: it indexes nothing useful.
+        # Coverage (issue #111): the index now holds every stored record (the
+        # back-fill above ran first when it did not); a fold without FTS5
+        # marks it partial.
         if graphstore.fts5_available(conn):
             texts = []
             for pr in bundle.get("prs", []):
@@ -6896,6 +7231,11 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
             graphstore.index_texts(
                 conn, [(qid(local), text) for local, text in texts if text],
                 commit=False)
+            graphstore.set_meta(conn, graphstore.FTS_COVERAGE_KEY,
+                                graphstore.FTS_COMPLETE, commit=False)
+        else:
+            graphstore.set_meta(conn, graphstore.FTS_COVERAGE_KEY,
+                                graphstore.FTS_PARTIAL, commit=False)
 
         graphstore.record_window(conn, project, repo, meta.get("from"),
                                  meta.get("to"), commit=False)
@@ -6942,7 +7282,8 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
         # window facts written above, and retract what those no longer imply.
         summary = _maintain_current_state(conn, bundle, project, repo, members,
                                           registry_by_slug,
-                                          bicep_prefix_by_slug, fetched)
+                                          bicep_prefix_by_slug, fetched,
+                                          records=records)
     return summary
 
 

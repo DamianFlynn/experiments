@@ -120,7 +120,11 @@ cross-month `spotlight` queries possible.
   `modules`/`areas` computed with that month's code graph (#94);
 - `validate` on the whole store: dependency, ownership, area-touch, milestone, sprint and
   blocker edges are proven exactly (ERROR on a stale or missing one) once a fold since #95
-  has run and every month has its per-month facts.
+  has run and every month has its per-month facts; closing-reference, commit → PR and
+  contribution edges (and the people they name) always, because each fold makes them what
+  the re-gathered PR / issue / commit now says (#111): a PR open in one month and merged the
+  next with an edited body, a deleted comment or a removed reviewer, or a commit whose
+  author resolves to a login on a later gather, leaves no stale edge or person.
 
 **Not exact, or different:**
 
@@ -142,14 +146,18 @@ cross-month `spotlight` queries possible.
    `--structural-iac` for a single repo) shows it gone — so **pass `--structural-iac` on a
    single-repo accumulated store** — a transitive dependency only on a new build, an owner
    only when a later month's code graph lists the area (HLD §10 item 9).
-4. **Fold months oldest first.** Milestone / sprint / blocker edges follow the last-folded
-   copy of each PR/issue, so re-folding an older month after a newer one brings its older
-   relations back. A month's structure is read at that month's last
+4. **Fold months oldest first.** Milestone / sprint / blocker edges, closing references,
+   contribution edges and people follow the last-folded copy of each PR/issue/commit, so
+   re-folding an older month after a newer one brings its older relations back. A month's structure is read at that month's last
    mainline commit, so a past month gathered late still reads its own tree (unless the
    bounded clone does not reach it: `meta.structure_as_of: "head"`).
 5. **Some `validate` results stay WARN:** person areas (a union over the months by design),
    and any current-state edge type while the store was last folded before #95 (fold one
-   month again) or holds a month gathered before #94 (re-gather it; §2.2).
+   month again) or holds a month gathered before #94 (re-gather it; §2.2). A store last
+   folded before #111 that holds stale closing / contribution edges FAILS `edge_set` with
+   the hint "fold any window of it once more": the next fold of any month heals every
+   record (gather prints `retracted N edge(s) of P/R that the re-folded records no longer
+   imply`).
 
 ### 2.2 Upgrading the skill: which stores to re-gather
 
@@ -168,7 +176,11 @@ into a **fresh** store for the first item, into the same store for the others:
 | #109 (collection review) | an issue of ANOTHER repo that mentions a PR made the same-numbered local issue a `cross_ref` of it; commits (and their code/symbol events) are windowed on the committer's local day, not the UTC day PRs and issues use | an unrelated issue in a PR's train context / forecast; a commit made near midnight UTC in the neighbouring month. Re-gather into a fresh store (a mention edge the new records no longer imply fails `validate`) |
 
 A store last folded before #95 heals its current-state edges on the next fold of any window
-(gather prints `retracted N stale current-state edge(s) …`).
+(gather prints `retracted N stale current-state edge(s) …`). A store last folded before #111
+heals its record-derived edges (closing references, commit → PR links, contribution edges)
+and drops the people only they named on the next fold of any window, and a store folded
+on a host without SQLite FTS5 gets its whole text index on the next fold on a host with it;
+nothing to re-gather.
 
 ## 3. Running it through Claude Code (the normal way)
 
@@ -837,6 +849,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | the WARN names why the edge type cannot be proven: the repo was last folded before #95, a window has no per-window facts (pre-#94), `touches` across a graphify / re-mapped code graph; person areas are always a union over the windows | not a failure. Fold one window again (pre-#95) or re-gather pre-#94 windows to make the edge checks exact |
 | `validate` ERROR `edge_set` on a `depends_on`/`owns`/`touches`/`in_milestone`/`in_iteration`/`blocks` edge of a store holding several windows | since #95 these are exact on a store a current fold maintained: the edge is not what the stored records / per-window facts imply | a producer defect or a hand-edited store: report it; don't publish |
 | `gather` stderr `retracted N stale current-state edge(s) of P/R (…)` | the fold found edges its inputs no longer imply (a removed module reference, a CODEOWNERS change, an item moved off a milestone/sprint, a blocker edited away), or healed an older store | expected; the edges are listed in `meta.retractions:P/R` |
+| `gather` stderr `retracted N edge(s) of P/R that the re-folded records no longer imply (…)`, `removed K person node(s) no contribution references any more` | a re-gathered PR / issue / commit no longer states a closing reference, commit → PR link, author, merger, reviewer or commenter it stated before (#111), or the first fold since #111 healed an older store | expected; listed in `meta.retractions:P/R` |
 | `validate` ERROR `provenance` "url names repo X, the node is in Y" | the repo was renamed or transferred and gathered under its old name (GitHub returns links with the new name), or the node was edited | gather under the repo's current name |
 | `validate` ERROR `provenance` "commit id … is not a 40/64-hex git sha" / ERROR `no_fabrication` id problems | a hand-made or corrupted node; gather writes only real shas and grammar ids | re-gather; never hand-edit the store |
 | `validate --repo R` of a multi-repo project passes but the project run fails `no_drift_people` | a single-member audit checks only the people that member derives (people are project-wide) | run `validate.py STORE --project P` without `--repo` for the full people check |

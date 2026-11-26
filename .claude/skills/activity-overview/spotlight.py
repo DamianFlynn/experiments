@@ -1895,9 +1895,11 @@ def main(argv=None):
                      "(it is time-independent)")
     try:
         if args.ts_from is not None:
-            manifest.check_reader_window(args.ts_from, args.ts_to or args.ts_from)
+            args.ts_from = manifest.check_reader_window(
+                args.ts_from, args.ts_to or args.ts_from)[0]
         if args.ts_to is not None:
-            manifest.check_reader_window(args.ts_from or args.ts_to, args.ts_to)
+            args.ts_to = manifest.check_reader_window(
+                args.ts_from or args.ts_to, args.ts_to)[1]
     except ValueError as exc:
         parser.error(str(exc))
 

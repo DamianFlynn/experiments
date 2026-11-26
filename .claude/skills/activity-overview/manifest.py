@@ -134,16 +134,36 @@ def check_ref_date(value, what="--ref-date"):
     return value
 
 
+def normalize_reader_bound(value, what="bound"):
+    """A validated reader window bound in the one form the store compares
+    (issue #111): a `YYYY-MM-DD` date is returned as is (it covers its whole
+    day: graphstore.ts_in_window compares it on the date); a timestamp is
+    converted to UTC and written `YYYY-MM-DDTHH:MM:SSZ`, its fractional
+    seconds dropped (bounds are second-granular, like every stored GitHub
+    timestamp: the bound covers its whole second). So two spellings of one
+    instant (`...T01:00:00+01:00`, `...T00:00:00.000Z`, `...T00:00:00Z`)
+    give one bound and string comparison against stored `...Z` timestamps
+    orders correctly. Raises ValueError naming `what` like _bound_instant."""
+    instant = _bound_instant(value, what, end=False)
+    if _DATE_RE.fullmatch(value):
+        return value
+    return instant.replace(microsecond=0).astimezone(
+        datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def check_reader_window(ts_from, ts_to, what_from="--from", what_to="--to"):
     """Validate a READER window (view/digest/spotlight): each bound is a date or a
     full timestamp, validated in full, and from <= to as instants (a date-only
-    `to` covers its whole day). Returns (ts_from, ts_to) unchanged."""
+    `to` covers its whole day). Returns (ts_from, ts_to) NORMALISED
+    (normalize_reader_bound: dates as given, timestamps as UTC
+    `YYYY-MM-DDTHH:MM:SSZ`); every reader queries with the returned values."""
     lo = _bound_instant(ts_from, what_from, end=False)
     hi = _bound_instant(ts_to, what_to, end=True)
     if lo > hi:
         raise ValueError("{} {} is after {} {}".format(
             what_from, ts_from, what_to, ts_to))
-    return ts_from, ts_to
+    return (normalize_reader_bound(ts_from, what_from),
+            normalize_reader_bound(ts_to, what_to))
 
 
 def check_branch(value, what="'branch'"):

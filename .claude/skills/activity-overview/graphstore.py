@@ -416,13 +416,11 @@ def edges_by_type(conn, edge_type, project):
 
 def add_code_event(conn, artifact_id, event, commit_sha, author=None, date=None,
                    hunk=None, ref=None, before=None, after=None, detail=None):
-    """Append one artifact lifecycle event. Keyed by (artifact, commit, event):
-    re-seeing the same event is a no-op (set semantics), so re-folding a window
-    never duplicates a lifecycle entry."""
+    """Record one artifact lifecycle event. Keyed by (artifact, commit, event):
+    re-seeing the same event never duplicates a lifecycle entry; its other
+    columns take the new values (issue #111, see add_code_events)."""
     conn.execute(
-        "INSERT OR IGNORE INTO code_events "
-        "(artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _CODE_EVENT_UPSERT,
         (
             artifact_id, event, commit_sha, author, date, hunk,
             json.dumps(ref, sort_keys=True) if ref is not None else None,
@@ -482,25 +480,40 @@ def upsert_edges(conn, rows, commit=True):
             conn.commit()
 
 
+# Keyed by (artifact, commit, event); the other columns are what the latest
+# fold of that commit says (issue #111): a commit whose author resolution
+# changed (#78) re-credits its rows, like the commit record it belongs to.
+_CODE_EVENT_UPSERT = (
+    "INSERT INTO code_events "
+    "(artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(artifact_id, commit_sha, event) DO UPDATE SET "
+    "author=excluded.author, date=excluded.date, hunk=excluded.hunk, "
+    "ref=excluded.ref, before=excluded.before, after=excluded.after, "
+    "detail=excluded.detail")
+
+
 def add_code_events(conn, rows, commit=True):
-    """Batch-append code events (set semantics, INSERT OR IGNORE). rows match
-    add_code_event's positional args: (artifact_id, event, commit_sha, author,
-    date, hunk, ref, before, after, detail). `ref` is JSON-serialized.
-    `commit=False`: see upsert_nodes."""
-    payload = []
+    """Batch-upsert code events. rows match add_code_event's positional args:
+    (artifact_id, event, commit_sha, author, date, hunk, ref, before, after,
+    detail). `ref` is JSON-serialized. Keyed by (artifact, commit, event): a
+    key already stored takes this batch's other columns (latest fold wins,
+    issue #111); within one batch the FIRST row of a key wins, as it did
+    with INSERT OR IGNORE, so a fold into an empty store writes what it
+    always wrote. `commit=False`: see upsert_nodes."""
+    payload, seen = [], set()
     for (artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) in rows:
+        key = (artifact_id, commit_sha, event)
+        if key in seen:
+            continue
+        seen.add(key)
         payload.append((
             artifact_id, event, commit_sha, author, date, hunk,
             json.dumps(ref, sort_keys=True) if ref is not None else None,
             before, after, detail,
         ))
     if payload:
-        conn.executemany(
-            "INSERT OR IGNORE INTO code_events "
-            "(artifact_id, event, commit_sha, author, date, hunk, ref, before, after, detail) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            payload,
-        )
+        conn.executemany(_CODE_EVENT_UPSERT, payload)
         if commit:
             conn.commit()
 
@@ -547,6 +560,14 @@ def ts_in_window(ts, ts_from, ts_to):
     - ISO bounds keep date-only-ts nodes (commits) on the first and last day
       (`2026-03-01` is inside `from=2026-03-01T00:00:00Z`).
 
+    Two datetimes are compared at SECOND granularity, on their first 19
+    characters (`YYYY-MM-DDTHH:MM:SS`), so a stored ts with fractional seconds
+    (`...:00.5Z`; GitHub sends none) is not misordered by the `.` sorting
+    before `Z`: like a date-only value, it counts as its whole second. Both
+    sides are taken to be UTC: stored GitHub timestamps end in `Z`, and
+    readers pass bounds through manifest.check_reader_window, which converts
+    an offset to UTC `...Z` (issue #111).
+
     Inclusive at both ends; either bound may be None (one-sided / unbounded).
     An empty/None `ts` cannot be proven in-window -> False. `range_query`'s SQL
     implements exactly this rule; every other window check delegates here."""
@@ -556,13 +577,13 @@ def ts_in_window(ts, ts_from, ts_to):
         if _is_date_only(ts_from) or _is_date_only(ts):
             if ts[:10] < ts_from[:10]:
                 return False
-        elif ts < ts_from:
+        elif ts[:19] < ts_from[:19]:
             return False
     if ts_to:
         if _is_date_only(ts_to) or _is_date_only(ts):
             if ts[:10] > ts_to[:10]:
                 return False
-        elif ts > ts_to:
+        elif ts[:19] > ts_to[:19]:
             return False
     return True
 
@@ -592,10 +613,10 @@ def _window_sql(ts_from, ts_to):
         clauses.append("ts >= ?")
         params.append(day)
         if not _is_date_only(ts_from):
-            # ISO bound: an ISO ts compares precisely; a date-only ts on/after
-            # the bound's day already passed the prefix test above.
-            clauses.append("(ts >= ? OR instr(ts, 'T') = 0)")
-            params.append(ts_from)
+            # ISO bound: an ISO ts compares to the second; a date-only ts
+            # on/after the bound's day already passed the prefix test above.
+            clauses.append("(substr(ts, 1, 19) >= ? OR instr(ts, 'T') = 0)")
+            params.append(ts_from[:19])
     if ts_to:
         day = ts_to[:10]
         nxt = _next_day(day)
@@ -605,8 +626,8 @@ def _window_sql(ts_from, ts_to):
         clauses.append("substr(ts, 1, 10) <= ?")
         params.append(day)
         if not _is_date_only(ts_to):
-            clauses.append("(ts <= ? OR instr(ts, 'T') = 0)")
-            params.append(ts_to)
+            clauses.append("(substr(ts, 1, 19) <= ? OR instr(ts, 'T') = 0)")
+            params.append(ts_to[:19])
     return " AND ".join(clauses), params
 
 
@@ -897,6 +918,27 @@ def index_texts(conn, items, commit=True):
         _index_one(conn, node_id, text)
     if commit:
         conn.commit()
+
+
+# FTS coverage (issue #111): whether fts_text holds every indexable stored
+# node. A fold on a host without FTS5 cannot index its records, so it sets
+# "partial"; the next fold WITH FTS5 that finds the key not "complete" (also
+# on a store that predates the key) indexes every stored node fts_map lacks
+# (gather._backfill_fts, one pass) and sets "complete".
+FTS_COVERAGE_KEY = "fts_coverage"
+FTS_COMPLETE = "complete"
+FTS_PARTIAL = "partial"
+
+
+def fts_unindexed_nodes(conn):
+    """[(id, node_class, data)] of the stored social / code nodes that have no
+    fts_text row (not in fts_map), sorted by id. Creates fts_map if absent
+    (writer only; needs FTS5)."""
+    _ensure_fts_map(conn)
+    return [(r[0], r[1], json.loads(r[2]) if r[2] else None) for r in conn.execute(
+        "SELECT id, node_class, data FROM nodes WHERE node_class IN "
+        "('social', 'code') AND id NOT IN (SELECT node_id FROM fts_map) "
+        "ORDER BY id")]
 
 
 def fts_search(conn, query):
@@ -1211,6 +1253,26 @@ def get_window_facts(conn, project, repo, frm, to, keys=WINDOW_FACT_KEYS):
             "ci_collected": bool(entry.get("ci_collected", True))}
 
 
+def split_window_key(key, prefix):
+    """(scope, window) of a per-window meta key `{prefix}{project}/{repo}:
+    {from}:{to}` (`facts:`, `ref_date:`, `branches:`, `clone:`), or None when
+    the key does not have that shape. The project may contain `:` and the
+    bounds may be timestamps, so the key is not split on its first `:`: the
+    project ends at the first `/` (a project name has none, check_project)
+    and the repo (`name` or `owner/name`, GitHub's alphabet: no `:`) at the
+    next `:` (issue #111)."""
+    if not key.startswith(prefix):
+        return None
+    rest = key[len(prefix):]
+    slash = rest.find("/")
+    if slash < 0:
+        return None
+    colon = rest.find(":", slash)
+    if colon < 0:
+        return None
+    return rest[:colon], rest[colon + 1:]
+
+
 def window_facts_problems(conn):
     """[(meta key, problem)] for every per-window facts entry of the store
     that is unreadable or names a value that is not stored (issue #94)."""
@@ -1219,8 +1281,8 @@ def window_facts_problems(conn):
         try:
             entry = json.loads(value)
             refs = entry.get("facts") or {}
-            scope = key[len("facts:"):].split(":", 1)[0]
-        except (ValueError, AttributeError):
+            scope = split_window_key(key, "facts:")[0]
+        except (ValueError, AttributeError, TypeError):
             out.append((key, "unreadable per-window facts entry"))
             continue
         for fact in sorted(refs):
@@ -1236,7 +1298,10 @@ def window_facts_problems(conn):
 # gather.fold_bundle and STORE.md "Current-state edges").
 #
 # `current_state:{project}/{repo}` records how the LAST fold of the repo kept
-# them: {"items": true, "structure": <bool>, "from", "to"}. `items` is true
+# them: {"items": true, "structure": <bool>, "records": true, "from", "to"}.
+# `records` (issue #111) is true once a fold kept the record-derived edges of
+# every stored record equal to its content (gather._maintain_record_edges;
+# the first such fold of a repo heals all its records). `items` is true
 # once a fold rebuilt the item relations (blocks / in_milestone /
 # in_iteration) from the stored records; `structure` is true when that fold
 # could replay depends_on / owns over every gathered window's facts (false
@@ -1245,7 +1310,8 @@ def window_facts_problems(conn):
 # exact. `retractions:{project}/{repo}` is the ledger of what folds retracted:
 # a JSON list (oldest first, at most RETRACTION_LEDGER_MAX entries) of
 # {"from", "to", "counts": {type: n}, "edges": [[src, dst, type], ...] (at
-# most RETRACTION_LEDGER_EDGES, sorted), "standins_removed": [id, ...]}. A
+# most RETRACTION_LEDGER_EDGES, sorted), "standins_removed": [id, ...],
+# "people_removed": [id, ...] (#111; absent from entries written before)}. A
 # fold that retracts nothing appends nothing, so a re-fold stays a no-op.
 RETRACTION_LEDGER_MAX = 100
 RETRACTION_LEDGER_EDGES = 200

@@ -514,7 +514,13 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
    later window rebuilt), a transitive edge only on a new build, and an area's owners only
    when a later window lists the area. The item relations follow the last-folded record, so
    folding an older window after a newer one brings its older relations back — fold oldest
-   first.
+   first. The same holds for the record-derived edges (#111): after a fold re-gathers a PR,
+   issue or commit, its closing references, commit → PR link and contribution edges are what
+   its new content implies (a closing reference edited away, a deleted comment, a removed
+   reviewer or a commit author resolved to a login on a later gather leave nothing behind),
+   and a person no contribution references any more is deleted; a record the fold does not
+   carry keeps its edges. Review / event nodes and ledger rows a re-gather no longer reports
+   stay (LLD §14.5).
 10. **Forecast depends on planning hygiene.** Candidates require a next milestone (one with a
     due date) or one of the recognized priority labels (`priority/high`, `priority/critical`,
     `p0`, `p1`, `high-priority`, `critical`); repos with other label names need
@@ -602,7 +608,9 @@ each recorded move against the ledger instead of re-matching across windows, and
 idempotency probe reports a whole-store re-match as INFO (LLD §8).
 
 **What the trust gate proves (#79, #89).** `validate` proves the store is *consistent*:
-every edge is exactly what the stored records imply (`edge_set`, both directions), people
+every edge is exactly what the stored records imply (`edge_set`, both directions; the
+record-derived ones on every store, since a fold keeps them equal to the re-folded record,
+#111), people
 are re-derived from the records alone, every PR/issue/review/event cites its own GitHub
 link and every commit id is a real sha, and ids follow the grammar. It does not prove the
 records are what GitHub holds: a record deleted with all its edges, a blob rewritten

@@ -581,16 +581,32 @@ class TestPeopleIdentity(_Case):
         graphstore.upsert_node(conn, qid, "o", "*", "structure", None, data)
         self.assertFailsOn(conn, "no_drift", "login_resolved")
 
-    def test_pre_78_git_name_person_gets_an_actionable_message(self):
-        # A pre-#78 store: dave's commit was keyed by his git name.
+    def _pre78_store(self):
         old = _bundle()
         for c in old["commits"]:
             if c["author"] == "dave":
                 c["author"] = "Dave D"
-        conn = _store(old)
-        # Re-gathered after #78: the same commit now names the login.
-        _set_data(conn, "o/r#" + C4, author="dave")
+        return _store(old)
+
+    def test_pre_78_git_name_person_gets_an_actionable_message(self):
+        # A pre-#78 store: dave's commit was keyed by his git name.
+        conn = self._pre78_store()
+        stale = [tuple(r) for r in conn.execute(
+            "SELECT * FROM edges WHERE src_id='o#person-Dave D'")]
+        person = tuple(conn.execute(
+            "SELECT * FROM nodes WHERE id='o#person-Dave D'").fetchone())
+        # Re-gathered after #78 by a fold from before #111, which only ever
+        # added edges: the commit now names the login, the git-name person
+        # and its `authored` edge stay beside it (and the marker has no
+        # `records`).
         gather.fold_bundle(conn, _bundle())
+        conn.executemany("INSERT OR IGNORE INTO edges VALUES (?, ?, ?, ?, ?)",
+                         stale)
+        conn.execute("INSERT OR IGNORE INTO nodes VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     person)
+        state = graphstore.get_current_state(conn, "o", "r")
+        state.pop("records")
+        graphstore.set_current_state(conn, "o", "r", state)
         report = _report(conn)
         nd = _check(report, "no_drift")
         self.assertIs(nd["ok"], False)
@@ -601,6 +617,15 @@ class TestPeopleIdentity(_Case):
         es = _check(report, "edge_set")
         self.assertIs(es["ok"], False)
         self.assertIn("#78", json.dumps(es["details"]))
+
+    def test_refold_since_111_recredits_the_git_name_person(self):
+        # Since #111 the re-gather itself re-credits the commit: the
+        # git-name person and its edge go, and the store is clean.
+        conn = self._pre78_store()
+        summary = gather.fold_bundle(conn, _bundle())
+        self.assertEqual(summary["people_removed"], ["o#person-Dave D"])
+        self.assertIsNone(graphstore.get_node(conn, "o#person-Dave D"))
+        self.assertClean(conn)
 
 
 # --- multi-window and multi-repo stores stay green -------------------------------

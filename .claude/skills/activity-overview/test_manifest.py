@@ -281,12 +281,18 @@ class TestFullStringValidation(unittest.TestCase):
                     check(value)
 
     def test_reader_window_validates_whole_bounds(self):
-        ok = (("2026-05-01", "2026-05-31"), ("2026-05-01", "2026-05-01"),
-              ("2026-05-01T00:00:00Z", "2026-05-31T23:59:59Z"),
-              ("2026-05-01T09:00:00+02:00", "2026-05-01"))
-        for a, b in ok:
+        # Returned normalised (issue #111): dates as given, timestamps as UTC
+        # `...Z` without fractional seconds.
+        ok = ((("2026-05-01", "2026-05-31"),) * 2,
+              (("2026-05-01", "2026-05-01"),) * 2,
+              (("2026-05-01T00:00:00Z", "2026-05-31T23:59:59Z"),) * 2,
+              (("2026-05-01T09:00:00+02:00", "2026-05-01"),
+               ("2026-05-01T07:00:00Z", "2026-05-01")),
+              (("2026-05-01T00:00:00.250Z", "2026-05-01T23:00:00-01:30"),
+               ("2026-05-01T00:00:00Z", "2026-05-02T00:30:00Z")))
+        for (a, b), want in ok:
             with self.subTest(a=a, b=b):
-                self.assertEqual(manifest.check_reader_window(a, b), (a, b))
+                self.assertEqual(manifest.check_reader_window(a, b), want)
         bad = (("2026-05-01Tgarbage", "2026-05-31"),
                ("2026-05-01T12:00:00Z", "2026-05-01T09:00:00Z"),
                ("2026-05-31", "2026-05-01"), ("2026-02-30", "2026-03-01"),
