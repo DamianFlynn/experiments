@@ -651,13 +651,34 @@ _QUALIFIED_URL_RE = re.compile(
 )
 
 
-_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+# A terminated comment anywhere, or an unterminated one that starts a line (an
+# HTML block, which then runs to the end of the text).
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->|(?m:^[ \t]{0,3})<!--.*\Z", re.DOTALL)
+# Markdown code: fenced blocks and inline spans. A `<!--` written there is a
+# literal, not a comment opener.
+_MD_CODE_RE = re.compile(
+    r"(?m)^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}(?P=fence)[ \t]*$|\Z)"
+    r"|(?P<tick>`+)(?!`).+?(?<!`)(?P=tick)(?!`)", re.DOTALL)
 
 
 def _visible_text(text):
     """`text` without its HTML comments (`<!-- ... -->`; an unterminated one
-    runs to the end): what GitHub renders and scans for references. Pure."""
-    return _HTML_COMMENT_RE.sub(" ", text or "")
+    that starts a line runs to the end): what GitHub renders and scans for
+    references. A `<!--` inside Markdown code (a fenced block or an inline
+    span) is a literal and opens nothing; code content itself stays scanned,
+    as before. Pure."""
+    text = text or ""
+    if "<!--" not in text:
+        return text
+    # find comments on a copy whose code has no `<` (same length, same offsets)
+    probe = _MD_CODE_RE.sub(lambda m: m.group(0).replace("<", " "), text)
+    out, pos = [], 0
+    for m in _HTML_COMMENT_RE.finditer(probe):
+        out.append(text[pos:m.start()])
+        out.append(" ")
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _ref_from_match(m):

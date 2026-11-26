@@ -1974,8 +1974,25 @@ class TestHtmlCommentsAreNotScanned(unittest.TestCase):
         self.assertEqual(gather.parse_blocks_refs("blocked by #11"),
                          [{"number": 11, "direction": "in"}])
 
-    def test_unterminated_comment_hides_the_rest(self):
-        self.assertEqual(gather.parse_closing_refs("Fixes #1 <!-- Fixes #2"), [1])
+    def test_unterminated_comment_at_line_start_hides_the_rest(self):
+        self.assertEqual(
+            gather.parse_closing_refs("Fixes #1\n<!-- Fixes #2\nFixes #3"), [1])
+
+    def test_literal_opener_in_code_is_not_a_comment(self):
+        # review finding: "Document the `<!--` delimiter." must not hide what follows
+        text = "Document the `<!--` delimiter.\n\nFixes #7, blocked by #8\n"
+        self.assertEqual(gather.parse_closing_refs(text), [7])
+        self.assertEqual(gather.parse_blocks_refs(text),
+                         [{"number": 8, "direction": "in"}])
+        fenced = "```html\n<!-- example\n```\nFixes #9 https://github.com/a/b/issues/4\n"
+        self.assertEqual(gather.parse_closing_refs(fenced), [9])
+        self.assertEqual([r["number"] for r in gather.parse_qualified_refs(fenced)], [4])
+
+    def test_opener_mid_line_without_a_close_is_text(self):
+        self.assertEqual(gather.parse_closing_refs("use <!-- here. Fixes #5"), [5])
+
+    def test_code_content_is_still_scanned(self):
+        self.assertEqual(gather.parse_closing_refs("`Fixes #6`"), [6])
 
     def test_normalize_pr_ignores_the_template_example(self):
         pr = gather.normalize_pr({"number": 5, "title": "t", "body": self.TEMPLATE,
