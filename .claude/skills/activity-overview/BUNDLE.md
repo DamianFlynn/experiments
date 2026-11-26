@@ -629,7 +629,10 @@ review's state to `DISMISSED`.
   (Bicep) or `terraform init -backend=false`+`terraform graph` (Terraform) against the cloned
   working tree. When the CLI or registry is unavailable, or a build fails, that area's `edges`
   stays `[]`. Immediate (`transitive:false`) edges are fully identified (area-id + version) from
-  source. **Bicep has no transitive edges**: they used to be guessed from the names of nested
+  source — the entry file's `module` references plus those of every file of the same area it
+  reaches through local references (a `./resources.bicep` beside the entry file is part of the
+  module, not a dependency on itself; a file in a subdirectory is a private child, named
+  `<area>/<child>` with `local: true`). **Bicep has no transitive edges**: they used to be guessed from the names of nested
   ARM deployments and were mostly wrong on real repositories (final-gate finding, #97); what a
   module reaches indirectly is the closure of the direct edges. A store gathered before this
   drops its guessed edges of an area the next time that area's build resolves. **Terraform (#80):** the direct edges are the area's

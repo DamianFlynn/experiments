@@ -2229,7 +2229,7 @@ def _normalize_id(text):
 
 
 def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None,
-                      module_exists=None):
+                      module_exists=None, read_local=None):
     """Build inter-area dependency edges for one Bicep area.
 
     Immediate edges (transitive=False) come from the SOURCE refs — fully identified
@@ -2242,33 +2242,52 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None,
     seen = set()
     self_id = classify_code_area(base_path, patterns)
 
-    for ri in parse_bicep_module_refs(source_text):
-        to = resolve_module_ref(ri, base_path, patterns, area_ids, module_exists)
-        local = False
-        # A local relative ref that resolves back to THIS area is a private child
-        # submodule (e.g. `nat-rule/main.bicep`), not a self-dependency. Name the
-        # child node (`<area>/<child>`) so the graph shows which private submodule
-        # is used; a ref to the area's own main.bicep is genuine recursion and is
-        # left as a self edge.
-        if ri.get("local_path") and to is not None and to == self_id:
-            joined = os.path.normpath(
-                os.path.join(os.path.dirname(base_path or ""), ri["local_path"]))
-            child_dir = os.path.dirname(joined)
-            if child_dir != self_id and child_dir.startswith(str(self_id) + "/"):
-                to = child_dir
-                local = True
-        key = (to, ri["ref"], False)
-        if key in seen:
-            continue
-        seen.add(key)
-        edge = {"to": to, "kind": "module", "ref": ri["ref"],
-                "version": ri["version"], "transitive": False,
-                "provider": "bicep", "resolved": to is not None}
-        if local:
-            edge["local"] = True
-            if ri.get("instances"):
-                edge["instances"] = ri["instances"]
-        edges.append(edge)
+    # The entry file, then every Bicep file of THIS area it reaches through
+    # local references (`read_local(rel_path) -> text | None`; without it only
+    # the entry file is read). A landing zone's `main.bicep` often does little
+    # but call `./resources.bicep`, which holds the real module calls.
+    entry_path = os.path.normpath(base_path or "")
+    queue, visited = [(source_text, base_path)], {entry_path}
+    while queue:
+        text, from_path = queue.pop(0)
+        for ri in parse_bicep_module_refs(text):
+            to = resolve_module_ref(ri, from_path, patterns, area_ids, module_exists)
+            local = False
+            # A local relative ref that resolves back to THIS area is one of its
+            # own files, not a dependency on itself. A file in a subdirectory is
+            # a private child (e.g. `nat-rule/main.bicep`): name the child node
+            # (`<area>/<child>`) so the graph shows which private submodule is
+            # used. A file beside the entry file (`./resources.bicep`) is just
+            # more of the module: no edge, its own references are followed. A
+            # ref to the entry file itself is genuine recursion and is left as
+            # a self edge.
+            if ri.get("local_path") and to is not None and to == self_id:
+                joined = os.path.normpath(
+                    os.path.join(os.path.dirname(from_path or ""), ri["local_path"]))
+                if joined != entry_path:
+                    if read_local is not None and joined not in visited:
+                        visited.add(joined)
+                        inner = read_local(joined)
+                        if inner is not None:
+                            queue.append((inner, joined))
+                    child_dir = os.path.dirname(joined)
+                    if child_dir != self_id and child_dir.startswith(str(self_id) + "/"):
+                        to = child_dir
+                        local = True
+                    else:
+                        continue
+            key = (to, ri["ref"], False)
+            if key in seen:
+                continue
+            seen.add(key)
+            edge = {"to": to, "kind": "module", "ref": ri["ref"],
+                    "version": ri["version"], "transitive": False,
+                    "provider": "bicep", "resolved": to is not None}
+            if local:
+                edge["local"] = True
+                if ri.get("instances"):
+                    edge["instances"] = ri["instances"]
+            edges.append(edge)
 
     # No transitive edges for Bicep. They used to be guessed by matching each
     # nested ARM deployment's `metadata.name` (a human title such as "Key Vault
@@ -2760,10 +2779,22 @@ def scan_structural_bicep_areas(clone_dir, patterns=None, list_files=None,
         if src is None:
             out[aid] = {"paths": sorted(by_area[aid]), "edges": [], "unread": True}
             continue
+        missed = []
+
+        def read_local(rel, _missed=missed):
+            text = read_text(rel)
+            if text is None:
+                _missed.append(rel)
+            return text
         edges = build_bicep_edges(src, None, entry[aid],
                                   modules, patterns,
-                                  module_exists=modules.__contains__)
+                                  module_exists=modules.__contains__,
+                                  read_local=read_local)
         out[aid] = {"paths": sorted(by_area[aid]), "edges": edges}
+        # a file of the area that could not be read: the edges found are kept,
+        # but the scan does not speak for the area (no retraction, #109)
+        if missed:
+            out[aid]["unread"] = True
     return out
 
 
@@ -3900,9 +3931,16 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
             if kind == "bicep":
                 arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
                 src = read_text(os.path.join(clone_dir, bp))
+                # A file of the area that cannot be read (refused symlink,
+                # unreadable) fails this attempt: a partial edge list must not
+                # be reported as `resolved`, or the replay would retract the
+                # stored edges of the part that was not read.
+                def read_local(rel):
+                    return read_text(os.path.join(clone_dir, rel))
                 return build_bicep_edges(
                     src, arm, bp, area_ids, patterns,
-                    module_exists=_clone_module_exists(clone_dir)), "resolved"
+                    module_exists=_clone_module_exists(clone_dir),
+                    read_local=read_local), "resolved"
             rel_dir = os.path.dirname(tp)
             dot = _terraform_graph_dot(run, clone_dir, rel_dir, timeout)
             # Read EVERY *.tf in the module dir (not just the entrypoint): a module's
