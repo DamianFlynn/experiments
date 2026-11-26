@@ -142,11 +142,13 @@ def _is_commit_node(node):
 
 
 def _is_artifact_node(node):
-    """True for an artifact `code` node (the non-commit ones `_is_commit_node`
-    excludes): file artifacts keyed `art:<path>`, symbol/comment artifacts keyed
-    `<path>#<lang>:<subkind>:<name>`. extract materializes the raw `artifacts`
-    dict by reading these nodes' data blobs (it does NOT re-run build_artifacts)."""
-    return not _is_commit_node(node)
+    """True for an artifact `code` node: file artifacts keyed `art:<path>`,
+    symbol/comment artifacts keyed `<path>#<lang>:<subkind>:<name>`. Decided by
+    the stored record (graphstore.is_artifact_node: a code node whose record
+    is not a commit's), not by the id shape (#101). extract materializes the raw
+    `artifacts` dict by reading these nodes' data blobs (it does NOT re-run
+    build_artifacts)."""
+    return graphstore.is_artifact_node(node)
 
 
 def _train_anchor(node):
@@ -849,6 +851,22 @@ def commit_times(conn, project, repo):
     return sorted(out, key=lambda c: c["sha"])
 
 
+def _symbol_row_test(conn, project, repo):
+    """Predicate `(local, commit_sha) -> bool`: is this ledger row a SYMBOL row
+    (graphstore.ledger_row_is_symbol)? A row with the symbol-tail shape is
+    checked against its commit's stored file list, read once on first need, so
+    a file path such as `notes#a:b:c.md` stays a file row (#101)."""
+    files = []
+
+    def is_symbol(local, sha):
+        if not graphstore.is_symbol_local(local):
+            return False
+        if not files:
+            files.append(graphstore.repo_commit_files(conn, project, repo))
+        return graphstore.ledger_row_is_symbol(local, files[0].get(sha))
+    return is_symbol
+
+
 def _materialize_code_events(conn, project, repo, rows=None, keep=None):
     """Reconstruct the raw `code_events` array from the file-level ledger, in
     original source order (ledger rowid order). rename/copy recover `old_path`
@@ -860,6 +878,7 @@ def _materialize_code_events(conn, project, repo, rows=None, keep=None):
     out = []
     if rows is None:
         rows = graphstore.repo_code_events(conn, project, repo)
+    is_symbol = _symbol_row_test(conn, project, repo)
     for ev in rows:
         if keep is not None and not keep(ev["commit_sha"], ev["date"]):
             continue
@@ -869,9 +888,10 @@ def _materialize_code_events(conn, project, repo, rows=None, keep=None):
         # Skip symbol-granular rows — they are part of the artifact substrate, not
         # this raw file-level `code_events` array. A file path MAY contain `#`
         # (`docs/C#-guide.md`); the symbol form is told apart by its
-        # `<lang>:<subkind>:<name>` tail (graphstore.split_symbol_local).
+        # `<lang>:<subkind>:<name>` tail (graphstore.split_symbol_local), unless
+        # the row's commit lists that exact path (_symbol_row_test).
         remainder = _full_local(aid, project, repo)
-        if graphstore.is_symbol_local(remainder):
+        if is_symbol(remainder, ev["commit_sha"]):
             continue
         rec = {
             "commit": ev["commit_sha"],
@@ -917,6 +937,7 @@ def _materialize_symbol_events(conn, project, repo, rows=None, keep=None):
     out = []
     if rows is None:
         rows = graphstore.repo_code_events(conn, project, repo)
+    is_symbol = _symbol_row_test(conn, project, repo)
     for ev in rows:
         if keep is not None and not keep(ev["commit_sha"], ev["date"]):
             continue
@@ -924,10 +945,10 @@ def _materialize_symbol_events(conn, project, repo, rows=None, keep=None):
         remainder = _full_local(aid, project, repo)
         # Symbol rows end in `#<lang>:<subkind>:<name>`. A bare `<path>` file-level
         # row (even with `#` in the path) has no such tail and belongs to
-        # code_events, not here.
-        split = graphstore.split_symbol_local(remainder)
-        if split is None:
+        # code_events, not here; nor does one whose commit lists that exact path.
+        if not is_symbol(remainder, ev["commit_sha"]):
             continue
+        split = graphstore.split_symbol_local(remainder)
         path, lang, subkind, name = split
         out.append({
             "path": path,

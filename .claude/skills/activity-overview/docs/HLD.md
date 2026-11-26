@@ -500,7 +500,9 @@ These are real, current limits — plan around them:
     calls whose module tree holds no resources are not in the graph, and without init's
     `modules.json` a nested call's target is unknown and is not folded. Single-repo gathers emit
     no Terraform edges at all without `terraform` unless given `--structural-iac`; manifest
-    gathers always get the static direct edges for every module dir.
+    gathers always get the static direct edges for every module dir. A nested module dir
+    under `modules/<name>/` (`modules/sub/inner/*.tf`) is its own area since #101; stores
+    gathered earlier keep those files under `modules/<name>` until re-gathered.
 12. **No historical in-flight state.** `gather` reads open PRs/issues, milestones and board
     status as they are *now*; re-gathering a past month reproduces its delivery history, not
     what was open or forecastable at the time.

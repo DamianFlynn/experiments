@@ -231,6 +231,65 @@ def is_artifact_local(local):
     return bool(local) and (local.startswith("art:") or is_symbol_local(local))
 
 
+# Classifying a STORED node or ledger row (#101). The id-shape helpers above are
+# the fallback for a dangling id only: a stored node is classified by its class
+# and record, so a structure node whose title holds `#<token>:<token>:` (e.g.
+# `milestone-v1#a:b:c`) is never an artifact.
+SYMBOL_ARTIFACT_KINDS = ("symbol", "comment")
+
+
+def is_artifact_node(node):
+    """True for a stored artifact node: a `code` node whose record is not a
+    commit's. Every commit record carries `sha` (gather writes it); an artifact
+    record (derive.build_artifacts) never does."""
+    data = node.get("data")
+    return node.get("node_class") == "code" and not (
+        isinstance(data, dict) and "sha" in data)
+
+
+def is_symbol_node(node):
+    """True for a stored symbol/comment artifact node (record `kind` symbol or
+    comment); a file artifact has a path kind (readme/doc/example)."""
+    return is_artifact_node(node) and isinstance(node.get("data"), dict) \
+        and node["data"].get("kind") in SYMBOL_ARTIFACT_KINDS
+
+
+def ledger_row_is_symbol(local, commit_files=None):
+    """True when a `code_events` ledger row keyed by `local` is a SYMBOL row.
+
+    File rows are keyed by the bare `<path>` and have no node of their own, so
+    the stored node that decides is the row's commit: when `commit_files` (that
+    commit's stored file list, repo_commit_files) names `local` itself, the row
+    is that file's row whatever its shape (`notes#a:b:c.md`). Otherwise (the
+    commit is not stored or has no file list) the id shape decides
+    (is_symbol_local)."""
+    if commit_files and local in commit_files:
+        return False
+    return is_symbol_local(local)
+
+
+def repo_commit_files(conn, project, repo):
+    """{sha: frozenset(files)} for the repo's stored commit nodes that carry a
+    non-empty file list (input to ledger_row_is_symbol). Only `code` rows whose
+    local id has a sha's length are decoded; a row counts when its `data.sha`
+    equals that local id."""
+    prefix = qualify_id(project, repo, "")
+    lo, hi = _prefix_range(prefix)
+    out = {}
+    for nid, raw in conn.execute(
+            "SELECT id, data FROM nodes WHERE id >= ? AND id < ? "
+            "AND node_class='code' AND length(id) IN (?, ?)",
+            (lo, hi, len(prefix) + 40, len(prefix) + 64)):
+        try:
+            data = json.loads(raw) if raw else None
+        except ValueError:
+            continue
+        sha = nid[len(prefix):]
+        if isinstance(data, dict) and data.get("sha") == sha and data.get("files"):
+            out[sha] = frozenset(f for f in data["files"] if isinstance(f, str))
+    return out
+
+
 def _row_to_node(row):
     return {
         "id": row["id"],

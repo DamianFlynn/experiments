@@ -320,9 +320,11 @@ bundle["blockers"] (highest `blocker.blocks_count` first) — the ones to unbloc
 
 - [{item.title}]({blocker.url}) (#{blocker.number}) — blocks {blocker.blocks_count}: {blocker.blocks}
 
-Embed the dependency graph when `diagrams.blocker_graph` is present. It draws every
-stored `blocks` relation, including ones whose blocker is already closed, so it can
-show more than the open-only lists above:
+Embed the dependency graph when `diagrams.blocker_graph` is present. It follows the
+same open-only rule as the lists above: an edge is drawn only when the blocker and the
+blocked issue are both open; a closed (resolved) blocker, a closed dependant and an
+issue of unknown state are omitted, so the graph shows exactly the relations
+bundle["blockers"] counts:
 
 ```mermaid
 {contents of diagrams.blocker_graph}

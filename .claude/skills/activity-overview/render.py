@@ -662,18 +662,27 @@ def emit_blocker_graph(bundle, max_edges=BLOCKER_MAX_EDGES, notes=None):
     Each issue that participates in a dependency becomes a node labelled `#<n>`;
     every `blocks` relation draws blocker --> blocked (fold normalized the edge
     direction, and extract surfaces it as `issue["blocking"]` = the issues this one
-    blocks). Emits a `No blocked issues` placeholder when no `blocks` edges exist.
-    Bounded: at most `max_edges` (BLOCKER_MAX_EDGES) edges are drawn, the first in
-    (blocker, blocked) number order, with a `+K more blocked` node when more exist.
-    Derived solely from existing bundle fields."""
+    blocks).
+
+    Open only, the flow rule (#60, #101): a relation is drawn only when the
+    blocker AND the blocked issue are bundle issues with `state == "open"` —
+    exactly the relation `blockers[]` counts. A closed (resolved) blocker no
+    longer blocks and is omitted, as are closed dependants and issues absent from
+    the bundle (state unknown). Emits a `No blocked issues` placeholder when no
+    such relation exists. Bounded: at most `max_edges` (BLOCKER_MAX_EDGES) edges
+    are drawn, the first in (blocker, blocked) number order, with a `+K more
+    blocked` node when more exist. Derived solely from existing bundle fields."""
     issues = bundle.get("issues") or []
-    # Collect blocker->blocked pairs from the resolved `blocking` lists; sorted +
-    # deduped so the diagram is deterministic regardless of issue/edge order.
+    open_issues = {iss.get("number") for iss in issues
+                   if iss.get("state") == "open"}
+    # Collect open blocker->open blocked pairs from the resolved `blocking` lists;
+    # sorted + deduped so the diagram is deterministic regardless of order.
     edges = sorted({
         (iss["number"], blocked)
         for iss in issues
-        if iss.get("number") is not None
+        if iss.get("number") is not None and iss["number"] in open_issues
         for blocked in (iss.get("blocking") or [])
+        if blocked in open_issues
     })
     lines = ["flowchart LR"]
     if not edges:

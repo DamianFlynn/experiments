@@ -1585,7 +1585,15 @@ def _main_bicep_dir(parts):
 def _terraform_modules_dir(parts):
     # modules/<name>/... -> modules/<name>. <name> must be a directory: a file
     # directly under modules/ (modules/README.md) is not a module and falls through.
+    # A *.tf file in a NESTED non-scaffold dir (modules/<name>/inner/x.tf) is a
+    # module of its own, as terraform reads one directory as one module: its area
+    # is that dir (#101). Other files there, and nested examples/tests, stay in
+    # modules/<name>.
     if len(parts) >= 3 and parts[0] == "modules":
+        nested = "/".join(parts[:-1])
+        if len(parts) > 3 and parts[-1].endswith(".tf") \
+                and not _is_scaffold_area(nested):
+            return nested
         return "/".join(parts[:2])
     return None
 
@@ -2780,6 +2788,18 @@ _KIND_PHRASES = (
     (("question",), "question"), (("support",), "question"),
     (("doc",), "docs"), (("docs",), "docs"), (("documentation",), "docs"),
 )
+# The title heuristic (#101) uses the same phrases, except that a bare "support"
+# in a title ("Add support for X") is not a question: only "support request" is.
+# As an issue-type / label / template value, "support" still means a question.
+_TITLE_KIND_PHRASES = tuple(
+    ((("support", "request"), "question") if phrase == ("support",) else (phrase, kind))
+    for phrase, kind in _KIND_PHRASES)
+# A title is a question when it ends with `?` written right after a word (not a
+# lone `?`, as in "name contains ?"), or starts with one of these words and
+# carries a `?` ("How to pin a version? (v2)").
+_INTERROGATIVES = frozenset((
+    "how", "what", "why", "when", "where", "which", "who", "is", "are", "can",
+    "could", "does", "do", "did", "should", "would", "will"))
 _VALID_KINDS = {"feature", "module-request", "bug", "idea", "question", "docs", "other"}
 _KIND_WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -2790,11 +2810,11 @@ def _kind_words(text):
     return tuple(_KIND_WORD_RE.findall((text or "").lower()))
 
 
-def _kind_from_token(text):
+def _kind_from_token(text, phrases=_KIND_PHRASES):
     """Map free text (issue-type name, label value, template stem, title) to a
-    kind: the first `_KIND_PHRASES` entry occurring as a whole-word sequence."""
+    kind: the first `phrases` entry occurring as a whole-word sequence."""
     words = _kind_words(text)
-    for phrase, kind in _KIND_PHRASES:
+    for phrase, kind in phrases:
         n = len(phrase)
         if any(words[i:i + n] == phrase for i in range(len(words) - n + 1)):
             return kind
@@ -2862,13 +2882,19 @@ def classify_issue_kind(issue, taxonomy, types_present):
     kind = _kind_from_token(issue.get("template"))
     if kind:
         return kind
-    # 4. title heuristic (title only: bodies mention modules, bugs, "support" ...)
-    title = issue.get("title") or ""
-    if "?" in title:
+    # 4. title heuristic (title only: bodies mention modules, bugs, "support" ...).
+    # A question-shaped title (interrogative start + `?`) is a question; else a
+    # kind phrase in the title decides ("Bug: crash when name contains ?"); else
+    # a title ending in a word followed by `?` is a question (#101).
+    title = (issue.get("title") or "").strip()
+    words = _kind_words(title)
+    if "?" in title and words and words[0] in _INTERROGATIVES:
         return "question"
-    kind = _kind_from_token(title)
+    kind = _kind_from_token(title, _TITLE_KIND_PHRASES)
     if kind:
         return kind
+    if len(title) >= 2 and title.endswith("?") and not title[-2].isspace():
+        return "question"
     return "other"
 
 

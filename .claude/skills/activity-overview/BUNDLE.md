@@ -425,7 +425,10 @@ review's state to `DISMISSED`.
   zero-dep, offline) maps each tracked file to its module directory (AVM
   `avm/res/<svc>/<module>/`, any `main.bicep` dir, Terraform `modules/<name>/` or
   any `*.tf` dir, else the top 2 segments of the file's directory — a repo-root file
-  keeps its own name); the area `id` is that directory. A file directly under an AVM
+  keeps its own name); the area `id` is that directory. A `*.tf` file in a nested,
+  non-`examples/`/`tests/` directory under `modules/<name>/` (`modules/sub/inner/x.tf`)
+  is a module of its own: its area is that directory (#101); other files there stay in
+  `modules/<name>`. A file directly under an AVM
   group (`avm/res/<svc>/README.md`) is not a module: it maps to the group area `avm/res/<svc>`.
   **graphify** is an OPTIONAL provider for its ~25 tree-sitter languages — it reads
   graphify's real `graph.json` (top keys `nodes`/`links`; each node carries an
@@ -520,7 +523,12 @@ review's state to `DISMISSED`.
   label kind (`type:`/`kind:` facet labels, then a bare label that is exactly a kind word,
   e.g. `bug`/`enhancement`/`documentation`) → template filename → **title** heuristic → other).
   Matching is on whole words, never substrings; a bare "module" is not a module request
-  (only "module request"/"module proposal" are); issue bodies are never read.
+  (only "module request"/"module proposal" are); issue bodies are never read. In the
+  title (#101) a bare "support" is not a question ("Add support for X"; only "support
+  request" is — as a type/label/template value `support` still is), and a `?` makes a
+  question only when the title starts with an interrogative (`how`, `is`, `can`, …) and
+  holds a `?`, or — when no kind phrase matched — ends with a `?` right after a word
+  ("Bug: crash when name contains ?" is a bug).
 - **artifacts[].code_area** and **feature_deltas[].area** are **populated** when the
   path resolves to a `code_graph` area; null otherwise.
 - **trains[].code_areas** — the distinct areas of a train's commits' files.
@@ -625,8 +633,8 @@ across members (see "Project view: `people` and `halls`").
   — per the "recognition, not blame" stance.
 - **Blocker state.** `issue["blocking"]` / `issue["blocked_by"]` (set by
   `extract._attach_blocks`) are the **raw stored relation**, whatever the state of
-  the issues at either end; `diagrams.blocker_graph` draws that raw relation. `flow`
-  and `blockers` apply an **open-only** filter on top, using the `state` of the
+  the issues at either end. `flow`, `blockers` and `diagrams.blocker_graph` (#101)
+  apply an **open-only** filter on top, using the `state` of the
   bundle's own issues: an issue at the other end counts only when it is in the
   bundle with `state == "open"`. A number **absent from the bundle** has **unknown**
   state; it never counts as open (gather pulls every open issue of the repo, so an

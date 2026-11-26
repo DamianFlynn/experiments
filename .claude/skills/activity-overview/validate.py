@@ -600,7 +600,7 @@ def check_provenance(conn):
         problem = None
         if n["node_class"] == "social":
             problem = _social_provenance_problem(n, local)
-        elif graphstore.is_artifact_local(local):
+        elif graphstore.is_artifact_node(n):
             if not _has_source_ref(n):
                 problem = "no lifecycle commit ref in data"
         elif n["node_class"] == "code":
@@ -702,6 +702,33 @@ def _case_variant_details(nodes):
     return details
 
 
+def _code_form_problem(node, local):
+    """Why a stored `code` node is none of the known code-node forms, or None
+    (#101). The forms: a commit (a commit record, i.e. `data.sha`, under a
+    40/64-hex sha id); a file artifact (an artifact record under `art:<path>`,
+    `kind` not symbol/comment); a symbol/comment artifact (an artifact record
+    under `<path>#<lang>:<subkind>:<name>`, `kind` symbol or comment). Any
+    other combination is an unknown form, which no_drift cannot audit."""
+    if not graphstore.is_artifact_node(node):
+        if _SHA_RE.match(local):
+            return None
+        return ("unknown code-node form: commit record under non-sha id "
+                "{!r}".format(local))
+    symbol_kind = graphstore.is_symbol_node(node)
+    if local.startswith("art:"):
+        if not symbol_kind:
+            return None
+        return ("unknown code-node form: symbol/comment record under file "
+                "artifact id {!r}".format(local))
+    if graphstore.is_symbol_local(local):
+        if symbol_kind:
+            return None
+        return ("unknown code-node form: non-symbol record under symbol id "
+                "{!r}".format(local))
+    return ("unknown code-node form: artifact record under non-artifact id "
+            "{!r}".format(local))
+
+
 def check_no_fabrication(conn):
     """No invented entities, no historyless artifacts, no malformed ids.
 
@@ -711,6 +738,9 @@ def check_no_fabrication(conn):
       write path skips it), so any EXISTING person node must have earned it.
     - Every artifact `code` node (local id `art:<path>` / `<path>#…`) has >=1
       lifecycle event (artifact with no history = ERROR).
+    - Every `code` node is a known form (_code_form_problem, #101): a commit
+      record under a sha id, or an artifact record under the matching artifact
+      id form; anything else is an ERROR.
     - No node has an empty/None id; ids round-trip through parse_id, follow the
       id grammar and agree with the row's project/repo columns
       (_id_grammar_problem), and no scope is stored under two case spellings
@@ -753,13 +783,15 @@ def check_no_fabrication(conn):
                     "severity": ERROR, "id": nid, "login": login,
                     "problem": "orphan person: no contribution edge "
                                "(invented contributor)"})
-        # artifact with no history
+        # code node form, and artifact with no history
         elif n["node_class"] == "code":
             local = parsed["local"]
+            problem = _code_form_problem(n, local)
+            if problem:
+                details.append({"severity": ERROR, "id": nid, "problem": problem})
             # `art:<path>` file artifacts and `<path>#<lang>:<subkind>:<name>`
-            # symbol/comment artifacts (graphstore.is_artifact_local).
-            is_artifact = graphstore.is_artifact_local(local)
-            if is_artifact:
+            # symbol/comment artifacts, by record (graphstore.is_artifact_node).
+            if graphstore.is_artifact_node(n):
                 lifecycle = (n["data"] or {}).get("lifecycle") or []
                 if not lifecycle:
                     details.append({
@@ -776,13 +808,28 @@ def _id_kind(conn, qid, node_cache):
     """Classify a node id by its stored node_class + local-id form, for edge
     endpoint conformance. Returns one of: person, area, milestone, pr, issue,
     commit, artifact, social, code, structure, or '<missing>' when not stored.
+
+    A stored node is classified on its class and record first (#101): a code
+    node is an artifact or a commit by its record (graphstore.is_artifact_node),
+    and a stored non-code node is never an artifact, whatever its id holds
+    (`milestone-v1#a:b:c`). The artifact id shape is tested only for a dangling
+    id (or with no `conn`).
     """
     local = _local(qid)
+    node = None
+    if conn is not None:
+        node = node_cache.get(qid)
+        if node is None and qid not in node_cache:
+            row = conn.execute("SELECT * FROM nodes WHERE id=?", (qid,)).fetchone()
+            node = _node(row) if row else None
+            node_cache[qid] = node
+    if node is not None and node["node_class"] == "code":
+        return "artifact" if graphstore.is_artifact_node(node) else "commit"
     if _is_person_id(qid):
         return "person"
     # Artifact form first: a symbol's PATH may itself start with a prefix below
     # (`issue-templates/main.tf#terraform:…`, `release-notes/…`).
-    if graphstore.is_artifact_local(local):
+    if node is None and graphstore.is_artifact_local(local):
         return "artifact"
     if local.startswith("area-"):
         return "area"
@@ -802,15 +849,8 @@ def _id_kind(conn, qid, node_cache):
         return "pr"
     if local.startswith("issue-"):
         return "issue"
-    node = node_cache.get(qid)
-    if node is None and qid not in node_cache:
-        row = conn.execute("SELECT * FROM nodes WHERE id=?", (qid,)).fetchone()
-        node = _node(row) if row else None
-        node_cache[qid] = node
     if node is None:
         return "<missing>"
-    if node["node_class"] == "code":
-        return "commit"
     return node["node_class"]
 
 
@@ -1525,9 +1565,12 @@ def check_no_drift(conn, project, repo, bundle, check_people=True,
     # (mirroring how fold_bundle / extract reconstruct it).
     want_arts = _derive_artifacts(conn, project, repo, bundle)
     stored_arts = {}
+    # Every non-commit code node is audited as an artifact (#101: classified by
+    # its record, not its id shape; check_no_fabrication rejects any code node
+    # whose id form disagrees with its record).
     for n in graphstore.repo_nodes(conn, project, repo, "code"):
         local = graphstore.local_id(n["id"], project, repo)
-        if graphstore.is_artifact_local(local):
+        if graphstore.is_artifact_node(n):
             stored_arts[local] = n["data"] or {}
     art_fields = ("kind", "path", "name", "status", "replaced_by", "code_area")
     for aid in sorted(set(stored_arts) | set(want_arts)):

@@ -412,7 +412,9 @@ paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 (warns when truncated) a
   word such as `bug`/`enhancement`) → issue-template filename → title heuristic → other. All
   steps match whole words via `_KIND_PHRASES` (module phrases first; a bare "module" maps to
   nothing); the body is never read, so "the module breaks" or "not supported" in a body does not
-  change kind (#58).
+  change kind (#58). Title rules (#101): `_TITLE_KIND_PHRASES` drops the bare "support"
+  (only "support request" is a question); an interrogative first word plus a `?` is a question,
+  then a title kind phrase decides, then a title ending in `?` right after a word is a question.
 - `classify_pr_kind` reads conventional-commit prefixes (`feat→feature`, `fix→bug`, `docs→docs`).
 - `normalize_pr` sets `closes = parse_closing_refs(title+body, repo=<base repo slug>)` with
   GitHub's semantics (#62): keywords `close[sd]`/`fix(e[sd])`/`resolve[sd]`, optional `:`, then
@@ -925,7 +927,7 @@ previous file intact, and a run that cannot write its bundle records no installm
 | `annotate_people_profile` | per-login metrics | prs authored/merged/reviewed, merge rate, review latency (median), first/last active, examples/docs/symbols authored |
 | `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored`, top 10; **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
-| `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (and feed `blocker_graph`) |
+| `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (`blocker_graph` applies the same open-only filter, #101) |
 
 ## 7. Present — `render.py`
 
@@ -944,7 +946,7 @@ is rejected (exit 2).
 | `contributor_graph` | `emit_contributor_graph` | flowchart | `GRAPH_MAX_EDGES` (120) edges, breadth-first: key = (area's position in the person's list, login, area), so every contributor keeps an edge first; `+K more edges not shown` node |
 | `kind_breakdown` | `emit_kind_breakdown` | pie | `PIE_MAX_SLICES` (10): largest kinds (count desc, name), the last slice `+K more kinds` sums the rest |
 | `module_graph` | `emit_module_graph` | flowchart | `GRAPH_MAX_EDGES` (120) edges by target in-degree desc (blast-radius hubs first), then src, dst, label; `+K more edges not shown` node |
-| `blocker_graph` | `emit_blocker_graph` | flowchart | `BLOCKER_MAX_EDGES` (40) edges in (blocker, blocked) order; `+K more blocked` node |
+| `blocker_graph` | `emit_blocker_graph` | flowchart | open blocker → open blocked only (closed blockers omitted, #101); `BLOCKER_MAX_EDGES` (40) edges in (blocker, blocked) order; `+K more blocked` node |
 | `train_flowcharts{id}` | `emit_train_flowchart` (deep trains) | flowchart; mode C with area nodes when ≤ `TRAIN_FLOW_MAX_PRS` (4) PRs and ≤ `TRAIN_FLOW_MAX_AREAS` (5) areas, else mode A chain | `TRAIN_FLOW_MAX_PR_NODES` (60) PRs in the train's `prs` order; the rest collapse into one `+K more PRs not shown` node in the chain |
 | project module graph | `emit_project_module_graph(module_edges, notes=None)` | flowchart (used by digest reports) | as `module_graph` |
 
@@ -1318,6 +1320,8 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Trains join through shared closed issues | member PRs are grouped transitively over the issues they close (#93) | a PR that closes several issues pulls every other PR closing any of them into one train, so an umbrella "closes #1 … #9" PR yields one large train | none needed while closing references are deliberate; split by a cap if it proves noisy |
 | Pre-#93 stores have no `head_repo` | gather stores the PR head repo since #93 | a stacked PR whose base branch name is the head of two or more member PRs (e.g. forks' `patch-1`) is attached to none of them until the window is re-gathered | re-gather the window |
 | Unmerged PRs into other branches have no train | trains hold mainline-targeting PRs; stacked PRs count only once merged (as `contributing_prs`) | an open or closed-unmerged PR into a feature / release branch is in no train and its bucket ref has no train id | attach it to its parent as a pending contribution if needed |
+| Nested Terraform module dirs split files by extension | since #101 a `*.tf` in a non-scaffold dir below `modules/<name>/` maps to its own dir; `classify_code_area` is per path, so a non-`.tf` file there (README, `.tftpl`) still maps to `modules/<name>` | that module dir's docs/templates count towards the enclosing module's area; stores gathered before #101 keep `modules/<name>` for the nested `.tf` files and its old self-edge until re-gathered | a set-aware classifier (needs the tree listing) |
+| Ledger rows of a commit with no file list | `graphstore.ledger_row_is_symbol` (#101) reads the row's commit's stored `files`; a shallow-boundary commit (#68) has an empty list and a merge commit lists none | a file row of such a commit whose path has the `#<token>:<token>:` symbol tail is still read as a symbol row | a row-kind column in `code_events` (schema change) |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE §2.1 (one single-window store per installment, or one

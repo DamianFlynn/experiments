@@ -151,18 +151,27 @@ def _scope(ts_from, ts_to):
     return {"from": ts_from, "to": ts_to}
 
 
-def _node_kind(node_id, data):
+def _node_kind(node_id, data, node_class=None):
     """Derive a node's kind for a timeline row from its id / data: one of
     pr / issue / commit / release / comment / symbol / file, else the node's
-    structural prefix. Deterministic."""
+    structural prefix. Deterministic.
+
+    With the stored node's `node_class` (#101), an artifact is told by its
+    class and record (graphstore.is_artifact_node / is_symbol_node), and a
+    non-code node is never an artifact whatever its id holds
+    (`milestone-v1#a:b:c`). Without it (a dangling id) the id form decides."""
     local = graphstore.local_id(node_id)
+    if node_class is not None:
+        node = {"node_class": node_class, "data": data}
+        if graphstore.is_artifact_node(node):
+            return "symbol" if graphstore.is_symbol_node(node) else "file"
     # Artifacts first, by id form (graphstore.split_symbol_local's tail rule):
     # `art:<path>` (path may contain `#`) is a file; `<path>#<lang>:<subkind>:
     # <name>` is a symbol/comment — whose PATH may start with a prefix tested
     # below (`issue-templates/…`, `release-notes/…`).
-    if local.startswith("art:"):
+    elif local.startswith("art:"):
         return "file"
-    if graphstore.is_symbol_local(local):
+    elif graphstore.is_symbol_local(local):
         return "symbol"
     # Phase 10: review submissions / lifecycle events are social leaves on the
     # PR/issue spine. Classify by their own prefix BEFORE the /pull/ url heuristic
@@ -208,7 +217,7 @@ def _timeline_row(node):
     nid = node["id"]
     data = node.get("data") or {}
     row = _cite(nid, data)
-    row["kind"] = _node_kind(nid, data)
+    row["kind"] = _node_kind(nid, data, node.get("node_class"))
     row["ts"] = node.get("ts") or ""
     if row["kind"] == "comment":
         row["excerpt"] = _excerpt(data.get("body"))
@@ -238,7 +247,7 @@ def _outcome(reached_nodes):
         if n is None:
             continue
         data = n.get("data") or {}
-        kind = _node_kind(n["id"], data)
+        kind = _node_kind(n["id"], data, n.get("node_class"))
         if kind == "release":
             return "shipped"
         if kind == "pr":
@@ -277,7 +286,7 @@ def _origin_anchor(nodes):
     yields the same origin however the train was entered. `nodes` is the list
     of hydrated node dicts (None-filtered)."""
     def key(n):
-        kind = _node_kind(n["id"], n.get("data") or {})
+        kind = _node_kind(n["id"], n.get("data") or {}, n.get("node_class"))
         prio = _ORIGIN_PRIORITY.get(kind, 4)
         return (prio, n.get("ts") or "", n["id"])
     return min(nodes, key=key)["id"]
@@ -377,7 +386,8 @@ def _train(conn, anchor, reached, focus_touch_ids, role_of,
             entries = [{"role": spec}]
         for entry in entries:
             row = _cite(tid, tdata)
-            row["kind"] = _node_kind(tid, tdata)
+            row["kind"] = _node_kind(tid, tdata,
+                                     tnode.get("node_class") if tnode else None)
             row["ts"] = (tnode["ts"] if tnode else None) or ""
             row["role"] = entry.get("role")
             roles.add(entry.get("role"))
@@ -507,14 +517,22 @@ def person_impact(conn, project, login, ts_from=None, ts_to=None,
         # range (LIKE is case-insensitive and cannot use the index)
         lo, hi = graphstore._prefix_range(graphstore.qualify_id(project, repo, ""))
         rows = conn.execute(
-            "SELECT DISTINCT artifact_id FROM code_events "
+            "SELECT artifact_id, commit_sha FROM code_events "
             "WHERE artifact_id >= ? AND artifact_id < ? AND author=? "
-            "AND event='add' ORDER BY artifact_id",
+            "AND event='add' ORDER BY artifact_id, commit_sha",
             (lo, hi, login)).fetchall()
-        for (aid,) in rows:
+        commit_files = None
+        seen = set()
+        for aid, sha in rows:
             local = graphstore.local_id(aid, project, repo)
-            if not graphstore.is_symbol_local(local):
+            if aid in seen or not graphstore.is_symbol_local(local):
                 continue  # file-level artifact (path may contain `#`), not a symbol
+            if commit_files is None:
+                commit_files = graphstore.repo_commit_files(conn, project, repo)
+            # a row whose commit lists that exact path is a file row (#101)
+            if not graphstore.ledger_row_is_symbol(local, commit_files.get(sha)):
+                continue
+            seen.add(aid)
             symbols_authored.append({"id": aid})
             rm = conn.execute(
                 "SELECT 1 FROM code_events "
@@ -1186,12 +1204,9 @@ def slice_module(conn, project, area, ts_from=None, ts_to=None,
         data = node["data"] or {}
         lifecycle, overflow, ordered = _lifecycle(members)
         all_dates.extend(e["date"] for e in ordered if e["date"])
-        # symbol/comment artifacts vs file artifacts. The id form is the tell:
-        # a symbol's local id is `<path>#<lang>:<subkind>:<name>`, a file's is
-        # `art:<path>` / a bare path (either may contain `#`). Strip the
-        # `{project}/{repo}#` qualifier and apply the tail-shape rule.
-        art_local = graphstore.local_id(rep, node["project"], node["repo"])
-        if graphstore.is_symbol_local(art_local):
+        # symbol/comment artifacts vs file artifacts, told by the stored record's
+        # kind (graphstore.is_symbol_node, #101), not the id form.
+        if graphstore.is_symbol_node(node):
             entry = {
                 "id": rep,
                 "repo": node["repo"],

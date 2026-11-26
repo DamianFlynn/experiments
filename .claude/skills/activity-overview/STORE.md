@@ -52,12 +52,25 @@ Helpers: `qualify_id`, `qualify_person`, `parse_id`, `local_id`,
   `subkind` matches `[A-Za-z0-9_-]+` (no `#`, `:`, `/`, `.` or whitespace);
   the rest is the name. A `#` inside a path is followed by more path text
   (`docs/C#-guide.md`, `C#/main.tf#terraform:resource:x`), which never has that
-  shape, so it is skipped. An id starting `art:` is never a symbol. This matters
-  for the `code_events` ledger, whose file-level rows are keyed by the bare
-  `<path>`: a row is a symbol row iff its local id has that tail.
-- **Residual ambiguity.** A file path in which a `#` is directly followed by
-  `<token>:<token>:` (e.g. `notes#a:b:c.md`) would be read as a symbol id. Git
-  paths with `:` are rare (and invalid on Windows); no such path is expected.
+  shape, so it is skipped. An id starting `art:` is never a symbol.
+- **Stored nodes are classified by class and record, not id shape (#101).** The
+  shape rule above is the fallback for a **dangling** id only (backfill's
+  `gather.classify_id`, an edge endpoint that is not stored). A stored `code`
+  node is a commit when its record carries `sha`, else an artifact
+  (`graphstore.is_artifact_node`); a symbol/comment artifact is one whose record
+  `kind` is `symbol`/`comment` (`is_symbol_node`). A stored non-code node is
+  never an artifact, so a milestone titled `v1#a:b:c` (`milestone-v1#a:b:c`) is
+  a milestone to `validate`'s edge-endpoint check and to spotlight.
+- **`code_events` ledger rows.** File-level rows are keyed by the bare `<path>`
+  and have no node of their own, so the row's commit decides: a row whose
+  commit's stored `files` list names its exact local id is a file row, whatever
+  its shape (`notes#a:b:c.md`); otherwise a row is a symbol row iff its local id
+  has the symbol tail (`graphstore.ledger_row_is_symbol`, used by `extract`'s
+  ledger readers — hence by fold's artifact rebuild and `no_drift` — and by
+  spotlight `person`).
+- **Residual ambiguity.** A file row with that tail shape whose commit is not
+  stored or has an empty file list (a shallow-boundary commit, #68) is still
+  read as a symbol row. Git paths with `:` are rare (and invalid on Windows).
 
 ## Node classes (`nodes` table)
 
@@ -651,6 +664,15 @@ fixtures, often other registry modules, via CI-manipulated paths) — they are
 **skipped at extraction and excluded at fold**, so they never become bogus intra-
 or cross-repo dependencies; that includes scaffold files nested inside a module
 (`modules/sub/examples/x/main.tf`), which are never read or built as `modules/sub`.
+**A nested module directory is its own area (#101):** a `*.tf` file in a
+non-scaffold directory below `modules/<name>/` (`modules/sub/inner/main.tf`) maps
+to that directory (`modules/sub/inner`), as terraform reads one directory as one
+module, so its own `module` blocks are reported on it and `modules/sub`'s
+`source = "./inner"` targets it (it used to be a self-edge, and the inner dir's
+references were reported nowhere). Other files there (README, templates) stay in
+`modules/<name>`. A store gathered before this keeps the old `modules/<name>`
+area for those files and its self-edge; re-gather for the new ids (edges are not
+retracted, #95).
 The module dir is resolved on disk in the clone, whichever of its files changed in
 the window (see BUNDLE.md, *Entrypoint*). `terraform graph` runs through the same parallel pool
 as the bicep build; with a shared `TF_PLUGIN_CACHE_DIR` a one-shot serial provider
@@ -832,7 +854,13 @@ Strictness (issue #89). Besides the checks above:
   a 40/64-hex sha equal to `data.sha`.
 - **`no_fabrication`** — ids follow the grammar above, their scope equals the
   row's `project`/`repo` (people: `{project}` with repo `*`), the local form
-  fits the node class, and no scope is stored under two case spellings.
+  fits the node class, and no scope is stored under two case spellings. Every
+  `code` node is one of exactly three forms (#101): a commit record (`sha`)
+  under a 40/64-hex sha id, a file-artifact record (`kind` not symbol/comment)
+  under `art:<path>`, or a symbol/comment record under
+  `<path>#<lang>:<subkind>:<name>`; any other combination is an ERROR
+  ("unknown code-node form"). `no_drift` audits every non-commit code node as an
+  artifact, so no code node escapes both checks.
 - **`no_drift`** — people are re-derived from the records alone (never seeded
   from the stored person nodes, which made the areas check tautological) and
   compare `modules`, `areas`, `is_bot` and `login_resolved`. A stored person
