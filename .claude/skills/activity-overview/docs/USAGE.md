@@ -165,6 +165,7 @@ into a **fresh** store for the first item, into the same store for the others:
 | #82 (commit times) | commits have only a day, so their timeline events sort before that day's comments | timeline order only |
 | #93 (PR head repo) | a stacked PR whose base branch is the head of two PRs (forks' `patch-1`) is attached to neither | `contributing_prs` missing |
 | #101 (nested Terraform areas) | `.tf` files in `modules/<name>/<sub>/` stay in `modules/<name>` | module counts / areas |
+| #109 (collection review) | an issue of ANOTHER repo that mentions a PR made the same-numbered local issue a `cross_ref` of it; commits (and their code/symbol events) are windowed on the committer's local day, not the UTC day PRs and issues use | an unrelated issue in a PR's train context / forecast; a commit made near midnight UTC in the neighbouring month. Re-gather into a fresh store (a mention edge the new records no longer imply fails `validate`) |
 
 A store last folded before #95 heals its current-state edges on the next fold of any window
 (gather prints `retracted N stale current-state edge(s) …`).

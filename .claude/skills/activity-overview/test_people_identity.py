@@ -147,18 +147,20 @@ class TestResolveCommitAuthors(unittest.TestCase):
 
 
 class TestParseGitLogEmail(unittest.TestCase):
-    def test_sixth_field_is_the_transient_author_email(self):
+    def test_fourth_field_is_the_transient_author_email(self):
         raw = (gather.RECORD_SEP + gather.FIELD_SEP.join(
-            ["a" * 40, "", "Jane Doe", "2026-05-20", "subj", "jane@corp.example"])
+            ["a" * 40, "", "Jane Doe", "jane@corp.example",
+             "2026-05-20T10:00:00Z", "subj"])
             + "\nf.txt\n")
         (c,) = gather.parse_git_log(raw)
         self.assertEqual(c["author"], "Jane Doe")
         self.assertEqual(c["author_email"], "jane@corp.example")
         self.assertEqual(c["files"], ["f.txt"])
 
-    def test_five_field_records_still_parse_without_email(self):
+    def test_empty_email_adds_no_key(self):
         raw = (gather.RECORD_SEP + gather.FIELD_SEP.join(
-            ["a" * 40, "", "Jane Doe", "2026-05-20", "subj"]) + "\nf.txt\n")
+            ["a" * 40, "", "Jane Doe", "", "2026-05-20T10:00:00Z", "subj"])
+            + "\nf.txt\n")
         (c,) = gather.parse_git_log(raw)
         self.assertNotIn("author_email", c)
 

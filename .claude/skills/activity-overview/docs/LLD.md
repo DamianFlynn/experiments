@@ -37,7 +37,8 @@
   no I/O. All network and git I/O is in `gather.py`; the store write path is
   `gather.fold_bundle` (and `gather.backfill`).
 - **Window.** `[from, to]` are inclusive `YYYY-MM-DD` dates. Windowing of commits is done in
-  Python on the committer date (`window_records`), not with git `--since/--until`.
+  Python on the UTC day of the committer timestamp (`window_records`, #109), the same UTC
+  calendar that windows PRs and issues, not with git `--since/--until`.
 - **Ref convention.** `{type: "pr"|"issue"|"commit", id, url}` on every narrative-bearing fact.
 - **Determinism.** `view.py`, `digest.py` and `spotlight.py --json` write JSON with
   `sort_keys=True`; `link.py` and `render.py` rewrite the bundle with `indent=2` only, which
@@ -246,7 +247,7 @@ sequenceDiagram
   `MissingBranchError`, which `acquire` turns into `SystemExit` naming it (a manifest member is
   recorded `failed`). A reused clone is put back on the default by the next `prepare_clone`.
 - Structure is read as of the window's end (issue #107). `window_end_commit` takes the newest
-  commit of the walked branch's first-parent chain whose committer date is on or before `to`;
+  commit of the walked branch's first-parent chain whose committer day (UTC) is on or before `to`;
   when it is the head (the current month) the clone is read in place, otherwise
   `structure_tree` adds a temporary detached `git worktree` of it, reads the code graph, IaC
   entrypoints/builds, structural scan and CODEOWNERS there, and removes it (also on error), so
@@ -267,8 +268,15 @@ sequenceDiagram
   `area_paths`, module counts, `touches` edges and train `code_areas` are not inflated. Any
   **in-window** commit handled this way is recorded in `meta.boundary_dropped_commits` and a
   warning is printed — widen the margin and re-gather to recover it.
-- Commit dates use the committer date; filtering is `window_records` in Python to avoid git's
-  timezone-sensitive pruning.
+- Commit dates are the UTC calendar day of the committer timestamp (#109): all three walks use
+  one format, `LOG_FORMAT` = sha, parents, author name, author email, `%cI`, subject (the
+  free-text subject LAST, so nothing can follow it), and every record of one commit (the
+  commit, its code events, its symbol events) gets the same `date`, so a commit at
+  `2026-10-31T20:00-08:00` is in November with the PR merged at that instant. Filtering is
+  `window_records` in Python to avoid git's timezone-sensitive pruning. The parsers split
+  records on a `RECORD_SEP` at the start of a line and lines on `\n` only (`str.splitlines()`
+  would also split on U+2028/U+2029, U+0085, form feed, vertical tab and the separator control
+  characters, which can appear in a subject or a non-ASCII path).
 
 ### 4.4 Code-event and symbol extraction
 
@@ -421,7 +429,7 @@ flowchart TB
 | Closed PRs | `pulls?state=closed&sort=updated` | `fetch_until` stops when a page's last `updated_at` < `from` |
 | Open PRs | `pulls?state=open` | all |
 | Per kept PR | `pulls/N/reviews`, `issues/N/timeline`, `pulls/N/comments`, `issues/N/comments` | paginated |
-| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | referenced 404s tolerated (`allow_404`) |
+| Issues | `issues?state=all&sort=updated` (until `< from`) + `issues?state=open` (all) + `issues/N` for referenced issues | a referenced issue answered 404 or 410 (deleted) is skipped with a stderr note (`allow_statuses=GONE_STATUSES`); an answer that is not #N of this repo (number, `repository_url` / `html_url`, case-insensitive; a transferred issue reached through a redirect) is skipped with a note, never stored (#109) |
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
@@ -442,7 +450,14 @@ text (source: graphql)` or `closing issues: GraphQL unavailable (<reason>), usin
 keywords only`; `meta.closing_refs_source` records `graphql` | `keywords` (bundle only, not
 views). The timeline `connected` event is still filed under `crossref_issues` when it names
 an issue number (an event without a usable number is ignored); whether the REST payload
-carries one is unverified.
+carries one is unverified. Since #109 `parse_timeline_crossrefs(timeline, slug)` reads the
+events in order: a `connected` link later undone by `disconnected` (same number) is dropped,
+and a `cross-referenced` / `connected` event whose source / subject issue names another repo
+(`repository.full_name`, case-insensitive) is not an issue of this repo — the cross-repo side
+is `parse_timeline_xrefs`, so each event is counted by exactly one of the two (an event with no
+repository name counts as this repo's). GitHub's closing list agrees: a disconnected sidebar
+link is no longer in `closingIssuesReferences`, and other-repo closing issues never enter
+`crossref_issues`.
 
 Kept PRs = merged in-window, closed-unmerged in-window, or open. Every REST and GraphQL call
 goes through `_github_open` (injectable `opener`/`sleep`/`clock`, so tests never sleep or touch
@@ -477,7 +492,9 @@ the network):
 
 `fetch_project_board` (GraphQL) auto-discovers the boards a repo links, keeps those
 `board_is_maintained` (open, touched within `ACTIVITY_BOARD_STALE_DAYS` = 365 of the ref date),
-paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 (warns when truncated) and
+paginates items up to `ACTIVITY_BOARD_MAX_ITEMS` = 5000 and `BOARD_MAX_PAGES` = 200 pages per
+board (a board cut short by either, by a failed or empty page or with no id to page by is
+warned on stderr and listed in `meta.project_board_truncated`, #109) and
 `parse_project_board` yields per-item `status` and `iteration`. Items are keyed per repo
 `(slug, number)` so a foreign repo's status never leaks. Gathered PRs/issues are stamped with
 `board_status` / `iteration`; iterations become `sprint-<id>` structure nodes with
@@ -638,8 +655,10 @@ flowchart TB
 ### 4.12 Backfill seam
 
 `gather.backfill(conn, id, fetch)` fetches one missing spine node plus its immediate spine
-edges. `fetch(kind, local, qid)` returns a payload, `ABSENT` (definitive 404 → recorded in
-`dead_refs`, pruned forever) or `None` (transient → reported as an `unreachable` gap).
+edges. `fetch(kind, local, qid)` returns a payload, `ABSENT` (definitive 404, or 410 for a
+deleted item → recorded in `dead_refs`, pruned forever) or `None` (transient, or an answer that
+is not the requested item of this repo — a transferred issue, #109 → reported as an
+`unreachable` gap).
 Production wiring: `make_backfill_fetcher(token, clone_dir)`. Only `gather` writes, so readers
 receive backfill as an **injected callable**.
 
@@ -1527,14 +1546,13 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 | IaC edges are build-gated on single-repo gathers by default | the structural scan is opt-in for single repos (`--structural-iac`, #92) to keep golden bundles byte-stable | without the flag and without `terraform`/`bicep` (or with a failed build), a single-repo bundle has no IaC edges; scan edges do not change an area's `edges_status` | pass `--structural-iac`; a scan-specific `edges_status` if needed |
 | Bicep structural scan reads `main.bicep` entrypoints only | a module area is one with a tracked `<area>/main.bicep` (#66 entrypoint rule); only `module` statements are parsed | modules whose entry file has another name (common in landing-zone repos, e.g. `hubNetworking.bicep`) are not scanned; `import … from 'br/public:…'` type imports and child-module refs are not edges; Bicep transitive edges still need `bicep build` | a configurable entrypoint pattern; parse `import` |
 | Cross-repo Bicep resolution is public-registry only | `resolve_bicep_registry_member` (#92) honours `br/public:` / `br:mcr.microsoft.com/bicep/` only and assumes the registry path is the publisher's module directory | refs through a private ACR, a template spec or a `bicepconfig.json` alias never become cross-repo edges; a publisher whose published path differs from its directory gets a stand-in at the registry path | a private-registry prefix + path mapping in the manifest |
-| The commit walk reads the default branch | `prepare_clone` checks out the remote's default branch; `--branches` / a member `branch` set `meta.base_branch` only | with a mainline that is not the default branch, commits, code and symbol events come from the default branch while buckets and trains use the named mainline | check out `meta.base_branch` for the walks |
 | One mainline per view | `link` compares a PR's `base` with one `meta.base_branch` | a roll-up spanning a default-branch rename (`master` → `main`) gets `null` (warned), so its merges are not told apart; view each gathered window on its own | carry a set of mainline names if needed |
-| Stores gathered before a fix | the fold writes `ref_date:` (#75), `branches:` (#84), `facts:` (#94) meta, login-keyed commit authors (#78), `committed_at` (#82), PR `head_repo` (#93) and nested Terraform areas (#101) only since those issues | an older store's views warn about an unknown base branch and count every merged PR as shipped, show the last folded window's CI stats/structure for every month, keep a person per git name beside the login (and fail `validate` people/`authored` with a "pre-#78 identity" hint), sort commit events before same-day comments, cannot attach a stacked PR whose base names two heads, and keep nested `.tf` files under `modules/<name>` | re-gather into a fresh store (USAGE §2.2) |
+| Stores gathered before a fix | the fold writes `ref_date:` (#75), `branches:` (#84), `facts:` (#94) meta, login-keyed commit authors (#78), `committed_at` (#82), PR `head_repo` (#93), nested Terraform areas (#101), same-repo-only timeline cross-references and UTC commit days (#109) only since those issues | an older store's views warn about an unknown base branch and count every merged PR as shipped, show the last folded window's CI stats/structure for every month, keep a person per git name beside the login (and fail `validate` people/`authored` with a "pre-#78 identity" hint), sort commit events before same-day comments, cannot attach a stacked PR whose base names two heads, keep nested `.tf` files under `modules/<name>`, can link a PR to a local issue whose number another repo's issue mentioned it from, and put a commit made near midnight UTC in the committer's local month | re-gather into a fresh store (USAGE §2.2) |
 | Trust gate cannot see record content changes | self-sourced checks compare the store with its own records and ledger; no per-fold content digest is recorded (it would need a `fold_bundle` change) | a record deleted with all its edges, a consistently rewritten blob or a wrong ledger pass a store-only `validate` | `--bundle` with a view saved at gather time catches the first two; a fold digest in `meta` would cover the rest |
 | Multi-window stores: some checks stay WARN | `_multi_window_plan` makes the current-state edge types exact on a multi-window store when it can prove them (§8, #95); it cannot for a repo last folded before #95, a window without `facts:` (pre-#94), `touches` with a graphify window or a path re-mapped between windows, people's areas (a union over every window's activity), or a missing cross-repo `depends_on` (needs the manifest's registries) | on such a store a stale or tampered edge of those types, or an extra stored area, is a WARN naming the reason, not an ERROR | fold once more (pre-#95); re-gather pre-#94 windows; people areas: re-derive each window's view and union |
 | A renamed or transferred repo fails `provenance` | PR/issue urls must name the node's repo; the API returns the current name after a rename | gathering a repo under its old name (manifest or `--repo`) stores `html_url`s of the new name and fails `provenance` | gather under the current name |
 | Unresolved commit authors stay separate | a commit whose SHA has no `author.login` (email linked to no account) and no noreply email keeps its git name, `login_resolved: false` | that person is counted apart from their login (by design: never merged on a guess) | none needed; the flag makes it visible |
-| Backfilled commits are thin | `make_backfill_fetcher` (`spotlight --complete`) logs one commit with the five-field format | a backfilled commit node's `author` is the git name and it has no `committed_at` (its timeline events sort before that day's social events); no person node or edge is written for it | log `%cI` and resolve via the commits API there too |
+| Backfilled commits are thin | `make_backfill_fetcher` (`spotlight --complete`) logs one commit with the walks' format (it carries `committed_at` since #109) but does not resolve the author | a backfilled commit node's `author` is the git name; no person node or edge is written for it | resolve via the commits API there too |
 | Incomplete members are not in the digest JSON | #77 surfaces a failed / not-attempted member through gather's exit code, `validate` and a `digest.py`/`view.py` stderr warning only | a formatter reading only the digest/view JSON cannot tell the project is partial | add the incomplete members to the view `meta` (BUNDLE.md change) |
 | Member status is the latest attempt | `member_status` keeps one entry per (member, window), overwritten by each attempt | a member that once folded `ok` and then failed a re-gather of the same window fails `validate` although its earlier fold is still stored | by design (the latest data is missing); `gather --resume` clears it |
 | Any open PR counts as in motion | `in_motion` needs an open PR or an `in_flight` train (#87), but it does not look at the PR's age, draft state or base branch | an open PR untouched for a year, or a draft, still scores `open PR` (+2.0) for the issue it references | weigh PR recency (e.g. `updated_at` in window) if stale open PRs prove common |
@@ -1546,7 +1564,6 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 | Nested Terraform module dirs split files by extension | a `*.tf` in a non-scaffold dir below `modules/<name>/` maps to its own dir (#101); `classify_code_area` is per path, so a non-`.tf` file there (README, `.tftpl`) still maps to `modules/<name>` | that module dir's docs/templates count towards the enclosing module's area | a set-aware classifier (needs the tree listing) |
 | `main.bicep` siblings are not in its area | the `main_bicep` pattern maps the `main.bicep` file itself to its directory; other files there fall through to `topn` (unless an AVM path) | outside `avm/`, a module's README or child `.bicep` files count towards a two-segment area, not the module's | a set-aware classifier, as above |
 | Ledger rows of a commit with no file list | `graphstore.ledger_row_is_symbol` (#101) reads the row's commit's stored `files`; a shallow-boundary commit (#68) has an empty list and a merge commit lists none | a file row of such a commit whose path has the `#<token>:<token>:` symbol tail is still read as a symbol row | a row-kind column in `code_events` (schema change) |
-| `link.py` / `transcript.py` have no `--help` | both parse `argv` by hand | `--help` is read as a file name: `link.py` ends in a traceback (exit 1), `transcript.py` in "cannot read transcript" (exit 2) | print the usage line for `-h`/`--help` |
 
 The operating guidance in USAGE §2.1 (one single-window store per installment, or one
 accumulated store viewed month by month as it grows; series file for continuity) says which of

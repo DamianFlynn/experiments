@@ -77,46 +77,76 @@ def build_bundle(meta, commits, prs, issues):
     }
 
 
-def parse_git_log(raw):
-    """Parse `git log` output formatted with RECORD_SEP/FIELD_SEP separators.
+def _log_records(raw):
+    """Split `git log --pretty=format:<LOG_FORMAT>` output into records, each a
+    list of lines: [header, body line, ...]. A record starts with RECORD_SEP at
+    the start of the output or of a line (git puts every separator there), so a
+    RECORD_SEP inside a subject (mid-line) does not start a new record. Lines
+    are split on "\\n" only: `str.splitlines()` also splits on U+2028/U+2029,
+    U+0085, form feed, vertical tab and the separator control characters,
+    which can appear unquoted in a subject or (non-ASCII with
+    core.quotepath=false) a path (#109)."""
+    for chunk in re.split("(?:^|\n)" + RECORD_SEP, raw or ""):
+        if chunk.strip():
+            yield chunk.split("\n")
 
-    Each record: <sha>\x1f<parents>\x1f<author>\x1f<date>\x1f<subject> followed by
-    newline-separated file paths. Returns a list of commit dicts. When the record
-    carries a sixth field (the author email, `%ae`, COMMIT_WALK_ARGS) it is kept as
-    a TRANSIENT `author_email` key: `resolve_commit_authors` reads it to find the
-    author's GitHub login and removes it, so no email reaches the bundle (#78).
-    A seventh field (the strict-ISO committer timestamp, `%cI`) becomes
-    `committed_at`, normalised to UTC `YYYY-MM-DDTHH:MM:SSZ` (the GitHub API's
-    form) so it sorts against comment timestamps; `date` stays the day used for
-    windowing. An empty or unparseable timestamp adds no key (#82).
+
+def _parse_log_header(line):
+    """The header line of a LOG_FORMAT record as a dict {sha, parents, author,
+    author_email, committed_at?, date, subject}, or None when it has too few
+    fields. The subject is the LAST field, so a FIELD_SEP inside it stays in it.
+    `committed_at` is the strict-ISO committer timestamp (`%cI`) normalised to
+    UTC `YYYY-MM-DDTHH:MM:SSZ` (absent when unparseable); `date` is its UTC
+    calendar day, the day every record of the commit is windowed on (#109:
+    PRs and issues are windowed in UTC too). Only an unparseable timestamp
+    falls back to its own first ten characters."""
+    fields = line.split(FIELD_SEP, 5)
+    if len(fields) < 6:
+        return None
+    sha, parents, author, email, stamp = (f.strip() for f in fields[:5])
+    head = {"sha": sha, "parents": parents.split(), "author": author,
+            "author_email": email, "subject": fields[5].strip(" \t\r")}
+    committed_at = _utc_timestamp(stamp)
+    if committed_at:
+        head["committed_at"] = committed_at
+    head["date"] = committed_at[:10] if committed_at else stamp[:10]
+    return head
+
+
+def parse_git_log(raw):
+    """Parse `git log` output formatted with LOG_FORMAT (COMMIT_WALK_ARGS).
+
+    Each record: the LOG_FORMAT header followed by newline-separated file paths
+    (`--name-only`). Returns a list of commit dicts. The author email (`%ae`)
+    is kept as a TRANSIENT `author_email` key: `resolve_commit_authors` reads
+    it to find the author's GitHub login and removes it, so no email reaches
+    the bundle (#78). `committed_at` is the committer timestamp in UTC
+    `YYYY-MM-DDTHH:MM:SSZ` (the GitHub API's form) so it sorts against comment
+    timestamps (#82); `date` is its UTC day, used for windowing (#109). An
+    empty email adds no `author_email`, an unparseable timestamp no
+    `committed_at`.
     """
     commits = []
-    for chunk in raw.split(RECORD_SEP):
-        if not chunk.strip():
+    for lines in _log_records(raw):
+        head = _parse_log_header(lines[0])
+        if head is None:
             continue
-        lines = chunk.splitlines()
-        fields = lines[0].split(FIELD_SEP)
-        if len(fields) < 5:
-            continue
-        sha, parents, author, date, subject = (f.strip() for f in fields[:5])
         # `--name-only` paths: C-quoted ones (quote/backslash/control chars, or
         # non-ASCII without core.quotepath=false) are unquoted.
-        files = [unquote_git_path(ln) for ln in lines[1:] if ln.strip()]
+        files = [unquote_git_path(ln) for ln in lines[1:] if ln]
         commit = {
-            "sha": sha,
-            "parents": parents.split() if parents.strip() else [],
-            "author": author,
-            "date": date,
-            "message": subject,
+            "sha": head["sha"],
+            "parents": head["parents"],
+            "author": head["author"],
+            "date": head["date"],
+            "message": head["subject"],
             "files": files,
             "pr": None,  # resolved in link.py
         }
-        if len(fields) > 5:
-            commit["author_email"] = fields[5].strip()
-        if len(fields) > 6:
-            committed_at = _utc_timestamp(fields[6].strip())
-            if committed_at:
-                commit["committed_at"] = committed_at
+        if head["author_email"]:
+            commit["author_email"] = head["author_email"]
+        if "committed_at" in head:
+            commit["committed_at"] = head["committed_at"]
         commits.append(commit)
     return commits
 
@@ -134,34 +164,34 @@ def _utc_timestamp(value):
     return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# git log format for the full-window code-event walk (Phase 3a). Same RECORD_SEP/
-# FIELD_SEP header as parse_git_log, but the BODY is `--name-status` lines so each
-# changed path carries its change type (and rename/copy detection via -M -C gives
-# `R###`/`C###` with old+new paths).
-CODE_LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%cd%x1f%s"
+# The one `git log` format of every walk (#109): sha, parents, author name,
+# author email, strict-ISO committer timestamp, subject. The subject is free
+# text, so it is LAST: nothing can follow it on the header line. The body after
+# the header depends on the walk (`--name-only` paths, `--name-status` lines or
+# a `-p` patch). The committer timestamp (`%cI`) gives every record of a commit
+# (the commit, its code events, its symbol events) the same UTC day, the day
+# PRs and issues are windowed on too. The author email is only used to resolve
+# the commit author's GitHub login and is never stored (#78); the code-event
+# and patch parsers ignore it.
+LOG_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%cI%x1f%s"
 
 # `git log` arguments (after `git -C <clone> log`) for acquire()'s three walks,
 # shared with the real-repo tests so they exercise the exact commands. Paths in
 # their output are made comparable by run_git (core.quotepath=false) plus
-# unquote_git_path in each parser.
-# The commit walk alone also asks for the author email (`%ae`, appended LAST so the
-# shared five-field header parses unchanged); it is only used to resolve the
-# author's GitHub login and is never stored (#78). After it comes the strict-ISO
-# committer timestamp (`%cI`, unaffected by `--date=short`), stored as the
-# commit's `committed_at` so the timeline orders same-day events by real time
-# (#82).
-COMMIT_LOG_FORMAT = CODE_LOG_FORMAT + "%x1f%ae%x1f%cI"
+# unquote_git_path in each parser. The code-event walk's body is
+# `--name-status` lines so each changed path carries its change type (and
+# rename/copy detection via -M -C gives `R###`/`C###` with old+new paths).
 # Belt and braces to run_git's config isolation (issue #109): flags that pin
 # what user config could otherwise change -- colour escapes, an external diff
 # or textconv driver, signature lines, rename detection (`-M` is git's default
 # `diff.renames=true`) and the `a/` / `b/` patch prefixes the diff parser reads.
 _WALK_PIN_ARGS = ("--no-color", "--no-ext-diff", "--no-textconv",
                   "--no-show-signature")
-COMMIT_WALK_ARGS = (f"--pretty=format:{COMMIT_LOG_FORMAT}", "--date=short",
+COMMIT_WALK_ARGS = (f"--pretty=format:{LOG_FORMAT}",
                     "--name-only", "-M") + _WALK_PIN_ARGS
-CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+CODE_WALK_ARGS = ("--reverse", f"--pretty=format:{LOG_FORMAT}",
                   "--name-status", "-M", "-C") + _WALK_PIN_ARGS
-PATCH_WALK_ARGS = ("--reverse", f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short",
+PATCH_WALK_ARGS = ("--reverse", f"--pretty=format:{LOG_FORMAT}",
                    "-p", "--unified=3", "-M", "-C") + _WALK_PIN_ARGS + (
                    "--src-prefix=a/", "--dst-prefix=b/")
 
@@ -177,14 +207,11 @@ def parse_code_events(raw):
     path in `old_path` and the new path in `path`. Pure; permissive on junk lines.
     """
     events = []
-    for chunk in raw.split(RECORD_SEP):
-        if not chunk.strip():
+    for lines in _log_records(raw):
+        head = _parse_log_header(lines[0])
+        if head is None:
             continue
-        lines = chunk.splitlines()
-        fields = lines[0].split(FIELD_SEP)
-        if len(fields) < 5:
-            continue
-        sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
+        sha, author, date = head["sha"], head["author"], head["date"]
         for ln in lines[1:]:
             if not ln.strip():
                 continue
@@ -539,8 +566,7 @@ def _in_window_boundary_on_head(clone_dir, from_date, to_date, run):
     boundary = shallow_boundary_shas(clone_dir)
     if not boundary:
         return []
-    raw = run(["git", "-C", clone_dir, "log", f"--pretty=format:{CODE_LOG_FORMAT}",
-               "--date=short"])
+    raw = run(["git", "-C", clone_dir, "log", f"--pretty=format:{LOG_FORMAT}"])
     head = window_records(parse_git_log(raw), from_date, to_date)
     return in_window_boundary_commits(boundary, head)
 
@@ -581,10 +607,11 @@ def in_window(ts, from_date, to_date):
 
 
 def window_records(records, from_date, to_date):
-    """Keep only commits/events whose `date` (committer/landing date) falls in
-    [from,to] inclusive. Pure. Used instead of git's `--since/--until`, which
-    silently prunes valid in-window commits when commit dates are non-monotonic
-    across committer timezones (and excludes the upper boundary day)."""
+    """Keep only commits/events whose `date` (the UTC day of the commit's
+    committer timestamp, #109) falls in [from,to] inclusive. Pure. Used instead
+    of git's `--since/--until`, which silently prunes valid in-window commits
+    when commit dates are non-monotonic across committer timezones (and
+    excludes the upper boundary day)."""
     return [r for r in records if in_window(r.get("date"), from_date, to_date)]
 
 
@@ -1080,28 +1107,55 @@ def remap_event_authors(events, by_sha):
     return events
 
 
-def parse_timeline_crossrefs(raw_timeline):
-    """Issue numbers cross-referenced/connected to a PR via timeline events.
+def _payload_in_repo(repository, current):
+    """True when a timeline payload's `repository` object names the repo
+    `current` (lower-case 'owner/repo'), compared case-insensitively (#70).
+    A payload with no repository name at all counts as the current repo, so
+    older fixtures and partial payloads keep parsing (#109)."""
+    full = ((repository or {}).get("full_name")) or ""
+    return not full or full.lower() == current
 
-    De-duplicated, order-preserving. Skips cross-refs whose source is itself a
-    pull request (we only want issue links). Pure."""
-    out = []
+
+def parse_timeline_crossrefs(raw_timeline, current_slug):
+    """Issue numbers of the repo `current_slug` ('owner/repo') cross-referenced
+    or connected to a PR via timeline events.
+
+    De-duplicated, order-preserving (first appearance). Skips cross-refs whose
+    source is itself a pull request (we only want issue links) and, since #109,
+    events whose source / subject issue lives in another repo (its
+    `repository.full_name`, compared case-insensitively): their number is not
+    an issue of this repo (parse_timeline_xrefs keeps them as cross-repo refs,
+    so each `cross-referenced` event is counted by exactly one of the two).
+    Events are read in order: a `connected` link later undone by a
+    `disconnected` event for the same issue does not count (a reconnect counts
+    again); a disconnect never cancels a cross-reference (a mention). Pure."""
+    current = (current_slug or "").lower()
+    order, mentioned, connected = [], set(), set()
     for ev in raw_timeline or []:
         kind = ev.get("event")
         num = None
         if kind == "cross-referenced":
             issue = (ev.get("source") or {}).get("issue") or {}
-            if issue.get("pull_request") is None:
+            if issue.get("pull_request") is None \
+                    and _payload_in_repo(issue.get("repository"), current):
                 num = issue.get("number")
-        elif kind == "connected":
+                if num is not None:
+                    mentioned.add(num)
+        elif kind in ("connected", "disconnected"):
             # Tolerant: an event without a usable issue number (no subject,
             # a null / non-integer number) is not a link (issue #105).
-            num = (ev.get("subject") or {}).get("number")
-            if not isinstance(num, int) or isinstance(num, bool):
+            subject = ev.get("subject") or {}
+            num = subject.get("number")
+            if not isinstance(num, int) or isinstance(num, bool) \
+                    or not _payload_in_repo(subject.get("repository"), current):
                 num = None
-        if num is not None and num not in out:
-            out.append(num)
-    return out
+            elif kind == "connected":
+                connected.add(num)
+            else:
+                connected.discard(num)
+        if num is not None and num not in order:
+            order.append(num)
+    return [n for n in order if n in mentioned or n in connected]
 
 
 def parse_timeline_xrefs(raw_timeline, current_slug):
@@ -1550,17 +1604,13 @@ def _iter_patch_files(raw):
     parse_unified_diff entry ({path, old_path, hunks}). Merge commits (no patch)
     yield nothing. Pure; the shared walk behind the parsers below + parse_patch_events
     (so acquire can extract both symbol events and file diffs in one pass)."""
-    for chunk in (raw or "").split(RECORD_SEP):
-        if not chunk.strip():
+    for lines in _log_records(raw):
+        head = _parse_log_header(lines[0])
+        if head is None:
             continue
-        lines = chunk.split("\n")
-        fields = lines[0].split(FIELD_SEP)
-        if len(fields) < 5:
-            continue
-        sha, _parents, author, date, _subject = (f.strip() for f in fields[:5])
         body = "\n".join(lines[1:])
         for f in parse_unified_diff(body):
-            yield sha, author, date, f
+            yield head["sha"], head["author"], head["date"], f
 
 
 def _symbol_events_for(sha, author, date, f):
@@ -3695,13 +3745,13 @@ def clone_head_sha(clone_dir, run=run_git):
 
 def window_end_commit(clone_dir, to_date, run=None):
     """The mainline as of the window's end (issue #107): the newest commit on
-    the checked-out branch's first-parent chain whose committer date (the
-    `date` the walks window on) is on or before `to_date`, or None when the
-    bounded clone holds no such commit. First-parent, so a topic branch merged
-    after `to_date` is not counted as on the mainline before its merge."""
+    the checked-out branch's first-parent chain whose committer day (the UTC
+    `date` the walks window on, #109) is on or before `to_date`, or None when
+    the bounded clone holds no such commit. First-parent, so a topic branch
+    merged after `to_date` is not counted as on the mainline before its merge."""
     run = run or run_git
     raw = run(["git", "-C", clone_dir, "log", "--first-parent",
-               f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short"])
+               f"--pretty=format:{LOG_FORMAT}"])
     for rec in parse_git_log(raw):
         if in_window(rec.get("date"), None, to_date):
             return rec["sha"]
@@ -4106,9 +4156,10 @@ def _wait_for_rate_limit(kind, wait, url, waits, max_wait, sleep, clock, diagnos
 
 
 def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
-                 rate_limited=None):
+                 rate_limited=None, allow_statuses=()):
     """Send `req` with timeout, retries and rate-limit back-off. Returns
-    (headers, body_bytes), or (None, 404) for a 404 when allow_404. Raises
+    (headers, body_bytes), or (None, status) for a 404 when allow_404 or for
+    an HTTP status listed in `allow_statuses` (neither retried). Raises
     GitHubAPIError on any other failure.
 
     `rate_limited(headers, body)` optionally reports a rate limit signalled in a
@@ -4133,8 +4184,8 @@ def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
             with opener.open(req, timeout=timeout) as resp:
                 headers, body = resp.headers, resp.read()
         except urllib.error.HTTPError as err:
-            if allow_404 and err.code == 404:
-                return None, 404
+            if (allow_404 and err.code == 404) or err.code in allow_statuses:
+                return None, err.code
             try:
                 body = err.read()
             except Exception:
@@ -4178,7 +4229,50 @@ def _github_open(req, url, allow_404=False, opener=None, sleep=None, clock=None,
         return headers, body
 
 
-def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=None):
+# HTTP statuses for a single issue / PR that is not (or no longer) in the repo:
+# 404 (never existed, or not visible) and 410 (deleted). A caller fetching
+# one referenced item by number skips it on either, instead of failing the
+# whole gather on one dangling reference (#109).
+GONE_STATUSES = (404, 410)
+
+
+def _repo_of_url(url):
+    """'owner/repo' (lower-case) named by a GitHub API `repository_url`
+    (`…/repos/{owner}/{repo}`) or web `html_url`
+    (`https://github.com/{owner}/{repo}/…`), or None. Pure."""
+    parts = [p for p in urllib.parse.urlparse(url or "").path.split("/") if p]
+    if len(parts) >= 3 and parts[0] == "repos":
+        parts = parts[1:]
+    elif urllib.parse.urlparse(url or "").netloc.startswith("api."):
+        return None
+    if len(parts) < 2:
+        return None
+    return "{}/{}".format(parts[0], parts[1]).lower()
+
+
+def fetched_item_mismatch(raw, slug, number):
+    """Why a REST issue / PR object fetched as #`number` of `slug`
+    ('owner/repo') is NOT that item, or None when it is (#109). GitHub answers
+    a transferred issue through a redirect to its new home, so the object
+    must carry the requested `number`, and its `repository_url` and `html_url`
+    (whichever it has; compared case-insensitively) must name `slug`. A
+    payload with neither URL is not rejected for it (it cannot be checked).
+    Pure."""
+    if not isinstance(raw, dict):
+        return "not an object"
+    if raw.get("number") != number:
+        return "it is #{}".format(raw.get("number"))
+    want = (slug or "").lower()
+    for key in ("repository_url", "html_url"):
+        if raw.get(key):
+            got = _repo_of_url(raw[key])
+            if got != want:
+                return "{} names {}".format(key, got or raw[key])
+    return None
+
+
+def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=None,
+                  allow_statuses=()):
     """GET a GitHub API URL → (parsed_json, next_url).
 
     Timeouts, retries, rate-limit back-off and redirect auth-stripping come from
@@ -4187,17 +4281,21 @@ def http_get_json(url, token, allow_404=False, opener=None, sleep=None, clock=No
     SAML SSO vs. token scope); `_format_http_error` surfaces both.
 
     With allow_404=True a 404 returns (None, 404) instead of raising, so the
-    backfill seam can map a definitively-absent ref to ABSENT. All other
-    failures raise SystemExit with the diagnostic (fail fast).
+    backfill seam can map a definitively-absent ref to ABSENT; each HTTP status
+    in `allow_statuses` (e.g. GONE_STATUSES: 404 and 410, a deleted issue)
+    likewise returns (None, status). Only the statuses a caller names are
+    tolerated: all other failures raise SystemExit with the diagnostic (fail
+    fast).
     """
     req = urllib.request.Request(url, headers=_github_headers(url, token))
     try:
         headers, body = _github_open(req, url, allow_404=allow_404, opener=opener,
-                                     sleep=sleep, clock=clock)
+                                     sleep=sleep, clock=clock,
+                                     allow_statuses=allow_statuses)
     except GitHubAPIError as err:
         raise SystemExit(str(err)) from None
-    if headers is None and body == 404:
-        return None, 404
+    if headers is None:
+        return None, body
     return json.loads(body.decode()), _next_link(headers.get("Link", ""))
 
 
@@ -4540,16 +4638,30 @@ def board_is_maintained(board, ref_date=None, stale_days=None):
     return upd_d >= cutoff
 
 
-def _paginate_board_items(graphql, board, owner, repo, max_items):
+# Page guard of _paginate_board_items: at most this many item pages per board
+# after the discovery page (each up to 100 items), whatever `max_items` says.
+BOARD_MAX_PAGES = 200
+
+
+def _paginate_board_items(graphql, board, owner, repo, max_items,
+                          truncations=None):
     """Collect ONE board's item nodes: seed from the discovery page, then page the
     rest by NODE ID (PROJECT_BOARD_ITEMS_QUERY — a cursor that belongs to this
-    board's connection), capped at `max_items`. Warns on truncation so lost
-    coverage is visible. Returns the (capped) list of item nodes."""
+    board's connection), capped at `max_items` items and BOARD_MAX_PAGES pages.
+    Returns the (capped) list of item nodes.
+
+    Whenever items are left behind — more pages remain when the loop stops (the
+    item cap, the page guard, a failed or empty page, no board id) or the last
+    page overshot the cap — it warns on stderr naming the reason and, when
+    `truncations` is a list, appends {board, kept, max_items, reason} to it
+    (acquire records them as `meta.project_board_truncated`, #109), so lost
+    coverage is visible in the data, not only on stderr."""
     nodes = list(((board.get("items") or {}).get("nodes") or []))
     info = (board.get("items") or {}).get("pageInfo") or {}
     cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
-    board_id, guard = board.get("id"), 0
-    while has_next and board_id and len(nodes) < max_items and guard < 200:
+    board_id, guard, reason = board.get("id"), 0, None
+    while has_next and board_id and len(nodes) < max_items \
+            and guard < BOARD_MAX_PAGES:
         guard += 1
         try:
             page = graphql(PROJECT_BOARD_ITEMS_QUERY,
@@ -4561,23 +4673,47 @@ def _paginate_board_items(graphql, board, owner, repo, max_items):
             sys.stderr.write(
                 "warning: partial Projects v2 board #{} for {}/{}: {}\n".format(
                     board.get("number"), owner, repo, err))
+            reason = "error"
             break
         items = ((page or {}).get("node") or {}).get("items") or {}
         page_nodes = items.get("nodes") or []
         if not page_nodes:
+            reason = "empty_page"
             break
         nodes.extend(page_nodes)
         info = items.get("pageInfo") or {}
         cursor, has_next = info.get("endCursor"), info.get("hasNextPage")
-    if has_next and len(nodes) >= max_items:
+    if not has_next and len(nodes) <= max_items:
+        return nodes
+    if len(nodes) >= max_items:
+        reason = "item_cap"
+    elif reason is None:
+        reason = "page_guard" if guard >= BOARD_MAX_PAGES else "no_board_id"
+    kept = nodes[:max_items]
+    if reason != "error":   # an error was warned about above
         sys.stderr.write(
             "warning: Projects v2 board #{} for {}/{} truncated at {} items "
-            "(raise ACTIVITY_BOARD_MAX_ITEMS for full coverage).\n".format(
-                board.get("number"), owner, repo, max_items))
-    return nodes[:max_items]
+            "({}; raise ACTIVITY_BOARD_MAX_ITEMS for full coverage when it is "
+            "the item cap); recorded in meta.project_board_truncated.\n".format(
+                board.get("number"), owner, repo, len(kept),
+                _BOARD_TRUNCATION_REASONS[reason]))
+    if truncations is not None:
+        truncations.append({"board": board.get("number"), "kept": len(kept),
+                            "max_items": max_items, "reason": reason})
+    return kept
 
 
-def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
+_BOARD_TRUNCATION_REASONS = {
+    "item_cap": "the item cap was reached",
+    "page_guard": "the page guard of {} pages was reached".format(BOARD_MAX_PAGES),
+    "empty_page": "a page claimed more items but returned none",
+    "no_board_id": "the board has no id to page by",
+    "error": "a page request failed",
+}
+
+
+def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None,
+                        truncations=None):
     """Auto-discover + fetch EVERY maintained Projects v2 board the repo links, via
     the injected `graphql(query, variables)` callable, returning
     `(sprints, items_by_ref)` (see parse_project_board, which merges items across
@@ -4585,7 +4721,8 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     skipped with a warning so a deprecated-but-not-removed board can't pollute the
     result. Each kept board's items are paginated by NODE ID and capped per board
     at `max_items`. `ref_date` (the window's ref/`to` date) anchors the staleness
-    check.
+    check. A board whose items were cut short is appended to the optional
+    `truncations` list (see _paginate_board_items).
 
     Degrades CLEANLY to ({}, {}) on any error (a GitHubAPIError / SystemExit, a
     network failure, a null repository, or no linked/maintained board) — a board
@@ -4636,7 +4773,8 @@ def fetch_project_board(graphql, owner, repo, max_items=5000, ref_date=None):
     # Fetch each maintained board fully (per-board node-id pagination), then merge.
     full_boards = []
     for b in kept:
-        nodes = _paginate_board_items(graphql, b, owner, repo, max_items)
+        nodes = _paginate_board_items(graphql, b, owner, repo, max_items,
+                                      truncations)
         fb = dict(b)
         fb["items"] = {"pageInfo": {"hasNextPage": False, "endCursor": None},
                        "nodes": nodes}
@@ -5016,7 +5154,8 @@ def enrich_pr(pr, get_page, api, current_slug):
     # in "Fixes #1, #2": mentioned, not closed) and add the timeline's, in order.
     seeded = list(pr.get("crossref_issues") or [])
     pr["crossref_issues"] = seeded + [
-        n for n in parse_timeline_crossrefs(timeline) if n not in seeded]
+        n for n in parse_timeline_crossrefs(timeline, current_slug)
+        if n not in seeded]
     _attach_timeline_xrefs(pr, timeline, current_slug)
     # Phase 10 slice 1: allowlisted lifecycle events (reopened/closed/
     # ready_for_review). Omit-when-empty for byte stability.
@@ -5310,11 +5449,25 @@ def acquire(args, env):
         seen.add(issue["number"])
         issues.append(issue)
     for n in sorted(wanted - seen):
-        # A closed/cross-referenced issue can 404 — deleted, transferred to another
-        # repo, or a cross-ref number that is not an issue in THIS repo. Tolerate it
-        # (skip) rather than aborting the whole gather on one dangling reference.
-        raw_issue, _ = http_get_json(f"{api}/issues/{n}", token, allow_404=True)
-        if raw_issue is None or raw_issue.get("pull_request"):
+        # A closed/cross-referenced issue can be gone: 404 (a number that is not
+        # an issue in THIS repo) or 410 (deleted). Tolerate it (skip, one note)
+        # rather than aborting the whole gather on one dangling reference. A
+        # transferred issue is answered through a redirect to its new repo: an
+        # object that is not #n of this repo is skipped too, never stored as
+        # this repo's issue (#109).
+        raw_issue, status = http_get_json(f"{api}/issues/{n}", token,
+                                          allow_statuses=GONE_STATUSES)
+        if raw_issue is None:
+            sys.stderr.write(f"note: {owner}/{repo}: referenced issue #{n} "
+                             f"skipped (HTTP {status})\n")
+            continue
+        why = fetched_item_mismatch(raw_issue, f"{owner}/{repo}", n)
+        if why:
+            sys.stderr.write(f"note: {owner}/{repo}: referenced issue #{n} "
+                             f"skipped: the API answered with another item "
+                             f"({why}; transferred?)\n")
+            continue
+        if raw_issue.get("pull_request"):
             continue
         raw_by_num[raw_issue["number"]] = raw_issue
         issues.append(normalize_issue(raw_issue))
@@ -5394,13 +5547,15 @@ def acquire(args, env):
     # missing read:project scope NEVER hard-fails the run; --no-project-board skips
     # the query entirely.
     sprints = {}
+    board_truncated = []
     if getattr(args, "project_board", True):
         _graphql = _graphql_client(token)
         # ref_date (the window's reference point) anchors the board staleness
         # check; it is finalized below but resolves to the same value here.
         sprints, items_by_ref = fetch_project_board(
             _graphql, owner, repo, max_items=_board_max_items(),
-            ref_date=getattr(args, "ref_date", None) or to)
+            ref_date=getattr(args, "ref_date", None) or to,
+            truncations=board_truncated)
         # Window-bound iterations to [frm, to] by date: keep a sprint that overlaps
         # the window at all (start <= to and end >= frm). A sprint with no dates is
         # kept (can't exclude it). Drop the iteration stamp on items whose sprint
@@ -5451,6 +5606,10 @@ def acquire(args, env):
     # Where `closes` came from (issue #105): "graphql" (keywords + GitHub's
     # closingIssuesReferences) or "keywords" (GraphQL unavailable).
     bundle["meta"]["closing_refs_source"] = closing_refs_source
+    # Boards whose items were cut short (item cap / page guard / failed page,
+    # #109): present only when one was, so a complete board changes nothing.
+    if board_truncated:
+        bundle["meta"]["project_board_truncated"] = board_truncated
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["code_events"] = code_events
@@ -5588,6 +5747,23 @@ def backfill(conn, id, fetch=None):
     return {"fetched": True, "absent": False, "id": id, "edges_added": len(edges)}
 
 
+def _backfilled_is(raw, slug, num, qid):
+    """True when the REST object fetched for backfill id `qid` really is
+    #`num` of `slug` (fetched_item_mismatch); else one stderr note and False,
+    so the node stays a warned gap rather than storing another repo's item
+    under this id (a transferred issue answers through a redirect, #109)."""
+    try:
+        number = int(num)
+    except (TypeError, ValueError):
+        number = num
+    why = fetched_item_mismatch(raw, slug, number)
+    if why:
+        sys.stderr.write(f"note: backfill {qid}: the API answered with another "
+                         f"item ({why}; transferred?); not stored\n")
+        return False
+    return True
+
+
 def make_backfill_fetcher(token, clone_dir=None):
     """Production `fetch` seam for `backfill`: resolves one node by REST (social)
     or local git (code). Returns a `fetch(kind, local, qid)` callable.
@@ -5601,8 +5777,10 @@ def make_backfill_fetcher(token, clone_dir=None):
 
     A `Closes #N` whose #N resolves to a PR (issues + PRs share one number
     space) is followed to the real PR and returned as a node — the thread is
-    traversed, not dropped. Outcomes: a fetched dict, `ABSENT` (a genuine 404),
-    or `None` (transient / not resolvable this run, e.g. a code sha with no clone).
+    traversed, not dropped. Outcomes: a fetched dict, `ABSENT` (a genuine 404,
+    or 410 for a deleted issue), or `None` (transient / not resolvable this
+    run, e.g. a code sha with no clone, or an answer that is not the requested
+    item of this repo: a transferred issue reached through a redirect, #109).
     """
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
@@ -5616,9 +5794,12 @@ def make_backfill_fetcher(token, clone_dir=None):
         api = f"https://api.github.com/repos/{slug}"
         if kind == "social" and local.startswith("issue-"):
             num = local[len("issue-"):]
-            raw, nxt = http_get_json(f"{api}/issues/{num}", token, allow_404=True)
-            if raw is None and nxt == 404:
+            raw, nxt = http_get_json(f"{api}/issues/{num}", token,
+                                     allow_statuses=GONE_STATUSES)
+            if raw is None:
                 return ABSENT
+            if not _backfilled_is(raw, slug, num, qid):
+                return None
             if raw.get("pull_request"):
                 # #N is actually a PR (issues + PRs share one number space). The
                 # parsed `issue-N` is gather's mis-classification, not a phantom:
@@ -5628,9 +5809,11 @@ def make_backfill_fetcher(token, clone_dir=None):
                 # and anchor the train's headline to in-window work, so an ancient
                 # cross-ref is traversed as context without hijacking the title.
                 pr_raw, pnxt = http_get_json(f"{api}/pulls/{num}", token,
-                                             allow_404=True)
-                if pr_raw is None and pnxt == 404:
+                                             allow_statuses=GONE_STATUSES)
+                if pr_raw is None:
                     return ABSENT
+                if not _backfilled_is(pr_raw, slug, num, qid):
+                    return None
                 pr = normalize_pr(pr_raw)
                 edges = [("issue-{}".format(n), "closes")
                          for n in pr.get("closes") or []]
@@ -5638,9 +5821,12 @@ def make_backfill_fetcher(token, clone_dir=None):
             return {"node": normalize_issue(raw), "edges": []}
         if kind == "social" and local.startswith("pr-"):
             num = local[len("pr-"):]
-            raw, nxt = http_get_json(f"{api}/pulls/{num}", token, allow_404=True)
-            if raw is None and nxt == 404:
+            raw, nxt = http_get_json(f"{api}/pulls/{num}", token,
+                                     allow_statuses=GONE_STATUSES)
+            if raw is None:
                 return ABSENT
+            if not _backfilled_is(raw, slug, num, qid):
+                return None
             pr = normalize_pr(raw)
             edges = [("issue-{}".format(n), "closes") for n in pr.get("closes") or []]
             return {"node": pr, "edges": edges}
@@ -5650,14 +5836,15 @@ def make_backfill_fetcher(token, clone_dir=None):
                 run_git(["git", "-C", clone_dir, "fetch", "--depth", "1",
                          "origin", sha])
                 raw = run_git(["git", "-C", clone_dir, "log", "-1",
-                               f"--pretty=format:{CODE_LOG_FORMAT}",
-                               "--date=short", "--name-only", sha])
+                               f"--pretty=format:{LOG_FORMAT}",
+                               "--name-only", sha])
             except Exception:
                 return None
             commits = parse_git_log(raw)
             if not commits:
                 return None
             c = commits[0]
+            c.pop("author_email", None)   # transient (#78): never stored
             prn = resolve_commit_pr(c.get("message", ""))
             edges = [("pr-{}".format(prn), "part_of")] if prn is not None else []
             return {"node": c, "edges": edges}

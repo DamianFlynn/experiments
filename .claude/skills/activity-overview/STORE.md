@@ -153,7 +153,10 @@ Each closed issue needs its own keyword — `Fixes #1, #2` closes only #1 (#2 is
 kept as a same-repo cross-reference in `crossref_issues`), while `Fixes #1, fixes
 #2` closes both. A same-repo qualified ref or URL is a same-repo `closes`; a
 cross-repo one goes to the cross-repo edge path below; a keyword before a
-`/pull/` URL is a `cross_ref`, never a close. Keywords are matched in code blocks
+`/pull/` URL is a `cross_ref`, never a close. A timeline `cross-referenced` /
+`connected` event joins `crossref_issues` only when its source issue is in this repo
+(#109; another repo's issue is a cross-repo ref only), and a `connected` link later
+`disconnected` does not. Keywords are matched in code blocks
 too (no Markdown parsing). GitHub's own list (#105) is merged in at gather time: the
 issues `closingIssuesReferences` reports (keywords AND manual Development-sidebar links)
 join the PR's `closes` (same repo; removed from `crossref_issues`) and, when anything is
@@ -173,7 +176,8 @@ event)` → set semantics (re-seeing a commit is a no-op). The ledger keeps ever
 folded window, and it is the source of truth for the artifact nodes: an
 artifact's `lifecycle[]` is all of its ledger rows in commit order: by the commit's UTC
 committer time (`committed_at` on the commit node) when it is stored, else by the
-event's `date`, the committer's local day (ties keep ledger order). File-level rows are
+event's `date`, the commit's UTC committer day (the committer's local day for windows
+gathered before #109; ties keep ledger order). File-level rows are
 keyed by the bare `<path>` (not the `art:<path>` node id) and keep git's change verb
 (`add`/`modify`/`delete`/`rename`/`copy`); symbol rows carry the mapped event
 (`add`/`change`/`remove`). A reader maps `art:<path>` to `<path>` before reading the

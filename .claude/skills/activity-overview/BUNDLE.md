@@ -136,8 +136,8 @@ the rest (engagement, code areas, trains, people/flow).
   remote does not have stops the gather (a manifest member is recorded failed).
   Plus **`clone_sha`** — the commit the structure (`code_graph` and its edges, the structural
   scan, CODEOWNERS) was read at, and **`structure_as_of`** (issue #107): `"window_end"` when
-  that commit is the last commit of the walked branch (first-parent) whose committer date is
-  on or before `to` — the current month's head, or for a past window re-gathered later the
+  that commit is the last commit of the walked branch (first-parent) whose committer day (UTC)
+  is on or before `to` — the current month's head, or for a past window re-gathered later the
   mainline as it was then (read from a temporary worktree; the clone stays on its branch
   head) — or `"head"` when the bounded clone does not hold that commit (a window with no
   commit in it or its margin, before later ones), so the structure is the head's; both `null`
@@ -153,7 +153,12 @@ the rest (engagement, code areas, trains, people/flow).
   the view, omitted when empty. **`closing_refs_source`** (`graphql` | `keywords`, issue
   #105) is bundle-only: where the PRs' `closes` came from — GitHub's
   `closingIssuesReferences` merged with the closing keywords, or the keywords alone because
-  GraphQL was unavailable (gather prints which on stderr). (Store-only — see `STORE.md`;
+  GraphQL was unavailable (gather prints which on stderr). **`project_board_truncated`**
+  (#109, bundle-only, present only when it applies) lists each Projects v2 board whose items
+  were cut short: `[{board, kept, max_items, reason}]`, `reason` one of `item_cap`
+  (`ACTIVITY_BOARD_MAX_ITEMS`), `page_guard` (200 pages), `error` (a page request failed),
+  `empty_page` (a page claimed more items but held none) or `no_board_id`; items past `kept`
+  carry no `board_status` / `iteration`. (Store-only — see `STORE.md`;
   this bundle shape is the transient view `extract` materializes from the store, not a
   produced file.)
   A view (`extract` / `view.py` / each `digest.py` member bundle) carries `owner, repo, from,
@@ -211,11 +216,15 @@ the rest (engagement, code areas, trains, people/flow).
   several gathered windows is their union.
 - `commits` — `[{ sha, parents, author, author_name, login_resolved, login_source?, date,
   committed_at?, message, files, pr }]` (`pr` set by link).
-  `date` is the **committer/landing date** (`%cd`); the walk windows in Python on it
-  (`window_records`) rather than via git `--since/--until`, which prunes valid in-window commits
-  across committer timezones. `committed_at` (#82) is the full committer timestamp (`%cI`)
-  in UTC, `YYYY-MM-DDTHH:MM:SSZ`; it orders the `timeline` only (windowing stays on `date`).
-  It is absent on commits gathered before #82 and on backfilled commits.
+  `date` is the **UTC calendar day of the committer timestamp** (#109; before it, the
+  committer's local day, `%cd`), so commits are windowed on the same UTC calendar as PRs and
+  issues: a commit at `2026-10-31T20:00-08:00` is dated `2026-11-01`, in November with the PR
+  merged at that instant. The walk windows in Python on it (`window_records`) rather than via
+  git `--since/--until`, which prunes valid in-window commits across committer timezones.
+  `code_events[].date` and `symbol_events[].date` are the same day of the same commit, so every
+  record of one commit lands in one window. `committed_at` (#82) is the full committer
+  timestamp (`%cI`) in UTC, `YYYY-MM-DDTHH:MM:SSZ`; it orders the `timeline`. It is absent on
+  commits gathered before #82 and on commits backfilled before #109.
   **People identity (#78):** `author` is the author's **GitHub login** — the same key PR, issue,
   review and comment records use — so one person is one `people` entry. `gather.resolve_commit_authors`
   resolves it from real data, in order: the commits-list API's `author.login` for that SHA
@@ -446,7 +455,7 @@ review's state to `DISMISSED`.
   `<path>#<lang>:<subkind>:<name>` and also carry `lang`/`subkind`. `feature_deltas[].artifact`
   joins back to these keys. `code_area` is filled by area attribution (below). Symbol lifecycle entries
   carry the bounded `before`/`after`. `lifecycle` is in commit order (the commit's UTC `committed_at`
-  when known, else the local `date`; ties keep git/ledger order). A view from a store holds
+  when known, else its `date`; ties keep git/ledger order). A view from a store holds
   only the view's window's events (issue #85; the stored node is cumulative over every folded
   window, #76) and `status`/`replaced_by` are as of the window's end. `status` is derived from the artifact's **last**
   lifecycle event: `replaced` only when that event is a rename to a tracked path

@@ -446,7 +446,8 @@ contributors. Attribution of stalls to people exists only in an **opt-in interna
 
 These are real, current limits — plan around them. Stores gathered before some fixes need
 a re-gather to benefit from them (person ids, base branch, per-window facts, commit times,
-nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them once.
+nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
+[`USAGE.md`](USAGE.md) §2.2 lists them once.
 
 1. **Cross-repo Bicep `depends_on` needs a declared publisher and the public registry.**
    A manifest member that declares `bicep_registry_prefix` (e.g. `"avm/"` on

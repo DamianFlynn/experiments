@@ -513,27 +513,32 @@ class TestReviewsAndTimeline(unittest.TestCase):
             gather.summarize_reviews(list(reversed(raw)))["decision"], "approved")
 
     def test_parse_timeline_crossrefs_collects_issue_numbers(self):
+        here = {"full_name": "o/r"}
         raw = [
             {"event": "cross-referenced",
-             "source": {"issue": {"number": 18, "pull_request": None}}},
+             "source": {"issue": {"number": 18, "pull_request": None,
+                                  "repository": here}}},
             {"event": "connected", "subject": {"number": 19}},
             {"event": "labeled"},
             {"event": "cross-referenced",
-             "source": {"issue": {"number": 18, "pull_request": None}}},
+             "source": {"issue": {"number": 18, "pull_request": None,
+                                  "repository": here}}},
         ]
-        self.assertEqual(gather.parse_timeline_crossrefs(raw), [18, 19])
+        self.assertEqual(gather.parse_timeline_crossrefs(raw, "o/r"), [18, 19])
 
     def test_parse_timeline_crossrefs_skips_pr_sourced_xref(self):
         raw = [{"event": "cross-referenced",
-                "source": {"issue": {"number": 99, "pull_request": {"url": "x"}}}}]
-        self.assertEqual(gather.parse_timeline_crossrefs(raw), [])
+                "source": {"issue": {"number": 99, "pull_request": {"url": "x"},
+                                     "repository": {"full_name": "o/r"}}}}]
+        self.assertEqual(gather.parse_timeline_crossrefs(raw, "o/r"), [])
 
-    def test_parse_timeline_crossrefs_ignores_disconnected(self):
+    def test_parse_timeline_crossrefs_disconnect_cancels_the_link(self):
+        # #109: a `connected` link later undone by `disconnected` is no link.
         raw = [
             {"event": "connected", "subject": {"number": 5}},
             {"event": "disconnected", "subject": {"number": 5}},
         ]
-        self.assertEqual(gather.parse_timeline_crossrefs(raw), [5])
+        self.assertEqual(gather.parse_timeline_crossrefs(raw, "o/r"), [])
 
     # --- Phase 10 slice 1: normalize_review (keep the submissions) -----------
     def test_normalize_review_maps_fields(self):
@@ -762,7 +767,7 @@ class TestAcquireAssemblyP2(unittest.TestCase):
             pr["reviewers"] = rv["reviewers"]
             pr["review_decision"] = rv["decision"]
             pr["crossref_issues"] = gather.parse_timeline_crossrefs(
-                data["timeline"].get(str(pr["number"]), []))
+                data["timeline"].get(str(pr["number"]), []), "o/r")
         issues = [gather.normalize_issue(i) for i in data["issues"].values()]
         workflows = [gather.normalize_workflow(w) for w in data["workflows"]]
         releases = [gather.normalize_release(r) for r in data["releases"]]
@@ -830,7 +835,8 @@ class TestParseCodeEvents(unittest.TestCase):
     def test_copy_and_type_change_status_codes(self):
         # C### (copy) -> copy with old+new path; T (type-change) -> modify.
         raw = (
-            "\x1e" + "f" * 40 + "\x1f" + "p" * 40 + "\x1fEve\x1f2026-05-20\x1fmix\n"
+            "\x1e" + "f" * 40 + "\x1f" + "p" * 40
+            + "\x1fEve\x1fe@x\x1f2026-05-20T12:00:00Z\x1fmix\n"
             "C085\told/x.bicep\tnew/x.bicep\n"
             "T\tlinks/sym.bicep\n"
         )
@@ -842,7 +848,7 @@ class TestParseCodeEvents(unittest.TestCase):
 
     def test_malformed_rename_line_is_skipped(self):
         # A rename status with only one path column is dropped, not mis-parsed.
-        raw = ("\x1e" + "f" * 40 + "\x1f\x1fEve\x1f2026-05-20\x1fbad\n"
+        raw = ("\x1e" + "f" * 40 + "\x1f\x1fEve\x1fe@x\x1f2026-05-20T12:00:00Z\x1fbad\n"
                "R096\tonly/old/path.bicep\n")
         self.assertEqual(gather.parse_code_events(raw), [])
 
@@ -3149,7 +3155,8 @@ class TestBuildSymbolDeltas(unittest.TestCase):
 class TestParseSymbolEvents(unittest.TestCase):
     def test_record_splitting_attaches_commit_metadata(self):
         sha = "a" * 40
-        header = gather.FIELD_SEP.join([sha, "parent", "Alice", "2026-05-03", "subj"])
+        header = gather.FIELD_SEP.join([sha, "parent", "Alice", "a@x",
+                                       "2026-05-03T12:00:00Z", "subj"])
         raw = gather.RECORD_SEP + header + "\n" + BICEP_DIFF
         events = gather.parse_symbol_events(raw)
         self.assertTrue(events)
@@ -3226,7 +3233,8 @@ class TestBoundedFileDiff(unittest.TestCase):
 
 class TestParseFileDiffs(unittest.TestCase):
     def _raw(self, *diffs, sha="a" * 40):
-        header = gather.FIELD_SEP.join([sha, "p", "Alice", "2026-05-03", "subj"])
+        header = gather.FIELD_SEP.join([sha, "p", "Alice", "a@x",
+                                       "2026-05-03T12:00:00Z", "subj"])
         return gather.RECORD_SEP + header + "\n" + "".join(diffs)
 
     def test_one_bounded_diff_per_changed_file(self):
@@ -3251,7 +3259,8 @@ class TestParseFileDiffs(unittest.TestCase):
         self.assertEqual(gather.parse_file_diffs(""), [])
 
     def test_merge_commit_no_patch_yields_nothing(self):
-        header = gather.FIELD_SEP.join(["b" * 40, "p1 p2", "Bob", "2026-05-04", "merge"])
+        header = gather.FIELD_SEP.join(["b" * 40, "p1 p2", "Bob", "b@x",
+                                       "2026-05-04T12:00:00Z", "merge"])
         self.assertEqual(
             gather.parse_file_diffs(gather.RECORD_SEP + header + "\n"), [])
 
@@ -5120,10 +5129,11 @@ class TestSeededCrossrefsSurviveEnrichment(unittest.TestCase):
 
     def test_list_tail_ref_kept_and_timeline_refs_appended(self):
         pr = {"number": 5, "merged": False, "crossref_issues": [2]}
+        here = {"full_name": "o/r"}
         timeline = [{"event": "cross-referenced",
-                     "source": {"issue": {"number": 9}}},
+                     "source": {"issue": {"number": 9, "repository": here}}},
                     {"event": "cross-referenced",
-                     "source": {"issue": {"number": 2}}}]
+                     "source": {"issue": {"number": 2, "repository": here}}}]
 
         def get_page(url):
             return (timeline if "/timeline" in url else []), None
@@ -5133,5 +5143,5 @@ class TestSeededCrossrefsSurviveEnrichment(unittest.TestCase):
         self.assertEqual(sorted(pr["crossref_issues"]),
                          sorted(set(pr["crossref_issues"])))
         self.assertEqual(pr["crossref_issues"],
-                         [2] + [n for n in gather.parse_timeline_crossrefs(timeline)
-                                if n != 2])
+                         [2] + [n for n in gather.parse_timeline_crossrefs(
+                             timeline, "o/r") if n != 2])
