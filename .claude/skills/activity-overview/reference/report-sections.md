@@ -118,7 +118,9 @@ member's train (`ptrain-<project>/<repo>#issue-<n>` ↔ member `<repo>`'s `train
   Then fill the template's `<!-- narrative: <train-id> -->` slot (in its deep-train block) with
   a per-train narrative (next).
 - **MENTION trains** (`train.tier` "mention") collapse to one line:
-  `- {train.id} — {short title} — {train.outcome} ({count of train.prs} PR(s))`.
+  `- {train.id} — {short title} — {train.outcome} ({count of train.prs} PR(s))` — unless the
+  train is a **story train** (`train.story` true): it gets its own sub-section with a story
+  (see "Stories (the story brief)" below).
 - **A monorepo of independent PRs** (most trains are one PR; the largest holds one or two):
   campaigns that run all month are dozens of trains with no closing reference between them,
   so a flat list of 100+ lines says little. Group the mention lines by **theme** — from the
@@ -139,7 +141,8 @@ embedded diagram, e.g. *"Showing 200 of 700 PRs."* (`shown` of `total` `unit`).
 
 ### Per-train narration (sub-agent pass)
 For EACH deep train, fill its `<!-- narrative: <train-id> -->` slot with a sourced narrative
-from a narrator sub-agent that reads ONLY that train's bounded slice:
+from a narrator sub-agent that reads ONLY that train's bounded slice (a train that is also a
+story train gets the story brief below instead):
 1. **Get the slice:** `python3 link.py <bundle-view> --slice <train-id>` prints the train's
    self-contained JSON slice (`slice_train` shape: train / issue / prs / commits +
    `review_rounds`, capped `reviews`/`lifecycle`, `reopen_count`, `feature_deltas`). Read-only.
@@ -197,6 +200,61 @@ from a narrator sub-agent that reads ONLY that train's bounded slice:
    Changed / Rejected / Shipped** bullets (omit empty ones), each carrying its evidence link(s).
    This is the analysis layer — the model's judgment over the slice — and MUST stay grounded in
    the slice's sourced facts.
+
+### Stories (the story brief)
+The deep tier ranks by footprint, so mechanical sweeps fill it while the most discussed work
+is a one-line mention. **Story trains** (`train.story` true, ranked by `train.story_rank`;
+`bundle["stories"]`, BUNDLE.md "The story layer") get a short story whatever their tier — in
+flight included: that is often where the debate is. Put the story in the train's
+sub-section (a story train that is a mention train gets one: its effort line, then the
+story); end the section with one line when `stories.more` is not empty: *"N more trains had
+notable discussion: <ids>"*. No story train → no stories, and nothing is said.
+
+1. **Get the slice** as for any train (`python3 link.py <bundle-view> --slice <train-id>`).
+   The story material is `slice.conversation`: one chronological `timeline` (openings with
+   their body, every human comment, review with its state, review comment, lifecycle event,
+   PR commit and merged commit with the code comments it added or removed, the merge),
+   `turning_points` marked by rule, `truncation`, `bots`, `pr_history`, `not_gathered`.
+2. **Dispatch one story narrator per story train** (the batching of step 2b applies, with
+   each slice as its own block). Hand it the slice and this brief:
+   > You write the story of one decision train from ONLY the supplied slice — never outside
+   > knowledge, never an invented fact, name, number or URL. In 3–5 short paragraphs (5–8
+   > sentences in all), tell the arc: what was proposed and why (the opening item); what
+   > objection, discovery or dependency changed its course (the turning points:
+   > `change_request`, `rework_after_change_request`, `reopened`, `silence_then_activity`,
+   > `new_attempt`, `history_rewritten`); how it was resolved, or why it is still open
+   > (`still_silent`, the last items); what it cost in time (`train.effort`,
+   > `train.discussion.longest_silence`, the dates in the timeline).
+   > - Every claim cites the timeline item it rests on by its `url`, copied verbatim. Short
+   >   verbatim quotes are allowed — in double quotes, attributed to the item's `actor`, the
+   >   text exactly as it appears in the item.
+   > - State what happened and what was said. Do not characterise people: no judgement of
+   >   competence, mood, tone, effort or motive (not "frustrated", "pushed back hard",
+   >   "finally", "sloppy", "patiently"), no blame, no praise.
+   > - Describe disagreement by positions: "X asked for …; Y preferred … because …" — the
+   >   because only when the item says it.
+   > - Dates and durations come from the items' `at` and the effort / discussion blocks;
+   >   say "N days without recorded activity", never why nobody acted.
+   > - Code notes (`code_notes` on commit items) show what the code said along the way —
+   >   quote a developer note when it shows a decision; parameter descriptions only when
+   >   they changed meaning. Their lines are not in file order: never join them into prose.
+   > - When `truncation.cut` or `truncation.text_omitted` is not empty, say once that the
+   >   material was truncated and which items (by url). When `pr_history` says
+   >   `not_gathered` / `missing`, do not speak about the PR's internal history. Things in
+   >   `not_gathered` (title edits, force-pushes, label changes) are never claimed.
+   > - When the slice does not support a story — no turn changes the course, the
+   >   conversation is acknowledgements — return exactly "No notable discussion." rather
+   >   than inflate.
+   > Return `{story, evidence: [url]}`.
+3. **Verify, then compose.** Run the mechanical check against the train's own slice file:
+   ```bash
+   python3 link.py workspace/view/<train-id>.slice.json --check-story workspace/view/<train-id>.story.md
+   ```
+   It exits 0 when every URL the story cites occurs in the slice and every quoted string
+   (in `"…"` or `“…”`, at least 4 characters) occurs verbatim in a slice text (whitespace
+   normalised), else 1, printing `urls_not_in_slice` / `quotes_not_in_slice`. Drop or fix
+   each listed sentence and check again; never publish a story that fails it. The check
+   cannot judge tone: read the story once against the hard rules above.
 
 ## Next-release forecast
 `bundle["forecast"]` is a forward-only prediction over `buckets.next_candidates`.

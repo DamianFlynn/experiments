@@ -1309,15 +1309,36 @@ def aggregate_workflow_stats(workflows):
     return stats
 
 
+# A release's notes text (the `body` GitHub already returns with the release
+# list) is kept up to this many characters, so a repository without a changelog
+# (a Terraform module repo, a landing zone) still has its maintainers' own
+# release text. Generated notes run to a few thousand characters (a "What's
+# changed" list of PR titles); the cap keeps a long one from dominating a view.
+RELEASE_NOTES_CAP = 4000
+
+
 def normalize_release(raw):
-    """Map a GitHub release object to the bundle's release shape."""
-    return {
+    """Map a GitHub release object to the bundle's release shape.
+
+    `notes` (only when the release has text) is its `body`, verbatim up to
+    RELEASE_NOTES_CAP characters; a longer one is cut there and
+    `notes_truncated_from` records its original length."""
+    out = {
         "tag_name": raw.get("tag_name"),
         "name": raw.get("name"),
         "published_at": raw.get("published_at"),
         "prerelease": bool(raw.get("prerelease")),
         "url": raw.get("html_url"),
     }
+    body = raw.get("body")
+    if isinstance(body, str) and body.strip():
+        body = body.replace("\r\n", "\n")
+        if len(body) > RELEASE_NOTES_CAP:
+            out["notes"] = body[:RELEASE_NOTES_CAP]
+            out["notes_truncated_from"] = len(body)
+        else:
+            out["notes"] = body
+    return out
 
 
 def normalize_milestone(raw):
@@ -2245,6 +2266,255 @@ def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
     if unread:
         notes["unread"] = unread
     return notes
+
+
+# --- PR-internal history (per-window fact `pr_history`) ---------------------
+#
+# The base-branch walk sees one commit per squash-merged PR, so the work inside
+# a PR (its first attempt, the rework after a review, a comment added and then
+# removed) is not in it. GitHub keeps every PR's commits at
+# `refs/pull/<N>/head`, fetchable with plain git after the merge. gather lists
+# those refs once (`ls-remote`), fetches the window's PR heads in batches into
+# `refs/remotes/pr/<N>` (blobless, like the main clone), lists each PR's own
+# commits (reachable from its head, not from the walked branch) and, for the
+# PRs most likely to carry a story, the comment / parameter adds and removes
+# between those commits (the patch walk's own symbol extraction).
+
+# Refspecs per `git fetch`. One fetch per batch keeps the command line short and
+# lets one failed batch be recorded without losing the others.
+PR_HISTORY_FETCH_BATCH = 100
+# Commits kept per PR (oldest first); the rest are counted in commits_omitted.
+# GitHub's own PR commit list stops at 250.
+PR_HISTORY_MAX_COMMITS = 250
+# The comment / parameter walk (a `git log -p` over the PR's commits, which
+# fetches the blobs of the .bicep / .tf files they touch) runs only for PRs
+# with human conversation (the gather-time sign of a story), at most this many
+# PRs per window, the most discussed first ...
+PR_HISTORY_NOTES_MAX_PRS = 40
+# ... and only for PRs of at most this many commits.
+PR_HISTORY_NOTES_MAX_COMMITS = 60
+# Comment / parameter events kept per PR (the newest; notes_omitted counts the
+# oldest left out). A new module's first commit alone can add a few hundred.
+PR_HISTORY_NOTES_MAX = 400
+# The symbol kinds the walk keeps: comments (developer notes, parameter
+# descriptions) and the interface (parameters, Terraform variables, outputs).
+PR_HISTORY_NOTE_SUBKINDS = ("comment", "todo", "param", "variable", "output")
+# One header per PR commit: sha, parents, author name, author timestamp,
+# committer timestamp, subject (last: free text).
+PR_COMMIT_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%cI%x1f%s"
+
+
+def parse_pr_head_refs(raw):
+    """`git ls-remote origin 'refs/pull/*/head'` output -> {number: sha}. Pure."""
+    out = {}
+    for line in (raw or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        m = re.fullmatch(r"refs/pull/(\d+)/head", parts[1])
+        if m:
+            out[int(m.group(1))] = parts[0]
+    return out
+
+
+def parse_pr_commits(raw):
+    """A `git log --format=PR_COMMIT_FORMAT --name-only` listing -> commits
+    [{sha, parents, author, authored_at, committed_at, subject, files}] in
+    the listing's order. `parents` is a count (2 for a merge), `files` the
+    number of paths the commit changed (a merge lists none). Pure."""
+    out = []
+    for lines in _log_records(raw):
+        fields = lines[0].split(FIELD_SEP, 5)
+        if len(fields) < 6:
+            continue
+        sha, parents, author, authored, committed = (f.strip() for f in fields[:5])
+        out.append({
+            "sha": sha, "parents": len(parents.split()), "author": author,
+            "authored_at": _utc_timestamp(authored),
+            "committed_at": _utc_timestamp(committed),
+            "subject": fields[5].strip(" \t\r"),
+            "files": len([ln for ln in lines[1:] if ln.strip()]),
+        })
+    return out
+
+
+def _shallow_parent_exclusions(clone_dir, run):
+    """The real parents of the clone's shallow boundary commits that exist
+    locally, sorted (revisions to list after `--not`, which already negates
+    them). The walked branch is cut at the boundary (its
+    oldest commit has no parents in a shallow clone), so `<pr head> --not HEAD`
+    would list the base-branch commits older than the boundary that a PR head
+    reaches (fetched with it); excluding the boundary commits' real parents
+    (read from the commit object, which keeps them) leaves the PR's own."""
+    try:
+        path = run(["git", "-C", clone_dir, "rev-parse", "--git-path",
+                    "shallow"]).strip()
+    except RuntimeError:
+        return []
+    if path and not os.path.isabs(path):
+        path = os.path.join(clone_dir, path)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            boundary = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return []
+    out = []
+    for sha in boundary:
+        try:
+            body = run(["git", "-C", clone_dir, "cat-file", "commit", sha])
+        except RuntimeError:
+            continue
+        for line in body.splitlines():
+            if not line:
+                break
+            if line.startswith("parent "):
+                parent = line.split()[1]
+                try:
+                    run(["git", "-C", clone_dir, "cat-file", "-e",
+                         parent + "^{commit}"])
+                except RuntimeError:
+                    continue
+                out.append(parent)
+    return sorted(set(out))
+
+
+def _human_conversation(pr):
+    """How many human (non-bot) comments and review comments a PR has."""
+    return sum(1 for key in ("comments_list", "review_comments")
+               for c in pr.get(key) or []
+               if isinstance(c, dict)
+               and not derive.is_bot_login(c.get("author")))
+
+
+def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
+                       base_branch=None):
+    """The window's `pr_history` fact. All git goes through `run` (default
+    run_git, which retries a dropped connection); a refusal is recorded,
+    never fatal.
+
+    1. `git ls-remote origin refs/pull/*/head` lists the PR head refs once.
+       A PR of the window without one is `status: "missing"`.
+    2. The listed heads are fetched in batches of PR_HISTORY_FETCH_BATCH
+       (`git fetch --filter=blob:none --no-tags origin
+       +refs/pull/<N>/head:refs/remotes/pr/<N> ...`); every PR of a batch
+       whose fetch failed is `status: "fetch_failed"`.
+    3. Each fetched PR's own commits: `git log --reverse --date-order` of
+       its head, not reachable from `base_ref` (the walked branch) nor from
+       the real parents of the shallow boundary, at most
+       PR_HISTORY_MAX_COMMITS (the rest counted in `commits_omitted`). No
+       commit at all means the head is on the walked branch (`on_base`:
+       a merge-commit merge, whose commits the base walk already has).
+    4. For the most discussed PRs (human comments and review comments > 0,
+       at most PR_HISTORY_NOTES_MAX_PRS of them, each of at most
+       PR_HISTORY_NOTES_MAX_COMMITS commits) a `git log -p` over the same
+       commits, limited to `*.bicep` / `*.tf`, run through the patch walk's
+       symbol extraction; the comment / parameter / variable / output events
+       are `notes` (the newest PR_HISTORY_NOTES_MAX; `notes_omitted` counts
+       the oldest left out).
+       A merge commit has no patch. Every other PR records `notes_skipped`
+       with the reason.
+
+    Returns {"collected": True, "base": base_branch, "prs": [per PR, by
+    number], "limits": {...}} or, when the refs cannot be listed,
+    {"collected": True, "base", "error", "prs": []}."""
+    run = run or run_git
+    numbers = sorted({p["number"] for p in prs if isinstance(p.get("number"), int)})
+    limits = {"max_commits": PR_HISTORY_MAX_COMMITS,
+              "notes_max_prs": PR_HISTORY_NOTES_MAX_PRS,
+              "notes_max_commits": PR_HISTORY_NOTES_MAX_COMMITS,
+              "notes_max": PR_HISTORY_NOTES_MAX}
+    out = {"collected": True, "base": base_branch, "prs": [], "limits": limits}
+    if not numbers:
+        return out
+    try:
+        heads = parse_pr_head_refs(run(["git", "-C", clone_dir, "ls-remote",
+                                        "origin", "refs/pull/*/head"]))
+    except RuntimeError as exc:
+        out["error"] = "listing the PR head refs failed: {}".format(
+            str(exc).splitlines()[-1] if str(exc) else "unknown error")
+        return out
+    rows = {n: {"number": n} for n in numbers}
+    available = [n for n in numbers if n in heads]
+    for n in numbers:
+        if n not in heads:
+            rows[n]["status"] = "missing"
+    fetched = []
+    for i in range(0, len(available), PR_HISTORY_FETCH_BATCH):
+        batch = available[i:i + PR_HISTORY_FETCH_BATCH]
+        specs = ["+refs/pull/{0}/head:refs/remotes/pr/{0}".format(n) for n in batch]
+        try:
+            run(["git", "-C", clone_dir, "fetch", "--quiet", "--filter=blob:none",
+                 "--no-tags", "--no-write-fetch-head", "origin"] + specs)
+        except RuntimeError as exc:
+            reason = (str(exc).splitlines() or ["fetch failed"])[-1][:200]
+            for n in batch:
+                rows[n].update(status="fetch_failed", reason=reason)
+            continue
+        fetched.extend(batch)
+    exclude = _shallow_parent_exclusions(clone_dir, run) if fetched else []
+    for n in fetched:
+        row = rows[n]
+        row.update(status="fetched", head=heads[n])
+        ref = "refs/remotes/pr/{}".format(n)
+        try:
+            listing = run(["git", "-C", clone_dir, "log", "--reverse",
+                           "--date-order", "--format=" + PR_COMMIT_FORMAT,
+                           "--name-only", "--no-renames"] + list(_WALK_PIN_ARGS)
+                          + [ref, "--not", base_ref] + exclude + ["--"])
+        except RuntimeError as exc:
+            row.update(status="log_failed",
+                       reason=(str(exc).splitlines() or ["log failed"])[-1][:200])
+            continue
+        commits = parse_pr_commits(listing)
+        if not commits:
+            row["on_base"] = True
+        if len(commits) > PR_HISTORY_MAX_COMMITS:
+            row["commits_omitted"] = len(commits) - PR_HISTORY_MAX_COMMITS
+            commits = commits[:PR_HISTORY_MAX_COMMITS]
+        row["commits"] = commits
+    by_number = {p["number"]: p for p in prs if isinstance(p.get("number"), int)}
+    candidates = sorted(
+        (n for n in fetched if rows[n].get("status") == "fetched"),
+        key=lambda n: (-_human_conversation(by_number.get(n, {})), n))
+    walked = 0
+    for n in candidates:
+        row = rows[n]
+        commits = row.get("commits") or []
+        if not commits:
+            row["notes_skipped"] = "no commits of its own"
+        elif _human_conversation(by_number.get(n, {})) == 0:
+            row["notes_skipped"] = "no human conversation"
+        elif len(commits) + row.get("commits_omitted", 0) \
+                > PR_HISTORY_NOTES_MAX_COMMITS:
+            row["notes_skipped"] = "more than {} commits".format(
+                PR_HISTORY_NOTES_MAX_COMMITS)
+        elif walked >= PR_HISTORY_NOTES_MAX_PRS:
+            row["notes_skipped"] = "over the {}-PR cap of the window".format(
+                PR_HISTORY_NOTES_MAX_PRS)
+        else:
+            walked += 1
+            try:
+                raw = run(["git", "-C", clone_dir, "log"] + list(PATCH_WALK_ARGS)
+                          + ["refs/remotes/pr/{}".format(n), "--not", base_ref]
+                          + exclude + ["--", "*.bicep", "*.tf"])
+            except RuntimeError as exc:
+                row["notes_skipped"] = "patch walk failed: {}".format(
+                    (str(exc).splitlines() or ["?"])[-1][:200])
+                continue
+            notes = [{k: e[k] for k in ("commit", "path", "subkind", "change",
+                                        "name", "before", "after")}
+                     for e in parse_symbol_events(raw)
+                     if e.get("subkind") in PR_HISTORY_NOTE_SUBKINDS]
+            if len(notes) > PR_HISTORY_NOTES_MAX:
+                # The oldest go first: the first commit of a new module adds
+                # every parameter and description, which the merged result
+                # (the base walk) carries too; the later rework is what only
+                # this history has.
+                row["notes_omitted"] = len(notes) - PR_HISTORY_NOTES_MAX
+                notes = notes[-PR_HISTORY_NOTES_MAX:]
+            row["notes"] = notes
+    out["prs"] = [rows[n] for n in numbers]
+    return out
 
 
 # Ordered code-area patterns for the directory provider (primary, zero-dep).
@@ -3909,6 +4179,14 @@ def parse_args(argv):
                         "search API calls per author of a PR / issue created "
                         "in the window); the window's `newcomers` fact then "
                         "says it was not collected")
+    p.add_argument("--no-pr-history", dest="pr_history", action="store_false",
+                   default=True,
+                   help="skip the PR-internal history: fetching every window "
+                        "PR's refs/pull/<N>/head (blobless; the first gather of "
+                        "a clone also brings the commit and tree history those "
+                        "heads reach) and the comment / parameter walk over the "
+                        "most discussed PRs' commits; the window's `pr_history` "
+                        "fact then says it was not collected")
     # Phase 12: auto-discover + ingest the repo's Projects v2 board (its single-
     # select Status, plus sprint/iteration nodes when the board defines them). On
     # by default; degrades to empty on any error (no board / missing read:project
@@ -6190,6 +6468,31 @@ def acquire(args, env):
     closing_refs_source = resolve_closing_issues(
         prs, _graphql_client(token), owner, repo)
 
+    # PR-internal history (per-window fact `pr_history`): each kept PR's own
+    # commits from refs/pull/<N>/head, and the comment / parameter changes
+    # between them for the most discussed PRs (collect_pr_history). Needs the
+    # clone; --no-pr-history records that it was not looked at.
+    pr_history = None
+    if not getattr(args, "pr_history", True):
+        pr_history = {"collected": False}
+    elif walk_clone and prs:
+        _started = time.monotonic()
+        pr_history = collect_pr_history(prs, clone_dir, base_branch=base_branch)
+        _rows = pr_history["prs"]
+        sys.stderr.write(
+            "pr history: {}/{}: {} PR head(s) fetched, {} missing, {} failed, "
+            "{} commit(s), notes for {} PR(s) in {:.0f}s{}\n".format(
+                owner, repo,
+                sum(1 for r in _rows if r.get("status") == "fetched"),
+                sum(1 for r in _rows if r.get("status") == "missing"),
+                sum(1 for r in _rows if r.get("status") in ("fetch_failed",
+                                                            "log_failed")),
+                sum(len(r.get("commits") or []) for r in _rows),
+                sum(1 for r in _rows if "notes" in r),
+                time.monotonic() - _started,
+                " ({})".format(pr_history["error"]) if pr_history.get("error")
+                else ""))
+
     # Issue set: every issue a kept PR closes or cross-references, plus open and
     # recently-closed issues (for in_flight / next_candidates / rejected buckets)
     # that existed at the window's end (keep_issue_for_window).
@@ -6401,6 +6704,8 @@ def acquire(args, env):
     # Omitted when the window's history was not on disk (nothing was read).
     if module_notes is not None:
         bundle["module_notes"] = module_notes
+    if pr_history is not None:
+        bundle["pr_history"] = pr_history
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph

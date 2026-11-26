@@ -675,8 +675,9 @@ rules}], `deprecations` [{area, target, basis}], `orphaned`, `removed`, `most_su
 (top 10 by `product_score`, ties by area; plumbing-only modules never rank) and `plumbing`
 {merged_prs, classified, plumbing_prs, share (of the classified), by_class}.
 
-**`releases`** — the window's GitHub releases {tag, name, published_at, url, prerelease}
-when any (release notes text is not gathered). **`inputs`** — `tags_collected`,
+**`releases`** — the window's GitHub releases {tag, name, published_at, url, prerelease,
+notes?, notes_truncated_from?} when any (the release text: "Release notes text" below).
+**`inputs`** — `tags_collected`,
 `tags_reason`, `unread`, and for a multi-window view `windows` / `covers_view`.
 
 **What the data cannot tell:** a parameter renamed inside one file reads as one removed and
@@ -689,6 +690,221 @@ Window and projection: every input is dated (commits, code / symbol events, note
 so the view follows `extract`'s window scoping; PR records are the as-of-end projection.
 Additive and omit-when-absent: `meta.schema_version` stays 3.
 
+**Version declared vs published** (only when the window's tags were collected):
+`versions.declared_not_published` — versions the module's own changelog declared in the
+window with no version tag of the module dated in it (a real case: `dev-test-lab/lab`
+0.6.0 declared in October 2026, tagged 2026-11-16; `Unreleased` and other labels that do
+not start with a digit are not counted); `versions.published_not_declared` — versions
+tagged in the window whose changelog entry the window did not add (declared earlier, or
+the module keeps no changelog). Versions compare without a leading `v`. The summary's
+`version_gaps` [{area, declared_not_published?, published_not_declared?}] rolls them up. A later tag outside the view is not visible to it: "not published" means "not
+tagged in this window".
+
+**Release notes text.** Each view release (`releases[]`) carries `notes` — the release's
+own text (GitHub's `body`), verbatim up to `gather.RELEASE_NOTES_CAP` = 4000 characters,
+`notes_truncated_from` the original length when cut — when the release has any; so do
+`module_changes.releases[]` and a Terraform root module's `versions.releases[]`. A
+repository without a changelog (a Terraform module repo, a landing zone) still has its
+maintainers' declared notes. Releases gathered before this have no `notes`: re-gather.
+
+## The story layer (`discussion`, `stories`, slice `conversation`, `pr_history`)
+
+Decisions sit in the text of issues and PRs (proposals, objections, rework, agreement).
+The story layer measures that conversation per train, selects the trains with the most to
+tell, and gives each train's slice the whole conversation as one timeline. It is derived
+by `link.enrich` from stored records only, as projected to the window's end (a story for a
+past window holds nothing said after it), and is additive and omit-when-absent:
+`meta.schema_version` stays 3, and a train or view without conversation is unchanged.
+
+### `trains[].discussion`
+
+Present when the train has at least one human (not bot: `derive.is_bot_login`) comment,
+review comment or review; absent otherwise.
+
+```json
+{"comments": 2, "review_comments": 86, "participants": 2,
+ "reviews": {"approved": 0, "changes_requested": 0, "commented": 0, "dismissed": 0},
+ "review_rounds": 1, "reopens": 0, "text_chars": 19126, "in_window": 0,
+ "first_response_days": 21.2,
+ "longest_silence": {"days": 19.7, "from": "…", "to": "…", "resumed_at": "<url>"},
+ "change_requests": 0, "change_requests_reworked": 0, "bot_comments": 0}
+```
+
+- `comments` / `review_comments` — human conversation comments and inline review
+  comments over the train's issues and PRs.
+- `participants` — distinct human authors of the items, comments, review comments and
+  reviews.
+- `reviews` — human review submissions by state, the PR author's own excluded (as review
+  rounds do); a `commented` review counts only with text: GitHub records each review-thread
+  reply as an empty `commented` review whose text is the review comment.
+- `review_rounds` / `reopens` — sums of the PRs' `review_rounds.count` and the items'
+  `reopen_count`.
+- `text_chars` — characters of human text (item bodies, comments, review comments, review
+  texts).
+- `in_window` — human comments, review comments and counted reviews made inside the
+  view's window: the window's own share of the debate.
+- `first_response_days` — from the train's first item to the first human comment / review
+  / review comment by someone other than that item's author (null when none).
+- `longest_silence` — the longest gap between consecutive recorded human events
+  (openings, comments, reviews, lifecycle events, merges, PR commits from `pr_history`),
+  with the URL of the event that ended it (`resumed_at`). Elapsed and idle time are in
+  `effort` and not repeated.
+- `change_requests` — `changes_requested` reviews; `change_requests_reworked` (only when
+  the PR history is known for every PR with one) — how many were followed by a commit on
+  that PR.
+- `bot_comments` — automation comments, review comments and reviews (counted nowhere
+  else).
+
+### Story selection: `trains[].story*` and `stories`
+
+A separate, explicit selection for narration, independent of `tier` (which ranks by
+footprint: PRs, commits and touched areas, so mechanical sweeps over hundreds of modules
+fill it while the most discussed trains are `mention`). `tier` is unchanged; a train can
+be deep and a story, either, or neither.
+
+`story_score` (`link.story_score`) = discussion points + relevance:
+
+| Discussion points | |
+|---|---|
+| each human comment / review comment | 1 |
+| each conversation turn inside the window (`in_window`) | +1 (the window's debate weighs double) |
+| each participant beyond the first | 2 |
+| each change request | 3 |
+| each reopen | 3 |
+| each review round beyond the first on a PR | 2 |
+| longest silence over `STORY_SILENCE_DAYS` (14) | 2 |
+| each 2,000 characters of human text (at most 5) | 1 |
+
+| Relevance | |
+|---|---|
+| kind feature / module-request | 3 |
+| kind bug | 1 |
+| a new module introduced by one of its PRs (module layer) | 5 |
+| declared breaking items / breaking candidates from its PRs (at most 3 each) | 2 / 1 each |
+| in flight (often where the debate still is) | 1 |
+
+A train **qualifies** when it has a `discussion` with at least `STORY_MIN_EXCHANGES` (3)
+turns (comments + review comments + counted reviews) and at least 2 participants, scores at
+least `STORY_MIN_SCORE` (8), and — when its work is plumbing (`module_changes.prs` marks
+every merged PR of it `plumbing` or a `sweep`; without the module layer: a chore / docs /
+other train touching more than 10 areas) — its discussion points alone reach
+`STORY_PLUMBING_MIN` (15). The `STORY_TOP_N` (8) best, by score then id, get:
+
+- `story: true`, `story_rank` (1 = most to tell), `story_score`, and `story_reasons`
+  (plain strings naming what scored, e.g. `"88 human comment(s) and review comment(s)"`,
+  `"1 change request(s)"`, `"219 days without recorded activity before 2026-06-10"`,
+  `"new module avm/res/x/y"`, `"in flight"`).
+
+The view gets **`stories`** (absent when no train qualifies): `{selected: [{id, rank,
+score}], more: [{id, score}] (the trains that qualified beyond the cap — "N more had
+notable discussion"), rule: {min_exchanges, min_score, top_n, plumbing_min,
+silence_days}}`.
+
+### Slice `conversation` (the story material)
+
+`link.py BUNDLE --slice <id>` adds `conversation` to every train's slice:
+
+- **`timeline`** — one chronological list of items `{at, kind, actor, url, on: {type,
+  number}, ...}`:
+  - `opened` — an issue / PR, with `title` and its body as `text`;
+  - `comment`, `review_comment` — with `text`;
+  - `review` — with `state` and `text` (an empty `commented` review is a review thread's
+    wrapper and is left out: its text is the review comment);
+  - `ready_for_review`, `reopened`, `closed` — the lifecycle events (`url` is the item page
+    anchored at the event, `<item url>#event-<id>`); a `closed` from `closed_at` when no
+    event records it;
+  - `merged` — with the merger as `actor`;
+  - `commit` — `source: "pr_head"` (a PR's own commit from `pr_history`: `subject`,
+    `files` count, `authored_at`, `merge: true` for a merge commit, `url`
+    `<pr url>/commits/<sha>`) or `source: "base"` (the train's commit on the walked branch,
+    e.g. the squash commit), each with the `code_notes` its diff added / removed / changed.
+  Ordered by time, then kind, then url. Bots are not in it.
+- **`code_notes`** (on commit items) — `{commit, path, change: add|drop|change, class,
+  source, pr?, text | before/after | kind/name}`. `class` (`link.comment_class`):
+  `parameter_description` (a Bicep `@description(...)` / `@metadata(...)` decorator),
+  `todo` (TODO / FIXME / HACK / XXX / BUG), `note` (a developer note), `interface` (a
+  parameter / variable / output line: `kind`, `name`, `before` / `after` declaration).
+  **Banners** — section labels such as `// Variables //`, `// Parameters`, `// =====
+  Outputs =====`: once the comment markers and decoration characters (`= - * # / _ ~`)
+  are stripped, at most three words and no punctuation — are dropped and counted
+  (`truncation.code_notes.banners_dropped`). One row per comment line: the symbol
+  extraction keys comments by text, so the lines of one file and commit are not in file
+  order and are never joined into prose. Within `STORY_CODE_NOTES_BUDGET` (12,000)
+  characters, developer notes and TODOs are kept first, then parameter descriptions
+  removed / changed, then added, then interface lines.
+- **`code_notes_by_module`** — `{module area: {path: {added, removed, changed}}}` counts
+  over every code note (kept or not).
+- **`turning_points`** — marked by rule, as data: `{rule, at, index (into timeline), url,
+  detail?}` — `change_request`; `reopened`; `silence_then_activity` (activity after more
+  than 14 days without a recorded human event; detail `{days, since}`);
+  `rework_after_change_request` (the first PR commit after a change request on that PR);
+  `history_rewritten` (a PR commit committed more than `STORY_REWRITE_HOURS` (24) after it
+  was authored: amended, rebased or cherry-picked — the branch's earlier states are not
+  kept); `new_attempt` (a PR of the train opened after another was closed unmerged);
+  `still_silent` (an open train with no human event in the last 14 days before the
+  as-of instant; `at` is that instant). A scope change cannot be marked: title edits are
+  not gathered.
+- **`truncation`** — `{item_cap, budget, chars_original, chars_kept, cut: [{index, url,
+  kept, original}], text_omitted: [{index, url, chars}], code_notes: {banners_dropped,
+  budget, kept, omitted}}`. Each text is capped at `STORY_ITEM_CAP` (5,000 characters:
+  every human comment, review and review comment of Sept-Oct 2026 in
+  Azure/bicep-registry-modules fits — the longest is 3,382, the 99th percentile about
+  2,400 — so only long PR / issue bodies, mostly template, are cut); the total is held to
+  `STORY_SLICE_BUDGET` (40,000: the most discussed train of those months, 88 comments and
+  a 4,131-character body, is 19,126 characters) by cutting the longest texts evenly, never
+  below `STORY_ITEM_FLOOR` (500), then leaving out whole texts from the middle of the
+  timeline outward (the opening and the latest stay). A cut item carries
+  `truncated_from`; an omitted one `text: null` and `text_omitted`. Nothing is cut
+  silently.
+- **`bots`** — `{login: count}` of the automation comments, review comments and reviews
+  left out of the timeline.
+- **`pr_history`** — `{pr number: status}`: `fetched` (with `, notes extracted` or `,
+  notes skipped: <reason>`, or ` (commits on the base branch)`), `missing`,
+  `fetch_failed`, `log_failed`, or `not_gathered` when the view has no PR history for it.
+- **`as_of`** — the instant the material is projected to (`meta.records_as_of.instant`,
+  else the window's last second).
+- **`not_gathered`** — what GitHub records that the store does not keep, so a narrator
+  says it rather than infers it: title and description edits, force-pushes and the branch
+  states they replaced, label / milestone / assignee changes over time.
+
+### `pr_history` (raw, from the store)
+
+The per-window fact gather writes (`gather.collect_pr_history`; STORE.md), omitted when
+no gather stored it (a store gathered before this layer, every fixture bundle, a gather
+without the clone):
+
+```json
+{"collected": true, "base": "main",
+ "limits": {"max_commits": 250, "notes_max_prs": 40, "notes_max_commits": 60, "notes_max": 400},
+ "prs": [{"number": 7146, "status": "fetched", "head": "<sha>",
+          "commits": [{"sha": "…", "parents": 1, "author": "<git author name>",
+                       "authored_at": "…Z", "committed_at": "…Z",
+                       "subject": "AVM-RES: Update changelog and fix e2e tests", "files": 5}],
+          "notes": [{"commit": "…", "path": "…/main.test.bicep", "subkind": "comment",
+                     "change": "add", "name": "// Enforcing location due to …",
+                     "before": null, "after": "// Enforcing location due to …"}]},
+         {"number": 6974, "status": "missing"}]}
+```
+
+- `status` — `fetched`, `missing` (no `refs/pull/<N>/head` on the remote), `fetch_failed`
+  / `log_failed` (with `reason`). `on_base: true` when the head is on the walked branch (a
+  merge-commit merge: the base walk already has its commits).
+- `commits` — the PR's own commits, oldest first (reachable from its head, not from the
+  walked branch), at most 250 (`commits_omitted` the rest); `author` is the git author
+  name (no email is stored).
+- `notes` — the comment / parameter / variable / output changes between those commits
+  (`.bicep` / `.tf` files, the patch walk's symbol extraction), only for the most
+  discussed PRs (human comments + review comments > 0, at most 40 PRs per window, each of
+  at most 60 commits; the newest 400 events per PR, `notes_omitted` the oldest left out);
+  every other fetched PR has `notes_skipped` with the reason.
+- `{"collected": false}` alone — the window was gathered with `--no-pr-history`.
+
+The fact holds each PR head **as gathered** — possibly after the window — so every
+consumer drops commits committed after the view's end (the as-of rule). A force-push
+before the gather is invisible: only the current head is fetched. A view of exactly a
+gathered window carries the stored value verbatim; a wider view takes, per PR, the entry
+of the latest overlapping window that collected one, and adds `windows`.
+
 ## Optional (omit-when-empty) keys
 
 These keys are reserved in the bundle skeleton and **filled when the data exists** —
@@ -699,7 +915,7 @@ empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, newcomers, module_notes,
-module_changes, releases, milestones, sprints, diagrams`.
+module_changes, pr_history, stories, releases, milestones, sprints, diagrams`.
 
 **Never in a view:** gather's in-memory bundle skeleton also reserves `workflows` (the raw
 CI runs `workflow_stats` is counted from; never folded, so no view carries it), and
@@ -723,9 +939,11 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   and duration), the board's iterations (current and completed) that overlap the gathered
   window; `{}` on a status-only board. `link.select_sprints(sprints, ref_date)` returns the
   `(previous, current, next)` `{id, title, start, end}` dicts (or `None`).
-- **releases[]** — `[{ tag_name, name, published_at, prerelease:bool, url }]` (the GitHub
-  release's tag, title, publish timestamp, prerelease flag and `html_url`), the releases
-  published in the view's window, sorted by `tag_name` (else `name`).
+- **releases[]** — `[{ tag_name, name, published_at, prerelease:bool, url, notes?,
+  notes_truncated_from? }]` (the GitHub release's tag, title, publish timestamp,
+  prerelease flag and `html_url`; `notes` its text, capped at 4000 characters, only when
+  it has any), the releases published in the view's window, sorted by `tag_name` (else
+  `name`).
 - **milestones[]** — `[{ title, number, state:"open"|"closed", due_on, open_issues,
   closed_issues, url }]` (`due_on` an ISO timestamp or `null` for an undated milestone; the
   issue counts as GitHub reported them at the latest gather). Not windowed (see "Window
@@ -1133,9 +1351,18 @@ review's state to `DISMISSED`.
     "commits":        [ { sha, message*, author, date, url } ],
     "feature_deltas": [ ...this train's deltas only... ],
     "feature_deltas_diff_overflow": <int>,
-    "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ]
+    "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ],
+    "conversation":   { timeline, turning_points, truncation, bots,
+                        code_notes_by_module, pr_history, as_of, not_gathered }
   }
   ```
+
+  The `train` block also carries `discussion`, `story`, `story_rank`, `story_score` and
+  `story_reasons` when the train has them, and `conversation` is the train's story
+  material: the whole conversation as one chronological timeline (see "The story layer"
+  below for every key). The capped `comments` / `reviews` / `lifecycle` lists of the
+  `issue` and `prs` blocks are unchanged for older narrators; a story narrator reads
+  `conversation`.
 
   (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
   chars with a `…[+N chars]` marker. Each comment list, `reviews` and `lifecycle` is

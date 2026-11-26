@@ -1150,6 +1150,11 @@ def slice_train(bundle, train_id):
         "issues":       train.get("issues", []),
         "pr_outcomes":  train.get("pr_outcomes", {}),
     }
+    # The story layer's keys, only when the train carries them.
+    for key in ("discussion", "story", "story_rank", "story_score",
+                "story_reasons"):
+        if key in train:
+            train_block[key] = train[key]
 
     # --- resolve issue ------------------------------------------------------
     root_num = train.get("root_issue")
@@ -1253,6 +1258,8 @@ def slice_train(bundle, train_id):
         "feature_deltas": own_deltas,
         "feature_deltas_diff_overflow": diff_overflow,
         "symbol_moves":   own_moves,
+        # The story material: the whole conversation as one timeline.
+        "conversation":   story_material(bundle, train),
     }
 
 
@@ -1678,6 +1685,8 @@ class _ModuleCtx:
         for t in bundle.get("trains", []):
             for n in t.get("prs") or []:
                 self.train_of.setdefault(n, t.get("id"))
+        tags = (bundle.get("module_notes") or {}).get("tags") or {}
+        self.tags_collected = bool(tags.get("collected"))
 
     def kind(self, area):
         """module_kind of an area over every path of the view (memoised)."""
@@ -1706,6 +1715,31 @@ class _ModuleCtx:
         if path:
             out["path"] = path
         return out
+
+
+def _bare_version(v):
+    """A version string compared across a changelog heading and a tag:
+    stripped, without a leading `v` / `V`."""
+    v = str(v or "").strip()
+    return v[1:] if v[:1] in ("v", "V") else v
+
+
+def _is_release_version(v):
+    """True for a changelog version that a tag could publish (starts with a
+    digit after an optional `v`): `Unreleased` and other labels are not."""
+    return bool(re.match(r"\d", _bare_version(v)))
+
+
+def _release_row(r, **keys):
+    """A view release as a module_changes row: `keys` maps the row's field
+    names to the release's, then its notes (and their truncation) when the
+    gather kept any."""
+    row = {out: r.get(src) for out, src in keys.items()}
+    if r.get("notes"):
+        row["notes"] = r["notes"]
+        if r.get("notes_truncated_from"):
+            row["notes_truncated_from"] = r["notes_truncated_from"]
+    return row
 
 
 def _dedupe_sources(sources):
@@ -2074,9 +2108,9 @@ def build_module_changes(bundle, path_rules=()):
 
     out = {"summary": _module_summary(entries, pr_rows), "modules": entries,
            "prs": pr_rows}
-    releases = [{"tag": r.get("tag_name"), "name": r.get("name"),
-                 "published_at": r.get("published_at"), "url": r.get("url"),
-                 "prerelease": r.get("prerelease")}
+    releases = [_release_row(r, tag="tag_name", name="name",
+                             published_at="published_at", url="url",
+                             prerelease="prerelease")
                 for r in bundle.get("releases", [])]
     if releases:
         out["releases"] = releases
@@ -2232,6 +2266,23 @@ def _module_entry(ctx, m, moves, bundle):
                    if c.get("version") and "module" not in c]
     if cl_versions:
         versions["changelog"] = cl_versions
+    own_tags = [t for t in m["_tags"] if (t.get("module") or "") == d]
+    if ctx.tags_collected and (cl_versions or own_tags):
+        # A version the module's changelog declared in the window with no
+        # version tag of the module in it, and the reverse: a tag in the window
+        # whose version the window's changelog entries did not declare (it was
+        # declared earlier, or the module keeps no changelog).
+        tagged = {_bare_version(t.get("version")) for t in own_tags}
+        declared_v = {_bare_version(v) for v in cl_versions}
+        not_published = [v for v in cl_versions
+                         if _is_release_version(v)
+                         and _bare_version(v) not in tagged]
+        not_declared = [t.get("version") for t in own_tags
+                        if _bare_version(t.get("version")) not in declared_v]
+        if not_published:
+            versions["declared_not_published"] = not_published
+        if not_declared:
+            versions["published_not_declared"] = not_declared
     if m["_tags"]:
         published = []
         for t in m["_tags"]:
@@ -2248,8 +2299,8 @@ def _module_entry(ctx, m, moves, bundle):
                 first_version = first_version or t.get("version")
         versions["published"] = published
     if kind in ("module",) and area == "main.tf":
-        rel = [{"tag": r.get("tag_name"), "published_at": r.get("published_at"),
-                "url": r.get("url")} for r in bundle.get("releases", [])]
+        rel = [_release_row(r, tag="tag_name", published_at="published_at",
+                            url="url") for r in bundle.get("releases", [])]
         if rel:
             versions["releases"] = rel
     if status == "new" and first_version is None and own_versions:
@@ -2406,7 +2457,16 @@ def _module_summary(entries, pr_rows):
     by_class = {}
     for r in pr_rows:
         by_class[r["class"]] = by_class.get(r["class"], 0) + 1
-    return {
+    gaps = []
+    for e in entries:
+        v = e.get("versions") or {}
+        if v.get("declared_not_published") or v.get("published_not_declared"):
+            gap = {"area": e["area"]}
+            for k in ("declared_not_published", "published_not_declared"):
+                if v.get(k):
+                    gap[k] = v[k]
+            gaps.append(gap)
+    out = {
         "modules": len(entries), "by_status": by_status,
         "new_modules": new, "new_child_modules": new_children,
         "declared_breaking": declared,
@@ -2421,6 +2481,912 @@ def _module_summary(entries, pr_rows):
                      "share": round(plumbing / len(known), 3) if known else None,
                      "by_class": by_class},
     }
+    if gaps:
+        out["version_gaps"] = gaps
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The story layer: the discussion signal, story selection and story material
+# ---------------------------------------------------------------------------
+#
+# Decisions sit in the text of issues and PRs. `discussion` measures that
+# conversation per train (from the stored, as-of-projected records), a
+# separate `story` selection ranks trains by it and by product relevance (not
+# by touched-area count, which is what `tier` measures), and the slice of a
+# train carries the whole conversation as one chronological timeline with its
+# turning points marked by rule.
+
+# Conversation turns (human comments, review comments, reviews with text or a
+# verdict) a train needs before it can be a story: a back-and-forth.
+STORY_MIN_EXCHANGES = 3
+# Minimum story_score to be selected at all.
+STORY_MIN_SCORE = 8.0
+# At most this many trains are selected per view (like the deep tier's top 8);
+# the others that qualify are counted in `stories.more`.
+STORY_TOP_N = 8
+# A train whose merged work is plumbing (module layer) or a mechanical sweep
+# qualifies only when its discussion alone scores at least this much.
+STORY_PLUMBING_MIN = 15.0
+# A gap between two consecutive recorded human events longer than this many
+# days is a silence (a turning point when activity resumes after it).
+STORY_SILENCE_DAYS = 14
+# A PR commit committed more than this many hours after it was authored was
+# rewritten (amended, rebased or cherry-picked).
+STORY_REWRITE_HOURS = 24
+# Per-item text cap in the story timeline. Every human comment, review and
+# review comment of Sept-Oct 2026 in Azure/bicep-registry-modules fits (the
+# longest is 3,382 characters; the 99th percentile about 2,400), so arguments
+# stay whole; PR / issue bodies are longer (median 2,100-2,600, much of it the
+# PR template), so only the opening body of a long description is cut.
+STORY_ITEM_CAP = 5000
+# Per-slice budget for the timeline's text. The most discussed train of the
+# two months (train-pr-6549: 88 human comments and review comments plus a
+# 4,131-character body, 19,126 characters) fits whole, as does the largest
+# issue train of October (about 23,000 once its 20,794-character body is
+# capped). About 10,000 tokens of text.
+STORY_SLICE_BUDGET = 40000
+# When the budget is exceeded, items are cut evenly from the longest down, never
+# below this many characters; past that, whole texts are left out from the
+# middle of the timeline outward (the opening and the latest items stay).
+STORY_ITEM_FLOOR = 500
+# Budget for the code notes (comments / parameter descriptions / interface
+# lines) carried on the timeline's commit items.
+STORY_CODE_NOTES_BUDGET = 12000
+# Relevance points by train kind (story_score).
+_STORY_KIND_RELEVANCE = {"feature": 3.0, "module-request": 3.0, "bug": 1.0}
+
+# What GitHub records but gather does not keep, named in every story slice so
+# a narrator says it rather than infers it.
+STORY_NOT_GATHERED = (
+    "title and description edits (titles and bodies are as last gathered)",
+    "force-pushes and the branch states they replaced (only each PR's current "
+    "head is fetched)",
+    "label, milestone and assignee changes over time",
+)
+
+_TIMELINE_KIND_ORDER = {"opened": 0, "commit": 1, "comment": 2,
+                        "review_comment": 3, "review": 4, "ready_for_review": 5,
+                        "reopened": 6, "closed": 7, "merged": 8}
+
+
+def window_end_instant(meta):
+    """The as-of instant of a view: `records_as_of.instant`, else the last
+    second of `period.to` / `to` (UTC) for a date, the value itself for a
+    timestamp, None for a dateless bundle."""
+    meta = meta or {}
+    inst = (meta.get("records_as_of") or {}).get("instant")
+    if inst:
+        return inst
+    to = window_period(meta).get("to")
+    if not to:
+        return None
+    return to + "T23:59:59Z" if len(to) == 10 else to
+
+
+def _not_after(ts, instant):
+    if instant is None:
+        return True
+    a, b = _parse_ts(ts), _parse_ts(instant)
+    return a is None or b is None or a <= b
+
+
+def _human_rows(rows):
+    return [r for r in rows or [] if isinstance(r, dict)
+            and not derive.is_bot_login(r.get("author"))]
+
+
+def _pr_history_index(bundle):
+    """{pr number: pr_history row} of the view's `pr_history` fact."""
+    ph = bundle.get("pr_history") or {}
+    return {r["number"]: r for r in ph.get("prs") or []
+            if isinstance(r, dict) and isinstance(r.get("number"), int)}
+
+
+def _pr_commits_as_of(row, instant):
+    """A pr_history row's commits committed by the instant (the as-of rule:
+    the fact holds the head as gathered, possibly after the window)."""
+    return [c for c in (row or {}).get("commits") or []
+            if _not_after(c.get("committed_at"), instant)]
+
+
+def _train_members(train, pr_index, issue_index):
+    issue_nums = train.get("issues")
+    if issue_nums is None:
+        root = train.get("root_issue")
+        issue_nums = [root] if root is not None else []
+    issues = [issue_index[n] for n in issue_nums if n in issue_index]
+    prs = [pr_index[n] for n in train.get("prs", []) if n in pr_index]
+    return issues, prs
+
+
+def _days(a, b):
+    return round((b - a).total_seconds() / 86400.0, 1)
+
+
+def train_discussion(train, pr_index, issue_index, history=None, instant=None,
+                     start=None):
+    """The discussion signal of one train, or None when it has no human
+    conversation (no human comment, review comment or review). Pure.
+
+    Counts over the train's issues and PRs as the view holds them (already
+    projected to the window's end): `comments` / `review_comments` (human),
+    `participants` (distinct human authors of the items, comments, review
+    comments and reviews), `reviews` by state (human, not the PR author's own;
+    a `commented` review counts only with text — GitHub records each review
+    thread reply as an empty `commented` review, whose text is the review
+    comment), `review_rounds` and `reopens` (sums of the per-PR / issue
+    annotations), `text_chars` (human bodies, comments, review comments and
+    review texts), `first_response_days` (from the train's first item to the
+    first human comment / review / review comment by someone other than that
+    item's author), `longest_silence` (the longest gap between consecutive
+    recorded human events — openings, comments, reviews, lifecycle events,
+    merges and PR commits — with where it ends), `change_requests` and, when
+    the PR history is known for every PR with a change request,
+    `change_requests_reworked` (followed by a commit on that PR), and
+    `bot_comments` (automation comments / reviews, not counted anywhere
+    else). `in_window` counts the human comments, review comments and
+    counted reviews made inside the view's window (from `start`, its first
+    day, to the instant) — the window's own share of the debate."""
+    issues, prs = _train_members(train, pr_index, issue_index)
+    history = history or {}
+    start_dt = _parse_ts(start + "T00:00:00Z" if start and len(start) == 10
+                         else start)
+    end_dt = _parse_ts(instant)
+    turn_times = []
+    comments = review_comments = bot = text = 0
+    reviews = {"approved": 0, "changes_requested": 0, "commented": 0,
+               "dismissed": 0}
+    people = set()
+    events = []        # (dt, url) of human events
+    responses = []     # dt of a human response to someone else's item
+    opened = []
+    change_reqs = []   # (pr number, dt)
+    for rec in issues + prs:
+        author = rec.get("author")
+        dt = _parse_ts(rec.get("created_at"))
+        if author and not derive.is_bot_login(author):
+            people.add(author)
+            text += len(rec.get("body") or "")
+        if dt is not None:
+            opened.append(dt)
+            events.append((dt, rec.get("url")))
+        for key in ("comments_list", "review_comments"):
+            for c in rec.get(key) or []:
+                if not isinstance(c, dict):
+                    continue
+                if derive.is_bot_login(c.get("author")):
+                    bot += 1
+                    continue
+                if key == "comments_list":
+                    comments += 1
+                else:
+                    review_comments += 1
+                if c.get("author"):
+                    people.add(c["author"])
+                text += len(c.get("body") or "")
+                cdt = _parse_ts(c.get("created_at"))
+                if cdt is not None:
+                    turn_times.append(cdt)
+                    events.append((cdt, c.get("url")))
+                    if c.get("author") != author:
+                        responses.append(cdt)
+        for r in rec.get("reviews") or []:
+            if not isinstance(r, dict) or (r.get("state") or "") == "pending":
+                continue
+            if derive.is_bot_login(r.get("author")):
+                bot += 1
+                continue
+            rdt = _parse_ts(r.get("submitted_at"))
+            body = r.get("body") or ""
+            text += len(body)
+            if r.get("author"):
+                people.add(r["author"])
+            if rdt is not None and (body or r.get("state") != "commented"):
+                events.append((rdt, r.get("url")))
+            if r.get("author") == author:
+                continue
+            state = r.get("state")
+            if state == "commented" and not body:
+                continue
+            if state in reviews:
+                reviews[state] += 1
+            if rdt is not None:
+                responses.append(rdt)
+                turn_times.append(rdt)
+            if state == "changes_requested":
+                change_reqs.append((rec.get("number"), rdt))
+        for e in rec.get("lifecycle") or []:
+            if isinstance(e, dict) and not derive.is_bot_login(e.get("actor")):
+                edt = _parse_ts(e.get("created_at"))
+                if edt is not None:
+                    events.append((edt, rec.get("url")))
+        mdt = _parse_ts(rec.get("merged_at")) if rec.get("merged") else None
+        if mdt is not None:
+            events.append((mdt, rec.get("url")))
+    for p in prs:
+        for c in _pr_commits_as_of(history.get(p.get("number")), instant):
+            cdt = _parse_ts(c.get("committed_at"))
+            if cdt is not None and not derive.is_bot_login(c.get("author")):
+                events.append((cdt, _pr_commit_url(p, c.get("sha"))))
+    human_reviews = sum(reviews.values())
+    if comments + review_comments + human_reviews == 0:
+        return None
+    out = {"comments": comments, "review_comments": review_comments,
+           "participants": len(people), "reviews": reviews,
+           "review_rounds": sum((p.get("review_rounds") or {}).get("count", 0)
+                                for p in prs),
+           "reopens": sum(r.get("reopen_count", 0) or 0 for r in issues + prs),
+           "text_chars": text,
+           "in_window": sum(1 for t in turn_times
+                            if (start_dt is None or t >= start_dt)
+                            and (end_dt is None or t <= end_dt))}
+    start = min(opened) if opened else None
+    later = sorted(d for d in responses if start is None or d >= start)
+    out["first_response_days"] = (_days(start, later[0])
+                                  if start is not None and later else None)
+    events.sort(key=lambda e: (e[0], e[1] or ""))
+    best = None
+    for (a, _u), (b, url) in zip(events, events[1:]):
+        if best is None or (b - a) > (best[1] - best[0]):
+            best = (a, b, url)
+    out["longest_silence"] = None if best is None else {
+        "days": _days(best[0], best[1]),
+        "from": best[0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": best[1].strftime("%Y-%m-%dT%H:%M:%SZ"), "resumed_at": best[2]}
+    out["change_requests"] = len(change_reqs)
+    if change_reqs and all(n in history for n, _ in change_reqs):
+        reworked = 0
+        for n, cdt in change_reqs:
+            times = [_parse_ts(c.get("committed_at"))
+                     for c in _pr_commits_as_of(history[n], instant)]
+            if cdt is not None and any(t is not None and t > cdt for t in times):
+                reworked += 1
+        out["change_requests_reworked"] = reworked
+    out["bot_comments"] = bot
+    return out
+
+
+def annotate_train_discussion(bundle):
+    """Add `discussion` to every train that has human conversation
+    (train_discussion); a train without any gets no key. In place."""
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    history = _pr_history_index(bundle)
+    instant = window_end_instant(bundle.get("meta"))
+    start = window_period(bundle.get("meta") or {}).get("from")
+    for t in bundle.get("trains", []):
+        d = train_discussion(t, pr_index, issue_index, history, instant, start)
+        if d is not None:
+            t["discussion"] = d
+    return bundle
+
+
+def _train_plumbing(train, module_changes):
+    """True when a train's work is plumbing: with the module layer, every
+    merged PR of the train it classified is `plumbing` (or a sweep); without
+    it, a chore / docs / other train touching more than 10 code areas (a
+    mechanical sweep)."""
+    if module_changes:
+        rows = {r.get("number"): r for r in module_changes.get("prs") or []}
+        mine = [rows[n] for n in train.get("prs", []) if n in rows]
+        if mine:
+            return all(r.get("plumbing") or r.get("sweep") for r in mine)
+    return (len(train.get("code_areas") or []) > 10
+            and train.get("kind") in ("chore", "docs", "other", None))
+
+
+def _train_module_relevance(train, module_changes):
+    """(points, reasons) of product relevance from the module layer: a new
+    module introduced by one of the train's PRs (5), declared breaking items
+    (2 each, at most 3), breaking candidates (1 each, at most 3)."""
+    if not module_changes:
+        return 0.0, []
+    prs = set(train.get("prs") or [])
+    points, reasons = 0.0, []
+    for e in module_changes.get("modules") or []:
+        mine = {p.get("number") for p in e.get("prs") or []} & prs
+        if not mine:
+            continue
+        if e.get("status") == "new":
+            points += 5
+            reasons.append("new module {}".format(e.get("area")))
+        br = e.get("breaking") or {}
+        declared = [b for b in br.get("declared") or []
+                    if any(s.get("pr") in prs for s in b.get("sources") or [])]
+        cands = [c for c in br.get("candidates") or []
+                 if any(s.get("pr") in prs for s in c.get("sources") or [])]
+        if declared:
+            points += 2 * min(3, len(declared))
+            reasons.append("declared breaking change in {}".format(e.get("area")))
+        if cands:
+            points += min(3, len(cands))
+            reasons.append("breaking candidate in {}".format(e.get("area")))
+    return points, reasons
+
+
+def story_score(train, module_changes=None, pr_index=None):
+    """(discussion_points, total, reasons) for one train with a `discussion`
+    (`pr_index` {number: pr} supplies each PR's review rounds).
+
+    discussion points = human comments + review comments
+                        + 1 per conversation turn inside the window
+                          (`in_window`: the window's debate weighs double)
+                        + 2 per participant beyond the first
+                        + 3 per change request + 3 per reopen
+                        + 2 per review round beyond the first on each
+                          reviewed PR
+                        + 2 when the longest silence exceeds
+                          STORY_SILENCE_DAYS
+                        + 1 per 2,000 characters of human text (at most 5)
+    total = discussion points + relevance, where relevance is 3 for a
+    feature / module-request train, 1 for a bug, 0 otherwise, plus the
+    module layer's (a new module 5; declared breaking 2 each, candidates 1
+    each, at most 3 of each) and 1 for an in-flight train (often where the
+    debate still is)."""
+    d = train.get("discussion") or {}
+    reasons = []
+    conv = d.get("comments", 0) + d.get("review_comments", 0)
+    pts = float(conv)
+    if conv:
+        reasons.append("{} human comment(s) and review comment(s)".format(conv))
+    if d.get("in_window"):
+        pts += d["in_window"]
+        reasons.append("{} conversation turn(s) in the window".format(
+            d["in_window"]))
+    if d.get("participants", 0) > 1:
+        pts += 2 * (d["participants"] - 1)
+        reasons.append("{} participants".format(d["participants"]))
+    cr = d.get("change_requests", 0)
+    if cr:
+        pts += 3 * cr
+        reasons.append("{} change request(s)".format(cr))
+    if d.get("reopens"):
+        pts += 3 * d["reopens"]
+        reasons.append("reopened {}x".format(d["reopens"]))
+    extra_rounds = sum(max(0, ((pr_index or {}).get(n, {}).get("review_rounds")
+                               or {}).get("count", 0) - 1)
+                       for n in train.get("prs") or [])
+    if extra_rounds:
+        pts += 2 * extra_rounds
+        reasons.append("{} extra review round(s)".format(extra_rounds))
+    sil = d.get("longest_silence") or {}
+    if sil.get("days", 0) > STORY_SILENCE_DAYS:
+        pts += 2
+        reasons.append("{} days without recorded activity before {}".format(
+            int(sil["days"]), sil["to"][:10]))
+    vol = min(5, d.get("text_chars", 0) // 2000)
+    pts += vol
+    rel = _STORY_KIND_RELEVANCE.get(train.get("kind"), 0.0)
+    if rel:
+        reasons.append("kind {}".format(train.get("kind")))
+    mpts, mreasons = _train_module_relevance(train, module_changes)
+    rel += mpts
+    reasons += mreasons
+    if train.get("outcome") == "in_flight":
+        rel += 1
+        reasons.append("in flight")
+    return pts, pts + rel, reasons
+
+
+def select_story_trains(bundle):
+    """Pick the trains with the most to tell (story_score), independently of
+    the deep / mention `tier`. A train qualifies when it has a `discussion`
+    with at least STORY_MIN_EXCHANGES conversation turns (comments, review
+    comments, reviews with text or a verdict) and at least two participants,
+    scores at least STORY_MIN_SCORE, and — when its work is plumbing or a
+    mechanical sweep (_train_plumbing) — its discussion alone scores at least
+    STORY_PLUMBING_MIN. The STORY_TOP_N best (score desc, then id) get
+    `story: true`, `story_rank`, `story_score` and `story_reasons`; the view
+    gets `stories` {selected, more, rule} (omitted when none qualifies). In
+    place."""
+    trains = bundle.get("trains", [])
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    mc = bundle.get("module_changes")
+    eligible = []
+    for t in trains:
+        d = t.get("discussion")
+        if not d:
+            continue
+        turns = (d["comments"] + d["review_comments"] + sum(d["reviews"].values()))
+        disc, total, reasons = story_score(t, mc, pr_index)
+        if turns < STORY_MIN_EXCHANGES or d["participants"] < 2:
+            continue
+        if total < STORY_MIN_SCORE:
+            continue
+        if _train_plumbing(t, mc) and disc < STORY_PLUMBING_MIN:
+            continue
+        eligible.append((round(total, 1), t, reasons))
+    if not eligible:
+        return bundle
+    eligible.sort(key=lambda e: (-e[0], e[1]["id"]))
+    selected = []
+    for rank, (score, t, reasons) in enumerate(eligible[:STORY_TOP_N], 1):
+        t["story"] = True
+        t["story_rank"] = rank
+        t["story_score"] = score
+        t["story_reasons"] = reasons
+        selected.append({"id": t["id"], "rank": rank, "score": score})
+    bundle["stories"] = {
+        "selected": selected,
+        "more": [{"id": t["id"], "score": s} for s, t, _ in eligible[STORY_TOP_N:]],
+        "rule": {"min_exchanges": STORY_MIN_EXCHANGES,
+                 "min_score": STORY_MIN_SCORE, "top_n": STORY_TOP_N,
+                 "plumbing_min": STORY_PLUMBING_MIN,
+                 "silence_days": STORY_SILENCE_DAYS},
+    }
+    return bundle
+
+
+# --- code notes: comments, parameter descriptions, interface lines -------
+
+_PARAM_DESC_RE = re.compile(r"^\s*@(?:sys\.)?(?:description|metadata)\s*\(")
+_COMMENT_MARK_RE = re.compile(r"^\s*(?://+|#+|/\*+|\*+)\s*|\s*(?:\*+/|//+)\s*$")
+_BANNER_PUNCT_RE = re.compile(r"[.,:;()'\"`!?\[\]{}<>@$%&|\\]")
+
+
+def comment_class(subkind, text):
+    """How a code comment reads: `parameter_description` (a Bicep
+    `@description(...)` / `@metadata(...)` decorator), `todo` (a TODO /
+    FIXME / HACK / XXX / BUG marker), `banner` (a section label: once the
+    comment markers and decoration characters `= - * # / _ ~` are stripped,
+    at most three words and no punctuation, e.g. "// Variables //",
+    "// Parameters", "// ===== Outputs ====="), else `note` (a developer
+    note). Pure."""
+    if subkind == "todo":
+        return "todo"
+    t = text or ""
+    if _PARAM_DESC_RE.match(t):
+        return "parameter_description"
+    core = _COMMENT_MARK_RE.sub("", t)
+    core = re.sub(r"[=\-*#/_~]+", " ", core).strip()
+    if not core or (len(core.split()) <= 3 and not _BANNER_PUNCT_RE.search(core)):
+        return "banner"
+    return "note"
+
+
+def _note_rows(events, source):
+    """Code-note rows from symbol events: comments are classified
+    (comment_class; banners dropped and counted), parameter / variable /
+    output events are `interface`. One row per comment line: the symbol
+    extraction keys a comment by its text, so the lines of one file and
+    commit are not in file order and are never joined into prose. Returns
+    (rows, banners_dropped)."""
+    rows, banners = [], 0
+    for e in events:
+        sub = e.get("subkind")
+        change = e.get("change")
+        if sub in ("comment", "todo"):
+            text = e.get("after") if change == "add" else e.get("before")
+            if not text or not text.strip().startswith((e.get("name") or "")[:20]):
+                text = e.get("name") or text
+            cls = comment_class(sub, e.get("name") or text)
+            if cls == "banner":
+                banners += 1
+                continue
+        elif sub in ("param", "variable", "output"):
+            cls = "interface"
+            text = None
+        else:
+            continue
+        row = {"commit": e.get("commit"), "path": e.get("path"),
+               "change": change, "class": cls, "source": source}
+        if cls == "interface":
+            row["kind"] = sub
+            row["name"] = e.get("name")
+            if e.get("before"):
+                row["before"] = e["before"]
+            if e.get("after"):
+                row["after"] = e["after"]
+        elif change == "change":
+            row["before"] = e.get("before")
+            row["after"] = e.get("after")
+        else:
+            row["text"] = text
+        rows.append(row)
+    return rows, banners
+
+
+def _note_chars(row):
+    return sum(len(row.get(k) or "") for k in ("text", "before", "after", "name"))
+
+
+_NOTE_PRIORITY = {"note": 0, "todo": 0, "parameter_description": 1,
+                  "interface": 2}
+
+
+def train_code_notes(bundle, train, history=None, instant=None):
+    """What the code said along the way for one train: the comment /
+    parameter-description / interface changes of its merged commits (the
+    view's symbol events) and of its PRs' own commits (`pr_history` notes,
+    as of the window's end). Returns (rows_by_commit {sha: [row]},
+    by_module {module: {path: {added, removed, changed}}}, info) where info
+    = {banners_dropped, budget, kept, omitted}. The rows kept are chosen
+    within STORY_CODE_NOTES_BUDGET characters: developer notes and TODOs
+    first, then parameter descriptions removed / changed, then added, then
+    interface lines; each class in commit order."""
+    history = history or {}
+    shas = set(train.get("commits") or [])
+    base_events = [e for e in bundle.get("symbol_events") or []
+                   if e.get("commit") in shas]
+    rows, banners = _note_rows(base_events, "base")
+    for n in train.get("prs") or []:
+        row = history.get(n) or {}
+        ok = {c["sha"] for c in _pr_commits_as_of(row, instant)}
+        evs = [e for e in row.get("notes") or [] if e.get("commit") in ok]
+        r2, b2 = _note_rows(evs, "pr_head")
+        for r in r2:
+            r["pr"] = n
+        rows += r2
+        banners += b2
+    idx = derive.area_index(bundle.get("code_graph", {}))
+
+    def module_of(path):
+        return idx.get(path) or gather.classify_code_area(
+            path, gather.DEFAULT_AREA_PATTERNS)
+    by_module = {}
+    for r in rows:
+        counts = by_module.setdefault(module_of(r["path"]) or "", {}).setdefault(
+            r["path"], {"added": 0, "removed": 0, "changed": 0})
+        counts[{"add": "added", "drop": "removed"}.get(r["change"], "changed")] \
+            += 1
+    order = sorted(range(len(rows)), key=lambda i: (
+        _NOTE_PRIORITY.get(rows[i]["class"], 3)
+        + (0.5 if rows[i]["class"] == "parameter_description"
+           and rows[i]["change"] == "add" else 0), i))
+    used, keep = 0, set()
+    for i in order:
+        c = _note_chars(rows[i])
+        if used + c <= STORY_CODE_NOTES_BUDGET:
+            keep.add(i)
+            used += c
+    by_commit = {}
+    for i, r in enumerate(rows):
+        if i in keep:
+            by_commit.setdefault(r["commit"], []).append(r)
+    info = {"banners_dropped": banners, "budget": STORY_CODE_NOTES_BUDGET,
+            "kept": len(keep), "omitted": len(rows) - len(keep)}
+    return by_commit, by_module, info
+
+
+# --- the story timeline ----------------------------------------------------
+
+def _event_url(rec, e):
+    """A citable link for a lifecycle event: the item page anchored at the
+    event (`<item url>#event-<id>`), the form GitHub's own pages use."""
+    if e.get("id") is not None and rec.get("url"):
+        return "{}#event-{}".format(rec["url"], e["id"])
+    return rec.get("url")
+
+
+def _pr_commit_url(pr, sha):
+    return "{}/commits/{}".format(pr.get("url"), sha) if pr.get("url") \
+        else None
+
+
+def _apply_story_budget(items):
+    """Cap each item's text at STORY_ITEM_CAP, then fit the total in
+    STORY_SLICE_BUDGET: cut the longest texts evenly (never below
+    STORY_ITEM_FLOOR) and, if that is not enough, leave out whole texts from
+    the middle of the timeline outward. Mutates `items`; returns the
+    truncation record {item_cap, budget, chars_original, chars_kept, cut:
+    [{index, url, kept, original}], text_omitted: [{index, url, chars}]}."""
+    orig = {i: len(it["text"]) for i, it in enumerate(items)
+            if isinstance(it.get("text"), str)}
+    limit = {i: min(n, STORY_ITEM_CAP) for i, n in orig.items()}
+    if sum(limit.values()) > STORY_SLICE_BUDGET:
+        lo, hi = STORY_ITEM_FLOOR, STORY_ITEM_CAP
+        while lo < hi:                                # largest fitting ceiling
+            mid = (lo + hi + 1) // 2
+            if sum(min(n, mid) for n in limit.values()) <= STORY_SLICE_BUDGET:
+                lo = mid
+            else:
+                hi = mid - 1
+        limit = {i: min(n, lo) for i, n in limit.items()}
+    omitted = set()
+    keyed = sorted(limit)
+    if sum(limit.values()) > STORY_SLICE_BUDGET:
+        mid = len(keyed) // 2
+        spiral = []
+        for k in range(len(keyed)):
+            j = mid + ((k + 1) // 2) * (1 if k % 2 else -1)
+            if 0 < j < len(keyed) - 1:
+                spiral.append(keyed[j])
+        for i in spiral:
+            if sum(n for j, n in limit.items() if j not in omitted) \
+                    <= STORY_SLICE_BUDGET:
+                break
+            omitted.add(i)
+    cut, dropped = [], []
+    for i in keyed:
+        it = items[i]
+        if i in omitted:
+            dropped.append({"index": i, "url": it.get("url"), "chars": orig[i]})
+            it["text"] = None
+            it["text_omitted"] = orig[i]
+        elif limit[i] < orig[i]:
+            it["text"] = it["text"][:limit[i]]
+            it["truncated_from"] = orig[i]
+            cut.append({"index": i, "url": it.get("url"), "kept": limit[i],
+                        "original": orig[i]})
+    return {"item_cap": STORY_ITEM_CAP, "budget": STORY_SLICE_BUDGET,
+            "chars_original": sum(orig.values()),
+            "chars_kept": sum(n for i, n in limit.items() if i not in omitted),
+            "cut": cut, "text_omitted": dropped}
+
+
+def story_material(bundle, train):
+    """The conversation of one train as one chronological timeline, for a
+    narrator. Pure (reads the bundle; returns new objects).
+
+    Items {at, kind, actor, url, on: {type, number}, ...}: `opened` (with
+    `title` and the body as `text`), `comment`, `review_comment`, `review`
+    (`state`, `text`), `ready_for_review` / `reopened` / `closed` (the
+    lifecycle events; a `closed` also from `closed_at` when no event records
+    it), `merged` (`by`), and `commit` — the PR's own commits from
+    `pr_history` (`source: "pr_head"`, `subject`, `files`, `authored_at`) and
+    the train's merged commits (`source: "base"`) — each carrying the
+    `code_notes` its diff added / removed / changed. Bots are left out of the
+    timeline and counted in `bots`. Everything is as of the window's end
+    (records are projected by the view; PR commits after the instant are
+    dropped). Turning points are marked by rule (`turning_points`), text is
+    bounded with every cut recorded (`truncation`)."""
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    issues, prs = _train_members(train, pr_index, issue_index)
+    history = _pr_history_index(bundle)
+    instant = window_end_instant(bundle.get("meta"))
+    items, bots = [], {}
+
+    def bot(login):
+        bots[login] = bots.get(login, 0) + 1
+
+    for rec in issues + prs:
+        typ = "pr" if rec in prs else "issue"
+        on = {"type": typ, "number": rec.get("number")}
+        if rec.get("created_at"):
+            items.append({"at": rec["created_at"], "kind": "opened",
+                          "actor": rec.get("author"), "url": rec.get("url"),
+                          "on": on, "title": rec.get("title"),
+                          "text": rec.get("body") or ""})
+        for key, kind in (("comments_list", "comment"),
+                          ("review_comments", "review_comment")):
+            for c in rec.get(key) or []:
+                if not isinstance(c, dict):
+                    continue
+                if derive.is_bot_login(c.get("author")):
+                    bot(c.get("author"))
+                    continue
+                items.append({"at": c.get("created_at"), "kind": kind,
+                              "actor": c.get("author"), "url": c.get("url"),
+                              "on": on, "text": c.get("body") or ""})
+        for r in rec.get("reviews") or []:
+            if not isinstance(r, dict) or r.get("state") == "pending":
+                continue
+            if derive.is_bot_login(r.get("author")):
+                bot(r.get("author"))
+                continue
+            if r.get("state") == "commented" and not r.get("body"):
+                continue          # a review thread's wrapper: its text is the
+                                  # review comment
+            items.append({"at": r.get("submitted_at"), "kind": "review",
+                          "actor": r.get("author"), "url": r.get("url"),
+                          "on": on, "state": r.get("state"),
+                          "text": r.get("body") or ""})
+        closed_seen = False
+        for e in rec.get("lifecycle") or []:
+            if not isinstance(e, dict):
+                continue
+            closed_seen = closed_seen or e.get("event") == "closed"
+            items.append({"at": e.get("created_at"), "kind": e.get("event"),
+                          "actor": e.get("actor"), "url": _event_url(rec, e),
+                          "on": on})
+        if rec.get("merged") and rec.get("merged_at"):
+            items.append({"at": rec["merged_at"], "kind": "merged",
+                          "actor": rec.get("merged_by"), "url": rec.get("url"),
+                          "on": on})
+        elif rec.get("closed_at") and not closed_seen \
+                and (rec.get("state") == "closed"):
+            items.append({"at": rec["closed_at"], "kind": "closed",
+                          "actor": None, "url": rec.get("url"), "on": on})
+    notes_by_commit, by_module, notes_info = train_code_notes(
+        bundle, train, history, instant)
+    seen = set()
+    for p in prs:
+        row = history.get(p.get("number"))
+        for c in _pr_commits_as_of(row, instant):
+            seen.add(c.get("sha"))
+            it = {"at": c.get("committed_at"), "kind": "commit",
+                  "actor": c.get("author"), "url": _pr_commit_url(p, c["sha"]),
+                  "on": {"type": "pr", "number": p.get("number")},
+                  "source": "pr_head", "sha": c.get("sha"),
+                  "subject": c.get("subject"), "files": c.get("files"),
+                  "authored_at": c.get("authored_at")}
+            if c.get("parents", 1) > 1:
+                it["merge"] = True
+            if notes_by_commit.get(c["sha"]):
+                it["code_notes"] = notes_by_commit[c["sha"]]
+            items.append(it)
+    commits_by_sha = {c.get("sha"): c for c in bundle.get("commits", [])}
+    for sha in train.get("commits") or []:
+        c = commits_by_sha.get(sha)
+        if c is None or sha in seen:
+            continue
+        it = {"at": c.get("committed_at") or c.get("date"), "kind": "commit",
+              "actor": c.get("author"), "url": derive._commit_url(bundle, sha),
+              "source": "base", "sha": sha, "subject": c.get("message"),
+              "files": len(c.get("files") or [])}
+        if c.get("pr") is not None:
+            it["on"] = {"type": "pr", "number": c.get("pr")}
+        if notes_by_commit.get(sha):
+            it["code_notes"] = notes_by_commit[sha]
+        items.append(it)
+    items = [it for it in items if it.get("at")]
+    items.sort(key=lambda it: (_parse_ts(it["at"]) or datetime.min.replace(
+        tzinfo=timezone.utc), _TIMELINE_KIND_ORDER.get(it["kind"], 9),
+        it.get("url") or ""))
+    truncation = _apply_story_budget(items)
+    truncation["code_notes"] = notes_info
+    out = {"timeline": items,
+           "turning_points": story_turning_points(
+               items, instant if train.get("outcome") == "in_flight" else None),
+           "truncation": truncation,
+           "bots": dict(sorted(bots.items())),
+           "code_notes_by_module": by_module,
+           "pr_history": _pr_history_status(prs, history),
+           "as_of": instant,
+           "not_gathered": list(STORY_NOT_GATHERED)}
+    return out
+
+
+def _pr_history_status(prs, history):
+    """{pr number (str): status} for the train's PRs: the pr_history row's
+    status (`fetched`, `missing`, `fetch_failed`, ...) with its notes state,
+    or `not_gathered` when the view carries no history for it."""
+    out = {}
+    for p in prs:
+        row = history.get(p.get("number"))
+        if row is None:
+            out[str(p.get("number"))] = "not_gathered"
+            continue
+        s = row.get("status") or "unknown"
+        if row.get("on_base"):
+            s += " (commits on the base branch)"
+        elif "notes" in row:
+            s += ", notes extracted"
+        elif row.get("notes_skipped"):
+            s += ", notes skipped: " + row["notes_skipped"]
+        out[str(p.get("number"))] = s
+    return out
+
+
+def story_turning_points(items, open_as_of=None):
+    """Turning points of a story timeline, by rule (data, not prose). Each
+    {rule, at, index, url, detail?}:
+    - `still_silent` (only with `open_as_of`, the as-of instant of a train
+      still open then): no recorded human event in the last
+      STORY_SILENCE_DAYS days before it (detail: days, since; `index` is
+      the last item's);
+    - `change_request`: a review with state changes_requested;
+    - `reopened`: an issue / PR reopened;
+    - `silence_then_activity`: activity after more than STORY_SILENCE_DAYS
+      days without any recorded human event (detail: days, since);
+    - `rework_after_change_request`: the first PR commit after a change
+      request on that PR;
+    - `history_rewritten`: a PR commit committed more than
+      STORY_REWRITE_HOURS after it was authored (amended, rebased or
+      cherry-picked; the branch's earlier states are not kept), once per PR
+      per day;
+    - `new_attempt`: a PR of the train opened after another of its PRs was
+      closed unmerged.
+    A scope change (a title edit) cannot be marked: edits are not gathered."""
+    out = []
+    pending_cr = {}
+    rewritten = set()
+    closed_unmerged = set()
+    merged = {it["on"]["number"] for it in items
+              if it["kind"] == "merged" and it.get("on")}
+    prev = None
+    for i, it in enumerate(items):
+        dt = _parse_ts(it["at"])
+        on = it.get("on") or {}
+        if prev is not None and dt is not None \
+                and (dt - prev).total_seconds() > STORY_SILENCE_DAYS * 86400:
+            out.append({"rule": "silence_then_activity", "at": it["at"],
+                        "index": i, "url": it.get("url"),
+                        "detail": {"days": _days(prev, dt),
+                                   "since": prev.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+        if dt is not None:
+            prev = dt
+        kind = it["kind"]
+        if kind == "review" and it.get("state") == "changes_requested":
+            out.append({"rule": "change_request", "at": it["at"], "index": i,
+                        "url": it.get("url")})
+            pending_cr[on.get("number")] = i
+        elif kind == "reopened":
+            out.append({"rule": "reopened", "at": it["at"], "index": i,
+                        "url": it.get("url")})
+        elif kind == "commit" and it.get("source") == "pr_head":
+            n = on.get("number")
+            if n in pending_cr:
+                out.append({"rule": "rework_after_change_request", "at": it["at"],
+                            "index": i, "url": it.get("url"),
+                            "detail": {"change_request_index": pending_cr.pop(n)}})
+            a, c = _parse_ts(it.get("authored_at")), dt
+            if a is not None and c is not None and \
+                    (c - a).total_seconds() > STORY_REWRITE_HOURS * 3600 and \
+                    (n, it["at"][:10]) not in rewritten:
+                rewritten.add((n, it["at"][:10]))
+                out.append({"rule": "history_rewritten", "at": it["at"],
+                            "index": i, "url": it.get("url"),
+                            "detail": {"authored_at": it.get("authored_at")}})
+        elif kind == "closed" and on.get("type") == "pr" \
+                and on.get("number") not in merged:
+            closed_unmerged.add(on.get("number"))
+        elif kind == "opened" and on.get("type") == "pr" and closed_unmerged \
+                and on.get("number") not in closed_unmerged:
+            out.append({"rule": "new_attempt", "at": it["at"], "index": i,
+                        "url": it.get("url"),
+                        "detail": {"after_closed": sorted(closed_unmerged)}})
+    end = _parse_ts(open_as_of)
+    if end is not None and prev is not None and items \
+            and (end - prev).total_seconds() > STORY_SILENCE_DAYS * 86400:
+        out.append({"rule": "still_silent", "at": open_as_of,
+                    "index": len(items) - 1, "url": items[-1].get("url"),
+                    "detail": {"days": _days(prev, end),
+                               "since": prev.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+    return out
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s)\]>\"'`]+")
+_QUOTE_RE = re.compile(r"\"([^\"\n]{4,})\"|“([^”\n]{4,})”")
+
+
+def _slice_strings(obj, urls, texts):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _slice_strings(v, urls, texts)
+    elif isinstance(obj, list):
+        for v in obj:
+            _slice_strings(v, urls, texts)
+    elif isinstance(obj, str):
+        texts.append(obj)
+        if obj.startswith(("http://", "https://")):
+            urls.add(obj)
+        urls.update(_URL_IN_TEXT_RE.findall(obj))
+
+
+def _norm_ws(s):
+    return " ".join((s or "").split())
+
+
+def check_story_evidence(slice_obj, text):
+    """The mechanical check of a narrative against its train slice: every URL
+    the text cites must occur in the slice (as a value or inside a slice
+    text), and every quoted string (in "..." or “...”, at least 4
+    characters) must occur verbatim in some slice text, whitespace-
+    normalised. Returns {"ok", "urls_not_in_slice", "quotes_not_in_slice",
+    "urls_checked", "quotes_checked"}. Pure."""
+    urls, texts = set(), []
+    _slice_strings(slice_obj, urls, texts)
+    norm_texts = [_norm_ws(t) for t in texts]
+    cited = []
+    for u in _URL_IN_TEXT_RE.findall(text or ""):
+        u = u.rstrip(".,;:")
+        if u not in cited:
+            cited.append(u)
+    bad_urls = [u for u in cited if u not in urls]
+    quotes = []
+    for m in _QUOTE_RE.finditer(text or ""):
+        q = m.group(1) or m.group(2)
+        if q.startswith(("http://", "https://")):
+            continue
+        quotes.append(q)
+    bad_quotes = [q for q in quotes
+                  if not any(_norm_ws(q) in t for t in norm_texts)]
+    return {"ok": not bad_urls and not bad_quotes,
+            "urls_not_in_slice": bad_urls, "quotes_not_in_slice": bad_quotes,
+            "urls_checked": len(cited), "quotes_checked": len(quotes)}
 
 
 # Item fields that hold a list or an object. A JSON null in one of them (a
@@ -2518,6 +3484,12 @@ def enrich(bundle, priority_patterns=(), path_rules=()):
     # vs plumbing): only for a bundle that carries the gathered module_notes,
     # so every other bundle is unchanged. Reads trains / symbol_moves above.
     build_module_changes(bundle, path_rules)
+    # The story layer: the discussion signal per train, then the story
+    # selection (reads module_changes for product relevance / plumbing).
+    # Omit-when-absent keys: a train with no human conversation, and a view
+    # where no train qualifies, are unchanged.
+    annotate_train_discussion(bundle)
+    select_story_trains(bundle)
     return bundle
 
 
@@ -2681,12 +3653,18 @@ def _load_bundle(path):
 
 
 _USAGE = ("usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json] "
-          "[--priority-label PATTERN ...] [--path-class CLASS=GLOB ...]\n")
+          "[--priority-label PATTERN ...] [--path-class CLASS=GLOB ...]\n"
+          "       link.py SLICE.json --check-story STORY.md\n")
 _HELP = _USAGE + """
 Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
 
   --slice TRAIN_ID     print one train's self-contained slice as JSON on
                        stdout; BUNDLE.json is not rewritten
+  --check-story PATH   with a slice file (what --slice printed) instead of a
+                       bundle: check the narrative at PATH against it — every
+                       URL it cites and every quoted string must be in the
+                       slice; prints the result as JSON, exit 0 when it
+                       passes, 1 when it does not
   --series PATH        also compare with, and record this window in, the
                        series index at PATH
   --priority-label PATTERN
@@ -2750,6 +3728,20 @@ def main(argv=None):
     if "-h" in argv or "--help" in argv:
         sys.stdout.write(_HELP)
         raise SystemExit(0)
+    if len(argv) == 3 and argv[1] == "--check-story" \
+            and not argv[0].startswith("-") and not argv[2].startswith("-"):
+        sliced = _load_bundle(argv[0])
+        try:
+            with open(argv[2], encoding="utf-8") as fh:
+                story = fh.read()
+        except OSError as exc:
+            sys.stderr.write("link.py: error: cannot read {} ({})\n".format(
+                argv[2], exc.strerror or exc))
+            raise SystemExit(2)
+        result = check_story_evidence(sliced, story)
+        json.dump(result, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        raise SystemExit(0 if result["ok"] else 1)
     parsed = _parse_argv(list(argv))
     if parsed is None:
         sys.stderr.write(_USAGE)

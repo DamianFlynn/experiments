@@ -301,7 +301,14 @@ moves and version tags of the window, read from the clone for the changelog / ve
 files the window's code events name — `gather.collect_module_notes`, BUNDLE.md "Module
 changes"; only per window, never a singleton node; absent when the gather had no
 window history on disk, and from windows gathered before it existed: re-gather a
-window to get it) — each named by the SHA-256 of
+window to get it) and `pr_history` (each window PR's own commits from
+`refs/pull/<N>/head` and the comment / parameter changes between them for the most
+discussed PRs — `gather.collect_pr_history`, BUNDLE.md "The story layer"; only per window;
+`{"collected": false}` for a gather run with `--no-pr-history`; absent without a clone and
+from windows gathered before it existed. A per-window fact rather than a field on the PR
+record because it is what the head ref held when that window was gathered — dated
+gather-time evidence like `newcomers`, read under the as-of rule — while PR records are
+latest-wins and compared field by field by the trust check) — each named by the SHA-256 of
 its JSON text (encoded as node `data` is: sorted keys), and the clone sha the
 window was gathered against. A key is present only when the bundle's value is
 present and non-empty (the latest-wins node rule). Each value is stored once per

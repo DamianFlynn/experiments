@@ -210,6 +210,7 @@ into a **fresh** store for the first item, into the same store for the others:
 | #93 (PR head repo) | a stacked PR whose base branch is the head of two PRs (forks' `patch-1`) is attached to neither | `contributing_prs` missing |
 | #101 (nested Terraform areas) | `.tf` files in `modules/<name>/<sub>/` stay in `modules/<name>` | module counts / areas |
 | the module change notes (`module_notes` / `module_changes`, BUNDLE.md "Module changes") | no `module_notes` per-window fact, so `link.py` builds no `module_changes` (new / changed / breaking / deprecated modules, product vs plumbing) | the view has no `module_changes` key. Re-gather the window (same store is fine: a re-fold replaces that window's facts) |
+| the story layer (`pr_history`, release notes text; BUNDLE.md "The story layer") | no `pr_history` per-window fact and no `releases[].notes` | the slice `conversation` has no PR commits (`pr_history: not_gathered`), `change_requests_reworked` is absent, `module_changes.releases` carry no notes. `discussion`, `stories` and the timeline still work from the stored comments and reviews. Re-gather the window (same store is fine) |
 | #109 (collection review) | an issue of ANOTHER repo that mentions a PR made the same-numbered local issue a `cross_ref` of it; commits (and their code/symbol events) are windowed on the committer's local day, not the UTC day PRs and issues use | an unrelated issue in a PR's train context / forecast; a commit made near midnight UTC in the neighbouring month. Re-gather into a fresh store (a mention edge the new records no longer imply fails `validate`) |
 
 A store last folded before #95 heals its current-state edges on the next fold of any window
@@ -572,6 +573,28 @@ the --bundle's window"), not as errors. Such a store needs no re-gather.
 `--project P --repo owner/repo` to cross-check one member). A run with `--repo` on a
 multi-repo project checks only the people that member derives; run without `--repo` for
 the full people check.
+
+### 5.6 Stories: the PR history it gathers and what it costs
+
+`link.py` ranks the trains with the most to tell (`stories`, `train.story_rank`: the
+conversation, the change requests, reopens, silences, and product relevance — not the touched
+area count that `tier` uses), and every slice carries the whole conversation as one timeline
+(BUNDLE.md "The story layer"). Narrate them with the story brief and check each story with
+`python3 link.py <slice.json> --check-story <story.md>` (reference/report-sections.md).
+
+The timeline's PR commits come from gather: a squash-merging repository keeps one commit per
+PR on its mainline, so gather fetches every window PR's `refs/pull/<N>/head` into
+`refs/remotes/pr/<N>` of the clone (one `git ls-remote`, then `git fetch --filter=blob:none`
+in batches of 100) and walks the `.bicep` / `.tf` diffs between the commits of the 40 most
+discussed PRs. Measured on `Azure/bicep-registry-modules` (a blobless clone shallow since
+2026-07-25): September 2026, 142 PRs — 42 s, the clone's `.git` from 13.5 MB to 23.1 MB (the
+commit and tree history the PR heads reach, plus the blobs the diff walk read), 1,092 PR
+commits, notes for 40 PRs, a 1.1 MB fact; October 2026 into the same clone, 160 PRs — 11 s,
++1.2 MB. Nearly all the time is the diff walk fetching blobs; the ref fetch itself took about
+2 s. A missing ref (a PR deleted by GitHub) is recorded as `missing`, a failed batch as
+`fetch_failed`; neither stops the gather. `--no-pr-history` skips all of it and records
+`{"collected": false}`. The refs stay in the clone (`refs/remotes/pr/*`); a refresh fetches
+only what moved.
 
 ## 6. Forecasting — reading it and making it useful
 

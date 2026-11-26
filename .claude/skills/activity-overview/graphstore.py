@@ -1161,9 +1161,12 @@ def get_clone_info(conn, project, repo, frm, to):
 # (no latest-wins node), and stored only by a gather that computed it; so is
 # `module_notes` (the changelog entries, version-file movement and version
 # tags the window's commits added, read from the clone: gather
-# collect_module_notes).
+# collect_module_notes), and `pr_history` (each window PR's own commits from
+# refs/pull/<N>/head and the comment / parameter changes between them: gather
+# collect_pr_history).
 WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
-                    "label_taxonomy", "newcomers", "module_notes")
+                    "label_taxonomy", "newcomers", "module_notes",
+                    "pr_history")
 
 
 def _window_facts_key(project, repo, frm, to):

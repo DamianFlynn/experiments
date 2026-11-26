@@ -304,8 +304,9 @@ _COMMAND_DOCS = _DOCS + (
     os.path.join("samples", "README.md"), os.path.join("examples", "README.md"))
 # Scripts whose argv is hand-rolled (no argparse --help to read flags from):
 # the exact flags each accepts. link.py: `BUNDLE [--slice ID | --series PATH]
-# [--priority-label PATTERN ...]`.
-_HAND_ROLLED = {"link.py": {"--slice", "--series", "--priority-label"},
+# [--priority-label PATTERN ...]`, or `SLICE --check-story STORY`.
+_HAND_ROLLED = {"link.py": {"--slice", "--series", "--priority-label",
+                            "--check-story"},
                 "transcript.py": set(),
                 "examples/formatters/shipped_changelog.py": set()}
 _PY_CMD = re.compile(r"python3\s+(\S+\.py)\b([^\n]*)")

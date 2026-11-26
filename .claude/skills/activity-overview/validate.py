@@ -1303,13 +1303,15 @@ def _fact_signatures(value):
     code_graph a dict with an `areas` list, label_taxonomy a dict with a
     `source` string, code_owners a CODEOWNERS rule list, workflow_stats a
     {workflow: {total, ...}} dict, module_notes a dict with a `changelogs`
-    list."""
+    list, pr_history a dict with a `prs` list and a `base`."""
     out = set()
     if isinstance(value, dict):
         if isinstance(value.get("areas"), list):
             out.add("code_graph")
         if isinstance(value.get("changelogs"), list):
             out.add("module_notes")
+        if isinstance(value.get("prs"), list) and "base" in value:
+            out.add("pr_history")
         if isinstance(value.get("source"), str):
             out.add("label_taxonomy")
         if value and all(isinstance(v, dict) and "total" in v

@@ -42,6 +42,7 @@ renderer over that view; changelogs, dashboards or slide decks are others.
 | Recognition | Who moved the project (no blame board, by design)? | `derive.annotate_people_profile` / `build_halls` |
 | Feature ledger | Which params/outputs/resources/docs were added, changed, removed? | `code_events` + `feature_deltas` |
 | Module release notes | Which modules are new, what changed in each, what is breaking (declared vs candidate), what was deprecated, how much was plumbing? | gather `module_notes` (changelogs, version files, tags) → `link` `module_changes` |
+| Stories | Which work had the most to tell (a debate, a change request and the rework after it, a long silence), and what was said along the way, in order? | gather `pr_history` (PR head refs) → `link` `discussion` / `stories` / slice `conversation` |
 | Module biography | How has one module's surface evolved across all history? | `spotlight module` |
 | Blast radius | If this module changes, which modules/repos consume it? | `spotlight dependents`, `digest.module_edges` |
 | Multi-repo project | One view across a constellation of repos | `gather --manifest`, `digest` |
@@ -639,9 +640,18 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     and derives breaking **candidates** from the stored declaration snippets: a parameter
     renamed within one file reads as removed + added, a Terraform variable's default is not
     in its snippet (`required: null`), and a candidate is a hint to check, never a claim.
-    Release notes text of GitHub releases is not gathered (only tag, name, date, url).
-    Tags come from the clone (lightweight tags are dated by their commit). A window gathered
-    before this layer has no `module_notes` and no `module_changes` until re-gathered.
+    GitHub release text is kept up to 4,000 characters (`releases[].notes`). A version a
+    changelog declared in the window but no tag published in it (and the reverse) is flagged,
+    within the window only. Tags come from the clone (lightweight tags are dated by their
+    commit). A window gathered before this layer has no `module_notes` and no
+    `module_changes` until re-gathered.
+21. **A story is as good as what people wrote down.** The story layer reads the stored
+    conversation (comments, reviews, review comments, lifecycle events) and each PR's own
+    commits from its head ref as gathered. It cannot see title or description edits,
+    force-pushes (only the current head is fetched), label changes over time, or anything
+    said outside GitHub; a rewritten commit is flagged by its dates, not reconstructed.
+    Story selection is a ranking by rule (`story_score`), not a judgement of importance, and
+    the narrator brief forbids characterising people.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
 per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it

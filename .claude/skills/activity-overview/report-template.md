@@ -303,6 +303,11 @@ list is in the bundle (`buckets.shipped`)".
 
 <!-- narrative: <train-id> -->
 
+<!-- Story trains (`train.story` true, any tier) get this block too, with their story in
+     the narrative slot — written to "Stories (the story brief)" in
+     reference/report-sections.md; then one line "N more trains had notable discussion"
+     from `stories.more` when it is not empty. -->
+
 **Mention trains** (`train.tier` "mention") — one line each (grouped by theme on a
 monorepo of independent PRs, see above; at most 40 lines per group, then the LONG LISTS
 "Showing N of M trains" line):

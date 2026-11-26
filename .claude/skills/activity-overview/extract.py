@@ -129,7 +129,7 @@ VIEW_CONTRACT_VERSION = 3
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
              "code_owners", "label_taxonomy", "newcomers", "module_notes",
-             "artifacts", "people")
+             "pr_history", "artifacts", "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
 # (not the raw symbol `change`). build_artifacts only uses `change` to recompute
@@ -452,6 +452,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_merged_module_notes`); absent when no gather collected them.
     if "module_notes" in facts:
         bundle["module_notes"] = facts["module_notes"]
+    # PR-internal history (per-window only): the gathered window's fact as
+    # stored, or the PRs of the windows overlapping the view
+    # (`_merged_pr_history`); absent when no gather collected it.
+    if "pr_history" in facts:
+        bundle["pr_history"] = facts["pr_history"]
 
     return bundle
 
@@ -1226,7 +1231,7 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     with_ci = {k for k in recorded if probes[k]["ci_collected"]}
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
                            if k not in ("workflow_stats", "newcomers",
-                                        "module_notes"))
+                                        "module_notes", "pr_history"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1281,6 +1286,9 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
                                  ts_from, ts_to)
     if notes is not None:
         facts["module_notes"] = notes
+    history = _merged_pr_history(conn, project, repo, overlapping, recorded)
+    if history is not None:
+        facts["pr_history"] = history
     note = {"structure": win(structure),
             "workflow_stats": [win(k) for k in summed],
             # every day of the view is in exactly one summed window
@@ -1404,6 +1412,41 @@ def _merged_module_notes(conn, project, repo, overlapping, recorded, ts_from,
     windows = [{"from": k[0], "to": k[1]} for k in sorted(values)]
     out["windows"] = windows
     out["covers_view"] = _covers(windows, ts_from, ts_to)
+    return out
+
+
+def _merged_pr_history(conn, project, repo, overlapping, recorded):
+    """The `pr_history` of a view that is not exactly one gathered window.
+
+    A PR's history is what its head ref held when a window was gathered, so
+    the view takes, per PR number, the entry of the LATEST gathered window
+    overlapping it that collected one (by end day, then start day); the
+    view's consumers drop commits dated after the view's end (the as-of
+    rule, link). Returns {"collected": True, "base", "prs": [by number],
+    "limits"?, "windows": [{from, to}]} or None when no overlapping window
+    collected a PR history."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("pr_history",))
+        value = (got or {}).get("facts", {}).get("pr_history")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+    prs, base, limits = {}, None, None
+    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
+        v = values[k]                      # later windows replace earlier ones
+        base = v.get("base", base)
+        limits = v.get("limits", limits)
+        for row in v.get("prs") or []:
+            if isinstance(row, dict) and isinstance(row.get("number"), int):
+                prs[row["number"]] = row
+    out = {"collected": True, "base": base,
+           "prs": [prs[n] for n in sorted(prs)],
+           "windows": [{"from": k[0], "to": k[1]} for k in sorted(values)]}
+    if limits is not None:
+        out["limits"] = limits
     return out
 
 

@@ -360,6 +360,48 @@ gather prints one line (`module notes: <repo>: N changelog update(s), M version 
 version tag(s) in the window`) and the bundle carries `module_notes`; fold stores it as a
 per-window fact (`graphstore.WINDOW_FACT_KEYS`, §4.10), never as a singleton node.
 
+### 4.4b PR-internal history (`collect_pr_history`)
+
+The base-branch walk sees one commit per squash-merged PR (69 commits for 69 merged PRs in
+September 2026 on Azure/bicep-registry-modules). The per-window fact `pr_history` (BUNDLE.md
+"The story layer") records each kept PR's own commits and the comment / parameter changes
+between them. It runs after the PR listing (it ranks PRs by their human conversation) and
+after every base walk (the clone's shallow state is never changed for them), only with a
+clone and not with `--no-pr-history`. Every git call goes through `run` (default `run_git`,
+with its network retry); a refusal is recorded, never fatal.
+
+1. `git ls-remote origin refs/pull/*/head` once → `{number: head sha}`
+   (`parse_pr_head_refs`). A window PR without a ref is `missing`; a failed listing leaves
+   `error` and no rows.
+2. `git fetch --quiet --filter=blob:none --no-tags --no-write-fetch-head origin
+   +refs/pull/<N>/head:refs/remotes/pr/<N> ...` in batches of `PR_HISTORY_FETCH_BATCH` (100).
+   A plain fetch (no depth flags) into the shallow clone brings the commit and tree history
+   the heads reach, down to the root: about 8–10 MB for the whole Bicep monorepo, blobless.
+   `--shallow-exclude=<base>` was tried and rejected: the server cuts every PR branch at its
+   first merge from the base branch, losing the PR's earlier commits. A failed batch marks its
+   PRs `fetch_failed`.
+3. Each PR's commits: `git log --reverse --date-order --format=PR_COMMIT_FORMAT --name-only
+   --no-renames refs/remotes/pr/<N> --not HEAD <real parents of the shallow boundary>`
+   (`parse_pr_commits`). The walked branch is cut at the shallow boundary, so `--not HEAD`
+   alone would list the base-branch commits older than the boundary that a PR head reaches;
+   `_shallow_parent_exclusions` reads the boundary commits' real parents from the commit
+   objects (which keep them) and excludes those that exist locally. No commit at all →
+   `on_base` (a merge-commit merge). At most `PR_HISTORY_MAX_COMMITS` (250) per PR.
+4. Notes for the most discussed PRs — human comments + review comments > 0, ranked by that
+   count, at most `PR_HISTORY_NOTES_MAX_PRS` (40) per window, each of at most
+   `PR_HISTORY_NOTES_MAX_COMMITS` (60) commits: `git log PATCH_WALK_ARGS refs/remotes/pr/<N>
+   --not HEAD … -- '*.bicep' '*.tf'` through `parse_symbol_events` (the patch walk's own
+   extraction), keeping `PR_HISTORY_NOTE_SUBKINDS` (comment, todo, param, variable, output);
+   the newest `PR_HISTORY_NOTES_MAX` (400) per PR. Each diff is against the commit's first
+   parent, the first commit's parent being its base commit (present after step 2), so the
+   first commit's adds are the PR's initial state. Every other PR records `notes_skipped`.
+
+Cost (Azure/bicep-registry-modules, blobless clone shallow since 2026-07-25): September 2026,
+142 PRs — 41.6 s (ls-remote 0.4 s, fetch 2.2 s, log / diff walks 38 s, nearly all lazy blob
+fetches), `.git` 13.5 → 23.1 MB, 1,092 commits, notes for 40 PRs (2,456 events), fact JSON
+1.1 MB; October 2026 into the same clone, 160 PRs — 10.6 s, +1.2 MB. GitHub serves
+`refs/pull/*` to a partial clone without complaint.
+
 ### 4.5 Code areas
 
 `select_code_area_provider(paths, clone_dir)` is directory-first: it uses **graphify** only when
@@ -1215,6 +1257,48 @@ deltas in order, a `diff` is kept only if `used + len(diff) <= SLICE_DIFF_CAP` (
 total never exceeds the cap; a diff that does not fit is omitted (the delta stays listed) and
 counted in `feature_deltas_diff_overflow`. BUNDLE.md documents every slice key; a docs-contract
 test (`test_link_small_fixes.py`) compares it with `slice_train`'s output.
+Since the story layer every slice also carries `conversation` (§6.8a), and the `train` block
+the train's `discussion` / `story*` keys when present.
+
+### 6.8a The story layer — discussion, selection, material
+
+Runs last in `enrich` (after `build_module_changes`, whose PR classes and module statuses it
+reads), over the as-of-projected records:
+
+```
+annotate_train_discussion  → trains[].discussion   (train_discussion; omitted without
+                                                     human conversation)
+select_story_trains        → trains[].story, story_rank, story_score, story_reasons
+                             + bundle.stories {selected, more, rule}   (omitted when none)
+slice_train                → slice.conversation = story_material(bundle, train)
+```
+
+- **`train_discussion`** counts human comments / review comments (bots by
+  `derive.is_bot_login`), participants, reviews by state (the PR author's own excluded; an
+  empty `commented` review — a review-thread wrapper — not counted), review rounds, reopens,
+  text volume, `in_window` turns, first response, the longest gap between consecutive human
+  events (PR-history commits as of the window's end included), change requests and — with
+  the PR history for each — whether a commit followed each.
+- **`story_score`** (BUNDLE.md table): discussion points (conversation, in-window turns,
+  participants, change requests, reopens, extra review rounds, a silence over 14 days, text
+  volume) + relevance (kind; the module layer's new module / breaking items; in flight).
+  Eligibility: ≥ 3 turns, ≥ 2 participants, score ≥ 8; a plumbing train
+  (`_train_plumbing`: every merged PR `plumbing` or a `sweep` in `module_changes.prs`;
+  without it, a chore / docs / other train over more than 10 areas) needs discussion points
+  ≥ 15. Top 8 by (score desc, id). Additive: `tier` and every existing key are unchanged
+  (the deep tier keeps its consumers: flowcharts, the deep-train narrative), so no golden
+  changes except a train that gains `discussion` (char_bundle_p3: one train).
+- **`story_material`** builds the timeline (opened / comment / review_comment / review /
+  lifecycle / merged / closed / commit), sorts it by (time, kind order, url), attaches
+  `train_code_notes` to commit items (base commits from the view's symbol events, PR commits
+  from `pr_history` notes; `comment_class` drops banners; priority-ordered within
+  `STORY_CODE_NOTES_BUDGET`), applies `_apply_story_budget` (per-item cap, then the largest
+  common ceiling ≥ `STORY_ITEM_FLOOR` found by bisection, then whole texts omitted from the
+  middle outward; every cut recorded), and marks `story_turning_points`.
+- **`check_story_evidence(slice, text)`** — the mechanical narrative check (CLI
+  `link.py SLICE --check-story STORY`): cited URLs must be slice values or occur in slice
+  texts; quoted strings (`"…"` / `“…”`, ≥ 4 characters) must occur in a slice text,
+  whitespace-normalised.
 
 ### 6.9 Series — `series.py` via `link.py BUNDLE --series series.json`
 
@@ -1777,6 +1861,12 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 | `MODULE_NOTE_TEXT_CAP` / `_ITEMS_CAP` / `_ENTRIES_CAP` | 600 / 40 / 12 | gather |
 | `DEFAULT_PATH_CLASS_RULES` | BUNDLE.md "Module changes" (override: `link.py --path-class CLASS=GLOB`) | link |
 | `SWEEP_MIN_AREAS` / `MODULE_RANK_TOP_N` | 5 / 10 | link |
+| `RELEASE_NOTES_CAP` | 4000 | gather |
+| `PR_HISTORY_FETCH_BATCH` / `_MAX_COMMITS` | 100 / 250 | gather |
+| `PR_HISTORY_NOTES_MAX_PRS` / `_NOTES_MAX_COMMITS` / `_NOTES_MAX` | 40 / 60 / 400 | gather |
+| `STORY_MIN_EXCHANGES` / `STORY_MIN_SCORE` / `STORY_TOP_N` / `STORY_PLUMBING_MIN` | 3 / 8.0 / 8 / 15.0 | link |
+| `STORY_SILENCE_DAYS` / `STORY_REWRITE_HOURS` | 14 / 24 | link |
+| `STORY_ITEM_CAP` / `STORY_SLICE_BUDGET` / `STORY_ITEM_FLOOR` / `STORY_CODE_NOTES_BUDGET` | 5000 / 40000 / 500 / 12000 | link |
 
 ## 14. Cross-cutting concerns
 
