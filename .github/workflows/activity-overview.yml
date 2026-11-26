@@ -322,6 +322,14 @@ jobs:
           print("enriched bundle: {}".format(counts))
           empty = [k for k, v in counts.items() if not v]
           assert not empty, "enriched bundle has empty {}".format(empty)
+          # One train holding most of the window's PRs means something joined
+          # unrelated work (a PR template's commented "Fixes #123" once did, #97).
+          big = max(b["trains"], key=lambda t: len(t.get("prs") or []))
+          share = len(big.get("prs") or [])
+          print("largest train: {} with {} of {} PR(s)".format(
+              big.get("id"), share, len(b["prs"])))
+          assert share <= 10 or share * 3 <= len(b["prs"]), \
+              "train {} holds {} of {} PRs".format(big.get("id"), share, len(b["prs"]))
           PY
 
       - name: Upload the journey-graph store and the enriched bundle

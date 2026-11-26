@@ -623,7 +623,11 @@ def window_records(records, from_date, to_date):
 # *listed* ref (GitHub links it as a mention, never closes it). Closing keywords
 # link issues only, so a keyword before a `/pull/` URL is a cross-ref, not a
 # close. No Markdown parsing: a keyword inside a code block / code span matches
-# like anywhere else. Owners/repos: GitHub names — alnum start, then word/.-.
+# like anywhere else. HTML comments are the exception (_visible_text): GitHub
+# does not act on text inside `<!-- ... -->`, and PR templates routinely carry
+# an example there ("<!-- Fixes #123 -->"), which made half the PRs of a real
+# repository "close" issue 123 (final-gate finding, #97).
+# Owners/repos: GitHub names — alnum start, then word/.-.
 _CLOSING_KW = r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
 _REF = (
     r"(?:https?://github\.com/(?P<uowner>[A-Za-z0-9][\w.-]*)/"
@@ -647,6 +651,36 @@ _QUALIFIED_URL_RE = re.compile(
 )
 
 
+# A terminated comment anywhere, or an unterminated one that starts a line (an
+# HTML block, which then runs to the end of the text).
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->|(?m:^[ \t]{0,3})<!--.*\Z", re.DOTALL)
+# Markdown code: fenced blocks and inline spans. A `<!--` written there is a
+# literal, not a comment opener.
+_MD_CODE_RE = re.compile(
+    r"(?m)^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}(?P=fence)[ \t]*$|\Z)"
+    r"|(?P<tick>`+)(?!`).+?(?<!`)(?P=tick)(?!`)", re.DOTALL)
+
+
+def _visible_text(text):
+    """`text` without its HTML comments (`<!-- ... -->`; an unterminated one
+    that starts a line runs to the end): what GitHub renders and scans for
+    references. A `<!--` inside Markdown code (a fenced block or an inline
+    span) is a literal and opens nothing; code content itself stays scanned,
+    as before. Pure."""
+    text = text or ""
+    if "<!--" not in text:
+        return text
+    # find comments on a copy whose code has no `<` (same length, same offsets)
+    probe = _MD_CODE_RE.sub(lambda m: m.group(0).replace("<", " "), text)
+    out, pos = [], 0
+    for m in _HTML_COMMENT_RE.finditer(probe):
+        out.append(text[pos:m.start()])
+        out.append(" ")
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _ref_from_match(m):
     """(owner, repo, number, is_pr) for a `_REF` match; owner/repo None for a
     bare `#N`. is_pr is True only for a `/pull/` URL (a bare/qualified `#N`
@@ -661,8 +695,9 @@ def _scan_closing(text):
     """Every closing-keyword reference in `text`, in order, as
     (owner, repo, number, is_pr, closes): the ref right after a keyword has
     closes=True unless it is a `/pull/` URL; each list-tail ref after it
-    (", #2", " and #2") has closes=False. Pure."""
-    text = text or ""
+    (", #2", " and #2") has closes=False. HTML comments are not scanned
+    (_visible_text). Pure."""
+    text = _visible_text(text)
     out = []
     for m in _CLOSING_RE.finditer(text):
         owner, repo, num, is_pr = _ref_from_match(m)
@@ -713,7 +748,7 @@ def parse_qualified_refs(text):
     for owner, repo, num, is_pr, closes in scanned:
         if not closes:
             add(owner, repo, num, "cross_ref", is_pr)
-    for m in _QUALIFIED_URL_RE.finditer(text or ""):
+    for m in _QUALIFIED_URL_RE.finditer(_visible_text(text)):
         add(m.group("owner"), m.group("repo"), int(m.group("num")), "cross_ref",
             m.group("kind") == "pull")
     return out
@@ -761,7 +796,7 @@ def parse_blocks_refs(text):
     [{number, direction}] where direction is 'out' (this issue blocks #N) or 'in'
     (this issue is blocked by / depends on #N). Pure."""
     out, seen = [], set()
-    for m in _BLOCKS_RE.finditer(text or ""):
+    for m in _BLOCKS_RE.finditer(_visible_text(text)):
         kw = " ".join(m.group("kw").lower().split())
         num = int(m.group("num"))
         direction = "in" if kw in _BLOCKS_INBOUND else "out"
@@ -2193,45 +2228,15 @@ def _normalize_id(text):
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
 
-def _match_repo_area(name, area_ids):
-    """Find the area-id in `area_ids` whose tail confidently matches `name`.
-
-    Lenient normalised comparison (the ARM `metadata.name` is a short module name
-    like `vault`; the area tail is `vault`/`key-vault`). DETERMINISTIC: an exact
-    normalised tail match always wins; otherwise the most specific (longest tail)
-    substring match wins, ties broken by area-id — so the result never depends on
-    `set` iteration order. Returns the area-id or None."""
-    target = _normalize_id(name)
-    if not target:
-        return None
-    exact, partial = [], []
-    for aid in area_ids:
-        tail = aid.rstrip("/").split("/")[-1]
-        nt = _normalize_id(tail)
-        if not nt:
-            continue
-        if nt == target:
-            exact.append(aid)
-        elif nt in target or target in nt:
-            partial.append((nt, aid))
-    if exact:
-        return min(exact)                                   # exact wins; stable
-    if partial:
-        return min(partial, key=lambda p: (-len(p[0]), p[1]))[1]  # longest tail, stable
-    return None
-
-
 def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None,
                       module_exists=None):
     """Build inter-area dependency edges for one Bicep area.
 
     Immediate edges (transitive=False) come from the SOURCE refs — fully identified
     (area-id + version), build-validated by the caller. They correspond to the
-    DEPTH-1 module instantiations in the ARM tree. Transitive edges (transitive=True)
-    come from deployments nested DEEPER (depth >= 2), and only when the nested
-    deployment's `metadata.name` confidently matches ANOTHER area in this repo (no
-    fabricated external ids) that is not already a direct dependency. Pure;
-    deterministic (deduped, then sorted)."""
+    DEPTH-1 module instantiations in the ARM tree. No transitive edges are
+    produced (see the note at the end of the body); `arm_json` is accepted for
+    the callers' sake and not read. Pure; deterministic (deduped, then sorted)."""
     patterns = patterns or DEFAULT_AREA_PATTERNS
     edges = []
     seen = set()
@@ -2265,26 +2270,15 @@ def build_bicep_edges(source_text, arm_json, base_path, area_ids, patterns=None,
                 edge["instances"] = ri["instances"]
         edges.append(edge)
 
-    immediate_tos = {e["to"] for e in edges}  # direct deps, already captured above
-    # Only module areas are transitive targets: an AVM group-level area (a group's
-    # README home) would otherwise substring-match nested names like `network`.
-    module_area_ids = [a for a in (area_ids or ()) if not _is_avm_group_area(a)]
-    for node in walk_arm_deployments(arm_json):
-        # depth 1 == the direct module instantiations (already emitted as immediate
-        # source refs); only genuinely-nested deployments are transitive.
-        if node["depth"] < 2:
-            continue
-        to = _match_repo_area(node.get("metadata_name"), module_area_ids)
-        if to is None or to == self_id or to in immediate_tos:
-            continue
-        key = (to, node.get("name"), True)
-        if key in seen:
-            continue
-        seen.add(key)
-        edges.append({"to": to, "kind": "module", "ref": node.get("name"),
-                      "version": None, "transitive": True,
-                      "provider": "bicep", "resolved": True})
-
+    # No transitive edges for Bicep. They used to be guessed by matching each
+    # nested ARM deployment's `metadata.name` (a human title such as "Key Vault
+    # Access Policies") against area names by substring; on real repositories
+    # most of those guesses were wrong (a `...-AccessPolicies` deployment
+    # became a dependency on `.github/policies`, a Service Bus `subscription`
+    # one on an Event Hub namespace). The compiled template carries no module
+    # path, so a nested deployment cannot be tied to a module with certainty;
+    # the direct edges above come from the source and are exact. What a module
+    # reaches indirectly is the closure of the direct edges.
     return sorted(edges, key=lambda e: (e["transitive"], str(e["to"]), str(e["ref"])))
 
 

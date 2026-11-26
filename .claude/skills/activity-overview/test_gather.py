@@ -1886,13 +1886,31 @@ class TestBuildBicepEdges(unittest.TestCase):
                                          self.area_ids, gather.DEFAULT_AREA_PATTERNS)
         self.assertEqual(sum(1 for e in edges if not e["transitive"]), 3)
 
-    def test_transitive_edge_for_deeply_nested_repo_area(self):
+    def test_no_transitive_edge_is_guessed_from_nested_deployment_names(self):
+        # A nested deployment's `metadata.name` is a human title; matching it
+        # against area names produced wrong dependencies on real repositories.
         edges = gather.build_bicep_edges(self.src, self.arm, self.base,
                                          self.area_ids, gather.DEFAULT_AREA_PATTERNS)
-        trans = {e["to"] for e in edges if e["transitive"]}
-        # private-endpoint is nested at depth 2 and is a repo area -> transitive edge.
-        self.assertIn("avm/res/network/private-endpoint", trans)
-        self.assertNotIn(None, trans)
+        self.assertEqual([e for e in edges if e["transitive"]], [])
+
+    def test_nested_title_never_becomes_a_dependency(self):
+        # the live case: "...-KeyVault-AccessPolicies" became `.github/policies`,
+        # a Service Bus "subscription" became an Event Hub namespace.
+        arm = {"resources": [{"type": "Microsoft.Resources/deployments", "name": "kv",
+               "properties": {"template": {"metadata": {"name": "Key Vaults"},
+                   "resources": [{"type": "Microsoft.Resources/deployments",
+                       "name": "[format('{0}-KeyVault-AccessPolicies', deployment().name)]",
+                       "properties": {"template": {
+                           "metadata": {"name": "Key Vault Access Policies"},
+                           "resources": []}}}]}}}]}
+        ids = {"avm/ptn/x/y", ".github/policies", "avm/res/key-vault/vault",
+               "avm/ptn/authorization/policy-assignment"}
+        edges = gather.build_bicep_edges(
+            "module kv 'br/public:avm/res/key-vault/vault:0.14.2' = {}\n", arm,
+            "avm/ptn/x/y/main.bicep", ids, gather.DEFAULT_AREA_PATTERNS,
+            module_exists=ids.__contains__)
+        self.assertEqual([(e["to"], e["transitive"]) for e in edges],
+                         [("avm/res/key-vault/vault", False)])
 
     def test_direct_dep_not_duplicated_as_transitive(self):
         edges = gather.build_bicep_edges(self.src, self.arm, self.base,
@@ -1935,27 +1953,52 @@ class TestBuildBicepEdges(unittest.TestCase):
                                      gather.DEFAULT_AREA_PATTERNS), [])
 
 
-class TestMatchRepoArea(unittest.TestCase):
-    """Deterministic area matching (review finding): never depends on set order."""
+class TestHtmlCommentsAreNotScanned(unittest.TestCase):
+    """Final-gate finding (#97): a PR template's commented example
+    ("<!-- Fixes #123 -->") is not a closing reference."""
 
-    def test_exact_normalized_match_beats_substring(self):
-        # "vault" exactly matches avm/res/key-vault/vault, not the substring
-        # candidate avm/res/key-vault/vault-secret — exact must always win.
-        ids = {"avm/res/key-vault/vault", "avm/res/key-vault/vault-secret"}
-        self.assertEqual(gather._match_repo_area("vault", ids),
-                         "avm/res/key-vault/vault")
+    TEMPLATE = ("## Description\r\n\r\n<!--\r\n> List any dependencies.\r\n\r\n"
+                "Fixes #123\r\nFixes #456\r\nCloses #123\r\n-->\r\n\r\n"
+                "Adds a thing. Fixes #7 and see https://github.com/a/b/issues/9\r\n"
+                "<!-- https://github.com/a/b/issues/10 blocked by #11 -->")
 
-    def test_longest_tail_substring_wins_and_is_stable(self):
-        # No exact match; "storageaccountblob" should resolve to the most specific
-        # (longest) tail, deterministically, regardless of set iteration order.
-        ids = {"avm/res/storage/account", "avm/res/storage/account-blob-service"}
-        results = {gather._match_repo_area("storage-account-blob-service", ids)
-                   for _ in range(20)}
-        self.assertEqual(results, {"avm/res/storage/account-blob-service"})
+    def test_closing_keywords_in_a_comment_close_nothing(self):
+        self.assertEqual(gather.parse_closing_refs(self.TEMPLATE), [7])
+        self.assertEqual(gather.parse_listed_refs(self.TEMPLATE), [])
 
-    def test_no_match_returns_none(self):
-        self.assertIsNone(gather._match_repo_area(
-            "network", {"avm/res/key-vault/vault"}))
+    def test_urls_and_blocks_in_a_comment_are_not_refs(self):
+        self.assertEqual([(r["number"], r["kind"]) for r in
+                          gather.parse_qualified_refs(self.TEMPLATE)],
+                         [(9, "cross_ref")])
+        self.assertEqual(gather.parse_blocks_refs(self.TEMPLATE), [])
+        self.assertEqual(gather.parse_blocks_refs("blocked by #11"),
+                         [{"number": 11, "direction": "in"}])
+
+    def test_unterminated_comment_at_line_start_hides_the_rest(self):
+        self.assertEqual(
+            gather.parse_closing_refs("Fixes #1\n<!-- Fixes #2\nFixes #3"), [1])
+
+    def test_literal_opener_in_code_is_not_a_comment(self):
+        # review finding: "Document the `<!--` delimiter." must not hide what follows
+        text = "Document the `<!--` delimiter.\n\nFixes #7, blocked by #8\n"
+        self.assertEqual(gather.parse_closing_refs(text), [7])
+        self.assertEqual(gather.parse_blocks_refs(text),
+                         [{"number": 8, "direction": "in"}])
+        fenced = "```html\n<!-- example\n```\nFixes #9 https://github.com/a/b/issues/4\n"
+        self.assertEqual(gather.parse_closing_refs(fenced), [9])
+        self.assertEqual([r["number"] for r in gather.parse_qualified_refs(fenced)], [4])
+
+    def test_opener_mid_line_without_a_close_is_text(self):
+        self.assertEqual(gather.parse_closing_refs("use <!-- here. Fixes #5"), [5])
+
+    def test_code_content_is_still_scanned(self):
+        self.assertEqual(gather.parse_closing_refs("`Fixes #6`"), [6])
+
+    def test_normalize_pr_ignores_the_template_example(self):
+        pr = gather.normalize_pr({"number": 5, "title": "t", "body": self.TEMPLATE,
+                                  "html_url": "https://github.com/o/r/pull/5"})
+        self.assertEqual(pr["closes"], [7])
+        self.assertEqual(pr["body"], self.TEMPLATE)      # the record keeps the text
 
 
 class TestCloneHeadSha(unittest.TestCase):
