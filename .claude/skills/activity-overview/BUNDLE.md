@@ -535,7 +535,7 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   high priority when it is one of `link.HIGH_PRIORITY_LABELS` (exact, case-insensitive) or
   matches one of `link.PRIORITY_LABEL_PATTERNS` (regular expressions searched
   case-insensitively: priority high / critical / urgent / P0 / P1, high priority, a bare
-  P0 / P1, urgent, critical (not "non-critical"), blocker, immediate attention), plus any
+  P0 / P1, urgent, critical (not "non-critical"), blocker), plus any
   `link.py BUNDLE --priority-label PATTERN` (repeatable), which are then listed in
   `forecast.priority_patterns` (absent without the flag). **Approved PR:** an open,
   unmerged PR that is not a draft (`draft` true; gather does not record it yet, so it is

@@ -3007,13 +3007,16 @@ class TestForecastWithoutMilestones(unittest.TestCase):
                 self.assertEqual(self._run([], [pr]), {})
 
     def test_repo_specific_priority_wording_is_recognised(self):
-        for label in ("Needs: Immediate Attention :bangbang:", "Priority: P1",
+        for label in ("Priority: P1",
                       "priority/high", "P0", "Severity: Critical", "blocker",
                       "urgent", "High Priority"):
             with self.subTest(label=label):
                 cands = self._run([self._issue(7, labels=(label,))], [])
                 self.assertEqual(cands[("issue", 7)]["signals"], ["high-priority"])
-        for label in ("Status: Response Overdue :triangular_flag_on_post:",
+        # a triage label automation puts on overdue items is not a default: on
+        # a real repository it made 59 old issues forecast candidates
+        for label in ("Needs: Immediate Attention :bangbang:",
+                      "Status: Response Overdue :triangular_flag_on_post:",
                       "Needs: Triage :mag:", "priority: low", "Non-Critical",
                       "Type: AVM :a: :v: :m:"):
             with self.subTest(label=label):

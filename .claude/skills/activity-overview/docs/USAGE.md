@@ -487,8 +487,10 @@ calibrate how much weight readers should put on each tier; skip installments who
   of `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`, `critical`, or
   contains (case-insensitive) one of the default patterns: priority high / critical / urgent /
   P0 / P1 (`Priority: High`, `priority/p1`), high priority, a bare P0 / P1, urgent, critical
-  (not "non-critical"), blocker, immediate attention (`Needs: Immediate Attention
-  :bangbang:`). Check a repo's labels with `gh label list -R <owner/repo> --limit 200`. For
+  (not "non-critical"), blocker. Triage labels that automation applies to
+  overdue items (for example `Needs: Immediate Attention :bangbang:` on
+  Azure/bicep-registry-modules, on about 60 open issues) are deliberately not defaults:
+  they would fill the forecast with old issues. Check a repo's labels with `gh label list -R <owner/repo> --limit 200`. For
   other wording, add patterns on each run:
   `python3 $AO/link.py $B --series $S/series.json --priority-label 'response overdue' --priority-label 'sev ?1'`
   — each a case-insensitive regular expression, searched in each label; repeat the flag for

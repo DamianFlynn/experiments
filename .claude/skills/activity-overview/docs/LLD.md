@@ -1050,8 +1050,8 @@ milestone is overdue, **current** = the most recently due (lowest number on a ti
 `HIGH_PRIORITY_LABELS` = `priority/high`, `priority/critical`, `p0`, `p1`, `high-priority`,
 `critical` (case-insensitive exact match) or matches a regular expression of
 `PRIORITY_LABEL_PATTERNS` (searched case-insensitively: priority high / critical / urgent /
-P0 / P1, high priority, a bare P0 / P1, urgent, critical but not non-critical, blocker,
-immediate attention) or of the operator's `link.py --priority-label PATTERN` (repeatable,
+P0 / P1, high priority, a bare P0 / P1, urgent, critical but not non-critical, blocker)
+or of the operator's `link.py --priority-label PATTERN` (repeatable,
 recorded in `forecast.priority_patterns`). An approved open PR (`approved_pr`: open, unmerged,
 not `draft`, an `approved` review by someone other than its author and no `changes_requested`
 review after the latest such approval, from the view's `reviews`) is a next candidate too.

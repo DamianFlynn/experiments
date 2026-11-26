@@ -50,7 +50,6 @@ PRIORITY_LABEL_PATTERNS = (
     r"\burgent\b",
     r"(?<![\w-])critical\b",
     r"\bblocker\b",
-    r"immediate\W+attention",
 )
 
 
