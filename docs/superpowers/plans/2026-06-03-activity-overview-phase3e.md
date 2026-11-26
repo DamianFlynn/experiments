@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 3e — symbol-identity tracking (implementation plan)
 
 **Status:** shipped (PR #9). Branch `claude/activity-phase3e`. Builds on the merged 3d symbol

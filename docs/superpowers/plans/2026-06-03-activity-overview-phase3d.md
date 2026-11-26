@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 3d — symbol-granular artifacts (implementation plan)
 
 **Status:** shipped (PR #8). Branch `claude/activity-phase3d`. Builds on the merged 3c/3c.1/3c.2

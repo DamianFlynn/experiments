@@ -4,7 +4,8 @@ How to fill each section of `report-template.md` from the materialized bundle vi
 Loaded on demand (progressive disclosure): `SKILL.md` carries the procedure; this is
 the per-section detail. **Universal rules:** the store/view is the only source of truth
 (omit anything not in it); quote PR/issue numbers and link their `url`; a section with no
-backing data is omitted, never padded. Sections appear in `report-template.md` order.
+backing data is omitted, never padded. This guide groups sections by topic; the order
+they appear in the report is `report-template.md`'s.
 
 **Field names.** The template's "Placeholder rules" block defines the row variables
 (`ref`, `item`, `train`, `ptrain`, `cand`, `flow_entry`, …) used below and in every
@@ -42,7 +43,7 @@ from `item`. Membership is deterministic and every item cites its ref; the conti
 narrative is the agent's. Omit on the first installment.
 
 ## Community call highlights
-Present ONLY when a transcript was provided (procedure step 4). Author it from the normalized
+Present ONLY when a transcript was provided (`SKILL.md` procedure step 8). Author it from the normalized
 `transcript.py` output and NOTHING else: summarize topics / decisions / asks / follow-ups,
 grounding each specific claim with a short **verbatim quote** from the transcript (the
 transcript is the source — there are no urls to cite). Never attribute to the call anything
@@ -55,8 +56,8 @@ Merged PRs + completed issues from `buckets.shipped` (multi-repo: `view["shipped
 refs add `repo`), each titled via `item` and linked by `ref.url`. **Group by code area** in
 the "Shipped by code area" section: a ref's `ref.train` names a `train.id`, and that train's
 `train.code_areas` are `area.id` values (`code_graph.areas[].label` for display); no train or
-no area → "Unattributed". Releases published in-window are a subsection (`release.tag_name`,
-`release.published_at`, `release.url`; flag `release.prerelease`).
+no area → "Unattributed". Releases are their own section (see "Releases · CI/CD health ·
+In-flight · Rejected" below), not part of this one.
 
 ## Activity at a glance
 Embed `diagrams.buckets_pie` (items per bucket) and `diagrams.timeline_gantt` here — this is
@@ -64,8 +65,9 @@ their one canonical place.
 
 ## Decision trains
 Two train shapes exist. **Project trains** (`view["trains"]`, multi-repo only) carry `repos`,
-`kind`, `outcome`, qualified `prs`/`issues`/`commits`, `code_areas`, `tickets`, `evidence` —
-no `tier`, `significance`, `effort` or `root_issue`. **Single-repo trains**
+`kind`, `outcome`, qualified `prs`/`issues`/`commits`, `code_areas` (the member trains' areas
+as `<repo>::<area>`), `tickets`, `evidence` — no `tier`, `significance`, `effort` or
+`root_issue`. **Single-repo trains**
 (`bundle["trains"]`, and each member bundle's) carry `significance`, `tier` (`"deep"`/
 `"mention"`), `root_issue`, numeric `issues` and `prs`, `pr_outcomes`, and an `effort` block.
 A train holds every attempt for its issues: `train.prs` can mix a rejected first try, the PR
@@ -77,11 +79,13 @@ member's train (`ptrain-<project>/<repo>#issue-<n>` ↔ member `<repo>`'s `train
 - **DEEP trains** (`train.tier` "deep") get a full sub-section. Embed the train's flowchart from
   `diagrams.train_flowcharts[id]` (a file path in the member's bundle view — read and inline as a
   fenced mermaid block). Add an **effort line** from `train.effort`:
-  - Merged: *"landed in N days · R reviewers · P contributors"* (`train.effort.elapsed_days`,
+  - Shipped: *"landed in N days · R reviewers · P contributors"* (`train.effort.elapsed_days`,
     `train.effort.reviewers`, `train.effort.participants` — the last two are integer COUNTS);
-    note stalled when `train.effort.stalled` is true.
+    when `train.effort.slow_to_land` is true (it took more than 21 days) say *"slow to land
+    (N days)"*. A shipped train is never "stalled".
   - Open: *"open N days"* (from `train.effort.opened_at` to the reference date;
-    `train.effort.merged_at` is null).
+    `train.effort.merged_at` is null); when `train.effort.stalled` is true add *"· stalled: no
+    activity for N days"* (`train.effort.idle_days`).
   - Append review/lifecycle texture when present: *"· K review rounds"* (sum
     `pr.review_rounds.count` over the train's PRs; definition in BUNDLE.md "Review decision &
     rounds") and *"· reopened M×"* (sum `pr.reopen_count` / `issue.reopen_count` across its
@@ -132,7 +136,8 @@ from a narrator sub-agent that reads ONLY that train's bounded slice:
    > Ground every statement in the slice. If a field has no support in the slice, set it to
    > `null`/`[]` rather than guessing.
 3. **Verify, then compose.** Drop any `evidence` ref whose URL is not in the slice (the
-   sub-agent introduces no new refs; a cited commit `sha`/url must be one from `slice.commits`).
+   sub-agent introduces no new refs; a cited commit must be one of `slice.commits`, linked
+   by its `url`).
    Render the narrative under the train's effort line: prose `summary`, then **Proposed /
    Changed / Rejected / Shipped** bullets (omit empty ones), each carrying its evidence link(s).
    This is the analysis layer — the model's judgment over the slice — and MUST stay grounded in
@@ -222,11 +227,16 @@ each item CITING its url (titles via `item`; `flow`/`blockers` entries are issue
   `hung` = open ≥ 60 d AND no update for ≥ 30 d.
 - **Top blockers** — `bundle["blockers"]` ranks OPEN issues by `blocker.blocks_count` (how many
   other OPEN issues each blocks, highest first) — the ones to unblock first. Embed
-  `diagrams.blocker_graph` (blocker → blocked) when present; it draws the raw stored relation,
-  closed blockers included.
-- **Stalled trains** — trains whose `train.effort.stalled` is true (train-level, distinct
-  from the issue-level flow); report the train + `train.effort.elapsed_days` (longest-stalled
-  first), citing the root issue's url (`train.root_issue` via `item`), else the first PR's.
+  `diagrams.blocker_graph` (blocker → blocked) when present; it follows the same open-only
+  rule: an edge is drawn only when both the blocker and the blocked issue are open (a closed
+  blocker, a closed dependant and an issue of unknown state are left out).
+- **Stalled trains** — OPEN trains (`train.outcome` "in_flight") whose `train.effort.stalled`
+  is true: no activity on any of their PRs or issues for more than 21 days at the reference
+  date (train-level, distinct from the issue-level flow). Report the train +
+  `train.effort.idle_days` (longest idle first; `train.effort.last_activity_at` is the last
+  recorded activity), citing the root issue's url (`train.root_issue` via `item`), else the
+  first PR's. Shipped trains never appear here, however long they took
+  (`train.effort.slow_to_land` belongs on the deep-train effort line).
 - **Frame as flow signals, not blame.** The public digest NEVER attributes a stall/blocker to a
   person — that is the gated internal appendix (below), off by default. Omit when `flow`/
   `blockers` are empty and there are no stalled trains.
@@ -251,7 +261,8 @@ pass, mirroring per-train narration; not pipeline prose):
      flip, a breaking rename via the folded chain).
    - `removed`: symbols whose last lifecycle event is `remove`.
    - `evidence`: commit/PR/issue refs **copied verbatim from the slice**; every claim traces to
-     one.
+     one. Spotlight output carries no commit url (a lifecycle `commit`, a `trains[].timeline`
+     row of kind `commit`): cite a commit by its sha as plain text, never an invented link.
 3. **Verify + render.** Drop any evidence ref not in the slice. Render the **Module biography**
    section — prose `summary` + the surface-change timeline, each line cited. Grounded in the
    slice's deterministic CRUD; the prose is the model's judgment over it.
@@ -259,7 +270,8 @@ pass, mirroring per-train narration; not pipeline prose):
 ## Internal appendix — stall & blocker attribution (GATED; off by default)
 Render ONLY when the operator explicitly requests an *internal* report (the request says e.g.
 "internal" / "with attribution"); the DEFAULT public digest NEVER includes it. It attributes the
-flow signals to people from existing bundle data, reading ONLY login fields: stalled trains →
+flow signals to people from existing bundle data, reading ONLY login fields: stalled trains
+(open trains with `train.effort.stalled`; shipped work is never attributed a stall) →
 the `pr.author` and `pr.reviewers` (login list) of the train's PRs and the `issue.author` and
 `issue.assignees` (login list) of its root issue; blocked issues → the `issue.author` and
 `issue.assignees` of the blocked issue and of its open blockers (`flow_entry.blocked_by`) —
@@ -273,6 +285,9 @@ Standard sections from `releases`, `workflow_stats` (skip keys starting `_`),
 via `item`); omit when empty. **CI caveat (#94):** when `meta.facts_windows` is present, the
 CI counts are a sum over the gathered windows it lists (`meta.facts_windows.workflow_stats`);
 when `meta.facts_windows.workflow_stats_complete` is false the total is partial and
-`meta.facts_windows.workflow_stats_excluded` names the windows left out; the code graph and
-owners come from `meta.facts_windows.structure`. Say so in one line under CI/CD health;
-omit it when the key is absent.
+`meta.facts_windows.workflow_stats_excluded` names the windows left out — with none left out,
+the missing days were never gathered: name the view's period (`meta.period`) minus the summed
+windows as "no gather covers …"; the code graph and owners come from
+`meta.facts_windows.structure`. Say so in one line under CI/CD health; omit it when the key
+is absent. **Releases** (`release.tag_name`, `release.published_at`, `release.url`; flag
+`release.prerelease`) is its own section, after Activity at a glance.

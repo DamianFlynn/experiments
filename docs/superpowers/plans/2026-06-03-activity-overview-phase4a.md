@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 4a — train significance + slices + forecast scaffold (implementation plan)
 
 **Status:** shipped (PR #10). Branch `claude/activity-phase4a`. Builds on the merged 3a–3e `trains`,

@@ -896,7 +896,7 @@ class TestRealDataSmoke(unittest.TestCase):
 
 
 class TestReviewFixes(unittest.TestCase):
-    """Regressions for the PR #14 review (Copilot): commit-only trains, date-only
+    """Regressions for the PR #14 review findings: commit-only trains, date-only
     range bounds, FTS phrase sanitization, dependency render, empty-text FTS."""
 
     def _store(self, bundle):

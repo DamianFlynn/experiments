@@ -978,8 +978,14 @@ Outcome is deliberately ignored (a rejected train's story still matters).
 
 `effort`, over every PR and issue of the train (#93): `opened_at` (earliest `created_at`),
 `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
-(sum), `commits`, `participants` (distinct authors + reviewers + commenters), `stalled`
-(merged and `elapsed_days > TRAIN_STALL_DAYS` = 21). Review rounds and reopen counts are added
+(sum), `commits`, `participants` (distinct authors + reviewers + commenters), and the stall
+flags (#112, threshold `TRAIN_STALL_DAYS` = 21, strict `>`): for an `in_flight` train,
+`last_activity_at` = the latest of its members' `created_at` / `updated_at` / `closed_at` /
+`merged_at`, comment and review-comment `created_at`, review `submitted_at`, lifecycle
+`created_at` and its commits' `committed_at` (else `date`); `idle_days` = calendar days from it
+to `meta.ref_date` (else `meta.to`), floored at 0; `stalled` = `idle_days > 21`. For a
+`shipped` train `slow_to_land` = `elapsed_days > 21` and `stalled` is false; `rejected` /
+`abandoned` trains have neither (BUNDLE.md `trains`). Review rounds and reopen counts are added
 by `annotate_review_rounds` / `annotate_reopen_count`. Review rounds ignore `PENDING` reviews
 and the PR author's own reviews; the exact round and `review_decision` rules are in
 `BUNDLE.md` → *Review decision & rounds*.
@@ -1016,7 +1022,8 @@ verification happens in the next installment's series block.
 Pure, read-only, raises `KeyError` on an unknown id. Returns `{train, issue, prs, commits,
 feature_deltas, symbol_moves}` plus review rounds, capped reviews/lifecycle and reopen counts.
 `issue` is the root issue; `train.issues` lists every closed issue and `prs` every attempt,
-whose own outcome is in `train.pr_outcomes` (#93).
+whose own outcome is in `train.pr_outcomes` (#93). Each `commits` row carries its commit `url`
+(`derive._commit_url`, as on `feature_deltas`, #112).
 Caps: text `SLICE_TEXT_CAP` = 1500 chars (with `…[+N chars]`), `SLICE_COMMENTS_KEPT` = 6 per list
 (overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars: walking the train's
 deltas in order, a `diff` is kept only if `used + len(diff) <= SLICE_DIFF_CAP` (#82), so the kept
@@ -1309,7 +1316,9 @@ the store's projects) or `--repo` (lists the project's repos). Ticket clustering
 opt-in: the manifest's `ticket_prefixes` → `\b(?:ABC|PLAT)-\d+\b`, or
 `--ticket-pattern` (wins); otherwise `tickets`/`related_work` are `[]`. Each
 `members[].bundle.meta` gains `project`, `slug`, `repo_owner`, `repo_name`
-(`meta.owner` stays the project scope).
+(`meta.owner` stays the project scope). A project train's `code_areas` (#112) is the sorted
+union of its member trains' `code_areas`, each as `"<repo>::<area>"` (BUNDLE.md "Project
+view: `trains`").
 
 People and totals (issue #88). A member bundle's `people` are that member's contributors in
 the window (§6.1 step 5) and their profile counts only its records, so `_merge_people`
@@ -1464,11 +1473,16 @@ Approximate REST cost per gather ≈ `pages(closed PRs since from) + pages(open 
 + pages(issues since from) + pages(open issues) + 2 × issues + referenced issues + workflow/
 release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100⌉` (the last term is
 the commit-author login listing, #78; zero for a window with no commits). Because **all open PRs and issues** are included every run, busy
-repos dominate the budget (GitHub's authenticated limit is 5,000 requests/hour). Wall time is
+repos dominate the budget (a personal token's authenticated limit is 5,000 requests/hour; the
+workflow's built-in `GITHUB_TOKEN`, which the CI live jobs use by default, has a lower limit
+that its runs in one repository share, so a live gather in CI is likelier to wait for the
+reset). Wall time is
 dominated by the per-item calls and, on IaC repos, by `terraform init`. Mitigations:
 `--no-workflows`, `--no-releases`, `TF_PLUGIN_CACHE_DIR`, and running heavy gathers
 off-hours. When the limit is hit, gather waits for the reset (announced on stderr, bounded by
-`ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7).
+`ACTIVITY_RATE_LIMIT_MAX_WAIT`) and continues, so a long gather is slowed rather than lost (§4.7);
+in CI that wait can push a job past an hour, so the live jobs run one at a time (chained, one
+concurrency group) with a 120-minute timeout (§15).
 A window with more than 1,000 workflow runs costs a few extra requests for the day-splits.
 GraphQL (a separate 5,000-point/hour budget): the closing-issue read costs ⌈kept PRs / 50⌉
 requests — 2 per 100 PRs — of 1 point each (50 connections of 25 nodes), plus one per extra
@@ -1492,7 +1506,9 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
   repo; a user config that already has its own `provider_installation` block is used as is.
   `TF_PLUGIN_CACHE_DIR` and `TF_TOKEN_<host>` are honoured. Residual: a repo can still pin
   providers in its own `.terraform.lock.hcl` and commit a `.terraform/` directory; the builds
-  are not sandboxed.
+  are not sandboxed. Gather only repositories you would build yourself, on a disposable host
+  or runner. The CI workflow checks out with `persist-credentials: false` (#112), so no
+  repository credential is left in the runner's git config.
 - **No build process sees the token** (issue #109). gather sends the token only in HTTPS
   headers to `https://api.github.com`. One exception: when the user's git config has a
   credential helper, git (alone) keeps `GH_TOKEN` / `GITHUB_TOKEN` and the two Enterprise
@@ -1526,8 +1542,16 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
   UTF-8 with replacement, so an undecodable byte never fails the member; an unread module file
   puts its area in `code_graph.structural_scan_unread` and an unread CODEOWNERS sets
   `code_graph.codeowners_unread`, so neither is taken as evidence for retraction (#95).
+- CI supply chain: actions are pinned to commit SHAs; the bicep binary and the Terraform zip
+  are checked against sha256 values pinned in the workflow (Terraform's was taken from the
+  release's SHA256SUMS after verifying its signature with the HashiCorp release key, #112).
+  **Residual risk:** `@mermaid-js/mermaid-cli` is pinned at the top level only — its
+  dependency tree (puppeteer and its Chrome download, run by an install script) is resolved at
+  install time; `--ignore-scripts` would skip the Chrome download mmdc needs, and a lockfile
+  for it is not kept. The mmdc install runs only in the offline `tests` job, which holds no
+  secret.
 - Recognition-not-blame: `halls` has no shame list; people attribution of stalls is an opt-in
-  report appendix.
+  report appendix, and only open trains are ever "stalled" (#112).
 
 ### 14.5 Known issues (verified, not yet fixed)
 
@@ -1571,7 +1595,7 @@ these affect an accumulated store.
 
 ## 15. Testing and CI
 
-- 46 `test_*.py` modules (stdlib `unittest`, about 2,000 tests), fixture-driven and fully
+- 55 `test_*.py` modules (stdlib `unittest`, about 2,200 tests), fixture-driven and fully
   offline (fake fetch seams; no network). Notable: `test_characterization.py` (store-derived ==
   link-derived golden equivalence), `test_validate.py` / `test_validate_strict.py` (each
   check), `test_gather.py` (parsers, fold, IaC parsing incl. modern/legacy DOT),
@@ -1586,10 +1610,20 @@ these affect an accumulated store.
   store, two FTS5-absent degrade paths when FTS5 is present); the mmdc diagram tests skip
   without `mmdc`, and fail instead under `CI=true`.
 - CI (`.github/workflows/activity-overview.yml`): `tests` on every relevant push/PR (Python 3.11,
-  3.12, 3.13, byte-compile, pinned mmdc, then the suite); `live` on dispatch, schedule (07:00 UTC on the 1st and
-  15th) or default-branch push — real gather into a store (pinned bicep CLI) then
-  `validate.py`, with the workflow's built-in token (`token_source: secret` on a dispatch
-  uses the `ACTIVITY_TEST_TOKEN` secret instead, for private targets).
+  3.12, 3.13, byte-compile of the skill, `samples/` and `examples/formatters/`, pinned mmdc, then
+  the suite; 20-minute timeout); `live` on dispatch, schedule (07:00 UTC on the 1st and
+  15th) or default-branch push — real gather into a store (pinned bicep CLI), minimum counts
+  (PR, issue and commit nodes, `closes` and `touches` edges each > 0), `validate.py`, then
+  `view.py` → `link.py` → `render.py --skip-validate` on the store with non-empty
+  `buckets.shipped`, `trains` and `timeline` asserted; the store and the enriched bundle are
+  uploaded (#112). It uses the workflow's built-in token (`token_source: secret` on a dispatch
+  uses the `ACTIVITY_TEST_TOKEN` secret instead, for private targets). The three live jobs
+  (`live` → `spotlight` → `constellation`, chained with `needs`, each running whatever the
+  previous one's result) share the concurrency group `activity-overview-live-gathers` with
+  `cancel-in-progress: false` and a 120-minute timeout, so gathers queue instead of starving
+  each other's API budget. GitHub keeps at most one pending job per group: when two runs
+  overlap, a newer pending job replaces an older pending one, which is cancelled before it
+  starts. Every checkout uses `persist-credentials: false`.
 - CI `spotlight` job (same triggers): gathers a pinned historical week of
   `Azure/bicep-registry-modules`, runs `validate.py`, then
   `ci_spotlight_integration.py --store … --require-all`. The gate discovers its query

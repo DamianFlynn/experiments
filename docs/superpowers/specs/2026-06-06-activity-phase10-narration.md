@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # activity-overview — Phase 10: sub-agent train narration (4b), on the store
 
 **Date:** 2026-06-06

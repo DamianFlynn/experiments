@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 9 — the multi-repo project (the constellation) — design
 
 **Status: PROPOSED (rev 1).** Detailed design for **Phase 9** of the

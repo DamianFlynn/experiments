@@ -277,16 +277,18 @@ flowchart TB
 2. **Gather into this month's own store** (`stores/YYYY-MM.db`). Re-running the same window
    into the same store is safe (idempotent). `gather` clones into `--clone-dir`, or, when that
    directory already holds a clone of the same repo, fetches it to the window's history bound
-   and checks out the default branch head — so last month's clone dir can be reused. A
+   and checks out the head of the mainline it walks (`meta.base_branch`, below) — so last
+   month's clone dir can be reused. A
    directory that is not a clone of this repo is refused, never deleted. Build output an earlier
    current-month run left in the clone (untracked `.terraform/`, `.terraform.lock.hcl`) is
    removed before the checkout; nothing else of yours is. `--no-clone` never
    creates a clone: it fetches an existing one, and with no clone on disk it gathers API data
    only (empty commit/code walks). A repo with no commits since `--from` minus the clone margin
    is cloned at depth 1 and has no commits in the window. `meta.clone_mode` records which
-   (`fresh`, `fetched`, `depth1-fallback`, `none`). "Shipped" means merged into the repo's
-   **default branch**, which gather detects (clone `origin/HEAD`, else the API) and stores
-   with the window as `meta.base_branch`; a PR merged into a feature or release branch is
+   (`fresh`, `fetched`, `depth1-fallback`, `none`). "Shipped" means merged into the analyzed
+   **mainline**, stored with the window as `meta.base_branch`: the repo's default branch, which
+   gather detects (clone `origin/HEAD`, else the API), unless `--branches B` or a manifest
+   member `branch` names another; a PR merged into any other branch (feature, release) is
    not shipped (a stacked PR shows as `contributing_prs` on its parent's train). Pass
    `--branches B` (or a manifest member `branch`) when the mainline is not the default: gather
    then fetches and walks `B` (commits, code areas, CODEOWNERS all come from it; a stderr note
@@ -798,7 +800,10 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 - **Narrative.** Run `/activity` (or the manual §4 steps 4–6 + "write the report") in Claude
   Code once the data is ready, review the citations, then publish.
 - **CI assurance.** The repo's GitHub Actions workflow runs the offline tests on every change
-  and a scheduled live gather → validate (1st and 15th, 07:00 UTC). Point its
+  and a scheduled live gather → validate → view → link → render (1st and 15th, 07:00 UTC),
+  failing on an empty store or an enriched bundle with no shipped items, trains or timeline;
+  its three live jobs run one at a time, each with a 120-minute timeout, because a gather that
+  waits for the API limit can take over an hour (LLD §15). Point its
   `workflow_dispatch` inputs at one of your targets to smoke-test a window. Its `spotlight`
   job also runs `ci_spotlight_integration.py --store S --require-all`, which checks the
   person / subsystem / symbol / grep answers against what the store holds. You can run it on
@@ -854,6 +859,11 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 - The token is **read-only** in effect — the skill never writes to GitHub — but treat it as a
   secret: environment/keychain only, never in manifests, scripts or reports; create short-lived
   tokens (the Azure org accepts 8 days at most).
+- **IaC builds run code the gathered repository chooses.** With `bicep` / `terraform` on PATH,
+  gather runs `bicep restore`/`build` and `terraform init`/`graph` in the clone; they download
+  and run third-party modules and provider plugins that the repository names. Gather only
+  repositories you would build yourself, preferably on a disposable machine, and keep other
+  credentials out of that environment (LLD §14.4). Without the CLIs on PATH no build runs.
 - Stores and clones contain repository content and contributor logins (and commit author
   names; author emails are read to resolve logins but never stored); keep them in your
   workspace, not in shared folders.
@@ -869,8 +879,10 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
   works). terraform never uses a `terraform.d/plugins` mirror shipped in the repo (gather gives
   it a CLI config with an explicit `provider_installation` block; your `~/.terraformrc`,
   `TF_PLUGIN_CACHE_DIR` and `TF_TOKEN_<host>` still apply). LLD §14.4 has the details.
-- Child processes never see the token: git, bicep, terraform and graphify run without
-  `GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_PAT` or any other `*_TOKEN` / `*_PAT` variable.
+- The builds never see the token: bicep, terraform and graphify run without
+  `GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_PAT` or any other `*_TOKEN` / `*_PAT` variable, and so
+  does git unless you have a git credential helper configured (it may need `GH_TOKEN` /
+  `GITHUB_TOKEN` to clone a private repo).
 - gather's git ignores your global and system git config (colour, diff prefixes, signatures,
   pager, … cannot corrupt the walks). Only proxy/TLS (`http.proxy`, `http.sslCAInfo`, …),
   `url.<base>.insteadOf`, credential helpers and `safe.directory` are carried over; proxy and

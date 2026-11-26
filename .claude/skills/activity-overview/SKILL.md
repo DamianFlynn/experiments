@@ -208,7 +208,7 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    - **Single repo:** every section reads the bundle view. Where the template says
      `view["shipped"]` read `bundle["buckets"]["shipped"]`; `view["people"]` /
      `view["halls"]` / `view["modules"]` → `bundle["people"]` / `bundle["halls"]` /
-     `bundle["modules"]` (keyed by area id);
+     `bundle["modules"]` (keyed by area id); `view["trains"]` → `bundle["trains"]`;
      `view["members"][i]["bundle"]` → the bundle view itself. There are no project
      trains: render *Decision trains* from the template's deep-train and mention-train
      blocks over `bundle["trains"]`. Omit *Related work* and *Cross-repo module

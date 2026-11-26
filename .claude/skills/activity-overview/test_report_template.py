@@ -25,6 +25,12 @@ What is checked:
 
 `PENDING` lists the few fields a document may name before the code emits them,
 each with its fallback rule written in the documents.
+
+Issue #112: the corpus holds a shipped train that took 72 days to land
+(`effort.slow_to_land`) and an open train idle for 46 days (`effort.stalled`),
+and both documents are checked to list only open trains as stalled, by
+`effort.idle_days`; the section guide's cross-references are checked against
+SKILL.md and the template.
 """
 
 import contextlib
@@ -114,6 +120,7 @@ AGENT_DERIVED = {
     "one-line what-this-module-is",
     "change",
     "effort line",
+    "uncovered span",
 }
 
 # Fields a document may name before the code emits them; each document states
@@ -138,12 +145,16 @@ def _rich_bundle(owner, name, base, area=AREA, edge_to=None, ticket=None):
     shipped / in-flight / rejected / next-candidate items, reviews, a reopen,
     a blocker, board status + sprints, artifacts (example removed, docs added,
     symbols, a TODO comment, a symbol move), releases, CI stats, CODEOWNERS,
-    milestones and (optionally) a module edge and a ticket reference."""
+    milestones and (optionally) a module edge and a ticket reference.
+    Train effort (issue #112): the shipped train took 72 days to land
+    (`effort.slow_to_land`, never `stalled`), and an open train — PR base+4
+    closing issue base+15 — has had no activity since 2026-04-15, so it is
+    `stalled` with `idle_days` 46 at the reference date 2026-05-31."""
     url = "https://github.com/{}/{}".format(owner, name)
     c1, c2, c3 = "a" * 40, "b" * 40, "c" * 40
-    pr_ship, pr_open, pr_rej = base + 1, base + 2, base + 3
-    iss_ship, iss_bug, iss_old, iss_np, iss_next = (
-        base + 10, base + 11, base + 12, base + 13, base + 14)
+    pr_ship, pr_open, pr_rej, pr_stuck = base + 1, base + 2, base + 3, base + 4
+    iss_ship, iss_bug, iss_old, iss_np, iss_next, iss_stuck = (
+        base + 10, base + 11, base + 12, base + 13, base + 14, base + 15)
     docs = ["{}/docs/page{}.md".format(area, i) for i in range(9)]
     edges = []
     if edge_to:
@@ -240,6 +251,15 @@ def _rich_bundle(owner, name, base, area=AREA, edge_to=None, ticket=None):
              "base": "main", "head": "exp", "closes": [], "crossref_issues": [],
              "url": "{}/pull/{}".format(url, pr_rej), "milestone": None,
              "reviewers": []},
+            # open and idle since 2026-04-15: a stalled train (issue #112)
+            {"number": pr_stuck, "title": "feat: stuck work",
+             "body": "Closes #{}".format(iss_stuck), "author": "ivan",
+             "labels": [], "merged": False, "merged_at": None,
+             "closed_at": None, "created_at": "2026-03-10T00:00:00Z",
+             "updated_at": "2026-04-15T00:00:00Z", "state": "open",
+             "base": "main", "head": "stuck", "closes": [iss_stuck],
+             "crossref_issues": [], "url": "{}/pull/{}".format(url, pr_stuck),
+             "milestone": None, "reviewers": []},
         ],
         "issues": [
             {"number": iss_ship, "title": "Add firewall module", "body": "",
@@ -280,6 +300,12 @@ def _rich_bundle(owner, name, base, area=AREA, edge_to=None, ticket=None):
              "lifecycle": [{"id": 901, "actor": "gina", "event": "reopened",
                             "created_at": "2026-05-21T00:00:00Z", "label": None,
                             "url": None}]},
+            {"number": iss_stuck, "title": "Stuck request", "body": "",
+             "kind": "feature", "author": "judy", "labels": [],
+             "assignees": ["ivan"], "state": "open", "state_reason": None,
+             "closed_at": None, "created_at": "2026-03-05T00:00:00Z",
+             "updated_at": "2026-04-10T00:00:00Z",
+             "url": "{}/issues/{}".format(url, iss_stuck), "milestone": None},
         ],
         "milestones": [
             {"title": "v1.0", "number": 1, "state": "closed",
@@ -742,6 +768,115 @@ class TestReportCaveats(_CorpusCase):
         ci = self._section("reference/report-sections.md", "releases")
         self.assertIn("`meta.facts_windows`", ci)
         self.assertIn("`meta.facts_windows.workflow_stats_complete`", ci)
+
+
+class TestStallMeansStuck(_CorpusCase):
+    """Issue #112 item 1: a shipped train that took long to land is never
+    reported as stalled; an open train with no recent activity is. The corpus
+    holds one of each, and both documents list stalled trains by
+    `train.effort.idle_days` and keep shipped work out of the stall lists."""
+
+    def _section(self, name, heading):
+        for head, body in _sections(self.docs[name]):
+            if head.lower().startswith(heading):
+                return body
+        self.fail("{} has no '{}' section".format(name, heading))
+
+    def test_corpus_has_a_shipped_slow_and_an_open_stuck_train(self):
+        trains = self.corpus.docs["bundle"]["trains"]
+        slow = [t for t in trains if t["effort"]["slow_to_land"]]
+        stuck = [t for t in trains if t["effort"]["stalled"]]
+        self.assertTrue(slow and stuck)
+        for t in slow:
+            self.assertEqual(t["outcome"], "shipped")
+            self.assertFalse(t["effort"]["stalled"])
+            self.assertGreater(t["effort"]["elapsed_days"], link.TRAIN_STALL_DAYS)
+        for t in stuck:
+            self.assertEqual(t["outcome"], "in_flight")
+            self.assertGreater(t["effort"]["idle_days"], link.TRAIN_STALL_DAYS)
+            self.assertIsNone(t["effort"]["merged_at"])
+        self.assertEqual([t["id"] for t in slow], ["train-issue-50"])
+        self.assertEqual([t["id"] for t in stuck], ["train-issue-55"])
+        self.assertEqual(stuck[0]["effort"]["idle_days"], 46)
+        # the in-flight train with recent activity is not stalled
+        live = [t for t in trains if t["id"] == "train-issue-51"][0]
+        self.assertFalse(live["effort"]["stalled"])
+        self.assertEqual(live["effort"]["idle_days"], 6)
+
+    def test_stalled_lists_read_idle_days_not_elapsed_days(self):
+        for name in self.docs:
+            for heading in ("stalled, blocked", "internal appendix"):
+                body = self._section(name, heading)
+                stalled = body[body.lower().index("stalled trains"):]
+                stalled = stalled.split("**Blocked issues**")[0].split(
+                    "- **Frame as flow")[0].split("blocked issues →")[0]
+                self.assertIn("train.effort.", stalled, (name, heading))
+                self.assertNotIn("elapsed_days", stalled, (name, heading))
+                self.assertIn("open", stalled.lower(), (name, heading))
+            body = self._section(name, "stalled, blocked")
+            self.assertIn("`train.effort.idle_days`", body, name)
+
+    def test_shipped_work_is_slow_to_land_on_the_effort_line(self):
+        for name in self.docs:
+            body = self._section(name, "decision trains")
+            self.assertIn("`train.effort.slow_to_land`", body, name)
+            self.assertIn("slow to land", body, name)
+            self.assertNotRegex(body, r'add\s+"stalled" when', name)
+
+    def test_appendix_never_attributes_a_stall_to_shipped_work(self):
+        for name in self.docs:
+            body = self._section(name, "internal appendix")
+            self.assertRegex(body, r"shipped work is never attributed a\s+stall",
+                             name)
+
+
+class TestSectionGuideCrossReferences(unittest.TestCase):
+    """Issue #112 items 7 and 12: the section guide agrees with SKILL.md and
+    the template (blocker graph open-only; transcript step number; Releases is
+    its own section, not part of Shipped)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.guide = _read(SECTIONS)
+        cls.template = _read(TEMPLATE)
+        cls.skill = _read(os.path.join(HERE, "SKILL.md"))
+
+    def test_blocker_graph_is_open_only(self):
+        self.assertNotIn("closed blockers included", self.guide)
+        stalled = self.guide.split("## Stalled, blocked & pile-ups")[1].split("\n## ")[0]
+        self.assertRegex(stalled, r"blocker_graph`[^.]*open-only")
+
+    def test_transcript_step_number_matches_skill(self):
+        steps = re.findall(r"`SKILL\.md` procedure step (\d+)", self.guide)
+        self.assertTrue(steps)
+        for n in steps:
+            self.assertRegex(self.skill, r"(?m)^{}\. \*\*Community-call transcript".format(n))
+
+    def test_releases_is_its_own_section(self):
+        self.assertIn("\n## Releases\n", self.template)
+        shipped = self.guide.split("## Shipped this period")[1].split("\n## ")[0]
+        self.assertNotIn("are a subsection", shipped)
+
+
+class TestStoreEdgeTypesWritten(unittest.TestCase):
+    """Issue #112 item 14: STORE.md says `reacted`, `spun_off` and
+    `duplicate_of` are allowed but not written by the fold. Fold the rich
+    fixture (every family of fact) and check the store agrees."""
+
+    def test_fold_never_writes_the_allowed_only_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "s.db")
+            _fold(db, [(_rich_bundle("o", "r", 40), {})])
+            conn = graphstore.open_store(db)
+            try:
+                types = {r[0] for r in conn.execute(
+                    "SELECT DISTINCT edge_type FROM edges")}
+            finally:
+                conn.close()
+        self.assertTrue({"closes", "touches", "authored", "blocks"} <= types, types)
+        self.assertEqual(types & {"reacted", "spun_off", "duplicate_of"}, set())
+        store_md = _read(os.path.join(HERE, "STORE.md"))
+        self.assertIn("`reacted` is allowed but\nnever written", store_md)
 
 
 class TestAttributionReadsLogins(_CorpusCase):

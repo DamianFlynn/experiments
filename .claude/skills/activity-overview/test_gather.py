@@ -1936,7 +1936,7 @@ class TestBuildBicepEdges(unittest.TestCase):
 
 
 class TestMatchRepoArea(unittest.TestCase):
-    """Deterministic area matching (Copilot review): never depends on set order."""
+    """Deterministic area matching (review finding): never depends on set order."""
 
     def test_exact_normalized_match_beats_substring(self):
         # "vault" exactly matches avm/res/key-vault/vault, not the substring

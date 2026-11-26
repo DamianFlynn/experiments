@@ -13,9 +13,9 @@ it, extend it, and debug it.
 > actually operating it.
 
 Companion docs (deeper, narrower): `SKILL.md` (the operating procedure), `STORE.md` (the
-database schema), `BUNDLE.md` (the data contract), `REFERENCE.md` (install/usage). The
-whole thing is framed by the original design spec,
-`docs/superpowers/specs/2026-06-01-activity-overview-design.md`.
+database schema), `BUNDLE.md` (the data contract), `REFERENCE.md` (install/usage). Those
+documents are the current contract; the dated design and plan documents under
+`docs/superpowers/` are historical and superseded by them.
 
 ---
 
@@ -704,7 +704,9 @@ or `--ticket-pattern`; unknown project/repo or a bad window exits 2.
 `ACTIVITY_MMDC_PUPPETEER_CONFIG` (puppeteer config for `mmdc -p`).
 A non-integer value for an integer knob is an error; one below its minimum is clamped.
 
-**Tunable constants (in code):** trains — top-N=8, significance floor=20.0, stall=21 days;
+**Tunable constants (in code):** trains — top-N=8, significance floor=20.0, stall=21 days
+(an open train idle that long is `stalled`; a shipped train that took that long is
+`slow_to_land`);
 forecast — likely ≥5.0, possible ≥2.0, overdue=200 days; slices — text cap 1500, comments
 kept 6, diff cap 6000 chars; flow — stale 30 days, upvote min 5, traction min 5, hung 60 days.
 

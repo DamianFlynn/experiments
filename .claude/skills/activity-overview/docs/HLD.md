@@ -426,8 +426,9 @@ Pass a `.vtt`/`.srt`/`.txt` transcript; `transcript.py` normalizes it and the re
 
 The deterministic `flow` classifier (blocked / upvoted-but-ignored / traction-then-abandoned
 / hung) and `blockers` ranking show where work is stuck; `halls.fame` recognizes
-contributors. Attribution of stalls to people exists only in an **opt-in internal appendix**
-— the public digest never blames individuals.
+contributors. A train is "stalled" only while it is open and idle (#112); shipped work
+that took long is "slow to land", never stalled. Attribution of stalls to people exists only
+in an **opt-in internal appendix** — the public digest never blames individuals.
 
 ## 9. Quality attributes
 
@@ -569,7 +570,18 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     (`meta.structure_as_of`: `window_end` or `head`). Not carried:
     `meta.closing_refs_source` is in gather's bundle only, and a view narrower than a gathered
     window does not repeat that window's dropped commits.
-18. **Narrative is not in CI.** The live CI jobs stop at the trust gate.
+18. **Narrative is not in CI.** The `live` CI job runs the deterministic report path on the
+    real store (view → link → render, asserting non-empty shipped items, trains and timeline,
+    #112); no narrative is authored or checked there, and its diagrams are not compiled (mmdc
+    runs only in the offline tests).
+19. **"Stalled" sees only recorded activity.** An open train is `stalled` when none of its
+    PRs / issues / commits shows activity (updates, comments, reviews, timeline events,
+    commits) for more than 21 days at the reference date (#112). The bundle holds mainline
+    commits only, so a push to an open PR's branch counts only through the PR's `updated_at`
+    (which GitHub moves on a push); discussion elsewhere does not count; and on a view of an
+    earlier window (`meta.state_as_of`) the
+    records are newer than the window, so a train idle then but active since is not stalled.
+    A shipped train is never stalled; one that took long to land is `slow_to_land`.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
 per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it

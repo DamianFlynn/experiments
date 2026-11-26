@@ -547,11 +547,14 @@
       "effort": {
         "commits": 1,
         "elapsed_days": null,
+        "idle_days": null,
+        "last_activity_at": null,
         "merged_at": "2026-05-10T12:00:00Z",
         "opened_at": null,
         "participants": 2,
         "review_comments": 0,
         "reviewers": 1,
+        "slow_to_land": false,
         "stalled": false
       },
       "evidence": [

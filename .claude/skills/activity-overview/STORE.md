@@ -124,7 +124,12 @@ equal to what the stored inputs imply and stale ones are deleted (see
 `data`), `replaced_by`/`identity_from` (artifact→artifact), `blocks`
 (issue→issue), `in_milestone`/`in_iteration` (social→structure). These are
 the endpoint rules `validate` enforces (`schema_conformance`, #89); any other
-edge type is an error. Both ends of an edge are in one project, and `touches`,
+edge type is an error. **Allowed is not written** (#112): `reacted` is allowed but
+never written (reactions are stored as counts on the issue record, see below);
+`duplicate_of` / `spun_off` are never written by the fold — only `backfill` would
+write one, when its fetch seam reports it, and the production fetcher
+(`make_backfill_fetcher`) reports only `closes` and `part_of`. Every other type above
+is written by the fold. Both ends of an edge are in one project, and `touches`,
 `part_of`, `blocks`, `in_milestone`, `in_iteration`, `replaced_by`,
 `identity_from`, `spun_off` and `duplicate_of` stay inside one repo.
 
@@ -612,8 +617,7 @@ already matched `validate.check_schema_conformance`'s allowlist.
 
 `in_iteration` (social→sprint) is written when the gather read a Projects v2
 board (Phase 12; the `read:project` scope). The
-`fts_text` FTS5 index IS populated on fold (see *Text index* above). See
-`docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
+`fts_text` FTS5 index IS populated on fold (see *Text index* above).
 
 ## Backfill on a traversal miss (slice 7c)
 
@@ -686,8 +690,7 @@ re-surfacing pruned phantoms. The fetch seam grows a third outcome to make this
 possible: `fetched payload` | `ABSENT` (definitive 404 → prune + record dead) |
 `None` (transient/unreachable → an `unreachable` gap). The tombstone is additive,
 ignored by the trust gate, and `first_seen` is excluded from determinism asserts
-(like `fetched_at`). See
-`docs/superpowers/specs/2026-06-04-activity-phase8d-completion.md`.
+(like `fetched_at`).
 
 ## Multi-repo project (the constellation)
 

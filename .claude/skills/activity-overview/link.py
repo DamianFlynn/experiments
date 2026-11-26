@@ -597,8 +597,11 @@ TRAIN_SIGNIFICANCE_TOP_N = 8
 # stays well below it.
 TRAIN_SIGNIFICANCE_FLOOR = 20.0
 
-# Elapsed-days threshold above which a merged train is considered "stalled"
-# (took too long to land).  Tune without touching logic.
+# Days threshold for the two train-effort flags (issue #112). An OPEN train
+# (outcome `in_flight`) is `stalled` when it has had no activity for more than
+# this many days as of the view's reference date; a SHIPPED train is
+# `slow_to_land` when it took more than this many days from first open to last
+# merge.  Tune without touching logic.
 TRAIN_STALL_DAYS = 21
 
 # ---------------------------------------------------------------------------
@@ -681,8 +684,44 @@ def _parse_ts(ts):
         return None
 
 
-def _effort_for_train(train, pr_index, issue_index):
-    """Compute the effort dict for one train.  Pure; never mutates arguments."""
+def _train_activity_times(train_prs, train_issues, train_commits):
+    """Every activity timestamp the bundle records for a train's members (issue
+    #112): each member PR's and issue's `created_at`, `updated_at`, `closed_at`,
+    `merged_at`, its `comments_list[].created_at`, `review_comments[].created_at`,
+    `reviews[].submitted_at` and `lifecycle[].created_at`, and each train commit's
+    `committed_at` (else its `date`). Unparseable / missing values are skipped."""
+    out = []
+
+    def add(ts):
+        dt = _parse_ts(ts)
+        if dt is not None:
+            out.append(dt)
+
+    for rec in list(train_prs) + list(train_issues):
+        for key in ("created_at", "updated_at", "closed_at", "merged_at"):
+            add(rec.get(key))
+        for key in ("comments_list", "review_comments", "lifecycle"):
+            for row in rec.get(key) or []:
+                if isinstance(row, dict):
+                    add(row.get("created_at"))
+        for row in rec.get("reviews") or []:
+            if isinstance(row, dict):
+                add(row.get("submitted_at"))
+    for c in train_commits:
+        add(c.get("committed_at") or c.get("date"))
+    return out
+
+
+def _effort_for_train(train, pr_index, issue_index, ref_date=None,
+                      commit_index=None):
+    """Compute the effort dict for one train.  Pure; never mutates arguments.
+
+    `ref_date` (the view's `meta.ref_date`, else `meta.to`) frames `idle_days`;
+    `commit_index` ({sha: commit}) lets a train's commits count as activity.
+    Flags (issue #112): `stalled` only for an OPEN train (outcome `in_flight`)
+    idle for more than TRAIN_STALL_DAYS days at the reference date;
+    `slow_to_land` only for a SHIPPED train whose `elapsed_days` exceeds
+    TRAIN_STALL_DAYS. A rejected or abandoned train has neither."""
     pr_nums = train.get("prs", [])
     train_prs = [pr_index[n] for n in pr_nums if n in pr_index]
 
@@ -748,8 +787,32 @@ def _effort_for_train(train, pr_index, issue_index):
         for c in i.get("comments_list", []):
             add_login(c.get("author"))
 
-    # ---- stalled ------------------------------------------------------
-    stalled = (elapsed_days is not None and elapsed_days > TRAIN_STALL_DAYS)
+    # ---- outcome (a train built by build_trains always carries it) -----
+    outcome = train.get("outcome")
+    if outcome is None:
+        if merged_dt is not None:
+            outcome = "shipped"
+        elif any(p.get("state") == "open" for p in train_prs):
+            outcome = "in_flight"
+
+    # ---- slow_to_land (shipped) / stalled + idle_days (open) ------------
+    slow_to_land = (outcome == "shipped" and elapsed_days is not None
+                    and elapsed_days > TRAIN_STALL_DAYS)
+    last_activity_at = idle_days = None
+    ref_dt = _parse_ts((ref_date or "")[:10] + "T00:00:00Z") if ref_date else None
+    if outcome == "in_flight":
+        commits_of = commit_index or {}
+        times = _train_activity_times(
+            train_prs, train_issues,
+            [commits_of[s] for s in train.get("commits", []) if s in commits_of])
+        if times:
+            last_dt = max(times)
+            last_activity_at = last_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if ref_dt is not None:
+                # calendar days; activity recorded after the reference date (a
+                # view of an earlier window, `meta.state_as_of`) means not idle.
+                idle_days = max(0, (ref_dt.date() - last_dt.date()).days)
+    stalled = idle_days is not None and idle_days > TRAIN_STALL_DAYS
 
     return {
         "opened_at": opened_at,
@@ -760,18 +823,26 @@ def _effort_for_train(train, pr_index, issue_index):
         "commits": commits,
         "participants": len(participants),
         "stalled": stalled,
+        "idle_days": idle_days,
+        "last_activity_at": last_activity_at,
+        "slow_to_land": slow_to_land,
     }
 
 
 def annotate_train_effort(bundle):
     """Annotate each train in bundle['trains'] with an `effort` dict.
 
-    Computes time-and-effort signals purely from bundle data (prs + issues).
-    Mutates trains in place; returns bundle for convenience."""
+    Computes time-and-effort signals purely from bundle data (prs + issues +
+    commits), with `idle_days` measured to the reference date (`meta.ref_date`,
+    else `meta.to`). Mutates trains in place; returns bundle for convenience."""
     pr_index = {p["number"]: p for p in bundle.get("prs", [])}
     issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    commit_index = {c["sha"]: c for c in bundle.get("commits", []) if c.get("sha")}
+    meta = bundle.get("meta") or {}
+    ref_date = meta.get("ref_date") or meta.get("to") or None
     for train in bundle.get("trains", []):
-        train["effort"] = _effort_for_train(train, pr_index, issue_index)
+        train["effort"] = _effort_for_train(train, pr_index, issue_index,
+                                            ref_date, commit_index)
     return bundle
 
 
@@ -885,7 +956,7 @@ def slice_train(bundle, train_id):
                          reviews_overflow,
                          lifecycle*:[{event, actor, created_at, label}],
                          lifecycle_overflow, reopen_count } ],
-          "commits": [ { sha, message*, author, date } ],
+          "commits": [ { sha, message*, author, date, url } ],
           "feature_deltas": [ ... only this train's deltas; file-level deltas may carry
                                a bounded `diff`. The combined diff chars are capped to
                                SLICE_DIFF_CAP: a diff that does not fit in what is
@@ -993,6 +1064,8 @@ def slice_train(bundle, train_id):
             "message": _cap_text(raw_c.get("message") or ""),
             "author":  raw_c.get("author"),
             "date":    raw_c.get("date"),
+            # issue #112: a citable commit url, built like feature_deltas[].url
+            "url":     derive._commit_url(bundle, raw_c.get("sha")),
         })
 
     # --- feature_deltas filtered to this train ------------------------------

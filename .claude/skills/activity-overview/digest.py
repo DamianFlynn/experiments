@@ -297,6 +297,7 @@ def build_project_trains(members, components, project):
     out = []
     for key, items in groups.items():
         prs, issues, commits, evidence, repos = [], [], [], [], []
+        code_areas = set()
         outcome = "abandoned"
         best_rank = -1
         for repo, tr in items:
@@ -315,6 +316,11 @@ def build_project_trains(members, components, project):
                     project, repo, "issue-{}".format(n)))
             for sha in tr.get("commits", []):
                 commits.append(graphstore.qualify_id(project, repo, sha))
+            # issue #112: the member trains' areas, repo-qualified like the
+            # project `modules` keys and people areas ("<repo>::<area>").
+            for area in tr.get("code_areas") or []:
+                if area:
+                    code_areas.add("{}::{}".format(repo, area))
             for ev in tr.get("evidence", []):
                 evidence.append({**ev, "repo": repo})
             rank = _OUTCOME_RANK.get(tr["outcome"], 0)
@@ -369,7 +375,7 @@ def build_project_trains(members, components, project):
             "issues": sorted(set(issues)),
             "commits": sorted(set(commits)),
             "evidence": evidence,
-            "code_areas": [],
+            "code_areas": sorted(code_areas),
         })
     out.sort(key=lambda t: t["id"])
     return out

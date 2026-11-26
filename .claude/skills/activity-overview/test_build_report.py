@@ -293,6 +293,36 @@ class TestReportCaveats(_Base):
                       "2026-05-15 → 2026-05-31 gather.", out)
         self.assertNotIn("**partial**", out)
 
+    def test_ungathered_days_are_named(self):
+        # issue #112 item 10: incomplete with nothing excluded — the days are
+        # simply not gathered; the uncovered span is the view period minus the
+        # summed windows, and the line names it.
+        view = copy.deepcopy(self.view)
+        meta = view["members"][1]["bundle"]["meta"]
+        meta["facts_windows"].pop("workflow_stats_excluded")
+        out = self.render_report(self.write_view(view))
+        self.assertIn("> CI counts are the sum of the gathered windows "
+                      "2026-05-01 → 2026-05-20; **partial**: not every day of "
+                      "the window is covered (no gather covers the rest of the "
+                      "window: 2026-05-21 → 2026-05-31). Code graph and owners "
+                      "from the 2026-05-15 → 2026-05-31 gather.", out)
+
+    def test_uncovered_spans_helper(self):
+        sys.path.insert(0, os.path.join(HERE, "samples"))
+        import build_report
+        meta = {"period": {"from": "2026-05-01", "to": "2026-05-31"},
+                "facts_windows": {"workflow_stats": [
+                    {"from": "2026-05-05", "to": "2026-05-10"},
+                    {"from": "2026-05-20", "to": "2026-05-25"}]}}
+        self.assertEqual(build_report.uncovered_spans(meta), [
+            {"from": "2026-05-01", "to": "2026-05-04"},
+            {"from": "2026-05-11", "to": "2026-05-19"},
+            {"from": "2026-05-26", "to": "2026-05-31"}])
+        meta["facts_windows"]["workflow_stats"] = []
+        self.assertEqual(build_report.uncovered_spans(meta),
+                         [{"from": "2026-05-01", "to": "2026-05-31"}])
+        self.assertEqual(build_report.uncovered_spans({"facts_windows": {}}), [])
+
     def test_caveat_is_shown_even_with_no_ci_rows(self):
         # a sub-window, a window gathered without workflows, or zero runs: the
         # view has a coverage caveat but no CI rows. The caveat must not vanish.

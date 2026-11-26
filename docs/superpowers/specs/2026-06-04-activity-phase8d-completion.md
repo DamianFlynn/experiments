@@ -1,3 +1,5 @@
+> Historical design/plan document, superseded by SKILL.md, BUNDLE.md and STORE.md; commands and flags shown here may no longer exist.
+
 # Phase 8d — train completion (the completion orchestrator) — design
 
 **Status: PROPOSED (rev 15).** Detailed design for **Phase 8d** of the
