@@ -395,9 +395,10 @@ Before bumping a major version of, say, `avm-res-network-virtualnetwork`, run
 `spotlight dependents Azure/terraform-azurerm-avm-res-network-virtualnetwork` against the
 constellation store: it lists every member module that depends on it (with pinned versions
 in `digest.module_edges`). On a fresh store, the structural scan means this reflects the
-module structure of the checkout gathered for that window, not just that month's churn. A
-store never retracts a `depends_on` edge, so in a store folded from several gathers the
-result is *recorded* dependencies — use a fresh store when you need the current structure.
+module structure of the checkout gathered for that window, not just that month's churn. In
+a store folded from several gathers, each fold retracts the `depends_on` edges its scan or
+build shows are gone (#95), so the result is the structure of the latest gathered window that
+speaks for each module (manifest members always carry the whole-tree scan).
 
 ### 8.5 Scenario E — module biography for release notes
 
@@ -497,9 +498,19 @@ These are real, current limits — plan around them:
     — so a quarter view attributes code areas with its last month's (window-scoped) code
     graph. `meta.facts_windows` says which windows. Stores folded before #94 keep the
     latest-wins values until re-gathered.
-10. **No retraction.** Edges are unioned, never deleted: a removed module `source` leaves its
-    `depends_on` edge in an existing store. On a multi-window store `validate` reports such
-    stale latest-wins edges as WARN, not ERROR.
+10. **Current-state edges are retracted only on evidence.** Since #95 a fold keeps
+    `depends_on`, `owns`, `in_milestone`, `in_iteration` and `blocks` equal to what the store's
+    inputs imply (STORE.md "Current-state edges"): a removed module `source`, a CODEOWNERS
+    change, an item moved off a milestone or sprint, a blocker edited away all drop their
+    edge. What is left: a `depends_on` edge goes only when a resolved build of its area or the
+    whole-tree structural scan shows it gone (a single-repo store without `--structural-iac`
+    and without `bicep`/`terraform` keeps the edges of areas no later window rebuilt), a
+    transitive edge only on a new build, and an area's owners only when a later window lists
+    the area; the item relations follow the last-folded record, so folding an older bundle
+    after a newer one brings its older relations back. On a multi-window store `validate`
+    checks these edge types exactly once a fold since #95 has maintained them (and every
+    window has its per-window facts); people's areas, a store last folded before #95 and a
+    window without facts stay WARN.
 11. **Terraform transitive edges come from the build.** Every `module {}` block an area
     declares is a direct `depends_on` (#80), with or without `terraform`. Nested calls
     (`module.a.module.b`) are added as transitive only by a successful `terraform init` + `graph`:

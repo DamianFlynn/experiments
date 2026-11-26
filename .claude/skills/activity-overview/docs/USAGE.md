@@ -116,11 +116,24 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 > add no person area) in it; a view inside one month or straddling two has **no**
 > `workflow_stats` (runs are counted per gathered window, not per day); (3) months gathered
 > into the store before issue #94 have no per-month facts: re-gather them, or their views
-> show the last folded month's CI statistics and structure; (4) on such a store `validate` can
-> only warn about, not prove, the edges that come from structure or latest-wins inputs
-> (ownership, area touches, dependencies, milestones); (5) edges are never retracted (a removed module `source` keeps its
-> `depends_on`, HLD §10 item 10). A single-window store per installment — the way CI and the
-> golden tests use it — has none of these, which is why the commands below still create one;
+> show the last folded month's CI statistics and structure, and while any such month is in
+> the store, dependency and ownership edges are only added, never retracted; (4) each fold
+> retracts the current-state edges its inputs show are gone (issue #95: a removed module
+> `source`, a CODEOWNERS change, an item moved off a milestone or sprint, an edited-away
+> blocker), but only on evidence: a dependency goes when a resolved `bicep`/`terraform` build
+> of that module or the whole-tree scan (manifest members; `--structural-iac` for a single
+> repo) shows it gone — so pass `--structural-iac` on a single-repo accumulated store — a
+> transitive dependency only on a new build, an owner only when a later month's code graph
+> lists the area; milestone / sprint / blocker edges follow the last-folded copy of each
+> PR/issue, so gather months **oldest first** (re-folding an older month after a newer one
+> brings its older relations back); (5) on such a store `validate` proves dependency,
+> ownership, area-touch, milestone, sprint and blocker edges exactly (ERROR on a stale or
+> missing one) once a fold since #95 has run and every month has its per-month facts, but
+> person areas stay a WARN (they are a union over the months by design), and so does any of
+> those edge types while the store was last folded before #95 (fold one month again) or holds
+> a pre-#94 month (re-gather it) — HLD §10 item 10. A single-window store per installment —
+> the way CI and the golden tests use it — has none of these, which is why the commands below
+> still create one;
 > an accumulated `history.db` is useful for cross-window `spotlight` queries either way (§8).
 
 ## 3. Running it through Claude Code (the normal way)
@@ -591,14 +604,19 @@ One store per stream keeps commands simple and failures isolated.
   person, grep across many months), build `history.db` from **one wide-window gather**
   (e.g. `--from 2026-01-01 --to 2026-11-30`) into a fresh file, and rebuild it — rather than
   folding month after month into it — when you need it refreshed. A single wide fold passes
-  `validate.py`. Folding month after month passes too, with WARNs for the edges and person
-  areas that come from each month's code graph / CODEOWNERS (only the latest is kept), which
-  `validate` cannot re-derive for older months (LLD §8).
+  `validate.py`. Folding month after month (oldest first) passes too: the dependency,
+  ownership, touch, milestone, sprint and blocker edges are checked exactly, person areas
+  with a WARN for areas only earlier months attributed (LLD §8).
   Wide gathers of busy repos are API-heavy (§11).
 - **Inspect:** `sqlite3 stores/2026-11.db "select project, repo, count(*) from nodes group by 1,2"`;
   folded windows are in `meta.gathered_windows`.
-- **Dependency edges are never retracted.** A store keeps every `depends_on` edge it has
-  folded; a fresh store reflects the checkout gathered for that window.
+- **Stale edges are retracted on evidence (#95).** Each fold drops the `depends_on`, `owns`,
+  `in_milestone`, `in_iteration` and `blocks` edges its inputs show are gone; what it dropped
+  is printed (`retracted N stale current-state edge(s) …`) and kept in
+  `meta.retractions:<project>/<repo>`
+  (`sqlite3 S "select value from meta where key like 'retractions:%'"`). A dependency is
+  dropped only where a resolved build or the whole-tree scan speaks for the module (STORE.md
+  "Current-state edges").
 - **Clones** are separate (`--clone-dir`); the next gather into the same path fetches the
   existing clone (it must be a clone of the same repo).
 
@@ -666,7 +684,9 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR `no_drift`/`idempotency` "could not self-source" | the target has no nodes, a row is corrupt (named), or no activity node has a timestamp | fix the target name; otherwise the store is damaged: re-gather it |
 | `validate` ERROR `no_drift` "lifecycle length drift" on a store folded window by window | the store was written before artifact folding became cumulative (#76) | re-fold each of its windows, or rebuild it from one wide gather |
 | `validate` ERROR `edge_set` "stored but not derivable" / "derived from the stored records but not stored" / "edge data drift" | an edge the stored records do not imply (or a missing one): a producer defect or a hand-edited store | report it; don't publish; re-gather into a fresh store |
-| `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | `owns`/`touches`/`depends_on`/`in_milestone`/`in_iteration`/`blocks` edges and person areas are re-derived from one whole-store bundle (latest month's code graph and CODEOWNERS, latest milestone lists) and are never retracted | expected; not a failure. A single-window store is checked exactly |
+| `validate` WARN in `edge_set` / `no_drift` on a store holding several windows | the WARN names why the edge type cannot be proven: the repo was last folded before #95, a window has no per-window facts (pre-#94), `touches` across a graphify / re-mapped code graph; person areas are always a union over the windows | not a failure. Fold one window again (pre-#95) or re-gather pre-#94 windows to make the edge checks exact |
+| `validate` ERROR `edge_set` on a `depends_on`/`owns`/`touches`/`in_milestone`/`in_iteration`/`blocks` edge of a store holding several windows | since #95 these are exact on a store a current fold maintained: the edge is not what the stored records / per-window facts imply | a producer defect or a hand-edited store: report it; don't publish |
+| `gather` stderr `retracted N stale current-state edge(s) of P/R (…)` | the fold found edges its inputs no longer imply (a removed module reference, a CODEOWNERS change, an item moved off a milestone/sprint, a blocker edited away), or healed an older store | expected; the edges are listed in `meta.retractions:P/R` |
 | `validate` ERROR `provenance` "url names repo X, the node is in Y" | the repo was renamed or transferred and gathered under its old name (GitHub returns links with the new name), or the node was edited | gather under the repo's current name |
 | `validate` ERROR `provenance` "commit id … is not a 40/64-hex git sha" / ERROR `no_fabrication` id problems | a hand-made or corrupted node; gather writes only real shas and grammar ids | re-gather; never hand-edit the store |
 | `validate --repo R` of a multi-repo project passes but the project run fails `no_drift_people` | a single-member audit checks only the people that member derives (people are project-wide) | run `validate.py STORE --project P` without `--repo` for the full people check |

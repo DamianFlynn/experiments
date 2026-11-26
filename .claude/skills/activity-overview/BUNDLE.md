@@ -491,8 +491,10 @@ review's state to `DISMISSED`.
   the window, which are appended as areas (see STORE.md). A Bicep scan edge is exactly a
   build-path immediate edge (`transitive: false`, same `to`/`ref`/`version`/`local`/
   `instances`); a public-registry ref resolves in-repo when `<path>/main.bicep` is a tracked
-  module. Transitive Bicep edges still need the build. Without the flag a single-repo gather
-  does not run the scan and stays build-gated (byte-stable). The `bicep` and
+  module. Transitive Bicep edges still need the build. A graph the scan ran over carries
+  `code_graph.structural_scan: true` (issue #95: it holds the whole tree's direct edges, so
+  fold may retract a stored direct `depends_on` it no longer has). Without the flag a
+  single-repo gather does not run the scan and stays build-gated (byte-stable). The `bicep` and
   `terraform` CLIs are therefore required to populate edges (see REFERENCE.md / the integration
   workflow for install). **Deferred:** resource-level `dependsOn` edges.
 

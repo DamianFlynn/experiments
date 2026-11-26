@@ -66,10 +66,21 @@ directions), people are re-derived from the records, every PR/issue cites its ow
 link and every commit id is a real sha — but not that the records match GitHub: a record
 deleted with its edges or a consistently rewritten blob passes. To catch those, save the
 view of the freshly gathered store (`view.py … --out view.json`, before `link.py` enriches it) and later run
-`validate.py STORE --bundle view.json`. On a store holding several windows, edges from
-structure or latest-wins inputs (code graph, CODEOWNERS, milestones) are WARNed, not failed; `--repo` of a multi-repo
+`validate.py STORE --bundle view.json`. On a store holding several windows, the
+dependency, ownership, touch, milestone, sprint and blocker edges are checked exactly
+once a fold since #95 maintained them and every window has its per-window facts
+(otherwise, and for person areas, a difference is a WARN naming why); `--repo` of a multi-repo
 project checks only that member's people (the full check runs without `--repo`). See
 `STORE.md` "Trust gate".
+
+**Stale edges are retracted on evidence.** Each fold keeps the current-state edges
+(`depends_on`, `owns`, `in_milestone`, `in_iteration`, `blocks`) equal to what the store's
+inputs imply and deletes the ones they no longer imply — a removed module reference, a
+CODEOWNERS change, an item moved off a milestone or sprint, a blocker edited away — only
+where the input speaks for that source (a resolved build or the whole-tree scan for a
+dependency; never a window that simply does not mention it). History edges are never
+deleted. `gather` prints what it retracted and keeps it in `meta.retractions:<project>/<repo>`
+(`STORE.md` "Current-state edges").
 
 **Whole-tree module graph (`--structural-iac`).** By default a single-repo gather builds
 IaC edges only for the areas changed in the window, and only with the `bicep`/`terraform`
@@ -78,8 +89,9 @@ Bicep `<area>/main.bicep` for its direct module references (static: no build, no
 read per module entrypoint), so modules nobody touched in the window still appear with
 their edges — use it on a monorepo such as `Azure/bicep-registry-modules` before asking
 `spotlight.py dependents owner/repo::<area>`. Manifest members always get the scan. The
-flag adds areas and edges to the bundle, so a store gathered with it differs from one
-gathered without it.
+flag adds areas and edges to the bundle (and `code_graph.structural_scan: true`), so a store
+gathered with it differs from one gathered without it. On a store kept across months it is
+also what lets a fold retract a dependency of a module nobody rebuilt that month.
 
 The report vertical (`view → link → render → report`) **composes from the
 store** — `view.py` (the CLI over `extract`) materializes one repo's raw bundle view,

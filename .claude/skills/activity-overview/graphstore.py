@@ -1174,6 +1174,174 @@ def window_facts_problems(conn):
     return out
 
 
+# Current-state edges (issue #95). A fold keeps the repo's current-state edges
+# (blocks, in_milestone, in_iteration, depends_on, owns) equal to what the
+# repo's stored inputs imply, retracting the ones they no longer imply (see
+# gather.fold_bundle and STORE.md "Current-state edges").
+#
+# `current_state:{project}/{repo}` records how the LAST fold of the repo kept
+# them: {"items": true, "structure": <bool>, "from", "to"}. `items` is true
+# once a fold rebuilt the item relations (blocks / in_milestone /
+# in_iteration) from the stored records; `structure` is true when that fold
+# could replay depends_on / owns over every gathered window's facts (false
+# when a window of the repo has no per-window facts: those edges were then
+# only added, as before #95). validate reads it to decide which checks are
+# exact. `retractions:{project}/{repo}` is the ledger of what folds retracted:
+# a JSON list (oldest first, at most RETRACTION_LEDGER_MAX entries) of
+# {"from", "to", "counts": {type: n}, "edges": [[src, dst, type], ...] (at
+# most RETRACTION_LEDGER_EDGES, sorted), "standins_removed": [id, ...]}. A
+# fold that retracts nothing appends nothing, so a re-fold stays a no-op.
+RETRACTION_LEDGER_MAX = 100
+RETRACTION_LEDGER_EDGES = 200
+
+
+def _current_state_key(project, repo):
+    return "current_state:{}/{}".format(project, repo)
+
+
+def _retractions_key(project, repo):
+    return "retractions:{}/{}".format(project, repo)
+
+
+def set_current_state(conn, project, repo, entry, commit=True):
+    """Record how the last fold of (project, repo) kept its current-state
+    edges (see above). `commit=False`: see upsert_nodes."""
+    set_meta(conn, _current_state_key(project, repo),
+             json.dumps(entry, sort_keys=True), commit=commit)
+
+
+def get_current_state(conn, project, repo):
+    """The current-state record of (project, repo), or None for a repo no
+    fold since issue #95 has written (or an unreadable record)."""
+    raw = get_meta(conn, _current_state_key(project, repo))
+    if not raw:
+        return None
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def record_retractions(conn, project, repo, entry, commit=True):
+    """Append one fold's retractions to the repo's ledger (see above), keeping
+    the newest RETRACTION_LEDGER_MAX entries. `commit=False`: see
+    upsert_nodes."""
+    entries = get_retractions(conn, project, repo)
+    entries.append(entry)
+    set_meta(conn, _retractions_key(project, repo),
+             json.dumps(entries[-RETRACTION_LEDGER_MAX:], sort_keys=True),
+             commit=commit)
+
+
+def get_retractions(conn, project, repo):
+    """The repo's retraction ledger (oldest first); [] when none."""
+    raw = get_meta(conn, _retractions_key(project, repo))
+    if not raw:
+        return []
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        return []
+    return entries if isinstance(entries, list) else []
+
+
+def edges_from_prefix(conn, prefix, edge_type):
+    """{(src, dst, type): data} of the `edge_type` edges whose src id starts
+    with `prefix` (a repo's '{project}/{repo}#'), as an index range scan."""
+    lo, hi = _prefix_range(prefix)
+    rows = conn.execute(
+        "SELECT * FROM edges WHERE edge_type=? AND src_id >= ? AND src_id < ?",
+        (edge_type, lo, hi))
+    return {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
+            for e in (_row_to_edge(r) for r in rows)}
+
+
+def edges_into_prefix(conn, prefix, edge_type):
+    """{(src, dst, type): data} of the `edge_type` edges whose dst id starts
+    with `prefix`."""
+    lo, hi = _prefix_range(prefix)
+    rows = conn.execute(
+        "SELECT * FROM edges WHERE dst_id >= ? AND dst_id < ? AND edge_type=?",
+        (lo, hi, edge_type))
+    return {(e["src_id"], e["dst_id"], e["edge_type"]): e["data"]
+            for e in (_row_to_edge(r) for r in rows)}
+
+
+def delete_edges(conn, keys, commit=True):
+    """Delete the edges keyed (src, dst, type) in `keys` (absent keys are a
+    no-op). `commit=False`: see upsert_nodes."""
+    rows = sorted(set(keys))
+    if rows:
+        conn.executemany(
+            "DELETE FROM edges WHERE src_id=? AND dst_id=? AND edge_type=?",
+            rows)
+        if commit:
+            conn.commit()
+
+
+def node_ids_with_prefix(conn, prefix):
+    """The ids of the nodes whose id starts with `prefix`, sorted."""
+    lo, hi = _prefix_range(prefix)
+    return [r[0] for r in conn.execute(
+        "SELECT id FROM nodes WHERE id >= ? AND id < ? ORDER BY id", (lo, hi))]
+
+
+def nodes_with_prefix(conn, prefix):
+    """[(id, data)] of the nodes whose id starts with `prefix`, sorted by id."""
+    lo, hi = _prefix_range(prefix)
+    return [(r[0], json.loads(r[1])) for r in conn.execute(
+        "SELECT id, data FROM nodes WHERE id >= ? AND id < ? ORDER BY id",
+        (lo, hi))]
+
+
+def _occurs_more(key):
+    """SQL: the JSON text `data` holds `"<key>": ` more often than
+    `"<key>": null`, i.e. some `<key>` member has a non-null value. String
+    contents never match (a `"` inside a JSON string is escaped)."""
+    k, n = '"{}": '.format(key), '"{}": null'.format(key)
+    return ("(length(data) - length(replace(data, '{k}', ''))) / {lk} > "
+            "(length(data) - length(replace(data, '{n}', ''))) / {ln}").format(
+                k=k, n=n, lk=len(k), ln=len(n))
+
+
+def item_relation_rows(conn, prefix):
+    """[(id, data)] of the PR/issue nodes under `prefix` ('{project}/{repo}#')
+    whose record may name a milestone, an iteration or a `blocks` ref, sorted
+    by id. A cheap SQL prefilter on the stored JSON text (it only ever lets
+    too many rows through; the caller reads the record itself), so a fold
+    does not decode every item of a large repo."""
+    where = "({} OR {} OR instr(data, '\"blocks\": [{{') > 0)".format(
+        _occurs_more("milestone"), _occurs_more("iteration"))
+    out = []
+    for local in ("issue-", "pr-"):
+        lo, hi = _prefix_range(prefix + local)
+        out.extend((r[0], json.loads(r[1])) for r in conn.execute(
+            "SELECT id, data FROM nodes WHERE id >= ? AND id < ? AND "
+            "node_class = 'social' AND " + where + " ORDER BY id", (lo, hi)))
+    return sorted(out, key=lambda r: r[0])
+
+
+def delete_orphan_standins(conn, ids, commit=True):
+    """Delete each id in `ids` that is a depends_on stand-in node
+    (`data.synthesized == STANDIN_MARK`) no edge references any more. Returns
+    the deleted ids, sorted. A real node is never deleted. `commit=False`: see
+    upsert_nodes."""
+    removed = []
+    for nid in sorted(set(ids)):
+        row = conn.execute("SELECT data FROM nodes WHERE id=?", (nid,)).fetchone()
+        if row is None or not _is_standin(row[0]):
+            continue
+        if conn.execute("SELECT 1 FROM edges WHERE src_id=? OR dst_id=? LIMIT 1",
+                        (nid, nid)).fetchone():
+            continue
+        conn.execute("DELETE FROM nodes WHERE id=?", (nid,))
+        removed.append(nid)
+    if removed and commit:
+        conn.commit()
+    return removed
+
+
 _DEAD_REFS_DDL = (
     "CREATE TABLE IF NOT EXISTS dead_refs ("
     "id TEXT PRIMARY KEY, project TEXT, reason TEXT, first_seen TEXT)"

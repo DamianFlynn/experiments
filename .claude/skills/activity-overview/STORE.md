@@ -105,7 +105,10 @@ merged `2026-05-31T15:00:00Z` is inside `--to 2026-05-31`, and a commit dated
 ## Edges (`edges` table)
 
 `(src_id, dst_id, edge_type, ts, data)`, PK `(src,dst,type)`. Re-upsert
-unions, never appends. Edge types:
+unions, never appends. History edges are only ever added; the current-state
+edges (`blocks`, `in_milestone`, `in_iteration`, `depends_on`, `owns`) are kept
+equal to what the stored inputs imply and stale ones are deleted (see
+*Current-state edges* below, #95). Edge types:
 
 `closes` (pr→issue), `part_of` (commit/review/event→pr/issue), `cross_ref`
 (pr→issue/pr), `duplicate_of`/`spun_off` (issue→issue), `touches` (commit→area),
@@ -235,7 +238,14 @@ The `code_graph` is window-scoped (the directory provider only sees the window's
 changed paths), so it is keyed by window, not by clone sha: two windows gathered
 from the same checkout can hold different graphs. Stores folded before #94 have no
 `facts:` keys; their views read the latest-wins singleton nodes as before. No
-schema change. How a view picks its facts: "Roll-up / resume" below.
+schema change. How a view picks its facts: "Roll-up / resume" below. Since #95
+the `depends_on` / `owns` edges are replayed from these entries (*Current-state
+edges* below); a code graph from the whole-tree scan carries
+`structural_scan: true`.
+
+`current_state:{project}/{repo}` and `retractions:{project}/{repo}` (issue #95):
+how the repo's last fold kept its current-state edges, and the ledger of what
+folds retracted — see *Current-state edges* below.
 
 `member_status` (issue #77; written only by a manifest gather): a JSON list of
 `{project, repo, from, to, status[, error]}`, one entry per member and window,
@@ -277,8 +287,10 @@ Code older than v2 writing into a v2 store would add `fts_text` rows without
 ## Transactions (atomic folds)
 
 `fold_bundle` writes a fold as **one transaction** (`with conn:`): nodes,
-edges, code events, the FTS index, `gathered_windows`, `ref_date`, `branches` and `clone_sha` commit
-together, and any exception rolls all of them back, so readers never see a
+edges (including the retraction of stale current-state edges and orphaned
+stand-ins, #95), code events, the FTS index, `gathered_windows`, `ref_date`,
+`branches`, `clone_sha`, the window facts and the `current_state:` /
+`retractions:` meta commit together, and any exception rolls all of them back, so readers never see a
 half-folded window. The batch writers (`upsert_nodes`, `upsert_edges`,
 `add_code_events`, `index_text(s)`, `set_meta`, `record_window`,
 `set_clone_sha`) take `commit=True` by default and `commit=False` to join the
@@ -356,7 +368,8 @@ the write path via the shared `derive.py` leaf module — `derive.build_artifact
   takes `identity_from` from its most recent incoming move, and a source is
   `replaced` by the dest of its most recent outgoing move only while its last
   lifecycle event is a remove (a later re-add makes it `live` again). So a drop
-  in one window and an add in another are not a move. Edges are never retracted.
+  in one window and an add in another are not a move. Move edges are history:
+  never retracted.
 
 **Slice 7b-1 (step 3) additionally persists people + the contribution / non-spine
 edges** (all derived on the write path via the shared `derive.py` leaf —
@@ -427,6 +440,76 @@ The contribution / `owns` / `touches` / `depends_on` / `in_milestone` edges
 never leak into `extract`: every one is non-spine, so `traverse_spine` never
 follows it, and extract reads none of them.
 
+### Current-state edges (#95)
+
+A store is kept across months, so an edge must not outlive the input it was
+derived from. Edges fall in two classes:
+
+- **History** — `authored`, `merged`, `reviewed`, `reported`, `commented`,
+  `closes`, `cross_ref`, `part_of`, `touches` (a commit's files never change)
+  and the symbol moves `replaced_by` / `identity_from`. Only ever added.
+- **Current state** — `blocks`, `in_milestone`, `in_iteration`, `depends_on`,
+  `owns` (`gather.CURRENT_STATE_EDGE_TYPES`). Each fold, inside its
+  transaction and after its nodes and window facts are written,
+  `_maintain_current_state` makes the repo's edges of these types equal to
+  what the repo's **stored inputs** imply, writing the missing ones and
+  deleting the ones those inputs no longer imply.
+
+| Edge type | Input it follows | Who speaks for a source (authoritative input) |
+|---|---|---|
+| `in_milestone` | the stored PR/issue record's `milestone` → a stored milestone node (the fold's own milestones first, in bundle order as before, then the stored ones by id) | the stored record; a fold replaces it when its bundle holds the item |
+| `in_iteration` | the stored record's `iteration` → a sprint of the fold or a stored `sprint-<id>` node | the stored record |
+| `blocks` | the `blocks` refs of the stored issue records, between two STORED issues; an edge stands while either end's record states it | both ends' stored records |
+| `depends_on`, direct (`transitive` false) | the code graph of the source area's latest authoritative window and of every later window | a window whose build of the area resolved (`edges_status: "resolved"`), or whose code graph carries the whole-tree structural scan (`structural_scan: true`, set by `apply_structural_scan`; then for every area of the repo, listed or not) |
+| `depends_on`, transitive | as above | only a window whose build of the area resolved (the scan sees direct `module` refs only) |
+| `owns` | `_owns_pairs` over the code graph + CODEOWNERS of the area's latest authoritative window and of every later one | a window whose code graph lists the area and that read a CODEOWNERS file (non-empty `code_owners`) or a checkout (`clone_sha`; then a missing CODEOWNERS means no owners) |
+
+For `depends_on` / `owns` the windows are the repo's gathered windows
+(`gathered_windows`) with their `facts:` entries (#94), replayed in window
+order — end day, then start day, the order `extract` uses to pick the latest
+window (`gather.StructureReplay`). A source's edges are the union of its
+in-effect windows (the latest authoritative one and every later one; all
+windows when none is authoritative), each edge carrying the data of the latest
+window that derives it.
+
+**Never on absence of evidence.** A window-scoped directory graph that does not
+list an area, a build that timed out / failed / was skipped, a window without
+CODEOWNERS or checkout, a member whose fold failed (it rolls back as one
+transaction) or that was quiet (its scan sees the same tree) retract nothing.
+A single-repo fold (`members` None) derives no cross-repo `depends_on`, so it
+leaves the ones a manifest fold wrote alone. When a gathered window of the
+repo has **no `facts:` entry** (folded before #94, or a bundle without
+`from`/`to`), the replay is skipped: the fold adds this bundle's `depends_on` /
+`owns` edges as before #95 and retracts none (`current_state.structure`
+false). History edges are never touched.
+
+**Stand-ins.** Every `depends_on` target the fold keeps that is not stored gets
+the stand-in node (create-if-absent). After a retraction, a stand-in
+(`data.synthesized == "depends_on_target"`) that no edge references any more is
+deleted, so a member that only existed as another member's dependency target
+leaves the project (`project_repos`). A real area node is never deleted.
+
+**Order.** `depends_on` / `owns` depend only on the SET of windows' facts:
+folding windows in any order converges. The item relations follow the stored
+record, which is upserted last-fold-wins, so re-folding an OLDER bundle after
+a newer one brings back the older record and with it its milestone, iteration
+and blockers (the store stays consistent with its records either way; order
+matters exactly as it already did for the record). A window's structure is
+read from the checkout at gather time, so a window re-gathered later carries a
+newer tree than its dates say; the replay still orders it by its dates.
+
+**What was retracted** is in the summary `fold_bundle` returns (`gather` prints
+`retracted N stale current-state edge(s) of P/R (…) (meta retractions:P/R)` to
+stderr) and in the meta ledger `retractions:{project}/{repo}`: a JSON list
+(oldest first, at most 100 entries) of `{from, to, counts: {type: n}, edges:
+[[src, dst, type], …] (first 200, sorted), standins_removed: [id, …]}`. A fold
+that retracts nothing appends nothing, so a re-fold stays a no-op.
+`current_state:{project}/{repo}` = `{items: true, structure: <bool>, from, to}`
+records how the last fold kept the repo's current-state edges; `validate`
+reads it (*Multi-window stores* below). The first fold since #95 into an older
+store heals it: stale edges earlier folds left are retracted on the same rules
+(and logged).
+
 **Slice 7b-2 — reader contract: `extract` materializes `artifacts` + `people`
 from the stored nodes; `link.enrich` shrank.** Because the write path now derives
 those two projections identically to how `enrich` used to (store-derived ==
@@ -484,13 +567,14 @@ dependency phrasing from an issue's title+body (`parse_blocks_refs` — "blocks 
 "blocking #N" → outbound; "blocked by #N" / "depends on #N" → inbound; same-repo
 bare `#N`), and fold emits a `blocks` edge normalized to **blocker → blocked**. To
 keep referential integrity, an edge is emitted ONLY when the target #N is itself a
-gathered issue (a ref to an out-of-window issue is dropped, never left dangling).
+STORED issue (a ref to an issue the store does not hold is dropped, never left
+dangling; it appears once a later fold stores that issue, #95).
 `blocks` is a NON-spine relation (not in `SPINE_EDGE_TYPES`), so `traverse_spine`
 never follows it and decision-train composition is unchanged; its issue→issue shape
 already matched `validate.check_schema_conformance`'s allowlist.
 
-Still NOT on the write path: `in_iteration` (social→sprint) — needs **Projects v2**
-acquisition (the `read:project` scope), which gather does not yet pull. The
+`in_iteration` (social→sprint) is written when the gather read a Projects v2
+board (Phase 12; the `read:project` scope). The
 `fts_text` FTS5 index IS populated on fold (see *Text index* above). See
 `docs/superpowers/specs/2026-06-04-activity-phase7-substrate.md`.
 
@@ -694,8 +778,9 @@ module, so its own `module` blocks are reported on it and `modules/sub`'s
 `source = "./inner"` targets it (it used to be a self-edge, and the inner dir's
 references were reported nowhere). Other files there (README, templates) stay in
 `modules/<name>`. A store gathered before this keeps the old `modules/<name>`
-area for those files and its self-edge; re-gather for the new ids (edges are not
-retracted, #95).
+area for those files and its self-edge; re-gather for the new ids (a later fold
+retracts the old self-edge once a resolved build or the structural scan speaks
+for that area, #95; the old area node itself stays).
 The module dir is resolved on disk in the clone, whichever of its files changed in
 the window (see BUNDLE.md, *Entrypoint*). `terraform graph` runs through the same parallel pool
 as the bicep build; with a shared `TF_PLUGIN_CACHE_DIR` a one-shot serial provider
@@ -713,7 +798,8 @@ therefore **ensures the target node exists** (a minimal `structure` stand-in,
 create-if-absent so a producer's real area always wins), keeping the edge from
 dangling. The node is an edge anchor only: `extract` rebuilds `code_graph` from
 the `codegraph` singleton, never from `area-*` nodes, so it is invisible to every
-member bundle. The shallow-clone margin is `ACTIVITY_CLONE_MARGIN_DAYS`
+member bundle. When the consumer's reference goes (#95) the edge is retracted and
+a stand-in no edge references any more is deleted. The shallow-clone margin is `ACTIVITY_CLONE_MARGIN_DAYS`
 (default 14); widen it when `meta.boundary_dropped_commits` is non-empty.
 
 The DOT-based extraction (`terraform graph`) only resolves edges for module areas
@@ -914,25 +1000,35 @@ Strictness (issue #89). Besides the checks above:
 
 **Multi-window stores** (more than one gathered window recorded for the repo).
 `edge_set` and `no_drift` re-derive from ONE self-sourced bundle over the whole
-store, which carries the structure of the latest gathered window (#94); the
-milestone / sprint / `blocks` lists ride latest-wins records; and edges are never
-retracted (#95). So `owns`, `touches`, `depends_on`, `in_milestone`,
-`in_iteration` and `blocks` edges of an older window cannot all be re-derived: a
-difference there is a WARN, and people's areas compare as derived ⊆ stored (an
-extra stored area is a WARN). Since #94 the inputs of `owns`, `touches`,
-`depends_on` and people's areas (each window's code graph and CODEOWNERS) are
-kept per window, so a per-window re-derivation could make those exact; the gate
-does not do that yet (LLD §14.5). `in_milestone`, `in_iteration` and `blocks`
-come from latest-wins records and stay WARN.
+store (every stored record; the structure of the latest gathered window, #94).
+The current-state edge types are compared **exactly** (ERROR) when the store
+shows they can be proven (`validate._multi_window_plan`, #95); otherwise a
+difference is a WARN that names why:
+
+| Edge type | Exact (ERROR) when | Expected set |
+|---|---|---|
+| `blocks`, `in_milestone`, `in_iteration` | the repo's last fold was since #95 (`current_state.items`) | the re-fold of the self-sourced bundle (every stored record, milestone and sprint) |
+| `depends_on`, `owns` | the last fold replayed them (`current_state.structure`) and every gathered window still has its `facts:` entry | `gather.StructureReplay` over the windows' facts, without the manifest's registries; a stored cross-repo `depends_on` must match an unresolved registry edge of its source in a window in effect for it |
+| `touches` | every gathered window has a stored code graph, none is a graphify one, and no path is in two different areas across windows | each stored commit's files against the union of the windows' path indexes |
+
+The WARN stays for a repo last folded before #95 (fold any window once more), a
+window without facts (re-gather it), and for `touches` a graphify window or a
+path re-mapped between windows. A missing cross-repo `depends_on` is not
+detected (it needs the manifest's registries). People's areas compare as
+derived ⊆ stored (an extra stored area is a WARN): a person's areas are a union
+over every window's activity — history, never retracted — and re-deriving them
+exactly would need each window's own view (LLD §14.5).
 `referential_integrity` also fails a `facts:` entry that cannot be read or names
 a `fact:` value that is not stored.
 Symbol moves are matched per fold window: each stored move must be supported by
 the ledger (its twin edge, a drop of the source — by `move_commit` — and an add
 of the destination, a consistent basis), and a move only a whole-store re-match
 finds is not required. The idempotency probe re-folds every window as one; the
-move and latest-wins edges that adds are reported as INFO, not counted (edges
-are keyed by `(src, dst, type)`, so they are never duplicates). On a one-window
-store all of this is exact.
+move and current-state edges that adds are reported as INFO, not counted (edges
+are keyed by `(src, dst, type)`, so they are never duplicates). Current-state
+edges the probe RETRACTS are a WARN, not counted, on a repo last folded before
+#95 (the re-fold heals what that fold left behind) and a failure otherwise. On
+a one-window store all of this is exact.
 
 **What the gate proves, and what it does not.** Self-sourced, it proves the
 store is *consistent*: every edge, person and artifact is exactly what the
