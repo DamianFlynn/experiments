@@ -5,6 +5,7 @@ later-phase fields are reserved empty here and filled by later phases.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import copy
 import datetime
 import http.client
@@ -14,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -410,6 +412,47 @@ def prepare_clone(repo_url, from_date, clone_dir, no_clone=False, run=None):
     depth1 = _shallow_or_depth1(
         run, lambda d1: build_clone_cmd(repo_url, from_date, clone_dir, d1))
     return "depth1-fallback" if depth1 else "fresh"
+
+
+class MissingBranchError(RuntimeError):
+    """The base branch a gather was told to walk does not exist on the remote."""
+
+
+# git's message when a fetched ref is not on the remote.
+_MISSING_REMOTE_REF = "couldn't find remote ref"
+
+
+def build_branch_fetch_cmd(clone_dir, branch, from_date, depth1=False):
+    """Fetch ONE branch into `refs/remotes/origin/<branch>` under the window's
+    history bound (the same `_shallow_selector` a fresh clone gets)."""
+    return ["git", "-C", clone_dir, "fetch", _shallow_selector(from_date, depth1),
+            "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"]
+
+
+def checkout_base_branch(clone_dir, branch, from_date, run=None):
+    """Make the clone walk `branch` (issue #107): fetch `origin/<branch>` with
+    the window's `--shallow-since` bound and check it out as the local branch
+    `<branch>`, on a fresh or a reused clone alike. Called after
+    resolve_branches, so the one clone serves both the default-branch
+    detection and the walk.
+
+    Returns True when the branch has no commit since the bound (a quiet
+    branch) and was fetched at `--depth=1` instead, as prepare_clone does for
+    a quiet repo: the caller then treats the walks as empty. A branch the
+    remote does not have raises MissingBranchError naming it, with the clone
+    left on the branch it was on; any other git failure raises RuntimeError."""
+    run = run or run_git
+    try:
+        depth1 = _shallow_or_depth1(
+            run, lambda d1: build_branch_fetch_cmd(clone_dir, branch, from_date, d1))
+    except RuntimeError as exc:
+        if _MISSING_REMOTE_REF in str(exc):
+            raise MissingBranchError(
+                f"base branch {branch!r} does not exist on the remote") from None
+        raise
+    run(["git", "-C", clone_dir, "checkout", "-q", "-B", branch,
+         f"refs/remotes/origin/{branch}"])
+    return depth1
 
 
 def shallow_boundary_shas(clone_dir):
@@ -1630,14 +1673,71 @@ DEFAULT_AREA_PATTERNS = [
 ]
 
 
-def classify_code_area(path, patterns):
+def bicep_module_dirs(paths):
+    """The Bicep module directories among `paths` (issue #107): the directory of
+    every `main.bicep` that is not under `examples/`/`tests/` scaffolding, not
+    in the AVM layout (`_avm_area` already gives every file there its module)
+    and not at the repo root (a root `main.bicep` would swallow the whole
+    repo; it keeps its own `main.bicep` area). Pure; a frozenset."""
+    out = set()
+    for p in paths:
+        head, sep, name = (p or "").rpartition("/")
+        if not sep or not head or name != "main.bicep":
+            continue
+        if _is_scaffold_path(p) or _avm_area(p.split("/")):
+            continue
+        out.add(head)
+    return frozenset(out)
+
+
+def _bicep_module_dir_rule(module_dirs):
+    """Area predicate for `module_area_patterns`: a file at or below a Bicep
+    module directory (the deepest one that holds it) belongs to it. Terraform
+    files keep the Terraform rules (one directory is one Terraform module), and
+    a file in an `examples/`/`tests/` subtree below the module directory keeps
+    today's classification (scaffolding is never the module itself)."""
+    def rule(parts):
+        if parts[-1].endswith(".tf"):
+            return None
+        for i in range(len(parts) - 1, 0, -1):
+            d = "/".join(parts[:i])
+            if d in module_dirs:
+                if _is_scaffold_area("/".join(parts[i:-1])):
+                    return None
+                return d
+        return None
+    return rule
+
+
+def module_area_patterns(module_dirs, patterns=None):
+    """`patterns` (default DEFAULT_AREA_PATTERNS) with the Bicep module
+    directory rule for `module_dirs` (bicep_module_dirs) slotted in just
+    before `main_bicep`, i.e. after the AVM rule. With no module dirs the
+    given list itself is returned, so callers keep today's behaviour. Pure."""
+    patterns = patterns or DEFAULT_AREA_PATTERNS
+    if not module_dirs:
+        return patterns
+    rule = ("bicep_module_dir", _bicep_module_dir_rule(frozenset(module_dirs)))
+    out = []
+    for name, fn in patterns:
+        if name == "main_bicep":
+            out.append(rule)
+        out.append((name, fn))
+    return out
+
+
+def classify_code_area(path, patterns, module_dirs=None):
     """Map a tracked file path to a single area id (a directory path), or None.
 
     Tries the ordered `patterns` (AVM module subtree, any main.bicep dir, Terraform
     modules/<name>, any *.tf dir, else the top 2 segments of the file's directory;
-    a repo-root file keeps its own name). Pure."""
+    a repo-root file keeps its own name). With `module_dirs` (bicep_module_dirs)
+    a file at or below a Bicep module directory belongs to that module
+    (module_area_patterns); without it, today's per-path rules. Pure."""
     if not path:
         return None
+    if module_dirs:
+        patterns = module_area_patterns(module_dirs, patterns)
     parts = path.split("/")
     for _name, fn in patterns:
         area = fn(parts)
@@ -1672,12 +1772,15 @@ def _is_scaffold_path(path):
     return _is_scaffold_area(os.path.dirname(path or ""))
 
 
-def build_directory_areas(paths, patterns):
+def build_directory_areas(paths, patterns, module_dirs=None):
     """Fold a list of tracked file paths into the `code_graph` directory provider.
 
     Shape: {"provider":"directory","areas":[{"id","label","paths":[...],"edges":[]}]}.
     Area id is the directory path; label is its tail; edges are deferred (empty).
-    Deterministic (areas sorted by id, paths sorted). Pure."""
+    `module_dirs` as in classify_code_area. Deterministic (areas sorted by id,
+    paths sorted). Pure."""
+    if module_dirs:
+        patterns = module_area_patterns(module_dirs, patterns)
     grouped = {}
     for p in paths:
         area = classify_code_area(p, patterns)
@@ -2964,7 +3067,8 @@ def parse_args(argv):
     p.add_argument("--to")
     p.add_argument("--branches", default=None,
                    help="comma-separated branches; the first is the mainline "
-                        "(meta.base_branch). Default: the repo's default "
+                        "(meta.base_branch), fetched and walked when it is not "
+                        "the remote default. Default: the repo's default "
                         "branch (from the clone, else the GitHub API).")
     p.add_argument("--clone-dir", default=None)
     p.add_argument("--no-clone", action="store_true")
@@ -2990,8 +3094,9 @@ def parse_args(argv):
     # Store-only (Phase 7): the SQLite journey-graph store is THE deliverable.
     # gather folds the assembled bundle into it and writes no bundle file. The
     # bundle is a transient view extract materializes from the store (Phase 8
-    # reader stage). Roll-up = a wider range_query; resume = re-fold against the
-    # pinned clone_sha — both store-native, so the flat-bundle flags are gone.
+    # reader stage). Roll-up = a wider range_query; resume = a re-gather of the
+    # window (its structure is read at the window's end, issue #107; clone_sha
+    # records that commit) — both store-native, so the flat-bundle flags are gone.
     # Whole-tree module graph (issue #92): statically scan every tracked
     # Terraform module dir and Bicep `<area>/main.bicep` for direct module deps,
     # not just the areas changed in the window. Always on for --manifest members.
@@ -3096,17 +3201,65 @@ def git_ls_files(clone_dir, run=None):
 
 
 def clone_head_sha(clone_dir, run=run_git):
-    """Resolve the clone's HEAD commit SHA — stamped into `meta.clone_sha` as
-    structural provenance.
-
-    Pins the exact tree the code_graph/edges were built against. The store-native
-    resume (re-fold against the pinned SHA) keys off it so a refresh rebuilds from
-    the identical source (no mixed-SHA graph). Returns the 40-char SHA, or None
-    when there is no clone (e.g. --no-clone with nothing on disk)."""
+    """Resolve the clone's HEAD commit SHA, or None when there is no clone
+    (e.g. --no-clone with nothing on disk). In acquire() it is the walked
+    branch's head: the commits-API listing starts there, and it is the
+    structure commit for the current month. `meta.clone_sha` is the commit the
+    structure was read at (issue #107: the window's end when the clone has it,
+    see window_end_commit / structure_tree) — provenance only: nothing checks
+    it out or rebuilds from it later."""
     try:
         return run(["git", "-C", clone_dir, "rev-parse", "HEAD"]).strip() or None
     except Exception:
         return None
+
+
+def window_end_commit(clone_dir, to_date, run=None):
+    """The mainline as of the window's end (issue #107): the newest commit on
+    the checked-out branch's first-parent chain whose committer date (the
+    `date` the walks window on) is on or before `to_date`, or None when the
+    bounded clone holds no such commit. First-parent, so a topic branch merged
+    after `to_date` is not counted as on the mainline before its merge."""
+    run = run or run_git
+    raw = run(["git", "-C", clone_dir, "log", "--first-parent",
+               f"--pretty=format:{CODE_LOG_FORMAT}", "--date=short"])
+    for rec in parse_git_log(raw):
+        if in_window(rec.get("date"), None, to_date):
+            return rec["sha"]
+    return None
+
+
+@contextlib.contextmanager
+def structure_tree(clone_dir, sha, run=None):
+    """The directory to read the structure of commit `sha` from (issue #107).
+
+    `sha` None or the clone's HEAD (the current month): the clone itself,
+    with no git call beyond the HEAD lookup. Any other commit: a temporary
+    detached `git worktree` of it, removed (and pruned) when the `with` ends,
+    also when a read raises. The clone's HEAD, branch, index and working tree
+    are never touched, so a reused clone stays on its branch for the next run
+    and by-products of the IaC builds (a `.terraform/`, a lock file) cannot
+    block a checkout in either direction."""
+    run = run or run_git
+    if not sha or sha == clone_head_sha(clone_dir, run):
+        yield clone_dir
+        return
+    run(["git", "-C", clone_dir, "worktree", "prune"])
+    tmp = tempfile.mkdtemp(prefix="activity-structure-")
+    tree = os.path.join(tmp, "tree")
+    try:
+        run(["git", "-C", clone_dir, "worktree", "add", "-q", "--detach", tree, sha])
+        yield tree
+    finally:
+        try:
+            run(["git", "-C", clone_dir, "worktree", "remove", "--force", tree])
+        except RuntimeError:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            run(["git", "-C", clone_dir, "worktree", "prune"])
+        except RuntimeError:
+            pass
 
 
 # IaC edge-extraction tuning. The timeout is GENEROUS — a healthy cold bicep/
@@ -4411,11 +4564,39 @@ def acquire(args, env):
     # Clone fresh, or fetch an existing clone of the same remote; a quiet repo
     # (nothing since `frm - margin`) falls back to --depth=1 (see prepare_clone).
     clone_mode = prepare_clone(repo_url, frm, clone_dir, no_clone=args.no_clone)
+    has_clone = clone_mode != "none" and os.path.isdir(clone_dir)
+
+    # The mainline (issue #84): `--branches` / a manifest member's `branch`,
+    # else the clone's default branch, else the API's `default_branch`.
+    branches, base_branch, branch_source = resolve_branches(
+        args.branches, clone_dir, clone_mode,
+        get_repo=lambda: _paginated(token)(
+            f"https://api.github.com/repos/{owner}/{repo}")[0])
+    # The walked branch is the mainline (issue #107): prepare_clone checked out
+    # the remote default branch (it needs no branch name, so the one clone also
+    # answers resolve_branches); a different base branch is fetched under the
+    # same shallow bound and checked out before any walk or structure read.
+    remote_default = _clone_default_branch(clone_dir, run_git) if has_clone else None
+    if has_clone and base_branch and base_branch != remote_default:
+        try:
+            quiet = checkout_base_branch(clone_dir, base_branch, frm)
+        except MissingBranchError as exc:
+            raise SystemExit(f"error: {owner}/{repo}: {exc} (from {branch_source}); "
+                             f"name an existing branch") from None
+        if quiet:
+            clone_mode = "depth1-fallback"
+        elif clone_mode == "depth1-fallback":
+            clone_mode = "fetched"     # the walked branch has window history
+        sys.stderr.write(
+            f"note: {owner}/{repo}: walking the base branch {base_branch!r}, not "
+            f"the remote default {remote_default!r}: commits, code events and "
+            f"structure come from {base_branch!r}\n")
     if clone_mode == "depth1-fallback":
         sys.stderr.write(
-            f"note: {owner}/{repo} has no commits since the clone bound "
-            f"(--from minus {_clone_margin_days()} days); cloned at --depth=1 and "
-            f"treating the commit walks as empty (meta.clone_mode=depth1-fallback)\n")
+            f"note: {owner}/{repo} has no commits on the walked branch since the "
+            f"clone bound (--from minus {_clone_margin_days()} days); fetched at "
+            f"--depth=1 and treating the commit walks as empty "
+            f"(meta.clone_mode=depth1-fallback)\n")
     # All three git walks need real window history on disk: skipped (empty) when
     # there is no clone (--no-clone with nothing on disk) or only the depth-1 tip
     # of a quiet repo (whose whole-tree diff is not window activity).
@@ -4425,13 +4606,6 @@ def acquire(args, env):
         # before `frm`) would diff as the whole tree: deepen so its parent is
         # present and its diff is real (#68). Leftovers are handled after the walks.
         deepen_window_boundary(clone_dir, frm, to)
-
-    # The mainline (issue #84): `--branches` / a manifest member's `branch`,
-    # else the clone's default branch, else the API's `default_branch`.
-    branches, base_branch, branch_source = resolve_branches(
-        args.branches, clone_dir, clone_mode,
-        get_repo=lambda: _paginated(token)(
-            f"https://api.github.com/repos/{owner}/{repo}")[0])
     if base_branch is None:
         sys.stderr.write(
             f"warning: {owner}/{repo}: could not determine the base branch "
@@ -4441,9 +4615,8 @@ def acquire(args, env):
     elif branch_source != "--branches":
         sys.stderr.write(f"note: {owner}/{repo}: base branch {base_branch!r} "
                          f"(the repo default branch, from the {branch_source})\n")
-    # Phase 1 walks the checked-out default branch only; the other `branches`
-    # are recorded in meta for provenance but not yet applied to the log/clone.
-    # Multi-branch commit walking arrives in a later phase.
+    # The walks read the checked-out base branch only; the other `branches` are
+    # recorded in meta for provenance but not applied to the log/clone.
     # The shallow clone already bounds history to ~CLONE_MARGIN_DAYS before `frm`;
     # we walk it fully and window in Python (window_records) rather than with git's
     # `--since/--until`, which prunes valid in-window commits across timezones.
@@ -4503,30 +4676,69 @@ def acquire(args, env):
         {e["path"] for e in code_events}
         | {e["old_path"] for e in code_events if e.get("old_path")}
         | {f for c in commits for f in c.get("files", [])})
-    code_graph = select_code_area_provider(area_paths, clone_dir)
 
-    # Phase 3c: enrich area edges via the real IaC toolchain (BUILD-ONLY — edges
-    # stay [] when bicep/terraform or the registry are unavailable). No-op without
-    # a clone on disk.
-    if not args.no_clone or os.path.isdir(clone_dir):
-        code_graph = extract_iac_edges(code_graph, clone_dir)
-        # Multi-repo (project) gathers -- and a single-repo gather given
-        # `--structural-iac` -- additionally fold the WHOLE module tree's static
-        # Terraform `source` and Bicep `module` deps (no terraform init, no bicep
-        # build) so the blast-radius graph is structural, not limited to
-        # in-window-changed areas. Off by default for a single repo: its bundles
-        # stay byte-stable (golden-bundle gate).
-        if getattr(args, "structural_iac", False) and os.path.isdir(clone_dir):
-            code_graph = apply_structural_scan(code_graph, clone_dir)
+    # Structure reads (issue #107) see the mainline as of the window's end: the
+    # last commit of the walked branch on or before `to` (window_end_commit)
+    # when the bounded clone has it, else the head. For the current month that
+    # IS the head and the clone itself is read; otherwise a temporary worktree
+    # of that commit is (structure_tree), and the clone never leaves its branch.
+    # The walks above read the branch; the commits-API listing below starts at
+    # its head (`walk_head`).
+    walk_head = clone_head_sha(clone_dir) if has_clone else None
+    structure_sha, structure_as_of = walk_head, ("head" if walk_head else None)
+    if walk_head:
+        end = window_end_commit(clone_dir, to)
+        if end:
+            structure_sha, structure_as_of = end, "window_end"
+            if end != walk_head:
+                sys.stderr.write(
+                    f"note: {owner}/{repo}: structure (code graph, IaC, "
+                    f"CODEOWNERS) read at {end[:12]}, the last {base_branch!r} "
+                    f"commit on or before {to} (meta.structure_as_of=window_end)\n")
+        else:
+            sys.stderr.write(
+                f"note: {owner}/{repo}: the last commit on or before {to} is not "
+                f"in the bounded clone; structure read at the branch head "
+                f"{walk_head[:12]} (meta.structure_as_of=head)\n")
+    clone_sha = structure_sha if has_clone else clone_head_sha(clone_dir)
 
-    # CODEOWNERS from the clone (local file; try the conventional locations).
-    code_owners = {}
-    for rel in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
-        p = os.path.join(clone_dir, rel)
-        if os.path.isfile(p):
-            with open(p, encoding="utf-8") as fh:
-                code_owners = parse_codeowners(fh.read())
-            break
+    with structure_tree(clone_dir, structure_sha) as tree:
+        # Bicep module dirs (issue #107): every file at or below a dir holding
+        # a main.bicep is that module's area. Known from the changed paths plus
+        # the tracked files of the structure tree (one listing, shared with the
+        # structural scan). With none, the default patterns and the calls are
+        # exactly as before.
+        tracked = git_ls_files(tree) if has_clone else None
+        module_dirs = bicep_module_dirs(area_paths + (tracked or []))
+        area_kw = {"patterns": module_area_patterns(module_dirs)} \
+            if module_dirs else {}
+        code_graph = select_code_area_provider(area_paths, tree, **area_kw)
+
+        # Phase 3c: enrich area edges via the real IaC toolchain (BUILD-ONLY —
+        # edges stay [] when bicep/terraform or the registry are unavailable).
+        # No-op without a clone on disk.
+        if not args.no_clone or os.path.isdir(clone_dir):
+            code_graph = extract_iac_edges(code_graph, tree, **area_kw)
+            # Multi-repo (project) gathers -- and a single-repo gather given
+            # `--structural-iac` -- additionally fold the WHOLE module tree's
+            # static Terraform `source` and Bicep `module` deps (no terraform
+            # init, no bicep build) so the blast-radius graph is structural, not
+            # limited to in-window-changed areas. Off by default for a single
+            # repo: its bundles stay byte-stable (golden-bundle gate).
+            if getattr(args, "structural_iac", False) and os.path.isdir(clone_dir):
+                code_graph = apply_structural_scan(
+                    code_graph, tree,
+                    list_files=(lambda: tracked) if tracked is not None else None,
+                    **area_kw)
+
+        # CODEOWNERS from the tree (local file; try the conventional locations).
+        code_owners = {}
+        for rel in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+            p = os.path.join(tree, rel)
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8") as fh:
+                    code_owners = parse_codeowners(fh.read())
+                break
 
     get_page = _paginated(token)
     api = f"https://api.github.com/repos/{owner}/{repo}"
@@ -4635,9 +4847,9 @@ def acquire(args, env):
     # window) joined on SHA; then the noreply email; else flagged unresolved.
     # Code/symbol events are re-keyed to the same author.
     if commits:
-        head = clone_head_sha(clone_dir)
-        api_items = fetch_all(get_page, commits_api_url(api, head, frm, to)) \
-            if head else []
+        # from the walked branch's head (the clone is back on it by now)
+        api_items = fetch_all(get_page, commits_api_url(api, walk_head, frm, to)) \
+            if walk_head else []
         known = set()
         for it in prs + issues:
             known.add(it.get("author"))
@@ -4713,7 +4925,10 @@ def acquire(args, env):
         # fork contributions, not shipped-to-main (link.build_trains keys on this).
         # None when unknown (see resolve_branches); fold stores it per window.
         "base_branch": base_branch,
-        "ref_date": ref_date, "clone_sha": clone_head_sha(clone_dir),
+        # the commit the structure (code graph, IaC, CODEOWNERS) was read at,
+        # and whether it is the window's end or the head (issue #107)
+        "ref_date": ref_date, "clone_sha": clone_sha,
+        "structure_as_of": structure_as_of,
         "clone_mode": clone_mode,
         "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,

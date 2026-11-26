@@ -119,11 +119,21 @@ the rest (engagement, code areas, trains, people/flow).
   overlaps. **`base_branch: null`** (with `branches: []`) means unknown — gather could not
   determine it, the overlapped windows disagree, or the store was folded before #84; `link`
   then counts every merged PR as merged into the mainline (no stacked-PR detection) and
-  `extract` warns on stderr when that decides anything.
-  Plus **`clone_sha`** — the clone's HEAD commit the `code_graph`/edges were built against
-  (provenance: stored per window, #94). A re-gather does not return to it: it fetches and
-  checks out the default branch's current head, so re-gathering a past window builds its
-  structure from today's tree. **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` |
+  `extract` warns on stderr when that decides anything. The walked branch IS `base_branch`
+  (issue #107): when it is not the remote default, gather fetches `origin/<base_branch>` under
+  the same shallow bound and checks it out, so `commits`, `code_events`, `symbol_events`, the
+  code graph and CODEOWNERS all describe it (one stderr note says so); a `base_branch` the
+  remote does not have stops the gather (a manifest member is recorded failed).
+  Plus **`clone_sha`** — the commit the structure (`code_graph` and its edges, the structural
+  scan, CODEOWNERS) was read at, and **`structure_as_of`** (issue #107): `"window_end"` when
+  that commit is the last commit of the walked branch (first-parent) whose committer date is
+  on or before `to` — the current month's head, or for a past window re-gathered later the
+  mainline as it was then (read from a temporary worktree; the clone stays on its branch
+  head) — or `"head"` when the bounded clone does not hold that commit (a window with no
+  commit in it or its margin, before later ones), so the structure is the head's; both `null`
+  without a clone. `clone_sha` is provenance only: nothing checks it out again or rebuilds
+  from it.
+  **`clone_mode`** (`fresh` | `fetched` | `depth1-fallback` |
   `none`) records how gather obtained the clone (see `gather.prepare_clone`), and
   **`boundary_dropped_commits`** lists in-window commits whose diffs were dropped at the
   shallow-clone boundary; both are in the bundle `acquire` assembles only — they are not
@@ -479,6 +489,15 @@ review's state to `DISMISSED`.
   is a module of its own: its area is that directory (#101); other files there stay in
   `modules/<name>`. A file directly under an AVM
   group (`avm/res/<svc>/README.md`) is not a module: it maps to the group area `avm/res/<svc>`.
+  A **Bicep module directory** (issue #107) — one holding a tracked or changed `main.bicep`,
+  outside the AVM layout, the repo root and `examples/`/`tests/` — is the area of every
+  non-`*.tf` file in it and below it, down to the next such directory; files under an
+  `examples/`/`tests/` subtree keep the rules above. So `infra/modules/net.bicep` next to
+  `infra/main.bicep` is in `infra` (was `infra/modules`) and `a/b/c/README.md` next to
+  `a/b/c/main.bicep` is in `a/b/c` (was `a/b`); a two-segment module dir
+  (`platform/hub/README.md`) and the AVM / Terraform layouts are unchanged. gather knows the
+  module directories from the window's changed paths plus the tracked files of the structure
+  commit; without a clone, from the changed paths alone.
   **graphify** is an OPTIONAL provider for its ~25 tree-sitter languages — it reads
   graphify's real `graph.json` (top keys `nodes`/`links`; each node carries an
   integer `community` + `source_file`; **no** top-level `communities` list; edges

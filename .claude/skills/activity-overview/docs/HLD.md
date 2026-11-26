@@ -471,11 +471,15 @@ nested Terraform areas, PR head repo); [`USAGE.md`](USAGE.md) §2.2 lists them o
    init's `modules.json` a nested call's target is unknown and is not folded. Single-repo
    gathers emit no Terraform edges without `terraform` unless given `--structural-iac`;
    manifest gathers always get the static direct edges for every module dir.
-4. **The commit walk covers the default branch.** The clone checks out the repo's default
-   branch and the commit, file and symbol walks read it; extra `--branches` entries are
-   provenance only. The *mainline* that "shipped" counts merges into (`meta.base_branch`) is
-   the repo's real default branch, or `--branches` / a manifest member `branch` (#84),
-   stored per window and carried by every view.
+4. **One branch walked: the mainline.** The *mainline* that "shipped" counts merges into
+   (`meta.base_branch`) is the repo's real default branch (or `--branches` / a manifest member
+   `branch`), stored per window and carried by every view (issue #84), and since #107 it is
+   also the branch the commit walk and the structure reads cover (a non-default mainline is
+   fetched and checked out; one that does not exist on the remote stops the gather). Extra
+   `--branches` entries are recorded as provenance only.
+   The structure (code graph, IaC, CODEOWNERS) is read at the window's last mainline commit,
+   so a past month re-gathered later reads its own tree — unless the bounded clone does not
+   reach it (`meta.structure_as_of: "head"`, LLD §14.5).
 5. **Open items are fetched every run.** All open PRs/issues are pulled regardless of window
    (they feed in-flight/forecast), each with per-item review/timeline/comment calls. On very
    busy repos (e.g. BRM) a gather is API-heavy. On a rate limit, gather waits for the reset

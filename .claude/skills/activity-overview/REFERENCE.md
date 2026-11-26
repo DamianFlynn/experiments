@@ -54,8 +54,8 @@ never double-counts), so you can either start a new store per report installment
 simplest, fully exact choice) or reuse the **same path** across windows and let it grow:
 views are window-scoped, with the limits `docs/USAGE.md` §2.1 lists (a past month
 re-viewed later shows today's record state). It's a local, rebuildable file; delete it to
-start fresh, or re-gather a window to refresh it (the clone is fetched to the default
-branch's current head; `STORE.md`). A single store *can* hold **multiple** projects/repos,
+start fresh, or re-gather a window to refresh it (its structure is read as of the
+window's end; `STORE.md`). A single store *can* hold **multiple** projects/repos,
 but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
 `spotlight.py`) error asking for `--project` (and `--repo` when a project spans several;
 `spotlight.py` instead unions an area across members unless `--repo` or `owner/repo::area`
@@ -206,7 +206,8 @@ carry it), with its diffs dropped **and** its `files` cleared (no whole-tree inf
 areas/modules); widen this knob and re-gather to recover it.
 
 An existing `--clone-dir` that is a clone of the same repo is **fetched** to that bound
-(and the default branch head checked out) instead of re-cloned; `--no-clone` never creates
+(and the base branch head checked out: the default, or `--branches`' first entry fetched
+under the same bound) instead of re-cloned; `--no-clone` never creates
 a clone (it fetches an existing one, or gathers API data only when there is none). A repo
 with no commits since the bound is cloned at `--depth=1` and contributes no commits.
 `meta.clone_mode` records `fresh` / `fetched` / `depth1-fallback` / `none`.

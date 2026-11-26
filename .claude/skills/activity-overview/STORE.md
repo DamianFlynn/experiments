@@ -207,10 +207,8 @@ significant and otherwise raise `OperationalError`.
 
 Key/value provenance: `schema_version` (see below); `gathered_windows` (JSON list of
 folded `{project,repo,from,to}`, deduped — `record_window`/`get_windows`);
-`clone_sha:{project}/{repo}` (the tree a repo was last gathered against — provenance
-only: a re-gather fetches and checks out the default branch's current head, it does not
-return to this sha; `extract` uses it as a pre-#94 store's `meta.clone_sha` —
-`set_clone_sha`/`get_clone_sha`);
+`clone_sha:{project}/{repo}` (the commit the structure of the repo's latest fold was
+read at — its window's end, issue #107 — provenance only; `set_clone_sha`/`get_clone_sha`);
 `ref_date:{project}/{repo}:{from}:{to}` (the reference date a gathered window was
 folded with: gather `--ref-date`, else the window's `to`; a re-fold of the same
 window replaces it — `set_ref_date`/`get_ref_date`). `extract` stamps it into the
@@ -315,7 +313,8 @@ between the two leaves the member `not_attempted` (re-folding it is idempotent).
 `gather --store PATH` (required) folds its in-memory assembled bundle into the
 store via `gather.fold_bundle(conn, bundle)` — the store is the **sole output**
 (no bundle file is written), idempotent by identity (re-folding an overlapping
-window mutates nothing already correct, so a refresh is a re-gather of the same window;
+window mutates nothing already correct, so a refresh is a re-gather of the same window (its structure is read at the
+window's end, issue #107);
 a roll-up is a wider view over the folded windows, or a wider gather). P6
 writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
 `data` blob), `code` (commits) + the file-level `code_events` ledger,
@@ -506,8 +505,9 @@ record, which is upserted last-fold-wins, so re-folding an OLDER bundle after
 a newer one brings back the older record and with it its milestone, iteration
 and blockers (the store stays consistent with its records either way; order
 matters exactly as it already did for the record). A window's structure is
-read from the checkout at gather time, so a window re-gathered later carries a
-newer tree than its dates say; the replay still orders it by its dates.
+read at its last mainline commit (issue #107), so a window re-gathered later reads
+its own tree; only when the bounded clone does not reach that commit
+(`meta.structure_as_of: "head"`) does it carry a newer tree than its dates say.
 
 **What was retracted** is in the summary `fold_bundle` returns (`gather` prints
 `retracted N stale current-state edge(s) of P/R (…) (meta retractions:P/R)` to

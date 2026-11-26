@@ -144,8 +144,9 @@ cross-month `spotlight` queries possible.
    only when a later month's code graph lists the area (HLD §10 item 9).
 4. **Fold months oldest first.** Milestone / sprint / blocker edges follow the last-folded
    copy of each PR/issue, so re-folding an older month after a newer one brings its older
-   relations back. A month's structure is the checkout at the time you gather it, so a past
-   month gathered late carries today's tree.
+   relations back. A month's structure is read at that month's last
+   mainline commit, so a past month gathered late still reads its own tree (unless the
+   bounded clone does not reach it: `meta.structure_as_of: "head"`).
 5. **Some `validate` results stay WARN:** person areas (a union over the months by design),
    and any current-state edge type while the store was last folded before #95 (fold one
    month again) or holds a month gathered before #94 (re-gather it; §2.2).
@@ -284,7 +285,12 @@ flowchart TB
    **default branch**, which gather detects (clone `origin/HEAD`, else the API) and stores
    with the window as `meta.base_branch`; a PR merged into a feature or release branch is
    not shipped (a stacked PR shows as `contributing_prs` on its parent's train). Pass
-   `--branches B` (or a manifest member `branch`) when the mainline is not the default.
+   `--branches B` (or a manifest member `branch`) when the mainline is not the default: gather
+   then fetches and walks `B` (commits, code areas, CODEOWNERS all come from it; a stderr note
+   says so), and a `B` the remote does not have stops the gather (a manifest member is recorded
+   failed). A past month re-gathered later reads its structure as of that month's last
+   mainline commit (`meta.structure_as_of: "window_end"`), or the head when the clone does not
+   reach it (`"head"`).
    Stores gathered before issue #84 have no stored base branch: their views warn and count
    every merged PR as shipped — re-gather them.
 3. **Validate.** Never publish from a store that is not `RESULT: OK`.

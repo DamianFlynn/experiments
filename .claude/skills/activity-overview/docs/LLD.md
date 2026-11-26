@@ -168,11 +168,19 @@ sequenceDiagram
   participant REST as GitHub REST
   participant GQL as GitHub GraphQL
   A->>Git: clone --shallow-since=(from - margin)
+  opt base branch is not the remote default
+    A->>Git: fetch --shallow-since origin/<base>, checkout -B <base>
+  end
   A->>Git: fetch --deepen=n while an in-window commit is on the boundary (bounded)
   A->>Git: log (commits, full walk) then window_records
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
   A->>A: fallback: drop unresolved boundary commits' diffs and files
+  A->>Git: log --first-parent (window_end_commit)
+  opt window end is not the head
+    A->>Git: worktree add --detach (structure_tree; removed afterwards)
+  end
+  A->>Git: ls-files (module dirs; shared with the structural scan)
   A->>A: select_code_area_provider (directory or graphify)
   A->>IaC: extract_iac_edges (parallel restore+build / init+graph)
   opt manifest gather, or --structural-iac
@@ -190,7 +198,7 @@ sequenceDiagram
   end
   A->>A: detect_label_taxonomy, apply_facets, classify_issue_kind
   opt window has commits
-    A->>REST: commits?sha=HEAD&since&until (author.login per SHA)
+    A->>REST: commits?sha=<walked branch head>&since&until (author.login per SHA)
     A->>A: resolve_commit_authors (API login, noreply email, else flagged git name)
   end
   A->>REST: workflow runs, releases, milestones
@@ -221,6 +229,23 @@ sequenceDiagram
   (or the manifest member's `branch`), else the clone's `origin/HEAD` (else its checked-out
   branch), else one `GET /repos/{o}/{r}` for `default_branch` (only when there is no clone),
   else `null` with a stderr warning. Never a hard-wired `main`.
+- The walked branch is the base branch (issue #107). `prepare_clone` checks out the remote
+  default (it needs no branch name, so the same clone answers `resolve_branches`); when
+  `base_branch` differs, `checkout_base_branch` fetches `+refs/heads/<base>:refs/remotes/origin/<base>`
+  under the same `--shallow-since` bound (`--depth=1` when that branch is quiet: `clone_mode`
+  `depth1-fallback`) and runs `checkout -q -B <base>`, before deepening, the walks and every
+  structure read; one stderr note names both branches. A base branch the remote lacks raises
+  `MissingBranchError`, which `acquire` turns into `SystemExit` naming it (a manifest member is
+  recorded `failed`). A reused clone is put back on the default by the next `prepare_clone`.
+- Structure is read as of the window's end (issue #107). `window_end_commit` takes the newest
+  commit of the walked branch's first-parent chain whose committer date is on or before `to`;
+  when it is the head (the current month) the clone is read in place, otherwise
+  `structure_tree` adds a temporary detached `git worktree` of it, reads the code graph, IaC
+  entrypoints/builds, structural scan and CODEOWNERS there, and removes it (also on error), so
+  the clone never leaves its branch. `meta.clone_sha` is that commit and
+  `meta.structure_as_of` is `window_end`; when the clone does not hold such a commit (no
+  commit in the window or its margin, only later ones) the head is read and it is `head`.
+  The commits-API listing starts at the branch head either way.
 - The clone/fetch uses `--shallow-since = from − ACTIVITY_CLONE_MARGIN_DAYS` (default 14). The
   margin keeps each in-window commit's real parent in the clone.
 - If the margin holds no earlier commit, the first in-window commit is a shallow-boundary
@@ -261,7 +286,8 @@ order (graphify does not parse Bicep/HCL, so IaC repos always land here):
 | Order | Pattern | Maps | Example |
 |---:|---|---|---|
 | 1 | `avm` (`_avm_area`) | `avm/{res,ptn,utl}/<a>/<b>/…` → 4-segment module subtree; a file directly under the group (`avm/res/<a>/README.md`) → group area `avm/res/<a>` (not a module) | `avm/ptn/ai-ml/landing-zone` |
-| 2 | `main_bicep` | a `main.bicep` file → its dir (other files in that dir fall through to the later patterns) | `infra/hub/main.bicep` → `infra/hub` |
+| 1a | `bicep_module_dir` (only with module dirs, #107) | a non-`*.tf` file at or below a Bicep module dir (`bicep_module_dirs`: a tracked or changed non-scaffold `main.bicep` outside `avm/` and the root) → the deepest such dir; a file under an `examples/`/`tests/` subtree of it falls through | `infra/modules/net.bicep` → `infra` |
+| 2 | `main_bicep` | a `main.bicep` file → its dir (other files in that dir are claimed by rule 1a when module dirs are known, else fall through) | `infra/hub/main.bicep` → `infra/hub` |
 | 3 | `terraform_modules` | `modules/<name>/…` (`<name>` a dir; `modules/README.md` falls through) | `modules/subnet` |
 | 4 | `tf_dir` | any `*.tf` dir; **repo-root `*.tf` collapse to one `main.tf` area** | `main.networking.tf` → `main.tf` |
 | 5 | `topn` | fallback: top 2 segments of the file's **directory** (`docs/README.md` → `docs`); a repo-root file keeps its own name | `src/Bicep.Core` |
@@ -275,6 +301,16 @@ read or built as that module.
 
 Area `paths` are the in-window **changed** files (including deleted ones), so they are not
 used to pick what to build; the entrypoint is resolved on disk (§4.6).
+
+Rule 1a needs the set of module directories, which a single path cannot show: `acquire`
+derives it with `bicep_module_dirs` from the changed paths plus one `git ls-files` of the
+structure tree (passed to the structural scan as its listing), or from the changed paths alone
+without a clone, and passes `module_area_patterns(module_dirs)` as `patterns` to the provider,
+`extract_iac_edges` and `apply_structural_scan`. With no module dir the calls are unchanged.
+`classify_code_area(path, patterns, module_dirs=None)` keeps today's per-path result without
+the set. A local Bicep ref to a file inside the module (`./modules/net.bicep` from
+`infra/main.bicep`) now resolves to the module itself, so `build_bicep_edges` records it as a
+private child (`to: infra/modules`, `local: true`).
 
 ### 4.6 IaC dependency edges (`extract_iac_edges`)
 
@@ -1420,7 +1456,8 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 | The report does not show `facts_windows` / `state_as_of` | `report-template.md`, `reference/report-sections.md` and `samples/build_report.py` read neither key | a quarter's CI section can show a partial sum without saying a month is missing; a past month re-viewed from a grown store does not say its records are as of a later date | add both caveats to the template's CI and header blocks |
 | Area ownership is directory-level | `derive.area_owners` matches `<area>/` only | files inside an area owned by a file rule (e.g. `*.tf` after the directory rule) do not make that owner an area owner | per-file ownership facts if needed |
 | Item relations follow the last-folded record | `blocks` / `in_milestone` / `in_iteration` are rebuilt from the stored PR/issue records (#95), which are upserted last-fold-wins | re-folding an OLDER bundle after a newer one restores the older record and its milestone / iteration / blockers (consistent with the store, but older); a record not re-gathered since a change keeps its old relations | fold windows oldest first; per-window record snapshots |
-| A window's structure is the checkout at gather time | a gather fetches and checks out the default branch's current head (`prepare_clone`); `meta.clone_sha` records that tree but a re-gather does not return to it; the `depends_on` / `owns` replay (#95) orders windows by their dates | a month re-gathered after a later month carries a newer tree than the later month, yet the later month still wins for the areas both speak for; a past month gathered today has today's code graph | re-gather months oldest first; check out the window's end commit if that proves common |
+| A window's structure is the head when its end is not in the clone | since #107 the code graph / IaC / CODEOWNERS of a window are read at its last mainline commit on or before `to`; when the bounded clone does not hold that commit (no commit in the window or its 14-day margin, only later ones) the head is read (`meta.structure_as_of: "head"`); `structure_as_of` is a bundle field, not stored per window; windows gathered before #107 carry the tree of their gather day | such a window's structure is newer than the window; the `depends_on` / `owns` replay (#95) still orders windows by their dates | widen `ACTIVITY_CLONE_MARGIN_DAYS` to reach the window end; re-gather pre-#107 windows |
+| Pre-#107 stores and Bicep module areas | since #107 every file below a non-AVM `main.bicep` dir is in that module's area; `touches` are only ever added | re-gathering, into a store folded before #107, a window that changed such a file (one area id changes: e.g. `infra/modules/x.bicep` `infra/modules` → `infra`, `a/b/c/README.md` `a/b` → `a/b/c`) leaves the old `touches` and people areas beside the new ones: `validate` fails a one-window store with them; on a multi-window store whose windows map the path differently they are WARNs | re-gather into a fresh store |
 | Some stale structure edges are not provable | `depends_on` is retracted only where a resolved build or the whole-tree scan speaks for the source area, transitive edges only by a resolved build; `owns` only for areas a window's code graph lists (#95) | on a single-repo store without `--structural-iac` and without a working `bicep`/`terraform`, edges of areas no later window rebuilt stay; a transitive edge stays until the area is built again; owners of an area no later window lists stay | `--structural-iac`; the IaC toolchain on the gathering host |
 | Terraform nested calls need init's module manifest | nested (`module.a.module.b`) targets come from `.terraform/modules/modules.json`; the DOT only names the call | if the manifest is missing or unreadable, nested edges have `to=ref=null` (kept in the bundle, never folded); calls whose module tree has no resources are not in the DOT, so they are not seen | read nested sources from the installed module dirs when the manifest is absent |
 | Digest `module_edges` drop edge detail | `digest.project_depends_on` emits `{src_repo, src_area, dst_repo, dst_area, version, transitive, cross_repo}` only | a transitive Terraform edge's `address` / `via` and an edge's `ref` are in the member bundle's `code_graph` but not in `module_edges` | pass `address`, `via`, `ref` through |

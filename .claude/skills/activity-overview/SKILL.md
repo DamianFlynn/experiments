@@ -82,8 +82,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
      that holds its months (no separate roll-up artifact; its CI statistics are the sum of
      the gathered windows inside it, its structure the latest one's — `meta.facts_windows`).
      A refresh re-gathers the same window into the same store: the fold is idempotent, and
-     the clone is fetched and checked out at the default branch's current head
-     (`meta.clone_sha` records which tree; it is not re-used). gather writes no bundle file
+     the window's structure is read at its last mainline commit (`meta.clone_sha` records
+     which; it is provenance, not a pin). gather writes no bundle file
      (there is no `--out`); its only `--resume` is the manifest one below.
    - **Multi-repo project.** To fold several repos under one logical
      project (e.g. an Azure Verified Modules — Terraform constellation, where each
