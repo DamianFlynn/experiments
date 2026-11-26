@@ -729,8 +729,8 @@ board (Phase 12; the `read:project` scope). The
 A reader (`extract`) traversing a decision train over the spine edges can hit a
 `missing` id — a spine edge pointing at a node never gathered (e.g. a windowed PR
 `closes` an issue opened/closed *before* the window). `gather.backfill(conn, id,
-fetch=…)` closes that gap on demand: it fetches THAT ONE node + its cheap
-immediate spine edges and upserts them by identity. It is the **only** network
+fetch=…)` closes that gap on demand: it fetches THAT ONE PR or issue and writes it
+exactly as a fold writes a record (issue #113). It is the **only** network
 call outside the main Acquire pass, so it lives in `gather.py` (`extract` never
 fetches itself — it calls in via an injected `backfill` callable).
 
@@ -738,17 +738,34 @@ fetches itself — it calls in via an injected `backfill` callable).
   if the node already exists it returns `{"fetched": False, …}` WITHOUT fetching.
   The fetched node is **durable** (upserted), so it persists for the next window
   and a re-run is a no-op — the backfilled node appears exactly once.
+- **PRs and issues only.** A spine traversal can only miss the dst of a
+  `closes` / `cross_ref` / `part_of` edge — a `pr-<n>` or `issue-<n>`; any other
+  id is never fetched (`fetched: False`). Commits are not backfilled: no spine
+  edge points at one, and a commit written on demand would lack the author
+  resolution, `committed_at`, file list and `touches` a gather derives.
+- **Written as a fold writes it.** The record goes through `gather.record_rows`,
+  the function `fold_bundle` uses for every PR / issue: its `social` node, its
+  `closes` / `cross_ref` (and, in a project store, cross-repo) spine edges, its
+  contribution edges (`authored` / `merged` / `reviewed` / `commented` /
+  `reported`) and its review / lifecycle leaves with their `part_of` edges; plus
+  the person nodes of its logins (`derive.enumerate_participants` and the fold's
+  union, a PR reviewer inheriting the areas of stored commits `part_of` the PR
+  under the latest window's code graph), its FTS text, and the `blocks` /
+  `in_milestone` / `in_iteration` edges `item_relation_edges` derives that touch
+  it — in one transaction. A backfilled record is therefore indistinguishable,
+  for `validate`'s participant_completeness / edge_set / no_drift /
+  idempotency, from a folded one. A record is stored under its id's kind: an
+  `issue-N` whose #N is a PR (the seam follows the thread and returns the PR,
+  with its /pull/ url) is an issue record to `extract` and to `validate`, so it
+  gets an issue's edges (its own `closes` are not written). A record whose
+  `number` differs from the id's is not written.
 - **Injectable network seam.** The actual fetch goes through a `fetch(kind,
-  local, qid)` callable (`None` == unfetchable; `{"node": raw, "edges":
-  [(dst_local, edge_type), …]}` == fetched). `classify_id` derives `kind`
-  (social `pr-`/`issue-`/`comment-`, code bare-`<sha>`, else structure) from the
-  local id form. Production wires `gather.make_backfill_fetcher(token,
-  clone_dir)` (REST `normalize_pr`/`normalize_issue` for social — re-deriving the
-  same `closes` spine edges fold does; bounded `git fetch --depth 1 <sha>` +
-  one-commit log for code; structure not backfilled on demand). The test suite
-  passes a **fixture-backed fake** — NO network. Only spine edge types from the
-  seam are honored (backfill closes a traversal gap, it does not re-derive the
-  non-spine substrate).
+  local, qid)` callable (`None` == unfetchable; `ABSENT` == a 404, tombstoned in
+  `dead_refs`; `{"node": raw, …}` == fetched — any `edges` it lists are ignored,
+  edges are derived from the record). `classify_id` derives `kind` from the
+  local id form. Production wires `gather.make_backfill_fetcher(token)` (REST
+  `normalize_pr` / `normalize_issue`). The test suite passes a
+  **fixture-backed fake** — NO network.
 - **Reader wiring + budget.** `extract.extract(…, backfill=None,
   backfill_budget=50)`: when `backfill` is injected and traversal yields
   `missing` ids, extract calls it per id under the per-window budget ceiling, then
@@ -763,7 +780,7 @@ fetches itself — it calls in via an injected `backfill` callable).
   `spotlight.py --complete` wires a fetcher (`gather.make_backfill_fetcher`, through
   `complete.complete_train`); `view.py`, `digest.py` and `validate.py` call
   `extract` with `backfill=None` (offline, warn-only). `make_backfill_fetcher`'s live
-  REST/git paths are therefore only exercisable against a real repo, not by the
+  REST path is therefore only exercisable against a real repo, not by the
   offline suite.
 
 ## Train completion + dead-ref memory

@@ -682,13 +682,18 @@ flowchart TB
 
 ### 4.12 Backfill seam
 
-`gather.backfill(conn, id, fetch)` fetches one missing spine node plus its immediate spine
-edges. `fetch(kind, local, qid)` returns a payload, `ABSENT` (definitive 404, or 410 for a
-deleted item → recorded in `dead_refs`, pruned forever) or `None` (transient, or an answer that
-is not the requested item of this repo — a transferred issue, #109 → reported as an
+`gather.backfill(conn, id, fetch)` fetches one missing PR or issue (`pr-<n>` / `issue-<n>`;
+any other id is not fetched, commits included) and writes it through `record_rows` — the
+function `fold_bundle` uses for each PR/issue (record node, closes/cross_ref and cross-repo
+spine edges, contribution edges, review/lifecycle leaves) — plus its logins' person nodes
+(`enumerate_participants`, the fold's union), its FTS text and the item-relation edges that
+touch it, so the trust check accepts the store afterwards (#113). `fetch(kind, local, qid)`
+returns a payload (`edges` in it are ignored), `ABSENT` (definitive 404, or 410 for a
+deleted item → recorded in `dead_refs`, pruned forever) or `None` (transient, or an answer
+that is not the requested item of this repo — a transferred issue, #109 → reported as an
 `unreachable` gap).
-Production wiring: `make_backfill_fetcher(token, clone_dir)`. Only `gather` writes, so readers
-receive backfill as an **injected callable**.
+Production wiring: `make_backfill_fetcher(token)` (REST only). Only `gather` writes, so
+readers receive backfill as an **injected callable**.
 
 ## 5. Persist — `graphstore.py`
 
@@ -1349,8 +1354,20 @@ Rules (issue #81):
   A NUL byte in a phrase is read as a space.
 - **Areas across repos.** `subsystem`/`module` look the area up in **every** project repo
   and union the results (the same area id — `main.tf`, `docs` — is common across members);
-  `owner/repo::area` or `--repo` (any case, `graphstore.resolve_repo`) narrows to one
-  member. Every row names its repo: envelope `repos` (members whose area answered),
+  `owner/repo::area` or `--repo` narrows to one member.
+- **Naming a repo** (#113). `dependents`, `subsystem`, `module`, the `<repo>::<area>`
+  qualifier and `--repo` resolve a repo by one rule (`resolve_repo_arg`): the stored
+  spelling in any case; `owner/repo` on a single-repo store (project = owner, repo = name);
+  `repo` alone when exactly one stored `owner/repo` has that name. No match or several:
+  `needs_gather` from the library, exit 2 listing the store's repos from the CLI.
+- **Module areas across windows** (#113). `module` unions the area index of every gathered
+  window's #94 code graph (plus the `codegraph` singleton on a store folded before #94), so
+  the answer does not depend on fold order. No other spotlight query reads a per-repo
+  singleton (`code_owners` / `workflow_stats` are not read).
+- **`--md` escaping** (#113). Every stored or typed value goes through `_md`: control
+  characters collapse to a space; in text, markdown/HTML syntax is backslash-escaped or
+  written as an entity and a leading block marker is escaped; a code span's fence is longer
+  than any backtick run inside it. `--json` stays raw. Every row names its repo: envelope `repos` (members whose area answered),
   contributor `repos`, depends_on `repo` (the member whose area node the edge hangs off),
   module symbol/file `repo` (files sort by `(path, repo)`), and every train's `repos`.
 - **Symbol query and file artifacts.** The file-level ledger is keyed by the bare path;
@@ -1358,12 +1375,15 @@ Rules (issue #81):
   `slice_module`). A lifecycle ending in `remove` (symbol) or `delete` (file, git's verb)
   is `removed`. A local id is qualified only against known `{project}/{repo}#` prefixes,
   so a path that starts with the project name (`avm/res/…`) still resolves.
-- **Train outcome** (`_outcome`, the `link.build_trains` vocabulary and precedence):
-  `shipped` (release, merged PR, or — no PR — an issue closed as completed; a closed issue
-  without `state_reason` counts as completed) > `in_flight` (open PR, or — no PR — open
-  issue) > `rejected` (PRs, all closed unmerged) > `direct_push` (no PR, no open/completed
-  issue, but commits) > `abandoned` (only issues closed `not_planned`/`duplicate`);
-  anything else `in_flight`. Rendered badges: `[direct-push]`, `[abandoned]`.
+- **Train outcome** (`_outcome`, the `link.build_trains` vocabulary), over the train's
+  stored members, in this order: (1) any release → `shipped`; (2) with PRs (a `pr-<n>`
+  record, or an `issue-<n>` record carrying a /pull/ url): any merged → `shipped`, else any
+  not closed → `in_flight`, else `rejected`; (3) no PR: any issue not closed → `in_flight`,
+  else any closed issue whose `state_reason` is not `not_planned`/`duplicate` (none counts as
+  completed) → `shipped`; (4) else commits → `direct_push`, else issues (all dropped) →
+  `abandoned`, else `in_flight`. So a no-PR train with an open and a completed issue is
+  `in_flight`. Rendered badges: `[direct-push]`, `[abandoned]`. Trains group over the causal
+  spine (every spine type but `cross_ref`), depth-capped as `traverse_spine`.
 - **CLI.** Exactly one query argument; `--complete` only for the train queries
   (`person`, `subsystem`, `grep`, `module`); `--repo` only for `subsystem`/`module`;
   `--from/--to` not for `dependents` and validated and normalised by `manifest.check_reader_window`
@@ -1716,14 +1736,22 @@ these affect an accumulated store.
   arguments from the store, scoped to the project by a case-sensitive id-prefix range (no
   `LIKE`, so `_`/`%` in a project name are literal): the most-active person, the most-touched
   area (with its repo), the code_events key with the most ledger rows, and a term with hits in
-  the project. It then checks each answer against the store: `person` — trains with outcomes
-  from spotlight's vocabulary, member `repos`, chronological project-only timelines, summary
-  counts equal to the delivered trains, citations, determinism; `subsystem` (narrowed with
-  `repo=`) — `repos`, contributor and `depends_on` rows name that member, and every commit/PR
-  that `touches` the area is a touchpoint; `symbol` — one lifecycle row per ledger event in
-  (date, commit) order, outcome `removed` exactly when the last event is `remove`/`delete`, and
-  the artifact somewhere in its identity chain (a move destination is not the chain head);
-  `grep` — the delivered mentions are exactly the project's FTS matches. A check whose input the
+  the project. It then checks each answer against the store, never against spotlight's own
+  output (#113). Every train of every query: member `repos`, a chronological project-only
+  timeline whose rows and touchpoints cite exactly what their stored nodes hold
+  (number/sha/url/title; a comment's excerpt is its body), and an outcome equal to the one the
+  gate computes from the stored member records (`_store_outcome`, the §9 rule written out
+  in the gate, not imported). `person` — the (target, role) touchpoints equal the person's
+  contribution edges (role from the edge type), each target in exactly one train (at least
+  one when its causal train is deeper than the traversal cap, where spotlight may list it
+  twice), no train without a touchpoint, a commenter excerpt from the person's own comment,
+  summary counts consistent; determinism; `subsystem` (narrowed with `repo=`) — `repos`,
+  contributor and `depends_on` rows name that member, and every commit/PR that `touches` the
+  area is a touchpoint; `symbol` — each lifecycle row's event, date, commit and author equal
+  its ledger row in (date, commit) order, outcome `removed` exactly when the last ledger row
+  is `remove`/`delete`, and the artifact somewhere in its identity chain (a move destination
+  is not the chain head); `grep` — the delivered mentions are exactly the project's FTS
+  matches, each with the stored title and an excerpt found in the stored text. A check whose input the
   store lacks is reported as skipped; it fails the run only under `--require-all`. Exit 0 / 1
   (a check failed, or a skip under `--require-all`) / 2 (usage: missing store, unknown or
   unnamed `--project`). `test_ci_spotlight_integration.py` runs the gate offline on stores

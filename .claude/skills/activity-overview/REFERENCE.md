@@ -59,7 +59,9 @@ window's end; `STORE.md`). A single store *can* hold **multiple** projects/repos
 but then the readers need to be told which: `validate.py` (and `view.py`/`digest.py`/
 `spotlight.py`) error asking for `--project` (and `--repo` when a project spans several;
 `spotlight.py` instead unions an area across members unless `--repo` or `owner/repo::area`
-names one) —
+names one; `dependents`, `subsystem` and `module` take a repo as `owner/repo` in any case or
+`repo` alone when unambiguous, on a single-repo or a project store, and exit 2 listing the
+store's repos for one that names none) —
 the bare `validate.py workspace/journey.db` example above assumes a single-project store.
 `validate.py` opens the store read-only and exits 0 (trusted), 1 (a check failed; a
 mistyped `--project`/`--repo` or an empty store fails the `target` check) or 2 (usage
@@ -280,7 +282,10 @@ python3 ci_spotlight_integration.py --store workspace/journey.db [--project P] [
 ```
 
 It discovers a person, an area, an artifact and a search term inside the project and checks
-the four spotlight answers against the store (see `docs/LLD.md` §15). Exit 0 (all verified,
+the four spotlight answers against the store, not against spotlight's own output: the
+person's trains and roles against their contribution edges, every train outcome against one
+computed from the stored records, every citation against its node, each lifecycle row
+against its ledger row, each grep mention against the stored text (see `docs/LLD.md` §15). Exit 0 (all verified,
 or skipped for lack of input), 1 (a check failed, or anything skipped with
 `--require-all`), 2 (usage error).
 

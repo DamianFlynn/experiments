@@ -246,7 +246,7 @@ the rest (engagement, code areas, trains, people/flow).
   `code_events[].date` and `symbol_events[].date` are the same day of the same commit, so every
   record of one commit lands in one window. `committed_at` (#82) is the full committer
   timestamp (`%cI`) in UTC, `YYYY-MM-DDTHH:MM:SSZ`; it orders the `timeline`. It is absent on
-  commits gathered before #82 and on commits backfilled before #109.
+  commits gathered before #82 (commits are never backfilled, #113).
   **People identity (#78):** `author` is the author's **GitHub login** — the same key PR, issue,
   review and comment records use — so one person is one `people` entry. `gather.resolve_commit_authors`
   resolves it from real data, in order: the commits-list API's `author.login` for that SHA

@@ -793,11 +793,21 @@ One store per stream keeps commands simple and failures isolated.
 | Blast radius (one module area, in-repo and cross-repo) | `spotlight.py dependents <owner/repo>::<area> --store S --project P` (gather single repos with `--structural-iac`) |
 | Project view for a formatter | `digest.py --store S --project P --from F --to T` (schema: `BUNDLE.md`) |
 | Ticket-linked related work | `digest.py … --manifest M` with `"ticket_prefixes": ["ABC"]` in the manifest, or `digest.py … --ticket-pattern '\b(AB#\d+)\b'` (off by default: `related_work` is `[]`) |
-| Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`) |
+| Complete out-of-window threads | add `--complete` to `person/subsystem/grep/module` (uses the token; bounded; refused for `symbol`/`dependents`). It fetches missing PRs/issues only (never commits) and writes each exactly as a gather would — person nodes, contribution edges, reviews/events, search text — so `validate.py` still passes afterwards |
+
+A repo is named the same way in every query (`dependents`, `subsystem`, `module`, the
+`<repo>::<area>` qualifier and `--repo`), on a single-repo store (project = owner) or a
+project store: `owner/repo` in any case, or `repo` alone when exactly one stored member has
+that name (`dependents Azure/bicep-registry-modules`, `module bicep-registry-modules::avm/res/network/virtual-network`).
+`module` reads the area index of every gathered window's code graph, so an area an earlier
+window listed is found whatever order the windows were folded in. `--md` escapes every
+stored or typed value (titles, excerpts, logins, paths, area ids, the focus, the phrase) so
+none can add markdown structure or HTML; `--json` is raw.
 
 `spotlight.py` exits 2 with usage for a wrong argument count, a flag the query does not take,
 a bad `--from/--to`, a missing or empty store, a store with several projects and no
-`--project` (the error lists them) and an unknown `--repo`. Train outcomes are `shipped`,
+`--project` (the error lists them) and a repo argument (member, `<repo>::` qualifier or
+`--repo`) that names no single stored repo (the error lists them). Train outcomes are `shipped`,
 `in_flight`, `rejected`, `abandoned` (an issue closed not-planned/duplicate) and
 `direct_push` (commits with no PR) — see LLD §9.
 
@@ -827,7 +837,9 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
   waits for the API limit can take over an hour (LLD §15). Point its
   `workflow_dispatch` inputs at one of your targets to smoke-test a window. Its `spotlight`
   job also runs `ci_spotlight_integration.py --store S --require-all`, which checks the
-  person / subsystem / symbol / grep answers against what the store holds. You can run it on
+  person / subsystem / symbol / grep answers against what the store holds (contribution
+  edges, stored records and outcomes, ledger rows, indexed text — not spotlight's own
+  answer). You can run it on
   your own store (`--project P` when the store holds several); without `--require-all` a
   check whose input the store lacks is reported as skipped instead of failing.
 

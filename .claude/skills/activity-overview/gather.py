@@ -5679,76 +5679,162 @@ def classify_id(qid):
 ABSENT = object()
 
 
+def _backfill_record_kind(local):
+    """"pr" / "issue" for a `pr-<n>` / `issue-<n>` local id (the only ids a
+    spine traversal can miss: the dst of closes / cross_ref / part_of), else
+    None. Returns (kind, number)."""
+    for kind in ("pr", "issue"):
+        head = kind + "-"
+        if local.startswith(head) and local[len(head):].isdigit():
+            return kind, int(local[len(head):])
+    return None, None
+
+
+def _latest_code_graph(conn, project, repo):
+    """The code graph of the repo's latest gathered window by date (#94
+    per-window facts) — the one a view spanning the store reads — else the
+    latest-wins `codegraph` singleton (a store folded before #94), else {}."""
+    try:
+        ledger = graphstore.get_windows(conn)
+    except ValueError:
+        ledger = []
+    windows = sorted({(w.get("from"), w.get("to")) for w in ledger
+                      if isinstance(w, dict) and w.get("project") == project
+                      and w.get("repo") == repo and w.get("from") and w.get("to")})
+    for frm, to in reversed(windows):
+        wf = graphstore.get_window_facts(conn, project, repo, frm, to,
+                                         keys=("code_graph",))
+        if wf is not None:
+            return (wf.get("facts") or {}).get("code_graph") or {}
+    node = graphstore.get_node(conn, graphstore.qualify_id(project, repo,
+                                                           "codegraph"))
+    return ((node or {}).get("data") or {}) if node else {}
+
+
+def _backfill_people(conn, kind, record, project, repo, rid):
+    """The person records for the logins of ONE backfilled PR / issue, derived
+    as fold_bundle derives them (derive.enumerate_participants, after
+    attach_commit_prs): a PR reviewer inherits the areas of the stored commits
+    that are `part_of` the PR, under the repo's latest code graph. Only the
+    record's own logins are returned (commit authors were folded already)."""
+    view = {"prs": [record]} if kind == "pr" else {"issues": [record]}
+    logins = set(derive.enumerate_participants(view, {}))
+    commits = []
+    if kind == "pr":
+        for e in graphstore.get_edges(conn, rid, direction="in",
+                                      edge_types=["part_of"]):
+            node = graphstore.get_node(conn, e["src_id"])
+            data = (node or {}).get("data") or {}
+            if node and node["node_class"] == "code" and "sha" in data:
+                commits.append(copy.deepcopy(data))
+    attach_commit_prs(commits)
+    idx = derive.area_index(_latest_code_graph(conn, project, repo))
+    people = derive.enumerate_participants({**view, "commits": commits}, idx)
+    return {login: people[login] for login in sorted(logins)}
+
+
+def _backfill_members(conn, project, repo):
+    """The member set a manifest fold would pass for a project store (the
+    stored repos plus those with recorded member run status, as
+    validate._project_members reads it), or None for a single-repo store
+    (repo without an owner/ part)."""
+    if "/" not in repo:
+        return None
+    members = set(graphstore.project_repos(conn, project))
+    try:
+        members |= {e["repo"] for e in graphstore.get_member_status(conn, project)}
+    except (ValueError, TypeError, KeyError):
+        pass
+    members.add(repo)
+    return members
+
+
 def backfill(conn, id, fetch=None):
-    """Fetch and upsert ONE missing spine node + its cheap immediate edges.
+    """Fetch and upsert ONE missing PR / issue, written exactly as a fold
+    writes a record (issue #113).
 
     Idempotent: if `get_node(id)` already returns a node, this is a no-op and
-    NOTHING is fetched. Otherwise it classifies `id`, calls the injected `fetch`
-    seam for that one node, and (when the fetch yields a record) upserts the node
-    plus any immediate spine edges the seam returned.
+    NOTHING is fetched. Only a `pr-<n>` / `issue-<n>` id is fetched — the only
+    ids a spine traversal can miss (the dst of closes / cross_ref / part_of);
+    any other id returns fetched=False without calling the seam (a commit,
+    artifact, review or structure node written from a seam alone would be a
+    row the trust check rejects).
 
     `fetch(kind, local, qid)` is the network seam with THREE outcomes:
-      - a dict `{"node": raw, "edges": [(dst_local, edge_type), ...]}` == fetched;
+      - a dict `{"node": raw, ...}` == fetched (any `edges` the seam returns
+        are ignored: the edges are derived from the record, below);
       - `gather.ABSENT` == the id DEFINITIVELY does not exist (a 404) —
         `backfill` tombstones it via `graphstore.record_dead_ref` so it is
         pruned and never re-chased;
       - `None` == transient/unreachable (could not be resolved this run).
     Tests pass a fixture-backed fake; production passes `make_backfill_fetcher`.
 
-    Returns `{"fetched": bool, "absent": bool, "id": id, "edges_added": int}` —
-    `absent=True` only on the ABSENT outcome.
-    """
-    if graphstore.get_node(conn, id) is not None:
-        return {"fetched": False, "absent": False, "id": id,
-                "edges_added": 0}  # already present
+    A fetched record is written through the fold's own derivation, in one
+    transaction: `record_rows` (the record node, its closes / cross_ref and
+    — in a project store — cross-repo spine edges, its contribution edges,
+    its review / lifecycle leaves), the person nodes of its logins
+    (`_backfill_people` + `_person_rows`, the fold's union), its FTS text,
+    and the item-relation edges (blocks / in_milestone / in_iteration) that
+    `item_relation_edges` derives for the stored records and that touch it.
+    The store's other rows are left alone. A record is stored under its id's
+    kind: an `issue-N` whose #N is a PR (the seam follows the thread and
+    returns the PR) is an issue record to every reader and to the trust
+    check, so it gets an issue's edges. A record whose `number` differs from
+    the id's is not written (fetched=False); a record without one takes it.
 
-    info = classify_id(id)
-    parsed = graphstore.parse_id(id)
-    # The scope is `{project}/{repo}`; recover project/repo so the upsert lands
-    # in the same identity columns fold_bundle uses.
-    project, _, repo = parsed["scope"].partition("/")
+    Returns `{"fetched": bool, "absent": bool, "id": id, "edges_added": int}` —
+    `absent=True` only on the ABSENT outcome; `edges_added` counts the edges
+    derived for the record.
+    """
+    miss = {"fetched": False, "absent": False, "id": id, "edges_added": 0}
+    if graphstore.get_node(conn, id) is not None:
+        return miss  # already present
 
     if fetch is None:
         raise ValueError("backfill needs a `fetch` seam (production: "
                          "make_backfill_fetcher(token); tests: a fake)")
+    info = classify_id(id)
+    kind, number = _backfill_record_kind(info["local"])
+    if kind is None:
+        return miss  # not a record a traversal can miss: never fetched
+    # The scope is `{project}/{repo}`; recover project/repo so the upsert lands
+    # in the same identity columns fold_bundle uses.
+    project, _, repo = graphstore.parse_id(id)["scope"].partition("/")
 
     result = fetch(info["kind"], info["local"], id)
     if result is ABSENT:
         graphstore.record_dead_ref(conn, id)  # only gather writes
-        return {"fetched": False, "absent": True, "id": id, "edges_added": 0}
+        return dict(miss, absent=True)
     if not result or not result.get("node"):
-        return {"fetched": False, "absent": False, "id": id,
-                "edges_added": 0}  # unreachable / transient
+        return miss  # unreachable / transient
 
-    raw = result["node"]
+    raw = dict(result["node"])
+    if raw.get("number") is None:
+        raw["number"] = number
+    elif raw["number"] != number:
+        return miss  # not the record this id names
     fetched_at = graphstore.now_iso()
-    # ts mirrors fold_bundle's choice per class: social PR -> merged/closed/
-    # created; social issue -> closed/updated; commit -> date; structure -> NULL.
-    if info["kind"] == "social" and info["local"].startswith("pr-"):
-        ts = raw.get("merged_at") or raw.get("closed_at") or raw.get("created_at")
-    elif info["kind"] == "social" and info["local"].startswith("issue-"):
-        ts = raw.get("closed_at") or raw.get("updated_at")
-    elif info["kind"] == "code":
-        ts = raw.get("date")
-    else:
-        ts = raw.get("published_at")  # release; milestone/area stay None
-
-    graphstore.upsert_node(
-        conn, id, project, repo, info["node_class"], ts, raw, fetched_at)
-
-    # Cheap immediate spine edges the seam surfaced (e.g. issue#7 spun_off #5).
-    # Only spine edge types are honored — backfill closes a TRAVERSAL gap, it does
-    # not re-derive the whole non-spine substrate. Edges to still-absent nodes are
-    # fine (a later traversal surfaces them as `missing` for another backfill).
-    edges = []
-    for dst_local, edge_type in result.get("edges") or []:
-        if edge_type not in graphstore.SPINE_EDGE_TYPES:
-            continue
-        edges.append((id, graphstore.qualify_id(project, repo, dst_local),
-                      edge_type, None, None))
-    if edges:
-        graphstore.upsert_edges(conn, edges)
-    return {"fetched": True, "absent": False, "id": id, "edges_added": len(edges)}
+    rows = record_rows(kind, raw, project, repo, fetched_at,
+                       _backfill_members(conn, project, repo))
+    people = _backfill_people(conn, kind, raw, project, repo, id)
+    comments = (raw.get("comments_list") or []) + (
+        (raw.get("review_comments") or []) if kind == "pr" else [])
+    text = _social_text(raw, comments)
+    with conn:
+        graphstore.upsert_nodes(
+            conn, rows["nodes"] + _person_rows(conn, project, people, fetched_at),
+            commit=False)
+        graphstore.upsert_edges(conn, rows["edges"], commit=False)
+        if text and graphstore.fts5_available(conn):
+            graphstore.index_texts(conn, [(id, text)], commit=False)
+        # Item relations now implied for (or by another stored record towards)
+        # this record; a fold rebuilds the whole set, backfill only adds these.
+        relations = [(k[0], k[1], k[2], None, v) for k, v in sorted(
+            item_relation_edges(conn, project, repo).items(),
+            key=lambda kv: kv[0]) if id in (k[0], k[1])]
+        graphstore.upsert_edges(conn, relations, commit=False)
+    return {"fetched": True, "absent": False, "id": id,
+            "edges_added": len(rows["edges"]) + len(relations)}
 
 
 def _backfilled_is(raw, slug, num, qid):
@@ -5768,23 +5854,25 @@ def _backfilled_is(raw, slug, num, qid):
     return True
 
 
-def make_backfill_fetcher(token, clone_dir=None):
-    """Production `fetch` seam for `backfill`: resolves one node by REST (social)
-    or local git (code). Returns a `fetch(kind, local, qid)` callable.
+def make_backfill_fetcher(token):
+    """Production `fetch` seam for `backfill`: resolves one PR / issue by
+    GitHub REST (normalize_pr / normalize_issue). Returns a `fetch(kind, local,
+    qid)` callable.
 
     NOT unit-tested (it is the live-network edge); the suite exercises backfill
-    with a fixture-backed fake instead. social -> GitHub REST (normalize_pr /
-    normalize_issue, plus the same `closes` spine edges fold derives); code -> a
-    bounded `git fetch --depth 1 <sha>` into the clone then a one-commit log;
-    structure -> not backfilled on demand (graphify/whole-dict facts come from
-    Acquire), so it returns None and the node stays a warned gap.
+    with a fixture-backed fake instead. Only social PR / issue ids are
+    resolved; anything else returns None and stays an honest gap. Commits are
+    not backfilled (#113 m4): a commit is never the dst of a spine edge, so no
+    traversal misses one, and a commit written on demand would lack the
+    author resolution, `committed_at`, file list and touches a gather derives.
 
     A `Closes #N` whose #N resolves to a PR (issues + PRs share one number
     space) is followed to the real PR and returned as a node — the thread is
     traversed, not dropped. Outcomes: a fetched dict, `ABSENT` (a genuine 404,
     or 410 for a deleted issue), or `None` (transient / not resolvable this
-    run, e.g. a code sha with no clone, or an answer that is not the requested
-    item of this repo: a transferred issue reached through a redirect, #109).
+    run, or an answer that is not the requested item of this repo: a
+    transferred issue reached through a redirect, #109). The returned `edges`
+    are empty: backfill derives a record's edges itself (record_rows).
     """
     def fetch(kind, local, qid):
         parsed = graphstore.parse_id(qid)
@@ -5818,10 +5906,7 @@ def make_backfill_fetcher(token, clone_dir=None):
                     return ABSENT
                 if not _backfilled_is(pr_raw, slug, num, qid):
                     return None
-                pr = normalize_pr(pr_raw)
-                edges = [("issue-{}".format(n), "closes")
-                         for n in pr.get("closes") or []]
-                return {"node": pr, "edges": edges}
+                return {"node": normalize_pr(pr_raw), "edges": []}
             return {"node": normalize_issue(raw), "edges": []}
         if kind == "social" and local.startswith("pr-"):
             num = local[len("pr-"):]
@@ -5831,28 +5916,8 @@ def make_backfill_fetcher(token, clone_dir=None):
                 return ABSENT
             if not _backfilled_is(raw, slug, num, qid):
                 return None
-            pr = normalize_pr(raw)
-            edges = [("issue-{}".format(n), "closes") for n in pr.get("closes") or []]
-            return {"node": pr, "edges": edges}
-        if kind == "code" and clone_dir:
-            sha = local
-            try:
-                run_git(["git", "-C", clone_dir, "fetch", "--depth", "1",
-                         "origin", sha])
-                raw = run_git(["git", "-C", clone_dir, "log", "-1",
-                               f"--pretty=format:{LOG_FORMAT}",
-                               "--name-only", sha])
-            except Exception:
-                return None
-            commits = parse_git_log(raw)
-            if not commits:
-                return None
-            c = commits[0]
-            c.pop("author_email", None)   # transient (#78): never stored
-            prn = resolve_commit_pr(c.get("message", ""))
-            edges = [("pr-{}".format(prn), "part_of")] if prn is not None else []
-            return {"node": c, "edges": edges}
-        return None  # structure / unfetchable on demand
+            return {"node": normalize_pr(raw), "edges": []}
+        return None  # commit / structure / artifact: not fetched on demand
 
     return fetch
 
@@ -6099,6 +6164,123 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
         "label": ev.get("label"),
         "url": url,
     }
+
+
+def record_rows(kind, record, project, repo, fetched, members=None):
+    """The store rows ONE PR (`kind` "pr") or issue (`kind` "issue") record
+    implies, as fold_bundle writes them — shared by fold_bundle and
+    gather.backfill so a backfilled record is written exactly as a folded one
+    (issue #113). Pure. Returns {"nodes": [node rows], "edges": [edge rows]}:
+
+      - the record's `social` node (`pr-<n>` / `issue-<n>`; ts = merged/closed/
+        created for a PR, closed/updated for an issue). In a multi-repo project
+        (`members` given) a PR's qualified refs and repo-aware timeline xrefs
+        also yield CROSS-repo spine edges (to member repos) or honest
+        `external_refs` on the record (to non-members) — see
+        _cross_repo_pr_edges; `members=None` (single repo) skips that;
+      - a PR's `closes` / `cross_ref` spine edges to its issues;
+      - the contribution edges (person -> record): PR authored / merged /
+        reviewed / commented, issue reported / commented. Absent logins are
+        skipped; the person NODES are the caller's (_person_rows, over
+        derive.enumerate_participants);
+      - Phase 10: PR review submissions and PR/issue lifecycle events as
+        `social` leaves with a `part_of` spine edge to the record (a review
+        without a url gets a stable `<pr url>#pullrequestreview-<id>`, an event
+        `_lifecycle_event_data`'s). Leaves have no onward spine edge, so they
+        ride into the record's train but cannot bridge it to anything else.
+    Current-state edges (blocks / in_milestone / in_iteration) are not here:
+    they need the stored milestones / sprints / issues (item_relation_edges)."""
+    def qid(local):
+        return graphstore.qualify_id(project, repo, local)
+    nodes, edges = [], []
+    num = record["number"]
+    local = "{}-{}".format(kind, num)
+    rid = qid(local)
+
+    def contrib(login, etype):
+        if login:
+            edges.append((graphstore.qualify_person(project, login), rid, etype,
+                          None, None))
+
+    if kind == "pr":
+        ts = record.get("merged_at") or record.get("closed_at") \
+            or record.get("created_at")
+        stored = record
+        if members is not None:
+            external, xedges = _cross_repo_pr_edges(record, project, repo, members)
+            if external:
+                stored = {**record, "external_refs": external}
+            edges.extend(xedges)
+        nodes.append((rid, project, repo, "social", ts, stored, fetched))
+        for n in record.get("closes") or []:
+            edges.append((rid, qid("issue-{}".format(n)), "closes", None, None))
+        for n in record.get("crossref_issues") or []:
+            edges.append((rid, qid("issue-{}".format(n)), "cross_ref", None, None))
+        contrib(record.get("author"), "authored")
+        contrib(record.get("merged_by"), "merged")
+        for reviewer in record.get("reviewers") or []:
+            contrib(reviewer, "reviewed")
+        for c in (record.get("comments_list") or []) \
+                + (record.get("review_comments") or []):
+            contrib(c.get("author"), "commented")
+        for rv in record.get("reviews") or []:
+            rvid = rv.get("id")
+            data = rv
+            if not rv.get("url"):
+                base = record.get("url") or local
+                data = {**rv, "url": "{}#pullrequestreview-{}".format(base, rvid)}
+            leaf = qid("review-{}-{}".format(num, rvid))
+            nodes.append((leaf, project, repo, "social", rv.get("submitted_at"),
+                          data, fetched))
+            edges.append((leaf, rid, "part_of", None, None))
+    elif kind == "issue":
+        ts = record.get("closed_at") or record.get("updated_at")
+        nodes.append((rid, project, repo, "social", ts, record, fetched))
+        contrib(record.get("author"), "reported")
+        for c in record.get("comments_list") or []:
+            contrib(c.get("author"), "commented")
+    else:
+        raise ValueError("record_rows: kind must be 'pr' or 'issue', got "
+                         "{!r}".format(kind))
+    for ev in record.get("lifecycle") or []:
+        data = _lifecycle_event_data(ev, record.get("url"), local)
+        leaf = qid("event-{}-{}".format(local, ev.get("id")))
+        nodes.append((leaf, project, repo, "social", ev.get("created_at"), data,
+                      fetched))
+        edges.append((leaf, rid, "part_of", None, None))
+    return {"nodes": nodes, "edges": edges}
+
+
+def _person_rows(conn, project, people, fetched, replace=False):
+    """People `structure` node rows (project-scoped) for `people` ({login:
+    {modules, areas, is_bot, ...}} from derive.enumerate_participants), as
+    fold_bundle and gather.backfill write them. The `repo` column is the
+    project sentinel "*" so the SAME login folded from another repo in the
+    project upserts the identical id (the sentinel keeps the row out of any
+    single repo's repo_nodes view). NULL ts -> excluded from window scans.
+
+    Project-scoped people aggregate across members: a later fold UNIONs its
+    attribution with what is already stored — a plain upsert would OVERWRITE,
+    so the last member folded (e.g. one where the person has no area
+    attribution) would erase another member's. Union keeps the person node the
+    true project-wide aggregate, independent of fold order and idempotent
+    (re-folding unions a subset -> no change). `replace` (a re-fold of the
+    project's only gathered window, #111) writes this derivation as it is."""
+    rows = []
+    for login, rec in people.items():
+        if not login:
+            continue
+        pid = graphstore.qualify_person(project, login)
+        data = {"login": login, **rec}
+        prior = None if replace else conn.execute(
+            "SELECT data FROM nodes WHERE id=?", (pid,)).fetchone()
+        if prior and prior[0]:
+            pd = json.loads(prior[0])
+            data["areas"] = sorted(set(rec.get("areas") or []) | set(pd.get("areas") or []))
+            data["modules"] = sorted(set(rec.get("modules") or []) | set(pd.get("modules") or []))
+            data["is_bot"] = bool(rec.get("is_bot")) or bool(pd.get("is_bot"))
+        rows.append((pid, project, "*", "structure", None, data, fetched))
+    return rows
 
 
 def _fold_artifacts(conn, bundle, project, repo, fetched):
@@ -6905,30 +7087,20 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     def qid(local):
         return graphstore.qualify_id(project, repo, local)
 
-    # social: PRs, with closes/cross_ref spine edges to their issues. In a
-    # multi-repo project (members given) a PR's qualified refs + repo-aware
-    # timeline xrefs also yield CROSS-repo spine edges (to member repos) or
-    # honest external_refs (to non-members) — see _cross_repo_pr_edges. Gated on
-    # `members is not None` so single-repo folds are byte-identical.
+    # social: PRs and issues — each record's node, its spine edges, its
+    # contribution edges and its review / lifecycle leaves, derived by
+    # record_rows (shared with gather.backfill, so a backfilled record is
+    # written exactly as a folded one). An issue's `blocks` (issue->issue)
+    # relation edges are current-state: written by _maintain_current_state
+    # from the stored records, between two STORED issues.
     for pr in bundle.get("prs", []):
-        pid = qid("pr-{}".format(pr["number"]))
-        ts = pr.get("merged_at") or pr.get("closed_at") or pr.get("created_at")
-        if members is not None:
-            external, xedges = _cross_repo_pr_edges(pr, project, repo, members)
-            if external:
-                pr = {**pr, "external_refs": external}
-            edges.extend(xedges)
-        nodes.append((pid, project, repo, "social", ts, pr, fetched))
-        edges.extend(_pr_spine_edges(pr, qid))
-
-    # social: issues. Their `blocks` (issue->issue, blocker -> blocked) relation
-    # edges are current-state: written by _maintain_current_state from the
-    # stored records, between two STORED issues (a ref to an issue the store
-    # does not hold is left out rather than dangling).
+        rows = record_rows("pr", pr, project, repo, fetched, members)
+        nodes.extend(rows["nodes"])
+        edges.extend(rows["edges"])
     for iss in bundle.get("issues", []):
-        ts = iss.get("closed_at") or iss.get("updated_at")
-        iid = qid("issue-{}".format(iss["number"]))
-        nodes.append((iid, project, repo, "social", ts, iss, fetched))
+        rows = record_rows("issue", iss, project, repo, fetched, members)
+        nodes.extend(rows["nodes"])
+        edges.extend(rows["edges"])
 
     # code: commits, with part_of spine edge to the PR named in the subject.
     for c in bundle.get("commits", []):
@@ -7029,82 +7201,21 @@ def fold_bundle(conn, bundle, project=None, repo=None, members=None,
     # and auditor can never diverge.
     people = derive.enumerate_participants(people_view, area_idx)
 
-    def qperson(login):
-        return graphstore.qualify_person(project, login)
-
-    # People `structure` nodes (project-scoped). The `repo` column is the
-    # project sentinel "*" so the SAME login folded from another repo in the
-    # project upserts the identical id (idempotency is by the project-scoped id;
-    # the sentinel keeps the row out of any single repo's repo_nodes view, an
-    # extra no-leak guard). NULL ts -> excluded from window scans.
+    # People `structure` nodes (project-scoped), unioned with what an earlier
+    # member already stored: see _person_rows.
     # A re-fold of the project's ONLY gathered window (issue #111): this bundle
     # is then everything the store knows about its people, so its derivation
     # REPLACES the stored one instead of being unioned with it — a commit
     # re-attributed by a later gather of the window takes its areas along.
-    sole_window = _is_sole_window(conn, project, repo, meta)
-    for login, rec in people.items():
-        if not login:
-            continue
-        data = {"login": login, **rec}
-        # Project-scoped people aggregate across members. A later member's fold must
-        # UNION its attribution with what an earlier member already stored — a plain
-        # upsert would OVERWRITE, so the last member folded (e.g. one where the
-        # person has no area attribution) would erase another member's. Union keeps
-        # the person node the true project-wide aggregate, independent of fold order
-        # and idempotent (re-folding a member unions a subset -> no change).
-        prior = None if sole_window else conn.execute(
-            "SELECT data FROM nodes WHERE id=?", (qperson(login),)).fetchone()
-        if prior and prior[0]:
-            pd = json.loads(prior[0])
-            data["areas"] = sorted(set(rec.get("areas") or []) | set(pd.get("areas") or []))
-            data["modules"] = sorted(set(rec.get("modules") or []) | set(pd.get("modules") or []))
-            data["is_bot"] = bool(rec.get("is_bot")) or bool(pd.get("is_bot"))
-        nodes.append((qperson(login), project, "*", "structure", None, data, fetched))
+    nodes.extend(_person_rows(conn, project, people, fetched,
+                              replace=_is_sole_window(conn, project, repo, meta)))
 
-    # Contribution edges from the RAW records (person -> node). Idempotent by
-    # (src,dst,type); absent logins/fields are skipped cleanly.
-    edges.extend(_contribution_edges(bundle.get("prs", []),
-                                     bundle.get("issues", []),
-                                     bundle.get("commits", []), qid, qperson))
-
-    # Phase 10 slice 1: PR review submissions + lifecycle events as first-class
-    # `social` nodes with a `part_of` spine edge to their parent. Folded by stable
-    # id from the raw records (idempotent); review/event nodes are spine LEAVES
-    # (no onward spine edge), so they ride into the PR/issue train when
-    # traverse_spine walks it but can't bridge it to anything unrelated. Emitted
-    # only when the data is present, so a bundle with no reviews/events stays
-    # byte-identical (no fabricated nodes/edges).
-    for pr in bundle.get("prs", []):
-        prlocal = "pr-{}".format(pr["number"])
-        prid = qid(prlocal)
-        for rv in pr.get("reviews") or []:
-            rid = rv.get("id")
-            local = "review-{}-{}".format(pr["number"], rid)
-            # Provenance: reviews normally carry an html_url, but synthesize a
-            # stable `<pr url>#pullrequestreview-<id>` ref if one is absent (same
-            # contract as lifecycle events) so check_provenance never fails.
-            data = rv
-            if not rv.get("url"):
-                base = pr.get("url") or prlocal
-                data = {**rv, "url": "{}#pullrequestreview-{}".format(base, rid)}
-            nodes.append((qid(local), project, repo, "social",
-                          rv.get("submitted_at"), data, fetched))
-            edges.append((qid(local), prid, "part_of", None, None))
-        for ev in pr.get("lifecycle") or []:
-            data = _lifecycle_event_data(ev, pr.get("url"), prlocal)
-            local = "event-{}-{}".format(prlocal, ev.get("id"))
-            nodes.append((qid(local), project, repo, "social",
-                          ev.get("created_at"), data, fetched))
-            edges.append((qid(local), prid, "part_of", None, None))
-    for iss in bundle.get("issues", []):
-        isslocal = "issue-{}".format(iss["number"])
-        issid = qid(isslocal)
-        for ev in iss.get("lifecycle") or []:
-            data = _lifecycle_event_data(ev, iss.get("url"), isslocal)
-            local = "event-{}-{}".format(isslocal, ev.get("id"))
-            nodes.append((qid(local), project, repo, "social",
-                          ev.get("created_at"), data, fetched))
-            edges.append((qid(local), issid, "part_of", None, None))
+    # Contribution edges of a commit's author (person -> commit); a PR's and an
+    # issue's contribution edges came with their record_rows above.
+    for c in bundle.get("commits", []):
+        if c.get("author"):
+            edges.append((graphstore.qualify_person(project, c["author"]),
+                          qid(c["sha"]), "authored", None, None))
 
     # owns (person -> area): CODEOWNERS semantics via derive.area_owners — an
     # area is owned by the owners of the LAST rule matching the area directory

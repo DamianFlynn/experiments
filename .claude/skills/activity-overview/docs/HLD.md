@@ -555,8 +555,8 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     per SHA, then a `users.noreply.github.com` email), so a PR author and their commits are
     one person (#78). A commit whose email GitHub links to no account and that has no
     noreply email stays a separate person keyed by its git name and flagged
-    `login_resolved: false` — never merged with a login on a guess. Commits fetched by
-    `spotlight --complete` backfill keep the git name and have no `committed_at`. A PR's
+    `login_resolved: false` — never merged with a login on a guess. `spotlight --complete`
+    backfills PRs and issues only, never commits (#113). A PR's
     author is never one of its reviewers (their review-thread replies are not reviews,
     #110); a store gathered before that keeps them in `reviewers` until re-gathered.
 14. **Spotlight trains are spine groups, not `link` trains.** `spotlight` groups by the

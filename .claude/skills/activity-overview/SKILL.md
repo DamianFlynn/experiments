@@ -253,7 +253,8 @@ relevant slice and narrate it grounded:
 - **Module biography** (how one module evolved across ALL history): `python3 spotlight.py
   module <area> --store <db> --project <name> --json` → narrate per `reference/report-sections.md`.
   An area found in several members (a multi-repo project) is unioned and each row names its
-  `repo`; write `owner/repo::<area>` (or add `--repo owner/repo`) for one member.
+  `repo`; write `owner/repo::<area>` (or add `--repo owner/repo`) for one member. A repo is
+  `owner/repo` (any case) or `repo` alone when unambiguous, on any store.
 - **Blast radius / dependents** of a module: `python3 spotlight.py dependents <owner/repo>
   --store <db> --project <name>` (which members depend on it), or
   `dependents <owner/repo>::<area>` (which module areas, in-repo or in other members,

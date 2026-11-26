@@ -1025,26 +1025,38 @@ class TestWindowedGapWithPhantom(unittest.TestCase):
     def test_person_query_reports_outside_window_and_prunes_phantom(self):
         conn = graphstore.open_store(":memory:")
         graphstore.init_schema(conn)
-        # alice's in-window PR #10 closes out-of-window issue #7 (a real anchor,
-        # provided by the fetcher) AND has a `Fixes #123` phantom (ABSENT).
+        # alice's in-window commit is part_of PR #8, merged BEFORE the window
+        # (a real anchor, provided by the fetcher) whose record closes issue
+        # #5; her in-window PR #10 has a `Fixes #123` phantom (ABSENT). Since
+        # #113 backfill derives a record's edges from the record (the fold's
+        # record_rows), not from edges the seam lists, so the onward pointer
+        # is the fetched PR's own `closes`.
+        commit = graphstore.qualify_id("acme", "widget", "c" * 40)
         pr = graphstore.qualify_id("acme", "widget", "pr-10")
-        issue = graphstore.qualify_id("acme", "widget", "issue-7")
         phantom = graphstore.qualify_id("acme", "widget", "issue-123")
         rfc = graphstore.qualify_id("acme", "widget", "issue-5")
         person = graphstore.qualify_person("acme", "alice")
+        graphstore.upsert_node(conn, commit, "acme", "widget", "code",
+                               "2026-06-10", {"sha": "c" * 40, "author": "alice",
+                                              "message": "fix (#8)"})
         graphstore.upsert_node(conn, pr, "acme", "widget", "social",
-                               "2026-06-10T00:00:00Z", {"number": 10})
+                               "2026-06-12T00:00:00Z", {"number": 10})
         graphstore.upsert_node(conn, person, "acme", "*", "structure", None,
                                {"login": "alice"})
+        graphstore.upsert_edge(conn, person, commit, "authored")
         graphstore.upsert_edge(conn, person, pr, "authored")
-        graphstore.upsert_edge(conn, pr, issue, "closes")
+        graphstore.upsert_edge(conn, commit,
+                               graphstore.qualify_id("acme", "widget", "pr-8"),
+                               "part_of")
         graphstore.upsert_edge(conn, pr, phantom, "closes")
 
         def fetch(kind, local, qid):
-            if local == "issue-7":
-                return {"node": {"number": 7, "closed_at": "2026-01-01T00:00:00Z",
-                                 "state": "closed"},
-                        "edges": [("issue-5", "spun_off")]}
+            if local == "pr-8":
+                return {"node": {"number": 8, "merged": True,
+                                 "merged_at": "2026-01-01T00:00:00Z",
+                                 "state": "closed", "closes": [5],
+                                 "author": "zed"},
+                        "edges": []}
             if local == "issue-123":
                 return gather.ABSENT
             return None
@@ -1053,13 +1065,15 @@ class TestWindowedGapWithPhantom(unittest.TestCase):
         res = spotlight.person_impact(conn, "acme", "alice",
                                       ts_from="2026-06-01", ts_to="2026-06-30",
                                       backfill=backfill)
-        self.assertTrue(res["delivered"])
-        train = res["delivered"][0]
-        self.assertFalse(train["complete"])
-        gap_ids = {g["id"]: g["reason"] for g in train["gaps"]}
+        self.assertEqual(len(res["delivered"]), 2)
+        gap_ids = {g["id"]: g["reason"] for t in res["delivered"]
+                   for g in t["gaps"]}
         self.assertNotIn(phantom, gap_ids)             # phantom pruned, not a gap
         self.assertTrue(graphstore.is_dead_ref(conn, phantom))
         self.assertEqual(gap_ids.get(rfc), "outside_window")  # honest pointer
+        train = [t for t in res["delivered"]
+                 if commit in {r["id"] for r in t["timeline"]}][0]
+        self.assertFalse(train["complete"])
 
 
 class TestMemberDependents(unittest.TestCase):
