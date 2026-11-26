@@ -75,6 +75,8 @@ def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
     Each is the single-repo enriched bundle for that member, produced via
     the unmodified extract -> link.enrich path, so each carries the window
     (`meta.period`, buckets limited to it) and `meta.ref_date` (issue #75).
+    Its records are as of the window's end (`extract(..., as_of_end=True)`,
+    issue #97), like view.py's.
     `ref_date` overrides every member's reference date; None lets extract use
     the value stored for the window, else `ts_to`.
 
@@ -89,10 +91,23 @@ def member_bundles(conn, project, repos, ts_from, ts_to, *, backfill=None,
         bundle = extract_mod.extract(
             conn, project, repo, ts_from, ts_to,
             backfill=backfill, backfill_budget=backfill_budget,
-            warn=warn, ref_date=ref_date)
+            warn=warn, ref_date=ref_date, as_of_end=True)
         bundle = link_mod.enrich(bundle)
         bundle["meta"].update(_member_identity(project, repo))
         out.append({"repo": repo, "bundle": bundle})
+    return out
+
+
+def _projected_ids(project, members):
+    """The qualified ids of the members' PR / issue records projected to
+    the window's end (they carry `extract.AS_OF_KEY`, issue #97)."""
+    out = []
+    for m in members:
+        for kind, key in (("pr", "prs"), ("issue", "issues")):
+            out.extend(graphstore.qualify_id(
+                project, m["repo"], "{}-{}".format(kind, r["number"]))
+                for r in m["bundle"].get(key) or []
+                if extract_mod.AS_OF_KEY in r)
     return out
 
 
@@ -128,7 +143,8 @@ def _member_identity(project, repo):
 TRAIN_EDGE_TYPES = ("closes", "part_of")
 
 
-def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
+def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6,
+                     seeds=()):
     """Connected components of the project-wide spine, seeded by in-window social
     nodes across `repos`, over TRAIN_EDGE_TYPES only. Each returned frozenset of
     qualified node ids is one decision train (possibly spanning members — the
@@ -144,7 +160,12 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
       social anchors reachable from an in-window seed (cross-window train context).
     - Each frozenset holds only PR/issue SOCIAL anchors; commits/areas traversed
       bridge the component but are dropped from the returned set (trains are keyed
-      off social anchors)."""
+      off social anchors).
+
+    `seeds` (issue #97): further PR / issue ids to seed from, after the
+    in-window ones — the members' records projected to the window's end,
+    whose stored timestamp can lie after the window (a PR open at its end
+    and merged since), so range_query does not return them."""
     in_window = graphstore.range_query(conn, project, repos, ts_from, ts_to)
     # Only pr/issue ANCHORS seed components. Phase 10's review/event social leaves
     # are train members reached from their parent anchor, not seeds — seeding from
@@ -152,6 +173,7 @@ def spine_components(conn, project, repos, ts_from, ts_to, max_depth=6):
     # parent is out of window), which build_project_trains can't key off.
     socials = [n["id"] for n in in_window if n["node_class"] == "social"
                and graphstore.parse_id(n["id"])["local"].startswith(("pr-", "issue-"))]
+    socials += sorted(set(seeds) - set(socials))
     seen, comps = set(), []
     for sid in socials:
         if sid in seen:
@@ -558,15 +580,23 @@ def build_project_view(conn, project, repos, ts_from, ts_to, *, backfill=None,
                              warn=warn, ref_date=ref_date)
     comps = link_components(conn, project, members, window_components(
         conn, project, members,
-        spine_components(conn, project, repos, ts_from, ts_to)))
+        spine_components(conn, project, repos, ts_from, ts_to,
+                         seeds=_projected_ids(project, members))))
     trains = build_project_trains(members, comps, project)
     _attach_tickets(members, trains, project, ticket_pattern)
     related = group_related_work(trains)
     people = _merge_people(members)
+    meta = {"project": project, "repos": list(repos),
+            "from": ts_from, "to": ts_to,
+            "schema_version": extract_mod.VIEW_CONTRACT_VERSION}
+    projected = [m["repo"] for m in members
+                 if (m["bundle"].get("meta") or {}).get("records_as_of")]
+    if projected:
+        # issue #97: which members' records were projected to the window's end
+        meta["records_as_of"] = {"instant": extract_mod.as_of_instant(ts_to),
+                                 "members": projected}
     return {
-        "meta": {"project": project, "repos": list(repos),
-                 "from": ts_from, "to": ts_to,
-                 "schema_version": extract_mod.VIEW_CONTRACT_VERSION},
+        "meta": meta,
         "members": members,
         "trains": trains,
         "related_work": related,

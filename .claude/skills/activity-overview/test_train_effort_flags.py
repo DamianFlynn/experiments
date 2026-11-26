@@ -107,6 +107,31 @@ class TestOpenTrainStall(unittest.TestCase):
                 self.assertEqual(eff["idle_days"], 11, name)
                 self.assertFalse(eff["stalled"], name)
 
+    def test_automation_is_not_activity(self):
+        # the live case (#97): a reminder bot commented on every open PR, and its
+        # comment (plus the label it added seconds later) hid months of idleness
+        human = {"author": "alice", "created_at": "2026-04-01T10:00:00Z"}
+        bot = {"author": "reminder[bot]", "created_at": "2026-05-24T03:21:00Z"}
+        eff = _effort("in_flight", [_pr(1, updated="2026-05-24T03:21:12Z",
+                                        comments_list=[human, bot])])
+        self.assertEqual(eff["last_activity_at"], "2026-04-01T10:00:00Z")
+        self.assertTrue(eff["stalled"])
+        # a bot review is not activity either
+        eff = _effort("in_flight", [_pr(1, updated="2026-05-24T03:21:12Z", reviews=[
+            {"author": "policy[bot]", "state": "approved",
+             "submitted_at": "2026-05-24T03:21:00Z"}], comments_list=[human])])
+        self.assertTrue(eff["stalled"])
+        # ... but an update that is NOT the bot's own (a push hours later) counts
+        eff = _effort("in_flight", [_pr(1, updated="2026-05-24T09:00:00Z",
+                                        comments_list=[human, bot])])
+        self.assertEqual(eff["last_activity_at"], "2026-05-24T09:00:00Z")
+        self.assertFalse(eff["stalled"])
+        # and a person's comment after the bot's counts
+        late = {"author": "bob", "created_at": "2026-05-25T00:00:00Z"}
+        eff = _effort("in_flight", [_pr(1, updated="2026-05-25T00:00:00Z",
+                                        comments_list=[human, bot, late])])
+        self.assertFalse(eff["stalled"])
+
     def test_commit_date_used_when_no_committed_at(self):
         eff = _effort("in_flight", [_pr(1, updated="2026-01-01T00:00:00Z")],
                       commits=[{"sha": "d" * 40, "date": "2026-05-30"}])

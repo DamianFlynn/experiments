@@ -128,7 +128,12 @@ class TestReaderBounds(unittest.TestCase):
             with self.subTest(frm=frm):
                 self.assertEqual(self._view(frm, "2026-01-31"), base)
         upper = self._view("2026-01-01", TO_SPELLINGS[0])
-        self.assertEqual(sorted(p["number"] for p in upper["prs"]), [1, 2])
+        # PR 3 (created 01-02, merged 00:30 after the end) was open at the
+        # end: as of it (issue #97) it is in the view, open and unmerged.
+        self.assertEqual(sorted(p["number"] for p in upper["prs"]), [1, 2, 3])
+        pr3 = next(p for p in upper["prs"] if p["number"] == 3)
+        self.assertEqual((pr3["state"], pr3["merged"], pr3["merged_at"]),
+                         ("open", False, None))
         for to in TO_SPELLINGS[1:]:
             with self.subTest(to=to):
                 self.assertEqual(self._view("2026-01-01", to), upper)

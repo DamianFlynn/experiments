@@ -606,6 +606,26 @@ def in_window(ts, from_date, to_date):
     return graphstore.ts_in_window(ts, from_date, to_date)
 
 
+def keep_pr_for_window(pr, from_date, to_date):
+    """True when a window's gather keeps PR `pr` (a normalized record):
+      - merged in the window, or closed unmerged in the window;
+      - open now;
+      - open at the window's END: created on or before `to_date` and merged /
+        closed only after it. A month gathered late needs these: the report
+        view shows each record as of the window's end (extract.record_as_of),
+        and a PR that was in flight then but has landed since would otherwise
+        not be in the store at all (final gate, #97). The closed-PR listing
+        already reaches them (it runs back to `from_date` by update time).
+    Pure."""
+    if pr.get("state") == "open":
+        return True
+    ended = pr.get("merged_at") if pr.get("merged") else pr.get("closed_at")
+    if in_window(ended, from_date, to_date):
+        return True
+    return bool(ended) and not in_window(ended, None, to_date) \
+        and in_window(pr.get("created_at"), None, to_date)
+
+
 def window_records(records, from_date, to_date):
     """Keep only commits/events whose `date` (the UTC day of the commit's
     committer timestamp, #109) falls in [from,to] inclusive. Pure. Used instead
@@ -5443,14 +5463,7 @@ def acquire(args, env):
     prs = []
     for raw in dedupe_raw_prs(raw_closed + raw_open):
         pr = normalize_pr(raw)
-        # Keep: merged-in-window, closed-unmerged-in-window, or any open PR.
-        keep = (
-            (pr["merged"] and in_window(pr["merged_at"], frm, to))
-            or (pr["state"] == "closed" and not pr["merged"]
-                and in_window(pr["closed_at"], frm, to))
-            or pr["state"] == "open"
-        )
-        if not keep:
+        if not keep_pr_for_window(pr, frm, to):
             continue
         enrich_pr(pr, get_page, api, f"{owner}/{repo}")
         prs.append(pr)
