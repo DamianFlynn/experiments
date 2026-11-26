@@ -665,8 +665,14 @@
         }
       ],
       "id": "train-issue-17",
+      "issues": [
+        17
+      ],
       "kind": "feature",
       "outcome": "shipped",
+      "pr_outcomes": {
+        "42": "merged"
+      },
       "prs": [
         42
       ],

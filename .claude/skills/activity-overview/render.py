@@ -460,11 +460,20 @@ def emit_kind_breakdown(bundle, notes=None):
     return "\n".join(lines) + "\n"
 
 
+# The PR outcome (link `train.pr_outcomes`) that decides each train outcome.
+_TRAIN_DECIDING_PR_OUTCOME = {"shipped": "merged", "in_flight": "open",
+                              "rejected": "rejected"}
+
+
 def emit_train_flowchart(bundle, train, notes=None):
     """A Mermaid `flowchart` telling the life story of one train.
 
     Outcome mapping: 'shipped' -> 'Shipped [-> <milestone>]';
     'rejected' -> 'Rejected'; anything else (open, in_flight, ...) -> 'In flight'.
+    Every PR of the train is drawn (issue #93); one whose own outcome
+    (`train.pr_outcomes`) is not the one that decided the train's is labelled
+    `<outcome>: <title>` (e.g. `rejected: ...` in a shipped train) and has no
+    edge to the outcome node.
 
     Adaptive layout:
       mode C (default): PR nodes annotated with distinct code_area nodes when
@@ -509,16 +518,28 @@ def _train_flowchart(bundle, train, scale, notes):
     shown_prs = train_prs[:pr_cap]
     omitted = len(train_prs) - len(shown_prs)
     _note(notes, len(shown_prs), len(train_prs), "PRs")
-    pr_node_ids = []
+    # A train holds every attempt (issue #93). An attempt whose own outcome is
+    # not the one that decided the train's (e.g. a rejected PR in a shipped
+    # train) is labelled with it and draws no edge to the outcome node.
+    pr_outcomes = train.get("pr_outcomes") or {}
+    deciding = _TRAIN_DECIDING_PR_OUTCOME.get(outcome)
+    pr_node_ids = []      # every shown PR node (issue -> PR edges)
+    to_outcome = []       # the PR nodes that lead to the outcome node
     for pr_num in shown_prs:
         pr = prs_by_num.get(pr_num, {})
         pr_title = pr.get("title") or f"PR #{pr_num}"
         pr_id = ids("pr", str(pr_num))
         pr_node_ids.append(pr_id)
+        own = pr_outcomes.get(str(pr_num))
+        if own and deciding and own != deciding:
+            pr_title = f"{own}: {pr_title}"
+        else:
+            to_outcome.append(pr_id)
         lines.append(f'    {pr_id}["{_flow_label(pr_title)}"]')
     if omitted:
         lines.append(_more_node(omitted, "PRs"))
         pr_node_ids.append("more")
+        to_outcome.append("more")
 
     # --- outcome node ---
     if outcome == "shipped":
@@ -550,8 +571,8 @@ def _train_flowchart(bundle, train, scale, notes):
             lines.append(f"    {issue_node_id} --> {pr_id}")
     # If PR-only train and no issue node, PRs are the start nodes (no extra edge needed)
 
-    # --- edges: PRs -> outcome ---
-    for pr_id in pr_node_ids:
+    # --- edges: PRs -> outcome (only the attempts that decided it) ---
+    for pr_id in to_outcome:
         lines.append(f"    {pr_id} --> {outcome_node_id}")
 
     # --- mode C: area annotation nodes and edges ---

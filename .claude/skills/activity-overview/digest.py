@@ -304,9 +304,15 @@ def build_project_trains(members, components, project):
                 repos.append(repo)
             for n in tr["prs"]:
                 prs.append(graphstore.qualify_id(project, repo, "pr-{}".format(n)))
-            if tr.get("root_issue") is not None:
+            # every issue of the member train (issue #93); `root_issue` only
+            # on a train from an older bundle without `issues`.
+            member_issues = tr.get("issues")
+            if member_issues is None:
+                member_issues = ([tr["root_issue"]]
+                                 if tr.get("root_issue") is not None else [])
+            for n in member_issues:
                 issues.append(graphstore.qualify_id(
-                    project, repo, "issue-{}".format(tr["root_issue"])))
+                    project, repo, "issue-{}".format(n)))
             for sha in tr.get("commits", []):
                 commits.append(graphstore.qualify_id(project, repo, sha))
             for ev in tr.get("evidence", []):

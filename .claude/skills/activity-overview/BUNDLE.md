@@ -171,34 +171,53 @@ the rest (engagement, code areas, trains, people/flow).
   Bundles gathered before #78 have no `author_name`/`login_resolved` and keep the git name in
   `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
-  labels, merged, merged_by, merged_at, closed_at, state, base, head, closes:[issue#], url }`.
+  labels, merged, merged_by, merged_at, closed_at, state, base, head, head_repo, closes:[issue#], url }`.
   `base`/`head` are branch refs; a `base` other than `meta.base_branch` marks a stacked/fork PR.
+  **`head_repo`** (#93) is the `owner/repo` the head branch lives in (a fork's name for a fork
+  PR; `null` when GitHub no longer knows it, e.g. a deleted fork, and absent from bundles
+  gathered before #93).
   PRs are de-duplicated by `number` (a PR listed twice across pages keeps its latest snapshot).
   `merged` is `merged_at != null`. GitHub's list-pulls payload omits `merged_by` and the comment
   counts, so `acquire` takes `merged_by` from the actor of the PR's issue-timeline `merged` event
   (`null` for an unmerged PR or a deleted account) — no extra per-PR call.
 - `issues` — issues in scope (PR-closing, plus open and not-planned-closed issues): `{ number, title, body, kind, author,
   author_association, labels, assignees, state, state_reason, closed_at, url }`.
-- `trains` — `[{ id, kind, root_issue, prs:[#], commits:[sha], code_areas:[id], outcome,
-  contributing_prs:[#], significance:float, tier:"deep"|"mention", effort:{opened_at, merged_at,
-  elapsed_days, reviewers, review_comments, commits, participants, stalled}, evidence:[ref] }]`.
-  A train is anchored by its root **issue** (`train-issue-<n>`) or, when no issue is linked
-  (process not followed / a forked PR), by its **PR** (`train-pr-<n>`). One train per anchor, by
-  precedence shipped > in_flight > rejected > abandoned: `"shipped"` (≥1 PR merged to
-  `meta.base_branch`), `"in_flight"` (only OPEN PR(s) targeting it; in progress), `"rejected"`
-  (only CLOSED-unmerged PR(s) targeting it; change dropped), `"abandoned"` (an issue closed
-  `not_planned` with no PR train — an idea that went nowhere). **`contributing_prs`** are
-  PRs merged into another PR's branch (`base == that PR's head`) — stacked/fork contributions to
-  this train's journey-to-main, tracked but not counted as shipped.
-  `kind` derives from the typed root issue; when there is no typed root issue it falls back to
-  the anchor PRs' conventional-commit title prefix (`feat→feature`, `fix→bug`, `docs→docs`), else
+- `trains` — `[{ id, kind, root_issue, issues:[#], prs:[#], pr_outcomes:{"<pr#>": outcome},
+  commits:[sha], code_areas:[id], outcome, contributing_prs:[#], significance:float,
+  tier:"deep"|"mention", effort:{opened_at, merged_at, elapsed_days, reviewers, review_comments,
+  commits, participants, stalled}, evidence:[ref] }]`.
+  **Membership (#93).** Every PR that targets `meta.base_branch` — merged into it, open, or
+  closed unmerged — is in exactly one train, whatever its own outcome. PRs are joined by the
+  issues they **close** (`closes`): a train is a connected group of PRs and the issues they close,
+  so two PRs closing the same issue (a rejected first attempt and the reworked one that shipped)
+  are one train, and every issue a train's PRs close is in its `issues` (sorted) and carries the
+  train id on its bucket ref. A mention or timeline cross-reference (`crossref_issues`) never
+  makes an issue a member or a root: a tracking issue that mentions three PRs leaves them three
+  trains. `pr_outcomes` maps each PR number (a string key) to that PR's own `"merged"`, `"open"`
+  or `"rejected"` (closed unmerged), so the narrative can tell attempts apart.
+  A train is anchored by its lowest closed issue — `root_issue`, id `train-issue-<n>` — or, when
+  its PRs close no issue (process not followed / a forked PR), by its lowest **PR**
+  (`train-pr-<n>`). `outcome`, by precedence shipped > in_flight > rejected > abandoned:
+  `"shipped"` (≥1 PR merged to `meta.base_branch`), `"in_flight"` (else ≥1 OPEN PR targeting it),
+  `"rejected"` (only CLOSED-unmerged PRs; change dropped), `"abandoned"` (an issue closed
+  `not_planned` that no PR closes — an idea that went nowhere; `prs: []`, `issues: [<n>]`).
+  **`contributing_prs`** are PRs merged into another PR's branch (`base` == that PR's `head`, the
+  head living in this repo: matched by `head_repo` + `head`, so a fork's same-named branch is
+  never the parent; with no `head_repo` on record a sole same-named candidate is used, several
+  are ambiguous and the PR is attached to none) — stacked/fork contributions to this train's
+  journey-to-main, tracked but not counted as shipped. A PR that targets another branch and is
+  not merged is in no train.
+  `kind` derives from the first typed issue of the train (lowest number first); when none is
+  typed it falls back to the PRs' conventional-commit title prefix (`feat→feature`, `fix→bug`,
+  `docs→docs`; lowest PR first), else
   `other` — so significance still differentiates work on repos that title PRs but rarely type issues.
   `significance = footprint × kind_weight + breadth` (footprint counts prs + commits + code_areas +
   contributing_prs); `tier` = `"deep"` for the top-N by significance ∪ any train ≥ the significance
   floor, else `"mention"`.
   `effort`: `reviewers` = count of distinct reviewer logins (int); `review_comments` = summed
   `review_comments_count` (int); `participants` = count of distinct authors + reviewers +
-  comment-authors (int);
+  comment-authors (int); all over every PR and issue of the train (`opened_at` = the earliest
+  `created_at` among them);
   `stalled` = merged but `elapsed_days > TRAIN_STALL_DAYS`. All fields degrade to null/0
   when data is thin. Tunables: `TRAIN_KIND_WEIGHTS`, `TRAIN_SIGNIFICANCE_TOP_N`,
   `TRAIN_SIGNIFICANCE_FLOOR`, `TRAIN_STALL_DAYS`.
@@ -258,7 +277,9 @@ docsRefs, release_train, sprints, project, diagrams`.
   `outcome` `in_flight`. A `rejected`, `shipped` or `abandoned` train, or a `train` id that
   names no train in the view, scores nothing. `notes` is non-scoring context (`[]` when
   none): `previous attempt rejected` (train `rejected`) or `linked PR already merged` (train
-  `shipped`). Tunables: `FORECAST_WEIGHTS`,
+  `shipped`; since #93 this includes an open follow-up PR whose train already shipped). An
+  issue that PRs only mention has no train (#93), so neither the train signal nor a note
+  applies to it. Tunables: `FORECAST_WEIGHTS`,
   `FORECAST_TIER_LIKELY_THRESHOLD` (≥5.0 → likely), `FORECAST_TIER_POSSIBLE_THRESHOLD`
   (≥2.0 → possible), `FORECAST_OVERDUE_DAYS`.
 - **series** (only with `link.py BUNDLE --series INDEX`; absent otherwise) —
@@ -531,7 +552,7 @@ review's state to `DISMISSED`.
   ```
   {
     "train":          { id, kind, outcome, significance, tier, effort,
-                        code_areas, evidence },
+                        code_areas, evidence, issues, pr_outcomes },
     "issue":          { number, title, body*, url, labels, kind,
                         comments*:[body*], comments_overflow,
                         lifecycle:[{event, actor, created_at, label}],
@@ -562,6 +583,8 @@ review's state to `DISMISSED`.
   chars kept in one slice never exceed `SLICE_DIFF_CAP` = 6000: walking the deltas in
   order, a diff is kept only if it fits in what is left of the budget, otherwise it is
   omitted (the delta is still listed) and counted in `feature_deltas_diff_overflow`.)
+  `issue` is the train's `root_issue`; the train's other closed issues are listed by number
+  in `train.issues`, and `prs` holds every attempt (its own outcome in `train.pr_outcomes`).
   Raises `KeyError` on unknown id. Does not mutate the bundle. The key lists above are
   checked against `slice_train`'s output by `test_link_small_fixes.py`.
 

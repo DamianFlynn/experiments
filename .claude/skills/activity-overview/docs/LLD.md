@@ -720,22 +720,44 @@ JSON like `digest.py`, and `test_key_order.py` enriches key-reversed bundles to 
 
 ```mermaid
 flowchart TB
-  pr["PR"] --> sb{"base == another PR's head?"}
-  sb -- yes --> cp["contributing_prs on the parent PR's train"]
-  sb -- no --> an{"closes / cross-refs an issue?"}
-  an -- yes --> ti["anchor train-issue-N"]
-  an -- no --> tp["anchor train-pr-N"]
+  pr["PR"] --> tm{"base == base_branch<br/>(or unknown)?"}
+  tm -- yes --> mb["member PR, own outcome in pr_outcomes:<br/>merged / open / rejected"]
+  tm -- no --> sb{"merged into a member PR's head?<br/>(head_repo + head)"}
+  sb -- yes --> cp["contributing_prs on that PR's train"]
+  sb -- no --> nt["no train"]
+  mb --> uf["join member PRs over the issues they CLOSE<br/>(union-find; a mention does not join)"]
+  uf --> an{"group closes an issue?"}
+  an -- yes --> ti["train-issue-N: N = lowest closed issue<br/>issues = every closed issue"]
+  an -- no --> tp["train-pr-N: N = lowest PR"]
   ti --> oc
   tp --> oc
   oc{"outcome precedence"} --> o1["shipped: any PR merged to base_branch"]
-  oc --> o2["in_flight: only open PRs to base_branch"]
+  oc --> o2["in_flight: else any open PR"]
   oc --> o3["rejected: only closed-unmerged PRs"]
-  ni["issue closed not_planned, no PR"] --> o4["abandoned train"]
+  ni["issue closed not_planned,<br/>closed by no member PR"] --> o4["abandoned train"]
 ```
 
-`kind` comes from the root issue's `kind`; when absent/`other`, from the lowest-numbered PR's
-conventional-commit prefix. Each train records `prs`, `commits`, `code_areas`,
-`contributing_prs`, `evidence` refs.
+Membership (#93): every PR targeting the mainline is in exactly one train whatever its own
+outcome, so a rejected first attempt, the PR that shipped and an open follow-up for the same
+issue are one train (`prs`), each with its own outcome in `pr_outcomes` (`{"<pr#>":
+"merged"|"open"|"rejected"}`). Member PRs and the issues they `close` are joined into connected
+groups; each group is one train, every issue it closes is in `issues` and is indexed to it by
+`train_index` (so its bucket ref carries the train id), and `root_issue` is the lowest of them.
+`crossref_issues` (mentions, timeline cross-references, list tails such as the `#2` of
+`Fixes #1, #2`) never join or anchor: they stay spine `cross_ref` edges for `extract`/`digest`
+traversal only. A stacked PR's parent is the member PR whose `head` is the stacked PR's `base`
+**and** whose `head_repo` is the stacked PR's repo (from its url), so a fork's same-named
+`patch-1` is never the parent; a candidate without `head_repo` (pre-#93 stores, deleted forks) is
+used only when it is the sole candidate.
+
+`kind` comes from the first typed issue of the train (lowest number first); when none is
+typed, from the lowest-numbered PR's conventional-commit prefix. Each train records `issues`,
+`prs`, `pr_outcomes`, `commits` (of every member PR), `code_areas`, `contributing_prs`,
+`evidence` refs (every gathered closed issue, then every PR). Effort, participants and
+significance (§6.6) read all of them. `digest.build_project_trains` qualifies every issue of a
+member train (not only its root), and `render.emit_train_flowchart` draws every PR, labelling an
+attempt whose own outcome did not decide the train's (`rejected: …` in a shipped train) and
+leaving it without an edge to the outcome node.
 
 ### 6.5 Buckets — `compute_buckets`
 
@@ -785,7 +807,8 @@ tier         = "deep" if rank ≤ TRAIN_SIGNIFICANCE_TOP_N (8) or significance �
 Kind weights: feature 3.0, module-request 3.0, bug 2.0, idea 1.5, docs/chore/other 1.0.
 Outcome is deliberately ignored (a rejected train's story still matters).
 
-`effort`: `opened_at`, `merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
+`effort`, over every PR and issue of the train (#93): `opened_at` (earliest `created_at`),
+`merged_at`, `elapsed_days`, `reviewers` (distinct), `review_comments`
 (sum), `commits`, `participants` (distinct authors + reviewers + commenters), `stalled`
 (merged and `elapsed_days > TRAIN_STALL_DAYS` = 21). Review rounds and reopen counts are added
 by `annotate_review_rounds` / `annotate_reopen_count`. Review rounds ignore `PENDING` reviews
@@ -806,10 +829,14 @@ For each `next_candidates` ref:
 
 The train is looked up in `bundle["trains"]` by the ref's `train` id. A train that is
 `rejected`, `shipped` or `abandoned` is not work in progress (an open issue whose only PR was
-closed unmerged, or that a merged PR merely cross-references, is not in motion), and neither
-is a `train` id that names no train in the bundle. Signal text: `open PR` for the first two
+closed unmerged is not in motion), and neither is a `train` id that names no train in the
+bundle — nor an issue with no train (since #93 one that a merged PR merely cross-references:
+a mention does not make it a train member). Signal text: `open PR` for the first two
 cases, `work in progress` for an `in_flight` train. `notes` carries non-scoring context: a
 `rejected` train adds `previous attempt rejected`, a `shipped` one `linked PR already merged`.
+Since a train now holds every attempt (#93), an open follow-up PR in a train that already
+shipped carries that train id and so the `linked PR already merged` note (its own `open PR`
+signal is unchanged).
 
 `tier` = likely (≥ 5.0) / possible (≥ 2.0) / longshot. Candidates sorted by `(−score, id)`.
 Output: `{next_milestone, candidates:[{ref, train, score, tier, signals, notes}]}`. Forward-only —
@@ -819,6 +846,8 @@ verification happens in the next installment's series block.
 
 Pure, read-only, raises `KeyError` on an unknown id. Returns `{train, issue, prs, commits,
 feature_deltas, symbol_moves}` plus review rounds, capped reviews/lifecycle and reopen counts.
+`issue` is the root issue; `train.issues` lists every closed issue and `prs` every attempt,
+whose own outcome is in `train.pr_outcomes` (#93).
 Caps: text `SLICE_TEXT_CAP` = 1500 chars (with `…[+N chars]`), `SLICE_COMMENTS_KEPT` = 6 per list
 (overflow counted), per-train diff budget `SLICE_DIFF_CAP` = 6000 chars: walking the train's
 deltas in order, a `diff` is kept only if `used + len(diff) <= SLICE_DIFF_CAP` (#82), so the kept
@@ -1285,6 +1314,10 @@ A window with more than 1,000 workflow runs costs a few extra requests for the d
 | Spotlight CI gate covers four queries | `ci_spotlight_integration.py` runs `person` / `subsystem` / `symbol` / `grep` only | `module` and `dependents` are exercised by the unit suite but not against the live store | add discovered-argument checks for both (a single-repo store has no cross-repo `depends_on`, so `dependents` belongs on the constellation store) |
 | Series compares bucket membership only | `series.compute_series` (#86) matches the prior snapshot against this window's four buckets | an item in flight last time that is still open but neither updated in the window nor on the current milestone (no bucket) leaves `carried_over` silently; a forecast item that shipped or was closed in a month missing from the index is `not_yet`; refreshing an earlier window does not recompute the later bundles' `series` blocks (stderr names them) | report "went quiet" items from the open item records; recompute later installments on request |
 | No series for a project view | `link.py --series` keys installments per bundle and items by `(type, id)` | a multi-repo constellation keeps one series per member bundle (USAGE §5.4) | key items by `repo` + type + id and accept the digest view |
+| Sidebar-linked issues do not anchor a train | since #93 only `closes` (closing keywords in the PR title/body) joins and anchors trains; gather files the timeline `connected` event (a link made in the PR's Development sidebar) under `crossref_issues` with mentions, and the REST payload of that event may not name the issue at all | a PR linked to its issue only through the sidebar forms its own `train-pr-<n>`; the issue's bucket ref carries no train | gather the PR's closing issues (GraphQL `closingIssuesReferences`) into `closes` |
+| Trains join through shared closed issues | member PRs are grouped transitively over the issues they close (#93) | a PR that closes several issues pulls every other PR closing any of them into one train, so an umbrella "closes #1 … #9" PR yields one large train | none needed while closing references are deliberate; split by a cap if it proves noisy |
+| Pre-#93 stores have no `head_repo` | gather stores the PR head repo since #93 | a stacked PR whose base branch name is the head of two or more member PRs (e.g. forks' `patch-1`) is attached to none of them until the window is re-gathered | re-gather the window |
+| Unmerged PRs into other branches have no train | trains hold mainline-targeting PRs; stacked PRs count only once merged (as `contributing_prs`) | an open or closed-unmerged PR into a feature / release branch is in no train and its bucket ref has no train id | attach it to its parent as a pending contribution if needed |
 | Digest view stamps the store version | `digest.py` sets view `meta.schema_version = graphstore.SCHEMA_VERSION` | the digest view reports `2` (store v2, issue #55) while BUNDLE.md views are `1` | stamp the view schema version instead |
 
 The operating guidance in USAGE §2.1 (one single-window store per installment, or one

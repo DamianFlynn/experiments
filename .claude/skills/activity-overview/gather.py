@@ -684,6 +684,11 @@ def normalize_pr(raw):
         # context but not counted as shipped-to-main (see link.build_trains).
         "base": (raw.get("base") or {}).get("ref"),
         "head": (raw.get("head") or {}).get("ref"),
+        # the repo the head branch lives in (a fork's full name for a fork PR;
+        # None when GitHub no longer knows it, e.g. a deleted fork) — a stacked
+        # PR's parent is matched by (head_repo, head), not the bare branch name
+        # (issue #93: two forks' `patch-1` are different branches).
+        "head_repo": (((raw.get("head") or {}).get("repo")) or {}).get("full_name"),
         "comments": raw.get("comments", 0) or 0,
         "review_comments_count": raw.get("review_comments", 0) or 0,
         "reviewers": [],

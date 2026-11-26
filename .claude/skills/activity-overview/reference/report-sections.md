@@ -63,7 +63,11 @@ Two train shapes exist. **Project trains** (`view["trains"]`, multi-repo only) c
 `kind`, `outcome`, qualified `prs`/`issues`/`commits`, `code_areas`, `tickets`, `evidence` —
 no `tier`, `significance`, `effort` or `root_issue`. **Single-repo trains**
 (`bundle["trains"]`, and each member bundle's) carry `significance`, `tier` (`"deep"`/
-`"mention"`), `root_issue`, numeric `prs`, and an `effort` block. A single-repo report has no
+`"mention"`), `root_issue`, numeric `issues` and `prs`, `pr_outcomes`, and an `effort` block.
+A train holds every attempt for its issues: `train.prs` can mix a rejected first try, the PR
+that shipped and an open follow-up — tell them apart by `train.pr_outcomes` (`"merged"` /
+`"open"` / `"rejected"` per PR number) rather than calling every PR of a shipped train shipped.
+`train.issues` lists every issue its PRs close (a merely mentioned issue is not a member). A single-repo report has no
 project trains; a multi-repo report renders each project train and drills into the owning
 member's train (`ptrain-<project>/<repo>#issue-<n>` ↔ member `<repo>`'s `train-issue-<n>`).
 - **DEEP trains** (`train.tier` "deep") get a full sub-section. Embed the train's flowchart from

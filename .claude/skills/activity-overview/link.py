@@ -128,11 +128,16 @@ def select_sprints(sprints, ref_date):
 
 
 def train_index(trains):
-    """Map ('pr'|'issue', number) -> train id, for cross-linking bucket refs."""
+    """Map ('pr'|'issue', number) -> train id, for cross-linking bucket refs.
+    Every issue a train lists in `issues` (issue #93) is indexed; a train
+    without that key (an older bundle) indexes its `root_issue`."""
     idx = {}
     for t in trains:
-        if t.get("root_issue") is not None:
-            idx[("issue", t["root_issue"])] = t["id"]
+        issues = t.get("issues")
+        if issues is None:
+            issues = [t["root_issue"]] if t.get("root_issue") is not None else []
+        for n in issues:
+            idx[("issue", n)] = t["id"]
         for n in t.get("prs", []):
             idx[("pr", n)] = t["id"]
     return idx
@@ -291,29 +296,86 @@ def _mainline_merge(pr, base_branch):
     return bool(pr.get("merged")) and _targets_mainline(pr, base_branch)
 
 
-def _pr_anchor(pr):
-    """A PR's train anchor: its first closing/crossref issue, else the PR itself."""
-    links = list(pr.get("closes") or [])
-    for n in pr.get("crossref_issues") or []:
-        if n not in links:
-            links.append(n)
-    root = links[0] if links else None
-    return ("issue", root) if root is not None else ("pr", pr["number"])
+def _pr_outcome(pr, base_branch):
+    """A mainline-targeting PR's own outcome in its train: "merged" (into the
+    mainline), "open", "rejected" (closed unmerged), or None when the PR does
+    not target the mainline (a stacked / release-branch PR) or its state is
+    unknown. Pure."""
+    if not _targets_mainline(pr, base_branch):
+        return None
+    if pr.get("merged"):
+        return "merged"
+    if pr.get("state") == "open":
+        return "open"
+    if pr.get("state") == "closed":
+        return "rejected"
+    return None
+
+
+# A train's outcome from its PRs' own outcomes, by precedence (issue #93).
+_TRAIN_OUTCOME_BY_PR = (("merged", "shipped"), ("open", "in_flight"),
+                        ("rejected", "rejected"))
+
+
+def _slug_of_url(url):
+    """'owner/repo' (lower-case) of a github.com issue/PR url, else None."""
+    parts = (url or "").split("/")
+    if len(parts) >= 5 and parts[2].lower() == "github.com":
+        return "{}/{}".format(parts[3], parts[4]).lower()
+    return None
+
+
+def _stacked_parent(pr, candidates):
+    """The mainline-targeting PR whose head branch `pr` merged into, or None.
+
+    `candidates` are the member PRs whose `head` equals `pr["base"]`. A PR's
+    base branch lives in the repo it was opened in (read from its url), so the
+    parent is the candidate whose `head_repo` is that repo; a candidate whose
+    head lives in another repo (a fork that happens to use the same branch
+    name, e.g. `patch-1`) is never the parent. A candidate with no
+    `head_repo` (older stores, a deleted fork) is used only when no candidate
+    matches by repo and it is the only one; more than one such candidate is
+    ambiguous and the PR is attached to none (issue #93)."""
+    base_repo = _slug_of_url(pr.get("url"))
+    exact, unknown = [], []
+    for p in candidates:
+        if p["number"] == pr["number"]:
+            continue
+        head_repo = (p.get("head_repo") or "").lower() or None
+        if head_repo is None or base_repo is None:
+            unknown.append(p)
+        elif head_repo == base_repo:
+            exact.append(p)
+    if len(exact) == 1:
+        return exact[0]
+    if not exact and len(unknown) == 1:
+        return unknown[0]
+    return None
 
 
 def build_trains(bundle):
-    """Group PRs (+ their commits + closing issue) into decision trains.
+    """Group PRs (+ their commits + the issues they close) into decision trains.
 
-    A train is anchored deterministically by its root issue (`train-issue-<n>`) or,
-    failing that, its PR (`train-pr-<n>`). One train per anchor, by precedence
-    shipped > in_flight > rejected > abandoned:
-      - `shipped`   — at least one PR merged into the analyzed mainline branch.
-      - `in_flight` — only OPEN PR(s) targeting mainline; the effort is in progress.
-      - `rejected`  — only CLOSED-unmerged PR(s) targeting mainline; the change was dropped.
-      - `abandoned` — an issue closed `not_planned` with no PR train of its own.
-    A PR merged into ANOTHER PR's branch (base == that PR's head) is a stacked/fork
-    contribution: it lands as a `contributing_prs` entry on the parent PR's train —
-    the journey-to-main context — not its own train and not shipped-to-main.
+    Membership (issue #93):
+      - Every PR that targets the analyzed mainline (merged into it, open, or
+        closed unmerged) is a member of exactly one train, whatever its own
+        outcome; that outcome is kept in `pr_outcomes` ("merged" / "open" /
+        "rejected", keyed by the PR number as a string).
+      - PRs are joined by the issues they CLOSE: a train is a connected group
+        of member PRs and the issues they close, so two PRs closing the same
+        issue are one train, and every issue a member PR closes is listed in
+        `issues` (sorted) and indexed to that train. A plain mention / timeline
+        cross-reference (`crossref_issues`) makes an issue neither a member
+        nor a root.
+      - Anchor: the lowest closed issue number (`root_issue`, id
+        `train-issue-<n>`), else the lowest PR number (`train-pr-<n>`).
+    `outcome`, by precedence: `shipped` (any member PR merged into the
+    mainline) > `in_flight` (any open) > `rejected` (only closed-unmerged) >
+    `abandoned` (an issue closed `not_planned` that no member PR closes).
+    A PR merged into ANOTHER PR's branch (its base == that PR's head, in the
+    same repo) is a stacked contribution: a `contributing_prs` entry on the
+    parent PR's train — the journey-to-main context — not a member and not
+    shipped-to-main.
     """
     commits_by_pr = {}
     for c in bundle["commits"]:
@@ -322,37 +384,46 @@ def build_trains(bundle):
     base_branch = bundle.get("meta", {}).get("base_branch")
     prs_all = bundle["prs"]
 
-    def _kind_for(root_issue, prs):
-        kind = "other"
-        if root_issue is not None and root_issue in issues_by_num:
-            kind = issues_by_num[root_issue].get("kind", "other")
-        if kind == "other":
-            # No typed root issue: derive from the PRs' conventional-commit titles
-            # (feat->feature, fix->bug, docs->docs). `prs` sorted, lowest # wins.
-            for p in prs:
-                pk = gather.classify_pr_kind(p)
-                if pk:
-                    kind = pk
-                    break
-        return kind
+    def _kind_for(issue_nums, prs):
+        # The first typed issue (lowest number first), else the PRs'
+        # conventional-commit titles (feat->feature, fix->bug, docs->docs;
+        # lowest # wins), else "other".
+        for n in issue_nums:
+            kind = (issues_by_num.get(n) or {}).get("kind") or "other"
+            if kind != "other":
+                return kind
+        for p in prs:
+            pk = gather.classify_pr_kind(p)
+            if pk:
+                return pk
+        return "other"
 
-    def _make_train(anchor, prs, outcome):
-        akind, key = anchor
+    def _make_train(issue_nums, prs):
         prs = sorted(prs, key=lambda p: p["number"])
+        issue_nums = sorted(set(issue_nums))
         pr_numbers = [p["number"] for p in prs]
-        root_issue = key if akind == "issue" else None
+        pr_outcomes = {str(p["number"]): _pr_outcome(p, base_branch) for p in prs}
+        root_issue = issue_nums[0] if issue_nums else None
         evidence, shas = [], []
-        if root_issue is not None and root_issue in issues_by_num:
-            evidence.append(ref("issue", root_issue, issues_by_num[root_issue]["url"]))
+        for n in issue_nums:
+            if n in issues_by_num:
+                evidence.append(ref("issue", n, issues_by_num[n]["url"]))
         for p in prs:
             shas.extend(commits_by_pr.get(p["number"], []))
             evidence.append(ref("pr", p["number"], p["url"]))
+        outcome = "abandoned"
+        for pr_outcome, train_outcome in _TRAIN_OUTCOME_BY_PR:
+            if pr_outcome in pr_outcomes.values():
+                outcome = train_outcome
+                break
         return {
             "id": f"train-issue-{root_issue}" if root_issue is not None
             else f"train-pr-{pr_numbers[0]}",
-            "kind": _kind_for(root_issue, prs),
+            "kind": _kind_for(issue_nums, prs),
             "root_issue": root_issue,
+            "issues": issue_nums,
             "prs": pr_numbers,
+            "pr_outcomes": pr_outcomes,
             "commits": sorted(shas),
             "code_areas": [],
             "outcome": outcome,
@@ -360,55 +431,62 @@ def build_trains(bundle):
             "evidence": evidence,
         }
 
-    # 1. Partition mainline-targeting PRs by outcome class, grouped by anchor.
-    shipped_groups, inflight_groups, rejected_groups = {}, {}, {}
-    for pr in prs_all:
-        anchor = _pr_anchor(pr)
-        if _mainline_merge(pr, base_branch):
-            shipped_groups.setdefault(anchor, []).append(pr)
-        elif not _targets_mainline(pr, base_branch):
-            continue  # stacked/fork PR — handled as a contribution in step 3
-        elif pr.get("state") == "open" and not pr.get("merged"):
-            inflight_groups.setdefault(anchor, []).append(pr)
-        elif pr.get("state") == "closed" and not pr.get("merged"):
-            rejected_groups.setdefault(anchor, []).append(pr)
+    # 1. Member PRs, joined over the issues they close: union-find over
+    #    ("pr", n) / ("issue", n) nodes. Order-independent: each group is
+    #    sorted when its train is made, and the trains are sorted by id.
+    members = [p for p in prs_all if _pr_outcome(p, base_branch) is not None]
+    parent = {}
 
-    # 2. Materialise trains by precedence — one per anchor:
-    #    shipped > in_flight > rejected > abandoned.
-    train_by_anchor = {}
+    def _find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    def _claim(groups, outcome):
-        for anchor, prs in groups.items():
-            if anchor not in train_by_anchor:
-                train_by_anchor[anchor] = _make_train(anchor, prs, outcome)
+    for pr in members:
+        node = _find(("pr", pr["number"]))
+        for n in pr.get("closes") or []:
+            parent[_find(("issue", n))] = node
+            node = _find(node)
 
-    _claim(shipped_groups, "shipped")
-    _claim(inflight_groups, "in_flight")
-    _claim(rejected_groups, "rejected")
-    # abandoned: issues closed not-planned with no PR-anchored train of their own.
+    groups = {}
+    for pr in members:
+        g = groups.setdefault(_find(("pr", pr["number"])), {"prs": [], "issues": set()})
+        g["prs"].append(pr)
+        g["issues"].update(pr.get("closes") or [])
+
+    trains, train_of_pr, closed_by_member = [], {}, set()
+    for g in groups.values():
+        train = _make_train(g["issues"], g["prs"])
+        trains.append(train)
+        closed_by_member |= g["issues"]
+        for n in train["prs"]:
+            train_of_pr[n] = train
+
+    # 2. abandoned: an issue closed not-planned that no member PR closes.
     for iss in bundle["issues"]:
-        if iss.get("state") == "closed" and iss.get("state_reason") == "not_planned":
-            anchor = ("issue", iss["number"])
-            if anchor not in train_by_anchor:
-                train_by_anchor[anchor] = _make_train(anchor, [], "abandoned")
+        if iss.get("state") == "closed" and iss.get("state_reason") == "not_planned" \
+                and iss["number"] not in closed_by_member:
+            trains.append(_make_train([iss["number"]], []))
 
-    # 3. Attach stacked contributions: a PR merged into a NON-mainline branch that is
-    #    some mainline-targeting PR's head feeds that parent's train (its journey).
-    head_to_parent = {p["head"]: p for p in prs_all
-                      if p.get("head") and _targets_mainline(p, base_branch)}
+    # 3. Attach stacked contributions: a PR merged into a NON-mainline branch
+    #    that is some member PR's head (in the same repo) feeds that PR's train.
+    heads = {}
+    for p in members:
+        if p.get("head"):
+            heads.setdefault(p["head"], []).append(p)
     for pr in prs_all:
         if not (pr.get("merged") and base_branch and pr.get("base")
                 and pr["base"] != base_branch):
             continue  # only stacked (merged into a known non-mainline branch)
-        parent = head_to_parent.get(pr["base"])
-        if parent is None or parent["number"] == pr["number"]:
-            continue
-        train = train_by_anchor.get(_pr_anchor(parent))
+        found = _stacked_parent(pr, heads.get(pr["base"], []))
+        train = train_of_pr.get(found["number"]) if found is not None else None
         if train is not None and pr["number"] not in train["contributing_prs"]:
             train["contributing_prs"].append(pr["number"])
             train["contributing_prs"].sort()
 
-    return sorted(train_by_anchor.values(), key=lambda t: t["id"])
+    return sorted(trains, key=lambda t: t["id"])
 
 
 def compute_buckets(bundle):
@@ -608,17 +686,17 @@ def _effort_for_train(train, pr_index, issue_index):
     pr_nums = train.get("prs", [])
     train_prs = [pr_index[n] for n in pr_nums if n in pr_index]
 
+    # Every issue of the train (issue #93); `root_issue` only on older trains.
+    issue_nums = train.get("issues")
+    if issue_nums is None:
+        root_num = train.get("root_issue")
+        issue_nums = [root_num] if root_num is not None else []
+    train_issues = [issue_index[n] for n in issue_nums if n in issue_index]
+
     # ---- dates --------------------------------------------------------
-    root_num = train.get("root_issue")
-    root_issue = issue_index.get(root_num) if root_num is not None else None
-
-    issue_created = _parse_ts((root_issue or {}).get("created_at"))
-    pr_created_dates = [d for d in
-                        (_parse_ts(p.get("created_at")) for p in train_prs)
-                        if d is not None]
-    earliest_pr = min(pr_created_dates) if pr_created_dates else None
-
-    candidates = [d for d in (issue_created, earliest_pr) if d is not None]
+    candidates = [d for d in
+                  (_parse_ts(x.get("created_at")) for x in train_issues + train_prs)
+                  if d is not None]
     opened_dt = min(candidates) if candidates else None
     opened_at = opened_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if opened_dt else None
 
@@ -656,18 +734,18 @@ def _effort_for_train(train, pr_index, issue_index):
     # PR authors
     for p in train_prs:
         add_login(p.get("author"))
-    # root issue author
-    if root_issue:
-        add_login(root_issue.get("author"))
+    # issue authors
+    for i in train_issues:
+        add_login(i.get("author"))
     # all reviewers
     participants |= all_reviewers
     # PR comment authors
     for p in train_prs:
         for c in p.get("comments_list", []):
             add_login(c.get("author"))
-    # root issue comment authors
-    if root_issue:
-        for c in root_issue.get("comments_list", []):
+    # issue comment authors
+    for i in train_issues:
+        for c in i.get("comments_list", []):
             add_login(c.get("author"))
 
     # ---- stalled ------------------------------------------------------
@@ -793,7 +871,7 @@ def slice_train(bundle, train_id):
 
         {
           "train":   { id, kind, outcome, significance, tier, effort,
-                       code_areas, evidence },
+                       code_areas, evidence, issues, pr_outcomes },
           "issue":   { number, title, body*, url, labels, kind,
                        comments*:[body*], comments_overflow,
                        lifecycle*:[{event, actor, created_at, label}],
@@ -838,6 +916,8 @@ def slice_train(bundle, train_id):
         "effort":       train.get("effort"),
         "code_areas":   train.get("code_areas", []),
         "evidence":     train.get("evidence", []),
+        "issues":       train.get("issues", []),
+        "pr_outcomes":  train.get("pr_outcomes", {}),
     }
 
     # --- resolve issue ------------------------------------------------------

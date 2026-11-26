@@ -165,6 +165,10 @@ flowchart LR
 
 Each train gets an **outcome** (shipped / in_flight / rejected / abandoned), a
 **significance** score and a **tier** (`deep` → full narrative, `mention` → one line).
+A single-repo `link` train holds every attempt — rejected, shipped and still-open PRs — with
+each PR's own outcome, and every issue its PRs close; PRs and issues are joined only by
+`closes`, so a `cross_ref` (a mention) is traversal context, never membership (#93, §10
+item 17).
 
 ### 5.3 Buckets
 
@@ -531,6 +535,14 @@ These are real, current limits — plan around them:
     refreshing an earlier month does not recompute the later months' already-written series
     blocks (`link` names them on stderr). A month recorded after a later one is marked
     `captured: "backfill"`; leave its forecast loop out of hit-rate statistics.
+17. **Trains follow closing references.** A `link` train holds every PR that targets the
+    mainline — shipped, open or rejected — joined with the other PRs that close the same issues,
+    and lists every issue they close (#93). Only a closing keyword (`Fixes #N`, `Closes #N`, …
+    in the PR title or body) joins a PR to an issue: a mention, a timeline cross-reference or a
+    link made only in the PR's Development sidebar does not, so such a PR is its own train
+    (`train-pr-<n>`). A PR closing several issues joins every PR that closes any of them. Stores
+    gathered before #93 have no PR head repo, so a stacked PR whose base branch name is shared
+    by two PRs' heads (forks' `patch-1`) is attached to neither until re-gathered.
 
 Item 8 is what USAGE weighs when choosing between one accumulated store and one store per
 installment. Artifact folding is cumulative: each fold rebuilds the artifacts it touches from

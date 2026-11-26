@@ -47,8 +47,11 @@ PLACEHOLDER RULES — read before filling anything below.
   - `loop` — a `series.forecast_loop.landed` / `not_yet` / `dropped` row `{type, id, tier}`;
     it has no `url` — cite `item.url`.
   - `train` — a single-repo train, bundle["trains"][] (`id`, `kind`, `outcome`,
-    `root_issue`, `prs`, `commits`, `code_areas`, `tier`, `significance`,
-    `effort`, `evidence`). It has no `title` and no `repos`.
+    `root_issue`, `issues`, `prs`, `pr_outcomes`, `commits`, `code_areas`, `tier`,
+    `significance`, `effort`, `evidence`). It has no `title` and no `repos`.
+    `train.prs` holds every attempt (rejected, merged, still open); each PR's own
+    outcome is `train.pr_outcomes["<pr number>"]` ("merged" / "open" / "rejected").
+    `train.issues` is every issue its PRs close; `train.root_issue` is the lowest.
   - `ptrain` — a project train, view["trains"][] (`id`, `repos`, `kind`, `outcome`,
     `prs`, `issues`, `commits`, `code_areas`, `tickets`, `evidence`). It has no
     `tier`, `effort`, `root_issue` or title.
@@ -74,7 +77,8 @@ PLACEHOLDER RULES — read before filling anything below.
 * LOOKUP RULE (`item`): `ref.type` "pr" -> the bundle["prs"] row whose `number`
   equals `ref.id`; `ref.type` "issue" -> the bundle["issues"] row whose `number`
   equals `ref.id`. Numbers that are issue numbers: `flow_entry.number`,
-  `flow_entry.blocked_by`, `blocker.number`, `blocker.blocks`, `train.root_issue`;
+  `flow_entry.blocked_by`, `blocker.number`, `blocker.blocks`, `train.root_issue`,
+  `train.issues`;
   PR numbers: `train.prs`, `delta.pr`. In the project view, look the item up in
   the bundle of the member whose `member.repo` equals `ref.repo`. A project-train
   id is `ptrain-<project>/<repo>#issue-<n>` (or `#pr-<n>`); its qualified

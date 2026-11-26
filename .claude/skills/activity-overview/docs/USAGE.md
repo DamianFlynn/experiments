@@ -295,7 +295,8 @@ Tiers: **likely ≥ 5**, **possible ≥ 2**, **longshot < 2**. Open items that a
 (not on the next milestone, not high-priority) appear under **In flight**, not in the forecast.
 
 "In motion" means live work only. An open issue whose only PR was closed unmerged, or that a
-merged PR merely references, is **not** in motion: its train is `rejected` / `shipped`, and
+merged PR merely references, is **not** in motion: its train is `rejected` / `shipped` (or,
+for a mere reference, it has no train — a mention does not make an issue part of a train), and
 that scores nothing. Each candidate's `notes` says so instead (`previous attempt rejected`,
 `linked PR already merged`) without changing the score, so the report can mention it. Any
 open PR still counts, however old or draft it is.
@@ -669,6 +670,8 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | `validate` ERROR (other drift/conformance) | producer defect | report it; don't publish; never hand-edit the store |
 | `--clone-dir ... is not a git clone` / `... is a clone of a different remote` | `--clone-dir` (or the default `workspace/<repo>-clone`) holds something other than a clone of this repo | point `--clone-dir` elsewhere (gather never deletes it) |
 | Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was made before issue #85 from a store holding several months | re-run `view`/`digest` with the current skill (views are window-scoped); a PR/issue of another month is in the view only as train context (an issue a view PR closes or cross-references) |
+| A PR and the issue it fixes are in different trains (or the issue's bucket ref has no train) | trains are joined by closing references only (#93): the PR mentions the issue, or was linked to it only in the Development sidebar, without `Fixes #N` / `Closes #N` in its title or body | expected; a mention is context, not membership (LLD §14.5) |
+| A train lists a rejected or open PR next to the one that shipped | a train holds every attempt for its issues (#93); each PR's own outcome is in `train.pr_outcomes` | expected; the narrative tells the attempts apart |
 | A past month's view has `meta.state_as_of` and fewer in-flight items than its report had | the store has grown since: records are stored latest-wins, so items closed after that month are not open in it (HLD §10 item 8) | use the view saved at the time; don't rebuild past months' in-flight from a grown store |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
 | A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" (and `edge_set` `authored` edges) with a `hint` naming "pre-#78 identity" | the store was folded before commit authors were resolved to logins (#78); the hint names the commits' current author | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |

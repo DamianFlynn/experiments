@@ -32,7 +32,12 @@ rename in commit c3 (2026-05-18) now lists the add of
 examples/advanced/main.bicep before the remove of examples/basic/main.bicep;
 `feature_deltas` are now in event-time order, then artifact id (they were
 grouped by artifact in insertion order). No other key changed, and the other
-four snapshots did not change. Unlike test_extract, this gate
+four snapshots did not change. Issue #93 (train membership) re-captured
+them once more: every train gained `issues` and `pr_outcomes`, and in
+`char_bundle_p2.json` the open PR #44, which only cross-references issue #18
+(no closing keyword), is now `train-pr-44` instead of `train-issue-18` — its
+bucket / forecast refs name `train-pr-44`, issue #18's refs carry no train
+(scores unchanged); no other key changed. Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is
 canonical JSON: json.dumps(obj, sort_keys=True, indent=2).
