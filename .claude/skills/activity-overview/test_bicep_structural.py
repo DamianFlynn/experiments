@@ -178,6 +178,48 @@ class TestStructuralBicepScan(unittest.TestCase):
         # another deployment using the root's shared module depends on the root area
         self.assertEqual({e["to"] for e in out["infra/sub"]["edges"]}, {"infra"})
 
+    def test_unreadable_own_file_marks_the_area_unread(self):
+        # review finding: a followed file that cannot be read must not let the
+        # scan speak for the area (the replay would retract its stored edges)
+        files = {
+            "infra/main.bicep": (
+                "module res './resources.bicep' = {\n  name: 'r'\n}\n"
+                "module kv 'modules/keyvault/kv.bicep' = {\n  name: 'k'\n}\n"),
+            "infra/modules/keyvault/kv.bicep": "param n string\n",
+        }       # ./resources.bicep is referenced but cannot be read
+        pat = gather.module_area_patterns(gather.bicep_module_dirs(list(files)))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = _scan(files, patterns=pat)
+            cg = gather.apply_structural_scan(
+                {"areas": []}, "/clone", pat, list_files=lambda: list(files),
+                read_text=lambda rel: files[rel] if rel in files
+                else (_ for _ in ()).throw(FileNotFoundError(rel)))
+        self.assertTrue(out["infra"]["unread"])
+        self.assertEqual({e["to"] for e in out["infra"]["edges"]},
+                         {"infra/modules/keyvault"})      # what was read is kept
+        self.assertEqual(cg["structural_scan_unread"], ["infra"])
+        self.assertIn("resources.bicep", err.getvalue())
+
+    def test_build_fails_the_area_when_an_own_file_cannot_be_read(self):
+        # review finding: a partial edge list is never reported as `resolved`
+        with tempfile.TemporaryDirectory() as clone:
+            os.makedirs(os.path.join(clone, "infra"))
+            entry = os.path.join(clone, "infra", "main.bicep")
+            with open(entry, "w") as fh:
+                fh.write("module res './resources.bicep' = {\n  name: 'r'\n}\n")
+
+            def read_text(path):
+                if path.endswith("resources.bicep"):
+                    raise gather.RepoFileRefused(path)
+                with open(path) as fh:
+                    return fh.read()
+            edges, status = gather._extract_area_edges(
+                {"id": "infra", "paths": ["infra/main.bicep"]}, clone, {"infra"},
+                gather.DEFAULT_AREA_PATTERNS, True, False,
+                lambda args, timeout=None: "{}", read_text, None, 0)
+        self.assertEqual((edges, status), (None, "failed"))
+
     def test_deterministic(self):
         rev = dict(reversed(list(BRM_FILES.items())))
         self.assertEqual(json.dumps(_scan(BRM_FILES), sort_keys=True),

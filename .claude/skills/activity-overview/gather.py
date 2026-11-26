@@ -2779,11 +2779,22 @@ def scan_structural_bicep_areas(clone_dir, patterns=None, list_files=None,
         if src is None:
             out[aid] = {"paths": sorted(by_area[aid]), "edges": [], "unread": True}
             continue
+        missed = []
+
+        def read_local(rel, _missed=missed):
+            text = read_text(rel)
+            if text is None:
+                _missed.append(rel)
+            return text
         edges = build_bicep_edges(src, None, entry[aid],
                                   modules, patterns,
                                   module_exists=modules.__contains__,
-                                  read_local=read_text)
+                                  read_local=read_local)
         out[aid] = {"paths": sorted(by_area[aid]), "edges": edges}
+        # a file of the area that could not be read: the edges found are kept,
+        # but the scan does not speak for the area (no retraction, #109)
+        if missed:
+            out[aid]["unread"] = True
     return out
 
 
@@ -3920,11 +3931,12 @@ def _extract_area_edges(area, clone_dir, area_ids, patterns, have_bicep, have_tf
             if kind == "bicep":
                 arm = json.loads(_bicep_build_arm(run, clone_dir, bp, timeout))
                 src = read_text(os.path.join(clone_dir, bp))
+                # A file of the area that cannot be read (refused symlink,
+                # unreadable) fails this attempt: a partial edge list must not
+                # be reported as `resolved`, or the replay would retract the
+                # stored edges of the part that was not read.
                 def read_local(rel):
-                    try:
-                        return read_text(os.path.join(clone_dir, rel))
-                    except OSError:
-                        return None
+                    return read_text(os.path.join(clone_dir, rel))
                 return build_bicep_edges(
                     src, arm, bp, area_ids, patterns,
                     module_exists=_clone_module_exists(clone_dir),
