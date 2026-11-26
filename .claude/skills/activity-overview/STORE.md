@@ -1077,7 +1077,9 @@ artifact's lifecycle events of its window, with status as of the window's end.
 So one store can grow window by window: a view of one gathered window equals the
 view of a store holding only that window (up to PR/issue records a later gather
 refreshed — nodes are upserted latest-wins, and the view then carries
-`meta.state_as_of`), and a view over `[March-start, April-end]` is the union of
+`meta.state_as_of`; since #97 `view.py` / `digest.py` project each refreshed record's
+dated fields back to the window's end, BUNDLE.md "As of the window's end"), and a view
+over `[March-start, April-end]` is the union of
 the two. Not windowed: milestones and sprints (latest fetch); people's stored
 `modules`/`areas` are the union over windows, and a view re-derives them (#88).
 

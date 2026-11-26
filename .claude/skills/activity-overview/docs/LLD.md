@@ -801,15 +801,19 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
 
 ## 6. Read and enrich
 
-### 6.1 `extract.extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None, backfill=None, backfill_budget=50, ref_date=None)`
+### 6.1 `extract.extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None, backfill=None, backfill_budget=50, ref_date=None, as_of_end=False)`
 
 1. `range_query` the window for in-window nodes.
 2. Seed trains from in-window **anchors** (PR/issue; reviews/events never seed), then
    `traverse_spine` to find out-of-window spine nodes (for completion / backfill).
 3. `complete.complete_train` (see 6.2) — with `backfill=None` this is warn-only.
-4. Materialize the raw arrays from the repo's nodes + ledger, **window-scoped** (issue #85;
-   the rule mirrors what `gather` collects for a window, applied to each record's latest
-   stored state; every test is `ts_in_window`):
+4. With `as_of_end` (view.py, digest.py; issue #97) first project every PR / issue record
+   that carries anything later than the window's end to that end (`_socials_as_of` →
+   `record_as_of`, below); validate leaves it False. Then materialize the raw arrays from
+   the repo's nodes + ledger, **window-scoped** (issue #85; the rule mirrors what `gather`
+   collects for a window, applied to each record's state as of the window's end — its
+   latest stored state without `as_of_end` — and, for a projected record, to the node
+   timestamp fold would give it, `_record_ts`; every test is `ts_in_window`):
    - `prs`: merged in the window, closed unmerged in it, or open with `created_at` by its end;
    - `issues`: `closed_at` or `updated_at` in the window, open with `created_at` by its end,
      or the target of a `closes`/`cross_ref` edge from a view PR (**train context** — what
@@ -821,8 +825,11 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
      node (it cannot be placed in a window);
    - `releases`: `published_at` in the window (or undated); `milestones`, `sprints`: not
      windowed (current structure).
+   A record created after the window's end is in no view (#97), not even as train context.
    Re-attach reviews/lifecycle onto the view's parents (a review/event follows its parent,
-   whatever its own timestamp); surface `blocks` as `blocking`/`blocked_by`.
+   whatever its own timestamp; a projected record already holds its leaves up to the end);
+   surface `blocks` as `blocking`/`blocked_by`; `meta.records_as_of` = `{instant, prs,
+   issues}` when any view record was projected.
 5. Read back `artifacts` and `people` (the write path already derived them) and the per-repo
    facts (`code_graph`, `code_owners`, `label_taxonomy`, `workflow_stats`) — `_window_facts`
    (#94): exactly a gathered window → its `facts:` entry; any other window → `workflow_stats`
@@ -856,7 +863,8 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    `null` / `[]` — and, when a merged PR is in the view, a `warn` saying why (windows
    disagree, gather could not determine it, or a pre-#84 store). Never a guessed `main`.
    Issue #85 adds `state_as_of` = the latest `to` of the repo's gathered windows, only when
-   that is after `ts_to` (the view's records are stored latest-wins). Issue #94: `clone_sha`
+   that is after `ts_to` (the view's records are stored latest-wins; with `as_of_end`, #97,
+   only their fields without history are still that gather's). Issue #94: `clone_sha`
    is the one recorded with the window whose structure the view carries (absent when that
    gather had none; the repo's latest on a pre-#94 store), and `facts_windows` =
    `{structure, workflow_stats: [windows summed], workflow_stats_complete,
@@ -877,6 +885,31 @@ The result is **raw** (no trains/buckets); `link.enrich` derives the rest.
 > store a view of exactly its window is unchanged; any other view of it now carries
 > `meta.facts_windows`, and a sub-window view omits `workflow_stats` (the month's runs cannot
 > be split by day). See HLD §10 items 7 and 8.
+
+> **As of the window's end (issue #97).** `record_as_of(kind, record, ts_to)` is pure. The
+> instant is `as_of_instant(ts_to)` (a date's last second UTC; a timestamp itself) and
+> "later" is `not ts_in_window(ts, None, ts_to)`. A record with no timestamp later than it
+> (`created_at`, `closed_at`, `merged_at`, `updated_at`, `comments_list[].created_at`,
+> `review_comments[].created_at`, `reviews[].submitted_at`, `lifecycle[].created_at`) is
+> returned as is — so a view of a window ending after everything stored is byte-identical
+> to before. One created later → `None`. Otherwise a copy: (1) state (`_state_as_of`): a
+> merge at or before the end is final; else `merged` false, `merged_at`/`merged_by` null,
+> and open/closed from the last `closed`/`reopened` lifecycle event at or before the end
+> when the record has any (fallback: `closed_at`); an issue's `state_reason` is kept only
+> when the closing in force is the stored one, else null (named in `not_projected`), or
+> `reopened` / null when open; (2) activity: entries of the four lists dated later are
+> dropped (`reviews`/`lifecycle` omitted when empty), `comments` / `review_comments_count`
+> lose them, `reviewers` / `review_decision` are re-derived with `gather.summarize_reviews`
+> over the remaining reviews (not derivable without submissions → named in
+> `not_projected`), `open_high_activity` re-derived; (3) `updated_at` = the latest
+> remaining timestamp; (4) `_NOT_PROJECTED` fields (title, body, labels/facets, kind,
+> milestone, assignees, base/head, closing / cross references, blocks, reactions, board
+> status, iteration) stay; (5) marker `as_of` = `{instant, fields, not_projected}`. `link`
+> and `derive` need no change: every train, bucket, effort, timeline, people and flow figure
+> is computed from the projected records. `digest.spine_components` is also seeded with the
+> projected records (`seeds`), whose stored node timestamp may lie after the window.
+> `spotlight.py` reads the stored graph and is not projected (BUNDLE.md, "As of the window's
+> end").
 
 ### 6.2 Completion and honest gaps (`complete.py`)
 
@@ -1698,7 +1731,7 @@ page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 
 | Issue | Mechanism | Effect | Candidate fix |
 |---|---|---|---|
-| Past-month views show the latest record state | PR/issue nodes are upserted latest-wins; a view is window-scoped (#85) but reads the stored record | on a store holding later windows, a past month's view shows today's state/labels/milestone/comments (`meta.state_as_of`); an item open at that month's end but closed since is not in it; an item updated in that month and again later is in the later month only | per-window snapshots of the record at fold |
+| Past-month views keep the latest value of what has no history | PR/issue nodes are upserted latest-wins; since #97 a report view projects state, comments, reviews, lifecycle events and `updated_at` back to the window's end from the timestamps in the record (BUNDLE.md, "As of the window's end"), but GitHub keeps no history of the rest | a month gathered or viewed late shows today's title, body, labels (and facets / kind), milestone, assignees, closing / cross references, blockers, reactions and board status / iteration; an issue closed in the window and reopened since is closed with `state_reason: null` (the closing's reason is not recorded), so it is in no shipped/rejected bucket; activity recorded nowhere else (a label change, a push) does not count towards `updated_at`; an item deleted or transferred since is absent; a PR open at the window's end and merged / closed before its gather is not collected by that window's gather (gather keeps PRs merged / closed in the window or open now), so it is in the view only when a later window holding it is folded into the same store; `spotlight.py` reads stored state; `validate --bundle` compares stored records, so its input is a `view.py --as-stored` view | per-window snapshots of the record at fold; keep the closing reason on lifecycle events at gather; gather the PRs updated since the window's start |
 | `enrich` re-matches moves over a view spanning windows | `link.enrich` runs `link_symbol_identity` over the view's `symbol_events`; a view of one gathered window holds only that window's events (fold's own matching set), but a view spanning several windows holds them all | only a multi-window view (e.g. a quarter over monthly folds) can carry a cross-window move the store does not | read the moves from the stored nodes/edges instead |
 | Wide views use one code graph | a view spanning several gathered windows takes its `code_graph` / owners / taxonomy from the latest of them (#94); the directory code graph only holds the areas of files its window changed | in a quarter view, files changed only in an earlier month have no area: their code-area attribution, people `areas` and the dependency diagram miss them (each month's own view is exact) | merge the covered windows' directory graphs (area by id, latest wins); a whole-tree area scan |
 | Sub-window CI statistics are not available | `workflow_stats` are counted per gathered window, not per run day | a view inside a gathered window (a week of a gathered month) or straddling two has no `workflow_stats` (`meta.facts_windows.workflow_stats_excluded` says why); a view over ungathered days sums only what was gathered (`workflow_stats_complete: false`) | store per-day run counts |

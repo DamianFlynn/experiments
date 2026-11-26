@@ -193,8 +193,16 @@ the rest (engagement, code areas, trains, people/flow).
   the gather `--ref-date` stored for exactly this window, else `to`.
   **`state_as_of`** (issue #85, omit-when-absent) is the `to` of the repo's latest gathered
   window, present only when that is after the view's `to`: the view is of an earlier window
-  than the store's latest, and its PR/issue records (state, labels, milestone, `updated_at`,
-  comments) are as the latest gather saw them, not as they were at the view's `to`.
+  than the store's latest. Its meaning is unchanged; since #97 a report view projects
+  its PR/issue records back to its `to` (below), so what is still as the latest gather saw
+  it is only what GitHub keeps no history of (title, body, labels, milestone, assignees,
+  closing references, board status).
+  **`records_as_of`** (issue #97, omit-when-absent) says the view's records were projected
+  to the end of its window: `{"instant", "prs", "issues"}` — the instant (`to`'s last
+  second, UTC, for a date; `to` itself for a timestamp) and how many PR / issue records of
+  the view carry an `as_of` marker. Absent when no record holds anything later than `to`
+  (a current window, or a store gathered at its end), so such a view is unchanged. A
+  `digest.py` project view's `meta.records_as_of` is `{"instant", "members": [repo]}`.
   **`facts_windows`** (issue #94, omit-when-absent) is present only when the store keeps
   per-window facts for the repo and the view is **not** exactly one gathered window. It names
   where the view's `workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` /
@@ -215,7 +223,9 @@ the rest (engagement, code areas, trains, people/flow).
   summed window, or have no per-window facts (folded before #94). A view of exactly a gathered window has no
   `facts_windows`: its facts are that window's.
   **Window scope** (issue #85): a view holds only its window's records — the rule mirrors what
-  gather collects for a window, applied to each record's latest stored state:
+  gather collects for a window, applied to each record's state as of the window's end
+  (#97, see "As of the window's end"; `extract` with `as_of_end` False, as the trust check
+  uses it, applies it to the latest stored state):
   `prs` merged in the window, closed (unmerged) in it, or open and created by its end;
   `issues` closed or updated in it, open and created by its end, or closed / cross-referenced
   by one of the view's PRs (**train context**: an issue from another window can be here; a PR
@@ -332,8 +342,8 @@ the rest (engagement, code areas, trains, people/flow).
     commits, so a push to an open PR's branch counts through the PR's `updated_at`.)
     `idle_days` = calendar days
     from that timestamp's date to the reference date (`meta.ref_date`, else `meta.to`),
-    floored at 0 (activity recorded after the reference date — a view of an earlier window
-    whose records are newer, `meta.state_as_of` — is not idleness); `null` without a
+    floored at 0 (activity recorded after the reference date — a `--ref-date` before the
+    window's end — is not idleness); `null` without a
     timestamp or a reference date. `stalled` = `idle_days > TRAIN_STALL_DAYS`.
     `slow_to_land` is `false`.
   - `shipped` — `slow_to_land` = `elapsed_days > TRAIN_STALL_DAYS` (it took long to land);
@@ -347,6 +357,70 @@ the rest (engagement, code areas, trains, people/flow).
   `TRAIN_STALL_DAYS`.
 - `buckets` — `{ shipped:[ref], in_flight:[ref], rejected:[ref], next_candidates:[ref] }`
   (all four buckets are classified — see below).
+
+### As of the window's end (issue #97)
+
+PR / issue records are stored latest-wins, so a window gathered after it ended — or viewed
+after a later gather — would read each record as the latest gather saw it. A **report view**
+(`view.py`, each `digest.py` member: `extract(..., as_of_end=True)`) instead projects every
+PR / issue record that carries anything later than the window's end back to that end
+(`extract.record_as_of`), **before** the window-scope rule picks the view's records. The
+instant is `to`'s last second (UTC) for a date, `to` itself for a timestamp; "later" is the
+window predicate's own rule.
+
+- **Existence.** A record created after the instant is in no view of that window, not even
+  as train context.
+- **State.** A PR merged at or before the instant keeps its state (a merge is final). A PR
+  merged after it is not merged (`merged: false`, `merged_at` / `merged_by` null). Open or
+  closed then comes from the record's `closed` / `reopened` `lifecycle` events when it has
+  any: the last one at or before the instant decides (closed and reopened before it: open;
+  closed → reopened → closed with the last close after it: open; closed before it and
+  reopened after: closed, `closed_at` = that close). Without such events, `closed_at`
+  decides: at or before the instant closed, after it (or never) open. An issue keeps its
+  `state_reason` when its closing at the instant is the stored one; an earlier closing
+  that was later undone has no recorded reason (`state_reason: null`, listed in
+  `not_projected`, so such an issue is in no shipped / rejected bucket); an issue open at
+  the instant has `reopened` when a recorded reopening precedes it, else `null`.
+- **Activity.** `comments_list`, `review_comments`, `reviews` and `lifecycle` entries dated
+  after the instant are dropped (`reviews` / `lifecycle` are left out when none remain);
+  `comments` and `review_comments_count` lose the dropped ones; `reviewers` and
+  `review_decision` are re-derived from the remaining reviews by gather's own rule (a PR
+  whose record has `reviewers` but no review submissions keeps them, listed in
+  `not_projected`); an issue's `open_high_activity` is re-derived (its `reactions` are as
+  stored). `review_rounds` / `reopen_count` are derived by `link` from what remains.
+- **`updated_at`** becomes the latest timestamp left at or before the instant (created /
+  closed / merged time, comments, review comments, reviews, lifecycle events): the item's
+  last recorded activity then, so the bucket rule (`in_flight` = open and updated in the
+  window) and the train idle / stall rule work unchanged. Activity GitHub records nowhere
+  else (a label change, a push) is not counted.
+- **Not projected** (GitHub keeps no history of them; as stored): `title`, `body`,
+  `labels` / `facets`, `kind` / `issue_type`, `milestone`, `assignees`, `base` / `head`,
+  `closes` / `closing_issues` / `crossref_issues` / `timeline_xrefs` / `external_refs`,
+  `blocks` (and the resolved `blocking` / `blocked_by`), `reactions`, `board_status` /
+  `iteration`. An item open at the window's end but deleted or transferred since is not in
+  the store, so not in the view.
+- **Marker.** Each projected record carries **`as_of`**: `{"instant", "fields": [the keys
+  that changed, sorted], "not_projected": [sorted: the stored fields of the list above that
+  the record has, plus `state_reason` / `reviewers` / `review_decision` when they could not
+  be projected]}`;
+  the view's `meta.records_as_of` counts them. A record with nothing later than the instant
+  is exactly as stored and has no `as_of`; a view with none has no `meta.records_as_of`.
+
+Every consumer reads the projected records: `link` (trains and their outcomes, buckets,
+effort — `stalled`, `idle_days`, `last_activity_at`, `slow_to_land`, reviewer / participant
+counts —, timeline, forecast, review rounds), `derive` (people profiles and halls, flow,
+blockers), the view's `people` (who contributed by the instant) and `digest.py`'s project
+trains, shipped list and people. Commits, code / symbol events, artifacts, releases and the
+per-window facts are dated facts already windowed and are not touched. The trust check
+(`validate.py`) self-sources its bundle with `as_of_end` False: it re-derives edges and
+people from the **full** stored records (a PR merged after some window's end has its
+`merged` edge). `spotlight.py` reads the stored graph directly and is not projected: its
+train outcomes and contribution counts are as stored, also with `--from` / `--to`.
+`view.py --as-stored` writes the records as stored (the form `validate.py --bundle` compares
+with the store). A gather of a past window collects the PRs merged / closed in it and those
+open at gather time: a PR open at the window's end and merged / closed before the gather is
+in its view only when the store also holds the later window that collected it.
+`meta.schema_version` is unchanged (3): `as_of` and `records_as_of` are additive keys.
 
 ## Optional (omit-when-empty) keys
 

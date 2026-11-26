@@ -488,16 +488,31 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
    busy repos (e.g. BRM) a gather is API-heavy. On a rate limit, gather waits for the reset
    (announced on stderr, at most `ACTIVITY_RATE_LIMIT_MAX_WAIT`, default one hour) and
    continues; any other 403 (SSO, scope) still fails fast with GitHub's headers.
-6. **No historical in-flight state.** `gather` reads open PRs/issues, milestones, board
-   status and the checkout as they are *now*; re-gathering a past month reproduces its
-   delivery history, not what was open or forecastable at the time.
-7. **A store holding several windows shows past months with today's record state.** Views
-   are window-scoped (#75, #85; BUNDLE.md "Window scope"), but PR/issue records are stored
-   latest-wins, so a past month's view shows each PR/issue as the latest gather saw it
-   (state, labels, milestone, `updated_at`, comments; `meta.state_as_of` says from when).
-   An item that was open at the end of that month but has closed since is not in its view;
-   an item updated in that month and again later is in the later month's view only; its
-   in-flight, next-candidate and forecast sets reflect today's open items.
+6. **Historical in-flight state comes from the records' own timestamps.** `gather` reads
+   PRs/issues, milestones, board status and the checkout as they are *now*. Since #97 a
+   report view winds each PR/issue back to the window's end from the timestamps the record
+   holds (item 7), so a past month gathered late shows what was open, merged and closed at
+   its end; milestones (and so next-candidates and the forecast's milestone frame) and
+   board status are still today's.
+7. **A past month is shown as of its end, except what GitHub keeps no history of.** Views
+   are window-scoped (#75, #85; BUNDLE.md "Window scope") and PR/issue records are stored
+   latest-wins. Since #97 a report view (`view.py`, `digest.py`) projects each record that
+   carries anything later than the window's end back to that end before picking the
+   window's records (BUNDLE.md "As of the window's end"): open / closed / merged state,
+   comments, review comments, reviews, reviewers, lifecycle events and `updated_at` are as
+   they were then, so an item open at the month's end but merged or closed since is in
+   flight in that month, a train's outcome, idle days and stall flag are as of the end,
+   and people and halls count only what was done by then. Each projected record carries
+   `as_of` and the view `meta.records_as_of`; `meta.state_as_of` still names a later
+   gather. Still today's: title, body, labels (and the kind / facets read from them),
+   milestone, assignees, closing / cross references, blockers, reactions and board status.
+   An issue closed in the month and reopened since is closed with no `state_reason` (the
+   closing's reason is not recorded); activity GitHub records nowhere in the record (a
+   label change, a push to the PR branch) does not move `updated_at`; an item open then but
+   deleted or transferred since is absent. A past month's own gather collects PRs merged or
+   closed in it and those open now, so a PR open at its end that landed before the gather
+   is there only when the later month was folded into the same store. `spotlight.py` and
+   the trust check read the stored records unprojected.
 8. **Per-repo facts are per gathered window, not per day.** Each fold records its window's
    `workflow_stats`, `code_graph`, `code_owners`, `label_taxonomy` and clone sha (#94), and a
    view of exactly a gathered window shows that window's. Other views are assembled from
@@ -583,7 +598,8 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     every view; the store's own schema version stays in the store), and the digest's
     `module_edges` keep `ref` / `address` / `via`. The report template and the sample
     builder state `meta.facts_windows` (a wider view's CI total may be partial) and
-    `meta.state_as_of` (a past month viewed from a later gather). A view of exactly
+    `meta.state_as_of` (a past month viewed from a later gather); `meta.records_as_of`
+    (#97) says its records were projected to the window's end. A view of exactly
     one gathered window also says which tree its structure was read at
     (`meta.structure_as_of`: `window_end` or `head`). Not carried:
     `meta.closing_refs_source` is in gather's bundle only, and a view narrower than a gathered
@@ -596,9 +612,10 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     PRs / issues / commits shows activity (updates, comments, reviews, timeline events,
     commits) for more than 21 days at the reference date (#112). The bundle holds mainline
     commits only, so a push to an open PR's branch counts only through the PR's `updated_at`
-    (which GitHub moves on a push); discussion elsewhere does not count; and on a view of an
-    earlier window (`meta.state_as_of`) the
-    records are newer than the window, so a train idle then but active since is not stalled.
+    (which GitHub moves on a push); discussion elsewhere does not count. On a view of an
+    earlier window the records are projected to its end (#97, item 7), so a train idle then
+    but active since is stalled in that view; a push to the PR branch is not dated in the
+    record, so it counts only while `updated_at` is not projected.
     A shipped train is never stalled; one that took long to land is `slow_to_land`.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store

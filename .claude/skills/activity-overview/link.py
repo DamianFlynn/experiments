@@ -818,7 +818,9 @@ def _effort_for_train(train, pr_index, issue_index, ref_date=None,
             last_activity_at = last_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             if ref_dt is not None:
                 # calendar days; activity recorded after the reference date (a
-                # view of an earlier window, `meta.state_as_of`) means not idle.
+                # `--ref-date` before the window's end) means not idle. A report
+                # view's records are as of the window's end (extract.record_as_of,
+                # issue #97), so later activity is not in them.
                 idle_days = max(0, (ref_dt.date() - last_dt.date()).days)
     stalled = idle_days is not None and idle_days > TRAIN_STALL_DAYS
 

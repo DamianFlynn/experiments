@@ -25,7 +25,9 @@ Materialization approach (slice 7a part 1)
 3. Materialize the raw arrays from the node `data` blobs of the records that
    belong to THIS window (issue #85 — a store holding several windows must not
    leak the others into the view). The rule mirrors what gather collects for a
-   window, applied to each record's latest stored state:
+   window, applied to each record's latest stored state — or, for a report view
+   (`as_of_end`, issue #97; view.py and digest.py), to the record as it was at
+   the window's end (`record_as_of`; a record created after it is in no view):
    - a PR merged in the window, closed (unmerged) in the window, or open and
      created by the window's end;
    - an issue closed or updated in the window, open and created by the
@@ -57,7 +59,9 @@ Materialization approach (slice 7a part 1)
    override, else the value fold stored for exactly this gathered window
    (gather `--ref-date`, default its `to`), else this view's `to`; and, when
    the repo has a gathered window ending after this view (issue #85),
-   `state_as_of` = that latest `to` (records are stored latest-wins).
+   `state_as_of` = that latest `to` (records are stored latest-wins); and, when
+   a report view projected any record to the window's end (issue #97),
+   `records_as_of` = {instant, prs, issues}.
 6. `artifacts`: the stored artifact nodes with each lifecycle limited to the
    view's events (an artifact with none is left out) and status /
    replaced_by / move fields as of the window's end; `people`: the stored
@@ -179,7 +183,7 @@ def _train_anchor(node):
 
 
 def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
-            backfill=None, backfill_budget=50, ref_date=None):
+            backfill=None, backfill_budget=50, ref_date=None, as_of_end=False):
     """Materialize a rev-13 RAW bundle view for project/repo over [ts_from, ts_to].
 
     Returns a bundle dict carrying ONLY raw keys; run `link.enrich` on it to add
@@ -200,6 +204,14 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
 
     `ref_date` (optional) overrides the reference date stamped into
     `meta.ref_date` (view.py / digest.py `--ref-date`); see `_materialize_meta`.
+
+    `as_of_end` (issue #97): project every PR / issue record to the end of
+    the window (`record_as_of`) before the window rule picks the view's
+    records, so a past window reads as it was then and not as the latest
+    gather saw it. The report readers (view.py, digest.py) pass True. The
+    default False gives every record as stored: the trust check (validate)
+    self-sources its bundle this way, because it re-derives edges and people
+    from the FULL stored records.
     """
     if warn is None:
         warn = lambda msg: sys.stderr.write(msg + "\n")  # noqa: E731
@@ -271,12 +283,20 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     socials = graphstore.repo_nodes(conn, project, repo, node_class="social")
     codes = graphstore.repo_nodes(conn, project, repo, node_class="code")
     commit_nodes = [n for n in codes if _is_commit_node(n)]
+    leaves = _social_leaves(socials)
+    # Issue #97: the records as of the window's end ({node id: projected
+    # record, or None for one created after it}; only the records that
+    # change). None when not asked for: every record as stored.
+    as_of = _socials_as_of(socials, leaves, ts_to) if as_of_end else None
     view_socials = _view_socials(conn, project, repo, socials, in_window_ids,
-                                 ts_from, ts_to)
+                                 ts_from, ts_to, as_of=as_of)
     view_commits = [n for n in commit_nodes
                     if not n["ts"] or n["id"] in in_window_ids]
+
+    def record(n):
+        return as_of[n["id"]] if as_of and n["id"] in as_of else n["data"]
     bundle["prs"] = _by(
-        [n["data"] for n in view_socials if _local(n["id"]).startswith("pr-")],
+        [record(n) for n in view_socials if _local(n["id"]).startswith("pr-")],
         key=lambda d: d.get("number"))
     # Unknown mainline (issue #84): link then counts EVERY merged PR as merged
     # into it (the pre-#84 behaviour). Say so whenever that decides anything.
@@ -286,7 +306,7 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
              "release-branch merges are not told apart)".format(
                  project, repo, ts_from, ts_to, branch_problems[0]))
     bundle["issues"] = _by(
-        [n["data"] for n in view_socials
+        [record(n) for n in view_socials
          if _local(n["id"]).startswith("issue-")],
         key=lambda d: d.get("number"))
 
@@ -296,8 +316,16 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # link.enrich (with forecast/modules), not here, so extract stays raw-only.
     # Done ONLY when such nodes exist so PRs/issues with none stay byte-identical.
     # A review/event follows its parent: it is attached only to a pr/issue in
-    # this view (orphans are skipped), whatever its own timestamp.
-    _attach_reviews_and_lifecycle(socials, bundle["prs"], bundle["issues"])
+    # this view (orphans are skipped), whatever its own timestamp. A record
+    # projected to the window's end (#97) already carries its leaves up to
+    # that end, so it is left as it is.
+    _attach_reviews_and_lifecycle(socials, bundle["prs"], bundle["issues"],
+                                  leaves=leaves)
+    projected = {kind: sum(1 for r in bundle[kind] if AS_OF_KEY in r)
+                 for kind in ("prs", "issues")}
+    if any(projected.values()):
+        bundle["meta"]["records_as_of"] = dict(
+            projected, instant=as_of_instant(ts_to))
 
     # Phase 11 slice 1: surface the store's `blocks` issue->issue edges as resolved
     # numbers (issue["blocking"] / issue["blocked_by"]) for the report + blocker_graph.
@@ -394,7 +422,7 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     return bundle
 
 
-def _attach_reviews_and_lifecycle(socials, prs, issues):
+def _attach_reviews_and_lifecycle(socials, prs, issues, leaves=None):
     """Re-attach `review`/`event` social nodes onto their parent pr/issue records.
 
     The inverse of `gather.fold_bundle`'s first-class node emission: a review
@@ -404,9 +432,27 @@ def _attach_reviews_and_lifecycle(socials, prs, issues):
     (submitted_at / created_at) then id, so a re-extract is byte-stable. Mutates
     the pr/issue dicts in place; only sets a key when >=1 child node exists (so
     records with none stay byte-identical). The node data blobs already carry the
-    exact normalized shape fold persisted, so they round-trip as-is."""
-    pr_by_num = {p.get("number"): p for p in prs}
-    issue_by_num = {i.get("number"): i for i in issues}
+    exact normalized shape fold persisted, so they round-trip as-is. `leaves`
+    is `_social_leaves(socials)` when the caller has it. A record projected to
+    the window's end (it carries `AS_OF_KEY`, issue #97) is skipped: it holds
+    its leaves up to that end already."""
+    reviews_by_pr, lifecycle_by_parent = leaves or _social_leaves(socials)
+    pr_by_num = {p.get("number"): p for p in prs if AS_OF_KEY not in p}
+    issue_by_num = {i.get("number"): i for i in issues if AS_OF_KEY not in i}
+    for prnum, revs in reviews_by_pr.items():
+        pr = pr_by_num.get(prnum)
+        if pr is not None:
+            pr["reviews"] = revs
+    for (kind, num), evs in lifecycle_by_parent.items():
+        parent = (pr_by_num if kind == "pr" else issue_by_num).get(num)
+        if parent is not None:
+            parent["lifecycle"] = evs
+
+
+def _social_leaves(socials):
+    """The stored review / lifecycle-event leaves by parent: ({pr number:
+    [review data]}, {("pr"|"issue", number): [event data]}), each list
+    ordered by its timestamp (submitted_at / created_at) then id."""
     reviews_by_pr = {}        # pr number -> [review data]
     lifecycle_by_parent = {}  # ("pr"|"issue", number) -> [event data]
     for n in socials:
@@ -432,14 +478,10 @@ def _attach_reviews_and_lifecycle(socials, prs, issues):
     def _sorted(items, ts_key):
         return sorted(items, key=lambda d: (d.get(ts_key) or "", d.get("id") or 0))
 
-    for prnum, revs in reviews_by_pr.items():
-        pr = pr_by_num.get(prnum)
-        if pr is not None:
-            pr["reviews"] = _sorted(revs, "submitted_at")
-    for (kind, num), evs in lifecycle_by_parent.items():
-        parent = (pr_by_num if kind == "pr" else issue_by_num).get(num)
-        if parent is not None:
-            parent["lifecycle"] = _sorted(evs, "created_at")
+    return ({num: _sorted(revs, "submitted_at")
+             for num, revs in reviews_by_pr.items()},
+            {key: _sorted(evs, "created_at")
+             for key, evs in lifecycle_by_parent.items()})
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +523,8 @@ def _issue_in_window(data, ts_from, ts_to):
             or _open_by(data, ts_to))
 
 
-def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to):
+def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to,
+                  as_of=None):
     """The pr/issue social nodes of one window's view, in `socials` order.
 
     A node is in the view when it is undated (it cannot be placed in any
@@ -493,12 +536,33 @@ def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to):
     as context: link counts every PR in the arrays (trains, people, timeline),
     so a PR from another window would be counted as this window's activity.
     Review and lifecycle-event nodes are not returned; they follow their
-    parent (see `_attach_reviews_and_lifecycle`)."""
+    parent (see `_attach_reviews_and_lifecycle`).
+
+    `as_of` (issue #97, `_socials_as_of`): the records projected to the
+    window's end. The rule then reads a projected record, and the timestamp
+    fold would give it (`_record_ts`), instead of the stored one; a record
+    created after the window's end (None) is in no view, not even as context.
+    A record `as_of` does not name is read as stored."""
+    as_of = as_of or {}
+
+    def data(n):
+        return as_of[n["id"]] if n["id"] in as_of else n["data"]
+
+    def gone(n):
+        return n["id"] in as_of and as_of[n["id"]] is None
+
     def dated_in(n):
-        return not n["ts"] or n["id"] in in_window_ids
+        if not n["ts"]:
+            return True
+        if n["id"] in as_of:
+            kind = "pr" if _local(n["id"]).startswith("pr-") else "issue"
+            return graphstore.ts_in_window(_record_ts(kind, data(n)), ts_from,
+                                           ts_to)
+        return n["id"] in in_window_ids
 
     prs = {n["id"] for n in socials if _local(n["id"]).startswith("pr-")
-           and (dated_in(n) or _pr_in_window(n["data"], ts_from, ts_to))}
+           and not gone(n)
+           and (dated_in(n) or _pr_in_window(data(n), ts_from, ts_to))}
     issue_prefix = graphstore.qualify_id(project, repo, "issue-")
     context = set()
     for edge_type in ("closes", "cross_ref"):
@@ -511,10 +575,272 @@ def _view_socials(conn, project, repo, socials, in_window_ids, ts_from, ts_to):
         if local.startswith("pr-"):
             if n["id"] in prs:
                 out.append(n)
-        elif local.startswith("issue-"):
+        elif local.startswith("issue-") and not gone(n):
             if (n["id"] in context or dated_in(n)
-                    or _issue_in_window(n["data"], ts_from, ts_to)):
+                    or _issue_in_window(data(n), ts_from, ts_to)):
                 out.append(n)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# As of the window's end (issue #97).
+#
+# PR / issue records are stored latest-wins: a month gathered (or viewed)
+# after it ended reads each record as the latest gather saw it — merged,
+# closed, commented on since. Every timestamp needed to wind a record back is
+# in the record: its created / closed / merged times, its comments, review
+# comments, reviews and lifecycle (closed / reopened) events. A report view
+# (`extract(..., as_of_end=True)`) projects each record carrying anything
+# later than the window's end back to that end (`record_as_of`), before the
+# window rule picks the view's records, so state, buckets, trains, effort,
+# people and the timeline all read the window as it was. What GitHub keeps
+# no history of stays as stored (`_NOT_PROJECTED`), and the record says so.
+# ---------------------------------------------------------------------------
+
+# The marker a projected record carries: {"instant", "fields",
+# "not_projected"} (BUNDLE.md, "As of the window's end").
+AS_OF_KEY = "as_of"
+
+# (list key, timestamp key) of the dated activity a record holds.
+_ACTIVITY_LISTS = (("comments_list", "created_at"),
+                   ("review_comments", "created_at"),
+                   ("reviews", "submitted_at"),
+                   ("lifecycle", "created_at"))
+
+# Leaves stored as their own nodes: omitted when empty (gather / extract
+# set them only when non-empty).
+_OMIT_WHEN_EMPTY = ("reviews", "lifecycle")
+
+# Fields GitHub gives no history for: kept as stored on a projected record
+# and named in its marker's `not_projected` when the record has them.
+_NOT_PROJECTED = {
+    "pr": ("title", "body", "labels", "facets", "milestone", "assignees",
+           "base", "head", "closes", "closing_issues", "crossref_issues",
+           "timeline_xrefs", "external_refs", "board_status", "iteration"),
+    "issue": ("title", "body", "labels", "facets", "kind", "issue_type",
+              "milestone", "assignees", "reactions", "blocks",
+              "board_status", "iteration"),
+}
+
+_MISSING = object()
+
+
+def as_of_instant(ts_to):
+    """The instant a view of a window ending `ts_to` is projected to: the
+    last second of that day (UTC) for a date, the timestamp itself else."""
+    if not ts_to:
+        return None
+    ts_to = str(ts_to)
+    if len(ts_to) == 10:
+        return ts_to + "T23:59:59Z"
+    return ts_to
+
+
+def _after(ts, ts_to):
+    """Is timestamp `ts` later than the end of a window ending `ts_to`? The
+    window predicate's own rule (a date covers its whole day); False for a
+    missing or non-text value (it cannot be placed)."""
+    return isinstance(ts, str) and bool(ts) and \
+        not graphstore.ts_in_window(ts, None, ts_to)
+
+
+def _ts_key(ts):
+    return ts[:19]
+
+
+def _record_times(rec):
+    """Every timestamp a PR / issue record carries (some may be None)."""
+    for key in ("created_at", "closed_at", "merged_at", "updated_at"):
+        yield rec.get(key)
+    for lst, tkey in _ACTIVITY_LISTS:
+        rows = rec.get(lst)
+        for row in rows if isinstance(rows, list) else ():
+            if isinstance(row, dict):
+                yield row.get(tkey)
+
+
+def _record_ts(kind, rec):
+    """The node timestamp fold gives a record (gather.record_rows): a PR's
+    merged_at, else closed_at, else created_at; an issue's closed_at, else
+    updated_at."""
+    if kind == "pr":
+        return rec.get("merged_at") or rec.get("closed_at") \
+            or rec.get("created_at")
+    return rec.get("closed_at") or rec.get("updated_at")
+
+
+def _state_as_of(kind, rec, out, ts_to, not_projected):
+    """Set `out`'s open / closed / merged state as of the end of a window
+    ending `ts_to`, from `rec` (the stored record, leaves attached).
+
+    A merge at or before the end is final: the record keeps its state. A PR
+    merged after it is not merged (`merged_at` / `merged_by` cleared). Then
+    open or closed: from the record's `closed` / `reopened` lifecycle events
+    when it has any — the last one at or before the end decides (closed
+    then reopened before the end: open; closed → reopened → closed with the
+    last close after the end: open; closed before the end and reopened after
+    it: closed at that close) — else from `closed_at` (closed at or before
+    the end: closed; after it, or open now: open). An issue's `state_reason`
+    is kept when its closing as of the end is the stored one; an earlier
+    closing's reason is not recorded (null, named in `not_projected`); an
+    issue open as of the end has `reopened` when a reopening before the end
+    is recorded, else null (an open record keeps its own reason when it has
+    no lifecycle to say otherwise)."""
+    if kind == "pr" and rec.get("merged_at") and not _after(rec.get("merged_at"),
+                                                           ts_to):
+        return
+    if kind == "pr" and (rec.get("merged") or rec.get("merged_at")):
+        out["merged"] = False
+        out["merged_at"] = None
+        out["merged_by"] = None
+    lifecycle = rec.get("lifecycle")
+    marks = [e for e in (lifecycle if isinstance(lifecycle, list) else ())
+             if isinstance(e, dict) and e.get("event") in ("closed", "reopened")
+             and isinstance(e.get("created_at"), str)]
+    marks.sort(key=lambda e: (_ts_key(e["created_at"]), str(e.get("id"))))
+    kept = [e for e in marks if not _after(e["created_at"], ts_to)]
+    stored_closed = rec.get("state") == "closed"
+    closed_at = rec.get("closed_at")
+    # The stored closing is the one in force at the end: closed at or before
+    # it, and no close / reopen recorded after it.
+    same_closing = stored_closed and (not closed_at or not _after(closed_at,
+                                                                 ts_to)) \
+        and len(kept) == len(marks)
+    if same_closing:
+        closed, closed_at = True, closed_at
+    elif marks:
+        last = kept[-1] if kept else None
+        closed = last is not None and last["event"] == "closed"
+        closed_at = last["created_at"] if closed else None
+    else:
+        closed, closed_at = False, None
+    out["state"] = "closed" if closed else "open"
+    out["closed_at"] = closed_at
+    if kind != "issue":
+        return
+    if closed and not same_closing:
+        out["state_reason"] = None
+        not_projected.add("state_reason")
+    elif not closed:
+        if marks:
+            out["state_reason"] = "reopened" if any(
+                e["event"] == "reopened" for e in kept) else None
+        elif stored_closed:
+            out["state_reason"] = None
+
+
+def _reviews_summary(reviews, author):
+    """(reviewers, review_decision) of the review submissions `reviews`
+    (the stored review shape), by gather's own reduction."""
+    import gather  # deferred: gather imports extract
+    raw = [{"id": r.get("id"), "user": {"login": r.get("author")},
+            "state": r.get("state"), "submitted_at": r.get("submitted_at")}
+           for r in reviews if isinstance(r, dict)]
+    summary = gather.summarize_reviews(raw, author=author)
+    return summary["reviewers"], summary["decision"]
+
+
+def record_as_of(kind, rec, ts_to):
+    """A PR (`kind` "pr") or issue ("issue") record as it was at the end of
+    a window ending `ts_to` (issue #97). Pure: `rec` is not changed.
+
+    Returns `rec` itself when it carries nothing later than that end (no
+    timestamp of `_record_times` after it), None when it was created after
+    it (it did not exist), else a projected copy:
+    - state: `_state_as_of`;
+    - activity: comments, review comments, reviews and lifecycle events
+      dated after the end are dropped (`reviews` / `lifecycle` left out when
+      none remain); `comments` / `review_comments_count` lose the dropped
+      ones; `reviewers` / `review_decision` are re-derived from the
+      remaining reviews (when the record has no review submissions they
+      cannot be, and are named in `not_projected`); `open_high_activity`
+      is re-derived (an issue's reactions are as stored);
+    - `updated_at`: the latest timestamp left at or before the end (its
+      created / closed / merged time, comments, reviews, lifecycle events),
+      the item's last recorded activity then;
+    - `_NOT_PROJECTED` fields stay as stored;
+    - `AS_OF_KEY`: {"instant": `as_of_instant(ts_to)`, "fields": the keys
+      that changed, "not_projected": the fields kept as stored}."""
+    if not ts_to or not any(_after(t, ts_to) for t in _record_times(rec)):
+        return rec
+    if _after(rec.get("created_at"), ts_to):
+        return None
+    out = dict(rec)
+    not_projected = {k for k in _NOT_PROJECTED[kind] if k in rec}
+    dropped = {}
+    for lst, tkey in _ACTIVITY_LISTS:
+        rows = rec.get(lst)
+        if not isinstance(rows, list):
+            continue
+        kept = [r for r in rows
+                if not (isinstance(r, dict) and _after(r.get(tkey), ts_to))]
+        dropped[lst] = len(rows) - len(kept)
+        if not dropped[lst]:
+            continue
+        if kept or lst not in _OMIT_WHEN_EMPTY:
+            out[lst] = kept
+        else:
+            out.pop(lst, None)
+    _state_as_of(kind, rec, out, ts_to, not_projected)
+    for lst, count in (("comments_list", "comments"),
+                       ("review_comments", "review_comments_count")):
+        if dropped.get(lst) and isinstance(rec.get(count), int) \
+                and not isinstance(rec.get(count), bool):
+            out[count] = max(0, rec[count] - dropped[lst])
+    if kind == "pr":
+        if dropped.get("reviews"):
+            reviewers, decision = _reviews_summary(out.get("reviews") or [],
+                                                   rec.get("author"))
+            out["reviewers"] = reviewers
+            if "review_decision" in rec:
+                out["review_decision"] = decision
+        elif rec.get("reviewers") and not isinstance(rec.get("reviews"), list):
+            not_projected.update(k for k in ("reviewers", "review_decision")
+                                 if k in rec)
+    if "open_high_activity" in rec:
+        import gather  # deferred: gather imports extract
+        out["open_high_activity"] = gather.derive_open_high_activity(out)
+    times = [t for t in _record_times({k: v for k, v in out.items()
+                                       if k != "updated_at"})
+             if isinstance(t, str) and t and not _after(t, ts_to)]
+    if isinstance(rec.get("updated_at"), str) \
+            and not _after(rec["updated_at"], ts_to):
+        times.append(rec["updated_at"])
+    out["updated_at"] = max(times, key=_ts_key) if times else None
+    fields = sorted(k for k in set(rec) | set(out)
+                    if rec.get(k, _MISSING) != out.get(k, _MISSING))
+    if not fields:
+        return rec
+    out[AS_OF_KEY] = {"instant": as_of_instant(ts_to), "fields": fields,
+                      "not_projected": sorted(not_projected)}
+    return out
+
+
+def _socials_as_of(socials, leaves, ts_to):
+    """{node id: record_as_of(record)} for the stored PR / issue records the
+    projection changes (None for one created after the end), each read with
+    its stored review / lifecycle leaves attached as the view attaches them.
+    Records it leaves unchanged are not named (they are read as stored)."""
+    reviews_by_pr, lifecycle_by_parent = leaves
+    out = {}
+    for n in socials:
+        local = _local(n["id"])
+        if local.startswith("pr-"):
+            kind = "pr"
+        elif local.startswith("issue-"):
+            kind = "issue"
+        else:
+            continue
+        rec = n["data"]
+        num = rec.get("number")
+        full = dict(rec)
+        if kind == "pr" and num in reviews_by_pr:
+            full["reviews"] = reviews_by_pr[num]
+        if (kind, num) in lifecycle_by_parent:
+            full["lifecycle"] = lifecycle_by_parent[(kind, num)]
+        projected = record_as_of(kind, full, ts_to)
+        if projected is not full:
+            out[n["id"]] = projected
     return out
 
 

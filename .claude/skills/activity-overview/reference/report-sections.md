@@ -20,6 +20,9 @@ use the root issue's title, else the first PR's. The reference date is `meta.ref
 **State as of (#85).** When `meta.state_as_of` is present (per member in the project
 view), the view's records are as last gathered at that date, later than the view's end:
 write one caveat line under the report title saying so. Omit it when the key is absent.
+Since #97 a view projects each record's state, comments, reviews and lifecycle events to
+its end (BUNDLE.md "As of the window's end"), so the caveat covers only what has no history: titles,
+labels, milestones, board status.
 
 ## Executive summary
 3–5 bullets — features, releases, CI health, key risks — informed by board + call context.

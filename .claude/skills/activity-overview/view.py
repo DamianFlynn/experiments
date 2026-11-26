@@ -4,7 +4,7 @@ The CLI face of `extract.extract` (the reader stage). gather writes only the
 store; this writes the per-repo **bundle view** file that `link.py` enriches in
 place and `render.py` draws from:
 
-    python3 view.py --store DB [--project P] [--repo R] --from F --to T --out bundle.json [--ref-date D]
+    python3 view.py --store DB [--project P] [--repo R] --from F --to T --out bundle.json [--ref-date D] [--as-stored]
 
 Store scoping (how gather keys what it folds):
   * single repo (`gather.py --owner O --repo N`): project = O, repo = N
@@ -20,6 +20,15 @@ comes from `digest.py`, not from this tool.
 The view carries its window (issue #75): `meta.period` = {--from, --to}, so
 `link.py` buckets only this window's items, and `meta.ref_date` = `--ref-date`,
 else the `--ref-date` gather stored for exactly this window, else `--to`.
+
+Records as of the window's end (issue #97): every PR / issue record holding
+anything later than `--to` is projected back to it (`extract.record_as_of`:
+state, comments, reviews, lifecycle events, `updated_at`), so a month viewed
+after it ended reads as it was then. Each such record carries `as_of` and the
+view's `meta.records_as_of` counts them; a window ending after everything
+stored gives the records as stored, with neither key. `--as-stored` writes
+every record as stored (the latest gather's): the form `validate.py --bundle`
+compares with the store.
 
 Output: exactly what `extract.extract` returns (the RAW keys only — no trains /
 buckets / diagrams; run `link.py` next), as canonical indented JSON
@@ -72,6 +81,10 @@ def parse_args(argv):
                    help="reference date written to meta.ref_date (YYYY-MM-DD "
                         "or a full ISO timestamp). Default: the --ref-date "
                         "gather stored for exactly this window, else --to.")
+    p.add_argument("--as-stored", dest="as_stored", action="store_true",
+                   help="write the PR / issue records as stored (latest "
+                        "gather), not projected to the window's end: the "
+                        "input for `validate.py --bundle` (issue #97)")
     args = p.parse_args(argv)
     # Shared reader-window rules (manifest.check_reader_window): each bound is a
     # real YYYY-MM-DD date or a full ISO timestamp, validated in FULL (no junk
@@ -170,7 +183,8 @@ def main(argv=None):
         if warning:
             sys.stderr.write("view.py: warning: {}\n".format(warning))
         bundle = extract.extract(conn, project, repo, args.ts_from, args.ts_to,
-                                 ref_date=args.ref_date)
+                                 ref_date=args.ref_date,
+                                 as_of_end=not args.as_stored)
     except sqlite3.DatabaseError as exc:
         return _fail("cannot read store {!r}: {}".format(args.store, exc))
     finally:

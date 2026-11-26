@@ -128,12 +128,15 @@ cross-month `spotlight` queries possible.
 
 **Not exact, or different:**
 
-1. **Re-viewing an earlier month later** shows each PR/issue as the latest gather saw it
-   (state, labels, milestone, comments; the view says so in `meta.state_as_of`): an item
-   open at that month's end but closed since is missing, and its in-flight / next /
-   forecast reflect today's open set. Keep each month's view and report from the time you
-   made them (`views/`, `reports/`), and don't re-link an old month into `series.json` from
-   a grown store (HLD §10 item 7).
+1. **Re-viewing an earlier month later** shows each PR/issue as it was at that month's end
+   for everything the record dates (#97: open / closed / merged state, comments, reviews,
+   reviewers, timeline events, `updated_at`; each such record carries `as_of`, the view
+   `meta.records_as_of`), but with today's title, labels, milestone, assignees, closing
+   references and board status (`meta.state_as_of` names the later gather). So its
+   in-flight set and train outcomes are that month's, while its next-candidates and
+   forecast (milestone-driven) reflect today's milestones. Keep each month's view and
+   report from the time you made them (`views/`, `reports/`) when those matter
+   (HLD §10 item 7).
 2. **A view that is not exactly one gathered month** is assembled from whole months: a
    quarter sums its gathered months' CI statistics (`meta.facts_windows` lists them;
    `workflow_stats_complete: false` when one is missing — the report template states this
@@ -353,8 +356,8 @@ flowchart TB
 | Situation | What to do |
 |---|---|
 | First month of a stream | Run normally; `series.first_installment = true` and the report omits *Since last installment*. |
-| Starting with history | You can gather past months for **delivery history** (what shipped / was rejected then), but you cannot recreate what was *in flight* or *forecast* at the time: `gather` reads open PRs/issues, milestones and board status as they are **now** (an item merged since is no longer open, so it is missing from that month's in-flight set). Don't chain backfilled months into `series.json` or use them to calibrate the forecast — start the series with the first month you capture at month-end (a month recorded after a later one is marked `captured: "backfill"`, but a first month captured late cannot be detected). |
-| Missed a month | Gather it for delivery history; its in-flight/forecast are "as of now" (above). Keep it out of the series chain, or note in the report that the comparison spans two months. |
+| Starting with history / catching up closed months | A month gathered late is **shown as of its end** (#97): `view.py` / `digest.py` wind every PR / issue back to the window's last second from the timestamps in its record, so what was open, merged, closed, in flight, stalled, reviewed and commented on at that month's end is that month's — an item merged since is in flight in it, an item opened since is not in it. Still **today's**: title, body, labels (and the kind / facets read from them), milestone, assignees, closing references, reactions and board status / sprint — so next-candidates and the forecast follow today's milestones; an issue closed in that month and reopened since is closed with no reason (in no shipped / rejected bucket); and an item that was open then but has since been deleted or transferred is absent. The view says what it projected (`meta.records_as_of`, each record's `as_of`). A gather of a past month collects the PRs merged or closed in it and those open **now**: a PR open at the month's end and merged or closed between then and the gather is stored only by the gather of the month it landed in — so catch up into **one** store, oldest month first and through the current month (§2.1), and each month's view then holds those PRs as they were at its end. Chaining caught-up months into `series.json` is fine for delivery and in-flight; don't use them to calibrate the forecast (a first month captured late is not marked `backfill`). |
+| Missed a month | Gather it late (above): its delivery history and in-flight set are as of its end; its milestones / board status / forecast are "as of now". Note that in the report if its series comparison matters. |
 | Quarter / year view | Gather the whole quarter window into its own store (`stores/2026-Q4.db`) and digest that, or digest the quarter window over an accumulated store that holds its months (the view is their union). A wider window over a single-month store adds nothing. Over an accumulated store the quarter's `workflow_stats` (CI health) are the sum of its gathered months (`meta.facts_windows`; `workflow_stats_complete: false` if one is missing) and its code graph / owners are its last month's (§2.1); a quarter gathered as one window has its own. Keep quarterly installments in a separate series file: `link --series` refuses (exit 2) to record a quarter in an index that holds its months, or a month in one that holds its quarter. |
 | Refresh a month after late merges | Re-gather the same window into that month's store, re-materialize, and re-run `link --series`: the month's entry is replaced. If later months are recorded, it is marked `backfill` and `link` names them; re-link their saved bundles oldest first to refresh their comparison. |
 
@@ -415,9 +418,12 @@ pass. To catch all but the last for a window, save the raw view right after the 
 and pass it later:
 
 ```bash
-python3 $AO/view.py --store $DB --from $FROM --to $TO --out $S/views/$M/at-gather.json
+python3 $AO/view.py --store $DB --from $FROM --to $TO --as-stored --out $S/views/$M/at-gather.json
 python3 $AO/validate.py $DB --bundle $S/views/$M/at-gather.json
 ```
+
+`--as-stored` writes the records as stored: a report view projects them to the window's end
+(#97), which is not what the store holds, so a projected view is not a `--bundle` input.
 
 `--bundle` is a single-repo cross-check (a project-mode run ignores it with a warning; pass
 `--project P --repo owner/repo` to cross-check one member). A run with `--repo` on a
@@ -883,7 +889,7 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 | Last month's PRs/commits/trains appear in this month's view (not as shipped: buckets are window-bounded) | the view was made before issue #85 from a store holding several months | re-run `view`/`digest` with the current skill (views are window-scoped); a PR/issue of another month is in the view only as train context (an issue a view PR closes or cross-references) |
 | A PR and the issue it fixes are in different trains (or the issue's bucket ref has no train) | trains are joined by closing references only (#93): the PR only mentions the issue, without `Fixes #N` / `Closes #N` in its title or body and without a Development-sidebar link; or the sidebar link was not read because GraphQL was unavailable (gather's stderr line `closing issues: GraphQL unavailable (…)`, `meta.closing_refs_source: keywords`), or the store was gathered before #105 | a mention is context, not membership; for a sidebar link, fix the token/GraphQL access and re-gather (LLD §4.7) |
 | A train lists a rejected or open PR next to the one that shipped | a train holds every attempt for its issues (#93); each PR's own outcome is in `train.pr_outcomes` | expected; the narrative tells the attempts apart |
-| A past month's view has `meta.state_as_of` and fewer in-flight items than its report had | the store has grown since: records are stored latest-wins, so items closed after that month are not open in it (HLD §10 item 7) | use the view saved at the time; don't rebuild past months' in-flight from a grown store |
+| A past month's view differs from the report made at the time | since #97 a view projects records to the window's end (`meta.records_as_of`), so in-flight and outcomes should match; what still differs is what has no history — labels, milestone, title, board status are today's (`meta.state_as_of` names the later gather) — and items deleted or transferred since, which are absent; a view made before #97 showed today's state (fewer in-flight items) | re-run `view` / `digest` with the current skill; for the milestone / board framing use the view saved at the time |
 | Warning: boundary-dropped commits | an in-window commit sat on the shallow boundary and `git fetch --deepen` failed (a "could not deepen" warning precedes it when the fetch errored) | raise `ACTIVITY_CLONE_MARGIN_DAYS` (e.g. 60–120), re-gather |
 | A contributor appears twice (login and git name), or `validate` ERROR person "stored but not derivable" (and `edge_set` `authored` edges) with a `hint` naming "pre-#78 identity" | the store was folded before commit authors were resolved to logins (#78); the hint names the commits' current author | re-gather the window into a fresh store; don't fold new windows into a pre-#78 store |
 | A person shows `login_resolved: false` | that commit's email is linked to no GitHub account and is not a noreply address, so gather kept the git name (suffixed ` (git)` when it looks like a login) rather than guess | expected; the person's PR/review activity is under their login |

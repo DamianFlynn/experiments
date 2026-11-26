@@ -106,8 +106,10 @@ PLACEHOLDER RULES — read before filling anything below.
   window than the store's latest gather; in the project view read it per member,
   `member.bundle.meta`), say so in one line under the report title: "Records are
   as last gathered on {meta.state_as_of}, after this report's end ({meta.to}):
-  open/closed state, labels, milestones and comments may be newer than the
-  window." Omit the line when the key is absent.
+  titles, labels, milestones and board status may be newer than the window."
+  (Open/closed state, comments and reviews are as of {meta.to} when the view
+  projected its records to its end, issue #97; BUNDLE.md "As of the window's
+  end".) Omit the line when the key is absent.
 * TRUNCATED DIAGRAMS: when `diagrams.truncated` has an entry for an embedded
   diagram, say so under it: "Showing {diagrams.truncated[].shown} of
   {diagrams.truncated[].total} {diagrams.truncated[].unit}."
