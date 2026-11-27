@@ -308,6 +308,23 @@ carries on, when the workspace path contains `Mobile Documents`, `iCloud`, `Drop
 `OneDrive`, or an ancestor folder holds `.obsidian`; the warning is also in
 `status.json` `workspace_warnings`. Write only the finished Markdown into the vault.
 
+### 8.1 Backing the workspace up
+
+A backup that copies files at one point in time (to a server share, a backup disk) is fine;
+what must not happen is a copy taken while a run is writing.
+
+- **Back up when no run is going.** Schedule the backup well clear of the nightly run, or
+  have the backup job skip (and retry later) while `<workspace>/.schedule.lock` exists. A
+  month store is replaced by a rename at the end of a run (§5), so outside a run every
+  `stores/YYYY-MM.db` is a complete, consistent file and a plain copy of it is a good
+  backup.
+- **Worth keeping:** `stores/*.db` (months that have closed cannot be gathered again as
+  they stood), `people.json`, `people-activity.json`, `streams.json`, and the status files.
+- **Leave out:** `stores/.*.next` and `*.prev` (working copies), `*-wal` / `*-shm`,
+  `.schedule.lock`, `logs/`, `.tfcache/` and each stream's `clone/` (all recreated).
+- **The token is not in the workspace** (§7) and should not be added to the backup.
+- **Restore** by copying the files back while no run is going, then `schedule.py status`.
+
 ## 9. First-time setup on the Mac mini, step by step
 
 Prerequisites: Python **3.11+** (the skill's minimum; `python3 --version`; Homebrew's
