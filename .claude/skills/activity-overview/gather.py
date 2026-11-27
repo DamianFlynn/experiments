@@ -1089,7 +1089,7 @@ def parse_timeline_lifecycle(raw_timeline):
     """Normalize the allowlisted timeline lifecycle events. Pure.
 
     Keeps only `reopened`/`closed`/`ready_for_review` (order-preserving), each as
-    {id, actor, event, created_at, label, url}. `url` is None when the raw event
+    {id, actor, event, created_at, label, url, [state_reason], [commit]}. `url` is None when the raw event
     carries none — the fold synthesizes a stable `<parent html_url>#event-<id>`
     provenance ref in that case (so check_provenance passes)."""
     out = []
@@ -1097,14 +1097,22 @@ def parse_timeline_lifecycle(raw_timeline):
         event = ev.get("event")
         if event not in _LIFECYCLE_EVENTS:
             continue
-        out.append({
+        row = {
             "id": ev.get("id"),
             "actor": (ev.get("actor") or {}).get("login"),
             "event": event,
             "created_at": ev.get("created_at"),
             "label": (ev.get("label") or {}).get("name"),
             "url": ev.get("url"),
-        })
+        }
+        # why / by what an item was closed: GitHub's state_reason
+        # (completed / not_planned / reopened) and the commit that closed
+        # it, when the event carries them (omitted otherwise)
+        if ev.get("state_reason"):
+            row["state_reason"] = ev["state_reason"]
+        if ev.get("commit_id"):
+            row["commit"] = ev["commit_id"]
+        out.append(row)
     return out
 
 
@@ -1700,6 +1708,30 @@ def _cap_snippet(text, limit=200):
     return (text or "").strip()[:limit] or None
 
 
+def _decorator_owners(lang, lines):
+    """{line index: (subkind, name)} for the lines of a Bicep decorator
+    block (`@allowed([` ... `])`, `@minValue(1)`, ...) that directly
+    precede a declaration in the hunk: the declaration they decorate.
+    Decorator lines not followed by a declaration inside the hunk are left
+    to the caller's rule. Other languages: {}. Pure."""
+    if lang != "bicep":
+        return {}
+    out, pending, depth = {}, [], 0
+    for i, (_sign, text) in enumerate(lines):
+        t = text.strip()
+        if depth > 0 or t.startswith("@"):
+            pending.append(i)
+            depth = max(0, depth + sum(t.count(c) for c in "([{")
+                        - sum(t.count(c) for c in ")]}"))
+            continue
+        decl = detect_symbol_decl(lang, text)
+        if decl is not None and decl[0] == "symbol":
+            for j in pending:
+                out[j] = (decl[1], decl[2])
+        pending = []
+    return out
+
+
 def build_symbol_deltas(path, hunks):
     """Attribute a file's diff hunks to symbol-level changes (diff-local). Pure.
 
@@ -1721,12 +1753,16 @@ def build_symbol_deltas(path, hunks):
 
     for hunk in hunks:
         current = None
-        for sign, text in hunk["lines"]:
+        owner = _decorator_owners(lang, hunk["lines"])
+        for i, (sign, text) in enumerate(hunk["lines"]):
             decl = detect_symbol_decl(lang, text)
             if decl is None:
-                if sign in ("+", "-") and current is not None:
-                    touched.add(current)
-                    note(current, sign, text)
+                # a decorator's lines (`@allowed([...])` and its entries)
+                # belong to the declaration BELOW them, not the one above
+                target = owner.get(i, current)
+                if sign in ("+", "-") and target is not None:
+                    touched.add(target)
+                    note(target, sign, text)
                 continue
             kind, subkind, name = decl
             key = (subkind, name)
@@ -7417,7 +7453,7 @@ CHECK_ROLLUPS = ("passing", "failing", "pending", "incomplete", "none")
 # is already a `lifecycle` event of the PR record).
 PR_TIMELINE_EVENTS = ("renamed", "convert_to_draft", "review_requested",
                       "review_request_removed", "review_dismissed",
-                      "head_ref_force_pushed")
+                      "head_ref_force_pushed", "assigned")
 
 _PR_ACTIVITY_FIELDS = (
     "number headRefOid "
@@ -7860,6 +7896,10 @@ def parse_timeline_pr_events(raw_timeline):
             team = (ev.get("requested_team") or {}).get("slug")
             row["requested"] = who or ("team:" + team if team else None)
             row["by"] = (ev.get("review_requester") or {}).get("login")
+        elif kind == "assigned":
+            # who assigned whom: for a coding agent's PR, the person who
+            # handed it the work
+            row["assignee"] = (ev.get("assignee") or {}).get("login")
         elif kind == "review_dismissed":
             d = ev.get("dismissed_review") or {}
             row["review_id"] = d.get("review_id")
@@ -10290,7 +10330,7 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
         url = "{}#event-{}".format(base, ev.get("id"))
     # `id` is kept in the blob so extract round-trips it and a re-fold rebuilds the
     # SAME `event-<parent>-<id>` node id (idempotency).
-    return {
+    data = {
         "id": ev.get("id"),
         "actor": ev.get("actor"),
         "event": ev.get("event"),
@@ -10298,6 +10338,10 @@ def _lifecycle_event_data(ev, parent_url, parent_local):
         "label": ev.get("label"),
         "url": url,
     }
+    for k in ("state_reason", "commit"):
+        if ev.get(k):
+            data[k] = ev[k]
+    return data
 
 
 def record_rows(kind, record, project, repo, fetched, members=None):

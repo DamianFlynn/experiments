@@ -1179,6 +1179,57 @@ score}], more: [{id, score}] (the trains that qualified beyond the cap — "N mo
 notable discussion"), rule: {min_exchanges, min_in_window, min_score, top_n, plumbing_min,
 silence_days}}`.
 
+### Every story of the window: `stories.all`, `plumbing_themes`
+
+For a view of a gathered story layer (it carries `pr_history`; other views and fixtures
+are unchanged), `link.build_story_list` adds **all** the stories, not a top N
+(`selected` / `more` / `quiet` stay as they were for older readers):
+
+- `stories.all` — `[{id, group, state, group_rule, title, modules, score, worthy,
+  released?}]`, ordered by group (`landed`, `in_flight`, `stalled`, `closed`,
+  `plumbing`), then score.
+  - **story-worthy** (`worthy`, `link.story_worthy`), in order: a human conversation
+    turn in the window (`discussion.in_window`); an issue / PR of the train opened,
+    merged, closed or reopened in it; a human commit on one of its PRs in it. An open
+    train with conversation but none of these is **carried over** (a stalled story)
+    when its last human event is at most `STORY_CARRY_MAX_DAYS` (180) old, else listed
+    in `stories.excluded` `[{id, reason}]`.
+  - **state** (`link.story_group`): `landed` — the train shipped (a PR merged into the
+    walked branch); `closed` — closed without landing (rejected / abandoned); an open
+    train is `stalled` when carried over, when its last human event is more than
+    `STORY_STALLED_DAYS` (14) old at the view's end, or when an open PR's head checks
+    fail (not only awaiting approval) with no comment by its author since the head
+    commit; else `in_flight`. `group_rule` says which rule fired.
+  - **group** — `plumbing` when every PR of the train is plumbing (the module layer's
+    class, or a sweep), whatever its state (`state` keeps it); else the state.
+  - `released` (landed stories) — **does landed mean released?** per module a PR of the
+    train touched (`link.train_released`): `{module, version, status, tag, date, url,
+    registry?}`, `status` `published` (a version tag of the module in the window: its
+    tag, date, tree `url`, the public registry reference `br/public:<module>:<version>`
+    for a Bicep module), `declared_not_published` (the changelog declared a version, no
+    tag), `unknown` (declared, tags not read for the whole view) or `no_version_change`.
+  - `stories.groups` `{group: count}`; `stories.all_rule` `{stalled_days,
+    carry_max_days, groups}`.
+- `plumbing_themes` (`link.build_plumbing_themes`) — the window's plumbing PRs grouped
+  by the shared paths they touch, so a writer can tell what was engineered: `[{id,
+  title_hint, paths, paths_more?, prs: [{number, title, author, state, merged_at,
+  url}], stories, people, evidence_counts: {commits, comments, docs, interface,
+  patches}, subjects: [{pr, sha, subject}], issues}]`. Themes (`PLUMBING_THEMES`, the
+  theme covering most of a PR's files): `ci_workflows` (`.github/workflows/`,
+  `.github/actions/`, pipeline folders), `pipeline_utilities` (`utilities/`),
+  `test_environment` (`tests/`, `e2e/`), `docs_generation` (READMEs, `docs/`, other
+  Markdown), `repository_policy` (CODEOWNERS, LICENSE, `.github/` files, editor and
+  tool configuration), `dependency_updates` (an automation account's update PR),
+  `other_plumbing`. No prose: `title_hint` is a neutral label.
+- `module_changes.modules[]` gain `url` (the module folder at the commit the structure
+  was read at) and `versions.published[]` gain `url` (the tag's tree) and `registry`
+  (the public Bicep registry reference, where derivable).
+- Closed issues gain `closing` `{at, by, state_reason?, commit?, prs?, before_merge?}`:
+  who closed it (the closing event's actor), GitHub's reason, the closing commit, the
+  view's PRs that name it as closed, and those not yet merged when it closed.
+- PR rows that carry `head_repo` gain `is_fork` (another repository; null head
+  repository: a deleted fork).
+
 ### Slice `conversation` (the story material)
 
 `link.py BUNDLE --slice <id>` adds `conversation` to every train's slice:
@@ -1300,6 +1351,12 @@ silence_days}}`.
   kept, omitted}` of the commit evidence rows.
 - **`bots`** — `{login: count}` of the automation comments, review comments and reviews
   left out of the timeline.
+- **`automation`** (only when any) — the automation accounts of the train, for what they
+  are: `[{login, is_bot: true, comments, review_comments, reviews, commits, prs_opened,
+  on_behalf_of?: {login, basis: assigned|requested review, pr}}]` — for a PR an
+  automation account opened, the person who handed it the work when the record shows it.
+- A `closed` lifecycle item carries `state_reason`, `commit` (the closing commit) and,
+  for an issue, `closing_prs` (the view's PRs that name it as closed), when recorded.
 - **`pr_history`** — `{pr number: status}`: `fetched` (with `, notes extracted` or `,
   notes skipped: <reason>`, or ` (commits on the base branch)`), `missing`,
   `fetch_failed`, `log_failed`, or `not_gathered` when the view has no PR history for it.
@@ -1380,6 +1437,7 @@ silence_days}}`.
     `awaiting reporter`. `state` / `with` say who; `derived` is always true;
   - `waiting_on` (only when any) — open linked items that the PR author's latest message
     names (`{number, type, state, title, named_in}`);
+  - `released` (a shipped train) — as `stories.all[].released`;
   - `linked` — the repository's issues / PRs named in the conversation (`#N`, or a
     github.com link to the repository's issue / pull; HTML comments — a template's
     "Fixes #123" — ignored; the train's own items excluded; at most `STORY_LINKED_MAX` 10,
@@ -1578,7 +1636,8 @@ no gather stored it (a store gathered before it, every fixture bundle):
   (`threads_omitted`). GitHub keeps no resolution time.
 - `events` — the PR lifecycle events from the issue timeline enrich_pr already fetched:
   `renamed`, `convert_to_draft`, `review_requested`, `review_request_removed`,
-  `review_dismissed`, `head_ref_force_pushed` (the latest `PR_EVENTS_MAX` 100,
+  `review_dismissed`, `head_ref_force_pushed`, `assigned` (with `assignee`; who handed
+  a coding agent its work) (the latest `PR_EVENTS_MAX` 100,
   `events_omitted`); a force-push gains `before` / `after` from the GraphQL read.
 - **Every commit** (`collect_check_history`, the second phase): when a PR has more
   commits than the latest 10, the older ones are read in pages of

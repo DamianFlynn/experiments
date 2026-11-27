@@ -211,6 +211,15 @@ on — so a reader does not have to guess (a guess can be unfair to the people i
 sub-section (a story train that is a mention train gets one: its effort line, then the
 story); end the section with one line when `stories.more` is not empty: *"N more trains had
 notable discussion: <ids>"*. No story train → no stories, and nothing is said.
+When the view carries the full story list, stories.all (BUNDLE.md "Every story of the window"), every story of
+the month is listed there with its `group` (landed, in flight, stalled, closed, plumbing)
+and the rule that put it there (`group_rule`); a report that covers the whole month groups
+its stories by it and gives each a slice. For a landed story say whether it was released
+from `released` (published with its tag and date, declared but not published, unknown,
+no version change). Plumbing work is told per theme from `plumbing_themes` (what the PRs
+changed, their commit subjects and code-comment / docs evidence); automation accounts are
+named as automation accounts (`automation`, with the person who handed a coding agent its
+work when `on_behalf_of` shows it).
 
 1. **Get the slice** as for any train (`python3 link.py <bundle-view> --slice <train-id>`).
    The story material is `slice.conversation` (BUNDLE.md "Slice `conversation`"):

@@ -1988,6 +1988,49 @@ def _merged_in_window(pr, ctx):
     return base is None or pr.get("base") in (None, base)
 
 
+def _repo_web(bundle):
+    meta = bundle.get("meta") or {}
+    if not meta.get("owner") or not meta.get("repo"):
+        return None
+    return "https://github.com/{}/{}".format(meta["owner"], meta["repo"])
+
+
+def registry_reference(area, kind, version):
+    """The public Bicep registry reference of a published module version
+    (`br/public:<area>:<version>`) for a Bicep module area under `avm/`;
+    None where none is derivable (Terraform, other repositories)."""
+    if not area or not version or not area.startswith("avm/") \
+            or kind in ("module", "submodule"):
+        return None
+    return "br/public:{}:{}".format(area, version)
+
+
+def _module_links(bundle, entries):
+    """Stable links on the module rows (in place): `url`, the module
+    folder at the commit the view's structure was read at (meta.clone_sha;
+    the branch when unknown), and per published version the tag's tree
+    `url` and, where derivable, its `registry` reference. Nothing without
+    the repository's owner / name."""
+    web = _repo_web(bundle)
+    if not web:
+        return
+    ref = (bundle.get("meta") or {}).get("clone_sha") or \
+        (bundle.get("meta") or {}).get("base_branch") or "HEAD"
+    for e in entries:
+        area = e.get("area")
+        if area and area != "main.tf":
+            e["url"] = "{}/tree/{}/{}".format(web, ref, area)
+        elif area:
+            e["url"] = "{}/tree/{}".format(web, ref)
+        for p in (e.get("versions") or {}).get("published") or []:
+            if p.get("tag"):
+                p["url"] = "{}/tree/{}".format(web, p["tag"])
+            reg = registry_reference(p.get("module") or area, e.get("kind"),
+                                     p.get("version"))
+            if reg:
+                p["registry"] = reg
+
+
 def build_module_changes(bundle, path_rules=()):
     """bundle["module_changes"] (BUNDLE.md "module_changes"), when the bundle
     carries `module_notes`; otherwise nothing is added. Pure over the
@@ -2098,6 +2141,7 @@ def build_module_changes(bundle, path_rules=()):
     entries = [_module_entry(ctx, m, moves, bundle) for m in mods.values()]
     entries = [e for e in entries if e is not None]
     entries.sort(key=lambda e: e["area"])
+    _module_links(bundle, entries)
 
     # 5. Merged PRs: product vs plumbing.
     pr_rows = [classify_pr_change(p, ctx) for p in bundle.get("prs", [])
@@ -2576,6 +2620,7 @@ _TIMELINE_KIND_ORDER = {"opened": 0, "commit": 1, "comment": 2,
                         "head_ref_force_pushed": 1, "checks": 2,
                         "renamed": 5, "convert_to_draft": 5,
                         "review_requested": 5, "review_request_removed": 5,
+                        "assigned": 5,
                         "review_dismissed": 5}
 # Timeline kinds that are not a person's move: check results arrive from
 # automation. They neither end a silence nor become an open PR's last event.
@@ -2583,7 +2628,7 @@ _AUTOMATION_KINDS = ("checks",)
 # What the `pr_activity` fact adds to the slice: the lifecycle events copied
 # onto the timeline and their extra fields.
 _PR_EVENT_FIELDS = ("from", "to", "requested", "by", "review_id", "state",
-                    "message", "before", "after")
+                    "message", "before", "after", "assignee")
 
 
 def window_end_instant(meta):
@@ -2964,6 +3009,397 @@ def select_story_trains(bundle):
     return bundle
 
 
+# --- every story of the window, grouped ---------------------------------------
+#
+# `stories.selected` keeps the top-N for older readers; `stories.all` is the
+# whole list. A train is a story when its record has something of the
+# window (story_worthy); each story gets one group by a stated rule.
+
+# An open train whose last human event is older than this many days before
+# the view's instant is stalled (it waits on someone).
+STORY_STALLED_DAYS = 14
+# An open train with conversation but no event in the window is carried
+# over as stalled when its last human event is at most this many days old;
+# older ones stay quiet (`stories.excluded` says so).
+STORY_CARRY_MAX_DAYS = 180
+STORY_GROUPS = ("landed", "in_flight", "stalled", "closed", "plumbing")
+
+
+def _ts_in(ts, start, end):
+    t = _parse_ts(ts)
+    return t is not None and (start is None or t >= start) and (end is None
+                                                                 or t <= end)
+
+
+def _train_items(bundle, t):
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    return _train_members(t, pr_index, issue_index)
+
+
+def story_worthy(bundle, t, start, end, history):
+    """Why train `t` is a story of the window [start, end], or None. In
+    order: a human conversation turn in the window (a comment, review
+    comment or review beyond the opening post: `discussion.in_window`); an
+    issue / PR of the train opened, merged, closed or reopened in it; a
+    human commit on one of its PRs in it. Mechanical: nothing scores."""
+    d = t.get("discussion") or {}
+    if (d.get("in_window") or 0) >= 1:
+        return "{} human turn(s) in the window".format(d["in_window"])
+    issues, prs = _train_items(bundle, t)
+    for rec in issues + prs:
+        typ = "PR" if rec in prs else "issue"
+        for key, what in (("created_at", "opened"), ("merged_at", "merged"),
+                          ("closed_at", "closed")):
+            if rec.get(key) and _ts_in(rec[key], start, end) \
+                    and (key != "merged_at" or rec.get("merged")):
+                return "{} #{} {} in the window".format(typ, rec.get("number"), what)
+        for e in rec.get("lifecycle") or []:
+            if isinstance(e, dict) and e.get("event") == "reopened" \
+                    and _ts_in(e.get("created_at"), start, end):
+                return "{} #{} reopened in the window".format(typ, rec.get("number"))
+    for p in prs:
+        for c in (history.get(p.get("number")) or {}).get("commits") or []:
+            if _ts_in(c.get("committed_at"), start, end) \
+                    and not derive.is_bot_login(c.get("author")):
+                return "a commit on PR #{} in the window".format(p.get("number"))
+    return None
+
+
+def _failing_unanswered(bundle, t, instant):
+    """(pr, head time) of an open PR of the train whose head checks are
+    failing as of the instant (not only awaiting approval) with no event by
+    its author since the head commit, else None."""
+    activity = _pr_activity_index(bundle) or {}
+    _issues, prs = _train_items(bundle, t)
+    for p in prs:
+        if p.get("state") != "open" or p.get("number") not in activity:
+            continue
+        commits = [c for c in activity[p["number"]].get("commits") or []
+                   if _not_after(c.get("committed_at"), instant)]
+        if not commits:
+            continue
+        roll = _commit_rollup(commits[-1], instant)
+        if roll["rollup"] != "failing" or \
+                set(roll["failing"]) <= set(roll["awaiting_approval"]):
+            continue
+        head_at = commits[-1].get("committed_at") or ""
+        author = p.get("author")
+        later = [c for key in ("comments_list", "review_comments")
+                 for c in p.get(key) or [] if isinstance(c, dict)
+                 and c.get("author") == author
+                 and (c.get("created_at") or "") > head_at
+                 and _not_after(c.get("created_at"), instant)]
+        if not later:
+            return p["number"], head_at
+    return None
+
+
+def story_group(bundle, t, worthy, instant, module_changes):
+    """(group, state, group_rule) of a story train. State: `landed` (the
+    train shipped: a PR merged into the walked branch), `closed` (closed
+    without landing: rejected or abandoned), else open: `stalled` when (a)
+    no story-worthy event of the window (carried over), (b) its last human
+    event is more than STORY_STALLED_DAYS old at the instant, or (c) an
+    open PR's head checks fail with no event by its author since; else
+    `in_flight`. Group: `plumbing` when every PR of the train is plumbing
+    (_train_plumbing: the module layer's class, or a sweep), whatever the
+    state; else the state."""
+    outcome = t.get("outcome")
+    if outcome == "shipped":
+        state, rule = "landed", "landed: merged into the walked branch"
+    elif outcome in ("rejected", "abandoned"):
+        state, rule = "closed", "closed: {} without landing".format(outcome)
+    else:
+        idle = (t.get("effort") or {}).get("idle_days")
+        failing = _failing_unanswered(bundle, t, instant)
+        if worthy is None:
+            state = "stalled"
+            rule = ("stalled: carried over, no event in the window "
+                    "({} days idle)".format(idle))
+        elif isinstance(idle, (int, float)) and idle > STORY_STALLED_DAYS:
+            state = "stalled"
+            rule = "stalled: {} days since the last human event (threshold " \
+                "{})".format(idle, STORY_STALLED_DAYS)
+        elif failing:
+            state = "stalled"
+            rule = ("stalled: PR #{} head checks failing since {} with no "
+                    "event by its author".format(failing[0], failing[1][:10]))
+        else:
+            state, rule = "in_flight", "in_flight: open, active in the window"
+    if t.get("prs") and _train_plumbing(t, module_changes):
+        return "plumbing", state, "plumbing: every PR is plumbing; " + rule
+    return state, state, rule
+
+
+def train_released(bundle, t):
+    """Does "landed" mean released? Per module a PR of the train touched
+    (module layer): [{module, version, status, tag, date, url, registry?}]
+    — `published` (a version tag of the module in the window), else
+    `declared_not_published` (the changelog declared a version, no tag in
+    the window), `unknown` (declared, but tags were not read for the whole
+    view), `no_version_change` (nothing declared). Omitted without the
+    module layer."""
+    mc = bundle.get("module_changes") or {}
+    prs = set(t.get("prs") or [])
+    tags_ok = (mc.get("inputs") or {}).get("tags_collected") and not \
+        (mc.get("inputs") or {}).get("windows_without_tags")
+    out = []
+    for e in mc.get("modules") or []:
+        if not {p.get("number") for p in e.get("prs") or []} & prs:
+            continue
+        v = e.get("versions") or {}
+        published = [x for x in v.get("published") or []
+                     if not x.get("module") or x.get("module") == e.get("area")]
+        if published:
+            for x in published:
+                row = {"module": e.get("area"), "version": x.get("version"),
+                       "status": "published", "tag": x.get("tag"),
+                       "date": x.get("date"), "url": x.get("url")}
+                if x.get("registry"):
+                    row["registry"] = x["registry"]
+                out.append(row)
+            continue
+        declared = v.get("changelog") or []
+        to = (v.get("version_file") or {}).get("to")
+        version = declared[-1] if declared else to
+        if version is None:
+            status = "no_version_change"
+        elif tags_ok:
+            status = "declared_not_published"
+        else:
+            status = "unknown"
+        out.append({"module": e.get("area"), "version": version, "status": status,
+                    "tag": None, "date": None, "url": e.get("url")})
+    return out
+
+
+def annotate_issue_closing(bundle):
+    """`closing` on every closed issue of a story-layer view (one carrying
+    `pr_history`): {at, by (the closing event's actor), state_reason,
+    commit (the commit that closed it, when recorded), prs (the view's PRs
+    that name it as closed, `closes`), before_merge: [pr] (those PRs that
+    were not merged yet when it closed)} — each key only when recorded, so
+    "closed two minutes after the PR opened, nine days before the merge, by
+    the PR's author" is read off the record. In place."""
+    if "pr_history" not in bundle:
+        return bundle
+    prs = bundle.get("prs") or []
+    for i in bundle.get("issues") or []:
+        if i.get("state") != "closed":
+            continue
+        ev = [e for e in i.get("lifecycle") or []
+              if isinstance(e, dict) and e.get("event") == "closed"]
+        last = ev[-1] if ev else {}
+        row = {"at": last.get("created_at") or i.get("closed_at")}
+        if last.get("actor"):
+            row["by"] = last["actor"]
+        reason = last.get("state_reason") or i.get("state_reason")
+        if reason:
+            row["state_reason"] = reason
+        if last.get("commit"):
+            row["commit"] = last["commit"]
+        closers = [p for p in prs if i.get("number") in (p.get("closes") or [])]
+        if closers:
+            row["prs"] = sorted(p.get("number") for p in closers)
+            early = sorted(p.get("number") for p in closers
+                           if row["at"] and (not p.get("merged_at")
+                                             or p["merged_at"] > row["at"]))
+            if early:
+                row["before_merge"] = early
+        i["closing"] = {k: v for k, v in row.items() if v is not None}
+    return bundle
+
+
+def build_story_list(bundle):
+    """`stories.all` — every story of the window: [{id, group, state,
+    group_rule, title, modules, score, worthy, released?}] ordered by
+    STORY_GROUPS then score; `stories.excluded` [{id, reason}] — trains
+    with conversation that are not stories (idle beyond
+    STORY_CARRY_MAX_DAYS); `stories.groups` {group: count};
+    `stories.all_rule`. `stories.selected` / `more` / `quiet` are unchanged.
+    Omitted when the view has no train. In place."""
+    trains = bundle.get("trains") or []
+    # Only for a view of a gathered story layer (it carries `pr_history`):
+    # existing views and fixtures without it keep their exact shape (their
+    # tests pin "no `stories` key when no train qualifies").
+    if not trains or "pr_history" not in bundle:
+        return bundle
+    meta = bundle.get("meta") or {}
+    start_s = window_period(meta).get("from")
+    start = _parse_ts(start_s + "T00:00:00Z" if start_s and len(start_s) == 10
+                      else start_s)
+    instant = window_end_instant(meta)
+    end = _parse_ts(instant)
+    history = _pr_history_index(bundle)
+    mc = bundle.get("module_changes")
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    rows, excluded = [], []
+    for t in trains:
+        worthy = story_worthy(bundle, t, start, end, history)
+        if worthy is None:
+            idle = (t.get("effort") or {}).get("idle_days")
+            if not t.get("discussion") or t.get("outcome") != "in_flight":
+                continue
+            if not isinstance(idle, (int, float)) or idle > STORY_CARRY_MAX_DAYS:
+                excluded.append({"id": t["id"], "reason": "no event in the window, "
+                                 "{} days idle (over {})".format(
+                                     idle, STORY_CARRY_MAX_DAYS)})
+                continue
+        group, state, rule = story_group(bundle, t, worthy, instant, mc)
+        _d, total, _r = story_score(t, mc, pr_index)
+        issues, prs = _train_items(bundle, t)
+        first = (issues + prs)[0] if issues + prs else {}
+        row = {"id": t["id"], "group": group, "state": state, "group_rule": rule,
+               "title": first.get("title"),
+               "modules": sorted(a for a in t.get("code_areas") or [] if a),
+               "score": round(total, 1),
+               "worthy": worthy or "carried over"}
+        if state == "landed":
+            rel = train_released(bundle, t)
+            if rel:
+                row["released"] = rel
+        rows.append(row)
+    if not rows and not excluded:
+        return bundle
+    rows.sort(key=lambda r: (STORY_GROUPS.index(r["group"]), -r["score"], r["id"]))
+    st = bundle.setdefault("stories", {"selected": [], "more": [],
+                                       "rule": _story_rule()})
+    st["all"] = rows
+    st["groups"] = {g: sum(1 for r in rows if r["group"] == g) for g in STORY_GROUPS
+                    if any(r["group"] == g for r in rows)}
+    if excluded:
+        st["excluded"] = excluded
+    st["all_rule"] = {"stalled_days": STORY_STALLED_DAYS,
+                      "carry_max_days": STORY_CARRY_MAX_DAYS,
+                      "groups": list(STORY_GROUPS)}
+    return bundle
+
+
+# --- plumbing themes ----------------------------------------------------------
+#
+# "What's been engineered?": the plumbing PRs of the window grouped by the
+# shared paths they touch. Facts only; a writer names the theme.
+
+PLUMBING_THEMES = (
+    ("ci_workflows", "CI workflows",
+     lambda p: p.startswith((".github/workflows/", ".github/actions/",
+                             ".azuredevops/", ".pipelines/", "pipelines/"))),
+    ("pipeline_utilities", "Shared pipeline utilities",
+     lambda p: p.startswith("utilities/")),
+    ("test_environment", "Test fixtures and test environment",
+     lambda p: "/tests/" in "/" + p or "/e2e/" in "/" + p),
+    ("docs_generation", "README and docs generation",
+     lambda p: p.rsplit("/", 1)[-1].lower() == "readme.md" or p.startswith("docs/")
+     or "/docs/" in p or (p.lower().endswith(".md")
+                          and not p.lower().endswith("changelog.md"))),
+    ("repository_policy", "Repository policy files",
+     lambda p: p.rsplit("/", 1)[-1] in ("CODEOWNERS", "LICENSE", ".gitignore",
+                                         ".gitattributes", ".editorconfig",
+                                         "bicepconfig.json", "dependabot.yml")
+     or p.startswith((".github/", ".vscode/", ".devcontainer/"))),
+)
+_DEPENDENCY_TITLE_RE = re.compile(r"\b(?:bump|update|upgrade)s?\b|\bdeps?\b", re.I)
+PLUMBING_THEME_PATHS_MAX = 50
+PLUMBING_THEME_SUBJECTS_MAX = 40
+
+
+def _pr_paths(bundle, n, history):
+    paths = set()
+    for c in bundle.get("commits") or []:
+        if c.get("pr") == n:
+            paths.update(f for f in c.get("files") or [] if f)
+    for c in (history.get(n) or {}).get("commits") or []:
+        paths.update(c.get("paths") or [])
+    return paths
+
+
+def plumbing_theme(pr, paths):
+    """(id, title_hint) of one plumbing PR: `dependency_updates` for an
+    automation account's update PR, else the theme of PLUMBING_THEMES
+    covering most of its files (ties: the earlier theme), else
+    `other_plumbing`."""
+    if derive.is_bot_login(pr.get("author")) and \
+            _DEPENDENCY_TITLE_RE.search(pr.get("title") or ""):
+        return "dependency_updates", "Dependency updates by automation"
+    counts = []
+    for i, (tid, hint, test) in enumerate(PLUMBING_THEMES):
+        n = sum(1 for x in paths if test(x))
+        if n:
+            counts.append((-n, i, tid, hint))
+    if not counts:
+        return "other_plumbing", "Other plumbing"
+    _n, _i, tid, hint = min(counts)
+    return tid, hint
+
+
+def build_plumbing_themes(bundle):
+    """`plumbing_themes` — the window's plumbing PRs (module layer:
+    `plumbing` true, or the PRs of a plumbing story) grouped by
+    plumbing_theme: [{id, title_hint, paths (at most
+    PLUMBING_THEME_PATHS_MAX; paths_more), prs: [{number, title, author,
+    state, merged_at, url}], stories, people, evidence_counts {commits,
+    comments, docs, interface, patches}, subjects (commit subjects, at
+    most PLUMBING_THEME_SUBJECTS_MAX), issues (linked closing issues)}].
+    Omitted when there is none. In place."""
+    mc = bundle.get("module_changes") or {}
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    history = _pr_history_index(bundle)
+    train_of = {n: t["id"] for t in bundle.get("trains") or []
+                for n in t.get("prs") or []}
+    numbers = {r.get("number") for r in mc.get("prs") or [] if r.get("plumbing")}
+    for r in (bundle.get("stories") or {}).get("all") or []:
+        if r.get("group") == "plumbing":
+            t = next((x for x in bundle.get("trains") or [] if x["id"] == r["id"]), {})
+            numbers.update(t.get("prs") or [])
+    themes = {}
+    for n in sorted(x for x in numbers if x in pr_index):
+        p = pr_index[n]
+        paths = _pr_paths(bundle, n, history)
+        tid, hint = plumbing_theme(p, paths)
+        th = themes.setdefault(tid, {"id": tid, "title_hint": hint, "_paths": set(),
+                                     "prs": [], "_stories": set(), "_people": set(),
+                                     "evidence_counts": {"commits": 0, "comments": 0,
+                                                         "docs": 0, "interface": 0,
+                                                         "patches": 0},
+                                     "subjects": [], "_issues": set()})
+        th["_paths"] |= paths
+        th["prs"].append({"number": n, "title": p.get("title"),
+                          "author": p.get("author"), "state": p.get("state"),
+                          "merged_at": p.get("merged_at"), "url": p.get("url")})
+        if n in train_of:
+            th["_stories"].add(train_of[n])
+        th["_people"].add(p.get("author"))
+        th["_people"].update(r.get("author") for r in p.get("reviews") or []
+                             if isinstance(r, dict))
+        th["_issues"].update(p.get("closes") or [])
+        row = history.get(n) or {}
+        ev = th["evidence_counts"]
+        for c in row.get("commits") or []:
+            ev["commits"] += 1
+            for k in ("comments", "docs", "interface"):
+                ev[k] += len(c.get(k) or [])
+            if c.get("subject") and len(th["subjects"]) < PLUMBING_THEME_SUBJECTS_MAX:
+                th["subjects"].append({"pr": n, "sha": c.get("sha"),
+                                       "subject": c["subject"]})
+        ev["patches"] += len(row.get("patches") or [])
+    if not themes:
+        return bundle
+    out = []
+    for tid in sorted(themes, key=lambda k: (-len(themes[k]["prs"]), k)):
+        th = themes[tid]
+        paths = sorted(th.pop("_paths"))
+        th["paths"] = paths[:PLUMBING_THEME_PATHS_MAX]
+        if len(paths) > PLUMBING_THEME_PATHS_MAX:
+            th["paths_more"] = len(paths) - PLUMBING_THEME_PATHS_MAX
+        th["stories"] = sorted(th.pop("_stories"))
+        th["people"] = sorted(x for x in th.pop("_people") if x)
+        th["issues"] = sorted(th.pop("_issues"))
+        out.append(th)
+    bundle["plumbing_themes"] = out
+    return bundle
+
+
 def _story_rule():
     return {"min_exchanges": STORY_MIN_EXCHANGES,
             "min_in_window": STORY_MIN_IN_WINDOW,
@@ -3238,9 +3674,22 @@ def story_material(bundle, train):
             if not isinstance(e, dict):
                 continue
             closed_seen = closed_seen or e.get("event") == "closed"
-            items.append({"at": e.get("created_at"), "kind": e.get("event"),
-                          "actor": e.get("actor"), "url": _event_url(rec, e),
-                          "on": on})
+            it = {"at": e.get("created_at"), "kind": e.get("event"),
+                  "actor": e.get("actor"), "url": _event_url(rec, e), "on": on}
+            # who closed it and why: the event's actor, GitHub's
+            # state_reason, the closing commit, and a PR of the view that
+            # names the item as closed (closes) — each only when recorded
+            if e.get("event") == "closed":
+                if e.get("state_reason") or rec.get("state_reason"):
+                    it["state_reason"] = e.get("state_reason") or rec["state_reason"]
+                if e.get("commit"):
+                    it["commit"] = e["commit"]
+                if typ == "issue":
+                    closers = sorted(p.get("number") for p in bundle.get("prs", [])
+                                     if rec.get("number") in (p.get("closes") or []))
+                    if closers:
+                        it["closing_prs"] = closers
+            items.append(it)
         if rec.get("merged") and rec.get("merged_at"):
             items.append({"at": rec["merged_at"], "kind": "merged",
                           "actor": rec.get("merged_by"), "url": rec.get("url"),
@@ -3328,6 +3777,7 @@ def story_material(bundle, train):
     _apply_thread_record(threads, prs, activity, instant)
     thread_responses(threads, items, prs, history, instant)
     requests = _outcome_requests(threads)
+    automation = _automation_accounts(issues + prs, prs, history, activity)
     out = {"timeline": items,
            "turning_points": turning,
            "truncation": truncation,
@@ -3342,6 +3792,8 @@ def story_material(bundle, train):
            "threads": threads[:STORY_THREADS_MAX]}
     if len(threads) > STORY_THREADS_MAX:
         out["threads_omitted"] = len(threads) - STORY_THREADS_MAX
+    if automation:
+        out["automation"] = automation
     coverage = _thread_coverage(prs, activity, threads)
     if coverage:
         out["thread_coverage"] = coverage
@@ -3474,6 +3926,52 @@ def _pr_history_status(prs, history):
             s += ", notes skipped: " + row["notes_skipped"]
         out[str(p.get("number"))] = s
     return out
+
+
+def _automation_accounts(records, prs, history, activity):
+    """The automation accounts of a train, for what they are (issue #97):
+    [{login, is_bot: true, comments, review_comments, reviews, commits,
+    prs_opened: [n], on_behalf_of?: {login, basis, pr}}] — counts over the
+    train's items (they stay out of the conversation timeline), the PRs
+    they opened, their PR commits (git author names an automation account
+    commits under), and for a PR an automation account opened, the person
+    who handed it the work when the record shows it: the actor of an
+    `assigned` event assigning it (basis `assigned`), else the first
+    person who requested a review on it (basis `requested review`)."""
+    acc = {}
+
+    def get(login):
+        return acc.setdefault(login, {"login": login, "is_bot": True,
+                                      "comments": 0, "review_comments": 0,
+                                      "reviews": 0, "commits": 0, "prs_opened": []})
+    for rec in records:
+        for key, field in (("comments_list", "comments"),
+                           ("review_comments", "review_comments"),
+                           ("reviews", "reviews")):
+            for c in rec.get(key) or []:
+                if isinstance(c, dict) and derive.is_bot_login(c.get("author")):
+                    get(c["author"])[field] += 1
+    for p in prs:
+        if derive.is_bot_login(p.get("author")):
+            row = get(p["author"])
+            row["prs_opened"].append(p.get("number"))
+            evs = ((activity or {}).get(p.get("number")) or {}).get("events") or []
+            by = next(({"login": e.get("actor"), "basis": "assigned",
+                        "pr": p.get("number")} for e in evs
+                       if e.get("event") == "assigned"
+                       and e.get("assignee") == p["author"]
+                       and e.get("actor") and not derive.is_bot_login(e["actor"])),
+                      None) or next(({"login": e.get("by"), "basis": "requested review",
+                                      "pr": p.get("number")} for e in evs
+                                     if e.get("event") == "review_requested"
+                                     and e.get("by")
+                                     and not derive.is_bot_login(e["by"])), None)
+            if by and "on_behalf_of" not in row:
+                row["on_behalf_of"] = by
+        for c in (history.get(p.get("number")) or {}).get("commits") or []:
+            if derive.is_bot_login(c.get("author")):
+                get(c["author"])["commits"] += 1
+    return [acc[k] for k in sorted(acc)]
 
 
 def _commit_evidence(c):
@@ -4583,6 +5081,10 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
     mods = _outcome_modules(bundle, train)
     if mods:
         out["modules"] = mods
+    if train.get("outcome") == "shipped":
+        rel = train_released(bundle, train)
+        if rel:
+            out["released"] = rel   # does "landed" mean released?
     net = {}
     for p in prs:
         if p.get("state") != "open":
@@ -5171,6 +5673,12 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     # where no train qualifies, are unchanged.
     annotate_train_discussion(bundle)
     select_story_trains(bundle)
+    # Every story of the window, grouped (issue #97: "all the stories for
+    # that month ... landed, in flight, stalled, plumbing"), and the
+    # plumbing themes; omit-when-absent.
+    build_story_list(bundle)
+    build_plumbing_themes(bundle)
+    annotate_issue_closing(bundle)
     # The people layer: affiliation shares, community counts, newcomers /
     # returning contributors and the hall with what each person's work was
     # about (module layer). Only when the view carries the gathered
