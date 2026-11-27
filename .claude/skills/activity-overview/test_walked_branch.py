@@ -224,6 +224,8 @@ class TestNonDefaultMainline(_TwoBranchRepo):
                                         clone=os.path.join(self.tmp, "b"))
         for b in (plain, named):
             b["meta"].pop("clone_dir")
+            # the wall-clock time of each run, which can fall either side of a second
+            (b.get("module_ownership") or {}).pop("gathered_at", None)
         self.assertEqual(named, plain)
         self.assertNotIn("remote default", err_plain + err_named)
 
