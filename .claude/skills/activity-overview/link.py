@@ -2790,11 +2790,44 @@ def own_change(c):
     one parent: a merge (two or more parents: "Merge branch 'main'") and a
     boundary commit (no parent in the walk: its diff is against an empty
     tree) carry the base branch's files, thousands of them — never the PR's
-    net change, interface or notes."""
-    return c.get("parents", 1) == 1
+    net change, interface or notes. A commit another PR holds too and
+    opened first (`belongs_to_pr`: a PR stacked on another PR's branch) is
+    that PR's change, not this one's."""
+    return c.get("parents", 1) == 1 and not c.get("belongs_to_pr")
+
+
+def annotate_stacked_commits(bundle):
+    """A commit several PRs' histories hold (one PR branched from another
+    open PR's branch) belongs to the PR opened first: the others' copies
+    get `belongs_to_pr` (that PR's number), so they are not their own
+    change. In place (the view's `pr_history`)."""
+    rows = _pr_history_index(bundle)
+    if not rows:
+        return bundle
+    opened = {p.get("number"): p.get("created_at") or "" for p in bundle.get("prs") or []
+              if isinstance(p, dict)}
+    holders = {}
+    for n, row in rows.items():
+        for c in row.get("commits") or []:
+            if isinstance(c, dict) and c.get("sha"):
+                holders.setdefault(c["sha"], []).append(n)
+    for sha, ns in holders.items():
+        if len(ns) < 2:
+            continue
+        owner = min(ns, key=lambda n: (opened.get(n) or "~", n))
+        for n in ns:
+            if n == owner:
+                continue
+            for c in rows[n].get("commits") or []:
+                if isinstance(c, dict) and c.get("sha") == sha:
+                    c["belongs_to_pr"] = owner
+    return bundle
 
 
 def _not_own_reason(c):
+    if c.get("belongs_to_pr"):
+        return "a commit of PR #{} (this PR's branch was made from it)".format(
+            c["belongs_to_pr"])
     return "a merge of another branch: its files are that branch's" \
         if c.get("parents", 1) > 1 else \
         "a boundary commit read against an empty tree: its files are not the PR's change"
@@ -2803,6 +2836,17 @@ def _not_own_reason(c):
 def _pr_own_commits_as_of(row, instant):
     """_pr_commits_as_of, the PR's own changes only (own_change)."""
     return [c for c in _pr_commits_as_of(row, instant) if own_change(c)]
+
+
+def _pr_content_commits_as_of(row, instant):
+    """What a PR CONTAINS, for what kind of work it is (plumbing class,
+    theme, where its content landed): its own changes, or — a PR every
+    commit of which another PR opened first also holds (an identical copy,
+    a consolidation) — those shared single-parent commits."""
+    own = _pr_own_commits_as_of(row, instant)
+    if own:
+        return own
+    return [c for c in _pr_commits_as_of(row, instant) if c.get("parents", 1) == 1]
 
 
 def _train_members(train, pr_index, issue_index):
@@ -3018,7 +3062,7 @@ def _classify_open_pr(bundle, n):
     pr = next((p for p in bundle.get("prs") or [] if p.get("number") == n), None)
     row = _pr_history_index(bundle).get(n)
     instant = window_end_instant(bundle.get("meta"))
-    paths = sorted({x for c in _pr_own_commits_as_of(row, instant)
+    paths = sorted({x for c in _pr_content_commits_as_of(row, instant)
                     for x in c.get("paths") or []})
     if pr is None or not paths:
         return None
@@ -3644,7 +3688,49 @@ def annotate_automation(bundle, registry=None):
             if len(by_pr) > 1:          # several PRs: who each one works for
                 row["on_behalf_of_by_pr"] = {k: by_pr[k] for k in sorted(by_pr, key=int)}
         people.setdefault(login, {})["automation"] = row
+    _alias_automated_reviewers(bundle, people, activity, instant)
     return bundle
+
+
+def _alias_automated_reviewers(bundle, people, activity, instant):
+    """One automation identity under two accounts, from the record: a
+    review is requested from automation account X and the reviews come from
+    automation account Y — on EVERY PR where Y reviewed, X had been
+    requested before and never reviewed itself (at least two such PRs).
+    Then Y's row gains `same_identity_as` {login: X, basis, prs} and X's
+    `reviews_as` [Y]. Never from the names."""
+    def auto(x):
+        row = people.get(x) or {}
+        return isinstance(row.get("automation"), dict)
+    seen = {}
+    for p in bundle.get("prs") or []:
+        if not isinstance(p, dict):
+            continue
+        evs = [e for e in (activity.get(p.get("number")) or {}).get("events") or []
+               if isinstance(e, dict) and _not_after(e.get("at"), instant)]
+        reviews = [r for r in p.get("reviews") or [] if isinstance(r, dict)
+                   and auto(r.get("author")) and _not_after(r.get("submitted_at"), instant)]
+        for r in reviews:
+            y = r["author"]
+            asked = {e.get("requested") for e in evs if e.get("event") == "review_requested"
+                     and auto(e.get("requested")) and e.get("requested") != y
+                     and (e.get("at") or "") <= (r.get("submitted_at") or "")}
+            self_reviewed = {x.get("author") for x in p.get("reviews") or []
+                             if isinstance(x, dict)}
+            asked = {x for x in asked if x not in self_reviewed}
+            seen.setdefault(y, []).append((p.get("number"), asked))
+    for y, rows in seen.items():
+        common = set.intersection(*[a for _n, a in rows]) if rows else set()
+        if len(common) == 1 and len({n for n, _a in rows}) >= 2:
+            x = next(iter(common))
+            prs = sorted({n for n, _a in rows})
+            people[y]["automation"]["same_identity_as"] = {
+                "login": x, "prs": prs,
+                "basis": "its reviews come only where a review was requested from "
+                         "{} (which never reviewed itself)".format(x)}
+            people[x]["automation"].setdefault("reviews_as", [])
+            if y not in people[x]["automation"]["reviews_as"]:
+                people[x]["automation"]["reviews_as"].append(y)
 
 
 def _is_automation(bundle, login):
@@ -3872,46 +3958,55 @@ def last_human_event(bundle, t, instant):
     url} or None."""
     issues, prs = _train_items(bundle, t)
     cands = []
+    names = _git_name_logins(bundle)
 
-    def add(at, kind, actor, url):
+    def add(at, kind, actor, url, rec):
         if at and _not_after(at, instant) and _parse_ts(at) is not None \
                 and not (actor and _cannot_act(bundle, actor)):
-            cands.append((_parse_ts(at), at, kind, actor, url))
+            on = {"type": "pr" if rec in prs else "issue", "number": rec.get("number")} \
+                if rec is not None else None
+            cands.append((_parse_ts(at), at, kind, actor, url, on))
     for rec in issues + prs:
-        add(rec.get("created_at"), "opened", rec.get("author"), rec.get("url"))
+        add(rec.get("created_at"), "opened", rec.get("author"), rec.get("url"), rec)
         for key, ts, kind in (("comments_list", "created_at", "comment"),
                               ("review_comments", "created_at", "review_comment"),
                               ("reviews", "submitted_at", "review")):
             for c in rec.get(key) or []:
                 if isinstance(c, dict):
-                    add(c.get(ts), kind, c.get("author"), c.get("url"))
+                    add(c.get(ts), kind, c.get("author"), c.get("url"), rec)
         for e in rec.get("lifecycle") or []:
             if isinstance(e, dict):
                 add(e.get("created_at"), e.get("event") or "lifecycle", e.get("actor"),
-                    rec.get("url"))
+                    rec.get("url"), rec)
         if rec.get("merged") and rec.get("merged_at"):
-            add(rec["merged_at"], "merged", rec.get("merged_by"), rec.get("url"))
+            add(rec["merged_at"], "merged", rec.get("merged_by"), rec.get("url"), rec)
         elif rec.get("closed_at") and rec.get("state") == "closed":
-            add(rec["closed_at"], "closed", None, rec.get("url"))
+            add(rec["closed_at"], "closed", None, rec.get("url"), rec)
     by_sha = {c.get("sha"): c for c in bundle.get("commits") or []}
+    pr_of = {p.get("number"): p for p in prs}
     for sha in t.get("commits") or []:
         c = by_sha.get(sha) or {}
         add(c.get("committed_at") or c.get("date"), "commit", c.get("author"),
-            derive._commit_url(bundle, sha))
+            derive._commit_url(bundle, sha), pr_of.get(c.get("pr")))
     history = _pr_history_index(bundle)
     activity = _pr_activity_index(bundle) or {}
     for p in prs:
         for c in _pr_own_commits_as_of(history.get(p.get("number")), instant):
             if not derive.is_bot_login(c.get("author")):
-                add(c.get("committed_at"), "commit", p.get("author"),
-                    _pr_commit_url(p, c.get("sha")))
+                # the commit's own author (resolved to a login where the
+                # record resolves it, else the git name), never the PR's
+                add(c.get("committed_at"), "commit", names.get(c.get("author"))
+                    or c.get("author"), _pr_commit_url(p, c.get("sha")), p)
         for e in (activity.get(p.get("number")) or {}).get("events") or []:
             if isinstance(e, dict):
-                add(e.get("at"), e.get("event"), e.get("actor"), _event_url(p, e))
+                add(e.get("at"), e.get("event"), e.get("actor"), _event_url(p, e), p)
     if not cands:
         return None
-    _dt, at, kind, actor, url = max(cands, key=lambda c: (c[0], c[2]))
-    return {"at": at, "kind": kind, "actor": actor, "url": url}
+    _dt, at, kind, actor, url, on = max(cands, key=lambda c: (c[0], c[2]))
+    out = {"at": at, "kind": kind, "actor": actor, "url": url}
+    if on:
+        out["on"] = on
+    return out
 
 
 def annotate_last_human_event(bundle):
@@ -3942,18 +4037,22 @@ def annotate_last_human_event(bundle):
 
 def status_reason(bundle, t, instant):
     """Why an open story stands where it does, in words a writer can use:
-    "opened N days before the window's end; <review state of its latest
-    open PR>; last human event M days before the end (<kind> by <actor>)".
+    "<PR / issue #N> opened N days before the window's end; PR #M: <review
+    state of its latest open PR>; last human event K days before the end
+    (<kind> by <actor> on <PR / issue #J>)" — each fact names the item it is
+    about.
     None for a train that is not open."""
     if t.get("outcome") != "in_flight":
         return None
     end = _parse_ts(instant)
     issues, prs = _train_items(bundle, t)
     parts = []
-    opened = [d for d in (_parse_ts(r.get("created_at")) for r in issues + prs) if d]
+    opened = [(d, r) for r in issues + prs for d in [_parse_ts(r.get("created_at"))] if d]
     if opened and end:
-        parts.append("opened {} days before the window's end".format(
-            (end.date() - min(opened).date()).days))
+        d, first = min(opened, key=lambda x: x[0])
+        parts.append("opened {} days before the window's end ({} #{})".format(
+            (end.date() - d.date()).days, "PR" if first in prs else "issue",
+            first.get("number")))
     open_prs = sorted((p for p in prs if p.get("state") == "open"),
                       key=lambda p: p.get("created_at") or "")
     if open_prs:
@@ -3963,9 +4062,12 @@ def status_reason(bundle, t, instant):
     ev = (t.get("effort") or {}).get("last_human_event") or \
         last_human_event(bundle, t, instant)
     if ev and end:
-        parts.append("last human event {} days before the end ({}{})".format(
+        on = ev.get("on") or {}
+        parts.append("last human event {} days before the end ({}{}{})".format(
             (end.date() - _parse_ts(ev["at"]).date()).days, ev.get("kind"),
-            " by " + ev["actor"] if ev.get("actor") else ""))
+            " by " + ev["actor"] if ev.get("actor") else "",
+            " on {} #{}".format("PR" if on.get("type") == "pr" else "issue", on["number"])
+            if on.get("number") is not None else ""))
     return "; ".join(parts) or None
 
 
@@ -4172,9 +4274,14 @@ def owner_response_request(bundle, ctx, typ, rec, instant, rxs):
     if owners:
         out["owners"] = owners
     elif module and module_owners(bundle).get(module):
-        # the module's owners at the window's end (its owner file)
-        out["owners"] = module_owners(bundle)[module]
-        out["owners_source"] = "owner_file"
+        # the module's owners at the window's end (its owner file); the
+        # item's own author is not who it waits on
+        others = [o for o in module_owners(bundle)[module] if o != rec.get("author")]
+        if others:
+            out["owners"] = others
+            out["owners_source"] = "owner_file"
+        else:
+            out["author_is_module_owner"] = True
     return out
 
 
@@ -4279,6 +4386,40 @@ def annotate_module_ownership(bundle):
             if isinstance(r, dict) and r.get("module") and module_url(bundle, r["module"]):
                 r["module_url"] = module_url(bundle, r["module"])
     mo["events"] = sorted(events, key=_ownership_event_key)
+    return bundle
+
+
+def annotate_train_joins(bundle):
+    """`joined_by` on every train of a story-layer view: for each member
+    issue, the PR that joined it and how — a closing reference (`closes`:
+    the line of the PR's description naming it when the description does,
+    else "a closing reference GitHub records"), or a cross-reference
+    (`crossref`); [{item {type, number}, via, by {type, number}, [quote]}]."""
+    if "pr_history" not in bundle:
+        return bundle
+    prs = {p.get("number"): p for p in bundle.get("prs") or [] if isinstance(p, dict)}
+    for t in bundle.get("trains") or []:
+        out = []
+        for n in t.get("issues") or []:
+            for m in t.get("prs") or []:
+                p = prs.get(m) or {}
+                via = "closes" if n in (p.get("closes") or []) else \
+                    "crossref" if n in (p.get("crossref_issues") or []) else None
+                if not via:
+                    continue
+                row = {"item": {"type": "issue", "number": n}, "via": via,
+                       "by": {"type": "pr", "number": m}}
+                line = next((ln.strip() for ln in (p.get("body") or "").splitlines()
+                             if re.search(r"#{}\b".format(n), ln)), None)
+                if line:
+                    row["quote"] = line[:300]
+                elif via == "closes":
+                    row["quote_absent"] = "a closing reference GitHub records (not in the " \
+                        "description as gathered)"
+                out.append(row)
+                break
+        if out:
+            t["joined_by"] = out
     return bundle
 
 
@@ -4415,7 +4556,7 @@ def _pr_paths(bundle, n, history, instant=None):
     for c in bundle.get("commits") or []:
         if c.get("pr") == n:
             paths.update(f for f in c.get("files") or [] if f)
-    for c in _pr_own_commits_as_of(history.get(n), instant):
+    for c in _pr_content_commits_as_of(history.get(n), instant):
         paths.update(c.get("paths") or [])
     return paths
 
@@ -4445,6 +4586,22 @@ def plumbing_theme(pr, paths, automated=None):
         return "other_plumbing", "Other plumbing"
     _n, _i, tid, hint = min(counts)
     return tid, hint
+
+
+def _net_files_summary(row):
+    """{files, added, removed, commits, top: [{path, added, removed}]} of a
+    PR's net change per file (gather pr_net_files) — what it changed as a
+    whole, beside what its description says; None without it."""
+    nf = (row or {}).get("net_files") or {}
+    files = [f for f in nf.get("files") or [] if isinstance(f, dict)]
+    if not files:
+        return None
+    total = len(files) + (nf.get("files_omitted") or 0)
+    top = sorted(files, key=lambda f: -((f.get("added") or 0) + (f.get("removed") or 0)))
+    return {"files": total, "added": sum(f.get("added") or 0 for f in files),
+            "removed": sum(f.get("removed") or 0 for f in files),
+            "commits": len([c for c in (row or {}).get("commits") or [] if own_change(c)]),
+            "top": [{k: f.get(k) for k in ("path", "added", "removed")} for f in top[:10]]}
 
 
 def build_plumbing_themes(bundle):
@@ -4503,6 +4660,8 @@ def build_plumbing_themes(bundle):
                           "author": p.get("author"), "state": p.get("state"),
                           "merged_at": p.get("merged_at"), "url": p.get("url"),
                           "carried_over": n in carried,
+                          **({"net_files": _net_files_summary(history.get(n))}
+                             if _net_files_summary(history.get(n)) else {}),
                           **({"closed_unmerged": p["closed_unmerged"]}
                              if p.get("closed_unmerged") else {}),
                           **({"review_state": p["review_state"]}
@@ -5025,6 +5184,8 @@ def story_material(bundle, train):
                   "authored_at": c.get("authored_at")}
             if c.get("parents", 1) > 1:
                 it["merge"] = True
+            if c.get("belongs_to_pr"):
+                it["belongs_to_pr"] = c["belongs_to_pr"]
             if not own_change(c):
                 it["not_own_change"] = _not_own_reason(c)
             # who the git author is, as far as the record resolves it
@@ -5141,7 +5302,8 @@ def story_material(bundle, train):
         out["threads_omitted"] = len(threads) - STORY_THREADS_MAX
     if automation:
         out["automation"] = automation
-    coverage = _thread_coverage(prs, activity, threads)
+    coverage = _thread_coverage(prs, activity, threads,
+                                lambda x: _is_automation(bundle, x) if x else False)
     if coverage:
         out["thread_coverage"] = coverage
     if requests:
@@ -5653,7 +5815,7 @@ def checks_outcome(row, instant, pr_url=None):
     return out
 
 
-def _thread_coverage(prs, activity, threads):
+def _thread_coverage(prs, activity, threads, is_auto=None):
     """{pr number (str): {flagged, omitted}} for the train's PRs with a
     `pr_activity` row: how many of the PR's review threads carry GitHub's
     resolved flag in the ledger, and how many review threads gather did not
@@ -5671,6 +5833,17 @@ def _thread_coverage(prs, activity, threads):
             and (t.get("on") or {}).get("number") == n
             and "resolved_on_github" in t),
             "omitted": row.get("threads_omitted") or 0}
+        if is_auto:
+            # review threads an automation account opened: their resolved
+            # flags are read, but they are no person's thread in the story
+            first = {c.get("id"): c.get("author") for c in p.get("review_comments") or []
+                     if isinstance(c, dict)}
+            auto = [t for t in row.get("threads") or [] if isinstance(t, dict)
+                    and is_auto(first.get(t.get("comment_id")))]
+            if auto:
+                out[str(n)]["by_automation"] = {
+                    "threads": len(auto),
+                    "resolved": sum(1 for t in auto if t.get("resolved") is True)}
     return out
 
 
@@ -5964,7 +6137,9 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
     - R2 author moved: the last event is the author's (an opening, a
       commit, a comment) -> `awaiting reviewer`: the reviewers whose latest
       verdict is a change request, else the people the author named, else
-      the reviewers who reviewed; nobody -> `awaiting a first review`;
+      the reviewers who reviewed, else the reviewers requested and not yet
+      reviewing (`review`'s `requested`); nobody -> `awaiting a first
+      review`. A commit's basis names the commit's own author;
     - R3 approved: the last event is an approval and no change request is
       outstanding -> `awaiting merge`;
     - R4 reviewer moved: otherwise -> `awaiting author`.
@@ -5995,6 +6170,7 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
     outranked by an automation re-request.
     Returns {state, with, rule, basis: {at, kind, actor, url}, derived:
     true}, or None when the PR has no recorded event."""
+    review = review if isinstance(review, dict) else None
     pr_items = [it for it in pr_items or [] if it.get("kind")
                 not in _AUTOMATION_KINDS
                 and not (cannot_act and it.get("actor") and cannot_act(it["actor"]))]
@@ -6004,6 +6180,10 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
     last = pr_items[-1]
     actor = author if last["kind"] in ("commit", "opened", "ready_for_review",
                                        "reopened") else last.get("actor")
+    # who made it, as the record says (a commit by someone else on the PR
+    # is still the PR side's move, but it names its own author)
+    shown = (last.get("author_login") or last.get("author_name") or actor) \
+        if last["kind"] == "commit" else actor
     outstanding = [r for r, v in verdicts.items()
                    if v.get("state") == "changes_requested"]
     named = _mentions(last.get("text"), exclude={actor})
@@ -6013,7 +6193,8 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
         state, who, rule = "awaiting mentioned", [m for m in named if m != author], \
             "R1 mention"
     elif actor == author:
-        who = outstanding or named or [r for r in reviewers if r != author]
+        who = outstanding or named or [r for r in reviewers if r != author] \
+            or [r for r in (review or {}).get("requested") or [] if r != author]
         state = "awaiting reviewer" if who else "awaiting a first review"
         rule = "R2 author moved"
     elif last["kind"] == "review" and last.get("state") == "approved" \
@@ -6023,7 +6204,7 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
         state, who, rule = "awaiting author", [author] if author else [], \
             "R4 reviewer moved"
     out = {"state": state, "with": who, "rule": rule,
-           "basis": _event_ref(last, actor), "derived": True}
+           "basis": _event_ref(last, shown), "derived": True}
     waiting = set((checks or {}).get("awaiting_approval") or [])
     if rule in ("R2 author moved", "R3 approved") and checks \
             and checks.get("rollup") == "failing" and waiting \
@@ -6053,6 +6234,8 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
                    review_basis={"approved_at": basis_r.get("at"),
                                  "last_push": review.get("last_push")})
         out["with"] = [approver] if approver else []
+    if owner_request and owner_request.get("author_is_module_owner"):
+        owner_request = None     # the author owns the module: the reviewers next
     if owner_request and out["rule"] == "R2 author moved" and not outstanding:
         out.update(state="awaiting module owner",
                    rule="R7 module owner response requested",
@@ -6474,6 +6657,8 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
                 w["owners"] = req["owners"]
                 if req.get("owners_source"):
                     w["owners_source"] = req["owners_source"]
+            if req.get("author_is_module_owner"):
+                w["author_is_module_owner"] = True
             waits.append(w)
             req = req if rec.get("state") == "open" else None
         owners_of = {a: module_owners(bundle)[a] for a in mods
@@ -7117,9 +7302,53 @@ def close_reason(bundle, pr, instant):
     return {"close_reason": "not stated"}
 
 
+def content_landed_in(bundle, pr, instant):
+    """Where a closed, unmerged PR's work reappears, as EVIDENCE (never
+    "superseded" — that only on explicit text): merged PRs whose own commit
+    subjects, or whose merge commit's message on the walked branch,
+    contain one of this PR's own commit subjects verbatim, or that hold the
+    very same commit. [{pr, basis (`same commit` / `same commit subject` /
+    `named in the merge commit message`),
+    commits [{sha, subject}]}]."""
+    history = _pr_history_index(bundle)
+    mine = [c for c in _pr_content_commits_as_of(history.get(pr.get("number")), instant)
+            if (c.get("subject") or "").strip() and len(c["subject"].strip()) >= 12]
+    if not mine:
+        return []
+    merged = [p for p in bundle.get("prs") or [] if isinstance(p, dict) and p.get("merged")
+              and p.get("number") != pr.get("number")
+              and _not_after(p.get("merged_at"), instant)]
+    messages = {}
+    for c in bundle.get("commits") or []:
+        if c.get("pr") is not None:
+            messages.setdefault(c["pr"], []).append(c.get("message") or "")
+    out = []
+    for p in merged:
+        # every single-parent commit the merged PR held (a commit it shares
+        # with the closed PR is how the content landed)
+        their_commits = [x for x in _pr_commits_as_of(history.get(p.get("number")), instant)
+                         if x.get("parents", 1) == 1]
+        theirs = {(c.get("subject") or "").strip() for c in their_commits}
+        shas = {c.get("sha") for c in their_commits}
+        text = "\n".join(messages.get(p.get("number")) or [])
+        same_commit = [c for c in mine if c.get("sha") in shas]
+        same = [c for c in mine if c not in same_commit and c["subject"].strip() in theirs]
+        named = [c for c in mine if c not in same_commit and c not in same
+                 and c["subject"].strip() in text]
+        for basis, rows in (("same commit", same_commit), ("same commit subject", same),
+                            ("named in the merge commit message", named)):
+            if rows:
+                out.append({"pr": p.get("number"), "basis": basis,
+                            "commits": [{"sha": c.get("sha"), "subject": c.get("subject")}
+                                        for c in rows]})
+    return out
+
+
 def annotate_close_reasons(bundle):
     """`closed_unmerged` (close_reason) on every PR of a story-layer view
-    closed without merging by the view's end. In place."""
+    closed without merging by the view's end, with `content_landed_in`
+    (content_landed_in) when its commits reappear in a merged PR. In
+    place."""
     if "pr_history" not in bundle:
         return bundle
     instant = window_end_instant(bundle.get("meta"))
@@ -7127,6 +7356,9 @@ def annotate_close_reasons(bundle):
         if isinstance(p, dict) and p.get("state") == "closed" and not p.get("merged") \
                 and p.get("closed_at") and _not_after(p["closed_at"], instant):
             p["closed_unmerged"] = close_reason(bundle, p, instant)
+            landed = content_landed_in(bundle, p, instant)
+            if landed:
+                p["closed_unmerged"]["content_landed_in"] = landed
     return bundle
 
 
@@ -7290,6 +7522,7 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
         # the registry's operator tags win, then the stored account type;
         # then the one review state every reader uses (approval lists too)
         annotate_automation(bundle, registry_automation(people_source))
+        annotate_stacked_commits(bundle)
         annotate_review_state(bundle)
         annotate_close_reasons(bundle)
         inst = window_end_instant(bundle.get("meta"))
@@ -7340,6 +7573,7 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     # where no train qualifies, are unchanged.
     annotate_last_human_event(bundle)
     annotate_train_modules(bundle)
+    annotate_train_joins(bundle)
     if "pr_history" in bundle:
         annotate_module_owners(bundle)
     annotate_train_discussion(bundle)
@@ -7609,8 +7843,33 @@ def _train_logins(bundle, train):
     commits = {c.get("sha"): c for c in bundle.get("commits", [])}
     for sha in train.get("commits") or []:
         logins.add((commits.get(sha) or {}).get("author"))
+    # who wrote the PRs' own commits, where the record resolves the git name
+    names = _git_name_logins(bundle)
+    history = _pr_history_index(bundle)
+    instant = window_end_instant(bundle.get("meta"))
+    for p in prs:
+        for c in _pr_own_commits_as_of(history.get(p.get("number")), instant):
+            logins.add(names.get(c.get("author")))
     logins.discard(None)
     return logins
+
+
+def _automation_for_train(automation, train):
+    """An automation people row as one train's slice shows it: who it works
+    for only on that train's PRs (never another PR's person)."""
+    out = {k: v for k, v in automation.items()
+           if k not in ("on_behalf_of", "on_behalf_of_by_pr")}
+    by_pr = dict(automation.get("on_behalf_of_by_pr") or {})
+    one = automation.get("on_behalf_of")
+    if isinstance(one, dict) and one.get("pr") is not None:
+        by_pr.setdefault(str(one["pr"]), one)
+    mine = {k: v for k, v in by_pr.items()
+            if str(k) in {str(n) for n in train.get("prs") or []}}
+    if mine:
+        out["on_behalf_of"] = mine[min(mine, key=int)]
+        if len(mine) > 1:
+            out["on_behalf_of_by_pr"] = mine
+    return out
 
 
 def slice_participants(bundle, train):
@@ -7643,7 +7902,7 @@ def slice_participants(bundle, train):
         if p.get("module_owner_of"):
             row["module_owner_of"] = p["module_owner_of"]
         if p.get("automation"):
-            row["automation"] = p["automation"]
+            row["automation"] = _automation_for_train(p["automation"], train)
         out[login] = row
     return {"participants": out}
 

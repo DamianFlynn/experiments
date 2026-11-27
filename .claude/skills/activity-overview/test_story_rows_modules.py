@@ -114,9 +114,13 @@ class TestThemeStories(unittest.TestCase):
 class TestAutomationTrains(unittest.TestCase):
 
     def test_bot_bump_with_no_human_turn_is_plumbing(self):
+        # the update's commit is the automation account's own (a commit is
+        # counted for its own author since the commit-actor fix)
+        row = hrow(7, [".github/workflows/a.yml"])
+        row["commits"][0]["author"] = "dependabot[bot]"
         b = view([pr(7, title="fix: bump actions/upload-artifact from 5 to 7",
                      author="dependabot[bot]")],
-                 pr_history=hist(hrow(7, [".github/workflows/a.yml"])))
+                 pr_history=hist(row))
         b = enriched(b)
         r = rows(b)["train-pr-7"]
         self.assertEqual((r["group"], r["state"]), ("plumbing", "in_flight"))

@@ -1744,6 +1744,45 @@ derived once in link and carried on every row that needs it:
   (400) lines, the breaking section included (gather's patch excerpts:
   `PR_HISTORY_PATCH_LINES`, 400).
 
+### Who did it, and why things belong together (story-layer views)
+
+- **A commit is its author's.** The last human event, `status_reason` and a ball's
+  `basis` name a commit's own author — the login the window's walked commits resolved its
+  git name to, else the git name — never the PR's author; the people of a train include
+  the authors of its PRs' own commits. `status_reason` names the item each fact is about:
+  "opened N days before the window's end (PR / issue #N); PR #M: <review state>; last human
+  event K days before the end (<kind> by <actor> on PR / issue #J)"; `last_human_event`
+  carries `on` `{type, number}`.
+- **Stacked PRs.** A commit several PRs' histories hold belongs to the PR opened first: the
+  others' copies get `belongs_to_pr` (`link.annotate_stacked_commits`) and are not their own
+  change (net change, modules, notes, theme paths); the timeline keeps them with
+  `belongs_to_pr` and `not_own_change`.
+- **Why a member is in its train.** Trains carry `joined_by` `[{item {type, number}, via:
+  closes | crossref, by {type, number}, quote | quote_absent}]` — the line of the PR's
+  description that names the issue, else "a closing reference GitHub records (not in the
+  description as gathered)".
+- **Where a closed PR's work went.** `closed_unmerged.content_landed_in` `[{pr, basis: same
+  commit | same commit subject | named in the merge commit message, commits [{sha,
+  subject}]}]` — merged PRs that hold the very same commit, or whose own commit subjects,
+  or whose merge commit's message, contain one of its commit subjects verbatim. Evidence
+  only: `superseded_by` still needs explicit text. What kind of work a PR is (its plumbing
+  class, theme paths) is read from its own commits, or — when another PR opened first
+  holds every one of them (an identical copy) — from those shared commits.
+- **Automation identities.** When reviews by automation account Y come only on PRs where a
+  review was requested from automation account X (which never submitted a review itself),
+  at least twice, Y's people row adds `automation.same_identity_as` `{login: X, basis,
+  prs}` and X's `reviews_as` [Y]. A slice's participant rows show an automation account's
+  `on_behalf_of` for that train's own PRs only.
+- **The module owner who is the author.** An owner response request whose module's only
+  owners are the item's own author names no owners (`author_is_module_owner: true`, also
+  on the outcome's `owner_response_requested` row) and never moves the ball to "awaiting
+  module owner": R2 falls through to the reviewers requested and not yet reviewing.
+- **Threads an automation account opened** are no person's thread in the story, but are
+  counted: `thread_coverage[pr].by_automation` `{threads, resolved}`.
+- **Theme PR rows** add `net_files` `{files, added, removed, commits, top: [{path, added,
+  removed}]}` — what a PR changed as a whole (gather `pr_net_files`), beside its
+  description.
+
 ### What a story can name (story-layer views)
 
 - **Linked items outside the window** — the per-window fact `linked_items`
