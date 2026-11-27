@@ -350,12 +350,25 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    (`checks_said_unknown`); likewise for a thread's resolution against the PRs whose
    resolution coverage is complete (`thread_coverage`: all review threads flagged,
    none omitted by gather or the ledger cap; `resolved_said_unknown`). A qualified
-   claim ("the checks of #2 were not read") passes under partial coverage; and every code comment
+   claim ("the checks of #2 were not read") passes under partial coverage — see the table
+   below; and every code comment
    the story quotes in backticks (a span starting with `//`, `/*`, `#` or `<#`; a bare
    issue / PR reference such as `#7146` is not one) occurs in
    the slice (`code_comments_not_in_slice`).
    Else exit 1 with the lists. Drop or fix each listed sentence and check again; never
    publish a story that fails it.
+   The rules that refuse a statement of not-knowing — each scoped to the items the
+   sentence names (`#N` or a link), refusing only when coverage of every one of them is
+   complete; a sentence naming none is refused only when every PR of the slice is
+   covered. The checker never forces a story to hide a real coverage limit:
+
+   | Rule | Refuses a sentence saying … is not in the record | Only when, for each item named |
+   |---|---|---|
+   | `checks_said_unknown` | CI / checks / check results of a PR | its outcome `checks` are gathered with a result (`passing`, `failing`, `pending`, `none`; not `incomplete` / `unavailable`); for a sentence about earlier commits or pushes, also every commit of the PR read (`commits_covered` = `commits_total`) |
+   | `resolved_said_unknown` | whether a PR's review threads were resolved | every review thread of the PR in the ledger carries `resolved_on_github`, `thread_coverage` shows none omitted by gather, and the ledger cap hid none (a PR with no ledger entry is never covered) |
+
+   No rule refuses a statement that commit evidence is missing (`evidence_omitted`,
+   `interface_unread`, `docs_unread`, history omissions in `not_gathered`).
    **What the check does not cover** — read the story once against rules 2–7: that each
    turning point is explained in substance, that decisions come from the outcome block
    and change summaries rather than tone, that every thread mentioned is closed or called

@@ -3335,7 +3335,8 @@ def story_material(bundle, train):
            "code_notes_by_module": by_module,
            "pr_history": _pr_history_status(prs, history),
            "as_of": instant,
-           "not_gathered": _story_not_gathered(prs, activity),
+           "not_gathered": _story_not_gathered(prs, activity)
+           + _history_omissions(prs, history),
            "outcome": story_outcome(bundle, train, items, history, instant, texts,
                                     activity),
            "threads": threads[:STORY_THREADS_MAX]}
@@ -3828,6 +3829,24 @@ def _apply_thread_record(threads, prs, activity, instant):
         t["derived_status"] = t["status"]
         t["status"] = "resolved on GitHub" if flag["resolved"] \
             else "not resolved on GitHub"
+
+
+def _history_omissions(prs, history):
+    """What gather's per-PR budgets left out of the PR history, named per PR
+    (a narrator must not read "no evidence" as "no change"): narrative
+    evidence rows of older commits (`narrative_omitted`) and the responses
+    of review comments (`responses_omitted`)."""
+    out = []
+    for p in prs:
+        row = history.get(p.get("number")) or {}
+        n = p.get("number")
+        if row.get("narrative_omitted"):
+            out.append("{} narrative evidence row(s) of the older commits of #{} "
+                       "(beyond the per-PR budget)".format(row["narrative_omitted"], n))
+        if row.get("responses_omitted"):
+            out.append("what followed {} review comment(s) of #{} (beyond the "
+                       "per-PR budget)".format(row["responses_omitted"], n))
+    return out
 
 
 def _story_not_gathered(prs, activity):
@@ -4796,6 +4815,10 @@ _RESOLVED_WORD_RE = re.compile(r"\bresolved\b", re.I)
 # Roll-ups that state a result: `incomplete` / `unavailable` do not, so a
 # story may call those checks unknown.
 _CHECKS_KNOWN = ("passing", "failing", "pending", "none")
+# A sentence about a PR's earlier commits / pushes (not its head).
+_EARLIER_COMMITS_RE = re.compile(
+    r"\b(?:earl(?:y|ier|iest)|older|first|previous|prior|preceding)\b"
+    r"[^.;!?]*\b(?:commits?|pushes)\b", re.I)
 
 
 def check_story_record_claims(slice_obj, text):
@@ -4808,8 +4831,13 @@ def check_story_record_claims(slice_obj, text):
     `resolved_said_unknown` — likewise for whether a thread was resolved,
     against the PRs whose resolution coverage is complete (every review
     thread in the ledger carries GitHub's `resolved_on_github` flag, gather
-    omitted none — `thread_coverage` — and the ledger cap hid none). A qualified unknown claim under partial
-    coverage passes. Pure."""
+    omitted none — `thread_coverage` — and the ledger cap hid none; a PR
+    with no ledger entry is not covered). A claim about a PR's earlier
+    commits needs every commit of it covered (`commits_covered` =
+    `commits_total`), not only its head. A sentence naming several items is
+    refused only when all of them are covered; a general claim only when
+    every PR of the slice is. A true statement of a coverage limit always
+    passes. Pure."""
     conv = slice_obj.get("conversation") or {}
     oc = conv.get("outcome") or {}
     prs = [r.get("number") for r in oc.get("items") or [] if r.get("type") == "pr"]
@@ -4817,6 +4845,12 @@ def check_story_record_claims(slice_obj, text):
              if isinstance(r.get("checks"), dict)
              and r["checks"].get("status") == "gathered"
              and r["checks"].get("rollup") in _CHECKS_KNOWN}
+    # the head is known, but are all of the PR's commits covered?
+    all_commits = {r.get("number") for r in oc.get("items") or []
+                   if r.get("number") in known
+                   and not (isinstance(r["checks"].get("commits_total"), int)
+                            and r["checks"]["commits_total"]
+                            > (r["checks"].get("commits_covered") or 0))}
     threads = {}
     for t in conv.get("threads") or []:
         if t.get("kind") == "review_thread":
@@ -4839,22 +4873,23 @@ def check_story_record_claims(slice_obj, text):
                  for x in re.split(r"(?<=[.;!?])\s+|\n+", text or "") if x.strip()]
 
     def covered(sent, have, scope):
-        """Does the sentence speak of something the slice holds: a PR it
-        names that is in `have`, or — naming none of `scope` — is every
-        item of `scope` in `have` (a general claim under partial coverage
-        is not refused)?"""
+        """Is every item the sentence speaks of fully covered: each PR of
+        `scope` it names in `have`, or — naming none — every PR of `scope`
+        (a claim naming one uncovered item, or a general claim under
+        partial coverage, may be true and is not refused)?"""
         named = [int(n) for n in re.findall(r"(?<![\w/.&])#(\d+)\b", sent)
                  if int(n) in scope]
-        if named:
-            return any(n in have for n in named)
-        return bool(scope) and all(n in have for n in scope)
+        return bool(named or scope) and all(n in have for n in named or scope)
     out = {"checks_said_unknown": [], "resolved_said_unknown": []}
     for sent in sentences:
         if not _UNKNOWN_RE.search(sent):
             continue
-        if _CHECKS_WORD_RE.search(sent) and covered(sent, known, prs):
+        # a claim about earlier commits needs every commit covered; one
+        # about the checks (the head) needs the head's result
+        have = all_commits if _EARLIER_COMMITS_RE.search(sent) else known
+        if _CHECKS_WORD_RE.search(sent) and covered(sent, have, prs):
             out["checks_said_unknown"].append(sent)
-        if _RESOLVED_WORD_RE.search(sent) and covered(sent, resolved, list(threads)):
+        if _RESOLVED_WORD_RE.search(sent) and covered(sent, resolved, prs):
             out["resolved_said_unknown"].append(sent)
     return out
 

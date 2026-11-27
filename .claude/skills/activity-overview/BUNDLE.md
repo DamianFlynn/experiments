@@ -1316,7 +1316,10 @@ silence_days}}`.
   requested — "check results and review-thread resolved flags of PR(s) #N (<status>)";
   a partial read is named too: review threads beyond those read (`threads_omitted`),
   earlier lifecycle events (`events_omitted`), and the earliest commits whose checks were
-  not read (`commits_total` above the commits read).
+  not read (`commits_total` above the commits read). What gather's per-PR budgets left
+  out of the PR history is named the same way, with or without `pr_activity`: narrative
+  evidence rows of older commits (`narrative_omitted`) and the responses of review
+  comments (`responses_omitted`).
 - **`thread_coverage`** (only with the view's `pr_activity`) — `{pr number: {flagged,
   omitted}}`: how many of the PR's review threads in the ledger carry GitHub's resolved
   flag, and how many review threads gather did not read. Resolution coverage of a PR is
