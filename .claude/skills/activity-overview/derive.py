@@ -1157,6 +1157,10 @@ def annotate_people_affiliation(bundle):
     for login, profile in (bundle.get("people") or {}).items():
         if profile.get("is_bot"):
             continue
+        # the labels are the fact's alone: drop any an earlier enrichment
+        # left, so a do_not_name entry (or no entry) never keeps them
+        for key in PERSON_LABEL_KEYS:
+            profile.pop(key, None)
         e = entries.get(login)
         if isinstance(e, dict) and e.get("affiliation"):
             profile["affiliation"] = e["affiliation"]

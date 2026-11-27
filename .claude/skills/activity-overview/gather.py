@@ -6880,11 +6880,22 @@ def find_affiliations(people, config, associations=None, email_home=(),
             "unknown": unknown, "not_checked": sorted(not_checked)}
 
 
-def _registry_label(entry):
+def affiliation_home(config):
+    """The home settings a label is decided against, as one compact string
+    kept with the label in the registry (`home`): the home organisations
+    (lower case, sorted) and the home names, "orgs|names". The email
+    domains are left out: a commit email never decides a stored label.
+    Pure."""
+    return "{}|{}".format(",".join(sorted({o.lower() for o in config["home_orgs"]})),
+                          ",".join(sorted(config["home_names"])))
+
+
+def _registry_label(entry, home=None):
     """The label a per-window decision leaves in the registry: what GitHub
     data decided (author_association, public_membership, profile_company or
-    none), without the per-window commit-email boolean. None for a decision
-    the registry must not keep (override, a failed lookup, ...)."""
+    none), without the per-window commit-email boolean, with the `home`
+    settings it was decided against. None for a decision the registry must
+    not keep (override, a failed lookup, ...)."""
     sig = (entry or {}).get("signal")
     if sig == "commit_email_domain":
         return {"affiliation": "unknown", "signal": "none"}
@@ -6894,6 +6905,8 @@ def _registry_label(entry):
     out = {"affiliation": entry["affiliation"], "signal": sig}
     if entry.get("strength"):
         out["strength"] = entry["strength"]
+    if home:
+        out["home"] = home
     return out
 
 
@@ -6940,6 +6953,10 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
                                     run, oldest lookup first     `refreshed`
       anything else                 a stale label is reused; else the commit
                                     email; else unknown, signal not_checked
+    A label is relative to the home settings (affiliation_home) it was
+    decided against, kept with it as `home`: it is fresh only under the same
+    settings, and one decided against other settings is never reused (an
+    entry without a recorded `home` is stale, and still reusable).
     A lookup reads the display name from the same profile response. People
     decided without a lookup who have no name yet get one profile call for
     it, at most run.names_left per run, `name_first` (the newcomers) first,
@@ -6949,6 +6966,7 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
     associations = associations or {}
     email_home = set(email_home or ())
     prs, issues, commits = records or ((), (), ())
+    home = affiliation_home(config)
     dates = people_mod.activity_dates(prs, issues, commits)
     evidence = people_mod.maintainer_evidence(prs, issues)
     for login in people:
@@ -6968,7 +6986,8 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
         return not (login in config["overrides"] or reg.get("do_not_name")
                     or associations.get(login) in _HOME_ASSOCIATIONS
                     or people_mod.is_locked(reg, "affiliation"))
-    stale = set(sorted((login for login in people if run.state(login) == "stale"
+    stale = set(sorted((login for login in people
+                        if run.state(login, home) == "stale"
                         and wants_lookup(login)),
                        key=lambda k: ((run.entry(k) or {}).get("looked_up_at") or "",
                                       k))[:max(run.refresh_left, 0)])
@@ -6986,7 +7005,7 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
                                        login in email_home, lookup=None)
         if e is not None:
             if e["signal"] == "author_association":
-                run.patch(login, label=_registry_label(e))
+                run.patch(login, label=_registry_label(e, home))
             out[login] = e
             counts["free"] += 1
             continue
@@ -6994,7 +7013,10 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
             out[login] = _reused_entry(reg, login in email_home)
             counts["free"] += 1
             continue
-        state = run.state(login)
+        state = run.state(login, home)
+        # a label decided against other home settings is never used here
+        # (one without a recorded home is: decided before homes were kept)
+        own = reg.get("home") in (None, home)
         if state == "fresh":
             out[login] = _reused_entry(reg, login in email_home)
             counts["reused"] += 1
@@ -7012,11 +7034,11 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
                 looked += 1
             if failed:
                 counts["lookup_failed"] += 1
-                if reg.get("affiliation") and e["affiliation"] == "unknown":
+                if reg.get("affiliation") and own and e["affiliation"] == "unknown":
                     e = _reused_entry(reg, login in email_home)
             else:
                 name = lookup("name", login)
-                fields = {"label": _registry_label(e), "looked_up_at": run.now}
+                fields = {"label": _registry_label(e, home), "looked_up_at": run.now}
                 if name is not None:
                     fields["name"] = name
                 run.patch(login, **fields)
@@ -7027,7 +7049,7 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
                     counts["looked_up"] += 1
             out[login] = e
             continue
-        if reg.get("affiliation"):
+        if reg.get("affiliation") and own:
             out[login] = _reused_entry(reg, login in email_home)
             counts["reused"] += 1
         elif login in email_home:

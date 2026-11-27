@@ -401,11 +401,12 @@ class TestRegistryDecisions(TmpDir):
         self.assertEqual(fact["people"]["member"]["signal"], "author_association")
 
     def test_unknown_is_retried_sooner_than_decided(self):
+        home = gather.affiliation_home(self.cfg())
         self.write(reg_of(
             {"login": "u", "affiliation": "unknown", "signal": "none",
-             "looked_up_at": "2026-10-01"},
+             "looked_up_at": "2026-10-01", "home": home},
             {"login": "d", "affiliation": "community", "signal": "profile_company",
-             "strength": "weak", "looked_up_at": "2026-10-01"}))
+             "strength": "weak", "looked_up_at": "2026-10-01", "home": home}))
         lk = _lookup()
         self.decide(self.run_(), ["u", "d"], lk)
         self.assertEqual({c[1] for c in lk.calls}, {"u"})

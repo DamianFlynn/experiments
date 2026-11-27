@@ -672,6 +672,14 @@ seen before are looked up as before (capped by `ACTIVITY_AFFILIATION_MAX`). Each
 `people registry: <repo>: N looked up, N refreshed, N reused from the registry, N decided
 without a lookup, N still unknown, N name(s) fetched, N maintainer(s)`.
 
+**Labels belong to the home settings.** `maintainer_org` / `community` mean "of these home
+organisations", so a label is stored with the settings it was decided against (`home`:
+the home organisations and names, e.g. `"azure,microsoft|azure,microsoft"`) and is
+reused only by a repository with the same settings; under other settings the person is
+looked up again within the refresh budget, or is `unknown` / `not_checked` beyond it. An
+entry without `home` (written before it was kept) is due for a refresh, your own pinned
+labels are used as they are, and names are shared by every repository.
+
 **Names.** The display name comes from the same `users/{login}` response as the company
 signal (no extra call). A person decided without a profile call (override list,
 `author_association`, a public membership, the registry) gets one profile call for the name,

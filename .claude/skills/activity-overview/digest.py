@@ -544,9 +544,12 @@ def _merge_people(members):
       maintainer / maintainer_signal   true when any member says so (that
                             member's signal), with those members listed in
                             `maintainer_of` (the property is per repository)
+      do_not_name           any member's wins: unknown / do_not_name, with
+                            no name and no maintainer property
     Any other field is kept from the first member's record. Member records are
     not mutated. Order: first appearance over members in `members` order."""
     people, samples, opened, maint = {}, {}, {}, {}
+    suppressed = set()
     for m in members:
         repo, bundle = m["repo"], m["bundle"]
         latencies = derive.review_latency_samples(bundle.get("prs") or [])
@@ -597,6 +600,15 @@ def _merge_people(members):
                 maint.setdefault(login, []).append(
                     (repo, rec["maintainer"], rec.get("maintainer_signal")))
             samples.setdefault(login, []).extend(latencies.get(login, []))
+            if rec.get("affiliation_signal") == "do_not_name":
+                suppressed.add(login)
+    # do_not_name in any member wins over every other member's labels
+    for login in suppressed:
+        maint.pop(login, None)
+        cur = people[login]
+        cur["affiliation"], cur["affiliation_signal"] = "unknown", "do_not_name"
+        for key in derive.PERSON_LABEL_KEYS + ("maintainer_of",):
+            cur.pop(key, None)
     for login, rows in maint.items():
         cur = people[login]
         yes = [r for r in rows if r[1]]

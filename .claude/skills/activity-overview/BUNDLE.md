@@ -652,6 +652,7 @@ owner's to read and edit; gather never needs it to read a store, and no view rea
 | `tags` | you only | free-form (`known`, `mvp`, …) |
 | `first_seen` / `last_seen` | skill | `{date, repo}` of the earliest / latest activity gathered |
 | `looked_up_at` | skill | date of the last profile / membership lookup |
+| `home` | skill | the home settings the label was decided against (home organisations, then names); reused only under the same settings |
 | `source` | skill / you | `lookup` (written by the skill) or `operator` (yours: every decided field pinned) |
 | `locked` | you only | `true`, or a list of `name` / `affiliation` / `maintainer_of` to pin |
 | `do_not_name` | you only | `true`: login only, no label, no call, in every output |

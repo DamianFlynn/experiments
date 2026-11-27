@@ -13,9 +13,10 @@ Where and what (docs/USAGE.md section 5.7, BUNDLE.md "The people registry"):
   changes, so version control shows one line per real change;
 * an entry holds only: login, name (the public profile's display name),
   affiliation / signal / strength, maintainer_of {repo: evidence}, tags,
-  first_seen / last_seen, looked_up_at, source, locked, do_not_name, note.
-  Never a company, bio, email or any other profile text; an unknown key is
-  an error naming the entry.
+  first_seen / last_seen, looked_up_at, source, locked, do_not_name, note,
+  home (the home settings the label was decided against). Never a company,
+  bio, email or any other profile text; an unknown key is an error naming
+  the entry.
 
 Operator edits win. An entry whose `source` is "operator", or whose `locked`
 is true, keeps every decided field (name, affiliation, maintainer_of) as the
@@ -84,7 +85,8 @@ SOURCES = ("lookup", "operator")
 LOCKABLE = ("name", "affiliation", "maintainer_of")
 ENTRY_KEYS = ("login", "name", "affiliation", "signal", "strength",
               "maintainer_of", "tags", "first_seen", "last_seen",
-              "looked_up_at", "source", "locked", "do_not_name", "note")
+              "looked_up_at", "source", "locked", "do_not_name", "note",
+              "home")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+$")
 _GHOST = "ghost"
@@ -201,6 +203,8 @@ def check_entry(login, entry):
         raise ValueError("`do_not_name` must be true or false")
     if "note" in entry and not isinstance(entry["note"], str):
         raise ValueError("`note` must be a string")
+    if "home" in entry and not isinstance(entry["home"], str):
+        raise ValueError("`home` must be a string")
     return entry
 
 
@@ -339,12 +343,18 @@ def is_locked(entry, field):
 
 
 def lookup_state(entry, now, refresh_days=REFRESH_DAYS,
-                 unknown_retry_days=UNKNOWN_RETRY_DAYS):
+                 unknown_retry_days=UNKNOWN_RETRY_DAYS, home=None):
     """"never" (no lookup or no label yet), "fresh" (reuse: no call) or
     "stale" (due for a refresh): a decided label is fresh for
-    `refresh_days`, an `unknown` one for `unknown_retry_days`. Pure."""
+    `refresh_days`, an `unknown` one for `unknown_retry_days`. With `home`
+    (the current home settings, gather.affiliation_home) a label decided
+    against other or unrecorded home settings is stale, unless the operator
+    owns it. Pure."""
     if not entry or not entry.get("looked_up_at") or not entry.get("affiliation"):
         return "never"
+    if home is not None and entry.get("home") != home \
+            and not is_locked(entry, "affiliation"):
+        return "stale"
     try:
         age = (datetime.date.fromisoformat(now)
                - datetime.date.fromisoformat(entry["looked_up_at"])).days
@@ -385,7 +395,8 @@ def apply_patch(entry, patch, login):
     """`entry` (or a new one for `login`) with one run's `patch` applied;
     operator-owned fields are left alone. Patch keys (all optional):
       seen        [(date, repo)]   first_seen / last_seen: earliest / latest
-      label       {affiliation, signal, strength?}   unless affiliation locked
+      label       {affiliation, signal, strength?, home?}   unless
+                  affiliation locked
       name        str ("" : the profile has none)     unless name locked
       looked_up_at  date
       maintainer  {repo: {signal, strength, last_evidence}}  unless locked or
@@ -409,6 +420,10 @@ def apply_patch(entry, patch, login):
             e["strength"] = label["strength"]
         else:
             e.pop("strength", None)
+        if label.get("home"):
+            e["home"] = label["home"]
+        else:
+            e.pop("home", None)
     if "name" in patch and not is_locked(e, "name") and not e.get("do_not_name"):
         name = (patch["name"] or "").strip()[:NAME_MAX_CHARS]
         name = "".join(ch for ch in name if ord(ch) >= 32)
@@ -609,9 +624,9 @@ class Run:
         key = key or login
         self.patches[key] = merge_patch(self.patches.get(key), fields)
 
-    def state(self, login):
+    def state(self, login, home=None):
         return lookup_state(self.entry(login), self.now, self.refresh_days,
-                            self.unknown_retry_days)
+                            self.unknown_retry_days, home)
 
     def save(self):
         """Merge this run's patches into the file; returns True when it

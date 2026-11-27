@@ -1355,7 +1355,9 @@ def _merged_newcomers(conn, project, repo, inside, ts_from, ts_to):
         if "returning" in v:
             dated = v.get("gap_thresholds_days")
         for e in v.get("returning") or []:
-            if isinstance(e, dict) and e.get("login") not in returning:
+            # regular in an earlier window: active at the view's start
+            if isinstance(e, dict) and e.get("login") not in returning \
+                    and e.get("login") not in regular:
                 returning[e.get("login")] = e
         for e in v.get("regular") or []:
             if isinstance(e, dict) and e.get("login") not in regular:
@@ -1524,7 +1526,9 @@ def _merged_affiliations(conn, project, repo, overlapping, recorded, ts_from,
             if isinstance(e, dict):
                 people[login] = e
         not_checked |= set(v.get("not_checked") or [])
-    not_checked -= set(people)
+    # a registry window lists its unchecked people in `people` too (signal
+    # not_checked): only a later deciding entry takes them off the list
+    not_checked -= {k for k, e in people.items() if e.get("signal") != "not_checked"}
     unknown = {k for k, e in people.items() if e.get("affiliation") == "unknown"}
     windows = [{"from": k[0], "to": k[1]} for k in sorted(values)]
     return {"collected": True,
