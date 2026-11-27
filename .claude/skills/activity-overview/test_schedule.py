@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import io
 import json
+import re
 import os
 import shutil
 import sqlite3
@@ -968,6 +969,299 @@ class TestEndToEnd(Case):
         self.assertEqual(commits, ["2026-10-28", "2026-11-03"])
         if os.environ.get("AO_PRINT_STATUS"):
             sys.stderr.write(json.dumps(st, indent=2) + "\n")
+
+
+# --- offline recompute -----------------------------------------------------------------------
+
+class TestRecompute(Case):
+    def setUp(self):
+        super().setUp()
+        self.path = streams_file(self.tmp)
+        self.store = os.path.join(self.ws, "demo", "stores", "2026-11.db")
+        make_store(self.store, [("2026-10-26", "2026-10-31"),
+                                ("2026-11-01", "2026-11-30")], prs=2)
+        with open(self.store, "rb") as fh:
+            self.good = fh.read()
+
+    def test_recomputes_every_window_on_a_copy_then_validates_and_swaps(self):
+        runner = Runner()
+        code, _out, _err = self.run_cli(["recompute", "--streams", self.path,
+                                         "--stream", "demo", "--month", "2026-11"],
+                                        runner=runner)
+        self.assertEqual(code, 0)
+        tmp = schedule.tmp_store_path(self.store)
+        gathers = runner.gathers()
+        self.assertEqual([(a[a.index("--from") + 1], a[a.index("--to") + 1])
+                          for a in gathers],
+                         [("2026-10-26", "2026-10-31"), ("2026-11-01", "2026-11-30")])
+        for argv in gathers:
+            self.assertEqual(argv[-1], "--recompute-ownership")
+            self.assertEqual(argv[argv.index("--store") + 1], tmp)
+            self.assertEqual(argv[argv.index("--clone-dir") + 1],
+                             os.path.join(self.ws, "demo", "clone"))
+            self.assertNotIn("--people", argv)
+        for _argv, env in runner.calls:
+            self.assertNotIn("GITHUB_TOKEN", env)        # offline: no token needed
+        vargv = [a for a, _ in runner.calls if a[1].endswith("validate.py")][0]
+        self.assertEqual(vargv[2], tmp)
+        self.assertEqual(schedule.store_counts(self.store)["prs"], 4)
+        with open(self.store + ".prev", "rb") as fh:
+            self.assertEqual(fh.read(), self.good)
+        rec = self.status()["windows"]["2026-11"]["last_recompute"]
+        self.assertEqual((rec["result"], rec["what"]), ("ok", "ownership"))
+        self.assertEqual(rec["validate"], {"exit": 0, "result": "OK"})
+        self.assertFalse(os.path.exists(os.path.join(self.ws, schedule.LOCK_NAME)))
+
+    def test_a_failed_validate_keeps_the_store(self):
+        runner = Runner(validate=lambda argv: (1, "RESULT: FAIL\n", ""))
+        code, _out, _err = self.run_cli(["recompute", "--streams", self.path,
+                                         "--stream", "demo", "--month", "2026-11"],
+                                        runner=runner)
+        self.assertEqual(code, 1)
+        with open(self.store, "rb") as fh:
+            self.assertEqual(fh.read(), self.good)
+        self.assertFalse(os.path.exists(schedule.tmp_store_path(self.store)))
+        rec = self.status()["windows"]["2026-11"]["last_recompute"]
+        self.assertEqual(rec["result"], "validate_failed")
+
+    def test_a_failed_recompute_keeps_the_store(self):
+        runner = Runner(gather=lambda argv: (1, "", "error: clone missing\n"))
+        code, _out, _err = self.run_cli(["recompute", "--streams", self.path,
+                                         "--stream", "demo", "--month", "2026-11"],
+                                        runner=runner)
+        self.assertEqual(code, 1)
+        with open(self.store, "rb") as fh:
+            self.assertEqual(fh.read(), self.good)
+        self.assertEqual(len(runner.gathers()), 1)      # stops at the first failure
+
+    def test_refusals(self):
+        code, _out, err = self.run_cli(["recompute", "--streams", self.path,
+                                        "--stream", "demo", "--month", "2026-09"])
+        self.assertEqual(code, 2)
+        self.assertIn("holds no gathered window", err)
+        mpath = streams_file(self.tmp, [{"id": "tf", "kind": "manifest",
+                                         "manifest": "tf/m.json"}])
+        make_store(os.path.join(self.ws, "tf", "stores", "2026-11.db"),
+                   [("2026-11-01", "2026-11-30")])
+        code, _out, err = self.run_cli(["recompute", "--streams", mpath,
+                                        "--stream", "tf", "--month", "2026-11"])
+        self.assertEqual(code, 2)
+        self.assertIn("single-repository", err)
+
+    def test_dry_run(self):
+        runner = Runner()
+        code, out, _err = self.run_cli(["recompute", "--streams", self.path, "--stream",
+                                        "demo", "--month", "2026-11", "--dry-run"],
+                                       runner=runner)
+        self.assertEqual(code, 0)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(out.count("--recompute-ownership"), 2)
+        self.assertIn("then: swap", out)
+
+    def test_every_recompute_flag_exists_in_gather(self):
+        proc = subprocess.run([sys.executable, schedule.GATHER_SCRIPT, "--help"],
+                              capture_output=True, text=True)
+        for flag in schedule.RECOMPUTE_FLAGS.values():
+            self.assertIn(flag, proc.stdout)
+
+
+# --- an expired / refused token ----------------------------------------------------------------
+
+EXPIRED_401 = ("error: GitHub API 401 for https://api.github.com/repos/o/r\n"
+               "  message: Bad credentials\n")
+LIFETIME_403 = ("error: GitHub API 403 for https://api.github.com/repos/o/r\n"
+                "  message: The 'Org' enterprise forbids access via a personal access "
+                "token whose lifetime is greater than 8 days.\n"
+                "  hint: 403 with rate-limit headers = rate limited; ...\n")
+
+
+class TestAuthFailure(Case):
+    def test_detection(self):
+        self.assertIn("401", schedule.auth_failure(EXPIRED_401))
+        self.assertIn("lifetime", schedule.auth_failure(LIFETIME_403))
+        self.assertIn("SSO", schedule.auth_failure(
+            "error: GitHub API 403 for u\n  x-github-sso: required; url=x\n"))
+        self.assertEqual(schedule.auth_failure(
+            "error: set GITHUB_TOKEN (or GH_TOKEN) with `repo` scope\n"),
+            "no token in the environment")
+        self.assertIsNone(schedule.auth_failure(
+            "error: GitHub API 403 for u\n  x-ratelimit-remaining: 0\n"))
+        self.assertIsNone(schedule.auth_failure("error: GitHub API 404 for u\n"))
+        self.assertIsNone(schedule.auth_failure(""))
+
+    def test_status_names_an_expired_token(self):
+        path = streams_file(self.tmp)
+        self.run_cli(["run", "--streams", path])
+        code, _out, _err = self.run_cli(["run", "--streams", path],
+                                        runner=Runner(gather=lambda a: (1, "", LIFETIME_403)))
+        self.assertEqual(code, 1)
+        attempt = self.status()["windows"]["2026-11"]["last_attempt"]
+        self.assertIn("lifetime", attempt["auth_error"])
+        with open(os.path.join(self.ws, "status.json"), encoding="utf-8") as fh:
+            self.assertIn("lifetime", json.load(fh)["streams"]["demo"]["auth_error"])
+        code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertEqual(code, 1)
+        self.assertIn("TOKEN: GitHub refused the token (403", out)
+        self.assertIn("Keeping the token valid", out)
+
+    def test_other_failures_are_not_called_token_problems(self):
+        path = streams_file(self.tmp)
+        self.run_cli(["run", "--streams", path],
+                     runner=Runner(gather=lambda a: (1, "", "error: clone failed\n")))
+        self.assertIsNone(self.status()["windows"]["2026-11"]["last_attempt"]["auth_error"])
+        _code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertNotIn("TOKEN:", out)
+
+
+# --- the commands after latest, per cadence ---------------------------------------------------
+
+class TestNextCommands(Case):
+    def setUp(self):
+        super().setUp()
+        self.path = streams_file(self.tmp, [
+            {"id": "wk", "kind": "repo", "owner": "o", "repo": "r",
+             "cadence": ["weekly", "monthly"]},
+            {"id": "mo", "kind": "repo", "owner": "o", "repo": "r"}])
+        for sid in ("wk", "mo"):
+            make_store(os.path.join(self.ws, sid, "stores", "2026-11.db"),
+                       [("2026-10-26", "2026-10-31"), ("2026-11-01", "2026-11-30")])
+            os.makedirs(os.path.join(self.ws, sid), exist_ok=True)
+            with open(os.path.join(self.ws, sid, "status.json"), "w") as fh:
+                json.dump({"windows": {"2026-11": TestLatest.entry(
+                    "2026-11", "2026-11-01", "2026-11-30", "2026-11-20T02:00:00Z")}}, fh)
+
+    def latest(self, stream, *args):
+        clock = FakeClock(start=T("2026-11-20T08:00:00Z"))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["latest", "--streams", self.path, "--stream", stream,
+                                  *args], now=clock.now)
+        return code, json.loads(out.getvalue()), err.getvalue()
+
+    def test_weekly_stream_gets_the_weekly_layout(self):
+        code, out, err = self.latest("wk", "--last-days", "7")
+        self.assertEqual(code, 0, out)
+        nxt = out["next"]
+        self.assertEqual(nxt["cadence"], "weekly")
+        cmds = nxt["commands"]
+        self.assertEqual(len(cmds), 4)
+        self.assertIn("view.py --store", cmds[0])
+        self.assertIn("--from 2026-11-14 --to 2026-11-20", cmds[0])
+        self.assertIn("link.py", cmds[1])
+        self.assertIn("--people " + os.path.join(self.ws, "people.json"), cmds[1])
+        self.assertIn(os.path.join(self.ws, "wk", "series-weekly.json"), cmds[1])
+        self.assertIn("--outline --weekly > ", cmds[2])
+        self.assertIn("--work-package", cmds[3])
+        self.assertTrue(cmds[3].endswith("--weekly"))
+        self.assertIn("next (weekly issue):", err)
+
+    def test_a_month_gets_the_monthly_layout(self):
+        _code, out, _err = self.latest("wk", "--month", "2026-11")
+        cmds = out["next"]["commands"]
+        self.assertEqual(out["next"]["cadence"], "monthly")
+        self.assertNotIn("--weekly", " ".join(cmds))
+        self.assertIn(os.path.join(self.ws, "wk", "series.json"), cmds[1])
+
+    def test_a_monthly_only_stream_and_the_override(self):
+        _code, out, _err = self.latest("mo", "--from", "2026-11-01", "--to", "2026-11-14")
+        self.assertEqual(out["next"]["cadence"], "monthly")
+        _code, out, _err = self.latest("mo", "--last-days", "14", "--cadence", "weekly")
+        self.assertEqual(out["next"]["cadence"], "weekly")
+        self.assertIn("--weekly", out["next"]["commands"][2])
+
+    def test_a_manifest_stream_views_each_member(self):
+        os.makedirs(os.path.join(self.ws, "tf"), exist_ok=True)
+        with open(os.path.join(self.ws, "tf", "m.json"), "w") as fh:
+            json.dump({"project": "proj", "window": {"from": "2026-11-01",
+                                                     "to": "2026-11-30"},
+                       "repos": [{"owner": "o", "repo": "a"}, {"owner": "o", "repo": "b"}]},
+                      fh)
+        path = streams_file(self.tmp, [{"id": "tf", "kind": "manifest",
+                                        "manifest": "tf/m.json"}])
+        store = os.path.join(self.ws, "tf", "stores", "2026-11.db")
+        os.makedirs(os.path.dirname(store))
+        conn = graphstore.open_store(store)
+        graphstore.init_schema(conn)
+        graphstore.record_window(conn, "proj", "o/a", "2026-11-01", "2026-11-30")
+        for repo in ("o/a", "o/b"):
+            graphstore.upsert_node(conn, "proj/{}#pr-1".format(repo), "proj", repo,
+                                   "social", "2026-11-02T00:00:00Z", {})
+        conn.commit()
+        conn.close()
+        cfg = schedule.load_streams(path)
+        nxt = schedule.next_commands(cfg, cfg["streams"][0], store, D("2026-11-01"),
+                                     D("2026-11-30"), "monthly")
+        self.assertEqual([os.path.basename(v) for v in nxt["views"]],
+                         ["o__a.json", "o__b.json"])
+        self.assertIn("--project proj --repo o/a", nxt["commands"][0])
+        self.assertIn(os.path.join("series", "o__b.json"), nxt["commands"][3])
+        self.assertIn("o__a.json", nxt["commands"][4])
+        self.assertIn("o__b.json", nxt["commands"][4])
+
+
+# --- no token on a command line in the docs and examples ---------------------------------------
+
+# A token typed into a command lands in shell history, whatever the file mode
+# of where it is written. Documented commands must prompt for it instead.
+_TOKEN_ON_COMMAND_LINE = (
+    # an assignment of a literal (not $(...), $VAR, %s, or an ellipsis)
+    re.compile(r"\b(?:GITHUB_TOKEN|GH_TOKEN|ACTIVITY_TEST_TOKEN)=(?![\"']?(?:\$|%s|…|\.\.\.))"
+               r"[\"']?[^\s\"'`]"),
+    # a placeholder or a real-looking token anywhere in a command
+    re.compile(r"<paste>|<your[ _-]?token>|\bgh[pousr]_[A-Za-z0-9]{4,}"
+               r"|\bgithub_pat_[A-Za-z0-9_]{4,}", re.I),
+    # the keychain item given its value instead of prompting (-w last prompts)
+    re.compile(r"security\s+add-generic-password\b.*\s-w\s+[^\s#]"),
+)
+
+
+def token_on_command_line(text):
+    """[(line number, line)] that put a token value on a command line."""
+    return [(n, ln) for n, ln in enumerate(text.splitlines(), 1)
+            if any(p.search(ln) for p in _TOKEN_ON_COMMAND_LINE)]
+
+
+class TestNoTokenOnCommandLine(unittest.TestCase):
+    def _files(self):
+        out = [os.path.join(HERE, n) for n in os.listdir(HERE) if n.endswith(".md")]
+        for sub in ("docs", "examples", "reference", "commands"):
+            for root, dirs, names in os.walk(os.path.join(HERE, sub)):
+                dirs[:] = [d for d in dirs if d != "__pycache__"]
+                out += [os.path.join(root, n) for n in names
+                        if n.endswith((".md", ".sh", ".txt", ".plist", ".json"))]
+        return sorted(out)
+
+    def test_docs_and_examples(self):
+        files = self._files()
+        self.assertIn(os.path.join(HERE, "docs", "SCHEDULING.md"), files)
+        self.assertIn(os.path.join(HERE, "examples", "cron", "activity-gather.sh"), files)
+        hits = []
+        for path in files:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                hits += ["{}:{}: {}".format(os.path.relpath(path, HERE), n, ln.strip())
+                         for n, ln in token_on_command_line(fh.read())]
+        self.assertEqual(hits, [], "\n".join(hits))
+
+    def test_the_checker_catches_what_it_claims_to(self):
+        bad = ["printf 'GITHUB_TOKEN=%s\\n' '<paste>' > token.env",
+               "export GITHUB_TOKEN=abc123",
+               "echo GH_TOKEN=\"s3cret\" >> ~/.env",
+               "echo ghp_abcdefABCDEF0123 > f",
+               "security add-generic-password -a me -s svc -w hunter2",
+               "security add-generic-password -a me -s svc -U -w 'x'"]
+        for line in bad:
+            with self.subTest(line=line):
+                self.assertTrue(token_on_command_line(line))
+        good = ['export GITHUB_TOKEN="$(security find-generic-password -a "$USER" -s s -w)"',
+                "GITHUB_TOKEN=$(cat file)",
+                "printf 'GITHUB_TOKEN=%s\\n' \"$t\" > token.env",
+                "security add-generic-password -a \"$USER\" -s svc -U -w",
+                "security add-generic-password -a me -s svc -w   # prompts",
+                "holding `GITHUB_TOKEN=…`, mode 600",
+                "gather reads GITHUB_TOKEN, else GH_TOKEN"]
+        for line in good:
+            with self.subTest(line=line):
+                self.assertEqual(token_on_command_line(line), [])
 
 
 if __name__ == "__main__":

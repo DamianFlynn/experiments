@@ -6,8 +6,11 @@
 # paths below, `chmod 700` it. It reads the token for THIS process only, from
 # the login keychain; nothing is written to disk.
 #
-#   one-time, in Terminal (paste the token when prompted; -T lets the
-#   `security` tool read it later without a dialog):
+#   one-time, in Terminal. `-w` given LAST with no value makes `security`
+#   prompt for the password (security(1)), so the token is typed at a prompt and
+#   never appears on the command line or in shell history; never write it after
+#   -w. -U updates an existing item; -T lets the `security` tool read it later
+#   without a dialog:
 #   security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
 set -eu
 

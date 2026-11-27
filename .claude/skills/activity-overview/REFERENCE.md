@@ -346,9 +346,10 @@ step which store to read; full guide `docs/SCHEDULING.md`, example `examples/str
 ```bash
 python3 schedule.py check  --streams ~/activity-data/streams.json      # how the file resolves
 python3 schedule.py run    --streams ~/activity-data/streams.json --dry-run
-python3 schedule.py run    --streams ~/activity-data/streams.json [--stream ID] [--backfill 2026-08..2026-10] [--max-minutes 120]
+python3 schedule.py run    --streams ~/activity-data/streams.json [--stream ID] [--backfill 2026-08..2026-10] [--max-minutes 180]
 python3 schedule.py status --streams ~/activity-data/streams.json [--json]
-python3 schedule.py latest --streams ~/activity-data/streams.json --stream ID --last-days 7
+python3 schedule.py latest --streams ~/activity-data/streams.json --stream ID --last-days 7   # prints the next commands
+python3 schedule.py recompute --streams ~/activity-data/streams.json --stream ID --month 2026-11 --what ownership
 ```
 
 The token is read by gather from `GITHUB_TOKEN` (else `GH_TOKEN`) in the runner's

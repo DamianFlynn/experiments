@@ -711,8 +711,12 @@ previous month again during its first `regather_previous_month_days`, carried da
 previous month for weekly streams — each gathered into a copy of `stores/YYYY-MM.db`,
 validated, then swapped in; lock, run log, `status.json`; exit 0 / 1 failed or skipped /
 2 usage / 3 locked) · `schedule.py latest --streams FILE --stream ID (--month M | --last-days N | --from F --to T) [--max-age-hours H] [--accept-stale]`
-(the store(s) to read, freshness, validate result; exit 1 = refused) · `status [--json]` ·
-`check`. docs/SCHEDULING.md.
+(the store(s) to read, freshness, validate result, and the `next` view / link / outline /
+work-package commands for the issue's cadence; `--cadence weekly|monthly`; exit 1 =
+refused) · `schedule.py recompute --streams FILE --stream ID --month YYYY-MM [--what ownership] [--dry-run]`
+(gather's offline `--recompute-*` on a copy of the month store, validated, swapped) ·
+`status [--json]` (a `TOKEN:` line when GitHub refused the token) · `check`.
+docs/SCHEDULING.md.
 
 ### `transcript.py` — normalize a transcript
 `transcript.py PATH` (`.vtt`/`.srt`/`.txt`/`.md`; missing file → exit 2).

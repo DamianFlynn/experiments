@@ -156,7 +156,15 @@ age, and still not removed: check that no run is active, then remove it or pass
 **The time budget.** `--max-minutes N` starts no new window after N minutes; the windows not
 started are recorded `skipped_time_budget` (in each stream's status and the roll-up's
 `last_run.skipped_time_budget`) and the run exits 1. Streams run one at a time, so they
-share the token's API budget instead of competing for it.
+share the token's API budget instead of competing for it. Measured on the main target
+(`Azure/bicep-registry-modules`, one month, every commit of every PR read): a gather takes
+about **29 minutes** and about **160 GraphQL points** for the check results plus the
+linked-items requests. A night therefore costs about 30 minutes for that stream, and about
+an hour during the first `regather_previous_month_days` of a month (two months gathered);
+backfilling three months takes about an hour and a half. Give `--max-minutes` room for
+that: e.g. 180 for the five example streams on a normal night (the other repositories are
+smaller), or leave it off when nothing else needs the machine at night. A window already
+started is never cut short; the budget only decides whether the next one starts.
 
 Exit codes of `run`: 0 every window ok, 1 a window failed or was skipped, 2 usage or
 streams-file error (or no token), 3 locked.
@@ -214,6 +222,11 @@ repository, the real gather and validate CLIs, the API stubbed empty; trimmed):
   manifest members.
 - `code_version` is the git commit of the skill directory that ran (`dirty`: it had local
   changes), or `null` outside a git checkout.
+- `auth_error` (on a `gather_failed` attempt, else `null`) says when GitHub refused the
+  token — 401, the lifetime policy, SAML SSO, or no token — read from gather's error lines;
+  also on the roll-up's stream entry, and printed by `status` as a `TOKEN:` line (§7.1).
+- `last_recompute` (beside `last_attempt`) is the last offline recompute of the month
+  (§13a), with the same fields plus `what`.
 
 `<workspace>/status.json` is the roll-up: `last_run` (`run_id`, `today`, `result`,
 `exit_code`, `log`, `max_minutes`, `skipped_time_budget`, `backfill`), `code_version`,
@@ -230,23 +243,61 @@ validate's environment, and replaces any token value (and anything shaped like a
 token) in captured output with `[REDACTED]`. The streams file refuses `env` names that
 look like credentials. Without a token `run` stops before doing anything (exit 2).
 
+**Never type the token into a command.** A value on a command line stays in shell history
+(and, for an external program, in the process list), whatever the mode of the file it is
+then written to. Every way of entering it below prompts for it instead; a test scans the
+docs and examples so a token-on-the-command-line instruction cannot come back.
+
 - **macOS:** keep it in the login keychain; the wrapper reads it for the one process:
   ```bash
   security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
-  # (paste when prompted; -U updates an existing item; -T lets `security` read it without a dialog)
   ```
-  A LaunchAgent runs in your login session, so the login keychain is available once you
-  have logged in after a reboot (enable automatic login, or log in once, on a headless Mac
-  mini).
+  `-w` given **last, with no value** makes `security` prompt for the password (as its manual
+  page, security(1), documents): paste the token at the prompt. Never write the token after
+  `-w`. `-U` updates an existing item (the weekly replacement, §7.1); `-T` lets the
+  `security` tool read it later without a dialog. A LaunchAgent runs in your login session,
+  so the login keychain is available once you have logged in after a reboot (enable
+  automatic login, or log in once, on a headless Mac mini).
 - **Plain env file** (Linux, or macOS without the keychain): `~/.config/activity-overview/token.env`
-  holding `GITHUB_TOKEN=…`, mode **600**, outside the workspace, any synced folder and any
-  git checkout. [`examples/cron/activity-gather.sh`](../examples/cron/activity-gather.sh)
-  refuses a file that is not 600.
-- **Lifetime.** The enterprise that owns `Azure/*` refuses personal tokens that live longer
-  than 8 days (USAGE §1.1). A nightly job with such a token must have it replaced every week
-  or so: when it expires, every run fails with gather's 403 message in the log and
-  `gather_failed` in status, and `latest` refuses stale months. See §12 for CI, whose
-  built-in token is not subject to that cap.
+  holding one line `GITHUB_TOKEN=…`, mode **600**, outside the workspace, any synced folder
+  and any git checkout. Create it from a silent prompt in **bash** (type `bash` first if
+  your shell is another one); `printf` is a bash builtin, so the value is in no process
+  listing either:
+  ```bash
+  mkdir -p ~/.config/activity-overview && chmod 700 ~/.config/activity-overview
+  ( umask 077; printf 'token: ' >&2; IFS= read -rs t; echo >&2;
+    printf 'GITHUB_TOKEN=%s\n' "$t" > ~/.config/activity-overview/token.env )
+  ```
+  or open the file in an editor, type the line there and `chmod 600` it.
+  [`examples/cron/activity-gather.sh`](../examples/cron/activity-gather.sh) refuses a file
+  that is not 600.
+
+### 7.1 Keeping the token valid
+
+The enterprise that owns `Azure/*` refuses personal access tokens (classic or fine-grained)
+that live longer than **8 days** (USAGE §1.1), so a nightly job on a workstation needs a new
+token every week. There is no way around that with a personal token: plan for it.
+
+- **The weekly step** (a calendar reminder; about two minutes): create a token with a
+  7-day expiry and the scopes of USAGE §1.1, then replace the stored one: run the
+  `security add-generic-password … -U -w` command above again (it updates the item) or
+  re-create the env file. Next, `python3 $AO/schedule.py run --streams $W/streams.json
+  --dry-run` checks nothing but the plan; `launchctl kickstart …` (or the wrapper) proves the
+  token with a real run.
+- **How an expired token shows.** Each gather fails at its first API call; the attempt is
+  `gather_failed`, and the runner reads gather's own error lines and records why in
+  `auth_error` (the attempt, and the roll-up's stream entry): a 401 (expired, revoked or
+  wrong), a 403 naming the lifetime policy, a 403 for SAML SSO, or no token at all.
+  `schedule.py status` then prints, under the month,
+  `TOKEN: GitHub refused the token (403: …): its lifetime is over the organisation's limit
+  - replace the token (docs/SCHEDULING.md "Keeping the token valid"), then re-run`.
+  The stores stay as they were (nothing is swapped), and after `stale_after_hours`
+  `latest` refuses the open month, so a newsletter is never written from silently old data.
+- **The alternative.** A GitHub App installed on your own account issues installation
+  tokens that last one hour and are not personal access tokens, minted per run from the
+  app's private key, which would remove the weekly step. It is not built or tested here,
+  including whether that organisation's policy accepts such tokens for reading its public
+  repositories; the CI route of §12 (the job's built-in token) is the other way out.
 
 ## 8. Where the workspace lives
 
@@ -284,7 +335,7 @@ chmod 700 $W/bin/activity-gather.sh
 $W/bin/activity-gather.sh --dry-run             # the plan and the exact commands
 
 # 4 · backfill the last three closed months (and the current month to date), one stream
-#     at a time if you want to watch it; a busy monorepo month takes minutes, a manifest longer
+#     at a time if you want to watch it; the monorepo takes about 30 minutes a month, a manifest longer
 $W/bin/activity-gather.sh --backfill 2026-08..2026-11
 
 # 5 · install the schedule (§10) and check the first result the next morning
@@ -343,7 +394,7 @@ time is local, the plan is by UTC date: keep the run well clear of midnight UTC.
 The same `schedule.py run` works in a scheduled CI job, with two differences: the
 workspace must outlive the job (restore it from, and save it back to, durable storage that
 is not the repository's git history — an artifact store, a cache keyed by stream and month,
-or a mounted volume — because stores are tens of MB a month and hold contributors' activity),
+or a mounted volume — because stores are up to about 85 MB a month and hold contributors' activity),
 and the token is the job's built-in token (no personal-token lifetime cap; public
 repositories only). Run one job at a time per workspace (the lock only protects one
 machine's disk). This task changes no workflow.
@@ -373,17 +424,53 @@ no single store holds (longer than the carried days, or a stream without them) c
 as one `read` entry per month with `split_note`: read each month on its own, or gather
 the whole period into its own store (USAGE §5.3 *Roll-ups*). Nothing here merges stores.
 
+**The next commands, per cadence.** When one store holds the period, `latest` also returns
+`next` (and prints it on stderr): the exact commands for the issue, in order — `view.py`
+per repository (each member of a manifest stream, read from the store), `link.py VIEW
+--series SERIES --people REGISTRY`, `newsletter.py VIEWS --outline > …outline.json` and
+`newsletter.py VIEWS --work-package DIR` (reference/newsletter.md), all under
+`<stream>/views/<from>_<to>/`. The layout comes from the streams file: `--month` gives the
+**monthly** issue; any other period gives the **weekly** one when the stream's `cadence`
+includes `weekly` (adding `--weekly` to the outline and the work package — without it the
+outline uses the monthly layout, whatever the window's length), else the monthly one.
+`--cadence weekly|monthly` decides for one call. Weekly and monthly issues keep separate
+series indexes (`series-weekly.json` / `series.json`; per member under `series/` for a
+manifest stream), so "since the last issue" compares like with like.
+
 The skill's flow (SKILL.md): **scheduled job gathers → `schedule.py latest` → `view.py`
-→ `link.py --people` → `newsletter.py --outline` → write → `--check-story` /
-`--check-newsletter`**. Without a scheduled workspace (no streams file, or `latest`
-refuses and you choose not to override), it gathers on demand as before.
+→ `link.py --people` → `newsletter.py --outline` (and `--work-package`) → write →
+`--check-story` / `--check-newsletter`**. Without a scheduled workspace (no streams file,
+or `latest` refuses and you choose not to override), it gathers on demand as before.
+
+## 13a. After a code upgrade: offline recompute
+
+Some facts are derived from the clone and can be recomputed without the API when the code
+that derives them improves. gather offers this today for module ownership
+(`gather.py --recompute-ownership`: the window's `module_ownership` fact only, from the
+stored records and the stream's clone; the window's other facts are kept). The runner wraps
+it with the same safety as a gather:
+
+```bash
+python3 $AO/schedule.py recompute --streams $W/streams.json --stream avm-bicep --month 2026-11 --dry-run
+python3 $AO/schedule.py recompute --streams $W/streams.json --stream avm-bicep --month 2026-11 --what ownership
+```
+
+It takes the lock, copies the month store, runs the recompute for every window the store
+holds (the month and its carried days, oldest first) against the copy with the stream's
+clone, validates the copy and swaps it in (`.prev` kept), and records the outcome under the
+month's `last_recompute` in the stream's status (the gather's `last_success`, and so the
+freshness `latest` reports, is unchanged). It needs no token (none is passed). Single
+repository streams only: gather's recompute takes `--owner/--repo`. A failure leaves the
+store as it was. `--what` offers what gather offers (`gather.py --help` lists its
+`--recompute-*` flags; a test checks every one the runner names exists).
 
 ## 14. When a run fails
 
 1. `python3 $AO/schedule.py status --streams $W/streams.json` names the stream, month,
    step and error; the run log (`last_run.log`) has gather's and validate's full output.
-2. By step: `gather_failed` — read gather's message in the log (an expired token is a 403
-   naming the lifetime policy: replace it, §7; a rate limit is waited out by gather itself);
+2. By step: `gather_failed` — read gather's message in the log (a refused token is named
+   on a `TOKEN:` line by `status`: replace it, §7.1; a rate limit is waited out by gather
+   itself);
    `validate_failed` — USAGE §5.5 reads the report; `swap_failed` — something held the
    store open during the run (close it; the next run retries); `config_error` — fix the
    streams file or manifest (`schedule.py check`).
@@ -401,16 +488,22 @@ others. To pause one, set `"enabled": false` (its stores and status stay).
 
 ## 16. Disk growth
 
-Measured: a month store of `Azure/bicep-registry-modules` is about **14–16 MB**; the people
-registry is about **100 KB** plus about **30 KB per month** for `people-activity.json`.
-Per stream and month that means the month store, plus while the month is gathered a `.prev`
-of the same size and the `.next` copy during a run, plus for a weekly stream the carried
-days (about a fifth of a month's records and one more set of per-window facts). The clone
-grows once and is reused (that repository's `.git` was 13.5 MB, 23.1 MB after the first
-PR-history fetch; USAGE §5.6). For the monorepo: about 15 MB × 12 ≈ **180–200 MB a year**,
-plus ~30–45 MB of `.prev` / `.next` working space; the other streams are smaller
-repositories. `counts.bytes` in each status entry gives the real figure per store; set
-`retention.store_months` to cap it.
+Measured: a month store of `Azure/bicep-registry-modules` is now about **85 MB** (every
+commit of every PR is read; it was 14–16 MB before that); the people registry is about
+**100 KB** plus about **30 KB per month** for `people-activity.json`. Per stream and month
+that means the month store, plus while the month is gathered a `.prev` of the same size and
+the `.next` copy during a run, plus for a weekly stream the carried days (about a fifth of a
+month's records and one more set of per-window facts, so roughly +15–20 MB). The clone
+grows as it is reused (that repository's `.git` was 13.5 MB, 23.1 MB after the first
+PR-history fetch, and grows further as more PR heads are fetched; USAGE §5.6: check it
+with `du -sh <stream>/clone`).
+
+For the monorepo: about 85–105 MB × 12 ≈ **1.0–1.3 GB a year** of month stores. Working
+space on top: during the first days of a month the current and the previous month each
+have a `.prev`, and a run holds one `.next` copy, so up to about **3 × 85–105 MB ≈ 250–
+320 MB** at the peak. The other streams are smaller repositories. `counts.bytes` in each
+status entry gives the real figure per store; set `retention.store_months` to cap the
+total.
 
 ## 17. Uninstall
 

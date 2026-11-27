@@ -53,7 +53,9 @@ python3 schedule.py latest --streams STREAMS.json --stream ID --last-days 7   # 
 — and continue at step 3 with each `read[].store` / its `from`..`to` (exit 1 = refused:
 stale, failed or missing; say so, or pass `--accept-stale` and state the data's age). The
 newsletter flow is then `latest` → `view.py` → `link.py --people` → `newsletter.py
---outline` → write → `--check-story` / `--check-newsletter`. Steps 1–2 below are the
+--outline` (and `--work-package`) → write → `--check-story` / `--check-newsletter`;
+`latest` prints those exact commands as `next`, with `--weekly` when the stream's cadence
+makes it a weekly issue (the outline's default layout is monthly). Steps 1–2 below are the
 fallback when no scheduled workspace exists (gather on demand).
 
 **Two artifacts feed the report:**

@@ -74,9 +74,12 @@ import urllib.parse
 import manifest as manifest_mod
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+TMP_STORE = "{TMP_STORE}"   # placeholder for the working copy in a recompute command
 GATHER_SCRIPT = os.path.join(SKILL_DIR, "gather.py")
 VALIDATE_SCRIPT = os.path.join(SKILL_DIR, "validate.py")
 VIEW_SCRIPT = os.path.join(SKILL_DIR, "view.py")
+LINK_SCRIPT = os.path.join(SKILL_DIR, "link.py")
+NEWSLETTER_SCRIPT = os.path.join(SKILL_DIR, "newsletter.py")
 
 STATUS_SCHEMA = 1
 DEFAULT_REGATHER_DAYS = 7
@@ -591,6 +594,31 @@ def gather_notes(stderr_text):
     }
 
 
+def auth_failure(stderr_text):
+    """A one-line reason when a gather failed because GitHub refused the
+    token (expired, revoked, over the organisation's lifetime limit, not
+    authorized for its SSO, or missing), else None. Read from gather's own
+    error lines (`error: GitHub API 401 ...`, its `message:` line)."""
+    text = stderr_text or ""
+    low = text.lower()
+    if "set github_token" in low:
+        return "no token in the environment"
+    m = re.search(r"error: GitHub API (401|403)\b", text)
+    if not m:
+        return None
+    msg = re.search(r"^\s*message: (.*)$", text, re.M)
+    message = msg.group(1).strip() if msg else ""
+    if m.group(1) == "401" or "bad credentials" in low:
+        return "GitHub refused the token (401{}): expired, revoked or wrong".format(
+            ": " + message if message else "")
+    if "lifetime" in low or "expir" in low:
+        return "GitHub refused the token (403: {}): its lifetime is over the " \
+               "organisation's limit".format(message or "lifetime policy")
+    if "x-github-sso" in low:
+        return "the token is not authorized for the organisation's SAML SSO (403)"
+    return None
+
+
 # --- SQLite file handling ------------------------------------------------------
 
 def _connect_ro(path):
@@ -837,9 +865,11 @@ def manifest_project(stream):
 
 
 def run_window(cfg, stream, win, log, env, run=run_subprocess, now=utc_now,
-               clock=time.monotonic, gather_script=None):
+               clock=time.monotonic, gather_script=None, commands=None):
     """Gather one window into a copy of its store, validate the copy, swap it
-    in. Returns the attempt record (result 'ok' or the failing step)."""
+    in. Returns the attempt record (result 'ok' or the failing step).
+    `commands` [(part, from, to, ref_date, argv with TMP_STORE)] replaces the
+    gather steps (an offline recompute); the store must then exist already."""
     store = win["store"]
     tmp = tmp_store_path(store)
     os.makedirs(os.path.dirname(store), exist_ok=True)
@@ -853,18 +883,28 @@ def run_window(cfg, stream, win, log, env, run=run_subprocess, now=utc_now,
         _remove(tmp)
         if os.path.exists(store):
             copy_store(store, tmp)
+        elif commands is not None:
+            raise ConfigError("store {} does not exist: nothing to recompute".format(
+                store))
         steps = []
-        if win["tail"]:
-            steps.append((win["tail"]["from"], win["tail"]["to"], None, "tail"))
-        steps.append((win["from"], win["to"], win["ref_date"], "month"))
+        if commands is not None:
+            steps = [(frm, to, ref_date, part, [tmp if a == TMP_STORE else a
+                                                for a in argv])
+                     for part, frm, to, ref_date, argv in commands]
+        else:
+            if win["tail"]:
+                steps.append((win["tail"]["from"], win["tail"]["to"], None, "tail",
+                              None))
+            steps.append((win["from"], win["to"], win["ref_date"], "month", None))
         project = None
-        for frm, to, ref_date, part in steps:
+        for frm, to, ref_date, part, argv in steps:
             mpath = None
-            if stream["kind"] == "manifest":
+            if stream["kind"] == "manifest" and argv is None:
                 mpath = manifest_run_path(cfg, stream, frm, to)
                 project = _write_run_manifest(cfg, stream, frm, to, mpath)
-            argv = gather_argv(cfg, stream, frm, to, ref_date, tmp, mpath,
-                               gather_script=gather_script)
+            if argv is None:
+                argv = gather_argv(cfg, stream, frm, to, ref_date, tmp, mpath,
+                                   gather_script=gather_script)
             log("gather {} {} [{}..{}]: {}".format(stream["id"], part, frm, to,
                                                    shlex.join(argv)))
             g0 = clock()
@@ -920,6 +960,8 @@ def run_window(cfg, stream, win, log, env, run=run_subprocess, now=utc_now,
         if attempt["result"] != "ok":
             _remove(tmp)
         attempt["notes"] = gather_notes("\n".join(all_err))
+        attempt["auth_error"] = auth_failure("\n".join(all_err)) \
+            if attempt["result"] == "gather_failed" else None
         attempt["duration_s"] = round(clock() - t0, 1)
         attempt["finished_at"] = iso(now())
 
@@ -1099,7 +1141,9 @@ def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
                 "windows": {w["month"]: a["result"] for w, a in records},
                 "last_success_at": max(
                     (e["last_success"]["at"] for e in status["windows"].values()
-                     if e.get("last_success")), default=None)}
+                     if e.get("last_success")), default=None),
+                "auth_error": next((a.get("auth_error") for _w, a in records
+                                    if a.get("auth_error")), None)}
         try:
             apply_retention(cfg, today, log)
         except OSError as exc:
@@ -1127,6 +1171,93 @@ def cmd_run(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
         log.close()
         release_lock(lock)
     return code
+
+
+# --- offline recompute ------------------------------------------------------------
+
+# What `recompute --what` can redo, and the gather flag that does it (offline:
+# from the stored records and the stream's clone, no API call). Only what
+# gather offers: `gather.py --help` lists its `--recompute-*` flags.
+RECOMPUTE_FLAGS = {"ownership": "--recompute-ownership"}
+
+
+def recompute_commands(cfg, stream, what, windows, python=None, gather_script=None):
+    """The recompute command for every gathered window of a store, oldest
+    first, against the working copy (TMP_STORE)."""
+    if stream["kind"] != "repo":
+        raise ConfigError("stream {!r}: recompute works on a single-repository "
+                          "stream only (gather's {} takes --owner/--repo)".format(
+                              stream["id"], RECOMPUTE_FLAGS[what]))
+    out = []
+    for frm, to in windows:
+        out.append(("recompute-" + what, frm, to, None, [
+            python or sys.executable, gather_script or GATHER_SCRIPT,
+            "--owner", stream["owner"], "--repo", stream["repo"],
+            "--from", frm, "--to", to, "--store", TMP_STORE,
+            "--clone-dir", os.path.join(stream_dir(cfg, stream), "clone"),
+            RECOMPUTE_FLAGS[what]]))
+    return out
+
+
+def cmd_recompute(cfg, args, run=run_subprocess, now=utc_now, clock=time.monotonic,
+                  version_of=code_version, gather_script=None, base_env=None,
+                  isdir=os.path.isdir):
+    """Recompute clone-derived facts of one month store after a code upgrade,
+    on a copy, validated, then swapped in (exactly as a gather is)."""
+    stream = select_streams(cfg, [args.stream])[0]
+    first = parse_month(args.month, "--month")
+    store = store_path(cfg, stream, first)
+    windows = store_windows(store)
+    commands = recompute_commands(cfg, stream, args.what, windows,
+                                  gather_script=gather_script)
+    if not windows:
+        raise ConfigError("store {} holds no gathered window (gather it first)".format(
+            store))
+    lo, hi = month_bounds(first)
+    win = {"month": month_key(first), "from": lo.isoformat(), "to": hi.isoformat(),
+           "ref_date": None, "reason": "recompute-" + args.what, "store": store,
+           "tail": None}
+    tmp = tmp_store_path(store)
+    if args.dry_run:
+        lines = ["recompute {} {} ({}):".format(stream["id"], win["month"], args.what)]
+        lines += ["  " + shlex.join([tmp if a == TMP_STORE else a for a in argv])
+                  for _p, _f, _t, _r, argv in commands]
+        lines.append("  " + shlex.join(validate_argv(stream, tmp)))
+        lines.append("  then: swap {} -> {}".format(tmp, store))
+        sys.stdout.write("\n".join(lines) + "\n")
+        return EXIT_OK
+    started = now()
+    env = token_free_env(dict(os.environ if base_env is None else base_env))
+    try:
+        lock = acquire_lock(cfg["workspace"], started, cfg["lock_stale_hours"])
+    except Locked as exc:
+        sys.stderr.write("schedule.py: {}\n".format(exc))
+        return EXIT_LOCKED
+    run_id = started.strftime("%Y%m%dT%H%M%SZ")
+    log_path = os.path.join(cfg["workspace"], "logs", "run-{}.log".format(run_id))
+    log = RunLog(log_path, [])
+    attempt = {"result": "error"}
+    try:
+        log("recompute {} for {} {} ({} window(s))".format(
+            args.what, stream["id"], win["month"], len(commands)))
+        attempt = run_window(cfg, stream, win, log, env, run=run, now=now,
+                             clock=clock, commands=commands)
+        attempt = dict(attempt, run_id=run_id, code_version=version_of(),
+                       what=args.what, log=rel(cfg, log_path))
+        path = stream_status_path(cfg, stream)
+        status = read_json(path, {}) or {}
+        entry = status.setdefault("windows", {}).setdefault(win["month"], {
+            "month": win["month"], "from": win["from"], "to": win["to"],
+            "store": rel(cfg, store), "store_prev": rel(cfg, store + ".prev")})
+        entry["last_recompute"] = attempt
+        write_json(path, status)
+        log("recompute {} {}: {}{}".format(
+            stream["id"], win["month"], attempt["result"],
+            " - " + attempt["error"] if attempt.get("error") else ""))
+    finally:
+        log.close()
+        release_lock(lock)
+    return EXIT_OK if attempt["result"] == "ok" else EXIT_FAILED
 
 
 # --- the reader --------------------------------------------------------------------
@@ -1203,11 +1334,23 @@ def store_freshness(cfg, stream, entry, store, now, max_age_hours):
     return out
 
 
+def issue_cadence(stream, explicit=None, by_month=False):
+    """The newsletter layout for this issue: as asked, else monthly for a
+    whole month, else weekly when the stream's cadence includes it."""
+    if explicit:
+        return explicit
+    if by_month or "weekly" not in stream["cadence"]:
+        return "monthly"
+    return "weekly"
+
+
 def latest(cfg, stream_id, lo, hi, now, max_age_hours=None, accept_stale=False,
-           windows_of=store_windows):
+           windows_of=store_windows, cadence=None, by_month=False):
     """Which store(s) to read for [lo, hi] and whether they may be read.
-    Returns a JSON-able dict; `ok` False carries `refusal`."""
+    Returns a JSON-able dict; `ok` False carries `refusal`. With one store,
+    `next` holds the commands that follow for the issue's cadence."""
     stream = select_streams(cfg, [stream_id])[0]
+    cadence = issue_cadence(stream, cadence, by_month)
     max_age = max_age_hours or stream["stale_hours"]
     status = read_json(stream_status_path(cfg, stream), {}) or {}
     entries = status.get("windows") or {}
@@ -1253,12 +1396,72 @@ def latest(cfg, stream_id, lo, hi, now, max_age_hours=None, accept_stale=False,
                           "the whole period into its own store (USAGE 5.3 "
                           "roll-ups)".format(lo, hi, len(used)))
         out["split_note"] = problems_split
+    if out["single_store"]:
+        out["next"] = next_commands(cfg, stream, used[0][1], lo, hi, cadence)
     if problems and not accept_stale:
         out["refusal"] = "; ".join(problems)
         return out
     out["overridden"] = problems
     out["ok"] = True
     return out
+
+
+def store_repos(path, project):
+    """The repositories a store holds for `project` (read-only)."""
+    if not os.path.isfile(path):
+        return []
+    try:
+        conn = _connect_ro(path)
+        try:
+            return sorted(r[0] for r in conn.execute(
+                "SELECT DISTINCT repo FROM nodes WHERE project=? AND repo != '*'",
+                (project,)))
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+
+
+def next_commands(cfg, stream, store, lo, hi, cadence):
+    """The commands after `latest` for one newsletter issue: a view per
+    repository, linked with the people registry (and the cadence's own
+    series index), the outline and the work package — with `--weekly` for a
+    weekly issue (the outline's default layout is the monthly one)."""
+    py = "python3"
+    label = "{}_{}".format(lo.isoformat(), hi.isoformat())
+    out_dir = os.path.join(stream_dir(cfg, stream), "views", label)
+    suffix = "-weekly" if cadence == "weekly" else ""
+    weekly = ["--weekly"] if cadence == "weekly" else []
+    if stream["kind"] == "repo":
+        members = [(["--project", stream["owner"], "--repo", stream["repo"]],
+                    os.path.join(out_dir, "bundle.json"),
+                    os.path.join(stream_dir(cfg, stream),
+                                 "series{}.json".format(suffix)))]
+    else:
+        project = manifest_project(stream) or ""
+        members = []
+        for repo in store_repos(store, project):
+            name = repo.replace("/", "__")
+            members.append((["--project", project, "--repo", repo],
+                            os.path.join(out_dir, name + ".json"),
+                            os.path.join(stream_dir(cfg, stream), "series",
+                                         "{}{}.json".format(name, suffix))))
+    cmds = []
+    for scope, view, _series in members:
+        cmds.append(shlex.join([py, VIEW_SCRIPT, "--store", store, *scope,
+                                "--from", lo.isoformat(), "--to", hi.isoformat(),
+                                "--out", view]))
+    for _scope, view, series in members:
+        cmds.append(shlex.join([py, LINK_SCRIPT, view, "--series", series,
+                                "--people", cfg["people"]]))
+    views = [v for _s, v, _r in members]
+    outline = os.path.join(out_dir, "newsletter.outline.json")
+    cmds.append(shlex.join([py, NEWSLETTER_SCRIPT, *views, "--outline", *weekly])
+                + " > " + shlex.quote(outline))
+    cmds.append(shlex.join([py, NEWSLETTER_SCRIPT, *views, "--work-package",
+                            os.path.join(out_dir, "package"), *weekly]))
+    return {"cadence": cadence, "views": views, "outline": outline,
+            "work_package": os.path.join(out_dir, "package"), "commands": cmds}
 
 
 # --- status ------------------------------------------------------------------------
@@ -1287,6 +1490,10 @@ def cmd_status(cfg, args, now=utc_now):
                 (e.get("last_attempt") or {}).get("result"),
                 ", " + str(e["last_attempt"]["error"])
                 if (e.get("last_attempt") or {}).get("error") else ""))
+            auth = (e.get("last_attempt") or {}).get("auth_error")
+            if auth:
+                lines.append("  TOKEN: {} - replace the token (docs/SCHEDULING.md "
+                             "\"Keeping the token valid\"), then re-run".format(auth))
     sys.stdout.write("\n".join(lines) + "\n")
     return EXIT_OK if last.get("exit_code") == 0 else EXIT_FAILED
 
@@ -1322,6 +1529,8 @@ commands:
          [--max-minutes N] [--today YYYY-MM-DD] [--break-stale-lock]
   latest --streams FILE --stream ID (--month YYYY-MM | --last-days N | --from D --to D)
          [--max-age-hours H] [--accept-stale] [--today YYYY-MM-DD]
+  recompute --streams FILE --stream ID --month YYYY-MM [--what ownership] [--dry-run]
+  latest ... [--cadence weekly|monthly]
   status --streams FILE [--json]
   check  --streams FILE
 """
@@ -1366,6 +1575,16 @@ def parse_args(argv):
                     help="answer ok despite stale data or a failed last run "
                          "(the problems are listed under `overridden`)")
     lt.add_argument("--today", type=_date_arg, default=None, metavar="YYYY-MM-DD")
+    lt.add_argument("--cadence", choices=CADENCES, default=None,
+                    help="the issue's layout (default: monthly for --month, else "
+                         "weekly when the stream's cadence includes it)")
+    rc = sub.add_parser("recompute", parents=[common],
+                        help="recompute clone-derived facts of a month store "
+                             "offline (after a code upgrade), validated, swapped")
+    rc.add_argument("--stream", required=True, metavar="ID")
+    rc.add_argument("--month", required=True, metavar="YYYY-MM")
+    rc.add_argument("--what", choices=sorted(RECOMPUTE_FLAGS), default="ownership")
+    rc.add_argument("--dry-run", action="store_true")
     st = sub.add_parser("status", parents=[common], help="the last results")
     st.add_argument("--json", action="store_true")
     sub.add_parser("check", parents=[common], help="check the streams file")
@@ -1381,6 +1600,8 @@ def main(argv=None, **seams):
         cfg = load_streams(args.streams)
         if args.cmd == "run":
             return cmd_run(cfg, args, **seams)
+        if args.cmd == "recompute":
+            return cmd_recompute(cfg, args, **seams)
         if args.cmd == "status":
             return cmd_status(cfg, args, **{k: v for k, v in seams.items()
                                              if k == "now"})
@@ -1390,7 +1611,8 @@ def main(argv=None, **seams):
         today = args.today or now.date()
         lo, hi = reader_period(args, today)
         out = latest(cfg, args.stream, lo, hi, now, args.max_age_hours,
-                     args.accept_stale)
+                     args.accept_stale, cadence=args.cadence,
+                     by_month=args.month is not None)
     except ConfigError as exc:
         sys.stderr.write("schedule.py: error: {}\n".format(exc))
         return EXIT_USAGE
@@ -1400,6 +1622,10 @@ def main(argv=None, **seams):
             len(out["stores"]), lo, hi,
             " (overridden: {})".format("; ".join(out["overridden"]))
             if out["overridden"] else ""))
+        if out.get("next"):
+            sys.stderr.write("next ({} issue):\n{}\n".format(
+                out["next"]["cadence"],
+                "\n".join("  " + c for c in out["next"]["commands"])))
         return EXIT_OK
     sys.stderr.write("latest: REFUSED: {}\n".format(out["refusal"]))
     return EXIT_FAILED
