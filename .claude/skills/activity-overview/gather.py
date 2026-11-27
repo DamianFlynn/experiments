@@ -552,51 +552,99 @@ def in_window_boundary_commits(boundary, commits):
     return sorted(s for s in boundary if s in shas)
 
 
-# `git fetch --deepen=<n>` steps tried, in order, while an in-window commit of the
-# walked branch still sits on the shallow boundary (#68). One commit past the
-# boundary is normally enough (the parent predates `from - margin`); the larger
-# steps cover non-monotonic committer dates. Bounded: at most 1+2+4+8 extra commits
-# per boundary, four fetches.
-BOUNDARY_DEEPEN_STEPS = (1, 2, 4, 8)
+# Deepening steps tried, in order, while a boundary commit of the walked branch
+# may still cut or hide window history (#68, #97): each pushes the clone bound
+# back by that many extra days (`git fetch --shallow-since=<from - margin -
+# extra>`); None is the last resort, `git fetch --unshallow`. Never `--deepen=<n>`:
+# git counts it from EVERY boundary commit of every fetched ref, so on a merge
+# history (a branch that merged the mainline, or a merge with one parent older
+# than the bound) it can make a mainline commit above the window a boundary and
+# cut all window history from the walked branch. A date bound is monotonic: an
+# earlier one only adds commits. Bounded: at most four fetches.
+BOUNDARY_DEEPEN_STEPS = (30, 90, 365, None)
 
 
-def _in_window_boundary_on_head(clone_dir, from_date, to_date, run):
-    """Shallow-boundary SHAs that are in-window commits of the checked-out branch
-    (the history the three walks read). Sorted. A root commit is never listed:
-    git records only grafted commits in `.git/shallow`."""
+def _is_merge_object(clone_dir, sha, run):
+    """True when commit `sha` has more than one parent in its own object (the
+    shallow graft hides them from `git log`, not from `cat-file`)."""
+    raw = run(["git", "-C", clone_dir, "cat-file", "commit", sha])
+    header = raw.split("\n\n", 1)[0]
+    return sum(1 for ln in header.splitlines() if ln.startswith("parent ")) > 1
+
+
+def _head_window_and_late_boundary(clone_dir, from_date, to_date, run):
+    """(in-window SHAs of the checked-out branch, its boundary SHAs that cut or
+    hide window history). Such a boundary commit is either an in-window commit,
+    whose diff is a whole-tree phantom (#68), or a later merge: git made it a
+    boundary because one parent is older than the bound, and grafted away ALL
+    its parents, so its other parents' in-window commits are unreachable (#97).
+    A later single-parent boundary hides only that older parent. A root commit
+    is never a boundary: git records only grafted commits in `.git/shallow`."""
     boundary = shallow_boundary_shas(clone_dir)
-    if not boundary:
-        return []
     raw = run(["git", "-C", clone_dir, "log", f"--pretty=format:{LOG_FORMAT}"])
-    head = window_records(parse_git_log(raw), from_date, to_date)
-    return in_window_boundary_commits(boundary, head)
+    head = parse_git_log(raw)
+    window = {c["sha"] for c in window_records(head, from_date, to_date)}
+    late = sorted(c["sha"] for c in head if c["sha"] in boundary and (
+        c["sha"] in window or (in_window(c.get("date"), from_date, None)
+                               and _is_merge_object(clone_dir, c["sha"], run))))
+    return window, late
+
+
+def _deepen_selector(from_date, extra):
+    return ("--unshallow" if extra is None else
+            f"--shallow-since={_shift_date(from_date, -(_clone_margin_days() + extra))}")
 
 
 def deepen_window_boundary(clone_dir, from_date, to_date, run=None,
                            steps=BOUNDARY_DEEPEN_STEPS):
-    """Make in-window shallow-boundary commits real (#68).
+    """Make the walked branch's window history complete and real (#68, #97).
 
-    A boundary commit's parent is grafted away, so git diffs it against the empty
-    tree (a whole-tree phantom). When the clone margin held no earlier commit, the
-    first in-window commit is such a commit. Deepen the clone (`git fetch
-    --deepen=<n>`, n from `steps`) until no in-window commit of the walked branch
-    is on the boundary. Stops at the first fetch error (not retried) or when the
-    steps run out. Returns the in-window boundary SHAs still left (sorted; empty
-    when resolved) — the caller falls back to dropping their diffs and files."""
+    A boundary commit's parents are grafted away: an in-window one diffs as the
+    whole tree (a phantom), and a later one (a merge with one parent older than
+    the bound) hides its other parents' in-window commits. While the checked-out
+    branch has such a boundary commit (in the window, or a merge dated on or
+    after `from_date`), push the bound back (`steps`, see BOUNDARY_DEEPEN_STEPS).
+    Guard: the in-window commits reachable before a step must all be reachable
+    after it; if not, the clone is re-fetched with the last good bound and
+    deepening stops, and if that does not bring them back RuntimeError is
+    raised: a gather never silently walks fewer commits than the clone had. Stops at the first fetch error (not
+    retried) or when the steps run out. Returns the in-window boundary SHAs still
+    left (sorted; empty when resolved): the caller drops their diffs and files."""
     run = run or run_git
-    left = _in_window_boundary_on_head(clone_dir, from_date, to_date, run)
-    for n in steps:
-        if not left:
+    if not shallow_boundary_shas(clone_dir):
+        return []
+    have, late = _head_window_and_late_boundary(clone_dir, from_date, to_date, run)
+    good = _shallow_selector(from_date)
+    for extra in steps:
+        if not late:
             break
+        step = _deepen_selector(from_date, extra)
         try:
-            run(["git", "-C", clone_dir, "fetch", f"--deepen={n}", "origin"])
+            run(["git", "-C", clone_dir, "fetch", step, "origin"])
         except RuntimeError as exc:
             sys.stderr.write(
-                f"warning: could not deepen {clone_dir} past the shallow boundary: "
+                f"warning: could not deepen {clone_dir} past the shallow boundary "
+                f"(window history behind it may be incomplete): "
                 f"{str(exc).strip().splitlines()[-1] if str(exc).strip() else exc}\n")
             break
-        left = _in_window_boundary_on_head(clone_dir, from_date, to_date, run)
-    return left
+        now, late = _head_window_and_late_boundary(clone_dir, from_date, to_date, run)
+        lost = have - now
+        if lost:
+            run(["git", "-C", clone_dir, "fetch", good, "origin"])
+            now, late = _head_window_and_late_boundary(clone_dir, from_date, to_date, run)
+            if have - now:
+                raise RuntimeError(
+                    f"deepening {clone_dir} ({step}) lost {len(have - now)} in-window "
+                    f"commit(s) of the walked branch and re-fetching with {good} did "
+                    f"not restore them: {sorted(have - now)}")
+            sys.stderr.write(
+                f"warning: deepening {clone_dir} ({step}) cut {len(lost)} in-window "
+                f"commit(s) from the walked branch; restored with {good} and "
+                f"stopped deepening\n")
+            have = now
+            break
+        have, good = now, step
+    return sorted(s for s in late if s in have)
 
 
 def in_window(ts, from_date, to_date):

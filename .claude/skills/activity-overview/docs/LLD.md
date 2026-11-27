@@ -180,7 +180,7 @@ sequenceDiagram
   opt base branch is not the remote default
     A->>Git: fetch --shallow-since origin/<base>, checkout -B <base>
   end
-  A->>Git: fetch --deepen=n while an in-window commit is on the boundary (bounded)
+  A->>Git: fetch --shallow-since=(earlier) while an in-window or later merge commit is on the boundary (bounded, guarded)
   A->>Git: log (commits, full walk) then window_records
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
@@ -286,10 +286,23 @@ sequenceDiagram
   margin keeps each in-window commit's real parent in the clone.
 - If the margin holds no earlier commit, the first in-window commit is a shallow-boundary
   commit: its parent is grafted away, so git diffs it against the empty tree (a whole-tree
-  phantom). After the clone/fetch, `deepen_window_boundary` runs `git fetch --deepen=n origin`
-  (n from `BOUNDARY_DEEPEN_STEPS` = 1, 2, 4, 8; stops at the first fetch error) until no
-  in-window commit of the checked-out branch is in `.git/shallow`, so its diff and file list
-  are real. A root commit is never in `.git/shallow`; its full file list is genuine.
+  phantom). On a merge history a later boundary commit can also hide window history: a merge
+  with one parent older than the bound becomes a boundary with ALL its parents grafted away,
+  so its other parent's in-window commits are not reachable (#97). After the clone/fetch,
+  `deepen_window_boundary` pushes the bound back while the checked-out branch has such a
+  boundary commit (an in-window one, or a merge dated on or after `from`): `git fetch --shallow-since=<from − margin − extra>`
+  (extra from `BOUNDARY_DEEPEN_STEPS` = 30, 90, 365 days, then `--unshallow`; stops at the
+  first fetch error). A root commit is never in `.git/shallow`; its full file list is genuine.
+- It never uses `git fetch --deepen=n` (#97): git counts that from **every** boundary commit of
+  every fetched ref, so a boundary on a branch that merged the mainline (or a merge with an
+  old parent) turns a mainline commit above the window into the new boundary and cuts all
+  window history from the walked branch (one `--deepen=1` took a real October from 65 commits
+  to 14). An earlier `--shallow-since` only ever adds commits. A guard checks every step: the
+  in-window commits of the walked branch before it must all be reachable after it; if not,
+  the clone is re-fetched with the last good bound and deepening stops, and if that does not
+  restore them the gather fails with `RuntimeError` instead of storing fewer commits. There is
+  no cheap independent completeness check: counting the remote branch's window commits needs
+  that history on disk (or a commits-API listing, which this path does not use for commits).
 - Fallback when deepening could not resolve it: `shallow_boundary_shas` + `drop_boundary_events`
   remove the commit's code/symbol events **and** its `commits[].files` is cleared, so
   `area_paths`, module counts, `touches` edges and train `code_areas` are not inflated. Any

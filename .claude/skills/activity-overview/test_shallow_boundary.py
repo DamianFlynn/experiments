@@ -6,7 +6,8 @@ its parent is grafted away and git reports the WHOLE tree as changed. Before
 #68 only code/symbol events were dropped; `commits[].files` kept the whole-tree
 list, so every area/module looked touched.
 
-The fix deepens the clone past such a commit (bounded `git fetch --deepen`) so
+The fix deepens the clone past such a commit (a bounded, earlier `git fetch
+--shallow-since`; never `--deepen`, which can cut a merge history, #97) so
 its parent is present and its diff is real; only if that fails does it fall back
 to dropping the commit's diffs AND clearing its `files`, recorded in
 `meta.boundary_dropped_commits`.
@@ -15,6 +16,7 @@ Real git against throwaway local `file://` repos (no network); the harness is
 shared with test_clone_handling.py.
 """
 import os
+import shutil
 import sys
 import unittest
 from unittest import mock
@@ -79,13 +81,22 @@ class _BoundaryRepo(tch._RepoCase):
                        for p in a.get("paths", [])})
 
 
+def _is_deepen_fetch(args):
+    """True for deepen_window_boundary's fetches: a `fetch` past the window's own
+    clone bound (an earlier `--shallow-since`, `--unshallow` or `--deepen`)."""
+    return "fetch" in args and any(
+        str(a).startswith(("--deepen", "--unshallow")) or (
+            str(a).startswith("--shallow-since") and a != gather._shallow_selector(FROM))
+        for a in args)
+
+
 def _refusing_deepen(calls=None):
-    """A run_git that fails every `fetch --deepen` (e.g. a remote that cannot
+    """A run_git that fails every deepening fetch (e.g. a remote that cannot
     deepen) and passes everything else to real git."""
     real = gather.run_git
 
     def run(args, cwd=None, timeout=None):
-        if any(str(a).startswith("--deepen") for a in args):
+        if _is_deepen_fetch(args):
             if calls is not None:
                 calls.append(list(args))
             raise RuntimeError("fatal: deepen refused (test)")
@@ -152,7 +163,7 @@ class TestDeepenBoundaryHelper(_BoundaryRepo):
         real = gather.run_git
 
         def run(args, cwd=None, timeout=None):
-            if any(str(a).startswith("--deepen") for a in args):
+            if _is_deepen_fetch(args):
                 calls.append(list(args))
                 return ""          # "succeeds" but never moves the boundary
             return real(args, cwd=cwd, timeout=timeout)
@@ -210,6 +221,147 @@ class TestAcquireBoundary(_BoundaryRepo):
         self.assertEqual(self.area_paths(b), [])  # nothing looks touched
         written = "".join(str(a[0][0]) for a in err.write.call_args_list)
         self.assertIn("shallow clone boundary", written)
+
+
+def _harmful_deepen(fail_restore=False, calls=None):
+    """A run_git that replaces deepen_window_boundary's widening fetch with the
+    old relative `fetch --deepen=1` (which cuts the walked branch on a merge
+    history); with `fail_restore` the restoring re-fetch is replaced too, so
+    the loss cannot be undone. Everything else goes to real git."""
+    real = gather.run_git
+    seen = []
+
+    def run(args, cwd=None, timeout=None):
+        if "fetch" in args and any(str(a).startswith(("--shallow-since", "--unshallow"))
+                                   for a in args):
+            seen.append(list(args))
+            if calls is not None:
+                calls.append(list(args))
+            if len(seen) == 1 or fail_restore:
+                args = [a for a in args if not str(a).startswith(
+                    ("--shallow-since", "--unshallow"))]
+                args.insert(args.index("fetch") + 1, "--deepen=1")
+        return real(args, cwd=cwd, timeout=timeout)
+    return run
+
+
+@unittest.skipUnless(shutil.which("git"), "git not installed")
+class TestDeepenNeverLosesHistory(_BoundaryRepo):
+    """#97: on a merge history `git fetch --deepen=<n>` (relative to EVERY
+    shallow boundary commit) could make a mainline commit above the window a
+    boundary and cut all in-window history from the walked branch; and a merge
+    with one parent older than the clone bound hides its other, in-window parent
+    behind the boundary. Real git over file://, the same server logic as a remote."""
+
+    def setUp(self):
+        super().setUp()
+        quiet(self)
+
+    def merge(self, msg, date, rev):
+        tch._git("merge", "-q", "--no-ff", "-m", msg, rev, cwd=self.src, date=date)
+        return tch._git("rev-parse", "HEAD", cwd=self.src).strip()
+
+    def checkout(self, *args):
+        tch._git("checkout", "-q", *args, cwd=self.src)
+
+    def cut_repro(self):
+        """main: R (old) - W - W2 (in-window) - X - X2 - Z(merge of `sync`).
+        `sync` is an old branch (Q, from R) that merged X: its merge commit B has
+        an old parent, so B is a clone boundary one step above X. W is an
+        in-window boundary (R predates the margin), which makes gather deepen."""
+        root = self.write_commit("root", "2026-01-10", OLD_FILES)
+        w = self.write_commit("w", "2026-05-20", CHANGED)
+        w2 = self.write_commit("w2", "2026-05-25", ["modules/c/main.tf"])
+        x = self.write_commit("x", "2026-06-10", ["modules/d/main.tf"])
+        self.checkout("-b", "sync", root)
+        self.write_commit("q", "2026-01-15", ["modules/e/main.tf"])
+        self.merge("sync main", "2026-06-15", x)
+        self.checkout("main")
+        self.write_commit("x2", "2026-06-18", ["modules/a/main.tf"])
+        self.merge("merge sync", "2026-06-20", "sync")
+        tch._git("branch", "-q", "-D", "sync", cwd=self.src)
+        return w, w2
+
+    def hidden_repro(self):
+        """main: R (old) - M1 (margin) - W (in-window) - Z(merge of `side`).
+        `side` (from M1) holds H (in-window) and then merges an old commit Q, so
+        its merge commit B2 (after the window) is a clone boundary with ALL its
+        parents grafted away: H is not reachable at all after the clone."""
+        root = self.write_commit("root", "2026-01-10", OLD_FILES)
+        m1 = self.write_commit("m1", "2026-05-10", ["modules/c/main.tf"])
+        w = self.write_commit("w", "2026-05-20", CHANGED)
+        self.checkout("-b", "old", root)
+        self.write_commit("q", "2026-01-15", ["modules/e/main.tf"])
+        self.checkout("-b", "side", m1)
+        h = self.write_commit("h", "2026-05-22", ["modules/d/main.tf"])
+        self.merge("merge old", "2026-06-02", "old")
+        self.checkout("main")
+        self.merge("merge side", "2026-06-05", "side")
+        tch._git("branch", "-q", "-D", "side", "old", cwd=self.src)
+        return w, h
+
+    def window(self):
+        raw = gather.run_git(["git", "-C", self.clone, "log",
+                              f"--pretty=format:{gather.LOG_FORMAT}"])
+        return {c["sha"] for c in gather.window_records(
+            gather.parse_git_log(raw), FROM, TO)}
+
+    def test_relative_deepen_cuts_the_walked_branch(self):
+        # Pins the git behaviour the fix avoids: `--deepen=1` counts from every
+        # boundary commit, so B's parent X becomes a boundary and W, W2 vanish.
+        w, w2 = self.cut_repro()
+        gather.prepare_clone(self.url, FROM, self.clone)
+        self.assertEqual(self.window(), {w, w2})
+        gather.run_git(["git", "-C", self.clone, "fetch", "--deepen=1", "origin"])
+        self.assertEqual(self.window(), set())
+
+    def test_deepening_keeps_every_in_window_commit(self):
+        w, w2 = self.cut_repro()
+        gather.prepare_clone(self.url, FROM, self.clone)
+        self.assertEqual(gather.deepen_window_boundary(self.clone, FROM, TO), [])
+        self.assertEqual(self.window(), {w, w2})
+        self.assertNotIn(w, gather.shallow_boundary_shas(self.clone))
+
+    def test_acquire_stores_the_in_window_commits_of_a_merge_history(self):
+        w, w2 = self.cut_repro()
+        b = self._acquire()
+        self.assertEqual({c["sha"] for c in b["commits"]}, {w, w2})
+        self.assertEqual(b["meta"]["boundary_dropped_commits"], [])
+        [cw] = [c for c in b["commits"] if c["sha"] == w]
+        self.assertEqual(sorted(cw["files"]), CHANGED)
+
+    def test_commit_hidden_behind_a_late_boundary_is_fetched(self):
+        w, h = self.hidden_repro()
+        gather.prepare_clone(self.url, FROM, self.clone)
+        self.assertEqual(self.window(), {w})          # H hidden by the clone bound
+        gather.deepen_window_boundary(self.clone, FROM, TO)
+        self.assertEqual(self.window(), {w, h})
+
+    def test_acquire_stores_a_commit_hidden_behind_a_late_boundary(self):
+        w, h = self.hidden_repro()
+        b = self._acquire()
+        self.assertEqual({c["sha"] for c in b["commits"]}, {w, h})
+
+    def test_guard_restores_a_deepen_step_that_lost_commits(self):
+        w, w2 = self.cut_repro()
+        gather.prepare_clone(self.url, FROM, self.clone)
+        calls = []
+        with mock.patch("sys.stderr") as err:
+            left = gather.deepen_window_boundary(self.clone, FROM, TO,
+                                                 run=_harmful_deepen(calls=calls))
+        self.assertEqual(self.window(), {w, w2})      # restored
+        self.assertEqual(left, [w])                   # the caller's #68 fallback
+        self.assertEqual(calls[1][4], gather._shallow_selector(FROM))
+        self.assertEqual(len(calls), 2)               # no further deepening
+        written = "".join(str(a[0][0]) for a in err.write.call_args_list)
+        self.assertIn("restored", written)
+
+    def test_guard_fails_loudly_when_the_loss_cannot_be_restored(self):
+        self.cut_repro()
+        gather.prepare_clone(self.url, FROM, self.clone)
+        with self.assertRaisesRegex(RuntimeError, "in-window commit"):
+            gather.deepen_window_boundary(self.clone, FROM, TO,
+                                          run=_harmful_deepen(fail_restore=True))
 
 
 if __name__ == "__main__":

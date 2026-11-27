@@ -210,9 +210,10 @@ defaults when needed: `ACTIVITY_IAC_BUILD_TIMEOUT` (seconds/subprocess, default
 The shallow clone reaches `ACTIVITY_CLONE_MARGIN_DAYS` (default `14`) before the
 window so an in-window commit keeps its real parent. If the margin holds no earlier
 commit (common on quiet per-module repos), the first in-window commit lands on the
-shallow boundary; gather then deepens the clone (`git fetch --deepen`, at most four
-bounded attempts) until that commit's parent is present, so its diff and file list
-are real. Only if deepening fails is the commit recorded in
+shallow boundary; gather then deepens the clone (an earlier `git fetch
+--shallow-since`, at most four bounded attempts, never `--deepen`, which can cut a
+merge history) until that commit's parent is present, so its diff and file list
+are real; the same steps fetch in-window commits a late merge boundary hides. Only if deepening fails is the commit recorded in
 `meta.boundary_dropped_commits` (printed as a warning; it is not stored, so views do not
 carry it), with its diffs dropped **and** its `files` cleared (no whole-tree inflation of
 areas/modules); widen this knob and re-gather to recover it.
