@@ -129,8 +129,8 @@ VIEW_CONTRACT_VERSION = 3
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
              "code_owners", "label_taxonomy", "newcomers", "module_notes",
-             "pr_history", "affiliations", "prior_activity", "artifacts",
-             "people")
+             "pr_history", "pr_activity", "affiliations", "prior_activity",
+             "artifacts", "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
 # (not the raw symbol `change`). build_artifacts only uses `change` to recompute
@@ -458,6 +458,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_merged_pr_history`); absent when no gather collected it.
     if "pr_history" in facts:
         bundle["pr_history"] = facts["pr_history"]
+    # PR check results / thread state / lifecycle events (per-window only):
+    # as stored, or per PR the latest window overlapping the view
+    # (`_merged_pr_activity`); absent when no gather collected it.
+    if "pr_activity" in facts:
+        bundle["pr_activity"] = facts["pr_activity"]
     # Contributor affiliation (per-window only): the gathered window's fact
     # as stored, or each person's latest decision over the windows
     # overlapping the view (`_merged_affiliations`); absent when no gather
@@ -1246,7 +1251,7 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
                            if k not in ("workflow_stats", "newcomers",
                                         "module_notes", "pr_history",
-                                        "affiliations"))
+                                        "affiliations", "pr_activity"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1304,6 +1309,9 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     history = _merged_pr_history(conn, project, repo, overlapping, recorded)
     if history is not None:
         facts["pr_history"] = history
+    activity = _merged_pr_activity(conn, project, repo, overlapping, recorded)
+    if activity is not None:
+        facts["pr_activity"] = activity
     affiliations = _merged_affiliations(conn, project, repo, overlapping,
                                         recorded, ts_from, ts_to)
     if affiliations is not None:
@@ -1493,6 +1501,40 @@ def _merged_pr_history(conn, project, repo, overlapping, recorded):
            "windows": [{"from": k[0], "to": k[1]} for k in sorted(values)]}
     if limits is not None:
         out["limits"] = limits
+    return out
+
+
+def _merged_pr_activity(conn, project, repo, overlapping, recorded):
+    """The `pr_activity` of a view that is not exactly one gathered window.
+
+    Check results, thread state and lifecycle events are what GitHub held
+    when a window was gathered, so the view takes, per PR number, the row of
+    the LATEST gathered window overlapping it that collected one (by end
+    day, then start day), stamped with that window's `gathered_at`; the
+    story layer projects them to the view's end (link). Returns
+    {"collected": True, "gathered_at" (the latest window's), "limits"?,
+    "prs": [by number], "windows": [{from, to}]} or None when no overlapping
+    window collected it."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("pr_activity",))
+        value = (got or {}).get("facts", {}).get("pr_activity")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+    prs, latest = {}, None
+    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
+        latest = values[k]                 # later windows replace earlier ones
+        for row in latest.get("prs") or []:
+            if isinstance(row, dict) and isinstance(row.get("number"), int):
+                prs[row["number"]] = dict(row, gathered_at=latest.get("gathered_at"))
+    out = {"collected": True, "gathered_at": latest.get("gathered_at"),
+           "prs": [prs[n] for n in sorted(prs)],
+           "windows": [{"from": k[0], "to": k[1]} for k in sorted(values)]}
+    if latest.get("limits") is not None:
+        out["limits"] = latest["limits"]
     return out
 
 

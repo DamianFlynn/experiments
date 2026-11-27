@@ -62,6 +62,15 @@ author, state, merge date, merger, base branch, reviewers and closing issues.
    November store 41 of 51 open trains are stalled (18 before); on October as of its end,
    53 of 66.
 
+7. **Deepening a shallow clone lost a month's commits** (#97). Found while seeding a
+   second real repository for the people registry: on
+   Azure-Samples/ai-hub-gateway-solution-accelerator (merge commits) August stored 0 of
+   31 commits. `git fetch --deepen` counts from every shallow boundary commit, and one
+   on a merged branch turned a September mainline commit into the boundary. Gather now
+   deepens by an earlier date only and checks that no in-window commit is lost. After
+   the fix August, September and October store 31, 8 and 17 commits, exactly the full
+   clone's; Azure/bicep-registry-modules (linear, never deepened) 23, 69 and 65 as before.
+
 A guard was added to the live CI job: it fails when one train holds more than a third of
 the window's PRs.
 

@@ -1165,10 +1165,12 @@ def get_clone_info(conn, project, repo, frm, to):
 # refs/pull/<N>/head and the comment / parameter changes between them: gather
 # collect_pr_history), and `affiliations` (each window person's
 # maintainer_org / community / unknown label with the deciding signal:
-# gather collect_affiliations).
+# gather collect_affiliations), and `pr_activity` (each window PR's check
+# results, review-thread resolved flags and lifecycle events: gather
+# collect_pr_activity).
 WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
                     "label_taxonomy", "newcomers", "module_notes",
-                    "pr_history", "affiliations")
+                    "pr_history", "affiliations", "pr_activity")
 
 
 def _window_facts_key(project, repo, frm, to):

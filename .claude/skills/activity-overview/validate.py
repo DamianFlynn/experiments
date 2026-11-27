@@ -1304,8 +1304,9 @@ def _fact_signatures(value):
     code_graph a dict with an `areas` list, label_taxonomy a dict with a
     `source` string, code_owners a CODEOWNERS rule list, workflow_stats a
     {workflow: {total, ...}} dict, module_notes a dict with a `changelogs`
-    list, pr_history a dict with a `prs` list and a `base`, affiliations a
-    dict with a `home_orgs` list and a `people` map."""
+    list, pr_history a dict with a `prs` list and a `base`, pr_activity a
+    dict with a `prs` list and a `gathered_at` (and no `base`), affiliations
+    a dict with a `home_orgs` list and a `people` map."""
     out = set()
     if isinstance(value, dict):
         if isinstance(value.get("areas"), list):
@@ -1317,6 +1318,9 @@ def _fact_signatures(value):
             out.add("module_notes")
         if isinstance(value.get("prs"), list) and "base" in value:
             out.add("pr_history")
+        if isinstance(value.get("prs"), list) and "gathered_at" in value \
+                and "base" not in value:
+            out.add("pr_activity")
         if isinstance(value.get("source"), str):
             out.add("label_taxonomy")
         if value and all(isinstance(v, dict) and "total" in v
@@ -1408,6 +1412,117 @@ def _affiliations_problem(value):
     return None
 
 
+# What a `pr_activity` fact and its rows may hold (gather collect_pr_activity).
+_PR_ACTIVITY_FACT_KEYS = {"collected", "gathered_at", "limits", "requests",
+                          "points", "prs", "windows"}
+_PR_ACTIVITY_ROW_KEYS = {"number", "checks_status", "checks_reason", "head",
+                         "commits_total", "commits", "threads_total", "threads",
+                         "threads_omitted", "events", "events_omitted",
+                         "gathered_at"}
+_PR_ACTIVITY_COMMIT_KEYS = {"sha", "committed_at", "rollup", "state", "checks",
+                            "checks_omitted"}
+_PR_ACTIVITY_CHECK_KEYS = {"name", "kind", "status", "conclusion", "started_at",
+                           "completed_at", "url"}
+_PR_ACTIVITY_THREAD_KEYS = {"comment_id", "path", "line", "resolved",
+                            "resolved_by", "outdated"}
+
+
+def _list_of_objects(v):
+    """True for a list whose every element is a JSON object."""
+    return isinstance(v, list) and all(isinstance(x, dict) for x in v)
+
+
+def _pr_activity_problem(value):
+    """Why a stored `pr_activity` value is not one gather writes (an unknown
+    key at any level, a checks_status / roll-up / event kind gather never
+    writes, a `resolved` flag that is not a boolean), or None."""
+    if value.get("collected") is False and set(value) == {"collected"}:
+        return None
+    extra = sorted(set(value) - _PR_ACTIVITY_FACT_KEYS)
+    if extra:
+        return "pr_activity carries unexpected key(s) {}".format(", ".join(extra))
+    if not isinstance(value.get("prs"), list):
+        return "pr_activity.prs is not a list"
+    for row in value["prs"]:
+        if not isinstance(row, dict) or not isinstance(row.get("number"), int):
+            return "pr_activity.prs holds a row without a PR number"
+        n = row["number"]
+        for key in ("commits", "threads", "events"):
+            if key in row and not _list_of_objects(row[key]):
+                return "pr_activity PR #{} {} is not a list of objects".format(n, key)
+        extra = sorted(set(row) - _PR_ACTIVITY_ROW_KEYS)
+        if extra:
+            return "pr_activity PR #{} carries unexpected key(s) {}".format(
+                n, ", ".join(extra))
+        if row.get("checks_status") not in gather.PR_ACTIVITY_CHECKS_STATUSES:
+            return "pr_activity PR #{} checks_status {!r} is not one gather " \
+                   "writes".format(n, row.get("checks_status"))
+        for c in row.get("commits") or []:
+            if not set(c) <= _PR_ACTIVITY_COMMIT_KEYS \
+                    or c.get("rollup") not in gather.CHECK_ROLLUPS \
+                    or ("checks" in c and not isinstance(c["checks"], list)):
+                return "pr_activity PR #{} has a commit entry gather does not " \
+                       "write".format(n)
+            for k in c.get("checks") or []:
+                if not isinstance(k, dict) or not set(k) <= _PR_ACTIVITY_CHECK_KEYS \
+                        or k.get("kind") not in ("check_run", "status"):
+                    return "pr_activity PR #{} has a check entry gather does " \
+                           "not write".format(n)
+        for t in row.get("threads") or []:
+            if not isinstance(t, dict) or not set(t) <= _PR_ACTIVITY_THREAD_KEYS \
+                    or not isinstance(t.get("resolved"), bool):
+                return "pr_activity PR #{} has a thread entry gather does not " \
+                       "write".format(n)
+        for e in row.get("events") or []:
+            if not isinstance(e, dict) or e.get("event") not in \
+                    gather.PR_TIMELINE_EVENTS:
+                return "pr_activity PR #{} has an event gather does not " \
+                       "write".format(n)
+    return None
+
+
+def _pr_history_problem(value):
+    """Why a stored `pr_history` value's narrative evidence is not what
+    gather writes (collect_pr_narrative): per commit `comments` /
+    `interface` / `docs` lists of objects, `responses` whose commits match
+    by `anchor` or `line`, a boolean `narrative_collected`; or None. Rows
+    of older gathers simply lack them."""
+    if "prs" in value and not isinstance(value["prs"], list):
+        return "pr_history.prs is not a list"
+    for row in value.get("prs") or []:
+        if not isinstance(row, dict):
+            return "pr_history.prs holds a row that is not an object"
+        n = row.get("number")
+        if "narrative_collected" in row and row["narrative_collected"] is not True:
+            return "pr_history PR #{} narrative_collected is not true".format(n)
+        if "commits" in row and not _list_of_objects(row["commits"]):
+            return "pr_history PR #{} commits is not a list of objects".format(n)
+        for c in row.get("commits") or []:
+            for key in ("comments", "interface", "docs"):
+                if key in c and not _list_of_objects(c[key]):
+                    return "pr_history PR #{} commit {} is not a list of " \
+                           "objects".format(n, key)
+            for d in c.get("docs") or []:
+                if not _list_of_objects(d.get("sections")):
+                    return "pr_history PR #{} commit docs sections is not a " \
+                           "list of objects".format(n)
+        resp = row.get("responses")
+        if resp is None:
+            continue
+        if not isinstance(resp, list):
+            return "pr_history PR #{} responses is not a list".format(n)
+        for r in resp:
+            if not isinstance(r, dict) or not _list_of_objects(r.get("commits")):
+                return "pr_history PR #{} has a response gather does not " \
+                       "write".format(n)
+            for c in r["commits"]:
+                if not isinstance(c, dict) or c.get("match") not in ("anchor", "line") \
+                        or not _list_of_objects(c.get("hunks", [])):
+                    return "pr_history PR #{} has a response commit gather " \
+                           "does not write".format(n)
+    return None
+
+
 def _fact_shape_problem(key, value):
     """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
     or None: it is not a JSON object (code_owners: an object or a rule list),
@@ -1419,6 +1534,14 @@ def _fact_shape_problem(key, value):
         ok = isinstance(value, dict)
     if ok and key == "affiliations":
         why = _affiliations_problem(value)
+        if why:
+            return why
+    if ok and key == "pr_history":
+        why = _pr_history_problem(value)
+        if why:
+            return why
+    if ok and key == "pr_activity":
+        why = _pr_activity_problem(value)
         if why:
             return why
     sig = _fact_signatures(value)

@@ -210,9 +210,10 @@ defaults when needed: `ACTIVITY_IAC_BUILD_TIMEOUT` (seconds/subprocess, default
 The shallow clone reaches `ACTIVITY_CLONE_MARGIN_DAYS` (default `14`) before the
 window so an in-window commit keeps its real parent. If the margin holds no earlier
 commit (common on quiet per-module repos), the first in-window commit lands on the
-shallow boundary; gather then deepens the clone (`git fetch --deepen`, at most four
-bounded attempts) until that commit's parent is present, so its diff and file list
-are real. Only if deepening fails is the commit recorded in
+shallow boundary; gather then deepens the clone (an earlier `git fetch
+--shallow-since`, at most four bounded attempts, never `--deepen`, which can cut a
+merge history) until that commit's parent is present, so its diff and file list
+are real; the same steps fetch in-window commits a late merge boundary hides. Only if deepening fails is the commit recorded in
 `meta.boundary_dropped_commits` (printed as a warning; it is not stored, so views do not
 carry it), with its diffs dropped **and** its `files` cleared (no whole-tree inflation of
 areas/modules); widen this knob and re-gather to recover it.
@@ -249,6 +250,17 @@ First-time contributors (`newcomers`, BUNDLE.md): one or two search API calls pe
 a PR / issue created in the window (the search API allows 30 requests a minute; a limit is
 waited out like any other). `ACTIVITY_NEWCOMERS_MAX` (default `200`, min `0`) caps the
 candidates checked (the rest are listed as `not_checked`); `--no-newcomers` skips the check.
+
+The PR-history step also reads the walked PRs' commits as narrative (git only):
+`ACTIVITY_ADR_DIRS` (comma-separated folder paths; default `adr,adrs,decisions,docs/adr,
+docs/decisions`) names the folders whose Markdown files are decision records.
+
+Check results, review-thread state and PR lifecycle events (`pr_activity`, BUNDLE.md):
+the events come from the issue timeline already fetched per PR (no extra call); the checks
+of each PR's latest 10 commits, the thread resolved flags and the force-push commits from
+one GraphQL request per 10 PRs (about 6 rate-limit points). `ACTIVITY_PR_CHECKS_MAX`
+(default `200`, min `0`) caps the PRs asked about (open first, then the most discussed;
+the rest `capped`); `--no-pr-checks` asks nothing (`not_requested`).
 
 Contributor affiliation (`affiliations`, BUNDLE.md "The people layer"): for each person not
 decided by the operator's override list or `author_association`, one

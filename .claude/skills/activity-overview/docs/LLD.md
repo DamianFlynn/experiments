@@ -143,6 +143,7 @@ scratch store) and `backfill` respectively.
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
 | `--no-newcomers` | off (check runs) | Skip the first-time-contributor search (§4.7); the window's `newcomers` fact is `{"collected": false}`. `ACTIVITY_NEWCOMERS_MAX` (default 200, min 0) caps the candidates checked |
+| `--no-pr-checks` | off (checks read) | Skip the batched GraphQL read of check results, review-thread state and force-push commits (§4.4c); the window's `pr_activity` keeps the lifecycle events with `checks_status: not_requested`. `ACTIVITY_PR_CHECKS_MAX` (default 200, min 0) caps the PRs asked about |
 | `--no-affiliation` | off (check runs) | Skip the contributor affiliation check (§4.7a); the window's `affiliations` fact is `{"collected": false}`. `ACTIVITY_AFFILIATION_MAX` (default 300, min 0) caps the people looked up |
 | `--home-org ORG`, `--home-name NAME`, `--home-email-domain DOMAIN` | the repo's owner only | Repeatable: extra home organisations (public membership, and a company name), extra company names, home commit email domains (§4.7a); a manifest's `affiliation` object adds the same lists |
 | `--affiliation LOGIN=A` / `@org/team=A` | none | Repeatable operator override (`maintainer_org` / `community` / `unknown`), highest priority; beats a manifest `affiliation.overrides` entry for the same key |
@@ -180,7 +181,7 @@ sequenceDiagram
   opt base branch is not the remote default
     A->>Git: fetch --shallow-since origin/<base>, checkout -B <base>
   end
-  A->>Git: fetch --deepen=n while an in-window commit is on the boundary (bounded)
+  A->>Git: fetch --shallow-since=(earlier) while an in-window or later merge commit is on the boundary (bounded, guarded)
   A->>Git: log (commits, full walk) then window_records
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
@@ -286,10 +287,23 @@ sequenceDiagram
   margin keeps each in-window commit's real parent in the clone.
 - If the margin holds no earlier commit, the first in-window commit is a shallow-boundary
   commit: its parent is grafted away, so git diffs it against the empty tree (a whole-tree
-  phantom). After the clone/fetch, `deepen_window_boundary` runs `git fetch --deepen=n origin`
-  (n from `BOUNDARY_DEEPEN_STEPS` = 1, 2, 4, 8; stops at the first fetch error) until no
-  in-window commit of the checked-out branch is in `.git/shallow`, so its diff and file list
-  are real. A root commit is never in `.git/shallow`; its full file list is genuine.
+  phantom). On a merge history a later boundary commit can also hide window history: a merge
+  with one parent older than the bound becomes a boundary with ALL its parents grafted away,
+  so its other parent's in-window commits are not reachable (#97). After the clone/fetch,
+  `deepen_window_boundary` pushes the bound back while the checked-out branch has such a
+  boundary commit (an in-window one, or a merge dated on or after `from`): `git fetch --shallow-since=<from − margin − extra>`
+  (extra from `BOUNDARY_DEEPEN_STEPS` = 30, 90, 365 days, then `--unshallow`; stops at the
+  first fetch error). A root commit is never in `.git/shallow`; its full file list is genuine.
+- It never uses `git fetch --deepen=n` (#97): git counts that from **every** boundary commit of
+  every fetched ref, so a boundary on a branch that merged the mainline (or a merge with an
+  old parent) turns a mainline commit above the window into the new boundary and cuts all
+  window history from the walked branch (one `--deepen=1` took a real October from 65 commits
+  to 14). An earlier `--shallow-since` only ever adds commits. A guard checks every step: the
+  in-window commits of the walked branch before it must all be reachable after it; if not,
+  the clone is re-fetched with the last good bound and deepening stops, and if that does not
+  restore them the gather fails with `RuntimeError` instead of storing fewer commits. There is
+  no cheap independent completeness check: counting the remote branch's window commits needs
+  that history on disk (or a commits-API listing, which this path does not use for commits).
 - Fallback when deepening could not resolve it: `shallow_boundary_shas` + `drop_boundary_events`
   remove the commit's code/symbol events **and** its `commits[].files` is cleared, so
   `area_paths`, module counts, `touches` edges and train `code_areas` are not inflated. Any
@@ -371,6 +385,38 @@ gather prints one line (`module notes: <repo>: N changelog update(s), M version 
 version tag(s) in the window`) and the bundle carries `module_notes`; fold stores it as a
 per-window fact (`graphstore.WINDOW_FACT_KEYS`, §4.10), never as a singleton node.
 
+### 4.4c Checks, thread state and lifecycle events (`collect_pr_activity`)
+
+The per-window fact `pr_activity` (BUNDLE.md) answers what the conversation does not:
+whether the checks passed on each push, whether a review thread was marked resolved, and
+the PR's renames, draft / ready changes, review requests, dismissals and force-pushes.
+
+1. **Lifecycle events, no extra call.** enrich_pr already pages each PR's issue timeline;
+   `parse_timeline_pr_events` keeps `PR_TIMELINE_EVENTS` (renamed, convert_to_draft,
+   review_requested, review_request_removed, review_dismissed, head_ref_force_pushed) into
+   a side dict (the PR record is unchanged, so stored PR nodes and fixture views are too).
+2. **One GraphQL request per `PR_ACTIVITY_BATCH` (10) PRs** (`pr_activity_query`, through
+   the same `_graphql_client` seam as the closing-issue read): per PR `headRefOid`,
+   `commits(last: 10)` each with `statusCheckRollup { state contexts(first: 50) }`
+   (CheckRun and StatusContext nodes), `reviewThreads(first: 50)` with `isResolved`,
+   `resolvedBy`, `isOutdated` and the first comment's `databaseId`, and
+   `timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 20)` with before / after
+   commits; plus `rateLimit { cost }`. GitHub's cost formula gives about 63 / 100 points
+   per PR, so 6 per request; the REST route would be two calls per commit (`check-runs`,
+   `status`) and has no thread state. A 160-PR month: 16 requests, about 100 points,
+   against a token budget of about 1,000 requests an hour.
+3. **Cap and order.** `ACTIVITY_PR_CHECKS_MAX` (200) PRs per window, open PRs first, then
+   by human conversation (the story candidates), then newest; the rest `capped`. A failed
+   request marks its batch `failed` with the reason; after `PR_ACTIVITY_FAILURE_STOP` (3) in
+   a row the rest are failed unasked. Nothing is fatal.
+4. **Normalise.** `normalize_check_context` maps both node types to `{name, kind, status,
+   conclusion, started_at, completed_at, url}`; `checks_rollup` (also used by link, with an
+   as-of instant) folds them to passing / failing / pending / none; a REST force-push event
+   gains the GraphQL push's commits matched on (time, actor). GraphQL field errors in a
+   partial answer reach this reader (`graphql_post(..., errors=list)`; the other
+   readers keep the partial-data behaviour): a PR an error's `path` names is `failed`,
+   an error naming none fails its batch.
+
 ### 4.4b PR-internal history (`collect_pr_history`)
 
 The base-branch walk sees one commit per squash-merged PR (69 commits for 69 merged PRs in
@@ -414,6 +460,26 @@ with its network retry); a refusal is recorded, never fatal.
    newest within `PR_HISTORY_PATCH_CHARS` 8,000 per PR. This is what a reviewer's "this
    would impact all the modules" is about and what the changelog said at each step; a
    failed walk is `patches_skipped`.
+
+6. For the same walked PRs, the narrative evidence (`collect_pr_narrative`): `git -c
+   core.attributesFile=<tmp: *.md diff=markdown> log --reverse -p --unified=3 -M
+   refs/remotes/pr/<N> --not HEAD … -- PR_NARRATIVE_PATHSPECS <review-comment paths>`
+   through `parse_narrative_patch` (hunks keep git's header context — the Markdown driver
+   names the heading above, the default driver the top-level line above — and per-line
+   old / new numbers). Per file: `narrative_comments` (Bicep `//` `/* */`, HCL `#` `//`
+   `/* */`, PowerShell `#` `<# #>`, YAML `#`; whole-line comments, grouped per change block,
+   paired in order as rewords; `_narrative_decl` names the declaration), `narrative_docs`
+   (README / ADR / docs / other Markdown; `markdown_generated_lines` reads the README's
+   before / after text, `git cat-file blob <sha>[^]:<path>`, to skip generated sections),
+   and `diff_interface` over `read_interface` of the module file's two versions (a
+   mask-based reader of top-level Bicep `param` / `var` / `output` / `resource` / `module`
+   / `type` / `func` / `metadata` with their decorators, and Terraform `variable` / `output`
+   / `module` / `resource` / `data` blocks with their own arguments; the module layer's
+   diff-local symbol events cannot see a decorator or a value past their cap, so the
+   delta is read from whole files). `review_responses` matches each review comment that
+   opens a thread on a file against the later commits' hunks (by its last diff-hunk lines,
+   else by line in the next commit). Budgets as in BUNDLE.md; a failed walk is
+   `narrative_skipped`.
 
 Step 3's format also carries each commit's message body (`%b`, closed by `\x1d` so its lines
 are not read as file names): `parse_pr_commits` keeps the file `paths` (at most

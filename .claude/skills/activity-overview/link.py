@@ -2547,6 +2547,15 @@ STORY_ITEM_FLOOR = 500
 # Budget for the code notes (comments / parameter descriptions / interface
 # lines) carried on the timeline's commit items.
 STORY_CODE_NOTES_BUDGET = 12000
+# Budget for the narrative evidence of PR commits (`evidence`: interface
+# deltas, code comments, documentation prose from `pr_history`), the newest
+# commits first; past it rows are left out and counted
+# (truncation.evidence).
+STORY_EVIDENCE_BUDGET = 16000
+# Per thread: the commits listed as what followed it; per slice: the
+# requests listed in outcome.requests.
+STORY_RESPONSE_COMMITS = 5
+STORY_REQUESTS_MAX = 20
 # Relevance points by train kind (story_score).
 _STORY_KIND_RELEVANCE = {"feature": 3.0, "module-request": 3.0, "bug": 1.0}
 
@@ -2563,7 +2572,18 @@ STORY_NOT_GATHERED = (
 
 _TIMELINE_KIND_ORDER = {"opened": 0, "commit": 1, "comment": 2,
                         "review_comment": 3, "review": 4, "ready_for_review": 5,
-                        "reopened": 6, "closed": 7, "merged": 8}
+                        "reopened": 6, "closed": 7, "merged": 8,
+                        "head_ref_force_pushed": 1, "checks": 2,
+                        "renamed": 5, "convert_to_draft": 5,
+                        "review_requested": 5, "review_request_removed": 5,
+                        "review_dismissed": 5}
+# Timeline kinds that are not a person's move: check results arrive from
+# automation. They neither end a silence nor become an open PR's last event.
+_AUTOMATION_KINDS = ("checks",)
+# What the `pr_activity` fact adds to the slice: the lifecycle events copied
+# onto the timeline and their extra fields.
+_PR_EVENT_FIELDS = ("from", "to", "requested", "by", "review_id", "state",
+                    "message", "before", "after")
 
 
 def window_end_instant(meta):
@@ -3169,6 +3189,7 @@ def story_material(bundle, train):
     issue_index = {i["number"]: i for i in bundle.get("issues", [])}
     issues, prs = _train_members(train, pr_index, issue_index)
     history = _pr_history_index(bundle)
+    activity = _pr_activity_index(bundle)
     instant = window_end_instant(bundle.get("meta"))
     items, bots = [], {}
 
@@ -3228,6 +3249,8 @@ def story_material(bundle, train):
                 and (rec.get("state") == "closed"):
             items.append({"at": rec["closed_at"], "kind": "closed",
                           "actor": None, "url": rec.get("url"), "on": on})
+        if typ == "pr" and activity and rec.get("number") in activity:
+            items += _activity_items(rec, activity[rec["number"]], instant)
     notes_by_commit, by_module, notes_info = train_code_notes(
         bundle, train, history, instant)
     rules = path_class_rules((bundle.get("module_changes") or {})
@@ -3263,6 +3286,9 @@ def story_material(bundle, train):
                 it["change"] = change
             if notes_by_commit.get(c["sha"]):
                 it["code_notes"] = notes_by_commit[c["sha"]]
+            ev = _commit_evidence(c)
+            if ev:
+                it["evidence"] = ev
             items.append(it)
     commits_by_sha = {c.get("sha"): c for c in bundle.get("commits", [])}
     for sha in train.get("commits") or []:
@@ -3292,10 +3318,16 @@ def story_material(bundle, train):
     hunks_omitted = _apply_hunk_budget(items)
     if hunks_omitted:
         truncation["hunks_omitted"] = hunks_omitted
+    ev_info = _apply_evidence_budget(items)
+    if ev_info:
+        truncation["evidence"] = ev_info
     turning = story_turning_points(
         items, instant if train.get("outcome") == "in_flight" else None)
     _rework_detail(items, turning)
     threads = story_threads(items, pr_index, issue_index)
+    _apply_thread_record(threads, prs, activity, instant)
+    thread_responses(threads, items, prs, history, instant)
+    requests = _outcome_requests(threads)
     out = {"timeline": items,
            "turning_points": turning,
            "truncation": truncation,
@@ -3303,12 +3335,36 @@ def story_material(bundle, train):
            "code_notes_by_module": by_module,
            "pr_history": _pr_history_status(prs, history),
            "as_of": instant,
-           "not_gathered": list(STORY_NOT_GATHERED),
-           "outcome": story_outcome(bundle, train, items, history, instant, texts),
+           "not_gathered": _story_not_gathered(prs, activity),
+           "outcome": story_outcome(bundle, train, items, history, instant, texts,
+                                    activity),
            "threads": threads[:STORY_THREADS_MAX]}
     if len(threads) > STORY_THREADS_MAX:
         out["threads_omitted"] = len(threads) - STORY_THREADS_MAX
+    coverage = _thread_coverage(prs, activity, threads)
+    if coverage:
+        out["thread_coverage"] = coverage
+    if requests:
+        out["outcome"]["requests"] = requests
     gaps = _story_gaps(items)
+    unwalked = [p.get("number") for p in prs
+                if "notes" in (history.get(p.get("number")) or {})
+                and not (history.get(p.get("number")) or {}).get("narrative_collected")]
+    if unwalked:
+        gaps.append("PR commits of {} carry no code-comment, documentation or "
+                    "per-commit interface evidence and review threads no "
+                    "`response` from the diffs (gathered before they were "
+                    "kept): what each commit did is known from its summary "
+                    "only".format(", ".join("#{}".format(n) for n in unwalked)))
+    if prs and any(p.get("number") not in (activity or {}) for p in prs):
+        gaps.append("check results, review-thread resolved flags and PR "
+                    "lifecycle events (renames, draft / ready, review "
+                    "requests, dismissals, force-pushes) are not in the store "
+                    "for PR(s) {} (gathered before they were kept, or with "
+                    "--no-pr-checks for the checks): the record does not show "
+                    "them".format(", ".join(
+                        "#{}".format(p.get("number")) for p in prs
+                        if p.get("number") not in (activity or {}))))
     if gaps:
         out["gaps"] = gaps
     return out
@@ -3419,6 +3475,409 @@ def _pr_history_status(prs, history):
     return out
 
 
+def _commit_evidence(c):
+    """The narrative evidence a pr_history commit carries (collect_pr_narrative):
+    {interface, comments (each with its comment_class), docs, [<key>_omitted],
+    [interface_unread], [docs_unread]} — the unread lists name files whose
+    version gather could not read, so "no evidence" is told from "evidence
+    unavailable" — or None when it has none."""
+    out = {}
+    if c.get("interface"):
+        out["interface"] = [dict(r) for r in c["interface"]]
+    if c.get("comments"):
+        rows = []
+        for r in c["comments"]:
+            r = dict(r)
+            r["class"] = comment_class("comment", r.get("text") or r.get("after")
+                                       or r.get("before"))
+            rows.append(r)
+        out["comments"] = rows
+    if c.get("docs"):
+        out["docs"] = [dict(r) for r in c["docs"]]
+    for k in ("interface_omitted", "comments_omitted"):
+        if c.get(k):
+            out[k] = c[k]
+    for k in ("interface_unread", "docs_unread"):
+        if c.get(k):
+            out[k] = list(c[k])
+    return out or None
+
+
+def _apply_evidence_budget(items):
+    """Hold the commit items' `evidence` rows to STORY_EVIDENCE_BUDGET
+    characters, the newest commits first (interface rows, then comments,
+    then docs within a commit); a commit whose rows were cut gets
+    `evidence_omitted`. Returns {budget, kept, omitted} or None when no item
+    carries evidence."""
+    used, kept, omitted, any_ev = 0, 0, 0, False
+    for it in reversed(items):
+        ev = it.get("evidence")
+        if not ev:
+            continue
+        any_ev = True
+        cut = 0
+        for key in ("interface", "comments", "docs"):
+            rows = ev.get(key) or []
+            keep = []
+            for r in rows:
+                size = len(json.dumps(r, sort_keys=True))
+                if used + size > STORY_EVIDENCE_BUDGET:
+                    cut += 1
+                    continue
+                used += size
+                keep.append(r)
+            if keep:
+                ev[key] = keep
+            elif key in ev:
+                del ev[key]
+        kept += sum(len(ev.get(k) or []) for k in ("interface", "comments", "docs"))
+        if cut:
+            it["evidence_omitted"] = cut
+            omitted += cut
+    if not any_ev:
+        return None
+    return {"budget": STORY_EVIDENCE_BUDGET, "kept": kept, "omitted": omitted}
+
+
+def _commit_ref(it, index):
+    return {"index": index, "sha": it.get("sha"), "at": it.get("at"),
+            "url": it.get("url"), "subject": it.get("subject")}
+
+
+def thread_responses(threads, items, prs, history, instant):
+    """What followed each thread on a PR, from the record (in place):
+    `response` {basis, commits: [{index, sha, at, url, subject, [match],
+    [hunks]}], [file_commits]} and `verdict_after` {state, at, url}.
+    - basis `anchor`: a review thread whose opening comment gather matched
+      against the later commits' diffs (pr_history `responses`): the
+      commits that changed the commented lines, with the removed / added
+      lines there (`match` anchor / line), as of the instant;
+    - basis `time`: otherwise, the PR's own non-merge commits after the
+      thread until its opener speaks again after one of them (the opener's
+      other comments and verdict of the same review round, before any
+      commit, do not end it); at most STORY_RESPONSE_COMMITS, each
+      pointing at its timeline item, whose `evidence` / `change` say what
+      it did.
+    `verdict_after` is the opener's first approval / change request /
+    dismissal on the PR after the thread (after its last response commit
+    when there is one). A sequence, not an agreement: nothing here says
+    anyone agreed to anything."""
+    by_pr = {p.get("number"): p for p in prs}
+    pos = {id(it): i for i, it in enumerate(items)}
+    for t in threads:
+        on = t.get("on") or {}
+        if on.get("type") != "pr" or on.get("number") not in by_pr:
+            continue
+        n = on["number"]
+        row = history.get(n) or {}
+        start = next((i for i, it in enumerate(items) if it.get("url") == t.get("url")
+                      and (it.get("on") or {}) == on), None)
+        if start is None:
+            continue
+        resp = None
+        if t.get("kind") == "review_thread" and row.get("responses"):
+            ids = {c.get("url"): c.get("id") for c in
+                   by_pr[n].get("review_comments") or [] if isinstance(c, dict)}
+            stored = next((r for r in row["responses"]
+                           if r.get("comment_id") == ids.get(t.get("url"))), None)
+            if stored:
+                when = {c.get("sha"): c.get("committed_at")
+                        for c in row.get("commits") or []}
+                commits = []
+                for h in stored.get("commits") or []:
+                    if not _not_after(when.get(h.get("sha")), instant):
+                        continue
+                    it = next((x for x in items if x.get("kind") == "commit"
+                               and x.get("sha") == h.get("sha")
+                               and (x.get("on") or {}) == on), None)
+                    ref = _commit_ref(it, pos[id(it)]) if it else \
+                        {"sha": h.get("sha"), "at": when.get(h.get("sha"))}
+                    ref.update(match=h.get("match"), hunks=h.get("hunks") or [])
+                    commits.append(ref)
+                if commits:
+                    resp = {"basis": "anchor", "commits": commits}
+                    files = [x for x in stored.get("file_commits") or []
+                             if _not_after(when.get(x), instant)]
+                    if files:
+                        resp["file_commits"] = files
+        if resp is None:
+            commits = []
+            for i in range(start + 1, len(items)):
+                it = items[i]
+                if (it.get("on") or {}) != on:
+                    continue
+                if it["kind"] in ("comment", "review", "review_comment") \
+                        and it.get("actor") == t.get("by") and commits:
+                    break       # the opener spoke again after a commit
+                if it["kind"] == "commit" and it.get("source") == "pr_head" \
+                        and not it.get("merge"):
+                    commits.append(_commit_ref(it, i))
+                    if len(commits) >= STORY_RESPONSE_COMMITS:
+                        break
+            if commits:
+                resp = {"basis": "time", "commits": commits}
+        if resp:
+            t["response"] = resp
+        after = t.get("at")
+        if resp:
+            after = max([after] + [c.get("at") or "" for c in resp["commits"]])
+        verdict = next((it for it in items[start + 1:]
+                        if it["kind"] == "review" and (it.get("on") or {}) == on
+                        and it.get("actor") == t.get("by")
+                        and it.get("state") in ("approved", "changes_requested",
+                                                "dismissed")
+                        and (it.get("at") or "") >= (after or "")), None)
+        if verdict is not None:
+            t["verdict_after"] = {"state": verdict.get("state"),
+                                  "at": verdict.get("at"), "url": verdict.get("url")}
+
+
+def _outcome_requests(threads):
+    """outcome.requests — "requests and what followed": per thread with a
+    `response` or a `verdict_after`, {thread, kind, by, at, url, [ask],
+    [path], followed_by: [{sha, at, url, subject}], basis, [verdict_after]},
+    at most STORY_REQUESTS_MAX."""
+    out = []
+    for t in threads:
+        if not t.get("response") and not t.get("verdict_after"):
+            continue
+        row = {"thread": t.get("id"), "kind": t.get("kind"), "by": t.get("by"),
+               "at": t.get("at"), "url": t.get("url")}
+        for k in ("ask", "path"):
+            if t.get(k):
+                row[k] = t[k]
+        resp = t.get("response") or {}
+        row["followed_by"] = [{k: c.get(k) for k in ("sha", "at", "url", "subject")
+                               if c.get(k) is not None}
+                              for c in resp.get("commits") or []]
+        if resp:
+            row["basis"] = resp.get("basis")
+        if t.get("verdict_after"):
+            row["verdict_after"] = t["verdict_after"]
+        out.append(row)
+    return out[:STORY_REQUESTS_MAX]
+
+
+def _pr_activity_index(bundle):
+    """{pr number: pr_activity row} of the view's `pr_activity` fact, each
+    row carrying the fact's `gathered_at` (a merged view's rows have their
+    own); None when the view carries no such fact (an older store)."""
+    pa = bundle.get("pr_activity")
+    if not isinstance(pa, dict) or not pa.get("collected"):
+        return None
+    out = {}
+    for r in pa.get("prs") or []:
+        if isinstance(r, dict) and isinstance(r.get("number"), int):
+            out[r["number"]] = dict(r) if "gathered_at" in r else \
+                dict(r, gathered_at=pa.get("gathered_at"))
+    return out
+
+
+def _check_item_time(checks, committed_at, instant):
+    """When a commit's check results were known as of the instant: the
+    latest completion by then, else the commit time (all still pending)."""
+    done = [c.get("completed_at") for c in checks or []
+            if c.get("completed_at") and _not_after(c["completed_at"], instant)]
+    return max(done) if done else committed_at
+
+
+def _activity_items(pr, row, instant):
+    """The timeline items the `pr_activity` row of one PR adds, as of the
+    instant: its lifecycle events (`renamed` with from / to,
+    `convert_to_draft`, `review_requested` / `review_request_removed` with
+    requested / by, `review_dismissed` with state / message,
+    `head_ref_force_pushed` with before / after commits when read), and one
+    `checks` item per covered commit committed by the instant: its roll-up
+    as of the instant (gather.checks_rollup), the failing and pending check
+    names and the passing count, collapsed (never one item per check run)."""
+    on = {"type": "pr", "number": pr.get("number")}
+    out = []
+    for e in row.get("events") or []:
+        if not isinstance(e, dict) or not e.get("at") \
+                or not _not_after(e["at"], instant):
+            continue
+        it = {"at": e["at"], "kind": e.get("event"), "actor": e.get("actor"),
+              "url": _event_url(pr, e), "on": on}
+        for k in _PR_EVENT_FIELDS:
+            if e.get(k) is not None:
+                it[k] = e[k]
+        out.append(it)
+    commits = [c for c in row.get("commits") or []
+               if isinstance(c, dict) and c.get("sha")
+               and _not_after(c.get("committed_at"), instant)]
+    head = commits[-1]["sha"] if commits else None
+    for c in commits:
+        roll = gather.checks_rollup(c.get("checks"), as_of=instant,
+                                    omitted=c.get("checks_omitted") or 0)
+        if roll["rollup"] == "none" and not c.get("checks"):
+            continue
+        it = {"at": _check_item_time(c.get("checks"), c.get("committed_at"),
+                                     instant),
+              "kind": "checks", "actor": None,
+              "url": _pr_commit_url(pr, c["sha"]), "on": on, "sha": c["sha"],
+              "rollup": roll["rollup"], "passing": roll["passing"]}
+        if roll["failing"]:
+            it["failing"] = roll["failing"]
+        if roll["pending"]:
+            it["pending"] = roll["pending"]
+        if c.get("checks_omitted"):
+            it["checks_omitted"] = c["checks_omitted"]
+        if c["sha"] == head:
+            it["head"] = True
+        out.append(it)
+    return out
+
+
+def checks_outcome(row, instant, pr_url=None):
+    """The outcome block's `checks` of one PR from its `pr_activity` row:
+    {status: gathered, head, [head_url], rollup, failing, pending, passing,
+    gathered_at, commits_total, commits_covered, [checks_omitted],
+    [completed_after_as_of]} — the head being the latest covered commit
+    committed by the instant, its roll-up as of the instant (`incomplete`
+    when the read missed some of its checks and none visible failed); with
+    no covered commit by the instant `rollup: unavailable`, `head: None`
+    and a `reason` — or {status,
+    [reason], gathered_at} when the checks were capped, failed, not found
+    or not requested."""
+    status = row.get("checks_status")
+    out = {"status": status, "gathered_at": row.get("gathered_at")}
+    if status != "gathered":
+        if row.get("checks_reason"):
+            out["reason"] = row["checks_reason"]
+        return out
+    commits = [c for c in row.get("commits") or []
+               if isinstance(c, dict) and c.get("sha")
+               and _not_after(c.get("committed_at"), instant)]
+    out["commits_total"] = row.get("commits_total")
+    out["commits_covered"] = len(commits)
+    if not commits:
+        # the read covers the PR's latest commits only: none of them existed
+        # at the instant, so the head's checks then are not in the record
+        out["head"] = None
+        out["rollup"] = "unavailable"
+        out["reason"] = ("the commits whose checks were read were all "
+                         "committed after the as-of instant")
+        return out
+    c = commits[-1]
+    roll = gather.checks_rollup(c.get("checks"), as_of=instant,
+                                omitted=c.get("checks_omitted") or 0)
+    out.update(head=c["sha"], rollup=roll["rollup"], failing=roll["failing"],
+               pending=roll["pending"], passing=roll["passing"])
+    if pr_url:
+        out["head_url"] = "{}/commits/{}".format(pr_url, c["sha"])
+    if c.get("checks_omitted"):
+        out["checks_omitted"] = c["checks_omitted"]
+    late = sum(1 for k in c.get("checks") or []
+               if k.get("completed_at") and not _not_after(k["completed_at"],
+                                                           instant))
+    if late:
+        out["completed_after_as_of"] = late
+    return out
+
+
+def _thread_coverage(prs, activity, threads):
+    """{pr number (str): {flagged, omitted}} for the train's PRs with a
+    `pr_activity` row: how many of the PR's review threads carry GitHub's
+    resolved flag in the ledger, and how many review threads gather did not
+    read (`threads_omitted`). The story check needs it: a ledger whose
+    visible threads all carry a flag is complete only with nothing
+    omitted."""
+    out = {}
+    for p in prs:
+        row = (activity or {}).get(p.get("number"))
+        if row is None:
+            continue
+        n = p.get("number")
+        out[str(n)] = {"flagged": sum(
+            1 for t in threads if t.get("kind") == "review_thread"
+            and (t.get("on") or {}).get("number") == n
+            and "resolved_on_github" in t),
+            "omitted": row.get("threads_omitted") or 0}
+    return out
+
+
+def _apply_thread_record(threads, prs, activity, instant):
+    """Where GitHub's own resolved flag is stored for a review thread (the
+    `pr_activity` row's threads, joined on the thread's opening review
+    comment), the record wins over the derived status: `status` becomes
+    `resolved on GitHub` / `not resolved on GitHub`, the rule's status is
+    kept as `derived_status`, and `resolved_on_github` {resolved, [by],
+    outdated, as_gathered} says what GitHub held when the window was
+    gathered (GitHub keeps no time for a resolution). In place."""
+    if not activity:
+        return
+    by_url = {}
+    for p in prs:
+        row = activity.get(p.get("number")) or {}
+        ids = {t.get("comment_id"): t for t in row.get("threads") or []
+               if isinstance(t, dict) and t.get("comment_id") is not None}
+        for c in p.get("review_comments") or []:
+            if isinstance(c, dict) and c.get("id") in ids and c.get("url"):
+                by_url[c["url"]] = (ids[c["id"]], row.get("gathered_at"))
+    for t in threads:
+        if t.get("kind") != "review_thread" or t.get("url") not in by_url:
+            continue
+        rec, when = by_url[t["url"]]
+        flag = {"resolved": bool(rec.get("resolved")),
+                "outdated": bool(rec.get("outdated")), "as_gathered": when}
+        if rec.get("resolved_by"):
+            flag["by"] = rec["resolved_by"]
+        if when and instant and not _not_after(when, instant):
+            flag["gathered_after_as_of"] = True
+        t["resolved_on_github"] = flag
+        t["derived_status"] = t["status"]
+        t["status"] = "resolved on GitHub" if flag["resolved"] \
+            else "not resolved on GitHub"
+
+
+def _story_not_gathered(prs, activity):
+    """STORY_NOT_GATHERED, minus what the view's `pr_activity` holds for
+    every PR of the train: check results (when gathered for each), the
+    resolved flag (likewise), renames (title edits) and force-pushes (their
+    before / after commits; the replaced content stays unfetched). A partial
+    read is named: review threads, lifecycle events or commits beyond what
+    gather read."""
+    out = list(STORY_NOT_GATHERED)
+    if not prs or not activity or any(p.get("number") not in activity
+                                      for p in prs):
+        return out
+    rows = [activity[p.get("number")] for p in prs]
+    asked = all(r.get("checks_status") == "gathered" for r in rows)
+    out[0] = ("description edits (bodies are as last gathered; title edits "
+              "are in the record as `renamed` events)")
+    out[1] = ("the content of the branch states force-pushes replaced (the "
+              "push and, when read, its before / after commits are in the "
+              "record)")
+    if asked:
+        out = [x for x in out if not x.startswith(("whether a review thread",
+                                                   "check runs"))]
+    else:
+        missing = ["#{} ({})".format(p.get("number"),
+                                     activity[p.get("number")].get("checks_status"))
+                   for p in prs
+                   if activity[p.get("number")].get("checks_status") != "gathered"]
+        out = [x for x in out if not x.startswith(("whether a review thread",
+                                                   "check runs"))]
+        out.append("check results and review-thread resolved flags of "
+                   "PR(s) {} (not read)".format(", ".join(missing)))
+    # partial reads: the record holds some, not all
+    for p, r in zip(prs, rows):
+        n = p.get("number")
+        if r.get("threads_omitted"):
+            out.append("the resolved flag of {} review thread(s) of #{} (beyond "
+                       "the threads read)".format(r["threads_omitted"], n))
+        if r.get("events_omitted"):
+            out.append("{} earlier lifecycle event(s) of #{} (beyond the "
+                       "events kept)".format(r["events_omitted"], n))
+        covered = len(r.get("commits") or [])
+        if r.get("checks_status") == "gathered" and \
+                isinstance(r.get("commits_total"), int) and r["commits_total"] > covered:
+            out.append("check results of the {} earliest commit(s) of #{} (only "
+                       "the latest {} were read)".format(
+                           r["commits_total"] - covered, n, covered))
+    return out
+
+
 # --- the substance: change summaries, outcome, open threads ----------------
 #
 # Who said what and when is not a story: a reader needs what the code change
@@ -3455,7 +3914,8 @@ STORY_NET_LINES_MAX = 20
 # The statuses a thread of the open-threads ledger can have (story_threads).
 STORY_THREAD_STATUSES = ("approved_after", "answered", "dismissed",
                          "followed_by_commit", "reply_on_item",
-                         "unresolved in the record")
+                         "unresolved in the record", "resolved on GitHub",
+                         "not resolved on GitHub")
 
 _MENTION_RE = re.compile(r"(?<![\w/.@])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
                          r"(?![\w/-])")
@@ -3591,7 +4051,7 @@ def _event_ref(it, actor=None):
             "actor": actor or it.get("actor"), "url": it.get("url")}
 
 
-def ball_with(pr, pr_items, verdicts, reviewers):
+def ball_with(pr, pr_items, verdicts, reviewers, checks=None):
     """Who the next move on an open PR is with — DERIVED by rule from the
     sequence of its recorded events (`pr_items`, the timeline items on that
     PR in time order), never read from anyone's words. A PR commit counts
@@ -3605,8 +4065,15 @@ def ball_with(pr, pr_items, verdicts, reviewers):
     - R3 approved: the last event is an approval and no change request is
       outstanding -> `awaiting merge`;
     - R4 reviewer moved: otherwise -> `awaiting author`.
+    - R5 failing checks (only with `checks`, the outcome block's checks of
+      the PR): when R2 or R3 fired and the head commit's checks are failing
+      as of the instant, the next move is the author's -> `awaiting author`
+      (`checks_basis` {head, failing}); R1 (somebody was named) and R4 stand.
+    Automation items (check results) are never the last event.
     Returns {state, with, rule, basis: {at, kind, actor, url}, derived:
     true}, or None when the PR has no recorded event."""
+    pr_items = [it for it in pr_items or [] if it.get("kind")
+                not in _AUTOMATION_KINDS]
     if not pr_items:
         return None
     author = pr.get("author")
@@ -3616,6 +4083,8 @@ def ball_with(pr, pr_items, verdicts, reviewers):
     outstanding = [r for r, v in verdicts.items()
                    if v.get("state") == "changes_requested"]
     named = _mentions(last.get("text"), exclude={actor})
+    if last["kind"] == "review_requested" and last.get("requested"):
+        named = [last["requested"]] + [m for m in named if m != last["requested"]]
     if actor != author and [m for m in named if m != author]:
         state, who, rule = "awaiting mentioned", [m for m in named if m != author], \
             "R1 mention"
@@ -3629,8 +4098,15 @@ def ball_with(pr, pr_items, verdicts, reviewers):
     else:
         state, who, rule = "awaiting author", [author] if author else [], \
             "R4 reviewer moved"
-    return {"state": state, "with": who, "rule": rule,
-            "basis": _event_ref(last, actor), "derived": True}
+    out = {"state": state, "with": who, "rule": rule,
+           "basis": _event_ref(last, actor), "derived": True}
+    if rule in ("R2 author moved", "R3 approved") and checks \
+            and checks.get("rollup") == "failing":
+        out.update(state="awaiting author", rule="R5 failing checks",
+                   checks_basis={"head": checks.get("head"),
+                                 "failing": checks.get("failing") or []})
+        out["with"] = [author] if author else []
+    return out
 
 
 def _issue_ball(issue, items):
@@ -3943,13 +4419,14 @@ def _outcome_modules(bundle, train):
     return out
 
 
-def story_outcome(bundle, train, items, history, instant, texts):
+def story_outcome(bundle, train, items, history, instant, texts, activity=None):
     """The outcome block of a story: where the train's items stand as of
     the instant and what ended up in the product. {train_outcome, as_of,
     items: [per issue / PR {type, number, title, author, state, url, ...;
     for a PR: merged, [merged_at], reviews {verdicts: [{reviewer, state,
     at, url}], outstanding_change_requests: [{by, since, url}]}, checks
-    ("not gathered"), [last_event], [ball]; for an open issue with no open
+    (checks_outcome from the view's `pr_activity`, else "not gathered"),
+    [last_event], [ball]; for an open issue with no open
     PR: [last_event], [ball]}], [ball] (the train's: its latest open PR's,
     else its open issue's), [waiting_on] (open linked items the PR author's
     latest message names), linked: [...] (_linked_items), [linked_omitted],
@@ -3969,7 +4446,8 @@ def story_outcome(bundle, train, items, history, instant, texts):
                "created_at": rec.get("created_at"), "url": rec.get("url")}
         on_items = [it for it in items
                     if (it.get("on") or {}) == {"type": typ, "number": rec.get("number")}
-                    and it["kind"] not in ("merged", "closed")]
+                    and it["kind"] not in ("merged", "closed")
+                    and it["kind"] not in _AUTOMATION_KINDS]
         if typ == "pr":
             row["merged"] = bool(rec.get("merged"))
             if rec.get("merged_at"):
@@ -3983,14 +4461,18 @@ def story_outcome(bundle, train, items, history, instant, texts):
                     {"by": r, "since": v.get("submitted_at"), "url": v.get("url")}
                     for r, v in sorted(verdicts.items())
                     if v.get("state") == "changes_requested"]}
-            row["checks"] = "not gathered"
+            arow = (activity or {}).get(rec.get("number"))
+            row["checks"] = checks_outcome(arow, instant, rec.get("url")) \
+                if arow is not None else "not gathered"
             if rec.get("state") == "open":
                 if on_items:
                     row["last_event"] = _event_ref(on_items[-1])
                 reviewers = sorted({it.get("actor") for it in on_items
                                     if it["kind"] in ("review", "review_comment")
                                     and it.get("actor") != rec.get("author")})
-                ball = ball_with(rec, on_items, verdicts, reviewers)
+                ball = ball_with(rec, on_items, verdicts, reviewers,
+                                 row["checks"] if isinstance(row["checks"], dict)
+                                 else None)
                 if ball:
                     row["ball"] = ball
                 open_prs.append((rec.get("created_at") or "", row))
@@ -4093,6 +4575,8 @@ def story_turning_points(items, open_as_of=None):
     for i, it in enumerate(items):
         dt = _parse_ts(it["at"])
         on = it.get("on") or {}
+        if it["kind"] in _AUTOMATION_KINDS:
+            continue
         if prev is not None and dt is not None \
                 and (dt - prev).total_seconds() > STORY_SILENCE_DAYS * 86400:
             out.append({"rule": "silence_then_activity", "at": it["at"],
@@ -4299,6 +4783,104 @@ def check_story_structure(slice_obj, text):
     return out
 
 
+# A sentence saying something is not known / not in the record.
+_UNKNOWN_RE = re.compile(
+    r"\b(?:not (?:in|part of) the record|(?:is|are|were|was) not (?:gathered|"
+    r"recorded|stored|known|kept)|not gathered|unknown|cannot be known|"
+    r"no record of|isn't recorded|aren't recorded|not shown)\b", re.I)
+_CHECKS_WORD_RE = re.compile(r"\b(?:CI|checks?|check runs?|check results?|"
+                             r"pipeline (?:runs?|results?))\b", re.I)
+_RESOLVED_WORD_RE = re.compile(r"\bresolved\b", re.I)
+
+
+# Roll-ups that state a result: `incomplete` / `unavailable` do not, so a
+# story may call those checks unknown.
+_CHECKS_KNOWN = ("passing", "failing", "pending", "none")
+
+
+def check_story_record_claims(slice_obj, text):
+    """Sentences of a story that call unknown what the slice holds, each
+    claim scoped to what it names: `checks_said_unknown` — a sentence
+    naming CI / checks / check runs and saying they are not in the record
+    (not gathered, unknown, ...) about a PR (#N or its link) whose outcome
+    `checks` state a result (gathered, roll-up not incomplete /
+    unavailable), or naming no PR while every PR of the slice has one;
+    `resolved_said_unknown` — likewise for whether a thread was resolved,
+    against the PRs whose resolution coverage is complete (every review
+    thread in the ledger carries GitHub's `resolved_on_github` flag, gather
+    omitted none — `thread_coverage` — and the ledger cap hid none). A qualified unknown claim under partial
+    coverage passes. Pure."""
+    conv = slice_obj.get("conversation") or {}
+    oc = conv.get("outcome") or {}
+    prs = [r.get("number") for r in oc.get("items") or [] if r.get("type") == "pr"]
+    known = {r.get("number") for r in oc.get("items") or []
+             if isinstance(r.get("checks"), dict)
+             and r["checks"].get("status") == "gathered"
+             and r["checks"].get("rollup") in _CHECKS_KNOWN}
+    threads = {}
+    for t in conv.get("threads") or []:
+        if t.get("kind") == "review_thread":
+            threads.setdefault((t.get("on") or {}).get("number"), []).append(
+                "resolved_on_github" in t)
+    cov = conv.get("thread_coverage") or {}
+    # complete only when every visible review thread of the PR has a flag,
+    # gather read all of them, and the slice's ledger cap hid none
+    resolved = {n for n, flags in threads.items() if flags and all(flags)
+                and str(n) in cov and not cov[str(n)].get("omitted")
+                and not conv.get("threads_omitted")}
+    base = _slice_repo_base(slice_obj)
+    item_link = re.compile(re.escape(base) + r"(?:issues|pull)/(\d+)") \
+        if base else None
+
+    def as_numbers(m):
+        hit = item_link.match(m.group(0)) if item_link else None
+        return " #{} ".format(hit.group(1)) if hit else " "
+    sentences = [_URL_IN_TEXT_RE.sub(as_numbers, x).strip()
+                 for x in re.split(r"(?<=[.;!?])\s+|\n+", text or "") if x.strip()]
+
+    def covered(sent, have, scope):
+        """Does the sentence speak of something the slice holds: a PR it
+        names that is in `have`, or — naming none of `scope` — is every
+        item of `scope` in `have` (a general claim under partial coverage
+        is not refused)?"""
+        named = [int(n) for n in re.findall(r"(?<![\w/.&])#(\d+)\b", sent)
+                 if int(n) in scope]
+        if named:
+            return any(n in have for n in named)
+        return bool(scope) and all(n in have for n in scope)
+    out = {"checks_said_unknown": [], "resolved_said_unknown": []}
+    for sent in sentences:
+        if not _UNKNOWN_RE.search(sent):
+            continue
+        if _CHECKS_WORD_RE.search(sent) and covered(sent, known, prs):
+            out["checks_said_unknown"].append(sent)
+        if _RESOLVED_WORD_RE.search(sent) and covered(sent, resolved, list(threads)):
+            out["resolved_said_unknown"].append(sent)
+    return out
+
+
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_CODE_COMMENT_START = ("//", "/*", "#", "<#")
+
+
+def check_story_code_comments(slice_obj, text):
+    """Code comments a story quotes in backticks (a span starting with //,
+    /*, # or <#) that occur in no slice text (whitespace-normalised): the
+    maintainers' own words must be quoted as the slice holds them. Pure."""
+    urls, texts = set(), []
+    _slice_strings(slice_obj, urls, texts)
+    norm = [_norm_ws(t) for t in texts]
+    out = []
+    for m in _CODE_SPAN_RE.finditer(text or ""):
+        span = m.group(1).strip()
+        if re.fullmatch(r"#\d+", span):
+            continue                     # an issue / PR reference, not a comment
+        if span.startswith(_CODE_COMMENT_START) and len(span) > 3 \
+                and not any(_norm_ws(span) in t for t in norm):
+            out.append(span)
+    return out
+
+
 def check_story_evidence(slice_obj, text):
     """The mechanical check of a narrative against its train slice: every URL
     the text cites must occur in the slice (as a value or inside a slice
@@ -4310,7 +4892,11 @@ def check_story_evidence(slice_obj, text):
     {"ok", "urls_not_in_slice", "quotes_not_in_slice", "urls_checked",
     "quotes_checked", "first_date_without_year", "closing_paragraph",
     "closing_paragraph_missing", "numbers_without_state",
-    "state_mismatch", "numbers_checked"}. Pure."""
+    "state_mismatch", "numbers_checked", "checks_said_unknown",
+    "resolved_said_unknown", "code_comments_not_in_slice"}
+    (check_story_record_claims: the story must not call unknown what the
+    slice holds; check_story_code_comments: a quoted code comment must be
+    in the slice). Pure."""
     urls, texts = set(), []
     _slice_strings(slice_obj, urls, texts)
     norm_texts = [_norm_ws(t) for t in texts]
@@ -4333,10 +4919,14 @@ def check_story_evidence(slice_obj, text):
            "urls_checked": len(cited), "quotes_checked": len(quotes)}
     st = check_story_structure(slice_obj, text)
     out.update(st)
+    claims = check_story_record_claims(slice_obj, text)
+    claims["code_comments_not_in_slice"] = check_story_code_comments(slice_obj, text)
+    out.update(claims)
     out["ok"] = out["ok"] and not (st["first_date_without_year"]
                                    or st["closing_paragraph_missing"]
                                    or st["numbers_without_state"]
-                                   or st["state_mismatch"])
+                                   or st["state_mismatch"]
+                                   or any(claims.values()))
     return out
 
 
