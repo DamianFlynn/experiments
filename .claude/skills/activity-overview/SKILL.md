@@ -215,11 +215,15 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    8 trains), each slice handed over separately and each train's cited URLs checked
    against its own slice (`reference/report-sections.md` "Per-train narration", step 2b).
    Story trains get the story brief (`reference/report-sections.md` "Stories (the story
-   brief)"); check each story against its slice before it goes in the report:
+   brief)": a headline, the substance of each turning point, decisions from the slice's
+   `outcome` block, every thread closed or called open, dates with the year, and a closing
+   "Where it stands" / "What landed"); check each story against its slice before it goes
+   in the report:
    ```bash
    python3 link.py workspace/view/<train-id>.slice.json --check-story workspace/view/<train-id>.story.md
    ```
-   (exit 0: every cited URL and every quoted string is in the slice).
+   (exit 0: every cited URL and every quoted string is in the slice, the first date has a
+   year, and the closing part states every issue / PR the story names).
 7. **Project view** (multi-repo only; skip for a single repo):
    ```bash
    python3 digest.py --store workspace/journey.db --project <name> --from FROM --to TO > workspace/view/project.json

@@ -1379,9 +1379,55 @@ def normalize_comment(raw):
     return _normalize_comment_obj(raw)
 
 
+# What a review comment is attached to: the diff hunk GitHub returns with
+# it ends at the commented line, so its LAST lines are kept (the hunk header
+# `@@ ... @@` first), at most this many lines and characters.
+REVIEW_HUNK_MAX_LINES = 12
+REVIEW_HUNK_CAP = 1500
+
+
+def review_hunk(hunk):
+    """(kept hunk, original line count) of a review comment's `diff_hunk`:
+    the `@@` header line plus the last REVIEW_HUNK_MAX_LINES - 1 lines,
+    capped at REVIEW_HUNK_CAP characters (from the end: the commented line
+    is last). The count is returned only when lines were cut, else None.
+    Pure."""
+    lines = (hunk or "").replace("\r\n", "\n").split("\n")
+    total = len(lines)
+    if total > REVIEW_HUNK_MAX_LINES:
+        head = [lines[0]] if lines[0].startswith("@@") else []
+        lines = head + lines[-(REVIEW_HUNK_MAX_LINES - len(head)):]
+    text = "\n".join(lines)
+    if len(text) > REVIEW_HUNK_CAP:
+        text = text[-REVIEW_HUNK_CAP:]
+    return text, (total if text != (hunk or "").replace("\r\n", "\n") else None)
+
+
 def normalize_review_comment(raw):
-    """Map a GitHub PR review comment (inline diff comment) to the same shape."""
-    return _normalize_comment_obj(raw)
+    """Map a GitHub PR review comment (inline diff comment) to the same
+    shape, plus what it is attached to when GitHub gives it (each key
+    omitted when absent): `path` (the file), `line` (the line it is on in
+    the diff's new side, else its original line), `diff_hunk` (review_hunk;
+    `diff_hunk_lines` the original line count when cut), `in_reply_to` (the
+    id of the comment that opened the thread it replies to) and `commit`
+    (the PR commit it was written against)."""
+    out = _normalize_comment_obj(raw)
+    if raw.get("path"):
+        out["path"] = raw["path"]
+    line = raw.get("line") if raw.get("line") is not None \
+        else raw.get("original_line")
+    if isinstance(line, int):
+        out["line"] = line
+    if raw.get("diff_hunk"):
+        out["diff_hunk"], total = review_hunk(raw["diff_hunk"])
+        if total is not None:
+            out["diff_hunk_lines"] = total
+    if raw.get("in_reply_to_id") is not None:
+        out["in_reply_to"] = raw["in_reply_to_id"]
+    commit = raw.get("original_commit_id") or raw.get("commit_id")
+    if commit:
+        out["commit"] = commit
+    return out
 
 
 # The four reaction kinds the bundle tracks (the upvote/downvote/affinity signal
@@ -2307,8 +2353,32 @@ PR_HISTORY_NOTES_MAX = 400
 # descriptions) and the interface (parameters, Terraform variables, outputs).
 PR_HISTORY_NOTE_SUBKINDS = ("comment", "todo", "param", "variable", "output")
 # One header per PR commit: sha, parents, author name, author timestamp,
-# committer timestamp, subject (last: free text).
-PR_COMMIT_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%cI%x1f%s"
+# committer timestamp, subject, then the message body, closed by a group
+# separator so the body's own lines are not read as file names.
+PR_COMMIT_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%cI%x1f%s%x1f%b%x1d"
+_PR_BODY_END = "\x1d"
+# Paths kept per PR commit (the change summary's file list; `paths_omitted`
+# counts the rest). A module's first commit touches a few dozen files.
+PR_HISTORY_PATHS_MAX = 60
+# Characters of a PR commit's message body kept (`body_truncated_from` when
+# cut). The body is where a commit says why ("narrow v0.1 scope ... because").
+# Trailer lines at its end (`Co-authored-by: ...`, `Signed-off-by: ...`) are
+# not part of the explanation and are dropped first.
+PR_HISTORY_BODY_CAP = 1500
+# The patch excerpts kept for the walked PRs: what each commit added to /
+# removed from a changelog, and from shared repository files (CI workflows,
+# actions, pipeline utilities) that every module depends on.
+PR_HISTORY_PATCH_PATHSPECS = ("*CHANGELOG.md", ".github/", "utilities/",
+                              ".azuredevops/", ".pipelines/", "pipelines/")
+# Lines kept per file per commit (added + removed; `lines_omitted` the rest),
+# characters per line, and characters per PR (the newest excerpts are kept,
+# `patches_omitted` counts the oldest left out).
+PR_HISTORY_PATCH_LINES = 40
+PR_HISTORY_PATCH_LINE_CAP = 500
+PR_HISTORY_PATCH_CHARS = 8000
+# A git trailer line: a hyphenated token (`Co-authored-by`, `Signed-off-by`,
+# `Change-Id`), a colon, a value. "Note: ..." is prose, not a trailer.
+_TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+: \S")
 
 
 def parse_pr_head_refs(raw):
@@ -2324,25 +2394,121 @@ def parse_pr_head_refs(raw):
     return out
 
 
+def pr_commit_body(text):
+    """A PR commit's message body for the story material: the trailing block
+    of trailer lines (`Token: value`, e.g. Co-authored-by / Signed-off-by)
+    dropped, surrounding blank lines stripped, capped at PR_HISTORY_BODY_CAP.
+    Returns (body, original length) — ("", 0) when nothing is left. Pure."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    while True:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        end = len(lines)
+        while end and lines[end - 1].strip() and _TRAILER_RE.match(lines[end - 1]):
+            end -= 1
+        if end < len(lines) and (end == 0 or not lines[end - 1].strip()):
+            lines = lines[:end]          # a whole trailer paragraph: drop it
+            continue
+        break
+    body = "\n".join(lines).strip()
+    if not body:
+        return "", 0
+    return body[:PR_HISTORY_BODY_CAP], len(body)
+
+
 def parse_pr_commits(raw):
     """A `git log --format=PR_COMMIT_FORMAT --name-only` listing -> commits
-    [{sha, parents, author, authored_at, committed_at, subject, files}] in
-    the listing's order. `parents` is a count (2 for a merge), `files` the
-    number of paths the commit changed (a merge lists none). Pure."""
+    [{sha, parents, author, authored_at, committed_at, subject, files,
+    [paths], [paths_omitted], [body], [body_truncated_from]}] in the
+    listing's order. `parents` is a count (2 for a merge), `files` the
+    number of paths the commit changed (a merge lists none), `paths` those
+    paths (at most PR_HISTORY_PATHS_MAX), `body` the message body
+    (pr_commit_body); both omitted when empty. A listing in the older
+    format (no body, no closing separator) still parses, without `paths`
+    and `body`. Pure."""
     out = []
     for lines in _log_records(raw):
-        fields = lines[0].split(FIELD_SEP, 5)
-        if len(fields) < 6:
-            continue
+        chunk = "\n".join(lines)
+        if _PR_BODY_END in chunk:
+            head, _, names = chunk.partition(_PR_BODY_END)
+            fields = head.split(FIELD_SEP, 6)
+            if len(fields) < 7:
+                continue
+            paths = [ln.strip("\r") for ln in names.split("\n") if ln.strip()]
+            body, body_len = pr_commit_body(fields[6])
+            subject = fields[5]
+        else:
+            fields = lines[0].split(FIELD_SEP, 5)
+            if len(fields) < 6:
+                continue
+            paths, body, body_len = None, "", 0
+            subject = fields[5]
+            names_count = len([ln for ln in lines[1:] if ln.strip()])
         sha, parents, author, authored, committed = (f.strip() for f in fields[:5])
-        out.append({
+        row = {
             "sha": sha, "parents": len(parents.split()), "author": author,
             "authored_at": _utc_timestamp(authored),
             "committed_at": _utc_timestamp(committed),
-            "subject": fields[5].strip(" \t\r"),
-            "files": len([ln for ln in lines[1:] if ln.strip()]),
-        })
+            "subject": subject.strip(" \t\r\n"),
+            "files": len(paths) if paths is not None else names_count,
+        }
+        if paths:
+            row["paths"] = paths[:PR_HISTORY_PATHS_MAX]
+            if len(paths) > PR_HISTORY_PATHS_MAX:
+                row["paths_omitted"] = len(paths) - PR_HISTORY_PATHS_MAX
+        if body:
+            row["body"] = body
+            if body_len > len(body):
+                row["body_truncated_from"] = body_len
+        out.append(row)
     return out
+
+
+def _patch_kind(path):
+    return "changelog" if (path or "").rsplit("/", 1)[-1].lower() \
+        == "changelog.md" else "shared"
+
+
+def parse_pr_patches(raw):
+    """A `git log -p --format=%x1e%H` listing over a PR's commits, limited to
+    PR_HISTORY_PATCH_PATHSPECS -> [{commit, path, kind (`changelog` /
+    `shared`), added: [line], removed: [line], [lines_omitted]}] in the
+    listing's order: what each commit added to and removed from a changelog
+    or a shared repository file, at most PR_HISTORY_PATCH_LINES lines per
+    file and commit, each line capped at PR_HISTORY_PATCH_LINE_CAP. A file
+    whose diff has no +/- line (a mode change, a binary file) is left out.
+    Pure."""
+    out, cur, sha = [], None, None
+
+    def close():
+        if cur is not None and (cur["added"] or cur["removed"]
+                                or cur.get("lines_omitted")):
+            out.append(cur)
+    for lines in _log_records(raw):
+        sha = lines[0].strip()
+        for ln in lines[1:]:
+            if ln.startswith("diff --git "):
+                close()
+                m = re.match(r"diff --git a/(.*) b/(.*)$", ln)
+                path = m.group(2) if m else ln[len("diff --git "):]
+                cur = {"commit": sha, "path": path, "kind": _patch_kind(path),
+                       "added": [], "removed": []}
+            elif cur is None or ln.startswith(("+++ ", "--- ")):
+                continue
+            elif ln.startswith(("+", "-")):
+                key = "added" if ln[0] == "+" else "removed"
+                if len(cur["added"]) + len(cur["removed"]) \
+                        >= PR_HISTORY_PATCH_LINES:
+                    cur["lines_omitted"] = cur.get("lines_omitted", 0) + 1
+                    continue
+                cur[key].append(ln[1:][:PR_HISTORY_PATCH_LINE_CAP])
+        close()
+        cur = None
+    return out
+
+
+def _patch_chars(p):
+    return sum(len(x) for x in p["added"] + p["removed"]) + len(p["path"])
 
 
 def _shallow_parent_exclusions(clone_dir, run):
@@ -2520,8 +2686,41 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
                 row["notes_omitted"] = len(notes) - PR_HISTORY_NOTES_MAX
                 notes = notes[-PR_HISTORY_NOTES_MAX:]
             row["notes"] = notes
+            _collect_pr_patches(row, n, clone_dir, base_ref, exclude, run)
     out["prs"] = [rows[n] for n in numbers]
     return out
+
+
+def _collect_pr_patches(row, n, clone_dir, base_ref, exclude, run):
+    """Add `patches` (parse_pr_patches; the newest within
+    PR_HISTORY_PATCH_CHARS, `patches_omitted` the oldest left out) to a
+    walked PR's row: what its commits wrote into a changelog or a shared
+    repository file. Omitted when there is none; a failed walk is recorded
+    as `patches_skipped`, never fatal."""
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--reverse", "-p",
+                   "--unified=0", "--format=" + RECORD_SEP + "%H", "--no-renames"]
+                  + list(_WALK_PIN_ARGS) + ["--src-prefix=a/", "--dst-prefix=b/",
+                                            "refs/remotes/pr/{}".format(n),
+                                            "--not", base_ref] + exclude
+                  + ["--"] + list(PR_HISTORY_PATCH_PATHSPECS))
+    except RuntimeError as exc:
+        row["patches_skipped"] = "patch walk failed: {}".format(
+            (str(exc).splitlines() or ["?"])[-1][:200])
+        return
+    patches = parse_pr_patches(raw)
+    kept, used = [], 0
+    for p in reversed(patches):
+        c = _patch_chars(p)
+        if used + c > PR_HISTORY_PATCH_CHARS:
+            break
+        kept.append(p)
+        used += c
+    kept.reverse()
+    if len(kept) < len(patches):
+        row["patches_omitted"] = len(patches) - len(kept)
+    if kept:
+        row["patches"] = kept
 
 
 # Ordered code-area patterns for the directory provider (primary, zero-dep).

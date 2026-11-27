@@ -204,47 +204,106 @@ story train gets the story brief below instead):
 ### Stories (the story brief)
 The deep tier ranks by footprint, so mechanical sweeps fill it while the most discussed work
 is a one-line mention. **Story trains** (`train.story` true, ranked by `train.story_rank`;
-`bundle["stories"]`, BUNDLE.md "The story layer") get a short story whatever their tier — in
-flight included: that is often where the debate is. Put the story in the train's
+`bundle["stories"]`, BUNDLE.md "The story layer") get a story whatever their tier — in
+flight included: that is often where the debate is. A story explains the substance — what
+changed, what each objection meant, what was decided, what landed or what open work waits
+on — so a reader does not have to guess (a guess can be unfair to the people involved). Put the story in the train's
 sub-section (a story train that is a mention train gets one: its effort line, then the
 story); end the section with one line when `stories.more` is not empty: *"N more trains had
 notable discussion: <ids>"*. No story train → no stories, and nothing is said.
 
 1. **Get the slice** as for any train (`python3 link.py <bundle-view> --slice <train-id>`).
-   The story material is `slice.conversation`: one chronological `timeline` (openings with
-   their body, every human comment, review with its state, review comment, lifecycle event,
-   PR commit and merged commit with the code comments it added or removed, the merge),
-   `turning_points` marked by rule, `truncation`, `bots`, `pr_history`, `not_gathered`.
+   The story material is `slice.conversation` (BUNDLE.md "Slice `conversation`"):
+   - `timeline` — openings with their body, every human comment, review with its state,
+     review comment (with the file, line and diff lines it is attached to and the thread it
+     replies to, when stored), lifecycle event, PR commit (with its message body as `text`
+     and a `change` summary: files by class, modules, `shared`, interface rows, changelog /
+     shared-file lines) and merged commit, the merge;
+   - `turning_points` marked by rule (a rework carries what changed after the request);
+   - `outcome` — where it stands as of `as_of` and what landed: the items' state, review
+     verdicts and outstanding change requests, `ball` (who the next move is with, DERIVED by
+     rule), `waiting_on`, `linked` items with title / author / state / description,
+     `modules` (shipped: the maintainers' changelog items verbatim, version, interface
+     names, breaking), `net_change` (an open PR's own net change);
+   - `threads` — the open-threads ledger, every question / request with a status by rule;
+   - `truncation`, `bots`, `pr_history`, `not_gathered`, and `gaps` (what an older store
+     cannot show).
 2. **Dispatch one story narrator per story train** (the batching of step 2b applies, with
    each slice as its own block). Hand it the slice and this brief:
-   > You write the story of one decision train from ONLY the supplied slice — never outside
-   > knowledge, never an invented fact, name, number or URL. In 3–5 short paragraphs (5–8
-   > sentences in all), tell the arc: what was proposed and why (the opening item); what
-   > objection, discovery or dependency changed its course (the turning points:
-   > `change_request`, `rework_after_change_request`, `reopened`, `silence_then_activity`,
-   > `new_attempt`, `history_rewritten`); how it was resolved, or why it is still open
-   > (`still_silent`, the last items); what it cost in time (`train.effort`,
-   > `train.discussion.longest_silence`, the dates in the timeline).
-   > - Every claim cites the timeline item it rests on by its `url`, copied verbatim. Short
-   >   verbatim quotes are allowed — in double quotes, attributed to the item's `actor`, the
-   >   text exactly as it appears in the item.
-   > - State what happened and what was said. Do not characterise people: no judgement of
-   >   competence, mood, tone, effort or motive (not "frustrated", "pushed back hard",
-   >   "finally", "sloppy", "patiently"), no blame, no praise.
-   > - Describe disagreement by positions: "X asked for …; Y preferred … because …" — the
-   >   because only when the item says it.
-   > - Dates and durations come from the items' `at` and the effort / discussion blocks;
-   >   say "N days without recorded activity", never why nobody acted.
-   > - Code notes (`code_notes` on commit items) show what the code said along the way —
-   >   quote a developer note when it shows a decision; parameter descriptions only when
-   >   they changed meaning. Their lines are not in file order: never join them into prose.
-   > - When `truncation.cut` or `truncation.text_omitted` is not empty, say once that the
-   >   material was truncated and which items (by url). When `pr_history` says
-   >   `not_gathered` / `missing`, do not speak about the PR's internal history. Things in
-   >   `not_gathered` (title edits, force-pushes, label changes) are never claimed.
-   > - When the slice does not support a story — no turn changes the course, the
-   >   conversation is acknowledgements — return exactly "No notable discussion." rather
-   >   than inflate.
+   > You write the story of one decision train for a reader who uses the module, from ONLY
+   > the supplied slice — never outside knowledge, never an invented fact, name, number or
+   > URL. A story says what happened IN SUBSTANCE: what the change was, what each objection
+   > was about, what was decided and what ended up in the product — or, for open work, what
+   > it waits on. Who said what and when is the evidence, not the story.
+   >
+   > **Shape.** One-sentence headline (bold) that says what this is about for a user of the
+   > module ("Disabling six weak TLS cipher suites by default in the API Management module").
+   > Then the story — 200–300 words, up to 400 for a long-running open item (the headline
+   > and the closing part not counted); spend them on substance, not on who replied when —
+   > then the closing part: **Where it stands** (work in flight) or **What landed** (shipped
+   > work), as a paragraph of at most about 120 words starting with those words.
+   >
+   > **Rules.**
+   > 1. *Dates carry the year* on first mention and whenever the year changes ("1 November
+   >    2025", then "10 June 2026"). Durations are anchored to a date: "219 days later, on 10
+   >    June 2026", never a bare "219 days later".
+   > 2. *Each turning point in substance.* For every change request, objection, rework or
+   >    constraint the story mentions, say in one plain sentence a module user can follow
+   >    what the change or objection was technically, tied to the file, parameter or module it
+   >    concerns — from the review comment's `path` / `diff_hunk`, the commit `change`
+   >    summaries and `patches`, the commit `text`, `paths_since_request`. "would impact all
+   >    the modules" becomes "the change was to `.github/workflows/avm.template.module.yml`,
+   >    the workflow template every module's pipeline runs, where it added
+   >    `skipPassedRulesReport: true`" (a commit `change` summary marks such a file `shared`). Define
+   >    repository-specific jargon once ("the `defaults` test", the rule check it runs) using only what
+   >    the slice states.
+   > 3. *Decisions and their effect, explicitly.* What was dropped, kept, renamed, deferred —
+   >    taken from the outcome block's `modules` (changelog items, interface names), the `change`
+   >    summaries (parameters dropped / added) and commit `text` (where a commit says why).
+   >    Never infer a decision from tone or from who spoke last. If the slice does not show
+   >    how something was resolved, say "the record does not show how this was resolved".
+   > 4. *No dangling threads.* Every question, constraint, request or second issue the story
+   >    mentions is either resolved in the story (what happened, with its evidence: a reply,
+   >    a commit, a changelog item) or explicitly called out as open with what it waits on.
+   >    Use `threads` (status by rule: `answered` only means somebody replied — read the
+   >    reply) and `outcome.linked` (a linked issue comes with its title, author, state and
+   >    what it asks: give them). Do not mention a thread you cannot close or call open.
+   > 5. *Where it stands* (in flight): what is blocking (an outstanding change request — by
+   >    whom, since when; an open linked item it waits on; a question nobody answered), who
+   >    the next move is with — the outcome block's `ball`, introduced as derived ("by the record's
+   >    sequence of events, the next move is with …"), never as anyone's fault — and what a
+   >    reader could do to help, ONLY actions the record itself points to (review the PR,
+   >    answer the question asked, take the ownership the maintainers asked for, work on the
+   >    linked issue). Give the state (open / closed / merged) of every issue and PR the story
+   >    names.
+   > 6. *What landed* (shipped): the version and the outcome in the maintainers' own
+   >    changelog words (quote the `changelog` items of the outcome block's `modules`), the PR's state
+   >    (merged), and whether anything discussed was deferred or left out (say so, with the
+   >    changelog or commit text that says it).
+   > 7. *Fairness.* Quote requests and answers in context: a short answer ("Agreed, no need
+   >    for both.") comes with what it agreed to and what changed as a result. Do not let the
+   >    choice of quotes suggest the work was compromised, rushed or watered down unless the
+   >    record says so; a scope reduction is a decision — give its stated reason (a commit
+   >    body, a changelog line) — and where the record gives none, say that. Do not
+   >    characterise people: no judgement of competence, mood, tone, effort or motive (not
+   >    "frustrated", "pushed back hard", "finally", "sloppy", "patiently"), no blame, no
+   >    praise. Describe disagreement by positions: "X asked for …; Y preferred … because …"
+   >    — the because only when the item says it.
+   > 8. *Evidence.* Every claim cites the item it rests on by its `url`, copied verbatim.
+   >    Short verbatim quotes are allowed — in double quotes, attributed to the item's
+   >    `actor`, exactly as in the slice. Dates and durations come from `at` values and the
+   >    effort / discussion blocks; say "N days without recorded activity", never why nobody
+   >    acted. Code notes (`code_notes`) are not in file order: never join their lines into
+   >    prose.
+   > 9. *Limits of the record.* When `truncation.cut` / `text_omitted` is not empty, say once
+   >    that the material was truncated and which items. When `pr_history` says
+   >    `not_gathered` / `missing`, do not speak about the PR's internal history. Never claim
+   >    anything in `not_gathered` (title edits, force-pushes, label changes, review-thread
+   >    resolution, CI results). When `gaps` is not empty and the story needs that detail
+   >    (which file a comment was on), say the record does not show it.
+   > 10. When the slice does not support a story — no turn changes the course, the
+   >    conversation is acknowledgements — return exactly "No notable discussion." rather
+   >    than inflate.
    > Return `{story, evidence: [url]}`.
 3. **Verify, then compose.** Run the mechanical check against the train's own slice file:
    ```bash
@@ -252,9 +311,21 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    ```
    It exits 0 when every URL the story cites occurs in the slice and every quoted string
    (in `"…"` or `“…”`, at least 4 characters) occurs verbatim in a slice text (whitespace
-   normalised), else 1, printing `urls_not_in_slice` / `quotes_not_in_slice`. Drop or fix
-   each listed sentence and check again; never publish a story that fails it. The check
-   cannot judge tone: read the story once against the hard rules above.
+   normalised), AND the structure holds: the first date in the prose carries a year
+   (`first_date_without_year`), the story has its closing part — "Where it stands" for a
+   train in flight, "What landed" for a shipped one (`closing_paragraph_missing`) — and
+   every issue / PR number the story names (`#N` or a link to the repository's issue /
+   pull) is named again in that closing part with a state word (open, closed, merged,
+   unmerged, draft; `numbers_without_state`) that matches the state the slice's outcome
+   block records (`state_mismatch`, read from the clause between that number and the next).
+   Else exit 1 with the lists. Drop or fix each listed sentence and check again; never
+   publish a story that fails it.
+   **What the check does not cover** — read the story once against rules 2–7: that each
+   turning point is explained in substance, that decisions come from the outcome block
+   and change summaries rather than tone, that every thread mentioned is closed or called
+   open, that a later date names its year when the year changes, that the "ball" is
+   presented as derived, and that the quotes are fair in context. A story can pass the
+   check and still fail these.
 
 ## Next-release forecast
 `bundle["forecast"]` is a forward-only prediction over `buckets.next_candidates`.

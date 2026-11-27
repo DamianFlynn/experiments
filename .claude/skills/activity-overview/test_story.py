@@ -715,10 +715,13 @@ class TestEvidenceCheck(unittest.TestCase):
     def test_cited_urls_and_quotes_must_be_in_the_slice(self):
         ok = ("Bob asked \"Why not reuse the shared type?\" "
               f"({URL}/pull/1#issuecomment-11); alice replied that it "
-              f"“lacks the field” ({URL}/pull/1#issuecomment-12).")
+              f"“lacks the field” ({URL}/pull/1#issuecomment-12).\n\n"
+              f"Where it stands: {URL}/pull/1 is open.")
         r = link.check_story_evidence(self.slice, ok)
         self.assertTrue(r["ok"], r)
-        self.assertEqual((r["urls_checked"], r["quotes_checked"]), (2, 2))
+        self.assertEqual((r["urls_checked"], r["quotes_checked"]), (3, 2))
+        self.assertEqual((r["closing_paragraph"], r["numbers_checked"]),
+                         ("Where it stands", 1))
         bad = (f"Bob \"insisted on a rewrite\" ({URL}/pull/1#issuecomment-99).")
         r = link.check_story_evidence(self.slice, bad)
         self.assertFalse(r["ok"])
@@ -732,7 +735,7 @@ class TestEvidenceCheck(unittest.TestCase):
         with open(sp, "w") as fh:
             json.dump(self.slice, fh)
         with open(good, "w") as fh:
-            fh.write(f"Opened at {URL}/pull/1.")
+            fh.write(f"Opened at {URL}/pull/1.\n\nWhere it stands: #1 is open.")
         with open(bad, "w") as fh:
             fh.write(f"See {URL}/pull/2.")
         for path, code in ((good, 0), (bad, 1)):

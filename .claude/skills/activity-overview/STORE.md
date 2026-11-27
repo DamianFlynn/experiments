@@ -302,8 +302,11 @@ files the window's code events name — `gather.collect_module_notes`, BUNDLE.md
 changes"; only per window, never a singleton node; absent when the gather had no
 window history on disk, and from windows gathered before it existed: re-gather a
 window to get it) and `pr_history` (each window PR's own commits from
-`refs/pull/<N>/head` and the comment / parameter changes between them for the most
-discussed PRs — `gather.collect_pr_history`, BUNDLE.md "The story layer"; only per window;
+`refs/pull/<N>/head` — each with its file paths and message body — and, for the most
+discussed PRs, the comment / parameter changes between them and the lines they wrote
+into a changelog or a shared repository file (`patches`) — `gather.collect_pr_history`,
+BUNDLE.md "The story layer"; windows gathered before paths, bodies and patches were kept
+hold commits without them; only per window;
 `{"collected": false}` for a gather run with `--no-pr-history`; absent without a clone and
 from windows gathered before it existed. A per-window fact rather than a field on the PR
 record because it is what the head ref held when that window was gathered — dated
@@ -435,7 +438,10 @@ window mutates nothing already correct, so a refresh is a re-gather of the same 
 window's end, issue #107);
 a roll-up is a wider view over the folded windows, or a wider gather). P6
 writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
-`data` blob), `code` (commits) + the file-level `code_events` ledger,
+`data` blob — an inline review comment also keeps, when GitHub gives them, its `path`,
+`line`, bounded `diff_hunk` (`diff_hunk_lines` when cut), `in_reply_to` and `commit`:
+optional keys of the same record, no schema change; records stored before they were
+kept lack them until the window is re-gathered), `code` (commits) + the file-level `code_events` ledger,
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
 `cross_ref`, and `part_of`. It also persists the per-repo **singleton facts**
 `workflow_stats`, `code_graph`, `code_owners`, and `label_taxonomy` — each as a

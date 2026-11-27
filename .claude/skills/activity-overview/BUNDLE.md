@@ -1094,7 +1094,15 @@ silence_days}}`.
 - **`timeline`** — one chronological list of items `{at, kind, actor, url, on: {type,
   number}, ...}`:
   - `opened` — an issue / PR, with `title` and its body as `text`;
-  - `comment`, `review_comment` — with `text`;
+  - `comment`, `review_comment` — with `text`; a review comment also carries what it is
+    attached to when the store has it (gathered since review-comment context is kept):
+    `path` (the file), `line`, `commit` (the PR commit it was written against),
+    `diff_hunk` (the diff lines GitHub shows with it, ending at the commented line; at
+    most 12 lines / `STORY_HUNK_CAP` 1,500 characters, `diff_hunk_lines` the original
+    count when cut; all hunks of one slice share `STORY_HUNK_BUDGET` 15,000 characters,
+    a hunk past it is left out and the item gets `diff_hunk_omitted`) and `in_reply_to`
+    (the URL of the review comment that opened its thread; a reply carries no hunk —
+    GitHub gives it the same one as the thread's opener);
   - `review` — with `state` and `text` (an empty `commented` review is a review thread's
     wrapper and is left out: its text is the review comment);
   - `ready_for_review`, `reopened`, `closed` — the lifecycle events (`url` is the item page
@@ -1103,9 +1111,27 @@ silence_days}}`.
   - `merged` — with the merger as `actor`;
   - `commit` — `source: "pr_head"` (a PR's own commit from `pr_history`: `subject`,
     `files` count, `authored_at`, `merge: true` for a merge commit, `url`
-    `<pr url>/commits/<sha>`) or `source: "base"` (the train's commit on the walked branch,
-    e.g. the squash commit), each with the `code_notes` its diff added / removed / changed.
+    `<pr url>/commits/<sha>`, and when stored its message body as `text` —
+    `body_truncated_from` when gather cut it — and its `change` summary) or
+    `source: "base"` (the train's commit on the walked branch, e.g. the squash commit,
+    with its `change` summary from the view's files and symbol events), each with the
+    `code_notes` its diff added / removed / changed.
   Ordered by time, then kind, then url. Bots are not in it.
+- **`change`** (on commit items; omitted when nothing is known about the commit) — the
+  compact, factual summary of what the commit changed (`link.change_summary`):
+  `files` `{class: [path]}` grouped by the module layer's path classes (`source`,
+  `tests`, `docs`, `generated`, `metadata`, `ci`; at most `STORY_CHANGE_PATHS_PER_CLASS`
+  8 per class, `files_more` `{class: n}` the rest, `paths_omitted` what gather did not
+  keep), `modules` (the module areas touched), `shared: true` when a `ci`-class file
+  changed (a workflow, action or pipeline utility every module depends on — what a
+  reviewer means by "this would impact all the modules"), `interface` `[{change:
+  add|drop|change, kind: param|variable|output|resource|module, name, path}]` (the
+  module's own interface first, then its tests'; at most `STORY_CHANGE_INTERFACE_MAX` 20,
+  `interface_more` the rest) and `patches` `[{path, kind: changelog|shared, added,
+  removed, lines_omitted?}]` (the lines the commit wrote into a changelog or a shared
+  file, from `pr_history.patches`). Each PR commit's summary is relative to its parent:
+  the rework after a change request is the summary of the commits that follow it (see
+  `rework_after_change_request`).
 - **`code_notes`** (on commit items) — `{commit, path, change: add|drop|change, class,
   source, pr?, text | before/after | kind/name}`. `class` (`link.comment_class`):
   `parameter_description` (a Bicep `@description(...)` / `@metadata(...)` decorator),
@@ -1124,7 +1150,10 @@ silence_days}}`.
 - **`turning_points`** — marked by rule, as data: `{rule, at, index (into timeline), url,
   detail?}` — `change_request`; `reopened`; `silence_then_activity` (activity after more
   than 14 days without a recorded human event; detail `{days, since}`);
-  `rework_after_change_request` (the first PR commit after a change request on that PR);
+  `rework_after_change_request` (the first PR commit after a change request on that PR;
+  detail `{change_request_index, commits_since_request, paths_since_request?}` — the PR's
+  own non-merge commits from the request until the requester's next comment / review
+  and the files they touched, at most 30);
   `history_rewritten` (a PR commit committed more than `STORY_REWRITE_HOURS` (24) after it
   was authored: amended, rebased or cherry-picked — the branch's earlier states are not
   kept); `new_attempt` (a PR of the train opened after another was closed unmerged);
@@ -1142,7 +1171,8 @@ silence_days}}`.
   below `STORY_ITEM_FLOOR` (500), then leaving out whole texts from the middle of the
   timeline outward (the opening and the latest stay). A cut item carries
   `truncated_from`; an omitted one `text: null` and `text_omitted`. Nothing is cut
-  silently.
+  silently. `hunks_omitted` (only when any) counts the review-comment hunks left out for
+  `STORY_HUNK_BUDGET`.
 - **`bots`** — `{login: count}` of the automation comments, review comments and reviews
   left out of the timeline.
 - **`pr_history`** — `{pr number: status}`: `fetched` (with `, notes extracted` or `,
@@ -1152,7 +1182,80 @@ silence_days}}`.
   else the window's last second).
 - **`not_gathered`** — what GitHub records that the store does not keep, so a narrator
   says it rather than infers it: title and description edits, force-pushes and the branch
-  states they replaced, label / milestone / assignee changes over time.
+  states they replaced, label / milestone / assignee changes over time, whether a review
+  thread was marked resolved, check runs and their results per PR.
+- **`gaps`** (omitted when empty) — what THIS slice cannot show because its store was
+  gathered before the data was kept: review comments with no file / diff lines / thread
+  link, PR commits with no file paths or message bodies. A re-gather of the window adds
+  them.
+- **`outcome`** — where the train stands as of `as_of` and what ended up in the product
+  (`link.story_outcome`):
+  - `train_outcome`, `as_of`;
+  - `items` — per issue / PR of the train: `type`, `number`, `title`, `author`, `state`,
+    `created_at`, `url`, `closed_at` (a closed issue); a PR adds `merged`, `merged_at`,
+    `reviews` `{verdicts: [{reviewer, state, at, url}] (each human reviewer's latest
+    approved / changes_requested / dismissed, the author's own excluded),
+    outstanding_change_requests: [{by, since, url}]}` and `checks: "not gathered"`; an
+    open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;
+  - `ball` — **who the next move is with, DERIVED by rule** from the sequence of recorded
+    events, never from anyone's words (`derived: true`; `link.ball_with`), with the
+    `rule` that fired, its `basis` (the last event) and, at train level, the `pr` it is
+    for (the latest open PR, else the open issue). A PR commit counts as the PR author's
+    move. For an open PR: **R1 mention** — the last event is by someone other than the
+    author and names other people (`@login`): `awaiting mentioned` (them); **R2 author
+    moved** — the last event is the author's (opening, commit, comment): `awaiting
+    reviewer` (the reviewers whose latest verdict is a change request, else the people the
+    author named, else the reviewers who reviewed; nobody: `awaiting a first review`);
+    **R3 approved** — the last event is an approval with no change request outstanding:
+    `awaiting merge`; **R4 reviewer moved** — otherwise: `awaiting author`. For an open
+    issue with no open PR: **I1** the reporter moved last: `awaiting maintainer
+    response`; **I2** someone else named people: `awaiting mentioned`; **I3** otherwise
+    `awaiting reporter`. `state` / `with` say who; `derived` is always true;
+  - `waiting_on` (only when any) — open linked items that the PR author's latest message
+    names (`{number, type, state, title, named_in}`);
+  - `linked` — the repository's issues / PRs named in the conversation (`#N`, or a
+    github.com link to the repository's issue / pull; HTML comments — a template's
+    "Fixes #123" — ignored; the train's own items excluded; at most `STORY_LINKED_MAX` 10,
+    `linked_omitted` the rest): `{number, type, title, author, state, created_at, url,
+    mentioned_in, merged (a PR), closed_at?, comments (human), last_activity_at,
+    description (verbatim, from an issue form's "### Description" when present; at most
+    `STORY_LINKED_BODY_CAP` 1,200 characters), description_truncated_from?}`, or
+    `{number, in_view: false, mentioned_in}` for an item the view does not hold;
+  - `modules` (shipped work; only when the module layer is present) — every module entry
+    a train PR contributed to: `area`, `kind`, `status`, `first_version`, `versions`
+    `{changelog, published: [{version, tag, date}], version_file: {from, to},
+    declared_not_published, published_not_declared}`, `changelog` (the entries the
+    train's PRs wrote — `version`, `sections` `[{heading, kind, items, placeholder?}]`,
+    items **verbatim**, at most `STORY_OUTCOME_ITEMS_MAX` 30 per module), `interface`
+    `{group: {change: [name], <change>_more?}}` (at most `STORY_OUTCOME_NAMES_MAX` 25
+    names each), `children` `[{path, change}]`, `breaking` `{declared: [text],
+    candidates: [{rule, subject}]}`;
+  - `net_change` (open PRs with stored commit paths / patch excerpts) — `{pr:
+    {files_touched: {class: [path]}, lines: {path: {kind, commits, net_added,
+    net_removed, lines_more?} | {kind, commits, reverted: true}}}}`: the files the PR's
+    own commits touched, and for changelogs and shared files the lines added / removed
+    net of the PR's own later commits (a change made and undone is `reverted`). Merges
+    from the base branch are not counted, so this is the PR's own work, not a diff
+    against the base.
+- **`threads`** — the open-threads ledger (`link.story_threads`): every question or request
+  raised, with its resolution status **by rule**. A thread is opened by a review comment
+  that starts a thread (not a reply) by anyone but the PR author, or by the author with a
+  question mark; a `changes_requested` review; a comment, review text or review-comment
+  reply with a question mark (quotations and code blocks ignored). Each `{id (T1, T2,
+  ...), kind: review_thread|change_request|question, on, at, by, url, ask (a verbatim
+  excerpt: the first question sentence, else the opening line, at most `STORY_ASK_CAP`
+  300 characters), path?, replies?, status, resolution?, signals}`. `status`, strongest
+  first: `approved_after` (a change request followed by an approval from the same
+  reviewer), `answered` (a reply by someone else in the same review thread — GitHub's
+  thread link — or, for a conversation question, a later comment on the same item by
+  someone else), `dismissed`, `followed_by_commit` (a later non-merge PR commit touching
+  the thread's file, `same_file: true`), `reply_on_item` (a later reply on the same PR by
+  someone else when the store holds no thread links), `followed_by_commit` with
+  `same_file: null` (a later commit whose files are not known to match), else
+  `unresolved in the record`. `resolution` is the strongest signal `{status, at, by, url,
+  same_file?}`; `signals` lists all. These are rules over the record, not a verdict:
+  "answered" means somebody replied, not that the reply settled it. At most
+  `STORY_THREADS_MAX` 40 (`threads_omitted` the rest).
 
 ### `pr_history` (raw, from the store)
 
@@ -1184,6 +1287,18 @@ without the clone):
   discussed PRs (human comments + review comments > 0, at most 40 PRs per window, each of
   at most 60 commits; the newest 400 events per PR, `notes_omitted` the oldest left out);
   every other fetched PR has `notes_skipped` with the reason.
+- `paths` / `paths_omitted` (per commit; omitted for a merge) — the files the commit
+  changed, at most `PR_HISTORY_PATHS_MAX` 60; `body` / `body_truncated_from` — its message
+  body (where a commit says why), trailer paragraphs (`Co-authored-by: ...`,
+  `Signed-off-by: ...`) dropped, at most `PR_HISTORY_BODY_CAP` 1,500 characters. Stores
+  gathered before these were kept have neither (the slice's `gaps` says so).
+- `patches` (walked PRs only) — `[{commit, path, kind: changelog|shared, added: [line],
+  removed: [line], lines_omitted?}]`: what each commit wrote into a `CHANGELOG.md` or a
+  shared repository file (`PR_HISTORY_PATCH_PATHSPECS`: `.github/`, `utilities/`,
+  `.azuredevops/`, `.pipelines/`, `pipelines/`), at most `PR_HISTORY_PATCH_LINES` 40 lines
+  per file and commit of at most 500 characters each, the newest within
+  `PR_HISTORY_PATCH_CHARS` 8,000 characters per PR (`patches_omitted` the oldest left
+  out); `patches_skipped` with the reason when that walk failed.
 - `{"collected": false}` alone — the window was gathered with `--no-pr-history`.
 
 The fact holds each PR head **as gathered** — possibly after the window — so every
@@ -1641,7 +1756,8 @@ review's state to `DISMISSED`.
     "feature_deltas_diff_overflow": <int>,
     "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ],
     "conversation":   { timeline, turning_points, truncation, bots,
-                        code_notes_by_module, pr_history, as_of, not_gathered }
+                        code_notes_by_module, pr_history, as_of, not_gathered,
+                        outcome, threads }
   }
   ```
 

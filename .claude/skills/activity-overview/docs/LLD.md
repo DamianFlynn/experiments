@@ -406,6 +406,19 @@ with its network retry); a refusal is recorded, never fatal.
    the newest `PR_HISTORY_NOTES_MAX` (400) per PR. Each diff is against the commit's first
    parent, the first commit's parent being its base commit (present after step 2), so the
    first commit's adds are the PR's initial state. Every other PR records `notes_skipped`.
+5. For the same walked PRs, the patch excerpts (`_collect_pr_patches`): `git log --reverse -p
+   --unified=0 --format=%x1e%H --no-renames refs/remotes/pr/<N> --not HEAD … --
+   PR_HISTORY_PATCH_PATHSPECS` (`*CHANGELOG.md`, `.github/`, `utilities/`, `.azuredevops/`,
+   `.pipelines/`, `pipelines/`) through `parse_pr_patches`: per commit and file the added /
+   removed lines (at most `PR_HISTORY_PATCH_LINES` 40, each at most 500 characters), the
+   newest within `PR_HISTORY_PATCH_CHARS` 8,000 per PR. This is what a reviewer's "this
+   would impact all the modules" is about and what the changelog said at each step; a
+   failed walk is `patches_skipped`.
+
+Step 3's format also carries each commit's message body (`%b`, closed by `\x1d` so its lines
+are not read as file names): `parse_pr_commits` keeps the file `paths` (at most
+`PR_HISTORY_PATHS_MAX` 60) and the `body` (`pr_commit_body`: trailer paragraphs dropped, at
+most `PR_HISTORY_BODY_CAP` 1,500 characters). A listing in the older format still parses.
 
 Cost (Azure/bicep-registry-modules, blobless clone shallow since 2026-07-25): September 2026,
 142 PRs — 41.6 s (ls-remote 0.4 s, fetch 2.2 s, log / diff walks 38 s, nearly all lazy blob
@@ -1419,10 +1432,29 @@ slice_train                → slice.conversation = story_material(bundle, train
   `STORY_CODE_NOTES_BUDGET`), applies `_apply_story_budget` (per-item cap, then the largest
   common ceiling ≥ `STORY_ITEM_FLOOR` found by bisection, then whole texts omitted from the
   middle outward; every cut recorded), and marks `story_turning_points`.
+- **The substance** (what a reader needs beyond who said what when): each review comment
+  carries its stored context (`path`, `line`, `diff_hunk`, `in_reply_to`; hunks within
+  `STORY_HUNK_BUDGET`); each commit item a `change_summary` (files by `path_class`, modules,
+  `shared`, interface rows from the PR notes / symbol events, the changelog / shared-file
+  patch lines) and, for a PR commit, its message body as `text` (inside the text budget);
+  `_rework_detail` adds what changed after each change request. `story_outcome` builds the
+  outcome block — items with their state, verdicts and outstanding change requests,
+  `ball_with` / `_issue_ball` (who the next move is with, rules R1–R4 / I1–I3, derived from
+  the event sequence only), the linked items named in the texts (`_linked_items`, with
+  title, state and description), `waiting_on`, the module layer's entries for shipped work
+  (`_outcome_modules`: changelog items verbatim, versions, interface names, breaking) and an
+  open PR's `net_change` (`_net_lines`: lines net of the PR's own reverts). `story_threads`
+  builds the open-threads ledger (review threads, change requests, questions) with a status
+  by rule (`_signal_rank`). `_story_gaps` names what an older store cannot show.
 - **`check_story_evidence(slice, text)`** — the mechanical narrative check (CLI
   `link.py SLICE --check-story STORY`): cited URLs must be slice values or occur in slice
   texts; quoted strings (`"…"` / `“…”`, ≥ 4 characters) must occur in a slice text,
-  whitespace-normalised.
+  whitespace-normalised; and `check_story_structure`: the first date in the prose carries a
+  year, the story ends with "Where it stands" (in flight) / "What landed" (shipped), and
+  every issue / PR number it names (`#N` or a link to the repository's item) is named
+  again there with a state word that matches the slice's outcome block (in the clause from
+  the number to the next one, else its sentence). It cannot judge substance, fairness or
+  whether every thread is closed: those stay with the writer.
 
 ### 6.9 Series — `series.py` via `link.py BUNDLE --series series.json`
 
