@@ -1083,6 +1083,80 @@ class TestAbsentIsNotFalse(unittest.TestCase):
         self.assertEqual(newsletter.story_key_norm("train-issue-5"), "train-issue-5")
 
 
+class TestFourthRound(unittest.TestCase):
+    """Versions belong to their module, landed work means merged, partial
+    stream totals say so."""
+
+    # 1
+    def test_landed_work_means_a_merged_pr(self):
+        v = view()
+        v["contributors"]["newcomers"].append(
+            {"login": "zed", "class": "first_ever", "affiliation": "unknown",
+             "first": {"first": "pr", "number": 98, "url": R + "/pull/98",
+                       "created_at": "2026-10-04T10:00:00Z"},
+             "contributed": {"prs": []}})
+        out = newsletter.outline([v])
+        row = next(r for r in section(out, "people")["newcomers"] if r["login"] == "zed")
+        self.assertEqual(row["contribution"], "unknown")
+        lead = {x["fact"]: x for x in section(out, "intro")["lead_with"]}
+        self.assertNotIn("zed", lead["newcomers_landed_work"]["logins"])
+        self.assertIn("nik", lead["newcomers_landed_work"]["logins"])
+
+    # 2
+    def _child_view(self):
+        v = view()
+        fac = next(m for m in v["module_changes"]["modules"]
+                   if m["area"] == "avm/res/data/factory")
+        fac["versions"]["child_version_files"] = [
+            {"module": "avm/res/data/factory/flow", "from": "0.2.0", "to": "0.2.1"}]
+        return v
+
+    def check(self, extra, v=None):
+        return newsletter.check_newsletter([v or self._child_view()], GOOD + extra,
+                                           slices={"train-issue-5": SLICE})
+
+    def test_swapped_parent_and_child_versions_fail(self):
+        r = self.check("\n- `avm/res/data/factory` 0.1.2, with its child "
+                       "`avm/res/data/factory/pipe` 0.13.0.\n")
+        self.assertIn({"module": "avm/res/data/factory", "version": "0.1.2"},
+                      r["versions_not_in_view"])
+        self.assertIn({"module": "avm/res/data/factory/pipe", "version": "0.13.0"},
+                      r["versions_not_in_view"])
+
+    def test_correct_parent_and_child_versions_pass(self):
+        r = self.check("\n- `avm/res/data/factory` 0.13.0, with its child "
+                       "`avm/res/data/factory/pipe` 0.1.2 and `avm/res/data/factory/flow` "
+                       "0.2.0 → 0.2.1.\n")
+        self.assertEqual(r["versions_not_in_view"], [])
+
+    def test_implied_child_version_in_a_parent_paragraph_passes(self):
+        r = self.check("\n- `avm/res/data/factory` 0.13.0, with a child module "
+                       "republished as 0.1.2.\n")
+        self.assertEqual(r["versions_not_in_view"], [])
+        # a version no module of the paragraph holds still fails
+        r = self.check("\n- `avm/res/data/factory` 0.13.0, with a child module "
+                       "republished as 0.7.4.\n")
+        self.assertIn({"module": None, "version": "0.7.4"}, r["versions_not_in_view"])
+
+    # 3
+    def test_stream_total_of_versions_is_marked_partial(self):
+        a, b = view(), view()
+        b["meta"] = dict(b["meta"], repo="s")
+        f = section(newsletter.outline([a, b]), "numbers")["facts"]
+        self.assertEqual(f["versions_published"], 4)
+        self.assertNotIn("versions_published_partial", f)
+        b["module_changes"]["inputs"] = {"tags_collected": True,
+                                         "windows_without_tags": ["2026-10-01..2026-10-15"]}
+        f = section(newsletter.outline([a, b]), "numbers")["facts"]
+        self.assertIs(f["versions_published_partial"], True)
+        b = view()
+        b["meta"] = dict(b["meta"], repo="s")
+        b["module_notes"]["tags"] = {"collected": False}
+        f = section(newsletter.outline([a, b]), "numbers")["facts"]
+        self.assertEqual(f["versions_published"], 2)
+        self.assertIs(f["versions_published_partial"], True)
+
+
 class TestCli(unittest.TestCase):
 
     def test_outline_and_check_commands(self):

@@ -1005,6 +1005,12 @@ def section_numbers(views, multi=False):
         for k in additive:
             if isinstance(p["facts"].get(k), int):
                 total[k] = total.get(k, 0) + p["facts"][k]
+    counts = [p["facts"].get("versions_published") for p in per]
+    if any(isinstance(c, int) for c in counts) and (
+            any(not isinstance(c, int) for c in counts)
+            or any(p["facts"].get("versions_published_partial") for p in per)):
+        # a member's count is partial or missing: the sum is a lower bound
+        total["versions_published_partial"] = True
     if total.get("classified_prs"):
         total["plumbing_share_pct"] = round(100.0 * total.get("plumbing_prs", 0)
                                             / total["classified_prs"])
@@ -1040,9 +1046,10 @@ def section_intro(out):
     mods = sec["module_changes"].get("modules") or []
     if mods:
         lead.append({"fact": "lead_modules", "areas": [q(m, "area") for m in mods[:3]]})
+    # landed means a merged PR is listed, whatever the class (an `unknown`
+    # class can be a first PR closed unmerged)
     landed = [q(r, "login") for r in sec["people"].get("newcomers") or []
-              if r["contribution"] in ("new_module", "module_change", "release", "docs",
-                                       "plumbing", "unknown")]
+              if r.get("merged")]
     if landed:
         lead.append({"fact": "newcomers_landed_work", "logins": landed})
     if sec["stories"].get("full"):
@@ -1262,8 +1269,14 @@ def _module_index(views):
     may be named in (changelog items, PR titles). Module areas are
     repository-local, so nothing is merged across repositories."""
     versions, paths, text = {}, {}, {}
+    own = {}       # {repo: {module path: versions of that exact module}}
     for v in views:
         repo = _slug(v)
+        ro = own.setdefault(repo, {})
+
+        def put(module, ver, ro=ro):
+            if ver:
+                ro.setdefault(module, set()).add(version_key(ver))
         rv = versions.setdefault(repo, {})
         rp = paths.setdefault(repo, set())
         rt = text.setdefault(repo, [])
@@ -1279,30 +1292,45 @@ def _module_index(views):
                 ver = m.get("versions") or {}
                 for k in ("changelog", "declared_not_published", "published_not_declared"):
                     vs.update(version_key(x) for x in ver.get(k) or [])
+                    for x in ver.get(k) or []:
+                        put(area, x)
                 for pub in ver.get("published") or []:
                     vs.add(version_key(pub.get("version")))
+                    put(pub.get("module") or area, pub.get("version"))
                     if pub.get("module"):
                         rp.add(pub["module"])
                 vf = ver.get("version_file") or {}
                 vs.update(version_key(x) for x in (vf.get("from"), vf.get("to")) if x)
+                put(area, vf.get("from"))
+                put(area, vf.get("to"))
                 for cv in ver.get("child_version_files") or []:
                     if cv.get("module"):
                         rp.add(cv["module"])
                     vs.update(version_key(x) for x in (cv.get("from"), cv.get("to")) if x)
+                    put(cv.get("module") or area, cv.get("from"))
+                    put(cv.get("module") or area, cv.get("to"))
                 for rel in ver.get("releases") or []:
                     tag = str(rel.get("tag") or "")
                     if tag:
                         vs.add(version_key(tag.rsplit("/", 1)[-1]))
+                        put(area, tag.rsplit("/", 1)[-1])
                 if m.get("first_version"):
                     vs.add(version_key(m["first_version"]))
+                    put(area, m["first_version"])
                 for c in m.get("changelog") or []:
                     vs.add(version_key(c.get("version")))
+                    put(c.get("module") or area, c.get("version"))
                     if c.get("module"):
                         rp.add(c["module"])
                     for sec in c.get("sections") or []:
                         for t in _items_text(sec.get("items")):
                             rt.append(t or "")
                             vs.update(_VERSION_RE.findall(t or ""))
+                            # a version a changelog item names (a referenced
+                            # module's) is evidence for the module whose
+                            # changelog it is
+                            for x in _VERSION_RE.findall(t or ""):
+                                put(c.get("module") or area, x)
                 for ch in (m.get("structure") or {}).get("children") or []:
                     if ch.get("path"):
                         rp.add(ch["path"])
@@ -1314,7 +1342,7 @@ def _module_index(views):
                             rp.add(part.strip())
                 vs.discard(None)
         rt.extend(pr.get("title") or "" for pr in v.get("prs") or [])
-    return versions, paths, {r: "\n".join(t) for r, t in text.items()}
+    return versions, paths, {r: "\n".join(t) for r, t in text.items()}, own
 
 
 _REPO_LINK_RE = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/")
@@ -1365,6 +1393,22 @@ def _suppression_hits(text, hidden, registry_names=None):
         if pat and re.search(r"(?<!\w)" + pat + r"(?!\w)", text, re.I):
             hits.add(login)
     return sorted(hits)
+
+
+_ATTACH_GAP_RE = re.compile(
+    r"^[\s`*_:]*(?:v?\d+\.\d+(?:\.\d+)?\s*(?:→|->|to)\s*)?v?$")
+
+
+def _attached_module(par, pos, toks):
+    """The module path a version at `pos` is written right after ("`x`
+    0.13.0", "`x` 0.12 → 0.13.0"), else None."""
+    best = None
+    for tok in toks:
+        for m in re.finditer(re.escape(tok) + r"(?![\w/-])", par):
+            if m.end() <= pos and _ATTACH_GAP_RE.match(par[m.end():pos]):
+                if best is None or m.end() > best[0]:
+                    best = (m.end(), tok)
+    return best[1] if best else None
 
 
 def _area_of(path, areas):
@@ -1452,7 +1496,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     urls, texts = _view_strings(views)
     norm_texts = [link._norm_ws(t) for t in texts]
     slugs = [_slug(v) for v in views]
-    versions, paths, module_text = _module_index(views)
+    versions, paths, module_text, own_versions = _module_index(views)
     items = {sl: set() for sl in slugs}
     people_by_repo = {sl: {} for sl in slugs}
     hidden = set(registry_names or {})
@@ -1572,12 +1616,30 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                 a = _area_of(tok, versions[sl])
                 if a is not None:
                     par_mods.setdefault((sl, a), None)
-        # versions, bound to the one module a paragraph names
-        for ver in _VERSION_RE.findall(par_c):
-            if len(par_mods) == 1:
-                (sl, a), = par_mods
-                ok = ver in versions[sl][a]
-                row = tag({"module": a, "version": ver}, sl)
+        # versions belong to their module: one written right after a module
+        # path is that module's; any other must belong to a module the
+        # paragraph names (parent, a named child, or a child of a named parent)
+        named_here = [(sl, tok) for tok in toks for sl in
+                      ([repo] if repo is not None else slugs)
+                      if tok in own_versions.get(sl, {}) or
+                      _area_of(tok, versions[sl]) is not None]
+        for vm in _VERSION_RE.finditer(par_c):
+            ver = vm.group(1)
+            attached = _attached_module(par_c, vm.start(), toks)
+            if attached is not None:
+                pool = [repo] if repo is not None else \
+                    [sl for sl in slugs if attached in own_versions.get(sl, {})
+                     or _area_of(attached, versions[sl]) is not None] or slugs
+                ok = any(ver in own_versions.get(sl, {}).get(attached, set()) for sl in pool)
+                row = tag({"module": attached, "version": ver},
+                          pool[0] if len(pool) == 1 else repo)
+            elif named_here:
+                ok = False
+                for sl, tok in named_here:
+                    for mod, vs in own_versions.get(sl, {}).items():
+                        if (mod == tok or mod.startswith(tok + "/")) and ver in vs:
+                            ok = True
+                row = tag({"module": None, "version": ver}, repo)
             else:
                 pool = [repo] if repo is not None else slugs
                 ok = any(ver in vs for sl in pool for vs in versions[sl].values())
