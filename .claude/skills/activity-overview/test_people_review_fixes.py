@@ -343,7 +343,8 @@ class TestRollUps(unittest.TestCase):
         sep = self.affiliations(
             {"pat": {"affiliation": "maintainer_org", "signal": "public_membership",
                      "name": "Pat P", "maintainer": True,
-                     "maintainer_signal": "merged_others_pr"},
+                     "maintainer_signal": "merged_others_pr",
+                     "maintainer_status": "active"},
              "ops": {"affiliation": "community", "signal": "override"},
              "lou": {"affiliation": "maintainer_org", "signal": "public_membership"}})
         sep["home_orgs"] = ["o", "bigco"]
@@ -359,7 +360,8 @@ class TestRollUps(unittest.TestCase):
         self.assertEqual(aff["people"]["pat"],
                          {"affiliation": "unknown", "signal": "not_checked",
                           "name": "Pat P", "maintainer": True,
-                          "maintainer_signal": "merged_others_pr"})
+                          "maintainer_signal": "merged_others_pr",
+                          "maintainer_status": "active"})
         self.assertIn("pat", aff["not_checked"])
         self.assertIn("pat", aff["unknown"])
         self.assertEqual(aff["people"]["ops"]["affiliation"], "community")

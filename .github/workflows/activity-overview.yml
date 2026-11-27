@@ -379,6 +379,7 @@ jobs:
             .claude/skills/activity-overview/workspace/journey.db
             .claude/skills/activity-overview/workspace/view/bundle.json
             .claude/skills/activity-overview/workspace/people.json
+            .claude/skills/activity-overview/workspace/people-activity.json
           if-no-files-found: warn
 
   spotlight:

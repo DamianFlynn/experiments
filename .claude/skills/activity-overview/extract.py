@@ -1538,8 +1538,7 @@ def _merged_affiliations(conn, project, repo, overlapping, recorded, ts_from,
                                                    "not_checked"):
                 # decided against other home settings: the label does not
                 # carry over; the name and maintainer property do
-                e = dict({x: e[x] for x in ("name", "maintainer",
-                                            "maintainer_signal") if x in e},
+                e = dict({x: e[x] for x in derive.PERSON_LABEL_KEYS if x in e},
                          affiliation="unknown", signal="not_checked")
                 not_checked.add(login)
             people[login] = e
