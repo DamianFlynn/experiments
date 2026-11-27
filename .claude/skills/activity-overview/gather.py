@@ -2510,7 +2510,7 @@ def _module_of_item(rec):
 
 def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                              end_files, frm, to, web=None, label_patterns=None,
-                             owner_files=None, start_files=None):
+                             owner_files=None, start_files=None, end_rev=None):
     """The window's `module_ownership` fact: {collected, events: [{kind,
     module, people, date, source: {type, number|sha, url, [pr]}, [quote],
     [via]}], start_without_owner, labelled_items, without_owner: [{module,
@@ -2539,7 +2539,10 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
     day it opened and the day it closed (label times are not recorded: an
     item counts from the day it opened). `without_owner` is that state at
     the window's end. A file version that cannot be read is listed in
-    `unread`, never read as "no owners". Events from a commit carry `at`
+    `unread`, never read as "no owners". With `end_rev` (the window's end
+    commit), `owners_at_end` {module folder: [login]} — the owners every
+    owner file of the end tree lists (who "the module's owner" is). Events
+    from a commit carry `at`
     (its commit time; a labelled item's: its opening time) and every event
     `seq`, the order of the replay (day, time, then the walk's order; one
     change's own events by kind): extract.ownership_event_order. The
@@ -2703,6 +2706,25 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
            "label_patterns": {k: list(v) for k, v in patterns.items()},
            "owner_files": list(owner_files)}
     out["without_owner"] = extract.standing_without_owner(out, (to or "")[:10])
+    if end_rev:
+        # who owns each module at the window's end: every owner file of the
+        # end tree, read at the window's end commit (`end_rev`)
+        owners = {}
+        for f in end_files or []:
+            folder, _, base = f.rpartition("/")
+            if base not in owner_files:
+                continue
+            try:
+                text = read_blob(end_rev, f)
+            except BlobUnreadable:
+                unread.append({"path": f, "commit": end_rev})
+                continue
+            got = _owners_from_json(text) if text else None
+            if got is _UNPARSEABLE:
+                unread.append({"path": f, "commit": end_rev, "reason": "not valid JSON"})
+            elif got:
+                owners[folder] = got
+        out["owners_at_end"] = {m: owners[m] for m in sorted(owners)}
     if unread:
         out["unread"] = unread
     return out
@@ -2737,7 +2759,8 @@ def recompute_module_ownership(conn, project, repo, frm, to, clone_dir,
         view.get("code_events") or [], view.get("commits") or [],
         view.get("prs") or [], view.get("issues") or [],
         read_blob or git_blob_reader(clone_dir, run), end_files, frm, to,
-        web="https://github.com/" + slug, start_files=start_files)
+        web="https://github.com/" + slug, start_files=start_files,
+        end_rev=got.get("clone_sha"))
     bundle = dict(got["facts"])
     bundle["module_ownership"] = fact
     bundle["meta"] = {"workflows_collected": got.get("ci_collected")}
@@ -3091,8 +3114,45 @@ def collect_replaced_commits(row, clone_dir, pushes, base_ref, exclude, run):
         row["replaced"] = out
 
 
+PR_HISTORY_NET_FILES_MAX = 300
+
+
+def pr_net_files(row, clone_dir, base_ref, run, as_of=None):
+    """The PR's net change per file as of `as_of` (the window's end): `git
+    diff --numstat` from the merge base of its head as of then (its latest
+    commit committed by `as_of`) with the walked branch, to that head ->
+    row["net_files"] = {head, base, files: [{path, added, removed}],
+    [files_omitted]} (`added` / `removed` null for a binary file); a failed
+    diff is `net_files_unavailable` with the reason. In place."""
+    commits = [c for c in row.get("commits") or []
+               if not as_of or (c.get("committed_at") or "") <= as_of]
+    if not commits:
+        return
+    head = commits[-1]["sha"]
+    try:
+        base = run(["git", "-C", clone_dir, "merge-base", base_ref, head]).strip()
+        raw = run(["git", "-C", clone_dir, "diff", "--numstat", "--no-renames",
+                   base, head])
+    except RuntimeError as exc:
+        row["net_files_unavailable"] = (str(exc).splitlines() or ["?"])[-1][:200]
+        return
+    files = []
+    for ln in raw.splitlines():
+        parts = ln.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        a, r, path = parts
+        files.append({"path": path, "added": int(a) if a.isdigit() else None,
+                      "removed": int(r) if r.isdigit() else None})
+    out = {"head": head, "base": base, "files": files[:PR_HISTORY_NET_FILES_MAX]}
+    if len(files) > PR_HISTORY_NET_FILES_MAX:
+        out["files_omitted"] = len(files) - PR_HISTORY_NET_FILES_MAX
+    row["net_files"] = out
+
+
 def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
-                       base_branch=None, all_prs=False, force_pushes=None):
+                       base_branch=None, all_prs=False, force_pushes=None,
+                       as_of=None):
     """The window's `pr_history` fact. All git goes through `run` (default
     run_git, which retries a dropped connection); a refusal is recorded,
     never fatal.
@@ -3122,6 +3182,9 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
        (_collect_pr_patches) and the narrative evidence
        (collect_pr_narrative: code comments, documentation prose and
        interface deltas per commit, and what followed each review comment).
+
+    5b. For every PR with commits, its net change per file from the merge
+       base to its head as of `as_of` (pr_net_files).
 
     6. With `force_pushes` ({number: [head_ref_force_pushed events]}, from
        `pr_activity`), the commits each push replaced
@@ -3200,6 +3263,8 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
     for n in candidates:
         row = rows[n]
         commits = row.get("commits") or []
+        if commits:
+            pr_net_files(row, clone_dir, base_ref, run, as_of)
         if force_pushes and force_pushes.get(n):
             collect_replaced_commits(row, clone_dir, force_pushes[n], base_ref,
                                      exclude, run)
@@ -7788,6 +7853,114 @@ def _graphql_client(token):
     return _graphql
 
 
+# --- Linked items outside the window (per-window fact `linked_items`) -------
+#
+# A story names issues / PRs its conversation links (#N, closing references,
+# cross-references) that the window's records do not hold. Their title, type,
+# state and closing dates come from ONE GraphQL request per
+# LINKED_ITEMS_BATCH numbers (`issueOrPullRequest`), at most LINKED_ITEMS_MAX
+# numbers per window (ACTIVITY_LINKED_ITEMS_MAX), the rest counted in `capped`.
+# The state is GitHub's when gathered; a reader projects it to its own end
+# from the dates (created / closed / merged).
+LINKED_ITEMS_BATCH = 50
+LINKED_ITEMS_MAX = 500
+_LINKED_REF_RE = re.compile(r"(?<![\w/.&])#(\d+)\b")
+_LINKED_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_LINKED_FIELDS = (
+    "__typename ... on Issue {{ number title state stateReason createdAt closedAt url "
+    "author {{ login }} }} ... on PullRequest {{ number title state createdAt closedAt "
+    "mergedAt merged url author {{ login }} }}")
+
+
+def linked_numbers(prs, issues, slug=None):
+    """The issue / PR numbers the window's records link (closing and
+    cross references, `#N` and github.com links to the repository in their
+    bodies, comments, review comments and reviews; HTML comments left out)
+    that are not records of the window, ascending. Pure."""
+    own = {r.get("number") for r in list(prs or []) + list(issues or [])
+           if isinstance(r, dict)}
+    link_re = re.compile(r"https://github\.com/{}/(?:issues|pull)/(\d+)".format(
+        re.escape(slug or "\x00")), re.I)
+    found = set()
+    for rec in list(prs or []) + list(issues or []):
+        if not isinstance(rec, dict):
+            continue
+        for key in ("closes", "crossref_issues"):
+            found.update(n for n in rec.get(key) or [] if isinstance(n, int))
+        texts = [rec.get("body")]
+        for key in ("comments_list", "review_comments", "reviews"):
+            texts += [c.get("body") for c in rec.get(key) or [] if isinstance(c, dict)]
+        for t in texts:
+            t = _LINKED_HTML_COMMENT_RE.sub("", t or "")
+            found.update(int(n) for n in link_re.findall(t))
+            found.update(int(n) for n in _LINKED_REF_RE.findall(
+                re.sub(r"https?://\S+", "", t)))
+    return sorted(n for n in found if n not in own and n > 0)
+
+
+def _linked_item(node):
+    if not isinstance(node, dict) or not node.get("number"):
+        return None
+    typ = "pr" if node.get("__typename") == "PullRequest" else "issue"
+    out = {"number": node["number"], "type": typ, "title": node.get("title"),
+           "state": _lower(node.get("state")), "created_at": node.get("createdAt"),
+           "url": node.get("url"), "author": (node.get("author") or {}).get("login")}
+    if node.get("closedAt"):
+        out["closed_at"] = node["closedAt"]
+    if typ == "pr":
+        out["merged"] = bool(node.get("merged"))
+        if node.get("mergedAt"):
+            out["merged_at"] = node["mergedAt"]
+    elif node.get("stateReason"):
+        out["state_reason"] = _lower(node["stateReason"])
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def collect_linked_items(prs, issues, graphql, owner, repo, clock=None, cap=None):
+    """The window's `linked_items` fact: {collected, gathered_at, items:
+    [{number, type, title, state (when gathered), created_at, [closed_at],
+    [merged, merged_at] | [state_reason], url, [author]}], missing:
+    [number] (no such issue / PR), [failed: [number]], [capped: n],
+    requests}. One GraphQL request per LINKED_ITEMS_BATCH numbers
+    (linked_numbers), at most `cap` (ACTIVITY_LINKED_ITEMS_MAX, default
+    LINKED_ITEMS_MAX) numbers. None without a GraphQL client."""
+    if graphql is None:
+        return None
+    clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+    cap = _env_int("ACTIVITY_LINKED_ITEMS_MAX", LINKED_ITEMS_MAX, 0) \
+        if cap is None else cap
+    numbers = linked_numbers(prs, issues, "{}/{}".format(owner, repo))
+    out = {"collected": True, "items": [], "missing": [], "requests": 0}
+    if len(numbers) > cap:
+        out["capped"] = len(numbers) - cap
+        numbers = numbers[:cap]
+    takes_errors = _accepts_errors(graphql)
+    for i in range(0, len(numbers), LINKED_ITEMS_BATCH):
+        batch = numbers[i:i + LINKED_ITEMS_BATCH]
+        q = "query($owner: String!, $name: String!) { repository(owner: $owner, " \
+            "name: $name) { " + " ".join(
+                "n{0}: issueOrPullRequest(number: {0}) {{ {1} }}".format(
+                    n, _LINKED_FIELDS.format()) for n in batch) + " } }"
+        errors = []
+        try:
+            got = graphql(q, {"owner": owner, "name": repo}, errors=errors) \
+                if takes_errors else graphql(q, {"owner": owner, "name": repo})
+        except Exception as exc:          # noqa: BLE001 - recorded, never fatal
+            out.setdefault("failed", []).extend(batch)
+            out["failure"] = str(exc)[:200]
+            continue
+        out["requests"] += 1
+        repo_obj = ((got or {}).get("data") or got or {}).get("repository") or {}
+        for n in batch:
+            item = _linked_item(repo_obj.get("n{}".format(n)))
+            if item is None:
+                out["missing"].append(n)
+            else:
+                out["items"].append(item)
+    out["gathered_at"] = clock().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return out
+
+
 # --- PR checks, review-thread state, lifecycle events (fact `pr_activity`) ---
 #
 # What happened to a PR besides its conversation: the check results of its
@@ -9957,6 +10130,8 @@ def acquire(args, env):
             if evs:
                 pushes[r["number"]] = evs
         pr_history = collect_pr_history(prs, clone_dir, base_branch=base_branch,
+                                        as_of=(to + "T23:59:59Z") if len(to) == 10
+                                        else to,
                                         all_prs=True, force_pushes=pushes)
         _rows = pr_history["prs"]
         sys.stderr.write(
@@ -10101,7 +10276,7 @@ def acquire(args, env):
         module_ownership = collect_module_ownership(
             code_events, commits, prs, issues, git_blob_reader(clone_dir),
             tracked or [], frm, to, web="https://github.com/{}/{}".format(owner, repo),
-            start_files=window_start_files(clone_dir, frm))
+            start_files=window_start_files(clone_dir, frm), end_rev=clone_sha)
         sys.stderr.write(
             "module ownership: {}/{}: {} event(s), {} module(s) without an owner "
             "at the window's end\n".format(owner, repo,
@@ -10211,6 +10386,20 @@ def acquire(args, env):
         "boundary_dropped_commits": _boundary_dropped,
         "period": {"from": frm, "to": to}, "prev_bundle": None,
     }
+    # Linked items outside the window (per-window fact `linked_items`): what
+    # the records link that the window does not hold, one GraphQL request
+    # per LINKED_ITEMS_BATCH numbers.
+    linked_items = None
+    if token and getattr(args, "pr_checks", True) and (prs or issues):
+        try:
+            linked_items = collect_linked_items(prs, issues, _graphql_client(token),
+                                                owner, repo)
+        except Exception as exc:          # noqa: BLE001 - recorded, never fatal
+            linked_items = {"collected": False, "failure": str(exc)[:200]}
+        sys.stderr.write("linked items: {}/{}: {} read, {} missing\n".format(
+            owner, repo, len((linked_items or {}).get("items") or []),
+            len((linked_items or {}).get("missing") or [])))
+
     bundle = build_bundle(meta, commits, prs, issues)
     bundle["workflows"] = workflows
     bundle["workflow_stats"] = workflow_stats
@@ -10236,6 +10425,8 @@ def acquire(args, env):
         bundle["pr_history"] = pr_history
     if pr_activity is not None:
         bundle["pr_activity"] = pr_activity
+    if linked_items is not None:
+        bundle["linked_items"] = linked_items
     # always when collected, empty or not: a later window that collected
     # nothing must clear an earlier window's standing list in a merged view
     if module_ownership is not None:

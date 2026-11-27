@@ -1324,6 +1324,9 @@ def _fact_signatures(value):
         if isinstance(value.get("events"), list) and \
                 isinstance(value.get("without_owner"), list):
             out.add("module_ownership")
+        if isinstance(value.get("items"), list) and \
+                isinstance(value.get("missing"), list):
+            out.add("linked_items")
         if isinstance(value.get("source"), str):
             out.add("label_taxonomy")
         if value and all(isinstance(v, dict) and "total" in v
@@ -1529,7 +1532,8 @@ def _pr_history_problem(value):
 
 _OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns",
                         "owner_files", "unread", "windows", "start_without_owner",
-                        "labelled_items", "without_owner_unavailable"}
+                        "labelled_items", "without_owner_unavailable",
+                        "owners_at_end"}
 _OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "at", "seq", "source",
                          "quote", "via"}
 
@@ -1609,6 +1613,11 @@ def _module_ownership_problem(value):
             isinstance(v, list) and all(isinstance(x, str) for x in v)
             for v in pats.values())):
         return "module_ownership label_patterns is not {kind: [regex]}"
+    oae = value.get("owners_at_end")
+    if oae is not None and not (isinstance(oae, dict) and all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v)
+            for v in oae.values())):
+        return "module_ownership owners_at_end is not {module: [login]}"
     files = value.get("owner_files")
     if files is not None and not (isinstance(files, list)
                                   and all(isinstance(x, str) for x in files)):
@@ -1633,6 +1642,12 @@ def _fact_shape_problem(key, value):
         why = _pr_history_problem(value)
         if why:
             return why
+    if ok and key == "linked_items":
+        if not _list_of_objects(value.get("items", [])) or any(
+                not isinstance(it.get("number"), int) or isinstance(it.get("number"), bool)
+                or it.get("type") not in ("issue", "pr")
+                for it in value.get("items") or []):
+            return "linked_items holds an item gather does not write"
     if ok and key == "module_ownership":
         why = _module_ownership_problem(value)
         if why:

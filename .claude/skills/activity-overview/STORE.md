@@ -333,7 +333,7 @@ with no ownership signal; validate refuses an unknown key or event kind, and
 `start_without_owner` / `labelled_items` that are not lists of objects. Events carry
 `at` (commit / item time) and `seq` (gather's order) so one day replays in order; a fact
 gathered before them replays by day and kind until rewritten with
-`gather.py ... --recompute-ownership`). Gathered with the people registry
+`gather.py ... --recompute-ownership`). `linked_items` (the issues / PRs the window's records link that are not its records, with title, type, state and dates when gathered: `gather.collect_linked_items`, BUNDLE.md "What a story can name"; per window only, a new fact key). Gathered with the people registry
 (`--people`, a JSON file outside the store, BUNDLE.md "The people registry"), each entry
 also records the labels used for that window from it: the display `name`, `maintainer`,
 `maintainer_signal` and `maintainer_status` (the role's lifecycle at gather time: active /

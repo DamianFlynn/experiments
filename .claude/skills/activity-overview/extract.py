@@ -131,7 +131,7 @@ _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
              "code_owners", "label_taxonomy", "newcomers", "module_notes",
              "pr_history", "pr_activity", "module_ownership", "affiliations",
-             "prior_activity",
+             "linked_items", "prior_activity",
              "artifacts", "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
@@ -470,6 +470,10 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_merged_module_ownership`); absent when no gather collected it.
     if "module_ownership" in facts:
         bundle["module_ownership"] = facts["module_ownership"]
+    # Linked items outside the window (per-window only): as stored, or per
+    # number the latest window overlapping the view (`_merged_linked_items`).
+    if "linked_items" in facts:
+        bundle["linked_items"] = facts["linked_items"]
     # Contributor affiliation (per-window only): the gathered window's fact
     # as stored, or each person's latest decision over the windows
     # overlapping the view (`_merged_affiliations`); absent when no gather
@@ -1259,7 +1263,7 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
                            if k not in ("workflow_stats", "newcomers",
                                         "module_notes", "pr_history",
                                         "affiliations", "pr_activity",
-                                        "module_ownership"))
+                                        "module_ownership", "linked_items"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1320,6 +1324,9 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     activity = _merged_pr_activity(conn, project, repo, overlapping, recorded)
     if activity is not None:
         facts["pr_activity"] = activity
+    linked = _merged_linked_items(conn, project, repo, overlapping, recorded)
+    if linked is not None:
+        facts["linked_items"] = linked
     ownership = _merged_module_ownership(conn, project, repo, overlapping, recorded,
                                          ts_from, ts_to)
     if ownership is not None:
@@ -1752,6 +1759,31 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
             "the window {}..{} was gathered before ownership could be "
             "reconstructed for a day inside it".format(k[0], k[1]))
     return out
+
+
+def _merged_linked_items(conn, project, repo, overlapping, recorded):
+    """The `linked_items` of a view that is not exactly one gathered window:
+    per number, the row of the latest overlapping window that read it (by
+    end day); `missing` the numbers no window found. None when no
+    overlapping window collected it."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("linked_items",))
+        value = (got or {}).get("facts", {}).get("linked_items")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+    items, missing = {}, set()
+    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
+        for it in values[k].get("items") or []:
+            if isinstance(it, dict) and isinstance(it.get("number"), int):
+                items[it["number"]] = dict(it, gathered_at=values[k].get("gathered_at"))
+        missing.update(n for n in values[k].get("missing") or [] if isinstance(n, int))
+    return {"collected": True, "items": [items[n] for n in sorted(items)],
+            "missing": sorted(missing - set(items)),
+            "windows": [{"from": k[0], "to": k[1]} for k in sorted(values)]}
 
 
 def _merged_pr_activity(conn, project, repo, overlapping, recorded):

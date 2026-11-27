@@ -3550,6 +3550,49 @@ def _on_behalf_of(p, activity_row, instant):
               and not derive.is_bot_login(e["by"])), None)
 
 
+def module_owners(bundle):
+    """{module: [login]} — who owns each module at the window's end: the
+    owner files of the end tree (`module_ownership.owners_at_end`, a gather
+    that read them) and CODEOWNERS rules naming people (`code_owners`;
+    teams left out) whose pattern is a module folder."""
+    out = {}
+    for m, logins in ((bundle.get("module_ownership") or {}).get("owners_at_end")
+                      or {}).items():
+        out.setdefault(m, [])
+        out[m] += [x for x in logins if x not in out[m]]
+    rules = bundle.get("code_owners")
+    rules = rules if isinstance(rules, list) else (rules or {}).get("rules") or []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        m = gather._codeowners_module(r.get("pattern"))
+        if module_kind(m) is None:
+            continue
+        people = [o.lstrip("@") for o in r.get("owners") or []
+                  if isinstance(o, str) and "/" not in o]
+        if people:
+            out.setdefault(m, [])
+            out[m] += [x for x in people if x not in out[m]]
+    return out
+
+
+def annotate_module_owners(bundle):
+    """`module_owner_of: [module]` on the people rows of module owners
+    (module_owners). In place."""
+    owners = module_owners(bundle)
+    if not owners:
+        return bundle
+    people = bundle.setdefault("people", {})
+    by_login = {}
+    for m, logins in owners.items():
+        for x in logins:
+            by_login.setdefault(x, []).append(m)
+    for x, mods in by_login.items():
+        if x in people:
+            people[x]["module_owner_of"] = sorted(mods)
+    return bundle
+
+
 def annotate_automation(bundle, registry=None):
     """`automation` on the people rows of the automation accounts:
     {kind: registry (the operator's tag) | account_type (the API's account
@@ -4106,6 +4149,10 @@ def owner_response_request(bundle, ctx, typ, rec, instant, rxs):
     owners = _owners_named(bundle, rec, instant)
     if owners:
         out["owners"] = owners
+    elif module and module_owners(bundle).get(module):
+        # the module's owners at the window's end (its owner file)
+        out["owners"] = module_owners(bundle)[module]
+        out["owners_source"] = "owner_file"
     return out
 
 
@@ -4619,6 +4666,135 @@ def _apply_story_budget(items):
             "cut": cut, "text_omitted": dropped}
 
 
+REPLACED_COMMITS_SHOWN = 20     # replaced commits listed per force-push item
+
+
+def _replaced_summary(rec):
+    """A force-push's replaced history for the timeline: {status, summary,
+    [commits [{sha, subject, files}]], [commits_more], [reason]}."""
+    when = (rec.get("at") or "")[:10]
+    if rec.get("status") != "read":
+        return {"status": "unavailable", "reason": rec.get("reason"),
+                "summary": "force-push on {}: what it replaced is unavailable ({})".format(
+                    when, rec.get("reason") or "not read")}
+    commits = rec.get("commits") or []
+    n = len(commits) + (rec.get("commits_omitted") or 0)
+    out = {"status": "read",
+           "summary": "force-push on {} replaced {} commit(s){}".format(
+               when, n, ": " + "; ".join(c.get("subject") or "" for c in commits[:5])
+               if commits else ""),
+           "commits": [{"sha": c.get("sha"), "subject": c.get("subject"),
+                        "files": c.get("files")} for c in commits[:REPLACED_COMMITS_SHOWN]]}
+    if n > REPLACED_COMMITS_SHOWN:
+        out["commits_more"] = n - REPLACED_COMMITS_SHOWN
+    return out
+
+
+def _git_name_logins(bundle):
+    """{git author name: login} from the window's walked commits whose
+    author the gather resolved to a login (commits API / noreply email),
+    only where the name resolved to one login. Never a guess."""
+    seen = {}
+    for c in bundle.get("commits") or []:
+        if isinstance(c, dict) and c.get("login_resolved") and c.get("author_name") \
+                and c.get("author"):
+            seen.setdefault(c["author_name"], set()).add(c["author"])
+    return {k: next(iter(v)) for k, v in seen.items() if len(v) == 1}
+
+
+_FAILED_PIPELINE_RE = re.compile(r"^\s*\[Failed pipeline\]\s*(\S+)", re.I)
+_RUN_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/(\d+)"
+                         r"(?:/job/(\d+))?")
+_FAILED_JOB_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:failed\s+)?(job|step)s?\s*[:\-]\s*(.+)$",
+                            re.I | re.M)
+
+
+def failed_pipeline(issue):
+    """For an automated "[Failed pipeline] <workflow>" issue: {workflow,
+    [module], run_url, run_id, [job_url], [jobs], [steps]} parsed from its
+    title and body (no log is downloaded); None for another issue."""
+    m = _FAILED_PIPELINE_RE.match(issue.get("title") or "")
+    if not m:
+        return None
+    wf = m.group(1)
+    out = {"workflow": wf}
+    parts = wf.split(".")
+    if len(parts) >= 4 and parts[0] == "avm":
+        out["module"] = "/".join(parts[:3]) + "/" + ".".join(parts[3:]) \
+            if len(parts) > 4 else "/".join(parts)
+    body = issue.get("body") or ""
+    r = _RUN_URL_RE.search(body)
+    if r:
+        out["run_url"] = r.group(0) if not r.group(2) else \
+            r.group(0).split("/job/")[0]
+        out["run_id"] = int(r.group(1))
+        if r.group(2):
+            out["job_url"] = r.group(0)
+    for kind, name in _FAILED_JOB_RE.findall(body):
+        out.setdefault(kind.lower() + "s", []).append(name.strip())
+    return out
+
+
+def related_prs(bundle, pr, days=7):
+    """PRs of the same author opened within `days` of `pr` that the record
+    links to it explicitly: one names the other (`#N` / a link in its body,
+    comments or review comments), or both close / reference the same item.
+    [{number, title, state, url, basis}] — never from timing alone."""
+    by_author = [p for p in bundle.get("prs") or [] if isinstance(p, dict)
+                 and p.get("author") == pr.get("author")
+                 and p.get("number") != pr.get("number")]
+    a = _parse_ts(pr.get("created_at"))
+    if a is None:
+        return []
+
+    def texts(p):
+        return [p.get("body")] + [c.get("body") for k in ("comments_list", "review_comments")
+                                  for c in p.get(k) or [] if isinstance(c, dict)]
+
+    def names(p):
+        out = set()
+        for t in texts(p):
+            out.update(int(n) for n in _ISSUE_NUMBER_RE.findall(t or ""))
+            out.update(int(n) for n in re.findall(r"/pull/(\d+)", t or ""))
+        return out
+    mine = names(pr)
+    refs = set(pr.get("closes") or []) | set(pr.get("crossref_issues") or [])
+    out = []
+    for p in by_author:
+        b = _parse_ts(p.get("created_at"))
+        if b is None or abs((b - a).total_seconds()) > days * 86400:
+            continue
+        basis = []
+        if p.get("number") in mine:
+            basis.append("#{} names #{}".format(pr.get("number"), p.get("number")))
+        if pr.get("number") in names(p):
+            basis.append("#{} names #{}".format(p.get("number"), pr.get("number")))
+        shared = refs & (set(p.get("closes") or []) | set(p.get("crossref_issues") or []))
+        if shared:
+            basis.append("both reference #" + ", #".join(str(n) for n in sorted(shared)))
+        if basis:
+            out.append({"number": p.get("number"), "title": p.get("title"),
+                        "state": p.get("state"), "url": p.get("url"),
+                        "basis": "; ".join(basis)})
+    return out
+
+
+def _net_files(row, instant, own):
+    """The PR's per-file net change (gather pr_net_files) for the files more
+    than one of its own commits touched: [{path, added, removed, commits}]
+    when the stored head is the head as of the instant."""
+    nf = (row or {}).get("net_files") or {}
+    if not nf.get("files") or not own or nf.get("head") != own[-1].get("sha"):
+        return None
+    counts = {}
+    for c in own:
+        for p in c.get("paths") or []:
+            counts[p] = counts.get(p, 0) + 1
+    rows = [dict(f, commits=counts[f["path"]]) for f in nf["files"]
+            if counts.get(f.get("path"), 0) > 1]
+    return rows or None
+
+
 def story_material(bundle, train):
     """The conversation of one train as one chronological timeline, for a
     narrator. Pure (reads the bundle; returns new objects).
@@ -4728,6 +4904,7 @@ def story_material(bundle, train):
                              .get("path_rules") or ())
     ctx = _ModuleCtx(bundle, rules)
     seen = set()
+    name_logins = _git_name_logins(bundle)
     for p in prs:
         row = history.get(p.get("number"))
         patches_by = {}
@@ -4745,6 +4922,11 @@ def story_material(bundle, train):
                 it["merge"] = True
             if not own_change(c):
                 it["not_own_change"] = _not_own_reason(c)
+            # who the git author is, as far as the record resolves it
+            it["author_name"] = c.get("author")
+            it["author_login"] = name_logins.get(c.get("author"))
+            if it["author_login"] and it["author_login"] != p.get("author"):
+                it["authored_by_other"] = True
             if c.get("committed_at") and p.get("created_at") \
                     and c["committed_at"] < p["created_at"]:
                 it["before_pr_opened"] = True       # a reused / older branch
@@ -4766,6 +4948,20 @@ def story_material(bundle, train):
             if ev:
                 it["evidence"] = ev
             items.append(it)
+        # what each force-push replaced, on its timeline item (or one of its own)
+        for rec in (row or {}).get("replaced") or []:
+            if not _not_after(rec.get("at"), instant):
+                continue
+            push = next((it for it in items if it.get("kind") == "head_ref_force_pushed"
+                         and it.get("on") == {"type": "pr", "number": p.get("number")}
+                         and it.get("at") == rec.get("at")), None)
+            if push is None:
+                push = {"at": rec.get("at"), "kind": "head_ref_force_pushed",
+                        "actor": rec.get("actor"), "url": p.get("url"),
+                        "on": {"type": "pr", "number": p.get("number")},
+                        "source": "pr_history"}
+                items.append(push)
+            push["replaced"] = _replaced_summary(rec)
         # a commit the checks read but the gathered history does not hold
         # (replaced when the branch was rewritten, or outside the walk): its
         # checks item says it is a commit of the PR
@@ -5944,15 +6140,52 @@ def _issue_ask(body):
     return b[:STORY_LINKED_BODY_CAP], len(b)
 
 
+def linked_item_as_of(item, instant):
+    """A `linked_items` row (an item outside the view, read when gathered)
+    projected to the instant: {number, type, title, author, url, created_at,
+    state (as of the instant: `not yet created` / `open` / `closed` /
+    `merged`), state_when_gathered, [closed_at] / [merged_at] (when by the
+    instant), [state_reason], in_view: false}."""
+    out = {"number": item.get("number"), "type": item.get("type"),
+           "title": item.get("title"), "author": item.get("author"),
+           "url": item.get("url"), "created_at": item.get("created_at"),
+           "state_when_gathered": item.get("state"), "in_view": False}
+    if item.get("created_at") and not _not_after(item["created_at"], instant):
+        out["state"] = "not yet created"
+    elif item.get("merged_at") and _not_after(item["merged_at"], instant):
+        out.update(state="merged", merged_at=item["merged_at"])
+    elif item.get("closed_at") and _not_after(item["closed_at"], instant):
+        out.update(state="closed", closed_at=item["closed_at"])
+        if item.get("state_reason"):
+            out["state_reason"] = item["state_reason"]
+    else:
+        out["state"] = "open"
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def _linked_items(bundle, texts, own):
     pr_index = {p["number"]: p for p in bundle.get("prs", [])}
     issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    outside = {it.get("number"): it for it in
+               (bundle.get("linked_items") or {}).get("items") or []
+               if isinstance(it, dict)}
+    instant = window_end_instant(bundle.get("meta"))
     out = []
     found = _linked_numbers(bundle, texts, own)
     for n, cited in found[:STORY_LINKED_MAX]:
         rec = issue_index.get(n) or pr_index.get(n)
         if rec is None:
-            out.append({"number": n, "in_view": False, "mentioned_in": cited})
+            if n in outside:
+                row = linked_item_as_of(outside[n], instant)
+                row["mentioned_in"] = cited
+                out.append(row)
+            else:
+                row = {"number": n, "in_view": False, "mentioned_in": cited}
+                if "linked_items" in bundle:
+                    row["not_read"] = "not found" if n in set(
+                        bundle["linked_items"].get("missing") or []) \
+                        else "not read (capped or failed)"
+                out.append(row)
             continue
         typ = "issue" if n in issue_index else "pr"
         row = {"number": n, "type": typ, "title": rec.get("title"),
@@ -6151,6 +6384,14 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
             row["closed_at"] = rec["closed_at"]
         if typ == "pr" and rec.get("closed_unmerged"):
             row["closed_unmerged"] = rec["closed_unmerged"]
+        if typ == "pr":
+            rel = related_prs(bundle, rec)
+            if rel:
+                row["related"] = rel
+        else:
+            fp = failed_pipeline(rec)
+            if fp:
+                row["failed_pipeline"] = fp
         out["items"].append(row)
     if open_prs:
         main = max(open_prs, key=lambda e: e[0])[1]
@@ -6210,6 +6451,9 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
         patches = [x for x in row.get("patches") or [] if x.get("commit") in ok]
         if patches:
             entry["lines"] = _net_lines(patches)
+        files = _net_files(row, instant, _pr_own_commits_as_of(row, instant))
+        if files:
+            entry["net_files"] = files      # the PR as a whole, per file
         if entry:
             net[str(p.get("number"))] = entry
     if net:
@@ -6943,6 +7187,8 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     # Omit-when-absent keys: a train with no human conversation, and a view
     # where no train qualifies, are unchanged.
     annotate_last_human_event(bundle)
+    if "pr_history" in bundle:
+        annotate_module_owners(bundle)
     annotate_train_discussion(bundle)
     select_story_trains(bundle)
     # Every story of the window, grouped (issue #97: "all the stories for
@@ -7225,7 +7471,8 @@ def slice_participants(bundle, train):
     no name, no label and no registry context. Pure."""
     people = bundle.get("people") or {}
     context = (bundle.get("people_context") or {}).get("people") or {}
-    if not any(k in p for p in people.values() for k in derive.PERSON_LABEL_KEYS) \
+    if not any(k in p for p in people.values()
+               for k in tuple(derive.PERSON_LABEL_KEYS) + ("module_owner_of", "automation")) \
             and not context:
         return {}
     logins = _train_logins(bundle, train)
@@ -7239,6 +7486,10 @@ def slice_participants(bundle, train):
             row["affiliation"] = p["affiliation"]
         if login in context:
             row["registry_context"] = context[login]
+        if p.get("module_owner_of"):
+            row["module_owner_of"] = p["module_owner_of"]
+        if p.get("automation"):
+            row["automation"] = p["automation"]
         out[login] = row
     return {"participants": out}
 

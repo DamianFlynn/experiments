@@ -1731,6 +1731,53 @@ derived once in link and carried on every row that needs it:
   (400) lines, the breaking section included (gather's patch excerpts:
   `PR_HISTORY_PATCH_LINES`, 400).
 
+### What a story can name (story-layer views)
+
+- **Linked items outside the window** — the per-window fact `linked_items`
+  (`gather.collect_linked_items`: every issue / PR number the window's records link —
+  closing and cross references, `#N` and repository links in bodies, comments, review
+  comments and reviews — that is not a record of the window; ONE GraphQL
+  `issueOrPullRequest` request per `LINKED_ITEMS_BATCH` (50) numbers, at most
+  `LINKED_ITEMS_MAX` (500, `ACTIVITY_LINKED_ITEMS_MAX`) per window, the rest `capped`):
+  `{collected, gathered_at, items: [{number, type, title, state (when gathered),
+  created_at, closed_at?, merged?, merged_at?, state_reason?, url, author?}], missing:
+  [number], failed?, capped?, requests}`; a view of several windows takes, per number, the
+  latest window's row. A slice's `outcome.linked` row for such an item
+  (`link.linked_item_as_of`) gives `type`, `title`, `author`, `url`, `created_at`,
+  `state` AS OF the view's end (`not yet created` / `open` / `closed` / `merged`, from the
+  dates), `state_when_gathered`, `closed_at` / `merged_at` / `state_reason` when by the
+  end, `in_view: false`; a number not read says `not_read` ("not found", "not read
+  (capped or failed)").
+- **The module's owner** — `module_ownership.owners_at_end` `{module folder: [login]}`
+  (gather reads every owner file of the end tree at the window's end commit; also
+  `--recompute-ownership`) and CODEOWNERS rules naming people (`code_owners`, teams left
+  out) give `module_owner_of: [module]` on people rows and slice participants
+  (`link.module_owners`). An owner response request names those owners (`owners`,
+  `owners_source: "owner_file"`) when no automation comment named them. Slice
+  participants also carry `automation` when the people row has it.
+- **What a force-push replaced** — a `head_ref_force_pushed` timeline item (or one of its
+  own, `source: "pr_history"`) carries `replaced` `{status: read | unavailable, summary
+  ("force-push on <day> replaced N commit(s): <subjects>"), commits [{sha, subject,
+  files}] (at most 20; `commits_more`), reason?}` from `pr_history` rows' `replaced`.
+- **Net change per file** — gather `pr_net_files`: a `pr_history` row's `net_files`
+  `{head, base, files: [{path, added, removed}], files_omitted?}` — `git diff --numstat`
+  from the merge base to the PR's head as of the window's end (`added` / `removed` null for
+  a binary file; `net_files_unavailable` with the reason when the diff failed). A slice's
+  `outcome.net_change[pr].net_files` lists the files MORE than one own commit touched,
+  `{path, added, removed, commits}`, when the stored head is the head as of the end.
+- **Sibling PRs** — an outcome PR item's `related` `[{number, title, state, url, basis}]`
+  (`link.related_prs`): PRs of the same author opened within 7 days that the record links
+  explicitly (one names the other, or both reference the same item); never from timing
+  alone.
+- **Who a commit's author is** — a PR commit item carries `author_name` (the git name) and
+  `author_login` (the login the window's walked commits resolved that name to, null when
+  none did — identities are never merged by name), and `authored_by_other: true` when that
+  login is not the PR author.
+- **A failed pipeline** — an outcome issue item of an automated "[Failed pipeline]
+  <workflow>" issue carries `failed_pipeline` `{workflow, module?, run_url, run_id,
+  job_url?, jobs?, steps?}` parsed from its title and body (no log download; the October
+  2026 bodies name the run only).
+
 ### `module_ownership` (raw, from the store)
 
 Who owns which module and the window's changes to it — "maintainer needed / added /

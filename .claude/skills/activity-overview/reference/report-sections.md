@@ -309,6 +309,19 @@ work when `on_behalf_of` shows it).
    >    changelog words (quote the `changelog` items of the outcome block's `modules`), the PR's state
    >    (merged), and whether anything discussed was deferred or left out (say so, with the
    >    changelog or commit text that says it).
+   > 6a. *A closed story* (group `closed`: closed without landing) ends with **Where it
+   >    stands** too: how it closed (by whom, the issue's closing reason, a PR's
+   >    `closed_unmerged` — `superseded_by` only when the record says so, else "the record
+   >    states no reason"), and what, if anything, carries the work on.
+   > 6b. *Versions and breaking changes.* A changelog that declares a breaking change in a
+   >    minor version bump of a 0.x module (0.12 → 0.13) is stated as exactly that: "the
+   >    changelog declares it breaking; the version moved from 0.12.0 to 0.13.0". Call it
+   >    the project's versioning convention ("a 0.x minor version may break") only when the
+   >    repository's own contribution docs say so — quote that sentence with its file. (For
+   >    Azure/bicep-registry-modules the October 2026 tree says the opposite: its pull
+   >    request template, `.github/pull_request_template.md`, reads "Breaking changes and I
+   >    have bumped the MAJOR version in `version.json`." — so state the two facts and do
+   >    not explain the difference.)
    > 7. *Fairness.* Quote requests and answers in context: a short answer ("Agreed, no need
    >    for both.") comes with what it agreed to and what changed as a result. Do not let the
    >    choice of quotes suggest the work was compromised, rushed or watered down unless the
