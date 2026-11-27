@@ -60,7 +60,7 @@ nothing to the view and writes no file: the same view always gives the same outl
 | 1 | **New modules** | `new_modules` | `module_changes.summary.new_modules` + the module rows | no module is new |
 | 2 | **What changed in existing modules** | `module_changes` | every module with a reader-facing change, with release, prompting issue, interface delta, PRs | no module had a reader-facing change |
 | 3 | **Breaking changes and deprecations** | `breaking` | declared items, candidates, deprecations, removed / orphaned modules | none of these |
-| 4 | **Stories**, grouped `### Landed`, `### In flight`, `### Stalled` (`### Closed without landing` when any) | `stories` | `stories.all` (else the selected and further stories, grouped provisionally) and their slices; `thin` for trains with history but no turn in the window | no story |
+| 4 | **Stories**, grouped `### Landed`, `### In flight`, `### Stalled`, `### Closed without landing` (plumbing stories in section 8) | `stories` | `stories.all` (else the selected and further stories, grouped provisionally), the story plan and the slices | no story |
 | 5 | **Module ownership** | `ownership` | `module_ownership` | the view has none (`needs a store gathered with module ownership`) or it holds no event and no module without an owner |
 | 6 | **People** | `people` | `contributors`, `affiliations`, `newcomers`, `people_context`, PR release status, automation accounts | no people layer |
 | 7 | **Coming up and stuck** | `coming` | each open train's slice outcome (derived next move, checks), forecast | nothing open was active |
@@ -106,28 +106,48 @@ verbatim, `release`, `published` true / false / null), `candidates` (`wording: c
 upgrading`, `covered_by_declared`), `deprecations`, `notices`. Say what breaks, in which
 module and version (linked), and what to do.
 
-**Stories** — every story of the window, in full, grouped by state: `groups` {landed,
-in_flight, stalled, closed, plumbing} from the view's `stories.all` (`group_source: view`) or,
-until the view has it, provisionally from the train (`group_source: provisional`: shipped →
-landed; in flight with `effort.stalled` → stalled; in flight; closed; plumbing when every
-merged PR is plumbing). Each row: `key`, `group`, `state`, `group_rule`, title, `modules`
-(with `url`), `released` (release rows of its merged PRs), slice / check commands. Plumbing
-stories are written in the plumbing section under their theme. `thin`: trains with history
-but no conversation turn in the window — one line each with module (linked), state and the
-reason (`idle_days`).
+**Stories** — every story of the window, grouped by state: `groups` {landed, in_flight,
+stalled, closed, plumbing} from the view's `stories.all` (`group_source: view`; closed = closed
+or rejected without landing) or, until the view has it, provisionally from the train
+(`group_source: provisional`: shipped → landed; in flight with `effort.stalled` → stalled; in
+flight; rejected → closed; plumbing when every merged PR is plumbing; `stories.quiet` → a
+stalled line). Each row: `key`, `group`, `state`, `group_rule`, `worthy`, title, `modules`
+(module areas only, with `url`), `released` (from the view, with tag link and registry
+reference; `unknown` with a `reason` when a module cannot be tied to the PR), `idle_days`,
+slice / check commands, and the **story plan**:
 
-Each story follows the story brief (`reference/report-sections.md`) unchanged in rigour, and
-**its first line states its state** ("**Landed — …**", "**In flight — …**", "**Stalled —
-…**", "**Closed — …**"). It answers, from its slice: which module or pattern it affects
-(linked), why it came up, what was decided or changed, the state of play, where it is heading
-or what it waits on, and how a reader can help. There is no "in short" pointer list. A story
-not yet written in full is acknowledged with `<!-- story pending: <key> — <reason> -->` (it is
-listed as pending; a story neither written nor pending fails the check).
+| Plan (`story_plan`) | Which trains | What the issue does |
+|---|---|---|
+| `full` | every train landed, in flight or closed; every stalled train with a human turn or an event in the window (`worthy` is not "carried over"); every plumbing train with a real discussion in the window (a selected story with a turn in the window, or at least `STORY_MIN_EXCHANGES` turns in the window between two or more people) | the story in full, under its group (a plumbing story under its theme) |
+| `line` | a stalled train merely carried over | one line in the Stalled group: the root item linked, its module (linked), "stalled", days without recorded activity (`idle_days`) and the derived next move (`waits_on`) |
+| `in_theme` | every other plumbing train | named (a link to one of its PRs) in its theme's narrative (`theme`) |
+
+`plan_counts` gives the counts per group and plan; `excluded` lists the trains the view left
+out (idle over its carry limit). Each story follows the story brief
+(`reference/report-sections.md`) unchanged in rigour, and **its first line states its state**
+("**Landed — …**", "**In flight — …**", "**Stalled — …**", "**Closed — …**"). It answers, from
+its slice: which module or pattern it affects (linked), why it came up, what was decided or
+changed, the state of play, where it is heading or what it waits on, and how a reader can help.
+A story may link the module folders and tags of its outline row beyond its slice
+(`story_links`: the check adds them to the slice as `newsletter_links`). A story not yet written
+is acknowledged with `<!-- story pending: <key> — <reason> -->`; a theme narrative not yet
+written with `<!-- theme pending: <theme id> — <reason> -->` (both listed as pending; anything
+neither written nor pending fails the check).
+
+**Writing many stories in parallel.** A month can hold dozens of `full` stories. Cut each
+story's slice once (`link.py --slice`, or `link.slice_train` on the linked view, adding
+`newsletter_links`), and hand writers batches of roughly equal slice size (a few to ten
+stories each), each with its slices, outline rows, the story brief and these rules, and one
+batch per plumbing theme (the theme row, the trains to name, the discussed trains' slices);
+each writer checks every story with `link.py --check-story` before handing it back.
 
 **Module ownership** — `events` (owner_needed / owner_added / owner_removed / orphaned /
-adopted: module with `module_url`, people, date, source link, quote) and `without_owner` (the
-standing list, with `marker` and `since`). Say who now looks after which module, which need
-an owner, and link where a reader can volunteer (the event's source).
+adopted: module with `module_url`, people, date, source link, quote, `via`), `unattributed`
+(events on an item that names no single module, e.g. a label on a repository-wide PR: say so,
+or leave it out with the reason), `labelled_items`, `without_owner` (the standing list at the
+window's end, with `marker`) and `start_without_owner` (the same at its start). Say who now
+looks after which module, which need an owner, and link where a reader can volunteer (the
+event's source); say when no request for an owner was recorded.
 
 **People** — newcomers (first-ever and returning) with what they contributed and, for each
 merged PR, its `release` and `module_urls`; affiliation split with the unknown share; the
@@ -143,8 +163,10 @@ name whom the next move is with here.
 view`) or provisional themes by PR class (sweeps, CI, tests, docs, mixed). Per theme: a short
 narrative paragraph written from its PRs' descriptions (as last gathered), commit evidence and
 stories — what problem, what was built or changed, what it means for contributors (test
-environment, CI checks, README generation, …), who did it — then the plumbing stories in full
-under the theme's `###` heading, then the counts (`share`, `by_class`).
+environment, CI checks, README generation, …), who did it — naming every `in_theme` train of
+the theme by a link to one of its PRs — then the plumbing stories in full under the theme's
+`###` heading (`### <title_hint>`), then the counts (`share`, `by_class`). Themes from the view
+carry `subjects`, `issues`, `paths` / `paths_more` and `evidence_counts`.
 
 **By the numbers** — `facts` and every `coverage` note.
 
@@ -227,7 +249,9 @@ It fails (exit 1) and lists:
 | `markers_malformed` | a story marker without its pair, nested or without a key; an `omitted` marker without an id and reason; an unclosed HTML comment |
 | `stories` / `stories_not_checked` / `stories_not_in_outline` / `stories_duplicate` | each story block passes `link.py`'s story check against `--slices DIR/<slice file of its key>`; a block without its slice, for a train that is not a story, or repeated fails |
 | `stories_missing` | a story of the outline neither written nor marked `<!-- story pending: <key> — <reason> -->` (pending ones are listed in `stories_pending`, which does not fail) |
-| `stories_misplaced` / `stories_state_missing` | a story not under its group's `###` heading in the Stories section (a plumbing story: not in the plumbing section); a story whose first line does not start with its state (`Landed`, `In flight`, `Stalled`, `Closed`) |
+| `story_lines_missing` | a `line` story whose root item link is not in the issue (and not pending) |
+| `themes_missing` / `theme_trains_missing` | a plumbing theme with neither a `### <title_hint>` heading in the plumbing section nor a `<!-- theme pending: … -->` marker; an `in_theme` train of a written theme that the plumbing section does not name (a link to one of its PRs or its root item) |
+| `stories_misplaced` / `stories_state_missing` | a story not under its group's `###` heading in the Stories section (a plumbing story: not under its theme's heading in the plumbing section); a story whose first line does not start with its state (`Landed`, `In flight`, `Stalled`, `Closed`) |
 | `modules_not_linked` / `versions_not_linked` | in New modules, What changed, Breaking, Module ownership, People and Coming up: a module path the view knows (a module or a versioned child) that is not inside a link's text; a published version written right after a module path that is not a link |
 | `release_status_missing` | in New modules, What changed and People: a sentence that names a PR or module and says landed / merged / shipped, with no release status ("released as", "published", "not yet published", "declared in the changelog", "no version change", "release status not known") in it or the next sentence |
 | `ownership_not_in_view` | a module named in the Module ownership section that `module_ownership` does not hold |

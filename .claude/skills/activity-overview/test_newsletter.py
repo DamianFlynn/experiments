@@ -347,17 +347,22 @@ class TestOutline(unittest.TestCase):
         v["stories"]["selected"] += [{"id": "train-pr-21", "rank": 3, "score": 10},
                                      {"id": "train-pr-20", "rank": 4, "score": 9},
                                      {"id": "train-pr-22", "rank": 5, "score": 8}]
-        v["stories"]["quiet"] = [{"id": "train-pr-20", "score": 3, "idle_days": 40}]
+        v["trains"].append({"id": "train-pr-23", "outcome": "in_flight", "issues": [],
+                            "prs": [10]})
+        v["stories"]["quiet"] = [{"id": "train-pr-23", "score": 3, "idle_days": 40}]
         st = section(newsletter.outline([v]), "stories")
         g = {k: [x["id"] for x in rows] for k, rows in st["groups"].items() if rows}
         self.assertEqual(g, {"landed": ["train-issue-5", "train-pr-11"],
-                             "in_flight": ["train-pr-20"], "stalled": ["train-pr-21"],
+                             "in_flight": ["train-pr-20"],
+                             "stalled": ["train-pr-21", "train-pr-23"],
                              "plumbing": ["train-pr-22"]})
-        self.assertIn("40 days", st["thin"][0]["reason"])
+        # a quiet train is one line (the delivered contract renamed thin -> lines)
+        self.assertEqual([(x["id"], x["plan"], x["idle_days"]) for x in st["lines"]],
+                         [("train-pr-23", "line", 40)])
         # the view's own grouping wins
         v["stories"]["all"] = [{"id": "train-pr-20", "group": "stalled", "state": "stalled",
                                 "group_rule": "idle", "modules": ["avm/res/hci/cluster"],
-                                "score": 9}]
+                                "score": 9, "worthy": "1 human turn(s) in the window"}]
         st = section(newsletter.outline([v]), "stories")
         self.assertEqual(st["group_source"], "view")
         self.assertEqual([x["id"] for x in st["groups"]["stalled"]], ["train-pr-20"])
@@ -503,6 +508,10 @@ Nik Peters (@nik), whose affiliation is not known, landed a new module ([#13](ht
 <!-- omitted: coming — nothing open in the window -->
 
 ## Plumbing: what was engineered
+
+### CI workflows and pipeline utilities
+
+A pipeline action was bumped in [#12](https://github.com/o/r/pull/12).
 
 One of the 4 merged pull requests was plumbing (25%).
 
@@ -1295,8 +1304,8 @@ class TestOwnersLayout(unittest.TestCase):
                             "issues": [50], "prs": []})
         v["stories"]["quiet"] = [{"id": "train-issue-50", "score": 5, "idle_days": 40}]
         st = section(newsletter.outline([v]), "stories")
-        self.assertEqual(st["thin"][0]["modules"][0]["area"], "avm/res/consumption/budget")
-        self.assertEqual(st["thin"][0]["idle_days"], 40)
+        self.assertEqual(st["lines"][0]["modules"][0]["area"], "avm/res/consumption/budget")
+        self.assertEqual(st["lines"][0]["idle_days"], 40)
         r = self.check(GOOD + "\nQuiet: [`avm/res/consumption/budget`](" + T +
                        "avm/res/consumption/budget).\n", v=v)
         self.assertEqual(r["modules_not_in_view"], [])
@@ -1352,6 +1361,166 @@ class TestOwnersLayout(unittest.TestCase):
         self.assertEqual(r["people_not_in_view"], [])
         r = self.check(GOOD + "\nTomaz M (@tomaz) synced it.\n", automation=["tomaz"])
         self.assertTrue(r["automation_as_person"])
+
+
+class TestDeliveredContract(unittest.TestCase):
+    """The delivered contract: stories.all with five groups and the story
+    plan, released rows, themes, closing, links from the view."""
+
+    def v(self):
+        v = view()
+        v["trains"] += [
+            {"id": "train-pr-30", "outcome": "rejected", "issues": [], "prs": [10]},
+            {"id": "train-pr-31", "outcome": "in_flight", "issues": [], "prs": [98],
+             "effort": {"stalled": True, "idle_days": 50}},
+            {"id": "train-pr-32", "outcome": "in_flight", "issues": [], "prs": [10],
+             "effort": {"stalled": True, "idle_days": 20}},
+            {"id": "train-pr-33", "outcome": "shipped", "issues": [], "prs": [12],
+             "discussion": {"in_window": 4, "participants": 2}},
+        ]
+        rel = [{"module": "avm/ptn/net/dns", "version": "0.7.4", "status": "published",
+                "url": "https://example.invalid/tag", "registry": "br/public:avm/ptn/net/dns:0.7.4"}]
+        v["stories"]["all"] = [
+            {"id": "train-issue-5", "group": "landed", "state": "landed", "score": 30,
+             "worthy": "3 human turn(s) in the window", "modules": [".github", "avm/res/data/factory"]},
+            {"id": "train-pr-11", "group": "landed", "state": "landed", "score": 20,
+             "worthy": "2 human turn(s) in the window", "released": rel},
+            {"id": "train-pr-30", "group": "closed", "state": "closed", "score": 5,
+             "worthy": "1 human turn(s) in the window"},
+            {"id": "train-pr-31", "group": "stalled", "state": "stalled", "score": 4,
+             "worthy": "carried over"},
+            {"id": "train-pr-32", "group": "stalled", "state": "stalled", "score": 3,
+             "worthy": "PR #10 opened in the window"},
+            {"id": "train-pr-12", "group": "plumbing", "state": "landed", "score": 2,
+             "worthy": "PR #12 opened in the window"},
+            {"id": "train-pr-33", "group": "plumbing", "state": "landed", "score": 1,
+             "worthy": "4 human turn(s) in the window"},
+        ]
+        v["plumbing_themes"] = [{"id": "ci_workflows", "title_hint": "CI workflows",
+                                 "prs": [{"number": 12}], "stories": ["train-pr-12", "train-pr-33"],
+                                 "subjects": ["ci"], "issues": [], "people": ["jared"]}]
+        v["module_changes"]["modules"][1]["url"] = "https://example.invalid/factory"
+        v["issues"][0]["closing"] = {"at": "2026-10-05T10:00:00Z", "by": "alex",
+                                     "state_reason": "completed", "prs": [10]}
+        v["prs"][0]["closes"] = [5]
+        v["prs"].append({"number": 98, "title": "feat: old work", "author": "sam",
+                         "url": R + "/pull/98", "state": "open", "merged": False,
+                         "created_at": "2026-08-01T10:00:00Z"})
+        return v
+
+    def test_story_plan_by_the_owners_rule(self):
+        st = section(newsletter.outline([self.v()]), "stories")
+        plan = {r["key"]: r["plan"] for r in st["story_plan"]}
+        self.assertEqual(plan, {"train-issue-5": "full", "train-pr-11": "full",
+                                "train-pr-32": "full", "train-pr-31": "line",
+                                "train-pr-30": "full", "train-pr-33": "full",
+                                "train-pr-12": "in_theme"})
+        self.assertEqual([r["key"] for r in st["lines"]], ["train-pr-31"])
+        self.assertEqual(st["lines"][0]["idle_days"], 50)
+        self.assertEqual(st["in_theme"][0]["theme"], "ci_workflows")
+        self.assertEqual(st["plan_counts"]["stalled"], {"line": 1, "full": 1})
+        self.assertEqual(list(st["groups"]), list(newsletter.STORY_GROUPS))
+        self.assertEqual([r["key"] for r in st["groups"]["closed"]], ["train-pr-30"])
+
+    def test_rows_from_the_view(self):
+        out = newsletter.outline([self.v()])
+        st = section(out, "stories")
+        row = next(r for r in st["full"] if r["key"] == "train-pr-11")
+        self.assertEqual(row["released"][0]["registry"], "br/public:avm/ptn/net/dns:0.7.4")
+        row = next(r for r in st["full"] if r["key"] == "train-issue-5")
+        self.assertEqual([m["area"] for m in row["modules"]], ["avm/res/data/factory"])
+        self.assertEqual(row["modules"][0]["url"], "https://example.invalid/factory")
+        fac = section(out, "module_changes")["modules"][0]
+        self.assertEqual(fac["prompted_by"][0]["closing"]["by"], "alex")
+        th = section(out, "plumbing")["themes"][0]
+        self.assertEqual((th["id"], th["theme_source"], th["subjects"]),
+                         ("ci_workflows", "view", ["ci"]))
+
+    def _text(self, extra_story="", theme=True):
+        t = GOOD.replace("<!-- story pending: train-pr-11 — written from the next store -->",
+                         "<!-- story pending: train-pr-11 — later -->\n\n"
+                         "### Stalled\n\n<!-- story pending: train-pr-32 — later -->\n\n"
+                         "- [#98](https://github.com/o/r/pull/98) carried over.\n\n"
+                         "### Closed without landing\n\n"
+                         "<!-- story pending: train-pr-30 — later -->" + extra_story)
+        if theme:
+            t = t.replace("### CI workflows and pipeline utilities\n\n"
+                          "A pipeline action was bumped in [#12](https://github.com/o/r/pull/12).",
+                          "### CI workflows\n\nA pipeline action was bumped in "
+                          "[#12](https://github.com/o/r/pull/12).\n\n"
+                          "<!-- story pending: train-pr-33 — later -->")
+        else:
+            t = t.replace("### CI workflows and pipeline utilities\n\n", "") + \
+                "\n<!-- story pending: train-pr-33 — later -->\n"
+        return t
+
+    def test_ownership_event_naming_no_module_is_kept_apart(self):
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [
+            {"kind": "orphaned", "module": None, "date": "2026-10-03",
+             "source": {"type": "pr", "number": 12, "url": R + "/pull/12"}},
+            {"kind": "owner_added", "module": "avm/res/hci/cluster", "people": ["alex"]}],
+            "without_owner": [], "start_without_owner": [
+                {"module": "avm/res/key/vault", "marker": "ORPHANED.md"}],
+            "labelled_items": [{"module": "avm/ptn/net/dns", "marker": "orphan label"}]}
+        own = section(newsletter.outline([v]), "ownership")
+        self.assertEqual([e["module"] for e in own["events"]], ["avm/res/hci/cluster"])
+        self.assertEqual(own["unattributed"][0]["source"]["number"], 12)
+        self.assertEqual(own["start_without_owner"][0]["module"], "avm/res/key/vault")
+        text = self._text().replace(
+            "<!-- omitted: ownership — needs a store gathered with module ownership -->",
+            "## Module ownership\n\n- [`avm/ptn/net/dns`](" + T + "avm/ptn/net/dns) was "
+            "labelled; [`avm/res/key/vault`](" + T + "avm/res/key/vault) had no owner.")
+        v["module_changes"] = view()["module_changes"]
+        r = newsletter.check_newsletter([v], text, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["ownership_not_in_view"], [])
+
+    def test_a_module_only_the_ownership_fact_names_is_known(self):
+        v = self.v()
+        v["module_changes"] = view()["module_changes"]
+        v["module_ownership"] = {"collected": True, "events": [], "without_owner": [
+            {"module": "avm/res/code/signing", "marker": "ORPHANED.md"}]}
+        text = self._text().replace(
+            "<!-- omitted: ownership — needs a store gathered with module ownership -->",
+            "## Module ownership\n\n- [`avm/res/code/signing`](" + T + "avm/res/code/signing)"
+            " has no owner.")
+        r = newsletter.check_newsletter([v], text, slices={"train-issue-5": SLICE})
+        self.assertEqual((r["modules_not_in_view"], r["urls_not_in_view"],
+                          r["ownership_not_in_view"]), ([], [], []))
+
+    def test_story_may_link_its_modules_and_tags(self):
+        t = self._text().replace(
+            "Landed. Something happened.",
+            "Landed. Something happened to [`avm/res/data/factory`](https://example.invalid/factory).")
+        r = newsletter.check_newsletter([self.v()], t, slices={"train-issue-5": SLICE})
+        self.assertTrue(r["stories"]["train-issue-5"]["ok"], r["stories"])
+        t = t.replace("https://example.invalid/factory", "https://example.invalid/other")
+        r = newsletter.check_newsletter([self.v()], t, slices={"train-issue-5": SLICE})
+        self.assertFalse(r["stories"]["train-issue-5"]["ok"])
+
+    def test_check_lines_themes_and_theme_trains(self):
+        v0 = self.v
+        self.v = lambda: dict(v0(), module_changes=view()["module_changes"])
+        r = newsletter.check_newsletter([self.v()], self._text(),
+                                        slices={"train-issue-5": SLICE})
+        self.assertTrue(r["ok"], {k: x for k, x in r.items() if x and k != "cannot_check"})
+        r = newsletter.check_newsletter(
+            [self.v()], self._text().replace("- [#98](https://github.com/o/r/pull/98) carried over.", ""),
+            slices={"train-issue-5": SLICE})
+        self.assertEqual(r["story_lines_missing"], ["train-pr-31"])
+        r = newsletter.check_newsletter([self.v()], self._text(theme=False),
+                                        slices={"train-issue-5": SLICE})
+        self.assertIn("ci_workflows", r["themes_missing"])
+        t = self._text().replace("A pipeline action was bumped in "
+                                 "[#12](https://github.com/o/r/pull/12).", "Actions were bumped.")
+        r = newsletter.check_newsletter([self.v()], t, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["theme_trains_missing"], [{"key": "train-pr-12", "theme": "ci_workflows"}])
+        t = self._text(theme=False).replace(
+            "## Plumbing: what was engineered",
+            "## Plumbing: what was engineered\n\n<!-- theme pending: ci_workflows — later -->")
+        r = newsletter.check_newsletter([self.v()], t, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["themes_missing"], [])
+        self.assertEqual(r["themes_pending"], ["ci_workflows"])
 
 
 class TestCli(unittest.TestCase):

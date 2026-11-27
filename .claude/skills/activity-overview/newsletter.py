@@ -481,6 +481,8 @@ def prompted_by(view, numbers):
             ask = link._issue_ask(iss.get("body"))[0]
             if ask:
                 row["asked"] = ask[:600]
+            if isinstance(iss.get("closing"), dict):
+                row["closing"] = iss["closing"]
             out.append(row)
     return out
 
@@ -732,6 +734,22 @@ def _cut_modules(sec, caps):
     return sec
 
 
+def story_links(row):
+    """The module folder and tag URLs a story may link beyond its slice (its
+    outline row's `modules[].url` and `released[].url`). The newsletter check
+    adds them to the slice as `newsletter_links` before the story check, and a
+    work package writes them into the slice files it hands out, so the story
+    check accepts exactly these links and nothing else new."""
+    out = []
+    for m in row.get("modules") or []:
+        if m.get("url") and m["url"] not in out:
+            out.append(m["url"])
+    for r in row.get("released") or []:
+        if r.get("url") and r["url"] not in out:
+            out.append(r["url"])
+    return out
+
+
 def _provisional_group(view, train):
     """(group, state) of a train when the view has no `stories.all`: the
     plumbing group when every merged PR of it is plumbing; landed when it
@@ -771,23 +789,76 @@ def _module_refs(view, areas):
     return [{"area": a, "url": module_url(view, a)[0]} for a in areas]
 
 
+def _discussed(train):
+    """A real discussion in the window: a selected story with a turn in the
+    window, or at least STORY_MIN_EXCHANGES human turns in the window
+    between at least two people (a discussion carried over is not one)."""
+    d = train.get("discussion") or {}
+    in_window = d.get("in_window") or 0
+    if train.get("story") and in_window >= link.STORY_MIN_IN_WINDOW:
+        return True
+    return in_window >= link.STORY_MIN_EXCHANGES and (d.get("participants") or 0) >= 2
+
+
+def story_plan(group, worthy, train, provisional=False):
+    """(plan, reason) of one story by the owner's rule: `full` for every
+    train landed, in flight or closed, and every stalled train with a human
+    turn or an event in the window; `line` for a stalled train merely carried
+    over; plumbing `full` under its theme when it had a real discussion, else
+    `in_theme` (named in the theme's narrative)."""
+    if group in ("landed", "in_flight", "closed"):
+        return "full", "{}: every story of the group in full".format(group)
+    if group == "stalled":
+        if provisional or (worthy and worthy != "carried over"):
+            return "full", "stalled, with {} in the window".format(worthy or "activity")
+        return "line", "stalled and carried over: no turn in the window"
+    if group == "plumbing":
+        if _discussed(train):
+            return "full", "plumbing with a real discussion: in full under its theme"
+        return "in_theme", "plumbing without a real discussion: named in its theme"
+    return "full", "ungrouped"
+
+
+def _theme_index(view, multi):
+    """{train id: theme id} from the view's plumbing_themes (else the
+    provisional themes by PR class)."""
+    out = {}
+    if isinstance(view.get("plumbing_themes"), list):
+        for th in view["plumbing_themes"]:
+            for tid in th.get("stories") or []:
+                out.setdefault(tid, th.get("id"))
+        return out
+    mc = view.get("module_changes") or {}
+    rows = {r.get("number"): r for r in mc.get("prs") or []}
+    for t in view.get("trains") or []:
+        for n in t.get("prs") or []:
+            if n in rows and rows[n].get("plumbing"):
+                out.setdefault(t["id"], _provisional_theme(rows[n]))
+    return out
+
+
 def section_stories(views, caps, multi=False):
-    """Every story of the window, in full, grouped by state (STORY_GROUPS):
-    `stories.all` when the view has it (group, state, modules, release),
-    else the selected and further stories grouped provisionally
-    (`group_source: provisional`). Trains with history but no turn in the
-    window (`stories.quiet`) are `thin`: one line each, with module, state and
-    the reason."""
-    rows, thin, source = [], [], "view"
+    """Every story of the window, grouped by state (STORY_GROUPS), with the
+    story plan (story_plan): `full` (written in full), `line` (one line:
+    module, state, days idle, what it waits on), `in_theme` (plumbing named
+    in its theme). `stories.all` when the view has it, else the selected and
+    further stories grouped provisionally (`group_source: provisional`) and
+    `stories.quiet` as lines."""
+    rows, source = [], "view"
+    excluded = []
     for v in views:
         trains = {t["id"]: t for t in v.get("trains") or []}
         st = v.get("stories") or {}
         alls = st.get("all")
+        themes = _theme_index(v, multi)
         if not isinstance(alls, list):
             source = "provisional"
             entries = [dict(x) for x in (st.get("selected") or []) + (st.get("more") or [])]
+            entries += [dict(x, _quiet=True) for x in st.get("quiet") or []
+                        if x.get("id") not in {e.get("id") for e in entries}]
         else:
             entries = [dict(x) for x in alls]
+            excluded += [_with_repo(dict(x), _slug(v), multi) for x in st.get("excluded") or []]
         for e in entries:
             t = trains.get(e.get("id"), {})
             if isinstance(alls, list):
@@ -796,12 +867,22 @@ def section_stories(views, caps, multi=False):
             else:
                 group, state = _provisional_group(v, t)
                 rule = "provisional: train outcome, effort.stalled, plumbing PRs"
+            if e.get("_quiet"):
+                plan, reason = "line", "no conversation turn in the window"
+                if group != "plumbing":
+                    group, state = "stalled", "stalled"
+            else:
+                plan, reason = story_plan(group, e.get("worthy"), t,
+                                          provisional=not isinstance(alls, list))
             title, url = _train_title(v, t)
             key = story_key(v, e["id"], multi)
             sfile = slice_filename(key)
             view_file = "VIEW" if not multi else \
                 "workspace/view/{}.json".format(_slug(v).replace("/", "__"))
-            areas = e.get("modules") or _train_areas(v, t)
+            # only module areas are modules (a view's story row can list CI
+            # folders); none left: the train's own module evidence
+            areas = [a for a in e.get("modules") or [] if link.module_kind(a) is not None] \
+                or _train_areas(v, t)
             released = e.get("released")
             if released is None:
                 released = []
@@ -811,32 +892,49 @@ def section_stories(views, caps, multi=False):
                         released += [r for r in pr_release(v, n) if r not in released]
                 if any(r.get("module") for r in released):
                     released = [r for r in released if r.get("module")]
-            rows.append(_with_repo({
+            row = {
                 "id": e["id"], "key": key, "group": group, "state": state,
-                "group_rule": rule, "score": e.get("score"),
-                "title": e.get("title") or title, "url": url,
-                "prs": t.get("prs") or [], "issues": t.get("issues") or [],
+                "group_rule": rule, "score": e.get("score"), "worthy": e.get("worthy"),
+                "plan": plan, "plan_reason": reason,
+                "title": e.get("title") if e.get("title") and e.get("title") != title
+                and len(e.get("title")) > len(title or "") else title or e.get("title"),
+                "url": url, "prs": t.get("prs") or [], "issues": t.get("issues") or [],
                 "modules": _module_refs(v, areas), "released": released,
+                "idle_days": (t.get("effort") or {}).get("idle_days", e.get("idle_days")),
                 "slice": "python3 link.py {} --slice {} > {}".format(view_file, e["id"], sfile),
+                "slice_file": sfile,
                 "check": "python3 link.py {} --check-story {}".format(
                     sfile, sfile.replace(".slice.json", ".story.md")),
-            }, _slug(v), multi))
-        for q in st.get("quiet") or []:
-            t = trains.get(q.get("id"), {})
-            title, url = _train_title(v, t)
-            _, state = _provisional_group(v, t)
-            thin.append(_with_repo({
-                "id": q.get("id"), "key": story_key(v, q.get("id"), multi),
-                "title": title, "url": url, "state": state,
-                "modules": _module_refs(v, _train_areas(v, t)),
-                "idle_days": q.get("idle_days"),
-                "reason": "no conversation turn in the window ({} days without "
-                          "recorded activity)".format(q.get("idle_days"))}, _slug(v), multi))
+            }
+            if group == "plumbing" or plan == "in_theme":
+                row["theme"] = themes.get(e["id"])
+            if plan == "line":
+                try:
+                    oc = link.slice_train(v, e["id"])["conversation"]["outcome"]
+                    ball = oc.get("ball") or {}
+                    row["waits_on"] = {"state": ball.get("state"), "derived": True}
+                    if oc.get("waiting_on"):
+                        row["waits_on"]["items"] = [
+                            {k: w.get(k) for k in ("number", "type", "state", "title")}
+                            for w in oc["waiting_on"]]
+                except (KeyError, TypeError):
+                    row["waits_on"] = None
+            rows.append(_with_repo(row, _slug(v), multi))
     order = {g: i for i, g in enumerate(STORY_GROUPS)}
     rows.sort(key=lambda r: (order.get(r["group"], len(order)), -(r["score"] or 0), r["key"]))
     groups = {g: [r for r in rows if r["group"] == g] for g in STORY_GROUPS}
-    out = {"full": rows, "groups": groups, "group_source": source, "thin": thin,
-           "omit": None}
+    plan_counts = {}
+    for r in rows:
+        plan_counts.setdefault(r["group"], {}).setdefault(r["plan"], 0)
+        plan_counts[r["group"]][r["plan"]] += 1
+    out = {"full": [r for r in rows if r["plan"] == "full"],
+           "lines": [r for r in rows if r["plan"] == "line"],
+           "in_theme": [r for r in rows if r["plan"] == "in_theme"],
+           "all": rows, "groups": groups, "group_source": source,
+           "story_plan": [{k: r.get(k) for k in ("key", "group", "state", "plan",
+                                                 "plan_reason", "theme", "repo") if k in r}
+                          for r in rows],
+           "plan_counts": plan_counts, "excluded": excluded, "omit": None}
     if not rows:
         out["omit"] = "no train qualified as a story in the window (stories is absent)"
     return out
@@ -1189,6 +1287,8 @@ def section_plumbing(view, caps, multi=False, automation=()):
                 "prs": [_pr_row(view, n, automation) for n in numbers],
                 "stories": [story_key(view, x, multi) for x in th.get("stories") or []],
                 "people": people_of(numbers),
+                "subjects": th.get("subjects"), "issues": th.get("issues"),
+                "paths_more": th.get("paths_more"),
                 "evidence_counts": th.get("evidence_counts")}, _slug(view), multi))
     else:
         by = {}
@@ -1231,23 +1331,30 @@ def section_ownership(view, multi=False):
         return {"events": [], "without_owner": [],
                 "omit": "needs a store gathered with module ownership "
                         "(module_ownership is absent)"}
-    events = []
+    events, unattributed = [], []
     for e in mo.get("events") or []:
         if not isinstance(e, dict):
             continue
         row = dict(e)
-        if e.get("module"):
-            row["module_url"] = module_url(view, e["module"])[0]
+        if not e.get("module"):
+            # a label on an item that names no single module (a repository-wide
+            # PR): kept apart, worded as such or left out with the reason
+            unattributed.append(_with_repo(row, _slug(view), multi))
+            continue
+        row["module_url"] = module_url(view, e["module"])[0]
         events.append(_with_repo(row, _slug(view), multi))
     order = {k: i for i, k in enumerate(OWNERSHIP_KINDS)}
     events.sort(key=lambda r: (order.get(r.get("kind"), len(order)), r.get("date") or "",
                                r.get("module") or ""))
-    without = []
-    for w in mo.get("without_owner") or []:
-        if isinstance(w, dict) and w.get("module"):
-            without.append(_with_repo(dict(w, module_url=module_url(view, w["module"])[0]),
-                                      _slug(view), multi))
-    out = {"events": events, "without_owner": without,
+    def with_urls(rows):
+        return [_with_repo(dict(w, module_url=module_url(view, w["module"])[0]),
+                           _slug(view), multi)
+                for w in rows or [] if isinstance(w, dict) and w.get("module")]
+    without = with_urls(mo.get("without_owner"))
+    out = {"events": events, "unattributed": unattributed, "without_owner": without,
+           "start_without_owner": with_urls(mo.get("start_without_owner")),
+           "labelled_items": with_urls(mo.get("labelled_items")),
+           "owner_files": mo.get("owner_files"),
            "label_patterns": mo.get("label_patterns"), "omit": None}
     if not events and not without:
         out["omit"] = "no ownership event and no module without an owner in the window"
@@ -1466,8 +1573,10 @@ def section_intro(out):
     groups = sec["stories"].get("groups") or {}
     counts = {g: len(groups.get(g) or []) for g in STORY_GROUPS if groups.get(g)}
     if counts:
+        full = sec["stories"].get("full") or sec["stories"].get("all") or []
         lead.append({"fact": "stories", "by_group": counts,
-                     "top_story": sec["stories"]["full"][0]["key"]})
+                     "plan": sec["stories"].get("plan_counts"),
+                     "top_story": full[0]["key"] if full else None})
     if sec["plumbing"].get("themes"):
         lead.append({"fact": "plumbing_themes",
                      "themes": [t.get("title_hint") for t in sec["plumbing"]["themes"]],
@@ -1521,7 +1630,8 @@ def outline(views, cadence="month", automation=()):
     coming = _finish_coming(coming, caps)
     plumbing, pparts = merged(section_plumbing, ("prs", "themes"), caps,
                               automation=automation)
-    ownership, _ = merged(section_ownership, ("events", "without_owner"))
+    ownership, oparts = merged(section_ownership, ("events", "unattributed", "without_owner",
+                                                   "start_without_owner", "labelled_items"))
     if len(pparts) == 1:
         plumbing.update({k: pparts[0].get(k) for k in ("merged_prs", "plumbing_prs",
                                                        "classified", "share", "by_class")})
@@ -1600,6 +1710,9 @@ def marker_problems(text):
 # and the reason: `<!-- story pending: <key> — <reason> -->`. It is listed in
 # `stories_pending` and is not missing; a story neither written nor pending is.
 _PENDING_RE = re.compile(r"<!--\s*story pending:\s*(\S+)\s*(?:—|-|:)\s*(\S.*?)\s*-->")
+# A plumbing theme whose narrative is not (yet) written:
+# `<!-- theme pending: <theme id> — <reason> -->`.
+_THEME_PENDING_RE = re.compile(r"<!--\s*theme pending:\s*(\S+)\s*(?:—|-|:)\s*(\S.*?)\s*-->")
 _STORY_BLOCK_RE = re.compile(r"<!--\s*story:\s*(\S+)\s*-->(.*?)<!--\s*/story\s*-->", re.S)
 _OMITTED_RE = re.compile(r"<!--\s*omitted:\s*([a-z_]+)\s*(?:—|-|:)\s*(\S.*?)\s*-->")
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
@@ -1829,6 +1942,12 @@ def _module_index(views):
                             rp.add(part.strip())
                 vs.discard(None)
         rt.extend(pr.get("title") or "" for pr in v.get("prs") or [])
+        mo = v.get("module_ownership") or {}
+        for k in ("events", "without_owner", "start_without_owner", "labelled_items"):
+            # the modules the ownership fact names are modules of the repository
+            for e in mo.get(k) or []:
+                if isinstance(e, dict) and e.get("module"):
+                    rp.add(e["module"])
         for iss in v.get("issues") or []:
             # the module an issue form names (the thin-story module evidence)
             mm = _ISSUE_MODULE_RE.search(iss.get("body") or "")
@@ -1929,11 +2048,15 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     # 1. story blocks: checked against their own slices, then blanked
     stories, not_checked, not_in_outline, duplicate, seen = {}, [], [], [], set()
     multi = len(views) > 1
-    story_ids = {story_key_norm(s["key"]) for s in sec["stories"].get("full") or []} | \
+    story_ids = {story_key_norm(s["key"]) for s in sec["stories"].get("all") or []} | \
+        {story_key_norm(s["key"]) for s in sec["stories"].get("full") or []} | \
         {story_key_norm(s["key"]) for s in sec["stories"].get("pointers") or []} | \
         {story_key_norm(key) for v in views for key in _story_trains(v, multi)}
     norm_slices = {story_key_norm(k): x for k, x in slices.items()}
-    info = {story_key_norm(r["key"]): r for r in sec["stories"].get("full") or []}
+    info = {story_key_norm(r["key"]): r for r in
+            (sec["stories"].get("all") or sec["stories"].get("full") or [])}
+    theme_titles = {t.get("id"): t.get("title_hint")
+                    for t in sec["plumbing"].get("themes") or []}
     misplaced, state_missing = [], []
     for m in _STORY_BLOCK_RE.finditer(text):
         tid, body = m.group(1), m.group(2).strip()
@@ -1944,8 +2067,10 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
             sid, h3 = _story_place(text, m.start())
             group = row.get("group")
             if group == "plumbing":
-                ok_place = sid == "plumbing"
-                where = "the plumbing section"
+                hint = theme_titles.get(row.get("theme"))
+                ok_place = sid == "plumbing" and (
+                    not hint or (h3 or "").lower().startswith(hint.lower()))
+                where = "the plumbing section" + (", under ### " + hint if hint else "")
             else:
                 label = GROUP_HEADINGS.get(group, "")
                 ok_place = sid == "stories" and (h3 or "").lower().startswith(label.lower())
@@ -1969,6 +2094,9 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
             if tid not in not_checked:
                 not_checked.append(tid)
         else:
+            if row is not None and story_links(row):
+                sl = dict(sl, newsletter_links=sorted(
+                    set(sl.get("newsletter_links") or []) | set(story_links(row))))
             r = link.check_story_evidence(sl, body)
             r = {k: x for k, x in r.items() if x or k == "ok"}
             prev = stories.get(tid)
@@ -1982,6 +2110,32 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                               if story_key_norm(r["key"]) not in written
                               and story_key_norm(r["key"]) not in pending]
     res["stories_pending"] = sorted(pending)
+    # a stalled train carried over is one line: its link appears in the issue
+    res["story_lines_missing"] = [
+        r["key"] for r in sec["stories"].get("lines") or []
+        if r.get("url") and r["url"] not in text and story_key_norm(r["key"]) not in pending]
+    # every plumbing theme has its narrative (a `###` heading in the plumbing
+    # section) or a pending marker; a written theme names each of its trains
+    plumbing_chunk = "".join(c for sid_, c in _section_chunks(text) if sid_ == "plumbing")
+    h3s = [h.strip().strip("*_").lower()
+           for h in re.findall(r"^###\s+(.+?)\s*$", plumbing_chunk, re.M)]
+    theme_pending = {m.group(1) for m in _THEME_PENDING_RE.finditer(text)}
+    written_themes, themes_missing = set(), []
+    for th in sec["plumbing"].get("themes") or []:
+        hint = (th.get("title_hint") or "").lower()
+        if hint and any(h.startswith(hint) for h in h3s):
+            written_themes.add(th.get("id"))
+        elif th.get("id") not in theme_pending:
+            themes_missing.append(th.get("id"))
+    res["themes_missing"] = themes_missing
+    res["themes_pending"] = sorted(theme_pending)
+    res["theme_trains_missing"] = [
+        {"key": r["key"], "theme": r.get("theme")}
+        for r in sec["stories"].get("in_theme") or []
+        if r.get("theme") in written_themes
+        and not (r.get("url") and r["url"] in plumbing_chunk)
+        and not any(re.search(r"(?<![\w/.&])#{}\b".format(n), plumbing_chunk) or
+                    "/pull/{})".format(n) in plumbing_chunk for n in r.get("prs") or [])]
     res.update(stories=stories, stories_not_checked=not_checked,
                stories_not_in_outline=not_in_outline, stories_duplicate=duplicate,
                stories_misplaced=misplaced, stories_state_missing=state_missing,
@@ -2296,8 +2450,9 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     owned = {}
     for v in views:
         mo = v.get("module_ownership") or {}
-        owned[_slug(v)] = {e.get("module") for e in (mo.get("events") or []) +
-                           (mo.get("without_owner") or []) if isinstance(e, dict)}
+        owned[_slug(v)] = {e.get("module") for k in ("events", "without_owner",
+                                                     "start_without_owner", "labelled_items")
+                           for e in mo.get(k) or [] if isinstance(e, dict)}
     not_linked, ver_not_linked, no_status, not_owned = [], [], [], []
     for sid, chunk in _section_chunks(no_quotes):
         if sid not in LINKED_SECTIONS and sid not in RELEASE_SECTIONS:
@@ -2399,7 +2554,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                                    if re.search(r"\b" + re.escape(w) + r"\b", low)]
 
     fail_keys = ("stories_not_checked", "stories_not_in_outline", "stories_duplicate",
-                 "stories_missing",
+                 "stories_missing", "story_lines_missing", "themes_missing",
+                 "theme_trains_missing",
                  "stories_misplaced", "stories_state_missing", "modules_not_linked",
                  "versions_not_linked", "release_status_missing", "ownership_not_in_view",
                  "automation_as_person",
