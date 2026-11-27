@@ -1418,9 +1418,10 @@ _PR_ACTIVITY_FACT_KEYS = {"collected", "gathered_at", "limits", "requests",
 _PR_ACTIVITY_ROW_KEYS = {"number", "checks_status", "checks_reason", "head",
                          "commits_total", "commits", "threads_total", "threads",
                          "threads_omitted", "events", "events_omitted",
-                         "gathered_at"}
+                         "gathered_at", "history_status", "history_reason",
+                         "head_repo", "is_fork"}
 _PR_ACTIVITY_COMMIT_KEYS = {"sha", "committed_at", "rollup", "state", "checks",
-                            "checks_omitted"}
+                            "checks_omitted", "state_only"}
 _PR_ACTIVITY_CHECK_KEYS = {"name", "kind", "status", "conclusion", "started_at",
                            "completed_at", "url"}
 _PR_ACTIVITY_THREAD_KEYS = {"comment_id", "path", "line", "resolved",

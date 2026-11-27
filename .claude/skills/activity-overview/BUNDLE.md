@@ -1350,8 +1350,13 @@ silence_days}}`.
     ten), `rollup: "unavailable"`, `head: null` and a `reason`; `commits_incomplete`
     counts the covered commits whose checks were only partly read (their result is
     `incomplete`), so the history read is complete only without it;
+    A PR row of the outcome adds `head_repo` and `is_fork` when the view's PR carries them
+    ("from a fork of …"; `head_repo` null with `is_fork` true: the fork was deleted).
     `{status: capped|failed|not_found|not_requested, reason?, gathered_at}` when
-    the checks were not read; the string `"not gathered"` when the view has no such row);
+    the checks were not read; the string `"not gathered"` when the view has no such row;
+    `awaiting_approval` — the head's checks whose run waits for a maintainer's approval,
+    `action_required`, e.g. a first-time contributor's fork — and `history_status` when
+    not every commit was read);
     an open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;
   - `ball` — **who the next move is with, DERIVED by rule** from the sequence of recorded
     events, never from anyone's words (`derived: true`; `link.ball_with`), with the
@@ -1366,7 +1371,9 @@ silence_days}}`.
     `awaiting merge`; **R4 reviewer moved** — otherwise: `awaiting author`; **R5 failing
     checks** — when R2 or R3 fired and the head commit's checks are failing as of the
     instant (the item's `checks`), the next move is the author's: `awaiting author`, with
-    `checks_basis` `{head, failing}` (R1 and R4 stand). A `checks` item is never the last
+    `checks_basis` `{head, failing}` (R1 and R4 stand); **R6 checks awaiting approval** —
+    as R5, but every failing check waits for a maintainer's approval to run: `awaiting
+    maintainer`. A `checks` item is never the last
     event; a `review_requested` event names its requested reviewer for R2. For an open
     issue with no open PR: **I1** the reporter moved last: `awaiting maintainer
     response`; **I2** someone else named people: `awaiting mentioned`; **I3** otherwise
@@ -1455,6 +1462,19 @@ without the clone):
          {"number": 6974, "status": "missing"}]}
 ```
 
+- **The whole record** — gather passes `all_prs`: every PR with commits of its own is
+  walked (not only the discussed ones), every commit of it; the walks' caps are safety
+  caps (`ACTIVITY_PR_HISTORY_MAX_PRS`, default 2,000 PRs; `ACTIVITY_PR_HISTORY_MAX_COMMITS`,
+  default 1,000 commits per PR; `PR_HISTORY_MAX_COMMITS` 1,000 listed; narrative 400,000
+  characters and responses 100,000 per PR; patch excerpts 200,000), each with a count of
+  what it left out. Fork PRs need nothing special: `refs/pull/<N>/head` lives in the base
+  repository, so a fork's commits, a deleted fork's, a closed PR's and commits by authors
+  with no login are read like any other.
+- `replaced` — per force-push of the PR (from `pr_activity`): `{at, actor, before, after,
+  status: read|unavailable, commits?, commits_omitted?, reason?}`: the commits the push
+  replaced (reachable from `before`, not from `after` nor the walked branch; subject, body,
+  paths; at most `PR_HISTORY_REPLACED_MAX` 100), the `before` commit fetched by sha when
+  the clone lacks it; `unavailable` with the reason when GitHub no longer serves it.
 - `status` — `fetched`, `missing` (no `refs/pull/<N>/head` on the remote), `fetch_failed`
   / `log_failed` (with `reason`). `on_base: true` when the head is on the walked branch (a
   merge-commit merge: the base walk already has its commits).
@@ -1560,6 +1580,23 @@ no gather stored it (a store gathered before it, every fixture bundle):
   `renamed`, `convert_to_draft`, `review_requested`, `review_request_removed`,
   `review_dismissed`, `head_ref_force_pushed` (the latest `PR_EVENTS_MAX` 100,
   `events_omitted`); a force-push gains `before` / `after` from the GraphQL read.
+- **Every commit** (`collect_check_history`, the second phase): when a PR has more
+  commits than the latest 10, the older ones are read in pages of
+  `PR_CHECKS_HISTORY_PAGE` (100) with GitHub's roll-up state only — rows `{sha,
+  committed_at, state, rollup, checks: [], state_only: true}` (`rollup` from the state:
+  success passing, failure / error failing, pending / expected pending) — and the check
+  contexts of every commit whose state is not a success are then read
+  (`PR_CHECKS_DETAIL_BATCH` 20 commits per request, the flag dropped); a commit cut at 50
+  contexts without a visible failure is paged to the end (at most
+  `PR_CHECKS_MAX_CONTEXTS` 500), so `incomplete` is left only where a cap or a failed
+  request stopped the read. `history_status` (only for a PR with older commits):
+  `complete`, `capped` (`ACTIVITY_PR_CHECKS_MAX_COMMITS`, default 1,000 per PR, or the
+  window's `ACTIVITY_PR_CHECKS_MAX_REQUESTS`, default 400; `history_reason`) or `failed`
+  (`history_reason`). Cost: a page about 1 point, a detail request about 1 point. October
+  2026 of Azure/bicep-registry-modules (160 PRs, 1,284 commits, 28 PRs with more than 10):
+  about 31 page requests and about 15 detail requests (38 % of the commits read in full
+  were not passing) on top of the 16 first-phase requests / 96 points — about 63 requests
+  and 150 points, well inside the built-in CI token's 1,000 points an hour.
 - `requests` / `points` — the GraphQL requests made and the rate-limit points they cost.
 - `{"collected": false}` is never written: `--no-pr-checks` still stores the events.
 

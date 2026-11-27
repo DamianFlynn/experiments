@@ -3708,8 +3708,7 @@ def _activity_items(pr, row, instant):
                and _not_after(c.get("committed_at"), instant)]
     head = commits[-1]["sha"] if commits else None
     for c in commits:
-        roll = gather.checks_rollup(c.get("checks"), as_of=instant,
-                                    omitted=c.get("checks_omitted") or 0)
+        roll = _commit_rollup(c, instant)
         if roll["rollup"] == "none" and not c.get("checks"):
             continue
         it = {"at": _check_item_time(c.get("checks"), c.get("committed_at"),
@@ -3723,10 +3722,33 @@ def _activity_items(pr, row, instant):
             it["pending"] = roll["pending"]
         if c.get("checks_omitted"):
             it["checks_omitted"] = c["checks_omitted"]
+        if roll["awaiting_approval"]:
+            it["awaiting_approval"] = roll["awaiting_approval"]
+        if roll.get("state_only"):
+            it["state_only"] = True
         if c["sha"] == head:
             it["head"] = True
         out.append(it)
     return out
+
+
+def _commit_rollup(c, instant):
+    """checks_rollup of one pr_activity commit as of the instant, plus
+    `awaiting_approval` (checks whose conclusion is action_required: they
+    wait for a maintainer to approve the run, e.g. a first-time
+    contributor's fork). A commit read by its roll-up state only
+    (`state_only`: an older commit whose state was a success) keeps that
+    state, as gathered (`state_only: true`)."""
+    if c.get("state_only"):
+        return {"rollup": c.get("rollup") or "none", "failing": [], "pending": [],
+                "passing": 0, "awaiting_approval": [], "state_only": True}
+    roll = gather.checks_rollup(c.get("checks"), as_of=instant,
+                                omitted=c.get("checks_omitted") or 0)
+    roll["awaiting_approval"] = sorted({
+        k.get("name") or "?" for k in c.get("checks") or []
+        if isinstance(k, dict) and k.get("conclusion") == "action_required"
+        and _not_after(k.get("completed_at") or k.get("started_at"), instant)})
+    return roll
 
 
 def checks_outcome(row, instant, pr_url=None):
@@ -3760,10 +3782,13 @@ def checks_outcome(row, instant, pr_url=None):
                          "committed after the as-of instant")
         return out
     c = commits[-1]
-    roll = gather.checks_rollup(c.get("checks"), as_of=instant,
-                                omitted=c.get("checks_omitted") or 0)
+    roll = _commit_rollup(c, instant)
     out.update(head=c["sha"], rollup=roll["rollup"], failing=roll["failing"],
                pending=roll["pending"], passing=roll["passing"])
+    if roll["awaiting_approval"]:
+        out["awaiting_approval"] = roll["awaiting_approval"]
+    if row.get("history_status") and row["history_status"] != "complete":
+        out["history_status"] = row["history_status"]
     if pr_url:
         out["head_url"] = "{}/commits/{}".format(pr_url, c["sha"])
     if c.get("checks_omitted"):
@@ -3775,9 +3800,8 @@ def checks_outcome(row, instant, pr_url=None):
         out["completed_after_as_of"] = late
     # per-commit completeness of the history read: a covered commit whose
     # checks were only partly read has no complete result
-    partial = sum(1 for x in commits if gather.checks_rollup(
-        x.get("checks"), as_of=instant,
-        omitted=x.get("checks_omitted") or 0)["rollup"] == "incomplete")
+    partial = sum(1 for x in commits
+                  if _commit_rollup(x, instant)["rollup"] == "incomplete")
     if partial:
         out["commits_incomplete"] = partial
     return out
@@ -4095,6 +4119,9 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None):
       the PR): when R2 or R3 fired and the head commit's checks are failing
       as of the instant, the next move is the author's -> `awaiting author`
       (`checks_basis` {head, failing}); R1 (somebody was named) and R4 stand.
+    - R6 checks awaiting approval: as R5, but every failing check is one
+      whose run waits for a maintainer's approval (`action_required`, e.g.
+      a first-time contributor's fork) -> `awaiting maintainer`.
     Automation items (check results) are never the last event.
     Returns {state, with, rule, basis: {at, kind, actor, url}, derived:
     true}, or None when the PR has no recorded event."""
@@ -4126,7 +4153,15 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None):
             "R4 reviewer moved"
     out = {"state": state, "with": who, "rule": rule,
            "basis": _event_ref(last, actor), "derived": True}
+    waiting = set((checks or {}).get("awaiting_approval") or [])
     if rule in ("R2 author moved", "R3 approved") and checks \
+            and checks.get("rollup") == "failing" and waiting \
+            and set(checks.get("failing") or []) <= waiting:
+        out.update(state="awaiting maintainer", rule="R6 checks awaiting approval",
+                   checks_basis={"head": checks.get("head"),
+                                 "awaiting_approval": sorted(waiting)})
+        out["with"] = []
+    elif rule in ("R2 author moved", "R3 approved") and checks \
             and checks.get("rollup") == "failing":
         out.update(state="awaiting author", rule="R5 failing checks",
                    checks_basis={"head": checks.get("head"),
@@ -4478,6 +4513,11 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
             row["merged"] = bool(rec.get("merged"))
             if rec.get("merged_at"):
                 row["merged_at"] = rec["merged_at"]
+            if "is_fork" in rec:
+                # "from a fork of ...": the head branch's repository (null:
+                # the fork was deleted)
+                row["head_repo"] = rec.get("head_repo")
+                row["is_fork"] = rec["is_fork"]
             verdicts = _latest_verdicts(rec, instant)
             row["reviews"] = {
                 "verdicts": [{"reviewer": r, "state": v.get("state"),
@@ -5051,6 +5091,21 @@ def _null_collections_to_empty(bundle):
     return bundle
 
 
+def annotate_pr_forks(bundle):
+    """`is_fork` on every PR row that carries `head_repo` (gather records
+    the head branch's repository): true when it is another repository than
+    the view's, or null — GitHub nulls a deleted head repository, and only
+    a fork's can be deleted while the PR exists. Rows without `head_repo`
+    (older stores, fixtures) are unchanged. In place."""
+    meta = bundle.get("meta") or {}
+    slug = "{}/{}".format(meta.get("owner"), meta.get("repo")).lower()
+    for p in bundle.get("prs") or []:
+        if isinstance(p, dict) and "head_repo" in p:
+            head = p.get("head_repo")
+            p["is_fork"] = head is None or head.lower() != slug
+    return bundle
+
+
 def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the window narrative projections (timeline/feature_deltas) and Phase 3b
@@ -5074,6 +5129,7 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     bundle.setdefault("artifacts", {})
     bundle.setdefault("people", {})
     attach_commit_prs(bundle["commits"])
+    annotate_pr_forks(bundle)
     bundle["trains"] = build_trains(bundle)
     bundle["buckets"] = compute_buckets(bundle, matchers)
     link_symbol_identity(bundle)   # Phase 3e: window-wide symbol moves over the ledger

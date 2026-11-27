@@ -617,8 +617,12 @@ area count that `tier` uses), and every slice carries the whole conversation as 
 The timeline's PR commits come from gather: a squash-merging repository keeps one commit per
 PR on its mainline, so gather fetches every window PR's `refs/pull/<N>/head` into
 `refs/remotes/pr/<N>` of the clone (one `git ls-remote`, then `git fetch --filter=blob:none`
-in batches of 100) and walks the `.bicep` / `.tf` diffs between the commits of the 40 most
-discussed PRs. Measured on `Azure/bicep-registry-modules` (a blobless clone shallow since
+in batches of 100) and walks the `.bicep` / `.tf` diffs between the commits of every PR
+(the whole record; earlier versions walked only the 40 most discussed PRs, which is
+what the first measurements below are of). Every PR and commit on October 2026 (160 PRs,
+1,280 commits, 32 force-pushes of which 21 replaced histories could still be fetched):
+296 s into the clone used for September (fetching October's refs and blobs), a 9.9 MB
+`pr_history` fact against 2.3 MB for the 40-PR walk. Measured on `Azure/bicep-registry-modules` (a blobless clone shallow since
 2026-07-25): September 2026, 142 PRs — 42 s, the clone's `.git` from 13.5 MB to 23.1 MB (the
 commit and tree history the PR heads reach, plus the blobs the diff walk read), 1,092 PR
 commits, notes for 40 PRs, a 1.1 MB fact; October 2026 into the same clone, 160 PRs — 11 s,

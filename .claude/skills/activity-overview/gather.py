@@ -2385,19 +2385,26 @@ def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
 # Refspecs per `git fetch`. One fetch per batch keeps the command line short and
 # lets one failed batch be recorded without losing the others.
 PR_HISTORY_FETCH_BATCH = 100
+# The whole record (issue #97: "we need all the commits"): every PR of the
+# window and every commit of it is walked; the caps below are safety caps,
+# set high, each with a count of what it left out. ACTIVITY_PR_HISTORY_MAX_PRS
+# / ACTIVITY_PR_HISTORY_MAX_COMMITS override the PR and per-PR commit caps
+# of the walks. Replaced commits (force-pushes): at most
+# PR_HISTORY_REPLACED_MAX per push are listed.
+PR_HISTORY_REPLACED_MAX = 100
 # Commits kept per PR (oldest first); the rest are counted in commits_omitted.
 # GitHub's own PR commit list stops at 250.
-PR_HISTORY_MAX_COMMITS = 250
+PR_HISTORY_MAX_COMMITS = 1000
 # The comment / parameter walk (a `git log -p` over the PR's commits, which
 # fetches the blobs of the .bicep / .tf files they touch) runs only for PRs
 # with human conversation (the gather-time sign of a story), at most this many
 # PRs per window, the most discussed first ...
-PR_HISTORY_NOTES_MAX_PRS = 40
+PR_HISTORY_NOTES_MAX_PRS = 2000
 # ... and only for PRs of at most this many commits.
-PR_HISTORY_NOTES_MAX_COMMITS = 60
+PR_HISTORY_NOTES_MAX_COMMITS = 1000
 # Comment / parameter events kept per PR (the newest; notes_omitted counts the
 # oldest left out). A new module's first commit alone can add a few hundred.
-PR_HISTORY_NOTES_MAX = 400
+PR_HISTORY_NOTES_MAX = 20000
 # The symbol kinds the walk keeps: comments (developer notes, parameter
 # descriptions) and the interface (parameters, Terraform variables, outputs).
 PR_HISTORY_NOTE_SUBKINDS = ("comment", "todo", "param", "variable", "output")
@@ -2424,7 +2431,7 @@ PR_HISTORY_PATCH_PATHSPECS = ("*CHANGELOG.md", ".github/", "utilities/",
 # `patches_omitted` counts the oldest left out).
 PR_HISTORY_PATCH_LINES = 40
 PR_HISTORY_PATCH_LINE_CAP = 500
-PR_HISTORY_PATCH_CHARS = 8000
+PR_HISTORY_PATCH_CHARS = 200000
 # A git trailer line: a hyphenated token (`Co-authored-by`, `Signed-off-by`,
 # `Change-Id`), a colon, a value. "Note: ..." is prose, not a trailer.
 _TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+: \S")
@@ -2608,8 +2615,73 @@ def _human_conversation(pr):
                and not derive.is_bot_login(c.get("author")))
 
 
+def _pr_history_caps(env=None):
+    """(PRs walked per window, commits per walked PR)."""
+    return (_env_int("ACTIVITY_PR_HISTORY_MAX_PRS", PR_HISTORY_NOTES_MAX_PRS, 0, env),
+            _env_int("ACTIVITY_PR_HISTORY_MAX_COMMITS", PR_HISTORY_NOTES_MAX_COMMITS,
+                     1, env))
+
+
+def collect_replaced_commits(row, clone_dir, pushes, base_ref, exclude, run):
+    """For each force-push of a PR (`pushes`: head_ref_force_pushed events
+    with `before` / `after` commits, from `pr_activity`), the commits it
+    replaced: reachable from `before` but not from `after` nor the walked
+    branch, with their subject, body and paths (parse_pr_commits; at most
+    PR_HISTORY_REPLACED_MAX). A `before` commit not in the clone is fetched
+    by sha (`git fetch origin <sha>`: GitHub often still serves a PR's
+    replaced commits); one that cannot be had is `unavailable` with the
+    reason. Sets row["replaced"] = [{at, actor, before, after, status:
+    read|unavailable, [commits], [commits_omitted], [reason]}]."""
+    out = []
+    for e in pushes:
+        before, after = e.get("before"), e.get("after")
+        rec = {k: e.get(k) for k in ("at", "actor", "before", "after")
+               if e.get(k) is not None}
+        if not before or not re.fullmatch(r"[0-9a-f]{40}", before):
+            rec.update(status="unavailable", reason="the push's before commit "
+                       "is not recorded")
+            out.append(rec)
+            continue
+        try:
+            run(["git", "-C", clone_dir, "cat-file", "-e", before + "^{commit}"])
+        except RuntimeError:
+            try:
+                run(["git", "-C", clone_dir, "fetch", "--quiet", "--filter=blob:none",
+                     "--no-tags", "--no-write-fetch-head", "origin", before])
+            except RuntimeError as exc:
+                rec.update(status="unavailable", reason="not fetchable: {}".format(
+                    (str(exc).splitlines() or ["?"])[-1][:200]))
+                out.append(rec)
+                continue
+        nots = [after] if after and re.fullmatch(r"[0-9a-f]{40}", after) else []
+        try:
+            for sha in nots:
+                run(["git", "-C", clone_dir, "cat-file", "-e", sha + "^{commit}"])
+        except RuntimeError:
+            nots = []
+        try:
+            listing = run(["git", "-C", clone_dir, "log", "--date-order", "--reverse",
+                           "--format=" + PR_COMMIT_FORMAT, "--name-only",
+                           "--no-renames"] + list(_WALK_PIN_ARGS)
+                          + [before, "--not", base_ref] + nots + exclude + ["--"])
+        except RuntimeError as exc:
+            rec.update(status="unavailable", reason="log failed: {}".format(
+                (str(exc).splitlines() or ["?"])[-1][:200]))
+            out.append(rec)
+            continue
+        commits = parse_pr_commits(listing)
+        rec["status"] = "read"
+        if len(commits) > PR_HISTORY_REPLACED_MAX:
+            rec["commits_omitted"] = len(commits) - PR_HISTORY_REPLACED_MAX
+            commits = commits[-PR_HISTORY_REPLACED_MAX:]
+        rec["commits"] = commits
+        out.append(rec)
+    if out:
+        row["replaced"] = out
+
+
 def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
-                       base_branch=None):
+                       base_branch=None, all_prs=False, force_pushes=None):
     """The window's `pr_history` fact. All git goes through `run` (default
     run_git, which retries a dropped connection); a refusal is recorded,
     never fatal.
@@ -2639,6 +2711,15 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
        (_collect_pr_patches) and the narrative evidence
        (collect_pr_narrative: code comments, documentation prose and
        interface deltas per commit, and what followed each review comment).
+
+    6. With `force_pushes` ({number: [head_ref_force_pushed events]}, from
+       `pr_activity`), the commits each push replaced
+       (collect_replaced_commits) as row["replaced"].
+
+    `all_prs` (what acquire passes: the whole record) walks every PR with
+    commits of its own, not only those with human conversation; the PR and
+    commit caps of the walks are then ACTIVITY_PR_HISTORY_MAX_PRS /
+    ACTIVITY_PR_HISTORY_MAX_COMMITS.
 
     Returns {"collected": True, "base": base_branch, "prs": [per PR, by
     number], "limits": {...}} or, when the refs cannot be listed,
@@ -2702,21 +2783,23 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
     candidates = sorted(
         (n for n in fetched if rows[n].get("status") == "fetched"),
         key=lambda n: (-_human_conversation(by_number.get(n, {})), n))
+    max_prs, max_commits = _pr_history_caps() if all_prs else (
+        PR_HISTORY_NOTES_MAX_PRS, PR_HISTORY_NOTES_MAX_COMMITS)
     walked = 0
     for n in candidates:
         row = rows[n]
         commits = row.get("commits") or []
+        if force_pushes and force_pushes.get(n):
+            collect_replaced_commits(row, clone_dir, force_pushes[n], base_ref,
+                                     exclude, run)
         if not commits:
             row["notes_skipped"] = "no commits of its own"
-        elif _human_conversation(by_number.get(n, {})) == 0:
+        elif not all_prs and _human_conversation(by_number.get(n, {})) == 0:
             row["notes_skipped"] = "no human conversation"
-        elif len(commits) + row.get("commits_omitted", 0) \
-                > PR_HISTORY_NOTES_MAX_COMMITS:
-            row["notes_skipped"] = "more than {} commits".format(
-                PR_HISTORY_NOTES_MAX_COMMITS)
-        elif walked >= PR_HISTORY_NOTES_MAX_PRS:
-            row["notes_skipped"] = "over the {}-PR cap of the window".format(
-                PR_HISTORY_NOTES_MAX_PRS)
+        elif len(commits) + row.get("commits_omitted", 0) > max_commits:
+            row["notes_skipped"] = "more than {} commits".format(max_commits)
+        elif walked >= max_prs:
+            row["notes_skipped"] = "over the {}-PR cap of the window".format(max_prs)
         else:
             walked += 1
             try:
@@ -2801,12 +2884,12 @@ PR_ADR_DIRS = ("adr", "adrs", "decisions", "docs/adr", "docs/decisions")
 # comment (`truncated_from`), documentation lines kept (added + removed;
 # `lines_omitted`), interface rows kept (`interface_omitted`), module files
 # whose interface is read.
-PR_NARRATIVE_COMMENTS = 25
+PR_NARRATIVE_COMMENTS = 200
 PR_NARRATIVE_COMMENT_CHARS = 500
-PR_NARRATIVE_DOC_LINES = 30
+PR_NARRATIVE_DOC_LINES = 200
 PR_NARRATIVE_LINE_CHARS = 300
-PR_NARRATIVE_INTERFACE_ROWS = 40
-PR_NARRATIVE_INTERFACE_FILES = 10
+PR_NARRATIVE_INTERFACE_ROWS = 400
+PR_NARRATIVE_INTERFACE_FILES = 100
 PR_NARRATIVE_VALUE_CHARS = 200
 PR_NARRATIVE_DESCRIPTION_CHARS = 300
 # A blob larger than this is not read for its interface.
@@ -2816,14 +2899,14 @@ PR_NARRATIVE_BLOB_BYTES = 400000
 # commit of a new module adds every comment and the whole README, which the
 # merged result carries anyway; the rework after a review is what only this
 # history has.
-PR_NARRATIVE_CHARS = 24000
+PR_NARRATIVE_CHARS = 400000
 # Per review comment: commits after it that touched the lines it is on (at
 # most this many), hunks per commit, lines per hunk; per PR a character
 # budget over all responses (`responses_omitted` the latest left out).
 PR_RESPONSE_COMMITS = 3
 PR_RESPONSE_HUNKS = 2
 PR_RESPONSE_LINES = 12
-PR_RESPONSE_CHARS = 12000
+PR_RESPONSE_CHARS = 100000
 # Lines either side of a review comment's line that count as "near" it.
 PR_RESPONSE_NEAR = 3
 # The sections an automated README generator writes (headings compared
@@ -7298,6 +7381,26 @@ PR_FORCE_PUSHES_LAST = 20
 # then the most discussed (the story candidates), then the newest; the rest
 # are `checks_status: capped`. 200 PRs = 20 requests.
 PR_CHECKS_MAX_PRS = 200
+# Every commit of a PR (issue #97: "we need all the commits"): the commits
+# before the latest PR_CHECKS_COMMITS are read in pages of
+# PR_CHECKS_HISTORY_PAGE with GitHub's roll-up STATE only (one point per
+# page: no nested connection), and their check contexts are then read only
+# where the state is not a success (`PR_CHECKS_DETAIL_BATCH` commits per
+# request, about one point). A commit whose contexts were cut at
+# PR_CHECKS_CONTEXTS without a visible failure is paged to the end (at
+# most PR_CHECKS_MAX_CONTEXTS), so a partial page is read rather than
+# reported `incomplete`. Caps: commits per PR (ACTIVITY_PR_CHECKS_MAX_COMMITS)
+# and requests of this second phase per window
+# (ACTIVITY_PR_CHECKS_MAX_REQUESTS); what a cap leaves out is recorded per PR
+# (`history_status: capped`).
+PR_CHECKS_HISTORY_PAGE = 100
+PR_CHECKS_DETAIL_BATCH = 20
+PR_CHECKS_MAX_COMMITS = 1000
+PR_CHECKS_MAX_CONTEXTS = 500
+PR_CHECKS_MAX_REQUESTS = 400
+PR_CHECKS_HISTORY_STATUSES = ("complete", "capped", "failed")
+_STATE_ROLLUP = {"success": "passing", "failure": "failing", "error": "failing",
+                 "pending": "pending", "expected": "pending"}
 # Requests in a row that failed before the rest are given up (`failed`).
 PR_ACTIVITY_FAILURE_STOP = 3
 # Lifecycle events kept per PR (the latest; `events_omitted` the rest).
@@ -7320,7 +7423,7 @@ _PR_ACTIVITY_FIELDS = (
     "number headRefOid "
     "commits(last: {commits}) {{ totalCount nodes {{ commit {{ oid committedDate "
     "statusCheckRollup {{ state contexts(first: {contexts}) {{ totalCount "
-    "pageInfo {{ hasNextPage }} nodes {{ __typename "
+    "pageInfo {{ hasNextPage endCursor }} nodes {{ __typename "
     "... on CheckRun {{ name status conclusion startedAt completedAt detailsUrl }} "
     "... on StatusContext {{ context state createdAt targetUrl }} }} }} }} }} }} }} "
     "reviewThreads(first: {threads}) {{ totalCount nodes {{ isResolved isOutdated "
@@ -7333,6 +7436,217 @@ _PR_ACTIVITY_FIELDS = (
 
 def _pr_checks_max(env=None):
     return _env_int("ACTIVITY_PR_CHECKS_MAX", PR_CHECKS_MAX_PRS, 0, env)
+
+
+def _pr_checks_history_settings(env=None):
+    """(commits per PR, second-phase requests per window)."""
+    return (_env_int("ACTIVITY_PR_CHECKS_MAX_COMMITS", PR_CHECKS_MAX_COMMITS, 0, env),
+            _env_int("ACTIVITY_PR_CHECKS_MAX_REQUESTS", PR_CHECKS_MAX_REQUESTS, 0,
+                     env))
+
+
+_CONTEXT_FIELDS = (
+    "totalCount pageInfo { hasNextPage endCursor } nodes { __typename "
+    "... on CheckRun { name status conclusion startedAt completedAt detailsUrl } "
+    "... on StatusContext { context state createdAt targetUrl } }")
+
+PR_COMMITS_PAGE_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
+  rateLimit { cost remaining }
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      commits(first: %d, after: $cursor) {
+        totalCount pageInfo { hasNextPage endCursor }
+        nodes { commit { oid committedDate statusCheckRollup { state } } }
+      }
+    }
+  }
+}
+""".strip() % PR_CHECKS_HISTORY_PAGE
+
+
+def commit_contexts_query(wanted):
+    """The GraphQL query reading the check contexts of several commits by
+    sha: `c<i>: object(oid: "<sha>") { ... on Commit { statusCheckRollup {
+    state contexts(first: 100[, after: "<cursor>"]) } } }`, one alias per
+    (sha, cursor) of `wanted`. A sha is 40 hex characters and a cursor is
+    written as a JSON string, so neither can break the query. Pure."""
+    lines = ["query($owner:String!, $repo:String!) {",
+             "  rateLimit { cost remaining }",
+             "  repository(owner:$owner, name:$repo) {"]
+    for i, (sha, cursor) in enumerate(wanted):
+        if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+            raise ValueError("not a commit sha: {!r}".format(sha))
+        after = ", after: {}".format(json.dumps(cursor)) if cursor else ""
+        lines.append('    c{0}: object(oid: "{1}") {{ ... on Commit {{ oid '
+                     "statusCheckRollup {{ state contexts(first: 100{2}) {{ {3} }} "
+                     "}} }} }}".format(i, sha, after, _CONTEXT_FIELDS))
+    lines += ["  }", "}"]
+    return "\n".join(lines)
+
+
+class _Budget:
+    """Requests / points of the second phase, against its window cap."""
+
+    def __init__(self, cap):
+        self.cap, self.requests, self.points = cap, 0, 0
+
+    def take(self):
+        if self.requests >= self.cap:
+            return False
+        self.requests += 1
+        return True
+
+    def cost(self, data):
+        c = ((data or {}).get("rateLimit") or {}).get("cost")
+        if isinstance(c, int):
+            self.points += c
+
+
+def _ask(graphql, takes_errors, query, variables):
+    """One GraphQL request; raises on field errors (this phase reads only
+    what it can trust whole)."""
+    errs = []
+    data = graphql(query, variables, errors=errs) if takes_errors \
+        else graphql(query, variables)
+    if errs:
+        raise ValueError(str(errs[0].get("message") or "GraphQL field error"))
+    repo_obj = (data or {}).get("repository")
+    if not isinstance(repo_obj, dict):
+        raise ValueError("no repository in the answer")
+    return data, repo_obj
+
+
+def _read_contexts(graphql, takes_errors, owner, repo, wanted, budget):
+    """{sha: (contexts, omitted)} for [(sha, cursor)]: each commit's
+    contexts from the cursor on (None: from the start), paged until the
+    end or PR_CHECKS_MAX_CONTEXTS; a commit left short keeps `omitted`
+    (count of contexts still unread, at least 1). Requests stop when the
+    budget does; a failed request leaves its commits out."""
+    out, todo = {}, list(wanted)
+    while todo:
+        batch, todo = todo[:PR_CHECKS_DETAIL_BATCH], todo[PR_CHECKS_DETAIL_BATCH:]
+        if not budget.take():
+            break
+        try:
+            data, repo_obj = _ask(graphql, takes_errors, commit_contexts_query(batch),
+                                  {"owner": owner, "repo": repo})
+        except (SystemExit, Exception):  # noqa: BLE001 — record, never fatal
+            continue
+        budget.cost(data)
+        for i, (sha, _cursor) in enumerate(batch):
+            node = repo_obj.get("c{}".format(i)) or {}
+            ctx = (node.get("statusCheckRollup") or {}).get("contexts") or {}
+            got = [x for x in (normalize_check_context(n)
+                               for n in ctx.get("nodes") or []) if x]
+            prev, _ = out.get(sha, ([], 0))
+            got = prev + got
+            info = ctx.get("pageInfo") or {}
+            total = ctx.get("totalCount")
+            if info.get("hasNextPage") and info.get("endCursor") \
+                    and len(got) < PR_CHECKS_MAX_CONTEXTS:
+                out[sha] = (got, 1)
+                todo.append((sha, info["endCursor"]))
+            else:
+                left = 0
+                if info.get("hasNextPage"):
+                    left = max(1, (total or 0) - len(got)) if isinstance(total, int) \
+                        else 1
+                out[sha] = (got, left)
+    return out
+
+
+def collect_check_history(row, n, graphql, owner, repo, budget, max_commits,
+                          takes_errors=None):
+    """Complete one gathered pr_activity row in place (the second phase):
+    the commits before the latest PR_CHECKS_COMMITS, in pages of
+    PR_CHECKS_HISTORY_PAGE with their roll-up `state` (rows `state_only:
+    true`, `rollup` from the state), then the contexts of every commit
+    whose state is not a success, and the remaining contexts of every
+    commit cut at PR_CHECKS_CONTEXTS without a visible failure. Records
+    `history_status` `complete` / `capped` (`max_commits` or the window's
+    request budget reached; `history_reason`) / `failed` (a page failed;
+    `history_reason`) when the PR has older commits; a commit's contexts
+    left short keep `checks_omitted`."""
+    takes_errors = _accepts_errors(graphql) if takes_errors is None else takes_errors
+    commits = row.get("commits") or []
+    known = {c["sha"] for c in commits}
+    total = row.get("commits_total")
+    older = []
+    if isinstance(total, int) and total > len(commits):
+        status, reason, cursor = "complete", None, None
+        while True:
+            if len(older) + len(commits) >= min(total, max_commits):
+                if total > max_commits:
+                    status = "capped"
+                    reason = "commits beyond the per-PR cap of {}".format(max_commits)
+                break
+            if not budget.take():
+                status, reason = "capped", "the window's request budget was spent"
+                break
+            try:
+                data, repo_obj = _ask(graphql, takes_errors, PR_COMMITS_PAGE_QUERY,
+                                      {"owner": owner, "repo": repo, "number": n,
+                                       "cursor": cursor})
+            except (SystemExit, Exception) as err:  # noqa: BLE001
+                status = "failed"
+                reason = (str(err).splitlines() or ["?"])[-1][:200]
+                break
+            budget.cost(data)
+            page = ((repo_obj.get("pullRequest") or {}).get("commits")) or {}
+            stop = False
+            for node in page.get("nodes") or []:
+                c = (node or {}).get("commit") or {}
+                if not c.get("oid"):
+                    continue
+                if c["oid"] in known:
+                    stop = True
+                    break
+                state = _lower((c.get("statusCheckRollup") or {}).get("state"))
+                r = {"sha": c["oid"], "committed_at": c.get("committedDate"),
+                     "rollup": _STATE_ROLLUP.get(state, "none"), "checks": [],
+                     "state_only": True}
+                if state:
+                    r["state"] = state
+                older.append(r)
+                if len(older) + len(commits) >= max_commits:
+                    break
+            info = page.get("pageInfo") or {}
+            if stop or not info.get("hasNextPage") or not info.get("endCursor"):
+                break
+            cursor = info["endCursor"]
+        if status == "complete" and total > max_commits:
+            status = "capped"
+            reason = "commits beyond the per-PR cap of {}".format(max_commits)
+        row["history_status"] = status
+        if reason:
+            row["history_reason"] = reason
+    wanted = [(c["sha"], None) for c in older if c.get("state") not in ("success",
+                                                                       None)]
+    wanted += [(c["sha"], c["_cursor"]) for c in commits
+               if c.get("_cursor") and c.get("rollup") != "failing"]
+    got = _read_contexts(graphql, takes_errors, owner, repo, wanted, budget) \
+        if wanted else {}
+    for c in older + commits:
+        c.pop("_cursor", None)
+        if c["sha"] not in got:
+            continue
+        ctx, left = got[c["sha"]]
+        merged = c.get("checks") or []
+        if c.pop("state_only", False):
+            merged = []
+        names = {(x.get("name"), x.get("kind"), x.get("started_at")) for x in merged}
+        merged = merged + [x for x in ctx if (x.get("name"), x.get("kind"),
+                                              x.get("started_at")) not in names]
+        merged.sort(key=lambda x: (x.get("name") or "", x.get("kind"),
+                                   x.get("started_at") or ""))
+        c["checks"] = merged
+        c["rollup"] = checks_rollup(merged)["rollup"]
+        if left:
+            c["checks_omitted"] = left
+        else:
+            c.pop("checks_omitted", None)
+    row["commits"] = older + commits
 
 
 def pr_activity_query(numbers):
@@ -7489,6 +7803,9 @@ def parse_pr_activity_node(pr_obj):
             row["state"] = _lower(roll["state"])
         if omitted:
             row["checks_omitted"] = omitted
+            cursor = (ctx.get("pageInfo") or {}).get("endCursor")
+            if cursor:
+                row["_cursor"] = cursor     # internal: collect pages the rest
         rows.append(row)
     out["commits"] = rows
     threads = pr_obj.get("reviewThreads") or {}
@@ -7696,6 +8013,18 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
             rows[n]["checks_status"] = "gathered"
             rows[n].update({k: v for k, v in got.items()
                             if v not in (None, []) or k in ("commits", "threads")})
+    # the second phase: every commit of every gathered PR (open PRs first)
+    max_commits, max_requests = _pr_checks_history_settings()
+    budget = _Budget(max_requests)
+    for n in order:
+        if rows[n].get("checks_status") == "gathered":
+            collect_check_history(rows[n], n, graphql, owner, repo, budget,
+                                  max_commits, takes_errors)
+    for r in rows.values():
+        for c in r.get("commits") or []:
+            c.pop("_cursor", None)
+    requests += budget.requests
+    points += budget.points
     return {"collected": True,
             "gathered_at": clock().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limits": {"batch": PR_ACTIVITY_BATCH, "max_prs": max_prs,
@@ -7703,7 +8032,8 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
                        "contexts": PR_CHECKS_CONTEXTS,
                        "threads": PR_THREADS_FIRST,
                        "force_pushes": PR_FORCE_PUSHES_LAST,
-                       "events": PR_EVENTS_MAX},
+                       "events": PR_EVENTS_MAX, "max_commits": max_commits,
+                       "history_requests": max_requests},
             "requests": requests, "points": points,
             "prs": [rows[n] for n in numbers]}
 
@@ -9150,7 +9480,14 @@ def acquire(args, env):
         pr_history = {"collected": False}
     elif walk_clone and prs:
         _started = time.monotonic()
-        pr_history = collect_pr_history(prs, clone_dir, base_branch=base_branch)
+        pushes = {}
+        for r in (pr_activity or {}).get("prs") or []:
+            evs = [e for e in r.get("events") or []
+                   if e.get("event") == "head_ref_force_pushed"]
+            if evs:
+                pushes[r["number"]] = evs
+        pr_history = collect_pr_history(prs, clone_dir, base_branch=base_branch,
+                                        all_prs=True, force_pushes=pushes)
         _rows = pr_history["prs"]
         sys.stderr.write(
             "pr history: {}/{}: {} PR head(s) fetched, {} missing, {} failed, "
