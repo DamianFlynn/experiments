@@ -68,9 +68,9 @@ words ("no new modules this month") when a reader would expect one.
 | module_changes | modules with a reader-facing change (not `plumbing_only`, not new), ordered by the module layer's `product_score` then area, capped (12 monthly / 6 weekly; the rest in `also`); per module: version `from` (version file) → `to` (latest changelog version), `published` / `declared_not_published` / child versions, non-breaking changelog items (capped), interface names, PRs, `breaking` flag, `story` | the grouping words, which items to quote, a "why it matters" line only when the changelog or a story states it |
 | stories | `full` (2 monthly / 1 weekly, by story score; when they all share one outcome and a story with the other outcome is selected, the last full slot goes to it), `pointers` (the rest, then `stories.more`), each with its title, outcome, slice and check commands | the story (the story brief), the one-line pointers |
 | people | `newcomers` (first-ever and returning, with `contribution` — `new_module`, `module_change`, `release`, `docs`, `plumbing`, `open_pr`, `issue` — their merged and open PRs, affiliation with its signal and strength, gap bucket, registry context), `returning_by_gap`, `affiliation` (people, merged PRs and reviews by label with shares), `community`, `maintainers` (reviews, merges of others' PRs, own merges, what they authored by class), `top` (the fame hall with merged PRs by class), `not_named` (do_not_name people left out) | who to thank and how, in one or two sentences each |
-| coming | open PRs with a recorded event in the window, by the derived `ball` of their train slice: `ready` (approved, nothing outstanding, checks not failing), `failing_checks` (rule R5), `needs_first_review`, `awaiting_review`, `other` (counts only), with days since the last event (longest wait first), failing check names, `title_signal: new_module` for a title that proposes a module; `forecast` (likely tier); `quiet` (stories with history and no turn this window) | what a reader can do (review, test, answer) |
+| coming | open PRs with a recorded event in the window, by the derived `ball` of their train slice (every train with PRs is read, a shipped train's open follow-up included): `ready` (the derived state is "awaiting merge": the last event is an approval, nothing outstanding, checks not failing; a retained approval followed by a later push or comment is not ready), every PR's `approved` flag, `failing_checks` (rule R5), `needs_first_review`, `awaiting_review`, `other` (counts only), with days since the last event (longest wait first), failing check names, `title_signal: new_module` for a title that proposes a module; `forecast` (likely tier); `quiet` (stories with history and no turn this window) | what a reader can do (review, test, answer) |
 | plumbing | share, counts by class, the plumbing PRs (sweeps first, by areas touched) | a short paragraph |
-| numbers | `facts` (each from one view key: merged PRs, plumbing share, modules touched / reader-facing / new / with declared breaking changes, versions published, PRs and issues opened, people by affiliation, merged PRs and reviews by affiliation, newcomers, stories, open trains) and `coverage` (what was not gathered or is uncertain) | which figures to show; the coverage notes, all of them |
+| numbers | `facts` (each from one view key: merged PRs, plumbing share, modules touched / reader-facing / new / with declared breaking changes, versions published, PRs and issues opened, people by affiliation, merged PRs and reviews by affiliation, newcomers, stories, open trains) and `coverage` (what was not gathered or is uncertain, including PRs whose checks, review threads or lifecycle events were only partly read) | which figures to show; the coverage notes, all of them |
 
 **Inputs (view keys):** `module_changes` (summary, modules, prs), `module_notes.tags`,
 `stories`, `trains` (story flags, outcome, code areas), `prs` / `issues` (titles, authors,
@@ -134,9 +134,13 @@ issue or first PR; every open PR in "Coming up and stuck" links the PR. Link tex
 
 ## Full stories in the issue
 
-Each full story sits between `<!-- story: <train-id> -->` and `<!-- /story -->`, with its
+Each full story sits between `<!-- story: <key> -->` and `<!-- /story -->`, with its
 bold headline first and its "Where it stands" / "What landed" closing last, exactly as it
-passed `link.py --check-story` against its own slice. A story is not shortened to fit the
+passed `link.py --check-story` against its own slice. The key is the outline's `key`: the
+plain train id in a single-repository issue, `owner/repo:<train-id>` in a multi-repo one
+(train ids are repository-local and can collide). Its slice file is the outline row's
+`slice` target: `<train-id>.slice.json`, or `<owner>__<repo>__<train-id>.slice.json` for a
+qualified key. Each story appears once; a repeated block fails the check. A story is not shortened to fit the
 issue: if the issue is too long, make a full story a pointer instead.
 
 ## Weekly variant
@@ -151,7 +155,7 @@ order and omission rule.
 ## A multi-repo stream (a manifest of module repositories)
 
 Pass every member's linked view (`workspace/view/<owner>__<repo>.json`) to `--outline` and to
-`--check-newsletter`. Every row then carries `repo`; sections are merged across members and
+`--check-newsletter`. Every row then carries `repo`, and every story its qualified `key` (above); sections are merged across members and
 ordered by the same keys (a module is a repository, or a submodule `modules/<name>` inside
 one), so the lead modules are the most substantive across the stream, not per repository.
 Group the changes section by repository when a reader thinks in repositories (one Terraform
@@ -167,12 +171,12 @@ It fails (exit 1) and lists:
 | Key | What |
 |---|---|
 | `sections_missing` / `omitted_section_present` / `sections_out_of_order` / `title_missing` / `intro_missing` | every section is present under its heading or omitted with `<!-- omitted: id — reason -->`; a section the outline omits is not padded; headings in the order above; a `# ` title and an intro |
-| `stories` / `stories_not_checked` / `stories_not_in_outline` | each story block passes `link.py`'s story check against `--slices DIR/<id>.slice.json`; a block without its slice, or for a train that is not a story, fails |
+| `stories` / `stories_not_checked` / `stories_not_in_outline` / `stories_duplicate` | each story block passes `link.py`'s story check against `--slices DIR/<slice file of its key>`; a block without its slice, for a train that is not a story, or repeated (`stories_duplicate`; a failing copy is never hidden by a passing one) fails |
 | `modules_not_in_view` | an AVM module path (or `modules/<name>`) that is not a module, child, code area or path the view's changelogs name |
 | `versions_not_in_view` | a version (x.y.z) in a paragraph naming one module that the module does not know (changelog, tags, version file, children, versions its changelog text names); with no or several modules, a version no module knows |
 | `items_not_in_view` / `urls_not_in_view` | a `#N` that is not a PR or issue of the view; a URL that occurs nowhere in the view |
 | `quotes_not_in_view` | a quoted text ("…", at least 4 characters) that is not verbatim in a view text |
-| `people_not_in_view` / `name_mismatch` / `do_not_name_named` | an `@login` the view does not know; a "Name (@login)" whose name is not the view's; a do_not_name person (by login, or by the registry's name with `--people`) |
+| `people_not_in_view` / `name_mismatch` / `do_not_name_named` | an `@login` the view does not know; a "Name (@login)" or "Name (@login, …)" whose name is not the view's; a do_not_name person (by login, or by the registry's name with `--people`), quotations and code spans included |
 | `affiliation_mismatch` | a sentence saying "community" (or the home organisation's name) about a person with another label — `unknown` included |
 | `candidates_worded_as_declared` | a paragraph with "break", "breaks" or "breaking" about a module whose breaking signal is only a candidate (or a candidate subject the declared text does not cover), with no hedge ("check before upgrading", "candidate", "may", "detected") |
 | `dates_without_year` | a day-and-month date without its year (outside story blocks, which the story check covers) |

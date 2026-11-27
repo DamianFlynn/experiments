@@ -89,8 +89,27 @@ _NO_MODULE_LAYER = ("the view has no module layer (module_notes were not gathere
 # --- small helpers ------------------------------------------------------------
 
 def _slug(view):
+    """`owner/repo` of a view. A manifest member's view already carries the
+    qualified `owner/repo` as `meta.repo` (its `meta.owner` is the project):
+    keep it; prepend the owner only to a bare repository name."""
     m = view.get("meta") or {}
-    return "{}/{}".format(m.get("owner"), m.get("repo"))
+    repo = m.get("repo") or ""
+    if "/" in repo:
+        return repo
+    return "{}/{}".format(m.get("owner"), repo)
+
+
+def story_key(view, train_id, multi):
+    """The identity of a story in an issue: the plain train id for a single
+    repository; `owner/repo:train-id` in a multi-repo issue, where train ids
+    (repository-local) can collide."""
+    return "{}:{}".format(_slug(view), train_id) if multi else train_id
+
+
+def slice_filename(key):
+    """The slice file of a story key: `<train-id>.slice.json`, or
+    `<owner>__<repo>__<train-id>.slice.json` for a qualified key."""
+    return key.replace("/", "__").replace(":", "__") + ".slice.json"
 
 
 def _period(view):
@@ -172,9 +191,11 @@ def _with_repo(row, repo, multi):
     return row
 
 
-def _story_trains(view):
+def _story_trains(view, multi=False):
+    """The story keys of a view (story_key), selected then more."""
     st = view.get("stories") or {}
-    return [s["id"] for s in (st.get("selected") or []) + (st.get("more") or [])]
+    return [story_key(view, s["id"], multi)
+            for s in (st.get("selected") or []) + (st.get("more") or [])]
 
 
 def _train_title(view, train):
@@ -192,12 +213,14 @@ def _train_title(view, train):
     return None, None
 
 
-def _module_story(view, numbers):
-    """The story train (selected or more) holding one of these PR numbers."""
+def _module_story(view, numbers, multi=False):
+    """The story (selected or more) holding one of these PR numbers, as its
+    story key."""
     trains = {t["id"]: t for t in view.get("trains") or []}
-    for tid in _story_trains(view):
-        if set(trains.get(tid, {}).get("prs") or []) & set(numbers):
-            return tid
+    st = view.get("stories") or {}
+    for s in (st.get("selected") or []) + (st.get("more") or []):
+        if set(trains.get(s["id"], {}).get("prs") or []) & set(numbers):
+            return story_key(view, s["id"], multi)
     return None
 
 
@@ -228,12 +251,14 @@ def section_breaking(view, multi=False):
     declared, candidates, deps, notices = [], [], [], []
     for m in mc.get("modules") or []:
         brk = m.get("breaking") or {}
-        published = set(_own_published(m))
+        published = {(p.get("module") or m["area"], _bare(p.get("version")))
+                     for p in (m.get("versions") or {}).get("published") or []}
         texts = " ".join(d.get("text") or "" for d in brk.get("declared") or [])
         if brk.get("declared"):
             items = [{"version": d.get("version"), "text": d.get("text"),
                       "module": d.get("module"),
-                      "published": d.get("version") in published,
+                      "published": (d.get("module") or m["area"],
+                                    _bare(d.get("version"))) in published,
                       "url": ((d.get("sources") or [{}])[0]).get("url")}
                      for d in brk["declared"]]
             declared.append(_with_repo({
@@ -241,7 +266,8 @@ def section_breaking(view, multi=False):
                 "versions": sorted({i["version"] for i in items if i["version"]},
                                    key=_vkey),
                 "items": items,
-                "story": _module_story(view, [p.get("number") for p in m.get("prs") or []]),
+                "story": _module_story(view, [p.get("number") for p in m.get("prs") or []],
+                                       multi),
             }, repo, multi))
         if brk.get("candidates"):
             candidates.append(_with_repo({
@@ -331,7 +357,7 @@ def section_new_modules(view, caps, multi=False):
                                                 if x["number"] == p), {})).get("url")}
                     for p in prs],
             "delivered_by": _delivered_by(view, prs),
-            "story": _module_story(view, prs),
+            "story": _module_story(view, prs, multi),
         }, repo, multi))
     child = [_with_repo(dict(c), repo, multi) for c in summ.get("new_child_modules") or []]
     out = {"modules": rows, "child_modules": child, "omit": None}
@@ -353,7 +379,7 @@ def _version_row(m):
                     if p.get("module") and p.get("module") != m.get("area")})
     if child:
         row["child_published"] = [{"module": a, "version": b} for a, b in child]
-    for k in ("declared_not_published", "published_not_declared"):
+    for k in ("declared_not_published", "published_not_declared", "releases"):
         if v.get(k):
             row[k] = v[k]
     return row
@@ -403,7 +429,7 @@ def section_module_changes(view, caps, multi=False):
                "prs": prs,
                "breaking": "declared" if brk.get("declared") else
                ("candidate" if brk.get("candidates") else None),
-               "story": _module_story(view, [p["number"] for p in prs])}
+               "story": _module_story(view, [p["number"] for p in prs], multi)}
         names = _interface_names(m)
         if names:
             row["interface"] = names
@@ -429,26 +455,32 @@ def section_stories(views, caps, multi=False):
         for s in (st.get("selected") or []):
             t = trains.get(s["id"], {})
             title, url = _train_title(v, t)
+            key = story_key(v, s["id"], multi)
+            sfile = slice_filename(key)
+            view_file = "VIEW" if not multi else \
+                "workspace/view/{}.json".format(_slug(v).replace("/", "__"))
             rows.append(_with_repo({
-                "id": s["id"], "rank": s.get("rank"), "score": s.get("score"),
+                "id": s["id"], "key": key, "rank": s.get("rank"), "score": s.get("score"),
                 "outcome": t.get("outcome"), "title": title, "url": url,
                 "prs": t.get("prs") or [], "issues": t.get("issues") or [],
                 "modules": [a for a in t.get("code_areas") or []
                             if link.module_kind(a) is not None][:3],
-                "slice": "python3 link.py VIEW --slice {0} > {0}.slice.json".format(s["id"]),
-                "check": "python3 link.py {0}.slice.json --check-story {0}.story.md"
-                         .format(s["id"]),
+                "slice": "python3 link.py {} --slice {} > {}".format(
+                    view_file, s["id"], sfile),
+                "check": "python3 link.py {} --check-story {}".format(
+                    sfile, sfile.replace(".slice.json", ".story.md")),
             }, _slug(v), multi))
         for s in st.get("more") or []:
             t = trains.get(s["id"], {})
             title, url = _train_title(v, t)
-            rows.append(_with_repo({"id": s["id"], "rank": None, "score": s.get("score"),
+            rows.append(_with_repo({"id": s["id"], "key": story_key(v, s["id"], multi),
+                                    "rank": None, "score": s.get("score"),
                                     "outcome": t.get("outcome"), "title": title,
                                     "url": url, "more": True}, _slug(v), multi))
     selected = sorted([r for r in rows if not r.get("more")],
-                      key=lambda r: (-(r["score"] or 0), r["rank"] or 0, r["id"]))
+                      key=lambda r: (-(r["score"] or 0), r["rank"] or 0, r["key"]))
     more = sorted([r for r in rows if r.get("more")],
-                  key=lambda r: (-(r["score"] or 0), r["id"]))
+                  key=lambda r: (-(r["score"] or 0), r["key"]))
     n = caps["stories_full"]
     full = selected[:n]
 
@@ -459,9 +491,10 @@ def section_stories(views, caps, multi=False):
         other = [r for r in selected[n:] if cls(r) != cls(full[0])]
         if other:
             full = full[:-1] + [other[0]]
-    full_ids = {r["id"] for r in full}
-    pointers = [r for r in selected if r["id"] not in full_ids] + more
-    pointers = [{k: r[k] for k in ("id", "title", "url", "outcome", "repo") if k in r}
+    full_keys = {r["key"] for r in full}
+    pointers = [r for r in selected if r["key"] not in full_keys] + more
+    pointers = [{k: r[k] for k in ("id", "key", "title", "url", "outcome", "repo")
+                 if k in r}
                 for r in pointers]
     out = {"full": full, "pointers": pointers[:caps["story_pointers"]],
            "pointers_omitted": max(0, len(pointers) - caps["story_pointers"]),
@@ -646,7 +679,9 @@ def section_coming(view, caps, multi=False):
     groups = {"ready": [], "failing_checks": [], "needs_first_review": [],
               "awaiting_review": [], "other": {}}
     for t in view.get("trains") or []:
-        if t.get("outcome") != "in_flight" or not t.get("prs"):
+        # every train with PRs: a shipped train can hold an open follow-up;
+        # the per-item open state and activity below select
+        if not t.get("prs"):
             continue
         try:
             oc = link.slice_train(view, t["id"])["conversation"]["outcome"]
@@ -675,7 +710,7 @@ def section_coming(view, caps, multi=False):
                    "modules": [a for a in t.get("code_areas") or []
                                if link.module_kind(a) is not None][:3]}
             if t.get("story"):
-                row["story"] = t["id"]
+                row["story"] = story_key(view, t["id"], multi)
             if _NEW_MODULE_TITLE_RE.search(it.get("title") or ""):
                 row["title_signal"] = "new_module"
             row = _with_repo(row, repo, multi)
@@ -684,7 +719,8 @@ def section_coming(view, caps, multi=False):
                 not row["outstanding_change_requests"]
             row["approved"] = approved
             st = ball.get("state")
-            if st == "awaiting merge" or (approved and checks.get("rollup") != "failing"):
+            # the derived next move decides; a retained approval does not
+            if st == "awaiting merge":
                 groups["ready"].append(row)
             elif ball.get("rule") == "R5 failing checks":
                 groups["failing_checks"].append(row)
@@ -796,6 +832,12 @@ def _coverage(view):
                if r.get("checks_status") != "gathered"]
         if bad:
             notes.append("checks not read for {} PR(s)".format(len(bad)))
+        partial = [r.get("number") for r in pa.get("prs") or []
+                   if r.get("checks_status") == "gathered" and _partly_read(r)]
+        if partial:
+            notes.append("checks, review threads or lifecycle events partly read for "
+                         "{} PR(s) (earlier commits, check contexts, threads or events "
+                         "beyond the read limits)".format(len(partial)))
     mc = view.get("module_changes")
     if isinstance(mc, dict):
         inp = mc.get("inputs") or {}
@@ -808,6 +850,17 @@ def _coverage(view):
     else:
         notes.append(_NO_MODULE_LAYER)
     return notes
+
+
+def _partly_read(row):
+    """True when a gathered pr_activity row left something out: earlier
+    commits (commits_total above the commits read), check contexts of a
+    commit, review threads or lifecycle events."""
+    commits = row.get("commits") or []
+    total = row.get("commits_total")
+    return bool((isinstance(total, int) and total > len(commits))
+                or any(c.get("checks_omitted") for c in commits if isinstance(c, dict))
+                or row.get("threads_omitted") or row.get("events_omitted"))
 
 
 def section_numbers(views, multi=False):
@@ -1157,23 +1210,32 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     res = {"ok": True}
 
     # 1. story blocks: checked against their own slices, then blanked
-    stories, not_checked, not_in_outline = {}, [], []
-    story_ids = {s["id"] for s in sec["stories"].get("full") or []} | \
-        {s["id"] for s in sec["stories"].get("pointers") or []} | \
-        {tid for v in views for tid in _story_trains(v)}
+    stories, not_checked, not_in_outline, duplicate, seen = {}, [], [], [], set()
+    multi = len(views) > 1
+    story_ids = {s["key"] for s in sec["stories"].get("full") or []} | \
+        {s["key"] for s in sec["stories"].get("pointers") or []} | \
+        {key for v in views for key in _story_trains(v, multi)}
     for m in _STORY_BLOCK_RE.finditer(text):
         tid, body = m.group(1), m.group(2).strip()
+        if tid in seen and tid not in duplicate:
+            duplicate.append(tid)
+        seen.add(tid)
         if tid not in story_ids:
             not_in_outline.append(tid)
         sl = slices.get(tid)
         if sl is None:
-            not_checked.append(tid)
+            if tid not in not_checked:
+                not_checked.append(tid)
         else:
             r = link.check_story_evidence(sl, body)
-            stories[tid] = {k: x for k, x in r.items() if x or k == "ok"}
+            r = {k: x for k, x in r.items() if x or k == "ok"}
+            prev = stories.get(tid)
+            if prev is not None and not prev.get("ok"):
+                r = prev            # a failing block is never hidden by a later one
+            stories[tid] = r
     body = _STORY_BLOCK_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
     res.update(stories=stories, stories_not_checked=not_checked,
-               stories_not_in_outline=not_in_outline)
+               stories_not_in_outline=not_in_outline, stories_duplicate=duplicate)
 
     # 2. sections: present (heading) or omitted with a reason, in order
     headings = []
@@ -1249,6 +1311,9 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                                                                     m.group(0)), body))
     with_code = _strip(no_quotes, code=False)
     prose = _strip(no_quotes, code=True)
+    # suppression reads the text with its quotations and code spans kept: a
+    # supported quote may still name a do_not_name person
+    quoted_prose = _strip(body, code=False)
 
     # modules: an AVM module path (or a Terraform `modules/<name>` submodule)
     # must be a module, child, code area or path the view's changelogs name
@@ -1288,18 +1353,18 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     # people: known logins, names tied to their login, do_not_name, affiliation words
     mentioned = _LOGIN_RE.findall(prose)
     res["people_not_in_view"] = sorted({m for m in mentioned if m not in people})
-    dnn = sorted({m for m in mentioned if m in hidden})
+    dnn = sorted({m for m in _LOGIN_RE.findall(quoted_prose) if m in hidden})
     for login, name in (registry_names or {}).items():
-        if name and re.search(r"\b" + re.escape(name) + r"\b", prose):
+        if name and re.search(r"\b" + re.escape(name) + r"\b", quoted_prose):
             dnn.append(login)
     for login in hidden:
-        if re.search(r"(?<![\w/@-])" + re.escape(login) + r"(?![\w-])", prose) \
+        if re.search(r"(?<![\w/@-])" + re.escape(login) + r"(?![\w-])", quoted_prose) \
                 and login not in dnn:
             dnn.append(login)
     res["do_not_name_named"] = sorted(set(dnn))
     mismatch = []
     names = {p["name"]: login for login, p in people.items() if p.get("name")}
-    for m in re.finditer(r"\(@([A-Za-z0-9-]+)\)", prose):
+    for m in re.finditer(r"\(@([A-Za-z0-9-]+)[,)]", prose):
         login = m.group(1)
         before = prose[max(0, m.start() - 80):m.start()].split("\n")[-1]
         before = re.sub(r"[*_\[\]]", "", before).rstrip()
@@ -1389,7 +1454,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     res["characterising_words"] = [w for w in CHARACTERISING_WORDS
                                    if re.search(r"\b" + re.escape(w) + r"\b", low)]
 
-    fail_keys = ("stories_not_checked", "stories_not_in_outline", "sections_missing",
+    fail_keys = ("stories_not_checked", "stories_not_in_outline", "stories_duplicate",
+                 "sections_missing",
                  "omitted_section_present", "sections_out_of_order", "title_missing",
                  "intro_missing", "urls_not_in_view", "quotes_not_in_view",
                  "modules_not_in_view", "versions_not_in_view", "items_not_in_view",
@@ -1487,7 +1553,7 @@ def main(argv=None):
     slices = {}
     if "--slices" in opts:
         for m in _STORY_BLOCK_RE.finditer(text):
-            p = os.path.join(opts["--slices"], m.group(1) + ".slice.json")
+            p = os.path.join(opts["--slices"], slice_filename(m.group(1)))
             if os.path.exists(p):
                 slices[m.group(1)] = _load(p)
     names = _registry_hidden(opts["--people"]) if "--people" in opts else None

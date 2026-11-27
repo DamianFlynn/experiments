@@ -13,7 +13,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 import link  # noqa: E402
 import newsletter  # noqa: E402
-from test_story import bundle, enriched, pr, review  # noqa: E402
+from test_story import bundle, comment, enriched, pr, review  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 R = "https://github.com/o/r"
@@ -578,6 +578,139 @@ class TestCheck(unittest.TestCase):
         self.assertTrue(r["stories"]["train-issue-5"]["ok"], r["stories"])
         r = self.check(GOOD.replace("story: train-issue-5", "story: train-nope"))
         self.assertIn("train-nope", r["stories_not_in_outline"])
+
+
+class TestReviewFixes(unittest.TestCase):
+    """The automated-review findings on the first version (one test each)."""
+
+    def check(self, text, views=None, **kw):
+        kw.setdefault("slices", {"train-issue-5": SLICE})
+        return newsletter.check_newsletter(views or [view()], text, **kw)
+
+    # 1
+    def test_duplicate_story_block_keeps_the_failure(self):
+        text = GOOD.replace("<!-- story: train-issue-5 -->",
+                            "<!-- story: train-issue-5 -->\nIt landed.\n<!-- /story -->"
+                            "\n\n<!-- story: train-issue-5 -->", 1)
+        r = self.check(text)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["stories_duplicate"], ["train-issue-5"])
+        self.assertFalse(r["stories"]["train-issue-5"]["ok"])
+
+    # 2
+    def test_suppressed_login_inside_a_supported_quote(self):
+        v = view()
+        v["issues"][0]["body"] = "ping @kim please"
+        r = self.check(GOOD + '\nThe issue said "ping @kim please".\n', views=[v])
+        self.assertEqual(r["quotes_not_in_view"], [])
+        self.assertIn("kim", r["do_not_name_named"])
+        self.assertFalse(r["ok"])
+
+    # 3
+    def _two_repos(self):
+        a, b = view(), view()
+        b["meta"] = dict(b["meta"], repo="s")
+        return a, b
+
+    def test_multi_repo_story_identities_are_qualified(self):
+        a, b = self._two_repos()
+        st = section(newsletter.outline([a, b]), "stories")
+        keys = [x["key"] for x in st["full"]] + [x["key"] for x in st["pointers"]]
+        self.assertEqual(sorted(keys), ["o/r:train-issue-5", "o/r:train-pr-11",
+                                        "o/s:train-issue-5", "o/s:train-pr-11"])
+        self.assertIn("o__s__train-issue-5.slice.json",
+                      next(x for x in st["full"] if x["repo"] == "o/s")["slice"])
+        # single repo keeps the plain id
+        one = section(newsletter.outline([a]), "stories")
+        self.assertEqual(one["full"][0]["key"], "train-issue-5")
+
+    def test_multi_repo_story_blocks_use_their_own_slice(self):
+        a, b = self._two_repos()
+        bad = {"train": {"id": "train-issue-5", "outcome": "in_flight", "evidence": []},
+               "conversation": {"timeline": [], "outcome": {"items": []}}}
+        block = "Something happened.\n\n**What landed.** It landed."
+        text = GOOD.replace(
+            "<!-- story: train-issue-5 -->\n" + block + "\n<!-- /story -->",
+            "<!-- story: o/r:train-issue-5 -->\n" + block + "\n<!-- /story -->\n\n"
+            "<!-- story: o/s:train-issue-5 -->\n" + block + "\n<!-- /story -->")
+        r = newsletter.check_newsletter([a, b], text, slices={
+            "o/r:train-issue-5": SLICE, "o/s:train-issue-5": bad})
+        self.assertTrue(r["stories"]["o/r:train-issue-5"]["ok"])
+        self.assertFalse(r["stories"]["o/s:train-issue-5"]["ok"])
+        self.assertEqual(r["stories_not_in_outline"], [])
+        r = newsletter.check_newsletter([a, b], GOOD, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["stories_not_in_outline"], ["train-issue-5"])
+
+    # 4
+    def test_member_view_slug_is_kept(self):
+        v = view()
+        v["meta"] = dict(v["meta"], owner="avm-tf", repo="Azure/terraform-x")
+        self.assertEqual(newsletter.outline([v])["repos"], ["Azure/terraform-x"])
+
+    # 5
+    def test_child_breaking_published_matches_module_and_version(self):
+        v = view()
+        fac = next(m for m in v["module_changes"]["modules"]
+                   if m["area"] == "avm/res/data/factory")
+        fac["breaking"]["declared"] = [
+            {"version": "0.1.2", "module": "avm/res/data/factory/pipe", "text": "child",
+             "sources": src(10)},
+            {"version": "0.1.2", "text": "parent", "sources": src(10)}]
+        b = section(newsletter.outline([v]), "breaking")
+        items = {i["text"]: i["published"] for i in b["declared"][0]["items"]}
+        self.assertEqual(items, {"child": True, "parent": False})
+
+    # 6
+    def test_release_notes_are_kept_on_the_version_row(self):
+        v = view()
+        rel = [{"tag": "v1.2.0", "url": R + "/releases/tag/v1.2.0",
+                "published_at": "2026-10-05T00:00:00Z", "notes": "Adds a thing."}]
+        m = next(m for m in v["module_changes"]["modules"] if m["area"] == "avm/ptn/net/dns")
+        m["versions"]["releases"] = rel
+        mc = section(newsletter.outline([v]), "module_changes")
+        row = next(x for x in mc["modules"] if x["area"] == "avm/ptn/net/dns")
+        self.assertEqual(row["version"]["releases"], rel)
+
+    # 7
+    def test_open_follow_up_of_a_shipped_train_is_listed(self):
+        iss = {"number": 5, "title": "x", "author": "carol", "url": R + "/issues/5",
+               "state": "closed", "created_at": "2026-05-01T09:00:00Z",
+               "closed_at": "2026-05-06T10:00:00Z", "labels": []}
+        b = enriched(bundle([
+            pr(1, state="closed", merged=True, merged_at="2026-05-06T10:00:00Z",
+               closes=[5]),
+            pr(2, created_at="2026-05-10T10:00:00Z", closes=[5])], issues=[iss]))
+        t = next(t for t in b["trains"] if 2 in t["prs"])
+        self.assertEqual(t["outcome"], "shipped")
+        c = section(newsletter.outline([b]), "coming")
+        self.assertEqual([r["number"] for r in c["needs_first_review"]], [2])
+        self.assertEqual(c["counts"]["open_prs_active"], 1)
+
+    # 8
+    def test_retained_approval_does_not_override_the_next_move(self):
+        b = enriched(bundle([pr(1, created_at="2026-05-03T10:00:00Z",
+                                reviews=[review("bob", "2026-05-10T10:00:00Z", "approved", 1)],
+                                comments_list=[comment("bob", "2026-05-12T10:00:00Z",
+                                                       "One more thing to fix here.", 7)])]))
+        c = section(newsletter.outline([b]), "coming")
+        self.assertEqual(c["ready"], [])
+        self.assertEqual(c["other"], {"awaiting author": 1})
+
+    # 9
+    def test_partial_activity_reads_reach_the_coverage_notes(self):
+        v = view(pr_activity={"collected": True, "prs": [
+            {"number": 10, "checks_status": "gathered", "commits_total": 14,
+             "commits": [{"sha": "a"}, {"sha": "b", "checks_omitted": 3}],
+             "threads_omitted": 2}]})
+        notes = section(newsletter.outline([v]), "numbers")["coverage"]
+        self.assertTrue(any("partly read for 1 PR" in n for n in notes), notes)
+
+    # 10
+    def test_name_check_accepts_a_comma_after_the_login(self):
+        r = self.check(GOOD.replace("Tomaz M (@tomaz)", "Tom Other (@tomaz, community)"))
+        self.assertEqual(r["name_mismatch"][0]["login"], "tomaz")
+        r = self.check(GOOD.replace("Tomaz M (@tomaz)", "Tomaz M (@tomaz, community)"))
+        self.assertEqual(r["name_mismatch"], [])
 
 
 class TestCli(unittest.TestCase):

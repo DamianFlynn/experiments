@@ -89,7 +89,7 @@ First pull requests still open: Chris Bragg (@chbragg, Microsoft), SQL server di
 
 32 open pull requests had activity in October 2026.
 
-- **Ready:** the NetApp `activeDirectorySite` input is approved, with checks passing on its head commit ([#7032](https://github.com/Azure/bicep-registry-modules/pull/7032)).
+- **Likely next:** the NetApp `activeDirectorySite` input is approved with no later change request and checks passing on its head commit ([#7032](https://github.com/Azure/bicep-registry-modules/pull/7032)). It is not ready to merge yet: by the record's sequence of events, its author's latest comment asks someone else to respond.
 - **New modules proposed:** `avm/res/azure-stack-hci/storage-container` ([#7539](https://github.com/Azure/bicep-registry-modules/pull/7539)) and `avm/res/azure-stack-hci/gallery-image` ([#7560](https://github.com/Azure/bicep-registry-modules/pull/7560)) are waiting for a first review; the SQL virtual machine module ([#7485](https://github.com/Azure/bicep-registry-modules/pull/7485)) is waiting for a reviewer.
 - **Checks failing on the head commit:** the end-to-end test fixes [#7449](https://github.com/Azure/bicep-registry-modules/pull/7449) (`Validate e2e resource names offline`), [#7483](https://github.com/Azure/bicep-registry-modules/pull/7483) and [#7527](https://github.com/Azure/bicep-registry-modules/pull/7527) (deployment validation), and the Cosmos DB change feed setting [#7494](https://github.com/Azure/bicep-registry-modules/pull/7494) (`Validate PR title`).
 - **Waiting for a first review:** 11 pull requests, among them the two proposed modules.
@@ -107,4 +107,4 @@ How to help: review a pull request waiting for a first review, or try one of the
 - 23 people opened a pull request or issue: 12 for the first time, 6 back after a gap.
 - 229 people in the month's records: 54 labelled Microsoft, 33 community, 142 (62%) unknown.
 
-*Coverage.* Records as of 31 October 2026; titles and labels as gathered on 27 November 2026. Unknown affiliation is never counted as community. The people registry covers only October 2026, so tenure and roles in other repositories are not given. A version not yet published by 31 October 2026 may have been tagged since.
+*Coverage.* Records as of 31 October 2026; titles and labels as gathered on 27 November 2026. Unknown affiliation is never counted as community. The people registry covers only October 2026, so tenure and roles in other repositories are not given. A version not yet published by 31 October 2026 may have been tagged since. For some pull requests only the latest commits, check results, review threads or events were read.
