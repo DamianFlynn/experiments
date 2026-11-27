@@ -81,11 +81,17 @@ NAMES = {
     "linked item": lambda known: False,
     "mixed": lambda known: False,
     "foreign link": lambda known: False,
+    # the slice's own repository, qualified (slug case differs): its own item
+    "own as owner/repo#N": lambda known: known,
+    "own as mixed-case URL": lambda known: known,
 }
 HEAD = {"no item": "The CI result is not in the record.",
         "own PR": "The CI result of #1 is not in the record.",
         "linked item": "The CI result of #2 is not in the record.",
         "mixed": "The CI results of #1 and #2 are not in the record.",
+        "own as owner/repo#N": "The CI result of O/r#1 is not in the record.",
+        "own as mixed-case URL": "The CI result of https://github.com/O/R/pull/1 "
+                                 "is not in the record.",
         "foreign link": "The CI result of https://github.com/p/s/pull/2 is not "
                         "in the record."}
 HISTORY = {"no item": "The CI results of the earlier pushes are not in the record.",
@@ -94,6 +100,11 @@ HISTORY = {"no item": "The CI results of the earlier pushes are not in the recor
                           "in the record.",
            "mixed": "The CI results of the earlier pushes of #1 and #2 are not "
                     "in the record.",
+           "own as owner/repo#N": "The CI results of the earlier pushes of o/R#1 "
+                                  "are not in the record.",
+           "own as mixed-case URL": "The CI results of the earlier pushes of "
+                                    "https://github.com/O/r/pull/1 are not in the "
+                                    "record.",
            "foreign link": "The CI results of the earlier pushes of p/s#2 are not "
                            "in the record."}
 
@@ -131,6 +142,11 @@ RESOLVED = {"no item": "Whether the review threads were resolved is not recorded
                       "recorded.",
             "linked item": "Whether the review threads of #2 were resolved is "
                            "not recorded.",
+            "own as owner/repo#N": "Whether the review threads of O/R#1 were "
+                                   "resolved is not recorded.",
+            "own as mixed-case URL": "Whether the review threads of "
+                                     "https://github.com/o/R/pull/1 were resolved "
+                                     "is not recorded.",
             "foreign link": "Whether the review threads of "
                             "https://github.com/p/s/pull/2 were resolved is not "
                             "recorded.",

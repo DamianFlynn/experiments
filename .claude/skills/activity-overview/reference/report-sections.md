@@ -361,7 +361,8 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    sentence names (`#N` or a link), refusing only when coverage of every one of them is
    complete — an item the slice holds no coverage for (a linked issue / PR outside the
    train, or any issue / PR of another repository — a link or `owner/repo#N`) is never
-   covered, so a claim naming it always passes; a sentence naming none is
+   covered, so a claim naming it always passes (a link or `owner/repo#N` naming the slice's
+   own repository, in any letter case, is its own `#N`); a sentence naming none is
    refused only when every PR of the slice is covered. The checker never forces a story
    to hide a real coverage limit (the full matrix is pinned in
    `test_story_check_truth_table.py`):

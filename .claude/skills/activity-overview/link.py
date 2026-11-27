@@ -4828,8 +4828,8 @@ _REPLACED_RE = re.compile(r"\b(?:force[- ]?push(?:ed|es)?|replaced|rewritten)\b"
 # Another repository's issue / PR: a github.com link outside the slice's
 # repository, or `owner/repo#N`; marked in the normalised sentence.
 _FOREIGN_ITEM_URL_RE = re.compile(
-    r"https://github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/\d+")
-_FOREIGN_SHORT_REF_RE = re.compile(r"(?<![\w/.])[\w.-]+/[\w.-]+#\d+\b")
+    r"https://github\.com/([^/\s]+/[^/\s]+)/(?:issues|pull)/(\d+)")
+_FOREIGN_SHORT_REF_RE = re.compile(r"(?<![\w/.])([\w.-]+/[\w.-]+)#(\d+)\b")
 _FOREIGN_ITEM = "\x00foreign-item\x00"
 # A sentence about a PR's earlier commits / pushes (not its head).
 _EARLIER_COMMITS_RE = re.compile(
@@ -4854,8 +4854,9 @@ def check_story_record_claims(slice_obj, text):
     `commits_incomplete`), not only its head. A sentence naming several items is
     refused only when all of them are covered (a linked item outside the
     outcome has no coverage, so a claim naming it passes); a general claim only when
-    every PR of the slice is. An item of another repository (a link
-    outside the slice's repository, `owner/repo#N`) is never covered. A PR
+    every PR of the slice is. A link or `owner/repo#N` reference to the
+    slice's own repository (slug compared case-insensitively) is its `#N`;
+    one to another repository is never covered. A PR
     with a recorded force-push never has covered history (the replaced
     commits' checks were not read), so no claim about its earlier or
     replaced commits is refused; a claim about its head still is. A true
@@ -4892,22 +4893,25 @@ def check_story_record_claims(slice_obj, text):
                 and str(n) in cov and not cov[str(n)].get("omitted")
                 and not conv.get("threads_omitted")}
     base = _slice_repo_base(slice_obj)
-    item_link = re.compile(re.escape(base) + r"(?:issues|pull)/(\d+)") \
-        if base else None
+    own = base[len("https://github.com/"):].strip("/").lower() if base else None
+
+    def qualified(slug, number):
+        """A reference to `slug`'s item `number`: `#N` when `slug` is the
+        slice's own repository (compared case-insensitively), else an item
+        the slice never covers."""
+        if own and slug.lower() == own:
+            return " #{} ".format(number)
+        return " " + _FOREIGN_ITEM + " "
 
     def as_numbers(m):
-        """A link to the repository's item reads as `#N`; a link to another
-        repository's issue / PR as an item the slice never covers; any
-        other URL as blank."""
-        hit = item_link.match(m.group(0)) if item_link else None
-        if hit:
-            return " #{} ".format(hit.group(1))
-        if _FOREIGN_ITEM_URL_RE.match(m.group(0)):
-            return " " + _FOREIGN_ITEM + " "
-        return " "
-    sentences = [_FOREIGN_SHORT_REF_RE.sub(" " + _FOREIGN_ITEM + " ",
-                                           _URL_IN_TEXT_RE.sub(as_numbers, x)).strip()
-                 for x in re.split(r"(?<=[.;!?])\s+|\n+", text or "") if x.strip()]
+        """A link to an issue / PR reads as qualified() says; any other
+        URL as blank."""
+        hit = _FOREIGN_ITEM_URL_RE.match(m.group(0))
+        return qualified(hit.group(1), hit.group(2)) if hit else " "
+    sentences = [_FOREIGN_SHORT_REF_RE.sub(
+        lambda m: qualified(m.group(1), m.group(2)),
+        _URL_IN_TEXT_RE.sub(as_numbers, x)).strip()
+        for x in re.split(r"(?<=[.;!?])\s+|\n+", text or "") if x.strip()]
 
     def covered(sent, have, scope):
         """Is every item the sentence speaks of fully covered: each item it
