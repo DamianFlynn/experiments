@@ -65,6 +65,19 @@ package (not the record) removed, italic cross-references between stories and th
 the same pull request (outside the story blocks), and four wordings the theme check rejected (a
 "#N (@login)" read as a name, a count the record does not hold, a quote with escaped quotes).
 
+**Refresh against the recomputed store.** The issue was then brought in line with a store
+recomputed with the data fixes (commit authors on commit events, ball precedence, stacked PRs,
+where closed work landed, orphan and shared notices, proposed modules, net change per PR).
+Every block was re-checked (`--check-story`, `--check-theme`, `--check-newsletter`) and the
+facts compared; the blocks whose facts changed were revised in place: the actor of #7374's
+commits in the #6001 story, the next move of #7530 (its reviewers, since its author is the
+module's only owner), where seven closed pipeline PRs' commits landed (the same commits in
+merged PRs) with #7479 and #7437 left as the record has them, #7529 told under CI workflows
+with only its own commit, #7512's net change, two dependency PRs' net change, the orphan
+notice quoted, the twelve deprecation notices said once as one text, six proposed modules with
+what each is, for whom the coding agent opened each PR, and Jared Holgate's 44 merged pull
+requests broken down by theme.
+
 The store, the view (105 MB), the work package and the slices are not kept here. All numbers
 come from that one October store; no month-over-month comparison is made. The "New modules"
 section is omitted with its reason, because no module was new in October 2026.

@@ -1447,7 +1447,8 @@ class TestDeliveredContract(unittest.TestCase):
         self.assertEqual((th["id"], th["theme_source"], th["subjects"]),
                          ("ci_workflows", "view", ["ci"]))
         self.assertEqual(th["counts"], {"prs": 1, "merged": 1, "closed_unmerged": 0,
-                                        "open": 0, "by_author": {"jared": 1}})
+                                        "open": 0, "by_author": {"jared": 1},
+                                        "merged_by_author": {"jared": 1}})
 
     def _text(self, extra_story="", theme=True):
         t = GOOD.replace("<!-- story pending: train-pr-11 — written from the next store -->",
@@ -1521,6 +1522,24 @@ class TestDeliveredContract(unittest.TestCase):
             "comments": 1, "participants": 1}
         st = section(newsletter.outline([v]), "stories")
         self.assertEqual(next(r for r in st["all"] if r["key"] == "train-pr-97")["plan"], "full")
+
+    def test_a_theme_train_is_named_under_its_own_theme(self):
+        v = self.v()
+        v["module_changes"] = view()["module_changes"]
+        v["plumbing_themes"].append({"id": "other", "title_hint": "Other plumbing",
+                                     "prs": [], "stories": []})
+        t = self._text()
+        r = newsletter.check_newsletter([v], t, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["theme_trains_missing"], [])
+        # #12 named only under another theme's heading does not count
+        moved = t.replace("### CI workflows\n\nA pipeline action was bumped in "
+                          "[#12](https://github.com/o/r/pull/12).",
+                          "### CI workflows\n\nNothing here.\n\n### Other plumbing\n\n"
+                          "A pipeline action was bumped in [#12](https://github.com/o/r/pull/12).")
+        self.assertNotEqual(moved, t)
+        r = newsletter.check_newsletter([v], moved, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["theme_trains_missing"], [{"key": "train-pr-12",
+                                                      "theme": "ci_workflows"}])
 
     def test_story_may_link_any_module_the_view_knows(self):
         t = self._text().replace(
@@ -1919,6 +1938,80 @@ class TestUpdatePass(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 newsletter.main([vp, "--outline", "--monthly"])
             self.assertEqual(json.loads(buf.getvalue())["cadence"], "month")
+
+
+class TestRefreshPass(unittest.TestCase):
+    """Orphan and shared notices, proposed modules from the tree, where a
+    closed PR's work landed, why a member joined, net change, the person an
+    automation account worked for."""
+
+    def v(self):
+        v = TestUpdatePass().v()
+        v["module_ownership"] = {
+            "collected": True, "events": [],
+            "without_owner": [{"module": "avm/res/code/signing", "lifecycle": "orphaned",
+                               "marker": "ORPHANED.md",
+                               "marker_text": "THIS MODULE IS CURRENTLY ORPHANED."}],
+            "deprecated_modules": [{"module": "avm/res/old/one", "marker_text_shared": True},
+                                   {"module": "avm/res/old/two", "marker_text_shared": True}],
+            "marker_texts": {"deprecated": {"modules": 2, "text": "THIS MODULE IS DEPRECATED."}},
+            "proposed_modules": {"avm/res/x/new": {"prs": [21], "info": {
+                "display_name": "X New", "resource_type": "Microsoft.X/new"}}}}
+        v["trains"].append({"id": "train-pr-21", "outcome": "in_flight", "prs": [21],
+                            "issues": [], "joined_by": [
+                                {"item": {"type": "issue", "number": 5}, "via": "closes",
+                                 "by": {"type": "pr", "number": 21}, "quote": "Fixes #5"}]})
+        v["stories"]["all"] = [{"id": "train-pr-21", "group": "in_flight", "state": "in_flight",
+                                "worthy": "PR #21 opened in the window"}]
+        v["prs"][-1]["closed_unmerged"] = {"close_reason": "not stated", "content_landed_in": [
+            {"pr": 10, "basis": "same commit", "commits": [{"sha": "abc", "subject": "fix: x"}]}]}
+        v["plumbing_themes"] = [{"id": "ci", "title_hint": "CI", "prs": [
+            {"number": 12, "net_files": {"files": 3, "added": 10, "removed": 2, "commits": 2}}],
+            "stories": [], "people": []}]
+        v["people"]["agent"] = {"automation": {"kind": "account_type", "on_behalf_of_by_pr": {
+            "20": {"login": "alex", "basis": "assignee", "pr": 20}}}}
+        v["prs"][-3]["author"] = "agent"
+        return v
+
+    def test_ownership_quotes_notices_once_and_lists_proposed_modules(self):
+        own = section(newsletter.outline([self.v()]), "ownership")
+        self.assertEqual(own["without_owner"][0]["marker_text"],
+                         "THIS MODULE IS CURRENTLY ORPHANED.")
+        self.assertEqual(own["marker_texts"]["deprecated"]["modules"], 2)
+        self.assertEqual(own["deprecated_replacements"], [])
+        self.assertEqual([(p["module"], p["info"]["display_name"]) for p in own["proposed_modules"]],
+                         [("avm/res/x/new", "X New")])
+
+    def test_coming_lists_every_proposed_module_with_what_it_is(self):
+        c = section(newsletter.outline([self.v()]), "coming")
+        row = next(p for p in c["proposed_modules"] if p["module"] == "avm/res/x/new")
+        self.assertEqual((row["story"], row["info"]["resource_type"], row["prs"][0]["number"]),
+                         ("train-pr-21", "Microsoft.X/new", 21))
+
+    def test_rows_carry_join_reason_net_change_and_principal(self):
+        v = self.v()
+        st = section(newsletter.outline([v]), "stories")
+        row = next(r for r in st["all"] if r["key"] == "train-pr-21")
+        self.assertEqual(row["joined_by"][0]["quote"], "Fixes #5")
+        self.assertEqual(newsletter._pr_row(v, 12)["net_files"]["files"], 3)
+        self.assertEqual(newsletter._pr_row(v, 20)["author_on_behalf_of"]["login"], "alex")
+        self.assertEqual(newsletter._pr_row(v, 22)["closed_unmerged"]["content_landed_in"][0]["pr"],
+                         10)
+        with tempfile.TemporaryDirectory() as d:
+            newsletter.work_package([v], d)
+            th = json.load(open(os.path.join(d, "rows", "theme-ci.json")))
+            self.assertEqual(th["theme"]["prs"][0]["net_files"]["added"], 10)
+
+    def test_superseded_only_where_the_record_says_so(self):
+        v = self.v()
+        bad = "## Stories\n\n[#22](" + R + "/pull/22) was superseded by [#10](" + R + "/pull/10).\n"
+        r = newsletter.state_claims([v], bad)["superseded_not_in_view"]
+        self.assertEqual((r[0]["pr"], r[0]["content_landed_in"]), (22, [10]))
+        ok = ("## Stories\n\n[#22](" + R + "/pull/22) was closed unmerged; its commit is part of "
+              "[#10](" + R + "/pull/10).\n")
+        self.assertEqual(newsletter.state_claims([v], ok)["superseded_not_in_view"], [])
+        v["prs"][-1]["closed_unmerged"] = {"superseded_by": 10, "quote": "superseded by #10"}
+        self.assertEqual(newsletter.state_claims([v], bad)["superseded_not_in_view"], [])
 
 
 class TestThemeCheck(unittest.TestCase):

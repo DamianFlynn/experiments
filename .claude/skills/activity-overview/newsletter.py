@@ -498,6 +498,34 @@ def module_info(view, area):
     return out
 
 
+def _pr_net_files(view, number):
+    """What a PR changed as a whole (`net_files` on the view's theme PR rows,
+    else its `pr_history` row), or None."""
+    for th in view.get("plumbing_themes") or []:
+        for p in th.get("prs") or []:
+            if isinstance(p, dict) and p.get("number") == number and p.get("net_files"):
+                return p["net_files"]
+    h = view.get("pr_history")
+    rows = h.get("prs") if isinstance(h, dict) else h
+    for r in rows or []:
+        if isinstance(r, dict) and r.get("number") == number and r.get("net_files"):
+            return r["net_files"]
+    return None
+
+
+def on_behalf_of(view, login, number):
+    """The person an automation account worked for on one PR (the view's
+    `automation.on_behalf_of_by_pr`), else None."""
+    auto = ((view.get("people") or {}).get(login) or {}).get("automation")
+    if not isinstance(auto, dict):
+        return None
+    row = (auto.get("on_behalf_of_by_pr") or {}).get(str(number))
+    ob = auto.get("on_behalf_of")
+    if row is None and isinstance(ob, dict) and ob.get("pr") == number:
+        row = ob
+    return row
+
+
 def _pr_row(view, number, automation=(), full=False):
     """A PR for a reader: number, title, link, author (name, affiliation or
     automation), merged date, fork, description (as last gathered)."""
@@ -508,6 +536,9 @@ def _pr_row(view, number, automation=(), full=False):
     if pr.get("author"):
         if is_automation(view, pr["author"], automation):
             out["author_automation"] = True
+            obo = on_behalf_of(view, pr["author"], number)
+            if obo:
+                out["author_on_behalf_of"] = obo
         else:
             person = _person(view, pr["author"])
             for k in ("name", "affiliation", "do_not_name"):
@@ -523,6 +554,9 @@ def _pr_row(view, number, automation=(), full=False):
         out["closed_unmerged"] = pr["closed_unmerged"]
     if pr.get("body_as_of"):
         out["body_as_of"] = pr["body_as_of"]
+    net = _pr_net_files(view, number)
+    if net:
+        out["net_files"] = net
     desc = _pr_description(pr, full=full)
     if desc:
         out["description"] = desc
@@ -1057,6 +1091,8 @@ def section_stories(views, caps, multi=False):
                       "new_module_proposed", "related_stories"):
                 if e.get(k):
                     row[k] = e[k]
+            if t.get("joined_by"):
+                row["joined_by"] = t["joined_by"]
             row["review_states"] = {str(n): review_state(v, n) for n in t.get("prs") or []
                                     if review_state(v, n)}
             for m in row["modules"]:
@@ -1224,6 +1260,11 @@ def _automation_rows(view, automation=(), multi=False):
             entry["kind"] = auto["kind"]
         if auto.get("on_behalf_of"):
             entry["on_behalf_of"] = auto["on_behalf_of"]
+        if auto.get("on_behalf_of_by_pr"):
+            entry["on_behalf_of_by_pr"] = auto["on_behalf_of_by_pr"]
+        if auto.get("same_identity_as"):
+            # one automated reviewer seen under two accounts: say it once
+            entry["same_identity_as"] = auto["same_identity_as"]
         out.append(_with_repo(entry, _slug(view), multi))
     return out
 
@@ -1407,7 +1448,9 @@ def proposed_modules(view, multi=False):
     module is when its metadata says."""
     prs = {p.get("number"): p for p in view.get("prs") or []}
     trains = {t["id"]: t for t in view.get("trains") or []}
+    tree = ((view.get("module_ownership") or {}).get("proposed_modules") or {})
     out = []
+    seen = set()
     for r in (view.get("stories") or {}).get("all") or []:
         areas = r.get("new_module_proposed") or r.get("proposes_new_module") or []
         for area in areas:
@@ -1420,10 +1463,30 @@ def proposed_modules(view, multi=False):
                             "review_state": review_state(view, n),
                             "fork_status": fork_status(view, prs.get(n) or {})}
                            for n in open_prs]}
-            info = dict((r.get("module_info") or {}).get(area) or {}) or module_info(view, area)
+            info = dict((r.get("module_info") or {}).get(area) or {}) or \
+                dict((tree.get(area) or {}).get("info") or {}) or module_info(view, area)
             if info:
                 row["info"] = info
+            seen.add(area)
             out.append(_with_repo(row, _slug(view), multi))
+    # the tree's `proposed` lifecycle: an open PR's own commits add the module's
+    # entry file (a train the stories carry over may hold it)
+    for area, t_row in sorted(tree.items()):
+        if area in seen or not isinstance(t_row, dict):
+            continue
+        open_prs = [n for n in t_row.get("prs") or [] if (prs.get(n) or {}).get("state") == "open"]
+        story = next((r for r in (view.get("stories") or {}).get("all") or []
+                      if set(open_prs) & set((trains.get(r["id"]) or {}).get("prs") or [])), None)
+        row = {"module": area, "story": story_key(view, story["id"], multi) if story else None,
+               "group": (story or {}).get("group"), "state": (story or {}).get("state"),
+               "plan_source": "module_ownership.proposed_modules",
+               "prs": [{"number": n, "url": (prs.get(n) or {}).get("url"),
+                        "title": (prs.get(n) or {}).get("title"),
+                        "review_state": review_state(view, n),
+                        "fork_status": fork_status(view, prs.get(n) or {})} for n in open_prs]}
+        if t_row.get("info"):
+            row["info"] = t_row["info"]
+        out.append(_with_repo(row, _slug(view), multi))
     return out
 
 
@@ -1541,13 +1604,19 @@ def section_plumbing(view, caps, multi=False, automation=()):
 
 def _theme_counts(view, numbers):
     """How a theme's PRs ended as of the window's end: merged, closed without
-    merging, open; and how many each author opened."""
+    merging, open; how many each author opened and how many of each author's
+    were merged."""
     prs = {p.get("number"): p for p in view.get("prs") or []}
-    out = {"prs": len(numbers), "merged": 0, "closed_unmerged": 0, "open": 0, "by_author": {}}
+    out = {"prs": len(numbers), "merged": 0, "closed_unmerged": 0, "open": 0, "by_author": {},
+           "merged_by_author": {}}
     for n in numbers:
         p = prs.get(n) or {}
         if p.get("merged"):
             out["merged"] += 1
+            if p.get("author"):
+                # so a person's merged total reconciles with the themes
+                out["merged_by_author"][p["author"]] = \
+                    out["merged_by_author"].get(p["author"], 0) + 1
         elif p.get("state") == "closed":
             out["closed_unmerged"] += 1
         elif p.get("state") == "open":
@@ -1659,6 +1728,18 @@ def section_ownership(view, multi=False):
         out["without_owner_unavailable"] = unavailable
     if mo.get("unread"):
         out["unread"] = mo["unread"]
+    # a notice many modules share is said once (`marker_texts`), with how many
+    # carry it and whether it names a replacement (only explicit text does)
+    if mo.get("marker_texts"):
+        out["marker_texts"] = mo["marker_texts"]
+    out["deprecated_replacements"] = [
+        {"module": d["module"], "replacement": d["replacement"]}
+        for d in out["deprecated_modules"] if d.get("replacement")]
+    out["proposed_modules"] = [
+        _with_repo(dict({"module": m, "module_url": None}, **{k: r.get(k) for k in
+                                                                ("prs", "info", "committed_at")
+                                                                if r.get(k)}), _slug(view), multi)
+        for m, r in sorted((mo.get("proposed_modules") or {}).items()) if isinstance(r, dict)]
     if not events and not without and not lifecycle and not out["deprecated_modules"]:
         out["omit"] = ("module ownership state not known: {}".format(unavailable)
                        if unavailable else
@@ -1959,7 +2040,14 @@ def outline(views, cadence=None, automation=()):
                               automation=automation)
     ownership, oparts = merged(section_ownership, ("events", "unattributed", "without_owner",
                                                    "start_without_owner", "labelled_items",
-                                                   "lifecycle_events", "deprecated_modules"))
+                                                   "lifecycle_events", "deprecated_modules",
+                                                   "deprecated_replacements",
+                                                   "proposed_modules"))
+    mts = [x.get("marker_texts") for x in oparts if x.get("marker_texts")]
+    if mts:
+        ownership["marker_texts"] = mts[0] if not multi else [
+            _with_repo({"marker_texts": x.get("marker_texts")}, _slug(v_), multi)
+            for x, v_ in zip(oparts, views) if x.get("marker_texts")]
     ownership["without_owner_by_kind"] = _without_owner_by_kind(ownership["without_owner"])
     ownership["stub_modules_count"] = sum(x.get("stub_modules_count") or 0 for x in oparts)
     unav = [_with_repo({"reason": x["without_owner_unavailable"]}, r, multi)
@@ -2478,13 +2566,28 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
             themes_missing.append(th.get("id"))
     res["themes_missing"] = themes_missing
     res["themes_pending"] = sorted(theme_pending)
-    res["theme_trains_missing"] = [
-        {"key": r["key"], "theme": r.get("theme")}
-        for r in sec["stories"].get("in_theme") or []
-        if r.get("theme") in written_themes
-        and not (r.get("url") and r["url"] in plumbing_chunk)
-        and not any(re.search(r"(?<![\w/.&])#{}\b".format(n), plumbing_chunk) or
-                    "/pull/{})".format(n) in plumbing_chunk for n in r.get("prs") or [])]
+    # a train is named under ITS theme's heading, not anywhere in the section
+    theme_text = {}
+    hint_of = {th.get("id"): (th.get("title_hint") or "").lower()
+               for th in sec["plumbing"].get("themes") or []}
+    for part in re.split(r"(?m)^(?=###\s)", plumbing_chunk):
+        h = re.match(r"^###\s+(.+?)\s*$", part, re.M)
+        if not h:
+            continue
+        hh = h.group(1).strip().strip("*_").lower()
+        for tid, hint in hint_of.items():
+            if hint and hh.startswith(hint):
+                theme_text[tid] = theme_text.get(tid, "") + part
+    res["theme_trains_missing"] = []
+    for r in sec["stories"].get("in_theme") or []:
+        if r.get("theme") not in written_themes:
+            continue
+        chunk_ = theme_text.get(r.get("theme"), plumbing_chunk)
+        if (r.get("url") and r["url"] in chunk_) or any(
+                re.search(r"(?<![\w/.&])#{}\b".format(n), chunk_) or
+                "/pull/{})".format(n) in chunk_ for n in r.get("prs") or []):
+            continue
+        res["theme_trains_missing"].append({"key": r["key"], "theme": r.get("theme")})
     res.update(stories=stories, stories_not_checked=not_checked,
                stories_not_in_outline=not_in_outline, stories_duplicate=duplicate,
                stories_misplaced=misplaced, stories_state_missing=state_missing,
@@ -2962,6 +3065,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence=None
                  "versions_not_linked", "release_status_missing", "ownership_not_in_view",
                  "automation_as_person",
                  "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
+                 "superseded_not_in_view",
                  "markers_malformed",
                  "sections_missing",
                  "omitted_section_present", "sections_out_of_order", "title_missing",
@@ -3024,6 +3128,7 @@ _PR_STATE_CLAIMS = (
     ("merged", re.compile(r"\b(?:is|was|been|got|has)\s+merged\b|\bmerged\s+on\b", re.I)),
     ("open", re.compile(r"\b(?:is|remains|still)\s+open\b|\bstill\s+in\s+review\b", re.I)),
 )
+_SUPERSEDE_RE = re.compile(r"\bsupersed\w*|\breplaced\s+by\b", re.I)
 _COUNT_SUBJECT_RE = re.compile(r"\b\d+\s+(?:were|are|of\s+them|others)\b", re.I)
 _CONDITIONAL_RE = re.compile(r"\b(?:once|if|until|unless|whether|would|could|should)\b", re.I)
 _PUB_CLAIMS = (
@@ -3057,6 +3162,7 @@ def state_claims(views, text):
     slugs = [_slug(v) for v in views]
     prs = {}
     rel = {}
+    closed = {}
     for v in views:
         sl = _slug(v)
         for pr in v.get("prs") or []:
@@ -3069,6 +3175,8 @@ def state_claims(views, text):
             rs = pr.get("review_state")
             prs[(sl, n)] = {"review": rs.get("state") if isinstance(rs, dict) else None,
                             "state": st}
+            if st == "closed_unmerged":
+                closed[(sl, n)] = pr.get("closed_unmerged") or {}
         for m in (v.get("module_changes") or {}).get("modules") or []:
             mods = {m["area"]} | {x.get("module") for x in
                                   (m.get("versions") or {}).get("published") or [] if x.get("module")}
@@ -3145,7 +3253,32 @@ def state_claims(views, text):
                     row.pop("repo")
                 out.append(row)
         return out
+    # "superseded" / "replaced by" only where the record says so (`superseded_by`);
+    # work that landed elsewhere (`content_landed_in`) is said with its basis
+    supersede = []
+    unstated = {k for k, x in closed.items() if x is not None and not x.get("superseded_by")}
+    for sid, chunk in _section_chunks(t):
+        for par, repo in _scoped_paragraphs(chunk, slugs):
+            repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
+            if repo is None:
+                continue
+            for snt in _sentences(_strip(_delink(par), code=False)):
+                snt_c = _CODE_SPAN_RE.sub(lambda m: m.group(0).strip("`"), snt)
+                if not _SUPERSEDE_RE.search(snt_c):
+                    continue
+                nums = [int(x) for x in _ITEM_RE.findall(snt_c) if (repo, int(x)) in prs]
+                said = [n for n in nums if (repo, n) in closed and closed[(repo, n)]
+                        and closed[(repo, n)].get("superseded_by")]
+                bad = [n for n in nums if (repo, n) in unstated]
+                if bad and not said:
+                    row = {"pr": bad[0], "section": sid,
+                           "sentence": " ".join(snt.split())[:160]}
+                    landed = (closed[(repo, bad[0])] or {}).get("content_landed_in")
+                    if landed:
+                        row["content_landed_in"] = [x.get("pr") for x in landed]
+                    supersede.append(row)
     return {
+        "superseded_not_in_view": supersede,
         "review_state_mismatch": verdicts(review, lambda k: prs[k]["review"], "pr"),
         "pr_state_mismatch": verdicts(pstate, lambda k: prs[k]["state"], "pr"),
         "release_status_mismatch": verdicts(
@@ -3159,7 +3292,7 @@ THEME_CHECK_KEYS = (
     "items_not_in_view", "modules_not_in_view", "versions_not_in_view", "people_not_in_view",
     "name_mismatch", "do_not_name_named", "affiliation_mismatch", "automation_as_person",
     "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
-    "candidates_worded_as_declared", "dates_without_year", "numbers_not_in_view",
+    "superseded_not_in_view", "candidates_worded_as_declared", "dates_without_year", "numbers_not_in_view",
     "characterising_words", "modules_not_linked", "versions_not_linked", "markers_malformed")
 
 
@@ -3271,6 +3404,14 @@ WORK_PACKAGE_RULES = """
 11. **Why it is in its state.** `status_reason` in the row file says why the story is in its
    group; a closed story ends "Where it stands" with the close reason (`closing.state_reason`,
    who closed it), what superseded it, or "the record states no reason".
+12. **Where closed work went.** A PR closed without merging whose commits a merged PR holds
+   (`closed_unmerged.content_landed_in`) is said as that, with its basis ("its commit ... is
+   part of #N, which merged"); "superseded" or "replaced by" only with `superseded_by` (the
+   record's own words). The issue check fails "superseded" without it.
+13. **Why a member is in a train** (`joined_by` in the row file: the line of the PR
+   description that names the issue, or "a closing reference GitHub records") and **what a PR
+   changed as a whole** (`net_files`: files, lines added / removed, own commits) may be said;
+   an automation account works for the person `author_on_behalf_of` names on that PR.
 """
 
 

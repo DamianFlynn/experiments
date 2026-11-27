@@ -240,6 +240,16 @@ account (a coding agent) working for Name (@login)". A PR row's `fork_status` (`
 (`superseded_by`, or no reason recorded) says how a closed PR ended — write "the record states
 no reason" when it has none.
 
+**From the refreshed store.** Ownership adds `marker_texts` (a notice many modules share,
+said once, with how many carry it; `deprecated_replacements` lists only replacements explicit
+text names), the orphan marker's `marker_text` on its `without_owner` row (quote it: it is the
+call to action) and `proposed_modules` (the tree's `proposed` lifecycle, with what each module's
+own metadata says it is). PR rows add `net_files` (what the PR changed as a whole),
+`author_on_behalf_of` (the person an automation account worked for on that PR) and
+`closed_unmerged.content_landed_in`; story rows add `joined_by`; automation rows add
+`on_behalf_of_by_pr` and `same_identity_as` (one automated reviewer under two accounts: say it
+once).
+
 **Coming up and stuck** — `ready` (derived "awaiting merge" **and** `review_state` approved),
 `approval_stale` (awaiting merge, but the approval predates the author's later changes: not
 ready), `failing_checks`, `needs_first_review` (review state `none`, `requested` or
@@ -356,6 +366,7 @@ It fails (exit 1) and lists:
 | `modules_not_linked` / `versions_not_linked` | in New modules, What changed, Breaking, Module ownership, People and Coming up: a module path the view knows (a module or a versioned child) that is not inside a link's text; a published version written right after a module path that is not a link |
 | `release_status_missing` | in New modules, What changed and People: a sentence that names a PR or module and says landed / merged / shipped, with no release status ("released as", "published", "not yet published", "declared in the changelog", "no version change", "release status not known") in it or the next sentence |
 | `ownership_not_in_view` | a module named in the Module ownership section that `module_ownership` does not hold (events, without an owner now or at the start, deprecated, stub, labelled) |
+| `superseded_not_in_view` | a sentence saying "superseded" or "replaced by" about a PR closed without merging whose record holds no `superseded_by` (work that landed elsewhere, `content_landed_in`, is said with its basis instead) |
 | `heading_missing` (theme check only) | a theme narrative whose first line is not `### <title_hint>` of its theme |
 | `review_state_mismatch` / `pr_state_mismatch` / `release_status_mismatch` | **one state per fact**, over the whole issue including story blocks (quoted text and comments blanked): a sentence that names exactly one PR and states its review state ("approved", "approved before …", "changes requested", "waiting for a first review", "reviewed only by automation", "ready to merge") that the PR's `review_state` does not hold, or that another section's sentence about the same PR contradicts; the same for a PR's open / merged / closed-without-merging state, and for a module version said to be published or not yet published against its release status. A conditional sentence ("once", "if", "until"), or one counting many PRs ("10 were closed without merging and one, #N, is open"), states nothing about one PR |
 | `automation_as_person` | an automation account written as "Name (@login)", or mentioned in a sentence without the marker word "automation" |
