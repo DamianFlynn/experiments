@@ -868,6 +868,221 @@ class TestSweep(unittest.TestCase):
         self.assertEqual(one["declared_breaking"]["areas"], ["avm/res/data/factory"])
 
 
+class TestThirdRound(unittest.TestCase):
+    """Unknown stays unknown, malformed input fails, identifiers are
+    normalised once."""
+
+    def check(self, text, views=None, **kw):
+        kw.setdefault("slices", {"train-issue-5": SLICE})
+        return newsletter.check_newsletter(views or [view()], text, **kw)
+
+    # 1
+    def test_publication_unknown_without_complete_tag_coverage(self):
+        v = view()
+        fac = next(m for m in v["module_changes"]["modules"]
+                   if m["area"] == "avm/res/data/factory")
+        fac["versions"]["published"] = []
+        new = next(m for m in v["module_changes"]["modules"] if m["area"] == "avm/res/new/thing")
+        new["versions"]["published"] = []
+        out = newsletter.outline([v])
+        self.assertIs(section(out, "breaking")["declared"][0]["items"][0]["published"], False)
+        self.assertIs(section(out, "new_modules")["modules"][0]["published"], False)
+        v["module_changes"]["inputs"] = {"tags_collected": False}
+        out = newsletter.outline([v])
+        self.assertIsNone(section(out, "breaking")["declared"][0]["items"][0]["published"])
+        self.assertIsNone(section(out, "new_modules")["modules"][0]["published"])
+        v["module_changes"]["inputs"] = {"tags_collected": True,
+                                         "windows_without_tags": ["2026-10-01..2026-10-15"]}
+        out = newsletter.outline([v])
+        self.assertIsNone(section(out, "breaking")["declared"][0]["items"][0]["published"])
+
+    # 2
+    def test_windows_without_tags_reach_the_coverage_notes(self):
+        v = view()
+        v["module_changes"]["inputs"] = {"tags_collected": True,
+                                         "windows_without_tags": ["2026-10-01..2026-10-15"]}
+        notes = section(newsletter.outline([v]), "numbers")["coverage"]
+        self.assertTrue(any("2026-10-01..2026-10-15" in n for n in notes), notes)
+
+    # 3
+    def test_shared_basename_stays_ambiguous(self):
+        pars = newsletter._scoped_paragraphs("### r\n\ntext\n", ["o/r", "p/r"])
+        self.assertIsNone(pars[-1][1])
+        pars = newsletter._scoped_paragraphs("### r\n\ntext\n", ["o/r", "p/s"])
+        self.assertEqual(pars[-1][1], "o/r")
+
+    # 4
+    def test_registry_do_not_name_without_a_name(self):
+        r = self.check(GOOD, registry_names={"amy": None})
+        self.assertTrue(r["ok"], r)
+        r = self.check(GOOD + "\nThanks @amy.\n", registry_names={"amy": None})
+        self.assertEqual(r["do_not_name_named"], ["amy"])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "people.json")
+            with open(path, "w") as fh:
+                json.dump({"format": "activity-overview/people", "version": 1,
+                           "people": {"amy": {"login": "amy", "do_not_name": True}}}, fh)
+            self.assertEqual(newsletter._registry_hidden(path), {"amy": None})
+
+    # 5
+    def test_unbalanced_story_markers_fail(self):
+        for text in (GOOD.replace("\n<!-- /story -->", "", 1),
+                     GOOD.replace("<!-- story: train-issue-5 -->\n", "", 1),
+                     GOOD.replace("<!-- story: train-issue-5 -->",
+                                  "<!-- story: train-issue-5 -->\n<!-- story: train-pr-11 -->",
+                                  1)):
+            r = self.check(text)
+            self.assertFalse(r["ok"])
+            self.assertTrue(r["markers_malformed"], text[-300:])
+        self.assertEqual(self.check(GOOD)["markers_malformed"], [])
+
+    # 6
+    def _root_view(self):
+        v = view()
+        v["module_changes"]["modules"].append(module(
+            "main.tf", 3, kind="module",
+            breaking={"candidates": [{"rule": "parameter_removed", "subject": "location",
+                                      "sources": src(12, "main.tf")}]}))
+        return v
+
+    def test_root_module_breaking_claim(self):
+        r = self.check(GOOD + "\nThe `location` variable was removed: a breaking change.\n",
+                       views=[self._root_view()])
+        self.assertEqual([c["module"] for c in r["candidates_worded_as_declared"]],
+                         ["main.tf"])
+        r = self.check(GOOD + "\nThe `location` variable was removed; check before upgrading.\n",
+                       views=[self._root_view()])
+        self.assertEqual(r["candidates_worded_as_declared"], [])
+        # a heading is not a module claim
+        r = self.check(GOOD.replace("## Breaking changes and deprecations",
+                                    "## Breaking changes and deprecations"),
+                       views=[self._root_view()])
+        self.assertEqual(r["candidates_worded_as_declared"], [])
+
+    # 7
+    def test_logins_resolve_case_insensitively(self):
+        r = self.check(GOOD.replace("(@nik)", "(@NIK)"))
+        self.assertEqual(r["people_not_in_view"], [])
+        self.assertEqual(r["name_mismatch"], [])
+        r = self.check(GOOD.replace("Tomaz M (@tomaz)", "Tom Other (@TOMAZ)"))
+        self.assertEqual(r["name_mismatch"][0]["login"], "tomaz")
+        r = self.check(GOOD.replace("Nik Peters (@nik), whose affiliation is not known,",
+                                    "From the community, Nik Peters (@Nik)"))
+        self.assertEqual(r["affiliation_mismatch"][0]["login"], "nik")
+
+
+class TestRobustness(unittest.TestCase):
+    """Malformed and edge inputs never raise."""
+
+    TEXTS = ("", "# Only a title\n", GOOD.replace("\n", "\r\n"),
+             GOOD + "\n<!-- story: x -->\n", GOOD + "\n<!-- /story -->\n",
+             GOOD + "\n<!-- omitted: coming -->\n", GOOD + "\n<!-- omitted: coming",
+             GOOD + "\n<!-- unclosed comment\n", GOOD + "\n<!-- story: -->\n<!-- /story -->\n",
+             GOOD + "\nZoë Ñandú (@nik) and 渡辺 (@tomaz).\n")
+
+    def views(self):
+        out = [view()]
+        for key in ("module_changes", "module_notes", "stories", "contributors",
+                    "affiliations", "pr_activity", "people_context", "forecast", "people",
+                    "newcomers", "trains", "prs", "issues"):
+            v = view()
+            v.pop(key, None)
+            out.append(v)
+        v = view()
+        v["module_notes"]["tags"] = {"collected": False, "reason": "none"}
+        v["module_changes"]["inputs"] = {"tags_collected": False}
+        out.append(v)
+        return out
+
+    def test_never_raises(self):
+        names = {"a": None, "b": "", "c": "Pat Hidden"}
+        for v in self.views():
+            for views in ([v], [v, dict(view(), meta=dict(view()["meta"], repo="s"))]):
+                for t in self.TEXTS:
+                    r = newsletter.check_newsletter(views, t, slices={},
+                                                    registry_names=names)
+                    self.assertIn("ok", r)
+                    if not t:
+                        self.assertFalse(r["ok"])
+
+    def test_cli_rejects_bad_inputs_without_raising(self):
+        with tempfile.TemporaryDirectory() as d:
+            vp, ip, rp, bad = (os.path.join(d, n) for n in
+                               ("v.json", "i.md", "p.json", "bad.json"))
+            with open(vp, "w") as fh:
+                json.dump(view(), fh)
+            open(ip, "w").close()
+            with open(rp, "w") as fh:
+                json.dump({"people": {"amy": {"login": "amy", "do_not_name": True}}}, fh)
+            with open(bad, "w") as fh:
+                json.dump([1, 2], fh)
+            cases = (([vp, "--check-newsletter", ip, "--people", rp], 1),
+                     ([vp, "--check-newsletter", ip, "--people", bad], 2),
+                     ([bad, "--check-newsletter", ip], 2),
+                     ([bad, "--outline"], 2))
+            for argv, code in cases:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        newsletter.main(argv)
+                self.assertEqual(cm.exception.code, code, argv)
+
+    def test_crlf_issue_passes_like_lf(self):
+        r = newsletter.check_newsletter([view()], GOOD.replace("\n", "\r\n"),
+                                        slices={"train-issue-5": SLICE})
+        self.assertTrue(r["ok"], {k: x for k, x in r.items() if x and k != "cannot_check"})
+
+
+class TestAbsentIsNotFalse(unittest.TestCase):
+    """The robustness pass: where coverage is not established, the outline
+    says unknown (None) instead of false / zero / empty."""
+
+    def test_first_pr_with_no_listed_pr_is_unknown_not_issue(self):
+        row = {"first": {"first": "pr", "number": 9}, "contributed": {"prs": []}}
+        self.assertEqual(newsletter.contribution_class(row), "unknown")
+        row = {"first": {"first": "issue", "number": 9}, "contributed": {"prs": []}}
+        self.assertEqual(newsletter.contribution_class(row), "issue")
+
+    def test_shares_and_counts_without_their_input(self):
+        v = view()
+        del v["module_changes"]["summary"]["plumbing"]["share"]
+        f = section(newsletter.outline([v]), "numbers")["facts"]
+        self.assertIsNone(f.get("plumbing_share_pct"))
+        v = view()
+        del v["module_changes"]
+        v["people"].pop("jared")
+        m = {r["login"]: r for r in section(newsletter.outline([v]), "people")["maintainers"]}
+        self.assertIsNone(m["jared"]["reviews"])
+        self.assertIsNone(m["alex"]["authored_by_class"])
+
+    def test_publication_coverage_on_version_rows_and_numbers(self):
+        v = view()
+        v["module_changes"]["inputs"] = {"tags_collected": True,
+                                         "windows_without_tags": ["2026-10-01..2026-10-15"]}
+        out = newsletter.outline([v])
+        row = section(out, "module_changes")["modules"][0]
+        self.assertIs(row["version"]["publication_known"], False)
+        self.assertIs(section(out, "numbers")["facts"]["versions_published_partial"], True)
+        row = section(newsletter.outline([view()]), "module_changes")["modules"][0]
+        self.assertIs(row["version"]["publication_known"], True)
+
+    def test_story_keys_compare_with_the_repository_case_insensitive(self):
+        a, b = view(), view()
+        b["meta"] = dict(b["meta"], repo="s")
+        text = GOOD.replace("story: train-issue-5", "story: O/R:train-issue-5")
+        r = newsletter.check_newsletter([a, b], text, slices={"o/r:train-issue-5": SLICE})
+        self.assertEqual(r["stories_not_in_outline"], [])
+        self.assertEqual(r["stories_not_checked"], [])
+        self.assertIn("O/R:train-issue-5", r["stories"])
+
+    def test_identifier_helpers(self):
+        self.assertEqual(newsletter.login_key("NIK"), "nik")
+        self.assertEqual(newsletter.slug_key("Azure/Repo"), "azure/repo")
+        self.assertEqual(newsletter.version_key("v1.2.0"), "1.2.0")
+        self.assertEqual(newsletter.story_key_norm("O/R:train-issue-5"), "o/r:train-issue-5")
+        self.assertEqual(newsletter.story_key_norm("train-issue-5"), "train-issue-5")
+
+
 class TestCli(unittest.TestCase):
 
     def test_outline_and_check_commands(self):

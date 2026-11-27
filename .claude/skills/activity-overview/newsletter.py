@@ -89,6 +89,36 @@ _NO_MODULE_LAYER = ("the view has no module layer (module_notes were not gathere
 
 # --- small helpers ------------------------------------------------------------
 
+def login_key(login):
+    """Logins compare case-insensitively (as GitHub's do): the one key every
+    person lookup uses."""
+    return (login or "").lower()
+
+
+def slug_key(slug):
+    """Repository slugs compare case-insensitively."""
+    return (slug or "").lower()
+
+
+def version_key(v):
+    """Versions compare without a leading `v` (link._bare_version's rule)."""
+    return _bare(v)
+
+
+def story_key_norm(key):
+    """A story key for comparison: the repository part of a qualified key
+    (`owner/repo:train-id`) case-insensitive, the train id exact."""
+    key = key or ""
+    if ":" in key:
+        repo, tid = key.split(":", 1)
+        return slug_key(repo) + ":" + tid
+    return key
+
+
+# Module paths and train ids compare exactly: repository paths are
+# case-sensitive and train ids are generated in one form.
+
+
 def _slug(view):
     """`owner/repo` of a view. A manifest member's view already carries the
     qualified `owner/repo` as `meta.repo` (its `meta.owner` is the project):
@@ -110,7 +140,7 @@ def story_key(view, train_id, multi):
 def slice_filename(key):
     """The slice file of a story key: `<train-id>.slice.json`, or
     `<owner>__<repo>__<train-id>.slice.json` for a qualified key."""
-    return key.replace("/", "__").replace(":", "__") + ".slice.json"
+    return story_key_norm(key).replace("/", "__").replace(":", "__") + ".slice.json"
 
 
 def _period(view):
@@ -238,6 +268,27 @@ def _merged_in_window(view):
 
 # --- sections -----------------------------------------------------------------
 
+def _tags_complete(view):
+    """True when the view's module layer read version tags for its whole
+    period (link `tags_partial`: windows_without_tags), so an absent tag
+    means not published; False when that is not established."""
+    inp = (view.get("module_changes") or {}).get("inputs") or {}
+    return bool(inp.get("tags_collected")) and not inp.get("windows_without_tags")
+
+
+def _publication(view, published, module, version):
+    """True when a tag of (module, version) is recorded; False only when the
+    tags were read for the whole period; else None (unknown)."""
+    if (module, version_key(version)) in published:
+        return True
+    return False if _tags_complete(view) else None
+
+
+def _published_set(m):
+    return {(p.get("module") or m["area"], version_key(p.get("version")))
+            for p in (m.get("versions") or {}).get("published") or []}
+
+
 def _own_published(m):
     return [p.get("version") for p in (m.get("versions") or {}).get("published") or []
             if not p.get("module") or p.get("module") == m.get("area")]
@@ -252,14 +303,14 @@ def section_breaking(view, multi=False):
     declared, candidates, deps, notices = [], [], [], []
     for m in mc.get("modules") or []:
         brk = m.get("breaking") or {}
-        published = {(p.get("module") or m["area"], _bare(p.get("version")))
-                     for p in (m.get("versions") or {}).get("published") or []}
+        published = _published_set(m)
         texts = " ".join(d.get("text") or "" for d in brk.get("declared") or [])
         if brk.get("declared"):
             items = [{"version": d.get("version"), "text": d.get("text"),
                       "module": d.get("module"),
-                      "published": (d.get("module") or m["area"],
-                                    _bare(d.get("version"))) in published,
+                      "published": _publication(view, published,
+                                                d.get("module") or m["area"],
+                                                d.get("version")),
                       "url": ((d.get("sources") or [{}])[0]).get("url")}
                      for d in brk["declared"]]
             declared.append(_with_repo({
@@ -352,7 +403,8 @@ def section_new_modules(view, caps, multi=False):
         rows.append(_with_repo({
             "area": n["area"], "kind": n.get("kind"),
             "first_version": n.get("first_version"),
-            "published": n.get("first_version") in _own_published(m),
+            "published": _publication(view, _published_set(m), n["area"],
+                                      n.get("first_version")),
             "changelog": items[:caps["changelog_items"] + 2],
             "prs": [{"number": p, "url": (next((x for x in view.get("prs") or []
                                                 if x["number"] == p), {})).get("url")}
@@ -367,14 +419,17 @@ def section_new_modules(view, caps, multi=False):
     return out
 
 
-def _version_row(m):
+def _version_row(m, view=None):
     v = m.get("versions") or {}
     vf = v.get("version_file") or {}
     cl = sorted(v.get("changelog") or [], key=_vkey)
     own = sorted(set(_own_published(m)), key=_vkey)
     row = {"from": vf.get("from"), "to": (cl[-1] if cl else None) or
            (own[-1] if own else None) or vf.get("to"),
-           "changelog": cl, "published": own}
+           "changelog": cl, "published": own,
+           # False: tags were not read for the whole period, so a version
+           # missing from `published` may still have been published
+           "publication_known": _tags_complete(view or {})}
     child = sorted({(p.get("module"), p.get("version"))
                     for p in v.get("published") or []
                     if p.get("module") and p.get("module") != m.get("area")})
@@ -425,7 +480,7 @@ def section_module_changes(view, caps, multi=False):
         prs = [{"number": p.get("number"), "url": p.get("url"), "title": p.get("title"),
                 "author": p.get("author")} for p in m.get("prs") or []]
         row = {"area": m["area"], "kind": m.get("kind"), "status": m.get("status"),
-               "score": m.get("product_score") or 0, "version": _version_row(m),
+               "score": m.get("product_score") or 0, "version": _version_row(m, view),
                "changelog": _changelog_items(m, cap=caps["changelog_items"]),
                "prs": prs,
                "breaking": "declared" if brk.get("declared") else
@@ -522,7 +577,12 @@ def contribution_class(row):
             c = "open_pr"
         if best is None or CONTRIBUTION_ORDER.index(c) < CONTRIBUTION_ORDER.index(best):
             best = c
-    return best or "issue"
+    if best:
+        return best
+    # no merged or open PR listed: an issue reporter, or a PR closed unmerged /
+    # not in the view — the latter is not established, so unknown
+    first = (row.get("first") or {}).get("first")
+    return "issue" if first == "issue" else "unknown"
 
 
 def _merged_by_class(view, login):
@@ -532,7 +592,7 @@ def _merged_by_class(view, login):
     plumbing, module_change (any other source change)."""
     mc = view.get("module_changes")
     if not isinstance(mc, dict):
-        return {}
+        return None             # no module layer: not known, not "nothing"
     prs = {p["number"]: p for p in view.get("prs") or []}
     intro = {n for m in (mc.get("summary") or {}).get("new_modules") or []
              for n in m.get("introduced_by") or []}
@@ -633,7 +693,7 @@ def section_people(views, caps, multi=False):
             own = sum(1 for n in merged if (prs.get(n) or {}).get("merged_by") == login
                       and prs[n].get("author") == login)
             row = {"login": login,
-                   "reviews": ((v.get("people") or {}).get(login) or {}).get("prs_reviewed", 0),
+                   "reviews": ((v.get("people") or {}).get(login) or {}).get("prs_reviewed"),
                    "merged_others": others, "merged_own": own,
                    "authored_by_class": _merged_by_class(v, login)}
             row.update({k: v2 for k, v2 in _person(v, login).items() if k != "login"})
@@ -652,7 +712,8 @@ def section_people(views, caps, multi=False):
             top.append(_with_repo(row, repo, multi))
     newcomers.sort(key=lambda r: (CONTRIBUTION_ORDER.index(r["contribution"]),
                                   r["login"].lower(), r.get("repo") or ""))
-    maint.sort(key=lambda r: (-(r["reviews"] + r["merged_others"]), r["login"].lower()))
+    maint.sort(key=lambda r: (-((r["reviews"] or 0) + r["merged_others"]),
+                              r["login"].lower()))
     top.sort(key=lambda r: (-(r["score"] or 0), r["login"].lower()))
     out = {"newcomers": newcomers[:caps["newcomers"]],
            "newcomers_omitted": max(0, len(newcomers) - caps["newcomers"]),
@@ -844,6 +905,10 @@ def _coverage(view):
         if not inp.get("tags_collected"):
             notes.append("version tags were not read: published / not published "
                          "is not known")
+        elif inp.get("windows_without_tags"):
+            notes.append("version tags were not listed for window(s) {}: published / not "
+                         "published is not known there".format(
+                             ", ".join(str(w) for w in inp["windows_without_tags"])))
         if inp.get("unread"):
             notes.append("{} changelog / version file(s) could not be read"
                          .format(len(inp["unread"])))
@@ -874,7 +939,8 @@ def section_numbers(views, multi=False):
             f.update(merged_prs=pl.get("merged_prs"), classified_prs=pl.get("classified"),
                      plumbing_prs=pl.get("plumbing_prs"),
                      product_prs=(pl.get("classified") or 0) - (pl.get("plumbing_prs") or 0),
-                     plumbing_share_pct=round(100 * (pl.get("share") or 0)),
+                     plumbing_share_pct=round(100 * pl["share"])
+                     if isinstance(pl.get("share"), (int, float)) else None,
                      modules_touched=(mc.get("summary") or {}).get("modules"),
                      modules_reader_facing=sum(1 for m in mc.get("modules") or []
                                                if not m.get("plumbing_only")),
@@ -884,6 +950,8 @@ def section_numbers(views, multi=False):
             tags = ((v.get("module_notes") or {}).get("tags") or {})
             if tags.get("collected"):
                 f["versions_published"] = len(tags.get("items") or [])
+                if not _tags_complete(v):
+                    f["versions_published_partial"] = True
         else:
             f["merged_prs"] = len(_merged_in_window(v))
         f["prs_opened"] = sum(1 for p in v.get("prs") or []
@@ -1063,6 +1131,41 @@ def outline(views, cadence="month"):
 
 # --- the check ----------------------------------------------------------------
 
+_STORY_OPEN_RE = re.compile(r"<!--\s*story:\s*(\S*)\s*-->")
+_STORY_CLOSE_RE = re.compile(r"<!--\s*/story\s*-->")
+
+
+def marker_problems(text):
+    """Malformed markers of an issue: story markers must pair up in order,
+    without nesting, with a train key on the opening one; an `omitted`
+    marker needs a section id and a reason; every `<!--` must close."""
+    out = []
+    tokens = sorted([(m.start(), "open", m.group(1)) for m in _STORY_OPEN_RE.finditer(text)]
+                    + [(m.start(), "close", None) for m in _STORY_CLOSE_RE.finditer(text)])
+    depth = 0
+    for _, kind, key in tokens:
+        if kind == "open":
+            if not key:
+                out.append("story marker without a train key")
+            if depth:
+                out.append("story block opened inside another story block")
+            depth += 1
+        else:
+            if not depth:
+                out.append("story closing marker without an opening one")
+            else:
+                depth -= 1
+    if depth:
+        out.append("story block not closed")
+    for m in re.finditer(r"<!--\s*omitted\b(.*?)(-->|$)", text, re.S):
+        if not m.group(2) or not _OMITTED_RE.match(m.group(0)):
+            out.append("omitted marker without a section id and reason: {}"
+                       .format(" ".join(m.group(0).split())[:80]))
+    if text.count("<!--") > len(re.findall(r"<!--.*?-->", text, re.S)):
+        out.append("an HTML comment is not closed")
+    return out
+
+
 _STORY_BLOCK_RE = re.compile(r"<!--\s*story:\s*(\S+)\s*-->(.*?)<!--\s*/story\s*-->", re.S)
 _OMITTED_RE = re.compile(r"<!--\s*omitted:\s*([a-z_]+)\s*(?:—|-|:)\s*(\S.*?)\s*-->")
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
@@ -1175,25 +1278,25 @@ def _module_index(views):
                 vs = rv.setdefault(area, set())
                 ver = m.get("versions") or {}
                 for k in ("changelog", "declared_not_published", "published_not_declared"):
-                    vs.update(_bare(x) for x in ver.get(k) or [])
+                    vs.update(version_key(x) for x in ver.get(k) or [])
                 for pub in ver.get("published") or []:
-                    vs.add(_bare(pub.get("version")))
+                    vs.add(version_key(pub.get("version")))
                     if pub.get("module"):
                         rp.add(pub["module"])
                 vf = ver.get("version_file") or {}
-                vs.update(_bare(x) for x in (vf.get("from"), vf.get("to")) if x)
+                vs.update(version_key(x) for x in (vf.get("from"), vf.get("to")) if x)
                 for cv in ver.get("child_version_files") or []:
                     if cv.get("module"):
                         rp.add(cv["module"])
-                    vs.update(_bare(x) for x in (cv.get("from"), cv.get("to")) if x)
+                    vs.update(version_key(x) for x in (cv.get("from"), cv.get("to")) if x)
                 for rel in ver.get("releases") or []:
                     tag = str(rel.get("tag") or "")
                     if tag:
-                        vs.add(_bare(tag.rsplit("/", 1)[-1]))
+                        vs.add(version_key(tag.rsplit("/", 1)[-1]))
                 if m.get("first_version"):
-                    vs.add(_bare(m["first_version"]))
+                    vs.add(version_key(m["first_version"]))
                 for c in m.get("changelog") or []:
-                    vs.add(_bare(c.get("version")))
+                    vs.add(version_key(c.get("version")))
                     if c.get("module"):
                         rp.add(c["module"])
                     for sec in c.get("sections") or []:
@@ -1226,8 +1329,9 @@ def _scoped_paragraphs(text, slugs):
     always that one."""
     if len(slugs) == 1:
         return [(par, slugs[0]) for par in _paragraphs(text)]
-    bare = {sl.split("/", 1)[1].lower(): sl for sl in slugs}
-    low = {sl.lower(): sl for sl in slugs}
+    names = [slug_key(sl).split("/", 1)[-1] for sl in slugs]
+    bare = {n: sl for n, sl in zip(names, slugs) if names.count(n) == 1}
+    low = {slug_key(sl): sl for sl in slugs}
     out, heading = [], None
     for par in _paragraphs(text):
         for line in par.split("\n"):
@@ -1257,7 +1361,7 @@ def _suppression_hits(text, hidden, registry_names=None):
         if re.search(pat, text, re.I):
             hits.add(login)
     for login, name in (registry_names or {}).items():
-        pat = r"\s+".join(re.escape(part) for part in name.split())
+        pat = r"\s+".join(re.escape(part) for part in str(name or "").split())
         if pat and re.search(r"(?<!\w)" + pat + r"(?!\w)", text, re.I):
             hits.add(login)
     return sorted(hits)
@@ -1287,17 +1391,19 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     # 1. story blocks: checked against their own slices, then blanked
     stories, not_checked, not_in_outline, duplicate, seen = {}, [], [], [], set()
     multi = len(views) > 1
-    story_ids = {s["key"] for s in sec["stories"].get("full") or []} | \
-        {s["key"] for s in sec["stories"].get("pointers") or []} | \
-        {key for v in views for key in _story_trains(v, multi)}
+    story_ids = {story_key_norm(s["key"]) for s in sec["stories"].get("full") or []} | \
+        {story_key_norm(s["key"]) for s in sec["stories"].get("pointers") or []} | \
+        {story_key_norm(key) for v in views for key in _story_trains(v, multi)}
+    norm_slices = {story_key_norm(k): x for k, x in slices.items()}
     for m in _STORY_BLOCK_RE.finditer(text):
         tid, body = m.group(1), m.group(2).strip()
-        if tid in seen and tid not in duplicate:
+        nk = story_key_norm(tid)
+        if nk in seen and tid not in duplicate:
             duplicate.append(tid)
-        seen.add(tid)
-        if tid not in story_ids:
+        seen.add(nk)
+        if nk not in story_ids:
             not_in_outline.append(tid)
-        sl = slices.get(tid)
+        sl = norm_slices.get(nk)
         if sl is None:
             if tid not in not_checked:
                 not_checked.append(tid)
@@ -1310,7 +1416,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
             stories[tid] = r
     body = _STORY_BLOCK_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
     res.update(stories=stories, stories_not_checked=not_checked,
-               stories_not_in_outline=not_in_outline, stories_duplicate=duplicate)
+               stories_not_in_outline=not_in_outline, stories_duplicate=duplicate,
+               markers_malformed=marker_problems(text))
 
     # 2. sections: present (heading) or omitted with a reason, in order
     headings = []
@@ -1356,10 +1463,11 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
         hidden |= _do_not_name(v)
         for login in set((v.get("people") or {})) | set(((v.get("affiliations") or {})
                                                            .get("people") or {})):
-            people_by_repo[sl].setdefault(login, _person(v, login))
+            people_by_repo[sl].setdefault(login_key(login), _person(v, login))
         for p in v.get("prs") or []:
             if p.get("author"):
-                people_by_repo[sl].setdefault(p["author"], _person(v, p["author"]))
+                people_by_repo[sl].setdefault(login_key(p["author"]),
+                                              _person(v, p["author"]))
     people = {}
     for sl in slugs:
         for login, row in people_by_repo[sl].items():
@@ -1437,6 +1545,11 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     # must be a module, child, code area or path the repository's changelogs name
     named_mods, bad_mods = [], []
     bad_versions, bad_items, worded = [], [], []
+    roots = {}
+    for v in views:
+        for m in (v.get("module_changes") or {}).get("modules") or []:
+            if m.get("area") == "main.tf":
+                roots.setdefault(_slug(v), []).append(m["area"])
     cand = {(c.get("repo") or slugs[0], c["area"]): c
             for c in sec["breaking"].get("candidates") or []}
     declared = {(d.get("repo") or slugs[0], d["area"])
@@ -1476,7 +1589,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
         linked_nums = []
         for m in _ITEM_LINK_RE.finditer(par):
             n, sl = int(m.group(1)), m.group(2)
-            sl = next((x for x in slugs if x.lower() == sl.lower()), sl)
+            sl = next((x for x in slugs if slug_key(x) == slug_key(sl)), sl)
             linked_nums.append(n)
             if n not in items.get(sl, set()):
                 row = tag({"number": n}, sl) if multi else n
@@ -1492,8 +1605,17 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                 if row not in bad_items:
                     bad_items.append(row)
         # breaking candidates worded as declared (per repository and area)
-        if _BREAK_WORD_RE.search(_strip(par, code=True)) and not _HEDGE_RE.search(par_c):
-            for (sl, a) in sorted(par_mods):
+        heading_only = all(re.match(r"^\s*#{1,6}\s", ln) or not ln.strip()
+                           for ln in par.split("\n"))
+        claim_mods = dict(par_mods)
+        if not claim_mods and repo is not None and not heading_only:
+            # a paragraph of a repository naming no module path speaks of its
+            # root module (a Terraform repository's `main.tf` area), if any
+            for a in roots.get(repo, []):
+                claim_mods[(repo, a)] = None
+        if not heading_only and _BREAK_WORD_RE.search(_strip(par, code=True)) \
+                and not _HEDGE_RE.search(par_c):
+            for (sl, a) in sorted(claim_mods):
                 c = cand.get((sl, a))
                 if c is None:
                     continue
@@ -1511,22 +1633,24 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
 
     # people: known logins, names tied to their login, affiliation words
     mentioned = _LOGIN_RE.findall(prose)
-    res["people_not_in_view"] = sorted({m for m in mentioned if m not in people})
+    res["people_not_in_view"] = sorted({m for m in mentioned
+                                        if login_key(m) not in people})
     # suppression reads the COMPLETE issue (stories, quotes, code, comments)
     res["do_not_name_named"] = _suppression_hits(text, hidden, registry_names)
     mismatch = []
-    names = {p["name"]: login for login, p in people.items() if p.get("name")}
+    names = {p["name"]: key for key, p in people.items() if p.get("name")}
     for m in re.finditer(r"\(@([A-Za-z0-9-]+)[,)]", prose):
-        login = m.group(1)
+        key = login_key(m.group(1))
+        login = (people.get(key) or {}).get("login") or m.group(1)
         before = prose[max(0, m.start() - 80):m.start()].split("\n")[-1]
         before = re.sub(r"[*_\[\]]", "", before).rstrip()
-        want = (people.get(login) or {}).get("name")
+        want = (people.get(key) or {}).get("name")
         if want:
             if not before.endswith(want):
                 mismatch.append({"login": login, "name": want,
                                  "written": before[-len(want) - 10:].strip()})
         else:
-            other = next((n for n, lg in names.items() if lg != login
+            other = next((n for n, lg in names.items() if lg != key
                           and before.endswith(n)), None)
             if other:
                 mismatch.append({"login": login, "name": None, "written": other})
@@ -1534,7 +1658,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     aff_bad = []
     for par, repo in scoped:
         for s in _sentences(_strip(par, code=True)):
-            logins = [x for x in _LOGIN_RE.findall(s) if x in people]
+            logins = [login_key(x) for x in _LOGIN_RE.findall(s)
+                      if login_key(x) in people]
             if not logins:
                 continue
             says = []
@@ -1549,7 +1674,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                               for sl in pool if lg in people_by_repo[sl]} or \
                         {people[lg].get("affiliation")}
                     if labels != {said}:
-                        aff_bad.append(tag({"login": lg, "said": "community"
+                        aff_bad.append(tag({"login": people[lg].get("login") or lg,
+                                            "said": "community"
                                             if said == "community" else "home organisation",
                                             "label": sorted(x or "unknown" for x in labels)[0]
                                             if len(labels) == 1 else sorted(
@@ -1592,6 +1718,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                                    if re.search(r"\b" + re.escape(w) + r"\b", low)]
 
     fail_keys = ("stories_not_checked", "stories_not_in_outline", "stories_duplicate",
+                 "markers_malformed",
                  "sections_missing",
                  "omitted_section_present", "sections_out_of_order", "title_missing",
                  "intro_missing", "urls_not_in_view", "quotes_not_in_view",
@@ -1642,8 +1769,12 @@ def _load(path):
 def _registry_hidden(path):
     """{login: name or None} of the registry's do_not_name entries."""
     reg = _load(path)
+    people = reg.get("people") if isinstance(reg, dict) else None
+    if not isinstance(people, dict):
+        sys.stderr.write("newsletter.py: error: {} is not a people registry\n".format(path))
+        raise SystemExit(2)
     out = {}
-    for login, e in ((reg or {}).get("people") or {}).items():
+    for login, e in people.items():
         if isinstance(e, dict) and e.get("do_not_name"):
             out[login] = e.get("name")
     return out
@@ -1677,6 +1808,10 @@ def main(argv=None):
         sys.stderr.write(_USAGE)
         raise SystemExit(2)
     views = [_load(p) for p in paths]
+    for p, v in zip(paths, views):
+        if not isinstance(v, dict) or not isinstance(v.get("meta"), dict):
+            sys.stderr.write("newsletter.py: error: {} is not a view (no meta)\n".format(p))
+            raise SystemExit(2)
     if do_outline:
         json.dump(outline(views, cadence=cadence), sys.stdout, indent=2)
         sys.stdout.write("\n")
