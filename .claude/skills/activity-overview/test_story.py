@@ -843,6 +843,20 @@ class TestReleaseNotes(unittest.TestCase):
 
 class TestVersionGaps(unittest.TestCase):
 
+    def test_no_unpublished_claim_when_a_window_listed_no_tags(self):
+        # a roll-up where one gathered window failed to list tags: a version
+        # without a tag in the view was never checked for that window
+        import test_module_changes as tmc
+        b = tmc.window()
+        b["module_notes"]["tags"]["windows_without_tags"] = [
+            {"from": "2026-10-01", "to": "2026-10-31"}]
+        mc = tmc.enriched(b)["module_changes"]
+        mods = {e["area"]: e for e in mc["modules"]}
+        self.assertNotIn("declared_not_published", mods[tmc.LAB]["versions"])
+        self.assertEqual(mc["inputs"]["windows_without_tags"],
+                         [{"from": "2026-10-01", "to": "2026-10-31"}])
+        self.assertIn("published_not_declared", mods[tmc.HUB]["versions"])
+
     def test_declared_not_published_and_the_reverse(self):
         import test_module_changes as tmc
         mc = tmc.enriched()["module_changes"]

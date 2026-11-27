@@ -858,7 +858,9 @@ the merged work was plumbing (CI, docs generation, tests). Two keys:
 A view of exactly a gathered window carries the stored value verbatim (`validate.py
 --bundle` compares it). Any other view takes the items (all dated) of every gathered window
 overlapping it that fall inside it, once each, and adds `windows` and `covers_view`;
-`tags.windows_without_tags` names windows that listed none.
+`tags.windows_without_tags` names windows that listed none. For such a view the
+module layer makes no `declared_not_published` claim (a missing tag may sit in a window that
+listed none) and repeats the list in `module_changes.inputs.windows_without_tags`.
 
 ### `module_changes`
 

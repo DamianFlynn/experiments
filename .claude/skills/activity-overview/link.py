@@ -1688,6 +1688,9 @@ class _ModuleCtx:
                 self.train_of.setdefault(n, t.get("id"))
         tags = (bundle.get("module_notes") or {}).get("tags") or {}
         self.tags_collected = bool(tags.get("collected"))
+        # a roll-up where some gathered window listed no tags: a version
+        # without a tag in the view may have been tagged in such a window
+        self.tags_partial = bool(tags.get("windows_without_tags"))
 
     def kind(self, area):
         """module_kind of an area over every path of the view (memoised)."""
@@ -2116,6 +2119,9 @@ def build_module_changes(bundle, path_rules=()):
     if releases:
         out["releases"] = releases
     inputs = {"tags_collected": bool(tags.get("collected"))}
+    if tags.get("windows_without_tags"):
+        # no "declared, not published" claim is made for such a view
+        inputs["windows_without_tags"] = tags["windows_without_tags"]
     if not tags.get("collected") and tags.get("reason"):
         inputs["tags_reason"] = tags["reason"]
     if notes.get("unread"):
@@ -2280,7 +2286,7 @@ def _module_entry(ctx, m, moves, bundle):
                          and _bare_version(v) not in tagged]
         not_declared = [t.get("version") for t in own_tags
                         if _bare_version(t.get("version")) not in declared_v]
-        if not_published:
+        if not_published and not ctx.tags_partial:
             versions["declared_not_published"] = not_published
         if not_declared:
             versions["published_not_declared"] = not_declared
