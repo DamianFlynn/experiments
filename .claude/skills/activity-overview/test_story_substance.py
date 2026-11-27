@@ -301,7 +301,8 @@ def ciphers_history():
         patches=[{"commit": B, "path": ".github/workflows/t.yml", "kind": "shared",
                   "added": ["  skip: true"], "removed": []},
                  {"commit": C, "path": "m/CHANGELOG.md", "kind": "changelog",
-                  "added": ["- Disabled weak ciphers."], "removed": ["- None"]}])
+                  "added": ["- Disabled weak ciphers."], "removed": ["- None"]}],
+        narrative_collected=True)
 
 
 def ciphers_bundle(**kw):
@@ -383,11 +384,13 @@ class TestChangeSummaries(unittest.TestCase):
             c.pop("paths", None)
             c.pop("body", None)
         b["pr_history"]["prs"][0].pop("patches")
+        b["pr_history"]["prs"][0].pop("narrative_collected")
         c = conversation(b, "train-issue-6")
-        self.assertEqual(len(c["gaps"]), 3)
+        self.assertEqual(len(c["gaps"]), 4)
         self.assertIn("review comments carry no file", c["gaps"][0])
         self.assertIn("PR commits carry no file paths", c["gaps"][1])
-        self.assertIn("are not in the store for PR(s) #1", c["gaps"][2])
+        self.assertIn("PR commits of #1 carry no code-comment", c["gaps"][2])
+        self.assertIn("are not in the store for PR(s) #1", c["gaps"][3])
         self.assertIn("check runs and their results per PR (CI pass / fail is "
                       "not stored)", c["not_gathered"])
 

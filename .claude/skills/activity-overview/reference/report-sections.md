@@ -218,8 +218,11 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
      review comment (with the file, line and diff lines it is attached to and the thread it
      replies to, when stored), lifecycle event (renames with the old and new title, draft /
      ready, review requests, dismissals, force-pushes, when stored), PR commit (with its
-     message body as `text` and a `change` summary: files by class, modules, `shared`,
-     interface rows, changelog / shared-file lines), one `checks` item per PR commit whose
+     message body as `text`, a `change` summary: files by class, modules, `shared`,
+     interface rows, changelog / shared-file lines, and its `evidence`: the interface delta
+     — parameters / outputs / resources added, removed, renamed, defaults, allowed values,
+     descriptions changed — the code comments and documentation prose it added, removed or
+     reworded), one `checks` item per PR commit whose
      checks were read (roll-up as of the window's end, failing check names) and merged
      commit, the merge;
    - `turning_points` marked by rule (a rework carries what changed after the request);
@@ -230,7 +233,10 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
      `modules` (shipped: the maintainers' changelog items verbatim, version, interface
      names, breaking), `net_change` (an open PR's own net change);
    - `threads` — the open-threads ledger, every question / request with a status by rule
-     (GitHub's own resolved flag, when stored, wins: `resolved on GitHub`);
+     (GitHub's own resolved flag, when stored, wins: `resolved on GitHub`), its `response`
+     (the commits that followed it — matched on the commented lines, or by time — with
+     what they changed) and `verdict_after` (the same reviewer's next verdict);
+     `outcome.requests` lists those sequences;
    - `truncation`, `bots`, `pr_history`, `not_gathered`, and `gaps` (what an older store
      cannot show).
 2. **Dispatch one story narrator per story train** (the batching of step 2b applies, with
@@ -264,9 +270,18 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    >    the slice states.
    > 3. *Decisions and their effect, explicitly.* What was dropped, kept, renamed, deferred —
    >    taken from the outcome block's `modules` (changelog items, interface names), the `change`
-   >    summaries (parameters dropped / added) and commit `text` (where a commit says why).
+   >    summaries and commit `evidence` (parameters removed / added / renamed, defaults and
+   >    allowed values changed) and commit `text` (where a commit says why). A decision may
+   >    be stated from the diff sequence the slice holds — a thread's `response` and
+   >    `verdict_after`, `outcome.requests`: "after the request, commit … removed
+   >    the firewallRules parameter from the module file; X approved on …" — exactly as that sequence,
+   >    with its URLs. An explicit agreement ("X agreed to drop …") is stated only when
+   >    someone wrote it; otherwise say what was done and what the reviewer did next.
    >    Never infer a decision from tone or from who spoke last. If the slice does not show
    >    how something was resolved, say "the record does not show how this was resolved".
+   >    Changelog, README / docs / ADR prose and code comments in `evidence` (and
+   >    `patches`) are the maintainers' own words: quote them verbatim, with their file
+   >    (a code comment in backticks, exactly as stored).
    > 4. *No dangling threads.* Every question, constraint, request or second issue the story
    >    mentions is either resolved in the story (what happened, with its evidence: a reply,
    >    a commit, a changelog item) or explicitly called out as open with what it waits on.
@@ -332,7 +347,9 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    and the story does not call unknown what the slice holds: no sentence saying CI /
    check results are not in the record when an outcome item has gathered `checks`
    (`checks_said_unknown`), none saying a thread's resolution is not recorded when a
-   thread carries `resolved_on_github` (`resolved_said_unknown`).
+   thread carries `resolved_on_github` (`resolved_said_unknown`); and every code comment
+   the story quotes in backticks (a span starting with `//`, `/*`, `#` or `<#`) occurs in
+   the slice (`code_comments_not_in_slice`).
    Else exit 1 with the lists. Drop or fix each listed sentence and check again; never
    publish a story that fails it.
    **What the check does not cover** — read the story once against rules 2–7: that each

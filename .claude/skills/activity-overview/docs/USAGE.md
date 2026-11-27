@@ -231,6 +231,7 @@ into a **fresh** store for the first item, into the same store for the others:
 | #101 (nested Terraform areas) | `.tf` files in `modules/<name>/<sub>/` stay in `modules/<name>` | module counts / areas |
 | the module change notes (`module_notes` / `module_changes`, BUNDLE.md "Module changes") | no `module_notes` per-window fact, so `link.py` builds no `module_changes` (new / changed / breaking / deprecated modules, product vs plumbing) | the view has no `module_changes` key. Re-gather the window (same store is fine: a re-fold replaces that window's facts) |
 | the story layer (`pr_history`, release notes text; BUNDLE.md "The story layer") | no `pr_history` per-window fact and no `releases[].notes` | the slice `conversation` has no PR commits (`pr_history: not_gathered`), `change_requests_reworked` is absent, `module_changes.releases` carry no notes. `discussion`, `stories` and the timeline still work from the stored comments and reviews. Re-gather the window (same store is fine) |
+| the narrative evidence of PR commits (code comments, docs, interface deltas, review responses; BUNDLE.md "`pr_history`") | walked `pr_history` rows without `narrative_collected` | commit items have no `evidence`, review threads get only time-based `response`s, the slice's `gaps` says so. Re-gather the window (same store is fine) |
 | check results, review-thread resolved flags, PR lifecycle events (`pr_activity`; BUNDLE.md) | no `pr_activity` per-window fact | the slice's `gaps` names the PRs without it, `outcome.items[].checks` is `"not gathered"`, threads keep their derived status, `not_gathered` keeps the full list. Re-gather the window (same store is fine) |
 | the story substance (review-comment context, PR commit paths / bodies / patch excerpts; BUNDLE.md "Slice `conversation`") | review comments without `path` / `diff_hunk` / `in_reply_to`; `pr_history` commits without `paths` / `body`, no `patches` | the slice's `conversation.gaps` names what is missing; commit items have no `change` summary, the open-threads ledger falls back to `reply_on_item` (no thread links), `outcome.net_change` is absent. The outcome block, the ball rule and linked items still work. Re-gather the window (same store is fine) |
 | #109 (collection review) | an issue of ANOTHER repo that mentions a PR made the same-numbered local issue a `cross_ref` of it; commits (and their code/symbol events) are windowed on the committer's local day, not the UTC day PRs and issues use | an unrelated issue in a PR's train context / forecast; a commit made near midnight UTC in the neighbouring month. Re-gather into a fresh store (a mention edge the new records no longer imply fails `validate`) |
@@ -621,6 +622,19 @@ commits, notes for 40 PRs, a 1.1 MB fact; October 2026 into the same clone, 160 
 `fetch_failed`; neither stops the gather. `--no-pr-history` skips all of it and records
 `{"collected": false}`. The refs stay in the clone (`refs/remotes/pr/*`); a refresh fetches
 only what moved.
+
+For the same 40 PRs gather reads the commits as narrative (git only, no API call): one
+more diff walk over the module, script, workflow and Markdown files (and the files review
+comments are on) and the before / after module files and READMEs, giving each commit its
+code comments added / removed / reworded, the hand-written documentation lines it changed
+(generated README sections skipped), its interface delta (parameters, outputs, resources,
+module references: added, removed, renamed, default / allowed values / descriptions /
+API versions changed), and each review comment the later commits that changed the lines
+it is on. Measured on September 2026 of `Azure/bicep-registry-modules` (the same clone,
+PR heads already fetched): the PR-history step went from 3 s to 10 s (28 s the first time,
+while the walk fetched the README / workflow blobs), and the stored `pr_history` from
+1.66 MB to 1.94 MB of JSON (+17 %). `ACTIVITY_ADR_DIRS` (comma-separated folders) names
+the folders whose Markdown files are decision records.
 
 Check results, review-thread state and PR lifecycle events (the per-window fact
 `pr_activity`, BUNDLE.md): the lifecycle events (renames, draft / ready, review requests

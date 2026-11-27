@@ -304,7 +304,9 @@ window history on disk, and from windows gathered before it existed: re-gather a
 window to get it) and `pr_history` (each window PR's own commits from
 `refs/pull/<N>/head` — each with its file paths and message body — and, for the most
 discussed PRs, the comment / parameter changes between them and the lines they wrote
-into a changelog or a shared repository file (`patches`) — `gather.collect_pr_history`,
+into a changelog or a shared repository file (`patches`), and the narrative evidence of
+their commits (code comments, documentation prose, interface deltas per commit, and the
+commits that followed each review comment) — `gather.collect_pr_history`,
 BUNDLE.md "The story layer"; windows gathered before paths, bodies and patches were kept
 hold commits without them; only per window;
 `{"collected": false}` for a gather run with `--no-pr-history`; absent without a clone and

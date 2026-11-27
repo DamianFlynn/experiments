@@ -33,6 +33,9 @@ vertical: `gather (manifest) → store → validate → digest`.
   checks them with `mmdc` unless `--skip-validate`. The report depends only on the
   view (no wall-clock date, no paths), so it is byte-stable. **No narrative.**
 - **[`manifest.json`](manifest.json)** — the project manifest used for the gather.
+- **[`stories/`](stories/README.md)** — two sample stories (a single-repo view of
+  `Azure/bicep-registry-modules`, September 2026) written from story slices with the
+  story brief, each passing `link.py --check-story`.
 
 ## Constellation
 

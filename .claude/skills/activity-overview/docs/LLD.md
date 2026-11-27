@@ -458,6 +458,26 @@ with its network retry); a refusal is recorded, never fatal.
    would impact all the modules" is about and what the changelog said at each step; a
    failed walk is `patches_skipped`.
 
+6. For the same walked PRs, the narrative evidence (`collect_pr_narrative`): `git -c
+   core.attributesFile=<tmp: *.md diff=markdown> log --reverse -p --unified=3 -M
+   refs/remotes/pr/<N> --not HEAD … -- PR_NARRATIVE_PATHSPECS <review-comment paths>`
+   through `parse_narrative_patch` (hunks keep git's header context — the Markdown driver
+   names the heading above, the default driver the top-level line above — and per-line
+   old / new numbers). Per file: `narrative_comments` (Bicep `//` `/* */`, HCL `#` `//`
+   `/* */`, PowerShell `#` `<# #>`, YAML `#`; whole-line comments, grouped per change block,
+   paired in order as rewords; `_narrative_decl` names the declaration), `narrative_docs`
+   (README / ADR / docs / other Markdown; `markdown_generated_lines` reads the README's
+   before / after text, `git cat-file blob <sha>[^]:<path>`, to skip generated sections),
+   and `diff_interface` over `read_interface` of the module file's two versions (a
+   mask-based reader of top-level Bicep `param` / `var` / `output` / `resource` / `module`
+   / `type` / `func` / `metadata` with their decorators, and Terraform `variable` / `output`
+   / `module` / `resource` / `data` blocks with their own arguments; the module layer's
+   diff-local symbol events cannot see a decorator or a value past their cap, so the
+   delta is read from whole files). `review_responses` matches each review comment that
+   opens a thread on a file against the later commits' hunks (by its last diff-hunk lines,
+   else by line in the next commit). Budgets as in BUNDLE.md; a failed walk is
+   `narrative_skipped`.
+
 Step 3's format also carries each commit's message body (`%b`, closed by `\x1d` so its lines
 are not read as file names): `parse_pr_commits` keeps the file `paths` (at most
 `PR_HISTORY_PATHS_MAX` 60) and the `body` (`pr_commit_body`: trailer paragraphs dropped, at

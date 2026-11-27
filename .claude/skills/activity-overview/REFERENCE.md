@@ -251,6 +251,10 @@ a PR / issue created in the window (the search API allows 30 requests a minute; 
 waited out like any other). `ACTIVITY_NEWCOMERS_MAX` (default `200`, min `0`) caps the
 candidates checked (the rest are listed as `not_checked`); `--no-newcomers` skips the check.
 
+The PR-history step also reads the walked PRs' commits as narrative (git only):
+`ACTIVITY_ADR_DIRS` (comma-separated folder paths; default `adr,adrs,decisions,docs/adr,
+docs/decisions`) names the folders whose Markdown files are decision records.
+
 Check results, review-thread state and PR lifecycle events (`pr_activity`, BUNDLE.md):
 the events come from the issue timeline already fetched per PR (no extra call); the checks
 of each PR's latest 10 commits, the thread resolved flags and the force-push commits from

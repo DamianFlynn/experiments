@@ -1472,6 +1472,40 @@ def _pr_activity_problem(value):
     return None
 
 
+def _pr_history_problem(value):
+    """Why a stored `pr_history` value's narrative evidence is not what
+    gather writes (collect_pr_narrative): per commit `comments` /
+    `interface` / `docs` lists of objects, `responses` whose commits match
+    by `anchor` or `line`, a boolean `narrative_collected`; or None. Rows
+    of older gathers simply lack them."""
+    for row in value.get("prs") or []:
+        if not isinstance(row, dict):
+            return "pr_history.prs holds a row that is not an object"
+        n = row.get("number")
+        if "narrative_collected" in row and row["narrative_collected"] is not True:
+            return "pr_history PR #{} narrative_collected is not true".format(n)
+        for c in row.get("commits") or []:
+            for key in ("comments", "interface", "docs"):
+                if key in c and not (isinstance(c[key], list) and all(
+                        isinstance(x, dict) for x in c[key])):
+                    return "pr_history PR #{} commit {} is not a list of " \
+                           "objects".format(n, key)
+        resp = row.get("responses")
+        if resp is None:
+            continue
+        if not isinstance(resp, list):
+            return "pr_history PR #{} responses is not a list".format(n)
+        for r in resp:
+            if not isinstance(r, dict) or not isinstance(r.get("commits"), list):
+                return "pr_history PR #{} has a response gather does not " \
+                       "write".format(n)
+            for c in r["commits"]:
+                if not isinstance(c, dict) or c.get("match") not in ("anchor", "line"):
+                    return "pr_history PR #{} has a response commit gather " \
+                           "does not write".format(n)
+    return None
+
+
 def _fact_shape_problem(key, value):
     """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
     or None: it is not a JSON object (code_owners: an object or a rule list),
@@ -1483,6 +1517,10 @@ def _fact_shape_problem(key, value):
         ok = isinstance(value, dict)
     if ok and key == "affiliations":
         why = _affiliations_problem(value)
+        if why:
+            return why
+    if ok and key == "pr_history":
+        why = _pr_history_problem(value)
         if why:
             return why
     if ok and key == "pr_activity":

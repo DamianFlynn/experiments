@@ -2547,6 +2547,15 @@ STORY_ITEM_FLOOR = 500
 # Budget for the code notes (comments / parameter descriptions / interface
 # lines) carried on the timeline's commit items.
 STORY_CODE_NOTES_BUDGET = 12000
+# Budget for the narrative evidence of PR commits (`evidence`: interface
+# deltas, code comments, documentation prose from `pr_history`), the newest
+# commits first; past it rows are left out and counted
+# (truncation.evidence).
+STORY_EVIDENCE_BUDGET = 16000
+# Per thread: the commits listed as what followed it; per slice: the
+# requests listed in outcome.requests.
+STORY_RESPONSE_COMMITS = 5
+STORY_REQUESTS_MAX = 20
 # Relevance points by train kind (story_score).
 _STORY_KIND_RELEVANCE = {"feature": 3.0, "module-request": 3.0, "bug": 1.0}
 
@@ -3277,6 +3286,9 @@ def story_material(bundle, train):
                 it["change"] = change
             if notes_by_commit.get(c["sha"]):
                 it["code_notes"] = notes_by_commit[c["sha"]]
+            ev = _commit_evidence(c)
+            if ev:
+                it["evidence"] = ev
             items.append(it)
     commits_by_sha = {c.get("sha"): c for c in bundle.get("commits", [])}
     for sha in train.get("commits") or []:
@@ -3306,11 +3318,16 @@ def story_material(bundle, train):
     hunks_omitted = _apply_hunk_budget(items)
     if hunks_omitted:
         truncation["hunks_omitted"] = hunks_omitted
+    ev_info = _apply_evidence_budget(items)
+    if ev_info:
+        truncation["evidence"] = ev_info
     turning = story_turning_points(
         items, instant if train.get("outcome") == "in_flight" else None)
     _rework_detail(items, turning)
     threads = story_threads(items, pr_index, issue_index)
     _apply_thread_record(threads, prs, activity, instant)
+    thread_responses(threads, items, prs, history, instant)
+    requests = _outcome_requests(threads)
     out = {"timeline": items,
            "turning_points": turning,
            "truncation": truncation,
@@ -3324,7 +3341,18 @@ def story_material(bundle, train):
            "threads": threads[:STORY_THREADS_MAX]}
     if len(threads) > STORY_THREADS_MAX:
         out["threads_omitted"] = len(threads) - STORY_THREADS_MAX
+    if requests:
+        out["outcome"]["requests"] = requests
     gaps = _story_gaps(items)
+    unwalked = [p.get("number") for p in prs
+                if "notes" in (history.get(p.get("number")) or {})
+                and not (history.get(p.get("number")) or {}).get("narrative_collected")]
+    if unwalked:
+        gaps.append("PR commits of {} carry no code-comment, documentation or "
+                    "per-commit interface evidence and review threads no "
+                    "`response` from the diffs (gathered before they were "
+                    "kept): what each commit did is known from its summary "
+                    "only".format(", ".join("#{}".format(n) for n in unwalked)))
     if prs and any(p.get("number") not in (activity or {}) for p in prs):
         gaps.append("check results, review-thread resolved flags and PR "
                     "lifecycle events (renames, draft / ready, review "
@@ -3442,6 +3470,183 @@ def _pr_history_status(prs, history):
             s += ", notes skipped: " + row["notes_skipped"]
         out[str(p.get("number"))] = s
     return out
+
+
+def _commit_evidence(c):
+    """The narrative evidence a pr_history commit carries (collect_pr_narrative):
+    {interface, comments (each with its comment_class), docs, [<key>_omitted]},
+    or None when it has none."""
+    out = {}
+    if c.get("interface"):
+        out["interface"] = [dict(r) for r in c["interface"]]
+    if c.get("comments"):
+        rows = []
+        for r in c["comments"]:
+            r = dict(r)
+            r["class"] = comment_class("comment", r.get("text") or r.get("after")
+                                       or r.get("before"))
+            rows.append(r)
+        out["comments"] = rows
+    if c.get("docs"):
+        out["docs"] = [dict(r) for r in c["docs"]]
+    for k in ("interface_omitted", "comments_omitted"):
+        if c.get(k):
+            out[k] = c[k]
+    return out or None
+
+
+def _apply_evidence_budget(items):
+    """Hold the commit items' `evidence` rows to STORY_EVIDENCE_BUDGET
+    characters, the newest commits first (interface rows, then comments,
+    then docs within a commit); a commit whose rows were cut gets
+    `evidence_omitted`. Returns {budget, kept, omitted} or None when no item
+    carries evidence."""
+    used, kept, omitted, any_ev = 0, 0, 0, False
+    for it in reversed(items):
+        ev = it.get("evidence")
+        if not ev:
+            continue
+        any_ev = True
+        cut = 0
+        for key in ("interface", "comments", "docs"):
+            rows = ev.get(key) or []
+            keep = []
+            for r in rows:
+                size = len(json.dumps(r, sort_keys=True))
+                if used + size > STORY_EVIDENCE_BUDGET:
+                    cut += 1
+                    continue
+                used += size
+                keep.append(r)
+            if keep:
+                ev[key] = keep
+            elif key in ev:
+                del ev[key]
+        kept += sum(len(ev.get(k) or []) for k in ("interface", "comments", "docs"))
+        if cut:
+            it["evidence_omitted"] = cut
+            omitted += cut
+    if not any_ev:
+        return None
+    return {"budget": STORY_EVIDENCE_BUDGET, "kept": kept, "omitted": omitted}
+
+
+def _commit_ref(it, index):
+    return {"index": index, "sha": it.get("sha"), "at": it.get("at"),
+            "url": it.get("url"), "subject": it.get("subject")}
+
+
+def thread_responses(threads, items, prs, history, instant):
+    """What followed each thread on a PR, from the record (in place):
+    `response` {basis, commits: [{index, sha, at, url, subject, [match],
+    [hunks]}], [file_commits]} and `verdict_after` {state, at, url}.
+    - basis `anchor`: a review thread whose opening comment gather matched
+      against the later commits' diffs (pr_history `responses`): the
+      commits that changed the commented lines, with the removed / added
+      lines there (`match` anchor / line), as of the instant;
+    - basis `time`: otherwise, the PR's own non-merge commits after the
+      thread until its opener speaks again after one of them (the opener's
+      other comments and verdict of the same review round, before any
+      commit, do not end it); at most STORY_RESPONSE_COMMITS, each
+      pointing at its timeline item, whose `evidence` / `change` say what
+      it did.
+    `verdict_after` is the opener's first approval / change request /
+    dismissal on the PR after the thread (after its last response commit
+    when there is one). A sequence, not an agreement: nothing here says
+    anyone agreed to anything."""
+    by_pr = {p.get("number"): p for p in prs}
+    pos = {id(it): i for i, it in enumerate(items)}
+    for t in threads:
+        on = t.get("on") or {}
+        if on.get("type") != "pr" or on.get("number") not in by_pr:
+            continue
+        n = on["number"]
+        row = history.get(n) or {}
+        start = next((i for i, it in enumerate(items) if it.get("url") == t.get("url")
+                      and (it.get("on") or {}) == on), None)
+        if start is None:
+            continue
+        resp = None
+        if t.get("kind") == "review_thread" and row.get("responses"):
+            ids = {c.get("url"): c.get("id") for c in
+                   by_pr[n].get("review_comments") or [] if isinstance(c, dict)}
+            stored = next((r for r in row["responses"]
+                           if r.get("comment_id") == ids.get(t.get("url"))), None)
+            if stored:
+                when = {c.get("sha"): c.get("committed_at")
+                        for c in row.get("commits") or []}
+                commits = []
+                for h in stored.get("commits") or []:
+                    if not _not_after(when.get(h.get("sha")), instant):
+                        continue
+                    it = next((x for x in items if x.get("kind") == "commit"
+                               and x.get("sha") == h.get("sha")), None)
+                    ref = _commit_ref(it, pos[id(it)]) if it else \
+                        {"sha": h.get("sha"), "at": when.get(h.get("sha"))}
+                    ref.update(match=h.get("match"), hunks=h.get("hunks") or [])
+                    commits.append(ref)
+                if commits:
+                    resp = {"basis": "anchor", "commits": commits}
+                    files = [x for x in stored.get("file_commits") or []
+                             if _not_after(when.get(x), instant)]
+                    if files:
+                        resp["file_commits"] = files
+        if resp is None:
+            commits = []
+            for i in range(start + 1, len(items)):
+                it = items[i]
+                if (it.get("on") or {}) != on:
+                    continue
+                if it["kind"] in ("comment", "review", "review_comment") \
+                        and it.get("actor") == t.get("by") and commits:
+                    break       # the opener spoke again after a commit
+                if it["kind"] == "commit" and it.get("source") == "pr_head" \
+                        and not it.get("merge"):
+                    commits.append(_commit_ref(it, i))
+                    if len(commits) >= STORY_RESPONSE_COMMITS:
+                        break
+            if commits:
+                resp = {"basis": "time", "commits": commits}
+        if resp:
+            t["response"] = resp
+        after = t.get("at")
+        if resp:
+            after = max([after] + [c.get("at") or "" for c in resp["commits"]])
+        verdict = next((it for it in items[start + 1:]
+                        if it["kind"] == "review" and (it.get("on") or {}) == on
+                        and it.get("actor") == t.get("by")
+                        and it.get("state") in ("approved", "changes_requested",
+                                                "dismissed")
+                        and (it.get("at") or "") >= (after or "")), None)
+        if verdict is not None:
+            t["verdict_after"] = {"state": verdict.get("state"),
+                                  "at": verdict.get("at"), "url": verdict.get("url")}
+
+
+def _outcome_requests(threads):
+    """outcome.requests — "requests and what followed": per thread with a
+    `response` or a `verdict_after`, {thread, kind, by, at, url, [ask],
+    [path], followed_by: [{sha, at, url, subject}], basis, [verdict_after]},
+    at most STORY_REQUESTS_MAX."""
+    out = []
+    for t in threads:
+        if not t.get("response") and not t.get("verdict_after"):
+            continue
+        row = {"thread": t.get("id"), "kind": t.get("kind"), "by": t.get("by"),
+               "at": t.get("at"), "url": t.get("url")}
+        for k in ("ask", "path"):
+            if t.get(k):
+                row[k] = t[k]
+        resp = t.get("response") or {}
+        row["followed_by"] = [{k: c.get(k) for k in ("sha", "at", "url", "subject")
+                               if c.get(k) is not None}
+                              for c in resp.get("commits") or []]
+        if resp:
+            row["basis"] = resp.get("basis")
+        if t.get("verdict_after"):
+            row["verdict_after"] = t["verdict_after"]
+        out.append(row)
+    return out[:STORY_REQUESTS_MAX]
 
 
 def _pr_activity_index(bundle):
@@ -4559,6 +4764,26 @@ def check_story_record_claims(slice_obj, text):
     return out
 
 
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_CODE_COMMENT_START = ("//", "/*", "#", "<#")
+
+
+def check_story_code_comments(slice_obj, text):
+    """Code comments a story quotes in backticks (a span starting with //,
+    /*, # or <#) that occur in no slice text (whitespace-normalised): the
+    maintainers' own words must be quoted as the slice holds them. Pure."""
+    urls, texts = set(), []
+    _slice_strings(slice_obj, urls, texts)
+    norm = [_norm_ws(t) for t in texts]
+    out = []
+    for m in _CODE_SPAN_RE.finditer(text or ""):
+        span = m.group(1).strip()
+        if span.startswith(_CODE_COMMENT_START) and len(span) > 3 \
+                and not any(_norm_ws(span) in t for t in norm):
+            out.append(span)
+    return out
+
+
 def check_story_evidence(slice_obj, text):
     """The mechanical check of a narrative against its train slice: every URL
     the text cites must occur in the slice (as a value or inside a slice
@@ -4571,8 +4796,10 @@ def check_story_evidence(slice_obj, text):
     "quotes_checked", "first_date_without_year", "closing_paragraph",
     "closing_paragraph_missing", "numbers_without_state",
     "state_mismatch", "numbers_checked", "checks_said_unknown",
-    "resolved_said_unknown"} (check_story_record_claims: the story must not
-    call unknown what the slice holds). Pure."""
+    "resolved_said_unknown", "code_comments_not_in_slice"}
+    (check_story_record_claims: the story must not call unknown what the
+    slice holds; check_story_code_comments: a quoted code comment must be
+    in the slice). Pure."""
     urls, texts = set(), []
     _slice_strings(slice_obj, urls, texts)
     norm_texts = [_norm_ws(t) for t in texts]
@@ -4596,6 +4823,7 @@ def check_story_evidence(slice_obj, text):
     st = check_story_structure(slice_obj, text)
     out.update(st)
     claims = check_story_record_claims(slice_obj, text)
+    claims["code_comments_not_in_slice"] = check_story_code_comments(slice_obj, text)
     out.update(claims)
     out["ok"] = out["ok"] and not (st["first_date_without_year"]
                                    or st["closing_paragraph_missing"]

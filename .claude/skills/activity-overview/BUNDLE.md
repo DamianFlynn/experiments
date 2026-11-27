@@ -1218,7 +1218,8 @@ silence_days}}`.
     `body_truncated_from` when gather cut it — and its `change` summary) or
     `source: "base"` (the train's commit on the walked branch, e.g. the squash commit,
     with its `change` summary from the view's files and symbol events), each with the
-    `code_notes` its diff added / removed / changed.
+    `code_notes` its diff added / removed / changed. A PR commit of a walked PR also
+    carries `evidence` (below);
   Ordered by time, then kind, then url. Bots are not in it.
 - **`change`** (on commit items; omitted when nothing is known about the commit) — the
   compact, factual summary of what the commit changed (`link.change_summary`):
@@ -1235,6 +1236,23 @@ silence_days}}`.
   file, from `pr_history.patches`). Each PR commit's summary is relative to its parent:
   the rework after a change request is the summary of the commits that follow it (see
   `rework_after_change_request`).
+- **`evidence`** (on PR commit items, from `pr_history`; omitted when none) — what the
+  commit's diff says, extracted by gather (`collect_pr_narrative`), never summarised:
+  `interface` (the delta of each changed module file between the commit's parent and the
+  commit: `{path, kind, name, change, before?, after?, from?, to?, entries_added?,
+  entries_removed?, entries_omitted?}` — `change` is `added`, `removed`, `renamed` (`from`
+  / `to`) or the field that moved: `type`, `default`, `allowed`, `description`,
+  `constraints`, `nullable`, `api_version`, `ref`, `source`, `version`, `value`; a
+  multi-line object / array default or allowed list gives the entries that appeared /
+  went instead of before / after), `comments` (code comments added / dropped / reworded:
+  `{path, change: add|drop|reword, text | before/after, decl?, line, class,
+  truncated_from?}`, `decl` the declaration it documents or sits in, `class` as for code
+  notes), `docs` (`{path, kind: readme|adr|docs|markdown, sections: [{section?, added,
+  removed, lines_omitted?, generated_skipped?}]}`: the prose lines a commit changed in a
+  Markdown file, generated README sections skipped and counted), `interface_omitted` /
+  `comments_omitted` (what gather's per-commit caps left out). All evidence of one slice
+  shares `STORY_EVIDENCE_BUDGET` (16,000 characters), the newest commits first; a commit
+  whose rows were cut gets `evidence_omitted` (`truncation.evidence`).
 - **`code_notes`** (on commit items) — `{commit, path, change: add|drop|change, class,
   source, pr?, text | before/after | kind/name}`. `class` (`link.comment_class`):
   `parameter_description` (a Bicep `@description(...)` / `@metadata(...)` decorator),
@@ -1275,7 +1293,8 @@ silence_days}}`.
   timeline outward (the opening and the latest stay). A cut item carries
   `truncated_from`; an omitted one `text: null` and `text_omitted`. Nothing is cut
   silently. `hunks_omitted` (only when any) counts the review-comment hunks left out for
-  `STORY_HUNK_BUDGET`.
+  `STORY_HUNK_BUDGET`. `evidence` (only when a commit item carries any) — `{budget,
+  kept, omitted}` of the commit evidence rows.
 - **`bots`** — `{login: count}` of the automation comments, review comments and reviews
   left out of the timeline.
 - **`pr_history`** — `{pr number: status}`: `fetched` (with `, notes extracted` or `,
@@ -1295,8 +1314,8 @@ silence_days}}`.
 - **`gaps`** (omitted when empty) — what THIS slice cannot show because its store was
   gathered before the data was kept: review comments with no file / diff lines / thread
   link, PR commits with no file paths or message bodies, PRs with no `pr_activity` row
-  (check results, resolved flags and lifecycle events). A re-gather of the window adds
-  them.
+  (check results, resolved flags and lifecycle events), walked PRs whose history has no
+  narrative evidence (`narrative_collected`). A re-gather of the window adds them.
 - **`outcome`** — where the train stands as of `as_of` and what ended up in the product
   (`link.story_outcome`):
   - `train_outcome`, `as_of`;
@@ -1349,6 +1368,11 @@ silence_days}}`.
     `{group: {change: [name], <change>_more?}}` (at most `STORY_OUTCOME_NAMES_MAX` 25
     names each), `children` `[{path, change}]`, `breaking` `{declared: [text],
     candidates: [{rule, subject}]}`;
+  - `requests` — **requests and what followed** (only when any): per thread with a
+    `response` or a `verdict_after`, `{thread, kind, by, at, url, ask?, path?,
+    followed_by: [{sha, at, url, subject}], basis, verdict_after?}`, at most
+    `STORY_REQUESTS_MAX` 20. A sequence from the record (asked, then these commits, then
+    this verdict), never an agreement nobody wrote;
   - `net_change` (open PRs with stored commit paths / patch excerpts) — `{pr:
     {files_touched: {class: [path]}, lines: {path: {kind, commits, net_added,
     net_removed, lines_more?} | {kind, commits, reverted: true}}}}`: the files the PR's
@@ -1378,7 +1402,15 @@ silence_days}}`.
   gathered_after_as_of?}` says what GitHub held when the window was gathered (GitHub keeps
   no time for a resolution, so a view of an earlier window marks `gathered_after_as_of`).
   `resolution` is the strongest signal `{status, at, by, url, same_file?}`; `signals` lists
-  all. These are rules over the record, not a verdict:
+  all. A thread on a PR also gets `response` (`link.thread_responses`) — `{basis, commits:
+  [{index, sha, at, url, subject, match?, hunks?}], file_commits?}`: basis `anchor` when
+  gather matched the thread's opening review comment against the later commits' diffs
+  (`pr_history.responses`: the commits that changed the commented lines, `match` `anchor` /
+  `line`, `hunks` the lines removed and added there), else basis `time`: the PR's own
+  non-merge commits after the thread until its opener speaks again after one of them
+  (at most `STORY_RESPONSE_COMMITS` 5; `index` points at the commit's timeline item and its
+  `evidence`) — and `verdict_after` `{state, at, url}`, the opener's first approval /
+  change request / dismissal after the thread (after its last response commit). These are rules over the record, not a verdict:
   "answered" means somebody replied, not that the reply settled it. At most
   `STORY_THREADS_MAX` 40 (`threads_omitted` the rest).
 
@@ -1424,6 +1456,30 @@ without the clone):
   per file and commit of at most 500 characters each, the newest within
   `PR_HISTORY_PATCH_CHARS` 8,000 characters per PR (`patches_omitted` the oldest left
   out); `patches_skipped` with the reason when that walk failed.
+- narrative evidence (walked PRs; `collect_pr_narrative`, git only: one more `git log -p
+  --unified=3 -M` over `PR_NARRATIVE_PATHSPECS` — `*.bicep`, `*.bicepparam`, `*.tf`,
+  `*.hcl`, `*.ps1`, `*.psm1`, `*.yml`, `*.yaml`, `*.md` — and the files review comments
+  are on, plus `git cat-file blob` for the before / after module files and READMEs that
+  walk already fetched): per commit `comments` (at most `PR_NARRATIVE_COMMENTS` 25,
+  `comments_omitted`; each at most 500 characters), `docs` (at most
+  `PR_NARRATIVE_DOC_LINES` 30 lines per file), `interface` (at most
+  `PR_NARRATIVE_INTERFACE_ROWS` 40, `interface_omitted`; at most 10 module files, tests
+  and examples excepted; values capped at 200 characters, descriptions at 300) — shapes
+  as in the slice's `evidence` — all within `PR_NARRATIVE_CHARS` 24,000 characters per
+  PR, the newest commits first (`narrative_omitted` counts the rows left out); per PR
+  `responses` `[{comment_id, path, line?, at, commits: [{sha, match: anchor|line, hunks:
+  [{old_start, new_start, removed, added, lines_omitted?}]}], file_commits?}]` (a review
+  comment's later commits that changed the lines it is on: a hunk removing or keeping one
+  of its last diff-hunk lines, or within `PR_RESPONSE_NEAR` 3 lines of it in the next
+  commit; at most 3 commits, 2 hunks, 12 lines each; `PR_RESPONSE_CHARS` 12,000 per PR,
+  `responses_omitted`); `narrative_collected: true`, or `narrative_skipped` with the
+  reason. A comment directly above a declaration documents it (`decl`); section labels
+  and separators are dropped. A README with `Navigation` and `Resource Types` sections
+  is a generated module README: its preamble and generated sections (Navigation,
+  Resource Types, Usage examples, Parameters, Outputs, ...) are skipped, as is any
+  `<!-- BEGIN_... -->` block. Markdown under an ADR folder (`adr`, `adrs`, `decisions`,
+  `docs/adr`, `docs/decisions`; `ACTIVITY_ADR_DIRS`) is `adr`. The changelog stays in
+  `patches`.
 - `{"collected": false}` alone — the window was gathered with `--no-pr-history`.
 
 The fact holds each PR head **as gathered** — possibly after the window — so every
