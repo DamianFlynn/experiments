@@ -1201,13 +1201,23 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
     fail (not only awaiting approval) with no comment by its author since the head
     commit; else `in_flight`. `group_rule` says which rule fired.
   - **group** — `plumbing` when every PR of the train is plumbing (the module layer's
-    class, or a sweep), whatever its state (`state` keeps it); else the state.
+    class, or a sweep), whatever its state (`state` keeps it); else the state. Every
+    PR must be classified: one the module layer did not classify (an open PR) is
+    classified from its own commits' paths in `pr_history` committed by the view's end;
+    a PR that cannot be classified keeps the train out of plumbing.
   - `released` (landed stories) — **does landed mean released?** per module a PR of the
     train touched (`link.train_released`): `{module, version, status, tag, date, url,
     registry?}`, `status` `published` (a version tag of the module in the window: its
     tag, date, tree `url`, the public registry reference `br/public:<module>:<version>`
     for a Bicep module), `declared_not_published` (the changelog declared a version, no
     tag), `unknown` (declared, tags not read for the whole view) or `no_version_change`.
+    **A version is the train's only when tied to it**: the changelog entry declaring it
+    has one of the train's PRs as its source, its tag sits on one of the train's commits
+    (the merge commit), or it is the module's first tag of the window on or after the
+    train's last merge commit (the walked branch is first-parent linear, so that is the
+    first tag containing the merge). A module whose versions in the window are not tied
+    to the train is `unknown` (`version` null, with a `reason`): a PR merged after a tag
+    is never reported as released in that earlier version.
   - `stories.groups` `{group: count}`; `stories.all_rule` `{stalled_days,
     carry_max_days, groups}`.
 - `plumbing_themes` (`link.build_plumbing_themes`) — the window's plumbing PRs grouped
@@ -1228,7 +1238,16 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
   who closed it (the closing event's actor), GitHub's reason, the closing commit, the
   view's PRs that name it as closed, and those not yet merged when it closed.
 - PR rows that carry `head_repo` gain `is_fork` (another repository; null head
-  repository: a deleted fork).
+  repository: a deleted fork). The view's own repository is `link.repo_slug`: `meta.repo`
+  as is when already qualified (a manifest member's view), else `owner/repo` — the one
+  place module, tag and item URLs and repository comparisons are built from.
+- **As of the view's end**, everywhere: themes, open-PR classification, automation
+  summaries, `closing` and story worthiness read only commits, events and closes up to
+  the view's instant. A commit read by its roll-up state only (`state_only`) is
+  `unknown` for a view that ends before the gather (`gathered_at`): GitHub's state has
+  no check times. A nightly gather of the open window reads it the same night, so its
+  view (ending after the read) keeps the state; `commits_incomplete` counts such
+  commits.
 
 ### Slice `conversation` (the story material)
 

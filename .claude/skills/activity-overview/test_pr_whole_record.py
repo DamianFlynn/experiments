@@ -149,6 +149,9 @@ class TestSliceReadsTheWholeHistory(unittest.TestCase):
             "sha": sha(1), "committed_at": "2026-05-01T00:00:00Z", "rollup": "passing",
             "checks": [], "state_only": True, "state": "success"})
         f["prs"][0]["history_status"] = "complete"
+        # read by the view's end (a nightly gather of the open window); a
+        # state read after it is unknown as of then (test_review_fixes_pr_story5)
+        f["gathered_at"] = "2026-05-31T22:00:00Z"
         c = conversation(_story_bundle(f))
         item = next(i for i in c["timeline"] if i.get("sha") == sha(1))
         self.assertEqual((item["kind"], item["rollup"], item["state_only"]),

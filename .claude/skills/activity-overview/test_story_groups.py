@@ -98,9 +98,15 @@ class TestStoryWorthyAndGroups(unittest.TestCase):
 class TestReleased(unittest.TestCase):
 
     def mc(self, versions, tags=True):
+        # the train's PR is the changelog source of what it declared (the
+        # tie train_released requires; test_review_fixes_pr_story5)
+        cl = [{"version": x, "sources": [{"pr": 1}]}
+              for x in versions.get("changelog") or []]
+        cl += [{"version": x["version"], "sources": [{"pr": 1}]}
+               for x in versions.get("published") or []]
         return {"inputs": {"tags_collected": tags},
                 "modules": [{"area": "avm/res/x", "kind": "resource",
-                             "url": "u", "versions": versions,
+                             "url": "u", "versions": versions, "changelog": cl,
                              "prs": [{"number": 1}]}]}
 
     def test_statuses(self):
