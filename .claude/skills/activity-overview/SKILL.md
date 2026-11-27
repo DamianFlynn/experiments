@@ -287,6 +287,14 @@ module graph, ownership, issue kinds, contributors, stalled/blocked, module biog
 gated appendix, releases/CI/in-flight/rejected — is in **`reference/report-sections.md`**.
 Read it when authoring the report.
 
+**Newsletter (reader-facing, release-notes style).** For the weekly or monthly issue written
+for the people who use the modules — breaking changes first, new modules, what changed, the
+stories, people, what is coming, plumbing and numbers last — follow
+**`reference/newsletter.md`**: `python3 newsletter.py <view> --outline` gives the ordered,
+pre-selected material per section, and `python3 newsletter.py <view> --check-newsletter
+ISSUE.md --slices DIR` checks the written issue against the view (a worked sample:
+`samples/newsletter/`).
+
 ## On-demand readers (other dimensions)
 
 The window digest is one lens. The same persistent store answers other questions — read the

@@ -26,6 +26,10 @@
        embedded copy (`view["members"][i]["bundle"]`) has no `series` and no
        `diagrams`: read those two from the member's own bundle view file. -->
 
+<!-- This template is the maintainers' digest. The reader-facing newsletter (a release-notes
+     style issue for the people who use the modules) has its own layout and check:
+     reference/newsletter.md. -->
+
 <!-- placeholder-rules:begin
 PLACEHOLDER RULES — read before filling anything below.
 

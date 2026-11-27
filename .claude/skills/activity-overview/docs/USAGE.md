@@ -941,6 +941,27 @@ and shares over per-person labels, and check every person you name.
   public data; to stop that, keep the entry with `do_not_name` instead.
 - **Turn lookups off:** `--people-offline` (registry only) or `--no-affiliation` (nothing).
 
+### 5.8 The newsletter (release-notes style issue)
+
+The digest is the maintainers' fact base; the newsletter is the post for the people who use
+the modules, one per stream per week or month. After step 5 (link, with `--people` for
+registry context):
+
+```bash
+python3 $AO/newsletter.py $S/views/$M/bundle.json --outline > $S/views/$M/newsletter.outline.json
+# one slice per full story the outline names (stories.full), each story checked as usual
+python3 $AO/link.py $S/views/$M/bundle.json --slice <train-id> > $S/views/$M/slices/<train-id>.slice.json
+# write $S/reports/$M.newsletter.md to reference/newsletter.md, then:
+python3 $AO/newsletter.py $S/views/$M/bundle.json --check-newsletter $S/reports/$M.newsletter.md \
+  --slices $S/views/$M/slices --people $PEOPLE
+```
+
+`--weekly` gives the shorter weekly layout; a multi-repo stream passes every member's linked
+view. The check exits 0 when every module, version, person, number, quote and URL in the issue
+is in the view, breaking candidates are not worded as declared, `unknown` people are not called
+community, do_not_name people are not named, every section is present or omitted with its
+reason and dates carry the year; `reference/newsletter.md` lists what it cannot check.
+
 ## 6. Forecasting — reading it and making it useful
 
 ### 6.1 What it is
