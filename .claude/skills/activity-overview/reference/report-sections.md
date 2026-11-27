@@ -359,8 +359,11 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    publish a story that fails it.
    The rules that refuse a statement of not-knowing — each scoped to the items the
    sentence names (`#N` or a link), refusing only when coverage of every one of them is
-   complete; a sentence naming none is refused only when every PR of the slice is
-   covered. The checker never forces a story to hide a real coverage limit:
+   complete — an item the slice holds no coverage for (a linked issue / PR outside the
+   train) is never covered, so a claim naming it always passes; a sentence naming none is
+   refused only when every PR of the slice is covered. The checker never forces a story
+   to hide a real coverage limit (the full matrix is pinned in
+   `test_story_check_truth_table.py`):
 
    | Rule | Refuses a sentence saying … is not in the record | Only when, for each item named |
    |---|---|---|

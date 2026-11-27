@@ -4843,7 +4843,8 @@ def check_story_record_claims(slice_obj, text):
     commits / pushes / runs needs every commit of it covered
     (`commits_covered` = `commits_total`) with a complete result each (no
     `commits_incomplete`), not only its head. A sentence naming several items is
-    refused only when all of them are covered; a general claim only when
+    refused only when all of them are covered (a linked item outside the
+    outcome has no coverage, so a claim naming it passes); a general claim only when
     every PR of the slice is. A true statement of a coverage limit always
     passes. Pure."""
     conv = slice_obj.get("conversation") or {}
@@ -4882,12 +4883,14 @@ def check_story_record_claims(slice_obj, text):
                  for x in re.split(r"(?<=[.;!?])\s+|\n+", text or "") if x.strip()]
 
     def covered(sent, have, scope):
-        """Is every item the sentence speaks of fully covered: each PR of
-        `scope` it names in `have`, or — naming none — every PR of `scope`
+        """Is every item the sentence speaks of fully covered: each item it
+        names (any #N / link, own or linked) in `have`, or — naming none —
+        every PR of `scope`
         (a claim naming one uncovered item, or a general claim under
         partial coverage, may be true and is not refused)?"""
-        named = [int(n) for n in re.findall(r"(?<![\w/.&])#(\d+)\b", sent)
-                 if int(n) in scope]
+        # every reference counts: a linked item outside the outcome has no
+        # coverage in the slice, so a claim naming it is never refused
+        named = [int(n) for n in re.findall(r"(?<![\w/.&])#(\d+)\b", sent)]
         return bool(named or scope) and all(n in have for n in named or scope)
     out = {"checks_said_unknown": [], "resolved_said_unknown": []}
     for sent in sentences:
