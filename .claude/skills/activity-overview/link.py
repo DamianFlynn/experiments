@@ -3341,6 +3341,9 @@ def story_material(bundle, train):
            "threads": threads[:STORY_THREADS_MAX]}
     if len(threads) > STORY_THREADS_MAX:
         out["threads_omitted"] = len(threads) - STORY_THREADS_MAX
+    coverage = _thread_coverage(prs, activity, threads)
+    if coverage:
+        out["thread_coverage"] = coverage
     if requests:
         out["outcome"]["requests"] = requests
     gaps = _story_gaps(items)
@@ -3474,8 +3477,10 @@ def _pr_history_status(prs, history):
 
 def _commit_evidence(c):
     """The narrative evidence a pr_history commit carries (collect_pr_narrative):
-    {interface, comments (each with its comment_class), docs, [<key>_omitted]},
-    or None when it has none."""
+    {interface, comments (each with its comment_class), docs, [<key>_omitted],
+    [interface_unread], [docs_unread]} — the unread lists name files whose
+    version gather could not read, so "no evidence" is told from "evidence
+    unavailable" — or None when it has none."""
     out = {}
     if c.get("interface"):
         out["interface"] = [dict(r) for r in c["interface"]]
@@ -3492,6 +3497,9 @@ def _commit_evidence(c):
     for k in ("interface_omitted", "comments_omitted"):
         if c.get(k):
             out[k] = c[k]
+    for k in ("interface_unread", "docs_unread"):
+        if c.get(k):
+            out[k] = list(c[k])
     return out or None
 
 
@@ -3580,7 +3588,8 @@ def thread_responses(threads, items, prs, history, instant):
                     if not _not_after(when.get(h.get("sha")), instant):
                         continue
                     it = next((x for x in items if x.get("kind") == "commit"
-                               and x.get("sha") == h.get("sha")), None)
+                               and x.get("sha") == h.get("sha")
+                               and (x.get("on") or {}) == on), None)
                     ref = _commit_ref(it, pos[id(it)]) if it else \
                         {"sha": h.get("sha"), "at": when.get(h.get("sha"))}
                     ref.update(match=h.get("match"), hunks=h.get("hunks") or [])
@@ -3763,6 +3772,27 @@ def checks_outcome(row, instant, pr_url=None):
                                                            instant))
     if late:
         out["completed_after_as_of"] = late
+    return out
+
+
+def _thread_coverage(prs, activity, threads):
+    """{pr number (str): {flagged, omitted}} for the train's PRs with a
+    `pr_activity` row: how many of the PR's review threads carry GitHub's
+    resolved flag in the ledger, and how many review threads gather did not
+    read (`threads_omitted`). The story check needs it: a ledger whose
+    visible threads all carry a flag is complete only with nothing
+    omitted."""
+    out = {}
+    for p in prs:
+        row = (activity or {}).get(p.get("number"))
+        if row is None:
+            continue
+        n = p.get("number")
+        out[str(n)] = {"flagged": sum(
+            1 for t in threads if t.get("kind") == "review_thread"
+            and (t.get("on") or {}).get("number") == n
+            and "resolved_on_github" in t),
+            "omitted": row.get("threads_omitted") or 0}
     return out
 
 
@@ -4776,8 +4806,9 @@ def check_story_record_claims(slice_obj, text):
     `checks` state a result (gathered, roll-up not incomplete /
     unavailable), or naming no PR while every PR of the slice has one;
     `resolved_said_unknown` — likewise for whether a thread was resolved,
-    against the PRs every review thread of which carries GitHub's
-    `resolved_on_github` flag. A qualified unknown claim under partial
+    against the PRs whose resolution coverage is complete (every review
+    thread in the ledger carries GitHub's `resolved_on_github` flag, gather
+    omitted none — `thread_coverage` — and the ledger cap hid none). A qualified unknown claim under partial
     coverage passes. Pure."""
     conv = slice_obj.get("conversation") or {}
     oc = conv.get("outcome") or {}
@@ -4791,7 +4822,12 @@ def check_story_record_claims(slice_obj, text):
         if t.get("kind") == "review_thread":
             threads.setdefault((t.get("on") or {}).get("number"), []).append(
                 "resolved_on_github" in t)
-    resolved = {n for n, flags in threads.items() if flags and all(flags)}
+    cov = conv.get("thread_coverage") or {}
+    # complete only when every visible review thread of the PR has a flag,
+    # gather read all of them, and the slice's ledger cap hid none
+    resolved = {n for n, flags in threads.items() if flags and all(flags)
+                and str(n) in cov and not cov[str(n)].get("omitted")
+                and not conv.get("threads_omitted")}
     base = _slice_repo_base(slice_obj)
     item_link = re.compile(re.escape(base) + r"(?:issues|pull)/(\d+)") \
         if base else None
@@ -4837,6 +4873,8 @@ def check_story_code_comments(slice_obj, text):
     out = []
     for m in _CODE_SPAN_RE.finditer(text or ""):
         span = m.group(1).strip()
+        if re.fullmatch(r"#\d+", span):
+            continue                     # an issue / PR reference, not a comment
         if span.startswith(_CODE_COMMENT_START) and len(span) > 3 \
                 and not any(_norm_ws(span) in t for t in norm):
             out.append(span)

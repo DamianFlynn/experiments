@@ -348,9 +348,11 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    check results are not in the record about a PR whose outcome `checks` state a result
    (roll-up not `incomplete` / `unavailable`), or — naming no PR — when every PR has one
    (`checks_said_unknown`); likewise for a thread's resolution against the PRs whose
-   review threads all carry `resolved_on_github` (`resolved_said_unknown`). A qualified
+   resolution coverage is complete (`thread_coverage`: all review threads flagged,
+   none omitted by gather or the ledger cap; `resolved_said_unknown`). A qualified
    claim ("the checks of #2 were not read") passes under partial coverage; and every code comment
-   the story quotes in backticks (a span starting with `//`, `/*`, `#` or `<#`) occurs in
+   the story quotes in backticks (a span starting with `//`, `/*`, `#` or `<#`; a bare
+   issue / PR reference such as `#7146` is not one) occurs in
    the slice (`code_comments_not_in_slice`).
    Else exit 1 with the lists. Drop or fix each listed sentence and check again; never
    publish a story that fails it.

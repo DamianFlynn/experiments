@@ -1252,7 +1252,8 @@ silence_days}}`.
   Markdown file, generated README sections skipped and counted), `interface_omitted` /
   `comments_omitted` (what gather's per-commit caps left out), `interface_unread` /
   `docs_unread` (files of the commit whose before or after version exists but could not
-  be read — over the size limit, a failed read — so no delta is claimed for them). All evidence of one slice
+  be read — over the size limit, a failed read — so no delta is claimed for them; a
+  commit with only such files carries just these lists, never no `evidence` at all). All evidence of one slice
   shares `STORY_EVIDENCE_BUDGET` (16,000 characters), the newest commits first; a commit
   whose rows were cut gets `evidence_omitted` (`truncation.evidence`).
 - **`code_notes`** (on commit items) — `{commit, path, change: add|drop|change, class,
@@ -1316,6 +1317,12 @@ silence_days}}`.
   a partial read is named too: review threads beyond those read (`threads_omitted`),
   earlier lifecycle events (`events_omitted`), and the earliest commits whose checks were
   not read (`commits_total` above the commits read).
+- **`thread_coverage`** (only with the view's `pr_activity`) — `{pr number: {flagged,
+  omitted}}`: how many of the PR's review threads in the ledger carry GitHub's resolved
+  flag, and how many review threads gather did not read. Resolution coverage of a PR is
+  complete only when every ledger review thread of it is flagged, `omitted` is 0 and the
+  ledger cap hid none (`threads_omitted`); the story check refuses an "unknown
+  resolution" claim only then.
 - **`gaps`** (omitted when empty) — what THIS slice cannot show because its store was
   gathered before the data was kept: review comments with no file / diff lines / thread
   link, PR commits with no file paths or message bodies, PRs with no `pr_activity` row
