@@ -3710,7 +3710,8 @@ DELETED_ACCOUNT = "ghost"
 def _cannot_act(bundle, login):
     """True for an actor who never holds the next move: an automation
     account (_is_automation) or a deleted account (DELETED_ACCOUNT)."""
-    return bool(login) and (login == DELETED_ACCOUNT or _is_automation(bundle, login))
+    return isinstance(login, str) and bool(login) and (
+        login == DELETED_ACCOUNT or _is_automation(bundle, login))
 
 
 def last_push(bundle, pr, instant):
@@ -7049,9 +7050,11 @@ def annotate_labels_as_of(bundle):
     for p in bundle.get("prs") or []:
         if not isinstance(p, dict):
             continue
-        evs = [e for e in p.get("label_events") or []
+        raw = p.get("label_events")
+        evs = [e for e in (raw if isinstance(raw, list) else [])
                if isinstance(e, dict) and e.get("event") in ("labeled", "unlabeled")
-               and e.get("label")]
+               and isinstance(e.get("label"), str) and e["label"]
+               and isinstance(e.get("at"), str)]
         if not evs:
             p["labels_as_of"] = {"state": "as last gathered"}
             continue

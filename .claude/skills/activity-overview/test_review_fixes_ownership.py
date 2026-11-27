@@ -130,7 +130,9 @@ class TestMergedViews(unittest.TestCase):
 
     def test_an_old_fact_says_a_day_inside_is_unavailable(self):
         old = self.oct_fact()
-        for k in ("start_without_owner", "labelled_items"):
+        # a fact gathered before the complete start state (the shape now
+        # marked by `start_state`; before, by `start_without_owner`)
+        for k in ("start_state", "start_state_source", "window", "labelled_items"):
             old.pop(k)
         conn = _store(("2026-10-01", "2026-10-31", old))
         v = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-07")

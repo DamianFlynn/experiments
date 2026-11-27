@@ -2510,11 +2510,19 @@ def _module_of_item(rec):
 
 def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                              end_files, frm, to, web=None, label_patterns=None,
-                             owner_files=None, start_files=None, end_rev=None):
-    """The window's `module_ownership` fact: {collected, events: [{kind,
-    module, people, date, source: {type, number|sha, url, [pr]}, [quote],
-    [via]}], start_without_owner, labelled_items, without_owner: [{module,
-    marker, [since], [source]}], label_patterns, owner_files, [unread]}.
+                             owner_files=None, start_files=None, end_rev=None,
+                             start_state=None, clock=None):
+    """The window's SELF-CONTAINED `module_ownership` fact: {collected,
+    gathered_at, window {from, to}, start_state, start_state_source, events:
+    [{kind, module, people, date, at, seq, source: {type, number|sha, url,
+    [pr]}, [quote], [via]}], labelled_items, without_owner: [{module,
+    marker, [since], [source]}], owners_at_end, [end_check], label_patterns,
+    owner_files, [unread]}.
+    - `start_state` (ownership_start_state, passed in): the COMPLETE state
+      at the window's start; without it (a caller with no tree before the
+      window) the orphan markers only, from `start_files` or derived from
+      `end_files` and the window's marker events (`start_state_source`
+      `markers_only`);
     - CODEOWNERS (CODEOWNERS_PATHS) changed in the window: per pattern,
       owners added -> `owner_added`, removed -> `owner_removed` (module: the
       pattern as a path), via `codeowners`;
@@ -2529,26 +2537,18 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
     - an issue / PR (as it was at the window's end: extract.record_as_of;
       one created later is skipped) opened in the window with an ownership
       label (`label_patterns` {kind: regexes}) -> that kind, its title as
-      `quote`, module from an `avm/res|ptn|utl/...` reference in the title.
-    Standing state, reconstructible as of any day of the window
-    (extract.standing_without_owner): `start_without_owner` — modules carrying an
-    orphan marker at the window's start (`start_files`: the paths tracked
-    then; None: derived from `end_files` and the window's marker events)
-    — and `labelled_items` — every
-    owner-needed / orphaned item that existed at the window's end, with the
-    day it opened and the day it closed (label times are not recorded: an
-    item counts from the day it opened). `without_owner` is that state at
-    the window's end. A file version that cannot be read is listed in
-    `unread`, never read as "no owners". With `end_rev` (the window's end
-    commit), `owners_at_end` {module folder: [login]} — the owners every
-    owner file of the end tree lists (who "the module's owner" is). Events
-    from a commit carry `at`
-    (its commit time; a labelled item's: its opening time) and every event
-    `seq`, the order of the replay (day, time, then the walk's order; one
-    change's own events by kind): extract.ownership_event_order. The
-    `owner_response_requested` label kind is not an ownership change and
-    is not stored as an event (link reads it off the records). Pure over
-    its readers."""
+      `quote`, module from an `avm/res|ptn|utl/...` reference in the title;
+      `labelled_items` — every owner-needed / orphaned item that existed at
+      the window's end, with the day it opened and the day it closed.
+    Events carry `at` (commit / item time) and `seq` (the replay order: day,
+    time, the walk's order; one change's own events by kind). The state of
+    any day of the window is extract.ownership_state over this fact alone;
+    `without_owner` / `owners_at_end` are that state at the window's end
+    (validate replays it again), `end_check` compares the replayed owners
+    with an independent read of the end tree's owner files at `end_rev`.
+    The `owner_response_requested` label kind is not an ownership change
+    and is not stored as an event (link reads it off the records). Pure
+    over its readers."""
     patterns = label_patterns or ownership_label_patterns()
     owner_files = owner_files or _owner_file_names()
     by_sha = {c.get("sha"): c for c in commits or []}
@@ -2673,24 +2673,30 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                 if closed:
                     item["closed"] = closed
                 labelled.append(item)
-    def markers_of(files):
-        return {f.rsplit("/", 1)[0] if "/" in f else "": f.rsplit("/", 1)[-1]
-                for f in files or [] if f.rsplit("/", 1)[-1] in ORPHAN_MARKER_NAMES}
-    if start_files is not None:
-        start = markers_of(start_files)
+    if start_state is None:
+        # no complete start state was read (a caller without the tree before
+        # the window): the orphan markers only, from the start tree or from
+        # the end tree and the window's marker events
+        def markers_of(files):
+            return {f.rsplit("/", 1)[0] if "/" in f else ""
+                    for f in files or [] if f.rsplit("/", 1)[-1] in ORPHAN_MARKER_NAMES}
+        if start_files is not None:
+            start = markers_of(start_files)
+        else:
+            start = markers_of(end_files)
+            for e in reversed(events):            # code events: in commit order
+                if (e.get("source") or {}).get("type") != "commit" \
+                        or e.get("via") not in ORPHAN_MARKER_NAMES:
+                    continue
+                if e["kind"] == "orphaned":
+                    start.discard(e["module"])
+                elif e["kind"] == "adopted":
+                    start.add(e["module"])
+        start_state = {m: {"owners": [], "codeowners": [], "orphan_marker": True}
+                       for m in sorted(start)}
+        start_source = "markers_only"
     else:
-        # the start snapshot from the end tree and the window's marker
-        # events (the code events cover the whole window): the markers at
-        # the end, minus those added in it, plus those removed in it
-        start = markers_of(end_files)
-        for e in reversed(events):            # code events: in commit order
-            if (e.get("source") or {}).get("type") != "commit" \
-                    or e.get("via") not in ORPHAN_MARKER_NAMES:
-                continue
-            if e["kind"] == "orphaned":
-                start.pop(e["module"], None)
-            elif e["kind"] == "adopted":
-                start[e["module"]] = e["via"]
+        start_source = "complete"
     # the replay order (extract.ownership_event_order): day, commit / item
     # time, then the order emitted (`seq`: a commit's events in walk order)
     order = sorted(range(len(events)), key=lambda i: (
@@ -2699,17 +2705,24 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
     for i, e in enumerate(events):
         e["seq"] = i
     labelled.sort(key=lambda x: (x["module"], x["opened"], x["source"]["number"] or 0))
-    out = {"collected": True, "events": events,
-           "start_without_owner": [{"module": m, "marker": start[m]}
-                                   for m in sorted(start)],
-           "labelled_items": labelled,
+    out = {"collected": True,
+           "gathered_at": (clock or (lambda: datetime.datetime.now(
+               datetime.timezone.utc)))().strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "window": {"from": (frm or "")[:10], "to": (to or "")[:10]},
+           "start_state": {m: start_state[m] for m in sorted(start_state)},
+           "start_state_source": start_source,
+           "events": events, "labelled_items": labelled,
            "label_patterns": {k: list(v) for k, v in patterns.items()},
            "owner_files": list(owner_files)}
-    out["without_owner"] = extract.standing_without_owner(out, (to or "")[:10])
-    if end_rev:
-        # who owns each module at the window's end: every owner file of the
-        # end tree, read at the window's end commit (`end_rev`)
-        owners = {}
+    # the window's end, derived by the same replay every reader uses (kept
+    # stored as a cross-check: validate replays it again)
+    end = extract.ownership_state(out, (to or "")[:10])
+    out["without_owner"] = end["without_owner"]
+    out["owners_at_end"] = end["owners"]
+    if end_rev and start_source == "complete":
+        # an independent read of the end tree's owner files: what the replay
+        # derived must match it (unread versions make it differ)
+        read = {}
         for f in end_files or []:
             folder, _, base = f.rpartition("/")
             if base not in owner_files:
@@ -2717,22 +2730,136 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
             try:
                 text = read_blob(end_rev, f)
             except BlobUnreadable:
-                unread.append({"path": f, "commit": end_rev})
                 continue
             got = _owners_from_json(text) if text else None
-            if got is _UNPARSEABLE:
-                unread.append({"path": f, "commit": end_rev, "reason": "not valid JSON"})
-            elif got:
-                owners[folder] = got
-        out["owners_at_end"] = {m: owners[m] for m in sorted(owners)}
+            if isinstance(got, list):
+                read[folder] = got
+        diffs = sorted(m for m in set(read) | {m for m, r in start_state.items()
+                                               if r.get("owner_file")}
+                       if sorted(read.get(m) or []) != sorted(
+                           (start_state_owner_files(out, m)) or []))
+        out["end_check"] = {"matches": not diffs, "differences": diffs[:50]}
     if unread:
         out["unread"] = unread
     return out
 
 
+def start_state_owner_files(fact, module):
+    """The owner-file owners of `module` at the window's end by replay (the
+    CODEOWNERS individuals left out), for the end-tree cross-check."""
+    import copy
+    f = copy.deepcopy(fact)
+    for r in (f.get("start_state") or {}).values():
+        r["codeowners"] = []
+    f["events"] = [e for e in f.get("events") or [] if e.get("via") != "codeowners"]
+    return (extract.ownership_state(f, "9999-12-31") or {}).get("owners", {}).get(module)
+
+
+def window_start_commit(clone_dir, from_date, run=None):
+    """The newest first-parent commit before `from_date` (the tree just
+    before the window), or None when the bounded clone holds none."""
+    run = run or run_git
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--first-parent",
+                   f"--pretty=format:{LOG_FORMAT}"])
+    except RuntimeError:
+        return None
+    return next((rec["sha"] for rec in parse_git_log(raw)
+                 if (rec.get("date") or "")[:10] < (from_date or "")[:10]), None)
+
+
+def _last_change_days(clone_dir, sha, names, run):
+    """{path: day it last changed by `sha`} for every file named one of
+    `names` (any folder), from ONE `git log --name-only` walk; {} when the
+    walk fails (the days are then simply not stated)."""
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--format=%x1e%cI", "--name-only",
+                   sha, "--"] + ["*" + n for n in names])
+    except RuntimeError:
+        return {}
+    out = {}
+    for rec in raw.split("\x1e"):
+        lines = [ln for ln in rec.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        day = lines[0].strip()[:10]
+        for path in lines[1:]:
+            out.setdefault(path.strip(), day)
+    return out
+
+
+def ownership_start_state(clone_dir, from_date, owner_files=None, run=None,
+                          read_blob=None):
+    """The COMPLETE ownership state at a window's start, from the tree of the
+    newest first-parent commit before `from_date`: {module folder:
+    {owner_file?, owners (that file's list), codeowners (CODEOWNERS rules
+    naming individuals for the folder), orphan_marker, marker_since? (the
+    day the marker file last changed), owners_since? (the day the owner
+    file last changed)}} — only folders with an owner file,
+    an orphan marker or a CODEOWNERS rule naming people. ([], unread) when
+    the clone holds no commit before the window: (None, []). Read once per
+    window; a reader never needs another window."""
+    run = run or run_git
+    owner_files = owner_files or _owner_file_names()
+    read_blob = read_blob or git_blob_reader(clone_dir, run)
+    sha = window_start_commit(clone_dir, from_date, run)
+    if sha is None:
+        return None, []
+    try:
+        files = [ln for ln in run(["git", "-C", clone_dir, "ls-tree", "-r", "--name-only",
+                                   sha]).split("\n") if ln]
+    except RuntimeError:
+        return None, []
+    state, unread = {}, []
+    days = _last_change_days(clone_dir, sha, tuple(owner_files) + ORPHAN_MARKER_NAMES, run)
+    for f in files:
+        folder, _, base = f.rpartition("/")
+        if base in owner_files:
+            try:
+                got = _owners_from_json(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                unread.append({"path": f, "commit": sha})
+                continue
+            if got is _UNPARSEABLE:
+                unread.append({"path": f, "commit": sha, "reason": "not valid JSON"})
+                continue
+            if got is None:
+                continue
+            r = state.setdefault(folder, {"owners": [], "codeowners": [],
+                                          "orphan_marker": False})
+            r["owner_file"] = base
+            r["owners"] = got
+            if days.get(f):
+                r["owners_since"] = days[f]
+        elif base in ORPHAN_MARKER_NAMES:
+            r = state.setdefault(folder, {"owners": [], "codeowners": [],
+                                          "orphan_marker": False})
+            r["orphan_marker"] = True
+            if days.get(f):
+                r["marker_since"] = days[f]
+    folders = {f.rpartition("/")[0] for f in files}
+    for path in CODEOWNERS_PATHS:
+        if path not in files:
+            continue
+        try:
+            text = read_blob(sha, path) or ""
+        except BlobUnreadable:
+            unread.append({"path": path, "commit": sha})
+            break
+        for rule in parse_codeowners(text):
+            m = _codeowners_module(rule["pattern"])
+            people = [o for o in rule["owners"] if "/" not in o and "@" not in o]
+            if people and m in folders:
+                r = state.setdefault(m, {"owners": [], "codeowners": [],
+                                         "orphan_marker": False})
+                r["codeowners"] = people
+        break
+    return state, unread
+
+
 def recompute_module_ownership(conn, project, repo, frm, to, clone_dir,
                                read_blob=None, end_files=None, start_files=None,
-                               run=None):
+                               run=None, start_state=None):
     """Recompute the `module_ownership` fact of an already gathered window
     [frm, to] of a store, offline, from a clone of the repository holding
     the window's history (`gather.py ... --recompute-ownership`): the
@@ -2753,14 +2880,17 @@ def recompute_module_ownership(conn, project, repo, frm, to, clone_dir,
         sha = got.get("clone_sha") or "HEAD"
         end_files = [ln for ln in run(["git", "-C", clone_dir, "ls-tree", "-r",
                                        "--name-only", sha]).split("\n") if ln]
-    if start_files is None:
+    if start_state is None and start_files is None:
+        # the complete state at the window's start, from the tree before it
+        start_state, _unread = ownership_start_state(clone_dir, frm, run=run,
+                                                     read_blob=read_blob)
         start_files = window_start_files(clone_dir, frm, run)
     fact = collect_module_ownership(
         view.get("code_events") or [], view.get("commits") or [],
         view.get("prs") or [], view.get("issues") or [],
         read_blob or git_blob_reader(clone_dir, run), end_files, frm, to,
         web="https://github.com/" + slug, start_files=start_files,
-        end_rev=got.get("clone_sha"))
+        end_rev=got.get("clone_sha"), start_state=start_state)
     bundle = dict(got["facts"])
     bundle["module_ownership"] = fact
     bundle["meta"] = {"workflows_collected": got.get("ci_collected")}
@@ -10276,7 +10406,8 @@ def acquire(args, env):
         module_ownership = collect_module_ownership(
             code_events, commits, prs, issues, git_blob_reader(clone_dir),
             tracked or [], frm, to, web="https://github.com/{}/{}".format(owner, repo),
-            start_files=window_start_files(clone_dir, frm), end_rev=clone_sha)
+            start_files=window_start_files(clone_dir, frm), end_rev=clone_sha,
+            start_state=ownership_start_state(clone_dir, frm)[0])
         sys.stderr.write(
             "module ownership: {}/{}: {} event(s), {} module(s) without an owner "
             "at the window's end\n".format(owner, repo,

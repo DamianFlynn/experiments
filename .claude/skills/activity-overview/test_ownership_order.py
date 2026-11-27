@@ -54,6 +54,9 @@ class TestA_SameDayOrder(unittest.TestCase):
 
 
 class TestB_CarriedAcrossWindows(unittest.TestCase):
+    """Since the self-contained design: the state a window starts with is in
+    its own fact (`start_state`, read from the tree before it), never carried
+    from another window."""
 
     def test_an_owner_list_emptied_in_september_stands_in_october(self):
         sep = ownership([{"commit": S1, "path": P, "change": "modify",
@@ -62,11 +65,18 @@ class TestB_CarriedAcrossWindows(unittest.TestCase):
                         {(S1 + "^", P): meta(["o"]), (S1, P): meta([])},
                         "2026-09-01", "2026-09-30")
         self.assertEqual([w["module"] for w in sep["without_owner"]], ["avm/res/x/y"])
-        octo = ownership([], [], {})
+        octo = gather.collect_module_ownership(
+            [], [], [], [], Blobs({}), [], "2026-10-01", "2026-10-31",
+            start_state={"avm/res/x/y": {"owner_file": "metadata.json", "owners": [],
+                                         "codeowners": [], "orphan_marker": False,
+                                         "owners_since": "2026-09-10"}})
         conn = _store(("2026-09-01", "2026-09-30", sep), ("2026-10-01", "2026-10-31", octo))
-        v = extract.extract(conn, "o", "r", "2026-09-01", "2026-10-31")
-        self.assertEqual([w["module"] for w in v["module_ownership"]["without_owner"]],
-                         ["avm/res/x/y"])
+        for frm in ("2026-09-01", "2026-10-01"):
+            for to in ("2026-10-07", "2026-10-31"):
+                v = extract.extract(conn, "o", "r", frm, to)
+                self.assertEqual([(w["module"], w.get("since")) for w in
+                                  v["module_ownership"]["without_owner"]],
+                                 [("avm/res/x/y", "2026-09-10")], (frm, to))
 
     def test_an_owner_added_later_clears_it(self):
         sep = ownership([{"commit": S1, "path": P, "change": "modify",
@@ -74,10 +84,14 @@ class TestB_CarriedAcrossWindows(unittest.TestCase):
                         [{"sha": S1, "committed_at": "2026-09-10T10:00:00Z"}],
                         {(S1 + "^", P): meta(["o"]), (S1, P): meta([])},
                         "2026-09-01", "2026-09-30")
-        octo = ownership([{"commit": S2, "path": P, "change": "modify",
-                           "date": "2026-10-03"}],
-                         [{"sha": S2, "committed_at": "2026-10-03T10:00:00Z"}],
-                         {(S2 + "^", P): meta([]), (S2, P): meta(["n"])})
+        octo = gather.collect_module_ownership(
+            [{"commit": S2, "path": P, "change": "modify", "date": "2026-10-03"}],
+            [{"sha": S2, "committed_at": "2026-10-03T10:00:00Z"}], [], [],
+            Blobs({(S2 + "^", P): meta([]), (S2, P): meta(["n"])}), [],
+            "2026-10-01", "2026-10-31",
+            start_state={"avm/res/x/y": {"owner_file": "metadata.json", "owners": [],
+                                         "codeowners": [], "orphan_marker": False,
+                                         "owners_since": "2026-09-10"}})
         conn = _store(("2026-09-01", "2026-09-30", sep), ("2026-10-01", "2026-10-31", octo))
         v = extract.extract(conn, "o", "r", "2026-09-01", "2026-10-31")
         self.assertEqual(v["module_ownership"]["without_owner"], [])

@@ -1749,7 +1749,7 @@ derived once in link and carried on every row that needs it:
   end, `in_view: false`; a number not read says `not_read` ("not found", "not read
   (capped or failed)").
 - **The module's owner** — `module_ownership.owners_at_end` `{module folder: [login]}`
-  (gather reads every owner file of the end tree at the window's end commit; also
+  (the replayed state for the view's end day: `start_state` and the window's events; also
   `--recompute-ownership`) and CODEOWNERS rules naming people (`code_owners`, teams left
   out) give `module_owner_of: [module]` on people rows and slice participants
   (`link.module_owners`). An owner response request names those owners (`owners`,
@@ -1791,87 +1791,58 @@ the window's history:
 `python3 gather.py --owner O --repo R --from F --to T --store S --clone-dir C --recompute-ownership`
 (no API call; the window's other facts are kept).
 
-**As of any day.** The fact stores what the standing list is reconstructed from
-(`extract.standing_without_owner`): `start_without_owner` (orphan markers at the window's
-start: the tree before `from`, else derived from the end tree and the window's marker
-events), the dated `events`, and `labelled_items` `[{module, marker, opened, closed?,
-source}]` (every owner-needed / orphaned item that existed at the window's end; a label's
-own time is not recorded, so an item counts from the day it opened). A view that is not
-exactly one gathered window — a week inside a gathered month, or several months — gets
-the events dated in it and `without_owner` reconstructed for its last day from the window
-containing that day. A module's latest ownership state, in event order, decides: an owner
-added and later removed again is without an owner. A fact gathered before this (no start
-snapshot) gives its stored list only for its own end day; for a day inside it the view
-says `without_owner_unavailable`.
+**Every window is self-contained.** A window's fact holds everything its state is replayed
+from, so no reader ever needs another window:
+- `start_state` `{module folder: {owner_file?, owners, codeowners, orphan_marker,
+  marker_since?, owners_since?}}` — the COMPLETE ownership state at the window's start,
+  read from the tree of the newest first-parent commit before `from`
+  (`gather.ownership_start_state`): every per-module owner file and its owners (and the
+  day the file last changed), every orphan marker (the day it was added), the
+  individuals CODEOWNERS names for a folder (teams left out). On
+  Azure/bicep-registry-modules at 1 October 2026: 267 folders, about 45 KB.
+  `start_state_source` says `complete`, or `markers_only` for a caller that had no tree
+  before the window;
+- the window's own dated `events` in recorded order (`at`: commit / item time; `seq`:
+  gather's order — commit time, then the walk's order, one change's own events by kind);
+- `labelled_items` `[{module, marker, opened, closed?, source}]` (a label's own time is not
+  recorded: an item counts from the day it opened);
+- `window` `{from, to}`, `gathered_at`; `without_owner` and `owners_at_end` — the window's
+  end state, DERIVED by the same replay (kept as a cross-check: validate replays the fact
+  and refuses a stored end that differs), and `end_check` `{matches, differences}` — the
+  replay against an independent read of the end tree's owner files.
 
-```json
-{"collected": true,
- "events": [{"kind": "owner_added", "module": "avm/res/network/network-security-group",
-             "people": ["arjenhuitema"], "date": "2026-10-06",
-             "source": {"type": "commit", "sha": "…", "url": "…", "pr": 7471},
-             "via": "metadata.json"},
-            {"kind": "orphaned", "module": "avm/res/sql/server", "people": ["chbragg"],
-             "date": "2026-10-02", "source": {"type": "pr", "number": 7448, "url": "…"},
-             "quote": "feat(avm/res/sql/server): …",
-             "via": "Status: Module Orphaned :yellow_circle:"}],
- "without_owner": [{"module": "avm/res/code-signing/code-signing-account",
-                    "marker": "ORPHANED.md"}],
- "label_patterns": {"owner_needed": ["…"], "orphaned": ["orphan"]},
- "owner_files": ["metadata.json"]}
-```
+The state of ANY day inside a window (`extract.ownership_state`): `start_state` plus that
+window's events up to the day, in recorded order, plus its labelled items open on the day
+— a module with an orphan marker, or whose owner file lists nobody (`since`: the day it
+changed), or named by an open owner-needed / orphaned item unless its latest change by
+the day (or before the window, as `start_state` dates it) gave it an owner on or after
+the item opened; `owners` `{module: [login]}` (owner file and CODEOWNERS individuals).
 
-- `events[].kind` — `owner_added` / `owner_removed` (owners added to / removed from a
-  CODEOWNERS pattern — `via: codeowners`, the module the pattern as a path — or from a
-  per-module owner file: a JSON file with an `owners` list, `ACTIVITY_OWNER_FILES`,
-  default `metadata.json`), `owner_needed` (an owner file's list became empty, or an item
-  opened in the window carries an owner-needed label), `orphaned` (an orphan marker,
-  `ORPHANED.md`, added under a module folder, or an item opened in the window with an
-  orphaned label), `adopted` (an orphan marker removed). `people` — the owners added /
-  removed, a marker commit's author, a labelled item's author; `source` — the commit (with
-  its PR) or the issue / PR; `quote` — a labelled item's own title (never inferred prose).
-- Label patterns (`OWNERSHIP_LABEL_PATTERNS`, overridable with
-  `ACTIVITY_OWNERSHIP_LABELS="kind=regex;kind=regex"`): `orphan` for orphaned; "owner
-  needed", "looking for an owner", "needs a new owner" for owner_needed. A label that asks
-  the existing owner to respond (Azure/bicep-registry-modules' "Needs: Module Owner") is
-  not an ownership change (on the October 2026 records it sits on PRs of owned modules):
-  its own kind `owner_response_requested` (pattern `needs\W*module\W*owner`,
-  configurable the same way) is never stored in `events` and never makes a module
-  without an owner. **In the view** (`link.annotate_module_ownership`, read off the
-  view's records, so a stored fact needs no recompute) each item opened in the window
-  carrying it adds an event `{kind: owner_response_requested, module, item {type,
-  number, url}, date (the day it opened: label times are not recorded), people, via,
-  source, owners?}` — `owners`: the people an automation comment on the item names as
-  the module owner, when recorded. Every event and `without_owner` row naming a module
-  gains `module_url` (`link.module_url`).
-- **Order within a day.** Each event gathered from a commit carries `at` (the commit
-  time) and a labelled item's `at` its opening time; `seq` is the order gather emitted
-  them in (commit time, then the walk's order; one change's own events by kind). The
-  reconstruction replays `(date, at, seq)` (`extract.ownership_event_order`): an owner
-  list emptied at 09:00 and refilled at 15:00 ends the day owned. Facts gathered before
-  `at` / `seq` replay by (date, kind) — recompute them with `--recompute-ownership`.
-- **Across windows.** Reconstructing from a later window's fact carries the
-  commit-derived state of the earlier windows of the view (`extract.carried_ownership`:
-  an owner list emptied in September and not refilled stands in October; the later
-  window's own start snapshot holds only the orphan markers) — from EVERY contributing
-  window's events dated before the selected window starts, an overlapping (carried-days)
-  window's included. One change is one event whichever windows stored it and whenever it
-  was gathered (`extract.ownership_event_identity`: source commit / item, kind, module,
-  people, day — never the optional `at` / window-local `seq`; a copy with `at` replaces a
-  legacy copy without it); events of the same day and time keep the order their facts
-  recorded (two commits in one second: emptied, then refilled), and a merged view
-  renumbers `seq`; `unread` is merged from every contributing window. When no collected
-  window covers the view's last day, `without_owner` is empty with
-  `without_owner_unavailable` (an earlier day's list is never presented as that day's);
-  the known events stand. The same history stored as one month, a month plus carried
-  days, adjacent months, weekly windows or a legacy fact plus a refreshed overlapping
-  window reads back identically (a legacy fact never recorded the order of one day's
-  changes: `--recompute-ownership` rewrites it). validate checks the type of every field
-  a reader indexes, slices, sorts or keys on (`validate._OWNERSHIP_ROW_TYPES`).
-- `without_owner` — modules carrying an orphan marker at the window's end (`since`: the
-  marker's date when added in the window), and modules named by an open item with an
+**Views.** A view that is not exactly one gathered window reads its state from the ONE
+stored window covering its END day (`extract.covering_window`: the one gathered latest,
+then the latest end, the latest start), named in `as_of_window`: `without_owner` and
+`owners_at_end` are that window's replay for the view's end day (an owner added after a
+view's end is never in it). Events REPORTED are those of every overlapping window dated
+in the view, each change once (`extract.ownership_event_identity`: source commit / item,
+kind, module, people, day — never `at` / `seq`; a refreshed copy replaces a legacy one and
+its order is the refreshed fact's); `unread` is merged. No window covers the end day, or
+the covering fact is legacy (no `start_state`) and the day is not its own end: `without_owner`
+is empty, `owners_at_end` absent, and `without_owner_unavailable` says why (the legacy
+reason names `--recompute-ownership`). The carry-across-windows design (a later window's
+state rebuilt from earlier windows' events) was dropped: it needed every earlier window
+loaded, broke whenever windows overlapped, were legacy, or ordered one second's changes
+differently, and could not know an owner list emptied before the first gathered window.
+The same history stored as one month, a month plus carried days, adjacent months, weekly
+windows or a legacy fact plus a refreshed overlapping window reads back identically for
+every day a self-contained window covers. validate checks the type of every field a reader
+indexes, slices, sorts or keys on (`validate._OWNERSHIP_ROW_TYPES`,
+`OWNERSHIP_STATE_SHAPE`). Rewrite a stored window in this shape, offline, from a clone:
+`python3 gather.py --owner O --repo R --from F --to T --store S --clone-dir C --recompute-ownership`.
+
+- `without_owner` — the window's end state (above): modules carrying an orphan marker,
+  modules whose owner file lists nobody, and modules named by an open item with an
   owner-needed / orphaned label unless the module gained an owner (or was adopted) on or
-  after that item was opened. Modules whose owner file lists nobody but did not change in
-  the window are not scanned (reading every owner file at the window's end is not done).
+  after that item was opened.
 - `unread` — owner-file / CODEOWNERS versions that could not be read or parsed (`reason`:
   "not valid JSON"); no change is derived from them, never "no owners". A Terraform module repository has CODEOWNERS only: the other sources are
   simply absent.

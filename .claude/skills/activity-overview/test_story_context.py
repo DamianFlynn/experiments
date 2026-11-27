@@ -101,8 +101,11 @@ class TestModuleOwner(unittest.TestCase):
         got = gather.collect_module_ownership(
             [], [], [], [], Blobs({("e" * 40, AREA + "/metadata.json"): meta(["olga"])}),
             [AREA + "/metadata.json", AREA + "/main.bicep"], "2026-05-01", "2026-05-31",
-            start_files=[], end_rev="e" * 40)
+            end_rev="e" * 40,
+            start_state={AREA: {"owner_file": "metadata.json", "owners": ["olga"],
+                                "codeowners": [], "orphan_marker": False}})
         self.assertEqual(got["owners_at_end"], {AREA: ["olga"]})
+        self.assertEqual(got["end_check"], {"matches": True, "differences": []})
         b = view([pr(1, title="fix(avm/res/x/y): z", labels=["Needs: Module Owner :mega:"],
                      comments_list=talk(1) + [comment("olga", "2026-05-26T00:00:00Z",
                                                       "Looking.", 9)])])

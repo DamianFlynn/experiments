@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
 import extract  # noqa: E402
@@ -86,15 +86,55 @@ def fact(frm, to):
     end_files = markers_at((date.fromisoformat(to) + timedelta(days=1)).isoformat())
     return gather.collect_module_ownership(
         evs, commits, [], list(ISSUES), Blobs(blobs()), end_files, frm, to,
-        web="https://github.com/o/r", start_files=markers_at(frm))
+        web="https://github.com/o/r", start_state=start_state_at(frm),
+        clock=lambda: datetime.fromisoformat(GATHERED.get(frm, "2026-12-01T00:00:00+00:00")))
+
+
+# when each window was gathered (a refreshed window later than the month)
+GATHERED = {}
+
+
+def start_state_at(day):
+    """The complete ownership state of the history's tree just before
+    `day`, as gather.ownership_start_state reads it from a clone: every
+    owner file (its owners; when it lists nobody, the day it last changed),
+    every orphan marker (the day it was added). An unreadable file is not
+    in it."""
+    state = {}
+    for _n, at, path, change, before, after in sorted(CHANGES, key=lambda c: c[1]):
+        module = path.rsplit("/", 1)[0]
+        if path.endswith("ORPHANED.md"):
+            continue
+        if before == "UNREAD":
+            continue
+        r = state.setdefault(module, {"owner_file": "metadata.json", "owners": list(before),
+                                      "codeowners": [], "orphan_marker": False})
+        if at[:10] < day:
+            r["owners"] = list(after)
+            r["owners_since"] = at[:10]
+    for _n, at, path, change, _b, _a in sorted(CHANGES, key=lambda c: c[1]):
+        if path.endswith("ORPHANED.md") and at[:10] < day:
+            module = path.rsplit("/", 1)[0]
+            r = state.setdefault(module, {"owners": [], "codeowners": [],
+                                          "orphan_marker": False})
+            r["orphan_marker"] = change == "add"
+            if change == "add":
+                r["marker_since"] = at[:10]
+            else:
+                r.pop("marker_since", None)
+    return state
 
 
 def legacy(f):
-    """A fact as a gather before `at` / `seq` stored it."""
+    """A fact as a gather stored it before times, sequence and the complete
+    start state: state is known for its own end day only."""
     f = json.loads(json.dumps(f))
     for e in f["events"]:
         e.pop("at", None)
         e.pop("seq", None)
+    for k in ("start_state", "start_state_source", "window", "gathered_at",
+              "end_check"):
+        f.pop(k, None)
     return f
 
 
@@ -113,7 +153,8 @@ STORAGES = {
 
 def store(name):
     rows = []
-    for w in STORAGES[name]:
+    for i, w in enumerate(STORAGES[name]):
+        GATHERED[w[0]] = "2026-12-0{}T00:00:00+00:00".format(i + 1)
         f = fact(w[0], w[1])
         rows.append((w[0], w[1], w[2](f) if len(w) > 2 else f))
     return _store(*rows)
@@ -178,24 +219,25 @@ class TestFindings(unittest.TestCase):
                          [{"path": owner_file(F), "commit": sha(3),
                            "reason": "not valid JSON"}])
 
-    def test_3_opening_state_from_an_overlapping_window(self):
+    def test_3_the_covering_window_alone_holds_the_state(self):
         conn = store("month+carried")
         v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-30")
         # D was emptied on 29 October, inside both windows; A's list was
-        # emptied on 6 October and refilled: only October's window saw it
+        # emptied on 6 October and refilled on 20 October: the carried-days
+        # window's own start state already says so
         self.assertEqual([w["module"] for w in v["module_ownership"]["without_owner"]],
                          [D])
-        self.assertEqual(sorted(extract.carried_ownership(
-            [(("2026-10-01", "2026-10-31"), fact("2026-10-01", "2026-10-31"))],
-            "2026-10-26")["emptied"]), [])
-        self.assertEqual(sorted(extract.carried_ownership(
-            [(("2026-10-01", "2026-10-31"), fact("2026-10-01", "2026-10-31"))],
-            "2026-10-10")["emptied"]), [A])
+        self.assertEqual(v["module_ownership"]["as_of_window"],
+                         {"from": "2026-10-26", "to": "2026-11-30"})
+        self.assertFalse(hasattr(extract, "carried_ownership"))
 
     def test_4_start_snapshot_rows_are_validated(self):
         f = fact("2026-10-01", "2026-10-31")
         for key, bad in (("start_without_owner", [{}]),
                          ("start_without_owner", [{"module": 3}]),
+                         ("start_state", {A: {"owners": "o1"}}),
+                         ("start_state", {A: {"orphan_marker": "yes"}}),
+                         ("start_state", [A]),
                          ("labelled_items", [{}]),
                          ("labelled_items", [{"module": "m", "opened": 5}])):
             self.assertIsNotNone(validate._fact_shape_problem(
@@ -218,9 +260,8 @@ class TestFindingsRound3(unittest.TestCase):
         merged = extract.merge_ownership_events([f, fact("2026-10-08", "2026-10-14")])
         g = [e["kind"] for e in merged if e["module"] == G]
         self.assertEqual(g, ["owner_needed", "owner_removed", "owner_added"])
-        carried = extract.carried_ownership([(("2026-10-01", "2026-10-31"), f)],
-                                            "2026-10-10")
-        self.assertNotIn(G, carried["emptied"])
+        self.assertNotIn(G, [w["module"] for w in
+                             extract.ownership_state(f, "2026-10-09")["without_owner"]])
 
     def test_3_an_end_day_no_window_covers_is_unavailable(self):
         conn = store("month")
@@ -249,6 +290,89 @@ class TestFindingsRound3(unittest.TestCase):
                                  (path, bad))
 
 
+class TestSelfContainedWindows(unittest.TestCase):
+    """Review round 5: every window's fact holds the complete state at its
+    start; any day's state is a replay of the covering window alone."""
+
+    def test_1_a_refreshed_copy_orders_a_legacy_same_second_change(self):
+        old = legacy(fact("2026-10-01", "2026-10-31"))
+        old["events"].sort(key=lambda e: (e["date"], e["kind"]))   # kind order
+        conn = _store(("2026-10-01", "2026-10-31", old),
+                      ("2026-10-08", "2026-10-14", fact("2026-10-08", "2026-10-14")))
+        v = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-09")
+        mo = v["module_ownership"]
+        self.assertEqual([e["kind"] for e in mo["events"] if e["module"] == G],
+                         ["owner_needed", "owner_removed", "owner_added"])
+        self.assertNotIn(G, [w["module"] for w in mo["without_owner"]])
+
+    def test_2_an_earlier_emptied_list_stands_in_a_week_of_the_next_month(self):
+        sep_state = start_state_at("2026-10-01")
+        sep_state[A] = {"owner_file": "metadata.json", "owners": [], "codeowners": [],
+                        "orphan_marker": False, "owners_since": "2026-09-10"}
+        octo = gather.collect_module_ownership(
+            [], [], [], [], Blobs({}), [], "2026-10-01", "2026-10-31",
+            start_state=sep_state)
+        conn = _store(("2026-10-01", "2026-10-31", octo))
+        v = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-07")
+        self.assertIn(A, [w["module"] for w in v["module_ownership"]["without_owner"]])
+
+    def test_3_owners_as_of_the_views_end(self):
+        conn = store("month")
+        early = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-07")
+        late = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-25")
+        self.assertNotIn(A, early["module_ownership"]["owners_at_end"])   # refilled 20th
+        self.assertEqual(late["module_ownership"]["owners_at_end"][A], ["o2"])
+
+    def test_4_every_unavailable_case_says_why(self):
+        conn = _store(("2026-10-01", "2026-10-31", legacy(fact("2026-10-01", "2026-10-31"))))
+        inside = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-07")
+        self.assertIn("--recompute-ownership",
+                      inside["module_ownership"]["without_owner_unavailable"])
+        beyond = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-30")
+        self.assertIn("2026-11-30", beyond["module_ownership"]["without_owner_unavailable"])
+        self.assertNotIn("owners_at_end", beyond["module_ownership"])
+        own_end = extract.extract(conn, "o", "r", "2026-10-15", "2026-10-31")
+        self.assertNotIn("without_owner_unavailable", own_end["module_ownership"])
+
+    def test_the_stored_end_is_checked_against_the_replay(self):
+        f = fact("2026-10-01", "2026-10-31")
+        self.assertIsNone(validate._fact_shape_problem("module_ownership", f))
+        g = json.loads(json.dumps(f))
+        g["without_owner"] = []
+        self.assertIn("replay", validate._fact_shape_problem("module_ownership", g))
+
+    def test_gather_reads_the_complete_start_state(self):
+        start = "s" * 40
+
+        def run(argv):
+            if argv[3] == "log" and "--first-parent" in argv:
+                return ""
+            if argv[3] == "ls-tree":
+                return "\n".join([A + "/metadata.json", A + "/main.bicep",
+                                   B + "/ORPHANED.md", C + "/metadata.json",
+                                   ".github/CODEOWNERS"])
+            if argv[3] == "log":
+                return ("\x1e2026-09-20T00:00:00Z\n\n" + C + "/metadata.json\n"
+                        "\x1e2026-09-02T00:00:00Z\n\n" + B + "/ORPHANED.md\n"
+                        + A + "/metadata.json\n")
+            raise AssertionError(argv)
+        blobs = Blobs({(start, A + "/metadata.json"): meta(["o1"]),
+                       (start, C + "/metadata.json"): meta([]),
+                       (start, ".github/CODEOWNERS"): "/avm/res/a/a/ @lead @Org/team\n"})
+        import unittest.mock as um
+        with um.patch.object(gather, "window_start_commit", lambda *a, **k: start):
+            state, unread = gather.ownership_start_state("/c", "2026-10-01", run=run,
+                                                         read_blob=blobs)
+        self.assertEqual(state, {
+            A: {"owner_file": "metadata.json", "owners": ["o1"], "codeowners": ["lead"],
+                "orphan_marker": False, "owners_since": "2026-09-02"},
+            B: {"owners": [], "codeowners": [], "orphan_marker": True,
+                "marker_since": "2026-09-02"},
+            C: {"owner_file": "metadata.json", "owners": [], "codeowners": [],
+                "orphan_marker": False, "owners_since": "2026-09-20"}})
+        self.assertEqual(unread, [])
+
+
 def _readers(g):
     """Every ownership reader over a fact: the reconstruction for every day,
     the merge, the carry, a merged view and link's annotation."""
@@ -256,7 +380,7 @@ def _readers(g):
     for d in days():
         extract.standing_without_owner(g, d)
     extract.merge_ownership_events([g, g])
-    extract.carried_ownership([(("2026-10-01", "2026-10-31"), g)], "2026-10-20")
+    extract.ownership_state(g, "2026-10-20")
     conn = _store(("2026-10-01", "2026-10-31", g), ("2026-11-01", "2026-11-30", g))
     v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-15")
     v.setdefault("prs", [])
@@ -275,16 +399,22 @@ class TestFuzzReaders(unittest.TestCase):
         base = fact("2026-10-01", "2026-10-31")
         base["unread"] = base.get("unread") or []
         accepted = 0
+        base["start_without_owner"] = [{"module": B, "marker": "ORPHANED.md"}]
         for key in ("events", "without_owner", "start_without_owner",
-                    "labelled_items", "unread"):
+                    "labelled_items", "unread", "start_state"):
             rows = base.get(key) or []
+            if key == "start_state":
+                rows = [base["start_state"][A]]
             if not rows:
                 continue
             fields = sorted({f for r in rows for f in r} | {"module", "date", "people"})
             for field in fields:
                 for val in self.VALUES:
                     g = json.loads(json.dumps(base))
-                    g[key][0][field] = val
+                    if key == "start_state":
+                        g[key][A][field] = val
+                    else:
+                        g[key][0][field] = val
                     if validate._fact_shape_problem("module_ownership", g):
                         continue
                     accepted += 1
@@ -314,32 +444,25 @@ class TestEveryStorageReadsTheSame(unittest.TestCase):
                 without = mo["without_owner"]
                 events = strip_time(mo["events"])     # a legacy fact has no times
                 if name == "legacy+refreshed" and d < "2026-10-26":
-                    # only the legacy fact covers the day: it never recorded
-                    # the order of one day's changes (G: emptied and refilled
-                    # in one second), so events compare as a set and G is
-                    # aside on every day (its state carries on);
-                    # --recompute-ownership rewrites such a fact
-                    got = [m for m in got if m != G]
-                    without = [w for w in without if w["module"] != G]
-                    events = sorted(events, key=lambda e: json.dumps(e, sort_keys=True))
-                    self.assertEqual(got, [m for m in want if m != G], (name, d))
-                    ref = json.loads(first[1][1])
-                    self.assertEqual(json.dumps(events, sort_keys=True), json.dumps(
-                        sorted(ref, key=lambda e: json.dumps(e, sort_keys=True)),
-                        sort_keys=True), (name, d, "events"))
-                    self.assertEqual(json.dumps(without, sort_keys=True), json.dumps(
-                        [w for w in json.loads(first[1][0]) if w["module"] != G],
-                        sort_keys=True), (name, d, "without"))
+                    # only the legacy fact covers the day: it holds no start
+                    # state, so the state of a day inside it is unavailable
+                    # (never another window's); its events are still reported,
+                    # without times (compared as a set)
+                    self.assertEqual(without, [], (name, d))
+                    self.assertIn("--recompute-ownership",
+                                  mo["without_owner_unavailable"], (name, d))
+                    self.assertEqual(
+                        sorted(json.dumps(e, sort_keys=True) for e in events),
+                        sorted(json.dumps(e, sort_keys=True)
+                               for e in json.loads(first[1][1])), (name, d, "events"))
                     continue
                 if name == "legacy+refreshed":
-                    # G's state carries from the legacy fact into later days
-                    got = [m for m in got if m != G]
-                    want_here = [m for m in want if m != G]
-                    self.assertEqual(got, want_here, (name, d))
-                    self.assertEqual(
-                        json.dumps([w for w in without if w["module"] != G], sort_keys=True),
-                        json.dumps([w for w in json.loads(first[1][0])
-                                    if w["module"] != G], sort_keys=True), (name, d))
+                    # the refreshed window covers the day: the same state; the
+                    # events only the legacy fact holds (9 October's same-second
+                    # change) never recorded their order, the rest are equal
+                    self.assertEqual(got, want, (name, d))
+                    self.assertEqual(json.dumps(without, sort_keys=True), first[1][0],
+                                     (name, d, "without"))
                     ref = json.loads(first[1][1])
 
                     def split(evs):
