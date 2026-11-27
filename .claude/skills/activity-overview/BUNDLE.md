@@ -1250,7 +1250,9 @@ silence_days}}`.
   notes), `docs` (`{path, kind: readme|adr|docs|markdown, sections: [{section?, added,
   removed, lines_omitted?, generated_skipped?}]}`: the prose lines a commit changed in a
   Markdown file, generated README sections skipped and counted), `interface_omitted` /
-  `comments_omitted` (what gather's per-commit caps left out). All evidence of one slice
+  `comments_omitted` (what gather's per-commit caps left out), `interface_unread` /
+  `docs_unread` (files of the commit whose before or after version exists but could not
+  be read — over the size limit, a failed read — so no delta is claimed for them). All evidence of one slice
   shares `STORY_EVIDENCE_BUDGET` (16,000 characters), the newest commits first; a commit
   whose rows were cut gets `evidence_omitted` (`truncation.evidence`).
 - **`code_notes`** (on commit items) — `{commit, path, change: add|drop|change, class,
@@ -1310,7 +1312,10 @@ silence_days}}`.
   missing: description edits (renames are `renamed` events), the content of the states a
   force-push replaced (the push and its before / after commits are in the record), label /
   milestone / assignee changes, and — only for PRs whose checks were capped, failed or not
-  requested — "check results and review-thread resolved flags of PR(s) #N (<status>)".
+  requested — "check results and review-thread resolved flags of PR(s) #N (<status>)";
+  a partial read is named too: review threads beyond those read (`threads_omitted`),
+  earlier lifecycle events (`events_omitted`), and the earliest commits whose checks were
+  not read (`commits_total` above the commits read).
 - **`gaps`** (omitted when empty) — what THIS slice cannot show because its store was
   gathered before the data was kept: review comments with no file / diff lines / thread
   link, PR commits with no file paths or message bodies, PRs with no `pr_activity` row
@@ -1326,9 +1331,13 @@ silence_days}}`.
     outstanding_change_requests: [{by, since, url}]}` and `checks` (`link.checks_outcome`
     from the view's `pr_activity`: `{status: "gathered", head, head_url, rollup, failing,
     pending, passing, gathered_at, commits_total, commits_covered, checks_omitted?,
-    completed_after_as_of?}` — the head is the latest covered commit committed by the
-    instant and its roll-up is as of the instant, a check completed after it counting as
-    pending; `{status: capped|failed|not_found|not_requested, reason?, gathered_at}` when
+    completed_after_as_of?, reason?}` — the head is the latest covered commit committed
+    by the instant and its roll-up is as of the instant, a check completed after it
+    counting as pending; a head whose checks were not all read (`checks_omitted`) is
+    `incomplete` unless a visible check failed (never a pass from a partial page); when
+    none of the commits read was committed by the instant (the read covers the latest
+    ten), `rollup: "unavailable"`, `head: null` and a `reason`;
+    `{status: capped|failed|not_found|not_requested, reason?, gathered_at}` when
     the checks were not read; the string `"not gathered"` when the view has no such row);
     an open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;
   - `ball` — **who the next move is with, DERIVED by rule** from the sequence of recorded
@@ -1515,8 +1524,10 @@ no gather stored it (a store gathered before it, every fixture bundle):
 ```
 
 - `checks_status` — `gathered`, `capped` (beyond `ACTIVITY_PR_CHECKS_MAX`: open PRs are
-  asked first, then the most discussed, then the newest), `failed` (its request failed;
-  `checks_reason`), `not_found` (GitHub answered null), `not_requested` (`--no-pr-checks`
+  asked first, then the most discussed, then the newest), `failed` (its request failed,
+  or a GraphQL field error named the PR — partial data for it is not trusted; an error
+  naming no PR fails its batch; `checks_reason`), `not_found` (GitHub answered null),
+  `not_requested` (`--no-pr-checks`
   or no GraphQL client). Only a `gathered` row says anything about checks; nothing is
   ever "no checks" for a PR that was not asked about.
 - `commits` — the latest `PR_CHECKS_COMMITS` (10) of the PR's commits, oldest first, each
@@ -1525,7 +1536,9 @@ no gather stored it (a store gathered before it, every fixture bundle):
   them, as gathered: a conclusion in `failure`, `timed_out`, `cancelled`,
   `action_required`, `startup_failure`, `error` fails it; `success`, `neutral`, `skipped`
   pass; anything else is pending; failing wins over pending, pending over passing; no
-  check at all is `none`) and `state` (GitHub's own roll-up state). `commits_total` is the
+  check at all is `none`; computed over the checks read — a reader passes
+  `checks_omitted` and gets `incomplete` unless a failure is visible) and `state`
+  (GitHub's own roll-up state). `commits_total` is the
   PR's commit count; `head` its head commit when gathered.
 - `threads` — GitHub's resolved flag per review thread (`comment_id` is the thread's
   opening review comment, `resolved_by` who resolved it), at most `PR_THREADS_FIRST` 50

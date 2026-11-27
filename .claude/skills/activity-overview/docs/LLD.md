@@ -412,7 +412,10 @@ the PR's renames, draft / ready changes, review requests, dismissals and force-p
 4. **Normalise.** `normalize_check_context` maps both node types to `{name, kind, status,
    conclusion, started_at, completed_at, url}`; `checks_rollup` (also used by link, with an
    as-of instant) folds them to passing / failing / pending / none; a REST force-push event
-   gains the GraphQL push's commits matched on (time, actor).
+   gains the GraphQL push's commits matched on (time, actor). GraphQL field errors in a
+   partial answer reach this reader (`graphql_post(..., errors=list)`; the other
+   readers keep the partial-data behaviour): a PR an error's `path` names is `failed`,
+   an error naming none fails its batch.
 
 ### 4.4b PR-internal history (`collect_pr_history`)
 

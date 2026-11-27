@@ -10,6 +10,7 @@ import contextlib
 import copy
 import datetime
 import http.client
+import inspect
 import json
 import os
 import re
@@ -2896,9 +2897,12 @@ def doc_kind(path, adr_dirs=PR_ADR_DIRS):
 
 
 def parse_narrative_patch(raw):
-    """A `git log -p --format=%x1e%H` listing -> [{commit, path, hunks:
-    [{old_start, new_start, func, lines: [(sign, text, old_no, new_no)]}]}]
-    in listing order. `func` is git's hunk-header context (the nearest line
+    """A `git log -p --format=%x1e%H` listing -> [{commit, path, old_path,
+    status, hunks: [{old_start, new_start, func, lines: [(sign, text,
+    old_no, new_no)]}]}] in listing order. `old_path` is the file's path in
+    the parent (a rename's source, else `path`), `status` `added` /
+    `deleted` / `modified` (from git's `new file mode` / `deleted file
+    mode` header lines). `func` is git's hunk-header context (the nearest line
     above the hunk its diff driver names: a heading for Markdown, a
     top-level line for code), `old_no` / `new_no` the line's number on the
     side(s) it is on (None on the other). A file with no hunk (a mode
@@ -2910,10 +2914,12 @@ def parse_narrative_patch(raw):
         hunk = None
         for ln in lines[1:]:
             if ln.startswith("diff --git "):
-                cur = {"commit": sha, "path": None, "hunks": []}
+                cur = {"commit": sha, "path": None, "old_path": None,
+                       "status": "modified", "hunks": []}
                 out.append(cur)
                 m = re.match(r"diff --git a/(.*) b/(.*)$", ln)
                 if m:
+                    cur["old_path"] = unquote_git_path(m.group(1))
                     cur["path"] = unquote_git_path(m.group(2))
                 hunk, old_left, new_left = None, 0, 0
                 continue
@@ -2947,12 +2953,28 @@ def parse_narrative_patch(raw):
                 hunk = {"old_start": old_no, "new_start": new_no,
                         "func": m.group(5).strip(), "lines": []}
                 cur["hunks"].append(hunk)
-            elif ln.startswith("+++ ") and not cur["hunks"]:
+            elif cur["hunks"]:
+                continue
+            elif ln.startswith("+++ "):
                 p = _diff_header_path(ln[4:])
                 if p:
                     cur["path"] = p
-            elif ln.startswith("--- ") and not cur["hunks"] and cur["path"] is None:
-                cur["path"] = _diff_header_path(ln[4:])
+            elif ln.startswith("--- "):
+                p = _diff_header_path(ln[4:])
+                if p:
+                    cur["old_path"] = p
+                elif cur["path"] is None:
+                    cur["path"] = p
+            elif ln.startswith("rename from "):
+                cur["old_path"] = unquote_git_path(ln[len("rename from "):])
+            elif ln.startswith("rename to "):
+                cur["path"] = unquote_git_path(ln[len("rename to "):])
+            elif ln.startswith("new file mode"):
+                cur["status"] = "added"
+            elif ln.startswith("deleted file mode"):
+                cur["status"] = "deleted"
+    for f in out:
+        f["old_path"] = f["old_path"] or f["path"]
     return [f for f in out if f["path"] and f["hunks"]]
 
 
@@ -2962,10 +2984,15 @@ def _cap(text, limit):
     return (text, None) if len(text) <= limit else (text[:limit], len(text))
 
 
-def _is_comment_line(lang, text, in_block=True):
-    """True for a whole-line comment in `lang`. A line starting with `*`
-    (a block comment's continuation) counts only `in_block`."""
+def _is_comment_line(lang, text, in_block=False):
+    """True for a whole-line comment in `lang`. `in_block` (_block_states:
+    inside a `/* ... */` or `<# ... #>` block opened earlier in the hunk):
+    every line counts, whatever it starts with — a block comment's body
+    need not carry a marker. Outside one, a line starting with `*` (a
+    continuation) does not count."""
     t = text.strip()
+    if in_block and lang in ("bicep", "hcl", "powershell"):
+        return True
     if not t or not t.startswith(_NARR_COMMENT_START.get(lang, ())):
         return False
     if lang in ("bicep", "hcl") and t.startswith("*") and not in_block:
@@ -3038,12 +3065,13 @@ def _narrative_decl(lang, hunk, i, side):
     context when it is a declaration. `side` is the sign the comment is on.
     None when nothing names one."""
     lines = hunk["lines"]
+    blocks = _block_states(lang, lines)
     seen = (" ", side)
     first = lines[i][1]
     if lang != "yaml" and _indent(first) == 0:
         j = i
         while j < len(lines) and (lines[j][0] not in seen
-                                  or _is_comment_line(lang, lines[j][1])
+                                  or _is_comment_line(lang, lines[j][1], blocks[j])
                                   or lines[j][1].strip().startswith("@")):
             j += 1
         if j < len(lines):
@@ -3053,7 +3081,7 @@ def _narrative_decl(lang, hunk, i, side):
     ind = _indent(first)
     for j in range(i - 1, -1, -1):
         sign, text = lines[j][0], lines[j][1]
-        if sign not in seen or _is_comment_line(lang, text):
+        if sign not in seen or _is_comment_line(lang, text, blocks[j]):
             continue
         if lang == "yaml":
             m = _NARR_DECL_RE["yaml"].match(text)
@@ -3230,10 +3258,10 @@ _BICEP_TOP_DECL_RE = re.compile(
 _BICEP_DECOR_RE = re.compile(r"^@(?:sys\.)?(\w+)")
 
 
-def _norm(text, limit=PR_NARRATIVE_VALUE_CHARS):
-    """Whitespace-normalised text, capped at `limit` (None: uncapped; the
-    reader keeps defaults / allowed lists whole so a change past the cap
-    is still seen, diff_interface caps what it emits)."""
+def _norm(text, limit=None):
+    """Whitespace-normalised text, capped at `limit` (default uncapped: the
+    interface reader keeps every value whole so a change past any cap is
+    still seen; diff_interface caps what it emits, _capped_field)."""
     t = " ".join((text or "").split())
     if not t:
         return None
@@ -3353,7 +3381,7 @@ def read_bicep_interface(text):
             if mm:
                 row["ref"] = mm.group(1)
         elif kind == "metadata" and value is not None:
-            row["value"] = _norm(_bicep_string(value), 600)
+            row["value"] = _norm(_bicep_string(value))
         for d in decorators:
             dm = _BICEP_DECOR_RE.match(d.strip())
             if not dm:
@@ -3363,8 +3391,7 @@ def read_bicep_interface(text):
             if arg.startswith("(") and arg.endswith(")"):
                 arg = arg[1:-1]
             if dname == "description":
-                row["description"] = _norm(_bicep_string(arg),
-                                           PR_NARRATIVE_DESCRIPTION_CHARS)
+                row["description"] = _norm(_bicep_string(arg))
             elif dname == "allowed":
                 row["allowed"] = _norm(arg, None)
                 entries = _value_entries(arg)
@@ -3401,16 +3428,14 @@ def _tf_attrs(body, keys):
                 endm = re.compile(r"(?m)^[ \t]*%s[ \t]*$" % re.escape(hd.group("id"))
                                   ).search(raw, hd.end())
                 val = raw[hd.end():endm.start() if endm else len(raw)]
-                out[key] = _norm(val, PR_NARRATIVE_DESCRIPTION_CHARS)
+                out[key] = _norm(val)
                 break
             stop = _statement_end(masked, depths, start)
             val = body[start:stop].strip()
             if len(val) >= 2 and val[0] == '"' and val[-1] == '"' \
                     and '"' not in masked[start:stop].strip()[1:-1]:
                 val = val[1:-1]
-            out[key] = _norm(val, PR_NARRATIVE_DESCRIPTION_CHARS
-                             if key == "description" else
-                             PR_NARRATIVE_VALUE_CHARS)
+            out[key] = _norm(val)
             break
     return out
 
@@ -3469,6 +3494,24 @@ def _iface_sig(row):
     return tuple(json.dumps(row.get(f), sort_keys=True) for f in _INTERFACE_FIELDS)
 
 
+# Characters an emitted interface value keeps (descriptions and metadata
+# values are prose and keep more); the reader compares them whole.
+PR_NARRATIVE_FIELD_CHARS = {"description": PR_NARRATIVE_DESCRIPTION_CHARS,
+                            "value": 2 * PR_NARRATIVE_DESCRIPTION_CHARS}
+
+
+def _capped_field(v, field=None):
+    """An emitted interface value: a string over its field's cap
+    (PR_NARRATIVE_FIELD_CHARS, else PR_NARRATIVE_VALUE_CHARS) is cut and
+    ends in "…"; a constraints map is capped value by value."""
+    if isinstance(v, dict):
+        return {k: _capped_field(x) for k, x in v.items()}
+    cap = PR_NARRATIVE_FIELD_CHARS.get(field, PR_NARRATIVE_VALUE_CHARS)
+    if isinstance(v, str) and len(v) > cap:
+        return v[:cap] + "…"
+    return v
+
+
 def diff_interface(path, before, after):
     """The interface delta of one file between two read_interface results:
     rows {path, kind, name, change, [before], [after], [from], [to]} —
@@ -3502,13 +3545,10 @@ def diff_interface(path, before, after):
                 news.remove(same[0])
                 del gone[o]
 
-    def capped(v):
-        if isinstance(v, str) and len(v) > PR_NARRATIVE_VALUE_CHARS:
-            return v[:PR_NARRATIVE_VALUE_CHARS] + "…"
-        return v
+    capped = _capped_field
 
     def fields(row):
-        return {f: capped(row[f]) for f in _INTERFACE_FIELDS if f in row}
+        return {f: capped(row[f], f) for f in _INTERFACE_FIELDS if f in row}
     for k, v in sorted(gone.items()):
         rows.append(dict({"path": path, "kind": k[0], "name": k[1],
                           "change": "removed"},
@@ -3525,9 +3565,9 @@ def diff_interface(path, before, after):
             if b.get(f) != a.get(f):
                 row = {"path": path, "kind": k[0], "name": k[1], "change": f}
                 if f in b:
-                    row["before"] = capped(b[f])
+                    row["before"] = capped(b[f], f)
                 if f in a:
-                    row["after"] = capped(a[f])
+                    row["after"] = capped(a[f], f)
                 be = (b.get("_entries") or {}).get(f)
                 ae = (a.get("_entries") or {}).get(f)
                 if be is not None and ae is not None:
@@ -3592,8 +3632,9 @@ def review_responses(comments, commits, files_by_commit):
     side is within PR_RESPONSE_NEAR lines of the comment's line, for the
     first commit after the comment's own commit only — later commits may
     have moved the line). "Later" is after the comment's commit in the
-    PR's commit order when that commit is listed, else committed after
-    the comment. Returns [{comment_id, path, [line], at, commits: [{sha,
+    PR's commit order when that commit is listed, and always committed
+    after the comment (a comment on an older commit is not answered by
+    the commits that already existed). Returns [{comment_id, path, [line], at, commits: [{sha,
     match, hunks: [_hunk_excerpt]}], [file_commits]}] — `file_commits`
     the later commits that changed the file anywhere (at most 5) — for
     every comment with at least one later commit touching its file.
@@ -3608,7 +3649,10 @@ def review_responses(comments, commits, files_by_commit):
         if c.get("commit") in order:
             later = order[order.index(c["commit"]) + 1:]
         else:
-            later = [s for s in order if when.get(s, "") > (c.get("created_at") or "")]
+            later = list(order)
+        # a comment written on an older commit after its descendants existed:
+        # only commits recorded after the comment can answer it
+        later = [s for s in later if when.get(s, "") > (c.get("created_at") or "")]
         touching = [s for s in later if c["path"] in files_by_commit.get(s, {})]
         if not touching:
             continue
@@ -3673,7 +3717,10 @@ def collect_pr_narrative(row, n, clone_dir, base_ref, exclude, run, pr=None,
     ([{path, kind, sections: narrative_docs}] for README / docs / ADR /
     other Markdown, not the changelog — that is `patches`) and `interface`
     (diff_interface of each changed `.bicep` / `.tf` module file, tests and
-    examples excepted, between the commit's first parent and the commit),
+    examples excepted, between the commit's first parent — at the file's
+    old path for a rename — and the commit; a version the patch shows
+    existed but that could not be read is skipped and listed in
+    `interface_unread`, a README in `docs_unread`),
     each bounded per commit, all within PR_NARRATIVE_CHARS per PR (the
     newest commits first; `narrative_omitted` counts the rows left out);
     and `responses` (review_responses for the PR's review comments, within
@@ -3719,39 +3766,61 @@ def collect_pr_narrative(row, n, clone_dir, base_ref, exclude, run, pr=None,
         wants = (p.endswith((".bicep", ".tf")) and not _is_scaffold_path(p)) \
             or doc_kind(p, adr_dirs) == "readme"
         if wants:
-            specs += ["{}:{}".format(f["commit"], p), "{}^:{}".format(f["commit"], p)]
+            if f["status"] != "deleted":
+                specs.append("{}:{}".format(f["commit"], p))
+            if f["status"] != "added":
+                specs.append("{}^:{}".format(f["commit"], f["old_path"]))
     blobs = _read_blobs(clone_dir, specs, run)
+
+    def versions(f):
+        """(before, after) text of a file: "" for a side the patch says
+        did not exist, None for a side that exists but could not be read
+        (over PR_NARRATIVE_BLOB_BYTES, a failed read)."""
+        before = "" if f["status"] == "added" else blobs.get(
+            "{}^:{}".format(f["commit"], f["old_path"]))
+        after = "" if f["status"] == "deleted" else blobs.get(
+            "{}:{}".format(f["commit"], f["path"]))
+        return before, after
     per_commit = {}
     for f in files:
         sha, p = f["commit"], f["path"]
         if sha not in parents:
             continue
         ev = per_commit.setdefault(sha, {"comments": [], "docs": [],
-                                         "interface": [], "iface_files": 0})
+                                         "interface": [], "iface_files": 0,
+                                         "unread": [], "docs_unread": []})
         lang = narrative_lang(p)
         if lang in _NARR_COMMENT_START:
             for r in narrative_comments(lang, f["hunks"]):
                 ev["comments"].append(dict({"path": p}, **r))
         kind = doc_kind(p, adr_dirs)
         if kind and kind != "changelog":
-            old = blobs.get("{}^:{}".format(sha, p)) if kind == "readme" else None
-            new = blobs.get("{}:{}".format(sha, p)) if kind == "readme" else None
-            secs = narrative_docs(kind, f["hunks"], old, new)
-            if any(g["added"] or g["removed"] for g in secs):
-                ev["docs"].append({"path": p, "kind": kind, "sections": secs})
+            old, new = versions(f) if kind == "readme" else (None, None)
+            if kind == "readme" and (old is None or new is None):
+                # which lines are generated is unknown: say so, not guess
+                ev["docs_unread"].append(p)
+            else:
+                secs = narrative_docs(kind, f["hunks"], old, new)
+                if any(g["added"] or g["removed"] for g in secs):
+                    ev["docs"].append({"path": p, "kind": kind, "sections": secs})
         if p.endswith((".bicep", ".tf")) and not _is_scaffold_path(p) \
                 and ev["iface_files"] < PR_NARRATIVE_INTERFACE_FILES:
             ev["iface_files"] += 1
-            before = blobs.get("{}^:{}".format(sha, p))
-            after = blobs.get("{}:{}".format(sha, p))
-            if before is not None or after is not None:
+            before, after = versions(f)
+            if before is None or after is None:
+                ev["unread"].append(p)      # skipped, never "all removed"
+            else:
                 ev["interface"] += diff_interface(
-                    p, read_interface(p, before or ""), read_interface(p, after or ""))
+                    p, read_interface(p, before), read_interface(p, after))
     used, omitted = 0, 0
     for c in reversed(commits):
         ev = per_commit.get(c["sha"])
         if not ev:
             continue
+        if ev["unread"]:
+            c["interface_unread"] = ev["unread"]
+        if ev["docs_unread"]:
+            c["docs_unread"] = ev["docs_unread"]
         rows = []
         for key, cap in (("interface", PR_NARRATIVE_INTERFACE_ROWS),
                          ("comments", PR_NARRATIVE_COMMENTS)):
@@ -6663,7 +6732,8 @@ def _graphql_rate_limited(headers, body):
                for e in errors)
 
 
-def graphql_post(token, query, variables=None, opener=None, sleep=None, clock=None):
+def graphql_post(token, query, variables=None, opener=None, sleep=None, clock=None,
+                 errors=None):
     """POST a GraphQL query to GitHub's `/graphql`, returning the parsed `data`.
 
     Shares `_github_open` with http_get_json (timeout, retries, rate-limit
@@ -6672,7 +6742,9 @@ def graphql_post(token, query, variables=None, opener=None, sleep=None, clock=No
     "never hard-fail" contract can catch it. When the response carries `errors`
     AND non-empty `data` (e.g. one inaccessible board among several), the partial
     `data` is KEPT and the errors are warned on stderr; only errors with no data
-    raise.
+    raise. A caller that must know which fields failed passes a list as
+    `errors`: the response's error objects are appended to it (the
+    `pr_activity` reader marks the PRs they name as failed).
     """
     payload = json.dumps({"query": query, "variables": variables or {}}).encode()
     req = urllib.request.Request(GRAPHQL_URL, data=payload, headers=_github_headers(
@@ -6685,13 +6757,15 @@ def graphql_post(token, query, variables=None, opener=None, sleep=None, clock=No
         raise GitHubAPIError(
             f"error: GraphQL {GRAPHQL_URL} returned non-JSON: {err}") from None
     data = body.get("data") if isinstance(body, dict) else None
-    errors = body.get("errors") if isinstance(body, dict) else None
-    if errors:
+    got = body.get("errors") if isinstance(body, dict) else None
+    if got:
         msgs = "; ".join(
-            e.get("message", "") for e in errors if isinstance(e, dict))
+            e.get("message", "") for e in got if isinstance(e, dict))
         if not data:
             raise GitHubAPIError(
                 f"error: GraphQL {GRAPHQL_URL} returned errors: {msgs}")
+        if errors is not None:
+            errors.extend(e for e in got if isinstance(e, dict))
         sys.stderr.write(
             f"warning: GraphQL {GRAPHQL_URL} returned partial data with errors "
             f"(keeping the data): {msgs}\n")
@@ -7189,8 +7263,8 @@ def resolve_closing_issues(prs, graphql, owner, repo):
 def _graphql_client(token):
     """The `graphql(query, variables)` callable acquire hands to the GraphQL
     readers (a seam so tests inject fixtures instead of the network)."""
-    def _graphql(query, variables=None):
-        return graphql_post(token, query, variables)
+    def _graphql(query, variables=None, errors=None):
+        return graphql_post(token, query, variables, errors=errors)
     return _graphql
 
 
@@ -7235,7 +7309,7 @@ PR_ACTIVITY_CHECKS_STATUSES = ("gathered", "capped", "failed", "not_found",
 CHECK_FAILING = frozenset(("failure", "timed_out", "cancelled", "action_required",
                            "startup_failure", "error"))
 CHECK_PASSING = frozenset(("success", "neutral", "skipped"))
-CHECK_ROLLUPS = ("passing", "failing", "pending", "none")
+CHECK_ROLLUPS = ("passing", "failing", "pending", "incomplete", "none")
 # The issue-timeline events kept as PR lifecycle events (`ready_for_review`
 # is already a `lifecycle` event of the PR record).
 PR_TIMELINE_EVENTS = ("renamed", "convert_to_draft", "review_requested",
@@ -7311,15 +7385,18 @@ def normalize_check_context(node):
     return {k: v for k, v in row.items() if v is not None}
 
 
-def checks_rollup(checks, as_of=None):
+def checks_rollup(checks, as_of=None, omitted=0):
     """The roll-up of one commit's checks, optionally as of an instant:
-    {rollup: passing|failing|pending|none, failing: [names], pending:
+    {rollup: passing|failing|pending|incomplete|none, failing: [names], pending:
     [names], passing: count}. A check whose conclusion is in CHECK_FAILING
     fails the commit; CHECK_PASSING passes it; any other (no conclusion yet,
     stale, an expected status) is pending. With `as_of`, a check started
     after it did not exist yet (left out) and one completed after it was
     still pending then. `failing` wins over `pending`, `pending` over
-    `passing`; no check at all is `none`. Names are sorted. Pure."""
+    `passing`; no check at all is `none`. With `omitted` (checks GitHub
+    counted but the read did not return), a partial page is never a pass:
+    the roll-up is `failing` when a failure is visible, else `incomplete`.
+    Names are sorted. Pure."""
     failing, pending, passing = set(), set(), 0
     for c in checks or []:
         if not isinstance(c, dict):
@@ -7348,6 +7425,8 @@ def checks_rollup(checks, as_of=None):
         rollup = "passing"
     else:
         rollup = "none"
+    if omitted and rollup != "failing":
+        rollup = "incomplete"
     return {"rollup": rollup, "failing": sorted(failing),
             "pending": sorted(pending - failing), "passing": passing}
 
@@ -7358,7 +7437,9 @@ def parse_pr_activity_node(pr_obj):
     (oldest first), threads_total, threads: [{comment_id, path, line,
     resolved, [resolved_by], outdated}], [threads_omitted], force_pushes:
     [{at, actor, before, after}]}. `rollup` is checks_rollup over the
-    commit's contexts as gathered, `state` GitHub's own roll-up state
+    commit's contexts as gathered (over the contexts read only: a reader
+    applies `checks_omitted`, checks_rollup(..., omitted=), so a partial
+    page is never a pass), `state` GitHub's own roll-up state
     (lowercase; absent with no status at all). Pure."""
     pr_obj = pr_obj if isinstance(pr_obj, dict) else {}
     out = {"head": pr_obj.get("headRefOid")}
@@ -7375,13 +7456,18 @@ def parse_pr_activity_node(pr_obj):
                               for n in ctx.get("nodes") or []) if x]
         checks.sort(key=lambda x: (x.get("name") or "", x.get("kind"),
                                    x.get("started_at") or ""))
+        total = ctx.get("totalCount")
+        omitted = total - len(checks) if isinstance(total, int) \
+            and total > len(checks) else 0
+        if not omitted and (ctx.get("pageInfo") or {}).get("hasNextPage"):
+            omitted = 1                     # more exist, count unknown
         row = {"sha": c["oid"], "committed_at": c.get("committedDate"),
-               "rollup": checks_rollup(checks)["rollup"], "checks": checks}
+               "rollup": checks_rollup(checks)["rollup"],
+               "checks": checks}
         if roll.get("state"):
             row["state"] = _lower(roll["state"])
-        total = ctx.get("totalCount")
-        if isinstance(total, int) and total > len(checks):
-            row["checks_omitted"] = total - len(checks)
+        if omitted:
+            row["checks_omitted"] = omitted
         rows.append(row)
     out["commits"] = rows
     threads = pr_obj.get("reviewThreads") or {}
@@ -7471,6 +7557,35 @@ def _activity_order(prs):
                        -p["number"]))]
 
 
+def _accepts_errors(fn):
+    """True when the injected graphql callable takes the `errors` list
+    (_graphql_client's does; a bare test stub may not)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "errors" or p.kind is p.VAR_KEYWORD for p in params)
+
+
+def _errors_by_pr(errors, batch):
+    """{pr number: message} for the GraphQL field errors of one batch: an
+    error whose `path` starts `repository`, `pr<N>` is that PR's; an error
+    naming no PR of the batch fails every PR of it (the data cannot be told
+    apart)."""
+    out = {}
+    for e in errors or []:
+        msg = str(e.get("message") or "GraphQL field error")
+        path = e.get("path") or []
+        key = path[1] if len(path) > 1 and isinstance(path[1], str) else ""
+        m = re.fullmatch(r"pr(\d+)", key)
+        if m and int(m.group(1)) in batch:
+            out.setdefault(int(m.group(1)), msg)
+        else:
+            for n in batch:
+                out.setdefault(n, msg)
+    return out
+
+
 def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
                         max_prs=None, enabled=True, clock=None):
     """The window's `pr_activity` fact.
@@ -7484,7 +7599,9 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
     their checks, threads with GitHub's resolved flag, and the force-push
     events' before / after commits. checks_status: `gathered`, `capped`
     (beyond max_prs), `failed` (its request failed; `checks_reason`),
-    `not_found` (GitHub answered null) or `not_requested` (`enabled` false
+    `not_found` (GitHub answered null), `failed` too for a PR a GraphQL
+    field error names (partial data: what came back for it is not trusted;
+    an error naming no PR fails its whole batch), or `not_requested` (`enabled` false
     or no GraphQL client). Never "no checks" for a PR that was not asked
     about. A failed request is recorded, never fatal; after
     PR_ACTIVITY_FAILURE_STOP failed requests in a row the rest are failed
@@ -7511,6 +7628,7 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
             rows[n]["checks_status"] = "capped" if enabled and graphql is not None \
                 else "not_requested"
     requests = points = failures = 0
+    takes_errors = _accepts_errors(graphql)
     for i in range(0, len(asked), PR_ACTIVITY_BATCH):
         batch = sorted(asked[i:i + PR_ACTIVITY_BATCH])
         if failures >= PR_ACTIVITY_FAILURE_STOP:
@@ -7519,8 +7637,14 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
                     "not asked: {} requests in a row failed".format(failures)))
             continue
         requests += 1
+        errs = []
         try:
-            data = graphql(pr_activity_query(batch), {"owner": owner, "repo": repo})
+            if takes_errors:
+                data = graphql(pr_activity_query(batch),
+                               {"owner": owner, "repo": repo}, errors=errs)
+            else:
+                data = graphql(pr_activity_query(batch),
+                               {"owner": owner, "repo": repo})
             repo_obj = (data or {}).get("repository")
             if not isinstance(repo_obj, dict):
                 raise ValueError("repository {}/{} not found".format(owner, repo))
@@ -7535,7 +7659,12 @@ def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
         cost = ((data or {}).get("rateLimit") or {}).get("cost")
         if isinstance(cost, int):
             points += cost
+        field_errors = _errors_by_pr(errs, batch)
         for n in batch:
+            if n in field_errors:
+                rows[n].update(checks_status="failed",
+                               checks_reason=field_errors[n][:200])
+                continue
             pr_obj = repo_obj.get("pr{}".format(n))
             if not isinstance(pr_obj, dict):
                 rows[n]["checks_status"] = "not_found"

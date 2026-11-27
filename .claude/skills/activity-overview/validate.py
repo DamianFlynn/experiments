@@ -1427,6 +1427,11 @@ _PR_ACTIVITY_THREAD_KEYS = {"comment_id", "path", "line", "resolved",
                             "resolved_by", "outdated"}
 
 
+def _list_of_objects(v):
+    """True for a list whose every element is a JSON object."""
+    return isinstance(v, list) and all(isinstance(x, dict) for x in v)
+
+
 def _pr_activity_problem(value):
     """Why a stored `pr_activity` value is not one gather writes (an unknown
     key at any level, a checks_status / roll-up / event kind gather never
@@ -1442,6 +1447,9 @@ def _pr_activity_problem(value):
         if not isinstance(row, dict) or not isinstance(row.get("number"), int):
             return "pr_activity.prs holds a row without a PR number"
         n = row["number"]
+        for key in ("commits", "threads", "events"):
+            if key in row and not _list_of_objects(row[key]):
+                return "pr_activity PR #{} {} is not a list of objects".format(n, key)
         extra = sorted(set(row) - _PR_ACTIVITY_ROW_KEYS)
         if extra:
             return "pr_activity PR #{} carries unexpected key(s) {}".format(
@@ -1450,8 +1458,9 @@ def _pr_activity_problem(value):
             return "pr_activity PR #{} checks_status {!r} is not one gather " \
                    "writes".format(n, row.get("checks_status"))
         for c in row.get("commits") or []:
-            if not isinstance(c, dict) or not set(c) <= _PR_ACTIVITY_COMMIT_KEYS \
-                    or c.get("rollup") not in gather.CHECK_ROLLUPS:
+            if not set(c) <= _PR_ACTIVITY_COMMIT_KEYS \
+                    or c.get("rollup") not in gather.CHECK_ROLLUPS \
+                    or ("checks" in c and not isinstance(c["checks"], list)):
                 return "pr_activity PR #{} has a commit entry gather does not " \
                        "write".format(n)
             for k in c.get("checks") or []:
@@ -1478,29 +1487,37 @@ def _pr_history_problem(value):
     `interface` / `docs` lists of objects, `responses` whose commits match
     by `anchor` or `line`, a boolean `narrative_collected`; or None. Rows
     of older gathers simply lack them."""
+    if "prs" in value and not isinstance(value["prs"], list):
+        return "pr_history.prs is not a list"
     for row in value.get("prs") or []:
         if not isinstance(row, dict):
             return "pr_history.prs holds a row that is not an object"
         n = row.get("number")
         if "narrative_collected" in row and row["narrative_collected"] is not True:
             return "pr_history PR #{} narrative_collected is not true".format(n)
+        if "commits" in row and not _list_of_objects(row["commits"]):
+            return "pr_history PR #{} commits is not a list of objects".format(n)
         for c in row.get("commits") or []:
             for key in ("comments", "interface", "docs"):
-                if key in c and not (isinstance(c[key], list) and all(
-                        isinstance(x, dict) for x in c[key])):
+                if key in c and not _list_of_objects(c[key]):
                     return "pr_history PR #{} commit {} is not a list of " \
                            "objects".format(n, key)
+            for d in c.get("docs") or []:
+                if not _list_of_objects(d.get("sections")):
+                    return "pr_history PR #{} commit docs sections is not a " \
+                           "list of objects".format(n)
         resp = row.get("responses")
         if resp is None:
             continue
         if not isinstance(resp, list):
             return "pr_history PR #{} responses is not a list".format(n)
         for r in resp:
-            if not isinstance(r, dict) or not isinstance(r.get("commits"), list):
+            if not isinstance(r, dict) or not _list_of_objects(r.get("commits")):
                 return "pr_history PR #{} has a response gather does not " \
                        "write".format(n)
             for c in r["commits"]:
-                if not isinstance(c, dict) or c.get("match") not in ("anchor", "line"):
+                if not isinstance(c, dict) or c.get("match") not in ("anchor", "line") \
+                        or not _list_of_objects(c.get("hunks", [])):
                     return "pr_history PR #{} has a response commit gather " \
                            "does not write".format(n)
     return None

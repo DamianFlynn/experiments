@@ -3698,7 +3698,8 @@ def _activity_items(pr, row, instant):
                and _not_after(c.get("committed_at"), instant)]
     head = commits[-1]["sha"] if commits else None
     for c in commits:
-        roll = gather.checks_rollup(c.get("checks"), as_of=instant)
+        roll = gather.checks_rollup(c.get("checks"), as_of=instant,
+                                    omitted=c.get("checks_omitted") or 0)
         if roll["rollup"] == "none" and not c.get("checks"):
             continue
         it = {"at": _check_item_time(c.get("checks"), c.get("committed_at"),
@@ -3723,7 +3724,10 @@ def checks_outcome(row, instant, pr_url=None):
     {status: gathered, head, [head_url], rollup, failing, pending, passing,
     gathered_at, commits_total, commits_covered, [checks_omitted],
     [completed_after_as_of]} — the head being the latest covered commit
-    committed by the instant, its roll-up as of the instant — or {status,
+    committed by the instant, its roll-up as of the instant (`incomplete`
+    when the read missed some of its checks and none visible failed); with
+    no covered commit by the instant `rollup: unavailable`, `head: None`
+    and a `reason` — or {status,
     [reason], gathered_at} when the checks were capped, failed, not found
     or not requested."""
     status = row.get("checks_status")
@@ -3738,11 +3742,16 @@ def checks_outcome(row, instant, pr_url=None):
     out["commits_total"] = row.get("commits_total")
     out["commits_covered"] = len(commits)
     if not commits:
+        # the read covers the PR's latest commits only: none of them existed
+        # at the instant, so the head's checks then are not in the record
         out["head"] = None
-        out["rollup"] = "none"
+        out["rollup"] = "unavailable"
+        out["reason"] = ("the commits whose checks were read were all "
+                         "committed after the as-of instant")
         return out
     c = commits[-1]
-    roll = gather.checks_rollup(c.get("checks"), as_of=instant)
+    roll = gather.checks_rollup(c.get("checks"), as_of=instant,
+                                omitted=c.get("checks_omitted") or 0)
     out.update(head=c["sha"], rollup=roll["rollup"], failing=roll["failing"],
                pending=roll["pending"], passing=roll["passing"])
     if pr_url:
@@ -3795,7 +3804,9 @@ def _story_not_gathered(prs, activity):
     """STORY_NOT_GATHERED, minus what the view's `pr_activity` holds for
     every PR of the train: check results (when gathered for each), the
     resolved flag (likewise), renames (title edits) and force-pushes (their
-    before / after commits; the replaced content stays unfetched)."""
+    before / after commits; the replaced content stays unfetched). A partial
+    read is named: review threads, lifecycle events or commits beyond what
+    gather read."""
     out = list(STORY_NOT_GATHERED)
     if not prs or not activity or any(p.get("number") not in activity
                                       for p in prs):
@@ -3819,6 +3830,21 @@ def _story_not_gathered(prs, activity):
                                                    "check runs"))]
         out.append("check results and review-thread resolved flags of "
                    "PR(s) {} (not read)".format(", ".join(missing)))
+    # partial reads: the record holds some, not all
+    for p, r in zip(prs, rows):
+        n = p.get("number")
+        if r.get("threads_omitted"):
+            out.append("the resolved flag of {} review thread(s) of #{} (beyond "
+                       "the threads read)".format(r["threads_omitted"], n))
+        if r.get("events_omitted"):
+            out.append("{} earlier lifecycle event(s) of #{} (beyond the "
+                       "events kept)".format(r["events_omitted"], n))
+        covered = len(r.get("commits") or [])
+        if r.get("checks_status") == "gathered" and \
+                isinstance(r.get("commits_total"), int) and r["commits_total"] > covered:
+            out.append("check results of the {} earliest commit(s) of #{} (only "
+                       "the latest {} were read)".format(
+                           r["commits_total"] - covered, n, covered))
     return out
 
 
@@ -4737,29 +4763,62 @@ _CHECKS_WORD_RE = re.compile(r"\b(?:CI|checks?|check runs?|check results?|"
 _RESOLVED_WORD_RE = re.compile(r"\bresolved\b", re.I)
 
 
+# Roll-ups that state a result: `incomplete` / `unavailable` do not, so a
+# story may call those checks unknown.
+_CHECKS_KNOWN = ("passing", "failing", "pending", "none")
+
+
 def check_story_record_claims(slice_obj, text):
-    """Sentences of a story that call unknown what the slice holds:
-    `checks_said_unknown` — a sentence naming CI / checks / check runs and
-    saying they are not in the record (not gathered, unknown, ...) while
-    an outcome item carries gathered `checks`; `resolved_said_unknown` — a
-    sentence saying whether a thread was resolved is not recorded while a
-    thread carries GitHub's `resolved_on_github` flag. Pure."""
+    """Sentences of a story that call unknown what the slice holds, each
+    claim scoped to what it names: `checks_said_unknown` — a sentence
+    naming CI / checks / check runs and saying they are not in the record
+    (not gathered, unknown, ...) about a PR (#N or its link) whose outcome
+    `checks` state a result (gathered, roll-up not incomplete /
+    unavailable), or naming no PR while every PR of the slice has one;
+    `resolved_said_unknown` — likewise for whether a thread was resolved,
+    against the PRs every review thread of which carries GitHub's
+    `resolved_on_github` flag. A qualified unknown claim under partial
+    coverage passes. Pure."""
     conv = slice_obj.get("conversation") or {}
     oc = conv.get("outcome") or {}
-    have_checks = any(isinstance(r.get("checks"), dict)
-                      and r["checks"].get("status") == "gathered"
-                      for r in oc.get("items") or [])
-    have_resolved = any("resolved_on_github" in t for t in conv.get("threads") or [])
-    prose = _URL_IN_TEXT_RE.sub(" ", text or "")
-    sentences = [x.strip() for x in re.split(r"(?<=[.;!?])\s+|\n+", prose)
-                 if x.strip()]
+    prs = [r.get("number") for r in oc.get("items") or [] if r.get("type") == "pr"]
+    known = {r.get("number") for r in oc.get("items") or []
+             if isinstance(r.get("checks"), dict)
+             and r["checks"].get("status") == "gathered"
+             and r["checks"].get("rollup") in _CHECKS_KNOWN}
+    threads = {}
+    for t in conv.get("threads") or []:
+        if t.get("kind") == "review_thread":
+            threads.setdefault((t.get("on") or {}).get("number"), []).append(
+                "resolved_on_github" in t)
+    resolved = {n for n, flags in threads.items() if flags and all(flags)}
+    base = _slice_repo_base(slice_obj)
+    item_link = re.compile(re.escape(base) + r"(?:issues|pull)/(\d+)") \
+        if base else None
+
+    def as_numbers(m):
+        hit = item_link.match(m.group(0)) if item_link else None
+        return " #{} ".format(hit.group(1)) if hit else " "
+    sentences = [_URL_IN_TEXT_RE.sub(as_numbers, x).strip()
+                 for x in re.split(r"(?<=[.;!?])\s+|\n+", text or "") if x.strip()]
+
+    def covered(sent, have, scope):
+        """Does the sentence speak of something the slice holds: a PR it
+        names that is in `have`, or — naming none of `scope` — is every
+        item of `scope` in `have` (a general claim under partial coverage
+        is not refused)?"""
+        named = [int(n) for n in re.findall(r"(?<![\w/.&])#(\d+)\b", sent)
+                 if int(n) in scope]
+        if named:
+            return any(n in have for n in named)
+        return bool(scope) and all(n in have for n in scope)
     out = {"checks_said_unknown": [], "resolved_said_unknown": []}
     for sent in sentences:
         if not _UNKNOWN_RE.search(sent):
             continue
-        if have_checks and _CHECKS_WORD_RE.search(sent):
+        if _CHECKS_WORD_RE.search(sent) and covered(sent, known, prs):
             out["checks_said_unknown"].append(sent)
-        if have_resolved and _RESOLVED_WORD_RE.search(sent):
+        if _RESOLVED_WORD_RE.search(sent) and covered(sent, resolved, list(threads)):
             out["resolved_said_unknown"].append(sent)
     return out
 

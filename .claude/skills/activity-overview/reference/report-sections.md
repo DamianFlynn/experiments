@@ -345,9 +345,11 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    unmerged, draft; `numbers_without_state`) that matches the state the slice's outcome
    block records (`state_mismatch`, read from the clause between that number and the next),
    and the story does not call unknown what the slice holds: no sentence saying CI /
-   check results are not in the record when an outcome item has gathered `checks`
-   (`checks_said_unknown`), none saying a thread's resolution is not recorded when a
-   thread carries `resolved_on_github` (`resolved_said_unknown`); and every code comment
+   check results are not in the record about a PR whose outcome `checks` state a result
+   (roll-up not `incomplete` / `unavailable`), or — naming no PR — when every PR has one
+   (`checks_said_unknown`); likewise for a thread's resolution against the PRs whose
+   review threads all carry `resolved_on_github` (`resolved_said_unknown`). A qualified
+   claim ("the checks of #2 were not read") passes under partial coverage; and every code comment
    the story quotes in backticks (a span starting with `//`, `/*`, `#` or `<#`) occurs in
    the slice (`code_comments_not_in_slice`).
    Else exit 1 with the lists. Drop or fix each listed sentence and check again; never
