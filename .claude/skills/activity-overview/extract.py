@@ -106,6 +106,7 @@ e.g. the existing goldens). See `_materialize_symbol_events`.
 """
 
 import datetime
+import json
 import sys
 
 import graphstore
@@ -129,7 +130,8 @@ VIEW_CONTRACT_VERSION = 3
 _RAW_KEYS = ("meta", "prs", "issues", "commits", "code_events", "symbol_events",
              "milestones", "releases", "workflow_stats", "code_graph",
              "code_owners", "label_taxonomy", "newcomers", "module_notes",
-             "pr_history", "pr_activity", "affiliations", "prior_activity",
+             "pr_history", "pr_activity", "module_ownership", "affiliations",
+             "prior_activity",
              "artifacts", "people")
 
 # Reverse of derive._SYMBOL_CHANGE_TO_EVENT: the ledger stored the MAPPED event
@@ -463,6 +465,11 @@ def extract(conn, project, repo, ts_from, ts_to, max_depth=6, warn=None,
     # (`_merged_pr_activity`); absent when no gather collected it.
     if "pr_activity" in facts:
         bundle["pr_activity"] = facts["pr_activity"]
+    # Module ownership (per-window only): as stored, or the events of the
+    # windows overlapping the view and the latest one's standing list
+    # (`_merged_module_ownership`); absent when no gather collected it.
+    if "module_ownership" in facts:
+        bundle["module_ownership"] = facts["module_ownership"]
     # Contributor affiliation (per-window only): the gathered window's fact
     # as stored, or each person's latest decision over the windows
     # overlapping the view (`_merged_affiliations`); absent when no gather
@@ -1251,7 +1258,8 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     structure_keys = tuple(k for k in graphstore.WINDOW_FACT_KEYS
                            if k not in ("workflow_stats", "newcomers",
                                         "module_notes", "pr_history",
-                                        "affiliations", "pr_activity"))
+                                        "affiliations", "pr_activity",
+                                        "module_ownership"))
 
     def win(key):
         return {"from": key[0], "to": key[1]}
@@ -1312,6 +1320,10 @@ def _window_facts(conn, project, repo, ts_from, ts_to):
     activity = _merged_pr_activity(conn, project, repo, overlapping, recorded)
     if activity is not None:
         facts["pr_activity"] = activity
+    ownership = _merged_module_ownership(conn, project, repo, overlapping, recorded,
+                                         ts_from, ts_to)
+    if ownership is not None:
+        facts["module_ownership"] = ownership
     affiliations = _merged_affiliations(conn, project, repo, overlapping,
                                         recorded, ts_from, ts_to)
     if affiliations is not None:
@@ -1501,6 +1513,38 @@ def _merged_pr_history(conn, project, repo, overlapping, recorded):
            "windows": [{"from": k[0], "to": k[1]} for k in sorted(values)]}
     if limits is not None:
         out["limits"] = limits
+    return out
+
+
+def _merged_module_ownership(conn, project, repo, overlapping, recorded,
+                             ts_from, ts_to):
+    """The `module_ownership` of a view that is not exactly one gathered
+    window: the events of every overlapping window dated in the view
+    (deduplicated), and the standing `without_owner` list of the latest
+    overlapping window (by end day). None when no window collected it."""
+    values = {}
+    for k in sorted(k for k in overlapping if k in recorded):
+        got = graphstore.get_window_facts(conn, project, repo, *k,
+                                          keys=("module_ownership",))
+        value = (got or {}).get("facts", {}).get("module_ownership")
+        if isinstance(value, dict) and value.get("collected"):
+            values[k] = value
+    if not values:
+        return None
+    events, seen, latest = [], set(), None
+    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
+        latest = values[k]
+        for e in latest.get("events") or []:
+            d = (e.get("date") or "")[:10]
+            if (ts_from and d and d < ts_from[:10]) or (ts_to and d and d > ts_to[:10]):
+                continue
+            key = json.dumps(e, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                events.append(e)
+    out = dict(latest, events=sorted(events, key=lambda e: (
+        e.get("date") or "", e.get("kind") or "", e.get("module") or "")),
+        windows=[{"from": k[0], "to": k[1]} for k in sorted(values)])
     return out
 
 

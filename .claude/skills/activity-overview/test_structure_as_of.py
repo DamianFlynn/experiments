@@ -113,6 +113,16 @@ class TestCurrentMonthUnchanged(GitRepoCase):
             "collected": True, "home_orgs": ["o"], "home_names": ["o"],
             "home_email_domains": [], "people": {}, "unknown": [],
             "not_checked": []})
+        # Added by the module ownership fact after the golden was captured:
+        # this repo's CODEOWNERS moved `platform` from one team to another
+        # in the window.
+        own = got.pop("module_ownership")
+        self.assertEqual([(e["kind"], e["module"], e["people"], e["via"])
+                          for e in own["events"]],
+                         [("owner_added", "platform", ["hub-team"], "codeowners"),
+                          ("owner_removed", "platform", ["platform-team"],
+                           "codeowners")])
+        self.assertEqual(own["without_owner"], [])
         # The view contract version is now stamped on gather's bundle too
         # (one version everywhere); the golden was captured when it was 1.
         golden = json.loads(json.dumps(self._golden()[key]))

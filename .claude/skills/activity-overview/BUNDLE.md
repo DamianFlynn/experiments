@@ -1588,6 +1588,54 @@ before the gather is invisible: only the current head is fetched. A view of exac
 gathered window carries the stored value verbatim; a wider view takes, per PR, the entry
 of the latest overlapping window that collected one, and adds `windows`.
 
+### `module_ownership` (raw, from the store)
+
+Who owns which module and the window's changes to it — "maintainer needed / added /
+removed" (`gather.collect_module_ownership`; a per-window fact, carried into the view
+as is; a wider view takes the events of every overlapping window dated in it and the
+latest window's standing list). Omitted for a window with no ownership signal at all
+(no event, no module without an owner, nothing unreadable) and for stores gathered
+before it existed.
+
+```json
+{"collected": true,
+ "events": [{"kind": "owner_added", "module": "avm/res/network/network-security-group",
+             "people": ["arjenhuitema"], "date": "2026-10-06",
+             "source": {"type": "commit", "sha": "…", "url": "…", "pr": 7471},
+             "via": "metadata.json"},
+            {"kind": "orphaned", "module": "avm/res/sql/server", "people": ["chbragg"],
+             "date": "2026-10-02", "source": {"type": "pr", "number": 7448, "url": "…"},
+             "quote": "feat(avm/res/sql/server): …",
+             "via": "Status: Module Orphaned :yellow_circle:"}],
+ "without_owner": [{"module": "avm/res/code-signing/code-signing-account",
+                    "marker": "ORPHANED.md"}],
+ "label_patterns": {"owner_needed": ["…"], "orphaned": ["orphan"]},
+ "owner_files": ["metadata.json"]}
+```
+
+- `events[].kind` — `owner_added` / `owner_removed` (owners added to / removed from a
+  CODEOWNERS pattern — `via: codeowners`, the module the pattern as a path — or from a
+  per-module owner file: a JSON file with an `owners` list, `ACTIVITY_OWNER_FILES`,
+  default `metadata.json`), `owner_needed` (an owner file's list became empty, or an item
+  opened in the window carries an owner-needed label), `orphaned` (an orphan marker,
+  `ORPHANED.md`, added under a module folder, or an item opened in the window with an
+  orphaned label), `adopted` (an orphan marker removed). `people` — the owners added /
+  removed, a marker commit's author, a labelled item's author; `source` — the commit (with
+  its PR) or the issue / PR; `quote` — a labelled item's own title (never inferred prose).
+- Label patterns (`OWNERSHIP_LABEL_PATTERNS`, overridable with
+  `ACTIVITY_OWNERSHIP_LABELS="kind=regex;kind=regex"`): `orphan` for orphaned; "owner
+  needed", "looking for an owner", "needs a new owner" for owner_needed. A label that asks
+  the existing owner to respond (Azure/bicep-registry-modules' "Needs: Module Owner") is
+  deliberately not one: on the October 2026 records it sits on PRs of owned modules.
+- `without_owner` — modules carrying an orphan marker at the window's end (`since`: the
+  marker's date when added in the window), and modules named by an open item with an
+  owner-needed / orphaned label unless the module gained an owner (or was adopted) on or
+  after that item was opened. Modules whose owner file lists nobody but did not change in
+  the window are not scanned (reading every owner file at the window's end is not done).
+- `unread` — owner-file / CODEOWNERS versions that could not be read; never read as "no
+  owners". A Terraform module repository has CODEOWNERS only: the other sources are
+  simply absent.
+
 ### `pr_activity` (raw, from the store)
 
 The per-window fact gather writes (`gather.collect_pr_activity`; STORE.md), omitted when

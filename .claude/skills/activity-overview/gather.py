@@ -2406,6 +2406,237 @@ def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
     return notes
 
 
+# --- Module ownership (per-window fact `module_ownership`) --------------------
+#
+# Who owns which module, and the window's changes to it (issue #97: "maintainer
+# needed / added / removed"). From the clone and the records already gathered:
+# CODEOWNERS changes, per-module owner files (a JSON file with an `owners`
+# list, e.g. Azure/bicep-registry-modules' `metadata.json`), orphaned-module
+# markers (`ORPHANED.md` added / removed under a module folder, and those
+# standing at the window's end) and issues / PRs carrying an ownership label.
+# Never inferred from prose: a quote is the item's own title.
+
+CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+# Per-module owner files (ACTIVITY_OWNER_FILES, comma-separated basenames).
+OWNER_FILE_NAMES = ("metadata.json",)
+ORPHAN_MARKER_NAMES = ("ORPHANED.md",)
+# Ownership labels by event kind, matched case-insensitively against label
+# names (ACTIVITY_OWNERSHIP_LABELS: `kind=regex;kind=regex`). The defaults
+# match "Status: Module Orphaned :yellow_circle:" style labels and "owner
+# needed" / "looking for an owner" / "needs a new owner" ones - NOT a label
+# such as Azure/bicep-registry-modules' "Needs: Module Owner :mega:", which
+# asks the existing owner to respond (checked on the October 2026 records:
+# it sits on PRs of modules that have owners).
+OWNERSHIP_LABEL_PATTERNS = {"owner_needed": (r"owner\W*needed",
+                                             r"looking\W*for\W*(?:an?\W*)?owner",
+                                             r"needs?\W*(?:a\W*)?new\W*owner"),
+                            "orphaned": (r"orphan",)}
+OWNERSHIP_EVENT_KINDS = ("owner_needed", "owner_added", "owner_removed",
+                         "orphaned", "adopted")
+_AVM_MODULE_REF_RE = re.compile(r"\b(?:avm/)?((?:res|ptn|utl)/[\w.-]+/[\w.-]+)")
+
+
+def ownership_label_patterns(env=None):
+    """{kind: (regex, ...)} from ACTIVITY_OWNERSHIP_LABELS or the defaults."""
+    env = os.environ if env is None else env
+    raw = env.get("ACTIVITY_OWNERSHIP_LABELS")
+    if not raw:
+        return {k: tuple(v) for k, v in OWNERSHIP_LABEL_PATTERNS.items()}
+    out = {}
+    for part in raw.split(";"):
+        kind, _, rx = part.partition("=")
+        kind = kind.strip()
+        if kind not in OWNERSHIP_EVENT_KINDS or not rx.strip():
+            raise SystemExit("error: ACTIVITY_OWNERSHIP_LABELS: {!r} is not "
+                             "kind=regex with a kind of {}".format(
+                                 part, ", ".join(OWNERSHIP_EVENT_KINDS)))
+        out.setdefault(kind, ())
+        out[kind] += (rx.strip(),)
+    return out
+
+
+def _owner_file_names(env=None):
+    env = os.environ if env is None else env
+    raw = env.get("ACTIVITY_OWNER_FILES")
+    if raw is None:
+        return OWNER_FILE_NAMES
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
+def _codeowners_module(pattern):
+    p = (pattern or "").strip().lstrip("/")
+    while p.endswith(("/**", "/*", "/")):
+        p = p[:-3] if p.endswith("/**") else p[:-2] if p.endswith("/*") else p[:-1]
+    return p or "/"
+
+
+def _owners_from_json(text):
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    owners = data.get("owners") if isinstance(data, dict) else None
+    if not isinstance(owners, list):
+        return None
+    return [str(o).lstrip("@") for o in owners if isinstance(o, str) and o.strip()]
+
+
+def _module_of_item(rec):
+    m = _AVM_MODULE_REF_RE.search(rec.get("title") or "")
+    return "avm/" + m.group(1) if m else None
+
+
+def collect_module_ownership(code_events, commits, prs, issues, read_blob,
+                             end_files, frm, to, web=None, label_patterns=None,
+                             owner_files=None):
+    """The window's `module_ownership` fact: {collected, events: [{kind,
+    module, people, date, source: {type, number|sha, url, [pr]}, [quote],
+    [via]}], without_owner: [{module, marker, [since]}], label_patterns,
+    owner_files, [unread]}.
+    - CODEOWNERS (CODEOWNERS_PATHS) changed in the window: per pattern,
+      owners added -> `owner_added`, removed -> `owner_removed` (module: the
+      pattern as a path), via `codeowners`;
+    - a per-module owner file (`owner_files`, default ACTIVITY_OWNER_FILES /
+      OWNER_FILE_NAMES: JSON with an `owners` list) changed: owners added /
+      removed, via that file; an `owners` list that became empty ->
+      `owner_needed`;
+    - an orphan marker (ORPHAN_MARKER_NAMES) added -> `orphaned`, removed ->
+      `adopted` (people: the commit author);
+    - an issue / PR opened in the window with an ownership label
+      (`label_patterns` {kind: regexes}) -> that kind, its title as `quote`,
+      module from an `avm/res|ptn|utl/...` reference in the title.
+    `without_owner` — modules carrying an orphan marker at the window's end
+    (`end_files`: the paths tracked then) and modules of open items with an
+    `owner_needed` / `orphaned` label, unless the module gained an owner or
+    was adopted on or after the item was opened. A file version that cannot be read is
+    listed in `unread`, never read as "no owners". Pure over its readers."""
+    patterns = label_patterns or ownership_label_patterns()
+    owner_files = owner_files or _owner_file_names()
+    by_sha = {c.get("sha"): c for c in commits or []}
+    events, unread = [], []
+
+    def src(e):
+        out = {"type": "commit", "sha": e.get("commit")}
+        if web and e.get("commit"):
+            out["url"] = "{}/commit/{}".format(web, e["commit"])
+        pr = (by_sha.get(e.get("commit")) or {}).get("pr")
+        if pr is not None:
+            out["pr"] = pr
+        return out
+
+    def versions(e):
+        before = after = ""
+        try:
+            if e.get("change") != "add":
+                before = read_blob(e["commit"] + "^", e.get("old_path") or e["path"])
+            if e.get("change") != "delete":
+                after = read_blob(e["commit"], e["path"])
+        except BlobUnreadable:
+            return None, None
+        return before, after
+
+    for e in sorted(code_events or [], key=lambda x: (x.get("date") or "",
+                                                      x.get("commit") or "")):
+        path = e.get("path") or ""
+        base = path.rsplit("/", 1)[-1]
+        folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        if path in CODEOWNERS_PATHS:
+            before, after = versions(e)
+            if before is None and after is None:
+                unread.append({"path": path, "commit": e.get("commit")})
+                continue
+            old = {r["pattern"]: r["owners"] for r in parse_codeowners(before or "")}
+            new = {r["pattern"]: r["owners"] for r in parse_codeowners(after or "")}
+            for pat in sorted(set(old) | set(new)):
+                a = [o for o in new.get(pat, []) if o not in old.get(pat, [])]
+                r = [o for o in old.get(pat, []) if o not in new.get(pat, [])]
+                for kind, people in (("owner_added", a), ("owner_removed", r)):
+                    if people:
+                        events.append({"kind": kind, "module": _codeowners_module(pat),
+                                       "people": people, "date": e.get("date"),
+                                       "source": src(e), "via": "codeowners"})
+        elif base in owner_files:
+            before, after = versions(e)
+            if before is None and after is None:
+                unread.append({"path": path, "commit": e.get("commit")})
+                continue
+            old = _owners_from_json(before) if before else []
+            new = _owners_from_json(after) if after else []
+            if old is None and new is None:
+                continue                      # not an owner file after all
+            old, new = old or [], new or []
+            module = folder
+            a = [o for o in new if o not in old]
+            r = [o for o in old if o not in new]
+            for kind, people in (("owner_added", a), ("owner_removed", r)):
+                if people:
+                    events.append({"kind": kind, "module": module, "people": people,
+                                   "date": e.get("date"), "source": src(e),
+                                   "via": base})
+            if old and not new and e.get("change") != "delete":
+                events.append({"kind": "owner_needed", "module": module, "people": [],
+                               "date": e.get("date"), "source": src(e), "via": base})
+        if base in ORPHAN_MARKER_NAMES and e.get("change") in ("add", "delete"):
+            events.append({"kind": "orphaned" if e["change"] == "add" else "adopted",
+                           "module": folder, "people": [p for p in [e.get("author")] if p],
+                           "date": e.get("date"), "source": src(e), "via": base})
+    compiled = {k: [re.compile(x, re.I) for x in v] for k, v in patterns.items()}
+
+    def label_kind(labels):
+        for kind in OWNERSHIP_EVENT_KINDS:
+            for lbl in labels or []:
+                if any(rx.search(lbl) for rx in compiled.get(kind, ())):
+                    return kind, lbl
+        return None, None
+    standing = {}
+    for typ, recs in (("issue", issues or []), ("pr", prs or [])):
+        for rec in recs:
+            kind, lbl = label_kind(rec.get("labels"))
+            if not kind:
+                continue
+            if in_window(rec.get("created_at"), frm, to):
+                events.append({"kind": kind, "module": _module_of_item(rec),
+                               "people": [p for p in [rec.get("author")] if p],
+                               "date": (rec.get("created_at") or "")[:10],
+                               "source": {"type": typ, "number": rec.get("number"),
+                                          "url": rec.get("url")},
+                               "quote": rec.get("title"), "via": lbl})
+            if rec.get("state") == "open" and kind in ("owner_needed", "orphaned") \
+                    and _module_of_item(rec):
+                standing.setdefault(_module_of_item(rec), {
+                    "module": _module_of_item(rec), "marker": lbl,
+                    "_at": (rec.get("created_at") or "")[:10],
+                    "source": {"type": typ, "number": rec.get("number"),
+                               "url": rec.get("url")}})
+    without = {}
+    for f in end_files or []:
+        base = f.rsplit("/", 1)[-1]
+        if base in ORPHAN_MARKER_NAMES:
+            module = f.rsplit("/", 1)[0] if "/" in f else ""
+            row = {"module": module, "marker": base}
+            since = [x["date"] for x in events if x["kind"] == "orphaned"
+                     and x["module"] == module]
+            if since:
+                row["since"] = since[-1]
+            without[module] = row
+    # a label on an open item is stale once the module gained an owner (or
+    # was adopted) on or after the item was opened
+    for module, row in standing.items():
+        at = row.pop("_at")
+        if any(x["kind"] in ("owner_added", "adopted") and x["module"] == module
+               and (x.get("date") or "") >= at for x in events):
+            continue
+        without.setdefault(module, row)
+    events.sort(key=lambda x: (x.get("date") or "", x["kind"], x.get("module") or ""))
+    out = {"collected": True, "events": events,
+           "without_owner": [without[k] for k in sorted(without)],
+           "label_patterns": {k: list(v) for k, v in patterns.items()},
+           "owner_files": list(owner_files)}
+    if unread:
+        out["unread"] = unread
+    return out
+
+
 # --- PR-internal history (per-window fact `pr_history`) ---------------------
 #
 # The base-branch walk sees one commit per squash-merged PR, so the work inside
@@ -9633,6 +9864,20 @@ def acquire(args, env):
         # in the existing issue loop — see Step 3a); the classifier is pure.
         issue["kind"] = classify_issue_kind(issue, label_taxonomy, types_present)
 
+    # Module ownership (per-window fact `module_ownership`): CODEOWNERS and
+    # per-module owner-file changes, orphan markers, ownership labels; see
+    # collect_module_ownership. Needs the window's history on disk.
+    module_ownership = None
+    if walk_clone:
+        module_ownership = collect_module_ownership(
+            code_events, commits, prs, issues, git_blob_reader(clone_dir),
+            tracked or [], frm, to, web="https://github.com/{}/{}".format(owner, repo))
+        sys.stderr.write(
+            "module ownership: {}/{}: {} event(s), {} module(s) without an owner "
+            "at the window's end\n".format(owner, repo,
+                                          len(module_ownership["events"]),
+                                          len(module_ownership["without_owner"])))
+
     # People identity (#78): resolve each commit author (git name) to the GitHub
     # login PR/issue/review records use, so one person is one key. One paginated
     # commits-list listing (ceil(commits / 100) REST calls, none for an empty
@@ -9790,6 +10035,12 @@ def acquire(args, env):
         bundle["pr_history"] = pr_history
     if pr_activity is not None:
         bundle["pr_activity"] = pr_activity
+    # only with something to say: a window with no ownership signal adds no
+    # fact, so every existing bundle and its golden stay as they were
+    if module_ownership is not None and (module_ownership["events"]
+                                         or module_ownership["without_owner"]
+                                         or module_ownership.get("unread")):
+        bundle["module_ownership"] = module_ownership
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph

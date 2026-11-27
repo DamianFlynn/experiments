@@ -255,6 +255,11 @@ The PR-history step also reads the walked PRs' commits as narrative (git only):
 `ACTIVITY_ADR_DIRS` (comma-separated folder paths; default `adr,adrs,decisions,docs/adr,
 docs/decisions`) names the folders whose Markdown files are decision records.
 
+Module ownership (`module_ownership`, BUNDLE.md) is read from the clone and the records
+already gathered: `ACTIVITY_OWNER_FILES` (comma-separated basenames of per-module owner
+files, default `metadata.json`) and `ACTIVITY_OWNERSHIP_LABELS` (`kind=regex;kind=regex`,
+kinds `owner_needed`, `orphaned`, ...) configure it.
+
 Check results, review-thread state and PR lifecycle events (`pr_activity`, BUNDLE.md):
 the events come from the issue timeline already fetched per PR (no extra call); the checks
 of each PR's latest 10 commits, the thread resolved flags and the force-push commits from

@@ -1321,6 +1321,9 @@ def _fact_signatures(value):
         if isinstance(value.get("prs"), list) and "gathered_at" in value \
                 and "base" not in value:
             out.add("pr_activity")
+        if isinstance(value.get("events"), list) and \
+                isinstance(value.get("without_owner"), list):
+            out.add("module_ownership")
         if isinstance(value.get("source"), str):
             out.add("label_taxonomy")
         if value and all(isinstance(v, dict) and "total" in v
@@ -1524,6 +1527,30 @@ def _pr_history_problem(value):
     return None
 
 
+_OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns",
+                        "owner_files", "unread", "windows"}
+_OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "source", "quote", "via"}
+
+
+def _module_ownership_problem(value):
+    """Why a stored `module_ownership` value is not one gather writes (an
+    unknown key, an event kind gather does not write, a container of the
+    wrong type), or None."""
+    extra = sorted(set(value) - _OWNERSHIP_FACT_KEYS)
+    if extra:
+        return "module_ownership carries unexpected key(s) {}".format(", ".join(extra))
+    if not _list_of_objects(value.get("events")) or \
+            not _list_of_objects(value.get("without_owner")):
+        return "module_ownership events / without_owner is not a list of objects"
+    for e in value["events"]:
+        if not set(e) <= _OWNERSHIP_EVENT_KEYS or \
+                e.get("kind") not in gather.OWNERSHIP_EVENT_KINDS or \
+                not isinstance(e.get("people", []), list) or \
+                not isinstance(e.get("source", {}), dict):
+            return "module_ownership has an event gather does not write"
+    return None
+
+
 def _fact_shape_problem(key, value):
     """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
     or None: it is not a JSON object (code_owners: an object or a rule list),
@@ -1539,6 +1566,10 @@ def _fact_shape_problem(key, value):
             return why
     if ok and key == "pr_history":
         why = _pr_history_problem(value)
+        if why:
+            return why
+    if ok and key == "module_ownership":
+        why = _module_ownership_problem(value)
         if why:
             return why
     if ok and key == "pr_activity":
