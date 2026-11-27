@@ -4484,6 +4484,13 @@ def parse_args(argv):
                         "heads reach) and the comment / parameter walk over the "
                         "most discussed PRs' commits; the window's `pr_history` "
                         "fact then says it was not collected")
+    p.add_argument("--no-pr-checks", dest="pr_checks", action="store_false",
+                   default=True,
+                   help="skip the check results / review-thread state read "
+                        "(batched GraphQL, PR_ACTIVITY_BATCH PRs per request); "
+                        "the window's `pr_activity` fact still carries each PR's "
+                        "lifecycle events (from the timeline already fetched) "
+                        "and records checks_status `not_requested`")
     # Phase 12: auto-discover + ingest the repo's Projects v2 board (its single-
     # select Status, plus sprint/iteration nodes when the board defines them). On
     # by default; degrades to empty on any error (no board / missing read:project
@@ -6170,6 +6177,370 @@ def _graphql_client(token):
     return _graphql
 
 
+# --- PR checks, review-thread state, lifecycle events (fact `pr_activity`) ---
+#
+# What happened to a PR besides its conversation: the check results of its
+# commits, whether each review thread was marked resolved (and by whom), and
+# the lifecycle events a story needs (renames, draft / ready, review requests,
+# dismissals, force-pushes). The lifecycle events come from the issue timeline
+# enrich_pr already fetches (no extra call). Checks, thread state and the
+# force-pushes' before / after commits come from ONE batched GraphQL request
+# per PR_ACTIVITY_BATCH PRs (the REST route is two calls per commit:
+# `commits/{sha}/check-runs` and `commits/{sha}/status`, and has no thread
+# state at all). Cost of one PR in GitHub's GraphQL rate-limit formula
+# (connections that may be requested, / 100): commits 1 + one contexts page
+# per commit PR_CHECKS_COMMITS + threads 1 + one comment page per thread
+# PR_THREADS_FIRST + force-pushes 1 = 63 at the defaults, so a batch of 10 PRs
+# is about 6 points, a 160-PR month 16 requests and about 100 points.
+
+PR_ACTIVITY_BATCH = 10
+# Commits per PR whose checks are read: the latest ones (the head and the
+# pushes before it); `commits_total` says how many the PR has.
+PR_CHECKS_COMMITS = 10
+# Check runs / commit statuses read per commit (`checks_omitted` the rest).
+PR_CHECKS_CONTEXTS = 50
+# Review threads read per PR (`threads_omitted` the rest).
+PR_THREADS_FIRST = 50
+# Force-push events whose before / after commits are read (the latest).
+PR_FORCE_PUSHES_LAST = 20
+# PRs asked about per window (ACTIVITY_PR_CHECKS_MAX, min 0): open PRs first,
+# then the most discussed (the story candidates), then the newest; the rest
+# are `checks_status: capped`. 200 PRs = 20 requests.
+PR_CHECKS_MAX_PRS = 200
+# Requests in a row that failed before the rest are given up (`failed`).
+PR_ACTIVITY_FAILURE_STOP = 3
+# Lifecycle events kept per PR (the latest; `events_omitted` the rest).
+PR_EVENTS_MAX = 100
+PR_ACTIVITY_CHECKS_STATUSES = ("gathered", "capped", "failed", "not_found",
+                               "not_requested")
+# A check conclusion that fails the roll-up / passes it; anything else
+# (queued, in progress, stale, an expected status not yet reported) is pending.
+CHECK_FAILING = frozenset(("failure", "timed_out", "cancelled", "action_required",
+                           "startup_failure", "error"))
+CHECK_PASSING = frozenset(("success", "neutral", "skipped"))
+CHECK_ROLLUPS = ("passing", "failing", "pending", "none")
+# The issue-timeline events kept as PR lifecycle events (`ready_for_review`
+# is already a `lifecycle` event of the PR record).
+PR_TIMELINE_EVENTS = ("renamed", "convert_to_draft", "review_requested",
+                      "review_request_removed", "review_dismissed",
+                      "head_ref_force_pushed")
+
+_PR_ACTIVITY_FIELDS = (
+    "number headRefOid "
+    "commits(last: {commits}) {{ totalCount nodes {{ commit {{ oid committedDate "
+    "statusCheckRollup {{ state contexts(first: {contexts}) {{ totalCount "
+    "pageInfo {{ hasNextPage }} nodes {{ __typename "
+    "... on CheckRun {{ name status conclusion startedAt completedAt detailsUrl }} "
+    "... on StatusContext {{ context state createdAt targetUrl }} }} }} }} }} }} }} "
+    "reviewThreads(first: {threads}) {{ totalCount nodes {{ isResolved isOutdated "
+    "path line resolvedBy {{ login }} comments(first: 1) {{ nodes {{ databaseId }} }} "
+    "}} }} "
+    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: {pushes}) {{ "
+    "nodes {{ ... on HeadRefForcePushedEvent {{ createdAt actor {{ login }} "
+    "beforeCommit {{ oid }} afterCommit {{ oid }} }} }} }}")
+
+
+def _pr_checks_max(env=None):
+    return _env_int("ACTIVITY_PR_CHECKS_MAX", PR_CHECKS_MAX_PRS, 0, env)
+
+
+def pr_activity_query(numbers):
+    """The GraphQL query reading checks, review threads and force-pushes for
+    every PR number in `numbers` (ascending), one `pr<N>: pullRequest(number:
+    N)` alias each, plus `rateLimit { cost remaining }`. Pure."""
+    fields = _PR_ACTIVITY_FIELDS.format(
+        commits=PR_CHECKS_COMMITS, contexts=PR_CHECKS_CONTEXTS,
+        threads=PR_THREADS_FIRST, pushes=PR_FORCE_PUSHES_LAST)
+    lines = ["query($owner:String!, $repo:String!) {",
+             "  rateLimit { cost remaining }",
+             "  repository(owner:$owner, name:$repo) {"]
+    for n in sorted({int(n) for n in numbers}):
+        lines.append("    pr{0}: pullRequest(number: {0}) {{ {1} }}".format(n, fields))
+    lines += ["  }", "}"]
+    return "\n".join(lines)
+
+
+def _lower(v):
+    return v.lower() if isinstance(v, str) else None
+
+
+def normalize_check_context(node):
+    """One StatusCheckRollup context -> {name, kind (`check_run` / `status`),
+    status, conclusion, started_at, completed_at, url} (None values
+    omitted), or None for a node of another type. A commit status is
+    `completed` with its state as the conclusion, or `pending` (a pending /
+    expected state, no conclusion); its one timestamp is both times. Pure."""
+    if not isinstance(node, dict):
+        return None
+    typ = node.get("__typename")
+    if typ == "CheckRun":
+        row = {"name": node.get("name"), "kind": "check_run",
+               "status": _lower(node.get("status")),
+               "conclusion": _lower(node.get("conclusion")),
+               "started_at": node.get("startedAt"),
+               "completed_at": node.get("completedAt"),
+               "url": node.get("detailsUrl")}
+    elif typ == "StatusContext":
+        state = _lower(node.get("state"))
+        done = state not in ("pending", "expected", None)
+        row = {"name": node.get("context"), "kind": "status",
+               "status": "completed" if done else "pending",
+               "conclusion": state if done else None,
+               "started_at": node.get("createdAt"),
+               "completed_at": node.get("createdAt") if done else None,
+               "url": node.get("targetUrl")}
+    else:
+        return None
+    return {k: v for k, v in row.items() if v is not None}
+
+
+def checks_rollup(checks, as_of=None):
+    """The roll-up of one commit's checks, optionally as of an instant:
+    {rollup: passing|failing|pending|none, failing: [names], pending:
+    [names], passing: count}. A check whose conclusion is in CHECK_FAILING
+    fails the commit; CHECK_PASSING passes it; any other (no conclusion yet,
+    stale, an expected status) is pending. With `as_of`, a check started
+    after it did not exist yet (left out) and one completed after it was
+    still pending then. `failing` wins over `pending`, `pending` over
+    `passing`; no check at all is `none`. Names are sorted. Pure."""
+    failing, pending, passing = set(), set(), 0
+    for c in checks or []:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name") or "?"
+        if as_of is not None:
+            started = c.get("started_at") or c.get("completed_at")
+            if started and started > as_of:
+                continue
+            done = c.get("completed_at")
+            if not done or done > as_of:
+                pending.add(name)
+                continue
+        concl = c.get("conclusion")
+        if concl in CHECK_FAILING:
+            failing.add(name)
+        elif concl in CHECK_PASSING:
+            passing += 1
+        else:
+            pending.add(name)
+    if failing:
+        rollup = "failing"
+    elif pending:
+        rollup = "pending"
+    elif passing:
+        rollup = "passing"
+    else:
+        rollup = "none"
+    return {"rollup": rollup, "failing": sorted(failing),
+            "pending": sorted(pending - failing), "passing": passing}
+
+
+def parse_pr_activity_node(pr_obj):
+    """One `pullRequest` answer of pr_activity_query -> {head, commits_total,
+    commits: [{sha, committed_at, rollup, state, checks, [checks_omitted]}]
+    (oldest first), threads_total, threads: [{comment_id, path, line,
+    resolved, [resolved_by], outdated}], [threads_omitted], force_pushes:
+    [{at, actor, before, after}]}. `rollup` is checks_rollup over the
+    commit's contexts as gathered, `state` GitHub's own roll-up state
+    (lowercase; absent with no status at all). Pure."""
+    pr_obj = pr_obj if isinstance(pr_obj, dict) else {}
+    out = {"head": pr_obj.get("headRefOid")}
+    commits = pr_obj.get("commits") or {}
+    out["commits_total"] = commits.get("totalCount")
+    rows = []
+    for node in commits.get("nodes") or []:
+        c = (node or {}).get("commit") or {}
+        if not c.get("oid"):
+            continue
+        roll = c.get("statusCheckRollup") or {}
+        ctx = roll.get("contexts") or {}
+        checks = [x for x in (normalize_check_context(n)
+                              for n in ctx.get("nodes") or []) if x]
+        checks.sort(key=lambda x: (x.get("name") or "", x.get("kind"),
+                                   x.get("started_at") or ""))
+        row = {"sha": c["oid"], "committed_at": c.get("committedDate"),
+               "rollup": checks_rollup(checks)["rollup"], "checks": checks}
+        if roll.get("state"):
+            row["state"] = _lower(roll["state"])
+        total = ctx.get("totalCount")
+        if isinstance(total, int) and total > len(checks):
+            row["checks_omitted"] = total - len(checks)
+        rows.append(row)
+    out["commits"] = rows
+    threads = pr_obj.get("reviewThreads") or {}
+    trows = []
+    for node in threads.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        first = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
+        t = {"comment_id": first.get("databaseId"), "path": node.get("path"),
+             "line": node.get("line"), "resolved": bool(node.get("isResolved")),
+             "outdated": bool(node.get("isOutdated"))}
+        by = (node.get("resolvedBy") or {}).get("login")
+        if by:
+            t["resolved_by"] = by
+        trows.append({k: v for k, v in t.items() if v is not None})
+    out["threads_total"] = threads.get("totalCount", len(trows))
+    out["threads"] = trows
+    if isinstance(out["threads_total"], int) and out["threads_total"] > len(trows):
+        out["threads_omitted"] = out["threads_total"] - len(trows)
+    pushes = []
+    for node in (pr_obj.get("timelineItems") or {}).get("nodes") or []:
+        if not isinstance(node, dict) or not node.get("createdAt"):
+            continue
+        pushes.append({"at": node["createdAt"],
+                       "actor": (node.get("actor") or {}).get("login"),
+                       "before": (node.get("beforeCommit") or {}).get("oid"),
+                       "after": (node.get("afterCommit") or {}).get("oid")})
+    out["force_pushes"] = pushes
+    return out
+
+
+def parse_timeline_pr_events(raw_timeline):
+    """The PR lifecycle events a story needs from an issue timeline (the
+    REST shapes of PR_TIMELINE_EVENTS), in timeline order: {id, event, at,
+    actor} plus `from` / `to` (renamed), `requested` (a login, or
+    `team:<slug>`) and `by` (the requester) for review_requested /
+    review_request_removed, `review_id` / `state` / `message` for
+    review_dismissed. A force-push's before / after commits are not in the
+    REST event (parse_pr_activity_node reads them). Pure."""
+    out = []
+    for ev in raw_timeline or []:
+        kind = ev.get("event") if isinstance(ev, dict) else None
+        if kind not in PR_TIMELINE_EVENTS:
+            continue
+        row = {"id": ev.get("id"), "event": kind, "at": ev.get("created_at"),
+               "actor": (ev.get("actor") or {}).get("login")}
+        if kind == "renamed":
+            ren = ev.get("rename") or {}
+            row["from"], row["to"] = ren.get("from"), ren.get("to")
+        elif kind in ("review_requested", "review_request_removed"):
+            who = (ev.get("requested_reviewer") or {}).get("login")
+            team = (ev.get("requested_team") or {}).get("slug")
+            row["requested"] = who or ("team:" + team if team else None)
+            row["by"] = (ev.get("review_requester") or {}).get("login")
+        elif kind == "review_dismissed":
+            d = ev.get("dismissed_review") or {}
+            row["review_id"] = d.get("review_id")
+            row["state"] = _lower(d.get("state"))
+            row["message"] = d.get("dismissal_message")
+        out.append({k: v for k, v in row.items() if v is not None})
+    return out
+
+
+def _attach_force_push_commits(events, pushes):
+    """Give each REST `head_ref_force_pushed` event the before / after
+    commits of the GraphQL force-push recorded at the same instant by the
+    same actor (each push used once). In place."""
+    left = list(pushes or [])
+    for ev in events:
+        if ev.get("event") != "head_ref_force_pushed":
+            continue
+        for i, p in enumerate(left):
+            if p.get("at") == ev.get("at") and p.get("actor") == ev.get("actor"):
+                for k in ("before", "after"):
+                    if p.get(k):
+                        ev[k] = p[k]
+                del left[i]
+                break
+
+
+def _activity_order(prs):
+    """PR numbers in the order checks are asked for: open first, then the
+    most discussed (human comments + review comments), then the newest."""
+    return [p["number"] for p in sorted(
+        (p for p in prs if isinstance(p.get("number"), int)),
+        key=lambda p: (p.get("state") != "open", -_human_conversation(p),
+                       -p["number"]))]
+
+
+def collect_pr_activity(prs, graphql, owner, repo, timeline_events=None,
+                        max_prs=None, enabled=True, clock=None):
+    """The window's `pr_activity` fact.
+
+    Every PR of the window gets a row {number, checks_status, ...}: its
+    lifecycle events (`timeline_events[number]`, parse_timeline_pr_events;
+    the latest PR_EVENTS_MAX, `events_omitted` the rest) and, for the
+    first `max_prs` (default ACTIVITY_PR_CHECKS_MAX / PR_CHECKS_MAX_PRS) in
+    _activity_order, what one batched GraphQL request per PR_ACTIVITY_BATCH
+    PRs answers (parse_pr_activity_node): head, commits_total, commits with
+    their checks, threads with GitHub's resolved flag, and the force-push
+    events' before / after commits. checks_status: `gathered`, `capped`
+    (beyond max_prs), `failed` (its request failed; `checks_reason`),
+    `not_found` (GitHub answered null) or `not_requested` (`enabled` false
+    or no GraphQL client). Never "no checks" for a PR that was not asked
+    about. A failed request is recorded, never fatal; after
+    PR_ACTIVITY_FAILURE_STOP failed requests in a row the rest are failed
+    without asking. Returns {"collected": True, "gathered_at", "limits",
+    "requests", "points", "prs": [by number]}."""
+    clock = clock or (lambda: datetime.datetime.now(datetime.timezone.utc))
+    timeline_events = timeline_events or {}
+    max_prs = _pr_checks_max() if max_prs is None else max_prs
+    numbers = sorted({p["number"] for p in prs if isinstance(p.get("number"), int)})
+    rows = {}
+    for n in numbers:
+        row = {"number": n}
+        evs = list(timeline_events.get(n) or [])
+        if len(evs) > PR_EVENTS_MAX:
+            row["events_omitted"] = len(evs) - PR_EVENTS_MAX
+            evs = evs[-PR_EVENTS_MAX:]
+        if evs:
+            row["events"] = evs
+        rows[n] = row
+    order = _activity_order(prs)
+    asked = order[:max_prs] if enabled and graphql is not None else []
+    for n in order:
+        if n not in asked:
+            rows[n]["checks_status"] = "capped" if enabled and graphql is not None \
+                else "not_requested"
+    requests = points = failures = 0
+    for i in range(0, len(asked), PR_ACTIVITY_BATCH):
+        batch = sorted(asked[i:i + PR_ACTIVITY_BATCH])
+        if failures >= PR_ACTIVITY_FAILURE_STOP:
+            for n in batch:
+                rows[n].update(checks_status="failed", checks_reason=(
+                    "not asked: {} requests in a row failed".format(failures)))
+            continue
+        requests += 1
+        try:
+            data = graphql(pr_activity_query(batch), {"owner": owner, "repo": repo})
+            repo_obj = (data or {}).get("repository")
+            if not isinstance(repo_obj, dict):
+                raise ValueError("repository {}/{} not found".format(owner, repo))
+        except (SystemExit, Exception) as err:  # noqa: BLE001 — record, never fatal
+            failures += 1
+            reason = (str(err).splitlines() or [type(err).__name__])[-1][:200] \
+                or type(err).__name__
+            for n in batch:
+                rows[n].update(checks_status="failed", checks_reason=reason)
+            continue
+        failures = 0
+        cost = ((data or {}).get("rateLimit") or {}).get("cost")
+        if isinstance(cost, int):
+            points += cost
+        for n in batch:
+            pr_obj = repo_obj.get("pr{}".format(n))
+            if not isinstance(pr_obj, dict):
+                rows[n]["checks_status"] = "not_found"
+                continue
+            got = parse_pr_activity_node(pr_obj)
+            pushes = got.pop("force_pushes")
+            _attach_force_push_commits(rows[n].get("events") or [], pushes)
+            rows[n]["checks_status"] = "gathered"
+            rows[n].update({k: v for k, v in got.items()
+                            if v not in (None, []) or k in ("commits", "threads")})
+    return {"collected": True,
+            "gathered_at": clock().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limits": {"batch": PR_ACTIVITY_BATCH, "max_prs": max_prs,
+                       "commits": PR_CHECKS_COMMITS,
+                       "contexts": PR_CHECKS_CONTEXTS,
+                       "threads": PR_THREADS_FIRST,
+                       "force_pushes": PR_FORCE_PUSHES_LAST,
+                       "events": PR_EVENTS_MAX},
+            "requests": requests, "points": points,
+            "prs": [rows[n] for n in numbers]}
+
+
 def _next_link(link_header):
     """Parse a GitHub Link header, returning the rel="next" url or None."""
     for part in (link_header or "").split(","):
@@ -7271,10 +7642,13 @@ def dedupe_raw_prs(raws):
     return [best[n] for n in order]
 
 
-def enrich_pr(pr, get_page, api, current_slug):
+def enrich_pr(pr, get_page, api, current_slug, events_out=None):
     """Per-PR enrichment for a kept PR (mutates `pr`): reviews, issue timeline
     (crossrefs, cross-repo xrefs, lifecycle), review comments and conversation
-    comments — four paginated fetches via `get_page`, no more.
+    comments — four paginated fetches via `get_page`, no more. With
+    `events_out` (a dict), the timeline's PR lifecycle events
+    (parse_timeline_pr_events, for the `pr_activity` fact) are stored there
+    under the PR number; the PR record itself is unchanged by them.
 
     The list-pulls payload `normalize_pr` sees omits `merged_by`, `comments` and
     `review_comments` (only GET /pulls/{n} has them, issue #61). Rather than one
@@ -7306,6 +7680,8 @@ def enrich_pr(pr, get_page, api, current_slug):
     lifecycle = parse_timeline_lifecycle(timeline)
     if lifecycle:
         pr["lifecycle"] = lifecycle
+    if events_out is not None:
+        events_out[num] = parse_timeline_pr_events(timeline)
     if pr.get("merged") and not pr.get("merged_by"):
         pr["merged_by"] = parse_timeline_merged_by(timeline)
     review_comments = fetch_all(get_page, f"{api}/pulls/{num}/comments?per_page=100")
@@ -7563,17 +7939,40 @@ def acquire(args, env):
         get_page, f"{api}/pulls?state=open&sort=updated&direction=desc&per_page=100")
 
     prs = []
+    pr_events = {}
     for raw in dedupe_raw_prs(raw_closed + raw_open):
         pr = normalize_pr(raw)
         if not keep_pr_for_window(pr, frm, to):
             continue
-        enrich_pr(pr, get_page, api, f"{owner}/{repo}")
+        enrich_pr(pr, get_page, api, f"{owner}/{repo}", events_out=pr_events)
         prs.append(pr)
     # GitHub's own closing-issue list (keywords AND Development-sidebar links,
     # issue #105): batched GraphQL over the kept PRs; on any failure the closing
     # keywords stand alone (one stderr line either way, meta.closing_refs_source).
     closing_refs_source = resolve_closing_issues(
         prs, _graphql_client(token), owner, repo)
+
+    # Check results, review-thread state and lifecycle events (per-window
+    # fact `pr_activity`): see collect_pr_activity. --no-pr-checks keeps the
+    # lifecycle events (already fetched) and asks GitHub nothing more.
+    pr_activity = None
+    if prs:
+        _started = time.monotonic()
+        pr_activity = collect_pr_activity(
+            prs, _graphql_client(token), owner, repo, timeline_events=pr_events,
+            enabled=getattr(args, "pr_checks", True))
+        _rows = pr_activity["prs"]
+        _by = {s: sum(1 for r in _rows if r.get("checks_status") == s)
+               for s in PR_ACTIVITY_CHECKS_STATUSES}
+        sys.stderr.write(
+            "pr activity: {}/{}: checks gathered for {} PR(s), {} capped, {} "
+            "failed, {} not found, {} not requested ({} request(s), {} "
+            "point(s)); {} lifecycle event(s) in {:.0f}s\n".format(
+                owner, repo, _by["gathered"], _by["capped"], _by["failed"],
+                _by["not_found"], _by["not_requested"], pr_activity["requests"],
+                pr_activity["points"],
+                sum(len(r.get("events") or []) for r in _rows),
+                time.monotonic() - _started))
 
     # PR-internal history (per-window fact `pr_history`): each kept PR's own
     # commits from refs/pull/<N>/head, and the comment / parameter changes
@@ -7845,6 +8244,8 @@ def acquire(args, env):
         bundle["module_notes"] = module_notes
     if pr_history is not None:
         bundle["pr_history"] = pr_history
+    if pr_activity is not None:
+        bundle["pr_activity"] = pr_activity
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph

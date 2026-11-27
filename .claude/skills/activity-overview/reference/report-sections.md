@@ -216,16 +216,21 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    The story material is `slice.conversation` (BUNDLE.md "Slice `conversation`"):
    - `timeline` — openings with their body, every human comment, review with its state,
      review comment (with the file, line and diff lines it is attached to and the thread it
-     replies to, when stored), lifecycle event, PR commit (with its message body as `text`
-     and a `change` summary: files by class, modules, `shared`, interface rows, changelog /
-     shared-file lines) and merged commit, the merge;
+     replies to, when stored), lifecycle event (renames with the old and new title, draft /
+     ready, review requests, dismissals, force-pushes, when stored), PR commit (with its
+     message body as `text` and a `change` summary: files by class, modules, `shared`,
+     interface rows, changelog / shared-file lines), one `checks` item per PR commit whose
+     checks were read (roll-up as of the window's end, failing check names) and merged
+     commit, the merge;
    - `turning_points` marked by rule (a rework carries what changed after the request);
    - `outcome` — where it stands as of `as_of` and what landed: the items' state, review
-     verdicts and outstanding change requests, `ball` (who the next move is with, DERIVED by
-     rule), `waiting_on`, `linked` items with title / author / state / description,
+     verdicts and outstanding change requests, `checks` (the head commit's roll-up and
+     failing check names, or why they were not read), `ball` (who the next move is with,
+     DERIVED by rule), `waiting_on`, `linked` items with title / author / state / description,
      `modules` (shipped: the maintainers' changelog items verbatim, version, interface
      names, breaking), `net_change` (an open PR's own net change);
-   - `threads` — the open-threads ledger, every question / request with a status by rule;
+   - `threads` — the open-threads ledger, every question / request with a status by rule
+     (GitHub's own resolved flag, when stored, wins: `resolved on GitHub`);
    - `truncation`, `bots`, `pr_history`, `not_gathered`, and `gaps` (what an older store
      cannot show).
 2. **Dispatch one story narrator per story train** (the batching of step 2b applies, with
@@ -298,9 +303,15 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    > 9. *Limits of the record.* When `truncation.cut` / `text_omitted` is not empty, say once
    >    that the material was truncated and which items. When `pr_history` says
    >    `not_gathered` / `missing`, do not speak about the PR's internal history. Never claim
-   >    anything in `not_gathered` (title edits, force-pushes, label changes, review-thread
-   >    resolution, CI results). When `gaps` is not empty and the story needs that detail
-   >    (which file a comment was on), say the record does not show it.
+   >    anything in `not_gathered`, and never call unknown what the slice holds: the
+   >    "cannot be known" part of a story names only what `not_gathered` / `gaps` list. When
+   >    `outcome.items[].checks` has `status: gathered`, say what the checks show ("the
+   >    checks failed on the first three pushes and passed on the head commit", the failing
+   >    check names), as of `as_of`; when it is `capped` / `failed` / `not_requested`, say
+   >    the checks were not read. A thread `resolved on GitHub` may be called resolved,
+   >    with who resolved it and "as gathered on <date>" (GitHub keeps no time). When
+   >    `gaps` is not empty and the story needs that detail (which file a comment was on),
+   >    say the record does not show it.
    > 10. When the slice does not support a story — no turn changes the course, the
    >    conversation is acknowledgements — return exactly "No notable discussion." rather
    >    than inflate.
@@ -317,7 +328,11 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    every issue / PR number the story names (`#N` or a link to the repository's issue /
    pull) is named again in that closing part with a state word (open, closed, merged,
    unmerged, draft; `numbers_without_state`) that matches the state the slice's outcome
-   block records (`state_mismatch`, read from the clause between that number and the next).
+   block records (`state_mismatch`, read from the clause between that number and the next),
+   and the story does not call unknown what the slice holds: no sentence saying CI /
+   check results are not in the record when an outcome item has gathered `checks`
+   (`checks_said_unknown`), none saying a thread's resolution is not recorded when a
+   thread carries `resolved_on_github` (`resolved_said_unknown`).
    Else exit 1 with the lists. Drop or fix each listed sentence and check again; never
    publish a story that fails it.
    **What the check does not cover** — read the story once against rules 2–7: that each

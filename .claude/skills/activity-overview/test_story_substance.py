@@ -354,7 +354,10 @@ class TestChangeSummaries(unittest.TestCase):
         reply = rcs[f"{URL}/pull/1#discussion_r102"]
         self.assertEqual(reply["in_reply_to"], f"{URL}/pull/1#discussion_r101")
         self.assertNotIn("diff_hunk", reply)        # the thread opener has it
-        self.assertNotIn("gaps", self.c)
+        # only the lack of the (newer) pr_activity fact is a gap here
+        self.assertEqual(len(self.c["gaps"]), 1)
+        self.assertIn("check results, review-thread resolved flags",
+                      self.c["gaps"][0])
 
     def test_rework_turning_point_lists_what_changed_after_the_request(self):
         tp = next(t for t in self.c["turning_points"]
@@ -381,9 +384,10 @@ class TestChangeSummaries(unittest.TestCase):
             c.pop("body", None)
         b["pr_history"]["prs"][0].pop("patches")
         c = conversation(b, "train-issue-6")
-        self.assertEqual(len(c["gaps"]), 2)
+        self.assertEqual(len(c["gaps"]), 3)
         self.assertIn("review comments carry no file", c["gaps"][0])
         self.assertIn("PR commits carry no file paths", c["gaps"][1])
+        self.assertIn("are not in the store for PR(s) #1", c["gaps"][2])
         self.assertIn("check runs and their results per PR (CI pass / fail is "
                       "not stored)", c["not_gathered"])
 

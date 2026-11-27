@@ -1080,7 +1080,7 @@ own text (GitHub's `body`), verbatim up to `gather.RELEASE_NOTES_CAP` = 4000 cha
 repository without a changelog (a Terraform module repo, a landing zone) still has its
 maintainers' declared notes. Releases gathered before this have no `notes`: re-gather.
 
-## The story layer (`discussion`, `stories`, slice `conversation`, `pr_history`)
+## The story layer (`discussion`, `stories`, slice `conversation`, `pr_history`, `pr_activity`)
 
 Decisions sit in the text of issues and PRs (proposals, objections, rework, agreement).
 The story layer measures that conversation per train, selects the trains with the most to
@@ -1200,6 +1200,17 @@ silence_days}}`.
   - `ready_for_review`, `reopened`, `closed` — the lifecycle events (`url` is the item page
     anchored at the event, `<item url>#event-<id>`); a `closed` from `closed_at` when no
     event records it;
+  - from the view's `pr_activity` (when stored): `renamed` (`from`, `to`: a title edit),
+    `convert_to_draft`, `review_requested` / `review_request_removed` (`requested` — a
+    login or `team:<slug>` — and `by`), `review_dismissed` (`review_id`, `state`,
+    `message`), `head_ref_force_pushed` (`before` / `after` commit when read), each with
+    `url` `<pr url>#event-<id>`; and `checks` — ONE item per PR commit whose checks were
+    read (never one per check run), committed by the instant: `sha`, `url` (the PR
+    commit), `rollup` as of the instant (`passing` / `failing` / `pending` / `none`,
+    `gather.checks_rollup`), `failing` / `pending` (check names), `passing` (a count),
+    `checks_omitted`, `head: true` on the latest such commit; `at` is the last completion
+    by the instant (the commit time when all are pending). A `checks` item is automation:
+    it ends no silence and is never an open PR's last event;
   - `merged` — with the merger as `actor`;
   - `commit` — `source: "pr_head"` (a PR's own commit from `pr_history`: `subject`,
     `files` count, `authored_at`, `merge: true` for a merge commit, `url`
@@ -1275,10 +1286,16 @@ silence_days}}`.
 - **`not_gathered`** — what GitHub records that the store does not keep, so a narrator
   says it rather than infers it: title and description edits, force-pushes and the branch
   states they replaced, label / milestone / assignee changes over time, whether a review
-  thread was marked resolved, check runs and their results per PR.
+  thread was marked resolved, check runs and their results per PR. When the view's
+  `pr_activity` holds a row for every PR of the train, the list shrinks to what is still
+  missing: description edits (renames are `renamed` events), the content of the states a
+  force-push replaced (the push and its before / after commits are in the record), label /
+  milestone / assignee changes, and — only for PRs whose checks were capped, failed or not
+  requested — "check results and review-thread resolved flags of PR(s) #N (<status>)".
 - **`gaps`** (omitted when empty) — what THIS slice cannot show because its store was
   gathered before the data was kept: review comments with no file / diff lines / thread
-  link, PR commits with no file paths or message bodies. A re-gather of the window adds
+  link, PR commits with no file paths or message bodies, PRs with no `pr_activity` row
+  (check results, resolved flags and lifecycle events). A re-gather of the window adds
   them.
 - **`outcome`** — where the train stands as of `as_of` and what ended up in the product
   (`link.story_outcome`):
@@ -1287,8 +1304,14 @@ silence_days}}`.
     `created_at`, `url`, `closed_at` (a closed issue); a PR adds `merged`, `merged_at`,
     `reviews` `{verdicts: [{reviewer, state, at, url}] (each human reviewer's latest
     approved / changes_requested / dismissed, the author's own excluded),
-    outstanding_change_requests: [{by, since, url}]}` and `checks: "not gathered"`; an
-    open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;
+    outstanding_change_requests: [{by, since, url}]}` and `checks` (`link.checks_outcome`
+    from the view's `pr_activity`: `{status: "gathered", head, head_url, rollup, failing,
+    pending, passing, gathered_at, commits_total, commits_covered, checks_omitted?,
+    completed_after_as_of?}` — the head is the latest covered commit committed by the
+    instant and its roll-up is as of the instant, a check completed after it counting as
+    pending; `{status: capped|failed|not_found|not_requested, reason?, gathered_at}` when
+    the checks were not read; the string `"not gathered"` when the view has no such row);
+    an open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;
   - `ball` — **who the next move is with, DERIVED by rule** from the sequence of recorded
     events, never from anyone's words (`derived: true`; `link.ball_with`), with the
     `rule` that fired, its `basis` (the last event) and, at train level, the `pr` it is
@@ -1299,7 +1322,11 @@ silence_days}}`.
     reviewer` (the reviewers whose latest verdict is a change request, else the people the
     author named, else the reviewers who reviewed; nobody: `awaiting a first review`);
     **R3 approved** — the last event is an approval with no change request outstanding:
-    `awaiting merge`; **R4 reviewer moved** — otherwise: `awaiting author`. For an open
+    `awaiting merge`; **R4 reviewer moved** — otherwise: `awaiting author`; **R5 failing
+    checks** — when R2 or R3 fired and the head commit's checks are failing as of the
+    instant (the item's `checks`), the next move is the author's: `awaiting author`, with
+    `checks_basis` `{head, failing}` (R1 and R4 stand). A `checks` item is never the last
+    event; a `review_requested` event names its requested reviewer for R2. For an open
     issue with no open PR: **I1** the reporter moved last: `awaiting maintainer
     response`; **I2** someone else named people: `awaiting mentioned`; **I3** otherwise
     `awaiting reporter`. `state` / `with` say who; `derived` is always true;
@@ -1344,8 +1371,14 @@ silence_days}}`.
   the thread's file, `same_file: true`), `reply_on_item` (a later reply on the same PR by
   someone else when the store holds no thread links), `followed_by_commit` with
   `same_file: null` (a later commit whose files are not known to match), else
-  `unresolved in the record`. `resolution` is the strongest signal `{status, at, by, url,
-  same_file?}`; `signals` lists all. These are rules over the record, not a verdict:
+  `unresolved in the record`. Where the view's `pr_activity` holds GitHub's own flag for
+  a review thread (joined on its opening review comment) the record wins: `status` is
+  `resolved on GitHub` / `not resolved on GitHub`, the rule's status moves to
+  `derived_status`, and `resolved_on_github` `{resolved, by?, outdated, as_gathered,
+  gathered_after_as_of?}` says what GitHub held when the window was gathered (GitHub keeps
+  no time for a resolution, so a view of an earlier window marks `gathered_after_as_of`).
+  `resolution` is the strongest signal `{status, at, by, url, same_file?}`; `signals` lists
+  all. These are rules over the record, not a verdict:
   "answered" means somebody replied, not that the reply settled it. At most
   `STORY_THREADS_MAX` 40 (`threads_omitted` the rest).
 
@@ -1399,6 +1432,61 @@ before the gather is invisible: only the current head is fetched. A view of exac
 gathered window carries the stored value verbatim; a wider view takes, per PR, the entry
 of the latest overlapping window that collected one, and adds `windows`.
 
+### `pr_activity` (raw, from the store)
+
+The per-window fact gather writes (`gather.collect_pr_activity`; STORE.md), omitted when
+no gather stored it (a store gathered before it, every fixture bundle):
+
+```json
+{"collected": true, "gathered_at": "2026-10-02T06:00:00Z",
+ "limits": {"batch": 10, "max_prs": 200, "commits": 10, "contexts": 50,
+            "threads": 50, "force_pushes": 20, "events": 100},
+ "requests": 16, "points": 96,
+ "prs": [{"number": 7146, "checks_status": "gathered", "head": "<sha>",
+          "commits_total": 9,
+          "commits": [{"sha": "…", "committed_at": "…Z", "rollup": "failing",
+                       "state": "failure",
+                       "checks": [{"name": "…", "kind": "check_run",
+                                   "status": "completed", "conclusion": "failure",
+                                   "started_at": "…Z", "completed_at": "…Z",
+                                   "url": "…"}]}],
+          "threads_total": 2,
+          "threads": [{"comment_id": 3408199937, "path": "…", "line": 78,
+                       "resolved": false, "outdated": true}],
+          "events": [{"id": 1, "event": "renamed", "at": "…Z", "actor": "…",
+                      "from": "…", "to": "…"}]},
+         {"number": 6974, "checks_status": "capped"}]}
+```
+
+- `checks_status` — `gathered`, `capped` (beyond `ACTIVITY_PR_CHECKS_MAX`: open PRs are
+  asked first, then the most discussed, then the newest), `failed` (its request failed;
+  `checks_reason`), `not_found` (GitHub answered null), `not_requested` (`--no-pr-checks`
+  or no GraphQL client). Only a `gathered` row says anything about checks; nothing is
+  ever "no checks" for a PR that was not asked about.
+- `commits` — the latest `PR_CHECKS_COMMITS` (10) of the PR's commits, oldest first, each
+  with its check runs and commit statuses (`kind` `check_run` / `status`; at most
+  `PR_CHECKS_CONTEXTS` 50, `checks_omitted` the rest), `rollup` (gather.checks_rollup over
+  them, as gathered: a conclusion in `failure`, `timed_out`, `cancelled`,
+  `action_required`, `startup_failure`, `error` fails it; `success`, `neutral`, `skipped`
+  pass; anything else is pending; failing wins over pending, pending over passing; no
+  check at all is `none`) and `state` (GitHub's own roll-up state). `commits_total` is the
+  PR's commit count; `head` its head commit when gathered.
+- `threads` — GitHub's resolved flag per review thread (`comment_id` is the thread's
+  opening review comment, `resolved_by` who resolved it), at most `PR_THREADS_FIRST` 50
+  (`threads_omitted`). GitHub keeps no resolution time.
+- `events` — the PR lifecycle events from the issue timeline enrich_pr already fetched:
+  `renamed`, `convert_to_draft`, `review_requested`, `review_request_removed`,
+  `review_dismissed`, `head_ref_force_pushed` (the latest `PR_EVENTS_MAX` 100,
+  `events_omitted`); a force-push gains `before` / `after` from the GraphQL read.
+- `requests` / `points` — the GraphQL requests made and the rate-limit points they cost.
+- `{"collected": false}` is never written: `--no-pr-checks` still stores the events.
+
+Everything is **as gathered** (the window's end plus however long until the gather), so
+the story layer projects it: commits committed after the view's end are dropped and a
+check completed after it counts as pending. A wider view takes, per PR, the row of the
+latest overlapping window (each row then carries its own `gathered_at`) and adds
+`windows`.
+
 ## Optional (omit-when-empty) keys
 
 These keys are reserved in the bundle skeleton and **filled when the data exists** —
@@ -1409,7 +1497,8 @@ empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
 code_graph, label_taxonomy, modules, workflow_stats, newcomers, module_notes,
-module_changes, pr_history, affiliations, prior_activity, contributors, stories, releases,
+module_changes, pr_history, pr_activity, affiliations, prior_activity, contributors,
+stories, releases,
 milestones, sprints, diagrams`.
 
 **Never in a view:** gather's in-memory bundle skeleton also reserves `workflows` (the raw
@@ -1849,7 +1938,7 @@ review's state to `DISMISSED`.
     "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ],
     "conversation":   { timeline, turning_points, truncation, bots,
                         code_notes_by_module, pr_history, as_of, not_gathered,
-                        outcome, threads }
+                        outcome, threads, gaps }
   }
   ```
 

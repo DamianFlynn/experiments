@@ -1304,8 +1304,9 @@ def _fact_signatures(value):
     code_graph a dict with an `areas` list, label_taxonomy a dict with a
     `source` string, code_owners a CODEOWNERS rule list, workflow_stats a
     {workflow: {total, ...}} dict, module_notes a dict with a `changelogs`
-    list, pr_history a dict with a `prs` list and a `base`, affiliations a
-    dict with a `home_orgs` list and a `people` map."""
+    list, pr_history a dict with a `prs` list and a `base`, pr_activity a
+    dict with a `prs` list and a `gathered_at` (and no `base`), affiliations
+    a dict with a `home_orgs` list and a `people` map."""
     out = set()
     if isinstance(value, dict):
         if isinstance(value.get("areas"), list):
@@ -1317,6 +1318,9 @@ def _fact_signatures(value):
             out.add("module_notes")
         if isinstance(value.get("prs"), list) and "base" in value:
             out.add("pr_history")
+        if isinstance(value.get("prs"), list) and "gathered_at" in value \
+                and "base" not in value:
+            out.add("pr_activity")
         if isinstance(value.get("source"), str):
             out.add("label_taxonomy")
         if value and all(isinstance(v, dict) and "total" in v
@@ -1408,6 +1412,66 @@ def _affiliations_problem(value):
     return None
 
 
+# What a `pr_activity` fact and its rows may hold (gather collect_pr_activity).
+_PR_ACTIVITY_FACT_KEYS = {"collected", "gathered_at", "limits", "requests",
+                          "points", "prs", "windows"}
+_PR_ACTIVITY_ROW_KEYS = {"number", "checks_status", "checks_reason", "head",
+                         "commits_total", "commits", "threads_total", "threads",
+                         "threads_omitted", "events", "events_omitted",
+                         "gathered_at"}
+_PR_ACTIVITY_COMMIT_KEYS = {"sha", "committed_at", "rollup", "state", "checks",
+                            "checks_omitted"}
+_PR_ACTIVITY_CHECK_KEYS = {"name", "kind", "status", "conclusion", "started_at",
+                           "completed_at", "url"}
+_PR_ACTIVITY_THREAD_KEYS = {"comment_id", "path", "line", "resolved",
+                            "resolved_by", "outdated"}
+
+
+def _pr_activity_problem(value):
+    """Why a stored `pr_activity` value is not one gather writes (an unknown
+    key at any level, a checks_status / roll-up / event kind gather never
+    writes, a `resolved` flag that is not a boolean), or None."""
+    if value.get("collected") is False and set(value) == {"collected"}:
+        return None
+    extra = sorted(set(value) - _PR_ACTIVITY_FACT_KEYS)
+    if extra:
+        return "pr_activity carries unexpected key(s) {}".format(", ".join(extra))
+    if not isinstance(value.get("prs"), list):
+        return "pr_activity.prs is not a list"
+    for row in value["prs"]:
+        if not isinstance(row, dict) or not isinstance(row.get("number"), int):
+            return "pr_activity.prs holds a row without a PR number"
+        n = row["number"]
+        extra = sorted(set(row) - _PR_ACTIVITY_ROW_KEYS)
+        if extra:
+            return "pr_activity PR #{} carries unexpected key(s) {}".format(
+                n, ", ".join(extra))
+        if row.get("checks_status") not in gather.PR_ACTIVITY_CHECKS_STATUSES:
+            return "pr_activity PR #{} checks_status {!r} is not one gather " \
+                   "writes".format(n, row.get("checks_status"))
+        for c in row.get("commits") or []:
+            if not isinstance(c, dict) or not set(c) <= _PR_ACTIVITY_COMMIT_KEYS \
+                    or c.get("rollup") not in gather.CHECK_ROLLUPS:
+                return "pr_activity PR #{} has a commit entry gather does not " \
+                       "write".format(n)
+            for k in c.get("checks") or []:
+                if not isinstance(k, dict) or not set(k) <= _PR_ACTIVITY_CHECK_KEYS \
+                        or k.get("kind") not in ("check_run", "status"):
+                    return "pr_activity PR #{} has a check entry gather does " \
+                           "not write".format(n)
+        for t in row.get("threads") or []:
+            if not isinstance(t, dict) or not set(t) <= _PR_ACTIVITY_THREAD_KEYS \
+                    or not isinstance(t.get("resolved"), bool):
+                return "pr_activity PR #{} has a thread entry gather does not " \
+                       "write".format(n)
+        for e in row.get("events") or []:
+            if not isinstance(e, dict) or e.get("event") not in \
+                    gather.PR_TIMELINE_EVENTS:
+                return "pr_activity PR #{} has an event gather does not " \
+                       "write".format(n)
+    return None
+
+
 def _fact_shape_problem(key, value):
     """Why a stored fact value cannot be the value of WINDOW_FACT_KEYS `key`,
     or None: it is not a JSON object (code_owners: an object or a rule list),
@@ -1419,6 +1483,10 @@ def _fact_shape_problem(key, value):
         ok = isinstance(value, dict)
     if ok and key == "affiliations":
         why = _affiliations_problem(value)
+        if why:
+            return why
+    if ok and key == "pr_activity":
+        why = _pr_activity_problem(value)
         if why:
             return why
     sig = _fact_signatures(value)

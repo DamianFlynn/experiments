@@ -143,6 +143,7 @@ scratch store) and `backfill` respectively.
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
 | `--no-newcomers` | off (check runs) | Skip the first-time-contributor search (§4.7); the window's `newcomers` fact is `{"collected": false}`. `ACTIVITY_NEWCOMERS_MAX` (default 200, min 0) caps the candidates checked |
+| `--no-pr-checks` | off (checks read) | Skip the batched GraphQL read of check results, review-thread state and force-push commits (§4.4c); the window's `pr_activity` keeps the lifecycle events with `checks_status: not_requested`. `ACTIVITY_PR_CHECKS_MAX` (default 200, min 0) caps the PRs asked about |
 | `--no-affiliation` | off (check runs) | Skip the contributor affiliation check (§4.7a); the window's `affiliations` fact is `{"collected": false}`. `ACTIVITY_AFFILIATION_MAX` (default 300, min 0) caps the people looked up |
 | `--home-org ORG`, `--home-name NAME`, `--home-email-domain DOMAIN` | the repo's owner only | Repeatable: extra home organisations (public membership, and a company name), extra company names, home commit email domains (§4.7a); a manifest's `affiliation` object adds the same lists |
 | `--affiliation LOGIN=A` / `@org/team=A` | none | Repeatable operator override (`maintainer_org` / `community` / `unknown`), highest priority; beats a manifest `affiliation.overrides` entry for the same key |
@@ -383,6 +384,35 @@ only when the window's history is on disk:
 gather prints one line (`module notes: <repo>: N changelog update(s), M version change(s), K
 version tag(s) in the window`) and the bundle carries `module_notes`; fold stores it as a
 per-window fact (`graphstore.WINDOW_FACT_KEYS`, §4.10), never as a singleton node.
+
+### 4.4c Checks, thread state and lifecycle events (`collect_pr_activity`)
+
+The per-window fact `pr_activity` (BUNDLE.md) answers what the conversation does not:
+whether the checks passed on each push, whether a review thread was marked resolved, and
+the PR's renames, draft / ready changes, review requests, dismissals and force-pushes.
+
+1. **Lifecycle events, no extra call.** enrich_pr already pages each PR's issue timeline;
+   `parse_timeline_pr_events` keeps `PR_TIMELINE_EVENTS` (renamed, convert_to_draft,
+   review_requested, review_request_removed, review_dismissed, head_ref_force_pushed) into
+   a side dict (the PR record is unchanged, so stored PR nodes and fixture views are too).
+2. **One GraphQL request per `PR_ACTIVITY_BATCH` (10) PRs** (`pr_activity_query`, through
+   the same `_graphql_client` seam as the closing-issue read): per PR `headRefOid`,
+   `commits(last: 10)` each with `statusCheckRollup { state contexts(first: 50) }`
+   (CheckRun and StatusContext nodes), `reviewThreads(first: 50)` with `isResolved`,
+   `resolvedBy`, `isOutdated` and the first comment's `databaseId`, and
+   `timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 20)` with before / after
+   commits; plus `rateLimit { cost }`. GitHub's cost formula gives about 63 / 100 points
+   per PR, so 6 per request; the REST route would be two calls per commit (`check-runs`,
+   `status`) and has no thread state. A 160-PR month: 16 requests, about 100 points,
+   against a token budget of about 1,000 requests an hour.
+3. **Cap and order.** `ACTIVITY_PR_CHECKS_MAX` (200) PRs per window, open PRs first, then
+   by human conversation (the story candidates), then newest; the rest `capped`. A failed
+   request marks its batch `failed` with the reason; after `PR_ACTIVITY_FAILURE_STOP` (3) in
+   a row the rest are failed unasked. Nothing is fatal.
+4. **Normalise.** `normalize_check_context` maps both node types to `{name, kind, status,
+   conclusion, started_at, completed_at, url}`; `checks_rollup` (also used by link, with an
+   as-of instant) folds them to passing / failing / pending / none; a REST force-push event
+   gains the GraphQL push's commits matched on (time, actor).
 
 ### 4.4b PR-internal history (`collect_pr_history`)
 

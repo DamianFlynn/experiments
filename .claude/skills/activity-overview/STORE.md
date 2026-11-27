@@ -316,7 +316,14 @@ window person's `maintainer_org` / `community` / `unknown` label with the name a
 strength of the signal that decided it — `gather.collect_affiliations`, BUNDLE.md "The
 people layer"; only per window, because it is GitHub's and the profile's answer when the
 window was gathered; `{"collected": false}` for a gather run with `--no-affiliation`;
-absent from windows gathered before it existed. Gathered with the people registry
+absent from windows gathered before it existed) and `pr_activity` (each window PR's check
+results for its latest commits, GitHub's resolved flag per review thread and its lifecycle
+events — renames, draft / ready, review requests and dismissals, force-pushes —
+`gather.collect_pr_activity`, BUNDLE.md "`pr_activity`"; only per window, because it is
+what GitHub held when the window was gathered (`gathered_at`); absent from windows gathered
+before it existed; `validate.py`'s meta integrity refuses a key, `checks_status`, roll-up
+or event kind gather does not write. A new fact key, not a schema change: older stores
+simply lack it and a story slice's `gaps` says so. Gathered with the people registry
 (`--people`, a JSON file outside the store, BUNDLE.md "The people registry"), each entry
 also records the labels used for that window from it: the display `name`, `maintainer`,
 `maintainer_signal` and `maintainer_status` (the role's lifecycle at gather time: active /

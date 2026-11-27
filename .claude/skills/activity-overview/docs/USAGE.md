@@ -231,6 +231,7 @@ into a **fresh** store for the first item, into the same store for the others:
 | #101 (nested Terraform areas) | `.tf` files in `modules/<name>/<sub>/` stay in `modules/<name>` | module counts / areas |
 | the module change notes (`module_notes` / `module_changes`, BUNDLE.md "Module changes") | no `module_notes` per-window fact, so `link.py` builds no `module_changes` (new / changed / breaking / deprecated modules, product vs plumbing) | the view has no `module_changes` key. Re-gather the window (same store is fine: a re-fold replaces that window's facts) |
 | the story layer (`pr_history`, release notes text; BUNDLE.md "The story layer") | no `pr_history` per-window fact and no `releases[].notes` | the slice `conversation` has no PR commits (`pr_history: not_gathered`), `change_requests_reworked` is absent, `module_changes.releases` carry no notes. `discussion`, `stories` and the timeline still work from the stored comments and reviews. Re-gather the window (same store is fine) |
+| check results, review-thread resolved flags, PR lifecycle events (`pr_activity`; BUNDLE.md) | no `pr_activity` per-window fact | the slice's `gaps` names the PRs without it, `outcome.items[].checks` is `"not gathered"`, threads keep their derived status, `not_gathered` keeps the full list. Re-gather the window (same store is fine) |
 | the story substance (review-comment context, PR commit paths / bodies / patch excerpts; BUNDLE.md "Slice `conversation`") | review comments without `path` / `diff_hunk` / `in_reply_to`; `pr_history` commits without `paths` / `body`, no `patches` | the slice's `conversation.gaps` names what is missing; commit items have no `change` summary, the open-threads ledger falls back to `reply_on_item` (no thread links), `outcome.net_change` is absent. The outcome block, the ball rule and linked items still work. Re-gather the window (same store is fine) |
 | #109 (collection review) | an issue of ANOTHER repo that mentions a PR made the same-numbered local issue a `cross_ref` of it; commits (and their code/symbol events) are windowed on the committer's local day, not the UTC day PRs and issues use | an unrelated issue in a PR's train context / forecast; a commit made near midnight UTC in the neighbouring month. Re-gather into a fresh store (a mention edge the new records no longer imply fails `validate`) |
 
@@ -620,6 +621,19 @@ commits, notes for 40 PRs, a 1.1 MB fact; October 2026 into the same clone, 160 
 `fetch_failed`; neither stops the gather. `--no-pr-history` skips all of it and records
 `{"collected": false}`. The refs stay in the clone (`refs/remotes/pr/*`); a refresh fetches
 only what moved.
+
+Check results, review-thread state and PR lifecycle events (the per-window fact
+`pr_activity`, BUNDLE.md): the lifecycle events (renames, draft / ready, review requests
+and dismissals, force-pushes) come from the issue timeline gather already reads for every
+PR — no extra call. The check runs and commit statuses of each PR's latest 10 commits, the
+resolved flag of each review thread and the force-pushes' before / after commits come from
+one GraphQL request per 10 PRs (about 6 rate-limit points each): a month of 160 PRs costs
+16 requests. `ACTIVITY_PR_CHECKS_MAX` (default 200, min 0) caps the PRs asked about — open
+PRs first, then the most discussed, then the newest; the rest are recorded as `capped`, a
+failed request as `failed` with its reason (after three failed requests in a row the rest
+are not asked). `--no-pr-checks` asks nothing and records `not_requested`. A story slice
+then shows one `checks` item per commit, the head's roll-up in the outcome block and
+GitHub's resolved flag on the threads it holds.
 
 ### 5.7 People: affiliation, the people registry, maintainers and newcomers
 

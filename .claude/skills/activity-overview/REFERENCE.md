@@ -251,6 +251,13 @@ a PR / issue created in the window (the search API allows 30 requests a minute; 
 waited out like any other). `ACTIVITY_NEWCOMERS_MAX` (default `200`, min `0`) caps the
 candidates checked (the rest are listed as `not_checked`); `--no-newcomers` skips the check.
 
+Check results, review-thread state and PR lifecycle events (`pr_activity`, BUNDLE.md):
+the events come from the issue timeline already fetched per PR (no extra call); the checks
+of each PR's latest 10 commits, the thread resolved flags and the force-push commits from
+one GraphQL request per 10 PRs (about 6 rate-limit points). `ACTIVITY_PR_CHECKS_MAX`
+(default `200`, min `0`) caps the PRs asked about (open first, then the most discussed;
+the rest `capped`); `--no-pr-checks` asks nothing (`not_requested`).
+
 Contributor affiliation (`affiliations`, BUNDLE.md "The people layer"): for each person not
 decided by the operator's override list or `author_association`, one
 `orgs/{org}/public_members/{login}` call per home organisation and one `users/{login}` call,
