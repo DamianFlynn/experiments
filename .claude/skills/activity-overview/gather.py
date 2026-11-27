@@ -7385,6 +7385,27 @@ def normalize_check_context(node):
     return {k: v for k, v in row.items() if v is not None}
 
 
+def _current_checks(checks):
+    """`checks` without the runs a re-run replaced: a check is superseded
+    when another of the same name STARTED at or after it COMPLETED (a job
+    run again after it finished). Runs of one name that overlap in time
+    (a matrix, parallel jobs) all stay. Order kept. Pure."""
+    starts = {}
+    for c in checks:
+        started = c.get("started_at") or c.get("completed_at")
+        if started:
+            starts.setdefault(c.get("name") or "?", []).append(started)
+    out = []
+    for c in checks:
+        done = c.get("completed_at")
+        later = starts.get(c.get("name") or "?", ())
+        own = c.get("started_at") or done
+        if done and any(s >= done and s != own for s in later):
+            continue
+        out.append(c)
+    return out
+
+
 def checks_rollup(checks, as_of=None, omitted=0):
     """The roll-up of one commit's checks, optionally as of an instant:
     {rollup: passing|failing|pending|incomplete|none, failing: [names], pending:
@@ -7392,20 +7413,20 @@ def checks_rollup(checks, as_of=None, omitted=0):
     fails the commit; CHECK_PASSING passes it; any other (no conclusion yet,
     stale, an expected status) is pending. With `as_of`, a check started
     after it did not exist yet (left out) and one completed after it was
-    still pending then. `failing` wins over `pending`, `pending` over
+    still pending then. A run replaced by a later re-run of the same check
+    does not count (_current_checks). `failing` wins over `pending`, `pending` over
     `passing`; no check at all is `none`. With `omitted` (checks GitHub
     counted but the read did not return), a partial page is never a pass:
     the roll-up is `failing` when a failure is visible, else `incomplete`.
     Names are sorted. Pure."""
     failing, pending, passing = set(), set(), 0
-    for c in checks or []:
-        if not isinstance(c, dict):
-            continue
+    seen = [c for c in checks or [] if isinstance(c, dict)]
+    if as_of is not None:
+        seen = [c for c in seen
+                if not ((c.get("started_at") or c.get("completed_at") or "") > as_of)]
+    for c in _current_checks(seen):
         name = c.get("name") or "?"
         if as_of is not None:
-            started = c.get("started_at") or c.get("completed_at")
-            if started and started > as_of:
-                continue
             done = c.get("completed_at")
             if not done or done > as_of:
                 pending.add(name)

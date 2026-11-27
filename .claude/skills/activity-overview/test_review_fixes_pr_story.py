@@ -341,5 +341,48 @@ class TestValidatorShapes(unittest.TestCase):
             "pr_activity", {"collected": True, "gathered_at": "x", "prs": [1]}))
 
 
+class TestRerunsReplaceEarlierRuns(unittest.TestCase):
+    """Found on the first live gather: a check that failed and was run
+    again successfully on the same commit still failed the roll-up."""
+
+    @staticmethod
+    def run_(name, concl, start, done):
+        return {"name": name, "conclusion": concl, "status": "completed",
+                "started_at": start, "completed_at": done}
+
+    def test_a_later_rerun_replaces_the_failed_run(self):
+        checks = [self.run_("title", "failure", "2026-09-05T14:07:00Z",
+                            "2026-09-05T14:08:01Z"),
+                  self.run_("title", "success", "2026-09-05T16:43:00Z",
+                            "2026-09-05T16:43:06Z"),
+                  self.run_("build", "success", "2026-09-05T14:07:00Z",
+                            "2026-09-05T14:20:00Z")]
+        got = gather.checks_rollup(checks)
+        self.assertEqual((got["rollup"], got["failing"]), ("passing", []))
+
+    def test_as_of_before_the_rerun_still_fails(self):
+        checks = [self.run_("title", "failure", "2026-09-05T14:07:00Z",
+                            "2026-09-05T14:08:01Z"),
+                  self.run_("title", "success", "2026-09-05T16:43:00Z",
+                            "2026-09-05T16:43:06Z")]
+        got = gather.checks_rollup(checks, as_of="2026-09-05T15:00:00Z")
+        self.assertEqual(got["rollup"], "failing")
+
+    def test_overlapping_runs_of_one_name_all_count(self):
+        # a matrix: two jobs of the same name at the same time, one fails
+        checks = [self.run_("unit", "failure", "2026-09-05T14:07:00Z",
+                            "2026-09-05T14:30:00Z"),
+                  self.run_("unit", "success", "2026-09-05T14:07:05Z",
+                            "2026-09-05T14:25:00Z")]
+        self.assertEqual(gather.checks_rollup(checks)["rollup"], "failing")
+
+    def test_a_failed_rerun_after_a_pass_fails(self):
+        checks = [self.run_("unit", "success", "2026-09-05T14:07:00Z",
+                            "2026-09-05T14:10:00Z"),
+                  self.run_("unit", "failure", "2026-09-05T15:00:00Z",
+                            "2026-09-05T15:05:00Z")]
+        self.assertEqual(gather.checks_rollup(checks)["rollup"], "failing")
+
+
 if __name__ == "__main__":
     unittest.main()
