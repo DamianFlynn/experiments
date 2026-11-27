@@ -296,7 +296,41 @@ the files that window changed, with their dependency edges), `code_owners` and
 `label_taxonomy` (read from that window's checkout) and `newcomers` (the window's
 first-time contributors, from the search API; only per window, never a singleton node;
 `{"collected": false}` for a gather run with `--no-newcomers`; absent from windows
-gathered before it existed) — each named by the SHA-256 of
+gathered before it existed) and `module_notes` (the changelog entries, `version.json`
+moves and version tags of the window, read from the clone for the changelog / version
+files the window's code events name — `gather.collect_module_notes`, BUNDLE.md "Module
+changes"; only per window, never a singleton node; absent when the gather had no
+window history on disk, and from windows gathered before it existed: re-gather a
+window to get it) and `pr_history` (each window PR's own commits from
+`refs/pull/<N>/head` — each with its file paths and message body — and, for the most
+discussed PRs, the comment / parameter changes between them and the lines they wrote
+into a changelog or a shared repository file (`patches`) — `gather.collect_pr_history`,
+BUNDLE.md "The story layer"; windows gathered before paths, bodies and patches were kept
+hold commits without them; only per window;
+`{"collected": false}` for a gather run with `--no-pr-history`; absent without a clone and
+from windows gathered before it existed. A per-window fact rather than a field on the PR
+record because it is what the head ref held when that window was gathered — dated
+gather-time evidence like `newcomers`, read under the as-of rule — while PR records are
+latest-wins and compared field by field by the trust check) and `affiliations` (each
+window person's `maintainer_org` / `community` / `unknown` label with the name and
+strength of the signal that decided it — `gather.collect_affiliations`, BUNDLE.md "The
+people layer"; only per window, because it is GitHub's and the profile's answer when the
+window was gathered; `{"collected": false}` for a gather run with `--no-affiliation`;
+absent from windows gathered before it existed. Gathered with the people registry
+(`--people`, a JSON file outside the store, BUNDLE.md "The people registry"), each entry
+also records the labels used for that window from it: the display `name`, `maintainer`,
+`maintainer_signal` and `maintainer_status` (the role's lifecycle at gather time: active /
+lapsed / former / unknown) for the window's repository — so a view stays reproducible after
+the registry changes, and no view reads the registry (`link.py --people` adds registry
+context to a view, outside the facts, as of the view's end). The registry's activity
+profile (`people-activity.json`, beside the registry) is filled from the same window's
+records at gather time, or from stores by `people.py seed`; it is never stored in a store.
+The fact holds no other profile text, no company or email: `validate.py`'s meta integrity
+refuses an entry with any key beyond `affiliation`, `signal`, `strength`,
+`home_email_domain`, `name`, `maintainer`, `maintainer_signal` and `maintainer_status`, a
+label / signal / strength / maintainer signal or status gather does not write, a `former`
+status on a maintainer, or a `do_not_name` entry that carries a name or a maintainer
+property; the schema is unchanged) — each named by the SHA-256 of
 its JSON text (encoded as node `data` is: sorted keys), and the clone sha the
 window was gathered against. A key is present only when the bundle's value is
 present and non-empty (the latest-wins node rule). Each value is stored once per
@@ -409,7 +443,10 @@ window mutates nothing already correct, so a refresh is a re-gather of the same 
 window's end, issue #107);
 a roll-up is a wider view over the folded windows, or a wider gather). P6
 writes: `social` (PRs/issues; comments/reviews stay embedded in the parent's
-`data` blob), `code` (commits) + the file-level `code_events` ledger,
+`data` blob — an inline review comment also keeps, when GitHub gives them, its `path`,
+`line`, bounded `diff_hunk` (`diff_hunk_lines` when cut), `in_reply_to` and `commit`:
+optional keys of the same record, no schema change; records stored before they were
+kept lack them until the window is re-gathered), `code` (commits) + the file-level `code_events` ledger,
 `structure` (milestones/releases/areas), and the **spine** edges `closes`,
 `cross_ref`, and `part_of`. It also persists the per-repo **singleton facts**
 `workflow_stats`, `code_graph`, `code_owners`, and `label_taxonomy` — each as a

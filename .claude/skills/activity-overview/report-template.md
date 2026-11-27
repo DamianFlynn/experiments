@@ -303,6 +303,11 @@ list is in the bundle (`buckets.shipped`)".
 
 <!-- narrative: <train-id> -->
 
+<!-- Story trains (`train.story` true, any tier) get this block too, with their story in
+     the narrative slot — written to "Stories (the story brief)" in
+     reference/report-sections.md; then one line "N more trains had notable discussion"
+     from `stories.more` when it is not empty. -->
+
 **Mention trains** (`train.tier` "mention") — one line each (grouped by theme on a
 monorepo of independent PRs, see above; at most 40 lines per group, then the LONG LISTS
 "Showing N of M trains" line):
@@ -481,6 +486,11 @@ part when it is empty. At most 40 candidates per tier, LONG LISTS: "Showing N of
 candidates — the full list is in the bundle (`forecast.candidates`)".)
 
 ## Feature changes (add / drop / change)
+
+<!-- Pointer: module-level release notes (new / changed / breaking / deprecated modules,
+     declared vs candidate breaking changes, product vs plumbing) are in the view's module
+     changes structure when the gather read the module change notes; BUNDLE.md "Module
+     changes" documents it. A newsletter layout over it is designed separately. -->
 
 The `feature_deltas` ledger as a table grouped by `delta.kind`. Each row cites its
 artifact (`delta.artifact`) and the commit/PR that changed it. `delta.area` is the
@@ -678,6 +688,22 @@ latency {person.review_latency_days}d · active {person.first_seen} →
      stanza). Bots are excluded from `halls.fame` already. -->
 
 **Automation:** the `people` logins whose `person.is_bot` is true.
+
+<!-- People layer — pointer only; the newsletter layout for these facts comes later.
+     When the view carries `contributors` (BUNDLE.md "The people layer"):
+     - `contributors.affiliation`: people, merged PRs and reviews by
+       maintainer_org / community / unknown (counts and shares; unknown is its own
+       bucket — never fold it into community);
+     - `contributors.community`: community PRs merged, first-timers, returning
+       contributors, modules that received a community contribution;
+     - `contributors.newcomers[]`: first_ever / returning (`gap_bucket`), what the
+       store saw of them before (`seen_in_store_before`), and `contributed.prs[]`
+       (`headline` new_module / module_change / plumbing / release, modules with
+       kind and status, changelog items verbatim, PR links);
+     - `contributors.hall[]`: the same for each `halls.fame` entry, plus `reviewed`;
+     - `halls.community` / `halls.maintainer_org`: the fame ranking within a label.
+     Labels come from public signals (`person.affiliation_signal`); prefer counts
+     and shares to naming a person's label, and say what `unknown` means. -->
 
 The people ↔ code-area relationships are shown by `diagrams.contributor_graph`, embedded
 once under **Module ownership** above (do not repeat the Mermaid block here).

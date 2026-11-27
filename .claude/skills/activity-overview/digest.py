@@ -538,9 +538,19 @@ def _merge_people(members):
       modules / areas       "{repo}::{area}", like the project `modules`
                             keys, so two members' same-named areas stay apart
       is_bot                OR; login_resolved false when any member says so
+      affiliation / affiliation_signal   the member record with the most
+                            decisive signal (derive.affiliation_rank)
+      name                  the first member record that has one
+      maintainer / maintainer_signal / maintainer_status   true when any
+                            member says so (that member's signal and status),
+                            with those members listed in `maintainer_of` (the
+                            property is per repository)
+      do_not_name           any member's wins: unknown / do_not_name, with
+                            no name and no maintainer property
     Any other field is kept from the first member's record. Member records are
     not mutated. Order: first appearance over members in `members` order."""
-    people, samples, opened = {}, {}, {}
+    people, samples, opened, maint = {}, {}, {}, {}
+    suppressed = set()
     for m in members:
         repo, bundle = m["repo"], m["bundle"]
         latencies = derive.review_latency_samples(bundle.get("prs") or [])
@@ -574,7 +584,44 @@ def _merge_people(members):
             cur["is_bot"] = cur["is_bot"] or bool(rec.get("is_bot"))
             if rec.get("login_resolved") is False:
                 cur["login_resolved"] = False
+            # affiliation: the member whose signal is the most decisive wins
+            # (derive.affiliation_rank; a known label beats unknown)
+            if "affiliation" in rec and ("affiliation" not in cur or
+                                         derive.affiliation_rank(rec)
+                                         < derive.affiliation_rank(cur)):
+                cur["affiliation"] = rec["affiliation"]
+                cur["affiliation_signal"] = rec.get("affiliation_signal")
+            # display name: the first member's that has one; maintainer is
+            # per repository, so the project record says true when any
+            # member says so (with that member's signal) and lists those
+            # members in `maintainer_of`
+            if rec.get("name") and not cur.get("name"):
+                cur["name"] = rec["name"]
+            if "maintainer" in rec:
+                maint.setdefault(login, []).append(
+                    (repo, rec["maintainer"], rec.get("maintainer_signal"),
+                     rec.get("maintainer_status")))
             samples.setdefault(login, []).extend(latencies.get(login, []))
+            if rec.get("affiliation_signal") == "do_not_name":
+                suppressed.add(login)
+    # do_not_name in any member wins over every other member's labels
+    for login in suppressed:
+        maint.pop(login, None)
+        cur = people[login]
+        cur["affiliation"], cur["affiliation_signal"] = "unknown", "do_not_name"
+        for key in derive.PERSON_LABEL_KEYS + ("maintainer_of",):
+            cur.pop(key, None)
+    for login, rows in maint.items():
+        cur = people[login]
+        yes = [r for r in rows if r[1]]
+        pick = yes[0] if yes else rows[0]
+        cur["maintainer"], cur["maintainer_signal"] = pick[1], pick[2]
+        if pick[3]:
+            cur["maintainer_status"] = pick[3]
+        else:
+            cur.pop("maintainer_status", None)
+        if yes:
+            cur["maintainer_of"] = sorted({r[0] for r in yes})
     for login, cur in people.items():
         if any(seen for seen, _total in opened.values()):
             cur["prs_opened"] = opened[login][1]

@@ -55,6 +55,18 @@ on:
         options:
           - "builtin"
           - "secret"
+      home_orgs:
+        description: "Organisations (besides the owner) whose members count as the maintainers' organisation, comma-separated; 'none' for none"
+        required: false
+        default: "microsoft"
+      home_names:
+        description: "Company names meaning the maintainers' organisation in a public profile, comma-separated; 'none' for none"
+        required: false
+        default: "Microsoft"
+      home_email_domains:
+        description: "Commit email domains meaning the maintainers' organisation, comma-separated; 'none' for none"
+        required: false
+        default: "microsoft.com"
   schedule:
     # 07:00 UTC on the 1st and 15th of each month (trailing-14-day window).
     - cron: "0 7 1,15 * *"
@@ -252,13 +264,39 @@ jobs:
           REPO: ${{ steps.cfg.outputs.repo }}
           FROM: ${{ steps.cfg.outputs.from }}
           TO: ${{ steps.cfg.outputs.to }}
+          HOME_ORGS: ${{ inputs.home_orgs || 'microsoft' }}
+          HOME_NAMES: ${{ inputs.home_names || 'Microsoft' }}
+          HOME_EMAIL_DOMAINS: ${{ inputs.home_email_domains || 'microsoft.com' }}
         run: |
+          set -euo pipefail
           cd .claude/skills/activity-overview
           mkdir -p workspace
+          # Home settings for the people layer (who counts as the
+          # maintainers' organisation). Untrusted inputs: env only, each
+          # value checked before it becomes an argument.
+          home=()
+          add_home() {  # flag, comma-separated list, allowed pattern
+            local flag="$1" list="$2" pattern="$3" item
+            [ "$list" = "none" ] && return 0
+            IFS=',' read -ra items <<< "$list"
+            for item in "${items[@]}"; do
+              item="${item#"${item%%[![:space:]]*}"}"; item="${item%"${item##*[![:space:]]}"}"
+              [ -z "$item" ] && continue
+              if ! [[ "$item" =~ $pattern ]]; then
+                echo "::error::bad value for $flag: '$item'"; exit 1
+              fi
+              home+=("$flag" "$item")
+            done
+          }
+          add_home --home-org "$HOME_ORGS" '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$'
+          add_home --home-name "$HOME_NAMES" '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,60}$'
+          add_home --home-email-domain "$HOME_EMAIL_DOMAINS" '^[a-z0-9][a-z0-9.-]{0,100}$'
           python gather.py \
             --owner "$OWNER" --repo "$REPO" \
             --from "$FROM" --to "$TO" \
-            --store workspace/journey.db
+            --store workspace/journey.db \
+            --people workspace/people.json \
+            "${home[@]}"
 
       - name: Store sanity (gather produced a non-trivial graph)
         # The store holds exactly the live window (a fresh store per run), so
@@ -340,6 +378,8 @@ jobs:
           path: |
             .claude/skills/activity-overview/workspace/journey.db
             .claude/skills/activity-overview/workspace/view/bundle.json
+            .claude/skills/activity-overview/workspace/people.json
+            .claude/skills/activity-overview/workspace/people-activity.json
           if-no-files-found: warn
 
   spotlight:

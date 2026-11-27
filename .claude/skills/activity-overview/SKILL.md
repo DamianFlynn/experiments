@@ -81,6 +81,12 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
      `Azure/bicep-registry-modules`. The builds download and run the modules/providers the
      repo names: on a repo you do not trust pass **`--no-iac-build`** (builds skipped and
      recorded `skipped`; the static scan still runs).
+   - **PR-internal history.** gather also fetches each window PR's
+     `refs/pull/<N>/head` (blobless, in batches) to record the PR's own commits and, for
+     the most discussed PRs, the code comments / parameters added and removed between them
+     — the commits a squash merge hides (per-window fact `pr_history`, BUNDLE.md "The story
+     layer"). On a monorepo month this took about 40 s and 10 MB of clone (`docs/USAGE.md`
+     §5.6); **`--no-pr-history`** skips it.
    - **Roll-up / refresh are store-native.** A long view is a wider window over a store
      that holds its months (no separate roll-up artifact; its CI statistics are the sum of
      the gathered windows inside it, its structure the latest one's — `meta.facts_windows`).
@@ -167,7 +173,10 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    ```
    This adds `trains`, the four `buckets` (`shipped`, `rejected`, `in_flight`,
    `next_candidates`), `forecast`, `flow`, … and `series` (`new` / `carried_over` /
-   `forecast_loop`). The series file is a thin convenience index over the store — never an
+   `forecast_loop`), and — when the gather read the module change notes (changelogs,
+   version files, tags) — `module_changes`: new / changed / deprecated / removed /
+   orphaned modules, declared vs candidate breaking changes and product vs plumbing
+   (BUNDLE.md "Module changes"; `--path-class CLASS=GLOB` adjusts the file classes). The series file is a thin convenience index over the store — never an
    override; delete it to start a fresh series. For a one-off digest run
    `python3 link.py workspace/view/bundle.json` instead (no `series` key is added).
    Multi-repo: keep one series file per member (`workspace/series/<owner>__<repo>.json`).
@@ -194,7 +203,10 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    unvalidated. (A render that fails because mmdc cannot render at all prints the same
    one-line reason as the preflight; a diagram mmdc rejects is named with mmdc's error.)
 6. **Train slices** (read-only; one per train you narrate — at least every
-   `tier: "deep"` train). The bounded, self-contained evidence a per-train narrator reads:
+   `tier: "deep"` train and every story train, `story: true`, listed in
+   `bundle["stories"]`). The bounded, self-contained evidence a per-train narrator reads
+   (its `conversation` is the whole discussion as one timeline, with turning points marked —
+   the story material):
    ```bash
    python3 link.py workspace/view/bundle.json --slice <train-id> > workspace/view/<train-id>.slice.json
    ```
@@ -202,6 +214,16 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
    many deep trains, one narrator may take a batch of slices (one per month, or per up to
    8 trains), each slice handed over separately and each train's cited URLs checked
    against its own slice (`reference/report-sections.md` "Per-train narration", step 2b).
+   Story trains get the story brief (`reference/report-sections.md` "Stories (the story
+   brief)": a headline, the substance of each turning point, decisions from the slice's
+   `outcome` block, every thread closed or called open, dates with the year, and a closing
+   "Where it stands" / "What landed"); check each story against its slice before it goes
+   in the report:
+   ```bash
+   python3 link.py workspace/view/<train-id>.slice.json --check-story workspace/view/<train-id>.story.md
+   ```
+   (exit 0: every cited URL and every quoted string is in the slice, the first date has a
+   year, and the closing part states every issue / PR the story names).
 7. **Project view** (multi-repo only; skip for a single repo):
    ```bash
    python3 digest.py --store workspace/journey.db --project <name> --from FROM --to TO > workspace/view/project.json
@@ -242,6 +264,8 @@ gather stores **project = the manifest's `project`, repo = `owner/repo`** per me
      lifecycle, module graph, contributors, issue kinds) read each member's bundle view.
    - Embed each `bundle.diagrams` file (resolved against the parent of `--diagrams-dir`)
      as a fenced mermaid block, and ground each train's narrative in its slice.
+   - Story trains (`train.story`) get their story in the decision-trains section whatever
+     their tier, written to the story brief in `reference/report-sections.md`.
 
 ## Report rules
 

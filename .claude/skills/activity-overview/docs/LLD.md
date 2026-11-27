@@ -143,6 +143,12 @@ scratch store) and `backfill` respectively.
 | `--project-board` / `--no-project-board` | on | Projects v2 ingest |
 | `--structural-iac` | off (always on for manifest members) | Whole-tree static Terraform + Bicep dependency scan (§4.6) |
 | `--no-newcomers` | off (check runs) | Skip the first-time-contributor search (§4.7); the window's `newcomers` fact is `{"collected": false}`. `ACTIVITY_NEWCOMERS_MAX` (default 200, min 0) caps the candidates checked |
+| `--no-affiliation` | off (check runs) | Skip the contributor affiliation check (§4.7a); the window's `affiliations` fact is `{"collected": false}`. `ACTIVITY_AFFILIATION_MAX` (default 300, min 0) caps the people looked up |
+| `--home-org ORG`, `--home-name NAME`, `--home-email-domain DOMAIN` | the repo's owner only | Repeatable: extra home organisations (public membership, and a company name), extra company names, home commit email domains (§4.7a); a manifest's `affiliation` object adds the same lists |
+| `--affiliation LOGIN=A` / `@org/team=A` | none | Repeatable operator override (`maintainer_org` / `community` / `unknown`), highest priority; beats a manifest `affiliation.overrides` entry for the same key |
+| `--people PATH` | none (no registry) | The workspace's retained people registry (§4.7b): consulted before any lookup, updated by the gather (atomic, locked, merged with the file on disk); beats a manifest `people` (a path relative to the manifest) |
+| `--people-offline` | off | With a registry: no API call for people at all (no lookups, names or team expansion); the registry and the free signals decide |
+| `--people-refresh-days N` | 120 | Re-check a registry entry looked up more than N days ago (also `ACTIVITY_PEOPLE_REFRESH_DAYS`) |
 | `--no-iac-build` | off (builds run) | Do not run `bicep restore/build` / `terraform init/graph` (they download and run third-party code, §14.4); every area `edges_status: skipped`, `edge_extraction.disabled: true`. The structural scan still runs |
 | `--store PATH` | **required** | SQLite store |
 
@@ -179,6 +185,7 @@ sequenceDiagram
   A->>Git: log --name-status -M -C --reverse (file code_events)
   A->>Git: log -p --unified=3 --reverse (symbol events + bounded diffs)
   A->>A: fallback: drop unresolved boundary commits' diffs and files
+  A->>Git: rev-parse + cat-file per changed changelog / version.json (commit and parent), for-each-ref refs/tags (collect_module_notes)
   A->>Git: log --first-parent (window_end_commit)
   opt window end is not the head
     A->>Git: worktree add --detach (structure_tree; removed afterwards)
@@ -208,6 +215,11 @@ sequenceDiagram
   A->>REST: workflow runs
   opt not --no-newcomers
     A->>REST: search/issues per candidate first-time contributor (collect_newcomers)
+  end
+  opt not --no-affiliation
+    A->>A: people registry consulted first (--people; fresh entries cost no call)
+    A->>REST: orgs/{org}/public_members/{login}, users/{login} per person not decided for free (collect_affiliations)
+    A->>A: registry updated (people.Run.save)
   end
   A->>REST: releases, milestones
   opt token has read:project
@@ -305,6 +317,114 @@ sequenceDiagram
   capped at 200 chars (`_cap_snippet`).
 - **Bounded file diffs** (`bounded_file_diff`, `FILE_DIFF_CAP`/`FILE_DIFF_LINE_CAP`) ride the
   file-level code event so narrators read real changes without a clone.
+
+### 4.4a Module change notes (`collect_module_notes`)
+
+The per-window fact `module_notes` (BUNDLE.md "Module changes") is what the maintainers wrote
+about their modules in the window, read from the clone after the walks and the boundary fallback,
+only when the window's history is on disk:
+
+- **Which files.** Only the changelog / version files the window's file-level code events name
+  (added, modified, renamed or copied; a delete adds nothing): `CHANGELOG_FILE_NAMES`
+  (`changelog.md`, `changes.md`, `history.md`, `release_notes.md`, `releasenotes.md`, any case)
+  and `VERSION_FILE_NAMES` (`version.json`). A month of Azure/bicep-registry-modules touches tens
+  of its ~550 changelogs; nothing else is read.
+- **Per commit, not from the patch walk.** A 3-line-context hunk often lacks the `## <version>`
+  heading an appended item sits under, so the file is read at the commit and at its first parent
+  (`read_blob(rev, path)`; `<sha>^` at `old_path` for a rename, none for an add or copy) and the
+  two parses are compared (`changelog_added_entries`). Each entry is attributed to the commit
+  that added it, and so to its PR. The blobs are the ones the patch walk already fetched.
+- **Parsing** (`parse_changelog`, pure): an entry starts at a heading naming a version
+  (`_changelog_version`: `0.6.0`, `v1.2.0`, `[1.2.0] - date`, `[1.2.0](url)`, `Version 1.2.0
+  (date)`, `[Unreleased]`); the first such heading sets the entry level, a later heading at or
+  above it that names no version ends the entry, deeper headings are sections
+  (`changelog_section_kind`: breaking / deprecated / removed / security / fixed / added /
+  changed / other, the heading kept verbatim). Items: bullets at the line start (continuations,
+  nested bullets and a following fenced block belong to them) or paragraphs; link reference
+  definitions are skipped; placeholders (`changelog_placeholder`: "None", "N/A", "None (…)")
+  leave `items: []` and `placeholder`. Caps: `MODULE_NOTE_TEXT_CAP` 600 characters per item
+  (`truncated_from`), `MODULE_NOTE_ITEMS_CAP` 40 per section (`items_omitted`),
+  `MODULE_NOTE_ENTRIES_CAP` 12 per file per commit (`entries_omitted`).
+- **Comparison.** A version the parent lacks is added whole; a version both have contributes
+  only the items its same-heading section did not hold (`amended: true`); a file with no version
+  heading at all contributes its new bullets as one `version: null` entry.
+- **Versions.** `parse_version_file`: the top-level `version` of `version.json` before and
+  after; recorded when it moved.
+- **Tags** (`parse_version_tags`, pure, over one local `git for-each-ref refs/tags` with
+  `TAG_LIST_FORMAT`): a tag whose last segment is a version publishes the module path before it
+  (`""` = the root). Annotated tags are dated by their tagger (`date_source: "tagger"`),
+  lightweight ones by the tagged commit's committer date (`"commit"`), in UTC; the window's tags
+  are kept with `first` (no version tag of the module dated before the window). The bounded clone
+  fetches the tags that point into its history and, observed on Azure/bicep-registry-modules,
+  every tag of the repository (3,584, dated back to 2024), so listing them costs one local call
+  and no network. No tag → `{"collected": false, "reason": "the clone holds no tags"}`.
+- **Seams and gaps.** `read_blob` and `list_tags` are injected (production `git_blob_reader`:
+  `rev-parse --verify -q <rev>:<path>` — trees are local in the partial clone, so absence is
+  answered without the network — then `cat-file blob`; `git_tag_lister`). A blob git cannot read
+  raises `BlobUnreadable` and is listed in `unread` with the commit's date; nothing is guessed.
+- **Cost** (measured on Azure/bicep-registry-modules, blobs already local as after the patch
+  walk): October 2026 (541 code events, 20 changelog updates, 8 version moves, 19 tags) 0.4 s;
+  August–October (6,128 events, 115 changelog updates) 1.5 s. With the blobs not yet fetched
+  (a cold partial clone) 3–11 s for a month.
+
+gather prints one line (`module notes: <repo>: N changelog update(s), M version change(s), K
+version tag(s) in the window`) and the bundle carries `module_notes`; fold stores it as a
+per-window fact (`graphstore.WINDOW_FACT_KEYS`, §4.10), never as a singleton node.
+
+### 4.4b PR-internal history (`collect_pr_history`)
+
+The base-branch walk sees one commit per squash-merged PR (69 commits for 69 merged PRs in
+September 2026 on Azure/bicep-registry-modules). The per-window fact `pr_history` (BUNDLE.md
+"The story layer") records each kept PR's own commits and the comment / parameter changes
+between them. It runs after the PR listing (it ranks PRs by their human conversation) and
+after every base walk (the clone's shallow state is never changed for them), only with a
+clone and not with `--no-pr-history`. Every git call goes through `run` (default `run_git`,
+with its network retry); a refusal is recorded, never fatal.
+
+1. `git ls-remote origin refs/pull/*/head` once → `{number: head sha}`
+   (`parse_pr_head_refs`). A window PR without a ref is `missing`; a failed listing leaves
+   `error` and no rows.
+2. `git fetch --quiet --filter=blob:none --no-tags --no-write-fetch-head origin
+   +refs/pull/<N>/head:refs/remotes/pr/<N> ...` in batches of `PR_HISTORY_FETCH_BATCH` (100).
+   A plain fetch (no depth flags) into the shallow clone brings the commit and tree history
+   the heads reach, down to the root: about 8–10 MB for the whole Bicep monorepo, blobless.
+   `--shallow-exclude=<base>` was tried and rejected: the server cuts every PR branch at its
+   first merge from the base branch, losing the PR's earlier commits. A failed batch marks its
+   PRs `fetch_failed`.
+3. Each PR's commits: `git log --reverse --date-order --format=PR_COMMIT_FORMAT --name-only
+   --no-renames refs/remotes/pr/<N> --not HEAD <real parents of the shallow boundary>`
+   (`parse_pr_commits`). The walked branch is cut at the shallow boundary, so `--not HEAD`
+   alone would list the base-branch commits older than the boundary that a PR head reaches;
+   `_shallow_parent_exclusions` reads the boundary commits' real parents from the commit
+   objects (which keep them) and excludes those that exist locally. No commit at all →
+   `on_base` (a merge-commit merge). At most `PR_HISTORY_MAX_COMMITS` (250) per PR.
+4. Notes for the most discussed PRs — human comments + review comments > 0, ranked by that
+   count, at most `PR_HISTORY_NOTES_MAX_PRS` (40) per window, each of at most
+   `PR_HISTORY_NOTES_MAX_COMMITS` (60) commits: `git log PATCH_WALK_ARGS refs/remotes/pr/<N>
+   --not HEAD … -- '*.bicep' '*.tf'` through `parse_symbol_events` (the patch walk's own
+   extraction), keeping `PR_HISTORY_NOTE_SUBKINDS` (comment, todo, param, variable, output);
+   the newest `PR_HISTORY_NOTES_MAX` (400) per PR. Each diff is against the commit's first
+   parent, the first commit's parent being its base commit (present after step 2), so the
+   first commit's adds are the PR's initial state. Every other PR records `notes_skipped`.
+5. For the same walked PRs, the patch excerpts (`_collect_pr_patches`): `git log --reverse -p
+   --unified=0 --format=%x1e%H --no-renames refs/remotes/pr/<N> --not HEAD … --
+   PR_HISTORY_PATCH_PATHSPECS` (`*CHANGELOG.md`, `.github/`, `utilities/`, `.azuredevops/`,
+   `.pipelines/`, `pipelines/`) through `parse_pr_patches`: per commit and file the added /
+   removed lines (at most `PR_HISTORY_PATCH_LINES` 40, each at most 500 characters), the
+   newest within `PR_HISTORY_PATCH_CHARS` 8,000 per PR. This is what a reviewer's "this
+   would impact all the modules" is about and what the changelog said at each step; a
+   failed walk is `patches_skipped`.
+
+Step 3's format also carries each commit's message body (`%b`, closed by `\x1d` so its lines
+are not read as file names): `parse_pr_commits` keeps the file `paths` (at most
+`PR_HISTORY_PATHS_MAX` 60) and the `body` (`pr_commit_body`: trailer paragraphs dropped, at
+most `PR_HISTORY_BODY_CAP` 1,500 characters). A listing in the older format still parses.
+
+Cost (Azure/bicep-registry-modules, blobless clone shallow since 2026-07-25): September 2026,
+142 PRs — 41.6 s (ls-remote 0.4 s, fetch 2.2 s, log / diff walks 38 s, nearly all lazy blob
+fetches), `.git` 13.5 → 23.1 MB, 1,092 commits, notes for 40 PRs (2,456 events), fact JSON
+1.1 MB; October 2026 into the same clone, 160 PRs — 10.6 s, +1.2 MB. GitHub serves
+`refs/pull/*` to a partial clone without complaint.
 
 ### 4.5 Code areas
 
@@ -448,7 +568,8 @@ flowchart TB
 | Per issue | `issues/N/comments`, `issues/N/timeline` | paginated |
 | Commit author logins (#78) | `commits?sha=<clone HEAD>&since=<from−1d>&until=<to+1d>&per_page=100` | one listing, only when the window has commits; joined on SHA |
 | Workflows, releases, milestones | `actions/runs` (window), releases, milestones | window / state; runs split by day past GitHub's 1,000-result cap |
-| First-time contributors (`newcomers`) | `search/issues?q=repo:O/R is:<pr\|issue> author:<login> created:<<from>&per_page=1` → `total_count` | one call per candidate (author of a PR / reporter of an issue created in the window, bots and `ghost` excluded), a second for the other kind only when the first is 0; at most `ACTIVITY_NEWCOMERS_MAX` (200) candidates, the rest `not_checked`; a failed or `incomplete_results` answer → `unknown`; three failures in a row → the rest `unknown`; `--no-newcomers` → none (`{"collected": false}`) |
+| First-time contributors (`newcomers`) | `search/issues?q=repo:O/R is:<pr\|issue> author:<login> created:<<from>&sort=created&order=desc&per_page=1` → `total_count` and the first item's `created_at` (`last_seen_before`) | one call per candidate (author of a PR / reporter of an issue created in the window, bots and `ghost` excluded), a second for the other kind only when the first is 0 or its latest item is more than 90 days before the candidate's first item (a possible returning contributor); at most `ACTIVITY_NEWCOMERS_MAX` (200) candidates, the rest `not_checked`; a failed or `incomplete_results` answer → `unknown`; three failures in a row → the rest `unknown`; `--no-newcomers` → none (`{"collected": false}`) |
+| Contributor affiliation (`affiliations`, §4.7a) | `orgs/{org}/teams/{team}/members` per `@org/team` override; per person not decided by the override list or `author_association`: `orgs/{org}/public_members/{login}` per home org (204 / 404, `public_member_probe`), then `users/{login}` | at most `ACTIVITY_AFFILIATION_MAX` (300) people looked up, most active first, the rest `not_checked`; three people in a row whose lookups failed → the rest `not_checked`; answers cached per URL for the run (shared by a manifest's members); `--no-affiliation` → none |
 | Closing issues (#105), GraphQL | `repository { pr<N>: pullRequest(number: N) { closingIssuesReferences(first: 25) { nodes { number repository { nameWithOwner } } pageInfo { hasNextPage endCursor } } } }` | 50 kept PRs aliased per request; a PR with more than 25 closing issues is paged on its own (`first: 100, after:`) |
 | Projects v2 boards, GraphQL | §4.8 | maintained boards only, items capped |
 
@@ -503,6 +624,172 @@ the network):
   range is split by day and re-queried. A single day still at the cap is left truncated: a
   stderr warning, and `workflow_stats._truncated = {truncated, cap, fetched, total_count,
   ranges}` (a reserved key, present only then).
+
+### 4.7a Contributor affiliation and returning contributors
+
+**Affiliation (`collect_affiliations`, per-window fact `affiliations`).** `affiliation_people`
+lists the window's human people from the kept records (PR / issue authors, mergers,
+reviewers, comment authors, commit authors resolved to a login; bots, `ghost` and
+unresolved git names out), most active first, with the best home `author_association` seen on
+their own records. `affiliation_config` resolves the settings: home orgs = the repo's owner
+plus `--home-org` / manifest `affiliation.home_orgs`; home names = those orgs plus
+`--home-name` / `home_names`, normalised by `normalize_company`; home email domains;
+overrides (logins, and `@org/team` groups expanded by `resolve_affiliation_groups` through
+the team members listing; a group the token cannot list is `groups_unresolved`).
+`decide_affiliation` takes the first signal that decides: override (`operator`) →
+`author_association` OWNER / MEMBER (`strong`) / COLLABORATOR (`medium`) → public membership
+of a home org (`strong`) → profile company: a match `maintainer_org` (`medium`), a non-empty
+non-match `community` (`weak`) → home commit email domain (`medium`) → `unknown` (`none`, or
+`lookup_failed`). A failed lookup blocks a `community` decision from a weaker signal.
+`find_affiliations` applies the free signals to everyone and the looked-up ones to at most
+`ACTIVITY_AFFILIATION_MAX` people (`not_checked` beyond, and after
+`AFFILIATION_FAILURE_STOP` = 3 people in a row whose lookups failed). The network seam is
+`make_affiliation_lookup(get_page, cache)` over the gather's client: `lookup("public_member",
+login, org)` → bool / None and `lookup("company", login)` → text / None; the company text
+goes to `company_matches` and nowhere else. `_paginated` routes
+`orgs/{org}/public_members/{login}` to `public_member_probe` (no JSON body: 204 → member, 404
+→ not). Answers are cached per URL in `args.affiliation_cache` (one dict per gather run;
+`_gather_manifest` shares it across members, so a person active in several members is looked
+up once). There is no cross-run cache: a later window asks again, because the answer is
+GitHub's at gather time. The commit email is read in `resolve_commit_authors`
+(`home_domains`, `home_email`): only the resolved login of a commit whose email is in a home
+domain is noted; the email is dropped as before. Cost per person not decided for free: one
+call per home org (until one answers 204) plus one profile call. The entry stored per person
+is `{affiliation, signal[, strength][, home_email_domain: true]}` (with the registry also
+`name`, `maintainer`, `maintainer_signal`, `maintainer_status`: §4.7b).
+
+### 4.7b The people registry (`people.py`)
+
+**File.** `{"format": "activity-overview/people", "version": 1, "people": {login: entry}}`,
+one per workspace, shared by every stream (`--people` / manifest `people`; USAGE §2.1 puts
+it at `~/activity/people.json`). The activity profile added only optional fields
+(`first_evidence`, the owner's `"former"`), so the version stays 1 and an older file is
+read as it is. `parse_registry` checks every entry (`check_entry`: only `ENTRY_KEYS`; `login` repeats the key;
+label / signal / strength / maintainer signals from their lists; `maintainer_of` values
+true / false / `"former"` / `{maintainer, signal, strength, first_evidence,
+last_evidence}`; dates `YYYY-MM-DD`; two keys equal ignoring case refused) and raises
+`RegistryError` naming the file and the entry; `load_registry` of a missing file is empty.
+`dumps` is `sort_keys`, indent 2, `ensure_ascii=False`, trailing newline; `write_registry`
+writes a temporary file in the
+same directory and `os.replace`s it, and skips the write when the text is unchanged;
+`update_registry(path, patches, windows)` holds an `fcntl` lock on `<path>.lock`, re-reads
+the file and applies the patches over it, and folds `windows` into the activity file
+(`activity_path`: `people.json` → `people-activity.json`) re-read under the same lock.
+
+**The activity file** (`ACTIVITY_FORMAT`, version 1; checked by `check_activity`, written by
+`write_activity` / `dumps_activity`: sorted keys, objects and lists of scalars on one line).
+`window_contributions(prs, issues, commits, frm, to, newcomers)` (pure) turns one window's
+records into `{login: {months, first, last, first_ever?}}` and stats, counting only events
+dated in `[frm, to]`: commits (resolved logins only; unresolved git authors are counted in
+stats), PRs opened, PRs merged (author), merges (merger; `merges_others` when not the
+author), reviews on others' PRs (`approvals`; `approvals_merged` once per merged PR),
+issues, comments; first / last per event as `[day, number | sha]` (ties by reference);
+`first_ever` = `newcomers.before` for a `new` login; `seen_before` = the earliest day
+before `frm`. `fold_window(activity, slug, frm, to, contributions, stats, stream, source)`
+(pure) replaces every record of the window key `FROM..TO` for the repository, records the
+window in `repos[slug].windows`, keeps `seen_before[login][slug]` as a min, drops empty
+records, and `_fold_old_windows` moves windows ending before the `months_kept` (36) cutoff
+into one `before` record per person and `repos[slug].before` {from, to, windows};
+`window_is_folded` skips a window inside that range. Derivations (pure): `coverage`
+(merged intervals, gaps, gathered days, gathered months), `_month_choice` (per month the
+windows that count: most days of the month first, then any that does not overlap a chosen
+one), `repo_profile` (totals and `by_month` over the chosen windows, firsts / lasts over all,
+`first_pr_ever` / `first_issue_ever` when the earliest observed PR / issue is in a window
+with `first_ever`, `seen_before` when outside every interval, `rates` over the last 3 / 6 /
+12 gathered months, `trend` (k = min(3, n // 2): recent vs prior activity, 1.25 / 0.75),
+contributor status by `_lifecycle` plus `returned` (≥ `ACTIVE_DAYS // 30` gathered months
+without activity between two active months), `maintainer_status` (owner true → active,
+`"former"` → former; evidence → `_lifecycle` with `former_days` over the later of the
+evidence's `last_evidence` and the activity file's last merge / approval, both as of;
+`former` makes `maintainer` false; `merges_others` / `approvals_merged` totals),
+`cross_project`, `writer_context` and `registry_stamp`. `_lifecycle(last, coverage)`:
+active within `active_days` (183) of the latest gathered day; else `unknown` when fewer than
+`GATHERED_SINCE_MIN_DAYS` (90) days were gathered after `last`; else `former` beyond
+`former_days` (548, maintainers only); else `lapsed`. `thresholds(env, ...)` reads
+`ACTIVITY_PEOPLE_ACTIVE_DAYS` / `ACTIVITY_PEOPLE_FORMER_DAYS` (gather checks them up front).
+
+**Patches and the operator.** A run never writes entries directly: it accumulates patches per
+login (`seen` [(date, repo)], `label`, `name`, `looked_up_at`, `maintainer` {repo: evidence};
+`merge_patch`) and `apply_patch` applies them: `first_seen` / `last_seen` always (min / max);
+`label`, `name`, `maintainer` only when the field is not `is_locked` (entry `source:
+"operator"`, `locked: true`, or the field in the `locked` list); a plain bool or `"former"`
+in `maintainer_of` is the operator's and is skipped; a stronger maintainer signal is never
+replaced by a weaker one (`MAINTAINER_SIGNALS` order), `first_evidence` is the earliest and
+`last_evidence` the latest; `tags`,
+`do_not_name` and `note` are never written; a `do_not_name` entry never gets a name. A new
+entry has `source: "lookup"`.
+
+**At gather time** (`gather.people_run_from_args` → `people.Run`, kept on `args.people_run` so
+a manifest's members share it; created in `main` before the store opens, so a malformed
+registry fails first). `collect_affiliations(..., people_run)` calls
+`find_affiliations_registry`: first the window's seen dates (`people.activity_dates`) and
+maintainer evidence (`people.maintainer_evidence`, `until` the window's end) are patched in
+for every person and the window is recorded in the activity profile
+(`Run.record_window(slug, from, to, records, newcomers, stream)`: `window_contributions` +
+`fold_window` in memory, folded into the file by `Run.save`; `stream` is a manifest's
+project), then per
+person: `do_not_name` → `{unknown, do_not_name}`, no call; the override list /
+`author_association` (free; an `author_association` label is patched in); a registry label
+locked by the operator → signal `override` (`operator`); `lookup_state` `fresh` → the stored
+label (`_reused_entry`: an `unknown` one with a home commit email becomes
+`commit_email_domain`), no call; `never` → `decide_affiliation` with the seam (within
+`ACTIVITY_AFFILIATION_MAX`); `stale` → the same, for the `Run.refresh_left` oldest lookups of
+the window; otherwise a stale label is reused, else the commit email, else `{unknown,
+not_checked}`. A lookup that answers patches `label` (`_registry_label`: the GitHub-data
+decision, never the per-window commit email or a failure), `looked_up_at` and the name
+(`lookup("name")`, read from the cached `users/{login}` answer: `make_affiliation_lookup` now
+caches `{company, name}` per users URL); a failed lookup patches nothing. Then the name pass:
+people without a name and never looked up, the newcomers (`name_first`) first, then by
+activity, at most `Run.names_left` profile calls. Last, every entry but `do_not_name` gets
+`name` (`people.display_name`) and `maintainer` / `maintainer_signal`
+(`people.maintainer_for(entry, "owner/repo")`: the operator's bool → `operator`, `"former"`
+→ `false` / `operator`; evidence → its signal; nothing → `false` / `none`) and, when the
+registry holds maintainer evidence there, `maintainer_status` (`Run.maintainer_status`;
+`former` sets `maintainer` false). `acquire` calls `Run.save()` after the fact is
+built (before the fold). `lookup_state`: `never` without `looked_up_at` or label; `fresh`
+when younger than `refresh_days` (decided) or `unknown_retry_days` (`unknown`); else
+`stale`. Offline (`--people-offline`): no seam, no team expansion, no name pass.
+
+**Maintainer evidence** (`maintainer_evidence(prs, issues, until=None)`, pure; evidence
+dated after `until` is left out): per merged PR, the merger
+→ `merged_others_pr` (author differs) or `merged_own_pr`; approving reviews (state
+`approved`, not by the author) of merged PRs counted per reviewer, `approving_reviewer` at
+`APPROVALS_MIN` = 3; `author_association` OWNER / COLLABORATOR on a person's PR, issue or
+comment records → `OWNER` / `COLLABORATOR`; bots and `ghost` out; the strongest signal wins
+(`MAINTAINER_SIGNALS`), `first_evidence` / `last_evidence` the earliest / latest day seen.
+`MEMBER` is not used.
+
+**Seeding** (`python3 people.py seed | update --people PATH STORE... [--stream NAME]`):
+`store_records` reads each store read-only (PR / issue social nodes with their `review-*`
+nodes attached, resolved commits, the window ledger with each window's `newcomers` fact,
+and any stored `affiliations` facts) per repository; `seed_patches` patches the seen dates,
+the maintainer evidence (`until` the latest window end), an `author_association` OWNER /
+MEMBER / COLLABORATOR label and a stored fact's GitHub-data label (no `looked_up_at`);
+`seed_windows` gives one `fold_window` per ledger window (source `seed`; stream: `--stream`,
+else a manifest store's project); one `update_registry`. `summary` prints `summarize`:
+people, labels, named / tagged / `do_not_name`, lookup states, the maintainers per
+repository by signal and by status, coverage, newcomers by month, the busiest people (rate
+over the last 3 gathered months) and the people in more than one repository. `show LOGIN`
+prints `show` (the entry, `repo_profile` per repository, `cross_project`); `check` prints
+`check_files` (errors: a file the skill would refuse; warnings: activity without an entry,
+coverage gaps) and exits 1 on an error.
+
+**Registry context in a view** (`link.py VIEW --people PATH`): `people.load_view_source`
+reads both files (the registry must exist) and the thresholds; `link.enrich(...,
+people_source)` ends with `build_people_context`: for `_named_people` (contributors'
+newcomers and hall, `halls.fame`, story trains' `_train_logins`, authors of PRs that
+introduced a module; bots and `do_not_name` out) `people.writer_context(registry, activity,
+login, "owner/repo", as_of=meta.to)`, plus the stamp, thresholds and this repository's
+coverage, as `people_context`. `slice_participants` adds each participant's entry as
+`registry_context`. Without `--people`, `people_source` is None and nothing changes.
+
+**Returning contributors (`find_newcomers`).** The search URL sorts by `created` descending,
+so `search_latest_created` reads the most recent earlier item from the same `per_page=1`
+answer. A candidate whose first-kind latest item is more than `RETURNING_GAP_DAYS[0]` (90)
+days before their first window item gets the other kind searched too (the gap is to the most
+recent earlier PR or issue); otherwise the call count is unchanged. Classes: `new` (none),
+`returning` (`gap_days` > 90; `gap_bucket` by `RETURNING_GAP_BUCKETS`: over 3 / 6 / 9 months;
+`gap_upper_bound` when the second search failed), `regular`, `earlier_undated`.
 
 ### 4.8 Projects v2 boards
 
@@ -589,7 +876,8 @@ fold that carries code/symbol events (linear in ledger size; ~0.5 s at 60k rows)
 fold also calls `graphstore.set_window_facts(project, repo, from, to, bundle, clone_sha)`:
 meta `facts:{p}/{r}:{from}:{to}` = `{clone_sha, facts: {key: sha256}}` for each non-empty
 `workflow_stats` / `code_graph` / `code_owners` / `label_taxonomy` / `newcomers` (the
-first-time contributors, §4.7; per-window only, no singleton node), each value stored once per
+first-time contributors, §4.7) / `module_notes` (§4.4a) — the last two per-window only, no
+singleton node — each value stored once per
 repo under `fact:{p}/{r}:{sha256}` (shared by windows with identical values; a re-fold of the
 window replaces its entry and unreferenced values are deleted). Keyed by window, not clone
 sha: the directory code graph is built from the window's changed paths, so two windows of one
@@ -864,7 +1152,19 @@ to write a whole fold (nodes, edges, code events, FTS, `gathered_windows`, `clon
    its stored value verbatim; any other window → merged over the gathered windows wholly
    inside the view that collected one, not overlapping one another (`_merged_newcomers`:
    `new` keeps each login's earliest entry, `unknown` / `not_checked` the unions less the
-   logins found new, plus `windows` and `covers_view`). When any record was projected,
+   logins found new, `returning` / `regular` with the earliest window's class winning, plus
+   `windows` and `covers_view`). `affiliations` (omitted when no gather stored it, §4.7a):
+   exactly a gathered window → verbatim; any other → `_merged_affiliations`, per person the
+   latest overlapping window's entry, `unknown` / `not_checked` recomputed, plus `windows` /
+   `covers_view`. `prior_activity` (only when the view's `newcomers` names a first-ever or
+   returning contributor): `_prior_activity` counts, from every stored social record of the
+   repo, the PRs / issues they authored, reviews they submitted and comments they wrote dated
+   before `newcomers.before`, with `store_from` (the earliest gathered window start).
+   `module_notes` (top-level key, omitted
+   when no gather stored it, §4.4a): exactly a gathered window → its stored value verbatim; any
+   other window → the dated items of every gathered window overlapping the view that fall in
+   it, once each (`_merged_module_notes`: changelogs / versions / unread by (path, commit), tags
+   by name), plus `windows`, `covers_view` and `tags.windows_without_tags`. When any record was projected,
    `meta.gathered_at` = the latest `fetched_at` of the view's PR / issue nodes (when they were
    gathered; validation finding 8). Window scope:
    each artifact's `lifecycle` keeps the view's events (same predicate as the ledger rows) and
@@ -967,6 +1267,7 @@ flowchart TB
   k --> l["annotate_review_rounds + annotate_reopen_count"]
   l --> m["derive.annotate_people_profile + derive.build_halls"]
   m --> n["derive.build_flow + derive.build_blockers"]
+  n --> o["build_module_changes (only with module_notes)"]
 ```
 
 Order matters: significance needs code areas; forecast needs buckets and milestones; people
@@ -1155,6 +1456,67 @@ deltas in order, a `diff` is kept only if `used + len(diff) <= SLICE_DIFF_CAP` (
 total never exceeds the cap; a diff that does not fit is omitted (the delta stays listed) and
 counted in `feature_deltas_diff_overflow`. BUNDLE.md documents every slice key; a docs-contract
 test (`test_link_small_fixes.py`) compares it with `slice_train`'s output.
+Since the story layer every slice also carries `conversation` (§6.8a), and the `train` block
+the train's `discussion` / `story*` keys when present.
+
+### 6.8a The story layer — discussion, selection, material
+
+Runs last in `enrich` (after `build_module_changes`, whose PR classes and module statuses it
+reads), over the as-of-projected records:
+
+```
+annotate_train_discussion  → trains[].discussion   (train_discussion; omitted without
+                                                     human conversation)
+select_story_trains        → trains[].story, story_rank, story_score, story_reasons
+                             + bundle.stories {selected, more, rule}   (omitted when none)
+slice_train                → slice.conversation = story_material(bundle, train)
+```
+
+- **`train_discussion`** counts human comments / review comments (bots by
+  `derive.is_bot_login`), participants, reviews by state (the PR author's own excluded; an
+  empty `commented` review — a review-thread wrapper — not counted), review rounds, reopens,
+  text volume, `in_window` turns, first response, the longest gap between consecutive human
+  events (PR-history commits as of the window's end included), change requests and — with
+  the PR history for each — whether a commit followed each.
+- **`story_score`** (BUNDLE.md table): discussion points (conversation, in-window turns,
+  participants, change requests, reopens, extra review rounds, a silence over 14 days, text
+  volume) + relevance (kind; the module layer's new module / breaking items; in flight).
+  Eligibility: ≥ 3 turns, ≥ 2 participants, score ≥ 8; a plumbing train
+  (`_train_plumbing`: every merged PR `plumbing` or a `sweep` in `module_changes.prs`;
+  without it, a chore / docs / other train over more than 10 areas) needs discussion points
+  ≥ 15. Top 8 by (score desc, id). Additive: `tier` and every existing key are unchanged
+  (the deep tier keeps its consumers: flowcharts, the deep-train narrative), so no golden
+  changes except a train that gains `discussion` (char_bundle_p3: one train).
+- **`story_material`** builds the timeline (opened / comment / review_comment / review /
+  lifecycle / merged / closed / commit), sorts it by (time, kind order, url), attaches
+  `train_code_notes` to commit items (base commits from the view's symbol events, PR commits
+  from `pr_history` notes; `comment_class` drops banners; priority-ordered within
+  `STORY_CODE_NOTES_BUDGET`), applies `_apply_story_budget` (per-item cap, then the largest
+  common ceiling ≥ `STORY_ITEM_FLOOR` found by bisection, then whole texts omitted from the
+  middle outward; every cut recorded), and marks `story_turning_points`.
+- **The substance** (what a reader needs beyond who said what when): each review comment
+  carries its stored context (`path`, `line`, `diff_hunk`, `in_reply_to`; hunks within
+  `STORY_HUNK_BUDGET`); each commit item a `change_summary` (files by `path_class`, modules,
+  `shared`, interface rows from the PR notes / symbol events, the changelog / shared-file
+  patch lines) and, for a PR commit, its message body as `text` (inside the text budget);
+  `_rework_detail` adds what changed after each change request. `story_outcome` builds the
+  outcome block — items with their state, verdicts and outstanding change requests,
+  `ball_with` / `_issue_ball` (who the next move is with, rules R1–R4 / I1–I3, derived from
+  the event sequence only), the linked items named in the texts (`_linked_items`, with
+  title, state and description), `waiting_on`, the module layer's entries for shipped work
+  (`_outcome_modules`: changelog items verbatim, versions, interface names, breaking) and an
+  open PR's `net_change` (`_net_lines`: lines net of the PR's own reverts). `story_threads`
+  builds the open-threads ledger (review threads, change requests, questions) with a status
+  by rule (`_signal_rank`). `_story_gaps` names what an older store cannot show.
+- **`check_story_evidence(slice, text)`** — the mechanical narrative check (CLI
+  `link.py SLICE --check-story STORY`): cited URLs must be slice values or occur in slice
+  texts; quoted strings (`"…"` / `“…”`, ≥ 4 characters) must occur in a slice text,
+  whitespace-normalised; and `check_story_structure`: the first date in the prose carries a
+  year, the story ends with "Where it stands" (in flight) / "What landed" (shipped), and
+  every issue / PR number it names (`#N` or a link to the repository's item) is named
+  again there with a state word that matches the slice's outcome block (in the clause from
+  the number to the next one, else its sentence). It cannot judge substance, fairness or
+  whether every thread is closed: those stay with the writer.
 
 ### 6.9 Series — `series.py` via `link.py BUNDLE --series series.json`
 
@@ -1222,6 +1584,66 @@ written (the index is never silently discarded). The bundle is written first and
 second, each atomically (`<path>.tmp` + `os.replace`, #82): an interrupted write leaves the
 previous file intact, and a run that cannot write its bundle records no installment.
 
+### 6.9a Module changes — `build_module_changes(bundle, path_rules=())`
+
+The last enrich step; a no-op unless the bundle carries `module_notes` with `collected: true`
+(so every fixture and every pre-existing store's view is unchanged). Pure over the bundle:
+its inputs are the view's commits, code events, symbol events, `symbol_moves` (built earlier
+in enrich), PRs, trains, releases and code graph, and the stored `module_notes` — no new
+state. Shape and rules: BUNDLE.md "Module changes". Steps:
+
+1. **Module areas.** `area_index(code_graph)` maps each path to its area (falling back to
+   `gather.classify_code_area` with the default patterns for a path the graph lacks, e.g. a
+   tag's module). `module_kind` decides which areas are modules and of what kind
+   (resource / pattern / utility from `avm/<kind>/…`; `module` for the Terraform root or a
+   dir with `*.tf`; `submodule` for `modules/<name>`; `deployment` for a Bicep dir outside
+   `avm/` with its own `main.bicep`), over every path the view saw.
+2. **Per module** (`_module_entry`): the commits' files (classes by `path_class`), the code
+   events of the entry file (`main.bicep` / `main.tf`: add → new, delete or rename away →
+   removed), of child `main.bicep` files (added / removed / moved / modified) and of
+   `DEPRECATED.md` / `ORPHANED.md` (module root → status; child dir → child row); the symbol
+   events of the interface file, netted over the window (`_net_symbols`) and summarised
+   (`_interface_summary`: parameters with `required` from the declaration, outputs, resource
+   API versions, module dependencies by ref); the notes' changelog entries, version moves and
+   tags of the area (child files under the area carry `module`).
+3. **Breaking**: `declared` = items of sections of kind `breaking`, verbatim; `candidates` by
+   rule (removed / moved parameter or output, new or newly required parameter, removed or
+   moved child module, removed module); none for a new module.
+4. **PR classes** (`classify_pr_change`) for every PR merged in the window into the base
+   branch, from the files of its commits in the view; sweep detection (`SWEEP_MIN_AREAS` = 5);
+   plumbing.
+5. **Summary** (`_module_summary`): status counts, new modules (with the PRs that introduced
+   them), new child modules, declared breaking, candidates, deprecations, orphaned, removed,
+   `most_substantive` (top `MODULE_RANK_TOP_N` = 10 by `_product_score`) and the plumbing
+   share.
+
+Sources: every item cites `{commit, pr?, url, path}` (`_ModuleCtx.source`: the PR url when
+the commit names a PR, else the commit url). Deterministic: every list has an explicit sort
+or follows the stored order; `test_module_changes.py` enriches a key-reversed bundle to prove
+key order does not matter.
+
+### 6.9b The people layer — `build_contributors(bundle, path_rules=())`
+
+Last step of `enrich`, only when the view carries a collected `affiliations` or `newcomers`
+fact (BUNDLE.md "The people layer"). `_module_layer` takes the view's `module_changes`, or
+builds the same over a shallow copy with an empty `module_notes` (`code_events_only`: status
+`new` from an added entry file only). `_contribution_index` maps each PR to the modules it
+touched (area, kind, status, `role` introduced / changed, `first_version`) and to the
+changelog entries its commits added (items verbatim, at most 5). `person_contributions`:
+the person's PRs merged in the window (rows of `module_changes.prs`: class, sweep), newest
+first, then their open PRs (`headline: unknown`: no file list), at most 10. `headline` =
+`new_module` when a module row is `introduced`, else from the PR class (`ci` / `docs-only` /
+`tests-only` → `plumbing`, `release`, `module` / `mixed` → `module_change`, `unknown`).
+`person_reviews`: PRs reviewed and the module areas of the merged ones.
+`_affiliation_summary`: people per label, signals, merged PRs by author label and reviews
+(reviewer-PR pairs) by reviewer label, with shares of the human total, `unknown` separate and
+`bots_excluded`, plus `maintainers` (`_maintainer_summary`, only when people carry the
+maintainer property: maintainer / non_maintainer / unknown, by signal, crossed with the
+label, and the maintainers' logins). `_community_summary`: `community`-labelled people
+only. Rows that name a person (newcomers, hall, `halls`, a slice's `participants` from
+`slice_participants`) copy `derive.person_labels` (name, maintainer, maintainer_signal) when
+the person carries them. Pure; no call.
+
 ### 6.10 `derive.py` projections
 
 | Function | Output | Rule highlights |
@@ -1234,7 +1656,8 @@ previous file intact, and a run that cannot write its bundle records no installm
 | `unresolved_person_key` | person key | the git name of a commit author gather could not resolve to a login, `+ " (git)"` when login-shaped, so it never equals a login (#78) |
 | `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*`; git-name forms `GitHub Actions`, `Dependabot`, `Dependabot Preview`, `Renovate`, `Renovate Bot` (case/space-insensitive), each also with the `" (git)"` suffix |
 | `annotate_people_profile` | per-login metrics | prs authored (in scope) / opened in the window (`prs_opened`, when the view holds an earlier PR) / merged / reviewed, merge rate, commits and `own_pr_commits` (landing commits of their own merged PRs, when not 0), review latency (median), first/last active, examples/docs/symbols authored |
-| `build_halls` | `halls.fame` | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored − own_pr_commits` (a commit landing the person's own merged PR is not counted again), top 10; **no shame/blame** |
+| `annotate_people_affiliation` | `people[].affiliation` / `affiliation_signal` (+ `name`, `maintainer`, `maintainer_signal` when the entry has them: `PERSON_LABEL_KEYS`) | only with a collected `affiliations` fact: the fact's entry, else `unknown` with `not_checked` / `not_looked_up`; bots untouched |
+| `build_halls` | `halls.fame` (+ `community`, `maintainer_org`, `unranked_unknown`) | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored − own_pr_commits` (`hall_score`; a commit landing the person's own merged PR is not counted again), top 10; when people carry `affiliation`, the same ranking within `community` and within `maintainer_org`, and how many scoring people are `unknown` (never ranked); **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
 | `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (`blocker_graph` applies the same open-only filter, #101) |
 
@@ -1555,7 +1978,11 @@ combines disjoint parts: counts (`derive.PROFILE_COUNT_FIELDS`) are summed; `mer
 recomputed from the sums; `review_latency_days` is the median of every member's samples
 (`derive.review_latency_samples` over each member's PRs, the samples
 `annotate_people_profile` takes the median of); `first_seen`/`last_active` are the min/max;
-`modules`/`areas` become `"<repo>::<area>"`; `is_bot` is OR'd, `login_resolved: false` wins.
+`modules`/`areas` become `"<repo>::<area>"`; `is_bot` is OR'd, `login_resolved: false` wins;
+`affiliation` / `affiliation_signal` come from the member record with the most decisive
+signal (`derive.affiliation_rank`: `AFFILIATION_SIGNAL_ORDER`, a known label before unknown);
+`name` from the first member that has one; `maintainer` true when any member says so (that
+member's signal) with `maintainer_of` listing those members, else the first member's.
 `halls` is `derive.build_halls` over the merged people. Nothing is stored: the person nodes
 stay the fold's union, which `validate`'s `no_drift_people` checks.
 
@@ -1645,6 +2072,11 @@ diff-stable.
 | `ACTIVITY_HTTP_RETRIES` | 3 | Extra attempts on timeout / connection error / 5xx |
 | `ACTIVITY_RATE_LIMIT_MAX_WAIT` | 3600 | Longest single rate-limit wait in seconds (`0` = fail instead of waiting) |
 | `TF_PLUGIN_CACHE_DIR` | unset | Shared terraform provider cache (enables serial pre-warm) |
+| `ACTIVITY_AFFILIATION_MAX` | 300 | People looked up for the affiliation check per window (min 0; the rest `not_checked`) |
+| `ACTIVITY_PEOPLE_REFRESH_DAYS` | 120 | People registry: a decided label is reused this long after its lookup (min 1; `--people-refresh-days`) |
+| `ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS` | 30 | People registry: an `unknown` label is retried after this long (min 1) |
+| `ACTIVITY_PEOPLE_REFRESH_MAX` | 50 | People registry: stale entries refreshed per run, oldest first (min 0) |
+| `ACTIVITY_PEOPLE_NAME_MAX` | 30 | People registry: profile calls per run made only for a display name (min 0) |
 | `ACTIVITY_BOARD_STALE_DAYS` | 365 | Board treated as deprecated beyond this |
 | `ACTIVITY_BOARD_MAX_ITEMS` | 5000 | Per-board item cap |
 | `ACTIVITY_MMDC_PUPPETEER_CONFIG` | unset | Puppeteer config file passed to `mmdc -p` (as root without it: generated `--no-sandbox` config) |
@@ -1675,6 +2107,16 @@ timeouts and workers, 0 for retries and max wait) is clamped with a warning.
 | `TIMELINE_MAX_DAYS` / `TIMELINE_MAX_EVENTS_PER_DAY` | 40 / 8 | render |
 | `TRAIN_FLOW_MAX_PR_NODES` / `PIE_MAX_SLICES` | 60 / 10 | render |
 | `DEFAULT_AREA_PATTERNS` | §4.5 | gather |
+| `CHANGELOG_FILE_NAMES` / `VERSION_FILE_NAMES` | §4.4a | gather |
+| `MODULE_NOTE_TEXT_CAP` / `_ITEMS_CAP` / `_ENTRIES_CAP` | 600 / 40 / 12 | gather |
+| `DEFAULT_PATH_CLASS_RULES` | BUNDLE.md "Module changes" (override: `link.py --path-class CLASS=GLOB`) | link |
+| `SWEEP_MIN_AREAS` / `MODULE_RANK_TOP_N` | 5 / 10 | link |
+| `RELEASE_NOTES_CAP` | 4000 | gather |
+| `PR_HISTORY_FETCH_BATCH` / `_MAX_COMMITS` | 100 / 250 | gather |
+| `PR_HISTORY_NOTES_MAX_PRS` / `_NOTES_MAX_COMMITS` / `_NOTES_MAX` | 40 / 60 / 400 | gather |
+| `STORY_MIN_EXCHANGES` / `STORY_MIN_SCORE` / `STORY_TOP_N` / `STORY_PLUMBING_MIN` | 3 / 8.0 / 8 / 15.0 | link |
+| `STORY_SILENCE_DAYS` / `STORY_REWRITE_HOURS` | 14 / 24 | link |
+| `STORY_ITEM_CAP` / `STORY_SLICE_BUDGET` / `STORY_ITEM_FLOOR` / `STORY_CODE_NOTES_BUDGET` | 5000 / 40000 / 500 / 12000 | link |
 
 ## 14. Cross-cutting concerns
 
@@ -1717,7 +2159,14 @@ release/milestone pages + ⌈commits on the branch in [from−1d, to+1d] / 100�
 the commit-author login listing, #78; zero for a window with no commits), plus 1–2 search calls
 per candidate first-time contributor (`newcomers`, capped by `ACTIVITY_NEWCOMERS_MAX`; the search
 API's own limit is 30 requests a minute, waited out like any rate limit; `--no-newcomers` skips
-them). Because **all open PRs and issues** are included every run, busy
+them; a possible returning contributor costs one more), plus, for the affiliation check
+(§4.7a), per person not decided by the override list or `author_association`: one
+public-membership call per home org (until one answers 204) and one profile call, capped by
+`ACTIVITY_AFFILIATION_MAX` and cached per URL for the run (`--no-affiliation` skips them; a
+September of Azure/bicep-registry-modules has about 230 people: with two home orgs and no
+free signal for most, up to about 660 core-API calls; with the people registry (§4.7b) only
+the first gather pays that: later ones call for new people, at most 30 names and at most 50
+refreshes). Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (a personal token's authenticated limit is 5,000 requests/hour; the
 workflow's built-in `GITHUB_TOKEN`, which the CI live jobs use by default, has a lower limit
 that its runs in one repository share, so a live gather in CI is likelier to wait for the
@@ -1733,6 +2182,8 @@ GraphQL (a separate 5,000-point/hour budget): the closing-issue read costs ⌈ke
 requests — 2 per 100 PRs — of 1 point each (50 connections of 25 nodes), plus one per extra
 page of a PR with more than 25 closing issues (#105); the board read is §4.8.
 (A reused `--clone-dir` is fetched rather than re-cloned.)
+The module change notes (§4.4a) cost no API call: two blob reads per changed changelog /
+version file and one local tag listing, about 0.5–1.5 s on Azure/bicep-registry-modules.
 
 ### 14.4 Security
 
@@ -1852,7 +2303,9 @@ these affect an accumulated store.
   check), `test_gather.py` (parsers, fold, IaC parsing incl. modern/legacy DOT),
   `test_digest.py` (cross-repo trains, module edges), `test_series.py`,
   `test_window_scoped_views.py` / `test_window_facts.py` / `test_retraction.py` (multi-window
-  stores), `test_view.py` (the `SKILL.md` / `commands/activity.md` docs contract: every
+  stores), `test_module_notes.py` / `test_module_changes.py` (changelog parsing on fixture
+  excerpts, the git seams on a throwaway repo, window scope, the module view and PR classes on
+  a synthetic window shaped like real October 2026 data), `test_view.py` (the `SKILL.md` / `commands/activity.md` docs contract: every
   documented command names a real script and accepted flags), `test_report_template.py`
   (template placeholders against real view output), `test_suite_hygiene.py` (every test is
   collectable by `unittest`; no conflict markers in skill files; no test writes to stdout —
@@ -1914,6 +2367,7 @@ these affect an accumulated store.
 |---|---|---|
 | New repo layout → areas | add `(name, fn)` to `DEFAULT_AREA_PATTERNS` (order matters) | area ids appear in stored nodes; re-gather after changing |
 | Org priority labels | `link.py --priority-label PATTERN` per run; defaults in `link.PRIORITY_LABEL_PATTERNS` / `HIGH_PRIORITY_LABELS` | patterns are case-insensitive regular expressions (searched); an invalid one is a usage error |
+| Repo layout for product vs plumbing | `link.py --path-class CLASS=GLOB` per run (classes `source`, `tests`, `docs`, `generated`, `metadata`, `ci`); defaults in `link.DEFAULT_PATH_CLASS_RULES` | first match wins, the operator's rules first; recorded in `module_changes.path_rules`; a malformed rule is a usage error |
 | Forecast / significance tuning | constants in `link.py` | tests pin thresholds; update tests + BUNDLE.md |
 | New view field | compute in `link.enrich` or `derive` (pure) | append-only; document in BUNDLE.md; omit when empty |
 | New stored fact | `fold_bundle` + `extract` reader + `validate` conformance | must keep `no_drift` and characterization green |

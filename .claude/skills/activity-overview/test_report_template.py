@@ -366,6 +366,18 @@ def _with_newcomers(bundle):
         "new": [{"login": "alice", "first": "pr", "number": 7,
                  "url": url + "/pull/7", "created_at": "2026-05-02T00:00:00Z"}],
         "unknown": ["bob"], "not_checked": []}
+    # and its contributor affiliation fact (the people layer): one person of
+    # each label, so the halls by affiliation are filled
+    b["affiliations"] = {
+        "collected": True, "home_orgs": [b["meta"]["owner"]],
+        "home_names": [b["meta"]["owner"].lower()], "home_email_domains": [],
+        "people": {
+            "alice": {"affiliation": "community", "signal": "profile_company",
+                      "strength": "weak"},
+            "carol": {"affiliation": "maintainer_org",
+                      "signal": "author_association", "strength": "strong"},
+            "bob": {"affiliation": "unknown", "signal": "none"}},
+        "unknown": ["bob"], "not_checked": []}
     return b
 
 

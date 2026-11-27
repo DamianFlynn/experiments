@@ -503,6 +503,29 @@ check; every fixture bundle):
   checked).
 - `{"collected": false}` alone — the window was gathered with `--no-newcomers`.
 
+**First ever, returning or regular.** The search is sorted by creation date, newest first
+(`sort=created&order=desc`, still `per_page=1`), so the one item it returns is the
+candidate's most recent earlier PR / issue of that kind: its `created_at` is
+`last_seen_before`. When that is more than `RETURNING_GAP_DAYS[0]` (90) days before the
+candidate's first item of the window, the other kind is searched too (a more recent item of
+that kind would shorten the gap), so the gap is measured to the most recent earlier PR **or**
+issue; a regular contributor still costs one call. Each checked candidate is then one of:
+
+- `new` (first ever: no PR / issue authored in the repo before `before`; the shape above);
+- `returning` — `{login, first, number, url, created_at, last_seen_before, gap_days,
+  gap_bucket}`: `gap_days` (whole days from `last_seen_before` to `created_at`) is more than
+  90; `gap_bucket` is `over_3_months` (> 90 days), `over_6_months` (> 180) or
+  `over_9_months` (> 270) — `gather.RETURNING_GAP_DAYS`, a month counted as 30 days;
+  `gap_upper_bound: true` when the second kind's search failed (the true gap may be
+  shorter);
+- `regular` — `{login, last_seen_before, gap_days}` (gap of 90 days or less);
+- `earlier_undated` (only when any) — earlier items exist but the answer carried no date.
+
+`returning`, `regular` and `gap_thresholds_days` ([90, 180, 270]) are present on facts
+gathered with this rule; a fact gathered before it has only `new` (its candidates with
+earlier activity are not classified). "First" always means first PR or issue **authored**;
+reviews and comments are not searched (see `prior_activity` below for what the store holds).
+
 A view of exactly a gathered window carries the stored value verbatim (so `validate.py
 --bundle` compares it like any per-window fact). A view spanning several gathered windows
 merges those lying wholly inside it that collected one, not overlapping one another (by start
@@ -510,8 +533,871 @@ day, the longest first): `new` keeps each login's earliest entry, `unknown` / `n
 are the unions less the logins found new, `candidates` is left out (a login can be a
 candidate in two windows), and two keys are added: `windows` (the merged windows) and
 `covers_view` (false when they leave days of the view uncovered — a newcomer in an uncovered
-day is missing). Multi-repo: per member bundle; a person new to one member may have worked in
+day is missing). `returning` / `regular` merge the same way, the earliest window's class
+winning (a login new in August and returning in September is new to the quarter).
+Multi-repo: per member bundle; a person new to one member may have worked in
 another. Additive and omit-when-absent: `meta.schema_version` stays 3.
+
+## The people layer (`affiliations`, `prior_activity`, `contributors`)
+
+Who contributed — the maintaining organisation or the community — who is new or back after
+a gap, and what each of them landed. Three keys, each omitted when its input is absent (a
+store gathered before this layer; every fixture bundle), so other views are unchanged;
+`meta.schema_version` stays 3.
+
+### `affiliations` (raw, from the store)
+
+The per-window fact gather writes (`gather.collect_affiliations`; STORE.md). For each human
+person of the window — PR / issue authors, mergers, reviewers, commenters and commit authors
+resolved to a login (bots, `ghost` and unresolved git names left out):
+
+```json
+{"collected": true, "home_orgs": ["Azure", "microsoft"], "home_names": ["azure", "microsoft"],
+ "home_email_domains": ["microsoft.com"],
+ "people": {"octo": {"affiliation": "maintainer_org", "signal": "author_association", "strength": "strong"},
+            "mona": {"affiliation": "community", "signal": "profile_company", "strength": "weak"},
+            "hubot": {"affiliation": "unknown", "signal": "none"}},
+ "unknown": ["hubot", "login-over-the-cap"], "not_checked": ["login-over-the-cap"],
+ "groups_unresolved": ["@org/secret-team"]}
+```
+
+- `affiliation` — `maintainer_org` (the organisation that owns the repository, or an
+  organisation the operator lists as home), `community`, or `unknown`. **Never defaulted to
+  community**: no signal means `unknown`.
+- `signal` / `strength` — the first signal that decided, in this order:
+  1. `override` (`operator`) — the operator's list (`--affiliation LOGIN=…`,
+     `--affiliation @org/team=…`, manifest `affiliation.overrides`);
+  2. `author_association` — GitHub's value on the person's own PR / issue / comment records of
+     the window, **at gather time**: `OWNER` / `MEMBER` (`strong`), `COLLABORATOR`
+     (`medium`). `MEMBER` means a member of the organisation that **owns the repository**
+     (e.g. `Azure` for Azure/bicep-registry-modules), not of any other home organisation.
+     `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR` and `NONE` decide nothing;
+  3. `public_membership` (`strong`) — `GET /orgs/{org}/public_members/{login}` answered 204
+     for a home organisation (404: not a public member — private membership is invisible);
+  4. `profile_company` — the public profile's `company`, normalised (lower case, leading `@`
+     dropped, punctuation removed, trailing "Corporation" / "Corp" / "Inc" / "Ltd" / "LLC" /
+     "GmbH" / "PLC" removed: "@microsoft", "Microsoft", "Microsoft Corporation" all read
+     "microsoft") and compared exactly with the home names (or any `@handle` in it): a match →
+     `maintainer_org` (`medium`); a non-empty company that does not match → `community`
+     (`weak`: self-declared and possibly stale); empty → no signal;
+  5. `commit_email_domain` (`medium`) — a commit email of theirs in a home email domain
+     (`users.noreply.github.com` never counts);
+  6. none → `unknown` with signal `none`, or `lookup_failed` when a lookup could not answer.
+     A failed lookup never lets a weaker signal decide `community` (a home-org public
+     membership might have been missed); a weaker signal may still decide `maintainer_org`.
+- `home_email_domain: true` — on any entry whose commit email was in a home domain (the only
+  trace of an email that is kept).
+- `unknown` — every person labelled unknown, plus `not_checked`.
+- `not_checked` — people the API was not asked about: beyond `ACTIVITY_AFFILIATION_MAX`
+  (default 300, the most active first) or after three people in a row whose lookups failed.
+  They have no entry and count as unknown.
+- `groups_unresolved` — `@org/team` overrides whose members the token could not list.
+- `{"collected": false}` alone — gathered with `--no-affiliation`.
+
+**With the people registry** (gather `--people PATH` or a manifest's `people`; next
+section) every entry also carries, for the labels used in that window:
+
+```json
+"octo":          {"affiliation": "maintainer_org", "signal": "public_membership", "strength": "strong",
+                  "name": "Octo Cat", "maintainer": true, "maintainer_signal": "merged_others_pr",
+                  "maintainer_status": "active"},
+"quiet-person":  {"affiliation": "unknown", "signal": "do_not_name"},
+"not-yet-seen":  {"affiliation": "unknown", "signal": "not_checked", "maintainer": false,
+                  "maintainer_signal": "none"}
+```
+
+- `name` — the public profile's display name as the registry holds it (an operator's own
+  spelling wins); absent when the profile has none, or the person is `do_not_name`.
+- `maintainer` / `maintainer_signal` — the maintainer property **for this window's
+  repository** (see "The people registry"): `true` with the signal that shows write access
+  (`operator`, `merged_others_pr`, `OWNER`, `merged_own_pr`, `COLLABORATOR`,
+  `approving_reviewer`), or `false` with `operator` (the owner said so) or `none` (no
+  evidence of write access in anything the registry has seen for that repository).
+- `maintainer_status` — only when the registry holds maintainer evidence for the
+  repository: its lifecycle at gather time, `active` / `lapsed` / `former` / `unknown`
+  (see "The people registry"); `former` always comes with `maintainer: false`.
+- signal `do_not_name` — the owner marked the person `do_not_name`: no name, no maintainer
+  property, label `unknown`, no API call. Every output shows the login only.
+- signal `not_checked` — with the registry, a person not looked up (over the cap, offline,
+  after repeated failures) still has an entry, so their name and maintainer property reach
+  the view; they are listed in `not_checked` and count as unknown as before.
+
+**What is stored about a person:** the login (already in every record), the label, the
+signal name, its strength, the `home_email_domain` boolean and, with the registry, the
+display name and the maintainer property with its signal and status. Never the profile
+company or any other profile text, never an email address or a domain of a non-home
+address. `validate.py` refuses a stored `affiliations` value whose entries carry anything
+else (or a `do_not_name` entry that carries a name or a maintainer property, or a
+`maintainer_status` that is not one of the four, has no `maintainer` beside it, or is
+`former` with `maintainer: true`).
+
+### The people registry (`people.json` + `people-activity.json`, outside the store)
+
+Two JSON files per workspace — one registry shared by every stream (default
+`~/activity/people.json` and the generated `people-activity.json` beside it; USAGE §2.1) —
+one entry per GitHub login, shared by every gather — all months, all repositories, all
+streams — so a person is looked up once and refreshed rarely, and their roles and activity
+are known across repositories (`people.py`; USAGE §5.7). `people.json` is the owner's to
+read and edit; `people-activity.json` is generated. gather never needs them to read a
+store, and no view reads them unless `link.py --people` asks for registry context.
+
+```json
+{"format": "activity-overview/people", "version": 1,
+ "people": {"octo": {"login": "octo", "name": "Octo Cat",
+                    "affiliation": "maintainer_org", "signal": "public_membership", "strength": "strong",
+                    "maintainer_of": {"Azure/bicep-registry-modules": {"maintainer": true,
+                        "signal": "merged_others_pr", "strength": "strong",
+                        "first_evidence": "2025-02-03", "last_evidence": "2026-10-29"},
+                        "Azure/bicep": "former"},
+                    "first_seen": {"date": "2025-01-07", "repo": "Azure/bicep-registry-modules"},
+                    "last_seen": {"date": "2026-10-31", "repo": "Azure/bicep-registry-modules"},
+                    "looked_up_at": "2026-11-26", "source": "lookup", "tags": ["known"]}}}
+```
+
+| Key | Written by | Meaning |
+|---|---|---|
+| `login` | skill | the key repeated (logins match ignoring case) |
+| `name` | lookup, or you | the profile's display name (from the same `users/{login}` response as the company signal) |
+| `affiliation` / `signal` / `strength` | lookup, or you | the latest label decided from GitHub data (`author_association`, `public_membership`, `profile_company`, `none`) |
+| `maintainer_of` | skill, or you | `{repo: evidence}` — write access per repository (`maintainer`, `signal`, `strength`, `first_evidence`, `last_evidence`); a plain `true` / `false` / `"former"` is yours |
+| `tags` | you only | free-form (`known`, `mvp`, …) |
+| `first_seen` / `last_seen` | skill | `{date, repo}` of the earliest / latest activity anywhere, as gathered (the global summary of the per-repository profile) |
+| `looked_up_at` | skill | date of the last profile / membership lookup |
+| `home` | skill | the home settings the label was decided against (home organisations, then names); reused only under the same settings |
+| `source` | skill / you | `lookup` (written by the skill) or `operator` (yours: every decided field pinned) |
+| `locked` | you only | `true`, or a list of `name` / `affiliation` / `maintainer_of` to pin |
+| `do_not_name` | you only | `true`: login only, no label, no call, in every output |
+| `note` | you only | free text |
+
+**Operator edits win.** `source: "operator"` or `locked: true` pins `name`, `affiliation`
+and `maintainer_of`; `locked: [...]` pins the fields listed; a plain `true` / `false` /
+`"former"` in `maintainer_of` is the operator's for that repository. Pinned fields, `tags`,
+`do_not_name` and `note` are never written by the skill; `first_seen` / `last_seen` and the
+activity file always are. Any other key, a bad value or two keys that are the same login is
+an error naming the entry (gather stops before touching the store); the file is never
+reset. A file written before the activity profile is read as it is (the format stays
+version 1: the profile only added optional fields); the next gather or seed adds them.
+
+**The activity file** (`people-activity.json`; `people.py` "the activity profile"):
+
+```json
+{"format": "activity-overview/people-activity", "version": 1, "months_kept": 36,
+ "repos": {"Azure/bicep-registry-modules": {"stream": "avm-bicep", "windows": {
+     "2026-09-01..2026-09-30": {"source": "gather", "people": 81, "unresolved_commit_authors": 0}},
+     "before": {"from": "2023-01-01", "to": "2023-09-30", "windows": 9}}},
+ "people": {"octo": {"Azure/bicep-registry-modules": {
+     "2026-09-01..2026-09-30": {"first": {"merge": ["2026-09-01", 7306], "comment": "2026-09-02"},
+                                "last": {"merge": ["2026-09-30", 7428], "comment": "2026-09-24"},
+                                "months": {"2026-09": {"merges": 40, "merges_others": 2, "comments": 10}},
+                                "first_ever": "2026-09-01"}}}},
+ "seen_before": {"octo": {"Azure/bicep-registry-modules": "2025-01-07"}}}
+```
+
+| Key | Meaning |
+|---|---|
+| `repos[repo].windows` | the coverage: every gathered window `FROM..TO` with its `source` (`gather` / `seed`), the people with an event in it and the commits whose author has no login |
+| `repos[repo].stream` | the manifest project (or `seed --stream`) the repository belongs to: the per-stream roll-up |
+| `repos[repo].before` | the range folded away beyond `months_kept` (36) months; a window inside it is not folded again |
+| `people[login][repo][window]` | one contribution record: `months` {YYYY-MM: counts of `commits`, `prs_opened`, `prs_merged`, `reviews`, `approvals`, `approvals_merged`, `merges`, `merges_others`, `issues`, `comments`}, `first` / `last` {`commit`, `pr_opened`, `pr_merged`, `review`, `approval`, `merge`, `issue`: [day, number or sha]; `comment`: day}, `first_ever` (the newcomer search's `before`: no earlier PR or issue) |
+| `people[login][repo].before` | the folded record (`months` {"before": counts}) |
+| `seen_before[login][repo]` | the earliest day the person shows in stored records dated before a gathered window — never counted |
+
+Only events dated inside a window enter its record; re-gathering a window replaces its
+records (never counted twice); overlapping windows inside a month are not summed (the one
+covering most of the month counts). Everything a reader sees is derived:
+`people.repo_profile` (coverage, `observed_since`, firsts / lasts with URLs,
+`first_pr_ever` / `first_issue_ever` only from the newcomer search, totals, `by_month`,
+`rates` over the last 3 / 6 / 12 gathered months, `trend`, contributor `status` active /
+returned / lapsed / unknown, `maintainer` with `status` active / lapsed / former / unknown
+and the merges / approvals behind it), `people.cross_project` (every repository with role
+and status, the repositories maintained, first / last anywhere, the per-stream roll-up) and
+`people.writer_context` (what `people_context` carries). Thresholds: active within 183
+days of the repository's latest gathered day, former beyond 548
+(`ACTIVITY_PEOPLE_ACTIVE_DAYS` / `ACTIVITY_PEOPLE_FORMER_DAYS`), `unknown` when fewer than
+90 days were gathered since the last action.
+
+**At gather time** the registry is consulted first (a fresh entry costs no call), the API
+fills the gaps (new people, then stale entries, at most `ACTIVITY_PEOPLE_REFRESH_MAX` = 50
+refreshes per run, oldest lookup first; decided labels are fresh for 120 days,
+`--people-refresh-days` / `ACTIVITY_PEOPLE_REFRESH_DAYS`, `unknown` ones for 30,
+`ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS`), the registry is updated (merged into the file as it
+is on disk, atomically, under a lock, keys sorted), and the window's `affiliations` fact
+records the labels used. **Views read only the fact**, so a report made last month is
+reproduced exactly after the registry changes. `--people-offline` makes no API call:
+the registry and the free signals decide.
+
+**The maintainer property** (a role; affiliation is the employer — neither implies the
+other, and a community maintainer is possible) is derived from records only, per
+repository, strongest first: `operator` > `merged_others_pr` (merged a PR somebody else
+authored: write access, `strong`) > `OWNER` (`strong`) > `merged_own_pr` (merged their own
+PR: write access, `medium`) > `COLLABORATOR` (`medium`) > `approving_reviewer` (approved
+at least 3 merged PRs of others in one window, or in one seeding pass, `medium`).
+`MEMBER` is not a maintainer signal: it means a member of the organisation that owns the
+repository (thousands of people for `Azure`), which is an affiliation. Evidence is kept:
+once a person is a maintainer of a repository the entry keeps it, with `first_evidence` /
+`last_evidence` (evidence dated after the gathered window is left out), until the owner
+says otherwise — but it is no longer blindly current: its lifecycle status (above) says
+whether it is recent, and a `former` maintainer is not counted as one.
+
+### `people_context` (link `--people`, registry context)
+
+Only when `link.py VIEW --people PATH` is run: what the people registry knows of the people
+the report names (newcomers and hall rows of `contributors`, `halls.fame`, story trains'
+participants, the authors of PRs that introduced a new module), beyond the window.
+
+```json
+"people_context": {
+  "kind": "registry_context", "repo": "Azure/bicep-registry-modules", "as_of": "2026-10-31",
+  "note": "from the people registry, not a fact of this window: ...",
+  "registry": {"people_sha256": "…", "activity_sha256": "…", "latest_gathered": "2026-10-31"},
+  "thresholds": {"active_days": 183, "former_days": 548},
+  "coverage": {"from": "2026-08-01", "to": "2026-10-31", "windows": 3, "gaps": [], "gathered_days": 92,
+               "months": ["2026-08", "2026-09", "2026-10"]},
+  "people": {"octo": {
+     "here": {"active_since": "2025-01-07", "active_since_basis": "seen in stored records dated before the coverage (not counted)",
+              "active_since_is_first_ever": false, "observed_since": "2026-08-01",
+              "prs_merged_last_6_months": 10, "months_counted": 3, "status": "active",
+              "trend": "falling", "maintainer_status": "active"},
+     "also_maintains": [{"repo": "Azure/bicep", "status": "lapsed"}],
+     "also_contributes_to": [{"repo": "Azure/terraform-azurerm-avm-res-network-virtualnetwork", "status": "active"}],
+     "first_anywhere": {"date": "2023-04-13", "repo": "Azure/bicep-registry-modules"},
+     "streams": {"avm-tf": {"repos": 3, "maintains": 1, "totals": {"prs_merged": 12}, "first": "…", "last": "…"}}}}}
+```
+
+It is **not a fact of the window** and the trust check does not compare it: it is read only
+on request, only from the registry's windows that end by the view's end (`as_of`), so
+re-linking an old view after later gathers gives the same `people` (one exception: an
+`active_since` taken from `seen_before` can move earlier when a later store holds older
+records); the owner's own edits (a role set to `"former"`, `do_not_name`) apply as they
+are now. The `registry` stamp says which registry state produced it. `months_counted` says how many gathered months the
+"last 6 months" figure covers. A `do_not_name` person and a person the registry does not
+know are left out. Without `--people` the key is absent and the view is unchanged.
+
+A view of exactly a gathered window carries the stored value verbatim (`validate.py
+--bundle` compares it). A wider view takes, per person, the entry of the latest gathered
+window overlapping it (the label is the answer when that window was gathered), recomputes
+`unknown` / `not_checked` and adds `windows` and `covers_view`.
+
+### `prior_activity` (raw, from the store)
+
+Only when the view's `newcomers` names a first-ever or returning contributor: what the
+store holds of each of them dated before `newcomers.before`:
+
+```json
+{"before": "2026-10-01", "store_from": "2026-08-01",
+ "people": {"octo": {"prs": 0, "issues": 0, "reviews": 1, "comments": 0, "earliest": "2026-08-31"}}}
+```
+
+`reviews` (review submissions), `comments` (PR conversation, review and issue comments),
+`prs` / `issues` authored. It tells a long-time reviewer's first PR from a true first-timer.
+**What the store can know:** only the records of its gathered windows (PRs and issues
+updated in them, the open ones, and older ones those reached), so `0` means "none in the
+store", not "none ever"; activity before `store_from` (the repo's earliest gathered window)
+is mostly invisible.
+
+### `contributors` (derived by `link.py`)
+
+Built when the view carries a collected `affiliations` or `newcomers` fact. Facts, not
+prose; every PR carries its URL.
+
+```json
+{"affiliation": {"home_orgs": [...], "people": {"maintainer_org": 8, "community": 0, "unknown": 222},
+                 "signals": {"author_association": 8, "none": 221, "not_looked_up": 1},
+                 "merged_prs": {"maintainer_org": {"count": 38, "share": 0.594}, "community": {...},
+                                "unknown": {"count": 26, "share": 0.406}, "total": 64, "bots_excluded": 5},
+                 "reviews": {...same shape...}},
+ "community": {"people": 0, "prs_merged": 0, "prs_merged_numbers": [], "reviews": 0,
+               "first_timers": [], "returning": [], "modules": []},
+ "newcomers": [{"login": "mona", "class": "first_ever",
+                "first": {"first": "pr", "number": 7558, "url": "…/pull/7558", "created_at": "…"},
+                "seen_in_store_before": {"prs": 0, "issues": 0, "reviews": 0, "comments": 0, "earliest": null},
+                "affiliation": "community", "affiliation_signal": "profile_company",
+                "name": "Mona Octocat", "maintainer": false, "maintainer_signal": "none",
+                "contributed": {"prs": [{"number": 7558, "url": "…", "title": "feat: add privatelink.redis.azure.net",
+                                         "state": "merged", "class": "module", "headline": "module_change",
+                                         "modules": [{"area": "avm/ptn/network/private-link-private-dns-zones",
+                                                      "kind": "pattern", "status": "changed", "role": "changed"}],
+                                         "changelog": [{"module": "…", "version": "0.7.4",
+                                                        "items": ["Added Redis zone `privatelink.redis.azure.net`"]}]}]}}],
+ "gap_thresholds_days": [90, 180, 270], "store_from": "2026-08-01",
+ "hall": [{"login": "…", "score": 82, "affiliation": "…", "affiliation_signal": "…",
+           "contributed": {"prs": [...], "prs_omitted": 29}, "reviewed": {"prs": 6, "modules": [...]}}],
+ "inputs": {"module_layer": "module_changes"}}
+```
+
+- **`affiliation`** (with `affiliations`) — people per label, the deciding signals, and the
+  window's PRs merged into the mainline (`module_changes.prs`) by their author's label and
+  its reviews (each reviewer once per PR) by the reviewer's label; `share` is of `total`
+  (the human-authored ones), `unknown` always its own bucket, `bots_excluded` the rest. A
+  wider view adds `windows` / `covers_view`.
+- **`affiliation.maintainers`** (only when the people carry the maintainer property, i.e.
+  the fact was gathered with the registry) — `people` {maintainer, non_maintainer,
+  unknown} (unknown: no property — `do_not_name`, or not a person of a gathered window),
+  `signals` (maintainers per signal), `by_affiliation` {label: the same three counts}
+  (maintainers vs non-maintainers within community and the home organisation, unknown
+  separate) and `logins` (the maintainers); `by_status` {active | lapsed | former |
+  unknown: [login]} when the fact carries `maintainer_status` (a `former` maintainer
+  counts as a non-maintainer).
+- **`community`** (with `affiliations`) — only people labelled `community` (never
+  `unknown`): how many, their merged PRs (and numbers), reviews, the first-timers and
+  returning contributors among them, and the module areas that received a community PR
+  merged in the window.
+- **`newcomers`** (with `newcomers`) — one row per first-ever or returning contributor
+  (sorted by login): `class`, their first item of the window, the gap fields for a
+  returning one, `seen_in_store_before` (`prior_activity`), their label, and `contributed`.
+- **`hall`** — for each `halls.fame` entry: label, `contributed`, and `reviewed` {prs: how
+  many of the view's PRs they reviewed, modules: the module areas of those merged in the
+  window}.
+- **`contributed`** — their PRs merged in the window (newest first), then their open ones;
+  at most 10 (`prs_omitted`). Each: `state`, `class` (the module layer's PR class), and
+  `headline`: `new_module` (the PR introduced a module that is new in the window; its row
+  has `role: "introduced"` and `first_version` — e.g. a first PR ever that lands the new
+  pattern module `avm/ptn/app/function-app` 0.1.0), `module_change`, `plumbing` (CI, docs
+  or tests only: `class` says which), `release` (a version cut with no code change) or
+  `unknown` (no commit of it in the view — an open PR: the store holds no file list for an
+  open PR's commits). `modules` (at most 5, introduced first): area, kind (resource /
+  pattern / utility / module / submodule / deployment), the module's status in the window,
+  the PR's role; for a mechanical sweep only the modules whose source it changed, with
+  `sweep`. `changelog`: the entries the PR's commits added to module changelogs, items
+  verbatim (at most 5 per entry, `items_omitted`).
+- **`inputs.module_layer`** — `module_changes` (the view's own, built from the gathered
+  `module_notes`), or `code_events_only` for a view without them: the same build over the
+  commits and file events alone (a module is `new` only from an added entry file; no
+  changelog items, no tags).
+
+**Halls by affiliation.** When the people carry `affiliation`, `halls` adds `community` and
+`maintainer_org` — the same people ranked the same way as `fame` (top 10 each) within one
+label — and `unranked_unknown` (how many people with a positive score are `unknown`). `fame`
+is unchanged. **people[]** rows gain `affiliation` and `affiliation_signal` (non-bots; a
+person the fact does not name is `unknown` with `not_checked` or `not_looked_up`) and,
+with the registry, `name`, `maintainer` and `maintainer_signal`; so do the `halls` entries,
+`contributors.newcomers[]` and `contributors.hall[]` rows, and a train slice's
+`participants` {login: {name?, maintainer?, maintainer_signal?, affiliation?}} (only when
+the view carries names or the maintainer property). The login stays the key everywhere;
+names are for display. The project view (digest) keeps, per person, the member's label
+with the most decisive signal (`derive.AFFILIATION_SIGNAL_ORDER`), the first member's
+name, `maintainer: true` when any member says so (those members in `maintainer_of`), and
+ranks the halls on the merged people.
+
+**What the data cannot tell:** private org membership; an employer the profile does not
+state (or states stale); vendors and contractors (a company that does not match is
+`community`); activity before the store's first window; what an open PR changes. The label
+is GitHub's and the profile's answer when the window was gathered, not as of the window.
+
+## Module changes (`module_notes` → `module_changes`)
+
+The reader's view of a window, shaped like a product's monthly release notes: which modules
+are new, what changed in existing ones, what is breaking, what was deprecated, and how much of
+the merged work was plumbing (CI, docs generation, tests). Two keys:
+
+- **`module_notes`** (raw, from the store) — what gather read from the clone for the window
+  (`gather.collect_module_notes`; a per-window fact like `newcomers`, STORE.md). Omitted when
+  no gather stored it (a store gathered before this layer; every fixture bundle; a gather
+  without the window's history on disk).
+- **`module_changes`** (added by `link.py`) — built only when the view carries
+  `module_notes` with `collected: true`, so every other bundle is unchanged.
+
+### `module_notes`
+
+```json
+{"collected": true,
+ "changelogs": [{"path": "avm/res/dev-test-lab/lab/CHANGELOG.md", "module": "avm/res/dev-test-lab/lab",
+                 "commit": "574f7d71…", "date": "2026-10-03", "change": "modify",
+                 "entries": [{"version": "0.6.0", "heading": "## 0.6.0", "sections": [
+                   {"heading": "Changes", "kind": "changed", "items": [], "placeholder": "None"},
+                   {"heading": "Breaking Changes", "kind": "breaking",
+                    "items": [{"text": "Deprecated `avm/res/dev-test-lab/lab/secret` as no longer supported by Resource Provider (…)"}]}]}]}],
+ "versions": [{"path": "avm/res/dev-test-lab/lab/version.json", "module": "avm/res/dev-test-lab/lab",
+               "commit": "574f7d71…", "date": "2026-10-03", "change": "modify", "from": "0.5", "to": "0.6"}],
+ "tags": {"collected": true, "source": "clone", "items": [
+   {"tag": "avm/res/devices/iot-hub/0.4.0", "module": "avm/res/devices/iot-hub", "version": "0.4.0",
+    "date": "2026-10-06T11:19:12Z", "date_source": "commit", "commit": "62b1f05b…", "first": false}]},
+ "unread": [{"path": "…", "commit": "…", "date": "…", "reason": "…"}]}
+```
+
+- **`changelogs`** — one row per (changelog file, commit) whose commit **added** entries. A
+  changelog is a file named `CHANGELOG.md`, `CHANGES.md`, `HISTORY.md`, `RELEASE_NOTES.md` or
+  `RELEASENOTES.md` (any case). The file is parsed at the commit and at its parent (at
+  `old_path` for a rename, so a moved module's changelog is not new) and compared
+  (`changelog_added_entries`): a version the parent lacks is added whole; items appended to
+  a version the parent already had are an entry with `amended: true`; a changelog that names
+  no version yields its new bullets as one entry with `version: null`. `new_file: true` when
+  the file did not exist before (an add or copy). Parsing is generic (`parse_changelog`): an
+  entry starts at a heading naming a version (`## 0.6.0`, `## [1.2.0] - 2026-10-14` → `date`,
+  `# v2.0.0`, `## [Unreleased]`), any heading level; deeper headings are its sections, each
+  with its verbatim `heading` and a `kind` — `breaking`, `deprecated`, `removed`, `security`,
+  `fixed`, `added`, `changed`, `other` (an unknown heading keeps its own heading) or
+  `unsectioned` (items before any section). Items are verbatim bullet or paragraph text
+  (continuation lines, nested bullets and a following fenced block included), capped at 600
+  characters with `truncated_from` the original length; more than 40 items in a section →
+  `items_omitted`, more than 12 entries per file per commit → `entries_omitted`. A section
+  holding only placeholders ("None", "N/A", "None (interface unchanged)") keeps `items: []` and
+  `placeholder` (what it said). Nothing is invented: text not in the file is never produced.
+- **`versions`** — a `version.json` whose top-level `version` moved (`from` null when the file
+  is new).
+- **`tags`** — the version tags the clone holds dated in the window: a tag whose last path
+  segment is a version; the rest is the module path it publishes (`""` = the repository
+  root, e.g. `v1.2.0`). `date` is the tagger date of an annotated tag (`date_source:
+  "tagger"`) or, for a lightweight tag (no date of its own), the committer date of the tagged
+  commit (`"commit"`). `first`: no version tag of that module in the clone is dated before
+  the window. `{"collected": false, "reason"}` when the clone holds no tag or listing them
+  failed. No network call: the tags the clone / fetch brought along.
+- **`unread`** (only when any) — file versions git could not read: a visible gap, never guessed.
+
+A view of exactly a gathered window carries the stored value verbatim (`validate.py
+--bundle` compares it). Any other view takes the items (all dated) of every gathered window
+overlapping it that fall inside it, once each, and adds `windows` and `covers_view`;
+`tags.windows_without_tags` names windows that listed none. For such a view the
+module layer makes no `declared_not_published` claim (a missing tag may sit in a window that
+listed none) and repeats the list in `module_changes.inputs.windows_without_tags`.
+
+### `module_changes`
+
+```json
+{"summary": {...}, "modules": [...], "prs": [...], "releases": [...]?, "inputs": {...}, "path_rules": [...]?}
+```
+
+**`modules[]`** — one entry per module area touched in the window (sorted by `area`); an
+area is a module when it is `avm/res|ptn|utl/<group>/<name>` (`kind` `resource` /
+`pattern` / `utility`), the Terraform root `main.tf` area or an area with a `*.tf` directly
+in it (`module`), `modules/<name>` (`submodule`), or a Bicep directory outside `avm/` with
+its own `main.bicep` (`deployment`, e.g. a landing zone's deployments). Docs, CI and other
+areas are not modules (they still count for the PR classes). Keys (empty ones omitted):
+
+- `area`, `kind`, `status` — `removed` (entry file `main.bicep` / `main.tf` deleted or moved
+  away; `structure.moved_to`) > `new` (entry file added, or the module's own changelog
+  created with entries, or its first version tag in the clone dated in the window) >
+  `deprecated` (a `DEPRECATED.md` added at the module root) > `orphaned` (an `ORPHANED.md`
+  added: no owner — **not** deprecated) > `changed` > `published` (only a version tag).
+- `first_version` (new modules: the oldest version of the new changelog, else the first
+  tag, else `version.json`), `introduced_by` (new modules: the sources of each signal).
+- `structure` — `moved_from` / `moved_to`, `lifecycle_markers` [{file, change, sources}],
+  `children` [{path, change: added | removed | moved (`from`) | modified | deprecated |
+  orphaned, markers?, interface?, sources}] for child modules (`<area>/…/main.bicep`).
+- `versions` — `version_file` {from, to, sources}, `child_version_files`, `changelog` (the
+  versions the module's own changelog gained), `published` (tags: version, tag, date,
+  date_source, commit, first, `module` when a child's), `releases` (Terraform root module:
+  the repo's GitHub releases of the window).
+- `changelog` — [{version, date?, amended?, module? (a child's changelog), sections:
+  [{heading, kind, items, placeholder?}], sources}] — the maintainers' text, verbatim.
+- `interface` — from the window's symbol events of the module's interface file
+  (`main.bicep`; for Terraform every `*.tf` directly in the module dir), net over the window
+  (added then removed = nothing): `parameters` {added [{name, declaration, required:
+  true | false | null}], removed, modified [{before, after}], moved [{from_path, to_path,
+  confidence}]}, `outputs` {added, removed, modified, moved}, `resources` {added, removed,
+  modified, `api_versions` [{name, type, from, to}]}, `dependencies` {added / removed [{name,
+  ref, target, version?, local?}], changed [{change: "version" | "target", from, to}]}.
+  `required` is true for a Bicep `param` without a default and not nullable (`?`), false
+  with either, null when the declaration snippet cannot tell (Terraform `variable` headers,
+  multi-line types). Declarations are the stored snippets (200 characters).
+- `breaking` — **`declared`**: the changelog's "Breaking Changes" items, verbatim
+  ({version, text, module?, sources}) — the maintainers' own statement. **`candidates`**:
+  derived by rule from the interface, a hint to check, never a claim: `parameter_removed`,
+  `parameter_moved`, `required_parameter_added`, `parameter_became_required`,
+  `output_removed`, `output_moved`, `child_module_removed`, `child_module_moved`,
+  `module_removed` ({rule, subject, sources}). A new module has no candidates (nobody
+  consumed it). The two lists are never merged.
+- `deprecations` — [{target, basis: "changelog" | "marker_file", version?, text?, file?,
+  sources}]: a changelog item that says "deprecat…" (or sits under a Deprecated section;
+  `target` = its first back-quoted path, else null) and every `DEPRECATED.md` added.
+- `prs` [{number, url, title, author, class, plumbing}], `authors`, `source_files_changed`.
+- `plumbing_only` — true when nothing reader-facing happened: no source file, changelog
+  entry, version move, tag, lifecycle marker, entry-file or child change (README / test /
+  CI churn only). `product_score` — 5 for a new module, 3 per declared breaking item, 2 per
+  candidate, 2 per child change, 1 per interface change, 1 per changelog item, 1 when a
+  source file changed; 0 when `plumbing_only`. It ranks by product change, never by PR count
+  or touched files.
+
+Every item carries **`sources`**: [{commit, pr?, url (the PR's, else the commit's), path}],
+so a writer can cite it.
+
+**`prs[]`** — every PR merged in the window into `meta.base_branch`: {number, url, title,
+train?, class, module_kinds?, title_signal?, sweep?, substantive_areas?, plumbing, areas}.
+`class`, by rule from the files of its commits (`path_class`; `generated` and `metadata`
+files travel with any change and are ignored): source and no CI → `module` (`module_kinds`:
+the kinds of the module areas whose source changed); source and CI → `mixed`; no source:
+only CI → `ci`, only tests → `tests-only`, only docs → `docs-only` unless a changelog or
+version file changed → `release` (a version cut with no code change); any other mix →
+`mixed`; no commit of the PR in the view → `unknown` (`plumbing: null`). `title_signal`
+(`ci` / `docs` / `tests`) is the secondary signal: a conventional-commit type (`ci`,
+`build`, `chore`, `docs`, `test`, `style`) or a title word (CI, pipeline, workflow, lint,
+readme, docs, tests). `sweep` {areas, plumbing_areas} marks a **mechanical sweep**: at least
+`SWEEP_MIN_AREAS` (5) module areas touched, half or more of them only in docs / generated /
+metadata / tests files; `substantive_areas` lists the modules whose source it did change —
+their changes stay in `modules[]` whatever the PR's class. `plumbing` = no source file (a
+`release` is not plumbing), or a sweep whose title says plumbing.
+
+**File classes** (`link.DEFAULT_PATH_CLASS_RULES`, first match wins; a rule with a `/`
+matches the path, `**` = any segments, otherwise the file name; case-insensitive):
+`ci` — `.github/**`, `.azuredevops/**`, `.azure-pipelines/**`, `.pipelines/**`,
+`pipelines/**`, `utilities/**`, `.devcontainer/**`, `.vscode/**`, `.config/**`, `Makefile`,
+`.gitignore`, `.gitattributes`, `.editorconfig`, `.pre-commit-config.yaml`, tflint configs,
+`avm` / `avm.bat` / `avm.ps1`; `metadata` — `CHANGELOG.md`, `CHANGES.md`, `HISTORY.md`,
+`RELEASE_NOTES.md`, `version.json`, `metadata.json`, `ORPHANED.md`, `DEPRECATED.md`,
+`CODEOWNERS`, `.terraform.lock.hcl`, `.terraform-docs.yml`; then `ci` — any other dot-file;
+`generated` — `main.json`; `tests` — `**/tests/**`, `**/test/**`, `**/examples/**`,
+`validation/**`, `*.test.bicep`, `*.tftest.hcl`, `*_test.go`; `docs` — `docs/**`,
+`guides/**`, `*.md`, images, `LICENSE`; anything else `source`. Override with
+`link.py BUNDLE --path-class CLASS=GLOB` (repeatable, before the defaults; recorded in
+`module_changes.path_rules`).
+
+**`summary`** — the roll-ups a writer needs first: `modules`, `by_status`, `new_modules`
+[{area, kind, first_version, introduced_by: [pr], prs}], `new_child_modules` [{area,
+child, prs}], `declared_breaking` [{area, versions, items}], `breaking_candidates` [{area,
+rules}], `deprecations` [{area, target, basis}], `orphaned`, `removed`, `most_substantive`
+(top 10 by `product_score`, ties by area; plumbing-only modules never rank) and `plumbing`
+{merged_prs, classified, plumbing_prs, share (of the classified), by_class}.
+
+**`releases`** — the window's GitHub releases {tag, name, published_at, url, prerelease,
+notes?, notes_truncated_from?} when any (the release text: "Release notes text" below).
+**`inputs`** — `tags_collected`,
+`tags_reason`, `unread`, and for a multi-window view `windows` / `covers_view`.
+
+**What the data cannot tell:** a parameter renamed inside one file reads as one removed and
+one added (moves are only matched across files); Terraform `variable` defaults are not in
+the stored snippet (`required: null`); a module's history before the clone's bound; for a
+multi-window view, areas are mapped with the latest window's code graph (a path it lacks
+falls back to the default area rules).
+
+Window and projection: every input is dated (commits, code / symbol events, notes items),
+so the view follows `extract`'s window scoping; PR records are the as-of-end projection.
+Additive and omit-when-absent: `meta.schema_version` stays 3.
+
+**Version declared vs published** (only when the window's tags were collected):
+`versions.declared_not_published` — versions the module's own changelog declared in the
+window with no version tag of the module dated in it (a real case: `dev-test-lab/lab`
+0.6.0 declared in October 2026, tagged 2026-11-16; `Unreleased` and other labels that do
+not start with a digit are not counted); `versions.published_not_declared` — versions
+tagged in the window whose changelog entry the window did not add (declared earlier, or
+the module keeps no changelog). Versions compare without a leading `v`. The summary's
+`version_gaps` [{area, declared_not_published?, published_not_declared?}] rolls them up. A later tag outside the view is not visible to it: "not published" means "not
+tagged in this window".
+
+**Release notes text.** Each view release (`releases[]`) carries `notes` — the release's
+own text (GitHub's `body`), verbatim up to `gather.RELEASE_NOTES_CAP` = 4000 characters,
+`notes_truncated_from` the original length when cut — when the release has any; so do
+`module_changes.releases[]` and a Terraform root module's `versions.releases[]`. A
+repository without a changelog (a Terraform module repo, a landing zone) still has its
+maintainers' declared notes. Releases gathered before this have no `notes`: re-gather.
+
+## The story layer (`discussion`, `stories`, slice `conversation`, `pr_history`)
+
+Decisions sit in the text of issues and PRs (proposals, objections, rework, agreement).
+The story layer measures that conversation per train, selects the trains with the most to
+tell, and gives each train's slice the whole conversation as one timeline. It is derived
+by `link.enrich` from stored records only, as projected to the window's end (a story for a
+past window holds nothing said after it), and is additive and omit-when-absent:
+`meta.schema_version` stays 3, and a train or view without conversation is unchanged.
+
+### `trains[].discussion`
+
+Present when the train has at least one human (not bot: `derive.is_bot_login`) comment,
+review comment or review; absent otherwise.
+
+```json
+{"comments": 2, "review_comments": 86, "participants": 2,
+ "reviews": {"approved": 0, "changes_requested": 0, "commented": 0, "dismissed": 0},
+ "review_rounds": 1, "reopens": 0, "text_chars": 19126, "in_window": 0,
+ "first_response_days": 21.2,
+ "longest_silence": {"days": 19.7, "from": "…", "to": "…", "resumed_at": "<url>"},
+ "change_requests": 0, "change_requests_reworked": 0, "bot_comments": 0}
+```
+
+- `comments` / `review_comments` — human conversation comments and inline review
+  comments over the train's issues and PRs.
+- `participants` — distinct human authors of the items, comments, review comments and
+  reviews.
+- `reviews` — human review submissions by state, the PR author's own excluded (as review
+  rounds do); a `commented` review counts only with text: GitHub records each review-thread
+  reply as an empty `commented` review whose text is the review comment.
+- `review_rounds` / `reopens` — sums of the PRs' `review_rounds.count` and the items'
+  `reopen_count`.
+- `text_chars` — characters of human text (item bodies, comments, review comments, review
+  texts).
+- `in_window` — human comments, review comments and counted reviews made inside the
+  view's window: the window's own share of the debate.
+- `first_response_days` — from the train's first item to the first human comment / review
+  / review comment by someone other than that item's author (null when none).
+- `longest_silence` — the longest gap between consecutive recorded human events
+  (openings, comments, reviews, lifecycle events, merges, PR commits from `pr_history`),
+  with the URL of the event that ended it (`resumed_at`). Elapsed and idle time are in
+  `effort` and not repeated.
+- `change_requests` — `changes_requested` reviews; `change_requests_reworked` (only when
+  the PR history is known for every PR with one) — how many were followed by a commit on
+  that PR.
+- `bot_comments` — automation comments, review comments and reviews (counted nowhere
+  else).
+
+### Story selection: `trains[].story*` and `stories`
+
+A separate, explicit selection for narration, independent of `tier` (which ranks by
+footprint: PRs, commits and touched areas, so mechanical sweeps over hundreds of modules
+fill it while the most discussed trains are `mention`). `tier` is unchanged; a train can
+be deep and a story, either, or neither.
+
+`story_score` (`link.story_score`) = discussion points + relevance:
+
+| Discussion points | |
+|---|---|
+| each human comment / review comment | 1 |
+| each conversation turn inside the window (`in_window`) | +1 (the window's debate weighs double) |
+| each participant beyond the first | 2 |
+| each change request | 3 |
+| each reopen | 3 |
+| each review round beyond the first on a PR | 2 |
+| longest silence over `STORY_SILENCE_DAYS` (14) | 2 |
+| each 2,000 characters of human text (at most 5) | 1 |
+
+| Relevance | |
+|---|---|
+| kind feature / module-request | 3 |
+| kind bug | 1 |
+| a new module introduced by one of its PRs (module layer) | 5 |
+| declared breaking items / breaking candidates from its PRs (at most 3 each) | 2 / 1 each |
+| in flight (often where the debate still is) | 1 |
+
+A train still **in flight** with no conversation turn inside the window
+(`discussion.in_window` below `STORY_MIN_IN_WINDOW`, 1) is not a story of this window however
+long its thread: it is listed in `stories.quiet` (`{id, score, idle_days}`, omitted when
+empty) — work with history that nobody touched this window. A train that landed or was closed
+in the window needs no in-window turn.
+
+A train **qualifies** when it has a `discussion` with at least `STORY_MIN_EXCHANGES` (3)
+turns (comments + review comments + counted reviews) and at least 2 participants, scores at
+least `STORY_MIN_SCORE` (8), and — when its work is plumbing (`module_changes.prs` marks
+every merged PR of it `plumbing` or a `sweep`; without the module layer: a chore / docs /
+other train touching more than 10 areas) — its discussion points alone reach
+`STORY_PLUMBING_MIN` (15). The `STORY_TOP_N` (8) best, by score then id, get:
+
+- `story: true`, `story_rank` (1 = most to tell), `story_score`, and `story_reasons`
+  (plain strings naming what scored, e.g. `"88 human comment(s) and review comment(s)"`,
+  `"1 change request(s)"`, `"219 days without recorded activity before 2026-06-10"`,
+  `"new module avm/res/x/y"`, `"in flight"`).
+
+The view gets **`stories`** (absent when no train qualifies): `{selected: [{id, rank,
+score}], more: [{id, score}] (the trains that qualified beyond the cap — "N more had
+notable discussion"), rule: {min_exchanges, min_in_window, min_score, top_n, plumbing_min,
+silence_days}}`.
+
+### Slice `conversation` (the story material)
+
+`link.py BUNDLE --slice <id>` adds `conversation` to every train's slice:
+
+- **`timeline`** — one chronological list of items `{at, kind, actor, url, on: {type,
+  number}, ...}`:
+  - `opened` — an issue / PR, with `title` and its body as `text`;
+  - `comment`, `review_comment` — with `text`; a review comment also carries what it is
+    attached to when the store has it (gathered since review-comment context is kept):
+    `path` (the file), `line`, `commit` (the PR commit it was written against),
+    `diff_hunk` (the diff lines GitHub shows with it, ending at the commented line; at
+    most 12 lines / `STORY_HUNK_CAP` 1,500 characters, `diff_hunk_lines` the original
+    count when cut; all hunks of one slice share `STORY_HUNK_BUDGET` 15,000 characters,
+    a hunk past it is left out and the item gets `diff_hunk_omitted`) and `in_reply_to`
+    (the URL of the review comment that opened its thread; a reply carries no hunk —
+    GitHub gives it the same one as the thread's opener);
+  - `review` — with `state` and `text` (an empty `commented` review is a review thread's
+    wrapper and is left out: its text is the review comment);
+  - `ready_for_review`, `reopened`, `closed` — the lifecycle events (`url` is the item page
+    anchored at the event, `<item url>#event-<id>`); a `closed` from `closed_at` when no
+    event records it;
+  - `merged` — with the merger as `actor`;
+  - `commit` — `source: "pr_head"` (a PR's own commit from `pr_history`: `subject`,
+    `files` count, `authored_at`, `merge: true` for a merge commit, `url`
+    `<pr url>/commits/<sha>`, and when stored its message body as `text` —
+    `body_truncated_from` when gather cut it — and its `change` summary) or
+    `source: "base"` (the train's commit on the walked branch, e.g. the squash commit,
+    with its `change` summary from the view's files and symbol events), each with the
+    `code_notes` its diff added / removed / changed.
+  Ordered by time, then kind, then url. Bots are not in it.
+- **`change`** (on commit items; omitted when nothing is known about the commit) — the
+  compact, factual summary of what the commit changed (`link.change_summary`):
+  `files` `{class: [path]}` grouped by the module layer's path classes (`source`,
+  `tests`, `docs`, `generated`, `metadata`, `ci`; at most `STORY_CHANGE_PATHS_PER_CLASS`
+  8 per class, `files_more` `{class: n}` the rest, `paths_omitted` what gather did not
+  keep), `modules` (the module areas touched), `shared: true` when a `ci`-class file
+  changed (a workflow, action or pipeline utility every module depends on — what a
+  reviewer means by "this would impact all the modules"), `interface` `[{change:
+  add|drop|change, kind: param|variable|output|resource|module, name, path}]` (the
+  module's own interface first, then its tests'; at most `STORY_CHANGE_INTERFACE_MAX` 20,
+  `interface_more` the rest) and `patches` `[{path, kind: changelog|shared, added,
+  removed, lines_omitted?}]` (the lines the commit wrote into a changelog or a shared
+  file, from `pr_history.patches`). Each PR commit's summary is relative to its parent:
+  the rework after a change request is the summary of the commits that follow it (see
+  `rework_after_change_request`).
+- **`code_notes`** (on commit items) — `{commit, path, change: add|drop|change, class,
+  source, pr?, text | before/after | kind/name}`. `class` (`link.comment_class`):
+  `parameter_description` (a Bicep `@description(...)` / `@metadata(...)` decorator),
+  `todo` (TODO / FIXME / HACK / XXX / BUG), `note` (a developer note), `interface` (a
+  parameter / variable / output line: `kind`, `name`, `before` / `after` declaration).
+  **Banners** — section labels such as `// Variables //`, `// Parameters`, `// =====
+  Outputs =====`: once the comment markers and decoration characters (`= - * # / _ ~`)
+  are stripped, at most three words and no punctuation — are dropped and counted
+  (`truncation.code_notes.banners_dropped`). One row per comment line: the symbol
+  extraction keys comments by text, so the lines of one file and commit are not in file
+  order and are never joined into prose. Within `STORY_CODE_NOTES_BUDGET` (12,000)
+  characters, developer notes and TODOs are kept first, then parameter descriptions
+  removed / changed, then added, then interface lines.
+- **`code_notes_by_module`** — `{module area: {path: {added, removed, changed}}}` counts
+  over every code note (kept or not).
+- **`turning_points`** — marked by rule, as data: `{rule, at, index (into timeline), url,
+  detail?}` — `change_request`; `reopened`; `silence_then_activity` (activity after more
+  than 14 days without a recorded human event; detail `{days, since}`);
+  `rework_after_change_request` (the first PR commit after a change request on that PR;
+  detail `{change_request_index, commits_since_request, paths_since_request?}` — the PR's
+  own non-merge commits from the request until the requester's next comment / review
+  and the files they touched, at most 30);
+  `history_rewritten` (a PR commit committed more than `STORY_REWRITE_HOURS` (24) after it
+  was authored: amended, rebased or cherry-picked — the branch's earlier states are not
+  kept); `new_attempt` (a PR of the train opened after another was closed unmerged);
+  `still_silent` (an open train with no human event in the last 14 days before the
+  as-of instant; `at` is that instant). A scope change cannot be marked: title edits are
+  not gathered.
+- **`truncation`** — `{item_cap, budget, chars_original, chars_kept, cut: [{index, url,
+  kept, original}], text_omitted: [{index, url, chars}], code_notes: {banners_dropped,
+  budget, kept, omitted}}`. Each text is capped at `STORY_ITEM_CAP` (5,000 characters:
+  every human comment, review and review comment of Sept-Oct 2026 in
+  Azure/bicep-registry-modules fits — the longest is 3,382, the 99th percentile about
+  2,400 — so only long PR / issue bodies, mostly template, are cut); the total is held to
+  `STORY_SLICE_BUDGET` (40,000: the most discussed train of those months, 88 comments and
+  a 4,131-character body, is 19,126 characters) by cutting the longest texts evenly, never
+  below `STORY_ITEM_FLOOR` (500), then leaving out whole texts from the middle of the
+  timeline outward (the opening and the latest stay). A cut item carries
+  `truncated_from`; an omitted one `text: null` and `text_omitted`. Nothing is cut
+  silently. `hunks_omitted` (only when any) counts the review-comment hunks left out for
+  `STORY_HUNK_BUDGET`.
+- **`bots`** — `{login: count}` of the automation comments, review comments and reviews
+  left out of the timeline.
+- **`pr_history`** — `{pr number: status}`: `fetched` (with `, notes extracted` or `,
+  notes skipped: <reason>`, or ` (commits on the base branch)`), `missing`,
+  `fetch_failed`, `log_failed`, or `not_gathered` when the view has no PR history for it.
+- **`as_of`** — the instant the material is projected to (`meta.records_as_of.instant`,
+  else the window's last second).
+- **`not_gathered`** — what GitHub records that the store does not keep, so a narrator
+  says it rather than infers it: title and description edits, force-pushes and the branch
+  states they replaced, label / milestone / assignee changes over time, whether a review
+  thread was marked resolved, check runs and their results per PR.
+- **`gaps`** (omitted when empty) — what THIS slice cannot show because its store was
+  gathered before the data was kept: review comments with no file / diff lines / thread
+  link, PR commits with no file paths or message bodies. A re-gather of the window adds
+  them.
+- **`outcome`** — where the train stands as of `as_of` and what ended up in the product
+  (`link.story_outcome`):
+  - `train_outcome`, `as_of`;
+  - `items` — per issue / PR of the train: `type`, `number`, `title`, `author`, `state`,
+    `created_at`, `url`, `closed_at` (a closed issue); a PR adds `merged`, `merged_at`,
+    `reviews` `{verdicts: [{reviewer, state, at, url}] (each human reviewer's latest
+    approved / changes_requested / dismissed, the author's own excluded),
+    outstanding_change_requests: [{by, since, url}]}` and `checks: "not gathered"`; an
+    open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;
+  - `ball` — **who the next move is with, DERIVED by rule** from the sequence of recorded
+    events, never from anyone's words (`derived: true`; `link.ball_with`), with the
+    `rule` that fired, its `basis` (the last event) and, at train level, the `pr` it is
+    for (the latest open PR, else the open issue). A PR commit counts as the PR author's
+    move. For an open PR: **R1 mention** — the last event is by someone other than the
+    author and names other people (`@login`): `awaiting mentioned` (them); **R2 author
+    moved** — the last event is the author's (opening, commit, comment): `awaiting
+    reviewer` (the reviewers whose latest verdict is a change request, else the people the
+    author named, else the reviewers who reviewed; nobody: `awaiting a first review`);
+    **R3 approved** — the last event is an approval with no change request outstanding:
+    `awaiting merge`; **R4 reviewer moved** — otherwise: `awaiting author`. For an open
+    issue with no open PR: **I1** the reporter moved last: `awaiting maintainer
+    response`; **I2** someone else named people: `awaiting mentioned`; **I3** otherwise
+    `awaiting reporter`. `state` / `with` say who; `derived` is always true;
+  - `waiting_on` (only when any) — open linked items that the PR author's latest message
+    names (`{number, type, state, title, named_in}`);
+  - `linked` — the repository's issues / PRs named in the conversation (`#N`, or a
+    github.com link to the repository's issue / pull; HTML comments — a template's
+    "Fixes #123" — ignored; the train's own items excluded; at most `STORY_LINKED_MAX` 10,
+    `linked_omitted` the rest): `{number, type, title, author, state, created_at, url,
+    mentioned_in, merged (a PR), closed_at?, comments (human), last_activity_at,
+    description (verbatim, from an issue form's "### Description" when present; at most
+    `STORY_LINKED_BODY_CAP` 1,200 characters), description_truncated_from?}`, or
+    `{number, in_view: false, mentioned_in}` for an item the view does not hold;
+  - `modules` (shipped work; only when the module layer is present) — every module entry
+    a train PR contributed to: `area`, `kind`, `status`, `first_version`, `versions`
+    `{changelog, published: [{version, tag, date}], version_file: {from, to},
+    declared_not_published, published_not_declared}`, `changelog` (the entries the
+    train's PRs wrote — `version`, `sections` `[{heading, kind, items, placeholder?}]`,
+    items **verbatim**, at most `STORY_OUTCOME_ITEMS_MAX` 30 per module), `interface`
+    `{group: {change: [name], <change>_more?}}` (at most `STORY_OUTCOME_NAMES_MAX` 25
+    names each), `children` `[{path, change}]`, `breaking` `{declared: [text],
+    candidates: [{rule, subject}]}`;
+  - `net_change` (open PRs with stored commit paths / patch excerpts) — `{pr:
+    {files_touched: {class: [path]}, lines: {path: {kind, commits, net_added,
+    net_removed, lines_more?} | {kind, commits, reverted: true}}}}`: the files the PR's
+    own commits touched, and for changelogs and shared files the lines added / removed
+    net of the PR's own later commits (a change made and undone is `reverted`). Merges
+    from the base branch are not counted, so this is the PR's own work, not a diff
+    against the base.
+- **`threads`** — the open-threads ledger (`link.story_threads`): every question or request
+  raised, with its resolution status **by rule**. A thread is opened by a review comment
+  that starts a thread (not a reply) by anyone but the PR author, or by the author with a
+  question mark; a `changes_requested` review; a comment, review text or review-comment
+  reply with a question mark (quotations and code blocks ignored). Each `{id (T1, T2,
+  ...), kind: review_thread|change_request|question, on, at, by, url, ask (a verbatim
+  excerpt: the first question sentence, else the opening line, at most `STORY_ASK_CAP`
+  300 characters), path?, replies?, status, resolution?, signals}`. `status`, strongest
+  first: `approved_after` (a change request followed by an approval from the same
+  reviewer), `answered` (a reply by someone else in the same review thread — GitHub's
+  thread link — or, for a conversation question, a later comment on the same item by
+  someone else), `dismissed`, `followed_by_commit` (a later non-merge PR commit touching
+  the thread's file, `same_file: true`), `reply_on_item` (a later reply on the same PR by
+  someone else when the store holds no thread links), `followed_by_commit` with
+  `same_file: null` (a later commit whose files are not known to match), else
+  `unresolved in the record`. `resolution` is the strongest signal `{status, at, by, url,
+  same_file?}`; `signals` lists all. These are rules over the record, not a verdict:
+  "answered" means somebody replied, not that the reply settled it. At most
+  `STORY_THREADS_MAX` 40 (`threads_omitted` the rest).
+
+### `pr_history` (raw, from the store)
+
+The per-window fact gather writes (`gather.collect_pr_history`; STORE.md), omitted when
+no gather stored it (a store gathered before this layer, every fixture bundle, a gather
+without the clone):
+
+```json
+{"collected": true, "base": "main",
+ "limits": {"max_commits": 250, "notes_max_prs": 40, "notes_max_commits": 60, "notes_max": 400},
+ "prs": [{"number": 7146, "status": "fetched", "head": "<sha>",
+          "commits": [{"sha": "…", "parents": 1, "author": "<git author name>",
+                       "authored_at": "…Z", "committed_at": "…Z",
+                       "subject": "AVM-RES: Update changelog and fix e2e tests", "files": 5}],
+          "notes": [{"commit": "…", "path": "…/main.test.bicep", "subkind": "comment",
+                     "change": "add", "name": "// Enforcing location due to …",
+                     "before": null, "after": "// Enforcing location due to …"}]},
+         {"number": 6974, "status": "missing"}]}
+```
+
+- `status` — `fetched`, `missing` (no `refs/pull/<N>/head` on the remote), `fetch_failed`
+  / `log_failed` (with `reason`). `on_base: true` when the head is on the walked branch (a
+  merge-commit merge: the base walk already has its commits).
+- `commits` — the PR's own commits, oldest first (reachable from its head, not from the
+  walked branch), at most 250 (`commits_omitted` the rest); `author` is the git author
+  name (no email is stored).
+- `notes` — the comment / parameter / variable / output changes between those commits
+  (`.bicep` / `.tf` files, the patch walk's symbol extraction), only for the most
+  discussed PRs (human comments + review comments > 0, at most 40 PRs per window, each of
+  at most 60 commits; the newest 400 events per PR, `notes_omitted` the oldest left out);
+  every other fetched PR has `notes_skipped` with the reason.
+- `paths` / `paths_omitted` (per commit; omitted for a merge) — the files the commit
+  changed, at most `PR_HISTORY_PATHS_MAX` 60; `body` / `body_truncated_from` — its message
+  body (where a commit says why), trailer paragraphs (`Co-authored-by: ...`,
+  `Signed-off-by: ...`) dropped, at most `PR_HISTORY_BODY_CAP` 1,500 characters. Stores
+  gathered before these were kept have neither (the slice's `gaps` says so).
+- `patches` (walked PRs only) — `[{commit, path, kind: changelog|shared, added: [line],
+  removed: [line], lines_omitted?}]`: what each commit wrote into a `CHANGELOG.md` or a
+  shared repository file (`PR_HISTORY_PATCH_PATHSPECS`: `.github/`, `utilities/`,
+  `.azuredevops/`, `.pipelines/`, `pipelines/`), at most `PR_HISTORY_PATCH_LINES` 40 lines
+  per file and commit of at most 500 characters each, the newest within
+  `PR_HISTORY_PATCH_CHARS` 8,000 characters per PR (`patches_omitted` the oldest left
+  out); `patches_skipped` with the reason when that walk failed.
+- `{"collected": false}` alone — the window was gathered with `--no-pr-history`.
+
+The fact holds each PR head **as gathered** — possibly after the window — so every
+consumer drops commits committed after the view's end (the as-of rule). A force-push
+before the gather is invisible: only the current head is fetched. A view of exactly a
+gathered window carries the stored value verbatim; a wider view takes, per PR, the entry
+of the latest overlapping window that collected one, and adds `windows`.
 
 ## Optional (omit-when-empty) keys
 
@@ -522,8 +1408,9 @@ report (the omit-when-empty rule that keeps the shape diff-stable), **not** perm
 empty. The groups below document each once it's populated.
 
 `timeline, artifacts, feature_deltas, code_owners,
-code_graph, label_taxonomy, modules, workflow_stats, newcomers, releases, milestones, sprints,
-diagrams`.
+code_graph, label_taxonomy, modules, workflow_stats, newcomers, module_notes,
+module_changes, pr_history, affiliations, prior_activity, contributors, stories, releases,
+milestones, sprints, diagrams`.
 
 **Never in a view:** gather's in-memory bundle skeleton also reserves `workflows` (the raw
 CI runs `workflow_stats` is counted from; never folded, so no view carries it), and
@@ -547,9 +1434,11 @@ CI runs `workflow_stats` is counted from; never folded, so no view carries it), 
   and duration), the board's iterations (current and completed) that overlap the gathered
   window; `{}` on a status-only board. `link.select_sprints(sprints, ref_date)` returns the
   `(previous, current, next)` `{id, title, start, end}` dicts (or `None`).
-- **releases[]** — `[{ tag_name, name, published_at, prerelease:bool, url }]` (the GitHub
-  release's tag, title, publish timestamp, prerelease flag and `html_url`), the releases
-  published in the view's window, sorted by `tag_name` (else `name`).
+- **releases[]** — `[{ tag_name, name, published_at, prerelease:bool, url, notes?,
+  notes_truncated_from? }]` (the GitHub release's tag, title, publish timestamp,
+  prerelease flag and `html_url`; `notes` its text, capped at 4000 characters, only when
+  it has any), the releases published in the view's window, sorted by `tag_name` (else
+  `name`).
 - **milestones[]** — `[{ title, number, state:"open"|"closed", due_on, open_issues,
   closed_issues, url }]` (`due_on` an ISO timestamp or `null` for an undated milestone; the
   issue counts as GitHub reported them at the latest gather). Not windowed (see "Window
@@ -957,9 +1846,26 @@ review's state to `DISMISSED`.
     "commits":        [ { sha, message*, author, date, url } ],
     "feature_deltas": [ ...this train's deltas only... ],
     "feature_deltas_diff_overflow": <int>,
-    "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ]
+    "symbol_moves":   [ ...moves whose from/to artifact is in this train's deltas... ],
+    "conversation":   { timeline, turning_points, truncation, bots,
+                        code_notes_by_module, pr_history, as_of, not_gathered,
+                        outcome, threads }
   }
   ```
+
+  The `train` block also carries `discussion`, `story`, `story_rank`, `story_score` and
+  `story_reasons` when the train has them, and `conversation` is the train's story
+  material: the whole conversation as one chronological timeline (see "The story layer"
+  below for every key). The capped `comments` / `reviews` / `lifecycle` lists of the
+  `issue` and `prs` blocks are unchanged for older narrators; a story narrator reads
+  `conversation`.
+
+  When the view's people carry a display name or the maintainer property (gathered with
+  the people registry), or the view has `people_context` (`link.py --people`), the slice
+  also has `participants` {login: {name?, maintainer?, maintainer_signal?,
+  maintainer_status?, affiliation?, registry_context?}} for the train's humans ("The
+  people layer"); `registry_context` is the person's `people_context` entry — registry
+  context, not a fact of the window.
 
   (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
   chars with a `…[+N chars]` marker. Each comment list, `reviews` and `lifecycle` is
@@ -1006,6 +1912,8 @@ across members (see "Project view: `people` and `halls`").
   | `examples_authored` / `docs_authored` / `symbols_authored` | distinct artifacts with an `add` lifecycle event by this login, bucketed by `kind` (example; doc+readme; symbol) (int) |
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
   | `stale_owned` | distinct areas in a stalled train's `code_areas` (an open train with `effort.stalled`, #112) that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
+  | `affiliation` / `affiliation_signal` | only when the view carries a collected `affiliations` fact, on non-bots: `maintainer_org` / `community` / `unknown` and the deciding signal ("The people layer") |
+  | `name` / `maintainer` / `maintainer_signal` / `maintainer_status` | only when the view's `affiliations` fact was gathered with the people registry, on non-bots the fact names (never for a `do_not_name` person): the display name and the maintainer property for the view's repository, with its lifecycle status at gather time when the registry holds maintainer evidence ("The people registry") |
 
   Counts are always present (ints, may be 0), except `prs_opened` and `own_pr_commits`
   (present when applicable, above); `merge_rate`/`review_latency_days`/

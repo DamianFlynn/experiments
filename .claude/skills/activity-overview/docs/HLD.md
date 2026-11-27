@@ -40,7 +40,10 @@ renderer over that view; changelogs, dashboards or slide decks are others.
 | Progressive series | What's new vs carried over since last month? Did last month's forecast land? | `link --series` (`series.py`) |
 | Flow health | What is blocked, hung, upvoted-but-ignored? Who/what blocks the most? | `derive.build_flow` / `build_blockers` |
 | Recognition | Who moved the project (no blame board, by design)? | `derive.annotate_people_profile` / `build_halls` |
+| People and community | How much came from the maintaining organisation and how much from the community? Who maintains the repository? Who is new, or back after 3 / 6 / 9 months, and what did their work land (a new module, a pattern, a change, plumbing)? Who are they (display name), looked up once per person? Since when are they active here, are they still maintaining, what else do they maintain or contribute to? | the people registry (`people.py`, with its activity profile) → gather `affiliations` + `newcomers` → extract `prior_activity` → `link` `contributors`, halls by affiliation; `link --people` → `people_context` (registry context) |
 | Feature ledger | Which params/outputs/resources/docs were added, changed, removed? | `code_events` + `feature_deltas` |
+| Module release notes | Which modules are new, what changed in each, what is breaking (declared vs candidate), what was deprecated, how much was plumbing? | gather `module_notes` (changelogs, version files, tags) → `link` `module_changes` |
+| Stories | Which work had the most to tell (a debate, a change request and the rework after it, a long silence), and what was said along the way, in order? | gather `pr_history` (PR head refs) → `link` `discussion` / `stories` / slice `conversation` |
 | Module biography | How has one module's surface evolved across all history? | `spotlight module` |
 | Blast radius | If this module changes, which modules/repos consume it? | `spotlight dependents`, `digest.module_edges` |
 | Multi-repo project | One view across a constellation of repos | `gather --manifest`, `digest` |
@@ -418,6 +421,21 @@ full-history lifecycle of every parameter/output/resource symbol (added → chan
 with before/after snippets and the driving PR). The narrator turns it into a cited
 "how this module evolved" section.
 
+### 8.5a Scenario E2 — a newsletter from the month's module changes
+
+A newsletter reader wants what a product's monthly release notes give: new modules,
+noteworthy changes per module, breaking changes, deprecations — not PR numbers. gather reads
+the changelog entries, `version.json` moves and version tags the month's commits added (from
+the clone, per touched file); `link` adds `module_changes`: one entry per module with its
+status (new / changed / deprecated / removed / orphaned), versions, the maintainers' changelog
+text and **declared** breaking items, the interface changes and rule-derived breaking
+**candidates** (kept apart), child-module moves, deprecations, the PRs and authors behind it,
+and whether its only activity was plumbing; plus roll-ups (new modules, declared breaking,
+deprecations, most substantive by product change, plumbing share of merged PRs). A README /
+CI sweep is classified as plumbing while the real module changes it carried stay on their
+modules. Works for a module monorepo (Bicep AVM), one-repo-per-module (Terraform, with the
+repo's releases) and landing-zone repos (deployments, from structure and interface).
+
 ### 8.6 Scenario F — community call fold-in
 
 Pass a `.vtt`/`.srt`/`.txt` transcript; `transcript.py` normalizes it and the report gains
@@ -618,6 +636,55 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     but active since is stalled in that view; a push to the PR branch is not dated in the
     record, so it counts only while `updated_at` is not projected.
     A shipped train is never stalled; one that took long to land is `slow_to_land`.
+20. **Module release notes are as good as the repository's own records.** `module_changes`
+    quotes the changelog verbatim (declared breaking items are the maintainers' statement)
+    and derives breaking **candidates** from the stored declaration snippets: a parameter
+    renamed within one file reads as removed + added, a Terraform variable's default is not
+    in its snippet (`required: null`), and a candidate is a hint to check, never a claim.
+    GitHub release text is kept up to 4,000 characters (`releases[].notes`). A version a
+    changelog declared in the window but no tag published in it (and the reverse) is flagged,
+    within the window only. Tags come from the clone (lightweight tags are dated by their
+    commit). A window gathered before this layer has no `module_notes` and no
+    `module_changes` until re-gathered.
+21. **A story is as good as what people wrote down.** The story layer reads the stored
+    conversation (comments, reviews, review comments, lifecycle events) and each PR's own
+    commits from its head ref as gathered. It cannot see title or description edits,
+    force-pushes (only the current head is fetched), label changes over time, or anything
+    said outside GitHub; a rewritten commit is flagged by its dates, not reconstructed.
+    Story selection is a ranking by rule (`story_score`), not a judgement of importance, and
+    the narrator brief forbids characterising people.
+22. **An affiliation is a label from public signals, and unknown is an answer.** gather
+    labels a person `maintainer_org` only on a stated signal (the operator's list, GitHub's
+    `author_association` on their records, public org membership, a matching profile company,
+    a home commit email domain) and `community` only on the operator's list or a stated
+    non-matching company; anything else is `unknown`, never community. It cannot see private
+    org membership, an unstated or stale employer, or a vendor relationship; the label is
+    GitHub's answer when the window was gathered. Only the label and the signal are stored —
+    no profile text, company or email — and `--no-affiliation` turns it off.
+23. **A person is looked up once; the owner's word wins; a report stays reproducible.** The
+    people registry (`people.json`, one for the whole workspace and shared by every stream,
+    outside the stores) keeps one record per login across months, repositories and streams:
+    the label, the public display name (the owner's choice), the maintainer property per
+    repository, and the owner's own tags. A lookup is
+    reused for 120 days (`unknown` for 30), refreshes are bounded per run, and fields the
+    owner sets are never overwritten. The maintainer property is a role, not an employer:
+    derived from stored merges, approving reviews and OWNER / COLLABORATOR, never from
+    affiliation (nor the reverse). Each window's `affiliations` fact records the labels it
+    used, and views read only the fact, so editing the registry changes the next gather,
+    never an old report. `do_not_name` keeps a person to their login in every output.
+24. **The registry knows only what was gathered, and says so.** Beside the registry, a
+    generated activity file keeps one small contribution record per person, repository and
+    gathered window (counts by month, first / last commit, PR, merge, review, issue with
+    their references). Every total, rate, trend and status is derived from the set of
+    windows, so re-gathering a window replaces it and nothing is counted twice; every first
+    and total is "as observed since" the repository's coverage start, never "ever", unless
+    the gather-time newcomer search established a true first. Roles have a lifecycle —
+    maintainers move on: evidence is kept, but a maintainer without a maintainer-type action
+    for six months of gathered history is `lapsed`, after eighteen `former`, and with too
+    little gathered since `unknown`; the owner's own setting wins. Cross-project context
+    ("also maintains …", "active here since …") reaches a report only when `link.py
+    --people` asks for it, read from windows ending by the view's end and stamped with the
+    registry's state: registry context, never a fact of the window.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
 per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it
@@ -657,6 +724,7 @@ people's areas (a union over the windows), a difference is a WARN naming the rea
 | New report formats (changelog, dashboard, deck) | Consume the versioned view (`BUNDLE.md`); see `examples/formatters/` |
 | New code-area layouts | Add a pattern to `gather.DEFAULT_AREA_PATTERNS` |
 | Organization-specific priority labels | `link.py --priority-label PATTERN` per run; `link.PRIORITY_LABEL_PATTERNS` / `link.HIGH_PRIORITY_LABELS` for defaults |
+| Repository layouts for product vs plumbing | `link.py --path-class CLASS=GLOB` per run; `link.DEFAULT_PATH_CLASS_RULES` for defaults; changelog / version file names in `gather.CHANGELOG_FILE_NAMES` / `VERSION_FILE_NAMES` |
 | Historical record state on multi-window stores (limitation 7) | Per-window snapshots of PR/issue records at fold (not implemented; views are window-scoped since #85) |
 | Forecast weights / tiers, train significance, flow thresholds | Named constants in `link.py` / `derive.py` (LLD §13) |
 | Cross-repo Bicep dependencies from private registries / template specs | `gather.resolve_bicep_registry_member` (public registry only, #92); a private-registry prefix field would extend it |

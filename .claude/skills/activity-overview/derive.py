@@ -1137,6 +1137,107 @@ def annotate_people_profile(bundle):
     return bundle
 
 
+def annotate_people_affiliation(bundle):
+    """Set `affiliation` / `affiliation_signal` on each non-bot person from
+    the view's `affiliations` fact (gather collect_affiliations), in place.
+    Only when the bundle carries a collected fact: every other bundle (and
+    every fixture view) is unchanged. A person the fact does not name is
+    `unknown` with signal `not_checked` (over the lookup cap / after
+    repeated failures) or `not_looked_up` (not a person of a gathered
+    window: e.g. an unresolved commit author). An entry gathered with the
+    people registry also gives the person's display `name` and the
+    `maintainer` property (with `maintainer_signal`) for the view's
+    repository; a `do_not_name` entry gives neither (the login only).
+    Returns bundle."""
+    fact = bundle.get("affiliations")
+    if not isinstance(fact, dict) or not fact.get("collected"):
+        return bundle
+    entries = fact.get("people") or {}
+    not_checked = set(fact.get("not_checked") or [])
+    for login, profile in (bundle.get("people") or {}).items():
+        if profile.get("is_bot"):
+            continue
+        # the labels are the fact's alone: drop any an earlier enrichment
+        # left, so a do_not_name entry (or no entry) never keeps them
+        for key in PERSON_LABEL_KEYS:
+            profile.pop(key, None)
+        e = entries.get(login)
+        if isinstance(e, dict) and e.get("affiliation"):
+            profile["affiliation"] = e["affiliation"]
+            profile["affiliation_signal"] = e.get("signal")
+            for key in PERSON_LABEL_KEYS:
+                if key in e:
+                    profile[key] = e[key]
+        else:
+            profile["affiliation"] = "unknown"
+            profile["affiliation_signal"] = ("not_checked" if login in not_checked
+                                             else "not_looked_up")
+    return bundle
+
+
+# How decisive each affiliation signal is, strongest first: when two member
+# views of a project disagree about one person, the stronger signal wins
+# (digest._merge_people).
+AFFILIATION_SIGNAL_ORDER = ("override", "author_association",
+                            "public_membership", "profile_company",
+                            "commit_email_domain", "lookup_failed", "none",
+                            "not_checked", "not_looked_up", "do_not_name")
+
+# What the people registry adds to a person record (and to every row that
+# names the person: halls, contributors, story participants): the display
+# name and the maintainer property for the repository, with its signal and
+# its lifecycle status at gather time (active / lapsed / former / unknown).
+PERSON_LABEL_KEYS = ("name", "maintainer", "maintainer_signal",
+                     "maintainer_status")
+
+
+def person_labels(profile):
+    """{name?, maintainer?, maintainer_signal?, maintainer_status?} of a
+    person record: only the keys it carries (omit-when-absent). Pure."""
+    return {k: profile[k] for k in PERSON_LABEL_KEYS if k in (profile or {})}
+
+
+def affiliation_rank(profile):
+    """Sort key of a person record's affiliation: lower is more decisive;
+    the operator's override first (also an explicit `unknown`), then a
+    known label before `unknown`. Pure."""
+    sig = profile.get("affiliation_signal")
+    order = AFFILIATION_SIGNAL_ORDER.index(sig) \
+        if sig in AFFILIATION_SIGNAL_ORDER else len(AFFILIATION_SIGNAL_ORDER)
+    return (sig != "override", profile.get("affiliation") == "unknown", order)
+
+
+def hall_score(profile):
+    """The `halls.fame` footprint of one person (build_halls). Pure."""
+    return (profile.get("prs_merged", 0) * 2 + profile.get("prs_reviewed", 0)
+            + profile.get("commits_authored", 0)
+            - (profile.get("own_pr_commits") or 0))
+
+
+def _hall_entries(people, keep=None):
+    entries = []
+    for login, profile in people.items():
+        if profile.get("is_bot") or (keep is not None and not keep(profile)):
+            continue
+        score = hall_score(profile)
+        if score <= 0:
+            continue
+        entry = {
+            "login": login,
+            "score": score,
+            "prs_merged": profile.get("prs_merged", 0),
+            "prs_reviewed": profile.get("prs_reviewed", 0),
+            "commits_authored": profile.get("commits_authored", 0),
+            "areas": profile.get("areas", []),
+        }
+        if profile.get("own_pr_commits"):
+            entry["own_pr_commits"] = profile["own_pr_commits"]
+        entry.update(person_labels(profile))
+        entries.append(entry)
+    entries.sort(key=lambda e: (-e["score"], e["login"]))
+    return entries[:10]
+
+
 def build_halls(bundle):
     """Build `bundle["halls"] = {"fame": [...]}` — recognition only.
 
@@ -1149,32 +1250,24 @@ def build_halls(bundle):
     not attributable to their own merged PRs (direct pushes, commits on
     others' PRs) add to the score. A fame entry carries `own_pr_commits` when
     it is not 0. `halls.internal`/`shame`/`blame` are intentionally NOT built
-    (recognition, not blame). Pure (sets halls); returns bundle."""
+    (recognition, not blame).
+
+    When the people carry `affiliation` (annotate_people_affiliation), the
+    same people are also ranked, the same way, within each known
+    affiliation: `halls.community` and `halls.maintainer_org` (top 10
+    each), plus `halls.unranked_unknown`, how many people with a positive
+    score are `unknown` — never ranked as community. `fame` itself does
+    not change. Pure (sets halls); returns bundle."""
     people = bundle.get("people") or {}
-    fame = []
-    for login, profile in people.items():
-        if profile.get("is_bot"):
-            continue
-        prs_merged = profile.get("prs_merged", 0)
-        prs_reviewed = profile.get("prs_reviewed", 0)
-        commits_authored = profile.get("commits_authored", 0)
-        own_pr_commits = profile.get("own_pr_commits") or 0
-        score = prs_merged * 2 + prs_reviewed + commits_authored - own_pr_commits
-        if score <= 0:
-            continue
-        entry = {
-            "login": login,
-            "score": score,
-            "prs_merged": prs_merged,
-            "prs_reviewed": prs_reviewed,
-            "commits_authored": commits_authored,
-            "areas": profile.get("areas", []),
-        }
-        if own_pr_commits:
-            entry["own_pr_commits"] = own_pr_commits
-        fame.append(entry)
-    fame.sort(key=lambda e: (-e["score"], e["login"]))
-    bundle["halls"] = {"fame": fame[:10]}
+    halls = {"fame": _hall_entries(people)}
+    if any("affiliation" in p for p in people.values()):
+        for aff in ("community", "maintainer_org"):
+            halls[aff] = _hall_entries(
+                people, keep=lambda p, a=aff: p.get("affiliation") == a)
+        halls["unranked_unknown"] = sum(
+            1 for p in people.values() if not p.get("is_bot")
+            and p.get("affiliation") == "unknown" and hall_score(p) > 0)
+    bundle["halls"] = halls
     return bundle
 
 

@@ -16,6 +16,7 @@ import series  # Phase 13: series continuity (installment_snapshot / compute_ser
 # are byte-identical to before — `link.enrich` calls the same functions, now
 # resolving to the names imported from derive (one-way: link -> derive).
 import derive
+import people as people_mod  # registry context (link --people)
 from derive import (
     ref,
     attribute_code_areas,
@@ -1150,6 +1151,11 @@ def slice_train(bundle, train_id):
         "issues":       train.get("issues", []),
         "pr_outcomes":  train.get("pr_outcomes", {}),
     }
+    # The story layer's keys, only when the train carries them.
+    for key in ("discussion", "story", "story_rank", "story_score",
+                "story_reasons"):
+        if key in train:
+            train_block[key] = train[key]
 
     # --- resolve issue ------------------------------------------------------
     root_num = train.get("root_issue")
@@ -1253,6 +1259,9 @@ def slice_train(bundle, train_id):
         "feature_deltas": own_deltas,
         "feature_deltas_diff_overflow": diff_overflow,
         "symbol_moves":   own_moves,
+        # The story material: the whole conversation as one timeline.
+        "conversation":   story_material(bundle, train),
+        **slice_participants(bundle, train),
     }
 
 
@@ -1428,6 +1437,2909 @@ def build_forecast(bundle, matchers=None, extra_patterns=()):
     return bundle
 
 
+# --- Module changes: the reader's view -------------------------------------
+#
+# `module_changes` answers what a release-notes reader asks of a window: which
+# modules are new, what changed in the existing ones, what is breaking, what
+# was deprecated, and how much of the window's merged work was plumbing (CI,
+# docs generation, tests). It is derived at view time from stored records
+# only: the view's commits / code events / symbol events / symbol moves /
+# PRs / releases / code graph, plus the gathered `module_notes` fact (the
+# changelog entries, version-file moves and version tags read from the
+# clone). It is built only when the view carries `module_notes` (a gather
+# that read them), so a bundle without them is unchanged.
+#
+# Two sources of "breaking" are kept apart on purpose:
+#   breaking.declared   — a changelog "Breaking Changes" item: the maintainers'
+#                         own statement, quoted verbatim;
+#   breaking.candidates — derived by rule from the interface (a removed or
+#                         moved parameter, a new required parameter, a removed
+#                         output, a removed or moved child module, a removed
+#                         module): a candidate a writer must check, never a
+#                         claim.
+
+# File classes, by path. First matching rule wins; `link.py --path-class
+# CLASS=GLOB` (repeatable) puts the operator's rules first. A GLOB with a `/`
+# matches the whole path (`**` any number of segments, `*` / `?` within one);
+# without one it matches the file's name. Matching ignores case. A path no
+# rule matches is `source` (deployable module code).
+PATH_CLASSES = ("source", "tests", "docs", "generated", "metadata", "ci")
+DEFAULT_PATH_CLASS_RULES = (
+    # CI, pipelines and repository tooling
+    ("ci", ".github/**"), ("ci", ".azuredevops/**"),
+    ("ci", ".azure-pipelines/**"), ("ci", ".pipelines/**"),
+    ("ci", "pipelines/**"), ("ci", "utilities/**"), ("ci", ".devcontainer/**"),
+    ("ci", ".vscode/**"), ("ci", ".config/**"), ("ci", "Makefile"),
+    ("ci", ".gitignore"), ("ci", ".gitattributes"), ("ci", ".editorconfig"),
+    ("ci", ".pre-commit-config.yaml"), ("ci", "*.tflint.hcl"),
+    ("ci", ".tflint*.hcl"), ("ci", "avm"), ("ci", "avm.bat"), ("ci", "avm.ps1"),
+    # release and ownership metadata that travels with a module
+    ("metadata", "CHANGELOG.md"), ("metadata", "CHANGES.md"),
+    ("metadata", "HISTORY.md"), ("metadata", "RELEASE_NOTES.md"),
+    ("metadata", "version.json"), ("metadata", "metadata.json"),
+    ("metadata", "ORPHANED.md"), ("metadata", "DEPRECATED.md"),
+    ("metadata", "CODEOWNERS"), ("metadata", ".terraform.lock.hcl"),
+    ("metadata", ".terraform-docs.yml"),
+    ("ci", ".*"),          # any other dot-file: repository configuration
+    # generated from the source (the compiled template next to main.bicep)
+    ("generated", "main.json"),
+    # tests and examples
+    ("tests", "**/tests/**"), ("tests", "**/test/**"), ("tests", "**/examples/**"),
+    ("tests", "validation/**"), ("tests", "*.test.bicep"),
+    ("tests", "*.tftest.hcl"), ("tests", "*_test.go"),
+    # documentation
+    ("docs", "docs/**"), ("docs", "guides/**"), ("docs", "*.md"),
+    ("docs", "*.png"), ("docs", "*.svg"), ("docs", "*.jpg"), ("docs", "*.drawio"),
+    ("docs", "LICENSE"),
+)
+# Conventional-commit types and title words that say "plumbing" (a secondary
+# signal: paths decide the class, the title only confirms a sweep is one).
+_PLUMBING_CC_TYPES = {"ci": "ci", "build": "ci", "chore": "ci", "docs": "docs",
+                      "test": "tests", "tests": "tests", "style": "docs"}
+_PLUMBING_TITLE_WORDS = (
+    (re.compile(r"\bCI\b"), "ci"),
+    (re.compile(r"\b(pipelines?|workflows?|lint(er|ing)?)\b", re.I), "ci"),
+    (re.compile(r"\b(readmes?|docs|documentation)\b", re.I), "docs"),
+    (re.compile(r"\btests?\b", re.I), "tests"),
+)
+# A PR is a mechanical sweep when it touches at least this many module areas
+# and at least half of them only in docs / generated / metadata files.
+SWEEP_MIN_AREAS = 5
+MODULE_RANK_TOP_N = 10
+_AVM_MODULE_KINDS = {"res": "resource", "ptn": "pattern", "utl": "utility"}
+_BICEP_MODULE_REF_RE = re.compile(r"^\s*module\s+\w+\s+'([^']*)'")
+_BICEP_RESOURCE_TYPE_RE = re.compile(r"'([^'@\s]+)@([^'\s]+)'")
+_BACKTICK_PATH_RE = re.compile(r"`([^`\s]+/[^`\s]+)`")
+_DEPRECATION_RE = re.compile(r"\bdeprecat", re.I)
+
+
+def _glob_regex(pattern):
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("/**", i) and i + 3 == len(pattern):
+            out.append("(?:/.*)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z", re.I)
+
+
+def path_class_rules(extra=()):
+    """[(class, glob, compiled)] of the operator's `extra` rules (each
+    "CLASS=GLOB") followed by DEFAULT_PATH_CLASS_RULES. A malformed rule or
+    an unknown class raises ValueError."""
+    rules = []
+    for spec in extra:
+        cls, sep, glob = str(spec).partition("=")
+        cls, glob = cls.strip(), glob.strip()
+        if not sep or not glob or cls not in PATH_CLASSES:
+            raise ValueError("--path-class wants CLASS=GLOB with CLASS one of "
+                             "{}, got {!r}".format(", ".join(PATH_CLASSES), spec))
+        rules.append((cls, glob))
+    rules.extend(DEFAULT_PATH_CLASS_RULES)
+    return [(cls, glob, _glob_regex(glob)) for cls, glob in rules]
+
+
+def path_class(path, rules):
+    """The class of one file path under `rules` (path_class_rules)."""
+    name = (path or "").rsplit("/", 1)[-1]
+    for cls, glob, rx in rules:
+        if rx.match(path if "/" in glob else name):
+            return cls
+    return "source"
+
+
+def _area_dir(area):
+    return "" if area in ("main.bicep", "main.tf") else area
+
+
+def _in_dir(path, d):
+    return path.startswith(d + "/") if d else True
+
+
+def module_kind(area, files=()):
+    """The module kind of a code area, or None when it is not a module:
+    `resource` / `pattern` / `utility` for `avm/res|ptn|utl/<group>/<name>`;
+    `module` for a Terraform module root (the repo-root `main.tf` area, or an
+    area with a `*.tf` file directly in it), `submodule` for
+    `modules/<name>`; `deployment` for a Bicep module directory outside
+    `avm/` (an area whose own `main.bicep` is among `files`, e.g. a landing
+    zone's deployments)."""
+    parts = (area or "").split("/")
+    if len(parts) == 4 and parts[0] == "avm" and parts[1] in _AVM_MODULE_KINDS:
+        return _AVM_MODULE_KINDS[parts[1]]
+    if parts[0] == "avm":
+        return None
+    if area == "main.tf":
+        return "module"
+    if len(parts) == 2 and parts[0] == "modules":
+        return "submodule"
+    d = _area_dir(area)
+    for f in files:
+        if not _in_dir(f, d):
+            continue
+        rest = f[len(d) + 1:] if d else f
+        if rest == "main.bicep":
+            return "deployment"
+        if "/" not in rest and rest.endswith(".tf"):
+            return "module"
+    return None
+
+
+def _entry_file(area, kind):
+    d = _area_dir(area)
+    name = "main.tf" if kind in ("module", "submodule") else "main.bicep"
+    return f"{d}/{name}" if d else name
+
+
+def _interface_file(path, area, kind):
+    """True for a file that declares the module's interface: its entry
+    `main.bicep`, or for Terraform any `*.tf` directly in the module dir."""
+    d = _area_dir(area)
+    if not _in_dir(path, d):
+        return False
+    rest = path[len(d) + 1:] if d else path
+    if kind in ("module", "submodule"):
+        return "/" not in rest and rest.endswith(".tf")
+    return rest == "main.bicep"
+
+
+def _child_dir(path, area):
+    """The child module directory a `main.bicep` path names inside `area`
+    (not the area's own entry, not under tests/ or examples/), else None."""
+    d = _area_dir(area)
+    if not path.endswith("/main.bicep") or not _in_dir(path, d):
+        return None
+    child = path[:-len("/main.bicep")]
+    if child == d or gather._is_scaffold_path(path):
+        return None
+    return child
+
+
+def _bicep_param_required(decl):
+    """True / False when a Bicep `param` declaration says whether it is
+    required (no default and not nullable `?`), None when the snippet cannot
+    tell (another language, a multi-line type, a snippet cut at its cap)."""
+    m = re.match(r"^\s*param\s+\w+\s+(.*)$", decl or "")
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    if "=" in rest:
+        return False
+    if rest.endswith("?"):
+        return False
+    if rest.endswith(("{", "[", "(")) or len(decl) >= 200:
+        return None
+    return True
+
+
+def _module_ref(decl):
+    m = _BICEP_MODULE_REF_RE.match(decl or "")
+    if not m:
+        return None
+    ref = m.group(1)
+    registry, version, local = gather._bicep_ref_parts(ref)
+    out = {"ref": ref}
+    if version:
+        out["version"] = version
+    out["target"] = registry or local or ref.rsplit(":", 1)[0]
+    if local:
+        out["local"] = True
+    return out
+
+
+def _resource_type(decl):
+    m = _BICEP_RESOURCE_TYPE_RE.search(decl or "")
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+class _ModuleCtx:
+    """What the module view reads from a bundle, indexed once."""
+
+    def __init__(self, bundle, rules):
+        self.bundle = bundle
+        self.rules = rules
+        self.period = window_period(bundle.get("meta", {}))
+        self.idx = derive.area_index(bundle.get("code_graph", {}))
+        self.commits = {c.get("sha"): c for c in bundle.get("commits", [])}
+        events = bundle.get("code_events", [])
+        # every path the view saw: decides which areas are modules
+        self.seen_files = sorted(
+            {f for c in bundle.get("commits", []) for f in c.get("files") or []}
+            | {e.get("path") for e in events if e.get("path")}
+            | {e.get("old_path") for e in events if e.get("old_path")})
+        self._kinds = {}
+        self.prs = {p.get("number"): p for p in bundle.get("prs", [])}
+        self.train_of = {}
+        for t in bundle.get("trains", []):
+            for n in t.get("prs") or []:
+                self.train_of.setdefault(n, t.get("id"))
+        tags = (bundle.get("module_notes") or {}).get("tags") or {}
+        self.tags_collected = bool(tags.get("collected"))
+        # a roll-up where some gathered window listed no tags: a version
+        # without a tag in the view may have been tagged in such a window
+        self.tags_partial = bool(tags.get("windows_without_tags"))
+
+    def kind(self, area):
+        """module_kind of an area over every path of the view (memoised)."""
+        if area not in self._kinds:
+            self._kinds[area] = module_kind(area, self.seen_files) \
+                if area else None
+        return self._kinds[area]
+
+    def area_of(self, path):
+        area = self.idx.get(path)
+        if area is None and path:
+            area = gather.classify_code_area(path, gather.DEFAULT_AREA_PATTERNS)
+        return area
+
+    def source(self, sha, path=None):
+        """{commit, [pr], url, [path]} citing one commit (its PR when known)."""
+        c = self.commits.get(sha) or {}
+        out = {"commit": sha}
+        pr = c.get("pr")
+        if pr is not None:
+            out["pr"] = pr
+            out["url"] = (self.prs.get(pr) or {}).get("url") or \
+                derive._commit_url(self.bundle, sha)
+        else:
+            out["url"] = derive._commit_url(self.bundle, sha)
+        if path:
+            out["path"] = path
+        return out
+
+
+def _bare_version(v):
+    """A version string compared across a changelog heading and a tag:
+    stripped, without a leading `v` / `V`."""
+    v = str(v or "").strip()
+    return v[1:] if v[:1] in ("v", "V") else v
+
+
+def _is_release_version(v):
+    """True for a changelog version that a tag could publish (starts with a
+    digit after an optional `v`): `Unreleased` and other labels are not."""
+    return bool(re.match(r"\d", _bare_version(v)))
+
+
+def _release_row(r, **keys):
+    """A view release as a module_changes row: `keys` maps the row's field
+    names to the release's, then its notes (and their truncation) when the
+    gather kept any."""
+    row = {out: r.get(src) for out, src in keys.items()}
+    if r.get("notes"):
+        row["notes"] = r["notes"]
+        if r.get("notes_truncated_from"):
+            row["notes_truncated_from"] = r["notes_truncated_from"]
+    return row
+
+
+def _dedupe_sources(sources):
+    seen, out = set(), []
+    for s in sources:
+        key = (s.get("commit"), s.get("path"))
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+def _net_symbols(events):
+    """Net change per symbol over the window's events (oldest first):
+    added (absent before, present after), removed, or modified (present on
+    both ends with a different declaration). An add-then-drop is nothing."""
+    by_key = {}
+    for e in events:
+        by_key.setdefault((e.get("path"), e.get("subkind"), e.get("name")),
+                          []).append(e)
+    out = []
+    for (path, subkind, name), evs in by_key.items():
+        first, last = evs[0], evs[-1]
+        before = first.get("change") != "add"
+        after = last.get("change") != "drop"
+        if before and after:
+            b, a = first.get("before"), last.get("after")
+            if b == a:
+                continue
+            change = "modified"
+        elif after:
+            change, b, a = "added", None, last.get("after")
+        elif before:
+            change, b, a = "removed", first.get("before"), None
+        else:
+            continue
+        out.append({"path": path, "subkind": subkind, "name": name,
+                    "change": change, "before": b, "after": a, "events": evs})
+    return sorted(out, key=lambda s: (s["path"] or "", s["subkind"] or "",
+                                      s["name"] or ""))
+
+
+def _interface_summary(ctx, events, moves):
+    """{parameters, outputs, resources, dependencies} of one module file set
+    (empty groups omitted) and its breaking candidates."""
+    groups, candidates = {}, []
+
+    def put(group, change, row):
+        groups.setdefault(group, {}).setdefault(change, []).append(row)
+
+    # a symbol a move fact accounts for is reported as moved, not as a
+    # removal here plus an addition there
+    moved = {(m.get("from_path"), m.get("subkind"), m.get("name")) for m in moves} \
+        | {(m.get("to_path"), m.get("subkind"), m.get("name")) for m in moves}
+    for s in _net_symbols(events):
+        if s["change"] != "modified" and (s["path"], s["subkind"], s["name"]) in moved:
+            continue
+        sources = _dedupe_sources(ctx.source(e.get("commit"), s["path"])
+                                  for e in s["events"])
+        sub, name = s["subkind"], s["name"]
+        if sub in ("param", "variable"):
+            row = {"name": name, "sources": sources}
+            if s["change"] == "added":
+                req = _bicep_param_required(s["after"]) if sub == "param" else None
+                row.update(declaration=s["after"], required=req)
+                put("parameters", "added", row)
+                if req:
+                    candidates.append({"rule": "required_parameter_added",
+                                       "subject": name, "sources": sources})
+            elif s["change"] == "removed":
+                row["declaration"] = s["before"]
+                put("parameters", "removed", row)
+                candidates.append({"rule": "parameter_removed", "subject": name,
+                                   "sources": sources})
+            else:
+                row.update(before=s["before"], after=s["after"])
+                put("parameters", "modified", row)
+                if sub == "param" and _bicep_param_required(s["before"]) is False \
+                        and _bicep_param_required(s["after"]) is True:
+                    candidates.append({"rule": "parameter_became_required",
+                                       "subject": name, "sources": sources})
+        elif sub == "output":
+            row = {"name": name, "sources": sources}
+            if s["change"] == "modified":
+                row.update(before=s["before"], after=s["after"])
+            else:
+                row["declaration"] = s["after"] or s["before"]
+            put("outputs", s["change"], row)
+            if s["change"] == "removed":
+                candidates.append({"rule": "output_removed", "subject": name,
+                                   "sources": sources})
+        elif sub == "resource":
+            row = {"name": name, "sources": sources}
+            if s["change"] == "modified":
+                bt, bv = _resource_type(s["before"])
+                at, av = _resource_type(s["after"])
+                if bt and at and bt == at and bv != av:
+                    put("resources", "api_versions",
+                        dict(row, type=at, **{"from": bv, "to": av}))
+                    continue
+                row.update(before=s["before"], after=s["after"])
+            else:
+                row["declaration"] = s["after"] or s["before"]
+            put("resources", s["change"], row)
+        elif sub == "module":
+            row = {"name": name, "sources": sources}
+            if s["change"] == "modified":
+                b, a = _module_ref(s["before"]), _module_ref(s["after"])
+                if b and a and b["target"] == a["target"]:
+                    row.update(change="version", target=a["target"],
+                               **{"from": b.get("version"), "to": a.get("version")})
+                elif b and a:
+                    row.update(change="target", **{"from": b["ref"], "to": a["ref"]})
+                else:
+                    row.update(before=s["before"], after=s["after"])
+                put("dependencies", "changed", row)
+            else:
+                ref = _module_ref(s["after"] or s["before"])
+                if ref:
+                    row.update(ref)
+                else:
+                    row["declaration"] = s["after"] or s["before"]
+                put("dependencies", s["change"], row)
+    for m in moves:
+        group = "parameters" if m.get("subkind") in ("param", "variable") \
+            else "outputs" if m.get("subkind") == "output" else None
+        if group is None:
+            continue
+        sources = _dedupe_sources(
+            ctx.source(e.get("commit"), e.get("path")) for e in events
+            if e.get("name") == m.get("name") and e.get("change") in ("drop", "add")
+            and e.get("path") in (m.get("from_path"), m.get("to_path")))
+        row = {"name": m.get("name"), "from_path": m.get("from_path"),
+               "to_path": m.get("to_path"), "confidence": m.get("confidence"),
+               "sources": sources}
+        put(group, "moved", row)
+        if m.get("leaves"):
+            candidates.append({"rule": "{}_moved".format(
+                "parameter" if group == "parameters" else "output"),
+                "subject": m.get("name"), "sources": sources})
+    return groups, candidates
+
+
+def _changelog_items(entry):
+    for s in entry.get("sections") or []:
+        for item in s.get("items") or []:
+            yield s, item
+
+
+def _deprecation_target(text):
+    m = _BACKTICK_PATH_RE.search(text or "")
+    return m.group(1) if m else None
+
+
+def classify_pr_change(pr, ctx):
+    """The product-vs-plumbing class of one PR, by rule from the files of
+    its commits in the view (the title is a secondary signal).
+
+    File classes come from `path_class`. Ignoring `generated` and
+    `metadata` (they travel with any change): source and no ci -> `module`
+    (`module_kinds` names the kinds of the module areas whose source
+    changed); source and ci -> `mixed`; no source: only ci -> `ci`, only
+    tests -> `tests-only`, only docs or nothing else -> `docs-only`, unless
+    a changelog or version file changed -> `release` (a version cut with
+    no code change); any other mix -> `mixed`. No commit of the PR in the view -> `unknown`.
+    `title_signal` (ci / docs / tests) comes from a conventional-commit
+    type (ci, build, chore, docs, test, style) or a title word (CI,
+    pipeline, workflow, lint, readme, docs, tests). `sweep` when the PR
+    touches at least SWEEP_MIN_AREAS module areas and half or more of them
+    only in docs / generated / metadata / tests files; `substantive_areas`
+    are the module areas whose source it did change. `plumbing`: no source
+    file (a `release` is not plumbing), or a sweep whose title says
+    plumbing."""
+    number = pr.get("number")
+    files = sorted({f for c in ctx.bundle.get("commits", [])
+                    if c.get("pr") == number for f in c.get("files") or []})
+    row = {"number": number, "url": pr.get("url"), "title": pr.get("title")}
+    if ctx.train_of.get(number):
+        row["train"] = ctx.train_of[number]
+    if not files:
+        row.update({"class": "unknown", "plumbing": None})
+        return row
+    classes, areas, source_areas = set(), set(), set()
+    kinds = {}
+    for f in files:
+        cls = path_class(f, ctx.rules)
+        classes.add(cls)
+        area = ctx.area_of(f)
+        kind = ctx.kind(area)
+        if kind is None:
+            continue
+        areas.add(area)
+        if cls == "source":
+            source_areas.add(area)
+            kinds[area] = kind
+    real = classes - {"generated", "metadata"}
+    release = any(gather._note_file_kind(f) for f in files)
+    if "source" in real:
+        cls = "mixed" if "ci" in real else "module"
+    elif real == {"ci"}:
+        cls = "ci"
+    elif real == {"tests"}:
+        cls = "tests-only"
+    elif real <= {"docs"} and release:
+        cls = "release"
+    elif real <= {"docs"}:
+        cls = "docs-only"
+    else:
+        cls = "mixed"
+    row["class"] = cls
+    if kinds:
+        row["module_kinds"] = sorted(set(kinds.values()))
+    title = pr.get("title") or ""
+    signal = None
+    cc = gather._CC_PREFIX_RE.match(title.strip().lower())
+    if cc and cc.group(1) in _PLUMBING_CC_TYPES:
+        signal = _PLUMBING_CC_TYPES[cc.group(1)]
+    else:
+        for rx, sig in _PLUMBING_TITLE_WORDS:
+            if rx.search(title):
+                signal = sig
+                break
+    if signal:
+        row["title_signal"] = signal
+    sweep = len(areas) >= SWEEP_MIN_AREAS and \
+        2 * len(areas - source_areas) >= len(areas)
+    if sweep:
+        row["sweep"] = {"areas": len(areas),
+                        "plumbing_areas": len(areas - source_areas)}
+        row["substantive_areas"] = sorted(source_areas)
+    row["plumbing"] = ("source" not in real and cls != "release") \
+        or bool(sweep and signal)
+    row["areas"] = sorted(areas)
+    return row
+
+
+def _merged_in_window(pr, ctx):
+    if not pr.get("merged") or not _in_window(pr.get("merged_at"), ctx.period):
+        return False
+    base = ctx.bundle.get("meta", {}).get("base_branch")
+    return base is None or pr.get("base") in (None, base)
+
+
+def build_module_changes(bundle, path_rules=()):
+    """bundle["module_changes"] (BUNDLE.md "module_changes"), when the bundle
+    carries `module_notes`; otherwise nothing is added. Pure over the
+    bundle (in place). `path_rules` are the operator's `--path-class`
+    rules, recorded in `module_changes.path_rules`."""
+    notes = bundle.get("module_notes")
+    if not isinstance(notes, dict) or not notes.get("collected"):
+        return bundle
+    ctx = _ModuleCtx(bundle, path_class_rules(path_rules))
+    commits = bundle.get("commits", [])
+    kind = ctx.kind
+
+    mods = {}
+
+    def mod(area):
+        if area not in mods:
+            mods[area] = {"area": area, "kind": kind(area), "_commits": set(),
+                          "_source": False, "_classes": set(), "_events": [],
+                          "_symbols": [], "_children": {}, "_markers": [],
+                          "_changelog": [], "_versions": [], "_tags": [],
+                          "_entry": []}
+        return mods[area]
+
+    # 1. Commit files: which module areas were touched, by which class.
+    for c in commits:
+        for f in c.get("files") or []:
+            area = ctx.area_of(f)
+            if not kind(area):
+                continue
+            m = mod(area)
+            m["_commits"].add(c.get("sha"))
+            cls = path_class(f, ctx.rules)
+            m["_classes"].add(cls)
+            if cls == "source":
+                m["_source"] = True
+                m.setdefault("_source_files", set()).add(f)
+
+    # 2. File events: entry files, child modules, lifecycle markers.
+    for e in bundle.get("code_events", []):
+        path, change, old = e.get("path") or "", e.get("change"), e.get("old_path")
+        for p, role in ((path, "new"), (old, "old")):
+            if not p:
+                continue
+            area = ctx.area_of(p)
+            if not kind(area):
+                continue
+            m = mod(area)
+            m["_commits"].add(e.get("commit"))
+            k = kind(area)
+            entry = _entry_file(area, k)
+            base = p.rsplit("/", 1)[-1]
+            d = p.rpartition("/")[0]
+            src = ctx.source(e.get("commit"), p)
+            if p == entry:
+                m["_entry"].append({"change": change, "role": role, "path": p,
+                                    "old_path": old, "new_path": path,
+                                    "source": src})
+            child = _child_dir(p, area)
+            if child:
+                ch = m["_children"].setdefault(child, {"path": child, "events": []})
+                ch["events"].append({"change": change, "role": role,
+                                     "other": path if role == "old" else old,
+                                     "source": src})
+            if base in ("DEPRECATED.md", "ORPHANED.md") and role == "new" \
+                    and change in ("add", "delete", "rename", "copy"):
+                m["_markers"].append({"file": base, "change": change, "dir": d,
+                                      "source": src})
+
+    # 3. Symbol events of interface files (the module's and its children's).
+    for e in bundle.get("symbol_events", []):
+        if e.get("subkind") in ("comment", "todo", "var"):
+            continue
+        path = e.get("path") or ""
+        area = ctx.area_of(path)
+        if not kind(area):
+            continue
+        k = kind(area)
+        if _interface_file(path, area, k):
+            mod(area)["_symbols"].append(e)
+        else:
+            child = _child_dir(path, area)
+            if child:
+                ch = mod(area)["_children"].setdefault(
+                    child, {"path": child, "events": []})
+                ch.setdefault("symbols", []).append(e)
+    moves = (bundle.get("symbol_moves") or {}).get("links") or []
+
+    # 4. The gathered notes: changelog entries, version moves, tags.
+    for rec in notes.get("changelogs") or []:
+        area = ctx.area_of(rec.get("path"))
+        if kind(area):
+            mod(area)["_changelog"].append(rec)
+    for rec in notes.get("versions") or []:
+        area = ctx.area_of(rec.get("path"))
+        if kind(area):
+            mod(area)["_versions"].append(rec)
+    tags = notes.get("tags") or {}
+    for t in tags.get("items") or []:
+        module = t.get("module") or ""
+        area = ctx.area_of(module + "/main.bicep") if module else None
+        if module and not kind(area):
+            area = ctx.area_of(module + "/main.tf")
+        if area is None and not module:
+            area = "main.tf" if kind("main.tf") else None
+        if area and kind(area):
+            mod(area)["_tags"].append(t)
+
+    entries = [_module_entry(ctx, m, moves, bundle) for m in mods.values()]
+    entries = [e for e in entries if e is not None]
+    entries.sort(key=lambda e: e["area"])
+
+    # 5. Merged PRs: product vs plumbing.
+    pr_rows = [classify_pr_change(p, ctx) for p in bundle.get("prs", [])
+               if _merged_in_window(p, ctx)]
+    pr_rows.sort(key=lambda r: r["number"] if isinstance(r["number"], int) else -1)
+    pr_class = {r["number"]: r for r in pr_rows}
+    for e in entries:
+        for p in e.get("prs", []):
+            r = pr_class.get(p["number"])
+            if r is not None:
+                p["class"] = r["class"]
+                p["plumbing"] = r["plumbing"]
+
+    out = {"summary": _module_summary(entries, pr_rows), "modules": entries,
+           "prs": pr_rows}
+    releases = [_release_row(r, tag="tag_name", name="name",
+                             published_at="published_at", url="url",
+                             prerelease="prerelease")
+                for r in bundle.get("releases", [])]
+    if releases:
+        out["releases"] = releases
+    inputs = {"tags_collected": bool(tags.get("collected"))}
+    if tags.get("windows_without_tags"):
+        # no "declared, not published" claim is made for such a view
+        inputs["windows_without_tags"] = tags["windows_without_tags"]
+    if not tags.get("collected") and tags.get("reason"):
+        inputs["tags_reason"] = tags["reason"]
+    if notes.get("unread"):
+        inputs["unread"] = notes["unread"]
+    if notes.get("windows"):
+        inputs["windows"] = notes["windows"]
+        inputs["covers_view"] = notes.get("covers_view")
+    out["inputs"] = inputs
+    if path_rules:
+        out["path_rules"] = list(path_rules)
+    bundle["module_changes"] = out
+    return bundle
+
+
+def _children_summary(ctx, m):
+    rows, candidates, deprecations = [], [], []
+    for path in sorted(m["_children"]):
+        ch = m["_children"][path]
+        evs = ch["events"]
+        change = None
+        row = {"path": path}
+        for ev in evs:
+            if ev["change"] == "rename" and ev["role"] == "old":
+                change = "moved"
+                row["to"] = ev["other"].rpartition("/")[0]
+            elif ev["change"] == "rename" and ev["role"] == "new":
+                change = "moved"
+                row["from"] = (ev["other"] or "").rpartition("/")[0]
+            elif ev["change"] in ("add", "copy") and change is None:
+                change = "added"
+            elif ev["change"] == "delete":
+                change = "removed"
+        row["change"] = change or "modified"
+        row["sources"] = _dedupe_sources(ev["source"] for ev in evs)
+        if ch.get("symbols"):
+            iface, _cands = _interface_summary(ctx, ch["symbols"], [])
+            if iface:
+                row["interface"] = iface
+        if row["change"] == "moved" and "to" in row and "from" not in row:
+            continue          # reported once, under the destination path
+        rows.append(row)
+        if row["change"] == "removed":
+            candidates.append({"rule": "child_module_removed", "subject": path,
+                               "sources": row["sources"]})
+        elif row["change"] == "moved":
+            candidates.append({"rule": "child_module_moved",
+                               "subject": "{} -> {}".format(row.get("from"), path),
+                               "sources": row["sources"]})
+    for mk in m["_markers"]:
+        if mk["dir"] == _area_dir(m["area"]):
+            continue
+        key = "deprecated" if mk["file"] == "DEPRECATED.md" else "orphaned"
+        if mk["change"] in ("add", "rename", "copy"):
+            match = next((r for r in rows if r["path"] == mk["dir"]), None)
+            if match is None:
+                match = {"path": mk["dir"], "change": key, "sources": []}
+                rows.append(match)
+            match.setdefault("markers", []).append(mk["file"])
+            match["sources"] = _dedupe_sources(match["sources"] + [mk["source"]])
+            if key == "deprecated":
+                deprecations.append({"target": mk["dir"], "basis": "marker_file",
+                                     "file": mk["file"], "sources": [mk["source"]]})
+    rows.sort(key=lambda r: r["path"])
+    return rows, candidates, deprecations
+
+
+def _module_entry(ctx, m, moves, bundle):
+    area, kind = m["area"], m["kind"]
+    d = _area_dir(area)
+    entry = {"area": area, "kind": kind}
+    # lifecycle of the module itself
+    status = None
+    moved_to = moved_from = None
+    introduced = []
+    for ev in m["_entry"]:
+        if ev["role"] == "new" and ev["change"] in ("add", "copy"):
+            status = status or "new"
+            introduced.append(ev["source"])
+        elif ev["role"] == "new" and ev["change"] == "delete":
+            status = "removed"
+        elif ev["role"] == "old" and ev["change"] == "rename":
+            status, moved_to = "removed", ev["new_path"]
+        elif ev["role"] == "new" and ev["change"] == "rename":
+            moved_from = ev["old_path"]
+    markers = [mk for mk in m["_markers"] if mk["dir"] == d]
+    lifecycle = []
+    for mk in markers:
+        lifecycle.append({"file": mk["file"], "change": mk["change"],
+                          "sources": [mk["source"]]})
+    marker_status = None
+    if any(mk["file"] == "DEPRECATED.md" and mk["change"] != "delete"
+           for mk in markers):
+        marker_status = "deprecated"
+    elif any(mk["file"] == "ORPHANED.md" and mk["change"] != "delete"
+             for mk in markers):
+        marker_status = "orphaned"
+    # changelog
+    changelog, declared, deprecations = [], [], []
+    first_version = None
+    for rec in m["_changelog"]:
+        src = ctx.source(rec.get("commit"), rec.get("path"))
+        module = rec.get("module")
+        if rec.get("new_file") and rec.get("change") == "add" and module == d \
+                and rec.get("entries"):
+            status = status or "new"
+            introduced.append(src)
+            first_version = first_version or rec["entries"][-1].get("version")
+        for e in rec.get("entries") or []:
+            row = {"version": e.get("version"), "sections": [
+                {k: s[k] for k in ("heading", "kind", "items", "placeholder",
+                                   "items_omitted") if k in s}
+                for s in e.get("sections") or []], "sources": [src]}
+            if module != d:
+                row["module"] = module
+            for k in ("date", "amended"):
+                if e.get(k):
+                    row[k] = e[k]
+            changelog.append(row)
+            for s, item in _changelog_items(e):
+                if s.get("kind") == "breaking":
+                    b = {"version": e.get("version"), "text": item["text"],
+                         "sources": [src]}
+                    if "truncated_from" in item:
+                        b["truncated_from"] = item["truncated_from"]
+                    if module != d:
+                        b["module"] = module
+                    declared.append(b)
+                if s.get("kind") == "deprecated" or _DEPRECATION_RE.search(
+                        item["text"]):
+                    deprecations.append({
+                        "target": _deprecation_target(item["text"]),
+                        "basis": "changelog", "version": e.get("version"),
+                        "text": item["text"], "sources": [src]})
+    # versions
+    versions = {}
+    own_versions = [v for v in m["_versions"] if v.get("module") == d]
+    if own_versions:
+        versions["version_file"] = {
+            "from": own_versions[0].get("from"), "to": own_versions[-1].get("to"),
+            "sources": [ctx.source(v.get("commit"), v.get("path"))
+                        for v in own_versions]}
+    child_versions = [v for v in m["_versions"] if v.get("module") != d]
+    if child_versions:
+        versions["child_version_files"] = [
+            {"module": v.get("module"), "from": v.get("from"), "to": v.get("to"),
+             "sources": [ctx.source(v.get("commit"), v.get("path"))]}
+            for v in child_versions]
+    cl_versions = [c["version"] for c in changelog
+                   if c.get("version") and "module" not in c]
+    if cl_versions:
+        versions["changelog"] = cl_versions
+    own_tags = [t for t in m["_tags"] if (t.get("module") or "") == d]
+    if ctx.tags_collected and (cl_versions or own_tags):
+        # A version the module's changelog declared in the window with no
+        # version tag of the module in it, and the reverse: a tag in the window
+        # whose version the window's changelog entries did not declare (it was
+        # declared earlier, or the module keeps no changelog).
+        tagged = {_bare_version(t.get("version")) for t in own_tags}
+        declared_v = {_bare_version(v) for v in cl_versions}
+        not_published = [v for v in cl_versions
+                         if _is_release_version(v)
+                         and _bare_version(v) not in tagged]
+        not_declared = [t.get("version") for t in own_tags
+                        if _bare_version(t.get("version")) not in declared_v]
+        if not_published and not ctx.tags_partial:
+            versions["declared_not_published"] = not_published
+        if not_declared:
+            versions["published_not_declared"] = not_declared
+    if m["_tags"]:
+        published = []
+        for t in m["_tags"]:
+            row = {"version": t.get("version"), "tag": t.get("tag"),
+                   "date": t.get("date"), "date_source": t.get("date_source"),
+                   "commit": t.get("commit"), "first": t.get("first")}
+            if (t.get("module") or "") != d:
+                row["module"] = t.get("module")
+            published.append(row)
+            if t.get("first") and (t.get("module") or "") == d:
+                status = status or "new"
+                introduced.append(ctx.source(t.get("commit"),
+                                             "refs/tags/" + (t.get("tag") or "")))
+                first_version = first_version or t.get("version")
+        versions["published"] = published
+    if kind in ("module",) and area == "main.tf":
+        rel = [_release_row(r, tag="tag_name", published_at="published_at",
+                            url="url") for r in bundle.get("releases", [])]
+        if rel:
+            versions["releases"] = rel
+    if status == "new" and first_version is None and own_versions:
+        first_version = own_versions[-1].get("to")
+    # interface
+    own_moves = []
+    for mv in moves:
+        f_in = _interface_file(mv.get("from_path") or "", area, kind)
+        t_in = _interface_file(mv.get("to_path") or "", area, kind)
+        if f_in or t_in:
+            own_moves.append(dict(mv, leaves=f_in and not t_in))
+    iface, candidates = _interface_summary(ctx, m["_symbols"], own_moves)
+    children, child_cands, child_deps = _children_summary(ctx, m)
+    candidates += child_cands
+    deprecations += child_deps
+    if status == "removed":
+        candidates.append({"rule": "module_removed", "subject": area,
+                           "sources": [ev["source"] for ev in m["_entry"]]})
+    if status is None:
+        status = marker_status
+    if status == "new":
+        # nobody consumes a module that did not exist before the window
+        candidates = []
+    if status is None:
+        status = "changed" if (m["_commits"] or changelog or own_versions) \
+            or not m["_tags"] else "published"
+    entry["status"] = status
+    if first_version:
+        entry["first_version"] = first_version
+    if status == "new" and introduced:
+        entry["introduced_by"] = _dedupe_sources(introduced)
+    structure = {}
+    if moved_to:
+        structure["moved_to"] = moved_to
+    if moved_from:
+        structure["moved_from"] = moved_from
+    if lifecycle:
+        structure["lifecycle_markers"] = lifecycle
+    if children:
+        structure["children"] = children
+    if structure:
+        entry["structure"] = structure
+    if versions:
+        entry["versions"] = versions
+    if changelog:
+        entry["changelog"] = changelog
+    if iface:
+        entry["interface"] = iface
+    breaking = {}
+    if declared:
+        breaking["declared"] = declared
+    if candidates:
+        breaking["candidates"] = candidates
+    if breaking:
+        entry["breaking"] = breaking
+    if deprecations:
+        entry["deprecations"] = deprecations
+    # PRs and people behind it
+    prs, authors = set(), set()
+    for sha in m["_commits"]:
+        c = ctx.commits.get(sha) or {}
+        if c.get("pr") is not None:
+            prs.add(c["pr"])
+        if c.get("author"):
+            authors.add(c["author"])
+    for rec in m["_changelog"] + m["_versions"]:
+        c = ctx.commits.get(rec.get("commit")) or {}
+        if c.get("pr") is not None:
+            prs.add(c["pr"])
+    pr_rows = []
+    for n in sorted(prs, key=lambda x: (not isinstance(x, int), x)):
+        p = ctx.prs.get(n) or {}
+        row = {"number": n}
+        for k in ("url", "title", "author"):
+            if p.get(k):
+                row[k] = p[k]
+        if p.get("author"):
+            authors.add(p["author"])
+        pr_rows.append(row)
+    if m.get("_source_files"):
+        entry["source_files_changed"] = len(m["_source_files"])
+    if pr_rows:
+        entry["prs"] = pr_rows
+    if authors:
+        entry["authors"] = sorted(authors, key=str)
+    product = bool(m["_source"] or changelog or own_versions or m["_tags"]
+                   or markers or m["_entry"] or children)
+    entry["plumbing_only"] = not product
+    entry["product_score"] = _product_score(entry)
+    return entry
+
+
+def _product_score(entry):
+    """How much a reader-facing change this module carries (not PR count or
+    touched files): 5 for a new module, 3 per declared breaking item, 2 per
+    breaking candidate, 2 per child module change, 1 per interface change
+    (parameter / output / resource / API version / dependency), 1 per
+    changelog item, and 1 when any of its source files changed (a change
+    inside the module that touches no declaration). 0 for a module whose
+    only activity was plumbing."""
+    if entry.get("plumbing_only"):
+        return 0
+    score = 5 if entry.get("status") == "new" else 0
+    score += 1 if entry.get("source_files_changed") else 0
+    b = entry.get("breaking") or {}
+    score += 3 * len(b.get("declared") or []) + 2 * len(b.get("candidates") or [])
+    score += 2 * len((entry.get("structure") or {}).get("children") or [])
+    for group in (entry.get("interface") or {}).values():
+        for rows in group.values():
+            score += len(rows)
+    for c in entry.get("changelog") or []:
+        for s in c.get("sections") or []:
+            score += len(s.get("items") or [])
+    return score
+
+
+def _module_summary(entries, pr_rows):
+    by_status = {}
+    for e in entries:
+        by_status[e["status"]] = by_status.get(e["status"], 0) + 1
+    new = [{"area": e["area"], "kind": e["kind"],
+            "first_version": e.get("first_version"),
+            "introduced_by": sorted({s["pr"] for s in e.get("introduced_by", [])
+                                     if s.get("pr") is not None}),
+            "prs": [p["number"] for p in e.get("prs", [])]}
+           for e in entries if e["status"] == "new"]
+    new_children = [{"area": e["area"], "child": ch["path"],
+                     "prs": sorted({s["pr"] for s in ch.get("sources", [])
+                                    if s.get("pr") is not None})}
+                    for e in entries
+                    for ch in (e.get("structure") or {}).get("children", [])
+                    if ch.get("change") == "added"]
+    declared = []
+    for e in entries:
+        items = (e.get("breaking") or {}).get("declared") or []
+        if items:
+            versions = []
+            for b in items:
+                if b.get("version") not in versions:
+                    versions.append(b.get("version"))
+            declared.append({"area": e["area"], "versions": versions,
+                             "items": len(items)})
+    candidates = [{"area": e["area"], "rules": sorted({c["rule"] for c in (
+        e.get("breaking") or {}).get("candidates") or []})}
+        for e in entries if (e.get("breaking") or {}).get("candidates")]
+    deprecations = [{"area": e["area"], "target": d.get("target"),
+                     "basis": d.get("basis")}
+                    for e in entries for d in e.get("deprecations") or []]
+    ranked = sorted((e for e in entries if e["product_score"] > 0),
+                    key=lambda e: (-e["product_score"], e["area"]))
+    merged = len(pr_rows)
+    known = [r for r in pr_rows if r["class"] != "unknown"]
+    plumbing = sum(1 for r in known if r.get("plumbing"))
+    by_class = {}
+    for r in pr_rows:
+        by_class[r["class"]] = by_class.get(r["class"], 0) + 1
+    gaps = []
+    for e in entries:
+        v = e.get("versions") or {}
+        if v.get("declared_not_published") or v.get("published_not_declared"):
+            gap = {"area": e["area"]}
+            for k in ("declared_not_published", "published_not_declared"):
+                if v.get(k):
+                    gap[k] = v[k]
+            gaps.append(gap)
+    out = {
+        "modules": len(entries), "by_status": by_status,
+        "new_modules": new, "new_child_modules": new_children,
+        "declared_breaking": declared,
+        "breaking_candidates": candidates, "deprecations": deprecations,
+        "orphaned": [e["area"] for e in entries if e["status"] == "orphaned"],
+        "removed": [e["area"] for e in entries if e["status"] == "removed"],
+        "most_substantive": [{"area": e["area"], "status": e["status"],
+                              "score": e["product_score"]}
+                             for e in ranked[:MODULE_RANK_TOP_N]],
+        "plumbing": {"merged_prs": merged, "classified": len(known),
+                     "plumbing_prs": plumbing,
+                     "share": round(plumbing / len(known), 3) if known else None,
+                     "by_class": by_class},
+    }
+    if gaps:
+        out["version_gaps"] = gaps
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The story layer: the discussion signal, story selection and story material
+# ---------------------------------------------------------------------------
+#
+# Decisions sit in the text of issues and PRs. `discussion` measures that
+# conversation per train (from the stored, as-of-projected records), a
+# separate `story` selection ranks trains by it and by product relevance (not
+# by touched-area count, which is what `tier` measures), and the slice of a
+# train carries the whole conversation as one chronological timeline with its
+# turning points marked by rule.
+
+# Conversation turns (human comments, review comments, reviews with text or a
+# verdict) a train needs before it can be a story: a back-and-forth.
+STORY_MIN_EXCHANGES = 3
+# A train still in flight is a story of THIS window only when somebody spoke
+# in it: a long thread that has been silent since before the window is listed
+# under `stories.quiet` instead (the 88-comment thread that ranked first two
+# months running had its last comment six months earlier). A train that landed
+# or was closed in the window needs no in-window turn: its ending is the news.
+STORY_MIN_IN_WINDOW = 1
+# Minimum story_score to be selected at all.
+STORY_MIN_SCORE = 8.0
+# At most this many trains are selected per view (like the deep tier's top 8);
+# the others that qualify are counted in `stories.more`.
+STORY_TOP_N = 8
+# A train whose merged work is plumbing (module layer) or a mechanical sweep
+# qualifies only when its discussion alone scores at least this much.
+STORY_PLUMBING_MIN = 15.0
+# A gap between two consecutive recorded human events longer than this many
+# days is a silence (a turning point when activity resumes after it).
+STORY_SILENCE_DAYS = 14
+# A PR commit committed more than this many hours after it was authored was
+# rewritten (amended, rebased or cherry-picked).
+STORY_REWRITE_HOURS = 24
+# Per-item text cap in the story timeline. Every human comment, review and
+# review comment of Sept-Oct 2026 in Azure/bicep-registry-modules fits (the
+# longest is 3,382 characters; the 99th percentile about 2,400), so arguments
+# stay whole; PR / issue bodies are longer (median 2,100-2,600, much of it the
+# PR template), so only the opening body of a long description is cut.
+STORY_ITEM_CAP = 5000
+# Per-slice budget for the timeline's text. The most discussed train of the
+# two months (train-pr-6549: 88 human comments and review comments plus a
+# 4,131-character body, 19,126 characters) fits whole, as does the largest
+# issue train of October (about 23,000 once its 20,794-character body is
+# capped). About 10,000 tokens of text.
+STORY_SLICE_BUDGET = 40000
+# When the budget is exceeded, items are cut evenly from the longest down, never
+# below this many characters; past that, whole texts are left out from the
+# middle of the timeline outward (the opening and the latest items stay).
+STORY_ITEM_FLOOR = 500
+# Budget for the code notes (comments / parameter descriptions / interface
+# lines) carried on the timeline's commit items.
+STORY_CODE_NOTES_BUDGET = 12000
+# Relevance points by train kind (story_score).
+_STORY_KIND_RELEVANCE = {"feature": 3.0, "module-request": 3.0, "bug": 1.0}
+
+# What GitHub records but gather does not keep, named in every story slice so
+# a narrator says it rather than infers it.
+STORY_NOT_GATHERED = (
+    "title and description edits (titles and bodies are as last gathered)",
+    "force-pushes and the branch states they replaced (only each PR's current "
+    "head is fetched)",
+    "label, milestone and assignee changes over time",
+    "whether a review thread was marked resolved on GitHub",
+    "check runs and their results per PR (CI pass / fail is not stored)",
+)
+
+_TIMELINE_KIND_ORDER = {"opened": 0, "commit": 1, "comment": 2,
+                        "review_comment": 3, "review": 4, "ready_for_review": 5,
+                        "reopened": 6, "closed": 7, "merged": 8}
+
+
+def window_end_instant(meta):
+    """The as-of instant of a view: `records_as_of.instant`, else the last
+    second of `period.to` / `to` (UTC) for a date, the value itself for a
+    timestamp, None for a dateless bundle."""
+    meta = meta or {}
+    inst = (meta.get("records_as_of") or {}).get("instant")
+    if inst:
+        return inst
+    to = window_period(meta).get("to")
+    if not to:
+        return None
+    return to + "T23:59:59Z" if len(to) == 10 else to
+
+
+def _not_after(ts, instant):
+    if instant is None:
+        return True
+    a, b = _parse_ts(ts), _parse_ts(instant)
+    return a is None or b is None or a <= b
+
+
+def _human_rows(rows):
+    return [r for r in rows or [] if isinstance(r, dict)
+            and not derive.is_bot_login(r.get("author"))]
+
+
+def _pr_history_index(bundle):
+    """{pr number: pr_history row} of the view's `pr_history` fact."""
+    ph = bundle.get("pr_history") or {}
+    return {r["number"]: r for r in ph.get("prs") or []
+            if isinstance(r, dict) and isinstance(r.get("number"), int)}
+
+
+def _pr_commits_as_of(row, instant):
+    """A pr_history row's commits committed by the instant (the as-of rule:
+    the fact holds the head as gathered, possibly after the window)."""
+    return [c for c in (row or {}).get("commits") or []
+            if _not_after(c.get("committed_at"), instant)]
+
+
+def _train_members(train, pr_index, issue_index):
+    issue_nums = train.get("issues")
+    if issue_nums is None:
+        root = train.get("root_issue")
+        issue_nums = [root] if root is not None else []
+    issues = [issue_index[n] for n in issue_nums if n in issue_index]
+    prs = [pr_index[n] for n in train.get("prs", []) if n in pr_index]
+    return issues, prs
+
+
+def _days(a, b):
+    return round((b - a).total_seconds() / 86400.0, 1)
+
+
+def train_discussion(train, pr_index, issue_index, history=None, instant=None,
+                     start=None):
+    """The discussion signal of one train, or None when it has no human
+    conversation (no human comment, review comment or review). Pure.
+
+    Counts over the train's issues and PRs as the view holds them (already
+    projected to the window's end): `comments` / `review_comments` (human),
+    `participants` (distinct human authors of the items, comments, review
+    comments and reviews), `reviews` by state (human, not the PR author's own;
+    a `commented` review counts only with text — GitHub records each review
+    thread reply as an empty `commented` review, whose text is the review
+    comment), `review_rounds` and `reopens` (sums of the per-PR / issue
+    annotations), `text_chars` (human bodies, comments, review comments and
+    review texts), `first_response_days` (from the train's first item to the
+    first human comment / review / review comment by someone other than that
+    item's author), `longest_silence` (the longest gap between consecutive
+    recorded human events — openings, comments, reviews, lifecycle events,
+    merges and PR commits — with where it ends), `change_requests` and, when
+    the PR history is known for every PR with a change request,
+    `change_requests_reworked` (followed by a commit on that PR), and
+    `bot_comments` (automation comments / reviews, not counted anywhere
+    else). `in_window` counts the human comments, review comments and
+    counted reviews made inside the view's window (from `start`, its first
+    day, to the instant) — the window's own share of the debate."""
+    issues, prs = _train_members(train, pr_index, issue_index)
+    history = history or {}
+    start_dt = _parse_ts(start + "T00:00:00Z" if start and len(start) == 10
+                         else start)
+    end_dt = _parse_ts(instant)
+    turn_times = []
+    comments = review_comments = bot = text = 0
+    reviews = {"approved": 0, "changes_requested": 0, "commented": 0,
+               "dismissed": 0}
+    people = set()
+    events = []        # (dt, url) of human events
+    responses = []     # dt of a human response to someone else's item
+    opened = []
+    change_reqs = []   # (pr number, dt)
+    for rec in issues + prs:
+        author = rec.get("author")
+        dt = _parse_ts(rec.get("created_at"))
+        if author and not derive.is_bot_login(author):
+            people.add(author)
+            text += len(rec.get("body") or "")
+        if dt is not None:
+            opened.append(dt)
+            events.append((dt, rec.get("url")))
+        for key in ("comments_list", "review_comments"):
+            for c in rec.get(key) or []:
+                if not isinstance(c, dict):
+                    continue
+                if derive.is_bot_login(c.get("author")):
+                    bot += 1
+                    continue
+                if key == "comments_list":
+                    comments += 1
+                else:
+                    review_comments += 1
+                if c.get("author"):
+                    people.add(c["author"])
+                text += len(c.get("body") or "")
+                cdt = _parse_ts(c.get("created_at"))
+                if cdt is not None:
+                    turn_times.append(cdt)
+                    events.append((cdt, c.get("url")))
+                    if c.get("author") != author:
+                        responses.append(cdt)
+        for r in rec.get("reviews") or []:
+            if not isinstance(r, dict) or (r.get("state") or "") == "pending":
+                continue
+            if derive.is_bot_login(r.get("author")):
+                bot += 1
+                continue
+            rdt = _parse_ts(r.get("submitted_at"))
+            body = r.get("body") or ""
+            text += len(body)
+            if r.get("author"):
+                people.add(r["author"])
+            if rdt is not None and (body or r.get("state") != "commented"):
+                events.append((rdt, r.get("url")))
+            if r.get("author") == author:
+                continue
+            state = r.get("state")
+            if state == "commented" and not body:
+                continue
+            if state in reviews:
+                reviews[state] += 1
+            if rdt is not None:
+                responses.append(rdt)
+                turn_times.append(rdt)
+            if state == "changes_requested":
+                change_reqs.append((rec.get("number"), rdt))
+        for e in rec.get("lifecycle") or []:
+            if isinstance(e, dict) and not derive.is_bot_login(e.get("actor")):
+                edt = _parse_ts(e.get("created_at"))
+                if edt is not None:
+                    events.append((edt, rec.get("url")))
+        mdt = _parse_ts(rec.get("merged_at")) if rec.get("merged") else None
+        if mdt is not None:
+            events.append((mdt, rec.get("url")))
+    for p in prs:
+        for c in _pr_commits_as_of(history.get(p.get("number")), instant):
+            cdt = _parse_ts(c.get("committed_at"))
+            if cdt is not None and not derive.is_bot_login(c.get("author")):
+                events.append((cdt, _pr_commit_url(p, c.get("sha"))))
+    human_reviews = sum(reviews.values())
+    if comments + review_comments + human_reviews == 0:
+        return None
+    out = {"comments": comments, "review_comments": review_comments,
+           "participants": len(people), "reviews": reviews,
+           "review_rounds": sum((p.get("review_rounds") or {}).get("count", 0)
+                                for p in prs),
+           "reopens": sum(r.get("reopen_count", 0) or 0 for r in issues + prs),
+           "text_chars": text,
+           "in_window": sum(1 for t in turn_times
+                            if (start_dt is None or t >= start_dt)
+                            and (end_dt is None or t <= end_dt))}
+    start = min(opened) if opened else None
+    later = sorted(d for d in responses if start is None or d >= start)
+    out["first_response_days"] = (_days(start, later[0])
+                                  if start is not None and later else None)
+    events.sort(key=lambda e: (e[0], e[1] or ""))
+    best = None
+    for (a, _u), (b, url) in zip(events, events[1:]):
+        if best is None or (b - a) > (best[1] - best[0]):
+            best = (a, b, url)
+    out["longest_silence"] = None if best is None else {
+        "days": _days(best[0], best[1]),
+        "from": best[0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": best[1].strftime("%Y-%m-%dT%H:%M:%SZ"), "resumed_at": best[2]}
+    out["change_requests"] = len(change_reqs)
+    if change_reqs and all(n in history for n, _ in change_reqs):
+        reworked = 0
+        for n, cdt in change_reqs:
+            times = [_parse_ts(c.get("committed_at"))
+                     for c in _pr_commits_as_of(history[n], instant)]
+            if cdt is not None and any(t is not None and t > cdt for t in times):
+                reworked += 1
+        out["change_requests_reworked"] = reworked
+    out["bot_comments"] = bot
+    return out
+
+
+def annotate_train_discussion(bundle):
+    """Add `discussion` to every train that has human conversation
+    (train_discussion); a train without any gets no key. In place."""
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    history = _pr_history_index(bundle)
+    instant = window_end_instant(bundle.get("meta"))
+    start = window_period(bundle.get("meta") or {}).get("from")
+    for t in bundle.get("trains", []):
+        d = train_discussion(t, pr_index, issue_index, history, instant, start)
+        if d is not None:
+            t["discussion"] = d
+    return bundle
+
+
+def _train_plumbing(train, module_changes):
+    """True when a train's work is plumbing: with the module layer, every
+    merged PR of the train it classified is `plumbing` (or a sweep); without
+    it, a chore / docs / other train touching more than 10 code areas (a
+    mechanical sweep)."""
+    if module_changes:
+        rows = {r.get("number"): r for r in module_changes.get("prs") or []}
+        mine = [rows[n] for n in train.get("prs", []) if n in rows]
+        if mine:
+            return all(r.get("plumbing") or r.get("sweep") for r in mine)
+    return (len(train.get("code_areas") or []) > 10
+            and train.get("kind") in ("chore", "docs", "other", None))
+
+
+def _train_module_relevance(train, module_changes):
+    """(points, reasons) of product relevance from the module layer: a new
+    module introduced by one of the train's PRs (5), declared breaking items
+    (2 each, at most 3), breaking candidates (1 each, at most 3)."""
+    if not module_changes:
+        return 0.0, []
+    prs = set(train.get("prs") or [])
+    points, reasons = 0.0, []
+    for e in module_changes.get("modules") or []:
+        mine = {p.get("number") for p in e.get("prs") or []} & prs
+        if not mine:
+            continue
+        if e.get("status") == "new":
+            points += 5
+            reasons.append("new module {}".format(e.get("area")))
+        br = e.get("breaking") or {}
+        declared = [b for b in br.get("declared") or []
+                    if any(s.get("pr") in prs for s in b.get("sources") or [])]
+        cands = [c for c in br.get("candidates") or []
+                 if any(s.get("pr") in prs for s in c.get("sources") or [])]
+        if declared:
+            points += 2 * min(3, len(declared))
+            reasons.append("declared breaking change in {}".format(e.get("area")))
+        if cands:
+            points += min(3, len(cands))
+            reasons.append("breaking candidate in {}".format(e.get("area")))
+    return points, reasons
+
+
+def story_score(train, module_changes=None, pr_index=None):
+    """(discussion_points, total, reasons) for one train with a `discussion`
+    (`pr_index` {number: pr} supplies each PR's review rounds).
+
+    discussion points = human comments + review comments
+                        + 1 per conversation turn inside the window
+                          (`in_window`: the window's debate weighs double)
+                        + 2 per participant beyond the first
+                        + 3 per change request + 3 per reopen
+                        + 2 per review round beyond the first on each
+                          reviewed PR
+                        + 2 when the longest silence exceeds
+                          STORY_SILENCE_DAYS
+                        + 1 per 2,000 characters of human text (at most 5)
+    total = discussion points + relevance, where relevance is 3 for a
+    feature / module-request train, 1 for a bug, 0 otherwise, plus the
+    module layer's (a new module 5; declared breaking 2 each, candidates 1
+    each, at most 3 of each) and 1 for an in-flight train (often where the
+    debate still is)."""
+    d = train.get("discussion") or {}
+    reasons = []
+    conv = d.get("comments", 0) + d.get("review_comments", 0)
+    pts = float(conv)
+    if conv:
+        reasons.append("{} human comment(s) and review comment(s)".format(conv))
+    if d.get("in_window"):
+        pts += d["in_window"]
+        reasons.append("{} conversation turn(s) in the window".format(
+            d["in_window"]))
+    if d.get("participants", 0) > 1:
+        pts += 2 * (d["participants"] - 1)
+        reasons.append("{} participants".format(d["participants"]))
+    cr = d.get("change_requests", 0)
+    if cr:
+        pts += 3 * cr
+        reasons.append("{} change request(s)".format(cr))
+    if d.get("reopens"):
+        pts += 3 * d["reopens"]
+        reasons.append("reopened {}x".format(d["reopens"]))
+    extra_rounds = sum(max(0, ((pr_index or {}).get(n, {}).get("review_rounds")
+                               or {}).get("count", 0) - 1)
+                       for n in train.get("prs") or [])
+    if extra_rounds:
+        pts += 2 * extra_rounds
+        reasons.append("{} extra review round(s)".format(extra_rounds))
+    sil = d.get("longest_silence") or {}
+    if sil.get("days", 0) > STORY_SILENCE_DAYS:
+        pts += 2
+        reasons.append("{} days without recorded activity before {}".format(
+            int(sil["days"]), sil["to"][:10]))
+    vol = min(5, d.get("text_chars", 0) // 2000)
+    pts += vol
+    rel = _STORY_KIND_RELEVANCE.get(train.get("kind"), 0.0)
+    if rel:
+        reasons.append("kind {}".format(train.get("kind")))
+    mpts, mreasons = _train_module_relevance(train, module_changes)
+    rel += mpts
+    reasons += mreasons
+    if train.get("outcome") == "in_flight":
+        rel += 1
+        reasons.append("in flight")
+    return pts, pts + rel, reasons
+
+
+def select_story_trains(bundle):
+    """Pick the trains with the most to tell (story_score), independently of
+    the deep / mention `tier`. A train qualifies when it has a `discussion`
+    with at least STORY_MIN_EXCHANGES conversation turns (comments, review
+    comments, reviews with text or a verdict) and at least two participants,
+    scores at least STORY_MIN_SCORE, and — when its work is plumbing or a
+    mechanical sweep (_train_plumbing) — its discussion alone scores at least
+    STORY_PLUMBING_MIN. The STORY_TOP_N best (score desc, then id) get
+    `story: true`, `story_rank`, `story_score` and `story_reasons`; the view
+    gets `stories` {selected, more, rule} (omitted when none qualifies). In
+    place."""
+    trains = bundle.get("trains", [])
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    mc = bundle.get("module_changes")
+    eligible, quiet = [], []
+    for t in trains:
+        d = t.get("discussion")
+        if not d:
+            continue
+        turns = (d["comments"] + d["review_comments"] + sum(d["reviews"].values()))
+        disc, total, reasons = story_score(t, mc, pr_index)
+        if turns < STORY_MIN_EXCHANGES or d["participants"] < 2:
+            continue
+        if total < STORY_MIN_SCORE:
+            continue
+        if _train_plumbing(t, mc) and disc < STORY_PLUMBING_MIN:
+            continue
+        if t.get("outcome") == "in_flight" \
+                and (d.get("in_window") or 0) < STORY_MIN_IN_WINDOW:
+            quiet.append((round(total, 1), t))
+            continue
+        eligible.append((round(total, 1), t, reasons))
+    quiet.sort(key=lambda e: (-e[0], e[1]["id"]))
+    quiet_rows = [{"id": t["id"], "score": s,
+                   "idle_days": (t.get("effort") or {}).get("idle_days")}
+                  for s, t in quiet]
+    if not eligible:
+        if quiet_rows:
+            bundle["stories"] = {"selected": [], "more": [], "quiet": quiet_rows,
+                                 "rule": _story_rule()}
+        return bundle
+    eligible.sort(key=lambda e: (-e[0], e[1]["id"]))
+    selected = []
+    for rank, (score, t, reasons) in enumerate(eligible[:STORY_TOP_N], 1):
+        t["story"] = True
+        t["story_rank"] = rank
+        t["story_score"] = score
+        t["story_reasons"] = reasons
+        selected.append({"id": t["id"], "rank": rank, "score": score})
+    bundle["stories"] = {
+        "selected": selected,
+        "more": [{"id": t["id"], "score": s} for s, t, _ in eligible[STORY_TOP_N:]],
+        "rule": _story_rule(),
+    }
+    if quiet_rows:
+        bundle["stories"]["quiet"] = quiet_rows
+    return bundle
+
+
+def _story_rule():
+    return {"min_exchanges": STORY_MIN_EXCHANGES,
+            "min_in_window": STORY_MIN_IN_WINDOW,
+            "min_score": STORY_MIN_SCORE, "top_n": STORY_TOP_N,
+            "plumbing_min": STORY_PLUMBING_MIN,
+            "silence_days": STORY_SILENCE_DAYS}
+
+
+# --- code notes: comments, parameter descriptions, interface lines -------
+
+_PARAM_DESC_RE = re.compile(r"^\s*@(?:sys\.)?(?:description|metadata)\s*\(")
+_COMMENT_MARK_RE = re.compile(r"^\s*(?://+|#+|/\*+|\*+)\s*|\s*(?:\*+/|//+)\s*$")
+_BANNER_PUNCT_RE = re.compile(r"[.,:;()'\"`!?\[\]{}<>@$%&|\\]")
+
+
+def comment_class(subkind, text):
+    """How a code comment reads: `parameter_description` (a Bicep
+    `@description(...)` / `@metadata(...)` decorator), `todo` (a TODO /
+    FIXME / HACK / XXX / BUG marker), `banner` (a section label: once the
+    comment markers and decoration characters `= - * # / _ ~` are stripped,
+    at most three words and no punctuation, e.g. "// Variables //",
+    "// Parameters", "// ===== Outputs ====="), else `note` (a developer
+    note). Pure."""
+    if subkind == "todo":
+        return "todo"
+    t = text or ""
+    if _PARAM_DESC_RE.match(t):
+        return "parameter_description"
+    core = _COMMENT_MARK_RE.sub("", t)
+    core = re.sub(r"[=\-*#/_~]+", " ", core).strip()
+    if not core or (len(core.split()) <= 3 and not _BANNER_PUNCT_RE.search(core)):
+        return "banner"
+    return "note"
+
+
+def _note_rows(events, source):
+    """Code-note rows from symbol events: comments are classified
+    (comment_class; banners dropped and counted), parameter / variable /
+    output events are `interface`. One row per comment line: the symbol
+    extraction keys a comment by its text, so the lines of one file and
+    commit are not in file order and are never joined into prose. Returns
+    (rows, banners_dropped)."""
+    rows, banners = [], 0
+    for e in events:
+        sub = e.get("subkind")
+        change = e.get("change")
+        if sub in ("comment", "todo"):
+            text = e.get("after") if change == "add" else e.get("before")
+            if not text or not text.strip().startswith((e.get("name") or "")[:20]):
+                text = e.get("name") or text
+            cls = comment_class(sub, e.get("name") or text)
+            if cls == "banner":
+                banners += 1
+                continue
+        elif sub in ("param", "variable", "output"):
+            cls = "interface"
+            text = None
+        else:
+            continue
+        row = {"commit": e.get("commit"), "path": e.get("path"),
+               "change": change, "class": cls, "source": source}
+        if cls == "interface":
+            row["kind"] = sub
+            row["name"] = e.get("name")
+            if e.get("before"):
+                row["before"] = e["before"]
+            if e.get("after"):
+                row["after"] = e["after"]
+        elif change == "change":
+            row["before"] = e.get("before")
+            row["after"] = e.get("after")
+        else:
+            row["text"] = text
+        rows.append(row)
+    return rows, banners
+
+
+def _note_chars(row):
+    return sum(len(row.get(k) or "") for k in ("text", "before", "after", "name"))
+
+
+_NOTE_PRIORITY = {"note": 0, "todo": 0, "parameter_description": 1,
+                  "interface": 2}
+
+
+def train_code_notes(bundle, train, history=None, instant=None):
+    """What the code said along the way for one train: the comment /
+    parameter-description / interface changes of its merged commits (the
+    view's symbol events) and of its PRs' own commits (`pr_history` notes,
+    as of the window's end). Returns (rows_by_commit {sha: [row]},
+    by_module {module: {path: {added, removed, changed}}}, info) where info
+    = {banners_dropped, budget, kept, omitted}. The rows kept are chosen
+    within STORY_CODE_NOTES_BUDGET characters: developer notes and TODOs
+    first, then parameter descriptions removed / changed, then added, then
+    interface lines; each class in commit order."""
+    history = history or {}
+    shas = set(train.get("commits") or [])
+    base_events = [e for e in bundle.get("symbol_events") or []
+                   if e.get("commit") in shas]
+    rows, banners = _note_rows(base_events, "base")
+    for n in train.get("prs") or []:
+        row = history.get(n) or {}
+        ok = {c["sha"] for c in _pr_commits_as_of(row, instant)}
+        evs = [e for e in row.get("notes") or [] if e.get("commit") in ok]
+        r2, b2 = _note_rows(evs, "pr_head")
+        for r in r2:
+            r["pr"] = n
+        rows += r2
+        banners += b2
+    idx = derive.area_index(bundle.get("code_graph", {}))
+
+    def module_of(path):
+        return idx.get(path) or gather.classify_code_area(
+            path, gather.DEFAULT_AREA_PATTERNS)
+    by_module = {}
+    for r in rows:
+        counts = by_module.setdefault(module_of(r["path"]) or "", {}).setdefault(
+            r["path"], {"added": 0, "removed": 0, "changed": 0})
+        counts[{"add": "added", "drop": "removed"}.get(r["change"], "changed")] \
+            += 1
+    order = sorted(range(len(rows)), key=lambda i: (
+        _NOTE_PRIORITY.get(rows[i]["class"], 3)
+        + (0.5 if rows[i]["class"] == "parameter_description"
+           and rows[i]["change"] == "add" else 0), i))
+    used, keep = 0, set()
+    for i in order:
+        c = _note_chars(rows[i])
+        if used + c <= STORY_CODE_NOTES_BUDGET:
+            keep.add(i)
+            used += c
+    by_commit = {}
+    for i, r in enumerate(rows):
+        if i in keep:
+            by_commit.setdefault(r["commit"], []).append(r)
+    info = {"banners_dropped": banners, "budget": STORY_CODE_NOTES_BUDGET,
+            "kept": len(keep), "omitted": len(rows) - len(keep)}
+    return by_commit, by_module, info
+
+
+# --- the story timeline ----------------------------------------------------
+
+def _event_url(rec, e):
+    """A citable link for a lifecycle event: the item page anchored at the
+    event (`<item url>#event-<id>`), the form GitHub's own pages use."""
+    if e.get("id") is not None and rec.get("url"):
+        return "{}#event-{}".format(rec["url"], e["id"])
+    return rec.get("url")
+
+
+def _pr_commit_url(pr, sha):
+    return "{}/commits/{}".format(pr.get("url"), sha) if pr.get("url") \
+        else None
+
+
+def _apply_story_budget(items):
+    """Cap each item's text at STORY_ITEM_CAP, then fit the total in
+    STORY_SLICE_BUDGET: cut the longest texts evenly (never below
+    STORY_ITEM_FLOOR) and, if that is not enough, leave out whole texts from
+    the middle of the timeline outward. Mutates `items`; returns the
+    truncation record {item_cap, budget, chars_original, chars_kept, cut:
+    [{index, url, kept, original}], text_omitted: [{index, url, chars}]}."""
+    orig = {i: len(it["text"]) for i, it in enumerate(items)
+            if isinstance(it.get("text"), str)}
+    limit = {i: min(n, STORY_ITEM_CAP) for i, n in orig.items()}
+    if sum(limit.values()) > STORY_SLICE_BUDGET:
+        lo, hi = STORY_ITEM_FLOOR, STORY_ITEM_CAP
+        while lo < hi:                                # largest fitting ceiling
+            mid = (lo + hi + 1) // 2
+            if sum(min(n, mid) for n in limit.values()) <= STORY_SLICE_BUDGET:
+                lo = mid
+            else:
+                hi = mid - 1
+        limit = {i: min(n, lo) for i, n in limit.items()}
+    omitted = set()
+    keyed = sorted(limit)
+    if sum(limit.values()) > STORY_SLICE_BUDGET:
+        mid = len(keyed) // 2
+        spiral = []
+        for k in range(len(keyed)):
+            j = mid + ((k + 1) // 2) * (1 if k % 2 else -1)
+            if 0 < j < len(keyed) - 1:
+                spiral.append(keyed[j])
+        for i in spiral:
+            if sum(n for j, n in limit.items() if j not in omitted) \
+                    <= STORY_SLICE_BUDGET:
+                break
+            omitted.add(i)
+    cut, dropped = [], []
+    for i in keyed:
+        it = items[i]
+        if i in omitted:
+            dropped.append({"index": i, "url": it.get("url"), "chars": orig[i]})
+            it["text"] = None
+            it["text_omitted"] = orig[i]
+        elif limit[i] < orig[i]:
+            it["text"] = it["text"][:limit[i]]
+            it["truncated_from"] = orig[i]
+            cut.append({"index": i, "url": it.get("url"), "kept": limit[i],
+                        "original": orig[i]})
+    return {"item_cap": STORY_ITEM_CAP, "budget": STORY_SLICE_BUDGET,
+            "chars_original": sum(orig.values()),
+            "chars_kept": sum(n for i, n in limit.items() if i not in omitted),
+            "cut": cut, "text_omitted": dropped}
+
+
+def story_material(bundle, train):
+    """The conversation of one train as one chronological timeline, for a
+    narrator. Pure (reads the bundle; returns new objects).
+
+    Items {at, kind, actor, url, on: {type, number}, ...}: `opened` (with
+    `title` and the body as `text`), `comment`, `review_comment`, `review`
+    (`state`, `text`), `ready_for_review` / `reopened` / `closed` (the
+    lifecycle events; a `closed` also from `closed_at` when no event records
+    it), `merged` (`by`), and `commit` — the PR's own commits from
+    `pr_history` (`source: "pr_head"`, `subject`, `files`, `authored_at`) and
+    the train's merged commits (`source: "base"`) — each carrying the
+    `code_notes` its diff added / removed / changed. Bots are left out of the
+    timeline and counted in `bots`. Everything is as of the window's end
+    (records are projected by the view; PR commits after the instant are
+    dropped). Turning points are marked by rule (`turning_points`), text is
+    bounded with every cut recorded (`truncation`)."""
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    issues, prs = _train_members(train, pr_index, issue_index)
+    history = _pr_history_index(bundle)
+    instant = window_end_instant(bundle.get("meta"))
+    items, bots = [], {}
+
+    def bot(login):
+        bots[login] = bots.get(login, 0) + 1
+
+    for rec in issues + prs:
+        typ = "pr" if rec in prs else "issue"
+        on = {"type": typ, "number": rec.get("number")}
+        if rec.get("created_at"):
+            items.append({"at": rec["created_at"], "kind": "opened",
+                          "actor": rec.get("author"), "url": rec.get("url"),
+                          "on": on, "title": rec.get("title"),
+                          "text": rec.get("body") or ""})
+        rc_urls = {c.get("id"): c.get("url") for c in rec.get("review_comments") or []
+                   if isinstance(c, dict) and c.get("id") is not None}
+        for key, kind in (("comments_list", "comment"),
+                          ("review_comments", "review_comment")):
+            for c in rec.get(key) or []:
+                if not isinstance(c, dict):
+                    continue
+                if derive.is_bot_login(c.get("author")):
+                    bot(c.get("author"))
+                    continue
+                it = {"at": c.get("created_at"), "kind": kind,
+                      "actor": c.get("author"), "url": c.get("url"),
+                      "on": on, "text": c.get("body") or ""}
+                if kind == "review_comment":
+                    _review_comment_context(it, c, rc_urls)
+                items.append(it)
+        for r in rec.get("reviews") or []:
+            if not isinstance(r, dict) or r.get("state") == "pending":
+                continue
+            if derive.is_bot_login(r.get("author")):
+                bot(r.get("author"))
+                continue
+            if r.get("state") == "commented" and not r.get("body"):
+                continue          # a review thread's wrapper: its text is the
+                                  # review comment
+            items.append({"at": r.get("submitted_at"), "kind": "review",
+                          "actor": r.get("author"), "url": r.get("url"),
+                          "on": on, "state": r.get("state"),
+                          "text": r.get("body") or ""})
+        closed_seen = False
+        for e in rec.get("lifecycle") or []:
+            if not isinstance(e, dict):
+                continue
+            closed_seen = closed_seen or e.get("event") == "closed"
+            items.append({"at": e.get("created_at"), "kind": e.get("event"),
+                          "actor": e.get("actor"), "url": _event_url(rec, e),
+                          "on": on})
+        if rec.get("merged") and rec.get("merged_at"):
+            items.append({"at": rec["merged_at"], "kind": "merged",
+                          "actor": rec.get("merged_by"), "url": rec.get("url"),
+                          "on": on})
+        elif rec.get("closed_at") and not closed_seen \
+                and (rec.get("state") == "closed"):
+            items.append({"at": rec["closed_at"], "kind": "closed",
+                          "actor": None, "url": rec.get("url"), "on": on})
+    notes_by_commit, by_module, notes_info = train_code_notes(
+        bundle, train, history, instant)
+    rules = path_class_rules((bundle.get("module_changes") or {})
+                             .get("path_rules") or ())
+    ctx = _ModuleCtx(bundle, rules)
+    seen = set()
+    for p in prs:
+        row = history.get(p.get("number"))
+        patches_by = {}
+        for x in (row or {}).get("patches") or []:
+            patches_by.setdefault(x.get("commit"), []).append(x)
+        for c in _pr_commits_as_of(row, instant):
+            seen.add(c.get("sha"))
+            it = {"at": c.get("committed_at"), "kind": "commit",
+                  "actor": c.get("author"), "url": _pr_commit_url(p, c["sha"]),
+                  "on": {"type": "pr", "number": p.get("number")},
+                  "source": "pr_head", "sha": c.get("sha"),
+                  "subject": c.get("subject"), "files": c.get("files"),
+                  "authored_at": c.get("authored_at")}
+            if c.get("parents", 1) > 1:
+                it["merge"] = True
+            if c.get("body"):
+                it["text"] = c["body"]
+                if c.get("body_truncated_from"):
+                    it["body_truncated_from"] = c["body_truncated_from"]
+            change = change_summary(
+                c.get("paths"), rules, ctx,
+                _interface_rows((row or {}).get("notes"), c.get("sha")),
+                patches_by.get(c.get("sha")))
+            if change:
+                if c.get("paths_omitted"):
+                    change["paths_omitted"] = c["paths_omitted"]
+                it["change"] = change
+            if notes_by_commit.get(c["sha"]):
+                it["code_notes"] = notes_by_commit[c["sha"]]
+            items.append(it)
+    commits_by_sha = {c.get("sha"): c for c in bundle.get("commits", [])}
+    for sha in train.get("commits") or []:
+        c = commits_by_sha.get(sha)
+        if c is None or sha in seen:
+            continue
+        it = {"at": c.get("committed_at") or c.get("date"), "kind": "commit",
+              "actor": c.get("author"), "url": derive._commit_url(bundle, sha),
+              "source": "base", "sha": sha, "subject": c.get("message"),
+              "files": len(c.get("files") or [])}
+        if c.get("pr") is not None:
+            it["on"] = {"type": "pr", "number": c.get("pr")}
+        change = change_summary(c.get("files"), rules, ctx,
+                                _interface_rows(bundle.get("symbol_events"), sha))
+        if change:
+            it["change"] = change
+        if notes_by_commit.get(sha):
+            it["code_notes"] = notes_by_commit[sha]
+        items.append(it)
+    items = [it for it in items if it.get("at")]
+    items.sort(key=lambda it: (_parse_ts(it["at"]) or datetime.min.replace(
+        tzinfo=timezone.utc), _TIMELINE_KIND_ORDER.get(it["kind"], 9),
+        it.get("url") or ""))
+    texts = [(it.get("text"), it.get("url")) for it in items if it.get("text")]
+    truncation = _apply_story_budget(items)
+    truncation["code_notes"] = notes_info
+    hunks_omitted = _apply_hunk_budget(items)
+    if hunks_omitted:
+        truncation["hunks_omitted"] = hunks_omitted
+    turning = story_turning_points(
+        items, instant if train.get("outcome") == "in_flight" else None)
+    _rework_detail(items, turning)
+    threads = story_threads(items, pr_index, issue_index)
+    out = {"timeline": items,
+           "turning_points": turning,
+           "truncation": truncation,
+           "bots": dict(sorted(bots.items())),
+           "code_notes_by_module": by_module,
+           "pr_history": _pr_history_status(prs, history),
+           "as_of": instant,
+           "not_gathered": list(STORY_NOT_GATHERED),
+           "outcome": story_outcome(bundle, train, items, history, instant, texts),
+           "threads": threads[:STORY_THREADS_MAX]}
+    if len(threads) > STORY_THREADS_MAX:
+        out["threads_omitted"] = len(threads) - STORY_THREADS_MAX
+    gaps = _story_gaps(items)
+    if gaps:
+        out["gaps"] = gaps
+    return out
+
+
+def _review_comment_context(it, c, rc_urls):
+    """Copy what a stored review comment is attached to onto its timeline
+    item (each key only when stored): `path`, `line`, `commit`, the
+    `diff_hunk` (capped at STORY_HUNK_CAP; `diff_hunk_lines` when gather cut
+    it; a thread reply carries none, its thread's opening comment has it)
+    and `in_reply_to` (the URL of the comment that opened the thread, or the
+    raw id when that comment is not in the record)."""
+    for k in ("path", "line", "commit"):
+        if c.get(k) is not None:
+            it[k] = c[k]
+    if c.get("in_reply_to") is not None:
+        it["in_reply_to"] = rc_urls.get(c["in_reply_to"], c["in_reply_to"])
+    elif c.get("diff_hunk"):
+        it["diff_hunk"] = c["diff_hunk"][-STORY_HUNK_CAP:]
+        if c.get("diff_hunk_lines"):
+            it["diff_hunk_lines"] = c["diff_hunk_lines"]
+
+
+def _apply_hunk_budget(items):
+    """Hold the review comments' diff hunks to STORY_HUNK_BUDGET characters,
+    keeping the earliest (the thread openers in time order); returns how
+    many were left out (each such item gets `diff_hunk_omitted`)."""
+    used, omitted = 0, 0
+    for it in items:
+        h = it.get("diff_hunk")
+        if h is None:
+            continue
+        if used + len(h) > STORY_HUNK_BUDGET:
+            del it["diff_hunk"]
+            it["diff_hunk_omitted"] = len(h)
+            omitted += 1
+        else:
+            used += len(h)
+    return omitted
+
+
+def _rework_detail(items, turning):
+    """Give each `rework_after_change_request` turning point what changed
+    after the request: `commits_since_request` and `paths_since_request`
+    (the files of the PR's own commits from the request until the
+    requester's next comment / review, at most 30), when the commits carry
+    their paths."""
+    for tp in turning:
+        if tp["rule"] != "rework_after_change_request":
+            continue
+        cr = items[tp["detail"]["change_request_index"]]
+        num, who = (cr.get("on") or {}).get("number"), cr.get("actor")
+        commits, paths = 0, []
+        for it in items[tp["detail"]["change_request_index"] + 1:]:
+            if (it.get("on") or {}).get("number") != num:
+                continue
+            if it["kind"] in ("review", "review_comment", "comment") \
+                    and it.get("actor") == who:
+                break
+            if it["kind"] == "commit" and it.get("source") == "pr_head" \
+                    and not it.get("merge"):
+                commits += 1
+                for ps in ((it.get("change") or {}).get("files") or {}).values():
+                    paths += [p for p in ps if p not in paths]
+        tp["detail"]["commits_since_request"] = commits
+        if paths:
+            tp["detail"]["paths_since_request"] = sorted(paths)[:30]
+
+
+def _story_gaps(items):
+    """What this slice cannot show because the store predates it, so a
+    narrator says "the record does not show ..." instead of guessing."""
+    gaps = []
+    rcs = [it for it in items if it["kind"] == "review_comment"]
+    if rcs and not any("path" in it or "in_reply_to" in it for it in rcs):
+        gaps.append("review comments carry no file, diff lines or thread link "
+                    "(the store was gathered before they were kept): which "
+                    "file each comment is about and which comments reply to "
+                    "which are not in the record")
+    pr_commits = [it for it in items if it["kind"] == "commit"
+                  and it.get("source") == "pr_head" and not it.get("merge")]
+    if pr_commits and not any("change" in it and "files" in it["change"]
+                              for it in pr_commits):
+        gaps.append("PR commits carry no file paths or message bodies (the "
+                    "store was gathered before they were kept): what each "
+                    "commit changed is known only from its subject")
+    return gaps
+
+
+def _pr_history_status(prs, history):
+    """{pr number (str): status} for the train's PRs: the pr_history row's
+    status (`fetched`, `missing`, `fetch_failed`, ...) with its notes state,
+    or `not_gathered` when the view carries no history for it."""
+    out = {}
+    for p in prs:
+        row = history.get(p.get("number"))
+        if row is None:
+            out[str(p.get("number"))] = "not_gathered"
+            continue
+        s = row.get("status") or "unknown"
+        if row.get("on_base"):
+            s += " (commits on the base branch)"
+        elif "notes" in row:
+            s += ", notes extracted"
+        elif row.get("notes_skipped"):
+            s += ", notes skipped: " + row["notes_skipped"]
+        out[str(p.get("number"))] = s
+    return out
+
+
+# --- the substance: change summaries, outcome, open threads ----------------
+#
+# Who said what and when is not a story: a reader needs what the code change
+# was, what each objection was about, what was decided and what ended up in
+# the product, and for open work what it waits on. Everything below is built
+# by rule from stored records (as of the window's end), never inferred.
+
+# Paths listed per file class in one change summary (`more` counts the rest).
+STORY_CHANGE_PATHS_PER_CLASS = 8
+# Interface rows (parameter / output / resource / dependency adds, drops and
+# changes) listed per change summary (`interface_more` counts the rest).
+STORY_CHANGE_INTERFACE_MAX = 20
+# Per review comment: the diff lines it is attached to (gather keeps at most
+# this much); a thread reply carries none (GitHub gives a reply the same
+# hunk as the comment that opened the thread). All hunks of one slice share
+# a budget; past it they are left out (counted in truncation.hunks_omitted).
+STORY_HUNK_CAP = 1500
+STORY_HUNK_BUDGET = 15000
+# Threads in the open-threads ledger (`threads_omitted` counts the rest).
+STORY_THREADS_MAX = 40
+# Characters of a thread's `ask` (a verbatim excerpt of the opening text).
+STORY_ASK_CAP = 300
+# Items linked from the conversation (issues / PRs of the repository that
+# are not part of the train) and the characters of each one's description.
+STORY_LINKED_MAX = 10
+STORY_LINKED_BODY_CAP = 1200
+# Names listed per interface group in the outcome block, and changelog items
+# per module.
+STORY_OUTCOME_NAMES_MAX = 25
+STORY_OUTCOME_ITEMS_MAX = 30
+# Lines listed per file in a PR's net change (changelog / shared files).
+STORY_NET_LINES_MAX = 20
+
+# The statuses a thread of the open-threads ledger can have (story_threads).
+STORY_THREAD_STATUSES = ("approved_after", "answered", "dismissed",
+                         "followed_by_commit", "reply_on_item",
+                         "unresolved in the record")
+
+_MENTION_RE = re.compile(r"(?<![\w/.@])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
+                         r"(?![\w/-])")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_FENCE_RE = re.compile(r"```.*?```", re.S)
+
+
+def _sha_of_url(url):
+    return (url or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def change_summary(paths, rules, ctx, interface=(), patches=()):
+    """The compact, factual summary of one commit's change, or None when
+    nothing is known about it: `files` {class: [path]} (path_class, at most
+    STORY_CHANGE_PATHS_PER_CLASS per class, `files_more` {class: n} the
+    rest), `modules` (the module areas touched, module_kind), `shared`
+    (true when a `ci`-class file — a workflow, action or pipeline utility
+    every module depends on — changed), `interface` [{change, kind, name,
+    path}] (at most STORY_CHANGE_INTERFACE_MAX, `interface_more` the rest)
+    and `patches` [{path, kind, added, removed, [lines_omitted]}] (the
+    changelog / shared-file lines the commit wrote, from `pr_history`).
+    Pure."""
+    paths = [p for p in paths or [] if p]
+    if not paths and not interface and not patches:
+        return None
+    out = {}
+    if paths:
+        by_class = {}
+        for p in paths:
+            by_class.setdefault(path_class(p, rules), []).append(p)
+        out["files"] = {c: sorted(v)[:STORY_CHANGE_PATHS_PER_CLASS]
+                        for c, v in sorted(by_class.items())}
+        more = {c: len(v) - STORY_CHANGE_PATHS_PER_CLASS
+                for c, v in sorted(by_class.items())
+                if len(v) > STORY_CHANGE_PATHS_PER_CLASS}
+        if more:
+            out["files_more"] = more
+        mods = sorted({a for a in (ctx.area_of(p) for p in paths)
+                       if a and ctx.kind(a)})
+        if mods:
+            out["modules"] = mods
+        if "ci" in by_class:
+            out["shared"] = True
+    # the module's own interface first, then the tests' / examples'
+    rows = sorted(interface, key=lambda r: gather._is_scaffold_path(
+        r.get("path") or ""))
+    if rows:
+        out["interface"] = rows[:STORY_CHANGE_INTERFACE_MAX]
+        if len(rows) > STORY_CHANGE_INTERFACE_MAX:
+            out["interface_more"] = len(rows) - STORY_CHANGE_INTERFACE_MAX
+    if patches:
+        out["patches"] = [{k: p[k] for k in ("path", "kind", "added", "removed",
+                                             "lines_omitted") if k in p}
+                          for p in patches]
+    return out
+
+
+def _interface_rows(events, sha):
+    """[{change, kind, name, path}] of the interface events (parameters,
+    variables, outputs, resources, module references) of one commit."""
+    return [{"change": e.get("change"), "kind": e.get("subkind"),
+             "name": e.get("name"), "path": e.get("path")}
+            for e in events or []
+            if e.get("commit") == sha
+            and e.get("subkind") in ("param", "variable", "output", "resource",
+                                     "module")]
+
+
+def _net_lines(patches):
+    """{path: {kind, net_added, net_removed, commits}} over a PR's patch
+    excerpts in commit order: a line added and later removed (or removed
+    and later restored) cancels out; a path with neither left is
+    `reverted` (touched, no net change in the kept lines)."""
+    out = {}
+    for p in patches:
+        row = out.setdefault(p["path"], {"kind": p.get("kind"), "added": [],
+                                         "removed": [], "commits": []})
+        if p.get("commit") not in row["commits"]:
+            row["commits"].append(p.get("commit"))
+        for ln in p.get("removed") or []:
+            if ln in row["added"]:
+                row["added"].remove(ln)
+            else:
+                row["removed"].append(ln)
+        for ln in p.get("added") or []:
+            if ln in row["removed"]:
+                row["removed"].remove(ln)
+            else:
+                row["added"].append(ln)
+    res = {}
+    for path, row in sorted(out.items()):
+        r = {"kind": row["kind"], "commits": len(row["commits"])}
+        if not row["added"] and not row["removed"]:
+            r["reverted"] = True
+        else:
+            r["net_added"] = row["added"][:STORY_NET_LINES_MAX]
+            r["net_removed"] = row["removed"][:STORY_NET_LINES_MAX]
+            extra = max(0, len(row["added"]) - STORY_NET_LINES_MAX) + \
+                max(0, len(row["removed"]) - STORY_NET_LINES_MAX)
+            if extra:
+                r["lines_more"] = extra
+        res[path] = r
+    return res
+
+
+def _latest_verdicts(pr, instant):
+    """{reviewer: review} — each human reviewer's latest verdict (approved,
+    changes_requested, dismissed) on a PR by the instant, the PR author's
+    own reviews excluded."""
+    out = {}
+    for r in sorted((r for r in pr.get("reviews") or [] if isinstance(r, dict)),
+                    key=lambda r: r.get("submitted_at") or ""):
+        if r.get("state") not in ("approved", "changes_requested", "dismissed"):
+            continue
+        if r.get("author") == pr.get("author") \
+                or derive.is_bot_login(r.get("author")) \
+                or not _not_after(r.get("submitted_at"), instant):
+            continue
+        out[r.get("author")] = r
+    return out
+
+
+def _mentions(text, exclude=()):
+    seen = []
+    for m in _MENTION_RE.findall(_FENCE_RE.sub("", text or "")):
+        if m not in exclude and m not in seen:
+            seen.append(m)
+    return seen
+
+
+def _event_ref(it, actor=None):
+    return {"at": it.get("at"), "kind": it.get("kind"),
+            "actor": actor or it.get("actor"), "url": it.get("url")}
+
+
+def ball_with(pr, pr_items, verdicts, reviewers):
+    """Who the next move on an open PR is with — DERIVED by rule from the
+    sequence of its recorded events (`pr_items`, the timeline items on that
+    PR in time order), never read from anyone's words. A PR commit counts
+    as the PR author's move (its git author name is not a login).
+    - R1 mention: the last event is by someone other than the author and
+      names other people (@login) -> `awaiting mentioned` (them);
+    - R2 author moved: the last event is the author's (an opening, a
+      commit, a comment) -> `awaiting reviewer`: the reviewers whose latest
+      verdict is a change request, else the people the author named, else
+      the reviewers who reviewed; nobody -> `awaiting a first review`;
+    - R3 approved: the last event is an approval and no change request is
+      outstanding -> `awaiting merge`;
+    - R4 reviewer moved: otherwise -> `awaiting author`.
+    Returns {state, with, rule, basis: {at, kind, actor, url}, derived:
+    true}, or None when the PR has no recorded event."""
+    if not pr_items:
+        return None
+    author = pr.get("author")
+    last = pr_items[-1]
+    actor = author if last["kind"] in ("commit", "opened", "ready_for_review",
+                                       "reopened") else last.get("actor")
+    outstanding = [r for r, v in verdicts.items()
+                   if v.get("state") == "changes_requested"]
+    named = _mentions(last.get("text"), exclude={actor})
+    if actor != author and [m for m in named if m != author]:
+        state, who, rule = "awaiting mentioned", [m for m in named if m != author], \
+            "R1 mention"
+    elif actor == author:
+        who = outstanding or named or [r for r in reviewers if r != author]
+        state = "awaiting reviewer" if who else "awaiting a first review"
+        rule = "R2 author moved"
+    elif last["kind"] == "review" and last.get("state") == "approved" \
+            and not outstanding:
+        state, who, rule = "awaiting merge", [], "R3 approved"
+    else:
+        state, who, rule = "awaiting author", [author] if author else [], \
+            "R4 reviewer moved"
+    return {"state": state, "with": who, "rule": rule,
+            "basis": _event_ref(last, actor), "derived": True}
+
+
+def _issue_ball(issue, items):
+    """The next move on an open issue with no open PR, derived like
+    ball_with: the last event is the reporter's -> `awaiting maintainer
+    response`; someone else's naming people -> `awaiting mentioned`;
+    otherwise `awaiting reporter`."""
+    if not items:
+        return None
+    last = items[-1]
+    author = issue.get("author")
+    actor = author if last["kind"] == "opened" else last.get("actor")
+    named = [m for m in _mentions(last.get("text"), exclude={actor})
+             if m != author]
+    if actor == author:
+        state, who, rule = "awaiting maintainer response", [], "I1 reporter moved"
+    elif named:
+        state, who, rule = "awaiting mentioned", named, "I2 mention"
+    else:
+        state, who, rule = "awaiting reporter", [author] if author else [], \
+            "I3 other moved"
+    return {"state": state, "with": who, "rule": rule,
+            "basis": _event_ref(last, actor), "derived": True}
+
+
+def _ask_text(text):
+    """A verbatim excerpt of what a comment asks: the first sentence with a
+    question mark on a line that is not a quotation (`> ...`) or inside a
+    code block, else the opening of its first such line; at most
+    STORY_ASK_CAP characters. None for an empty text."""
+    body = _FENCE_RE.sub("", text or "")
+    lines = [ln.strip() for ln in body.split("\n")
+             if ln.strip() and not ln.lstrip().startswith(">")]
+    for ln in lines:
+        if "?" in ln:
+            for sent in re.split(r"(?<=[.!?])\s+", ln):
+                if "?" in sent and not sent.startswith(("http://", "https://")):
+                    return sent[:STORY_ASK_CAP]
+    return lines[0][:STORY_ASK_CAP] if lines else None
+
+
+def _signal_rank(sig):
+    """Strongest resolution signal first: an approval after a change
+    request, an answer in the thread, a dismissal, a commit touching the
+    thread's file, a reply on the same item (thread links not stored), a
+    later commit on the PR whose files are not known to match."""
+    order = {"approved_after": 0, "answered": 1, "dismissed": 2,
+             "followed_by_commit": 3, "reply_on_item": 4}
+    if sig["status"] == "followed_by_commit" and sig.get("same_file") is None:
+        return 5
+    return order.get(sig["status"], 9)
+
+
+def _has_question(text):
+    body = _FENCE_RE.sub("", text or "")
+    body = re.sub(r"https?://\S+", "", body)
+    return any("?" in ln for ln in body.split("\n")
+               if not ln.lstrip().startswith(">"))
+
+
+def story_threads(items, pr_index, issue_index):
+    """The open-threads ledger: every question or request raised in the
+    conversation, with its resolution status BY RULE. A thread is opened by
+    a review comment that starts a thread (not a reply) by anyone but the
+    PR author, or by the author with a question mark; a `changes_requested`
+    review; a comment (issue or PR conversation) or a review text with a
+    question mark (quotations and code blocks ignored). Each {id, kind
+    (review_thread / change_request / question), on, at, by, url, ask
+    (_ask_text, verbatim), [path], [replies], status, [resolution
+    {status, at, by, url, same_file?}], signals}. Status, strongest first:
+    `approved_after` (a change request followed by an approval from the
+    same reviewer), `answered` (a reply by someone else in the same review
+    thread — GitHub's thread link, `in_reply_to` — or, for a conversation
+    question, a later comment on the same item by someone else),
+    `dismissed`, `followed_by_commit` (a later commit on the PR touching
+    the thread's file: `same_file: true`; `same_file: null` when the file is
+    not stored, any later commit on the PR), `reply_on_item` (a later reply
+    on the same PR by someone else when the review thread links are not
+    stored), else `unresolved in the record`. GitHub's own
+    resolved / unresolved flag is not gathered. Pure over the timeline."""
+    threads, replies = [], {}
+    for it in items:
+        if it["kind"] == "review_comment" and it.get("in_reply_to"):
+            replies.setdefault(it["in_reply_to"], []).append(it)
+    linked_prs = {it["on"]["number"] for it in items
+                  if it["kind"] == "review_comment" and it.get("on")
+                  and ("in_reply_to" in it or "path" in it)}
+    for i, it in enumerate(items):
+        on = it.get("on") or {}
+        rec = (pr_index if on.get("type") == "pr" else issue_index).get(
+            on.get("number")) or {}
+        author = rec.get("author")
+        kind = None
+        if it["kind"] == "review_comment" and not it.get("in_reply_to") \
+                and (it.get("actor") != author or _has_question(it.get("text"))):
+            kind = "review_thread"
+        elif it["kind"] == "review" and it.get("state") == "changes_requested":
+            kind = "change_request"
+        elif it["kind"] in ("comment", "review", "review_comment") \
+                and _has_question(it.get("text")):
+            kind = "question"
+        if kind is None:
+            continue
+        t = {"kind": kind, "on": on, "at": it.get("at"), "by": it.get("actor"),
+             "url": it.get("url")}
+        ask = _ask_text(it.get("text"))
+        if ask:
+            t["ask"] = ask
+        if it.get("path"):
+            t["path"] = it["path"]
+        signals = []
+        later = items[i + 1:]
+        same = [x for x in later if (x.get("on") or {}) == on]
+        if kind == "review_thread":
+            reps = replies.get(it.get("url")) or []
+            if reps:
+                t["replies"] = len(reps)
+            other = next((r for r in reps if r.get("actor") != it.get("actor")), None)
+            if other is not None:
+                signals.append(("answered", other, None))
+            elif on.get("number") not in linked_prs:
+                rep = next((x for x in same if x["kind"] in
+                            ("comment", "review_comment", "review")
+                            and x.get("text") and x.get("actor") != it.get("actor")),
+                           None)
+                if rep is not None:
+                    signals.append(("reply_on_item", rep, None))
+        elif kind == "change_request":
+            ok = next((x for x in same if x["kind"] == "review"
+                       and x.get("actor") == it.get("actor")
+                       and x.get("state") in ("approved", "dismissed")), None)
+            if ok is not None:
+                signals.append(("approved_after" if ok["state"] == "approved"
+                                else "dismissed", ok, None))
+        else:
+            rep = next((x for x in same if x["kind"] in
+                        ("comment", "review_comment", "review")
+                        and x.get("text") and x.get("actor") != it.get("actor")),
+                       None)
+            if rep is not None:
+                signals.append(("answered", rep, None))
+        if on.get("type") == "pr" and kind != "question":
+            commits = [x for x in same if x["kind"] == "commit"
+                       and x.get("source") == "pr_head" and not x.get("merge")]
+            path = it.get("path")
+            if path:
+                hit = next((x for x in commits if path in
+                            [p for ps in ((x.get("change") or {}).get("files")
+                                          or {}).values() for p in ps]), None)
+                if hit is not None:
+                    signals.append(("followed_by_commit", hit, True))
+            elif commits:
+                signals.append(("followed_by_commit", commits[0], None))
+        t["signals"] = [{"status": s, "at": x.get("at"),
+                         "by": x.get("actor"), "url": x.get("url"),
+                         **({"same_file": f} if s == "followed_by_commit" else {})}
+                        for s, x, f in signals]
+        best = min(t["signals"], key=_signal_rank, default=None)
+        t["status"] = best["status"] if best else "unresolved in the record"
+        if best:
+            t["resolution"] = best
+        threads.append(t)
+    for n, t in enumerate(threads, 1):
+        t["id"] = "T{}".format(n)
+    return threads
+
+
+def _linked_numbers(bundle, texts, own):
+    """[(number, first citing url)] of the repository's issues / PRs named in
+    the conversation's texts (`#N` not preceded by a word, `/` or `.`, or
+    a github.com/<owner>/<repo>/issues|pull/N link), HTML comments (a
+    template's "Fixes #123") left out, the train's own numbers excluded, in
+    order of first mention."""
+    meta = bundle.get("meta") or {}
+    owner, repo = meta.get("owner"), meta.get("repo")
+    link_re = re.compile(r"https://github\.com/{}/{}/(?:issues|pull)/(\d+)".format(
+        re.escape(owner or "\x00"), re.escape(repo or "\x00")))
+    found = []
+    for text, url in texts:
+        t = _HTML_COMMENT_RE.sub("", text or "")
+        nums = [int(n) for n in link_re.findall(t)]
+        stripped = re.sub(r"https?://\S+", "", t)
+        nums += [int(n) for n in re.findall(r"(?<![\w/.&])#(\d+)\b", stripped)]
+        for n in nums:
+            if n not in own and n not in [f[0] for f in found]:
+                found.append((n, url))
+    return found
+
+
+def _issue_ask(body):
+    """The description of a linked item, verbatim: from an issue form's
+    `### Description` heading when it has one, else from the start; at most
+    STORY_LINKED_BODY_CAP characters. (text, original length)."""
+    b = (body or "").replace("\r\n", "\n")
+    k = b.find("### Description")
+    if k >= 0:
+        b = b[k + len("### Description"):]
+    b = _HTML_COMMENT_RE.sub("", b).strip()
+    return b[:STORY_LINKED_BODY_CAP], len(b)
+
+
+def _linked_items(bundle, texts, own):
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    out = []
+    found = _linked_numbers(bundle, texts, own)
+    for n, cited in found[:STORY_LINKED_MAX]:
+        rec = issue_index.get(n) or pr_index.get(n)
+        if rec is None:
+            out.append({"number": n, "in_view": False, "mentioned_in": cited})
+            continue
+        typ = "issue" if n in issue_index else "pr"
+        row = {"number": n, "type": typ, "title": rec.get("title"),
+               "author": rec.get("author"), "state": rec.get("state"),
+               "created_at": rec.get("created_at"), "url": rec.get("url"),
+               "mentioned_in": cited}
+        if typ == "pr":
+            row["merged"] = bool(rec.get("merged"))
+        if rec.get("closed_at") and rec.get("state") == "closed":
+            row["closed_at"] = rec["closed_at"]
+        human = _human_rows(rec.get("comments_list"))
+        row["comments"] = len(human)
+        last = max([c.get("created_at") or "" for c in human]
+                   + [rec.get("created_at") or ""])
+        row["last_activity_at"] = last or None
+        ask, n_chars = _issue_ask(rec.get("body"))
+        if ask:
+            row["description"] = ask
+            if n_chars > len(ask):
+                row["description_truncated_from"] = n_chars
+        out.append(row)
+    return out, max(0, len(found) - STORY_LINKED_MAX)
+
+
+def _names(rows):
+    return [r.get("name") for r in rows or []][:STORY_OUTCOME_NAMES_MAX]
+
+
+def _outcome_modules(bundle, train):
+    """What ended up in the product, from the module layer: every module
+    entry one of the train's PRs contributed to, with its status, versions,
+    the changelog entries the train's PRs wrote (verbatim items), the
+    interface names added / removed / modified, child modules, and declared
+    breaking items and breaking candidates."""
+    mc = bundle.get("module_changes") or {}
+    prs = set(train.get("prs") or [])
+    out = []
+    for e in mc.get("modules") or []:
+        if not {p.get("number") for p in e.get("prs") or []} & prs:
+            continue
+        row = {"area": e.get("area"), "kind": e.get("kind"),
+               "status": e.get("status")}
+        if e.get("first_version"):
+            row["first_version"] = e["first_version"]
+        v = e.get("versions") or {}
+        vers = {k: v[k] for k in ("changelog", "declared_not_published",
+                                  "published_not_declared") if v.get(k)}
+        if v.get("published"):
+            vers["published"] = [{k: p.get(k) for k in ("version", "tag", "date")}
+                                 for p in v["published"]]
+        if v.get("version_file"):
+            vers["version_file"] = {k: v["version_file"].get(k)
+                                    for k in ("from", "to")}
+        if vers:
+            row["versions"] = vers
+        entries, n_items = [], 0
+        for c in e.get("changelog") or []:
+            if not any(s.get("pr") in prs for s in c.get("sources") or []):
+                continue
+            secs = []
+            for s in c.get("sections") or []:
+                items = [i.get("text") for i in s.get("items") or []]
+                keep = items[:max(0, STORY_OUTCOME_ITEMS_MAX - n_items)]
+                n_items += len(keep)
+                sec = {"heading": s.get("heading"), "kind": s.get("kind"),
+                       "items": keep}
+                if s.get("placeholder"):
+                    sec["placeholder"] = s["placeholder"]
+                secs.append(sec)
+            entries.append({"version": c.get("version"), "sections": secs})
+        if entries:
+            row["changelog"] = entries
+        iface = {}
+        for group, changes in (e.get("interface") or {}).items():
+            g = {ch: _names(rows) for ch, rows in changes.items() if rows}
+            g.update({ch + "_more": len(rows) - STORY_OUTCOME_NAMES_MAX
+                      for ch, rows in changes.items()
+                      if len(rows or []) > STORY_OUTCOME_NAMES_MAX})
+            if g:
+                iface[group] = g
+        if iface:
+            row["interface"] = iface
+        kids = [{"path": c.get("path"), "change": c.get("change")}
+                for c in (e.get("structure") or {}).get("children") or []]
+        if kids:
+            row["children"] = kids
+        br = e.get("breaking") or {}
+        b = {}
+        if br.get("declared"):
+            b["declared"] = [d.get("text") for d in br["declared"]
+                             if any(s.get("pr") in prs for s in d.get("sources") or [])]
+        if br.get("candidates"):
+            b["candidates"] = [{"rule": c.get("rule"), "subject": c.get("subject")}
+                               for c in br["candidates"]
+                               if any(s.get("pr") in prs for s in c.get("sources") or [])]
+        b = {k: x for k, x in b.items() if x}
+        if b:
+            row["breaking"] = b
+        out.append(row)
+    return out
+
+
+def story_outcome(bundle, train, items, history, instant, texts):
+    """The outcome block of a story: where the train's items stand as of
+    the instant and what ended up in the product. {train_outcome, as_of,
+    items: [per issue / PR {type, number, title, author, state, url, ...;
+    for a PR: merged, [merged_at], reviews {verdicts: [{reviewer, state,
+    at, url}], outstanding_change_requests: [{by, since, url}]}, checks
+    ("not gathered"), [last_event], [ball]; for an open issue with no open
+    PR: [last_event], [ball]}], [ball] (the train's: its latest open PR's,
+    else its open issue's), [waiting_on] (open linked items the PR author's
+    latest message names), linked: [...] (_linked_items), [linked_omitted],
+    [modules] (_outcome_modules: shipped work), [net_change] {pr number:
+    {files, changelog / shared paths net of the PR's own reverts}} for open
+    PRs with stored patch excerpts}."""
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    issues, prs = _train_members(train, pr_index, issue_index)
+    out = {"train_outcome": train.get("outcome"), "as_of": instant, "items": []}
+    own = {r.get("number") for r in issues + prs}
+    open_prs, open_issue_balls = [], []
+    for rec in issues + prs:
+        typ = "pr" if rec in prs else "issue"
+        row = {"type": typ, "number": rec.get("number"), "title": rec.get("title"),
+               "author": rec.get("author"), "state": rec.get("state"),
+               "created_at": rec.get("created_at"), "url": rec.get("url")}
+        on_items = [it for it in items
+                    if (it.get("on") or {}) == {"type": typ, "number": rec.get("number")}
+                    and it["kind"] not in ("merged", "closed")]
+        if typ == "pr":
+            row["merged"] = bool(rec.get("merged"))
+            if rec.get("merged_at"):
+                row["merged_at"] = rec["merged_at"]
+            verdicts = _latest_verdicts(rec, instant)
+            row["reviews"] = {
+                "verdicts": [{"reviewer": r, "state": v.get("state"),
+                              "at": v.get("submitted_at"), "url": v.get("url")}
+                             for r, v in sorted(verdicts.items())],
+                "outstanding_change_requests": [
+                    {"by": r, "since": v.get("submitted_at"), "url": v.get("url")}
+                    for r, v in sorted(verdicts.items())
+                    if v.get("state") == "changes_requested"]}
+            row["checks"] = "not gathered"
+            if rec.get("state") == "open":
+                if on_items:
+                    row["last_event"] = _event_ref(on_items[-1])
+                reviewers = sorted({it.get("actor") for it in on_items
+                                    if it["kind"] in ("review", "review_comment")
+                                    and it.get("actor") != rec.get("author")})
+                ball = ball_with(rec, on_items, verdicts, reviewers)
+                if ball:
+                    row["ball"] = ball
+                open_prs.append((rec.get("created_at") or "", row))
+        elif rec.get("state") == "open":
+            if on_items:
+                row["last_event"] = _event_ref(on_items[-1])
+            ball = _issue_ball(rec, on_items)
+            if ball:
+                row["ball"] = ball
+                open_issue_balls.append(ball)
+        elif rec.get("closed_at"):
+            row["closed_at"] = rec["closed_at"]
+        out["items"].append(row)
+    if open_prs:
+        main = max(open_prs, key=lambda e: e[0])[1]
+        if main.get("ball"):
+            out["ball"] = dict(main["ball"], pr=main["number"])
+    elif open_issue_balls:
+        out["ball"] = open_issue_balls[-1]
+    linked, more = _linked_items(bundle, texts, own)
+    out["linked"] = linked
+    if more:
+        out["linked_omitted"] = more
+    if open_prs:
+        for _, row in open_prs:
+            author = row.get("author")
+            mine = [it for it in items if it.get("actor") == author
+                    and it["kind"] in ("comment", "review_comment", "review")
+                    and it.get("text")]
+            if not mine:
+                continue
+            last_text = mine[-1]
+            nums = [n for n, _u in _linked_numbers(bundle, [(last_text["text"],
+                                                             last_text["url"])], own)]
+            waiting = [{"number": l["number"], "type": l.get("type"),
+                        "state": l.get("state"), "title": l.get("title"),
+                        "named_in": last_text["url"]}
+                       for l in linked if l["number"] in nums
+                       and l.get("state") == "open"]
+            if waiting:
+                out["waiting_on"] = waiting
+    mods = _outcome_modules(bundle, train)
+    if mods:
+        out["modules"] = mods
+    net = {}
+    for p in prs:
+        if p.get("state") != "open":
+            continue
+        row = history.get(p.get("number")) or {}
+        ok = {c["sha"] for c in _pr_commits_as_of(row, instant)}
+        if not row.get("commits"):
+            continue
+        paths = sorted({x for c in _pr_commits_as_of(row, instant)
+                        for x in c.get("paths") or []})
+        entry = {}
+        if paths:
+            rules = path_class_rules((bundle.get("module_changes") or {})
+                                     .get("path_rules") or ())
+            by_class = {}
+            for x in paths:
+                by_class.setdefault(path_class(x, rules), []).append(x)
+            entry["files_touched"] = dict(sorted(by_class.items()))
+        patches = [x for x in row.get("patches") or [] if x.get("commit") in ok]
+        if patches:
+            entry["lines"] = _net_lines(patches)
+        if entry:
+            net[str(p.get("number"))] = entry
+    if net:
+        out["net_change"] = net
+    return out
+
+
+def story_turning_points(items, open_as_of=None):
+    """Turning points of a story timeline, by rule (data, not prose). Each
+    {rule, at, index, url, detail?}:
+    - `still_silent` (only with `open_as_of`, the as-of instant of a train
+      still open then): no recorded human event in the last
+      STORY_SILENCE_DAYS days before it (detail: days, since; `index` is
+      the last item's);
+    - `change_request`: a review with state changes_requested;
+    - `reopened`: an issue / PR reopened;
+    - `silence_then_activity`: activity after more than STORY_SILENCE_DAYS
+      days without any recorded human event (detail: days, since);
+    - `rework_after_change_request`: the first PR commit after a change
+      request on that PR;
+    - `history_rewritten`: a PR commit committed more than
+      STORY_REWRITE_HOURS after it was authored (amended, rebased or
+      cherry-picked; the branch's earlier states are not kept), once per PR
+      per day;
+    - `new_attempt`: a PR of the train opened after another of its PRs was
+      closed unmerged.
+    A scope change (a title edit) cannot be marked: edits are not gathered."""
+    out = []
+    pending_cr = {}
+    rewritten = set()
+    closed_unmerged = set()
+    merged = {it["on"]["number"] for it in items
+              if it["kind"] == "merged" and it.get("on")}
+    prev = None
+    for i, it in enumerate(items):
+        dt = _parse_ts(it["at"])
+        on = it.get("on") or {}
+        if prev is not None and dt is not None \
+                and (dt - prev).total_seconds() > STORY_SILENCE_DAYS * 86400:
+            out.append({"rule": "silence_then_activity", "at": it["at"],
+                        "index": i, "url": it.get("url"),
+                        "detail": {"days": _days(prev, dt),
+                                   "since": prev.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+        if dt is not None:
+            prev = dt
+        kind = it["kind"]
+        if kind == "review" and it.get("state") == "changes_requested":
+            out.append({"rule": "change_request", "at": it["at"], "index": i,
+                        "url": it.get("url")})
+            pending_cr[on.get("number")] = i
+        elif kind == "reopened":
+            out.append({"rule": "reopened", "at": it["at"], "index": i,
+                        "url": it.get("url")})
+        elif kind == "commit" and it.get("source") == "pr_head":
+            n = on.get("number")
+            if n in pending_cr:
+                out.append({"rule": "rework_after_change_request", "at": it["at"],
+                            "index": i, "url": it.get("url"),
+                            "detail": {"change_request_index": pending_cr.pop(n)}})
+            a, c = _parse_ts(it.get("authored_at")), dt
+            if a is not None and c is not None and \
+                    (c - a).total_seconds() > STORY_REWRITE_HOURS * 3600 and \
+                    (n, it["at"][:10]) not in rewritten:
+                rewritten.add((n, it["at"][:10]))
+                out.append({"rule": "history_rewritten", "at": it["at"],
+                            "index": i, "url": it.get("url"),
+                            "detail": {"authored_at": it.get("authored_at")}})
+        elif kind == "closed" and on.get("type") == "pr" \
+                and on.get("number") not in merged:
+            closed_unmerged.add(on.get("number"))
+        elif kind == "opened" and on.get("type") == "pr" and closed_unmerged \
+                and on.get("number") not in closed_unmerged:
+            out.append({"rule": "new_attempt", "at": it["at"], "index": i,
+                        "url": it.get("url"),
+                        "detail": {"after_closed": sorted(closed_unmerged)}})
+    end = _parse_ts(open_as_of)
+    if end is not None and prev is not None and items \
+            and (end - prev).total_seconds() > STORY_SILENCE_DAYS * 86400:
+        out.append({"rule": "still_silent", "at": open_as_of,
+                    "index": len(items) - 1, "url": items[-1].get("url"),
+                    "detail": {"days": _days(prev, end),
+                               "since": prev.strftime("%Y-%m-%dT%H:%M:%SZ")}})
+    return out
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s)\]>\"'`]+")
+_QUOTE_RE = re.compile(r"\"([^\"\n]{4,})\"|“([^”\n]{4,})”")
+
+
+def _slice_strings(obj, urls, texts):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _slice_strings(v, urls, texts)
+    elif isinstance(obj, list):
+        for v in obj:
+            _slice_strings(v, urls, texts)
+    elif isinstance(obj, str):
+        texts.append(obj)
+        if obj.startswith(("http://", "https://")):
+            urls.add(obj)
+        urls.update(_URL_IN_TEXT_RE.findall(obj))
+
+
+def _norm_ws(s):
+    return " ".join((s or "").split())
+
+
+_MONTH_NAMES = ("January|February|March|April|May|June|July|August|September|"
+                "October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|"
+                "Oct|Nov|Dec")
+_DATE_IN_PROSE_RE = re.compile(
+    r"\b(\d{4})-\d{2}-\d{2}\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:" + _MONTH_NAMES + r")\.?(?:,?\s+(\d{4}))?\b"
+    r"|\b(?:" + _MONTH_NAMES + r")\.?\s+\d{1,2}(?:st|nd|rd|th)?\b(?:,?\s+(\d{4}))?")
+_CLOSING_RE = re.compile(r"^[#*_\s>]*(Where it stands|What landed)\b", re.I | re.M)
+_STATE_WORD_RE = re.compile(r"\b(open|closed|merged|unmerged|draft)\b", re.I)
+STORY_NO_DISCUSSION = "No notable discussion."
+
+
+def _slice_repo_base(slice_obj):
+    """`https://github.com/<owner>/<repo>/` of the slice's train, from its
+    evidence or timeline URLs; None when no URL names one."""
+    urls = [e.get("url") for e in (slice_obj.get("train") or {}).get("evidence") or []]
+    urls += [it.get("url") for it in (slice_obj.get("conversation") or {})
+             .get("timeline") or []]
+    for u in urls:
+        m = re.match(r"(https://github\.com/[^/\s]+/[^/\s]+/)(?:issues|pull)/\d+", u or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def _slice_states(slice_obj):
+    """{number: (state, merged)} of every issue / PR the slice's outcome
+    block states (the train's own items and the linked ones in the view)."""
+    out = {}
+    oc = (slice_obj.get("conversation") or {}).get("outcome") or {}
+    for row in (oc.get("items") or []) + (oc.get("linked") or []):
+        if row.get("number") is not None and row.get("state"):
+            out[row["number"]] = (row["state"], bool(row.get("merged")))
+    return out
+
+
+def _story_numbers(text, base):
+    """Issue / PR numbers a story names: `#N` (not preceded by a word, `/`,
+    `.` or `&`) and links to the repository's issues / pulls."""
+    nums = []
+    if base:
+        for n in re.findall(re.escape(base) + r"(?:issues|pull)/(\d+)", text):
+            if int(n) not in nums:
+                nums.append(int(n))
+    for n in re.findall(r"(?<![\w/.&])#(\d+)\b", _URL_IN_TEXT_RE.sub(" ", text)):
+        if int(n) not in nums:
+            nums.append(int(n))
+    return nums
+
+
+def check_story_structure(slice_obj, text):
+    """The mechanical part of the story brief's structure rules. Pure.
+
+    - `first_date_without_year`: the first date the prose names (an ISO
+      date, "10 June", "June 10", "Nov 1", ... outside URLs) must carry a
+      year ("10 June 2026", "2026-06-10"); else the date as written.
+    - `closing_paragraph_missing`: a story ends with a paragraph (or
+      heading) starting "Where it stands" (a train in flight) or "What
+      landed" (a shipped train; any other outcome accepts either).
+    - `numbers_without_state`: every issue / PR number the story names
+      (`#N` or a link to the repository's issue / pull) is named again in
+      that closing part, in a sentence with a state word (open, closed,
+      merged, unmerged, draft).
+    - `state_mismatch`: such a sentence's state words must include the
+      state the slice records for that number (the outcome block's items
+      and linked items; a merged PR accepts "merged" or "closed").
+    A story that is exactly STORY_NO_DISCUSSION is exempt. What this cannot
+    check — that every thread mentioned is closed, that a turning point is
+    explained in substance, that quotes are fair in context — stays the
+    writer's responsibility (reference/report-sections.md)."""
+    out = {"first_date_without_year": None, "closing_paragraph": None,
+           "closing_paragraph_missing": False, "numbers_without_state": [],
+           "state_mismatch": [], "numbers_checked": 0}
+    if (text or "").strip() == STORY_NO_DISCUSSION:
+        return out
+    prose = _URL_IN_TEXT_RE.sub(lambda m: " " * len(m.group(0)), text or "")
+    m = _DATE_IN_PROSE_RE.search(prose)
+    if m and not (m.group(1) or m.group(2) or m.group(3)):
+        out["first_date_without_year"] = m.group(0)
+    outcome = (slice_obj.get("train") or {}).get("outcome")
+    want = {"in_flight": ("where it stands",), "shipped": ("what landed",)}.get(
+        outcome, ("where it stands", "what landed"))
+    heads = [h for h in _CLOSING_RE.finditer(text or "")
+             if h.group(1).lower() in want]
+    if not heads:
+        out["closing_paragraph_missing"] = True
+        closing = ""
+    else:
+        out["closing_paragraph"] = heads[-1].group(1)
+        closing = (text or "")[heads[-1].start():]
+    base = _slice_repo_base(slice_obj)
+    nums = _story_numbers(text or "", base)
+    out["numbers_checked"] = len(nums)
+    states = _slice_states(slice_obj)
+    item_link = re.compile(re.escape(base) + r"(?:issues|pull)/(\d+)") \
+        if base else None
+
+    def as_numbers(m):
+        """A link to the repository's issue / PR reads as `#N`; any other
+        URL as blank (its words are not prose)."""
+        hit = item_link.match(m.group(0)) if item_link else None
+        return " #{} ".format(hit.group(1)) if hit else " "
+    # split into sentences BEFORE rewriting URLs: their dots are no ends
+    sentences = [_URL_IN_TEXT_RE.sub(as_numbers, s) for s in re.split(
+        r"(?<=[.;!?])\s+|\n+", closing)]
+    any_num = re.compile(r"(?<![\w/.&])#\d+\b")
+
+    def state_words(n):
+        """The state words said of #n: in the clause from its mention to
+        the next number's mention, else (#1 and #2 are open) in its
+        whole sentence."""
+        pat = re.compile(r"(?<![\w/.&])#{}\b".format(n))
+        words = set()
+        for s in sentences:
+            for m in pat.finditer(s):
+                nxt = any_num.search(s, m.end())
+                seg = s[m.start():nxt.start() if nxt else len(s)]
+                found = {w.lower() for w in _STATE_WORD_RE.findall(seg)}
+                words |= found or {w.lower() for w in _STATE_WORD_RE.findall(s)}
+        return words
+    for n in nums:
+        words = state_words(n)
+        if not words:
+            out["numbers_without_state"].append(n)
+            continue
+        if n in states:
+            state, merged = states[n]
+            ok = {"merged", "closed"} if merged else {state}
+            if not words & ok:
+                out["state_mismatch"].append({"number": n,
+                                              "stated": sorted(words),
+                                              "recorded": "merged" if merged
+                                              else state})
+    return out
+
+
+def check_story_evidence(slice_obj, text):
+    """The mechanical check of a narrative against its train slice: every URL
+    the text cites must occur in the slice (as a value or inside a slice
+    text), and every quoted string (in "..." or “...”, at least 4
+    characters) must occur verbatim in some slice text, whitespace-
+    normalised; plus the structure rules of check_story_structure (a year
+    in the first date, a closing "Where it stands" / "What landed" part
+    that gives the state of every issue / PR the story names). Returns
+    {"ok", "urls_not_in_slice", "quotes_not_in_slice", "urls_checked",
+    "quotes_checked", "first_date_without_year", "closing_paragraph",
+    "closing_paragraph_missing", "numbers_without_state",
+    "state_mismatch", "numbers_checked"}. Pure."""
+    urls, texts = set(), []
+    _slice_strings(slice_obj, urls, texts)
+    norm_texts = [_norm_ws(t) for t in texts]
+    cited = []
+    for u in _URL_IN_TEXT_RE.findall(text or ""):
+        u = u.rstrip(".,;:")
+        if u not in cited:
+            cited.append(u)
+    bad_urls = [u for u in cited if u not in urls]
+    quotes = []
+    for m in _QUOTE_RE.finditer(text or ""):
+        q = m.group(1) or m.group(2)
+        if q.startswith(("http://", "https://")):
+            continue
+        quotes.append(q)
+    bad_quotes = [q for q in quotes
+                  if not any(_norm_ws(q) in t for t in norm_texts)]
+    out = {"ok": not bad_urls and not bad_quotes,
+           "urls_not_in_slice": bad_urls, "quotes_not_in_slice": bad_quotes,
+           "urls_checked": len(cited), "quotes_checked": len(quotes)}
+    st = check_story_structure(slice_obj, text)
+    out.update(st)
+    out["ok"] = out["ok"] and not (st["first_date_without_year"]
+                                   or st["closing_paragraph_missing"]
+                                   or st["numbers_without_state"]
+                                   or st["state_mismatch"])
+    return out
+
+
 # Item fields that hold a list or an object. A JSON null in one of them (a
 # hand-edited view, a REST object with `"labels": null`, an older store) would
 # raise TypeError deep in enrich; `_null_collections_to_empty` reads it as empty.
@@ -1468,7 +4380,7 @@ def _null_collections_to_empty(bundle):
     return bundle
 
 
-def enrich(bundle, priority_patterns=()):
+def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the window narrative projections (timeline/feature_deltas) and Phase 3b
     code-area attribution (code_area/area/modules). Label facets and `kind` are
@@ -1482,7 +4394,9 @@ def enrich(bundle, priority_patterns=()):
     never KeyErrors and never recomputes them. Null list/object fields on
     PRs/issues/commits are read as empty first (`_null_collections_to_empty`).
     `priority_patterns` are the operator's extra priority-label patterns
-    (`--priority-label`), added to PRIORITY_LABEL_PATTERNS."""
+    (`--priority-label`), added to PRIORITY_LABEL_PATTERNS. `path_rules` are
+    the operator's `--path-class CLASS=GLOB` rules for `module_changes`,
+    which is built only when the bundle carries `module_notes`."""
     priority_patterns = tuple(priority_patterns or ())
     matchers = priority_matchers(priority_patterns)
     _null_collections_to_empty(bundle)
@@ -1512,11 +4426,480 @@ def enrich(bundle, priority_patterns=()):
     # Phase 11 slice 1: people profile + recognition halls (read-side projections
     # over the materialized bundle; need people/prs/commits/artifacts/trains above).
     derive.annotate_people_profile(bundle)
+    # affiliation labels from the gathered `affiliations` fact (only when the
+    # view carries it), before the halls rank people within each label
+    derive.annotate_people_affiliation(bundle)
     derive.build_halls(bundle)
     # Phase 11 slice 2: flow pathology classifier + blockers in-degree (read-side
     # projections over issues/prs; placed after halls).
     derive.build_flow(bundle)
     derive.build_blockers(bundle)
+    # The reader's module view (new / changed / breaking / deprecated, product
+    # vs plumbing): only for a bundle that carries the gathered module_notes,
+    # so every other bundle is unchanged. Reads trains / symbol_moves above.
+    build_module_changes(bundle, path_rules)
+    # The story layer: the discussion signal per train, then the story
+    # selection (reads module_changes for product relevance / plumbing).
+    # Omit-when-absent keys: a train with no human conversation, and a view
+    # where no train qualifies, are unchanged.
+    annotate_train_discussion(bundle)
+    select_story_trains(bundle)
+    # The people layer: affiliation shares, community counts, newcomers /
+    # returning contributors and the hall with what each person's work was
+    # about (module layer). Only when the view carries the gathered
+    # `affiliations` or `newcomers` facts (omit-when-absent).
+    build_contributors(bundle, path_rules)
+    # Registry context (link --people / `people_source`): what the people
+    # registry knows of the people the report names, beyond the window, read
+    # as of the view's end and stamped; nothing without a source.
+    build_people_context(bundle, people_source)
+    return bundle
+
+
+# --- The people layer: `contributors` ---------------------------------------
+#
+# Facts, not prose: who contributed (by affiliation), who is new or back after
+# a gap, and what each of them landed, read off the module layer
+# (`module_changes`: module, kind, status, PR class, changelog items). Built
+# from the view's records and gathered facts only; no call is made.
+
+CONTRIBUTION_PRS_MAX = 10           # PRs listed per person
+CONTRIBUTION_MODULES_MAX = 5        # modules listed per PR
+CONTRIBUTION_ITEMS_MAX = 5          # changelog items listed per module entry
+_HEADLINE_BY_CLASS = {"ci": "plumbing", "docs-only": "plumbing",
+                      "tests-only": "plumbing", "release": "release",
+                      "unknown": "unknown"}
+
+
+def _module_layer(bundle, path_rules):
+    """(module_changes, source): the view's own `module_changes`, or — for a
+    view without the gathered `module_notes` — the same build over the
+    view's commits and file events alone (source `code_events_only`: status
+    `new` only from an added entry file, no changelog, no tags). The
+    fallback is built on a shallow copy: the view is not changed."""
+    mc = bundle.get("module_changes")
+    if isinstance(mc, dict):
+        return mc, "module_changes"
+    shadow = dict(bundle)
+    shadow["module_notes"] = {"collected": True, "changelogs": [],
+                              "versions": [], "tags": {"collected": False}}
+    build_module_changes(shadow, path_rules)
+    return shadow.get("module_changes") or {}, "code_events_only"
+
+
+def _contribution_index(mc):
+    """({pr number: [module rows]}, {pr number: [changelog rows]}) of a
+    module_changes value: per PR, each module it touched with the module's
+    kind and status and whether this PR introduced it, and the changelog
+    entries the PR's commits added."""
+    by_pr, logs = {}, {}
+    for m in mc.get("modules") or []:
+        introduced = {s.get("pr") for s in m.get("introduced_by") or []}
+        for p in m.get("prs") or []:
+            n = p.get("number")
+            row = {"area": m.get("area"), "kind": m.get("kind"),
+                   "status": m.get("status")}
+            if m.get("status") == "new" and n in introduced:
+                row["role"] = "introduced"
+                if m.get("first_version"):
+                    row["first_version"] = m["first_version"]
+            else:
+                row["role"] = "changed"
+            by_pr.setdefault(n, []).append(row)
+        for entry in m.get("changelog") or []:
+            items = [item.get("text") for s in entry.get("sections") or []
+                     for item in s.get("items") or [] if isinstance(item, dict)]
+            for n in sorted({s.get("pr") for s in entry.get("sources") or []
+                             if s.get("pr") is not None}):
+                row = {"module": entry.get("module") or m.get("area"),
+                       "version": entry.get("version"),
+                       "items": items[:CONTRIBUTION_ITEMS_MAX]}
+                if len(items) > CONTRIBUTION_ITEMS_MAX:
+                    row["items_omitted"] = len(items) - CONTRIBUTION_ITEMS_MAX
+                logs.setdefault(n, []).append(row)
+    return by_pr, logs
+
+
+def _pr_contribution(pr, row, modules, changelog):
+    """One PR as a contribution fact: {number, url, title, state, class?,
+    headline, modules?, modules_omitted?, sweep?, changelog?}. `headline`:
+    `new_module` (the PR introduced a module that is new in the window),
+    `module_change`, `plumbing` (CI / docs / tests only: `class` says
+    which), `release` (a version cut), `unknown` (no commit of it in the
+    view, e.g. an open PR)."""
+    out = {"number": pr.get("number"), "url": pr.get("url"),
+           "title": pr.get("title"),
+           "state": "merged" if pr.get("merged") else (pr.get("state") or None)}
+    cls = (row or {}).get("class")
+    if cls:
+        out["class"] = cls
+    mods = list(modules or [])
+    if row and row.get("sweep"):
+        keep = set(row.get("substantive_areas") or [])
+        mods = [m for m in mods if m["area"] in keep]
+        out["sweep"] = row["sweep"]
+    mods.sort(key=lambda m: (m["role"] != "introduced", m["area"] or ""))
+    if any(m["role"] == "introduced" for m in mods):
+        headline = "new_module"
+    elif cls in _HEADLINE_BY_CLASS:
+        headline = _HEADLINE_BY_CLASS[cls]
+    elif cls in ("module", "mixed"):
+        headline = "module_change"
+    else:
+        headline = "unknown"
+    out["headline"] = headline
+    if mods:
+        out["modules"] = mods[:CONTRIBUTION_MODULES_MAX]
+        if len(mods) > CONTRIBUTION_MODULES_MAX:
+            out["modules_omitted"] = len(mods) - CONTRIBUTION_MODULES_MAX
+    if changelog:
+        out["changelog"] = changelog
+    return out
+
+
+def person_contributions(login, bundle, rows, by_pr, logs):
+    """What `login`'s work in the view was about: their PRs merged in the
+    window (module layer facts), then their open PRs, newest number first
+    within each, at most CONTRIBUTION_PRS_MAX (`prs_omitted` the rest).
+    Pure."""
+    merged, open_ = [], []
+    for pr in bundle.get("prs") or []:
+        if pr.get("author") != login:
+            continue
+        n = pr.get("number")
+        if n in rows:
+            merged.append(_pr_contribution(pr, rows[n], by_pr.get(n), logs.get(n)))
+        elif pr.get("state") == "open" and not pr.get("merged"):
+            open_.append(_pr_contribution(pr, None, None, None))
+    items = sorted(merged, key=lambda c: -(c["number"] or 0)) + \
+        sorted(open_, key=lambda c: -(c["number"] or 0))
+    out = {"prs": items[:CONTRIBUTION_PRS_MAX]}
+    if len(items) > CONTRIBUTION_PRS_MAX:
+        out["prs_omitted"] = len(items) - CONTRIBUTION_PRS_MAX
+    return out
+
+
+def person_reviews(login, bundle, rows):
+    """{prs, modules}: how many of the view's PRs `login` reviewed and the
+    module areas of those that merged in the window (module layer). Pure."""
+    count, areas = 0, set()
+    for pr in bundle.get("prs") or []:
+        if login in (pr.get("reviewers") or []):
+            count += 1
+            row = rows.get(pr.get("number")) or {}
+            areas.update(row.get("substantive_areas") if row.get("sweep")
+                         else row.get("areas") or [])
+    return {"prs": count, "modules": sorted(areas)}
+
+
+def _share(part, total):
+    return round(part / total, 3) if total else None
+
+
+def _affiliation_summary(bundle, rows, people):
+    """Counts and shares by affiliation of the view's people, of its PRs
+    merged in the window (by author) and of its reviews (reviewer-PR pairs),
+    with `unknown` separate; bots are left out."""
+    fact = bundle["affiliations"]
+    labels = ("maintainer_org", "community", "unknown")
+    aff = {login: p.get("affiliation") for login, p in people.items()
+           if not p.get("is_bot") and p.get("affiliation")}
+    counts = {k: 0 for k in labels}
+    signals = {}
+    for login, a in aff.items():
+        counts[a] = counts.get(a, 0) + 1
+        sig = people[login].get("affiliation_signal")
+        signals[sig] = signals.get(sig, 0) + 1
+
+    def split(logins):
+        tally = {k: 0 for k in labels}
+        excluded = 0
+        for login in logins:
+            if login in aff:
+                tally[aff[login]] += 1
+            else:
+                excluded += 1        # a bot, or no person record
+        total = sum(tally.values())
+        return dict({k: {"count": tally[k], "share": _share(tally[k], total)}
+                     for k in labels}, total=total, bots_excluded=excluded)
+    merged_authors = [pr.get("author") for pr in bundle.get("prs") or []
+                      if pr.get("number") in rows]
+    reviewers = [rv for pr in bundle.get("prs") or []
+                 for rv in sorted(set(pr.get("reviewers") or []))]
+    out = {"home_orgs": list(fact.get("home_orgs") or []),
+           "people": counts,
+           "signals": {k: signals[k] for k in sorted(signals, key=str)},
+           "merged_prs": split(merged_authors),
+           "reviews": split(reviewers)}
+    maint = _maintainer_summary(people)
+    if maint is not None:
+        out["maintainers"] = maint
+    if fact.get("windows"):
+        out["windows"] = fact["windows"]
+        out["covers_view"] = fact.get("covers_view")
+    return out
+
+
+def _maintainer_summary(people):
+    """Maintainers vs non-maintainers of the view's repository (the people
+    registry's `maintainer` property), with `unknown` separate (no
+    maintainer property: not checked, do_not_name, or not a person of a
+    gathered window), by signal and crossed with the affiliation: a
+    community maintainer is possible, and neither label implies the other.
+    None when no person carries the property (bots left out)."""
+    humans = {login: p for login, p in people.items() if not p.get("is_bot")}
+    if not any("maintainer" in p for p in humans.values()):
+        return None
+    keys = ("maintainer", "non_maintainer", "unknown")
+
+    def bucket(p):
+        if "maintainer" not in p:
+            return "unknown"
+        return "maintainer" if p["maintainer"] else "non_maintainer"
+    counts = {k: 0 for k in keys}
+    signals, cross, logins, statuses = {}, {}, [], {}
+    for login in sorted(humans, key=str):
+        p = humans[login]
+        b = bucket(p)
+        counts[b] += 1
+        if b == "maintainer":
+            logins.append(login)
+            sig = p.get("maintainer_signal")
+            signals[sig] = signals.get(sig, 0) + 1
+        if p.get("maintainer_status"):
+            statuses.setdefault(p["maintainer_status"], []).append(login)
+        aff = p.get("affiliation") or "unknown"
+        row = cross.setdefault(aff, {k: 0 for k in keys})
+        row[b] += 1
+    out = {"people": counts,
+           "signals": {k: signals[k] for k in sorted(signals, key=str)},
+           "by_affiliation": {k: cross[k] for k in sorted(cross)},
+           "logins": logins}
+    if statuses:
+        # the lifecycle at gather time: a `former` maintainer is counted as a
+        # non-maintainer above and listed here
+        out["by_status"] = {k: statuses[k] for k in people_mod.MAINTAINER_STATUSES
+                            if k in statuses}
+    return out
+
+
+def _train_logins(bundle, train):
+    """The logins of one train: authors, mergers, reviewers, commenters of
+    its issues and PRs, its commit authors (None removed)."""
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    issues, prs = _train_members(train, pr_index, issue_index)
+    logins = set()
+    for rec in issues + prs:
+        logins.add(rec.get("author"))
+        logins.add(rec.get("merged_by"))
+        logins.update(rec.get("reviewers") or [])
+        for key in ("comments_list", "review_comments", "reviews"):
+            for c in rec.get(key) or []:
+                if isinstance(c, dict):
+                    logins.add(c.get("author"))
+    commits = {c.get("sha"): c for c in bundle.get("commits", [])}
+    for sha in train.get("commits") or []:
+        logins.add((commits.get(sha) or {}).get("author"))
+    logins.discard(None)
+    return logins
+
+
+def slice_participants(bundle, train):
+    """{"participants": {login: {name?, maintainer?, maintainer_signal?,
+    maintainer_status?, affiliation?, registry_context?}}} for the humans of
+    one train (authors, mergers, reviewers, commenters of its issues and
+    PRs, its commit authors), so a narrator can name them; {} when the
+    view's people carry no display name or maintainer property and the view
+    has no `people_context` (omit-when-absent). `registry_context` is the
+    person's entry of `people_context` (link --people: registry context, not
+    a fact of the window). The login stays the key; a do_not_name person has
+    no name, no label and no registry context. Pure."""
+    people = bundle.get("people") or {}
+    context = (bundle.get("people_context") or {}).get("people") or {}
+    if not any(k in p for p in people.values() for k in derive.PERSON_LABEL_KEYS) \
+            and not context:
+        return {}
+    logins = _train_logins(bundle, train)
+    out = {}
+    for login in sorted(k for k in logins if k and k in people):
+        p = people[login]
+        if p.get("is_bot"):
+            continue
+        row = derive.person_labels(p)
+        if p.get("affiliation") and p.get("affiliation_signal") != "do_not_name":
+            row["affiliation"] = p["affiliation"]
+        if login in context:
+            row["registry_context"] = context[login]
+        out[login] = row
+    return {"participants": out}
+
+
+# --- registry context (link --people) ----------------------------------------
+#
+# What the people registry knows of the people a report names, beyond the
+# window: "also maintains ...", "active in this repo since <date, as
+# observed>", "N merged PRs here in the last 6 months", the maintainer status.
+# Registry context, never a fact of the window: it is read only with an
+# explicit `--people PATH`, only from the registry's windows that END BY THE
+# VIEW'S END (an old report keeps the context it had, whatever was gathered
+# since), and stamped with the registry files' sha256 so a reader can tell
+# which registry state produced it. Without `--people` nothing is added.
+
+def _named_people(bundle):
+    """The logins a report names: newcomers and hall entries
+    (`contributors`), story participants (trains with `story`), and the
+    authors of the PRs that introduced a new module (`module_changes`)."""
+    c = bundle.get("contributors") or {}
+    names = {r.get("login") for r in c.get("newcomers") or []}
+    names |= {r.get("login") for r in c.get("hall") or []}
+    names |= {h.get("login") for h in (bundle.get("halls") or {}).get("fame") or []}
+    for t in bundle.get("trains") or []:
+        if t.get("story"):
+            names |= _train_logins(bundle, t)
+    authors = {p.get("number"): p.get("author") for p in bundle.get("prs") or []}
+    for m in (bundle.get("module_changes") or {}).get("modules") or []:
+        for s in m.get("introduced_by") or []:
+            names.add(authors.get(s.get("pr")))
+    people = bundle.get("people") or {}
+    return sorted(k for k in names if k and not (people.get(k) or {}).get("is_bot")
+                  and (people.get(k) or {}).get("affiliation_signal") != "do_not_name")
+
+
+def build_people_context(bundle, source):
+    """bundle["people_context"] from the people registry `source`
+    (people.load_view_source), for the people the report names
+    (_named_people): {"kind": "registry_context", "note", "repo", "as_of"
+    (the view's end: only windows ending by then are read), "registry"
+    (people.registry_stamp), "thresholds", "coverage" (this repository's,
+    as of), "people": {login: people.writer_context}}. A do_not_name person
+    and a person the registry does not know are left out. Nothing is added
+    without a source. Pure over the bundle (in place)."""
+    if not source:
+        return bundle
+    meta = bundle.get("meta") or {}
+    repo = meta.get("repo") or ""
+    slug = repo if "/" in repo else "{}/{}".format(meta.get("owner"), repo)
+    as_of = str(meta.get("to") or "")[:10] or None
+    reg, act, limits = source["registry"], source["activity"], source["limits"]
+    out = {}
+    for login in _named_people(bundle):
+        ctx = people_mod.writer_context(reg, act, login, slug, as_of, limits)
+        if ctx:
+            out[login] = ctx
+    cov = people_mod.coverage(act, slug, as_of)
+    bundle["people_context"] = {
+        "kind": "registry_context",
+        "note": "from the people registry, not a fact of this window: windows "
+                "gathered up to {}; every first and total is as observed "
+                "since the coverage start".format(as_of),
+        "repo": slug, "as_of": as_of,
+        "registry": people_mod.registry_stamp(source["people_text"],
+                                              source["activity_text"], act, as_of),
+        "thresholds": dict(limits),
+        "coverage": {k: v for k, v in (cov or {}).items() if k != "intervals"},
+        "people": out}
+    return bundle
+
+
+def _community_summary(bundle, rows, people, newcomer_rows):
+    """Community-specific counts: people, PRs merged in the window, reviews,
+    first-timers and returning contributors labelled `community`, and the
+    module areas that received a community PR merged in the window. People
+    whose affiliation is `unknown` are never counted here."""
+    community = {login for login, p in people.items()
+                 if not p.get("is_bot") and p.get("affiliation") == "community"}
+    author = {p.get("number"): p.get("author") for p in bundle.get("prs") or []}
+    merged = sorted(n for n in rows if author.get(n) in community)
+    areas = set()
+    for n in merged:
+        r = rows[n]
+        areas.update(r.get("substantive_areas") if r.get("sweep")
+                     else r.get("areas") or [])
+    reviews = sum(1 for pr in bundle.get("prs") or []
+                  for rv in set(pr.get("reviewers") or []) if rv in community)
+    return {"people": len(community), "prs_merged": len(merged),
+            "prs_merged_numbers": merged, "reviews": reviews,
+            "first_timers": sorted(r["login"] for r in newcomer_rows
+                                   if r["class"] == "first_ever"
+                                   and r["login"] in community),
+            "returning": sorted(r["login"] for r in newcomer_rows
+                                if r["class"] == "returning"
+                                and r["login"] in community),
+            "modules": sorted(areas)}
+
+
+def build_contributors(bundle, path_rules=()):
+    """bundle["contributors"] (BUNDLE.md "The people layer"), when the view
+    carries a collected `affiliations` or `newcomers` fact; otherwise
+    nothing is added. Keys (each only when its input exists):
+    `affiliation` (_affiliation_summary), `community`
+    (_community_summary), `newcomers` [{login, class: first_ever |
+    returning, first, gap_days?, gap_bucket?, last_seen_before?,
+    seen_in_store_before?, affiliation?, affiliation_signal?,
+    contributed}], `hall` [{login, score, affiliation?, contributed,
+    reviewed}] for each `halls.fame` entry, and `inputs` {module_layer:
+    module_changes | code_events_only}. Pure over the bundle (in place)."""
+    aff_fact = bundle.get("affiliations")
+    nc = bundle.get("newcomers")
+    has_aff = isinstance(aff_fact, dict) and bool(aff_fact.get("collected"))
+    has_nc = isinstance(nc, dict) and bool(nc.get("collected"))
+    if not has_aff and not has_nc:
+        return bundle
+    people = bundle.get("people") or {}
+    mc, source = _module_layer(bundle, path_rules)
+    rows = {r.get("number"): r for r in mc.get("prs") or []}
+    by_pr, logs = _contribution_index(mc)
+    prior = (bundle.get("prior_activity") or {}).get("people") or {}
+
+    def labels(login, row):
+        p = people.get(login) or {}
+        if "affiliation" in p:
+            row["affiliation"] = p["affiliation"]
+            row["affiliation_signal"] = p.get("affiliation_signal")
+        row.update(derive.person_labels(p))
+        return row
+    newcomer_rows = []
+    if has_nc:
+        entries = [("first_ever", e) for e in nc.get("new") or []] + \
+            [("returning", e) for e in nc.get("returning") or []]
+        for cls, e in sorted(entries, key=lambda t: str(t[1].get("login"))):
+            login = e.get("login")
+            row = {"login": login, "class": cls,
+                   "first": {k: e.get(k) for k in ("first", "number", "url",
+                                                   "created_at")}}
+            for k in ("last_seen_before", "gap_days", "gap_bucket",
+                      "gap_upper_bound"):
+                if k in e:
+                    row[k] = e[k]
+            if login in prior:
+                row["seen_in_store_before"] = prior[login]
+            labels(login, row)
+            row["contributed"] = person_contributions(login, bundle, rows,
+                                                      by_pr, logs)
+            newcomer_rows.append(row)
+    out = {}
+    if has_aff:
+        out["affiliation"] = _affiliation_summary(bundle, rows, people)
+        out["community"] = _community_summary(bundle, rows, people,
+                                              newcomer_rows)
+    if has_nc:
+        out["newcomers"] = newcomer_rows
+        if "returning" in nc:
+            out["gap_thresholds_days"] = nc.get("gap_thresholds_days")
+        if "prior_activity" in bundle:
+            out["store_from"] = bundle["prior_activity"].get("store_from")
+    hall = []
+    for h in (bundle.get("halls") or {}).get("fame") or []:
+        login = h.get("login")
+        row = labels(login, {"login": login, "score": h.get("score")})
+        row["contributed"] = person_contributions(login, bundle, rows, by_pr,
+                                                  logs)
+        row["reviewed"] = person_reviews(login, bundle, rows)
+        hall.append(row)
+    out["hall"] = hall
+    out["inputs"] = {"module_layer": source}
+    bundle["contributors"] = out
     return bundle
 
 
@@ -1680,34 +5063,70 @@ def _load_bundle(path):
 
 
 _USAGE = ("usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json] "
-          "[--priority-label PATTERN ...]\n")
+          "[--priority-label PATTERN ...] [--path-class CLASS=GLOB ...] "
+          "[--people people.json]\n"
+          "       link.py SLICE.json --check-story STORY.md\n")
 _HELP = _USAGE + """
 Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
 
   --slice TRAIN_ID     print one train's self-contained slice as JSON on
                        stdout; BUNDLE.json is not rewritten
+  --check-story PATH   with a slice file (what --slice printed) instead of a
+                       bundle: check the narrative at PATH against it — every
+                       URL it cites and every quoted string must be in the
+                       slice; prints the result as JSON, exit 0 when it
+                       passes, 1 when it does not
   --series PATH        also compare with, and record this window in, the
                        series index at PATH
   --priority-label PATTERN
                        also treat a label matching this regular expression
                        (case-insensitive search) as high priority, besides
                        the default patterns; repeatable
+  --path-class CLASS=GLOB
+                       classify files matching GLOB as CLASS (source, tests,
+                       docs, generated, metadata, ci) in module_changes,
+                       before the default rules; repeatable
+  --people PATH        add `people_context`: registry context (not a fact of
+                       the window) for the people the report names, read from
+                       the people registry at PATH and its activity file,
+                       only from windows ending by the view's end, stamped
+                       with the files' sha256; story slices carry it per
+                       participant
   -h, --help           show this help and exit
 """
 
 
+def _split_people(argv):
+    """(argv without `--people PATH`, PATH or None); None for the whole
+    result when `--people` is repeated or has no value."""
+    rest, path = [], None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--people":
+            if path is not None or i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                return None
+            path = argv[i + 1]
+            i += 2
+            continue
+        rest.append(argv[i])
+        i += 1
+    return rest, path
+
+
 def _parse_argv(argv):
-    """(path, slice_id, series_path, priority_patterns) of the documented
-    shapes: BUNDLE first, then at most one of `--slice ID` / `--series PATH`
-    and any number of `--priority-label PATTERN`, each flag followed by its
-    value. Anything else (an unknown flag, a missing value, a value or BUNDLE
-    that looks like a flag, `--slice` with `--series`, a pattern that is not
-    a valid regular expression) is a usage error: exit 2."""
+    """(path, slice_id, series_path, priority_patterns, path_rules) of the
+    documented shapes: BUNDLE first, then at most one of `--slice ID` /
+    `--series PATH` and any number of `--priority-label PATTERN` and
+    `--path-class CLASS=GLOB`, each flag followed by its value. Anything else
+    (an unknown flag, a missing value, a value or BUNDLE that looks like a
+    flag, `--slice` with `--series`, a pattern that is not a valid regular
+    expression, a path rule that is not CLASS=GLOB with a known class) is a
+    usage error: exit 2."""
     if not argv or argv[0].startswith("-"):
         return None
     path, rest = argv[0], argv[1:]
     slice_id = series_path = None
-    patterns = []
+    patterns, path_rules = [], []
     if len(rest) % 2:
         return None
     for flag, value in zip(rest[0::2], rest[1::2]):
@@ -1723,9 +5142,15 @@ def _parse_argv(argv):
             except re.error:
                 return None
             patterns.append(value)
+        elif flag == "--path-class":
+            try:
+                path_class_rules([value])
+            except ValueError:
+                return None
+            path_rules.append(value)
         else:
             return None
-    return path, slice_id, series_path, patterns
+    return path, slice_id, series_path, patterns, path_rules
 
 
 def main(argv=None):
@@ -1737,11 +5162,34 @@ def main(argv=None):
     if "-h" in argv or "--help" in argv:
         sys.stdout.write(_HELP)
         raise SystemExit(0)
-    parsed = _parse_argv(list(argv))
+    if len(argv) == 3 and argv[1] == "--check-story" \
+            and not argv[0].startswith("-") and not argv[2].startswith("-"):
+        sliced = _load_bundle(argv[0])
+        try:
+            with open(argv[2], encoding="utf-8") as fh:
+                story = fh.read()
+        except OSError as exc:
+            sys.stderr.write("link.py: error: cannot read {} ({})\n".format(
+                argv[2], exc.strerror or exc))
+            raise SystemExit(2)
+        result = check_story_evidence(sliced, story)
+        json.dump(result, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        raise SystemExit(0 if result["ok"] else 1)
+    split = _split_people(list(argv))
+    parsed = _parse_argv(split[0]) if split else None
     if parsed is None:
         sys.stderr.write(_USAGE)
         raise SystemExit(2)
-    path, slice_id, series_path, priority_patterns = parsed
+    path, slice_id, series_path, priority_patterns, path_rules = parsed
+    people_source = None
+    if split[1] is not None:
+        try:
+            people_source = people_mod.load_view_source(split[1])
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("link.py: error: people registry {}: {}\n".format(
+                split[1], exc))
+            raise SystemExit(2)
     bundle = _load_bundle(path)
     # Load (and shape-check) the series index BEFORE any work, so a malformed
     # index stops the run with rc 2 and nothing is written.
@@ -1751,7 +5199,7 @@ def main(argv=None):
         problem = _series_bundle_problem(bundle.get("meta", {}), installments)
         if problem is not None:
             _series_refusal(series_path, problem)
-    enrich(bundle, priority_patterns)
+    enrich(bundle, priority_patterns, path_rules, people_source=people_source)
     if series_path is not None:
         # Phase 13: series continuity, idempotent by window (#86). Compare
         # against the installment immediately BEFORE this window and record

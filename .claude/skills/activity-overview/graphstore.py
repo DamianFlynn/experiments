@@ -1158,9 +1158,17 @@ def get_clone_info(conn, project, repo, frm, to):
 # and label taxonomy of its checkout, and the first-time contributors of its
 # PRs / issues). Kept per (project, repo, from, to) so a view of an earlier
 # window does not read a later gather's values. `newcomers` is per-window only
-# (no latest-wins node), and stored only by a gather that computed it.
+# (no latest-wins node), and stored only by a gather that computed it; so is
+# `module_notes` (the changelog entries, version-file movement and version
+# tags the window's commits added, read from the clone: gather
+# collect_module_notes), and `pr_history` (each window PR's own commits from
+# refs/pull/<N>/head and the comment / parameter changes between them: gather
+# collect_pr_history), and `affiliations` (each window person's
+# maintainer_org / community / unknown label with the deciding signal:
+# gather collect_affiliations).
 WINDOW_FACT_KEYS = ("workflow_stats", "code_graph", "code_owners",
-                    "label_taxonomy", "newcomers")
+                    "label_taxonomy", "newcomers", "module_notes",
+                    "pr_history", "affiliations")
 
 
 def _window_facts_key(project, repo, frm, to):

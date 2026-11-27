@@ -27,6 +27,7 @@ import derive
 import extract
 import graphstore
 import manifest as manifest_mod
+import people as people_mod
 
 # The bundle carries the bundle/view contract version (issue #107); the
 # store's own schema version is graphstore.SCHEMA_VERSION.
@@ -1154,7 +1155,8 @@ def commits_api_url(api, head_sha, frm, to):
     return f"{api}/commits?{query}"
 
 
-def resolve_commit_authors(commits, api_logins, known_logins=()):
+def resolve_commit_authors(commits, api_logins, known_logins=(),
+                           home_domains=(), home_email=None):
     """Resolve each commit's `author` to a GitHub login, in place (#78).
 
     Sets `author` (the login, or the unresolved person key), `author_name` (the
@@ -1162,7 +1164,10 @@ def resolve_commit_authors(commits, api_logins, known_logins=()):
     transient `author_email`. A noreply-email login takes the spelling of a
     `known_logins` entry that differs only in case (GitHub logins are
     case-insensitive). Returns {sha: author} so the code/symbol events of the
-    same commits can be re-keyed (`remap_event_authors`). Deterministic."""
+    same commits can be re-keyed (`remap_event_authors`). Deterministic.
+    With `home_domains`, the resolved login of a commit whose email is in one
+    of them (email_domain_is_home) is added to the set `home_email`: the only
+    trace of the email that survives (the affiliation signal)."""
     by_lower = {}
     for login in sorted(k for k in known_logins if k):
         by_lower.setdefault(login.lower(), login)
@@ -1180,6 +1185,8 @@ def resolve_commit_authors(commits, api_logins, known_logins=()):
             c["author"] = login
             c["login_resolved"] = True
             c["login_source"] = source
+            if home_email is not None and email_domain_is_home(email, home_domains):
+                home_email.add(login)
         else:
             c["author"] = derive.unresolved_person_key(name)
             c["login_resolved"] = False
@@ -1309,15 +1316,36 @@ def aggregate_workflow_stats(workflows):
     return stats
 
 
+# A release's notes text (the `body` GitHub already returns with the release
+# list) is kept up to this many characters, so a repository without a changelog
+# (a Terraform module repo, a landing zone) still has its maintainers' own
+# release text. Generated notes run to a few thousand characters (a "What's
+# changed" list of PR titles); the cap keeps a long one from dominating a view.
+RELEASE_NOTES_CAP = 4000
+
+
 def normalize_release(raw):
-    """Map a GitHub release object to the bundle's release shape."""
-    return {
+    """Map a GitHub release object to the bundle's release shape.
+
+    `notes` (only when the release has text) is its `body`, verbatim up to
+    RELEASE_NOTES_CAP characters; a longer one is cut there and
+    `notes_truncated_from` records its original length."""
+    out = {
         "tag_name": raw.get("tag_name"),
         "name": raw.get("name"),
         "published_at": raw.get("published_at"),
         "prerelease": bool(raw.get("prerelease")),
         "url": raw.get("html_url"),
     }
+    body = raw.get("body")
+    if isinstance(body, str) and body.strip():
+        body = body.replace("\r\n", "\n")
+        if len(body) > RELEASE_NOTES_CAP:
+            out["notes"] = body[:RELEASE_NOTES_CAP]
+            out["notes_truncated_from"] = len(body)
+        else:
+            out["notes"] = body
+    return out
 
 
 def normalize_milestone(raw):
@@ -1351,9 +1379,55 @@ def normalize_comment(raw):
     return _normalize_comment_obj(raw)
 
 
+# What a review comment is attached to: the diff hunk GitHub returns with
+# it ends at the commented line, so its LAST lines are kept (the hunk header
+# `@@ ... @@` first), at most this many lines and characters.
+REVIEW_HUNK_MAX_LINES = 12
+REVIEW_HUNK_CAP = 1500
+
+
+def review_hunk(hunk):
+    """(kept hunk, original line count) of a review comment's `diff_hunk`:
+    the `@@` header line plus the last REVIEW_HUNK_MAX_LINES - 1 lines,
+    capped at REVIEW_HUNK_CAP characters (from the end: the commented line
+    is last). The count is returned only when lines were cut, else None.
+    Pure."""
+    lines = (hunk or "").replace("\r\n", "\n").split("\n")
+    total = len(lines)
+    if total > REVIEW_HUNK_MAX_LINES:
+        head = [lines[0]] if lines[0].startswith("@@") else []
+        lines = head + lines[-(REVIEW_HUNK_MAX_LINES - len(head)):]
+    text = "\n".join(lines)
+    if len(text) > REVIEW_HUNK_CAP:
+        text = text[-REVIEW_HUNK_CAP:]
+    return text, (total if text != (hunk or "").replace("\r\n", "\n") else None)
+
+
 def normalize_review_comment(raw):
-    """Map a GitHub PR review comment (inline diff comment) to the same shape."""
-    return _normalize_comment_obj(raw)
+    """Map a GitHub PR review comment (inline diff comment) to the same
+    shape, plus what it is attached to when GitHub gives it (each key
+    omitted when absent): `path` (the file), `line` (the line it is on in
+    the diff's new side, else its original line), `diff_hunk` (review_hunk;
+    `diff_hunk_lines` the original line count when cut), `in_reply_to` (the
+    id of the comment that opened the thread it replies to) and `commit`
+    (the PR commit it was written against)."""
+    out = _normalize_comment_obj(raw)
+    if raw.get("path"):
+        out["path"] = raw["path"]
+    line = raw.get("line") if raw.get("line") is not None \
+        else raw.get("original_line")
+    if isinstance(line, int):
+        out["line"] = line
+    if raw.get("diff_hunk"):
+        out["diff_hunk"], total = review_hunk(raw["diff_hunk"])
+        if total is not None:
+            out["diff_hunk_lines"] = total
+    if raw.get("in_reply_to_id") is not None:
+        out["in_reply_to"] = raw["in_reply_to_id"]
+    commit = raw.get("original_commit_id") or raw.get("commit_id")
+    if commit:
+        out["commit"] = commit
+    return out
 
 
 # The four reaction kinds the bundle tracks (the upvote/downvote/affinity signal
@@ -1780,6 +1854,873 @@ def attach_file_diffs(code_events, file_diffs):
         if hunk:
             ev["hunk"] = hunk
     return code_events
+
+
+# --- Module change notes (per-window fact `module_notes`) ---------------------
+#
+# What the maintainers themselves wrote about a module, read from the clone:
+# the changelog entries a window's commits ADDED, the version-file movement
+# (`version.json` of a Bicep AVM module) and the version tags created in the
+# window. Work is per changed file: only the changelog / version files the
+# window's file-level code events name are read (two blob reads per changed
+# file: the commit's version and its parent's), never the whole tree.
+#
+# Why per commit and not from the patch walk: a unified diff with 3 lines of
+# context often lacks the `## <version>` heading an added item sits under (an
+# item appended to an existing section), so the hunk alone cannot say which
+# version or section it belongs to. Parsing the file at the commit and at its
+# parent and comparing the two is exact, attributes each entry to the commit
+# (and so the PR) that added it, and costs the same blobs the patch walk
+# already fetched. A rename (git `R`) reads the parent at the old path, so a
+# moved module's changelog is not mistaken for a new one.
+#
+# Everything network- or git-facing goes through two seams: `read_blob(rev,
+# path)` and `list_tags()` (production: git_blob_reader / git_tag_lister).
+
+# Changelog files, matched on the lower-cased basename.
+CHANGELOG_FILE_NAMES = ("changelog.md", "changes.md", "history.md",
+                        "release_notes.md", "releasenotes.md")
+# Version files: a JSON object with a top-level "version" (Bicep AVM).
+VERSION_FILE_NAMES = ("version.json",)
+MODULE_NOTE_TEXT_CAP = 600       # characters kept of one changelog item
+MODULE_NOTE_ITEMS_CAP = 40       # items kept per section
+MODULE_NOTE_ENTRIES_CAP = 12     # entries kept per changelog file per commit
+# An item that only says "nothing here" (the AVM template writes `- None`).
+CHANGELOG_PLACEHOLDERS = frozenset(("none", "none.", "n/a", "na", "-", "—"))
+# ... also when such a word opens the item and only an aside follows it
+# ("None (external interface unchanged)", "N/A - docs only").
+_PLACEHOLDER_LEAD_RE = re.compile(r"^(?:none|n/a|na)\s*(?:[.:(—–-]|$)", re.I)
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
+_MD_LINK_RE = re.compile(r"^\[([^\]]+)\](?:\([^)]*\)|\[[^\]]*\])?")
+_CHANGELOG_VERSION_RE = re.compile(
+    r"^(?:version|release)?[ \t]*v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.+-]*)?)"
+    r"(?=$|[\s\]\)(:,-])", re.IGNORECASE)
+_ISO_DAY_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+# a Markdown link reference definition (`[1.2.0]: https://...`), not text
+_MD_LINK_DEF_RE = re.compile(r"^ {0,3}\[[^\]]+\]:\s*\S")
+_MD_BULLET_RE = re.compile(r"^( {0,1})(?:[-*+]|\d{1,3}[.)])[ \t]+(.*)$")
+_VERSION_TAG_RE = re.compile(r"^v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.+-]*)?$")
+TAG_LIST_FORMAT = ("%(refname:strip=2)%1f%(objecttype)%1f"
+                   "%(creatordate:iso-strict)%1f%(objectname)%1f%(*objectname)")
+
+
+def changelog_placeholder(text):
+    """True for a changelog item that only says there is nothing ("None",
+    "N/A", "None (interface unchanged)"). Pure."""
+    t = (text or "").strip()
+    return t.lower() in CHANGELOG_PLACEHOLDERS or bool(_PLACEHOLDER_LEAD_RE.match(t))
+
+
+class BlobUnreadable(RuntimeError):
+    """A file version that exists but could not be read (a git error)."""
+
+
+def _changelog_version(title):
+    """(version, date) of a changelog heading that names a version, else
+    None. Accepts `1.2.0`, `v1.2.0`, `[1.2.0] - 2024-01-31`, `[1.2.0](url)`,
+    `Version 1.2.0 (2024-01-31)` and `[Unreleased]` (version "Unreleased").
+    Pure."""
+    text = title.strip()
+    m = _MD_LINK_RE.match(text)
+    if m:                       # `[1.2.0](url) - date` / `[Unreleased]`
+        inner, rest = m.group(1).strip(), text[m.end():]
+    else:
+        inner, rest = text, ""
+    if inner.lower() == "unreleased":
+        return "Unreleased", None
+    v = _CHANGELOG_VERSION_RE.match(inner)
+    if not v:
+        return None
+    day = _ISO_DAY_RE.search(inner[v.end():] + " " + rest)
+    return v.group(1), (day.group(1) if day else None)
+
+
+def changelog_section_kind(heading):
+    """The kind of a changelog section heading: breaking, deprecated,
+    removed, security, fixed, added, changed or other (an unknown heading is
+    kept under its own heading with kind `other`). Pure."""
+    h = (heading or "").lower()
+    if "breaking" in h:
+        return "breaking"
+    if "deprecat" in h:
+        return "deprecated"
+    if re.search(r"\bremov", h):
+        return "removed"
+    if re.search(r"\bsecurity\b", h):
+        return "security"
+    if re.search(r"\bfix|\bbug", h):
+        return "fixed"
+    if re.search(r"\b(added|adds|new|features?)\b", h):
+        return "added"
+    if re.search(r"\b(changes?|changed|updates?|updated|improvements?|"
+                 r"enhancements?)\b", h):
+        return "changed"
+    return "other"
+
+
+def _cap_item(text):
+    if len(text) <= MODULE_NOTE_TEXT_CAP:
+        return {"text": text}
+    return {"text": text[:MODULE_NOTE_TEXT_CAP], "truncated_from": len(text)}
+
+
+def _new_section(heading):
+    return {"heading": heading, "kind": changelog_section_kind(heading)
+            if heading is not None else "unsectioned", "items": []}
+
+
+def parse_changelog(text):
+    """The version entries of a changelog, in file order. Pure.
+
+    An entry starts at a heading naming a version (`_changelog_version`);
+    the first one sets the entry heading level, and a later heading at that
+    level or above that names no version (a title, a footer) ends the entry.
+    Deeper headings inside an entry are its sections (`### Changes`, `###
+    Breaking Changes`, `### Added`, ... — any heading, kept verbatim with a
+    `kind`); items before any section go to a section with heading None.
+    An item is a list bullet at the line start (its continuation lines and
+    nested bullets belong to it) or a paragraph; fenced code is kept inside
+    the item it follows; link reference definitions (`[1.2.0]: url`) are
+    not text. Item text is verbatim (lines joined with a newline,
+    stripped; a fenced block right after an item, even past a blank line,
+    is part of it) and capped at MODULE_NOTE_TEXT_CAP characters
+    (`truncated_from` keeps the original length). A section whose only
+    items are placeholders (`changelog_placeholder`: "None", "N/A") keeps
+    no items and records `placeholder` (the text it said). Entry: {"version", "heading",
+    ["date"], "sections": [{"heading", "kind", "items": [{"text",
+    ["truncated_from"]}], ["placeholder"], ["items_omitted"]}]}."""
+    entries, level = [], None
+    entry = section = None
+    item_lines, item_open, in_code = None, False, False
+
+    def flush():
+        nonlocal item_lines
+        if item_lines is not None and section is not None:
+            body = "\n".join(item_lines).strip()
+            if body:
+                section["items"].append(body)
+        item_lines = None
+
+    for raw in (text or "").replace("\r\n", "\n").split("\n"):
+        line = raw.rstrip("\r")
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            if not in_code and item_lines is None and section is not None \
+                    and section["items"]:
+                # a fenced block after a blank line belongs to the item
+                # before it ("Before:" followed by an example)
+                item_lines = [section["items"].pop()]
+            in_code = not in_code
+            if item_lines is not None:
+                item_lines.append(line)
+            continue
+        if in_code:
+            if item_lines is not None:
+                item_lines.append(line)
+            continue
+        m = _MD_HEADING_RE.match(line)
+        if m:
+            flush()
+            item_open = False
+            depth, title = len(m.group(1)), m.group(2).strip()
+            ver = _changelog_version(title)
+            if ver is not None and (level is None or depth <= level):
+                level = depth
+                entry = {"version": ver[0], "heading": line.strip(),
+                         "sections": []}
+                if ver[1]:
+                    entry["date"] = ver[1]
+                entries.append(entry)
+                section = None
+            elif entry is not None and level is not None and depth > level:
+                section = _new_section(title)
+                entry["sections"].append(section)
+            elif level is not None and depth <= level:
+                entry = section = None          # a heading that ends the entry
+            continue
+        if entry is None or _MD_LINK_DEF_RE.match(line):
+            continue
+        if not stripped:
+            flush()
+            item_open = False
+            continue
+        bullet = _MD_BULLET_RE.match(line)
+        if bullet:
+            flush()
+            if section is None:
+                section = _new_section(None)
+                entry["sections"].append(section)
+            item_lines, item_open = [bullet.group(2)], True
+        elif item_open and item_lines is not None:
+            item_lines.append(stripped)          # continuation / nested bullet
+        else:
+            flush()
+            if section is None:
+                section = _new_section(None)
+                entry["sections"].append(section)
+            item_lines, item_open = [stripped], True   # a paragraph
+    flush()
+    for e in entries:
+        for s in e["sections"]:
+            texts = s.pop("items")
+            real = [t for t in texts if not changelog_placeholder(t)]
+            if texts and not real:
+                s["placeholder"] = texts[0]
+            s["items"] = [_cap_item(t) for t in real[:MODULE_NOTE_ITEMS_CAP]]
+            if len(real) > MODULE_NOTE_ITEMS_CAP:
+                s["items_omitted"] = len(real) - MODULE_NOTE_ITEMS_CAP
+    return entries
+
+
+def _entry_key(entry):
+    v = (entry.get("version") or "").lower()
+    return v[1:] if v.startswith("v") else v
+
+
+def _changelog_bullets(text):
+    """The top-level bullet texts of a changelog that names no version, in
+    order (the fallback of changelog_added_entries)."""
+    out, cur = [], None
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        bullet = _MD_BULLET_RE.match(line)
+        if bullet:
+            if cur is not None:
+                out.append("\n".join(cur).strip())
+            cur = [bullet.group(2)]
+        elif cur is not None and line.strip() and not _MD_HEADING_RE.match(line):
+            cur.append(line.strip())
+        elif cur is not None:
+            out.append("\n".join(cur).strip())
+            cur = None
+    if cur is not None:
+        out.append("\n".join(cur).strip())
+    return [t for t in out if t and not changelog_placeholder(t)]
+
+
+def changelog_added_entries(before, after):
+    """The changelog entries `after` adds to `before` (either None when the
+    file is absent), in `after`'s order. Pure.
+
+    A version `before` does not have is added whole. A version both have
+    is added with only the items `before`'s same section (same heading) did
+    not hold, marked `amended: true` (an item appended to a version not yet
+    released); nothing new -> not listed. A changelog that names no version
+    at all: its new top-level bullets, as one entry with version None.
+    Removed entries are not reported (the file's history keeps them)."""
+    new = parse_changelog(after)
+    old = parse_changelog(before) if before else []
+    if not new and not old:
+        # compared on the capped text, as the versioned path compares items
+        known = {_cap_item(t)["text"] for t in _changelog_bullets(before)} \
+            if before else set()
+        items = [t for t in _changelog_bullets(after)
+                 if _cap_item(t)["text"] not in known]
+        if not items:
+            return []
+        return [{"version": None, "heading": None, "sections": [
+            {"heading": None, "kind": "unsectioned",
+             "items": [_cap_item(t) for t in items[:MODULE_NOTE_ITEMS_CAP]]}]}]
+    old_by_key = {}
+    for e in old:
+        old_by_key.setdefault(_entry_key(e), e)
+    out = []
+    for e in new:
+        prior = old_by_key.get(_entry_key(e))
+        if prior is None:
+            out.append(e)
+            continue
+        seen = {}
+        for s in prior["sections"]:
+            seen.setdefault((s["heading"] or "").lower(), set()).update(
+                i["text"] for i in s["items"])
+        sections = []
+        for s in e["sections"]:
+            known = seen.get((s["heading"] or "").lower(), set())
+            items = [i for i in s["items"] if i["text"] not in known]
+            if items:
+                kept = {k: v for k, v in s.items()
+                        if k not in ("items", "placeholder")}
+                kept["items"] = items
+                sections.append(kept)
+        if sections:
+            out.append(dict(e, sections=sections, amended=True))
+    return out
+
+
+def parse_version_file(text):
+    """The `version` of a version.json text, or None. Pure."""
+    try:
+        doc = json.loads(text) if text else None
+    except ValueError:
+        return None
+    if isinstance(doc, dict) and isinstance(doc.get("version"), (str, int, float)) \
+            and not isinstance(doc.get("version"), bool):
+        return str(doc["version"])
+    return None
+
+
+def parse_version_tags(raw, from_date, to_date):
+    """The window's version tags from `git for-each-ref` output in
+    TAG_LIST_FORMAT. Pure.
+
+    A version tag's last path segment is a version (`v1.2.0`, `0.6.0`); the
+    rest is the module path it publishes (`avm/res/x/y/0.6.0` -> module
+    `avm/res/x/y`; `v1.2.0` -> module "" = the repository root). Its date is
+    the tagger date of an annotated tag (`date_source: "tagger"`), else the
+    committer date of the tagged commit (`"commit"`: a lightweight tag holds
+    no date of its own), as a UTC timestamp. Tags dated in [from, to] are
+    returned, each with `first`: no version tag of the same module in the
+    clone is dated before `from`. -> {"items": [...], "undated": n}."""
+    rows = []
+    undated = 0
+    for line in (raw or "").split("\n"):
+        cols = line.split("\x1f")
+        if len(cols) < 5 or not cols[0]:
+            continue
+        name, otype, created, oid, peeled = cols[:5]
+        module, _, last = name.rpartition("/")
+        if not _VERSION_TAG_RE.match(last):
+            continue
+        stamp = _utc_timestamp(created) if created else None
+        if stamp is None:
+            undated += 1
+            continue
+        rows.append({"tag": name, "module": module, "version": last,
+                     "date": stamp,
+                     "date_source": "tagger" if otype == "tag" else "commit",
+                     "commit": peeled or oid})
+    earlier = {r["module"] for r in rows
+               if not in_window(r["date"], from_date, None)}
+    items = [dict(r, first=r["module"] not in earlier) for r in rows
+             if in_window(r["date"], from_date, to_date)]
+    items.sort(key=lambda r: (r["date"], r["tag"]))
+    return {"items": items, "undated": undated}
+
+
+def git_blob_reader(clone_dir, run=None):
+    """The production `read_blob(rev, path)` seam: the text of `path` at
+    `rev`, None when the commit has no such file (or `rev` does not resolve:
+    a root commit's parent), BlobUnreadable when the file is there but git
+    could not read it. Trees are local in the partial clone, so the lookup
+    never needs the network; the blob may be fetched (the patch walk usually
+    fetched it already)."""
+    run = run or run_git
+
+    def read(rev, path):
+        if "\n" in path:
+            return None
+        try:
+            oid = run(["git", "-C", clone_dir, "rev-parse", "--verify", "-q",
+                       f"{rev}:{path}"]).strip()
+        except RuntimeError:
+            return None
+        if not oid:
+            return None
+        try:
+            return run(["git", "-C", clone_dir, "cat-file", "blob", oid])
+        except RuntimeError as exc:
+            raise BlobUnreadable(str(exc).splitlines()[0]) from None
+    return read
+
+
+def git_tag_lister(clone_dir, run=None):
+    """The production `list_tags()` seam: one local `git for-each-ref
+    refs/tags` (no network: the tags the clone/fetch brought along)."""
+    run = run or run_git
+    return lambda: run(["git", "-C", clone_dir, "for-each-ref", "refs/tags",
+                        f"--format={TAG_LIST_FORMAT}"])
+
+
+def _note_file_kind(path):
+    base = (path or "").rsplit("/", 1)[-1].lower()
+    if base in CHANGELOG_FILE_NAMES:
+        return "changelog"
+    if base in VERSION_FILE_NAMES:
+        return "version"
+    return None
+
+
+def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
+    """The window's `module_notes` fact. Pure given its two seams.
+
+    For every file-level code event (the window's, boundary commits already
+    dropped) of a changelog or version file that was added, modified,
+    renamed or copied: the file at the commit and at its first parent (at
+    `old_path` for a rename; none for an add or copy) are compared.
+    - `changelogs`: [{path, module (the file's directory, "" at the root),
+      commit, date, change, [old_path], [new_file], entries
+      (changelog_added_entries, at most MODULE_NOTE_ENTRIES_CAP),
+      [entries_omitted]}] — only commits that added something;
+    - `versions`: [{path, module, commit, date, change, [old_path], from,
+      to}] — version.json `version` before -> after, when it moved (or the
+      file was added with one);
+    - `tags`: {"collected": true, "source": "clone", "items", ["undated"]}
+      (parse_version_tags), or {"collected": false, "reason"} when the clone
+      holds no tag or listing them failed;
+    - `unread` (only when any): [{path, commit, date, reason}] file versions git
+      could not read (with the commit date) — a visible gap, never guessed.
+    Deleted files add nothing (the code events record the deletion)."""
+    changelogs, versions, unread = [], [], []
+    for ev in code_events:
+        path, change = ev.get("path"), ev.get("change")
+        kind = _note_file_kind(path)
+        if kind is None or change not in ("add", "modify", "rename", "copy"):
+            continue
+        sha, old_path = ev.get("commit"), ev.get("old_path")
+        try:
+            after = read_blob(sha, path)
+            before = None if change in ("add", "copy") else \
+                read_blob(f"{sha}^", old_path or path)
+        except BlobUnreadable as exc:
+            unread.append({"path": path, "commit": sha, "date": ev.get("date"),
+                           "reason": str(exc)})
+            continue
+        if after is None:
+            unread.append({"path": path, "commit": sha, "date": ev.get("date"),
+                           "reason": "the file is not in the commit"})
+            continue
+        rec = {"path": path, "module": path.rpartition("/")[0],
+               "commit": sha, "date": ev.get("date"), "change": change}
+        if old_path:
+            rec["old_path"] = old_path
+        if kind == "changelog":
+            entries = changelog_added_entries(before, after)
+            if not entries:
+                continue
+            if before is None:
+                rec["new_file"] = True
+            rec["entries"] = entries[:MODULE_NOTE_ENTRIES_CAP]
+            if len(entries) > MODULE_NOTE_ENTRIES_CAP:
+                rec["entries_omitted"] = len(entries) - MODULE_NOTE_ENTRIES_CAP
+            changelogs.append(rec)
+        else:
+            vb = parse_version_file(before) if before is not None else None
+            va = parse_version_file(after)
+            if va is not None and va != vb:
+                versions.append(dict(rec, **{"from": vb, "to": va}))
+    try:
+        raw_tags = list_tags() if list_tags is not None else None
+    except RuntimeError as exc:
+        tags = {"collected": False,
+                "reason": "listing tags failed: {}".format(
+                    str(exc).splitlines()[0] if str(exc) else "error")}
+    else:
+        if not (raw_tags or "").strip():
+            tags = {"collected": False, "reason": "the clone holds no tags"}
+        else:
+            parsed = parse_version_tags(raw_tags, from_date, to_date)
+            tags = {"collected": True, "source": "clone",
+                    "items": parsed["items"]}
+            if parsed["undated"]:
+                tags["undated"] = parsed["undated"]
+    notes = {"collected": True, "changelogs": changelogs,
+             "versions": versions, "tags": tags}
+    if unread:
+        notes["unread"] = unread
+    return notes
+
+
+# --- PR-internal history (per-window fact `pr_history`) ---------------------
+#
+# The base-branch walk sees one commit per squash-merged PR, so the work inside
+# a PR (its first attempt, the rework after a review, a comment added and then
+# removed) is not in it. GitHub keeps every PR's commits at
+# `refs/pull/<N>/head`, fetchable with plain git after the merge. gather lists
+# those refs once (`ls-remote`), fetches the window's PR heads in batches into
+# `refs/remotes/pr/<N>` (blobless, like the main clone), lists each PR's own
+# commits (reachable from its head, not from the walked branch) and, for the
+# PRs most likely to carry a story, the comment / parameter adds and removes
+# between those commits (the patch walk's own symbol extraction).
+
+# Refspecs per `git fetch`. One fetch per batch keeps the command line short and
+# lets one failed batch be recorded without losing the others.
+PR_HISTORY_FETCH_BATCH = 100
+# Commits kept per PR (oldest first); the rest are counted in commits_omitted.
+# GitHub's own PR commit list stops at 250.
+PR_HISTORY_MAX_COMMITS = 250
+# The comment / parameter walk (a `git log -p` over the PR's commits, which
+# fetches the blobs of the .bicep / .tf files they touch) runs only for PRs
+# with human conversation (the gather-time sign of a story), at most this many
+# PRs per window, the most discussed first ...
+PR_HISTORY_NOTES_MAX_PRS = 40
+# ... and only for PRs of at most this many commits.
+PR_HISTORY_NOTES_MAX_COMMITS = 60
+# Comment / parameter events kept per PR (the newest; notes_omitted counts the
+# oldest left out). A new module's first commit alone can add a few hundred.
+PR_HISTORY_NOTES_MAX = 400
+# The symbol kinds the walk keeps: comments (developer notes, parameter
+# descriptions) and the interface (parameters, Terraform variables, outputs).
+PR_HISTORY_NOTE_SUBKINDS = ("comment", "todo", "param", "variable", "output")
+# One header per PR commit: sha, parents, author name, author timestamp,
+# committer timestamp, subject, then the message body, closed by a group
+# separator so the body's own lines are not read as file names.
+PR_COMMIT_FORMAT = "%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%cI%x1f%s%x1f%b%x1d"
+_PR_BODY_END = "\x1d"
+# Paths kept per PR commit (the change summary's file list; `paths_omitted`
+# counts the rest). A module's first commit touches a few dozen files.
+PR_HISTORY_PATHS_MAX = 60
+# Characters of a PR commit's message body kept (`body_truncated_from` when
+# cut). The body is where a commit says why ("narrow v0.1 scope ... because").
+# Trailer lines at its end (`Co-authored-by: ...`, `Signed-off-by: ...`) are
+# not part of the explanation and are dropped first.
+PR_HISTORY_BODY_CAP = 1500
+# The patch excerpts kept for the walked PRs: what each commit added to /
+# removed from a changelog, and from shared repository files (CI workflows,
+# actions, pipeline utilities) that every module depends on.
+PR_HISTORY_PATCH_PATHSPECS = ("*CHANGELOG.md", ".github/", "utilities/",
+                              ".azuredevops/", ".pipelines/", "pipelines/")
+# Lines kept per file per commit (added + removed; `lines_omitted` the rest),
+# characters per line, and characters per PR (the newest excerpts are kept,
+# `patches_omitted` counts the oldest left out).
+PR_HISTORY_PATCH_LINES = 40
+PR_HISTORY_PATCH_LINE_CAP = 500
+PR_HISTORY_PATCH_CHARS = 8000
+# A git trailer line: a hyphenated token (`Co-authored-by`, `Signed-off-by`,
+# `Change-Id`), a colon, a value. "Note: ..." is prose, not a trailer.
+_TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+: \S")
+
+
+def parse_pr_head_refs(raw):
+    """`git ls-remote origin 'refs/pull/*/head'` output -> {number: sha}. Pure."""
+    out = {}
+    for line in (raw or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        m = re.fullmatch(r"refs/pull/(\d+)/head", parts[1])
+        if m:
+            out[int(m.group(1))] = parts[0]
+    return out
+
+
+def pr_commit_body(text):
+    """A PR commit's message body for the story material: the trailing block
+    of trailer lines (`Token: value`, e.g. Co-authored-by / Signed-off-by)
+    dropped, surrounding blank lines stripped, capped at PR_HISTORY_BODY_CAP.
+    Returns (body, original length) — ("", 0) when nothing is left. Pure."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    while True:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        end = len(lines)
+        while end and lines[end - 1].strip() and _TRAILER_RE.match(lines[end - 1]):
+            end -= 1
+        if end < len(lines) and (end == 0 or not lines[end - 1].strip()):
+            lines = lines[:end]          # a whole trailer paragraph: drop it
+            continue
+        break
+    body = "\n".join(lines).strip()
+    if not body:
+        return "", 0
+    return body[:PR_HISTORY_BODY_CAP], len(body)
+
+
+def parse_pr_commits(raw):
+    """A `git log --format=PR_COMMIT_FORMAT --name-only` listing -> commits
+    [{sha, parents, author, authored_at, committed_at, subject, files,
+    [paths], [paths_omitted], [body], [body_truncated_from]}] in the
+    listing's order. `parents` is a count (2 for a merge), `files` the
+    number of paths the commit changed (a merge lists none), `paths` those
+    paths (at most PR_HISTORY_PATHS_MAX), `body` the message body
+    (pr_commit_body); both omitted when empty. A listing in the older
+    format (no body, no closing separator) still parses, without `paths`
+    and `body`. Pure."""
+    out = []
+    for lines in _log_records(raw):
+        chunk = "\n".join(lines)
+        if _PR_BODY_END in chunk:
+            head, _, names = chunk.partition(_PR_BODY_END)
+            fields = head.split(FIELD_SEP, 6)
+            if len(fields) < 7:
+                continue
+            paths = [ln.strip("\r") for ln in names.split("\n") if ln.strip()]
+            body, body_len = pr_commit_body(fields[6])
+            subject = fields[5]
+        else:
+            fields = lines[0].split(FIELD_SEP, 5)
+            if len(fields) < 6:
+                continue
+            paths, body, body_len = None, "", 0
+            subject = fields[5]
+            names_count = len([ln for ln in lines[1:] if ln.strip()])
+        sha, parents, author, authored, committed = (f.strip() for f in fields[:5])
+        row = {
+            "sha": sha, "parents": len(parents.split()), "author": author,
+            "authored_at": _utc_timestamp(authored),
+            "committed_at": _utc_timestamp(committed),
+            "subject": subject.strip(" \t\r\n"),
+            "files": len(paths) if paths is not None else names_count,
+        }
+        if paths:
+            row["paths"] = paths[:PR_HISTORY_PATHS_MAX]
+            if len(paths) > PR_HISTORY_PATHS_MAX:
+                row["paths_omitted"] = len(paths) - PR_HISTORY_PATHS_MAX
+        if body:
+            row["body"] = body
+            if body_len > len(body):
+                row["body_truncated_from"] = body_len
+        out.append(row)
+    return out
+
+
+def _patch_kind(path):
+    return "changelog" if (path or "").rsplit("/", 1)[-1].lower() \
+        == "changelog.md" else "shared"
+
+
+def parse_pr_patches(raw):
+    """A `git log -p --format=%x1e%H` listing over a PR's commits, limited to
+    PR_HISTORY_PATCH_PATHSPECS -> [{commit, path, kind (`changelog` /
+    `shared`), added: [line], removed: [line], [lines_omitted]}] in the
+    listing's order: what each commit added to and removed from a changelog
+    or a shared repository file, at most PR_HISTORY_PATCH_LINES lines per
+    file and commit, each line capped at PR_HISTORY_PATCH_LINE_CAP. A file
+    whose diff has no +/- line (a mode change, a binary file) is left out.
+    Pure."""
+    out, cur, sha = [], None, None
+
+    def close():
+        if cur is not None and (cur["added"] or cur["removed"]
+                                or cur.get("lines_omitted")):
+            out.append(cur)
+    for lines in _log_records(raw):
+        sha = lines[0].strip()
+        for ln in lines[1:]:
+            if ln.startswith("diff --git "):
+                close()
+                m = re.match(r"diff --git a/(.*) b/(.*)$", ln)
+                path = m.group(2) if m else ln[len("diff --git "):]
+                cur = {"commit": sha, "path": path, "kind": _patch_kind(path),
+                       "added": [], "removed": []}
+            elif cur is None or ln.startswith(("+++ ", "--- ")):
+                continue
+            elif ln.startswith(("+", "-")):
+                key = "added" if ln[0] == "+" else "removed"
+                if len(cur["added"]) + len(cur["removed"]) \
+                        >= PR_HISTORY_PATCH_LINES:
+                    cur["lines_omitted"] = cur.get("lines_omitted", 0) + 1
+                    continue
+                cur[key].append(ln[1:][:PR_HISTORY_PATCH_LINE_CAP])
+        close()
+        cur = None
+    return out
+
+
+def _patch_chars(p):
+    return sum(len(x) for x in p["added"] + p["removed"]) + len(p["path"])
+
+
+def _shallow_parent_exclusions(clone_dir, run):
+    """The real parents of the clone's shallow boundary commits that exist
+    locally, sorted (revisions to list after `--not`, which already negates
+    them). The walked branch is cut at the boundary (its
+    oldest commit has no parents in a shallow clone), so `<pr head> --not HEAD`
+    would list the base-branch commits older than the boundary that a PR head
+    reaches (fetched with it); excluding the boundary commits' real parents
+    (read from the commit object, which keeps them) leaves the PR's own."""
+    try:
+        path = run(["git", "-C", clone_dir, "rev-parse", "--git-path",
+                    "shallow"]).strip()
+    except RuntimeError:
+        return []
+    if path and not os.path.isabs(path):
+        path = os.path.join(clone_dir, path)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            boundary = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return []
+    out = []
+    for sha in boundary:
+        try:
+            body = run(["git", "-C", clone_dir, "cat-file", "commit", sha])
+        except RuntimeError:
+            continue
+        for line in body.splitlines():
+            if not line:
+                break
+            if line.startswith("parent "):
+                parent = line.split()[1]
+                try:
+                    run(["git", "-C", clone_dir, "cat-file", "-e",
+                         parent + "^{commit}"])
+                except RuntimeError:
+                    continue
+                out.append(parent)
+    return sorted(set(out))
+
+
+def _human_conversation(pr):
+    """How many human (non-bot) comments and review comments a PR has."""
+    return sum(1 for key in ("comments_list", "review_comments")
+               for c in pr.get(key) or []
+               if isinstance(c, dict)
+               and not derive.is_bot_login(c.get("author")))
+
+
+def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
+                       base_branch=None):
+    """The window's `pr_history` fact. All git goes through `run` (default
+    run_git, which retries a dropped connection); a refusal is recorded,
+    never fatal.
+
+    1. `git ls-remote origin refs/pull/*/head` lists the PR head refs once.
+       A PR of the window without one is `status: "missing"`.
+    2. The listed heads are fetched in batches of PR_HISTORY_FETCH_BATCH
+       (`git fetch --filter=blob:none --no-tags origin
+       +refs/pull/<N>/head:refs/remotes/pr/<N> ...`); every PR of a batch
+       whose fetch failed is `status: "fetch_failed"`.
+    3. Each fetched PR's own commits: `git log --reverse --date-order` of
+       its head, not reachable from `base_ref` (the walked branch) nor from
+       the real parents of the shallow boundary, at most
+       PR_HISTORY_MAX_COMMITS (the rest counted in `commits_omitted`). No
+       commit at all means the head is on the walked branch (`on_base`:
+       a merge-commit merge, whose commits the base walk already has).
+    4. For the most discussed PRs (human comments and review comments > 0,
+       at most PR_HISTORY_NOTES_MAX_PRS of them, each of at most
+       PR_HISTORY_NOTES_MAX_COMMITS commits) a `git log -p` over the same
+       commits, limited to `*.bicep` / `*.tf`, run through the patch walk's
+       symbol extraction; the comment / parameter / variable / output events
+       are `notes` (the newest PR_HISTORY_NOTES_MAX; `notes_omitted` counts
+       the oldest left out).
+       A merge commit has no patch. Every other PR records `notes_skipped`
+       with the reason.
+
+    Returns {"collected": True, "base": base_branch, "prs": [per PR, by
+    number], "limits": {...}} or, when the refs cannot be listed,
+    {"collected": True, "base", "error", "prs": []}."""
+    run = run or run_git
+    numbers = sorted({p["number"] for p in prs if isinstance(p.get("number"), int)})
+    limits = {"max_commits": PR_HISTORY_MAX_COMMITS,
+              "notes_max_prs": PR_HISTORY_NOTES_MAX_PRS,
+              "notes_max_commits": PR_HISTORY_NOTES_MAX_COMMITS,
+              "notes_max": PR_HISTORY_NOTES_MAX}
+    out = {"collected": True, "base": base_branch, "prs": [], "limits": limits}
+    if not numbers:
+        return out
+    try:
+        heads = parse_pr_head_refs(run(["git", "-C", clone_dir, "ls-remote",
+                                        "origin", "refs/pull/*/head"]))
+    except RuntimeError as exc:
+        out["error"] = "listing the PR head refs failed: {}".format(
+            str(exc).splitlines()[-1] if str(exc) else "unknown error")
+        return out
+    rows = {n: {"number": n} for n in numbers}
+    available = [n for n in numbers if n in heads]
+    for n in numbers:
+        if n not in heads:
+            rows[n]["status"] = "missing"
+    fetched = []
+    for i in range(0, len(available), PR_HISTORY_FETCH_BATCH):
+        batch = available[i:i + PR_HISTORY_FETCH_BATCH]
+        specs = ["+refs/pull/{0}/head:refs/remotes/pr/{0}".format(n) for n in batch]
+        try:
+            run(["git", "-C", clone_dir, "fetch", "--quiet", "--filter=blob:none",
+                 "--no-tags", "--no-write-fetch-head", "origin"] + specs)
+        except RuntimeError as exc:
+            reason = (str(exc).splitlines() or ["fetch failed"])[-1][:200]
+            for n in batch:
+                rows[n].update(status="fetch_failed", reason=reason)
+            continue
+        fetched.extend(batch)
+    exclude = _shallow_parent_exclusions(clone_dir, run) if fetched else []
+    for n in fetched:
+        row = rows[n]
+        row.update(status="fetched", head=heads[n])
+        ref = "refs/remotes/pr/{}".format(n)
+        try:
+            listing = run(["git", "-C", clone_dir, "log", "--reverse",
+                           "--date-order", "--format=" + PR_COMMIT_FORMAT,
+                           "--name-only", "--no-renames"] + list(_WALK_PIN_ARGS)
+                          + [ref, "--not", base_ref] + exclude + ["--"])
+        except RuntimeError as exc:
+            row.update(status="log_failed",
+                       reason=(str(exc).splitlines() or ["log failed"])[-1][:200])
+            continue
+        commits = parse_pr_commits(listing)
+        if not commits:
+            row["on_base"] = True
+        if len(commits) > PR_HISTORY_MAX_COMMITS:
+            row["commits_omitted"] = len(commits) - PR_HISTORY_MAX_COMMITS
+            commits = commits[:PR_HISTORY_MAX_COMMITS]
+        row["commits"] = commits
+    by_number = {p["number"]: p for p in prs if isinstance(p.get("number"), int)}
+    candidates = sorted(
+        (n for n in fetched if rows[n].get("status") == "fetched"),
+        key=lambda n: (-_human_conversation(by_number.get(n, {})), n))
+    walked = 0
+    for n in candidates:
+        row = rows[n]
+        commits = row.get("commits") or []
+        if not commits:
+            row["notes_skipped"] = "no commits of its own"
+        elif _human_conversation(by_number.get(n, {})) == 0:
+            row["notes_skipped"] = "no human conversation"
+        elif len(commits) + row.get("commits_omitted", 0) \
+                > PR_HISTORY_NOTES_MAX_COMMITS:
+            row["notes_skipped"] = "more than {} commits".format(
+                PR_HISTORY_NOTES_MAX_COMMITS)
+        elif walked >= PR_HISTORY_NOTES_MAX_PRS:
+            row["notes_skipped"] = "over the {}-PR cap of the window".format(
+                PR_HISTORY_NOTES_MAX_PRS)
+        else:
+            walked += 1
+            try:
+                raw = run(["git", "-C", clone_dir, "log"] + list(PATCH_WALK_ARGS)
+                          + ["refs/remotes/pr/{}".format(n), "--not", base_ref]
+                          + exclude + ["--", "*.bicep", "*.tf"])
+            except RuntimeError as exc:
+                row["notes_skipped"] = "patch walk failed: {}".format(
+                    (str(exc).splitlines() or ["?"])[-1][:200])
+                continue
+            notes = [{k: e[k] for k in ("commit", "path", "subkind", "change",
+                                        "name", "before", "after")}
+                     for e in parse_symbol_events(raw)
+                     if e.get("subkind") in PR_HISTORY_NOTE_SUBKINDS]
+            if len(notes) > PR_HISTORY_NOTES_MAX:
+                # The oldest go first: the first commit of a new module adds
+                # every parameter and description, which the merged result
+                # (the base walk) carries too; the later rework is what only
+                # this history has.
+                row["notes_omitted"] = len(notes) - PR_HISTORY_NOTES_MAX
+                notes = notes[-PR_HISTORY_NOTES_MAX:]
+            row["notes"] = notes
+            _collect_pr_patches(row, n, clone_dir, base_ref, exclude, run)
+    out["prs"] = [rows[n] for n in numbers]
+    return out
+
+
+def _collect_pr_patches(row, n, clone_dir, base_ref, exclude, run):
+    """Add `patches` (parse_pr_patches; the newest within
+    PR_HISTORY_PATCH_CHARS, `patches_omitted` the oldest left out) to a
+    walked PR's row: what its commits wrote into a changelog or a shared
+    repository file. Omitted when there is none; a failed walk is recorded
+    as `patches_skipped`, never fatal."""
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--reverse", "-p",
+                   "--unified=0", "--format=" + RECORD_SEP + "%H", "--no-renames"]
+                  + list(_WALK_PIN_ARGS) + ["--src-prefix=a/", "--dst-prefix=b/",
+                                            "refs/remotes/pr/{}".format(n),
+                                            "--not", base_ref] + exclude
+                  + ["--"] + list(PR_HISTORY_PATCH_PATHSPECS))
+    except RuntimeError as exc:
+        row["patches_skipped"] = "patch walk failed: {}".format(
+            (str(exc).splitlines() or ["?"])[-1][:200])
+        return
+    patches = parse_pr_patches(raw)
+    kept, used = [], 0
+    for p in reversed(patches):
+        c = _patch_chars(p)
+        if used + c > PR_HISTORY_PATCH_CHARS:
+            break
+        kept.append(p)
+        used += c
+    kept.reverse()
+    if len(kept) < len(patches):
+        row["patches_omitted"] = len(patches) - len(kept)
+    if kept:
+        row["patches"] = kept
 
 
 # Ordered code-area patterns for the directory provider (primary, zero-dep).
@@ -3444,6 +4385,57 @@ def parse_args(argv):
                         "search API calls per author of a PR / issue created "
                         "in the window); the window's `newcomers` fact then "
                         "says it was not collected")
+    p.add_argument("--no-affiliation", dest="affiliation_enabled",
+                   action="store_false", default=True,
+                   help="skip the contributor affiliation check (up to one "
+                        "public-membership call per home organisation and "
+                        "one profile call per person not decided by the "
+                        "override list or author_association); the window's "
+                        "`affiliations` fact then says it was not collected")
+    p.add_argument("--home-org", action="append", default=[], metavar="ORG",
+                   help="a GitHub organisation whose members count as the "
+                        "maintainers (repeatable; the repo's owner always "
+                        "does). Also matched against profile companies.")
+    p.add_argument("--home-name", action="append", default=[], metavar="NAME",
+                   help="another company name meaning a home organisation in "
+                        "a profile (repeatable; compared after normalisation, "
+                        "e.g. 'Microsoft' matches '@microsoft' and 'Microsoft "
+                        "Corporation')")
+    p.add_argument("--home-email-domain", action="append", default=[],
+                   metavar="DOMAIN",
+                   help="a commit email domain meaning a home organisation "
+                        "(repeatable; checked at gather time, only a boolean "
+                        "is kept)")
+    p.add_argument("--affiliation", action="append", default=[],
+                   metavar="LOGIN=AFFILIATION",
+                   help="operator override, highest priority: LOGIN or "
+                        "@org/team mapped to maintainer_org, community or "
+                        "unknown (repeatable)")
+    p.add_argument("--people", default=None, metavar="PATH",
+                   help="the workspace's retained people registry (JSON, one "
+                        "entry per login; recommended: <stream>/people.json). "
+                        "Consulted before any lookup and updated by the "
+                        "gather: a person is looked up once and refreshed "
+                        "rarely; holds display names, labels, the maintainer "
+                        "property per repository and your own edits "
+                        "(USAGE 5.7). Beats a manifest's `people`")
+    p.add_argument("--people-offline", action="store_true", default=False,
+                   help="with --people: no API call for people at all (no "
+                        "lookups, no names, no team expansion); the registry "
+                        "and the free signals decide, everyone else is "
+                        "unknown (not_checked)")
+    p.add_argument("--people-refresh-days", type=int, default=None, metavar="N",
+                   help="re-check a registry entry looked up more than N days "
+                        "ago (default {}; ACTIVITY_PEOPLE_REFRESH_DAYS)".format(
+                            people_mod.REFRESH_DAYS))
+    p.add_argument("--no-pr-history", dest="pr_history", action="store_false",
+                   default=True,
+                   help="skip the PR-internal history: fetching every window "
+                        "PR's refs/pull/<N>/head (blobless; the first gather of "
+                        "a clone also brings the commit and tree history those "
+                        "heads reach) and the comment / parameter walk over the "
+                        "most discussed PRs' commits; the window's `pr_history` "
+                        "fact then says it was not collected")
     # Phase 12: auto-discover + ingest the repo's Projects v2 board (its single-
     # select Status, plus sprint/iteration nodes when the board defines them). On
     # by default; degrades to empty on any error (no board / missing read:project
@@ -3513,6 +4505,15 @@ def parse_args(argv):
         # Stored with the window at fold and read back by every view (#75).
         if args.ref_date is not None:
             manifest_mod.check_ref_date(args.ref_date, "--ref-date")
+        for text in args.affiliation:
+            parse_affiliation_override(text)
+        for org in args.home_org:
+            manifest_mod.check_owner(org, "--home-org")
+        if args.people_offline and not args.people and not args.manifest:
+            raise ValueError("--people-offline needs --people PATH (or a "
+                             "manifest's `people`)")
+        if args.people_refresh_days is not None and args.people_refresh_days < 1:
+            raise ValueError("--people-refresh-days must be at least 1")
     except ValueError as exc:
         p.error(str(exc))
     return args
@@ -4202,6 +5203,12 @@ def validate_env_knobs(env=None):
     _http_settings(env)
     _iac_settings(env)
     _newcomers_max(env)
+    _affiliation_max(env)
+    _people_settings(env)
+    try:
+        people_mod.thresholds(env)      # the registry's lifecycle thresholds
+    except ValueError as exc:
+        raise SystemExit("error: {}".format(exc)) from None
 
 
 def _auth_allowed(url):
@@ -5127,9 +6134,29 @@ def _next_link(link_header):
     return None
 
 
+_PUBLIC_MEMBER_RE = re.compile(r"^https://api\.github\.com/orgs/[^/?#]+/public_members/[^/?#]+$")
+
+
+def public_member_probe(url, token, opener=None, sleep=None, clock=None):
+    """GET /orgs/{org}/public_members/{login} -> ({"public_member": bool},
+    None): GitHub answers 204 (a public member) or 404 (not one, or the
+    membership is private). Any other failure raises SystemExit, as
+    http_get_json does."""
+    req = urllib.request.Request(url, headers=_github_headers(url, token))
+    try:
+        headers, _body = _github_open(req, url, opener=opener, sleep=sleep,
+                                      clock=clock, allow_statuses=(404,))
+    except GitHubAPIError as err:
+        raise SystemExit(str(err)) from None
+    return {"public_member": headers is not None}, None
+
+
 def _paginated(token):
-    """Adapter: turn http_get_json into the (items, next) shape fetch_all wants."""
+    """Adapter: turn http_get_json into the (items, next) shape fetch_all wants.
+    A public-membership probe (no JSON body) answers {"public_member": bool}."""
     def get_page(url):
+        if _PUBLIC_MEMBER_RE.match(url or ""):
+            return public_member_probe(url, token)
         return http_get_json(url, token)
     return get_page
 
@@ -5300,11 +6327,62 @@ def newcomer_candidates(prs, issues, from_date, to_date):
 
 def newcomer_search_url(owner, repo, login, before, kind):
     """The search URL counting `login`'s `kind` ("pr" | "issue") items in
-    owner/repo created before `before` (the window's first day). Pure."""
+    owner/repo created before `before` (the window's first day), newest
+    first, so the one item returned (`per_page=1`) is the most recent
+    earlier one: its `created_at` is `last_seen_before`. Pure."""
     q = "repo:{}/{} is:{} author:{} created:<{}".format(owner, repo, kind,
                                                         login, before)
-    return "{}?{}".format(SEARCH_ISSUES_URL,
-                          urllib.parse.urlencode({"q": q, "per_page": 1}))
+    return "{}?{}".format(SEARCH_ISSUES_URL, urllib.parse.urlencode(
+        {"q": q, "sort": "created", "order": "desc", "per_page": 1}))
+
+
+def search_latest_created(page):
+    """`created_at` of the first item of one search response (sorted by
+    created, newest first: the most recent earlier item), or None. Pure."""
+    if not isinstance(page, dict):
+        return None
+    items = page.get("items")
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return None
+    created = items[0].get("created_at")
+    return created if isinstance(created, str) and created else None
+
+
+# Returning contributors: a candidate whose most recent earlier PR / issue is
+# more than RETURNING_GAP_DAYS[0] days before their first item of the window
+# is `returning`, bucketed by the largest threshold the gap exceeds (a month
+# counted as 30 days); anyone else with earlier activity is `regular`.
+RETURNING_GAP_DAYS = (90, 180, 270)
+RETURNING_GAP_BUCKETS = {90: "over_3_months", 180: "over_6_months",
+                         270: "over_9_months"}
+
+
+def _gap_days(earlier, later):
+    a, b = derive._iso_date(earlier), derive._iso_date(later)
+    if a is None or b is None:
+        return None
+    return (b - a).days
+
+
+def gap_bucket(gap_days):
+    """The RETURNING_GAP_BUCKETS label of a gap, or None when it is not more
+    than the smallest threshold (or unknown). Pure."""
+    if not isinstance(gap_days, int):
+        return None
+    hit = [t for t in RETURNING_GAP_DAYS if gap_days > t]
+    return RETURNING_GAP_BUCKETS[max(hit)] if hit else None
+
+
+def _search_answer(answer):
+    """(count, latest created_at) of a `search` seam answer: an int count
+    (no date), a {"count", "latest"} dict, or None (cannot tell)."""
+    if isinstance(answer, dict):
+        count, latest = answer.get("count"), answer.get("latest")
+    else:
+        count, latest = answer, None
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None, None
+    return count, latest if count else None
 
 
 def search_total_count(page):
@@ -5323,43 +6401,89 @@ def find_newcomers(candidates, search, before, max_candidates=NEWCOMERS_MAX,
     """Decide which `candidates` (newcomer_candidates) are new before `before`.
 
     `search(login, kind)` returns how many `kind` items `login` created in the
-    repo before `before`, or None (or raises) when it cannot tell. A candidate
-    is checked for the kind they started with first and, only when that count
-    is 0, for the other kind. Returns the per-window fact value:
+    repo before `before` — an int, or {"count", "latest"} with the most
+    recent such item's `created_at` — or None (or raises) when it cannot
+    tell. A candidate is checked for the kind they started with first and,
+    when that count is 0, for the other kind; when it is not 0 and its
+    latest date is more than RETURNING_GAP_DAYS[0] days before the
+    candidate's first item, the other kind is checked too (a more recent
+    item of that kind would make the gap shorter), so `last_seen_before` is
+    the most recent earlier PR or issue. Returns the per-window fact value:
     {"collected": True, "before", "candidates": n, "new": [{"login", "first",
     "number", "url", "created_at"}] (by login), "unknown": [login],
     "not_checked": [login]} — `unknown`: a check failed (never guessed);
-    `not_checked`: beyond `max_candidates`. Network-free given `search`."""
+    `not_checked`: beyond `max_candidates`. When the seam answers dates, also
+    "returning": [candidate + {"last_seen_before", "gap_days",
+    "gap_bucket"}] (`gap_upper_bound: true` when the second kind's check
+    failed), "regular": [{"login", "last_seen_before", "gap_days"}],
+    "earlier_undated" (only when any: earlier activity, no date) and
+    "gap_thresholds_days". Network-free given `search`."""
     checked = candidates[:max_candidates]
     not_checked = sorted(c["login"] for c in candidates[max_candidates:])
-    new, unknown = [], []
+    new, unknown, returning, regular, undated = [], [], [], [], []
+    dated = False
     failures = 0
+
+    def ask(login, kind):
+        try:
+            return _search_answer(search(login, kind))
+        except (Exception, SystemExit):   # a failed call: http_get_json exits
+            return None, None
     for i, cand in enumerate(checked):
         if failures >= stop_after:
             unknown.extend(c["login"] for c in checked[i:])
             break
-        total = 0
-        for kind in (cand["first"], "issue" if cand["first"] == "pr" else "pr"):
-            try:
-                count = search(cand["login"], kind)
-            except (Exception, SystemExit):   # a failed call: http_get_json exits
-                count = None
-            if count is None:
-                total = None
-                break
-            total += count
-            if total:
-                break
-        if total is None:
+        first = cand["first"]
+        other = "issue" if first == "pr" else "pr"
+        count, latest = ask(cand["login"], first)
+        if count is None:
             unknown.append(cand["login"])
             failures += 1
             continue
+        dated = dated or latest is not None
+        upper_bound = False
+        gap = _gap_days(latest, cand["created_at"]) if latest else None
+        if count == 0 or (gap is not None and gap > RETURNING_GAP_DAYS[0]):
+            count2, latest2 = ask(cand["login"], other)
+            if count2 is None:
+                if count == 0:
+                    unknown.append(cand["login"])
+                    failures += 1
+                    continue
+                upper_bound = True
+            else:
+                dated = dated or latest2 is not None
+                count += count2
+                if latest2 and (latest is None or latest2 > latest):
+                    latest = latest2
         failures = 0
-        if total == 0:
+        if count == 0:
             new.append(dict(cand))
-    return {"collected": True, "before": before, "candidates": len(candidates),
-            "new": sorted(new, key=lambda e: e["login"]),
-            "unknown": sorted(unknown), "not_checked": not_checked}
+            continue
+        if latest is None:
+            undated.append(cand["login"])
+            continue
+        gap = _gap_days(latest, cand["created_at"])
+        bucket = gap_bucket(gap)
+        if bucket:
+            row = dict(cand, last_seen_before=latest, gap_days=gap,
+                       gap_bucket=bucket)
+            if upper_bound:
+                row["gap_upper_bound"] = True
+            returning.append(row)
+        else:
+            regular.append({"login": cand["login"], "last_seen_before": latest,
+                            "gap_days": gap})
+    out = {"collected": True, "before": before, "candidates": len(candidates),
+           "new": sorted(new, key=lambda e: e["login"]),
+           "unknown": sorted(unknown), "not_checked": not_checked}
+    if dated:
+        out["returning"] = sorted(returning, key=lambda e: e["login"])
+        out["regular"] = sorted(regular, key=lambda e: e["login"])
+        out["gap_thresholds_days"] = list(RETURNING_GAP_DAYS)
+    if undated:
+        out["earlier_undated"] = sorted(undated)
+    return out
 
 
 def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
@@ -5376,7 +6500,10 @@ def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
         calls[0] += 1
         page, _next = get_page(newcomer_search_url(owner, repo, login,
                                                    from_date, kind))
-        return search_total_count(page)
+        count = search_total_count(page)
+        if count is None:
+            return None
+        return {"count": count, "latest": search_latest_created(page)}
     if len(cands) > cap:
         sys.stderr.write(
             f"warning: {owner}/{repo}: {len(cands)} candidate first-time "
@@ -5386,12 +6513,687 @@ def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
     sys.stderr.write(
         f"newcomers: {owner}/{repo}: {len(cands)} candidate author(s), "
         f"{calls[0]} search call(s), {len(result['new'])} with no PR / issue "
-        f"before {from_date}\n")
+        f"before {from_date}, {len(result.get('returning') or [])} returning "
+        f"after more than {RETURNING_GAP_DAYS[0]} days\n")
     if result["unknown"]:
         sys.stderr.write(
             f"warning: {owner}/{repo}: could not tell whether "
             f"{len(result['unknown'])} author(s) are new (search failed); "
             f"recorded as newcomers.unknown: {', '.join(result['unknown'])}\n")
+    return result
+
+
+# --- Contributor affiliation (per-window fact `affiliations`) -----------------
+#
+# For each human person of the window (PR / issue authors, mergers, reviewers,
+# commenters, resolved commit authors): is that person with the organisation
+# that maintains the repository (`maintainer_org`: the repo's owner, plus any
+# organisation the operator names as home), `community`, or `unknown`? The
+# first signal that decides wins, in this order, and the fact records which
+# signal it was and how strong:
+#   1. the operator's override list (`--affiliation LOGIN=…`, `@org/team=…`,
+#      or the manifest's `affiliation.overrides`)               strength operator
+#   2. `author_association` on the person's own records in the window: OWNER /
+#      MEMBER (of the organisation that owns the repo, GitHub's value when
+#      gathered) -> strong, COLLABORATOR -> medium; never decides community
+#   3. public membership of a home organisation:
+#      GET /orgs/{org}/public_members/{login}, 204 = member        strong
+#   4. the public profile's `company` (GET /users/{login}), normalised
+#      (normalize_company) and compared with the home names: a match ->
+#      maintainer_org (medium); a non-empty company that does not match ->
+#      community (weak); empty -> no signal
+#   5. a commit author email in a home email domain, read at gather time and
+#      kept only as a boolean                                      medium
+#   6. nothing -> unknown (never community by default).
+# A failed lookup never lets a weaker signal decide `community` (that person
+# is `unknown`, signal `lookup_failed`). Signals 3 and 4 cost up to one call
+# per home organisation plus one per person, through the gather's GitHub
+# client (rate-limit waits, retries); answers are cached per URL for the run
+# (a manifest's members share it). Only the label, the signal name and its
+# strength are stored: never the company text, profile fields or an email.
+
+AFFILIATIONS = manifest_mod.AFFILIATION_VALUES
+AFFILIATION_SIGNALS = ("override", "author_association", "public_membership",
+                       "profile_company", "commit_email_domain", "none",
+                       "lookup_failed", "not_checked", "do_not_name")
+AFFILIATION_STRENGTHS = ("operator", "strong", "medium", "weak")
+AFFILIATION_MAX = 300             # people looked up per window (ACTIVITY_AFFILIATION_MAX)
+AFFILIATION_FAILURE_STOP = 3      # people in a row whose lookups failed
+_HOME_ASSOCIATIONS = {"OWNER": "strong", "MEMBER": "strong",
+                      "COLLABORATOR": "medium"}
+_ASSOCIATION_RANK = {"OWNER": 3, "MEMBER": 2, "COLLABORATOR": 1}
+_COMPANY_SUFFIXES = ("corporation", "corp", "incorporated", "inc", "limited",
+                     "ltd", "llc", "gmbh", "plc")
+USERS_API = "https://api.github.com/users/"
+ORGS_API = "https://api.github.com/orgs/"
+NOREPLY_EMAIL_DOMAIN = "users.noreply.github.com"
+_GROUP_RE = manifest_mod._GROUP_RE      # `@org/team`
+
+
+def _affiliation_max(env=None):
+    return _env_int("ACTIVITY_AFFILIATION_MAX", AFFILIATION_MAX, 0, env)
+
+
+def _people_settings(env=None):
+    """The registry's refresh policy from the environment: {refresh_days,
+    unknown_retry_days, refresh_max, name_max} (people.py constants by
+    default)."""
+    return {"refresh_days": _env_int("ACTIVITY_PEOPLE_REFRESH_DAYS",
+                                     people_mod.REFRESH_DAYS, 1, env),
+            "unknown_retry_days": _env_int("ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS",
+                                           people_mod.UNKNOWN_RETRY_DAYS, 1, env),
+            "refresh_max": _env_int("ACTIVITY_PEOPLE_REFRESH_MAX",
+                                    people_mod.REFRESH_MAX, 0, env),
+            "name_max": _env_int("ACTIVITY_PEOPLE_NAME_MAX",
+                                 people_mod.NAME_MAX, 0, env)}
+
+
+def people_run_from_args(args, env=None):
+    """The run's people.Run (the retained registry), created once and kept on
+    `args.people_run` so a manifest's members share it; None without
+    --people / a manifest `people`. A malformed registry stops the gather
+    with a message naming the entry (never a silent reset)."""
+    run = getattr(args, "people_run", None)
+    if run is not None:
+        return run
+    path = getattr(args, "people", None) or getattr(args, "people_manifest", None)
+    if not path:
+        return None
+    settings = _people_settings(env)
+    if getattr(args, "people_refresh_days", None):
+        settings["refresh_days"] = args.people_refresh_days
+    try:
+        run = people_mod.Run(path, offline=bool(getattr(args, "people_offline", False)),
+                             limits=people_mod.thresholds(env), **settings)
+    except (people_mod.RegistryError, ValueError) as exc:
+        raise SystemExit("error: {}".format(exc)) from None
+    args.people_run = run
+    return run
+
+
+def normalize_company(text):
+    """A profile company (or a home name) in the form they are compared in:
+    lower case, a leading `@` dropped, `.` `,` and surrounding punctuation
+    removed, whitespace collapsed, and trailing legal suffixes
+    (_COMPANY_SUFFIXES: "Corporation", "Corp", "Inc", "Ltd", "LLC", "GmbH",
+    …) removed. "@microsoft", "Microsoft", "Microsoft Corporation" and
+    "Microsoft Corp." all give "microsoft". Pure."""
+    s = (text or "").strip().lower()
+    s = s.lstrip("@").strip()
+    s = re.sub(r"[.,;:!()\[\]\"']", " ", s)
+    words = s.split()
+    while len(words) > 1 and words[-1] in _COMPANY_SUFFIXES:
+        words.pop()
+    return " ".join(words)
+
+
+def company_matches(company, home_names):
+    """True when the profile `company` names a home organisation, False when
+    it names something else, None when it is empty. Matches are exact after
+    normalize_company, on the whole text or on any `@handle` in it ("@Azure
+    @microsoft"); `home_names` are already normalised. Pure."""
+    whole = normalize_company(company)
+    if not whole:
+        return None
+    names = set(home_names or ())
+    if whole in names:
+        return True
+    handles = {normalize_company(t) for t in re.split(r"[\s,/|;]+", company or "")
+               if t.startswith("@")}
+    return bool(handles & names)
+
+
+def email_domain_is_home(email, domains):
+    """True when `email`'s domain is one of `domains` (or a subdomain of
+    one); `users.noreply.github.com` never is. Only this boolean leaves the
+    function: the address is not kept. Pure."""
+    if not email or "@" not in email or not domains:
+        return False
+    domain = email.rsplit("@", 1)[1].strip().lower()
+    if not domain or domain == NOREPLY_EMAIL_DOMAIN \
+            or domain.endswith("." + NOREPLY_EMAIL_DOMAIN):
+        return False
+    return any(domain == d or domain.endswith("." + d) for d in domains)
+
+
+def _check_affiliation_value(value, what):
+    if value not in AFFILIATIONS:
+        raise ValueError("{} must be one of {}, got {!r}".format(
+            what, ", ".join(AFFILIATIONS), value))
+    return value
+
+
+def parse_affiliation_override(text):
+    """`LOGIN=AFFILIATION` or `@org/team=AFFILIATION` -> (key, affiliation);
+    raises ValueError. Pure."""
+    key, sep, value = (text or "").partition("=")
+    key, value = key.strip(), value.strip()
+    if not sep or not key:
+        raise ValueError("--affiliation takes LOGIN=AFFILIATION or "
+                         "@org/team=AFFILIATION, got {!r}".format(text))
+    _check_affiliation_value(value, "--affiliation {}".format(key))
+    if key.startswith("@"):
+        if not _GROUP_RE.fullmatch(key):
+            raise ValueError("--affiliation group must be @org/team, got "
+                             "{!r}".format(key))
+    else:
+        manifest_mod.check_owner(key, "--affiliation login")
+    return key, value
+
+
+def affiliation_config(owner, home_orgs=(), home_names=(), email_domains=(),
+                       overrides=None):
+    """The resolved affiliation settings of one repository: {"home_orgs"
+    (the repo's owner first, then the operator's, de-duplicated without
+    regard to case), "home_names" (normalised: the home orgs and the
+    operator's extra names), "home_email_domains" (lower case), "overrides"
+    {login: affiliation}, "groups" {"@org/team": affiliation}}. Pure."""
+    orgs, seen = [], set()
+    for org in [owner] + list(home_orgs or ()):
+        if org and org.lower() not in seen:
+            seen.add(org.lower())
+            orgs.append(org)
+    names = sorted({normalize_company(n) for n in orgs + list(home_names or ())
+                    if normalize_company(n)})
+    domains = sorted({d.strip().lower().lstrip("@") for d in email_domains or ()
+                      if d and d.strip()})
+    logins, groups = {}, {}
+    for key, value in (overrides or {}).items():
+        (groups if key.startswith("@") else logins)[key] = value
+    return {"home_orgs": orgs, "home_names": names,
+            "home_email_domains": domains, "overrides": logins,
+            "groups": groups}
+
+
+def affiliation_people(prs, issues, commits):
+    """The window's human people and what the records say of them: ([logins
+    by (-activity, login)], {login: best home author_association}). Bots,
+    `ghost` and commit authors gather could not resolve to a login are left
+    out. Activity counts PRs and issues authored, merges, reviews, comments
+    and commits. Pure."""
+    weight, assoc = {}, {}
+
+    def add(login, n=1, association=None):
+        if not login or login == _GHOST_LOGIN or derive.is_bot_login(login):
+            return
+        weight[login] = weight.get(login, 0) + n
+        if association in _ASSOCIATION_RANK and _ASSOCIATION_RANK[association] > \
+                _ASSOCIATION_RANK.get(assoc.get(login), 0):
+            assoc[login] = association
+    for it in list(prs or []) + list(issues or []):
+        add(it.get("author"), association=it.get("author_association"))
+        if it.get("merged_by"):
+            add(it.get("merged_by"))
+        for rv in it.get("reviewers") or []:
+            add(rv)
+        for c in (it.get("comments_list") or []) + (it.get("review_comments") or []):
+            add(c.get("author"), association=c.get("author_association"))
+    for c in commits or []:
+        if c.get("login_resolved") is not False:
+            add(c.get("author"))
+    order = sorted(weight, key=lambda k: (-weight[k], k))
+    return order, assoc
+
+
+def resolve_affiliation_groups(groups, get_page, cache=None):
+    """Expand `@org/team` override groups to logins through the team members
+    listing (GET /orgs/{org}/teams/{team}/members: the token must be able
+    to see the team). Returns ({login: affiliation}, [unresolved groups]).
+    A later group in sorted order does not replace an earlier one's login."""
+    cache = {} if cache is None else cache
+    out, unresolved = {}, []
+    for group in sorted(groups or {}):
+        m = _GROUP_RE.fullmatch(group)
+        if not m:
+            unresolved.append(group)
+            continue
+        url = "{}{}/teams/{}/members?per_page=100".format(ORGS_API, m.group(1),
+                                                          m.group(2))
+        if url not in cache:
+            try:
+                members = fetch_all(get_page, url)
+                cache[url] = sorted({(u or {}).get("login") for u in members
+                                     if isinstance(u, dict) and u.get("login")})
+            except (Exception, SystemExit):
+                cache[url] = None
+        if cache[url] is None:
+            unresolved.append(group)
+            continue
+        for login in cache[url]:
+            out.setdefault(login, groups[group])
+    return out, unresolved
+
+
+def make_affiliation_lookup(get_page, cache=None):
+    """The network seam of find_affiliations over the gather's GitHub client
+    (`get_page`): lookup("public_member", login, org) -> True / False / None
+    (cannot tell), lookup("company", login) -> the profile company text ("" for
+    none) or None, lookup("name", login) -> the profile's display name ("" for
+    none) or None, read from the SAME `users/{login}` response (no extra
+    call). The company text is handed to the classifier and never returned
+    anywhere else; of the profile only these two fields are kept, and only
+    in the run's memory. Answers are cached per URL in `cache`."""
+    cache = {} if cache is None else cache
+
+    def lookup(kind, login, org=None):
+        if kind == "public_member":
+            url = "{}{}/public_members/{}".format(ORGS_API, org, login)
+        else:
+            url = USERS_API + login
+        if url not in cache:
+            try:
+                page, _next = get_page(url)
+            except (Exception, SystemExit):
+                return None              # not cached: a later window may retry
+            if kind == "public_member":
+                got = page.get("public_member") if isinstance(page, dict) else None
+                answer = got if isinstance(got, bool) else None
+            elif isinstance(page, dict) and page.get("login"):
+                company, name = page.get("company"), page.get("name")
+                answer = {"company": company if isinstance(company, str) else "",
+                          "name": name if isinstance(name, str) else ""}
+            else:
+                answer = None
+            if answer is None:
+                return None
+            cache[url] = answer
+        answer = cache[url]
+        if kind == "public_member":
+            return answer
+        return answer.get("name" if kind == "name" else "company", "")
+    return lookup
+
+
+def decide_affiliation(login, config, association=None, email_home=False,
+                       lookup=None):
+    """(entry, looked_up, failed) for one person: `entry` {"affiliation",
+    "signal"[, "strength"][, "home_email_domain": true]} by the rule in the
+    section comment; `looked_up` when the API seam was asked; `failed` when
+    a lookup could not tell. `lookup` None: only the free signals."""
+    def entry(aff, signal, strength=None):
+        e = {"affiliation": aff, "signal": signal}
+        if strength:
+            e["strength"] = strength
+        if email_home:
+            e["home_email_domain"] = True
+        return e
+    if login in config["overrides"]:
+        return entry(config["overrides"][login], "override", "operator"), False, False
+    if association in _HOME_ASSOCIATIONS:
+        return (entry("maintainer_org", "author_association",
+                      _HOME_ASSOCIATIONS[association]), False, False)
+    if lookup is None:
+        return None, False, False
+    failed = False
+    for org in config["home_orgs"]:
+        member = lookup("public_member", login, org)
+        if member is True:
+            return entry("maintainer_org", "public_membership", "strong"), True, False
+        if member is None:
+            failed = True
+    company = lookup("company", login)
+    if company is None:
+        failed = True
+    else:
+        match = company_matches(company, config["home_names"])
+        if match is True:
+            return entry("maintainer_org", "profile_company", "medium"), True, failed
+        if match is False and not failed:
+            return entry("community", "profile_company", "weak"), True, False
+    if email_home:
+        return entry("maintainer_org", "commit_email_domain", "medium"), True, failed
+    return entry("unknown", "lookup_failed" if failed else "none"), True, failed
+
+
+def find_affiliations(people, config, associations=None, email_home=(),
+                      lookup=None, max_lookups=AFFILIATION_MAX,
+                      stop_after=AFFILIATION_FAILURE_STOP):
+    """The `affiliations` fact value for `people` (logins, most active
+    first). The free signals (override, author_association) apply to
+    everyone; the looked-up ones to at most `max_lookups` people, and none
+    after `stop_after` people in a row whose lookups failed: those are
+    `not_checked` (no entry, counted unknown). Returns {"collected": True,
+    "home_orgs", "home_names", "home_email_domains", "people": {login:
+    entry}, "unknown": [login], "not_checked": [login]}. Network-free given
+    `lookup`."""
+    associations = associations or {}
+    email_home = set(email_home or ())
+    out, not_checked = {}, []
+    looked, failures = 0, 0
+    for login in people:
+        e, _l, _f = decide_affiliation(login, config, associations.get(login),
+                                       login in email_home, lookup=None)
+        if e is not None:
+            out[login] = e
+            continue
+        if lookup is None or looked >= max_lookups or failures >= stop_after:
+            not_checked.append(login)
+            continue
+        e, was_looked, failed = decide_affiliation(
+            login, config, associations.get(login), login in email_home,
+            lookup=lookup)
+        looked += was_looked
+        failures = failures + 1 if failed else 0
+        out[login] = e
+    unknown = sorted([k for k, e in out.items() if e["affiliation"] == "unknown"]
+                     + not_checked)
+    return {"collected": True, "home_orgs": list(config["home_orgs"]),
+            "home_names": list(config["home_names"]),
+            "home_email_domains": list(config["home_email_domains"]),
+            "people": {k: out[k] for k in sorted(out)},
+            "unknown": unknown, "not_checked": sorted(not_checked)}
+
+
+def affiliation_home(config):
+    """The home settings a label is decided against, as one compact string
+    kept with the label in the registry (`home`): the home organisations
+    (lower case, sorted) and the home names, "orgs|names". The email
+    domains are left out: a commit email never decides a stored label.
+    Pure."""
+    return "{}|{}".format(",".join(sorted({o.lower() for o in config["home_orgs"]})),
+                          ",".join(sorted(config["home_names"])))
+
+
+def _registry_label(entry, home=None):
+    """The label a per-window decision leaves in the registry: what GitHub
+    data decided (author_association, public_membership, profile_company or
+    none), without the per-window commit-email boolean, with the `home`
+    settings it was decided against. None for a decision the registry must
+    not keep (override, a failed lookup, ...)."""
+    sig = (entry or {}).get("signal")
+    if sig == "commit_email_domain":
+        return {"affiliation": "unknown", "signal": "none"}
+    if sig not in ("author_association", "public_membership", "profile_company",
+                   "none"):
+        return None
+    out = {"affiliation": entry["affiliation"], "signal": sig}
+    if entry.get("strength"):
+        out["strength"] = entry["strength"]
+    if home:
+        out["home"] = home
+    return out
+
+
+def _reused_entry(reg_entry, email_home):
+    """The per-window entry for a person decided from the registry: its label
+    (an operator-locked one as `override` / operator), the commit email
+    deciding an `unknown` one, as decide_affiliation would."""
+    if people_mod.is_locked(reg_entry, "affiliation"):
+        e = {"affiliation": reg_entry["affiliation"], "signal": "override",
+             "strength": "operator"}
+    elif reg_entry.get("affiliation") == "unknown" and email_home:
+        e = {"affiliation": "maintainer_org", "signal": "commit_email_domain",
+             "strength": "medium"}
+    else:
+        e = {"affiliation": reg_entry["affiliation"],
+             "signal": reg_entry.get("signal") or "none"}
+        if reg_entry.get("strength"):
+            e["strength"] = reg_entry["strength"]
+    if email_home:
+        e["home_email_domain"] = True
+    return e
+
+
+def find_affiliations_registry(people, config, run, repo_slug, associations=None,
+                               email_home=(), lookup=None, records=None,
+                               name_first=(), max_lookups=AFFILIATION_MAX,
+                               stop_after=AFFILIATION_FAILURE_STOP, window=None,
+                               stream=None, newcomers=None):
+    """find_affiliations with the retained people registry (`run`, a
+    people.Run): the registry is consulted first, the API fills the gaps,
+    the registry is updated (in memory; run.save() writes it) and the fact
+    records the labels used for this window, each person's display `name`
+    and their `maintainer` property for `repo_slug`.
+
+    Per person, the first rule that applies:
+      do_not_name in the registry   unknown, signal do_not_name, no name, no
+                                    maintainer, no call
+      override list / author_association   as find_affiliations (free; an
+                                    author_association label is stored)
+      registry affiliation locked by the operator   signal override
+      registry entry fresh          its label (no call)          `reused`
+      never looked up               looked up (within `max_lookups`)
+                                                                 `looked_up`
+      stale                         refreshed, at most run.refresh_left per
+                                    run, oldest lookup first     `refreshed`
+      anything else                 a stale label is reused; else the commit
+                                    email; else unknown, signal not_checked
+    A label is relative to the home settings (affiliation_home) it was
+    decided against, kept with it as `home`: it is fresh only under the same
+    settings, and one decided against other settings is never reused (an
+    entry without a recorded `home` is stale, and still reusable).
+    A lookup reads the display name from the same profile response. People
+    decided without a lookup who have no name yet get one profile call for
+    it, at most run.names_left per run, `name_first` (the newcomers) first,
+    then the most active. `lookup` None (offline): no call at all.
+    `records` (prs, issues, commits) give the seen dates and the maintainer
+    evidence (people.maintainer_evidence). With `window` (from, to) the
+    window is also recorded in the registry's activity profile
+    (people.Run.record_window, with the window's `newcomers` fact and the
+    manifest `stream`), and a maintainer's entry carries
+    `maintainer_status` (people.maintainer_status: active / lapsed /
+    former / unknown by recency; `former` makes `maintainer` false).
+    Network-free given `lookup`."""
+    associations = associations or {}
+    email_home = set(email_home or ())
+    prs, issues, commits = records or ((), (), ())
+    home = affiliation_home(config)
+    dates = people_mod.activity_dates(prs, issues, commits)
+    evidence = people_mod.maintainer_evidence(
+        prs, issues, until=window[1][:10] if window else None)
+    for login in people:
+        fields = {}
+        if login in dates:
+            fields["seen"] = [(dates[login][0], repo_slug),
+                              (dates[login][1], repo_slug)]
+        if login in evidence:
+            fields["maintainer"] = {repo_slug: evidence[login]}
+        if fields:
+            run.patch(login, **fields)
+    if window:
+        run.record_window(repo_slug, window[0][:10], window[1][:10], prs, issues,
+                          commits, newcomers=newcomers, stream=stream)
+    # the refresh budget goes to the oldest lookups among the people a
+    # lookup would decide (not the override list, author_association, an
+    # operator-locked label or do_not_name)
+    def wants_lookup(login):
+        reg = run.entry(login) or {}
+        return not (login in config["overrides"] or reg.get("do_not_name")
+                    or associations.get(login) in _HOME_ASSOCIATIONS
+                    or people_mod.is_locked(reg, "affiliation"))
+    stale = set(sorted((login for login in people
+                        if run.state(login, home) == "stale"
+                        and wants_lookup(login)),
+                       key=lambda k: ((run.entry(k) or {}).get("looked_up_at") or "",
+                                      k))[:max(run.refresh_left, 0)])
+    counts = {"looked_up": 0, "refreshed": 0, "reused": 0, "names_fetched": 0,
+              "free": 0, "do_not_name": 0, "lookup_failed": 0}
+    out, not_checked, looked_now = {}, [], set()
+    looked, failures = 0, 0
+    for login in people:
+        reg = run.entry(login) or {}
+        if reg.get("do_not_name"):
+            out[login] = {"affiliation": "unknown", "signal": "do_not_name"}
+            counts["do_not_name"] += 1
+            continue
+        e, _l, _f = decide_affiliation(login, config, associations.get(login),
+                                       login in email_home, lookup=None)
+        if e is not None:
+            if e["signal"] == "author_association":
+                run.patch(login, label=_registry_label(e, home))
+            out[login] = e
+            counts["free"] += 1
+            continue
+        if people_mod.is_locked(reg, "affiliation") and reg.get("affiliation"):
+            out[login] = _reused_entry(reg, login in email_home)
+            counts["free"] += 1
+            continue
+        state = run.state(login, home)
+        # a label decided against other home settings is never used here
+        # (one without a recorded home is: decided before homes were kept)
+        own = reg.get("home") in (None, home)
+        if state == "fresh":
+            out[login] = _reused_entry(reg, login in email_home)
+            counts["reused"] += 1
+            continue
+        can = lookup is not None and failures < stop_after and (
+            (state == "never" and looked < max_lookups)
+            or (state == "stale" and run.refresh_left > 0 and login in stale))
+        if can:
+            e, _was, failed = decide_affiliation(
+                login, config, associations.get(login), login in email_home,
+                lookup=lookup)
+            looked_now.add(login)
+            failures = failures + 1 if failed else 0
+            if state == "never":
+                looked += 1
+            if failed:
+                counts["lookup_failed"] += 1
+                if reg.get("affiliation") and own and e["affiliation"] == "unknown":
+                    e = _reused_entry(reg, login in email_home)
+            else:
+                name = lookup("name", login)
+                fields = {"label": _registry_label(e, home), "looked_up_at": run.now}
+                if name is not None:
+                    fields["name"] = name
+                run.patch(login, **fields)
+                if state == "stale":
+                    run.refresh_left -= 1
+                    counts["refreshed"] += 1
+                else:
+                    counts["looked_up"] += 1
+            out[login] = e
+            continue
+        if reg.get("affiliation") and own:
+            out[login] = _reused_entry(reg, login in email_home)
+            counts["reused"] += 1
+        elif login in email_home:
+            out[login] = {"affiliation": "maintainer_org",
+                          "signal": "commit_email_domain", "strength": "medium",
+                          "home_email_domain": True}
+        else:
+            out[login] = {"affiliation": "unknown", "signal": "not_checked"}
+            not_checked.append(login)
+    # display names for people decided without a lookup (newcomers first)
+    if lookup is not None and failures < stop_after:
+        order = [k for k in name_first if k in out] + \
+            [k for k in people if k not in set(name_first)]
+        for login in order:
+            if run.names_left <= 0:
+                break
+            reg = run.entry(login) or {}
+            if login in looked_now or reg.get("do_not_name") or reg.get("name") \
+                    or reg.get("looked_up_at") or people_mod.is_locked(reg, "name"):
+                continue
+            name = lookup("name", login)
+            run.names_left -= 1
+            if name is None:
+                continue
+            run.patch(login, name=name, looked_up_at=run.now)
+            counts["names_fetched"] += 1
+    for login, e in out.items():
+        if e["signal"] == "do_not_name":
+            continue
+        reg = run.entry(login) or {}
+        name = people_mod.display_name(reg)
+        if name:
+            e["name"] = name
+        e["maintainer"], e["maintainer_signal"] = people_mod.maintainer_for(
+            reg, repo_slug)
+        status = run.maintainer_status(login, repo_slug) if window else None
+        if status:
+            e["maintainer_status"] = status["status"]
+            if status["status"] == "former":
+                e["maintainer"] = False
+    for key in ("looked_up", "refreshed", "reused", "names_fetched"):
+        run.totals[key] = run.totals.get(key, 0) + counts[key]
+    unknown = sorted(k for k, e in out.items() if e["affiliation"] == "unknown")
+    result = {"collected": True, "home_orgs": list(config["home_orgs"]),
+              "home_names": list(config["home_names"]),
+              "home_email_domains": list(config["home_email_domains"]),
+              "people": {k: out[k] for k in sorted(out)},
+              "unknown": unknown, "not_checked": sorted(not_checked)}
+    return result, counts
+
+
+def args_affiliation_config(args, owner):
+    """affiliation_config from the CLI (`--home-org`, `--home-name`,
+    `--home-email-domain`, `--affiliation`) and, for a manifest member, the
+    manifest's `affiliation` object (`args.affiliation_manifest`): lists are
+    joined; a CLI override beats the manifest's for the same key."""
+    man = getattr(args, "affiliation_manifest", None) or {}
+    overrides = dict(man.get("overrides") or {})
+    for text in getattr(args, "affiliation", None) or []:
+        key, value = parse_affiliation_override(text)
+        overrides[key] = value
+    return affiliation_config(
+        owner,
+        list(man.get("home_orgs") or []) + list(getattr(args, "home_org", None) or []),
+        list(man.get("home_names") or []) + list(getattr(args, "home_name", None) or []),
+        list(man.get("home_email_domains") or [])
+        + list(getattr(args, "home_email_domain", None) or []),
+        overrides)
+
+
+def collect_affiliations(prs, issues, commits, owner, repo, get_page, config,
+                         email_home=(), cache=None, max_people=None,
+                         people_run=None, name_first=(), window=None, stream=None,
+                         newcomers=None):
+    """The window's `affiliations` fact, looked up through `get_page` (the
+    gather's GitHub client). One stderr line says what it cost and found.
+    With `people_run` (a people.Run: the retained registry) the registry is
+    consulted first (find_affiliations_registry) and a second line reports
+    looked up / refreshed / reused / still unknown; an offline run makes no
+    call at all (an `@org/team` override is then left unresolved)."""
+    cache = {} if cache is None else cache
+    people, assoc = affiliation_people(prs, issues, commits)
+    calls = [0]
+    offline = people_run is not None and people_run.offline
+
+    def counted(url):
+        calls[0] += 1
+        return get_page(url)
+    if offline:
+        group_logins, unresolved = {}, sorted(config.get("groups") or {})
+    else:
+        group_logins, unresolved = resolve_affiliation_groups(
+            config.get("groups"), counted, cache)
+    cfg = dict(config, overrides={**group_logins, **config["overrides"]})
+    cap = _affiliation_max() if max_people is None else max_people
+    lookup = None if offline else make_affiliation_lookup(counted, cache)
+    if people_run is None:
+        result = find_affiliations(people, cfg, assoc, email_home, lookup,
+                                   max_lookups=cap)
+    else:
+        result, counts = find_affiliations_registry(
+            people, cfg, people_run, "{}/{}".format(owner, repo), assoc,
+            email_home, lookup, records=(prs, issues, commits),
+            name_first=name_first, max_lookups=cap, window=window, stream=stream,
+            newcomers=newcomers)
+        maint = sum(1 for e in result["people"].values() if e.get("maintainer"))
+        sys.stderr.write(
+            "people registry: {}/{}: {} looked up, {} refreshed, {} reused from "
+            "the registry, {} decided without a lookup, {} still unknown, {} "
+            "name(s) fetched, {} maintainer(s){}\n".format(
+                owner, repo, counts["looked_up"], counts["refreshed"],
+                counts["reused"], counts["free"], len(result["unknown"]),
+                counts["names_fetched"], maint,
+                " (offline: no API call)" if offline else ""))
+    if unresolved:
+        result["groups_unresolved"] = unresolved
+    by = {}
+    for e in result["people"].values():
+        by[e["affiliation"]] = by.get(e["affiliation"], 0) + 1
+    sys.stderr.write(
+        "affiliation: {}/{}: {} person(s), {} API call(s) (cached answers "
+        "reused): {} maintainer_org, {} community, {} unknown ({} not "
+        "checked)\n".format(owner, repo, len(people), calls[0],
+                            by.get("maintainer_org", 0), by.get("community", 0),
+                            len(result["unknown"]), len(result["not_checked"])))
+    if unresolved:
+        sys.stderr.write("warning: {}/{}: affiliation group(s) not resolved "
+                         "(team not visible to the token?): {}\n".format(
+                             owner, repo, ", ".join(unresolved)))
     return result
 
 
@@ -5591,6 +7393,25 @@ def acquire(args, env):
             f"(ACTIVITY_CLONE_MARGIN_DAYS, default {CLONE_MARGIN_DAYS}) and re-gather "
             f"to recover: {_boundary_dropped}\n")
 
+    # Module change notes (per-window fact `module_notes`): the changelog
+    # entries, version.json moves and version tags of the window, read from
+    # the clone for the changelog / version files the code events name only
+    # (collect_module_notes). Needs the window's history on disk.
+    module_notes = None
+    if walk_clone:
+        module_notes = collect_module_notes(
+            code_events, git_blob_reader(clone_dir), git_tag_lister(clone_dir),
+            frm, to)
+        sys.stderr.write(
+            f"module notes: {owner}/{repo}: {len(module_notes['changelogs'])} "
+            f"changelog update(s), {len(module_notes['versions'])} version "
+            f"change(s), " + (
+                f"{len(module_notes['tags']['items'])} version tag(s) in the "
+                f"window" if module_notes["tags"].get("collected")
+                else f"tags not collected ({module_notes['tags']['reason']})")
+            + (f", {len(module_notes['unread'])} file version(s) unreadable"
+               if module_notes.get("unread") else "") + "\n")
+
     # Phase 3b: code-area provider (directory-first; graphify optional). Paths come
     # from the code-event walk + the commit file lists (local, zero-token).
     area_paths = sorted(
@@ -5706,6 +7527,31 @@ def acquire(args, env):
     closing_refs_source = resolve_closing_issues(
         prs, _graphql_client(token), owner, repo)
 
+    # PR-internal history (per-window fact `pr_history`): each kept PR's own
+    # commits from refs/pull/<N>/head, and the comment / parameter changes
+    # between them for the most discussed PRs (collect_pr_history). Needs the
+    # clone; --no-pr-history records that it was not looked at.
+    pr_history = None
+    if not getattr(args, "pr_history", True):
+        pr_history = {"collected": False}
+    elif walk_clone and prs:
+        _started = time.monotonic()
+        pr_history = collect_pr_history(prs, clone_dir, base_branch=base_branch)
+        _rows = pr_history["prs"]
+        sys.stderr.write(
+            "pr history: {}/{}: {} PR head(s) fetched, {} missing, {} failed, "
+            "{} commit(s), notes for {} PR(s) in {:.0f}s{}\n".format(
+                owner, repo,
+                sum(1 for r in _rows if r.get("status") == "fetched"),
+                sum(1 for r in _rows if r.get("status") == "missing"),
+                sum(1 for r in _rows if r.get("status") in ("fetch_failed",
+                                                            "log_failed")),
+                sum(len(r.get("commits") or []) for r in _rows),
+                sum(1 for r in _rows if "notes" in r),
+                time.monotonic() - _started,
+                " ({})".format(pr_history["error"]) if pr_history.get("error")
+                else ""))
+
     # Issue set: every issue a kept PR closes or cross-references, plus open and
     # recently-closed issues (for in_flight / next_candidates / rejected buckets)
     # that existed at the window's end (keep_issue_for_window).
@@ -5800,7 +7646,12 @@ def acquire(args, env):
     # login PR/issue/review records use, so one person is one key. One paginated
     # commits-list listing (ceil(commits / 100) REST calls, none for an empty
     # window) joined on SHA; then the noreply email; else flagged unresolved.
-    # Code/symbol events are re-keyed to the same author.
+    # Code/symbol events are re-keyed to the same author. The same pass
+    # notes, as a boolean per login, a commit email in a home domain (the
+    # affiliation signal); the email itself is dropped.
+    want_affiliation = getattr(args, "affiliation_enabled", True)
+    aff_config = args_affiliation_config(args, owner) if want_affiliation else None
+    email_home = set()
     if commits:
         # from the walked branch's head (the clone is back on it by now)
         api_items = fetch_all(get_page, commits_api_url(api, walk_head, frm, to)) \
@@ -5814,7 +7665,9 @@ def acquire(args, env):
                 known.add(c.get("author"))
         known.discard(None)
         by_sha = resolve_commit_authors(
-            commits, commit_logins_from_api(api_items), known)
+            commits, commit_logins_from_api(api_items), known,
+            home_domains=(aff_config or {}).get("home_email_domains") or (),
+            home_email=email_home)
         remap_event_authors(code_events, by_sha)
         remap_event_authors(symbol_events, by_sha)
 
@@ -5832,6 +7685,30 @@ def acquire(args, env):
         newcomers = collect_newcomers(prs, issues, owner, repo, frm, to, get_page)
     else:
         newcomers = {"collected": False}
+
+    # Contributor affiliation (per-window fact `affiliations`): see
+    # collect_affiliations. --no-affiliation records that it was not looked at.
+    # With the retained people registry (--people / manifest `people`) the
+    # registry is consulted first and updated here, before the fold.
+    if want_affiliation:
+        cache = getattr(args, "affiliation_cache", None)
+        people_run = people_run_from_args(args)
+        affiliations = collect_affiliations(
+            prs, issues, commits, owner, repo, get_page, aff_config,
+            email_home=email_home, cache={} if cache is None else cache,
+            people_run=people_run,
+            name_first=[e.get("login") for key in ("new", "returning")
+                        for e in newcomers.get(key) or [] if isinstance(e, dict)],
+            window=(frm, to), stream=getattr(args, "people_stream", None),
+            newcomers=newcomers)
+        if people_run is not None:
+            try:
+                people_run.save()
+            except (OSError, people_mod.RegistryError) as exc:
+                raise SystemExit("error: people registry {}: {}".format(
+                    people_run.path, exc)) from None
+    else:
+        affiliations = {"collected": False}
 
     releases = []
     if getattr(args, "include_releases", True):
@@ -5914,6 +7791,12 @@ def acquire(args, env):
     bundle["releases"] = releases
     bundle["milestones"] = milestones
     bundle["newcomers"] = newcomers
+    bundle["affiliations"] = affiliations
+    # Omitted when the window's history was not on disk (nothing was read).
+    if module_notes is not None:
+        bundle["module_notes"] = module_notes
+    if pr_history is not None:
+        bundle["pr_history"] = pr_history
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
     bundle["code_graph"] = code_graph
@@ -7824,6 +9707,9 @@ def _gather_manifest(conn, args, man):
                 if e["from"] == frm and e["to"] == to
                 and e["status"] == graphstore.MEMBER_OK}
     todo = [s for s in slugs if s not in done]
+    # One affiliation answer cache for the whole run: a person active in
+    # several members is looked up once.
+    affiliation_cache = {}
     if not todo:
         sys.stderr.write("nothing to resume: every member of project '{}' is "
                          "ok for {}..{}\n".format(project, frm, to))
@@ -7837,7 +9723,11 @@ def _gather_manifest(conn, args, man):
         if slug not in todo:
             continue
         try:
-            bundle = acquire(_member_args(args, m, frm, to), os.environ)
+            member_args = _member_args(args, m, frm, to)
+            member_args.affiliation_manifest = man.get("affiliation")
+            member_args.affiliation_cache = affiliation_cache
+            member_args.people_stream = project     # the registry's stream roll-up
+            bundle = acquire(member_args, os.environ)
             summary = fold_bundle(conn, bundle, project=project, repo=slug,
                                   members=members,
                                   registry_by_slug=registry_by_slug,
@@ -7872,6 +9762,14 @@ def main(argv=None):
     # manifest fails fast instead of leaving an empty DB behind.
     man = manifest_mod.load_manifest(args.manifest) if getattr(
         args, "manifest", None) else None
+    # The retained people registry: loaded (and checked) before the store is
+    # touched; --people beats the manifest's `people`.
+    if man is not None and man.get("people") and not getattr(args, "people", None):
+        args.people_manifest = man["people"]
+    if getattr(args, "affiliation_enabled", True):
+        if people_run_from_args(args) is None and getattr(args, "people_offline", False):
+            raise SystemExit("error: --people-offline needs a people registry "
+                             "(--people PATH or the manifest's `people`)")
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
     failures = []

@@ -101,6 +101,18 @@ class TestCurrentMonthUnchanged(GitRepoCase):
         self.assertEqual(got.pop("newcomers"), {
             "collected": True, "before": CURRENT_FROM, "candidates": 0,
             "new": [], "unknown": [], "not_checked": []})
+        # Added by the module change notes after the golden was captured:
+        # this repo has no changelog, version file or tag.
+        self.assertEqual(got.pop("module_notes"), {
+            "collected": True, "changelogs": [], "versions": [],
+            "tags": {"collected": False, "reason": "the clone holds no tags"}})
+        # Added by the contributor affiliation check after the golden was
+        # captured: no PR / issue and no commit resolved to a login, so
+        # nobody to label and no call.
+        self.assertEqual(got.pop("affiliations"), {
+            "collected": True, "home_orgs": ["o"], "home_names": ["o"],
+            "home_email_domains": [], "people": {}, "unknown": [],
+            "not_checked": []})
         # The view contract version is now stamped on gather's bundle too
         # (one version everywhere); the golden was captured when it was 1.
         golden = json.loads(json.dumps(self._golden()[key]))

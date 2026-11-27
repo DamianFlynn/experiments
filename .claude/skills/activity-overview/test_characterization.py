@@ -58,6 +58,16 @@ the hall) re-captured char_bundle_p3b.json once, by a script that refused to
 write unless these were the only differences: `people.alice` and alice's
 `halls.fame` entry gained `own_pr_commits: 1` (commit c1 lands her merged
 PR #42) and that entry's `score` went from 3 to 2; the other four snapshots
+did not change. The story layer (#97: the discussion signal per train)
+re-captured char_bundle_p3.json once, by a script that refused to write unless
+every difference was a story-layer key added to a train or the view: its one
+train, train-issue-17, gained `discussion` = {comments 1, review_comments 1,
+participants 2, reviews all 0, review_rounds 0, reopens 0, text_chars 59,
+in_window 2, first_response_days null (the PR has no created_at),
+longest_silence {days 0.0, from 2026-05-10T10:00:00Z, to 2026-05-10T11:00:00Z,
+resumed_at …/pull/42#issuecomment-8001}, change_requests 0, bot_comments 0}; it
+qualifies for no story (2 turns, fewer than 3), so no `story*` key and no
+top-level `stories`; the other four snapshots have no human conversation and
 did not change. Unlike test_extract, this gate
 does NOT drop empty containers: we want an EXACT end-to-end snapshot, so a
 present-but-empty `people: []` is part of the locked shape. The snapshot file is

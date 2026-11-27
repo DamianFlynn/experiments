@@ -17,6 +17,7 @@ can import it without a cycle.
 """
 import datetime
 import json
+import os
 import re
 
 # GitHub user/org names: alphanumerics and single hyphens, not starting with a
@@ -199,7 +200,11 @@ def load_manifest(path):
      "repos": [{"owner": str, "repo": str, "registry": str|None,
                 "branch": str|None,
                 "bicep_registry_prefix": str|None}, ...],
-     "ticket_prefixes": [str, ...]}   # optional in the file; [] when absent
+     "ticket_prefixes": [str, ...],   # optional in the file; [] when absent
+     "affiliation": {...},            # only when the file has it: check_affiliation
+     "people": str}                   # only when the file has it: the people
+                                      # registry path, resolved against the
+                                      # manifest's directory
     `ticket_prefixes` (e.g. ["ABC", "PLAT"]) opts the project into digest.py's
     ticket clustering (`related_work`); see check_ticket_prefixes.
     Raises ValueError (message prefixed 'manifest: ') on any missing, mistyped or
@@ -311,8 +316,77 @@ def load_manifest(path):
         except ValueError as exc:
             raise ValueError("manifest: {}".format(exc)) from None
 
-    return {"project": project, "from": date_from, "to": date_to, "repos": repos,
-            "ticket_prefixes": ticket_prefixes}
+    out = {"project": project, "from": date_from, "to": date_to, "repos": repos,
+           "ticket_prefixes": ticket_prefixes}
+    # optional contributor-affiliation settings (gather's `affiliations`
+    # fact); the key is returned only when the file has it
+    if "affiliation" in raw:
+        try:
+            out["affiliation"] = check_affiliation(raw["affiliation"])
+        except ValueError as exc:
+            raise ValueError("manifest: {}".format(exc)) from None
+    # optional retained people registry (gather --people): a path relative to
+    # the manifest's own directory, so `../people.json` is the workspace's
+    # registry shared by every stream (USAGE 2.1) and `people.json` one of the
+    # stream's own
+    if "people" in raw:
+        value = raw["people"]
+        if not isinstance(value, str) or not value.strip() or "\n" in value:
+            raise ValueError("manifest: 'people' must be the path of the people "
+                             "registry (a non-empty string)")
+        out["people"] = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(path)), os.path.expanduser(value)))
+    return out
+
+
+AFFILIATION_VALUES = ("maintainer_org", "community", "unknown")
+_AFFILIATION_KEYS = ("home_orgs", "home_names", "home_email_domains", "overrides")
+_GROUP_RE = re.compile(r"^@([A-Za-z0-9][A-Za-z0-9_-]*)/([A-Za-z0-9][A-Za-z0-9_.-]*)$")
+_DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
+
+
+def check_affiliation(value, what="'affiliation'"):
+    """Return the manifest's affiliation settings, validated:
+    {"home_orgs": [GitHub org names], "home_names": [company names],
+     "home_email_domains": [domains], "overrides": {login | "@org/team":
+     "maintainer_org" | "community" | "unknown"}} — every key optional
+    (absent keys come back empty). Raises ValueError naming `what`."""
+    if not isinstance(value, dict):
+        raise ValueError("{} must be an object".format(what))
+    extra = sorted(set(value) - set(_AFFILIATION_KEYS))
+    if extra:
+        raise ValueError("{}: unknown key(s) {} (allowed: {})".format(
+            what, ", ".join(extra), ", ".join(_AFFILIATION_KEYS)))
+    out = {}
+    for key in ("home_orgs", "home_names", "home_email_domains"):
+        items = value.get(key, [])
+        if not isinstance(items, list) or not all(
+                isinstance(i, str) and i.strip() for i in items):
+            raise ValueError("{}.{} must be a list of non-empty strings".format(
+                what, key))
+        out[key] = list(items)
+    for org in out["home_orgs"]:
+        check_owner(org, "{}.home_orgs entry".format(what))
+    for d in out["home_email_domains"]:
+        if not _DOMAIN_RE.fullmatch(d.strip().lower()):
+            raise ValueError("{}.home_email_domains: {!r} is not a domain".format(
+                what, d))
+    overrides = value.get("overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("{}.overrides must be an object {{login: affiliation}}"
+                         .format(what))
+    for key, aff in overrides.items():
+        if aff not in AFFILIATION_VALUES:
+            raise ValueError("{}.overrides[{!r}] must be one of {}, got {!r}"
+                             .format(what, key, ", ".join(AFFILIATION_VALUES), aff))
+        if key.startswith("@"):
+            if not _GROUP_RE.fullmatch(key):
+                raise ValueError("{}.overrides: group {!r} must be @org/team"
+                                 .format(what, key))
+        else:
+            check_owner(key, "{}.overrides login".format(what))
+    out["overrides"] = dict(overrides)
+    return out
 
 
 # One path component of an OCI repository name (the public Bicep registry is an
