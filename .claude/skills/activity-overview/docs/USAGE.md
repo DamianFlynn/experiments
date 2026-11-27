@@ -9,8 +9,8 @@
 > (§5, incl. the series file §5.2 and reading the trust check §5.5), **forecasting** (§6),
 > **playbooks for each target estate** — Bicep, AVM Bicep, AVM Terraform, AI landing zone,
 > hub/platform landing zone, an enterprise Bicep landing zone on AVM (§7) — store management
-> (§8), readers and spotlight queries (§9), automation (§10), troubleshooting (§11) and
-> security (§12).
+> (§8), readers and spotlight queries (§9), automation (§10; the nightly gather job is
+> [`SCHEDULING.md`](SCHEDULING.md)), troubleshooting (§11) and security (§12).
 
 ---
 
@@ -118,6 +118,11 @@ export AO=~/.claude/skills/activity-overview
 ```
 
 ### 2.1 Recommended workspace layout
+
+> **Scheduled gathering.** With the nightly runner (`schedule.py`, [`SCHEDULING.md`](SCHEDULING.md))
+> this layout is created for you from a streams file (`<workspace>/<stream>/stores/YYYY-MM.db`,
+> one shared `people.json`, `status.json` per stream); keep that workspace on a local,
+> non-synced disk and write only the reports into a notes vault.
 
 Keep **one directory per report stream**, and inside it **one store per monthly installment**
 (`stores/YYYY-MM.db`). Month-to-month continuity lives in `series.json`, not in the store.
@@ -1432,7 +1437,12 @@ skeleton for the bundled sample) and `examples/formatters/shipped_changelog.py`.
 
 ## 10. Automation
 
-- **Deterministic part on a schedule.** A cron/launchd job can run `gather` + `validate` +
+- **Nightly gather (recommended).** `schedule.py run` keeps every stream's current month
+  store up to date (copy → gather → validate → atomic swap; the previous month re-gathered
+  for its first days; a lock, a run log and `status.json`), and `schedule.py latest` tells
+  the report step which store to read and refuses stale data. Setup, launchd / cron
+  templates and failure handling: [`SCHEDULING.md`](SCHEDULING.md).
+- **Deterministic part on a schedule (by hand).** A cron/launchd job can run `gather` + `validate` +
   `digest` on the 1st of each month for the previous month, so data is ready when you sit
   down. Example (Linux cron, 06:30 on the 1st):
 

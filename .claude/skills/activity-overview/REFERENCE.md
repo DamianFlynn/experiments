@@ -333,6 +333,24 @@ Then: `/activity <owner/repo> <from> <to> [options]` or `/activity --manifest PA
 flags) — it parses the args and defers to `SKILL.md` (gather → validate → view → link
 → render → slices → report).
 
+### Scheduled gathering
+
+`schedule.py` runs the gathers on a schedule (launchd / cron / CI) and tells the report
+step which store to read; full guide `docs/SCHEDULING.md`, example `examples/streams.json`.
+
+```bash
+python3 schedule.py check  --streams ~/activity-data/streams.json      # how the file resolves
+python3 schedule.py run    --streams ~/activity-data/streams.json --dry-run
+python3 schedule.py run    --streams ~/activity-data/streams.json [--stream ID] [--backfill 2026-08..2026-10] [--max-minutes 120]
+python3 schedule.py status --streams ~/activity-data/streams.json [--json]
+python3 schedule.py latest --streams ~/activity-data/streams.json --stream ID --last-days 7
+```
+
+The token is read by gather from `GITHUB_TOKEN` (else `GH_TOKEN`) in the runner's
+environment; nothing writes it to disk, and captured output is redacted. Exit codes:
+`run` 0 ok / 1 a window failed or skipped / 2 usage / 3 locked; `latest` 0 ok / 1 refused
+(stale, failed, missing) / 2 usage.
+
 ## Tests
 
 ```bash

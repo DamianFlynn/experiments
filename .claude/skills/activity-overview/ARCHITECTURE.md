@@ -704,6 +704,16 @@ or `--ticket-pattern`; unknown project/repo or a bad window exits 2.
 `--avm res|ptn|utl` (or `--index FILE|URL|-`) · `--project` · `--from`/`--to` ·
 `--kind`/`--status`/`--name-contains`/`--include`/`--exclude` · `--limit` · `--out`.
 
+### `schedule.py` — scheduled gather runner + store reader (network only through gather)
+`schedule.py run --streams FILE [--stream ID]… [--backfill YYYY-MM[..YYYY-MM]] [--dry-run] [--max-minutes N] [--today D] [--break-stale-lock]`
+(per enabled stream: whole-month windows — the current month with `--ref-date` today, the
+previous month again during its first `regather_previous_month_days`, carried days of the
+previous month for weekly streams — each gathered into a copy of `stores/YYYY-MM.db`,
+validated, then swapped in; lock, run log, `status.json`; exit 0 / 1 failed or skipped /
+2 usage / 3 locked) · `schedule.py latest --streams FILE --stream ID (--month M | --last-days N | --from F --to T) [--max-age-hours H] [--accept-stale]`
+(the store(s) to read, freshness, validate result; exit 1 = refused) · `status [--json]` ·
+`check`. docs/SCHEDULING.md.
+
 ### `transcript.py` — normalize a transcript
 `transcript.py PATH` (`.vtt`/`.srt`/`.txt`/`.md`; missing file → exit 2).
 
