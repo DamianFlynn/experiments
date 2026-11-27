@@ -51,13 +51,19 @@ delivered fact (14 modules without an owner by kind, the owner added, the deprec
 the one review state of each open pull request, the four proposed modules, and the
 automation accounts with all their pull requests.
 
-The issue holds 30 stories in full as written and 9 pending (14 landed, 10 in flight, 11
-stalled after activity in October 2026, 3 closed), 20 stalled threads carried over in one line
-each, and seven plumbing themes (six pending revision). Edits made at assembly to the writers'
-text: a folder link on the first unlinked mention of a module the view knows, vendor names of
-coding assistants replaced by "an automation account (a coding agent)", one sentence about the
-work package (not the record) removed, and italic cross-references between stories and themes
-that tell the same pull request (outside the story blocks).
+The revised stories and themes came back and were assembled: the issue holds 39 stories in
+full (14 landed, 10 in flight, 11 stalled after activity in October 2026, 3 closed; within each
+group new modules first, then changes, then breaking changes), 20 stalled threads carried over
+in one line each, and seven plumbing themes, each passing `--check-theme`. The theme files now
+carry every PR's full description; where the full text answered or changed a statement written
+from the 800-character cut, the theme was corrected (the probe runs of #7572, the cause cited
+by #7510, the limits of #7545, the reason given by #7144), and a sentence saying descriptions
+were cut was removed. Edits made at assembly to the writers' text: a folder link on the first
+unlinked mention of a module the view knows, vendor names of coding assistants replaced by "an
+automation account (a coding agent)" (one file path among them), one sentence about the work
+package (not the record) removed, italic cross-references between stories and themes that tell
+the same pull request (outside the story blocks), and four wordings the theme check rejected (a
+"#N (@login)" read as a name, a count the record does not hold, a quote with escaped quotes).
 
 The store, the view (105 MB), the work package and the slices are not kept here. All numbers
 come from that one October store; no month-over-month comparison is made. The "New modules"

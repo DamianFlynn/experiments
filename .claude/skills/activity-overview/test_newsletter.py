@@ -325,15 +325,22 @@ class TestOutline(unittest.TestCase):
 
     def test_every_story_in_full_grouped_by_state(self):
         st = section(newsletter.outline([view()]), "stories")
-        self.assertEqual([s["id"] for s in st["full"]], ["train-issue-5", "train-pr-11"])
-        self.assertEqual(st["full"][0]["title"], "Git config lost")
-        self.assertIn("--slice train-issue-5", st["full"][0]["slice"])
+        # within a group: new, then changed, then breaking (the owner's order);
+        # train-issue-5 is about the data factory's declared breaking change
+        self.assertEqual([(s["id"], s["story_kind"]) for s in st["full"]],
+                         [("train-pr-11", "changed"), ("train-issue-5", "breaking")])
+        self.assertEqual(st["full"][1]["title"], "Git config lost")
+        self.assertIn("--slice train-issue-5", st["full"][1]["slice"])
         self.assertEqual(st["group_source"], "provisional")
         self.assertEqual([s["id"] for s in st["groups"]["landed"]],
-                         ["train-issue-5", "train-pr-11"])
+                         ["train-pr-11", "train-issue-5"])
         self.assertNotIn("pointers", st)
         week = section(newsletter.outline([view()], cadence="week"), "stories")
-        self.assertEqual([s["id"] for s in week["full"]], ["train-issue-5", "train-pr-11"])
+        self.assertEqual([s["id"] for s in week["full"]], ["train-pr-11", "train-issue-5"])
+        # the intro's top story stays the highest-scoring one
+        lead = section(newsletter.outline([view()]), "intro")
+        self.assertEqual(next(f for f in lead["lead_with"] if f["fact"] == "stories")["top_story"],
+                         "train-issue-5")
 
     def test_provisional_groups_and_the_view_groups(self):
         v = view()
@@ -352,7 +359,7 @@ class TestOutline(unittest.TestCase):
         v["stories"]["quiet"] = [{"id": "train-pr-23", "score": 3, "idle_days": 40}]
         st = section(newsletter.outline([v]), "stories")
         g = {k: [x["id"] for x in rows] for k, rows in st["groups"].items() if rows}
-        self.assertEqual(g, {"landed": ["train-issue-5", "train-pr-11"],
+        self.assertEqual(g, {"landed": ["train-pr-11", "train-issue-5"],
                              "in_flight": ["train-pr-20"],
                              "stalled": ["train-pr-21", "train-pr-23"],
                              "plumbing": ["train-pr-22"]})
@@ -665,10 +672,11 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual(sorted(keys), ["o/r:train-issue-5", "o/r:train-pr-11",
                                         "o/s:train-issue-5", "o/s:train-pr-11"])
         self.assertIn("o__s__train-issue-5.slice.json",
-                      next(x for x in st["full"] if x["repo"] == "o/s")["slice"])
+                      next(x for x in st["full"] if x["repo"] == "o/s"
+                           and x["id"] == "train-issue-5")["slice"])
         # single repo keeps the plain id
         one = section(newsletter.outline([a]), "stories")
-        self.assertEqual(one["full"][0]["key"], "train-issue-5")
+        self.assertEqual(one["full"][0]["key"], "train-pr-11")
 
     def test_multi_repo_story_blocks_use_their_own_slice(self):
         a, b = self._two_repos()
@@ -1589,8 +1597,8 @@ class TestWorkPackage(unittest.TestCase):
             doc = newsletter.work_package([view()], d)
             self.assertEqual(doc["kind"], "newsletter_work_package")
             self.assertEqual([(m["key"], m["plan"], m["batch"]) for m in doc["stories"]],
-                             [("train-issue-5", "full", "stories-01"),
-                              ("train-pr-11", "full", "stories-01")])
+                             [("train-pr-11", "full", "stories-01"),
+                              ("train-issue-5", "full", "stories-01")])
             sl = json.load(open(os.path.join(d, "slices", "train-issue-5.slice.json")))
             self.assertIn("newsletter_links", sl)
             self.assertEqual(sl["train"]["id"], "train-issue-5")
@@ -1603,6 +1611,30 @@ class TestWorkPackage(unittest.TestCase):
             brief = open(os.path.join(d, "batches", "stories-01", "STORY_BRIEF.md")).read()
             self.assertIn("Stories (the story brief)", brief)
             self.assertIn("Where it stands", brief)
+
+    def test_theme_and_row_files_carry_full_descriptions_and_child_releases(self):
+        v = view()
+        long = "### Description\n\n" + "word " * 400 + "THE END"
+        v["prs"][2]["body"] = long
+        v["prs"][0]["body"] = long
+        with tempfile.TemporaryDirectory() as d:
+            newsletter.work_package([v], d, view_paths=["/x/v.json"])
+            th = json.load(open(os.path.join(d, "rows", "theme-ci.json")))
+            pr12 = next(p for p in th["theme"]["prs"] if p["number"] == 12)
+            self.assertTrue(pr12["description"].endswith("THE END"))
+            self.assertIn("THE END", pr12["body"])
+            row = json.load(open(os.path.join(d, "rows", "train-issue-5.row.json")))
+            self.assertTrue(row["pr_details"][0]["description"].endswith("THE END"))
+            fac = row["module_releases"]["avm/res/data/factory"]
+            self.assertEqual(fac["child_releases"][0]["module"], "avm/res/data/factory/pipe")
+            batch = open(os.path.join(d, "batches", "theme-ci", "BATCH.md")).read()
+            self.assertIn("--check-theme", batch)
+            self.assertIn("/x/v.json", batch)
+        # the outline keeps its cut, and says so
+        mc = section(newsletter.outline([v]), "module_changes")
+        fac = next(m for m in mc["modules"] if m["area"] == "avm/res/data/factory")
+        self.assertEqual(len(fac["pr_details"][0]["description"]), newsletter.PR_DESCRIPTION_CAP)
+        self.assertTrue(fac["pr_details"][0]["description_cut"])
 
     def test_batches_respect_the_story_limit(self):
         v = view()
@@ -1682,6 +1714,11 @@ class TestUpdatePass(unittest.TestCase):
         # a sentence naming two PRs or a condition states nothing about one
         r = self.claims("## People\n\nOnce [#21](" + R + "/pull/21) is approved it can merge.\n")
         self.assertEqual(r["review_state_mismatch"], [])
+
+    def test_a_count_of_many_prs_states_nothing_about_one(self):
+        r = self.claims("## Plumbing: what was engineered\n\n2 were merged, 1 was closed without "
+                        "merging and one, [#21](" + R + "/pull/21), is an open draft.\n")
+        self.assertEqual(r["pr_state_mismatch"], [])
 
     def test_sections_disagreeing_without_a_view_state_fail(self):
         v = self.v()
@@ -1882,6 +1919,80 @@ class TestUpdatePass(unittest.TestCase):
             with contextlib.redirect_stdout(buf):
                 newsletter.main([vp, "--outline", "--monthly"])
             self.assertEqual(json.loads(buf.getvalue())["cadence"], "month")
+
+
+class TestThemeCheck(unittest.TestCase):
+    """A theme narrative is checked like a story: quotes, PR and review
+    states, release claims, numbers, items, people, not only heading and
+    links."""
+
+    THEME = ("### CI workflows and pipeline utilities\n\n"
+             "A pipeline action was bumped in [#12](https://github.com/o/r/pull/12) by "
+             "Jared Holt (@jared).\n")
+
+    def check(self, text, v=None):
+        return newsletter.check_theme([v or view()], text)
+
+    def test_good_theme_passes(self):
+        r = self.check(self.THEME)
+        self.assertTrue(r["ok"], {k: x for k, x in r.items() if x and k not in ("ok", "theme")})
+        self.assertEqual(r["theme"], "ci")
+
+    def test_a_bare_item_reference_states_what_its_description_says(self):
+        v = view()
+        v["prs"][2]["body"] = "Pins tool 0.4.2 and runs it 37 times."
+        r = self.check(self.THEME + "\n#12 pins tool 0.4.2 and runs it 37 times.\n", v)
+        self.assertEqual((r["versions_not_in_view"], r["numbers_not_in_view"]), ([], []))
+        r = self.check(self.THEME + "\nIt pins tool 0.4.9.\n", v)
+        self.assertTrue(r["versions_not_in_view"])
+
+    def test_heading_and_trains(self):
+        r = self.check(self.THEME.replace("### CI workflows and pipeline utilities", "### Other"))
+        self.assertTrue(r["heading_missing"])
+        self.assertFalse(r["ok"])
+        v = TestDeliveredContract().v()
+        r = newsletter.check_theme([v], "### CI workflows\n\nNothing named here.\n")
+        self.assertEqual(r["theme"], "ci_workflows")
+        self.assertEqual([x["key"] for x in r["theme_trains_missing"]], ["train-pr-12"])
+        r = newsletter.check_theme([v], "### CI workflows\n\nA bump in "
+                                   "[#12](https://github.com/o/r/pull/12).\n")
+        self.assertEqual(r["theme_trains_missing"], [])
+
+    def test_quotes_numbers_items_and_people(self):
+        r = self.check(self.THEME + "\nIts description says \"this never happened at all\".\n")
+        self.assertEqual(r["quotes_not_in_view"], ["this never happened at all"])
+        r = self.check(self.THEME + "\nIt ran 37 times.\n")
+        self.assertEqual(r["numbers_not_in_view"], ["37"])
+        r = self.check(self.THEME + "\nSee [#99](https://github.com/o/r/pull/99).\n")
+        self.assertIn(99, r["items_not_in_view"])
+        r = self.check(self.THEME.replace("Jared Holt", "Jarred Holt"))
+        self.assertTrue(r["name_mismatch"])
+        self.assertFalse(r["ok"])
+
+    def test_pr_state_review_state_and_release_claims(self):
+        r = self.check(self.THEME + "\n[#12](https://github.com/o/r/pull/12) is still open.\n")
+        self.assertEqual(r["pr_state_mismatch"][0]["pr"], 12)
+        v = view()
+        v["prs"][2]["review_state"] = {"state": "approved"}
+        r = self.check(self.THEME + "\n[#12](https://github.com/o/r/pull/12) is awaiting a first "
+                       "review.\n", v)
+        self.assertEqual(r["review_state_mismatch"][0]["view"], "approved")
+        r = self.check(self.THEME + "\n[`avm/res/hci/cluster`](" + T + "avm/res/hci/cluster) "
+                       "0.3.0 was published.\n")
+        self.assertEqual(r["release_status_mismatch"][0]["view"], "declared_not_published")
+        self.assertFalse(r["ok"])
+
+    def test_cli(self):
+        with tempfile.TemporaryDirectory() as d:
+            vp = os.path.join(d, "v.json")
+            json.dump(view(), open(vp, "w"))
+            tp = os.path.join(d, "t.md")
+            open(tp, "w").write(self.THEME)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    newsletter.main([vp, "--check-theme", tp, "--theme", "ci"])
+            self.assertEqual(cm.exception.code, 0, buf.getvalue())
 
 
 class TestCli(unittest.TestCase):

@@ -125,7 +125,10 @@ minor version is stated as the changelog and version say it; where the repositor
 says breaking changes bump the MAJOR version, quote that once in this section next to the first
 such change, without explaining.
 
-**Stories** — every story of the window, grouped by state: `groups` {landed, in_flight,
+**Stories** — every story of the window, grouped by state and, within a group, in the
+owner's order — stories about a new module (`story_kind: new`: a proposed or new module), then
+changes (`changed`), then breaking changes (`breaking`: a module with a declared breaking
+change) — each part by score: `groups` {landed, in_flight,
 stalled, closed, plumbing} from the view's `stories.all` (`group_source: view`; closed = closed
 or rejected without landing) or, until the view has it, provisionally from the train
 (`group_source: provisional`: shipped → landed; in flight with `effort.stalled` → stalled; in
@@ -160,15 +163,29 @@ python3 newsletter.py workspace/view/bundle.json --work-package workspace/wp
 ```
 
 writes every `full` story's slice (with `newsletter_links`) and outline row (with
-`prompted_by`, `pr_details`, people), one theme file per plumbing theme, `manifest.json` (every
+`prompted_by`, `pr_details` with each PR's **full** description and body as last gathered — the
+outline keeps `PR_DESCRIPTION_CAP` (800) characters and marks a cut `description_cut` —,
+people, and `module_releases`: per module the release rows and `child_releases` with their
+`contents`), one theme file per plumbing theme (its PRs with full descriptions and bodies), `manifest.json` (every
 story in issue order with its plan, slice size and batch) and batches for parallel writers:
 stories in batches of at most `WORK_PACKAGE_BATCH` (8) stories and `WORK_PACKAGE_BYTES`
 (1.5 MB) of slices, of roughly equal slice size, and one batch per plumbing theme. Each batch
 directory holds `BATCH.md` (the files to read, the files to write, the check command per story)
 and `STORY_BRIEF.md` (the story brief plus the newsletter rules below). A writer gets only the
-batch path; it checks every story with `link.py --check-story` before handing it back. The
-issue is then assembled: each pending marker replaced by its story (in its group, in
-`stories.all` order) or theme (in theme order), and `--check-newsletter` run on the whole.
+batch path; it checks every story with `link.py --check-story`, and a theme narrative with
+
+```bash
+python3 newsletter.py workspace/view/bundle.json --check-theme wp/out/theme-<id>.md --theme <id>
+```
+
+before handing it back. The theme check verifies what the story check verifies for a story:
+the `### <title_hint>` heading and every `in_theme` train named, and, as `--check-newsletter`
+does for the plumbing section, every quote verbatim in the record, URLs, items, modules,
+versions, people and names, numbers (in the view or in the PRs the paragraph links or names as
+`#N`), each PR's review state and open / merged / closed state and each version's release
+status as the view has them, dates with their year, no characterising word. The issue is then
+assembled: each pending marker replaced by its story (in its group, in the outline's group
+order) or theme (in theme order), and `--check-newsletter` run on the whole.
 
 **Updating an issue for a newer store.** Build a new work package from the new view (keep the
 old one), then re-check every written story and theme against it: the story check against the
@@ -339,7 +356,8 @@ It fails (exit 1) and lists:
 | `modules_not_linked` / `versions_not_linked` | in New modules, What changed, Breaking, Module ownership, People and Coming up: a module path the view knows (a module or a versioned child) that is not inside a link's text; a published version written right after a module path that is not a link |
 | `release_status_missing` | in New modules, What changed and People: a sentence that names a PR or module and says landed / merged / shipped, with no release status ("released as", "published", "not yet published", "declared in the changelog", "no version change", "release status not known") in it or the next sentence |
 | `ownership_not_in_view` | a module named in the Module ownership section that `module_ownership` does not hold (events, without an owner now or at the start, deprecated, stub, labelled) |
-| `review_state_mismatch` / `pr_state_mismatch` / `release_status_mismatch` | **one state per fact**, over the whole issue including story blocks (quoted text and comments blanked): a sentence that names exactly one PR and states its review state ("approved", "approved before …", "changes requested", "waiting for a first review", "reviewed only by automation", "ready to merge") that the PR's `review_state` does not hold, or that another section's sentence about the same PR contradicts; the same for a PR's open / merged / closed-without-merging state, and for a module version said to be published or not yet published against its release status. A conditional sentence ("once", "if", "until") states nothing |
+| `heading_missing` (theme check only) | a theme narrative whose first line is not `### <title_hint>` of its theme |
+| `review_state_mismatch` / `pr_state_mismatch` / `release_status_mismatch` | **one state per fact**, over the whole issue including story blocks (quoted text and comments blanked): a sentence that names exactly one PR and states its review state ("approved", "approved before …", "changes requested", "waiting for a first review", "reviewed only by automation", "ready to merge") that the PR's `review_state` does not hold, or that another section's sentence about the same PR contradicts; the same for a PR's open / merged / closed-without-merging state, and for a module version said to be published or not yet published against its release status. A conditional sentence ("once", "if", "until"), or one counting many PRs ("10 were closed without merging and one, #N, is open"), states nothing about one PR |
 | `automation_as_person` | an automation account written as "Name (@login)", or mentioned in a sentence without the marker word "automation" |
 | `modules_not_in_view` | a module path that is not a module, child, code area, path the view's changelogs / PR titles name, or the module an issue form names |
 | `versions_not_in_view` | a version that does not belong to its module (versions indexed by the module they belong to; a version right after a module path is that module's; any other must belong to a module the paragraph names, a named child or a child of a named parent) |
