@@ -1332,12 +1332,12 @@ def _fact_signatures(value):
 # What an `affiliations` person entry may hold (gather decide_affiliation,
 # find_affiliations_registry): the label, the signal name, its strength and
 # the email-domain boolean, and - with the retained people registry - the
-# display name, the maintainer property for the window's repository and its
-# signal. Never a company, other profile text or an email (the privacy
-# contract).
+# display name, the maintainer property for the window's repository, its
+# signal and its lifecycle status at gather time. Never a company, other
+# profile text or an email (the privacy contract).
 _AFFILIATION_ENTRY_KEYS = {"affiliation", "signal", "strength",
                            "home_email_domain", "name", "maintainer",
-                           "maintainer_signal"}
+                           "maintainer_signal", "maintainer_status"}
 _AFFILIATION_FACT_KEYS = {"collected", "home_orgs", "home_names",
                           "home_email_domains", "people", "unknown",
                           "not_checked", "groups_unresolved", "windows",
@@ -1360,8 +1360,8 @@ def _affiliations_problem(value):
         e = people[login]
         if not isinstance(e, dict) or not set(e) <= _AFFILIATION_ENTRY_KEYS:
             return "affiliations.people[{!r}] holds more than the label, signal, " \
-                   "strength, home_email_domain, name, maintainer and " \
-                   "maintainer_signal".format(login)
+                   "strength, home_email_domain, name, maintainer, " \
+                   "maintainer_signal and maintainer_status".format(login)
         if e.get("affiliation") not in gather.AFFILIATIONS:
             return "affiliations.people[{!r}].affiliation {!r} is not one gather " \
                    "writes".format(login, e.get("affiliation"))
@@ -1390,8 +1390,18 @@ def _affiliations_problem(value):
                 e["maintainer_signal"] not in people_mod.MAINTAINER_SIGNALS:
             return "affiliations.people[{!r}].maintainer_signal {!r} is not one " \
                    "gather writes".format(login, e["maintainer_signal"])
+        if "maintainer_status" in e and (
+                e["maintainer_status"] not in people_mod.MAINTAINER_STATUSES
+                or "maintainer" not in e
+                or (e["maintainer_status"] == "former" and e["maintainer"])):
+            return "affiliations.people[{!r}].maintainer_status {!r} is not one " \
+                   "gather writes (one of {}, beside maintainer; former is " \
+                   "never a maintainer)".format(
+                       login, e["maintainer_status"],
+                       ", ".join(people_mod.MAINTAINER_STATUSES))
         if e.get("signal") == "do_not_name" and (
-                set(e) & {"name", "maintainer", "maintainer_signal"}
+                set(e) & {"name", "maintainer", "maintainer_signal",
+                          "maintainer_status"}
                 or e.get("affiliation") != "unknown"):
             return "affiliations.people[{!r}] is do_not_name but carries a " \
                    "label".format(login)

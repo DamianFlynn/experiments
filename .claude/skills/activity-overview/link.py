@@ -16,6 +16,7 @@ import series  # Phase 13: series continuity (installment_snapshot / compute_ser
 # are byte-identical to before — `link.enrich` calls the same functions, now
 # resolving to the names imported from derive (one-way: link -> derive).
 import derive
+import people as people_mod  # registry context (link --people)
 from derive import (
     ref,
     attribute_code_areas,
@@ -4379,7 +4380,7 @@ def _null_collections_to_empty(bundle):
     return bundle
 
 
-def enrich(bundle, priority_patterns=(), path_rules=()):
+def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     """Deterministically enrich a bundle in place: commit->PR, trains, buckets,
     the window narrative projections (timeline/feature_deltas) and Phase 3b
     code-area attribution (code_area/area/modules). Label facets and `kind` are
@@ -4448,6 +4449,10 @@ def enrich(bundle, priority_patterns=(), path_rules=()):
     # about (module layer). Only when the view carries the gathered
     # `affiliations` or `newcomers` facts (omit-when-absent).
     build_contributors(bundle, path_rules)
+    # Registry context (link --people / `people_source`): what the people
+    # registry knows of the people the report names, beyond the window, read
+    # as of the view's end and stamped; nothing without a source.
+    build_people_context(bundle, people_source)
     return bundle
 
 
@@ -4652,7 +4657,7 @@ def _maintainer_summary(people):
             return "unknown"
         return "maintainer" if p["maintainer"] else "non_maintainer"
     counts = {k: 0 for k in keys}
-    signals, cross, logins = {}, {}, []
+    signals, cross, logins, statuses = {}, {}, [], {}
     for login in sorted(humans, key=str):
         p = humans[login]
         b = bucket(p)
@@ -4661,25 +4666,26 @@ def _maintainer_summary(people):
             logins.append(login)
             sig = p.get("maintainer_signal")
             signals[sig] = signals.get(sig, 0) + 1
+        if p.get("maintainer_status"):
+            statuses.setdefault(p["maintainer_status"], []).append(login)
         aff = p.get("affiliation") or "unknown"
         row = cross.setdefault(aff, {k: 0 for k in keys})
         row[b] += 1
-    return {"people": counts,
-            "signals": {k: signals[k] for k in sorted(signals, key=str)},
-            "by_affiliation": {k: cross[k] for k in sorted(cross)},
-            "logins": logins}
+    out = {"people": counts,
+           "signals": {k: signals[k] for k in sorted(signals, key=str)},
+           "by_affiliation": {k: cross[k] for k in sorted(cross)},
+           "logins": logins}
+    if statuses:
+        # the lifecycle at gather time: a `former` maintainer is counted as a
+        # non-maintainer above and listed here
+        out["by_status"] = {k: statuses[k] for k in people_mod.MAINTAINER_STATUSES
+                            if k in statuses}
+    return out
 
 
-def slice_participants(bundle, train):
-    """{"participants": {login: {name?, maintainer?, maintainer_signal?,
-    affiliation?}}} for the humans of one train (authors, mergers,
-    reviewers, commenters of its issues and PRs, its commit authors), so a
-    narrator can name them; {} when the view's people carry no display name
-    or maintainer property (omit-when-absent). The login stays the key;
-    a do_not_name person has no name and no label. Pure."""
-    people = bundle.get("people") or {}
-    if not any(k in p for p in people.values() for k in derive.PERSON_LABEL_KEYS):
-        return {}
+def _train_logins(bundle, train):
+    """The logins of one train: authors, mergers, reviewers, commenters of
+    its issues and PRs, its commit authors (None removed)."""
     pr_index = {p["number"]: p for p in bundle.get("prs", [])}
     issue_index = {i["number"]: i for i in bundle.get("issues", [])}
     issues, prs = _train_members(train, pr_index, issue_index)
@@ -4695,6 +4701,26 @@ def slice_participants(bundle, train):
     commits = {c.get("sha"): c for c in bundle.get("commits", [])}
     for sha in train.get("commits") or []:
         logins.add((commits.get(sha) or {}).get("author"))
+    logins.discard(None)
+    return logins
+
+
+def slice_participants(bundle, train):
+    """{"participants": {login: {name?, maintainer?, maintainer_signal?,
+    maintainer_status?, affiliation?, registry_context?}}} for the humans of
+    one train (authors, mergers, reviewers, commenters of its issues and
+    PRs, its commit authors), so a narrator can name them; {} when the
+    view's people carry no display name or maintainer property and the view
+    has no `people_context` (omit-when-absent). `registry_context` is the
+    person's entry of `people_context` (link --people: registry context, not
+    a fact of the window). The login stays the key; a do_not_name person has
+    no name, no label and no registry context. Pure."""
+    people = bundle.get("people") or {}
+    context = (bundle.get("people_context") or {}).get("people") or {}
+    if not any(k in p for p in people.values() for k in derive.PERSON_LABEL_KEYS) \
+            and not context:
+        return {}
+    logins = _train_logins(bundle, train)
     out = {}
     for login in sorted(k for k in logins if k and k in people):
         p = people[login]
@@ -4703,8 +4729,77 @@ def slice_participants(bundle, train):
         row = derive.person_labels(p)
         if p.get("affiliation") and p.get("affiliation_signal") != "do_not_name":
             row["affiliation"] = p["affiliation"]
+        if login in context:
+            row["registry_context"] = context[login]
         out[login] = row
     return {"participants": out}
+
+
+# --- registry context (link --people) ----------------------------------------
+#
+# What the people registry knows of the people a report names, beyond the
+# window: "also maintains ...", "active in this repo since <date, as
+# observed>", "N merged PRs here in the last 6 months", the maintainer status.
+# Registry context, never a fact of the window: it is read only with an
+# explicit `--people PATH`, only from the registry's windows that END BY THE
+# VIEW'S END (an old report keeps the context it had, whatever was gathered
+# since), and stamped with the registry files' sha256 so a reader can tell
+# which registry state produced it. Without `--people` nothing is added.
+
+def _named_people(bundle):
+    """The logins a report names: newcomers and hall entries
+    (`contributors`), story participants (trains with `story`), and the
+    authors of the PRs that introduced a new module (`module_changes`)."""
+    c = bundle.get("contributors") or {}
+    names = {r.get("login") for r in c.get("newcomers") or []}
+    names |= {r.get("login") for r in c.get("hall") or []}
+    names |= {h.get("login") for h in (bundle.get("halls") or {}).get("fame") or []}
+    for t in bundle.get("trains") or []:
+        if t.get("story"):
+            names |= _train_logins(bundle, t)
+    authors = {p.get("number"): p.get("author") for p in bundle.get("prs") or []}
+    for m in (bundle.get("module_changes") or {}).get("modules") or []:
+        for s in m.get("introduced_by") or []:
+            names.add(authors.get(s.get("pr")))
+    people = bundle.get("people") or {}
+    return sorted(k for k in names if k and not (people.get(k) or {}).get("is_bot")
+                  and (people.get(k) or {}).get("affiliation_signal") != "do_not_name")
+
+
+def build_people_context(bundle, source):
+    """bundle["people_context"] from the people registry `source`
+    (people.load_view_source), for the people the report names
+    (_named_people): {"kind": "registry_context", "note", "repo", "as_of"
+    (the view's end: only windows ending by then are read), "registry"
+    (people.registry_stamp), "thresholds", "coverage" (this repository's,
+    as of), "people": {login: people.writer_context}}. A do_not_name person
+    and a person the registry does not know are left out. Nothing is added
+    without a source. Pure over the bundle (in place)."""
+    if not source:
+        return bundle
+    meta = bundle.get("meta") or {}
+    repo = meta.get("repo") or ""
+    slug = repo if "/" in repo else "{}/{}".format(meta.get("owner"), repo)
+    as_of = str(meta.get("to") or "")[:10] or None
+    reg, act, limits = source["registry"], source["activity"], source["limits"]
+    out = {}
+    for login in _named_people(bundle):
+        ctx = people_mod.writer_context(reg, act, login, slug, as_of, limits)
+        if ctx:
+            out[login] = ctx
+    cov = people_mod.coverage(act, slug, as_of)
+    bundle["people_context"] = {
+        "kind": "registry_context",
+        "note": "from the people registry, not a fact of this window: windows "
+                "gathered up to {}; every first and total is as observed "
+                "since the coverage start".format(as_of),
+        "repo": slug, "as_of": as_of,
+        "registry": people_mod.registry_stamp(source["people_text"],
+                                              source["activity_text"], act, as_of),
+        "thresholds": dict(limits),
+        "coverage": {k: v for k, v in (cov or {}).items() if k != "intervals"},
+        "people": out}
+    return bundle
 
 
 def _community_summary(bundle, rows, people, newcomer_rows):
@@ -4968,7 +5063,8 @@ def _load_bundle(path):
 
 
 _USAGE = ("usage: link.py BUNDLE.json [--slice TRAIN_ID | --series series.json] "
-          "[--priority-label PATTERN ...] [--path-class CLASS=GLOB ...]\n"
+          "[--priority-label PATTERN ...] [--path-class CLASS=GLOB ...] "
+          "[--people people.json]\n"
           "       link.py SLICE.json --check-story STORY.md\n")
 _HELP = _USAGE + """
 Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
@@ -4990,8 +5086,31 @@ Enrich a bundle/view with trains and buckets, rewriting BUNDLE.json in place.
                        classify files matching GLOB as CLASS (source, tests,
                        docs, generated, metadata, ci) in module_changes,
                        before the default rules; repeatable
+  --people PATH        add `people_context`: registry context (not a fact of
+                       the window) for the people the report names, read from
+                       the people registry at PATH and its activity file,
+                       only from windows ending by the view's end, stamped
+                       with the files' sha256; story slices carry it per
+                       participant
   -h, --help           show this help and exit
 """
+
+
+def _split_people(argv):
+    """(argv without `--people PATH`, PATH or None); None for the whole
+    result when `--people` is repeated or has no value."""
+    rest, path = [], None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--people":
+            if path is not None or i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                return None
+            path = argv[i + 1]
+            i += 2
+            continue
+        rest.append(argv[i])
+        i += 1
+    return rest, path
 
 
 def _parse_argv(argv):
@@ -5057,11 +5176,20 @@ def main(argv=None):
         json.dump(result, sys.stdout, indent=2)
         sys.stdout.write("\n")
         raise SystemExit(0 if result["ok"] else 1)
-    parsed = _parse_argv(list(argv))
+    split = _split_people(list(argv))
+    parsed = _parse_argv(split[0]) if split else None
     if parsed is None:
         sys.stderr.write(_USAGE)
         raise SystemExit(2)
     path, slice_id, series_path, priority_patterns, path_rules = parsed
+    people_source = None
+    if split[1] is not None:
+        try:
+            people_source = people_mod.load_view_source(split[1])
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("link.py: error: people registry {}: {}\n".format(
+                split[1], exc))
+            raise SystemExit(2)
     bundle = _load_bundle(path)
     # Load (and shape-check) the series index BEFORE any work, so a malformed
     # index stops the run with rc 2 and nothing is written.
@@ -5071,7 +5199,7 @@ def main(argv=None):
         problem = _series_bundle_problem(bundle.get("meta", {}), installments)
         if problem is not None:
             _series_refusal(series_path, problem)
-    enrich(bundle, priority_patterns, path_rules)
+    enrich(bundle, priority_patterns, path_rules, people_source=people_source)
     if series_path is not None:
         # Phase 13: series continuity, idempotent by window (#86). Compare
         # against the installment immediately BEFORE this window and record

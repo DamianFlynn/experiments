@@ -599,7 +599,8 @@ section) every entry also carries, for the labels used in that window:
 
 ```json
 "octo":          {"affiliation": "maintainer_org", "signal": "public_membership", "strength": "strong",
-                  "name": "Octo Cat", "maintainer": true, "maintainer_signal": "merged_others_pr"},
+                  "name": "Octo Cat", "maintainer": true, "maintainer_signal": "merged_others_pr",
+                  "maintainer_status": "active"},
 "quiet-person":  {"affiliation": "unknown", "signal": "do_not_name"},
 "not-yet-seen":  {"affiliation": "unknown", "signal": "not_checked", "maintainer": false,
                   "maintainer_signal": "none"}
@@ -612,6 +613,9 @@ section) every entry also carries, for the labels used in that window:
   (`operator`, `merged_others_pr`, `OWNER`, `merged_own_pr`, `COLLABORATOR`,
   `approving_reviewer`), or `false` with `operator` (the owner said so) or `none` (no
   evidence of write access in anything the registry has seen for that repository).
+- `maintainer_status` — only when the registry holds maintainer evidence for the
+  repository: its lifecycle at gather time, `active` / `lapsed` / `former` / `unknown`
+  (see "The people registry"); `former` always comes with `maintainer: false`.
 - signal `do_not_name` — the owner marked the person `do_not_name`: no name, no maintainer
   property, label `unknown`, no API call. Every output shows the login only.
 - signal `not_checked` — with the registry, a person not looked up (over the cap, offline,
@@ -620,24 +624,31 @@ section) every entry also carries, for the labels used in that window:
 
 **What is stored about a person:** the login (already in every record), the label, the
 signal name, its strength, the `home_email_domain` boolean and, with the registry, the
-display name and the maintainer property with its signal. Never the profile company or any
-other profile text, never an email address or a domain of a non-home address.
-`validate.py` refuses a stored `affiliations` value whose entries carry anything else (or a
-`do_not_name` entry that carries a name or a maintainer property).
+display name and the maintainer property with its signal and status. Never the profile
+company or any other profile text, never an email address or a domain of a non-home
+address. `validate.py` refuses a stored `affiliations` value whose entries carry anything
+else (or a `do_not_name` entry that carries a name or a maintainer property, or a
+`maintainer_status` that is not one of the four, has no `maintainer` beside it, or is
+`former` with `maintainer: true`).
 
-### The people registry (`people.json`, outside the store)
+### The people registry (`people.json` + `people-activity.json`, outside the store)
 
-One JSON file per workspace (default `<stream>/people.json`, next to `stores/`), one entry
-per GitHub login, shared by every gather of the stream — all months, all repositories — so
-a person is looked up once and refreshed rarely (`people.py`; USAGE §5.7). It is the
-owner's to read and edit; gather never needs it to read a store, and no view reads it.
+Two JSON files per workspace — one registry shared by every stream (default
+`~/activity/people.json` and the generated `people-activity.json` beside it; USAGE §2.1) —
+one entry per GitHub login, shared by every gather — all months, all repositories, all
+streams — so a person is looked up once and refreshed rarely, and their roles and activity
+are known across repositories (`people.py`; USAGE §5.7). `people.json` is the owner's to
+read and edit; `people-activity.json` is generated. gather never needs them to read a
+store, and no view reads them unless `link.py --people` asks for registry context.
 
 ```json
 {"format": "activity-overview/people", "version": 1,
  "people": {"octo": {"login": "octo", "name": "Octo Cat",
                     "affiliation": "maintainer_org", "signal": "public_membership", "strength": "strong",
                     "maintainer_of": {"Azure/bicep-registry-modules": {"maintainer": true,
-                        "signal": "merged_others_pr", "strength": "strong", "last_evidence": "2026-10-29"}},
+                        "signal": "merged_others_pr", "strength": "strong",
+                        "first_evidence": "2025-02-03", "last_evidence": "2026-10-29"},
+                        "Azure/bicep": "former"},
                     "first_seen": {"date": "2025-01-07", "repo": "Azure/bicep-registry-modules"},
                     "last_seen": {"date": "2026-10-31", "repo": "Azure/bicep-registry-modules"},
                     "looked_up_at": "2026-11-26", "source": "lookup", "tags": ["known"]}}}
@@ -648,9 +659,9 @@ owner's to read and edit; gather never needs it to read a store, and no view rea
 | `login` | skill | the key repeated (logins match ignoring case) |
 | `name` | lookup, or you | the profile's display name (from the same `users/{login}` response as the company signal) |
 | `affiliation` / `signal` / `strength` | lookup, or you | the latest label decided from GitHub data (`author_association`, `public_membership`, `profile_company`, `none`) |
-| `maintainer_of` | skill, or you | `{repo: evidence}` — write access per repository; a plain `true` / `false` is yours |
+| `maintainer_of` | skill, or you | `{repo: evidence}` — write access per repository (`maintainer`, `signal`, `strength`, `first_evidence`, `last_evidence`); a plain `true` / `false` / `"former"` is yours |
 | `tags` | you only | free-form (`known`, `mvp`, …) |
-| `first_seen` / `last_seen` | skill | `{date, repo}` of the earliest / latest activity gathered |
+| `first_seen` / `last_seen` | skill | `{date, repo}` of the earliest / latest activity anywhere, as gathered (the global summary of the per-repository profile) |
 | `looked_up_at` | skill | date of the last profile / membership lookup |
 | `home` | skill | the home settings the label was decided against (home organisations, then names); reused only under the same settings |
 | `source` | skill / you | `lookup` (written by the skill) or `operator` (yours: every decided field pinned) |
@@ -659,11 +670,51 @@ owner's to read and edit; gather never needs it to read a store, and no view rea
 | `note` | you only | free text |
 
 **Operator edits win.** `source: "operator"` or `locked: true` pins `name`, `affiliation`
-and `maintainer_of`; `locked: [...]` pins the fields listed; a plain `true` / `false` in
-`maintainer_of` is the operator's for that repository. Pinned fields, `tags`,
-`do_not_name` and `note` are never written by the skill; `first_seen` / `last_seen` always
-are. Any other key, a bad value or two keys that are the same login is an error naming the
-entry (gather stops before touching the store); the file is never reset.
+and `maintainer_of`; `locked: [...]` pins the fields listed; a plain `true` / `false` /
+`"former"` in `maintainer_of` is the operator's for that repository. Pinned fields, `tags`,
+`do_not_name` and `note` are never written by the skill; `first_seen` / `last_seen` and the
+activity file always are. Any other key, a bad value or two keys that are the same login is
+an error naming the entry (gather stops before touching the store); the file is never
+reset. A file written before the activity profile is read as it is (the format stays
+version 1: the profile only added optional fields); the next gather or seed adds them.
+
+**The activity file** (`people-activity.json`; `people.py` "the activity profile"):
+
+```json
+{"format": "activity-overview/people-activity", "version": 1, "months_kept": 36,
+ "repos": {"Azure/bicep-registry-modules": {"stream": "avm-bicep", "windows": {
+     "2026-09-01..2026-09-30": {"source": "gather", "people": 81, "unresolved_commit_authors": 0}},
+     "before": {"from": "2023-01-01", "to": "2023-09-30", "windows": 9}}},
+ "people": {"octo": {"Azure/bicep-registry-modules": {
+     "2026-09-01..2026-09-30": {"first": {"merge": ["2026-09-01", 7306], "comment": "2026-09-02"},
+                                "last": {"merge": ["2026-09-30", 7428], "comment": "2026-09-24"},
+                                "months": {"2026-09": {"merges": 40, "merges_others": 2, "comments": 10}},
+                                "first_ever": "2026-09-01"}}}},
+ "seen_before": {"octo": {"Azure/bicep-registry-modules": "2025-01-07"}}}
+```
+
+| Key | Meaning |
+|---|---|
+| `repos[repo].windows` | the coverage: every gathered window `FROM..TO` with its `source` (`gather` / `seed`), the people with an event in it and the commits whose author has no login |
+| `repos[repo].stream` | the manifest project (or `seed --stream`) the repository belongs to: the per-stream roll-up |
+| `repos[repo].before` | the range folded away beyond `months_kept` (36) months; a window inside it is not folded again |
+| `people[login][repo][window]` | one contribution record: `months` {YYYY-MM: counts of `commits`, `prs_opened`, `prs_merged`, `reviews`, `approvals`, `approvals_merged`, `merges`, `merges_others`, `issues`, `comments`}, `first` / `last` {`commit`, `pr_opened`, `pr_merged`, `review`, `approval`, `merge`, `issue`: [day, number or sha]; `comment`: day}, `first_ever` (the newcomer search's `before`: no earlier PR or issue) |
+| `people[login][repo].before` | the folded record (`months` {"before": counts}) |
+| `seen_before[login][repo]` | the earliest day the person shows in stored records dated before a gathered window — never counted |
+
+Only events dated inside a window enter its record; re-gathering a window replaces its
+records (never counted twice); overlapping windows inside a month are not summed (the one
+covering most of the month counts). Everything a reader sees is derived:
+`people.repo_profile` (coverage, `observed_since`, firsts / lasts with URLs,
+`first_pr_ever` / `first_issue_ever` only from the newcomer search, totals, `by_month`,
+`rates` over the last 3 / 6 / 12 gathered months, `trend`, contributor `status` active /
+returned / lapsed / unknown, `maintainer` with `status` active / lapsed / former / unknown
+and the merges / approvals behind it), `people.cross_project` (every repository with role
+and status, the repositories maintained, first / last anywhere, the per-stream roll-up) and
+`people.writer_context` (what `people_context` carries). Thresholds: active within 183
+days of the repository's latest gathered day, former beyond 548
+(`ACTIVITY_PEOPLE_ACTIVE_DAYS` / `ACTIVITY_PEOPLE_FORMER_DAYS`), `unknown` when fewer than
+90 days were gathered since the last action.
 
 **At gather time** the registry is consulted first (a fresh entry costs no call), the API
 fills the gaps (new people, then stale entries, at most `ACTIVITY_PEOPLE_REFRESH_MAX` = 50
@@ -682,9 +733,45 @@ authored: write access, `strong`) > `OWNER` (`strong`) > `merged_own_pr` (merged
 PR: write access, `medium`) > `COLLABORATOR` (`medium`) > `approving_reviewer` (approved
 at least 3 merged PRs of others in one window, or in one seeding pass, `medium`).
 `MEMBER` is not a maintainer signal: it means a member of the organisation that owns the
-repository (thousands of people for `Azure`), which is an affiliation. Evidence is sticky:
-once a person is a maintainer of a repository the entry keeps it, with `last_evidence`,
-until the owner says otherwise.
+repository (thousands of people for `Azure`), which is an affiliation. Evidence is kept:
+once a person is a maintainer of a repository the entry keeps it, with `first_evidence` /
+`last_evidence` (evidence dated after the gathered window is left out), until the owner
+says otherwise — but it is no longer blindly current: its lifecycle status (above) says
+whether it is recent, and a `former` maintainer is not counted as one.
+
+### `people_context` (link `--people`, registry context)
+
+Only when `link.py VIEW --people PATH` is run: what the people registry knows of the people
+the report names (newcomers and hall rows of `contributors`, `halls.fame`, story trains'
+participants, the authors of PRs that introduced a new module), beyond the window.
+
+```json
+"people_context": {
+  "kind": "registry_context", "repo": "Azure/bicep-registry-modules", "as_of": "2026-10-31",
+  "note": "from the people registry, not a fact of this window: ...",
+  "registry": {"people_sha256": "…", "activity_sha256": "…", "latest_gathered": "2026-10-31"},
+  "thresholds": {"active_days": 183, "former_days": 548},
+  "coverage": {"from": "2026-08-01", "to": "2026-10-31", "windows": 3, "gaps": [], "gathered_days": 92,
+               "months": ["2026-08", "2026-09", "2026-10"]},
+  "people": {"octo": {
+     "here": {"active_since": "2025-01-07", "active_since_basis": "seen in stored records dated before the coverage (not counted)",
+              "active_since_is_first_ever": false, "observed_since": "2026-08-01",
+              "prs_merged_last_6_months": 10, "months_counted": 3, "status": "active",
+              "trend": "falling", "maintainer_status": "active"},
+     "also_maintains": [{"repo": "Azure/bicep", "status": "lapsed"}],
+     "also_contributes_to": [{"repo": "Azure/terraform-azurerm-avm-res-network-virtualnetwork", "status": "active"}],
+     "first_anywhere": {"date": "2023-04-13", "repo": "Azure/bicep-registry-modules"},
+     "streams": {"avm-tf": {"repos": 3, "maintains": 1, "totals": {"prs_merged": 12}, "first": "…", "last": "…"}}}}}
+```
+
+It is **not a fact of the window** and the trust check does not compare it: it is read only
+on request, only from the registry's windows that end by the view's end (`as_of`), so
+re-linking an old view after later gathers gives the same `people` (one exception: an
+`active_since` taken from `seen_before` can move earlier when a later store holds older
+records); the owner's own edits (a role set to `"former"`, `do_not_name`) apply as they
+are now. The `registry` stamp says which registry state produced it. `months_counted` says how many gathered months the
+"last 6 months" figure covers. A `do_not_name` person and a person the registry does not
+know are left out. Without `--people` the key is absent and the view is unchanged.
 
 A view of exactly a gathered window carries the stored value verbatim (`validate.py
 --bundle` compares it). A wider view takes, per person, the entry of the latest gathered
@@ -748,7 +835,9 @@ prose; every PR carries its URL.
   unknown} (unknown: no property — `do_not_name`, or not a person of a gathered window),
   `signals` (maintainers per signal), `by_affiliation` {label: the same three counts}
   (maintainers vs non-maintainers within community and the home organisation, unknown
-  separate) and `logins` (the maintainers).
+  separate) and `logins` (the maintainers); `by_status` {active | lapsed | former |
+  unknown: [login]} when the fact carries `maintainer_status` (a `former` maintainer
+  counts as a non-maintainer).
 - **`community`** (with `affiliations`) — only people labelled `community` (never
   `unknown`): how many, their merged PRs (and numbers), reviews, the first-timers and
   returning contributors among them, and the module areas that received a community PR
@@ -1772,8 +1861,11 @@ review's state to `DISMISSED`.
   `conversation`.
 
   When the view's people carry a display name or the maintainer property (gathered with
-  the people registry), the slice also has `participants` {login: {name?, maintainer?,
-  maintainer_signal?, affiliation?}} for the train's humans ("The people layer").
+  the people registry), or the view has `people_context` (`link.py --people`), the slice
+  also has `participants` {login: {name?, maintainer?, maintainer_signal?,
+  maintainer_status?, affiliation?, registry_context?}} for the train's humans ("The
+  people layer"); `registry_context` is the person's `people_context` entry — registry
+  context, not a fact of the window.
 
   (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
   chars with a `…[+N chars]` marker. Each comment list, `reviews` and `lifecycle` is
@@ -1821,7 +1913,7 @@ across members (see "Project view: `people` and `halls`").
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
   | `stale_owned` | distinct areas in a stalled train's `code_areas` (an open train with `effort.stalled`, #112) that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
   | `affiliation` / `affiliation_signal` | only when the view carries a collected `affiliations` fact, on non-bots: `maintainer_org` / `community` / `unknown` and the deciding signal ("The people layer") |
-  | `name` / `maintainer` / `maintainer_signal` | only when the view's `affiliations` fact was gathered with the people registry, on non-bots the fact names (never for a `do_not_name` person): the display name and the maintainer property for the view's repository ("The people registry") |
+  | `name` / `maintainer` / `maintainer_signal` / `maintainer_status` | only when the view's `affiliations` fact was gathered with the people registry, on non-bots the fact names (never for a `do_not_name` person): the display name and the maintainer property for the view's repository, with its lifecycle status at gather time when the registry holds maintainer evidence ("The people registry") |
 
   Counts are always present (ints, may be 0), except `prs_opened` and `own_pr_commits`
   (present when applicable, above); `merge_rate`/`review_latency_days`/

@@ -1185,13 +1185,15 @@ AFFILIATION_SIGNAL_ORDER = ("override", "author_association",
 
 # What the people registry adds to a person record (and to every row that
 # names the person: halls, contributors, story participants): the display
-# name and the maintainer property for the repository, with its signal.
-PERSON_LABEL_KEYS = ("name", "maintainer", "maintainer_signal")
+# name and the maintainer property for the repository, with its signal and
+# its lifecycle status at gather time (active / lapsed / former / unknown).
+PERSON_LABEL_KEYS = ("name", "maintainer", "maintainer_signal",
+                     "maintainer_status")
 
 
 def person_labels(profile):
-    """{name?, maintainer?, maintainer_signal?} of a person record: only the
-    keys it carries (omit-when-absent). Pure."""
+    """{name?, maintainer?, maintainer_signal?, maintainer_status?} of a
+    person record: only the keys it carries (omit-when-absent). Pure."""
     return {k: profile[k] for k in PERSON_LABEL_KEYS if k in (profile or {})}
 
 

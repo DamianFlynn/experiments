@@ -259,8 +259,9 @@ up (the rest are `not_checked`); `--no-affiliation` skips the check. Settings: `
 a manifest `affiliation` object.
 
 The people registry (`--people PATH` or a manifest `people`; `people.py`; USAGE §5.7): one
-JSON file per workspace, consulted before any lookup and updated by each gather, so a person
-is looked up once. A decided label is reused for `ACTIVITY_PEOPLE_REFRESH_DAYS` (default
+JSON file per workspace, shared by every stream, consulted before any lookup and updated by
+each gather, so a person is looked up once; the generated `people-activity.json` beside it
+keeps each person's activity per repository and gathered window. A decided label is reused for `ACTIVITY_PEOPLE_REFRESH_DAYS` (default
 `120`, min `1`; also `--people-refresh-days`), an `unknown` one for
 `ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS` (default `30`, min `1`); at most
 `ACTIVITY_PEOPLE_REFRESH_MAX` (default `50`, min `0`) stale entries are refreshed per run,
@@ -268,8 +269,20 @@ oldest first; at most `ACTIVITY_PEOPLE_NAME_MAX` (default `30`, min `0`) profile
 are made only for a display name (newcomers first). `--people-offline`: no API call for people
 at all. The maintainer property (per repository, from stored merges, approving reviews and
 `author_association` OWNER / COLLABORATOR; `people.APPROVALS_MIN` = 3) costs no call.
-`python3 people.py seed --people PATH STORE...` fills the registry from stores without the API;
-`python3 people.py summary --people PATH` prints the counts and the maintainers.
+Lifecycle thresholds: `ACTIVITY_PEOPLE_ACTIVE_DAYS` (default `183`, min `1`; also
+`people.py --active-days`): a maintainer or contributor whose latest action is within that
+many days of the repository's latest gathered day is `active`, older `lapsed` (when at least
+90 days were gathered since, else `unknown`); `ACTIVITY_PEOPLE_FORMER_DAYS` (default `548`,
+not below the active threshold; also `--former-days`): a maintainer beyond it is `former`.
+The monthly detail is kept for `people.MONTHS_KEPT` = 36 months per repository; rates over the
+last 3 / 6 / 12 gathered months; trend thresholds 1.25 / 0.75.
+`python3 people.py seed --people PATH STORE... [--stream NAME]` (or `update`) fills the
+registry and the activity profile from stores without the API (re-running changes nothing);
+`python3 people.py summary --people PATH` prints the counts, coverage, maintainers by status,
+newcomers by month, the busiest people and the people in several repositories;
+`python3 people.py show LOGIN --people PATH` one person across repositories;
+`python3 people.py check --people PATH` checks both files. `link.py VIEW --people PATH` adds
+`people_context` (registry context as of the view's end, stamped; BUNDLE.md).
 
 ### Projects v2 board knobs
 

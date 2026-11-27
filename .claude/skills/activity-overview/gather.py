@@ -5205,6 +5205,10 @@ def validate_env_knobs(env=None):
     _newcomers_max(env)
     _affiliation_max(env)
     _people_settings(env)
+    try:
+        people_mod.thresholds(env)      # the registry's lifecycle thresholds
+    except ValueError as exc:
+        raise SystemExit("error: {}".format(exc)) from None
 
 
 def _auth_allowed(url):
@@ -6600,8 +6604,8 @@ def people_run_from_args(args, env=None):
         settings["refresh_days"] = args.people_refresh_days
     try:
         run = people_mod.Run(path, offline=bool(getattr(args, "people_offline", False)),
-                             **settings)
-    except people_mod.RegistryError as exc:
+                             limits=people_mod.thresholds(env), **settings)
+    except (people_mod.RegistryError, ValueError) as exc:
         raise SystemExit("error: {}".format(exc)) from None
     args.people_run = run
     return run
@@ -6933,7 +6937,8 @@ def _reused_entry(reg_entry, email_home):
 def find_affiliations_registry(people, config, run, repo_slug, associations=None,
                                email_home=(), lookup=None, records=None,
                                name_first=(), max_lookups=AFFILIATION_MAX,
-                               stop_after=AFFILIATION_FAILURE_STOP):
+                               stop_after=AFFILIATION_FAILURE_STOP, window=None,
+                               stream=None, newcomers=None):
     """find_affiliations with the retained people registry (`run`, a
     people.Run): the registry is consulted first, the API fills the gaps,
     the registry is updated (in memory; run.save() writes it) and the fact
@@ -6962,13 +6967,20 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
     it, at most run.names_left per run, `name_first` (the newcomers) first,
     then the most active. `lookup` None (offline): no call at all.
     `records` (prs, issues, commits) give the seen dates and the maintainer
-    evidence (people.maintainer_evidence). Network-free given `lookup`."""
+    evidence (people.maintainer_evidence). With `window` (from, to) the
+    window is also recorded in the registry's activity profile
+    (people.Run.record_window, with the window's `newcomers` fact and the
+    manifest `stream`), and a maintainer's entry carries
+    `maintainer_status` (people.maintainer_status: active / lapsed /
+    former / unknown by recency; `former` makes `maintainer` false).
+    Network-free given `lookup`."""
     associations = associations or {}
     email_home = set(email_home or ())
     prs, issues, commits = records or ((), (), ())
     home = affiliation_home(config)
     dates = people_mod.activity_dates(prs, issues, commits)
-    evidence = people_mod.maintainer_evidence(prs, issues)
+    evidence = people_mod.maintainer_evidence(
+        prs, issues, until=window[1][:10] if window else None)
     for login in people:
         fields = {}
         if login in dates:
@@ -6978,6 +6990,9 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
             fields["maintainer"] = {repo_slug: evidence[login]}
         if fields:
             run.patch(login, **fields)
+    if window:
+        run.record_window(repo_slug, window[0][:10], window[1][:10], prs, issues,
+                          commits, newcomers=newcomers, stream=stream)
     # the refresh budget goes to the oldest lookups among the people a
     # lookup would decide (not the override list, author_association, an
     # operator-locked label or do_not_name)
@@ -7085,6 +7100,11 @@ def find_affiliations_registry(people, config, run, repo_slug, associations=None
             e["name"] = name
         e["maintainer"], e["maintainer_signal"] = people_mod.maintainer_for(
             reg, repo_slug)
+        status = run.maintainer_status(login, repo_slug) if window else None
+        if status:
+            e["maintainer_status"] = status["status"]
+            if status["status"] == "former":
+                e["maintainer"] = False
     for key in ("looked_up", "refreshed", "reused", "names_fetched"):
         run.totals[key] = run.totals.get(key, 0) + counts[key]
     unknown = sorted(k for k, e in out.items() if e["affiliation"] == "unknown")
@@ -7117,7 +7137,8 @@ def args_affiliation_config(args, owner):
 
 def collect_affiliations(prs, issues, commits, owner, repo, get_page, config,
                          email_home=(), cache=None, max_people=None,
-                         people_run=None, name_first=()):
+                         people_run=None, name_first=(), window=None, stream=None,
+                         newcomers=None):
     """The window's `affiliations` fact, looked up through `get_page` (the
     gather's GitHub client). One stderr line says what it cost and found.
     With `people_run` (a people.Run: the retained registry) the registry is
@@ -7147,7 +7168,8 @@ def collect_affiliations(prs, issues, commits, owner, repo, get_page, config,
         result, counts = find_affiliations_registry(
             people, cfg, people_run, "{}/{}".format(owner, repo), assoc,
             email_home, lookup, records=(prs, issues, commits),
-            name_first=name_first, max_lookups=cap)
+            name_first=name_first, max_lookups=cap, window=window, stream=stream,
+            newcomers=newcomers)
         maint = sum(1 for e in result["people"].values() if e.get("maintainer"))
         sys.stderr.write(
             "people registry: {}/{}: {} looked up, {} refreshed, {} reused from "
@@ -7676,7 +7698,9 @@ def acquire(args, env):
             email_home=email_home, cache={} if cache is None else cache,
             people_run=people_run,
             name_first=[e.get("login") for key in ("new", "returning")
-                        for e in newcomers.get(key) or [] if isinstance(e, dict)])
+                        for e in newcomers.get(key) or [] if isinstance(e, dict)],
+            window=(frm, to), stream=getattr(args, "people_stream", None),
+            newcomers=newcomers)
         if people_run is not None:
             try:
                 people_run.save()
@@ -9702,6 +9726,7 @@ def _gather_manifest(conn, args, man):
             member_args = _member_args(args, m, frm, to)
             member_args.affiliation_manifest = man.get("affiliation")
             member_args.affiliation_cache = affiliation_cache
+            member_args.people_stream = project     # the registry's stream roll-up
             bundle = acquire(member_args, os.environ)
             summary = fold_bundle(conn, bundle, project=project, repo=slug,
                                   members=members,

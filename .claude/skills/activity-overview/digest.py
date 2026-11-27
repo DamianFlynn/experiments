@@ -541,9 +541,10 @@ def _merge_people(members):
       affiliation / affiliation_signal   the member record with the most
                             decisive signal (derive.affiliation_rank)
       name                  the first member record that has one
-      maintainer / maintainer_signal   true when any member says so (that
-                            member's signal), with those members listed in
-                            `maintainer_of` (the property is per repository)
+      maintainer / maintainer_signal / maintainer_status   true when any
+                            member says so (that member's signal and status),
+                            with those members listed in `maintainer_of` (the
+                            property is per repository)
       do_not_name           any member's wins: unknown / do_not_name, with
                             no name and no maintainer property
     Any other field is kept from the first member's record. Member records are
@@ -598,7 +599,8 @@ def _merge_people(members):
                 cur["name"] = rec["name"]
             if "maintainer" in rec:
                 maint.setdefault(login, []).append(
-                    (repo, rec["maintainer"], rec.get("maintainer_signal")))
+                    (repo, rec["maintainer"], rec.get("maintainer_signal"),
+                     rec.get("maintainer_status")))
             samples.setdefault(login, []).extend(latencies.get(login, []))
             if rec.get("affiliation_signal") == "do_not_name":
                 suppressed.add(login)
@@ -614,6 +616,10 @@ def _merge_people(members):
         yes = [r for r in rows if r[1]]
         pick = yes[0] if yes else rows[0]
         cur["maintainer"], cur["maintainer_signal"] = pick[1], pick[2]
+        if pick[3]:
+            cur["maintainer_status"] = pick[3]
+        else:
+            cur.pop("maintainer_status", None)
         if yes:
             cur["maintainer_of"] = sorted({r[0] for r in yes})
     for login, cur in people.items():

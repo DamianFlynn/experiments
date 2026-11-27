@@ -656,28 +656,66 @@ GitHub's at gather time. The commit email is read in `resolve_commit_authors`
 domain is noted; the email is dropped as before. Cost per person not decided for free: one
 call per home org (until one answers 204) plus one profile call. The entry stored per person
 is `{affiliation, signal[, strength][, home_email_domain: true]}` (with the registry also
-`name`, `maintainer`, `maintainer_signal`: §4.7b).
+`name`, `maintainer`, `maintainer_signal`, `maintainer_status`: §4.7b).
 
 ### 4.7b The people registry (`people.py`)
 
 **File.** `{"format": "activity-overview/people", "version": 1, "people": {login: entry}}`,
-one per workspace (`--people` / manifest `people`; USAGE §2.1 puts it at
-`<stream>/people.json`). `parse_registry` checks every entry (`check_entry`: only
-`ENTRY_KEYS`; `login` repeats the key; label / signal / strength / maintainer signals from
-their lists; dates `YYYY-MM-DD`; two keys equal ignoring case refused) and raises
+one per workspace, shared by every stream (`--people` / manifest `people`; USAGE §2.1 puts
+it at `~/activity/people.json`). The activity profile added only optional fields
+(`first_evidence`, the owner's `"former"`), so the version stays 1 and an older file is
+read as it is. `parse_registry` checks every entry (`check_entry`: only `ENTRY_KEYS`; `login` repeats the key;
+label / signal / strength / maintainer signals from their lists; `maintainer_of` values
+true / false / `"former"` / `{maintainer, signal, strength, first_evidence,
+last_evidence}`; dates `YYYY-MM-DD`; two keys equal ignoring case refused) and raises
 `RegistryError` naming the file and the entry; `load_registry` of a missing file is empty.
 `dumps` is `sort_keys`, indent 2, `ensure_ascii=False`, trailing newline; `write_registry`
-writes a temporary file in the same directory and `os.replace`s it, and skips the write when
-the text is unchanged; `update_registry(path, patches)` holds an `fcntl` lock on
-`<path>.lock`, re-reads the file and applies the patches over it.
+writes a temporary file in the
+same directory and `os.replace`s it, and skips the write when the text is unchanged;
+`update_registry(path, patches, windows)` holds an `fcntl` lock on `<path>.lock`, re-reads
+the file and applies the patches over it, and folds `windows` into the activity file
+(`activity_path`: `people.json` → `people-activity.json`) re-read under the same lock.
+
+**The activity file** (`ACTIVITY_FORMAT`, version 1; checked by `check_activity`, written by
+`write_activity` / `dumps_activity`: sorted keys, objects and lists of scalars on one line).
+`window_contributions(prs, issues, commits, frm, to, newcomers)` (pure) turns one window's
+records into `{login: {months, first, last, first_ever?}}` and stats, counting only events
+dated in `[frm, to]`: commits (resolved logins only; unresolved git authors are counted in
+stats), PRs opened, PRs merged (author), merges (merger; `merges_others` when not the
+author), reviews on others' PRs (`approvals`; `approvals_merged` once per merged PR),
+issues, comments; first / last per event as `[day, number | sha]` (ties by reference);
+`first_ever` = `newcomers.before` for a `new` login; `seen_before` = the earliest day
+before `frm`. `fold_window(activity, slug, frm, to, contributions, stats, stream, source)`
+(pure) replaces every record of the window key `FROM..TO` for the repository, records the
+window in `repos[slug].windows`, keeps `seen_before[login][slug]` as a min, drops empty
+records, and `_fold_old_windows` moves windows ending before the `months_kept` (36) cutoff
+into one `before` record per person and `repos[slug].before` {from, to, windows};
+`window_is_folded` skips a window inside that range. Derivations (pure): `coverage`
+(merged intervals, gaps, gathered days, gathered months), `_month_choice` (per month the
+windows that count: most days of the month first, then any that does not overlap a chosen
+one), `repo_profile` (totals and `by_month` over the chosen windows, firsts / lasts over all,
+`first_pr_ever` / `first_issue_ever` when the earliest observed PR / issue is in a window
+with `first_ever`, `seen_before` when outside every interval, `rates` over the last 3 / 6 /
+12 gathered months, `trend` (k = min(3, n // 2): recent vs prior activity, 1.25 / 0.75),
+contributor status by `_lifecycle` plus `returned` (≥ `ACTIVE_DAYS // 30` gathered months
+without activity between two active months), `maintainer_status` (owner true → active,
+`"former"` → former; evidence → `_lifecycle` with `former_days` over the later of the
+evidence's `last_evidence` and the activity file's last merge / approval, both as of;
+`former` makes `maintainer` false; `merges_others` / `approvals_merged` totals),
+`cross_project`, `writer_context` and `registry_stamp`. `_lifecycle(last, coverage)`:
+active within `active_days` (183) of the latest gathered day; else `unknown` when fewer than
+`GATHERED_SINCE_MIN_DAYS` (90) days were gathered after `last`; else `former` beyond
+`former_days` (548, maintainers only); else `lapsed`. `thresholds(env, ...)` reads
+`ACTIVITY_PEOPLE_ACTIVE_DAYS` / `ACTIVITY_PEOPLE_FORMER_DAYS` (gather checks them up front).
 
 **Patches and the operator.** A run never writes entries directly: it accumulates patches per
 login (`seen` [(date, repo)], `label`, `name`, `looked_up_at`, `maintainer` {repo: evidence};
 `merge_patch`) and `apply_patch` applies them: `first_seen` / `last_seen` always (min / max);
 `label`, `name`, `maintainer` only when the field is not `is_locked` (entry `source:
-"operator"`, `locked: true`, or the field in the `locked` list); a plain bool in
-`maintainer_of` is the operator's and is skipped; a stronger maintainer signal is never
-replaced by a weaker one (`MAINTAINER_SIGNALS` order), `last_evidence` is the latest; `tags`,
+"operator"`, `locked: true`, or the field in the `locked` list); a plain bool or `"former"`
+in `maintainer_of` is the operator's and is skipped; a stronger maintainer signal is never
+replaced by a weaker one (`MAINTAINER_SIGNALS` order), `first_evidence` is the earliest and
+`last_evidence` the latest; `tags`,
 `do_not_name` and `note` are never written; a `do_not_name` entry never gets a name. A new
 entry has `source: "lookup"`.
 
@@ -685,7 +723,11 @@ entry has `source: "lookup"`.
 a manifest's members share it; created in `main` before the store opens, so a malformed
 registry fails first). `collect_affiliations(..., people_run)` calls
 `find_affiliations_registry`: first the window's seen dates (`people.activity_dates`) and
-maintainer evidence (`people.maintainer_evidence`) are patched in for every person, then per
+maintainer evidence (`people.maintainer_evidence`, `until` the window's end) are patched in
+for every person and the window is recorded in the activity profile
+(`Run.record_window(slug, from, to, records, newcomers, stream)`: `window_contributions` +
+`fold_window` in memory, folded into the file by `Run.save`; `stream` is a manifest's
+project), then per
 person: `do_not_name` → `{unknown, do_not_name}`, no call; the override list /
 `author_association` (free; an `author_association` label is patched in); a registry label
 locked by the operator → signal `override` (`operator`); `lookup_state` `fresh` → the stored
@@ -700,26 +742,46 @@ caches `{company, name}` per users URL); a failed lookup patches nothing. Then t
 people without a name and never looked up, the newcomers (`name_first`) first, then by
 activity, at most `Run.names_left` profile calls. Last, every entry but `do_not_name` gets
 `name` (`people.display_name`) and `maintainer` / `maintainer_signal`
-(`people.maintainer_for(entry, "owner/repo")`: the operator's bool → `operator`; evidence →
-its signal; nothing → `false` / `none`). `acquire` calls `Run.save()` after the fact is
+(`people.maintainer_for(entry, "owner/repo")`: the operator's bool → `operator`, `"former"`
+→ `false` / `operator`; evidence → its signal; nothing → `false` / `none`) and, when the
+registry holds maintainer evidence there, `maintainer_status` (`Run.maintainer_status`;
+`former` sets `maintainer` false). `acquire` calls `Run.save()` after the fact is
 built (before the fold). `lookup_state`: `never` without `looked_up_at` or label; `fresh`
 when younger than `refresh_days` (decided) or `unknown_retry_days` (`unknown`); else
 `stale`. Offline (`--people-offline`): no seam, no team expansion, no name pass.
 
-**Maintainer evidence** (`maintainer_evidence(prs, issues)`, pure): per merged PR, the merger
+**Maintainer evidence** (`maintainer_evidence(prs, issues, until=None)`, pure; evidence
+dated after `until` is left out): per merged PR, the merger
 → `merged_others_pr` (author differs) or `merged_own_pr`; approving reviews (state
 `approved`, not by the author) of merged PRs counted per reviewer, `approving_reviewer` at
 `APPROVALS_MIN` = 3; `author_association` OWNER / COLLABORATOR on a person's PR, issue or
 comment records → `OWNER` / `COLLABORATOR`; bots and `ghost` out; the strongest signal wins
-(`MAINTAINER_SIGNALS`), `last_evidence` the latest day seen. `MEMBER` is not used.
+(`MAINTAINER_SIGNALS`), `first_evidence` / `last_evidence` the earliest / latest day seen.
+`MEMBER` is not used.
 
-**Seeding** (`python3 people.py seed --people PATH STORE...`): `store_records` reads each
-store read-only (PR / issue social nodes with their `review-*` nodes attached, resolved
-commits, and any stored `affiliations` facts) per repository; `seed_patches` patches the seen
-dates, the maintainer evidence, an `author_association` OWNER / MEMBER / COLLABORATOR label
-and a stored fact's GitHub-data label (no `looked_up_at`); one `update_registry`.
-`summary` prints `summarize`: people, labels, named / tagged / `do_not_name`, lookup states
-and the maintainers per repository by signal.
+**Seeding** (`python3 people.py seed | update --people PATH STORE... [--stream NAME]`):
+`store_records` reads each store read-only (PR / issue social nodes with their `review-*`
+nodes attached, resolved commits, the window ledger with each window's `newcomers` fact,
+and any stored `affiliations` facts) per repository; `seed_patches` patches the seen dates,
+the maintainer evidence (`until` the latest window end), an `author_association` OWNER /
+MEMBER / COLLABORATOR label and a stored fact's GitHub-data label (no `looked_up_at`);
+`seed_windows` gives one `fold_window` per ledger window (source `seed`; stream: `--stream`,
+else a manifest store's project); one `update_registry`. `summary` prints `summarize`:
+people, labels, named / tagged / `do_not_name`, lookup states, the maintainers per
+repository by signal and by status, coverage, newcomers by month, the busiest people (rate
+over the last 3 gathered months) and the people in more than one repository. `show LOGIN`
+prints `show` (the entry, `repo_profile` per repository, `cross_project`); `check` prints
+`check_files` (errors: a file the skill would refuse; warnings: activity without an entry,
+coverage gaps) and exits 1 on an error.
+
+**Registry context in a view** (`link.py VIEW --people PATH`): `people.load_view_source`
+reads both files (the registry must exist) and the thresholds; `link.enrich(...,
+people_source)` ends with `build_people_context`: for `_named_people` (contributors'
+newcomers and hall, `halls.fame`, story trains' `_train_logins`, authors of PRs that
+introduced a module; bots and `do_not_name` out) `people.writer_context(registry, activity,
+login, "owner/repo", as_of=meta.to)`, plus the stamp, thresholds and this repository's
+coverage, as `people_context`. `slice_participants` adds each participant's entry as
+`registry_context`. Without `--people`, `people_source` is None and nothing changes.
 
 **Returning contributors (`find_newcomers`).** The search URL sorts by `created` descending,
 so `search_latest_created` reads the most recent earlier item from the same `per_page=1`

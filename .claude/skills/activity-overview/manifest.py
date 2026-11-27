@@ -326,7 +326,9 @@ def load_manifest(path):
         except ValueError as exc:
             raise ValueError("manifest: {}".format(exc)) from None
     # optional retained people registry (gather --people): a path relative to
-    # the manifest's own directory, so `people.json` next to it is the stream's
+    # the manifest's own directory, so `../people.json` is the workspace's
+    # registry shared by every stream (USAGE 2.1) and `people.json` one of the
+    # stream's own
     if "people" in raw:
         value = raw["people"]
         if not isinstance(value, str) or not value.strip() or "\n" in value:

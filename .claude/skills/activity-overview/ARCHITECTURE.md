@@ -659,7 +659,7 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--no-newcomers` | off (check runs) | skip the first-time-contributor search (one or two search API calls per author of a PR / issue created in the window); the window's `newcomers` fact says it was not collected |
 | `--no-affiliation` | off (check runs) | skip the contributor affiliation check (public-membership and profile calls per person not decided by the override list or `author_association`); the window's `affiliations` fact says it was not collected |
 | `--home-org` / `--home-name` / `--home-email-domain` / `--affiliation` | repo owner only | affiliation settings (repeatable): home orgs, company names, commit email domains, `LOGIN=` / `@org/team=` overrides (`maintainer_org` / `community` / `unknown`) |
-| `--people PATH` / `--people-offline` / `--people-refresh-days N` | no registry | the workspace's retained people registry (`people.py`): consulted before any lookup, updated by the gather; display names and the maintainer property per repository; offline: no API call for people |
+| `--people PATH` / `--people-offline` / `--people-refresh-days N` | no registry | the workspace's retained people registry (`people.py`): consulted before any lookup, updated by the gather (with the window's activity records); display names and the maintainer property per repository with its lifecycle status; offline: no API call for people |
 | `--structural-iac` | off (on for manifest members) | whole-tree static Terraform + Bicep dependency scan |
 | `--no-iac-build` | off | skip the `bicep`/`terraform` builds (they run third-party code; use for untrusted repos); areas `edges_status: skipped` |
 | `--resume` | off | manifest only: gather just the members not `ok` for the window |
@@ -672,7 +672,9 @@ scope → exit 2.
 
 ### `link.py` — enrich (offline)
 `link.py BUNDLE.json` (enrich in place) · `--slice TRAIN_ID` (emit one train's slice) ·
-`--series series.json` (record this window + frame "since last installment").
+`--series series.json` (record this window + frame "since last installment") ·
+`--people people.json` (add `people_context`: registry context for the people the report
+names, as of the view's end, stamped with the registry's sha256).
 
 ### `render.py` — diagrams (needs mmdc)
 `render.py BUNDLE` · `--diagrams-dir` (`workspace/diagrams`) · `--export svg|png` ·
@@ -682,10 +684,12 @@ scope → exit 2.
 `validate.py STORE` · `--project` · `--repo` · `--bundle` (optional cross-check) · `--json`.
 
 ### `people.py` — the people registry (offline)
-`people.py seed --people PATH STORE... [--repo OWNER/NAME] [--json]` (logins, first / last
-seen, maintainer evidence and `author_association` labels from stores, no API call) ·
-`people.py summary --people PATH [--repo OWNER/NAME] [--json]`. gather reads and updates the
-same file with `--people` (USAGE §5.7).
+`people.py seed|update --people PATH STORE... [--repo OWNER/NAME] [--stream NAME] [--json]`
+(logins, maintainer evidence, `author_association` labels and one contribution record per
+gathered window into `people-activity.json`, from stores, no API call; idempotent) ·
+`people.py summary --people PATH [--repo OWNER/NAME] [--active-days N] [--former-days N] [--json]` ·
+`people.py show LOGIN --people PATH [--json]` · `people.py check --people PATH`. gather reads
+and updates the same files with `--people` (USAGE §5.7).
 
 ### `spotlight.py` — analytics (offline)
 `spotlight.py <query> <arg> --store STORE [--project] [--repo] [--from] [--to] [--json|--md] [--complete]`.

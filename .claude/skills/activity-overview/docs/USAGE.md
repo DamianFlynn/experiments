@@ -124,19 +124,33 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 
 ```
 ~/activity/
-  bicep/            stores/2026-11.db  series.json  people.json  reports/2026-11.md  views/
-  avm-bicep/        stores/  series.json  people.json  reports/  views/  [history.db]
-  avm-tf-network/   stores/  manifest.json  people.json  series/  reports/  views/
-  ai-lz/            stores/  manifest.json  people.json  series/  reports/  views/
-  hub-lz/           stores/  manifest.json  people.json  series/  reports/  views/
+  people.json           the people registry: identity, roles, your edits   (one for ALL streams)
+  people-activity.json  generated beside it: activity per repository per gathered window
+  bicep/            stores/2026-11.db  series.json  reports/2026-11.md  views/
+  avm-bicep/        stores/  series.json  reports/  views/  [history.db]
+  avm-tf-network/   stores/  manifest.json  series/  reports/  views/
+  ai-lz/            stores/  manifest.json  series/  reports/  views/
+  hub-lz/           stores/  manifest.json  series/  reports/  views/
   .tfcache/         (shared TF_PLUGIN_CACHE_DIR)
 ```
 
-`people.json` is the stream's **people registry** (§5.7): one entry per GitHub login, shared
-by every month's gather (`--people $S/people.json`, or `"people": "people.json"` in the
-manifest), so a person is looked up once. It lives beside `stores/`, not in a store,
-because stores are per month and the registry must outlive them; it is plain, sorted JSON
-for you to keep in version control and edit by hand.
+`people.json` is the **people registry** (§5.7): one entry per GitHub login. Keep **one
+registry for all your streams** at the workspace root and point every gather at it
+(`--people ~/activity/people.json`, or `"people": "../people.json"` in a manifest — the
+path is relative to the manifest). The same people show up across the Bicep monorepo, the
+Terraform module repositories and the landing-zone repositories, and the point of the
+registry is to say so: a person is looked up once for every stream, their maintainer role
+is kept per repository, and the cross-project context ("also maintains …") only exists
+when the repositories share one registry. A registry per stream still works (each is
+self-contained), but a person then has one entry per stream, looked up once per stream,
+and no stream knows about the others.
+
+`people-activity.json` is generated beside it (`<stem>-activity.json` for any other
+name) and you never edit it: one small contribution record per person per repository per
+gathered window, from which the activity profile is derived (§5.7). Both files live
+outside the stores, because stores are per month and the registry must outlive them; both
+are plain, sorted JSON for you to keep in version control. Gathers of different streams
+that run at the same time update them one after the other (an advisory lock).
 
 #### One store per installment, or one store that grows?
 
@@ -253,6 +267,7 @@ each other estate needs.
 
 ```bash
 S=~/activity/bicep               # stream directory
+PEOPLE=~/activity/people.json    # the people registry shared by every stream (§2.1)
 FROM=2026-11-01; TO=2026-11-30; M=2026-11
 DB=$S/stores/$M.db               # a NEW store for this installment
 mkdir -p $S/stores $S/views/$M $S/reports
@@ -264,9 +279,9 @@ mkdir -p $S/stores $S/views/$M $S/reports
 #     It also checks each author of a PR / issue created in the window for an earlier one
 #     (first-time contributors: one or two search calls each; --no-newcomers skips it),
 #     and labels each person maintainer_org / community / unknown (§5.7; --no-affiliation),
-#     looking people up once through the stream's registry ($S/people.json).
+#     looking people up once through the shared registry ($PEOPLE).
 python3 $AO/gather.py --owner Azure --repo bicep \
-  --from $FROM --to $TO --store $DB --clone-dir $S/clone --people $S/people.json \
+  --from $FROM --to $TO --store $DB --clone-dir $S/clone --people $PEOPLE \
   --home-org microsoft --home-name Microsoft --home-email-domain microsoft.com
 
 # 2 · Trust gate — stop if this is not "RESULT: OK" (exit 0); see §5.5 to read a failure
@@ -620,7 +635,7 @@ home organisations are `Azure` and `microsoft`, and a Microsoft email domain cou
 
 ```bash
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
-  --store $DB --people $S/people.json \
+  --store $DB --people $PEOPLE \
   --home-org microsoft --home-name Microsoft --home-email-domain microsoft.com \
   --affiliation some-login=community --affiliation @Azure/some-team=maintainer_org
 ```
@@ -633,7 +648,7 @@ key, `--people` beats `people`):
 "affiliation": {"home_orgs": ["Azure", "microsoft"], "home_names": ["Microsoft"],
                 "home_email_domains": ["microsoft.com"],
                 "overrides": {"some-login": "community", "@Azure/some-team": "maintainer_org"}},
-"people": "people.json"
+"people": "../people.json"
 ```
 
 The override list is the highest-priority signal: use it to correct a label you know is
@@ -644,9 +659,11 @@ listing, which the token must be able to see (otherwise it is listed in
 company that is not a home organisation → `community` — is kept and always shown with its
 strength (`weak`): check it before you print it.
 
-#### The people registry (`people.json`)
+#### The people registry (`people.json` and `people-activity.json`)
 
-One JSON file per stream, one entry per GitHub login (BUNDLE.md "The people registry"):
+One registry for the whole workspace (§2.1), one entry per GitHub login, in two files
+(BUNDLE.md "The people registry"). `people.json` holds who a person is and what roles they
+hold, and is yours to edit:
 
 ```json
 {"format": "activity-overview/people", "version": 1,
@@ -655,11 +672,81 @@ One JSON file per stream, one entry per GitHub login (BUNDLE.md "The people regi
            "affiliation": "community", "signal": "profile_company", "strength": "weak",
            "maintainer_of": {"Azure/bicep-registry-modules": {"maintainer": true,
                              "signal": "merged_others_pr", "strength": "strong",
-                             "last_evidence": "2026-10-29"}},
+                             "first_evidence": "2026-08-07", "last_evidence": "2026-10-29"},
+                             "Azure/bicep": "former"},
            "first_seen": {"date": "2026-08-04", "repo": "Azure/bicep-registry-modules"},
            "last_seen": {"date": "2026-10-29", "repo": "Azure/bicep-registry-modules"},
            "looked_up_at": "2026-11-02", "source": "lookup", "tags": ["known", "mvp"]}}}
 ```
+
+`people-activity.json` (generated beside it; never edit it) holds what the person did in
+each repository, as one small contribution record per **gathered window**:
+
+```json
+{"format": "activity-overview/people-activity", "version": 1, "months_kept": 36,
+ "repos": {"Azure/bicep-registry-modules": {"windows": {
+     "2026-09-01..2026-09-30": {"people": 81, "source": "gather", "unresolved_commit_authors": 0}}}},
+ "people": {"octo": {"Azure/bicep-registry-modules": {"2026-09-01..2026-09-30": {
+     "first": {"merge": ["2026-09-01", 7306], "pr_opened": ["2026-09-01", 7319], "comment": "2026-09-02"},
+     "last":  {"merge": ["2026-09-30", 7428], "pr_opened": ["2026-09-30", 7428], "comment": "2026-09-24"},
+     "months": {"2026-09": {"prs_opened": 43, "prs_merged": 38, "merges": 40, "merges_others": 2,
+                            "reviews": 6, "approvals": 6, "approvals_merged": 6, "comments": 10}}}}}}}
+```
+
+**What it accumulates, per person and repository:** the first and last commit on the
+mainline the store walked, PR opened, PR merged, review, approval, merge performed (as the
+merger) and issue reported, each with its date and reference (PR / issue number or commit
+sha; `show` prints the URL), and the first / last comment (date only); counts per month of
+commits, PRs opened, PRs merged, reviews given, approvals, approvals of PRs that were merged,
+merges performed (`merges_others`: of somebody else's PR), issues and comments. From those
+the skill derives, whenever it is asked (`people.py show`, `summary`, `link.py --people`):
+totals, the monthly series, **rates** (per-month averages over the repository's last 3, 6
+and 12 gathered months; a month nobody gathered is not a zero, a gathered month without
+activity is), a **trend** (activity = commits + PRs opened + reviews + merges + issues per
+month; the last k gathered months against the k before them, k = 3, or half of what was
+gathered when that is less: `rising` at 1.25 times or more, `falling` at 0.75 times or
+less, `steady` between, `inactive` with no activity recently, `insufficient` with fewer than
+two gathered months), the **lifecycle** below and the **cross-project** summary.
+
+**Coverage honesty.** The registry only knows what was gathered. Each repository's coverage
+(the windows gathered: earliest from, latest to, the gaps between) is kept beside the
+records, and every first and total is **as observed since the coverage start**
+(`observed_since`) — never "ever". The one exception is the gather-time newcomer search
+(the `newcomers` fact): a person it found with no earlier PR or issue gets
+`first_pr_ever: true` / `first_issue_ever: true` when their first observed PR / issue is in
+that window; nothing else sets them. A store also keeps older records (an open issue's
+early comments): a person seen there before any gathered window gets `seen_before` (the
+earliest such day), which is shown as "seen before the coverage (not counted)" and never
+enters a total. Commits whose author git could not resolve to a login (no API, no
+`users.noreply.github.com` address) are counted per window as `unresolved_commit_authors`
+and are not anybody's activity: logins are never guessed from names.
+
+**Never counted twice.** Re-gathering or re-seeding a window **replaces** that window's
+records (by its `FROM..TO` key), so running gather or seed again, in any order, over any
+number of stores, gives the same file. Two windows that overlap inside a month (a quarter
+store beside monthly stores) are never summed: per month the window covering most of it
+counts, plus any other that does not overlap it. The monthly detail is kept for
+**36 months** per repository (`months_kept`); older windows fold into one `before` record
+per person (totals, firsts and lasts kept; the folded range is recorded, and a window
+inside it gathered again is skipped rather than counted twice).
+
+**Lifecycle — maintainers move on.** Per repository, from the latest maintainer-type action
+(merges performed, approvals, or the stored evidence's `last_evidence`) against the
+repository's latest gathered day:
+
+| Status | Rule |
+|---|---|
+| `active` | last action within **183 days** (`--active-days N`, `ACTIVITY_PEOPLE_ACTIVE_DAYS`) |
+| `lapsed` | longer ago, and at least 90 days of the repository were gathered since |
+| `former` | longer ago than **548 days** (`--former-days N`, `ACTIVITY_PEOPLE_FORMER_DAYS`), or your own `"former"` |
+| `unknown` | longer ago, but fewer than 90 days were gathered since (a coverage gap: absence is not known) |
+
+Evidence never disappears from the record; the status says how recent it is, and a `former`
+maintainer is not counted as a maintainer. Your own `true` / `false` / `"former"` wins and
+is never overwritten. Plain contributors get the same lifecycle by the same thresholds,
+from their latest activity of any kind: `active`, `lapsed`, `unknown`, and `returned`
+(active again after at least six gathered months without activity), which sits beside the
+newcomer search's "returning after 3 / 6 / 9 months".
 
 **Lookup once, refresh rarely.** A person whose entry was looked up recently costs no call:
 a decided label (`maintainer_org` / `community`) is reused for **120 days**
@@ -695,7 +782,7 @@ repository says nothing about another. Strongest first:
 
 | Signal | Rule | Strength |
 |---|---|---|
-| `operator` | your own `true` / `false` in `maintainer_of` | operator |
+| `operator` | your own `true` / `false` / `"former"` in `maintainer_of` | operator |
 | `merged_others_pr` | merged a PR somebody else authored (needs write access) | strong |
 | `OWNER` | `author_association` OWNER on their records | strong |
 | `merged_own_pr` | merged their own PR (needs write access; often a release-branch hand-off) | medium |
@@ -703,41 +790,80 @@ repository says nothing about another. Strongest first:
 | `approving_reviewer` | approved at least 3 PRs of others that were merged (one window, or one seeding pass) | medium |
 
 `MEMBER` is not a maintainer signal: it means a member of the organisation that owns the
-repository (for `Azure`, thousands of people), which is an affiliation. Evidence is sticky:
-once found, the registry keeps it (with `last_evidence`) until you set `false`.
+repository (for `Azure`, thousands of people), which is an affiliation. Evidence is kept
+(with `first_evidence` and `last_evidence`; evidence dated after the gathered window is left
+out) until you set `false`; its status follows the lifecycle above.
 
 **How it joins the store.** At gather time the registry is consulted first, the API fills
-the gaps, the registry is updated, and the window's `affiliations` fact records the labels
-used for that window — now with `name`, `maintainer` and `maintainer_signal`. Views read only
+the gaps, the registry is updated (the window's contribution records too), and the window's
+`affiliations` fact records the labels used for that window — with `name`, `maintainer`,
+`maintainer_signal` and `maintainer_status` (the lifecycle at gather time). Views read only
 the fact, so last month's report is reproduced exactly even after you edit the registry; the
 next gather uses your edits.
+
+**Cross-project context in a report.** `link.py VIEW --people $PEOPLE` adds
+`people_context` to the view: for the people the report names (newcomers, hall entries,
+story participants, authors of new modules) what the registry knows beyond the window —
+"also maintains …", "also contributes to …", "active in this repo since <date, as
+observed>", "N merged PRs here in the last 6 gathered months", the maintainer status, the
+person's streams. It is **registry context, not a fact of the window**: it is read only
+when you ask for it, only from windows that **end by the view's end** (so re-linking an old
+view later gives the same context, whatever was gathered since), stamped with the two
+files' sha256 and the latest gathered day, and absent for a `do_not_name` person. Story
+slices (`--slice`) carry it per participant as `registry_context`. Without `--people`
+nothing changes.
 
 **Editing it.** Open the file and edit; no tool is needed. The rules:
 
 - `"source": "operator"` (or `"locked": true`) on an entry: every decided field — `name`,
   `affiliation`, `maintainer_of` — is yours and is never overwritten.
 - `"locked": ["name"]` (any of `name`, `affiliation`, `maintainer_of`): only those fields.
-- `"maintainer_of": {"Azure/bicep-registry-modules": true}` — a plain `true` / `false` for a
-  repository is yours for that repository.
+- `"maintainer_of": {"Azure/bicep-registry-modules": true}` — a plain `true` / `false` /
+  `"former"` for a repository is yours for that repository.
 - `tags`, `note` and `do_not_name` are yours alone; the skill never writes them.
-  `first_seen` / `last_seen` are always updated (they are observations).
+  `do_not_name` also withholds the activity profile from every output.
+  `first_seen` / `last_seen` (the first / last activity anywhere, as gathered) and the
+  activity file are always updated (they are observations).
+- A registry written before the activity profile is read as it is (still version 1: the
+  profile only added optional fields such as `first_evidence` and your `"former"`); the next
+  gather or seed adds the new fields. Nothing of yours changes.
 - A key the registry does not know, a bad value, or two entries for the same login (logins
   ignore case) stops the gather with a message naming the entry — the file is never reset.
 - The file is rewritten only when something changed, with keys sorted, atomically and
   merged with the file as it is on disk at that moment (an edit you make during a gather is
   kept).
 
-**Seeding it before the next gather** (no API call): read the logins, first / last seen and
-the maintainer evidence from stores you already have, then review and tag people:
+**The commands** (no API call; `--json` prints JSON):
 
 ```bash
-python3 $AO/people.py seed --people $S/people.json $S/stores/2026-08.db $S/stores/2026-09.db $S/stores/2026-10.db
-python3 $AO/people.py summary --people $S/people.json        # counts and the maintainers found
+# seed (or update: the same) the registry and the activity profile from stores you have,
+# any number of stores and repositories; running it again changes nothing
+python3 $AO/people.py seed --people $PEOPLE $S/stores/2026-08.db $S/stores/2026-09.db $S/stores/2026-10.db
+python3 $AO/people.py update --people $PEOPLE ~/activity/avm-tf-network/stores/*.db --stream avm-tf-network
+# who maintains what (by status), coverage, newcomers by month, the busiest people, people in several repos
+python3 $AO/people.py summary --people $PEOPLE
+# one person across repositories: role and status, firsts / lasts, totals, months, rates, trend
+python3 $AO/people.py show some-login --people $PEOPLE
+# check both files and explain any problem (exit 1 on an error)
+python3 $AO/people.py check --people $PEOPLE
 ```
 
-Seeding also takes an `author_association` OWNER / MEMBER / COLLABORATOR label and the label
-of a stored `affiliations` fact, without a lookup date (the next gather looks those people up
-once for their name).
+Seeding takes, per gathered window of each store, the window's contribution records (only
+events dated inside the window; a store read later than its window does not leak later
+activity into it), the maintainer evidence, an `author_association` OWNER / MEMBER /
+COLLABORATOR label and the label of a stored `affiliations` fact, without a lookup date (the
+next gather looks those people up once for their name). A manifest store's project becomes
+the repositories' **stream** (the roll-up per stream in `show` and `link.py --people`);
+`--stream NAME` names it for single-repo stores. `--active-days` / `--former-days` change
+the lifecycle thresholds for `summary` and `show`.
+
+**Size.** For Azure/bicep-registry-modules, three months (298 people, of whom about 90 act
+inside the windows; the rest are seen only in older stored records) make a 93 KB
+`people.json` and a 75 KB `people-activity.json`, which grows by about 20 KB a month (about
+0.5 KB per person per window they act in). A year of that repository is roughly 0.3 MB of
+activity; forty small Terraform module repositories with a handful of active people each
+add roughly 1.5 to 4 KB per repository per month, 1 to 2 MB a year. Both files stay plain,
+sorted text: one line per changed month in a diff.
 
 **Cost.** People decided by the override list, by `author_association` or by a fresh registry
 entry cost nothing. Everyone else costs one `orgs/{org}/public_members/{login}` call per home
@@ -862,13 +988,14 @@ calibrate how much weight readers should put on each tier; skip installments who
 
 ## 7. Playbooks per target estate
 
-The commands below reuse `AO`, `FROM`, `TO` and `M` (e.g. `2026-11`) from §4 and write each
+The commands below reuse `AO`, `PEOPLE`, `FROM`, `TO` and `M` (e.g. `2026-11`) from §4 and write each
 installment to its own store, `$S/stores/$M.db`. The clone directory is reused: `gather`
 fetches an existing clone instead of cloning again.
 
 **People defaults for Azure/\* repositories** (§5.7): the home organisations are `Azure`
 (the owner, always home) and `microsoft`, the home company name `Microsoft`, and a
-`microsoft.com` commit email counts; each stream keeps its registry at `$S/people.json`.
+`microsoft.com` commit email counts; every stream shares the one registry at `$PEOPLE`
+(`~/activity/people.json`, §2.1).
 These are the playbooks' settings, not built in: other owners name their own.
 
 ```bash
@@ -877,7 +1004,7 @@ AZ_PEOPLE="--home-org Azure --home-org microsoft --home-name Microsoft --home-em
 
 A manifest carries the same as `"affiliation": {"home_orgs": ["Azure", "microsoft"],
 "home_names": ["Microsoft"], "home_email_domains": ["microsoft.com"]}` and
-`"people": "people.json"` (`examples/manifest.json`).
+`"people": "../people.json"` (`examples/manifest.json`).
 
 ### 7.1 Bicep — `Azure/bicep`
 
@@ -892,7 +1019,7 @@ A manifest carries the same as `"affiliation": {"home_orgs": ["Azure", "microsof
 ```bash
 S=~/activity/bicep; DB=$S/stores/$M.db; mkdir -p $S/stores $S/views/$M
 python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
-  --store $DB --clone-dir $S/clone --people $S/people.json $AZ_PEOPLE
+  --store $DB --clone-dir $S/clone --people $PEOPLE $AZ_PEOPLE
 python3 $AO/validate.py $DB
 python3 $AO/view.py --store $DB --from $FROM --to $TO --out $S/views/$M/bundle.json
 python3 $AO/link.py $S/views/$M/bundle.json --series $S/series.json
@@ -927,7 +1054,7 @@ python3 $AO/render.py $S/views/$M/bundle.json --diagrams-dir $S/views/$M/diagram
 ```bash
 S=~/activity/avm-bicep; mkdir -p $S/stores $S/views/$M
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
-  --store $S/stores/$M.db --clone-dir $S/clone --structural-iac --people $S/people.json $AZ_PEOPLE
+  --store $S/stores/$M.db --clone-dir $S/clone --structural-iac --people $PEOPLE $AZ_PEOPLE
 python3 $AO/validate.py $S/stores/$M.db --project Azure --repo bicep-registry-modules
 python3 $AO/view.py --store $S/stores/$M.db --from $FROM --to $TO --out $S/views/$M/bundle.json
 python3 $AO/link.py $S/views/$M/bundle.json --series $S/series.json
@@ -979,7 +1106,7 @@ python3 $AO/manifest_from_index.py --avm res --avm ptn \
 export TF_PLUGIN_CACHE_DIR=~/activity/.tfcache && mkdir -p "$TF_PLUGIN_CACHE_DIR"
 mkdir -p $S/stores $S/views/$M                       # manifest: --clone-dir is the PARENT dir (clones in $S/clones/<owner>/<repo>)
 python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones \
-  --people $S/people.json $AZ_PEOPLE         # a generated manifest has no people / affiliation keys
+  --people $PEOPLE $AZ_PEOPLE         # a generated manifest has no people / affiliation keys
 python3 $AO/validate.py $S/stores/$M.db --project avm-tf-network
 python3 $AO/digest.py --store $S/stores/$M.db --project avm-tf-network --from $FROM --to $TO > $S/views/$M/project.json
 

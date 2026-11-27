@@ -318,14 +318,19 @@ people layer"; only per window, because it is GitHub's and the profile's answer 
 window was gathered; `{"collected": false}` for a gather run with `--no-affiliation`;
 absent from windows gathered before it existed. Gathered with the people registry
 (`--people`, a JSON file outside the store, BUNDLE.md "The people registry"), each entry
-also records the labels used for that window from it: the display `name`, `maintainer` and
-`maintainer_signal` for the window's repository — so a view stays reproducible after the
-registry changes, and no view reads the registry. It holds no other profile text, no
-company or email: `validate.py`'s meta integrity refuses an entry with any key beyond
-`affiliation`, `signal`, `strength`, `home_email_domain`, `name`, `maintainer` and
-`maintainer_signal`, a label / signal / strength / maintainer signal gather does not write,
-or a `do_not_name` entry that carries a name or a maintainer property; the schema is
-unchanged) — each named by the SHA-256 of
+also records the labels used for that window from it: the display `name`, `maintainer`,
+`maintainer_signal` and `maintainer_status` (the role's lifecycle at gather time: active /
+lapsed / former / unknown) for the window's repository — so a view stays reproducible after
+the registry changes, and no view reads the registry (`link.py --people` adds registry
+context to a view, outside the facts, as of the view's end). The registry's activity
+profile (`people-activity.json`, beside the registry) is filled from the same window's
+records at gather time, or from stores by `people.py seed`; it is never stored in a store.
+The fact holds no other profile text, no company or email: `validate.py`'s meta integrity
+refuses an entry with any key beyond `affiliation`, `signal`, `strength`,
+`home_email_domain`, `name`, `maintainer`, `maintainer_signal` and `maintainer_status`, a
+label / signal / strength / maintainer signal or status gather does not write, a `former`
+status on a maintainer, or a `do_not_name` entry that carries a name or a maintainer
+property; the schema is unchanged) — each named by the SHA-256 of
 its JSON text (encoded as node `data` is: sorted keys), and the clone sha the
 window was gathered against. A key is present only when the bundle's value is
 present and non-empty (the latest-wins node rule). Each value is stored once per

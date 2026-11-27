@@ -11,7 +11,7 @@ golden bundles the suite runs against.
 
 | File | What it is | Used by |
 |------|-----------|---------|
-| [`manifest.json`](manifest.json) | A small multi-repo project manifest (project, window, repos[]), with the Azure people defaults (`affiliation`: home orgs `Azure` and `microsoft`, home name `Microsoft`, email domain `microsoft.com`) and the stream's people registry (`people`: `people.json` next to the manifest; USAGE §5.7). | `python3 gather.py --manifest examples/manifest.json --store …` (or generate one with `manifest_from_index.py`). |
+| [`manifest.json`](manifest.json) | A small multi-repo project manifest (project, window, repos[]), with the Azure people defaults (`affiliation`: home orgs `Azure` and `microsoft`, home name `Microsoft`, email domain `microsoft.com`) and the workspace's people registry shared by every stream (`people`: `../people.json`, relative to the manifest; USAGE §2.1, §5.7). | `python3 gather.py --manifest examples/manifest.json --store …` (or generate one with `manifest_from_index.py`). |
 | [`community-call.vtt`](community-call.vtt) | A community-call transcript (WebVTT) with header metadata, `<v>` speaker tags, cue timings, and a rolling-caption duplicate — exercises every strip path. | `python3 transcript.py examples/community-call.vtt` → the **Community call highlights** report section. |
 | [`series.json`](series.json) | A two-installment series index (version 2: one entry per window, in window order). | `python3 link.py <view> --series examples/series.json` → the **Since last installment** section. |
 
