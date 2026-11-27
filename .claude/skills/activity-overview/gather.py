@@ -2533,6 +2533,32 @@ def marker_text(text):
     return "\n".join(lines[:MARKER_TEXT_LINES])[:MARKER_TEXT_CAP]
 
 
+_REPLACEMENT_RES = (
+    re.compile(r"(?i)\b(?:replaced by|superseded by|moved to|migrated to|"
+               r"successor(?: module)? is|please use|migrate to)\s+(?:the\s+)?`?"
+               r"((?:avm/)?(?:res|ptn|utl)/[\w.-]+/[\w.-]+)`?"),
+    re.compile(r"(?i)\buse\s+(?:the\s+)?`?((?:avm/)?(?:res|ptn|utl)/[\w.-]+/[\w.-]+)`?"
+               r"\s+(?:module\s+)?instead\b"))
+
+
+def replacement_named(texts):
+    """{module, quote, file} — the replacement module a deprecated module's
+    own texts name EXPLICITLY ("replaced by / superseded by / moved to /
+    migrate to <module>", "use <module> instead"), from [(file, text)] in
+    order; None when none does (never guessed)."""
+    for name, text in texts:
+        for rx in _REPLACEMENT_RES:
+            m = rx.search(text or "")
+            if m:
+                mod = m.group(1)
+                if not mod.startswith("avm/"):
+                    mod = "avm/" + mod
+                line = next((ln.strip() for ln in (text or "").splitlines()
+                             if m.group(0) in ln), m.group(0))
+                return {"module": mod, "quote": line[:300], "file": name}
+    return None
+
+
 def is_module_folder(folder, entry_names=MODULE_ENTRY_FILES):
     """A folder a module lives in: `avm/res|ptn|utl/<group>/<name>`, the
     repository root of a Terraform module, or `modules/<name>`."""
@@ -2580,7 +2606,7 @@ def _module_of_item(rec):
 def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                              end_files, frm, to, web=None, label_patterns=None,
                              owner_files=None, start_files=None, end_rev=None,
-                             start_state=None, clock=None):
+                             start_state=None, clock=None, proposed=None):
     """The window's SELF-CONTAINED `module_ownership` fact: {collected,
     gathered_at, window {from, to}, start_state, start_state_source, events:
     [{kind, module, people, date, at, seq, source: {type, number|sha, url,
@@ -2717,9 +2743,17 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                 events.append({"kind": "owner_needed", "module": module, "people": [],
                                "date": e.get("date"), "source": src(e), "via": base})
         if base in ORPHAN_MARKER_NAMES and e.get("change") in ("add", "delete"):
-            events.append({"kind": "orphaned" if e["change"] == "add" else "adopted",
-                           "module": folder, "people": [p for p in [e.get("author")] if p],
-                           "date": e.get("date"), "source": src(e), "via": base})
+            ev = {"kind": "orphaned" if e["change"] == "add" else "adopted",
+                  "module": folder, "people": [p for p in [e.get("author")] if p],
+                  "date": e.get("date"), "source": src(e), "via": base}
+            if e["change"] == "add":
+                try:
+                    text = marker_text(read_blob(e["commit"], path) or "")
+                except BlobUnreadable:
+                    text = ""
+                if text:
+                    ev["marker_text"] = text
+            events.append(ev)
         if base in dep_names and e.get("change") in ("add", "delete"):
             ev = {"kind": "deprecated" if e["change"] == "add" else "undeprecated",
                   "module": folder, "people": [p for p in [e.get("author")] if p],
@@ -2731,6 +2765,17 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                     text = ""
                 if text:
                     ev["marker_text"] = text
+                if ev["kind"] == "deprecated":
+                    texts = [("DEPRECATED marker", text)]
+                    for name in ("README.md", "CHANGELOG.md"):
+                        try:
+                            texts.append((name, read_blob(e["commit"], folder + "/" + name)
+                                          or ""))
+                        except BlobUnreadable:
+                            continue
+                    rep_ = replacement_named(texts)
+                    if rep_:
+                        ev["replacement"] = rep_
             events.append(ev)
         if base in entry_names and e.get("change") in ("add", "delete") \
                 and is_module_folder(folder):
@@ -2823,6 +2868,8 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
            "marker_files": {"orphaned": list(ORPHAN_MARKER_NAMES),
                             "deprecated": list(dep_names)},
            "entry_files": list(entry_names)}
+    if proposed:
+        out["proposed_modules"] = proposed
     # the window's end, derived by the same replay every reader uses (kept
     # stored as a cross-check: validate replays it again)
     end = extract.ownership_state(out, (to or "")[:10])
@@ -2869,6 +2916,51 @@ def start_state_owner_files(fact, module):
         r["codeowners"] = []
     f["events"] = [e for e in f.get("events") or [] if e.get("via") != "codeowners"]
     return (extract.ownership_state(f, "9999-12-31") or {}).get("owners", {}).get(module)
+
+
+def proposed_module_info(pr_history, read_blob, as_of=None, prs=None):
+    """{module folder: {prs: [n], commit, committed_at, [info]}} — the
+    module folders whose entry file a PR's own commits (committed by
+    `as_of`, the window's end) ADD: proposed modules; `info` is what the
+    metadata file the PR adds says the module is (display name,
+    description, resource type) — a stub on the base keeps its own.
+    Only PRs still open at `as_of` propose (`prs`: the window's PR records;
+    one merged or closed by then does not). Offline: the PR heads are in the
+    clone (refs/remotes/pr/<N>)."""
+    ended = {p.get("number") for p in prs or [] if isinstance(p, dict)
+             and (p.get("merged_at") or p.get("closed_at"))
+             and (not as_of or (p.get("merged_at") or p.get("closed_at")) <= as_of)}
+    out = {}
+    for row in (pr_history or {}).get("prs") or []:
+        if not isinstance(row, dict) or row.get("number") in ended:
+            continue
+        commits = [c for c in row.get("commits") or [] if isinstance(c, dict)
+                   and c.get("parents", 1) == 1
+                   and (not as_of or (c.get("committed_at") or "") <= as_of)]
+        added = {p: c for c in commits for p in c.get("added") or []}
+        for path, c in added.items():
+            folder, _, base = path.rpartition("/")
+            if base not in module_entry_names() or not is_module_folder(folder):
+                continue
+            # the PR's commits add the folder's entry file: proposed (a stub
+            # on the base keeps its metadata; a new folder's metadata file
+            # comes with the PR)
+            r = out.setdefault(folder, {"prs": [], "commit": c["sha"],
+                                        "committed_at": c.get("committed_at")})
+            if row.get("number") not in r["prs"]:
+                r["prs"].append(row.get("number"))
+            for name in _owner_file_names():
+                meta_c = added.get(folder + "/" + name)
+                if meta_c is None or r.get("info"):
+                    continue
+                try:
+                    info = module_info_from_json(read_blob(meta_c["sha"],
+                                                           folder + "/" + name) or "")
+                except BlobUnreadable:
+                    info = {}
+                if info:
+                    r["info"] = info
+    return {k: out[k] for k in sorted(out)}
 
 
 def window_start_commit(clone_dir, from_date, run=None):
@@ -2974,6 +3066,26 @@ def ownership_start_state(clone_dir, from_date, owner_files=None, run=None,
             r["orphan_marker"] = True
             if days.get(f):
                 r["marker_since"] = days[f]
+            try:
+                text = marker_text(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                text = ""
+            if text:
+                r["marker_text"] = text
+    for folder, r in state.items():
+        if r.get("deprecated"):
+            # where the repository names the replacement, explicitly: the
+            # marker, the module's README, its CHANGELOG
+            texts = [("DEPRECATED marker", r.get("deprecated_text") or "")]
+            for name in ("README.md", "CHANGELOG.md"):
+                try:
+                    texts.append((name, read_blob(sha, (folder + "/" if folder else "")
+                                                  + name) or ""))
+                except BlobUnreadable:
+                    continue
+            rep_ = replacement_named(texts)
+            if rep_:
+                r["replacement"] = rep_
     for folder, r in state.items():
         # a live module has its entry file; metadata alone is a stub
         r["entry"] = any((folder + "/" if folder else "") + n in tracked
@@ -3031,7 +3143,10 @@ def recompute_module_ownership(conn, project, repo, frm, to, clone_dir,
         view.get("prs") or [], view.get("issues") or [],
         read_blob or git_blob_reader(clone_dir, run), end_files, frm, to,
         web="https://github.com/" + slug, start_files=start_files,
-        end_rev=got.get("clone_sha"), start_state=start_state)
+        end_rev=got.get("clone_sha"), start_state=start_state,
+        proposed=proposed_module_info(
+            view.get("pr_history"), read_blob or git_blob_reader(clone_dir, run),
+            (to + "T23:59:59Z") if len(to) == 10 else to, view.get("prs")))
     bundle = dict(got["facts"])
     bundle["module_ownership"] = fact
     bundle["meta"] = {"workflows_collected": got.get("ci_collected")}
@@ -10550,7 +10665,10 @@ def acquire(args, env):
             code_events, commits, prs, issues, git_blob_reader(clone_dir),
             tracked or [], frm, to, web="https://github.com/{}/{}".format(owner, repo),
             start_files=window_start_files(clone_dir, frm), end_rev=clone_sha,
-            start_state=ownership_start_state(clone_dir, frm)[0])
+            start_state=ownership_start_state(clone_dir, frm)[0],
+            proposed=proposed_module_info(pr_history, git_blob_reader(clone_dir),
+                                          (to + "T23:59:59Z") if len(to) == 10 else to,
+                                          prs))
         sys.stderr.write(
             "module ownership: {}/{}: {} event(s), {} module(s) without an owner "
             "at the window's end\n".format(owner, repo,

@@ -3530,24 +3530,36 @@ def _account_types(bundle):
     return out
 
 
-def _on_behalf_of(p, activity_row, instant):
-    """The person who handed an automation account PR `p` the work, when the
-    record shows it: the actor of an `assigned` event assigning it (basis
-    `assigned`), else the first person who requested a review on it (basis
-    `requested review`); None otherwise."""
+def _on_behalf_of(p, activity_row, instant, issues=None):
+    """The person an automation account's PR `p` works for, from the record
+    only, with the `basis`: the person who assigned the agent (an
+    `assigned` event giving it the PR, by someone else: `assigned`), else
+    the person assigned to the PR with it (`assignee`), else the first
+    person who requested a review on it (`requested review`), else the
+    author of the issue the PR closes (`closes the issue of`; `issues`
+    {number: issue}); None when the record shows none."""
     evs = [e for e in (activity_row or {}).get("events") or []
-           if _not_after(e.get("at"), instant)]
-    return next(({"login": e.get("actor"), "basis": "assigned",
-                  "pr": p.get("number")} for e in evs
-                 if e.get("event") == "assigned"
-                 and e.get("assignee") == p.get("author")
-                 and e.get("actor") and e["actor"] != p.get("author")
-                 and not derive.is_bot_login(e["actor"])), None) or \
-        next(({"login": e.get("by"), "basis": "requested review",
-               "pr": p.get("number")} for e in evs
-              if e.get("event") == "review_requested" and e.get("by")
-              and e["by"] != p.get("author")
-              and not derive.is_bot_login(e["by"])), None)
+           if isinstance(e, dict) and _not_after(e.get("at"), instant)]
+    author = p.get("author")
+
+    def person(x):
+        return isinstance(x, str) and x and x != author and not derive.is_bot_login(x)
+    for e in evs:
+        if e.get("event") == "assigned" and e.get("assignee") == author \
+                and person(e.get("actor")):
+            return {"login": e["actor"], "basis": "assigned", "pr": p.get("number")}
+    for e in evs:
+        if e.get("event") == "assigned" and person(e.get("assignee")):
+            return {"login": e["assignee"], "basis": "assignee", "pr": p.get("number")}
+    for e in evs:
+        if e.get("event") == "review_requested" and person(e.get("by")):
+            return {"login": e["by"], "basis": "requested review", "pr": p.get("number")}
+    for n in p.get("closes") or []:
+        i = (issues or {}).get(n)
+        if i and person(i.get("author")):
+            return {"login": i["author"], "basis": "closes the issue of",
+                    "pr": p.get("number"), "issue": n}
+    return None
 
 
 def module_owners(bundle):
@@ -3619,12 +3631,18 @@ def annotate_automation(bundle, registry=None):
         else:
             continue
         row = {"kind": kind}
+        issues = {i.get("number"): i for i in bundle.get("issues") or []
+                  if isinstance(i, dict)}
+        by_pr = {}
         for p in bundle.get("prs") or []:
             if isinstance(p, dict) and p.get("author") == login:
-                by = _on_behalf_of(p, activity.get(p.get("number")), instant)
+                by = _on_behalf_of(p, activity.get(p.get("number")), instant, issues)
                 if by:
-                    row["on_behalf_of"] = by
-                    break
+                    by_pr[str(p.get("number"))] = by
+        if by_pr:
+            row["on_behalf_of"] = by_pr[min(by_pr, key=int)]
+            if len(by_pr) > 1:          # several PRs: who each one works for
+                row["on_behalf_of_by_pr"] = {k: by_pr[k] for k in sorted(by_pr, key=int)}
         people.setdefault(login, {})["automation"] = row
     return bundle
 
@@ -4261,6 +4279,27 @@ def annotate_module_ownership(bundle):
             if isinstance(r, dict) and r.get("module") and module_url(bundle, r["module"]):
                 r["module_url"] = module_url(bundle, r["module"])
     mo["events"] = sorted(events, key=_ownership_event_key)
+    return bundle
+
+
+def annotate_train_modules(bundle):
+    """On every train of a story-layer view: `modules` / `modules_source`
+    (train_modules — the module areas every consumer uses), and for a train
+    with no merged code `pr_code_areas` (every code area its PRs' own
+    commits touched as of the view's end; `code_areas` stays the merged
+    commits' areas). In place."""
+    if "pr_history" not in bundle:
+        return bundle
+    ctx = _module_ctx(bundle)
+    instant = window_end_instant(bundle.get("meta"))
+    for t in bundle.get("trains") or []:
+        mods, source = train_modules(bundle, ctx, t, instant)
+        t["modules"], t["modules_source"] = mods, source
+        if not t.get("commits"):
+            _issues, prs = _train_items(bundle, t)
+            areas = {ctx.area_of(x) for p in prs
+                     for x in _pr_own_paths(bundle, p.get("number"), instant)}
+            t["pr_code_areas"] = sorted(a for a in areas if a)
     return bundle
 
 
@@ -5083,7 +5122,9 @@ def story_material(bundle, train):
     requests = _outcome_requests(threads)
     automation = _automation_accounts(issues + prs, prs, history, activity,
                                       instant,
-                                      lambda x: _is_automation(bundle, x))
+                                      lambda x: _is_automation(bundle, x),
+                                      {i.get("number"): i for i in
+                                       bundle.get("issues") or []})
     out = {"timeline": items,
            "turning_points": turning,
            "truncation": truncation,
@@ -5235,7 +5276,7 @@ def _pr_history_status(prs, history):
 
 
 def _automation_accounts(records, prs, history, activity, instant=None,
-                         is_auto=None):
+                         is_auto=None, issues_index=None):
     """The automation accounts of a train, for what they are (issue #97):
     [{login, is_bot: true, comments, review_comments, reviews, commits,
     prs_opened: [n], on_behalf_of?: {login, basis, pr}}] — counts over the
@@ -5263,7 +5304,8 @@ def _automation_accounts(records, prs, history, activity, instant=None,
         if p.get("author") and is_auto(p["author"]):
             row = get(p["author"])
             row["prs_opened"].append(p.get("number"))
-            by = _on_behalf_of(p, (activity or {}).get(p.get("number")), instant)
+            by = _on_behalf_of(p, (activity or {}).get(p.get("number")), instant,
+                               issues_index)
             if by and "on_behalf_of" not in row:
                 row["on_behalf_of"] = by
         for c in _pr_commits_as_of(history.get(p.get("number")), instant):
@@ -5912,7 +5954,7 @@ def _event_ref(it, actor=None):
 
 
 def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None,
-              cannot_act=None):
+              cannot_act=None, review=None):
     """Who the next move on an open PR is with — DERIVED by rule from the
     sequence of its recorded events (`pr_items`, the timeline items on that
     PR in time order), never read from anyone's words. A PR commit counts
@@ -5938,6 +5980,14 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
       change request outstanding, checks not failing), the next move is
       the module owner's -> `awaiting module owner` (the owners the
       request names, when recorded; `owner_basis` {label, item}).
+    - R8 approval made stale by a later push (only with `review`, the PR's
+      review_state): when R2 fired, or R4 on an event older than the
+      author's last push, and the state is `approved_stale` with no change
+      request outstanding -> `awaiting reviewer` (the approver;
+      `review_basis` {approved_at, last_push}).
+    Precedence: failing checks (R5 / R6) over everything but R1 and R4; an
+    outstanding change request over R7 / R8; R1 (a named person) stands;
+    then R7 (module owner asked), then R8, then R2 / R3 / R4.
     Automation items (check results) are never the last event, and
     neither is an event by an actor who cannot act (`cannot_act(login)`:
     an automation account re-requesting reviews, a deleted account's
@@ -5988,6 +6038,21 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None
                    checks_basis={"head": checks.get("head"),
                                  "failing": checks.get("failing") or []})
         out["with"] = [author] if author else []
+    review = review if isinstance(review, dict) else None
+    basis_r = (review or {}).get("basis")
+    basis_r = basis_r if isinstance(basis_r, dict) else {}
+    if review and review.get("state") == "approved_stale" and not outstanding \
+            and out["rule"] in ("R2 author moved", "R4 reviewer moved") \
+            and (out["rule"] == "R2 author moved"
+                 or str(out["basis"].get("at") or "") < str(review.get("last_push") or "")):
+        # an approval made stale by the author's later push: the next move
+        # is the approver's (checks failing and an outstanding change
+        # request keep theirs; a named person, R1, stands)
+        approver = basis_r.get("reviewer")
+        out.update(state="awaiting reviewer", rule="R8 approval made stale by a later push",
+                   review_basis={"approved_at": basis_r.get("at"),
+                                 "last_push": review.get("last_push")})
+        out["with"] = [approver] if approver else []
     if owner_request and out["rule"] == "R2 author moved" and not outstanding:
         out.update(state="awaiting module owner",
                    rule="R7 module owner response requested",
@@ -6453,7 +6518,8 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
                 ball = ball_with(rec, on_items, verdicts, reviewers,
                                  row["checks"] if isinstance(row["checks"], dict)
                                  else None, owner_request=req,
-                                 cannot_act=lambda x: _cannot_act(bundle, x))
+                                 cannot_act=lambda x: _cannot_act(bundle, x),
+                                 review=row.get("review_state"))
                 if ball:
                     row["ball"] = ball
                 open_prs.append((rec.get("created_at") or "", row))
@@ -7273,6 +7339,7 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     # Omit-when-absent keys: a train with no human conversation, and a view
     # where no train qualifies, are unchanged.
     annotate_last_human_event(bundle)
+    annotate_train_modules(bundle)
     if "pr_history" in bundle:
         annotate_module_owners(bundle)
     annotate_train_discussion(bundle)

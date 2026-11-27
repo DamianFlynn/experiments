@@ -1536,9 +1536,11 @@ _OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns"
                         "owners_at_end", "gathered_at", "start_state",
                         "start_state_source", "end_check", "window", "as_of_window",
                         "marker_files", "entry_files", "deprecated_modules",
-                        "stub_modules", "modules_at_end"}
+                        "stub_modules", "modules_at_end", "proposed_modules",
+                        "marker_texts"}
 _OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "at", "seq", "source",
-                         "quote", "via", "marker_text", "info", "file_removed"}
+                         "quote", "via", "marker_text", "info", "file_removed",
+                         "replacement"}
 
 
 # --- typed shapes of the fields readers touch ---------------------------------
@@ -1626,7 +1628,14 @@ OWNERSHIP_STATE_SHAPE = ("map", ("obj", {
     "marker_since": (_SN, False), "owners_since": (_SN, False),
     "entry": ("bool", False), "deprecated": ("bool", False),
     "deprecated_since": (_SN, False), "deprecated_text": (_SN, False),
+    "marker_text": (_SN, False),
+    "replacement": (("obj", {"module": (_S, True), "quote": (_S, False),
+                             "file": (_S, False)}), False),
     "info": (MODULE_INFO_SHAPE, False)}))
+PROPOSED_MODULES_SHAPE = ("map", ("obj", {"prs": (("list", _I), True),
+                                          "commit": (_S, False),
+                                          "committed_at": (_SN, False),
+                                          "info": (MODULE_INFO_SHAPE, False)}))
 LIFECYCLE_ROW_SHAPE = ("obj", {"module": (_S, True), "lifecycle": (_S, True),
                                "display_name": (_S, False), "description": (_S, False),
                                "resource_type": (_S, False),
@@ -1647,6 +1656,7 @@ _OWNERSHIP_ROW_TYPES = {
     "events": {"kind": (_STR, True), "module": (_STR + _NONE, False),
                "marker_text": (_STR, False), "info": ("info", False),
                "file_removed": ("bool", False),
+               "replacement": ("replacement", False),
                "people": ("list_of_str", False), "date": (_STR, True),
                "at": (_STR + _NONE, False), "seq": ("int", False),
                "source": ("source", False), "via": (_STR + _NONE, False),
@@ -1674,6 +1684,9 @@ def _typed_ok(v, types):
         return isinstance(v, list) and all(isinstance(x, str) for x in v)
     if types == "info":
         return _typed(v, MODULE_INFO_SHAPE)
+    if types == "replacement":
+        return _typed(v, ("obj", {"module": (_S, True), "quote": (_S, False),
+                                  "file": (_S, False)}))
     if types == "source":
         return isinstance(v, dict) and all(
             k not in v or (isinstance(v[k], t) and not isinstance(v[k], bool))
@@ -1729,6 +1742,9 @@ def _module_ownership_problem(value):
             return "module_ownership {} has a row gather does not write".format(key)
     for key, spec in (("modules_at_end", ("map", ("obj", {"lifecycle": (_S, True)}))),
                       ("marker_files", ("map", ("list", _S))),
+                      ("proposed_modules", PROPOSED_MODULES_SHAPE),
+                      ("marker_texts", ("map", ("obj", {"text": (_S, True),
+                                                        "modules": (_I, True)}))),
                       ("entry_files", ("list", _S))):
         if key in value and not _typed(value[key], spec):
             return "module_ownership {} is not what gather writes".format(key)

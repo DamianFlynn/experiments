@@ -1260,8 +1260,11 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
   everything else), `account_type` (GitHub's account type for the author, kept by
   gather as `author_type` on PRs, issues, comments and reviews when it is not `User`),
   `app_login` (a `name[bot]` login) or `automation_name` (a git name automation commits
-  under). Never from a display name alone. `on_behalf_of` `{login, basis: assigned |
-  requested review, pr}` — who handed it the work on a PR it opened, when recorded.
+  under). Never from a display name alone. `on_behalf_of: {login, basis, pr, issue?}` — who the PR works for, from the record
+  only, in order: the person who assigned the agent (`assigned`), the person assigned to
+  the PR with it (`assignee`), the first person who requested a review (`requested
+  review`), the author of the issue the PR closes (`closes the issue of`); absent when the
+  record has none. An account with several PRs adds `on_behalf_of_by_pr` `{pr: {...}}`.
 - `module_changes.modules[]` gain `url` (`link.module_url`: the module folder at the
   commit the structure was read at) and `versions.published[]` gain `url` (the tag's tree) and `registry`
   (the public Bicep registry reference, where derivable).
@@ -1483,7 +1486,13 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
     maintainer`; **R7 module owner response requested** — when R2 stands (no change
     request outstanding, checks not failing) and the PR carries the owner-response
     label: `awaiting module owner` (the owners the request names, when recorded), with
-    `owner_basis` `{label, item}`. A `checks` item is never the last
+    `owner_basis` `{label, item}`; **R8 approval made stale by a later push** — when the
+    PR's `review_state` is `approved_stale`, no change request is outstanding and R2 fired
+    (or R4 on an event older than the author's last push): `awaiting reviewer` (the
+    approver), with `review_basis` `{approved_at, last_push}`. **Precedence**, so the ball
+    and the review state never disagree: failing checks (R5 / R6) over everything but R1
+    and R4; an outstanding change request over R7 and R8; a named person (R1) stands; then
+    R7 (the module owner was asked), then R8, then R2 / R3 / R4. A `checks` item is never the last
     event; a `review_requested` event names its requested reviewer for R2. For an open
     issue with no open PR: **I1** the reporter moved last: `awaiting maintainer
     response`; **I2** someone else named people: `awaiting mentioned`; **I3** otherwise
@@ -1827,8 +1836,20 @@ folder's lifecycle comes from the tree (`extract.module_lifecycle`): `deprecated
 deprecation marker, `ACTIVITY_DEPRECATED_FILES`, default `DEPRECATED.md`), `orphaned` (an
 orphan marker), `live` (its entry file, `ACTIVITY_ENTRY_FILES`, default `main.bicep` /
 `main.tf`), `stub` (its metadata file only: reserved, not yet published or removed), `removed`
-(its entry file deleted in the window), or `unknown` (a start state read before entry
-files were recorded). Deleting a populated owner file is `owner_removed` with
+(its entry file deleted in the window), or `proposed` (no entry file on the base, but an open PR's own commits by that day add the
+folder's entry and metadata files: `proposed_modules` `{module: {prs, commit,
+committed_at, info}}`, what the PR's own metadata file says the module is; a stub an open
+PR fills is `proposed`, not `stub`; `modules_at_end` rows add `proposed_by` [pr]), or
+`unknown` (a start state read before entry files were recorded). Every lifecycle marker's
+first lines are kept verbatim: `deprecated_text` for a deprecation marker and
+`marker_text` for an orphan marker (on `without_owner` rows too — it is the call to action).
+When several modules carry the SAME marker text (boilerplate), the rows say
+`marker_text_shared: true` and `marker_texts` `{deprecated | orphaned: {text, modules}}`
+holds the text once. A deprecated module's `replacement` `{module, quote, file}` comes only
+from explicit text — its marker, README or CHANGELOG naming the module that replaces it
+("replaced by / superseded by / moved to / migrate to <module>", "use <module> instead");
+on the October 2026 tree all 12 markers are the same boilerplate naming none, and no README
+or CHANGELOG names one. Deleting a populated owner file is `owner_removed` with
 `file_removed: true` — the file (often the module) is gone, not an owner list emptied —
 so a removed module is never "without an owner". Provenance is honoured: a fact whose
 `start_state_source` is not `complete` (no tree before the window was read) has NO known
@@ -1853,7 +1874,10 @@ its events. `module_changes.modules[]` rows take `module_lifecycle`, `display_na
 only_tree}}` cross-checks the module layer's own window statuses against the tree's
 events. `stories.all[]` rows add `module_info` `{area: {display_name?, description?,
 resource_type?, lifecycle}}`, and slice outcome items and `outcome.modules[]` rows carry
-the same. Refresh offline from a clone (`--recompute-modules` is the same flag as
+the same. Every train of a story-layer view carries `modules` / `modules_source` (the
+module areas `stories.all` shows, `link.train_modules`) and, with no merged code,
+`pr_code_areas` (every area its PRs' own commits touched by the view's end; `code_areas`
+stays the merged commits' areas). Refresh offline from a clone (`--recompute-modules` is the same flag as
 `--recompute-ownership`): `python3 gather.py --owner O --repo R --from F --to T --store S
 --clone-dir C --recompute-modules`.
 

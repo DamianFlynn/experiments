@@ -1613,6 +1613,8 @@ def ownership_state(fact, day):
                 "deprecated": bool(r.get("deprecated")),
                 "deprecated_since": r.get("deprecated_since"),
                 "deprecated_text": r.get("deprecated_text"),
+                "marker_text": r.get("marker_text"),
+                "replacement": r.get("replacement"),
                 "info": dict(r.get("info")) if isinstance(r.get("info"), dict) else {}}
             for m, r in start.items() if isinstance(r, dict)}
     # the last ownership change before the window, as the start state dates
@@ -1629,7 +1631,8 @@ def ownership_state(fact, day):
                                    "marker": False, "marker_since": None,
                                    "owners_since": None, "entry": None,
                                    "deprecated": False, "deprecated_since": None,
-                                   "deprecated_text": None, "info": {}})
+                                   "deprecated_text": None, "info": {},
+                                   "marker_text": None, "replacement": None})
     for e in sorted((e for e in fact.get("events") or [] if isinstance(e, dict)),
                     key=ownership_event_order):
         d = str(e.get("date") or "")[:10]
@@ -1643,7 +1646,8 @@ def ownership_state(fact, day):
         if kind in ("deprecated", "undeprecated"):
             r.update(deprecated=kind == "deprecated",
                      deprecated_since=d if kind == "deprecated" else None,
-                     deprecated_text=e.get("marker_text") if kind == "deprecated" else None)
+                     deprecated_text=e.get("marker_text") if kind == "deprecated" else None,
+                     replacement=e.get("replacement") if kind == "deprecated" else None)
             continue
         if kind in ("module_added", "module_removed"):
             r["entry"] = kind == "module_added"
@@ -1655,9 +1659,9 @@ def ownership_state(fact, day):
             continue
         if via in ORPHAN_MARKER_NAMES:
             if kind == "orphaned":
-                r.update(marker=True, marker_since=d)
+                r.update(marker=True, marker_since=d, marker_text=e.get("marker_text"))
             elif kind == "adopted":
-                r.update(marker=False, marker_since=None)
+                r.update(marker=False, marker_since=None, marker_text=None)
         elif via == "codeowners":
             people = [p for p in people if "/" not in p and "@" not in p]
             if kind == "owner_added":
@@ -1710,24 +1714,60 @@ def ownership_state(fact, day):
                            "source": it.get("source")})
     owners = {m: sorted(set(r["owners"]) | set(r["codeowners"]))
               for m, r in mods.items() if r["owners"] or r["codeowners"]}
+    # a module an open PR proposes (its own commits by `day` add the folder's
+    # entry and metadata files): `proposed` unless the base already has it live
+    for m, p in (fact.get("proposed_modules") or {}).items():
+        if not isinstance(p, dict) or not isinstance(m, str) or \
+                str(p.get("committed_at") or "")[:10] > day:
+            continue
+        r = mod(m)
+        if module_lifecycle(r) in ("live", "deprecated", "orphaned", "removed"):
+            continue
+        r["proposed"] = [n for n in p.get("prs") or [] if isinstance(n, int)]
+        if isinstance(p.get("info"), dict) and not r["info"]:
+            r["info"] = dict(p["info"])
+    # one boilerplate marker text shared by several modules is said once
+    counts = {}
+    for r in mods.values():
+        for key in ("deprecated_text", "marker_text"):
+            if r.get(key) and (key == "marker_text" and r["marker"]
+                               or key == "deprecated_text" and r["deprecated"]):
+                counts[(key, " ".join(r[key].split()))] = counts.get(
+                    (key, " ".join(r[key].split())), 0) + 1
+    shared = {k for k, n in counts.items() if n > 1}
+    marker_texts = {}
     modules = {}
     for m, r in mods.items():
         row = {"lifecycle": module_lifecycle(r)}
         for k in ("display_name", "description", "resource_type", "alternative_names"):
             if r["info"].get(k):
                 row[k] = r["info"][k]
+        if r.get("proposed"):
+            row["proposed_by"] = r["proposed"]
+        for key, on in (("deprecated_text", r["deprecated"]), ("marker_text", r["marker"])):
+            if not on or not r.get(key):
+                continue
+            norm = " ".join(r[key].split())
+            if (key, norm) in shared:
+                row["marker_text_shared"] = True
+                kind = "deprecated" if key == "deprecated_text" else "orphaned"
+                marker_texts.setdefault(kind, {"text": r[key], "modules": 0})
+                marker_texts[kind]["modules"] += 1
+            else:
+                row[key] = r[key]
         if r["deprecated"]:
             if r["deprecated_since"]:
                 row["deprecated_since"] = r["deprecated_since"]
-            if r["deprecated_text"]:
-                row["deprecated_text"] = r["deprecated_text"]
+            if r.get("replacement"):
+                row["replacement"] = r["replacement"]
         modules[m] = row
     rows = []
     for k in sorted(out, key=lambda m: m or ""):
         row = dict(out[k])
         info = modules.get(k) or {"lifecycle": "unknown"}
         row["lifecycle"] = info["lifecycle"]
-        for f in ("display_name", "description", "resource_type"):
+        for f in ("display_name", "description", "resource_type", "marker_text",
+                  "marker_text_shared"):
             if info.get(f):
                 row[f] = info[f]
         rows.append(row)
@@ -1737,7 +1777,8 @@ def ownership_state(fact, day):
             "stub_modules": [_lifecycle_row(m, modules[m]) for m in sorted(modules)
                              if modules[m]["lifecycle"] == "stub"],
             "owners": {m: owners[m] for m in sorted(owners)},
-            "modules": {m: modules[m] for m in sorted(modules)}}
+            "modules": {m: modules[m] for m in sorted(modules)},
+            "marker_texts": marker_texts}
 
 
 # A module's lifecycle from the tree: `deprecated` (a deprecation marker),
@@ -1746,13 +1787,17 @@ def ownership_state(fact, day):
 # `unknown` (a start state read before entry files
 # were recorded). "Without an owner" is about live and orphaned modules
 # (and unknown ones, never hidden).
-MODULE_LIFECYCLES = ("live", "deprecated", "orphaned", "stub", "removed", "unknown")
+MODULE_LIFECYCLES = ("live", "deprecated", "orphaned", "stub", "removed", "proposed",
+                     "unknown")
 OWNERLESS_LIFECYCLES = ("live", "orphaned", "unknown")
 
 
 def module_lifecycle(r):
     if r.get("removed"):
         return "removed"
+    if r.get("proposed") and not r.get("entry") and not r.get("deprecated") \
+            and not r.get("marker"):
+        return "proposed"
     if r.get("deprecated"):
         return "deprecated"
     if r.get("marker"):
@@ -1776,7 +1821,8 @@ def ownership_end_fields(end):
             "deprecated_modules": end["deprecated_modules"],
             "stub_modules": end["stub_modules"],
             "owners_at_end": end["owners"],
-            "modules_at_end": end["modules"]}
+            "modules_at_end": end["modules"],
+            "marker_texts": end["marker_texts"]}
 
 
 def standing_without_owner(fact, day):
@@ -1861,7 +1907,7 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
     elif end == k[1][:10]:
         out["without_owner"] = list(fact.get("without_owner") or [])
         for key in ("owners_at_end", "modules_at_end", "deprecated_modules",
-                    "stub_modules"):
+                    "stub_modules", "marker_texts"):
             if key in fact:
                 out[key] = fact[key]
     else:

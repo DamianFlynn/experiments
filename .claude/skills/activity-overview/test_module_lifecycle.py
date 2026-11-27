@@ -190,5 +190,194 @@ class TestReaders(unittest.TestCase):
         self.assertEqual(o["items"][0]["proposes_new_module"], ["avm/res/e/new"])
 
 
+class TestMarkerTextsAndProposed(unittest.TestCase):
+
+    def test_orphan_marker_text_is_kept(self):
+        st = start_state()
+        st[ORPH]["marker_text"] = "THIS MODULE IS CURRENTLY ORPHANED.\n- Become its owner: see the list."
+        f = gather.collect_module_ownership([], [], [], [], Blobs({}), [], "2026-10-01",
+                                            "2026-10-31", start_state=st)
+        row = next(r for r in f["without_owner"] if r["module"] == ORPH)
+        self.assertIn("Become its owner", row["marker_text"])
+
+    def test_gather_reads_the_orphan_marker_text(self):
+        files = [ORPH + "/main.bicep", ORPH + "/metadata.json", ORPH + "/ORPHANED.md"]
+
+        def run(argv):
+            return "\n".join(files) if argv[3] == "ls-tree" else ""
+        blobs = Blobs({(START, ORPH + "/metadata.json"): meta([]),
+                       (START, ORPH + "/ORPHANED.md"): "ORPHANED.\n\n- Take it over."})
+        with mock.patch.object(gather, "window_start_commit", lambda *a, **k: START):
+            state, _u = gather.ownership_start_state("/c", "2026-10-01", run=run,
+                                                     read_blob=blobs)
+        self.assertEqual(state[ORPH]["marker_text"], "ORPHANED.\n- Take it over.")
+
+    def test_shared_boilerplate_is_said_once(self):
+        st = start_state()
+        boiler = "THIS MODULE IS DEPRECATED.\n- It will no longer receive any updates."
+        for m in (DEP, "avm/ptn/b/dep2"):
+            st.setdefault(m, {"owners": [], "codeowners": [], "orphan_marker": False})
+            st[m].update(deprecated=True, deprecated_text=boiler, entry=True)
+        f = gather.collect_module_ownership([], [], [], [], Blobs({}), [], "2026-10-01",
+                                            "2026-10-31", start_state=st)
+        rows = {r["module"]: r for r in f["deprecated_modules"]}
+        self.assertTrue(all(r["marker_text_shared"] for r in rows.values()))
+        self.assertTrue(all("deprecated_text" not in r for r in rows.values()))
+        self.assertEqual(f["marker_texts"]["deprecated"], {"text": boiler, "modules": 2})
+
+    def test_a_replacement_only_from_explicit_text(self):
+        self.assertIsNone(gather.replacement_named([
+            ("DEPRECATED marker", "It is recommended to migrate to a replacement/"
+                                  "alternative version of the module, if available.")]))
+        got = gather.replacement_named([("README.md", "> This module is replaced by "
+                                                      "`avm/ptn/b/new`.")])
+        self.assertEqual(got, {"module": "avm/ptn/b/new", "file": "README.md",
+                               "quote": "> This module is replaced by `avm/ptn/b/new`."})
+
+    def test_a_proposed_module_is_described_and_proposed(self):
+        hist_ = {"prs": [{"number": 7560, "commits": [{
+            "sha": "p" * 40, "parents": 1, "committed_at": "2026-10-23T10:00:00Z",
+            "added": [STUB + "/main.bicep", STUB + "/metadata.json",
+                      "avm/res/n/gallery-image/main.bicep",
+                      "avm/res/n/gallery-image/metadata.json",
+                      "utilities/t/x/metadata.json"]}]}]}
+        blobs = Blobs({("p" * 40, "avm/res/n/gallery-image/metadata.json"):
+                       meta([], "Gallery Image", "AVM Resource Module for Gallery Image",
+                            "Microsoft.AzureStackHCI/galleryImages"),
+                       ("p" * 40, STUB + "/metadata.json"): meta([], "Stub One")})
+        prop = gather.proposed_module_info(hist_, blobs, "2026-10-31T23:59:59Z")
+        self.assertEqual(sorted(prop), sorted(["avm/res/n/gallery-image", STUB]))
+        f = gather.collect_module_ownership([], [], [], [], Blobs({}), [], "2026-10-01",
+                                            "2026-10-31", start_state=start_state(),
+                                            proposed=prop)
+        mods = f["modules_at_end"]
+        self.assertEqual((mods["avm/res/n/gallery-image"]["lifecycle"],
+                          mods["avm/res/n/gallery-image"]["display_name"]),
+                         ("proposed", "Gallery Image"))
+        self.assertEqual(mods[STUB]["lifecycle"], "proposed")    # a stub its PR fills
+        self.assertNotIn(STUB, [r["module"] for r in f["stub_modules"]])
+        early = extract.ownership_state(f, "2026-10-20")
+        self.assertEqual(early["modules"][STUB]["lifecycle"], "stub")
+        self.assertIsNone(validate._fact_shape_problem("module_ownership", f))
+
+    def test_a_stub_whose_entry_file_a_pr_adds_is_proposed(self):
+        # the real #7485 shape: the folder holds only its metadata on the
+        # base; the PR's own commits add main.bicep, not the metadata file
+        hist_ = {"prs": [{"number": 7485, "commits": [{
+            "sha": "q" * 40, "parents": 1, "committed_at": "2026-10-07T10:00:00Z",
+            "added": [STUB + "/main.bicep", STUB + "/README.md"]}]}]}
+        prop = gather.proposed_module_info(hist_, Blobs({}), "2026-10-31T23:59:59Z")
+        self.assertEqual(prop, {STUB: {"prs": [7485], "commit": "q" * 40,
+                                       "committed_at": "2026-10-07T10:00:00Z"}})
+        f = gather.collect_module_ownership([], [], [], [], Blobs({}), [], "2026-10-01",
+                                            "2026-10-31", start_state=start_state(),
+                                            proposed=prop)
+        self.assertEqual((f["modules_at_end"][STUB]["lifecycle"],
+                          f["modules_at_end"][STUB]["display_name"]),
+                         ("proposed", "Stub One"))
+
+
+class TestTrainsAndAutomation(unittest.TestCase):
+
+    def test_open_pr_trains_carry_their_modules(self):
+        b = view([pr(1, title="feat: z", comments_list=talk(1))],
+                 pr_history=hist({"number": 1, "status": "fetched", "commits": [
+                     commit("a" * 40, "2026-05-10T00:00:00Z", "z",
+                            ["avm/res/e/new/main.bicep", ".github/workflows/x.yml"])]}))
+        b = enriched(b)
+        t = next(t for t in b["trains"] if t["id"] == "train-pr-1")
+        self.assertEqual((t["modules"], t["modules_source"]), (["avm/res/e/new"], "pr_commits"))
+        self.assertEqual(t["pr_code_areas"], [".github/workflows", "avm/res/e/new"])
+        self.assertEqual(rows(b)["train-pr-1"]["modules"], t["modules"])
+
+    def test_on_behalf_of_from_the_record_per_pr(self):
+        f = {"collected": True, "prs": [
+            {"number": 1, "events": [{"event": "assigned", "at": "2026-05-01T00:00:00Z",
+                                      "actor": "agent", "assignee": "segraef"}]},
+            {"number": 2, "events": []}]}
+        i = {"number": 9, "title": "t", "body": "", "author": "reporter", "state": "open",
+             "created_at": "2026-04-01T00:00:00Z", "url": "u9", "labels": [],
+             "comments_list": []}
+        b = view([pr(1, author="agent", author_type="Bot", comments_list=talk(1)),
+                  pr(2, author="agent", closes=[9], comments_list=talk(2))], [i],
+                 pr_activity=f)
+        b = enriched(b)
+        a = b["people"]["agent"]["automation"]
+        self.assertEqual(a["on_behalf_of_by_pr"], {
+            "1": {"login": "segraef", "basis": "assignee", "pr": 1},
+            "2": {"login": "reporter", "basis": "closes the issue of", "pr": 2, "issue": 9}})
+
+
+class TestBallAndReviewState(unittest.TestCase):
+
+    def test_a_stale_approval_puts_the_ball_with_the_approver(self):
+        from test_story import review
+        h = hist({"number": 1, "status": "fetched", "commits": [
+            commit("a" * 40, "2026-05-20T00:00:00Z", "rework", [LIVE + "/main.bicep"])]})
+        p = pr(1, reviews=[review("bob", "2026-05-05T00:00:00Z", "approved", 6)])
+        b = enriched(view([p], pr_history=h))
+        o = link.slice_train(b, "train-pr-1")["conversation"]["outcome"]
+        self.assertEqual(o["items"][0]["review_state"]["state"], "approved_stale")
+        self.assertEqual((o["ball"]["state"], o["ball"]["with"], o["ball"]["rule"]),
+                         ("awaiting reviewer", ["bob"],
+                          "R8 approval made stale by a later push"))
+
+
+class TestUnavailableEndToEnd(unittest.TestCase):
+    """A clone whose history does not reach the window's start: through
+    gather (the offline recompute) -> store -> view, the ownership state is
+    unavailable, with the reason; the events are still there."""
+
+    def test_shallow_clone(self):
+        import shutil
+        import subprocess
+        import tempfile
+        import graphstore
+        from test_pr_activity import _folded
+        from test_story import git
+        tmp = tempfile.mkdtemp()
+        try:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            git("init", "-q", "-b", "main", cwd=src)
+            os.makedirs(os.path.join(src, LIVE))
+            with open(os.path.join(src, LIVE, "metadata.json"), "w") as fh:
+                fh.write(meta(["alice"]))
+            with open(os.path.join(src, LIVE, "main.bicep"), "w") as fh:
+                fh.write("param a string\n")
+            git("add", ".", cwd=src)
+            git("commit", "-q", "-m", "module", cwd=src, date="2026-09-10")
+            with open(os.path.join(src, LIVE, "ORPHANED.md"), "w") as fh:
+                fh.write("ORPHANED.\n")
+            git("add", ".", cwd=src)
+            git("commit", "-q", "-m", "orphan it", cwd=src, date="2026-10-05")
+            clone = os.path.join(tmp, "clone")
+            git("clone", "-q", "--shallow-since=2026-10-01", "file://" + src, clone)
+            self.assertEqual(gather.window_start_commit(clone, "2026-10-01"), None)
+            conn = _folded(None)
+            head = git("rev-parse", "HEAD", cwd=clone).strip()
+            gather.fold_bundle(conn, {
+                "meta": {"owner": "o", "repo": "r", "from": "2026-10-01",
+                         "to": "2026-10-31", "period": {"from": "2026-10-01",
+                                                        "to": "2026-10-31"},
+                         "ref_date": "2026-10-31", "base_branch": "main",
+                         "branches": ["main"], "clone_sha": head},
+                "prs": [], "issues": [], "commits": [],
+                "code_events": [{"commit": head, "path": LIVE + "/ORPHANED.md",
+                                 "change": "add", "date": "2026-10-05", "author": "x"}]})
+            fact = gather.recompute_module_ownership(conn, "o", "r", "2026-10-01",
+                                                     "2026-10-31", clone)
+            self.assertEqual(fact["start_state_source"], "markers_only")
+            self.assertEqual(fact["without_owner"], [])
+            self.assertIn("never read", fact["without_owner_unavailable"])
+            v = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-15")
+            mo = v["module_ownership"]
+            self.assertEqual(mo["without_owner"], [])
+            self.assertIn("never read", mo["without_owner_unavailable"])
+            self.assertEqual([e["kind"] for e in mo["events"]], ["orphaned"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
