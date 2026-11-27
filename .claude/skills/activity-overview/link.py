@@ -3733,7 +3733,7 @@ def checks_outcome(row, instant, pr_url=None):
     """The outcome block's `checks` of one PR from its `pr_activity` row:
     {status: gathered, head, [head_url], rollup, failing, pending, passing,
     gathered_at, commits_total, commits_covered, [checks_omitted],
-    [completed_after_as_of]} — the head being the latest covered commit
+    [completed_after_as_of], [commits_incomplete]} — the head being the latest covered commit
     committed by the instant, its roll-up as of the instant (`incomplete`
     when the read missed some of its checks and none visible failed); with
     no covered commit by the instant `rollup: unavailable`, `head: None`
@@ -3773,6 +3773,13 @@ def checks_outcome(row, instant, pr_url=None):
                                                            instant))
     if late:
         out["completed_after_as_of"] = late
+    # per-commit completeness of the history read: a covered commit whose
+    # checks were only partly read has no complete result
+    partial = sum(1 for x in commits if gather.checks_rollup(
+        x.get("checks"), as_of=instant,
+        omitted=x.get("checks_omitted") or 0)["rollup"] == "incomplete")
+    if partial:
+        out["commits_incomplete"] = partial
     return out
 
 
@@ -4817,8 +4824,8 @@ _RESOLVED_WORD_RE = re.compile(r"\bresolved\b", re.I)
 _CHECKS_KNOWN = ("passing", "failing", "pending", "none")
 # A sentence about a PR's earlier commits / pushes (not its head).
 _EARLIER_COMMITS_RE = re.compile(
-    r"\b(?:earl(?:y|ier|iest)|older|first|previous|prior|preceding)\b"
-    r"[^.;!?]*\b(?:commits?|pushes)\b", re.I)
+    r"\b(?:earl(?:y|ier|iest)|older|first|initial|previous|prior|preceding)\b"
+    r"[^.;!?]*\b(?:commits?|push(?:es)?|runs?)\b", re.I)
 
 
 def check_story_record_claims(slice_obj, text):
@@ -4833,8 +4840,9 @@ def check_story_record_claims(slice_obj, text):
     thread in the ledger carries GitHub's `resolved_on_github` flag, gather
     omitted none — `thread_coverage` — and the ledger cap hid none; a PR
     with no ledger entry is not covered). A claim about a PR's earlier
-    commits needs every commit of it covered (`commits_covered` =
-    `commits_total`), not only its head. A sentence naming several items is
+    commits / pushes / runs needs every commit of it covered
+    (`commits_covered` = `commits_total`) with a complete result each (no
+    `commits_incomplete`), not only its head. A sentence naming several items is
     refused only when all of them are covered; a general claim only when
     every PR of the slice is. A true statement of a coverage limit always
     passes. Pure."""
@@ -4850,7 +4858,8 @@ def check_story_record_claims(slice_obj, text):
                    if r.get("number") in known
                    and not (isinstance(r["checks"].get("commits_total"), int)
                             and r["checks"]["commits_total"]
-                            > (r["checks"].get("commits_covered") or 0))}
+                            > (r["checks"].get("commits_covered") or 0))
+                   and not r["checks"].get("commits_incomplete")}
     threads = {}
     for t in conv.get("threads") or []:
         if t.get("kind") == "review_thread":

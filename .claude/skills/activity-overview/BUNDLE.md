@@ -1341,12 +1341,15 @@ silence_days}}`.
     outstanding_change_requests: [{by, since, url}]}` and `checks` (`link.checks_outcome`
     from the view's `pr_activity`: `{status: "gathered", head, head_url, rollup, failing,
     pending, passing, gathered_at, commits_total, commits_covered, checks_omitted?,
-    completed_after_as_of?, reason?}` — the head is the latest covered commit committed
+    completed_after_as_of?, commits_incomplete?, reason?}` — the head is the latest
+    covered commit committed
     by the instant and its roll-up is as of the instant, a check completed after it
     counting as pending; a head whose checks were not all read (`checks_omitted`) is
     `incomplete` unless a visible check failed (never a pass from a partial page); when
     none of the commits read was committed by the instant (the read covers the latest
-    ten), `rollup: "unavailable"`, `head: null` and a `reason`;
+    ten), `rollup: "unavailable"`, `head: null` and a `reason`; `commits_incomplete`
+    counts the covered commits whose checks were only partly read (their result is
+    `incomplete`), so the history read is complete only without it;
     `{status: capped|failed|not_found|not_requested, reason?, gathered_at}` when
     the checks were not read; the string `"not gathered"` when the view has no such row);
     an open PR, and an open issue, add `last_event` `{at, kind, actor, url}` and `ball`;

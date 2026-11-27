@@ -364,7 +364,7 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
 
    | Rule | Refuses a sentence saying … is not in the record | Only when, for each item named |
    |---|---|---|
-   | `checks_said_unknown` | CI / checks / check results of a PR | its outcome `checks` are gathered with a result (`passing`, `failing`, `pending`, `none`; not `incomplete` / `unavailable`); for a sentence about earlier commits or pushes, also every commit of the PR read (`commits_covered` = `commits_total`) |
+   | `checks_said_unknown` | CI / checks / check results of a PR | its outcome `checks` are gathered with a result (`passing`, `failing`, `pending`, `none`; not `incomplete` / `unavailable`); for a sentence about earlier commits, pushes or runs, also every commit of the PR read (`commits_covered` = `commits_total`) with a complete result each (no `commits_incomplete`) |
    | `resolved_said_unknown` | whether a PR's review threads were resolved | every review thread of the PR in the ledger carries `resolved_on_github`, `thread_coverage` shows none omitted by gather, and the ledger cap hid none (a PR with no ledger entry is never covered) |
 
    No rule refuses a statement that commit evidence is missing (`evidence_omitted`,
