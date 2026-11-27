@@ -1807,11 +1807,19 @@ says `without_owner_unavailable`.
   an owner list emptied in September and not refilled stands in October; the later
   window's own start snapshot holds only the orphan markers) — from EVERY contributing
   window's events dated before the selected window starts, an overlapping (carried-days)
-  window's included. One change is one event whichever windows stored it
-  (`extract.ownership_event_identity`: kind, module, people, source, time, marker /
-  label — never the window-local `seq`, which a merged view renumbers); `unread` is
-  merged from every contributing window. The same history stored as one month, a month
-  plus carried days, adjacent months or weekly windows reads back identically.
+  window's included. One change is one event whichever windows stored it and whenever it
+  was gathered (`extract.ownership_event_identity`: source commit / item, kind, module,
+  people, day — never the optional `at` / window-local `seq`; a copy with `at` replaces a
+  legacy copy without it); events of the same day and time keep the order their facts
+  recorded (two commits in one second: emptied, then refilled), and a merged view
+  renumbers `seq`; `unread` is merged from every contributing window. When no collected
+  window covers the view's last day, `without_owner` is empty with
+  `without_owner_unavailable` (an earlier day's list is never presented as that day's);
+  the known events stand. The same history stored as one month, a month plus carried
+  days, adjacent months, weekly windows or a legacy fact plus a refreshed overlapping
+  window reads back identically (a legacy fact never recorded the order of one day's
+  changes: `--recompute-ownership` rewrites it). validate checks the type of every field
+  a reader indexes, slices, sorts or keys on (`validate._OWNERSHIP_ROW_TYPES`).
 - `without_owner` — modules carrying an orphan marker at the window's end (`since`: the
   marker's date when added in the window), and modules named by an open item with an
   owner-needed / orphaned label unless the module gained an owner (or was adopted) on or

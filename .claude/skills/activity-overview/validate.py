@@ -1534,36 +1534,85 @@ _OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "at", "seq", "sourc
                          "quote", "via"}
 
 
+_STR, _NONE = (str,), (type(None),)
+_INT = (int,)
+# Every field an ownership reader (extract.standing_without_owner /
+# merge_ownership_events / carried_ownership / ownership_event_order,
+# link.annotate_module_ownership, the newsletter's ownership section)
+# indexes, slices, sorts or keys on: {field: (types, required)}. A day is
+# a string (sliced [:10], compared); a module a string (a dict key, a
+# path joined into a URL) or null where gather writes null; people a list
+# of strings (sorted); seq an integer (never a boolean).
+_OWNERSHIP_ROW_TYPES = {
+    "events": {"kind": (_STR, True), "module": (_STR + _NONE, False),
+               "people": ("list_of_str", False), "date": (_STR, True),
+               "at": (_STR + _NONE, False), "seq": ("int", False),
+               "source": ("source", False), "via": (_STR + _NONE, False),
+               "quote": (_STR + _NONE, False)},
+    "without_owner": {"module": (_STR, True), "marker": (_STR + _NONE, False),
+                      "since": (_STR, False), "source": ("source", False)},
+    "start_without_owner": {"module": (_STR, True), "marker": (_STR + _NONE, False),
+                            "since": (_STR, False)},
+    "labelled_items": {"module": (_STR, True), "marker": (_STR + _NONE, False),
+                       "opened": (_STR, True), "closed": (_STR + _NONE, False),
+                       "source": ("source", False)},
+    "unread": {"path": (_STR, True), "commit": (_STR + _NONE, False),
+               "reason": (_STR, False)},
+}
+_OWNERSHIP_SOURCE_TYPES = {"type": _STR, "sha": _STR + _NONE, "number": _INT + _NONE,
+                           "url": _STR + _NONE, "pr": _INT + _NONE}
+
+
+def _typed_ok(v, types):
+    if types == "int":
+        return isinstance(v, int) and not isinstance(v, bool)
+    if types == "list_of_str":
+        return isinstance(v, list) and all(isinstance(x, str) for x in v)
+    if types == "source":
+        return isinstance(v, dict) and all(
+            k not in v or (isinstance(v[k], t) and not isinstance(v[k], bool))
+            for k, t in _OWNERSHIP_SOURCE_TYPES.items())
+    return isinstance(v, types) and not isinstance(v, bool)
+
+
 def _module_ownership_problem(value):
     """Why a stored `module_ownership` value is not one gather writes (an
     unknown key, an event kind gather does not write, a container of the
-    wrong type), or None."""
+    wrong type, a field of the wrong type that a reader indexes, slices,
+    sorts or keys on: _OWNERSHIP_ROW_TYPES), or None."""
     extra = sorted(set(value) - _OWNERSHIP_FACT_KEYS)
     if extra:
         return "module_ownership carries unexpected key(s) {}".format(", ".join(extra))
     if not _list_of_objects(value.get("events")) or \
             not _list_of_objects(value.get("without_owner")):
         return "module_ownership events / without_owner is not a list of objects"
-    for key in ("start_without_owner", "labelled_items"):
+    for key in ("start_without_owner", "labelled_items", "unread"):
         if key in value and not _list_of_objects(value[key]):
             return "module_ownership {} is not a list of objects".format(key)
-    # the keys extract.standing_without_owner indexes
-    for r in value.get("start_without_owner") or []:
-        if not isinstance(r.get("module"), str):
-            return "module_ownership start_without_owner has a row without a module"
-    for r in value.get("labelled_items") or []:
-        if not isinstance(r.get("opened"), str) or \
-                not isinstance(r.get("closed", ""), (str, type(None))) or \
-                not isinstance(r.get("module", ""), (str, type(None))):
-            return "module_ownership labelled_items has a row gather does not write"
+    for key, spec in _OWNERSHIP_ROW_TYPES.items():
+        for r in value.get(key) or []:
+            for field, (types, required) in spec.items():
+                if field not in r:
+                    if required:
+                        return "module_ownership {} has a row without `{}`".format(
+                            key, field)
+                    continue
+                if not _typed_ok(r[field], types):
+                    return "module_ownership {} has a `{}` of the wrong type".format(
+                        key, field)
     for e in value["events"]:
         if not set(e) <= _OWNERSHIP_EVENT_KEYS or \
-                e.get("kind") not in gather.OWNERSHIP_EVENT_KINDS or \
-                not isinstance(e.get("people", []), list) or \
-                not isinstance(e.get("source", {}), dict) or \
-                not isinstance(e.get("seq", 0), int) or \
-                not isinstance(e.get("at", ""), (str, type(None))):
+                e.get("kind") not in gather.OWNERSHIP_EVENT_KINDS:
             return "module_ownership has an event gather does not write"
+    pats = value.get("label_patterns")
+    if pats is not None and not (isinstance(pats, dict) and all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v)
+            for v in pats.values())):
+        return "module_ownership label_patterns is not {kind: [regex]}"
+    files = value.get("owner_files")
+    if files is not None and not (isinstance(files, list)
+                                  and all(isinstance(x, str) for x in files)):
+        return "module_ownership owner_files is not a list of names"
     return None
 
 

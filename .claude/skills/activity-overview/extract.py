@@ -1563,39 +1563,58 @@ def _replay_ownership(events, after, until, markers, emptied, state):
 
 def ownership_event_identity(e):
     """What makes two stored ownership events the same change, whichever
-    window stored it: kind, module, people, the source commit / item, the
-    time and the marker / label (`via`) — never the window-local `seq`
-    (each gathered window numbers its own events from zero)."""
+    window stored it and whenever it was gathered: the source commit /
+    item, kind, module, people and day — never the optional `at` / `seq`
+    (a fact gathered before them and a refreshed one describe the same
+    change; each window numbers its own `seq` from zero)."""
     src = e.get("source") or {}
-    return json.dumps([e.get("kind"), e.get("module"), sorted(e.get("people") or []),
+    return json.dumps([e.get("kind"), e.get("module"),
+                       sorted(str(p) for p in e.get("people") or []),
                        src.get("type"), src.get("sha") or src.get("number"),
-                       e.get("at") or "", (e.get("date") or "")[:10], e.get("via")],
+                       str(e.get("date") or "")[:10]],
                       sort_keys=True, default=str)
 
 
-def _merged_event_order(e):
-    src = e.get("source") or {}
-    return ((e.get("date") or "")[:10], e.get("at") or "", e.get("kind") or "",
-            e.get("module") or "", str(src.get("sha") or src.get("number") or ""))
+def _fact_event_order(f):
+    """One fact's events in its own recorded order: by `seq` when it
+    carries one (day, time, then the order gather emitted them), else the
+    legacy (day, kind) order."""
+    return sorted(f.get("events") or [], key=ownership_event_order)
+
+
+def _day_time(e):
+    return (str(e.get("date") or "")[:10], e.get("at") or "")
 
 
 def merge_ownership_events(facts):
     """The events of several windows' facts, each change once
-    (ownership_event_identity), in replay order — day, time, kind (one
-    change's own events), module — with `seq` renumbered over the merged
-    list when the events carry one."""
-    seen, out = set(), []
+    (ownership_event_identity; a copy carrying `at` replaces a legacy copy
+    without it), by day and time; events of the same day and time keep the
+    relative order their own facts recorded (two commits in the same
+    second: emptied, then refilled), never re-sorted by kind. `seq` is
+    renumbered over the merged list when the events carry one."""
+    merged, index = [], {}
     for f in facts:
-        for e in f.get("events") or []:
-            key = ownership_event_identity(e)
-            if key not in seen:
-                seen.add(key)
-                out.append(dict(e))
-    out.sort(key=_merged_event_order)
-    if any("seq" in e for e in out):
-        for i, e in enumerate(out):
-            e["seq"] = i
-    return out
+        prev = -1
+        for e in _fact_event_order(f):
+            ident = ownership_event_identity(e)
+            if ident in index:
+                k = index[ident]
+                if e.get("at") and not merged[k].get("at"):
+                    merged[k] = dict(e)
+                prev = max(prev, k)
+                continue
+            k = prev + 1
+            while k < len(merged) and _day_time(merged[k]) <= _day_time(e):
+                k += 1
+            merged.insert(k, dict(e))
+            index = {ownership_event_identity(x): n for n, x in enumerate(merged)}
+            prev = k
+    merged.sort(key=_day_time)            # stable: ties keep the recorded order
+    if any("seq" in e for e in merged):
+        for n, e in enumerate(merged):
+            e["seq"] = n
+    return merged
 
 
 def carried_ownership(facts, before):
@@ -1701,6 +1720,16 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
     # the start snapshot gives its stored list only for its own end day
     end = (ts_to or "")[:10]
     holder = [k for k in values if k[0][:10] <= end <= k[1][:10]] if end else []
+    if end and not holder:
+        # no collected window covers the view's last day: an earlier day's
+        # list is not that day's — say so; the known events stand
+        for key in ("start_without_owner", "labelled_items"):
+            out.pop(key, None)
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = (
+            "ownership was not collected for {} (the collected windows end {})"
+            .format(end, max(k[1][:10] for k in values)))
+        return out
     k = max(holder, key=lambda k: (k[1][:10], k[0][:10], k)) if holder else \
         max(values, key=lambda k: (k[1][:10], k[0][:10], k))
     fact = values[k]

@@ -28,8 +28,8 @@ def owner_file(module):
 
 
 # The history: (sha, commit time, path, change, owners before, owners after)
-A, B, C, D, E, F = ("avm/res/a/a", "avm/res/b/b", "avm/res/c/c", "avm/res/d/d",
-                    "avm/res/e/e", "avm/res/f/f")
+A, B, C, D, E, F, G = ("avm/res/a/a", "avm/res/b/b", "avm/res/c/c", "avm/res/d/d",
+                       "avm/res/e/e", "avm/res/f/f", "avm/res/g/g")
 CHANGES = [
     (1, "2026-10-03T08:00:00Z", B + "/ORPHANED.md", "add", None, None),
     (2, "2026-10-06T10:00:00Z", owner_file(A), "modify", ["o1"], []),
@@ -39,6 +39,10 @@ CHANGES = [
     (6, "2026-10-27T15:00:00Z", owner_file(C), "modify", [], ["o4"]),
     (7, "2026-10-28T11:00:00Z", B + "/ORPHANED.md", "delete", None, None),
     (8, "2026-10-29T12:00:00Z", owner_file(D), "modify", ["o5"], []),
+    # two commits in the same second: emptied, then refilled (walk order);
+    # sha 0x0a sorts after 0x09, kind order would put owner_added first
+    (9, "2026-10-09T10:00:00Z", owner_file(G), "modify", ["o6"], []),
+    (10, "2026-10-09T10:00:00Z", owner_file(G), "modify", [], ["o7"]),
 ]
 LABEL = "Status: Module Orphaned"
 ISSUES = [
@@ -85,6 +89,15 @@ def fact(frm, to):
         web="https://github.com/o/r", start_files=markers_at(frm))
 
 
+def legacy(f):
+    """A fact as a gather before `at` / `seq` stored it."""
+    f = json.loads(json.dumps(f))
+    for e in f["events"]:
+        e.pop("at", None)
+        e.pop("seq", None)
+    return f
+
+
 STORAGES = {
     "month": [("2026-10-01", "2026-10-31")],
     "month+carried": [("2026-10-01", "2026-10-31"), ("2026-10-26", "2026-11-30")],
@@ -92,7 +105,22 @@ STORAGES = {
     "weekly": [("2026-10-01", "2026-10-07"), ("2026-10-08", "2026-10-14"),
                ("2026-10-15", "2026-10-21"), ("2026-10-22", "2026-10-28"),
                ("2026-10-29", "2026-11-04")],
+    # a fact gathered before `at` / `seq`, and a refreshed overlapping window
+    "legacy+refreshed": [("2026-10-01", "2026-10-31", legacy),
+                         ("2026-10-26", "2026-11-30")],
 }
+
+
+def store(name):
+    rows = []
+    for w in STORAGES[name]:
+        f = fact(w[0], w[1])
+        rows.append((w[0], w[1], w[2](f) if len(w) > 2 else f))
+    return _store(*rows)
+
+
+def strip_time(events):
+    return [{k: v for k, v in e.items() if k not in ("at", "seq")} for e in events]
 
 
 def replay(day):
@@ -136,7 +164,7 @@ def days():
 class TestFindings(unittest.TestCase):
 
     def test_1_one_change_is_one_event_across_overlapping_windows(self):
-        conn = _store(*[(f, t, fact(f, t)) for f, t in STORAGES["month+carried"]])
+        conn = store("month+carried")
         v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-30")
         ids = [(e["kind"], e.get("module"), json.dumps(e["source"], sort_keys=True))
                for e in v["module_ownership"]["events"]]
@@ -144,14 +172,14 @@ class TestFindings(unittest.TestCase):
         self.assertEqual(len(ids), len(fact("2026-10-01", "2026-10-31")["events"]))
 
     def test_2_unread_survives_a_collected_empty_later_window(self):
-        conn = _store(*[(f, t, fact(f, t)) for f, t in STORAGES["two months"]])
+        conn = store("two months")
         v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-30")
         self.assertEqual(v["module_ownership"]["unread"],
                          [{"path": owner_file(F), "commit": sha(3),
                            "reason": "not valid JSON"}])
 
     def test_3_opening_state_from_an_overlapping_window(self):
-        conn = _store(*[(f, t, fact(f, t)) for f, t in STORAGES["month+carried"]])
+        conn = store("month+carried")
         v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-30")
         # D was emptied on 29 October, inside both windows; A's list was
         # emptied on 6 October and refilled: only October's window saw it
@@ -175,12 +203,104 @@ class TestFindings(unittest.TestCase):
         self.assertIsNone(validate._fact_shape_problem("module_ownership", f))
 
 
+class TestFindingsRound3(unittest.TestCase):
+
+    def test_1_a_legacy_copy_and_a_refreshed_copy_are_one_event(self):
+        conn = store("legacy+refreshed")
+        v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-30")
+        evs = v["module_ownership"]["events"]
+        self.assertEqual(len(evs), len(fact("2026-10-01", "2026-10-31")["events"]))
+        late = [e for e in evs if e["date"] >= "2026-10-27"]
+        self.assertTrue(all(e.get("at") for e in late))    # the timed copy wins
+
+    def test_2_same_second_keeps_the_recorded_order(self):
+        f = fact("2026-10-01", "2026-10-31")
+        merged = extract.merge_ownership_events([f, fact("2026-10-08", "2026-10-14")])
+        g = [e["kind"] for e in merged if e["module"] == G]
+        self.assertEqual(g, ["owner_needed", "owner_removed", "owner_added"])
+        carried = extract.carried_ownership([(("2026-10-01", "2026-10-31"), f)],
+                                            "2026-10-10")
+        self.assertNotIn(G, carried["emptied"])
+
+    def test_3_an_end_day_no_window_covers_is_unavailable(self):
+        conn = store("month")
+        v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-30")
+        mo = v["module_ownership"]
+        self.assertEqual(mo["without_owner"], [])
+        self.assertIn("2026-11-30", mo["without_owner_unavailable"])
+        self.assertEqual(len(mo["events"]), len(fact("2026-10-01", "2026-10-31")["events"]))
+
+    def test_4_field_types_readers_rely_on(self):
+        f = fact("2026-10-01", "2026-10-31")
+        for path, bad in ((("events", 0, "date"), 20261003),
+                          (("events", 0, "module"), ["x"]),
+                          (("events", 0, "people"), ["a", 3]),
+                          (("events", 0, "seq"), True),
+                          (("events", 0, "source"), {"sha": 5}),
+                          (("without_owner", 0, "module"), None),
+                          (("labelled_items", 0, "opened"), 5),
+                          (("label_patterns",), {"orphaned": "orphan"})):
+            g = json.loads(json.dumps(f))
+            cur = g
+            for k in path[:-1]:
+                cur = cur[k]
+            cur[path[-1]] = bad
+            self.assertIsNotNone(validate._fact_shape_problem("module_ownership", g),
+                                 (path, bad))
+
+
+def _readers(g):
+    """Every ownership reader over a fact: the reconstruction for every day,
+    the merge, the carry, a merged view and link's annotation."""
+    import link
+    for d in days():
+        extract.standing_without_owner(g, d)
+    extract.merge_ownership_events([g, g])
+    extract.carried_ownership([(("2026-10-01", "2026-10-31"), g)], "2026-10-20")
+    conn = _store(("2026-10-01", "2026-10-31", g), ("2026-11-01", "2026-11-30", g))
+    v = extract.extract(conn, "o", "r", "2026-10-01", "2026-11-15")
+    v.setdefault("prs", [])
+    v.setdefault("issues", [])
+    link.annotate_module_ownership(v)
+
+
+class TestFuzzReaders(unittest.TestCase):
+    """Facts validate accepts never crash a reader: every field of every
+    row replaced by values of other types; each mutant validate lets
+    through is fed to every reader."""
+
+    VALUES = (None, 0, 1.5, True, "", "x", "2026-10-05", [], ["a"], [1], {}, {"a": 1})
+
+    def test_accepted_mutants_never_raise(self):
+        base = fact("2026-10-01", "2026-10-31")
+        base["unread"] = base.get("unread") or []
+        accepted = 0
+        for key in ("events", "without_owner", "start_without_owner",
+                    "labelled_items", "unread"):
+            rows = base.get(key) or []
+            if not rows:
+                continue
+            fields = sorted({f for r in rows for f in r} | {"module", "date", "people"})
+            for field in fields:
+                for val in self.VALUES:
+                    g = json.loads(json.dumps(base))
+                    g[key][0][field] = val
+                    if validate._fact_shape_problem("module_ownership", g):
+                        continue
+                    accepted += 1
+                    try:
+                        _readers(g)
+                    except Exception as exc:        # noqa: BLE001
+                        self.fail("{}[0].{} = {!r}: {!r}".format(key, field, val, exc))
+        self.assertGreater(accepted, 0)
+
+
 class TestEveryStorageReadsTheSame(unittest.TestCase):
 
     def test_identical_for_every_day_and_equal_to_a_replay(self):
         views = {}
-        for name, windows in STORAGES.items():
-            conn = _store(*[(f, t, fact(f, t)) for f, t in windows])
+        for name in STORAGES:
+            conn = store(name)
             views[name] = {d: extract.extract(conn, "o", "r", "2026-10-01", d)
                            ["module_ownership"] for d in days()}
         for d in days():
@@ -188,16 +308,54 @@ class TestEveryStorageReadsTheSame(unittest.TestCase):
             first = None
             for name in STORAGES:
                 mo = views[name][d]
+                ids = [extract.ownership_event_identity(e) for e in mo["events"]]
+                self.assertEqual(len(ids), len(set(ids)), (name, d, "duplicates"))
                 got = [w["module"] for w in mo["without_owner"]]
+                without = mo["without_owner"]
+                events = strip_time(mo["events"])     # a legacy fact has no times
+                if name == "legacy+refreshed" and d < "2026-10-26":
+                    # only the legacy fact covers the day: it never recorded
+                    # the order of one day's changes (G: emptied and refilled
+                    # in one second), so events compare as a set and G is
+                    # aside on every day (its state carries on);
+                    # --recompute-ownership rewrites such a fact
+                    got = [m for m in got if m != G]
+                    without = [w for w in without if w["module"] != G]
+                    events = sorted(events, key=lambda e: json.dumps(e, sort_keys=True))
+                    self.assertEqual(got, [m for m in want if m != G], (name, d))
+                    ref = json.loads(first[1][1])
+                    self.assertEqual(json.dumps(events, sort_keys=True), json.dumps(
+                        sorted(ref, key=lambda e: json.dumps(e, sort_keys=True)),
+                        sort_keys=True), (name, d, "events"))
+                    self.assertEqual(json.dumps(without, sort_keys=True), json.dumps(
+                        [w for w in json.loads(first[1][0]) if w["module"] != G],
+                        sort_keys=True), (name, d, "without"))
+                    continue
+                if name == "legacy+refreshed":
+                    # G's state carries from the legacy fact into later days
+                    got = [m for m in got if m != G]
+                    want_here = [m for m in want if m != G]
+                    self.assertEqual(got, want_here, (name, d))
+                    self.assertEqual(
+                        json.dumps([w for w in without if w["module"] != G], sort_keys=True),
+                        json.dumps([w for w in json.loads(first[1][0])
+                                    if w["module"] != G], sort_keys=True), (name, d))
+                    ref = json.loads(first[1][1])
+
+                    def split(evs):
+                        return ([e for e in evs if e["module"] != G],
+                                sorted(json.dumps(e, sort_keys=True) for e in evs
+                                       if e["module"] == G))
+                    self.assertEqual(split(events), split(ref), (name, d, "events"))
+                    continue
                 self.assertEqual(got, want, (name, d))
-                shape = (json.dumps(mo["without_owner"], sort_keys=True),
-                         json.dumps(mo["events"], sort_keys=True))
+                shape = (json.dumps(without, sort_keys=True),
+                         json.dumps(events, sort_keys=True))
                 if first is None:
                     first = (name, shape)
                 else:
                     self.assertEqual(shape[0], first[1][0], (name, first[0], d, "without"))
                     self.assertEqual(shape[1], first[1][1], (name, first[0], d, "events"))
-
 
 if __name__ == "__main__":
     unittest.main()
