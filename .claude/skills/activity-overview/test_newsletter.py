@@ -451,7 +451,10 @@ class TestComingAndStuck(unittest.TestCase):
         self.assertEqual(r["ball"]["state"], "awaiting a first review")
         self.assertTrue(r["ball"]["derived"])
         self.assertNotIn("with", r["ball"])   # the newsletter names no one
-        self.assertEqual(r["title_signal"], "new_module")
+        # a proposed new module comes from the view's `new_module_proposed`,
+        # never from a PR title (the owner's update pass)
+        self.assertNotIn("title_signal", r)
+        self.assertEqual(c["proposed_modules"], [])
         self.assertTrue(c["ready"][0]["approved"])
 
     def test_omitted_when_nothing_open(self):
@@ -1626,6 +1629,259 @@ class TestWorkPackage(unittest.TestCase):
                 with self.assertRaises(SystemExit) as cm:
                     newsletter.main([vp, "--work-package", d, "--outline"])
             self.assertEqual(cm.exception.code, 2)
+
+
+class TestUpdatePass(unittest.TestCase):
+    """One state per fact across sections; module lifecycle and what a
+    module is; ownership from the delivered fact; automation from the view."""
+
+    def v(self):
+        v = view()
+        v["prs"] += [
+            {"number": 20, "title": "feat: thing", "author": "sam", "url": R + "/pull/20",
+             "state": "open", "merged": False, "created_at": "2026-10-10T10:00:00Z",
+             "review_state": {"state": "approved_stale", "basis": "alex 2026-10-12"},
+             "fork_status": "fork"},
+            {"number": 21, "title": "feat: other", "author": "sam", "url": R + "/pull/21",
+             "state": "open", "merged": False, "created_at": "2026-10-10T10:00:00Z",
+             "review_state": {"state": "automated_only"}, "fork_status": "not_fork"},
+            {"number": 22, "title": "feat: old", "author": "sam", "url": R + "/pull/22",
+             "state": "closed", "merged": False, "created_at": "2026-10-10T10:00:00Z",
+             "closed_unmerged": {"superseded_by": 10}},
+        ]
+        return v
+
+    def claims(self, text, v=None):
+        return newsletter.state_claims([v or self.v()], text)
+
+    # one state per fact
+    def test_two_review_states_for_one_pr_fail(self):
+        text = ("## Stories\n\n[#20](" + R + "/pull/20) was approved before the last push.\n\n"
+                "## Coming up and stuck\n\n[#20](" + R + "/pull/20) is ready to merge.\n")
+        r = self.claims(text)["review_state_mismatch"]
+        self.assertEqual(r[0]["pr"], 20)
+        self.assertEqual(r[0]["view"], "approved_stale")
+        self.assertEqual([x["section"] for x in r[0]["stated"]], ["coming"])
+        ok = text.replace("is ready to merge", "had an approval that predates later changes")
+        self.assertEqual(self.claims(ok)["review_state_mismatch"], [])
+        ok = text.replace("is ready to merge", "was approved on 12 October 2026, before the "
+                          "author's latest changes, so it is not ready to merge")
+        self.assertEqual(self.claims(ok)["review_state_mismatch"], [])
+
+    def test_review_wording_against_the_view(self):
+        r = self.claims("## People\n\n[#21](" + R + "/pull/21) was approved.\n")
+        self.assertEqual(r["review_state_mismatch"][0]["view"], "automated_only")
+        r = self.claims("## People\n\n[#21](" + R + "/pull/21) is awaiting a first review.\n")
+        self.assertEqual(r["review_state_mismatch"], [])
+        # "approved" as an adjective is no review state
+        r = self.claims("## People\n\n[#21](" + R + "/pull/21) runs one test against an "
+                        "approved test subscription.\n")
+        self.assertEqual(r["review_state_mismatch"], [])
+        r = self.claims("## People\n\n@alex approved [#21](" + R + "/pull/21).\n")
+        self.assertEqual(r["review_state_mismatch"][0]["stated"][0]["claim"], "approved")
+        # a sentence naming two PRs or a condition states nothing about one
+        r = self.claims("## People\n\nOnce [#21](" + R + "/pull/21) is approved it can merge.\n")
+        self.assertEqual(r["review_state_mismatch"], [])
+
+    def test_sections_disagreeing_without_a_view_state_fail(self):
+        v = self.v()
+        v["prs"][-2].pop("review_state")
+        text = ("## People\n\n[#21](" + R + "/pull/21) is ready to merge.\n\n"
+                "## Coming up and stuck\n\n[#21](" + R + "/pull/21) awaits a first review.\n")
+        r = self.claims(text, v)["review_state_mismatch"]
+        self.assertEqual((r[0]["pr"], r[0]["view"]), (21, None))
+        self.assertEqual(len(r[0]["stated"]), 2)
+
+    def test_pr_state_and_release_status_across_sections(self):
+        r = self.claims("## People\n\n[#10](" + R + "/pull/10) is still open.\n\n"
+                        "## Stories\n\n[#22](" + R + "/pull/22) was closed without being merged.\n")
+        self.assertEqual([(x["pr"], x["view"]) for x in r["pr_state_mismatch"]],
+                         [(10, "merged")])
+        r = self.claims("## Stories\n\n`avm/res/hci/cluster` 0.3.0 was published.\n\n"
+                        "## People\n\nThe module `avm/ptn/net/dns` is not yet published "
+                        "as 0.7.4.\n")
+        self.assertEqual(sorted((x["version"], x["view"]) for x in r["release_status_mismatch"]),
+                         [("avm/ptn/net/dns/0.7.4", "published"),
+                          ("avm/res/hci/cluster/0.3.0", "declared_not_published")])
+
+    def test_check_fails_on_a_story_block_that_disagrees(self):
+        v = self.v()
+        text = GOOD.replace("**What landed.** It landed.",
+                            "**What landed.** [#20](" + R + "/pull/20) is ready to merge.")
+        r = newsletter.check_newsletter([v], text, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["review_state_mismatch"][0]["stated"][0]["section"], "stories")
+        self.assertFalse(r["ok"])
+        r = newsletter.check_newsletter([v], GOOD, slices={"train-issue-5": SLICE})
+        self.assertEqual((r["review_state_mismatch"], r["pr_state_mismatch"],
+                          r["release_status_mismatch"]), ([], [], []))
+
+    # PR rows and coming up
+    def test_pr_rows_carry_one_review_state_fork_status_and_closing(self):
+        v = self.v()
+        row = newsletter._pr_row(v, 20)
+        self.assertEqual((row["review_state"]["state"], row["fork_status"], row["is_fork"]),
+                         ("approved_stale", "fork", True))
+        self.assertEqual(newsletter._pr_row(v, 22)["closed_unmerged"], {"superseded_by": 10})
+        self.assertEqual(newsletter._pr_row(v, 11)["fork_status"], "unknown")
+
+    def test_approved_stale_is_not_ready_and_proposed_modules_come_from_the_view(self):
+        b = enriched(bundle([pr(1, created_at="2026-05-03T10:00:00Z", reviews=[
+            review("bob", "2026-05-10T10:00:00Z", "approved", 1)])]))
+        b["prs"][0]["review_state"] = {"state": "approved_stale"}
+        b["trains"] = [{"id": "train-pr-1", "outcome": "in_flight", "prs": [1], "issues": []}]
+        b["stories"] = dict(b.get("stories") or {}, all=[
+            {"id": "train-pr-1", "group": "in_flight", "state": "in_flight",
+             "new_module_proposed": ["avm/res/x/y"],
+             "module_info": {"avm/res/x/y": {"display_name": "X Y"}}}])
+        c = section(newsletter.outline([b]), "coming")
+        self.assertEqual(c["ready"], [])
+        self.assertEqual([r["number"] for r in c["approval_stale"]], [1])
+        self.assertFalse(c["approval_stale"][0]["approved"])
+        self.assertEqual(c["proposed_modules"][0]["module"], "avm/res/x/y")
+        self.assertEqual(c["proposed_modules"][0]["info"]["display_name"], "X Y")
+        self.assertEqual(c["proposed_modules"][0]["prs"][0]["review_state"], "approved_stale")
+
+    def test_story_rows_carry_what_the_view_says_beyond_the_group(self):
+        v = self.v()
+        v["trains"].append({"id": "train-pr-20", "outcome": "in_flight", "prs": [20],
+                            "issues": [], "code_areas": ["avm/res/x/y"]})
+        v["stories"]["all"] = [
+            {"id": "train-pr-20", "group": "in_flight", "state": "in_flight",
+             "worthy": "PR #20 opened in the window", "modules": ["avm/res/x/y"],
+             "module_info": {"avm/res/x/y": {"display_name": "X Y"}},
+             "status_reason": "open, active in the window", "new_module_proposed": ["avm/res/x/y"]}]
+        st = section(newsletter.outline([v]), "stories")
+        row = next(r for r in st["full"] if r["key"] == "train-pr-20")
+        self.assertEqual(row["status_reason"], "open, active in the window")
+        self.assertEqual(row["new_module_proposed"], ["avm/res/x/y"])
+        self.assertEqual(row["review_states"], {"20": "approved_stale"})
+        self.assertEqual(row["modules"][0]["info"], {"display_name": "X Y"})
+
+    # automation from the view
+    def test_automation_from_the_view_marking(self):
+        v = self.v()
+        v["people"]["agent"] = {"automation": {"kind": "account_type", "on_behalf_of": "alex"}}
+        v["people"]["helper[bot]"] = {"automation": None}
+        self.assertTrue(newsletter.is_automation(v, "agent"))
+        self.assertFalse(newsletter.is_automation(v, "helper[bot]"))
+        self.assertTrue(newsletter.is_automation(v, "other[bot]"))
+        v["prs"][-3]["author"] = "agent"
+        auto = {a["login"]: a for a in section(newsletter.outline([v]), "people")["automation"]}
+        self.assertEqual((auto["agent"]["kind"], auto["agent"]["on_behalf_of"]),
+                         ("account_type", "alex"))
+        self.assertEqual(auto["agent"]["prs"][0]["review_state"]["state"], "approved_stale")
+        self.assertNotIn("helper[bot]", auto)
+
+    # what a module is; release contents; deprecations
+    def test_module_rows_say_what_the_module_is_and_releases_their_contents(self):
+        v = self.v()
+        dns = v["module_changes"]["modules"][0]
+        dns.update(display_name="DNS zones", description="Deploys private DNS zones.",
+                   resource_type="Microsoft.Network/privateDnsZones")
+        dns["versions"]["published"][0]["contents"] = {"source": "commits", "prs": [11]}
+        mc = section(newsletter.outline([v]), "module_changes")
+        row = next(m for m in mc["modules"] if m["area"] == "avm/ptn/net/dns")
+        self.assertEqual(row["info"]["display_name"], "DNS zones")
+        self.assertEqual(row["release"][0]["contents"], {"source": "commits", "prs": [11]})
+        fac = v["module_changes"]["modules"][1]
+        fac["versions"]["published"][1]["contents"] = {"source": "commits_between_tags",
+                                                       "prs": [], "commits": []}
+        mc = section(newsletter.outline([v]), "module_changes")
+        row = next(m for m in mc["modules"] if m["area"] == "avm/res/data/factory")
+        self.assertEqual([(c["module"], c["version"], c["own_change"], c.get("note"))
+                          for c in row["child_releases"]],
+                         [("avm/res/data/factory/pipe", "0.1.2", False,
+                           "republished with its parent")])
+        v["module_ownership"] = {"collected": True, "modules_at_end": {
+            "avm/res/hci/cluster": {"display_name": "HCI cluster", "lifecycle": "live"}}}
+        self.assertEqual(newsletter.module_info(v, "avm/res/hci/cluster"),
+                         {"display_name": "HCI cluster", "lifecycle": "live"})
+
+    def test_deprecation_from_a_lifecycle_event(self):
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [
+            {"kind": "deprecated", "module": "avm/res/data/factory/pipe", "date": "2026-10-03",
+             "marker_text": "Use the parent module instead.",
+             "source": {"type": "pr", "number": 10, "url": R + "/pull/10"}}]}
+        br = section(newsletter.outline([v]), "breaking")
+        d = next(x for x in br["deprecations"] if x["target"] == "avm/res/data/factory/pipe")
+        self.assertEqual((d["area"], d["basis"], d["date"]),
+                         ("avm/res/data/factory", ["lifecycle"], "2026-10-03"))
+        own = section(newsletter.outline([v]), "ownership")
+        self.assertEqual(own["lifecycle_events"][0]["kind"], "deprecated")
+        self.assertEqual(own["events"], [])
+
+    # ownership from the delivered fact
+    def test_ownership_from_start_state_and_lifecycle_lists(self):
+        v = self.v()
+        v["module_ownership"] = {
+            "collected": True, "events": [],
+            "without_owner": [
+                {"module": "avm/res/key/vault", "lifecycle": "live", "marker": None},
+                {"module": "avm/res/code/signing", "lifecycle": "orphaned",
+                 "marker": "ORPHAN.md"}],
+            "deprecated_modules": [{"module": "avm/res/old/one", "deprecated_text": "Use x."}],
+            "stub_modules": [{"module": "avm/res/stub/a"}, {"module": "avm/res/stub/b"}],
+            "start_state": {
+                "avm/res/key/vault": {"owners": [], "owner_file": "CODEOWNERS", "entry": True},
+                "avm/res/hci/cluster": {"owners": ["alex"], "owner_file": "CODEOWNERS",
+                                        "entry": True},
+                "avm/res/old/one": {"owners": [], "deprecated": True, "entry": True}}}
+        own = section(newsletter.outline([v]), "ownership")
+        self.assertIsNone(own["omit"])
+        self.assertEqual(own["without_owner_by_kind"],
+                         {"empty_owner_list": ["avm/res/key/vault"],
+                          "orphan_marker": ["avm/res/code/signing"]})
+        self.assertEqual([x["module"] for x in own["start_without_owner"]],
+                         ["avm/res/key/vault"])
+        self.assertEqual(own["deprecated_modules"][0]["module"], "avm/res/old/one")
+        self.assertEqual(own["stub_modules_count"], 2)
+        text = GOOD.replace(
+            "<!-- omitted: ownership — needs a store gathered with module ownership -->",
+            "## Module ownership\n\n[`avm/res/old/one`](" + T + "avm/res/old/one) is "
+            "deprecated.")
+        r = newsletter.check_newsletter([v], text, slices={"train-issue-5": SLICE})
+        self.assertEqual(r["ownership_not_in_view"], [])
+
+    def test_unavailable_ownership_never_says_no_module_without_an_owner(self):
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [],
+                                 "without_owner": [{"module": "avm/res/key/vault"}],
+                                 "without_owner_unavailable": "owner file not read at end"}
+        out = newsletter.outline([v])
+        own = section(out, "ownership")
+        self.assertEqual(own["without_owner"], [])
+        self.assertIn("not known", own["omit"])
+        self.assertNotIn("no module without an owner", own["omit"])
+        cov = section(out, "numbers")["coverage"]
+        self.assertTrue(any("no owner is not known" in c for c in cov), cov)
+        # a stream: one member quiet, one unavailable
+        a, b = view(), self.v()
+        a["module_ownership"] = {"collected": True, "events": [], "without_owner": []}
+        b["meta"] = dict(b["meta"], repo="s")
+        b["module_ownership"] = v["module_ownership"]
+        own = section(newsletter.outline([a, b]), "ownership")
+        self.assertIn("not known", own["omit"])
+        self.assertEqual(own["without_owner_unavailable"],
+                         [{"repo": "o/s", "reason": "owner file not read at end"}])
+
+    # cadence
+    def test_short_window_is_weekly_unless_monthly_is_asked(self):
+        v = self.v()
+        v["meta"]["period"] = {"from": "2026-10-01", "to": "2026-10-14"}
+        out = newsletter.outline([v])
+        self.assertEqual((out["cadence"], out["cadence_source"], out["window_days"]),
+                         ("week", "window", 14))
+        self.assertEqual(newsletter.outline([v], cadence="month")["cadence"], "month")
+        self.assertEqual(newsletter.outline([self.v()])["cadence"], "month")
+        with tempfile.TemporaryDirectory() as d:
+            vp = os.path.join(d, "v.json")
+            with open(vp, "w") as fh:
+                json.dump(v, fh)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                newsletter.main([vp, "--outline", "--monthly"])
+            self.assertEqual(json.loads(buf.getvalue())["cadence"], "month")
 
 
 class TestCli(unittest.TestCase):

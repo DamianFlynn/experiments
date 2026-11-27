@@ -37,7 +37,8 @@ use it? So:
 ```bash
 # the ordered, pre-selected material per section (read-only; JSON on stdout)
 python3 newsletter.py workspace/view/bundle.json --outline > workspace/view/newsletter.outline.json
-#   weekly issue: add --weekly; a multi-repo stream: pass every member's linked view;
+#   weekly when the window is at most 16 days, else monthly (--weekly / --monthly override);
+#   a multi-repo stream: pass every member's linked view;
 #   an automation account the view does not mark (no `[bot]` suffix): --automation LOGIN
 
 # one slice per story (every story of stories.full), each story checked against its slice
@@ -49,7 +50,7 @@ python3 newsletter.py workspace/view/bundle.json --work-package workspace/wp
 
 # the mechanical check of the written issue (exit 0 = passes, 1 = lists, 2 = usage)
 python3 newsletter.py workspace/view/bundle.json --check-newsletter workspace/newsletter.md \
-  --slices workspace/slices [--people ~/activity/people.json] [--automation LOGIN] [--weekly]
+  --slices workspace/slices [--people ~/activity/people.json] [--automation LOGIN] [--weekly|--monthly]
 ```
 
 The view must be linked (`link.py`; with `--people` for registry context). The outline adds
@@ -89,12 +90,18 @@ link), the module's changelog items, PRs, `delivered_by` (login, name, affiliati
 Write what the module deploys from its changelog / README words, its first version (linked),
 who delivered it.
 
+**What a module is.** Every module row (`info`: `display_name`, `description`,
+`resource_type`, `lifecycle`, from the module's metadata file via the module layer or
+`module_ownership.modules_at_end`; a story row's `module_info`) says what the module is: on a
+module's **first mention** in the issue, say it in a few words ("the Data Factory module, which
+deploys `Microsoft.DataFactory/factories`"), then use the module's link alone.
+
 **What changed in existing modules** — every module with a reader-facing change, ordered by
 the module layer's `product_score`, then area. Per module:
 
 | Key | Use it to answer |
 |---|---|
-| `url`, `release` (per version: `published` with `tag`, `date`, `url`; `declared_not_published`; `unknown`; or `no_version_change`) | which module, released as what |
+| `url`, `info`, `release` (per version: `published` with `tag`, `date`, `url`, the version's `contents` and `note`; `declared_not_published`; `unknown`; or `no_version_change`) | which module, what it is, released as what, and what the version holds: the PRs or commits it contains, or "republished with its parent" for a child version whose own folder no change touched; `child_releases` lists the child versions published in the window, each with `own_change` and `contents` |
 | `changelog` (non-breaking items, verbatim), `breaking` (declared / candidate flag) | what changed for a user — in the maintainers' words |
 | `prompted_by` (issues the PRs close: title, author, name / affiliation, what they asked — the issue form's Description, verbatim) | why it came up, who asked, for whom |
 | `interface_detail` (parameters / outputs / resources / dependencies added, removed, modified with before / after), `interface` (names) | what a user must change, if anything |
@@ -108,6 +115,15 @@ why or for whom, the row says what it can and does not guess.
 verbatim, `release`, `published` true / false / null), `candidates` (`wording: check before
 upgrading`, `covered_by_declared`), `deprecations`, `notices`. Say what breaks, in which
 module and version (linked), and what to do.
+
+**Deprecations** are one part of this section: `deprecations[]` joins what a changelog
+declares (`basis: changelog`, `marker_file`) with the tree's lifecycle events
+(`module_ownership.events[]` of kind `deprecated`: `basis: lifecycle`, `date`, the marker's
+`marker_text`). Say which module (or child module) is deprecated, since when, and what its
+marker says to use instead; quote, never paraphrase, the marker. A breaking change in a `0.x`
+minor version is stated as the changelog and version say it; where the repository's PR template
+says breaking changes bump the MAJOR version, quote that once in this section next to the first
+such change, without explaining.
 
 **Stories** — every story of the window, grouped by state: `groups` {landed, in_flight,
 stalled, closed, plumbing} from the view's `stories.all` (`group_source: view`; closed = closed
@@ -154,6 +170,17 @@ batch path; it checks every story with `link.py --check-story` before handing it
 issue is then assembled: each pending marker replaced by its story (in its group, in
 `stories.all` order) or theme (in theme order), and `--check-newsletter` run on the whole.
 
+**Updating an issue for a newer store.** Build a new work package from the new view (keep the
+old one), then re-check every written story and theme against it: the story check against the
+new slice, `newsletter.state_claims` on the story text, the headline state, and the row (group,
+state, release status, PRs, review state). Classify each in `<new wp>/REVISIONS.md` before
+rewriting anything: (a) passes and the row is unchanged — keep; (b) passes but the row changed,
+or the new view answers what the text said the record did not show — revise; (c) fails —
+revise; (d) a new full story — write; (e) no longer full — remove. Revisions go to writers as
+`batches/rev-NN/BATCH.md` (the old text, the new slice and row, exactly what to change; same
+batch size rule) and one `batches/rev-theme-<id>/` per theme whose membership or material
+changed; until they are back, each sits in the issue as a pending marker.
+
 A **closed** story ends with "Where it stands" (what was decided, by whom, what is left), as an
 in-flight or stalled one does; only a landed story ends with "What landed".
 
@@ -161,23 +188,56 @@ A train whose every PR is authored by an automation account and that has no huma
 conversation turn is not a story, whatever group the view gives it: its plan is `in_theme`,
 and it is named in the plumbing theme of its PRs' author (`_theme_by_author`).
 
-**Module ownership** — `events` (owner_needed / owner_added / owner_removed / orphaned /
-adopted: module with `module_url`, people, date, source link, quote, `via`), `unattributed`
-(events on an item that names no single module, e.g. a label on a repository-wide PR: say so,
-or leave it out with the reason), `labelled_items`, `without_owner` (the standing list at the
-window's end, with `marker`) and `start_without_owner` (the same at its start). Say who now
-looks after which module, which need an owner, and link where a reader can volunteer (the
-event's source); say when no request for an owner was recorded.
+**Module ownership** — from the view's `module_ownership`: `events` (owner_needed /
+owner_response_requested / owner_added / owner_removed / orphaned / adopted: module with
+`module_url`, people, date, source link, quote, `via`), `lifecycle_events` (deprecated,
+undeprecated, module_added, module_removed, module_info_changed), `unattributed` (events on an
+item that names no single module, e.g. a label on a repository-wide PR: say so, or leave it out
+with the reason), `labelled_items`, `without_owner` (the standing list at the window's end:
+**live and orphaned modules only**, each with `lifecycle`, `marker`, `since` and what the module
+is), `without_owner_by_kind` (`empty_owner_list` — the owner file lists nobody —
+and `orphan_marker`), `deprecated_modules` (one short paragraph: they are retired, not looking
+for an owner; each `deprecated_text` names its replacement where it does), `stub_modules_count`
+(folders without a module entry file: at most one sentence, never listed as without an owner),
+and `start_without_owner` (derived from `start_state`: a live module whose owner file lists
+nobody, or with an orphan marker, at the window's start). Say who now looks after which module,
+which need an owner, and link where a reader can act (the event's source; for an orphaned
+module, quote its marker's own text, which points to where volunteers go); say when no request
+for an owner was recorded. When `without_owner_unavailable` is set (the owner files could not
+be read at the window's end) the outline lists no module as without an owner and the section
+says the state is not known: never "no module without an owner". In a stream it is a list of
+`{repo, reason}` and the section's `omit` says "not known" whenever any member's state is
+unknown.
 
 **People** — newcomers (first-ever and returning) with what they contributed and, for each
 merged PR, its `release` and `module_urls`; affiliation split with the unknown share; the
 maintainers' review and merge load; top contributors; registry context. **Automation**
 accounts (`automation`) in their own short paragraph: each named, marked as automation, with
-what it did (counts, PRs) — never hidden, never presented as a person.
+what it did (counts, PRs) — never hidden, never presented as a person. Which accounts are
+automation is the view's `people[login].automation` (`{kind, on_behalf_of?}`: an account type,
+a `[bot]` login, or the registry's operator tag; `null` is the operator's "not automation" and
+wins over a `[bot]` suffix); without that key, `is_bot` / the `[bot]` suffix, plus
+`--automation LOGIN`. An account acting for a person (`on_behalf_of`) is "an automation
+account (a coding agent) working for Name (@login)". A PR row's `fork_status` (`fork`,
+`deleted_fork`, `not_fork`, `unknown`) says where the change came from; `closed_unmerged`
+(`superseded_by`, or no reason recorded) says how a closed PR ended — write "the record states
+no reason" when it has none.
 
-**Coming up and stuck** — as before: `ready` (derived "awaiting merge"), `failing_checks`,
-`needs_first_review`, `awaiting_review`, `other` counts, `forecast`, with `module_urls`. Never
-name whom the next move is with here.
+**Coming up and stuck** — `ready` (derived "awaiting merge" **and** `review_state` approved),
+`approval_stale` (awaiting merge, but the approval predates the author's later changes: not
+ready), `failing_checks`, `needs_first_review` (review state `none`, `requested` or
+`automated_only`), `awaiting_review` (a human has reviewed), `other` counts, `forecast`, and
+`proposed_modules` (the new modules open PRs propose: `stories.all[].new_module_proposed`, never
+a PR title; each with the train's open PRs, their review state and `fork_status`, the story's
+group and `info` when the PR adds the module's metadata), with `module_urls`. Never name whom
+the next move is with here.
+
+**One review state.** Every row that names an open PR carries `review_state` (the view's
+`prs[].review_state.state`: `none`, `requested`, `automated_only`, `commented`,
+`changes_requested`, `approved`, `approved_stale`). It is the only source for review wording,
+in every section and story: "approved" only for `approved`; "approved before the latest
+changes" for `approved_stale` (never "ready to merge"); "waiting for a first review" for
+`none` / `requested`; "reviewed only by automation" for `automated_only`.
 
 **Plumbing: what was engineered** — `themes`: the view's `plumbing_themes` (`theme_source:
 view`) or provisional themes by PR class (sweeps, CI, tests, docs, mixed). Per theme: an intro
@@ -237,8 +297,11 @@ appears once.
 
 ## Weekly variant
 
-`--weekly` uses the same layout and the same rules; a weekly issue is shorter only because the
-window holds less.
+A window of at most `WEEKLY_MAX_DAYS` (16) days is a weekly issue by default (`cadence:
+week`, `cadence_source: window`, `window_days`); a longer one is monthly. `--weekly` or
+`--monthly` overrides (`cadence_source: caller`). Two weeks are a weekly issue, not a month;
+16 days leave room for a window that starts or ends mid-week. A weekly issue uses the same
+layout and the same rules; it is shorter only because the window holds less.
 
 ## A multi-repo stream (a manifest of module repositories)
 
@@ -252,8 +315,9 @@ repositories (one Terraform module per repository); people counts stay per repos
 
 ## Inputs (view keys)
 
-`module_changes` (summary, modules with `url` when recorded, prs with `head_repo` /
-`is_fork`), `module_notes.tags`, `stories` (`all` when present, `selected`, `more`, `quiet`),
+`module_changes` (summary, modules with `url`, `display_name`, `description`,
+`resource_type`, `module_lifecycle` when recorded, prs with `head_repo`), `prs[]`
+(`review_state`, `fork_status`, `closed_unmerged`, `body_as_of`), `module_notes.tags`, `stories` (`all` when present, `selected`, `more`, `quiet`),
 `trains`, `prs` / `issues`, `pr_history` (commit paths), the train slices' outcome,
 `contributors`, `affiliations`, `newcomers`, `people`, `people_context`, `forecast`,
 `plumbing_themes`, `module_ownership`, `meta`. Every key is optional: a view without one
@@ -274,7 +338,8 @@ It fails (exit 1) and lists:
 | `stories_misplaced` / `stories_state_missing` | a story not under its group's `###` heading in the Stories section (a plumbing story: not under its theme's heading in the plumbing section); a story whose first line does not start with its state (`Landed`, `In flight`, `Stalled`, `Closed`) |
 | `modules_not_linked` / `versions_not_linked` | in New modules, What changed, Breaking, Module ownership, People and Coming up: a module path the view knows (a module or a versioned child) that is not inside a link's text; a published version written right after a module path that is not a link |
 | `release_status_missing` | in New modules, What changed and People: a sentence that names a PR or module and says landed / merged / shipped, with no release status ("released as", "published", "not yet published", "declared in the changelog", "no version change", "release status not known") in it or the next sentence |
-| `ownership_not_in_view` | a module named in the Module ownership section that `module_ownership` does not hold |
+| `ownership_not_in_view` | a module named in the Module ownership section that `module_ownership` does not hold (events, without an owner now or at the start, deprecated, stub, labelled) |
+| `review_state_mismatch` / `pr_state_mismatch` / `release_status_mismatch` | **one state per fact**, over the whole issue including story blocks (quoted text and comments blanked): a sentence that names exactly one PR and states its review state ("approved", "approved before …", "changes requested", "waiting for a first review", "reviewed only by automation", "ready to merge") that the PR's `review_state` does not hold, or that another section's sentence about the same PR contradicts; the same for a PR's open / merged / closed-without-merging state, and for a module version said to be published or not yet published against its release status. A conditional sentence ("once", "if", "until") states nothing |
 | `automation_as_person` | an automation account written as "Name (@login)", or mentioned in a sentence without the marker word "automation" |
 | `modules_not_in_view` | a module path that is not a module, child, code area, path the view's changelogs / PR titles name, or the module an issue form names |
 | `versions_not_in_view` | a version that does not belong to its module (versions indexed by the module they belong to; a version right after a module path is that module's; any other must belong to a module the paragraph names, a named child or a child of a named parent) |

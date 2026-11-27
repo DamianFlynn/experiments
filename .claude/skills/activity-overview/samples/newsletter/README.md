@@ -32,15 +32,32 @@ python3 newsletter.py view/bundle.json --check-newsletter avm-bicep-2026-10.md \
   --slices wp/slices --people people.json
 ```
 
-The issue holds 37 stories in full (14 landed, 8 in flight, 12 stalled after activity in
-October 2026, 3 closed), 20 stalled threads carried over in one line each, and seven plumbing
-themes naming every plumbing train, with the one plumbing train that had a real discussion in
-October (#7482) told in full under its theme; two automation-only trains (#7473, #7557) are
-told in their themes. Edits made at assembly to the writers' text: a folder link on the first
-unlinked mention of a module the view knows, vendor names of coding assistants replaced by
-"an automation account (a coding agent)", one sentence about the work package (not the
-record) removed, and italic cross-references between stories and themes that tell the same
-pull request (outside the story blocks).
+**Update pass (store of 27 November 2026, second gathering).** The issue was re-checked
+against a newer store of the same window. Every story and theme written for the earlier store
+was checked again (the story check against the new slice, one state per fact against the new
+view, the headline state, and the row: group, state, release status, PRs, review state) and
+classified in the work package's `REVISIONS.md`: 30 kept as written, 5 to revise because the
+row changed (child versions released with their parent, a review state, a close reason, a story
+that moved theme), 3 to revise because they fail (two stories now in flight, two links the new
+slice no longer holds), 1 new story (#6001), 2 no longer stories (automation-only trains, told
+in their themes); six plumbing themes changed membership. The revisions go to writers as
+`batches/rev-NN/` (the old text, the new slice and row, exactly what to change) and
+`batches/rev-theme-<id>/`; until they come back, each sits in the issue as a
+`<!-- story pending -->` or `<!-- theme pending -->` marker, so the check passes. The
+non-story sections were rewritten from the new outline: what each module is on its first
+mention, the release contents of each version, child versions, the deprecation of the
+DevTest Lab `secret` child module from the tree's lifecycle event, module ownership from the
+delivered fact (14 modules without an owner by kind, the owner added, the deprecated modules),
+the one review state of each open pull request, the four proposed modules, and the
+automation accounts with all their pull requests.
+
+The issue holds 30 stories in full as written and 9 pending (14 landed, 10 in flight, 11
+stalled after activity in October 2026, 3 closed), 20 stalled threads carried over in one line
+each, and seven plumbing themes (six pending revision). Edits made at assembly to the writers'
+text: a folder link on the first unlinked mention of a module the view knows, vendor names of
+coding assistants replaced by "an automation account (a coding agent)", one sentence about the
+work package (not the record) removed, and italic cross-references between stories and themes
+that tell the same pull request (outside the story blocks).
 
 The store, the view (105 MB), the work package and the slices are not kept here. All numbers
 come from that one October store; no month-over-month comparison is made. The "New modules"

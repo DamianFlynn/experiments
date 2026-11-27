@@ -4,7 +4,7 @@ view (reference/newsletter.md).
 
 Two read-only commands, neither of which writes the view:
 
-  newsletter.py VIEW.json [VIEW.json ...] --outline [--weekly]
+  newsletter.py VIEW.json [VIEW.json ...] --outline [--weekly|--monthly]
       The ordered, pre-selected material per section, as JSON on stdout:
       which modules lead, the new modules, breaking changes declared by the
       maintainers kept apart from the candidates the module layer detected,
@@ -16,7 +16,7 @@ Two read-only commands, neither of which writes the view:
       multi-repo stream) are merged and every row names its `repo`.
 
   newsletter.py VIEW.json [VIEW.json ...] --check-newsletter ISSUE.md
-          [--slices DIR] [--people PEOPLE.json] [--weekly]
+          [--slices DIR] [--people PEOPLE.json] [--weekly|--monthly]
       The mechanical check of a written issue against the same views (exit
       0 when it passes, 1 with the lists, 2 on a usage error). Each full
       story in the issue sits between `<!-- story: <train-id> -->` and
@@ -76,6 +76,21 @@ _CAP_KEYS = ("modules", "changelog_items", "newcomers", "maintainers", "top", "r
              "failing", "first_review", "awaiting_review", "plumbing_prs")
 CADENCE = {"month": {k: SAFETY_LIMIT for k in _CAP_KEYS},
            "week": {k: SAFETY_LIMIT for k in _CAP_KEYS}}
+# A window of at most this many days is a weekly issue unless the caller says
+# --monthly (a 14-day window is two weeks, not a month); longer is monthly.
+WEEKLY_MAX_DAYS = 16
+
+
+def auto_cadence(views):
+    """("week" | "month", window days) from the views' combined period:
+    weekly when the window is at most WEEKLY_MAX_DAYS days."""
+    froms = sorted(f for f, _ in (_period(v) for v in views) if f)
+    tos = sorted(t for _, t in (_period(v) for v in views) if t)
+    if not froms or not tos:
+        return "month", None
+    days = (datetime.date.fromisoformat(tos[-1][:10]) -
+            datetime.date.fromisoformat(froms[0][:10])).days + 1
+    return ("week" if days <= WEEKLY_MAX_DAYS else "month"), days
 
 # What a person's work in the window is, best first: the module layer's PR
 # headline, `docs` split out of plumbing, then open work, then an issue.
@@ -357,9 +372,13 @@ def module_release(view, m, module=None):
         if ver in pub:
             p = pub[ver]
             url, src = tag_url(view, p.get("tag"), p.get("url"))
-            rows.append({"module": module, "version": ver, "status": "published",
-                         "tag": p.get("tag"), "date": (p.get("date") or "")[:10] or None,
-                         "url": url, "url_source": src})
+            row = {"module": module, "version": ver, "status": "published",
+                   "tag": p.get("tag"), "date": (p.get("date") or "")[:10] or None,
+                   "url": url, "url_source": src}
+            for k in ("registry", "contents", "note"):
+                if p.get(k):
+                    row[k] = p[k]
+            rows.append(row)
         else:
             rows.append({"module": module, "version": ver,
                          "status": "declared_not_published" if _tags_complete(view)
@@ -430,7 +449,49 @@ def is_automation(view, login, extra=()):
     if login_key(login) in {login_key(x) for x in extra}:
         return True
     row = (view.get("people") or {}).get(login) or {}
+    if "automation" in row:
+        # the view's own marking (account type, the registry's operator tag);
+        # `null` is the operator's "not automation" and wins
+        return bool(row["automation"])
     return bool(row.get("is_bot")) or link.derive.is_bot_login(login)
+
+
+def fork_status(view, pr):
+    """`fork`, `deleted_fork`, `not_fork` or `unknown`: the view's own
+    `fork_status`, else derived from `head_repo` (unknown without one)."""
+    if pr.get("fork_status"):
+        return pr["fork_status"]
+    if not pr.get("head_repo"):
+        return "unknown"
+    return "fork" if slug_key(pr["head_repo"]) != slug_key(_slug(view)) else "not_fork"
+
+
+def review_state(view, number):
+    """The PR's ONE review state (the view's `review_state.state`): none,
+    requested, automated_only, commented, changes_requested, approved,
+    approved_stale; None when the view does not derive it."""
+    pr = next((x for x in view.get("prs") or [] if x.get("number") == number), None) or {}
+    rs = pr.get("review_state")
+    return rs.get("state") if isinstance(rs, dict) else None
+
+
+def module_info(view, area):
+    """What a module is: display name, description, resource type and
+    lifecycle, from the module layer's row or the ownership fact's
+    `modules_at_end` (the module's metadata file)."""
+    out = {}
+    for m in (view.get("module_changes") or {}).get("modules") or []:
+        if m.get("area") == area:
+            for k in ("display_name", "description", "resource_type"):
+                if m.get(k):
+                    out[k] = m[k]
+            if m.get("module_lifecycle"):
+                out["lifecycle"] = m["module_lifecycle"]
+    end = ((view.get("module_ownership") or {}).get("modules_at_end") or {}).get(area) or {}
+    for k in ("display_name", "description", "resource_type", "lifecycle"):
+        if end.get(k) and k not in out:
+            out[k] = end[k]
+    return out
 
 
 def _pr_row(view, number, automation=()):
@@ -450,7 +511,14 @@ def _pr_row(view, number, automation=()):
                     out["author_" + k] = person[k]
     if pr.get("head_repo"):
         out["head_repo"] = pr["head_repo"]
-        out["is_fork"] = pr.get("is_fork", slug_key(pr["head_repo"]) != slug_key(_slug(view)))
+    out["fork_status"] = fork_status(view, pr)
+    out["is_fork"] = out["fork_status"] in ("fork", "deleted_fork")
+    if pr.get("review_state"):
+        out["review_state"] = pr["review_state"]
+    if pr.get("closed_unmerged"):
+        out["closed_unmerged"] = pr["closed_unmerged"]
+    if pr.get("body_as_of"):
+        out["body_as_of"] = pr["body_as_of"]
     desc = _pr_description(pr)
     if desc:
         out["description"] = desc
@@ -535,6 +603,7 @@ def section_breaking(view, multi=False):
                      for d in brk["declared"]]
             declared.append(_with_repo({
                 "area": m["area"], "kind": m.get("kind"), "url": module_url(view, m["area"])[0],
+                "info": module_info(view, m["area"]),
                 "release": module_release(view, m),
                 "versions": sorted({i["version"] for i in items if i["version"]},
                                    key=_vkey),
@@ -569,6 +638,24 @@ def section_breaking(view, multi=False):
         if m.get("status") in ("removed", "orphaned"):
             notices.append(_with_repo({"area": m["area"], "status": m["status"]},
                                       repo, multi))
+    for e in ((view.get("module_ownership") or {}).get("events") or []):
+        if not isinstance(e, dict) or e.get("kind") != "deprecated":
+            continue
+        target = e.get("module")
+        row = next((d for d in deps if d.get("target") == target), None)
+        if row is None:
+            area = next((m["area"] for m in mc.get("modules") or []
+                         if target and (target == m["area"] or target.startswith(m["area"] + "/"))),
+                        target)
+            row = _with_repo({"area": area, "target": target, "basis": [], "version": None,
+                              "text": None, "url": (e.get("source") or {}).get("url")},
+                             repo, multi)
+            deps.append(row)
+        if "lifecycle" not in row["basis"]:
+            row["basis"].append("lifecycle")
+        row["date"] = e.get("date") or (e.get("at") or "")[:10] or None
+        if e.get("marker_text"):
+            row["marker_text"] = e["marker_text"]
     declared.sort(key=lambda r: (-len(r["items"]), r["area"]))
     out = {"declared": declared, "candidates": candidates, "deprecations": deps,
            "notices": notices, "omit": None}
@@ -704,7 +791,7 @@ def section_module_changes(view, caps, multi=False, automation=()):
         numbers = [p["number"] for p in prs]
         url, url_source = module_url(view, m["area"])
         row = {"area": m["area"], "kind": m.get("kind"), "status": m.get("status"),
-               "url": url, "url_source": url_source,
+               "url": url, "url_source": url_source, "info": module_info(view, m["area"]),
                # what the change means for a reader, why it came up, who did it
                "release": module_release(view, m),
                "prompted_by": prompted_by(view, numbers),
@@ -720,6 +807,22 @@ def section_module_changes(view, caps, multi=False, automation=()):
         names = _interface_names(m)
         if names:
             row["interface"] = names
+        # child versions published in the window, each with what it holds:
+        # its own change (`contents`) or, when no change touched its folder,
+        # republished with its parent
+        children = sorted({p.get("module") for p in (m.get("versions") or {}).get("published") or []
+                           if p.get("module") and p.get("module") != m["area"]})
+        if children:
+            row["child_releases"] = []
+            for child in children:
+                for r in module_release(view, m, child):
+                    if r.get("version"):
+                        c = r.get("contents") or {}
+                        r = dict(r, own_change=bool(c.get("items") or c.get("commits")) if c
+                                 else None, info=module_info(view, child))
+                        if c and not r["own_change"]:
+                            r["note"] = r.get("note") or "republished with its parent"
+                        row["child_releases"].append(r)
         rows.append(_with_repo(row, repo, multi))
     rows.sort(key=lambda r: (-r["score"], r["area"]))
     return {"modules": rows, "also": [], "plumbing_only": sorted(plumbing_only),
@@ -936,6 +1039,18 @@ def section_stories(views, caps, multi=False):
                 "check": "python3 link.py {} --check-story {}".format(
                     sfile, sfile.replace(".slice.json", ".story.md")),
             }
+            # what the view says beyond the group: what each module is, why the
+            # story is in its state, the proposed new module, related stories
+            for k in ("module_info", "modules_source", "status_reason", "substance",
+                      "new_module_proposed", "related_stories"):
+                if e.get(k):
+                    row[k] = e[k]
+            row["review_states"] = {str(n): review_state(v, n) for n in t.get("prs") or []
+                                    if review_state(v, n)}
+            for m in row["modules"]:
+                info = (e.get("module_info") or {}).get(m["area"]) or module_info(v, m["area"])
+                if info:
+                    m["info"] = info
             if group == "plumbing" or plan == "in_theme":
                 row["theme"] = themes.get(e["id"]) or _theme_by_author(v, t)
             if plan == "line":
@@ -1072,10 +1187,18 @@ def _automation_rows(view, automation=(), multi=False):
                if x.get("author") == login]
         if not counts and not prs:
             continue
-        out.append(_with_repo({"login": login, "automation": True, "counts": counts,
-                               "prs": [{k: r.get(k) for k in ("number", "title", "url",
-                                                              "state", "merged_at")}
-                                       for r in prs]}, _slug(view), multi))
+        auto = row.get("automation") if isinstance(row.get("automation"), dict) else {}
+        entry = {"login": login, "automation": True, "counts": counts,
+                 "prs": [{k: r.get(k) for k in ("number", "title", "url", "state", "merged_at",
+                                                "review_state", "closed_unmerged")
+                          if r.get(k) is not None or k in ("number", "state", "merged_at")}
+                         for r in prs]}
+        # what kind of automation, and for whom it acted (the view's marking)
+        if auto.get("kind"):
+            entry["kind"] = auto["kind"]
+        if auto.get("on_behalf_of"):
+            entry["on_behalf_of"] = auto["on_behalf_of"]
+        out.append(_with_repo(entry, _slug(view), multi))
     return out
 
 
@@ -1173,8 +1296,14 @@ def section_coming(view, caps, multi=False):
     repo = _slug(view)
     period = _period(view)
     as_of = (view.get("meta") or {}).get("ref_date") or period[1]
-    groups = {"ready": [], "failing_checks": [], "needs_first_review": [],
-              "awaiting_review": [], "other": {}}
+    groups = {"ready": [], "approval_stale": [], "failing_checks": [],
+              "needs_first_review": [], "awaiting_review": [], "other": {}}
+    # the view's story rows name a train's modules (from its commits) when the
+    # train itself records no code areas
+    story_modules = {r.get("id"): r.get("modules") for r in
+                     (view.get("stories") or {}).get("all") or [] if r.get("modules")}
+    story_groups = {r.get("id"): r.get("group") for r in
+                    (view.get("stories") or {}).get("all") or [] if r.get("group") != "plumbing"}
     for t in view.get("trains") or []:
         # every train with PRs: a shipped train can hold an open follow-up;
         # the per-item open state and activity below select
@@ -1204,28 +1333,34 @@ def section_coming(view, caps, multi=False):
                               "failing": checks.get("failing") or []}
                    if checks.get("status") == "gathered" else
                    {"status": checks.get("status") or "not gathered"},
-                   "modules": [a for a in t.get("code_areas") or []
+                   "modules": [a for a in (story_modules.get(t["id"]) or t.get("code_areas") or [])
                                if link.module_kind(a) is not None][:3]}
             row["module_urls"] = {a: module_url(view, a)[0] for a in row["modules"]}
-            if t.get("story"):
+            if t.get("story") or t["id"] in story_groups:
                 row["story"] = story_key(view, t["id"], multi)
-            if _NEW_MODULE_TITLE_RE.search(it.get("title") or ""):
-                row["title_signal"] = "new_module"
+                if story_groups.get(t["id"]):
+                    row["story_group"] = story_groups[t["id"]]
+            row["review_state"] = review_state(view, it.get("number"))
             row = _with_repo(row, repo, multi)
             verdicts = (it.get("reviews") or {}).get("verdicts") or []
-            approved = any(x.get("state") == "approved" for x in verdicts) and \
-                not row["outstanding_change_requests"]
-            row["approved"] = approved
+            rs = row["review_state"]
+            # the review state is the one source for review wording; the
+            # verdicts only where the view derives none
+            row["approved"] = rs == "approved" if rs else (
+                any(x.get("state") == "approved" for x in verdicts) and
+                not row["outstanding_change_requests"])
             st = ball.get("state")
-            # the derived next move decides; a retained approval does not
-            if st == "awaiting merge":
+            # the derived next move decides, and only a current approval is
+            # ready: an approval followed by the author's change is not
+            if st == "awaiting merge" and rs in ("approved", None):
                 groups["ready"].append(row)
+            elif st == "awaiting merge" and rs == "approved_stale":
+                groups["approval_stale"].append(row)
             elif ball.get("rule") == "R5 failing checks":
                 groups["failing_checks"].append(row)
-            elif st == "awaiting a first review":
-                groups["needs_first_review"].append(row)
-            elif st == "awaiting reviewer":
-                groups["awaiting_review"].append(row)
+            elif st in ("awaiting a first review", "awaiting reviewer"):
+                first = rs in _NOT_REVIEWED if rs else st == "awaiting a first review"
+                groups["needs_first_review" if first else "awaiting_review"].append(row)
             else:
                 groups["other"][st] = groups["other"].get(st, 0) + 1
     fc = view.get("forecast") or {}
@@ -1235,7 +1370,35 @@ def section_coming(view, caps, multi=False):
                                      repo, multi)
                           for c in fc.get("candidates") or [] if c.get("tier") == "likely"]
     groups["quiet"] = len((view.get("stories") or {}).get("quiet") or [])
+    groups["proposed_modules"] = proposed_modules(view, multi)
     return groups
+
+
+def proposed_modules(view, multi=False):
+    """The new modules open PRs propose: the module areas whose entry file
+    the train's PRs add (`stories.all[].new_module_proposed`), each with the
+    train's open PRs, their review state, the story's group and what the
+    module is when its metadata says."""
+    prs = {p.get("number"): p for p in view.get("prs") or []}
+    trains = {t["id"]: t for t in view.get("trains") or []}
+    out = []
+    for r in (view.get("stories") or {}).get("all") or []:
+        areas = r.get("new_module_proposed") or r.get("proposes_new_module") or []
+        for area in areas:
+            t = trains.get(r["id"], {})
+            open_prs = [n for n in t.get("prs") or [] if (prs.get(n) or {}).get("state") == "open"]
+            row = {"module": area, "story": story_key(view, r["id"], multi),
+                   "group": r.get("group"), "state": r.get("state"),
+                   "prs": [{"number": n, "url": (prs.get(n) or {}).get("url"),
+                            "title": (prs.get(n) or {}).get("title"),
+                            "review_state": review_state(view, n),
+                            "fork_status": fork_status(view, prs.get(n) or {})}
+                           for n in open_prs]}
+            info = dict((r.get("module_info") or {}).get(area) or {}) or module_info(view, area)
+            if info:
+                row["info"] = info
+            out.append(_with_repo(row, _slug(view), multi))
+    return out
 
 
 def _finish_coming(groups, caps):
@@ -1368,45 +1531,112 @@ def _theme_counts(view, numbers):
     return out
 
 
-OWNERSHIP_KINDS = ("owner_needed", "owner_added", "owner_removed", "orphaned", "adopted")
+OWNERSHIP_KINDS = ("owner_needed", "owner_response_requested", "owner_added",
+                   "owner_removed", "orphaned", "adopted")
+
+
+LIFECYCLE_EVENT_KINDS = ("deprecated", "undeprecated", "module_added", "module_removed",
+                         "module_info_changed")
+
+
+def _start_without_owner(mo):
+    """The modules without an owner at the window's start, from
+    `start_state` (a live or orphaned module whose owner file lists nobody or
+    that carries an orphan marker); a legacy fact's `start_without_owner`."""
+    if isinstance(mo.get("start_state"), dict):
+        out = []
+        for module, row in sorted(mo["start_state"].items()):
+            if not isinstance(row, dict) or row.get("deprecated"):
+                continue
+            if row.get("orphan_marker") or (row.get("owner_file") and not row.get("owners")
+                                             and row.get("entry")):
+                out.append({"module": module,
+                            "marker": row.get("orphan_marker") or row.get("owner_file")})
+        return out
+    return mo.get("start_without_owner") or []
+
+
+def _without_owner_by_kind(rows):
+    """{empty_owner_list | orphan_marker: [module (repo-qualified in a stream)]}."""
+    by_kind = {}
+    for w in rows:
+        k = "orphan_marker" if w.get("lifecycle") == "orphaned" or \
+            (w.get("marker") or "").upper().startswith("ORPHAN") else "empty_owner_list"
+        by_kind.setdefault(k, []).append(
+            "{}:{}".format(w["repo"], w["module"]) if w.get("repo") else w["module"])
+    return by_kind
+
+
+def ownership_modules(mo):
+    """The modules the ownership fact says something about: its events, the
+    modules without an owner (now and at the start), the deprecated modules,
+    the stub folders and the labelled items."""
+    if not isinstance(mo, dict):
+        return set()
+    out = {e.get("module") for k in ("events", "without_owner", "labelled_items",
+                                     "deprecated_modules", "stub_modules")
+           for e in mo.get(k) or [] if isinstance(e, dict) and e.get("module")}
+    out |= {e["module"] for e in _start_without_owner(mo) if isinstance(e, dict)
+            and e.get("module")}
+    return out
 
 
 def section_ownership(view, multi=False):
     """Module ownership from the view's `module_ownership`: events (owner
-    needed / added / removed, orphaned, adopted) with module link, people,
-    date and source, and the standing list of modules without an owner."""
+    needed / added / removed, orphaned, adopted, owner response requested)
+    with module link, people, date and source; the module lifecycle events
+    (deprecated, added, removed, ...); the standing list of LIVE and
+    orphaned modules without an owner at the window's end (with what each
+    module is), the deprecated modules and the count of stub folders
+    apart. When the state cannot be known (`without_owner_unavailable`) the
+    section says so and never says "no module without an owner"."""
     mo = view.get("module_ownership")
     if not isinstance(mo, dict) or not mo.get("collected"):
         return {"events": [], "without_owner": [],
                 "omit": "needs a store gathered with module ownership "
                         "(module_ownership is absent)"}
-    events, unattributed = [], []
+    events, unattributed, lifecycle = [], [], []
     for e in mo.get("events") or []:
         if not isinstance(e, dict):
             continue
         row = dict(e)
-        if not e.get("module"):
+        if e.get("module"):
+            row["module_url"] = module_url(view, e["module"])[0]
+        if e.get("kind") in LIFECYCLE_EVENT_KINDS:
+            lifecycle.append(_with_repo(row, _slug(view), multi))
+        elif not e.get("module"):
             # a label on an item that names no single module (a repository-wide
             # PR): kept apart, worded as such or left out with the reason
             unattributed.append(_with_repo(row, _slug(view), multi))
-            continue
-        row["module_url"] = module_url(view, e["module"])[0]
-        events.append(_with_repo(row, _slug(view), multi))
+        else:
+            events.append(_with_repo(row, _slug(view), multi))
     order = {k: i for i, k in enumerate(OWNERSHIP_KINDS)}
     events.sort(key=lambda r: (order.get(r.get("kind"), len(order)), r.get("date") or "",
                                r.get("module") or ""))
+
     def with_urls(rows):
         return [_with_repo(dict(w, module_url=module_url(view, w["module"])[0]),
                            _slug(view), multi)
                 for w in rows or [] if isinstance(w, dict) and w.get("module")]
-    without = with_urls(mo.get("without_owner"))
-    out = {"events": events, "unattributed": unattributed, "without_owner": without,
-           "start_without_owner": with_urls(mo.get("start_without_owner")),
+    unavailable = mo.get("without_owner_unavailable")
+    without = [] if unavailable else with_urls(mo.get("without_owner"))
+    by_kind = _without_owner_by_kind(without)
+    out = {"events": events, "unattributed": unattributed, "lifecycle_events": lifecycle,
+           "without_owner": without, "without_owner_by_kind": by_kind,
+           "deprecated_modules": with_urls(mo.get("deprecated_modules")),
+           "stub_modules_count": len(mo.get("stub_modules") or []),
+           "start_without_owner": with_urls(_start_without_owner(mo)),
            "labelled_items": with_urls(mo.get("labelled_items")),
            "owner_files": mo.get("owner_files"),
            "label_patterns": mo.get("label_patterns"), "omit": None}
-    if not events and not without:
-        out["omit"] = "no ownership event and no module without an owner in the window"
+    if unavailable:
+        out["without_owner_unavailable"] = unavailable
+    if mo.get("unread"):
+        out["unread"] = mo["unread"]
+    if not events and not without and not lifecycle and not out["deprecated_modules"]:
+        out["omit"] = ("module ownership state not known: {}".format(unavailable)
+                       if unavailable else
+                       "no ownership event and no module without an owner in the window")
     return out
 
 
@@ -1480,6 +1710,21 @@ def _coverage(view):
                          .format(len(inp["unread"])))
     else:
         notes.append(_NO_MODULE_LAYER)
+    mo = view.get("module_ownership")
+    if isinstance(mo, dict) and mo.get("collected"):
+        if mo.get("without_owner_unavailable"):
+            notes.append("which modules have no owner is not known ({}): the issue does "
+                         "not say that every module has one".format(
+                             mo["without_owner_unavailable"]))
+        if mo.get("unread"):
+            notes.append("{} owner / marker file(s) could not be read".format(
+                len(mo["unread"])))
+        if mo.get("start_state_source") and mo["start_state_source"] != "complete":
+            notes.append("module ownership at the window's start is {} "
+                         "(module_ownership.start_state_source)".format(
+                             mo["start_state_source"]))
+    elif "module_ownership" not in view:
+        notes.append("module ownership was not gathered: no ownership section")
     return notes
 
 
@@ -1635,15 +1880,19 @@ def section_intro(out):
     return {"lead_with": lead, "omit": None}
 
 
-def outline(views, cadence="month", automation=()):
+def outline(views, cadence=None, automation=()):
     """The ordered, pre-selected material of one issue over one or more linked
     views (the members of a stream). Pure: reads the views, never modifies
     them. `automation` names accounts to treat as automation beyond the
-    view's own marking. Raises ValueError for an unknown cadence."""
+    view's own marking. `cadence` None picks it from the window
+    (auto_cadence). Raises ValueError for an unknown cadence."""
+    views = list(views)
+    auto, days = auto_cadence(views)
+    cadence_source = "caller" if cadence else "window"
+    cadence = cadence or auto
     if cadence not in CADENCE:
         raise ValueError("cadence must be one of {}".format(sorted(CADENCE)))
     caps = CADENCE[cadence]
-    views = list(views)
     multi = len(views) > 1
     froms = sorted(f for f, _ in (_period(v) for v in views) if f)
     tos = sorted(t for _, t in (_period(v) for v in views) if t)
@@ -1667,11 +1916,12 @@ def outline(views, cadence="month", automation=()):
     if changes["omit"] is None and not changes["modules"]:
         changes["omit"] = "no module had a reader-facing change in the window"
     coming = {"ready": [], "failing_checks": [], "needs_first_review": [],
-              "awaiting_review": [], "other": {}, "forecast": [], "quiet": 0}
+              "awaiting_review": [], "other": {}, "forecast": [], "quiet": 0,
+              "proposed_modules": [], "approval_stale": []}
     for v in views:
         g = section_coming(v, caps, multi=multi)
-        for k in ("ready", "failing_checks", "needs_first_review", "awaiting_review",
-                  "forecast"):
+        for k in ("ready", "approval_stale", "failing_checks", "needs_first_review",
+                  "awaiting_review", "forecast", "proposed_modules"):
             coming[k] += g[k]
         for k, n in g["other"].items():
             coming["other"][k] = coming["other"].get(k, 0) + n
@@ -1680,7 +1930,19 @@ def outline(views, cadence="month", automation=()):
     plumbing, pparts = merged(section_plumbing, ("prs", "themes"), caps,
                               automation=automation)
     ownership, oparts = merged(section_ownership, ("events", "unattributed", "without_owner",
-                                                   "start_without_owner", "labelled_items"))
+                                                   "start_without_owner", "labelled_items",
+                                                   "lifecycle_events", "deprecated_modules"))
+    ownership["without_owner_by_kind"] = _without_owner_by_kind(ownership["without_owner"])
+    ownership["stub_modules_count"] = sum(x.get("stub_modules_count") or 0 for x in oparts)
+    unav = [_with_repo({"reason": x["without_owner_unavailable"]}, r, multi)
+            for x, r in zip(oparts, [_slug(v) for v in views])
+            if x.get("without_owner_unavailable")]
+    if unav:
+        # never "no module without an owner" for a repository whose state is unknown
+        ownership["without_owner_unavailable"] = unav if multi else unav[0]["reason"]
+        if ownership.get("omit") and "not known" not in ownership["omit"]:
+            ownership["omit"] = "module ownership state not known: {}".format(
+                unav[0]["reason"])
     if len(pparts) == 1:
         plumbing.update({k: pparts[0].get(k) for k in ("merged_prs", "plumbing_prs",
                                                        "classified", "share", "by_class")})
@@ -1709,6 +1971,7 @@ def outline(views, cadence="month", automation=()):
     out = {"kind": "newsletter_outline", "version": 1,
            "repos": [_slug(v) for v in views], "period": {"from": frm, "to": to},
            "period_label": period_label(frm, to), "cadence": cadence,
+           "cadence_source": cadence_source, "window_days": days,
            "as_of": max(((v.get("meta") or {}).get("records_as_of") or {}).get("instant")
                         or (v.get("meta") or {}).get("ref_date") or "" for v in views),
            "sections": sections}
@@ -1993,11 +2256,10 @@ def _module_index(views):
                 vs.discard(None)
         rt.extend(pr.get("title") or "" for pr in v.get("prs") or [])
         mo = v.get("module_ownership") or {}
-        for k in ("events", "without_owner", "start_without_owner", "labelled_items"):
-            # the modules the ownership fact names are modules of the repository
-            for e in mo.get(k) or []:
-                if isinstance(e, dict) and e.get("module"):
-                    rp.add(e["module"])
+        # the modules the ownership fact names are modules of the repository,
+        # and so is every module its end-of-window list holds
+        rp.update(ownership_modules(mo))
+        rp.update(k for k in (mo.get("modules_at_end") or {}) if isinstance(k, str))
         for iss in v.get("issues") or []:
             # the module an issue form names (the thin-story module evidence)
             mm = _ISSUE_MODULE_RE.search(iss.get("body") or "")
@@ -2081,7 +2343,7 @@ def _area_of(path, areas):
     return best
 
 
-def check_newsletter(views, text, slices=None, registry_names=None, cadence="month",
+def check_newsletter(views, text, slices=None, registry_names=None, cadence=None,
                      automation=()):
     """The mechanical check of an issue against its views
     (reference/newsletter.md "The check"). `slices` maps a story train id to
@@ -2531,9 +2793,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     owned = {}
     for v in views:
         mo = v.get("module_ownership") or {}
-        owned[_slug(v)] = {e.get("module") for k in ("events", "without_owner",
-                                                     "start_without_owner", "labelled_items")
-                           for e in mo.get(k) or [] if isinstance(e, dict)}
+        owned[_slug(v)] = ownership_modules(mo)
     not_linked, ver_not_linked, no_status, not_owned = [], [], [], []
     for sid, chunk in _section_chunks(no_quotes):
         if sid not in LINKED_SECTIONS and sid not in RELEASE_SECTIONS:
@@ -2601,6 +2861,10 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                     as_person.append({"login": lg, "sentence": " ".join(snt.split())[:200]})
     res["automation_as_person"] = as_person
 
+    # one state per fact: a PR's review state, its open/merged/closed state and
+    # a version's release status read the same in every section
+    res.update(state_claims(views, text))
+
     # dates carry the year
     no_year = []
     for m in link._DATE_IN_PROSE_RE.finditer(prose):
@@ -2659,6 +2923,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                  "stories_misplaced", "stories_state_missing", "modules_not_linked",
                  "versions_not_linked", "release_status_missing", "ownership_not_in_view",
                  "automation_as_person",
+                 "review_state_mismatch", "pr_state_mismatch", "release_status_mismatch",
                  "markers_malformed",
                  "sections_missing",
                  "omitted_section_present", "sections_out_of_order", "title_missing",
@@ -2676,6 +2941,176 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                       "sections_present": present, "sections_omitted": sorted(omitted)}
     res["cannot_check"] = list(CANNOT_CHECK)
     return res
+
+
+# --- one state per fact across sections -------------------------------------
+
+REVIEW_STATES = ("none", "requested", "automated_only", "commented", "changes_requested",
+                 "approved", "approved_stale")
+_NOT_REVIEWED = {"none", "requested", "automated_only"}
+# (claim, pattern, the review states the claim is true of); the first match
+# per pattern group wins, stale before plain approval
+_REVIEW_CLAIMS = (
+    ("approved_stale", re.compile(
+        r"\b(?:stale|earlier|older|previous|prior)\s+approval|\bapprov\w*\b[^.;]*?\b(?:before|"
+        r"predates?|ahead of|since then|then|but|later)\b[^.;]*?\b(?:push\w*|commit\w*|chang\w*)"
+        r"|\bpushed\b[^.;]*\bafter\b[^.;]*\bapprov", re.I), {"approved_stale"}),
+    ("not_approved", re.compile(
+        r"\b(?:not\s+(?:yet\s+)?(?:been\s+)?approved|no\s+approval|without\s+(?:an?\s+)?approval|"
+        r"awaiting\s+(?:an?\s+)?approval|waiting\s+for\s+(?:an?\s+)?approval)\b", re.I),
+     set(REVIEW_STATES) - {"approved"}),
+    # a review verdict, not the adjective ("an approved test subscription")
+    ("approved", re.compile(
+        r"(?:@[\w\[\]-]+\s+|\b(?:was|is|been|got|were|has|have|had|and|then|it|first|"
+        r"maintainers?|reviewers?)\s+)approved\b|\bapproved\s+(?:it|the\s+(?:pr|pull\s+request|"
+        r"change)|on|by)\b|\b(?:an?|the|his|her|their|its|one|current)\s+approv(?:al|ing\s+review)\b",
+        re.I), {"approved"}),
+    ("changes_requested", re.compile(
+        r"\bchanges?\s+(?:(?:were|was|have\s+been|has\s+been)\s+)?requested\b|"
+        r"\brequested\s+changes\b", re.I), {"changes_requested"}),
+    ("automated_only", re.compile(
+        r"\bonly\s+(?:an?\s+)?automat\w*\s+review|\breview\w*\s+only\s+(?:by|from)\s+"
+        r"(?:an?\s+)?automat", re.I), {"automated_only"}),
+    ("not_reviewed", re.compile(
+        r"\b(?:awaiting|awaits|waiting\s+for|waits\s+for|needs|has\s+not\s+had|hasn't\s+had|without|"
+        r"no)\s+(?:a\s+|its\s+)?first\s+(?:human\s+)?review|\bnot\s+(?:yet\s+)?(?:been\s+)?"
+        r"reviewed\b|\bno\s+(?:human\s+)?review\s+(?:yet|so\s+far)\b", re.I), _NOT_REVIEWED),
+    # "not ready to merge" says nothing about the approval
+    ("ready", re.compile(r"(?<!not\s)(?<!never\s)(?<!n't\s)\bready\s+(?:to|for)\s+merg\w*",
+                         re.I), {"approved"}),
+)
+_PR_STATE_CLAIMS = (
+    ("closed_unmerged", re.compile(
+        r"\bclosed\s+(?:without\s+(?:being\s+)?merg\w*|unmerged)|\bwas\s+not\s+merged\b|"
+        r"\bnever\s+merged\b", re.I)),
+    ("merged", re.compile(r"\b(?:is|was|been|got|has)\s+merged\b|\bmerged\s+on\b", re.I)),
+    ("open", re.compile(r"\b(?:is|remains|still)\s+open\b|\bstill\s+in\s+review\b", re.I)),
+)
+_CONDITIONAL_RE = re.compile(r"\b(?:once|if|until|unless|whether|would|could|should)\b", re.I)
+_PUB_CLAIMS = (
+    ("not_published", re.compile(
+        r"\bnot\s+(?:yet\s+)?(?:been\s+)?(?:published|released|tagged)\b|\bunpublished\b|"
+        r"\bunreleased\b|\bawait\w*\s+(?:its\s+)?(?:publication|tag)\b|\bno\s+tag\b", re.I)),
+    ("published", re.compile(r"\b(?:published|released|tagged)\b", re.I)),
+)
+
+
+def _review_claim(snt):
+    out = []
+    for name, rx, states in _REVIEW_CLAIMS:
+        if rx.search(snt):
+            if name == "approved" and out and out[-1][0] in ("approved_stale", "not_approved"):
+                continue
+            out.append((name, states))
+    return out
+
+
+def state_claims(views, text):
+    """One state per fact: every sentence of the issue (stories, quotes and
+    comments blanked of quoted text only) that names exactly ONE pull
+    request and states its review state, or its open/merged/closed state, or
+    that names one module version and says whether it was published, is
+    compared with the view's single source (`review_state`, the PR's state,
+    the release status) and with what the other sections say of the same
+    PR or version. Returns {review_state_mismatch, pr_state_mismatch,
+    release_status_mismatch}: each row names the claim, the view's state and
+    the sections that stated it."""
+    slugs = [_slug(v) for v in views]
+    prs = {}
+    rel = {}
+    for v in views:
+        sl = _slug(v)
+        for pr in v.get("prs") or []:
+            n = pr.get("number")
+            if n is None:
+                continue
+            st = "merged" if pr.get("merged") else (
+                "open" if pr.get("state") == "open" else
+                "closed_unmerged" if pr.get("state") == "closed" else None)
+            rs = pr.get("review_state")
+            prs[(sl, n)] = {"review": rs.get("state") if isinstance(rs, dict) else None,
+                            "state": st}
+        for m in (v.get("module_changes") or {}).get("modules") or []:
+            mods = {m["area"]} | {x.get("module") for x in
+                                  (m.get("versions") or {}).get("published") or [] if x.get("module")}
+            for mod in mods:
+                for r in module_release(v, m, mod):
+                    if r.get("version"):
+                        rel[(sl, mod, version_key(r["version"]))] = r.get("status")
+    known_areas = sorted({k[1] for k in rel}, key=len, reverse=True)
+
+    blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))   # noqa: E731
+    t = _COMMENT_RE.sub(blank, text)
+    t = _FENCE_RE.sub(blank, t)
+    t = link._QUOTE_RE.sub(blank, t)
+    t = re.sub(r"^\s*>.*$", blank, t, flags=re.M)
+    review, pstate, pub = {}, {}, {}
+    for sid, chunk in _section_chunks(t):
+        for par, repo in _scoped_paragraphs(chunk, slugs):
+            if re.match(r"^\s*#", par):
+                continue
+            repo = repo if repo is not None else (slugs[0] if len(slugs) == 1 else None)
+            if repo is None:
+                continue
+            plain = _strip(_delink(par), code=False)
+            for snt in _sentences(plain):
+                snt_c = _CODE_SPAN_RE.sub(lambda m: m.group(0).strip("`"), snt)
+                nums = sorted({int(x) for x in _ITEM_RE.findall(snt_c)
+                               if (repo, int(x)) in prs})
+                cond = bool(_CONDITIONAL_RE.search(snt_c))
+                if len(nums) == 1 and not cond:
+                    key = (repo, nums[0])
+                    for name, states in _review_claim(snt_c):
+                        review.setdefault(key, []).append((sid, name, states, snt))
+                    for name, rx in _PR_STATE_CLAIMS:
+                        if rx.search(snt_c):
+                            pstate.setdefault(key, []).append((sid, name, {name}, snt))
+                            break
+                vers = []
+                for vm in _VERSION_RE.finditer(snt_c):
+                    toks = [a for a in known_areas if a in snt_c]
+                    mod = _attached_module(snt_c, vm.start(), toks) if toks else None
+                    if mod is None and len({x for x in toks if not any(
+                            y != x and y.startswith(x + "/") for y in toks)}) == 1:
+                        # "the module ... was released as 0.13.0": the one module
+                        # the sentence names, when that module has the version
+                        only = max(toks, key=len)
+                        if (repo, only, version_key(vm.group(1))) in rel:
+                            mod = only
+                    if mod:
+                        vers.append((mod, version_key(vm.group(1))))
+                vers = sorted(set(vers))
+                if len(vers) == 1 and not cond and (repo,) + vers[0] in rel:
+                    for name, rx in _PUB_CLAIMS:
+                        if rx.search(snt_c):
+                            pub.setdefault((repo,) + vers[0], []).append(
+                                (sid, name, {"published"} if name == "published" else
+                                 {"declared_not_published"}, snt))
+                            break
+
+    def verdicts(claims, actual_of, label):
+        out = []
+        for key, rows in claims.items():
+            actual = actual_of(key)
+            ok = set.intersection(*[set(r[2]) for r in rows])
+            wrong = [r for r in rows if actual is not None and actual not in r[2]]
+            if wrong or not ok:
+                row = {"repo": key[0], label: key[1] if len(key) == 2 else "/".join(key[1:]),
+                       "view": actual,
+                       "stated": [{"section": r[0], "claim": r[1],
+                                   "sentence": " ".join(r[3].split())[:160]}
+                                  for r in (wrong or rows)]}
+                if len(slugs) == 1:
+                    row.pop("repo")
+                out.append(row)
+        return out
+    return {
+        "review_state_mismatch": verdicts(review, lambda k: prs[k]["review"], "pr"),
+        "pr_state_mismatch": verdicts(pstate, lambda k: prs[k]["state"], "pr"),
+        "release_status_mismatch": verdicts(
+            pub, lambda k: rel.get(k) if rel.get(k) in ("published", "declared_not_published")
+            else ("unknown" if rel.get(k) == "unknown" else None), "version"),
+    }
 
 
 CANNOT_CHECK = (
@@ -2717,15 +3152,28 @@ WORK_PACKAGE_RULES = """
 6. **Who / why / state of play.** Answer, from the slice: which module or pattern (linked), why
    it came up (`prompted_by` in the row file), what was decided or changed, the state of play,
    where it is heading or what it waits on, how a reader can help (only actions the record
-   points to). Fork contributions are said as such (`pr_details[].is_fork`).
-7. **Automation accounts** (`[bot]` logins, `automation: true` in the row's people) are
-   named as automation, never as a person.
+   points to). Fork contributions are said as such (`pr_details[].fork_status`: `fork`,
+   `deleted_fork` — "from a fork since deleted" —, `not_fork`, `unknown`).
+7. **Automation accounts** (`[bot]` logins, `automation` set in the row's people or the
+   view's people) are named as automation, never as a person; one acting for a person
+   (`on_behalf_of`) is "an automation account (a coding agent) working for Name (@login)".
 8. **No tool, model or vendor names** that appear in the record (agent footers, assistant
    account names): say "an automation account (a coding agent)".
+9. **One review state.** Say an open PR's review state only as `review_states` in the row
+   file (and `pr_details[].review_state`) gives it: `approved` "approved"; `approved_stale`
+   "approved before the author's latest changes" (never "ready to merge"); `none` / `requested`
+   "waiting for a first review"; `automated_only` "reviewed only by automation, not yet by a
+   person"; `commented` "reviewed with comments, no verdict"; `changes_requested` "changes
+   requested". The issue's check fails a PR whose review state reads differently anywhere.
+10. **What a module is.** On a module's first mention say what it is, from
+   `modules[].info` / `module_info` (display name, resource type), in a few words.
+11. **Why it is in its state.** `status_reason` in the row file says why the story is in its
+   group; a closed story ends "Where it stands" with the close reason (`closing.state_reason`,
+   who closed it), what superseded it, or "the record states no reason".
 """
 
 
-def work_package(views, out_dir, skill_dir=None, cadence="month", automation=()):
+def work_package(views, out_dir, skill_dir=None, cadence=None, automation=()):
     """Write the work package of one issue into `out_dir`: every `full`
     story's slice (with `newsletter_links`) and outline row, one theme file
     per plumbing theme, `manifest.json` (every story in issue order with its
@@ -2891,11 +3339,11 @@ def _write_batch(out_dir, skill_dir, b, manifest, brief):
 
 # --- CLI ----------------------------------------------------------------------
 
-_USAGE = ("usage: newsletter.py VIEW.json [VIEW.json ...] --outline [--weekly] "
+_USAGE = ("usage: newsletter.py VIEW.json [VIEW.json ...] --outline [--weekly|--monthly] "
           "[--automation LOGIN ...]\n"
           "       newsletter.py VIEW.json [VIEW.json ...] --check-newsletter ISSUE.md "
-          "[--slices DIR] [--people PEOPLE.json] [--weekly]\n"
-          "       newsletter.py VIEW.json [VIEW.json ...] --work-package DIR [--weekly] "
+          "[--slices DIR] [--people PEOPLE.json] [--weekly|--monthly]\n"
+          "       newsletter.py VIEW.json [VIEW.json ...] --work-package DIR [--weekly|--monthly] "
           "[--automation LOGIN ...]\n")
 
 
@@ -2935,10 +3383,16 @@ def main(argv=None):
             raise SystemExit(2)
         automation.append(argv[i + 1])
         del argv[i:i + 2]
-    cadence = "month"
+    cadence = None          # from the window: weekly when it is short
+    if "--weekly" in argv and "--monthly" in argv:
+        sys.stderr.write(_USAGE)
+        raise SystemExit(2)
     if "--weekly" in argv:
         argv.remove("--weekly")
         cadence = "week"
+    if "--monthly" in argv:
+        argv.remove("--monthly")
+        cadence = "month"
     opts = {}
     for flag in ("--check-newsletter", "--slices", "--people", "--work-package"):
         if flag in argv:

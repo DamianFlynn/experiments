@@ -968,8 +968,8 @@ python3 $AO/newsletter.py $S/views/$M/bundle.json --check-newsletter $S/reports/
 
 Sections: new modules, what changed, breaking changes, stories (Landed / In flight /
 Stalled), module ownership, people (with automation accounts), coming up, plumbing: what was
-engineered, numbers. There is no length target; `--weekly` uses the same layout over a
-shorter window. A multi-repo stream passes every member's linked view; `--automation LOGIN`
+engineered, numbers. There is no length target; a window of at most 16 days is a weekly issue
+(same layout, shorter window) unless `--monthly` is given; `--weekly` forces it. A multi-repo stream passes every member's linked view; `--automation LOGIN`
 marks an automation account the view does not. The check exits 0 when every module, version,
 person, number, quote and URL in the issue is in the view, module mentions are links and
 published versions link their tags, landed work states its release status, every story is
