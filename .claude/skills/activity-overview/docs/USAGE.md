@@ -124,13 +124,19 @@ Keep **one directory per report stream**, and inside it **one store per monthly 
 
 ```
 ~/activity/
-  bicep/            stores/2026-11.db  series.json  reports/2026-11.md  views/
-  avm-bicep/        stores/  series.json  reports/  views/  [history.db]
-  avm-tf-network/   stores/  manifest.json  series/  reports/  views/
-  ai-lz/            stores/  manifest.json  series/  reports/  views/
-  hub-lz/           stores/  manifest.json  series/  reports/  views/
+  bicep/            stores/2026-11.db  series.json  people.json  reports/2026-11.md  views/
+  avm-bicep/        stores/  series.json  people.json  reports/  views/  [history.db]
+  avm-tf-network/   stores/  manifest.json  people.json  series/  reports/  views/
+  ai-lz/            stores/  manifest.json  people.json  series/  reports/  views/
+  hub-lz/           stores/  manifest.json  people.json  series/  reports/  views/
   .tfcache/         (shared TF_PLUGIN_CACHE_DIR)
 ```
+
+`people.json` is the stream's **people registry** (§5.7): one entry per GitHub login, shared
+by every month's gather (`--people $S/people.json`, or `"people": "people.json"` in the
+manifest), so a person is looked up once. It lives beside `stores/`, not in a store,
+because stores are per month and the registry must outlive them; it is plain, sorted JSON
+for you to keep in version control and edit by hand.
 
 #### One store per installment, or one store that grows?
 
@@ -256,9 +262,11 @@ mkdir -p $S/stores $S/views/$M $S/reports
 #     the network up for the whole run; a dropped git connection is retried three times.
 #     It also checks each author of a PR / issue created in the window for an earlier one
 #     (first-time contributors: one or two search calls each; --no-newcomers skips it),
-#     and labels each person maintainer_org / community / unknown (§5.7; --no-affiliation).
+#     and labels each person maintainer_org / community / unknown (§5.7; --no-affiliation),
+#     looking people up once through the stream's registry ($S/people.json).
 python3 $AO/gather.py --owner Azure --repo bicep \
-  --from $FROM --to $TO --store $DB --clone-dir $S/clone
+  --from $FROM --to $TO --store $DB --clone-dir $S/clone --people $S/people.json \
+  --home-org microsoft --home-name Microsoft --home-email-domain microsoft.com
 
 # 2 · Trust gate — stop if this is not "RESULT: OK" (exit 0); see §5.5 to read a failure
 python3 $AO/validate.py $DB --project Azure --repo bicep
@@ -597,48 +605,146 @@ commits, notes for 40 PRs, a 1.1 MB fact; October 2026 into the same clone, 160 
 `{"collected": false}`. The refs stay in the clone (`refs/remotes/pr/*`); a refresh fetches
 only what moved.
 
-### 5.7 People: affiliation, newcomers and what they contributed
+### 5.7 People: affiliation, the people registry, maintainers and newcomers
 
 gather labels each human person of the window `maintainer_org` (the organisation that owns
 the repository, or one you name as home), `community`, or `unknown`, and records which signal
 decided and how strongly (BUNDLE.md "The people layer"). It never defaults to community: a
-person with no signal is `unknown`, and the view reports unknown as its own bucket.
+person with no signal is `unknown`, and the view reports unknown as its own bucket. With the
+**people registry** it also records each person's display name and whether they are a
+**maintainer** of the repository.
 
-**Settings.** The repo's owner is always a home organisation. For Azure/* repositories,
-whose maintainers are Microsoft people, name Microsoft too:
+**Settings.** The repo's owner is always a home organisation. For Azure/* repositories the
+home organisations are `Azure` and `microsoft`, and a Microsoft email domain counts (§7):
 
 ```bash
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
-  --store $DB --home-org microsoft --home-name Microsoft --home-email-domain microsoft.com \
+  --store $DB --people $S/people.json \
+  --home-org microsoft --home-name Microsoft --home-email-domain microsoft.com \
   --affiliation some-login=community --affiliation @Azure/some-team=maintainer_org
 ```
 
-or, for a manifest, an `affiliation` object (every key optional; CLI flags add to it and a
-CLI override beats the manifest's for the same key):
+or, for a manifest, an `affiliation` object and the registry path (relative to the manifest;
+every key optional; CLI flags add to it, a CLI override beats the manifest's for the same
+key, `--people` beats `people`):
 
 ```json
-"affiliation": {"home_orgs": ["microsoft"], "home_names": ["Microsoft"],
+"affiliation": {"home_orgs": ["Azure", "microsoft"], "home_names": ["Microsoft"],
                 "home_email_domains": ["microsoft.com"],
-                "overrides": {"some-login": "community", "@Azure/some-team": "maintainer_org"}}
+                "overrides": {"some-login": "community", "@Azure/some-team": "maintainer_org"}},
+"people": "people.json"
 ```
 
 The override list is the highest-priority signal: use it to correct a label you know is
 wrong (a vendor, a contractor, someone whose profile is stale) and to name team members
 whose membership is private. An `@org/team` entry is expanded through the team's member
 listing, which the token must be able to see (otherwise it is listed in
-`affiliations.groups_unresolved` and a warning names it).
+`affiliations.groups_unresolved` and a warning names it). The weakest signal — a profile
+company that is not a home organisation → `community` — is kept and always shown with its
+strength (`weak`): check it before you print it.
 
-**Cost.** People decided by the override list or by `author_association` (OWNER / MEMBER /
-COLLABORATOR of the repo's owner on their own records) cost nothing. Everyone else costs one
-`orgs/{org}/public_members/{login}` call per home organisation (until one says member) and
-one `users/{login}` call: with two home orgs, up to three core-API calls per person. A
-September of Azure/bicep-registry-modules has about 230 people; most are not decided for free,
-so the check costs up to about 660 calls (of the 5,000 an hour a personal token has).
-`ACTIVITY_AFFILIATION_MAX` (default 300) caps the people looked up, most active first; three
-people in a row whose lookups fail stop the lookups for the window. Answers are cached for
-the run (a manifest's members share them), not across runs: each window asks again, because
-the answer is GitHub's at gather time. `--no-affiliation` skips the whole check and records
-`{"collected": false}`.
+#### The people registry (`people.json`)
+
+One JSON file per stream, one entry per GitHub login (BUNDLE.md "The people registry"):
+
+```json
+{"format": "activity-overview/people", "version": 1,
+ "people": {
+  "octo": {"login": "octo", "name": "Octo Cat",
+           "affiliation": "community", "signal": "profile_company", "strength": "weak",
+           "maintainer_of": {"Azure/bicep-registry-modules": {"maintainer": true,
+                             "signal": "merged_others_pr", "strength": "strong",
+                             "last_evidence": "2026-10-29"}},
+           "first_seen": {"date": "2026-08-04", "repo": "Azure/bicep-registry-modules"},
+           "last_seen": {"date": "2026-10-29", "repo": "Azure/bicep-registry-modules"},
+           "looked_up_at": "2026-11-02", "source": "lookup", "tags": ["known", "mvp"]}}}
+```
+
+**Lookup once, refresh rarely.** A person whose entry was looked up recently costs no call:
+a decided label (`maintainer_org` / `community`) is reused for **120 days**
+(`--people-refresh-days N`, `ACTIVITY_PEOPLE_REFRESH_DAYS`), an `unknown` one for **30 days**
+(`ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS`) — retried sooner because a profile that gets filled in
+or a membership made public shows up by the next installment, while a decided label rarely
+changes. At most **50** stale entries are refreshed per run, oldest lookup first
+(`ACTIVITY_PEOPLE_REFRESH_MAX`); the rest keep their label until a later run. People never
+seen before are looked up as before (capped by `ACTIVITY_AFFILIATION_MAX`). Each run prints
+`people registry: <repo>: N looked up, N refreshed, N reused from the registry, N decided
+without a lookup, N still unknown, N name(s) fetched, N maintainer(s)`.
+
+**Names.** The display name comes from the same `users/{login}` response as the company
+signal (no extra call). A person decided without a profile call (override list,
+`author_association`, a public membership, the registry) gets one profile call for the name,
+at most **30** per run (`ACTIVITY_PEOPLE_NAME_MAX`): the window's newcomers and returning
+contributors first, then the most active people (the hall and the stories' participants are
+drawn from them). The long tail fills in over later runs; an empty profile name is stored as
+none and every output falls back to the login. The login stays the key everywhere.
+
+**The maintainer property** (a role; affiliation is the employer — kept apart, neither
+implies the other, and a community maintainer is possible) comes from stored records only,
+no API call, and is kept **per repository** (`maintainer_of`), because write access to one
+repository says nothing about another. Strongest first:
+
+| Signal | Rule | Strength |
+|---|---|---|
+| `operator` | your own `true` / `false` in `maintainer_of` | operator |
+| `merged_others_pr` | merged a PR somebody else authored (needs write access) | strong |
+| `OWNER` | `author_association` OWNER on their records | strong |
+| `merged_own_pr` | merged their own PR (needs write access; often a release-branch hand-off) | medium |
+| `COLLABORATOR` | `author_association` COLLABORATOR | medium |
+| `approving_reviewer` | approved at least 3 PRs of others that were merged (one window, or one seeding pass) | medium |
+
+`MEMBER` is not a maintainer signal: it means a member of the organisation that owns the
+repository (for `Azure`, thousands of people), which is an affiliation. Evidence is sticky:
+once found, the registry keeps it (with `last_evidence`) until you set `false`.
+
+**How it joins the store.** At gather time the registry is consulted first, the API fills
+the gaps, the registry is updated, and the window's `affiliations` fact records the labels
+used for that window — now with `name`, `maintainer` and `maintainer_signal`. Views read only
+the fact, so last month's report is reproduced exactly even after you edit the registry; the
+next gather uses your edits.
+
+**Editing it.** Open the file and edit; no tool is needed. The rules:
+
+- `"source": "operator"` (or `"locked": true`) on an entry: every decided field — `name`,
+  `affiliation`, `maintainer_of` — is yours and is never overwritten.
+- `"locked": ["name"]` (any of `name`, `affiliation`, `maintainer_of`): only those fields.
+- `"maintainer_of": {"Azure/bicep-registry-modules": true}` — a plain `true` / `false` for a
+  repository is yours for that repository.
+- `tags`, `note` and `do_not_name` are yours alone; the skill never writes them.
+  `first_seen` / `last_seen` are always updated (they are observations).
+- A key the registry does not know, a bad value, or two entries for the same login (logins
+  ignore case) stops the gather with a message naming the entry — the file is never reset.
+- The file is rewritten only when something changed, with keys sorted, atomically and
+  merged with the file as it is on disk at that moment (an edit you make during a gather is
+  kept).
+
+**Seeding it before the next gather** (no API call): read the logins, first / last seen and
+the maintainer evidence from stores you already have, then review and tag people:
+
+```bash
+python3 $AO/people.py seed --people $S/people.json $S/stores/2026-08.db $S/stores/2026-09.db $S/stores/2026-10.db
+python3 $AO/people.py summary --people $S/people.json        # counts and the maintainers found
+```
+
+Seeding also takes an `author_association` OWNER / MEMBER / COLLABORATOR label and the label
+of a stored `affiliations` fact, without a lookup date (the next gather looks those people up
+once for their name).
+
+**Cost.** People decided by the override list, by `author_association` or by a fresh registry
+entry cost nothing. Everyone else costs one `orgs/{org}/public_members/{login}` call per home
+organisation (until one says member) and one `users/{login}` call: with two home orgs, up to
+three core-API calls per person, **once per refresh period**. A September of
+Azure/bicep-registry-modules has about 230 people: the first gather with an empty registry
+costs up to about 690 calls (of the 5,000 an hour a personal token has); later months only
+the new people, the names budget and at most 50 refreshes. `ACTIVITY_AFFILIATION_MAX`
+(default 300) caps the people looked up per window, most active first; three people in a row
+whose lookups fail stop the lookups for the window (a failed lookup is not written to the
+registry, so the next run retries it). `--no-affiliation` skips the whole check (no call,
+nothing labelled, the registry untouched) and records `{"collected": false}`.
+**`--people-offline`** runs with the registry only — no API call at all for people: the
+registry and the free signals decide, everyone else is `unknown` (`not_checked`), and the
+maintainer property and names still come from the registry. Use it when you cannot or will
+not call the API.
 
 **Returning contributors.** The first-time-contributor search now reads the date of each
 candidate's most recent earlier PR / issue from the same call (sorted newest first) and tells
@@ -648,13 +754,29 @@ gap is to the most recent earlier PR or issue). A view also says what the store 
 newcomer before the window (reviews, comments: a long-time reviewer's first PR is not a true
 first-timer), within the limits of what the store gathered.
 
-**Privacy.** Every signal is public data, but the result labels named people in a public
-newsletter. gather stores only the label, the signal's name, its strength and, for a commit
-email in a home domain, a `home_email_domain: true` boolean. It never stores the profile
-company or any other profile text, an email address, or the domain of a non-home address;
-the trust check refuses a stored entry that holds anything else. Before publishing, prefer
-counts and shares over per-person labels, and check every person you name with the override
-list. To turn the feature off: `--no-affiliation` (no calls, nothing labelled).
+**Privacy.** Every signal is public data, but the result names people in a public newsletter.
+What is kept about a person, exhaustively:
+
+- in the **store** (the window's `affiliations` fact): the login, the label, the signal's name
+  and strength, a `home_email_domain: true` boolean for a commit email in a home domain, and —
+  with the registry — the display name and the maintainer property with its signal;
+- in the **registry**: the login, the display name (by the owner's choice: a public profile
+  field), the label with its signal and strength, the maintainer evidence per repository
+  (signal, strength, date of the latest evidence), the dates and repository of the first and
+  last activity gathered, the date of the last lookup, and your own `tags`, `note`,
+  `locked`, `source` and `do_not_name`.
+
+Never the profile company, bio, location, blog or any other profile text, never an email
+address or the domain of a non-home address; the trust check refuses a stored entry that
+holds anything else, and the registry refuses unknown keys. Before publishing, prefer counts
+and shares over per-person labels, and check every person you name.
+
+- **Do not name someone:** set `"do_not_name": true` on their entry. Every output then uses
+  the login only, with no name and no label (affiliation `unknown`, signal `do_not_name`, no
+  maintainer property), and they are never looked up.
+- **Remove someone:** delete their entry. The next gather that sees them adds them back from
+  public data; to stop that, keep the entry with `do_not_name` instead.
+- **Turn lookups off:** `--people-offline` (registry only) or `--no-affiliation` (nothing).
 
 ## 6. Forecasting — reading it and making it useful
 
@@ -735,6 +857,19 @@ The commands below reuse `AO`, `FROM`, `TO` and `M` (e.g. `2026-11`) from §4 an
 installment to its own store, `$S/stores/$M.db`. The clone directory is reused: `gather`
 fetches an existing clone instead of cloning again.
 
+**People defaults for Azure/\* repositories** (§5.7): the home organisations are `Azure`
+(the owner, always home) and `microsoft`, the home company name `Microsoft`, and a
+`microsoft.com` commit email counts; each stream keeps its registry at `$S/people.json`.
+These are the playbooks' settings, not built in: other owners name their own.
+
+```bash
+AZ_PEOPLE="--home-org Azure --home-org microsoft --home-name Microsoft --home-email-domain microsoft.com"
+```
+
+A manifest carries the same as `"affiliation": {"home_orgs": ["Azure", "microsoft"],
+"home_names": ["Microsoft"], "home_email_domains": ["microsoft.com"]}` and
+`"people": "people.json"` (`examples/manifest.json`).
+
 ### 7.1 Bicep — `Azure/bicep`
 
 - **Shape:** one product repo (the Bicep compiler and tooling, .NET). Single-repo gather.
@@ -748,7 +883,7 @@ fetches an existing clone instead of cloning again.
 ```bash
 S=~/activity/bicep; DB=$S/stores/$M.db; mkdir -p $S/stores $S/views/$M
 python3 $AO/gather.py --owner Azure --repo bicep --from $FROM --to $TO \
-  --store $DB --clone-dir $S/clone
+  --store $DB --clone-dir $S/clone --people $S/people.json $AZ_PEOPLE
 python3 $AO/validate.py $DB
 python3 $AO/view.py --store $DB --from $FROM --to $TO --out $S/views/$M/bundle.json
 python3 $AO/link.py $S/views/$M/bundle.json --series $S/series.json
@@ -783,7 +918,7 @@ python3 $AO/render.py $S/views/$M/bundle.json --diagrams-dir $S/views/$M/diagram
 ```bash
 S=~/activity/avm-bicep; mkdir -p $S/stores $S/views/$M
 python3 $AO/gather.py --owner Azure --repo bicep-registry-modules --from $FROM --to $TO \
-  --store $S/stores/$M.db --clone-dir $S/clone --structural-iac
+  --store $S/stores/$M.db --clone-dir $S/clone --structural-iac --people $S/people.json $AZ_PEOPLE
 python3 $AO/validate.py $S/stores/$M.db --project Azure --repo bicep-registry-modules
 python3 $AO/view.py --store $S/stores/$M.db --from $FROM --to $TO --out $S/views/$M/bundle.json
 python3 $AO/link.py $S/views/$M/bundle.json --series $S/series.json
@@ -834,7 +969,8 @@ python3 $AO/manifest_from_index.py --avm res --avm ptn \
 ```bash
 export TF_PLUGIN_CACHE_DIR=~/activity/.tfcache && mkdir -p "$TF_PLUGIN_CACHE_DIR"
 mkdir -p $S/stores $S/views/$M                       # manifest: --clone-dir is the PARENT dir (clones in $S/clones/<owner>/<repo>)
-python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones
+python3 $AO/gather.py --manifest $S/manifest.json --store $S/stores/$M.db --clone-dir $S/clones \
+  --people $S/people.json $AZ_PEOPLE         # a generated manifest has no people / affiliation keys
 python3 $AO/validate.py $S/stores/$M.db --project avm-tf-network
 python3 $AO/digest.py --store $S/stores/$M.db --project avm-tf-network --from $FROM --to $TO > $S/views/$M/project.json
 

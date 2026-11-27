@@ -119,6 +119,7 @@ import graphstore
 from graphstore import SPINE_EDGE_TYPES
 import derive
 import extract
+import people as people_mod
 
 try:
     import gather
@@ -1328,11 +1329,15 @@ def _fact_signatures(value):
     return out
 
 
-# What an `affiliations` person entry may hold (gather decide_affiliation):
-# the label, the signal name, its strength and the email-domain boolean —
-# never profile text, a company or an email (the privacy contract).
+# What an `affiliations` person entry may hold (gather decide_affiliation,
+# find_affiliations_registry): the label, the signal name, its strength and
+# the email-domain boolean, and - with the retained people registry - the
+# display name, the maintainer property for the window's repository and its
+# signal. Never a company, other profile text or an email (the privacy
+# contract).
 _AFFILIATION_ENTRY_KEYS = {"affiliation", "signal", "strength",
-                           "home_email_domain"}
+                           "home_email_domain", "name", "maintainer",
+                           "maintainer_signal"}
 _AFFILIATION_FACT_KEYS = {"collected", "home_orgs", "home_names",
                           "home_email_domains", "people", "unknown",
                           "not_checked", "groups_unresolved", "windows",
@@ -1355,7 +1360,8 @@ def _affiliations_problem(value):
         e = people[login]
         if not isinstance(e, dict) or not set(e) <= _AFFILIATION_ENTRY_KEYS:
             return "affiliations.people[{!r}] holds more than the label, signal, " \
-                   "strength and home_email_domain".format(login)
+                   "strength, home_email_domain, name, maintainer and " \
+                   "maintainer_signal".format(login)
         if e.get("affiliation") not in gather.AFFILIATIONS:
             return "affiliations.people[{!r}].affiliation {!r} is not one gather " \
                    "writes".format(login, e.get("affiliation"))
@@ -1368,6 +1374,27 @@ def _affiliations_problem(value):
         if "home_email_domain" in e and e["home_email_domain"] is not True:
             return "affiliations.people[{!r}].home_email_domain is not true".format(
                 login)
+        if "name" in e:
+            try:
+                people_mod.check_name(e["name"], "name")
+            except ValueError:
+                return "affiliations.people[{!r}].name is not a one-line display " \
+                       "name".format(login)
+        if ("maintainer" in e) != ("maintainer_signal" in e):
+            return "affiliations.people[{!r}] has maintainer without " \
+                   "maintainer_signal (or the reverse)".format(login)
+        if "maintainer" in e and not isinstance(e["maintainer"], bool):
+            return "affiliations.people[{!r}].maintainer is not true / false".format(
+                login)
+        if "maintainer_signal" in e and \
+                e["maintainer_signal"] not in people_mod.MAINTAINER_SIGNALS:
+            return "affiliations.people[{!r}].maintainer_signal {!r} is not one " \
+                   "gather writes".format(login, e["maintainer_signal"])
+        if e.get("signal") == "do_not_name" and (
+                set(e) & {"name", "maintainer", "maintainer_signal"}
+                or e.get("affiliation") != "unknown"):
+            return "affiliations.people[{!r}] is do_not_name but carries a " \
+                   "label".format(login)
     return None
 
 

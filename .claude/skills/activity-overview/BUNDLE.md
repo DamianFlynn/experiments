@@ -594,10 +594,96 @@ resolved to a login (bots, `ghost` and unresolved git names left out):
 - `groups_unresolved` — `@org/team` overrides whose members the token could not list.
 - `{"collected": false}` alone — gathered with `--no-affiliation`.
 
+**With the people registry** (gather `--people PATH` or a manifest's `people`; next
+section) every entry also carries, for the labels used in that window:
+
+```json
+"octo":          {"affiliation": "maintainer_org", "signal": "public_membership", "strength": "strong",
+                  "name": "Octo Cat", "maintainer": true, "maintainer_signal": "merged_others_pr"},
+"quiet-person":  {"affiliation": "unknown", "signal": "do_not_name"},
+"not-yet-seen":  {"affiliation": "unknown", "signal": "not_checked", "maintainer": false,
+                  "maintainer_signal": "none"}
+```
+
+- `name` — the public profile's display name as the registry holds it (an operator's own
+  spelling wins); absent when the profile has none, or the person is `do_not_name`.
+- `maintainer` / `maintainer_signal` — the maintainer property **for this window's
+  repository** (see "The people registry"): `true` with the signal that shows write access
+  (`operator`, `merged_others_pr`, `OWNER`, `merged_own_pr`, `COLLABORATOR`,
+  `approving_reviewer`), or `false` with `operator` (the owner said so) or `none` (no
+  evidence of write access in anything the registry has seen for that repository).
+- signal `do_not_name` — the owner marked the person `do_not_name`: no name, no maintainer
+  property, label `unknown`, no API call. Every output shows the login only.
+- signal `not_checked` — with the registry, a person not looked up (over the cap, offline,
+  after repeated failures) still has an entry, so their name and maintainer property reach
+  the view; they are listed in `not_checked` and count as unknown as before.
+
 **What is stored about a person:** the login (already in every record), the label, the
-signal name, its strength and the `home_email_domain` boolean. Never the profile company or
-any other profile text, never an email address or a domain of a non-home address.
-`validate.py` refuses a stored `affiliations` value whose entries carry anything else.
+signal name, its strength, the `home_email_domain` boolean and, with the registry, the
+display name and the maintainer property with its signal. Never the profile company or any
+other profile text, never an email address or a domain of a non-home address.
+`validate.py` refuses a stored `affiliations` value whose entries carry anything else (or a
+`do_not_name` entry that carries a name or a maintainer property).
+
+### The people registry (`people.json`, outside the store)
+
+One JSON file per workspace (default `<stream>/people.json`, next to `stores/`), one entry
+per GitHub login, shared by every gather of the stream — all months, all repositories — so
+a person is looked up once and refreshed rarely (`people.py`; USAGE §5.7). It is the
+owner's to read and edit; gather never needs it to read a store, and no view reads it.
+
+```json
+{"format": "activity-overview/people", "version": 1,
+ "people": {"octo": {"login": "octo", "name": "Octo Cat",
+                    "affiliation": "maintainer_org", "signal": "public_membership", "strength": "strong",
+                    "maintainer_of": {"Azure/bicep-registry-modules": {"maintainer": true,
+                        "signal": "merged_others_pr", "strength": "strong", "last_evidence": "2026-10-29"}},
+                    "first_seen": {"date": "2025-01-07", "repo": "Azure/bicep-registry-modules"},
+                    "last_seen": {"date": "2026-10-31", "repo": "Azure/bicep-registry-modules"},
+                    "looked_up_at": "2026-11-26", "source": "lookup", "tags": ["known"]}}}
+```
+
+| Key | Written by | Meaning |
+|---|---|---|
+| `login` | skill | the key repeated (logins match ignoring case) |
+| `name` | lookup, or you | the profile's display name (from the same `users/{login}` response as the company signal) |
+| `affiliation` / `signal` / `strength` | lookup, or you | the latest label decided from GitHub data (`author_association`, `public_membership`, `profile_company`, `none`) |
+| `maintainer_of` | skill, or you | `{repo: evidence}` — write access per repository; a plain `true` / `false` is yours |
+| `tags` | you only | free-form (`known`, `mvp`, …) |
+| `first_seen` / `last_seen` | skill | `{date, repo}` of the earliest / latest activity gathered |
+| `looked_up_at` | skill | date of the last profile / membership lookup |
+| `source` | skill / you | `lookup` (written by the skill) or `operator` (yours: every decided field pinned) |
+| `locked` | you only | `true`, or a list of `name` / `affiliation` / `maintainer_of` to pin |
+| `do_not_name` | you only | `true`: login only, no label, no call, in every output |
+| `note` | you only | free text |
+
+**Operator edits win.** `source: "operator"` or `locked: true` pins `name`, `affiliation`
+and `maintainer_of`; `locked: [...]` pins the fields listed; a plain `true` / `false` in
+`maintainer_of` is the operator's for that repository. Pinned fields, `tags`,
+`do_not_name` and `note` are never written by the skill; `first_seen` / `last_seen` always
+are. Any other key, a bad value or two keys that are the same login is an error naming the
+entry (gather stops before touching the store); the file is never reset.
+
+**At gather time** the registry is consulted first (a fresh entry costs no call), the API
+fills the gaps (new people, then stale entries, at most `ACTIVITY_PEOPLE_REFRESH_MAX` = 50
+refreshes per run, oldest lookup first; decided labels are fresh for 120 days,
+`--people-refresh-days` / `ACTIVITY_PEOPLE_REFRESH_DAYS`, `unknown` ones for 30,
+`ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS`), the registry is updated (merged into the file as it
+is on disk, atomically, under a lock, keys sorted), and the window's `affiliations` fact
+records the labels used. **Views read only the fact**, so a report made last month is
+reproduced exactly after the registry changes. `--people-offline` makes no API call:
+the registry and the free signals decide.
+
+**The maintainer property** (a role; affiliation is the employer — neither implies the
+other, and a community maintainer is possible) is derived from records only, per
+repository, strongest first: `operator` > `merged_others_pr` (merged a PR somebody else
+authored: write access, `strong`) > `OWNER` (`strong`) > `merged_own_pr` (merged their own
+PR: write access, `medium`) > `COLLABORATOR` (`medium`) > `approving_reviewer` (approved
+at least 3 merged PRs of others in one window, or in one seeding pass, `medium`).
+`MEMBER` is not a maintainer signal: it means a member of the organisation that owns the
+repository (thousands of people for `Azure`), which is an affiliation. Evidence is sticky:
+once a person is a maintainer of a repository the entry keeps it, with `last_evidence`,
+until the owner says otherwise.
 
 A view of exactly a gathered window carries the stored value verbatim (`validate.py
 --bundle` compares it). A wider view takes, per person, the entry of the latest gathered
@@ -638,6 +724,7 @@ prose; every PR carries its URL.
                 "first": {"first": "pr", "number": 7558, "url": "…/pull/7558", "created_at": "…"},
                 "seen_in_store_before": {"prs": 0, "issues": 0, "reviews": 0, "comments": 0, "earliest": null},
                 "affiliation": "community", "affiliation_signal": "profile_company",
+                "name": "Mona Octocat", "maintainer": false, "maintainer_signal": "none",
                 "contributed": {"prs": [{"number": 7558, "url": "…", "title": "feat: add privatelink.redis.azure.net",
                                          "state": "merged", "class": "module", "headline": "module_change",
                                          "modules": [{"area": "avm/ptn/network/private-link-private-dns-zones",
@@ -655,6 +742,12 @@ prose; every PR carries its URL.
   its reviews (each reviewer once per PR) by the reviewer's label; `share` is of `total`
   (the human-authored ones), `unknown` always its own bucket, `bots_excluded` the rest. A
   wider view adds `windows` / `covers_view`.
+- **`affiliation.maintainers`** (only when the people carry the maintainer property, i.e.
+  the fact was gathered with the registry) — `people` {maintainer, non_maintainer,
+  unknown} (unknown: no property — `do_not_name`, or not a person of a gathered window),
+  `signals` (maintainers per signal), `by_affiliation` {label: the same three counts}
+  (maintainers vs non-maintainers within community and the home organisation, unknown
+  separate) and `logins` (the maintainers).
 - **`community`** (with `affiliations`) — only people labelled `community` (never
   `unknown`): how many, their merged PRs (and numbers), reviews, the first-timers and
   returning contributors among them, and the module areas that received a community PR
@@ -686,9 +779,15 @@ prose; every PR carries its URL.
 `maintainer_org` — the same people ranked the same way as `fame` (top 10 each) within one
 label — and `unranked_unknown` (how many people with a positive score are `unknown`). `fame`
 is unchanged. **people[]** rows gain `affiliation` and `affiliation_signal` (non-bots; a
-person the fact does not name is `unknown` with `not_checked` or `not_looked_up`). The
-project view (digest) keeps, per person, the member's label with the most decisive signal
-(`derive.AFFILIATION_SIGNAL_ORDER`) and ranks the halls on the merged people.
+person the fact does not name is `unknown` with `not_checked` or `not_looked_up`) and,
+with the registry, `name`, `maintainer` and `maintainer_signal`; so do the `halls` entries,
+`contributors.newcomers[]` and `contributors.hall[]` rows, and a train slice's
+`participants` {login: {name?, maintainer?, maintainer_signal?, affiliation?}} (only when
+the view carries names or the maintainer property). The login stays the key everywhere;
+names are for display. The project view (digest) keeps, per person, the member's label
+with the most decisive signal (`derive.AFFILIATION_SIGNAL_ORDER`), the first member's
+name, `maintainer: true` when any member says so (those members in `maintainer_of`), and
+ranks the halls on the merged people.
 
 **What the data cannot tell:** private org membership; an employer the profile does not
 state (or states stale); vendors and contractors (a company that does not match is
@@ -1553,6 +1652,10 @@ review's state to `DISMISSED`.
   `issue` and `prs` blocks are unchanged for older narrators; a story narrator reads
   `conversation`.
 
+  When the view's people carry a display name or the maintainer property (gathered with
+  the people registry), the slice also has `participants` {login: {name?, maintainer?,
+  maintainer_signal?, affiliation?}} for the train's humans ("The people layer").
+
   (`*` = text-capped: any body/message/comment body truncated to `SLICE_TEXT_CAP` = 1500
   chars with a `…[+N chars]` marker. Each comment list, `reviews` and `lifecycle` is
   capped at `SLICE_COMMENTS_KEPT` = 6 entries, overflow count in `<key>_overflow`.
@@ -1599,6 +1702,7 @@ across members (see "Project view: `people` and `halls`").
   | `authored_then_removed` | distinct artifacts this login added whose `status` ∈ `{removed, dropped, replaced}` (int) |
   | `stale_owned` | distinct areas in a stalled train's `code_areas` (an open train with `effort.stalled`, #112) that this login owns under `code_owners` (`derive.area_owners`: last rule matching the area directory) (int) |
   | `affiliation` / `affiliation_signal` | only when the view carries a collected `affiliations` fact, on non-bots: `maintainer_org` / `community` / `unknown` and the deciding signal ("The people layer") |
+  | `name` / `maintainer` / `maintainer_signal` | only when the view's `affiliations` fact was gathered with the people registry, on non-bots the fact names (never for a `do_not_name` person): the display name and the maintainer property for the view's repository ("The people registry") |
 
   Counts are always present (ints, may be 0), except `prs_opened` and `own_pr_commits`
   (present when applicable, above); `merge_rate`/`review_latency_days`/

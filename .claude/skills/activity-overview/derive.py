@@ -1144,7 +1144,11 @@ def annotate_people_affiliation(bundle):
     every fixture view) is unchanged. A person the fact does not name is
     `unknown` with signal `not_checked` (over the lookup cap / after
     repeated failures) or `not_looked_up` (not a person of a gathered
-    window: e.g. an unresolved commit author). Returns bundle."""
+    window: e.g. an unresolved commit author). An entry gathered with the
+    people registry also gives the person's display `name` and the
+    `maintainer` property (with `maintainer_signal`) for the view's
+    repository; a `do_not_name` entry gives neither (the login only).
+    Returns bundle."""
     fact = bundle.get("affiliations")
     if not isinstance(fact, dict) or not fact.get("collected"):
         return bundle
@@ -1157,6 +1161,9 @@ def annotate_people_affiliation(bundle):
         if isinstance(e, dict) and e.get("affiliation"):
             profile["affiliation"] = e["affiliation"]
             profile["affiliation_signal"] = e.get("signal")
+            for key in PERSON_LABEL_KEYS:
+                if key in e:
+                    profile[key] = e[key]
         else:
             profile["affiliation"] = "unknown"
             profile["affiliation_signal"] = ("not_checked" if login in not_checked
@@ -1170,7 +1177,18 @@ def annotate_people_affiliation(bundle):
 AFFILIATION_SIGNAL_ORDER = ("override", "author_association",
                             "public_membership", "profile_company",
                             "commit_email_domain", "lookup_failed", "none",
-                            "not_checked", "not_looked_up")
+                            "not_checked", "not_looked_up", "do_not_name")
+
+# What the people registry adds to a person record (and to every row that
+# names the person: halls, contributors, story participants): the display
+# name and the maintainer property for the repository, with its signal.
+PERSON_LABEL_KEYS = ("name", "maintainer", "maintainer_signal")
+
+
+def person_labels(profile):
+    """{name?, maintainer?, maintainer_signal?} of a person record: only the
+    keys it carries (omit-when-absent). Pure."""
+    return {k: profile[k] for k in PERSON_LABEL_KEYS if k in (profile or {})}
 
 
 def affiliation_rank(profile):
@@ -1207,6 +1225,7 @@ def _hall_entries(people, keep=None):
         }
         if profile.get("own_pr_commits"):
             entry["own_pr_commits"] = profile["own_pr_commits"]
+        entry.update(person_labels(profile))
         entries.append(entry)
     entries.sort(key=lambda e: (-e["score"], e["login"]))
     return entries[:10]

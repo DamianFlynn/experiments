@@ -17,6 +17,7 @@ can import it without a cycle.
 """
 import datetime
 import json
+import os
 import re
 
 # GitHub user/org names: alphanumerics and single hyphens, not starting with a
@@ -200,7 +201,10 @@ def load_manifest(path):
                 "branch": str|None,
                 "bicep_registry_prefix": str|None}, ...],
      "ticket_prefixes": [str, ...],   # optional in the file; [] when absent
-     "affiliation": {...}}            # only when the file has it: check_affiliation
+     "affiliation": {...},            # only when the file has it: check_affiliation
+     "people": str}                   # only when the file has it: the people
+                                      # registry path, resolved against the
+                                      # manifest's directory
     `ticket_prefixes` (e.g. ["ABC", "PLAT"]) opts the project into digest.py's
     ticket clustering (`related_work`); see check_ticket_prefixes.
     Raises ValueError (message prefixed 'manifest: ') on any missing, mistyped or
@@ -321,6 +325,15 @@ def load_manifest(path):
             out["affiliation"] = check_affiliation(raw["affiliation"])
         except ValueError as exc:
             raise ValueError("manifest: {}".format(exc)) from None
+    # optional retained people registry (gather --people): a path relative to
+    # the manifest's own directory, so `people.json` next to it is the stream's
+    if "people" in raw:
+        value = raw["people"]
+        if not isinstance(value, str) or not value.strip() or "\n" in value:
+            raise ValueError("manifest: 'people' must be the path of the people "
+                             "registry (a non-empty string)")
+        out["people"] = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(path)), os.path.expanduser(value)))
     return out
 
 

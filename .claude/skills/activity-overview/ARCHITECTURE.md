@@ -659,6 +659,7 @@ output in `samples/`, and keep the **Reference appendices** below open while you
 | `--no-newcomers` | off (check runs) | skip the first-time-contributor search (one or two search API calls per author of a PR / issue created in the window); the window's `newcomers` fact says it was not collected |
 | `--no-affiliation` | off (check runs) | skip the contributor affiliation check (public-membership and profile calls per person not decided by the override list or `author_association`); the window's `affiliations` fact says it was not collected |
 | `--home-org` / `--home-name` / `--home-email-domain` / `--affiliation` | repo owner only | affiliation settings (repeatable): home orgs, company names, commit email domains, `LOGIN=` / `@org/team=` overrides (`maintainer_org` / `community` / `unknown`) |
+| `--people PATH` / `--people-offline` / `--people-refresh-days N` | no registry | the workspace's retained people registry (`people.py`): consulted before any lookup, updated by the gather; display names and the maintainer property per repository; offline: no API call for people |
 | `--structural-iac` | off (on for manifest members) | whole-tree static Terraform + Bicep dependency scan |
 | `--no-iac-build` | off | skip the `bicep`/`terraform` builds (they run third-party code; use for untrusted repos); areas `edges_status: skipped` |
 | `--resume` | off | manifest only: gather just the members not `ok` for the window |
@@ -679,6 +680,12 @@ scope → exit 2.
 
 ### `validate.py` — trust gate (offline)
 `validate.py STORE` · `--project` · `--repo` · `--bundle` (optional cross-check) · `--json`.
+
+### `people.py` — the people registry (offline)
+`people.py seed --people PATH STORE... [--repo OWNER/NAME] [--json]` (logins, first / last
+seen, maintainer evidence and `author_association` labels from stores, no API call) ·
+`people.py summary --people PATH [--repo OWNER/NAME] [--json]`. gather reads and updates the
+same file with `--people` (USAGE §5.7).
 
 ### `spotlight.py` — analytics (offline)
 `spotlight.py <query> <arg> --store STORE [--project] [--repo] [--from] [--to] [--json|--md] [--complete]`.

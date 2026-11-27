@@ -27,6 +27,7 @@ import derive
 import extract
 import graphstore
 import manifest as manifest_mod
+import people as people_mod
 
 # The bundle carries the bundle/view contract version (issue #107); the
 # store's own schema version is graphstore.SCHEMA_VERSION.
@@ -4211,6 +4212,23 @@ def parse_args(argv):
                    help="operator override, highest priority: LOGIN or "
                         "@org/team mapped to maintainer_org, community or "
                         "unknown (repeatable)")
+    p.add_argument("--people", default=None, metavar="PATH",
+                   help="the workspace's retained people registry (JSON, one "
+                        "entry per login; recommended: <stream>/people.json). "
+                        "Consulted before any lookup and updated by the "
+                        "gather: a person is looked up once and refreshed "
+                        "rarely; holds display names, labels, the maintainer "
+                        "property per repository and your own edits "
+                        "(USAGE 5.7). Beats a manifest's `people`")
+    p.add_argument("--people-offline", action="store_true", default=False,
+                   help="with --people: no API call for people at all (no "
+                        "lookups, no names, no team expansion); the registry "
+                        "and the free signals decide, everyone else is "
+                        "unknown (not_checked)")
+    p.add_argument("--people-refresh-days", type=int, default=None, metavar="N",
+                   help="re-check a registry entry looked up more than N days "
+                        "ago (default {}; ACTIVITY_PEOPLE_REFRESH_DAYS)".format(
+                            people_mod.REFRESH_DAYS))
     p.add_argument("--no-pr-history", dest="pr_history", action="store_false",
                    default=True,
                    help="skip the PR-internal history: fetching every window "
@@ -4292,6 +4310,11 @@ def parse_args(argv):
             parse_affiliation_override(text)
         for org in args.home_org:
             manifest_mod.check_owner(org, "--home-org")
+        if args.people_offline and not args.people and not args.manifest:
+            raise ValueError("--people-offline needs --people PATH (or a "
+                             "manifest's `people`)")
+        if args.people_refresh_days is not None and args.people_refresh_days < 1:
+            raise ValueError("--people-refresh-days must be at least 1")
     except ValueError as exc:
         p.error(str(exc))
     return args
@@ -4982,6 +5005,7 @@ def validate_env_knobs(env=None):
     _iac_settings(env)
     _newcomers_max(env)
     _affiliation_max(env)
+    _people_settings(env)
 
 
 def _auth_allowed(url):
@@ -6328,7 +6352,7 @@ def collect_newcomers(prs, issues, owner, repo, from_date, to_date, get_page,
 AFFILIATIONS = manifest_mod.AFFILIATION_VALUES
 AFFILIATION_SIGNALS = ("override", "author_association", "public_membership",
                        "profile_company", "commit_email_domain", "none",
-                       "lookup_failed")
+                       "lookup_failed", "not_checked", "do_not_name")
 AFFILIATION_STRENGTHS = ("operator", "strong", "medium", "weak")
 AFFILIATION_MAX = 300             # people looked up per window (ACTIVITY_AFFILIATION_MAX)
 AFFILIATION_FAILURE_STOP = 3      # people in a row whose lookups failed
@@ -6345,6 +6369,43 @@ _GROUP_RE = manifest_mod._GROUP_RE      # `@org/team`
 
 def _affiliation_max(env=None):
     return _env_int("ACTIVITY_AFFILIATION_MAX", AFFILIATION_MAX, 0, env)
+
+
+def _people_settings(env=None):
+    """The registry's refresh policy from the environment: {refresh_days,
+    unknown_retry_days, refresh_max, name_max} (people.py constants by
+    default)."""
+    return {"refresh_days": _env_int("ACTIVITY_PEOPLE_REFRESH_DAYS",
+                                     people_mod.REFRESH_DAYS, 1, env),
+            "unknown_retry_days": _env_int("ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS",
+                                           people_mod.UNKNOWN_RETRY_DAYS, 1, env),
+            "refresh_max": _env_int("ACTIVITY_PEOPLE_REFRESH_MAX",
+                                    people_mod.REFRESH_MAX, 0, env),
+            "name_max": _env_int("ACTIVITY_PEOPLE_NAME_MAX",
+                                 people_mod.NAME_MAX, 0, env)}
+
+
+def people_run_from_args(args, env=None):
+    """The run's people.Run (the retained registry), created once and kept on
+    `args.people_run` so a manifest's members share it; None without
+    --people / a manifest `people`. A malformed registry stops the gather
+    with a message naming the entry (never a silent reset)."""
+    run = getattr(args, "people_run", None)
+    if run is not None:
+        return run
+    path = getattr(args, "people", None) or getattr(args, "people_manifest", None)
+    if not path:
+        return None
+    settings = _people_settings(env)
+    if getattr(args, "people_refresh_days", None):
+        settings["refresh_days"] = args.people_refresh_days
+    try:
+        run = people_mod.Run(path, offline=bool(getattr(args, "people_offline", False)),
+                             **settings)
+    except people_mod.RegistryError as exc:
+        raise SystemExit("error: {}".format(exc)) from None
+    args.people_run = run
+    return run
 
 
 def normalize_company(text):
@@ -6504,8 +6565,11 @@ def make_affiliation_lookup(get_page, cache=None):
     """The network seam of find_affiliations over the gather's GitHub client
     (`get_page`): lookup("public_member", login, org) -> True / False / None
     (cannot tell), lookup("company", login) -> the profile company text ("" for
-    none) or None. The company text is handed to the classifier and never
-    returned anywhere else. Answers are cached per URL in `cache`."""
+    none) or None, lookup("name", login) -> the profile's display name ("" for
+    none) or None, read from the SAME `users/{login}` response (no extra
+    call). The company text is handed to the classifier and never returned
+    anywhere else; of the profile only these two fields are kept, and only
+    in the run's memory. Answers are cached per URL in `cache`."""
     cache = {} if cache is None else cache
 
     def lookup(kind, login, org=None):
@@ -6513,23 +6577,27 @@ def make_affiliation_lookup(get_page, cache=None):
             url = "{}{}/public_members/{}".format(ORGS_API, org, login)
         else:
             url = USERS_API + login
-        if url in cache:
-            return cache[url]
-        try:
-            page, _next = get_page(url)
-        except (Exception, SystemExit):
-            return None              # not cached: a later window may retry
-        if kind == "public_member":
-            got = page.get("public_member") if isinstance(page, dict) else None
-            answer = got if isinstance(got, bool) else None
-        elif isinstance(page, dict) and page.get("login"):
-            company = page.get("company")
-            answer = company if isinstance(company, str) else ""
-        else:
-            answer = None
-        if answer is not None:
+        if url not in cache:
+            try:
+                page, _next = get_page(url)
+            except (Exception, SystemExit):
+                return None              # not cached: a later window may retry
+            if kind == "public_member":
+                got = page.get("public_member") if isinstance(page, dict) else None
+                answer = got if isinstance(got, bool) else None
+            elif isinstance(page, dict) and page.get("login"):
+                company, name = page.get("company"), page.get("name")
+                answer = {"company": company if isinstance(company, str) else "",
+                          "name": name if isinstance(name, str) else ""}
+            else:
+                answer = None
+            if answer is None:
+                return None
             cache[url] = answer
-        return answer
+        answer = cache[url]
+        if kind == "public_member":
+            return answer
+        return answer.get("name" if kind == "name" else "company", "")
     return lookup
 
 
@@ -6613,6 +6681,200 @@ def find_affiliations(people, config, associations=None, email_home=(),
             "unknown": unknown, "not_checked": sorted(not_checked)}
 
 
+def _registry_label(entry):
+    """The label a per-window decision leaves in the registry: what GitHub
+    data decided (author_association, public_membership, profile_company or
+    none), without the per-window commit-email boolean. None for a decision
+    the registry must not keep (override, a failed lookup, ...)."""
+    sig = (entry or {}).get("signal")
+    if sig == "commit_email_domain":
+        return {"affiliation": "unknown", "signal": "none"}
+    if sig not in ("author_association", "public_membership", "profile_company",
+                   "none"):
+        return None
+    out = {"affiliation": entry["affiliation"], "signal": sig}
+    if entry.get("strength"):
+        out["strength"] = entry["strength"]
+    return out
+
+
+def _reused_entry(reg_entry, email_home):
+    """The per-window entry for a person decided from the registry: its label
+    (an operator-locked one as `override` / operator), the commit email
+    deciding an `unknown` one, as decide_affiliation would."""
+    if people_mod.is_locked(reg_entry, "affiliation"):
+        e = {"affiliation": reg_entry["affiliation"], "signal": "override",
+             "strength": "operator"}
+    elif reg_entry.get("affiliation") == "unknown" and email_home:
+        e = {"affiliation": "maintainer_org", "signal": "commit_email_domain",
+             "strength": "medium"}
+    else:
+        e = {"affiliation": reg_entry["affiliation"],
+             "signal": reg_entry.get("signal") or "none"}
+        if reg_entry.get("strength"):
+            e["strength"] = reg_entry["strength"]
+    if email_home:
+        e["home_email_domain"] = True
+    return e
+
+
+def find_affiliations_registry(people, config, run, repo_slug, associations=None,
+                               email_home=(), lookup=None, records=None,
+                               name_first=(), max_lookups=AFFILIATION_MAX,
+                               stop_after=AFFILIATION_FAILURE_STOP):
+    """find_affiliations with the retained people registry (`run`, a
+    people.Run): the registry is consulted first, the API fills the gaps,
+    the registry is updated (in memory; run.save() writes it) and the fact
+    records the labels used for this window, each person's display `name`
+    and their `maintainer` property for `repo_slug`.
+
+    Per person, the first rule that applies:
+      do_not_name in the registry   unknown, signal do_not_name, no name, no
+                                    maintainer, no call
+      override list / author_association   as find_affiliations (free; an
+                                    author_association label is stored)
+      registry affiliation locked by the operator   signal override
+      registry entry fresh          its label (no call)          `reused`
+      never looked up               looked up (within `max_lookups`)
+                                                                 `looked_up`
+      stale                         refreshed, at most run.refresh_left per
+                                    run, oldest lookup first     `refreshed`
+      anything else                 a stale label is reused; else the commit
+                                    email; else unknown, signal not_checked
+    A lookup reads the display name from the same profile response. People
+    decided without a lookup who have no name yet get one profile call for
+    it, at most run.names_left per run, `name_first` (the newcomers) first,
+    then the most active. `lookup` None (offline): no call at all.
+    `records` (prs, issues, commits) give the seen dates and the maintainer
+    evidence (people.maintainer_evidence). Network-free given `lookup`."""
+    associations = associations or {}
+    email_home = set(email_home or ())
+    prs, issues, commits = records or ((), (), ())
+    dates = people_mod.activity_dates(prs, issues, commits)
+    evidence = people_mod.maintainer_evidence(prs, issues)
+    for login in people:
+        fields = {}
+        if login in dates:
+            fields["seen"] = [(dates[login][0], repo_slug),
+                              (dates[login][1], repo_slug)]
+        if login in evidence:
+            fields["maintainer"] = {repo_slug: evidence[login]}
+        if fields:
+            run.patch(login, **fields)
+    # the refresh budget goes to the oldest lookups among the people a
+    # lookup would decide (not the override list, author_association, an
+    # operator-locked label or do_not_name)
+    def wants_lookup(login):
+        reg = run.entry(login) or {}
+        return not (login in config["overrides"] or reg.get("do_not_name")
+                    or associations.get(login) in _HOME_ASSOCIATIONS
+                    or people_mod.is_locked(reg, "affiliation"))
+    stale = set(sorted((login for login in people if run.state(login) == "stale"
+                        and wants_lookup(login)),
+                       key=lambda k: ((run.entry(k) or {}).get("looked_up_at") or "",
+                                      k))[:max(run.refresh_left, 0)])
+    counts = {"looked_up": 0, "refreshed": 0, "reused": 0, "names_fetched": 0,
+              "free": 0, "do_not_name": 0, "lookup_failed": 0}
+    out, not_checked, looked_now = {}, [], set()
+    looked, failures = 0, 0
+    for login in people:
+        reg = run.entry(login) or {}
+        if reg.get("do_not_name"):
+            out[login] = {"affiliation": "unknown", "signal": "do_not_name"}
+            counts["do_not_name"] += 1
+            continue
+        e, _l, _f = decide_affiliation(login, config, associations.get(login),
+                                       login in email_home, lookup=None)
+        if e is not None:
+            if e["signal"] == "author_association":
+                run.patch(login, label=_registry_label(e))
+            out[login] = e
+            counts["free"] += 1
+            continue
+        if people_mod.is_locked(reg, "affiliation") and reg.get("affiliation"):
+            out[login] = _reused_entry(reg, login in email_home)
+            counts["free"] += 1
+            continue
+        state = run.state(login)
+        if state == "fresh":
+            out[login] = _reused_entry(reg, login in email_home)
+            counts["reused"] += 1
+            continue
+        can = lookup is not None and failures < stop_after and (
+            (state == "never" and looked < max_lookups)
+            or (state == "stale" and run.refresh_left > 0 and login in stale))
+        if can:
+            e, _was, failed = decide_affiliation(
+                login, config, associations.get(login), login in email_home,
+                lookup=lookup)
+            looked_now.add(login)
+            failures = failures + 1 if failed else 0
+            if state == "never":
+                looked += 1
+            if failed:
+                counts["lookup_failed"] += 1
+                if reg.get("affiliation") and e["affiliation"] == "unknown":
+                    e = _reused_entry(reg, login in email_home)
+            else:
+                name = lookup("name", login)
+                fields = {"label": _registry_label(e), "looked_up_at": run.now}
+                if name is not None:
+                    fields["name"] = name
+                run.patch(login, **fields)
+                if state == "stale":
+                    run.refresh_left -= 1
+                    counts["refreshed"] += 1
+                else:
+                    counts["looked_up"] += 1
+            out[login] = e
+            continue
+        if reg.get("affiliation"):
+            out[login] = _reused_entry(reg, login in email_home)
+            counts["reused"] += 1
+        elif login in email_home:
+            out[login] = {"affiliation": "maintainer_org",
+                          "signal": "commit_email_domain", "strength": "medium",
+                          "home_email_domain": True}
+        else:
+            out[login] = {"affiliation": "unknown", "signal": "not_checked"}
+            not_checked.append(login)
+    # display names for people decided without a lookup (newcomers first)
+    if lookup is not None and failures < stop_after:
+        order = [k for k in name_first if k in out] + \
+            [k for k in people if k not in set(name_first)]
+        for login in order:
+            if run.names_left <= 0:
+                break
+            reg = run.entry(login) or {}
+            if login in looked_now or reg.get("do_not_name") or reg.get("name") \
+                    or reg.get("looked_up_at") or people_mod.is_locked(reg, "name"):
+                continue
+            name = lookup("name", login)
+            run.names_left -= 1
+            if name is None:
+                continue
+            run.patch(login, name=name, looked_up_at=run.now)
+            counts["names_fetched"] += 1
+    for login, e in out.items():
+        if e["signal"] == "do_not_name":
+            continue
+        reg = run.entry(login) or {}
+        name = people_mod.display_name(reg)
+        if name:
+            e["name"] = name
+        e["maintainer"], e["maintainer_signal"] = people_mod.maintainer_for(
+            reg, repo_slug)
+    for key in ("looked_up", "refreshed", "reused", "names_fetched"):
+        run.totals[key] = run.totals.get(key, 0) + counts[key]
+    unknown = sorted(k for k, e in out.items() if e["affiliation"] == "unknown")
+    result = {"collected": True, "home_orgs": list(config["home_orgs"]),
+              "home_names": list(config["home_names"]),
+              "home_email_domains": list(config["home_email_domains"]),
+              "people": {k: out[k] for k in sorted(out)},
+              "unknown": unknown, "not_checked": sorted(not_checked)}
+    return result, counts
+
+
 def args_affiliation_config(args, owner):
     """affiliation_config from the CLI (`--home-org`, `--home-name`,
     `--home-email-domain`, `--affiliation`) and, for a manifest member, the
@@ -6633,23 +6895,47 @@ def args_affiliation_config(args, owner):
 
 
 def collect_affiliations(prs, issues, commits, owner, repo, get_page, config,
-                         email_home=(), cache=None, max_people=None):
+                         email_home=(), cache=None, max_people=None,
+                         people_run=None, name_first=()):
     """The window's `affiliations` fact, looked up through `get_page` (the
-    gather's GitHub client). One stderr line says what it cost and found."""
+    gather's GitHub client). One stderr line says what it cost and found.
+    With `people_run` (a people.Run: the retained registry) the registry is
+    consulted first (find_affiliations_registry) and a second line reports
+    looked up / refreshed / reused / still unknown; an offline run makes no
+    call at all (an `@org/team` override is then left unresolved)."""
     cache = {} if cache is None else cache
     people, assoc = affiliation_people(prs, issues, commits)
     calls = [0]
+    offline = people_run is not None and people_run.offline
 
     def counted(url):
         calls[0] += 1
         return get_page(url)
-    group_logins, unresolved = resolve_affiliation_groups(
-        config.get("groups"), counted, cache)
+    if offline:
+        group_logins, unresolved = {}, sorted(config.get("groups") or {})
+    else:
+        group_logins, unresolved = resolve_affiliation_groups(
+            config.get("groups"), counted, cache)
     cfg = dict(config, overrides={**group_logins, **config["overrides"]})
     cap = _affiliation_max() if max_people is None else max_people
-    result = find_affiliations(people, cfg, assoc, email_home,
-                               make_affiliation_lookup(counted, cache),
-                               max_lookups=cap)
+    lookup = None if offline else make_affiliation_lookup(counted, cache)
+    if people_run is None:
+        result = find_affiliations(people, cfg, assoc, email_home, lookup,
+                                   max_lookups=cap)
+    else:
+        result, counts = find_affiliations_registry(
+            people, cfg, people_run, "{}/{}".format(owner, repo), assoc,
+            email_home, lookup, records=(prs, issues, commits),
+            name_first=name_first, max_lookups=cap)
+        maint = sum(1 for e in result["people"].values() if e.get("maintainer"))
+        sys.stderr.write(
+            "people registry: {}/{}: {} looked up, {} refreshed, {} reused from "
+            "the registry, {} decided without a lookup, {} still unknown, {} "
+            "name(s) fetched, {} maintainer(s){}\n".format(
+                owner, repo, counts["looked_up"], counts["refreshed"],
+                counts["reused"], counts["free"], len(result["unknown"]),
+                counts["names_fetched"], maint,
+                " (offline: no API call)" if offline else ""))
     if unresolved:
         result["groups_unresolved"] = unresolved
     by = {}
@@ -7159,11 +7445,23 @@ def acquire(args, env):
 
     # Contributor affiliation (per-window fact `affiliations`): see
     # collect_affiliations. --no-affiliation records that it was not looked at.
+    # With the retained people registry (--people / manifest `people`) the
+    # registry is consulted first and updated here, before the fold.
     if want_affiliation:
         cache = getattr(args, "affiliation_cache", None)
+        people_run = people_run_from_args(args)
         affiliations = collect_affiliations(
             prs, issues, commits, owner, repo, get_page, aff_config,
-            email_home=email_home, cache={} if cache is None else cache)
+            email_home=email_home, cache={} if cache is None else cache,
+            people_run=people_run,
+            name_first=[e.get("login") for key in ("new", "returning")
+                        for e in newcomers.get(key) or [] if isinstance(e, dict)])
+        if people_run is not None:
+            try:
+                people_run.save()
+            except (OSError, people_mod.RegistryError) as exc:
+                raise SystemExit("error: people registry {}: {}".format(
+                    people_run.path, exc)) from None
     else:
         affiliations = {"collected": False}
 
@@ -9218,6 +9516,14 @@ def main(argv=None):
     # manifest fails fast instead of leaving an empty DB behind.
     man = manifest_mod.load_manifest(args.manifest) if getattr(
         args, "manifest", None) else None
+    # The retained people registry: loaded (and checked) before the store is
+    # touched; --people beats the manifest's `people`.
+    if man is not None and man.get("people") and not getattr(args, "people", None):
+        args.people_manifest = man["people"]
+    if getattr(args, "affiliation_enabled", True):
+        if people_run_from_args(args) is None and getattr(args, "people_offline", False):
+            raise SystemExit("error: --people-offline needs a people registry "
+                             "(--people PATH or the manifest's `people`)")
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
     failures = []

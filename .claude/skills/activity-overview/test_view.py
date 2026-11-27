@@ -399,7 +399,7 @@ class TestDocsContract(unittest.TestCase):
 
 # Every command-line entry point the skill ships (issue #107 item 2).
 _CLIS = ("gather.py", "view.py", "link.py", "render.py", "digest.py",
-         "validate.py", "spotlight.py", "transcript.py",
+         "validate.py", "spotlight.py", "transcript.py", "people.py",
          "manifest_from_index.py", "ci_spotlight_integration.py",
          os.path.join("samples", "build_report.py"),
          os.path.join("examples", "formatters", "shipped_changelog.py"))

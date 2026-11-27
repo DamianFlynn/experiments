@@ -1260,6 +1260,7 @@ def slice_train(bundle, train_id):
         "symbol_moves":   own_moves,
         # The story material: the whole conversation as one timeline.
         "conversation":   story_material(bundle, train),
+        **slice_participants(bundle, train),
     }
 
 
@@ -3700,10 +3701,85 @@ def _affiliation_summary(bundle, rows, people):
            "signals": {k: signals[k] for k in sorted(signals, key=str)},
            "merged_prs": split(merged_authors),
            "reviews": split(reviewers)}
+    maint = _maintainer_summary(people)
+    if maint is not None:
+        out["maintainers"] = maint
     if fact.get("windows"):
         out["windows"] = fact["windows"]
         out["covers_view"] = fact.get("covers_view")
     return out
+
+
+def _maintainer_summary(people):
+    """Maintainers vs non-maintainers of the view's repository (the people
+    registry's `maintainer` property), with `unknown` separate (no
+    maintainer property: not checked, do_not_name, or not a person of a
+    gathered window), by signal and crossed with the affiliation: a
+    community maintainer is possible, and neither label implies the other.
+    None when no person carries the property (bots left out)."""
+    humans = {login: p for login, p in people.items() if not p.get("is_bot")}
+    if not any("maintainer" in p for p in humans.values()):
+        return None
+    keys = ("maintainer", "non_maintainer", "unknown")
+
+    def bucket(p):
+        if "maintainer" not in p:
+            return "unknown"
+        return "maintainer" if p["maintainer"] else "non_maintainer"
+    counts = {k: 0 for k in keys}
+    signals, cross, logins = {}, {}, []
+    for login in sorted(humans, key=str):
+        p = humans[login]
+        b = bucket(p)
+        counts[b] += 1
+        if b == "maintainer":
+            logins.append(login)
+            sig = p.get("maintainer_signal")
+            signals[sig] = signals.get(sig, 0) + 1
+        aff = p.get("affiliation") or "unknown"
+        row = cross.setdefault(aff, {k: 0 for k in keys})
+        row[b] += 1
+    return {"people": counts,
+            "signals": {k: signals[k] for k in sorted(signals, key=str)},
+            "by_affiliation": {k: cross[k] for k in sorted(cross)},
+            "logins": logins}
+
+
+def slice_participants(bundle, train):
+    """{"participants": {login: {name?, maintainer?, maintainer_signal?,
+    affiliation?}}} for the humans of one train (authors, mergers,
+    reviewers, commenters of its issues and PRs, its commit authors), so a
+    narrator can name them; {} when the view's people carry no display name
+    or maintainer property (omit-when-absent). The login stays the key;
+    a do_not_name person has no name and no label. Pure."""
+    people = bundle.get("people") or {}
+    if not any(k in p for p in people.values() for k in derive.PERSON_LABEL_KEYS):
+        return {}
+    pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    issue_index = {i["number"]: i for i in bundle.get("issues", [])}
+    issues, prs = _train_members(train, pr_index, issue_index)
+    logins = set()
+    for rec in issues + prs:
+        logins.add(rec.get("author"))
+        logins.add(rec.get("merged_by"))
+        logins.update(rec.get("reviewers") or [])
+        for key in ("comments_list", "review_comments", "reviews"):
+            for c in rec.get(key) or []:
+                if isinstance(c, dict):
+                    logins.add(c.get("author"))
+    commits = {c.get("sha"): c for c in bundle.get("commits", [])}
+    for sha in train.get("commits") or []:
+        logins.add((commits.get(sha) or {}).get("author"))
+    out = {}
+    for login in sorted(k for k in logins if k and k in people):
+        p = people[login]
+        if p.get("is_bot"):
+            continue
+        row = derive.person_labels(p)
+        if p.get("affiliation") and p.get("affiliation_signal") != "do_not_name":
+            row["affiliation"] = p["affiliation"]
+        out[login] = row
+    return {"participants": out}
 
 
 def _community_summary(bundle, rows, people, newcomer_rows):
@@ -3761,6 +3837,7 @@ def build_contributors(bundle, path_rules=()):
         if "affiliation" in p:
             row["affiliation"] = p["affiliation"]
             row["affiliation_signal"] = p.get("affiliation_signal")
+        row.update(derive.person_labels(p))
         return row
     newcomer_rows = []
     if has_nc:

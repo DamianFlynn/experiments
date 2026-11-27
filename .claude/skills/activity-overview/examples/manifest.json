@@ -14,5 +14,11 @@
       "repo": "terraform-azurerm-avm-res-network-virtualnetwork",
       "registry": "Azure/avm-res-network-virtualnetwork/azurerm"
     }
-  ]
+  ],
+  "affiliation": {
+    "home_orgs": ["Azure", "microsoft"],
+    "home_names": ["Microsoft"],
+    "home_email_domains": ["microsoft.com"]
+  },
+  "people": "people.json"
 }

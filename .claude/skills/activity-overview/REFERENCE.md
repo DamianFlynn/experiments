@@ -258,6 +258,19 @@ up (the rest are `not_checked`); `--no-affiliation` skips the check. Settings: `
 `--home-name`, `--home-email-domain`, `--affiliation LOGIN=…` / `@org/team=…` (repeatable), or
 a manifest `affiliation` object.
 
+The people registry (`--people PATH` or a manifest `people`; `people.py`; USAGE §5.7): one
+JSON file per workspace, consulted before any lookup and updated by each gather, so a person
+is looked up once. A decided label is reused for `ACTIVITY_PEOPLE_REFRESH_DAYS` (default
+`120`, min `1`; also `--people-refresh-days`), an `unknown` one for
+`ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS` (default `30`, min `1`); at most
+`ACTIVITY_PEOPLE_REFRESH_MAX` (default `50`, min `0`) stale entries are refreshed per run,
+oldest first; at most `ACTIVITY_PEOPLE_NAME_MAX` (default `30`, min `0`) profile calls per run
+are made only for a display name (newcomers first). `--people-offline`: no API call for people
+at all. The maintainer property (per repository, from stored merges, approving reviews and
+`author_association` OWNER / COLLABORATOR; `people.APPROVALS_MIN` = 3) costs no call.
+`python3 people.py seed --people PATH STORE...` fills the registry from stores without the API;
+`python3 people.py summary --people PATH` prints the counts and the maintainers.
+
 ### Projects v2 board knobs
 
 When a repo links Projects v2 boards, gather ingests **every maintained** board it

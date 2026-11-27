@@ -146,6 +146,9 @@ scratch store) and `backfill` respectively.
 | `--no-affiliation` | off (check runs) | Skip the contributor affiliation check (§4.7a); the window's `affiliations` fact is `{"collected": false}`. `ACTIVITY_AFFILIATION_MAX` (default 300, min 0) caps the people looked up |
 | `--home-org ORG`, `--home-name NAME`, `--home-email-domain DOMAIN` | the repo's owner only | Repeatable: extra home organisations (public membership, and a company name), extra company names, home commit email domains (§4.7a); a manifest's `affiliation` object adds the same lists |
 | `--affiliation LOGIN=A` / `@org/team=A` | none | Repeatable operator override (`maintainer_org` / `community` / `unknown`), highest priority; beats a manifest `affiliation.overrides` entry for the same key |
+| `--people PATH` | none (no registry) | The workspace's retained people registry (§4.7b): consulted before any lookup, updated by the gather (atomic, locked, merged with the file on disk); beats a manifest `people` (a path relative to the manifest) |
+| `--people-offline` | off | With a registry: no API call for people at all (no lookups, names or team expansion); the registry and the free signals decide |
+| `--people-refresh-days N` | 120 | Re-check a registry entry looked up more than N days ago (also `ACTIVITY_PEOPLE_REFRESH_DAYS`) |
 | `--no-iac-build` | off (builds run) | Do not run `bicep restore/build` / `terraform init/graph` (they download and run third-party code, §14.4); every area `edges_status: skipped`, `edge_extraction.disabled: true`. The structural scan still runs |
 | `--store PATH` | **required** | SQLite store |
 
@@ -214,7 +217,9 @@ sequenceDiagram
     A->>REST: search/issues per candidate first-time contributor (collect_newcomers)
   end
   opt not --no-affiliation
+    A->>A: people registry consulted first (--people; fresh entries cost no call)
     A->>REST: orgs/{org}/public_members/{login}, users/{login} per person not decided for free (collect_affiliations)
+    A->>A: registry updated (people.Run.save)
   end
   A->>REST: releases, milestones
   opt token has read:project
@@ -637,7 +642,71 @@ GitHub's at gather time. The commit email is read in `resolve_commit_authors`
 (`home_domains`, `home_email`): only the resolved login of a commit whose email is in a home
 domain is noted; the email is dropped as before. Cost per person not decided for free: one
 call per home org (until one answers 204) plus one profile call. The entry stored per person
-is `{affiliation, signal[, strength][, home_email_domain: true]}`.
+is `{affiliation, signal[, strength][, home_email_domain: true]}` (with the registry also
+`name`, `maintainer`, `maintainer_signal`: §4.7b).
+
+### 4.7b The people registry (`people.py`)
+
+**File.** `{"format": "activity-overview/people", "version": 1, "people": {login: entry}}`,
+one per workspace (`--people` / manifest `people`; USAGE §2.1 puts it at
+`<stream>/people.json`). `parse_registry` checks every entry (`check_entry`: only
+`ENTRY_KEYS`; `login` repeats the key; label / signal / strength / maintainer signals from
+their lists; dates `YYYY-MM-DD`; two keys equal ignoring case refused) and raises
+`RegistryError` naming the file and the entry; `load_registry` of a missing file is empty.
+`dumps` is `sort_keys`, indent 2, `ensure_ascii=False`, trailing newline; `write_registry`
+writes a temporary file in the same directory and `os.replace`s it, and skips the write when
+the text is unchanged; `update_registry(path, patches)` holds an `fcntl` lock on
+`<path>.lock`, re-reads the file and applies the patches over it.
+
+**Patches and the operator.** A run never writes entries directly: it accumulates patches per
+login (`seen` [(date, repo)], `label`, `name`, `looked_up_at`, `maintainer` {repo: evidence};
+`merge_patch`) and `apply_patch` applies them: `first_seen` / `last_seen` always (min / max);
+`label`, `name`, `maintainer` only when the field is not `is_locked` (entry `source:
+"operator"`, `locked: true`, or the field in the `locked` list); a plain bool in
+`maintainer_of` is the operator's and is skipped; a stronger maintainer signal is never
+replaced by a weaker one (`MAINTAINER_SIGNALS` order), `last_evidence` is the latest; `tags`,
+`do_not_name` and `note` are never written; a `do_not_name` entry never gets a name. A new
+entry has `source: "lookup"`.
+
+**At gather time** (`gather.people_run_from_args` → `people.Run`, kept on `args.people_run` so
+a manifest's members share it; created in `main` before the store opens, so a malformed
+registry fails first). `collect_affiliations(..., people_run)` calls
+`find_affiliations_registry`: first the window's seen dates (`people.activity_dates`) and
+maintainer evidence (`people.maintainer_evidence`) are patched in for every person, then per
+person: `do_not_name` → `{unknown, do_not_name}`, no call; the override list /
+`author_association` (free; an `author_association` label is patched in); a registry label
+locked by the operator → signal `override` (`operator`); `lookup_state` `fresh` → the stored
+label (`_reused_entry`: an `unknown` one with a home commit email becomes
+`commit_email_domain`), no call; `never` → `decide_affiliation` with the seam (within
+`ACTIVITY_AFFILIATION_MAX`); `stale` → the same, for the `Run.refresh_left` oldest lookups of
+the window; otherwise a stale label is reused, else the commit email, else `{unknown,
+not_checked}`. A lookup that answers patches `label` (`_registry_label`: the GitHub-data
+decision, never the per-window commit email or a failure), `looked_up_at` and the name
+(`lookup("name")`, read from the cached `users/{login}` answer: `make_affiliation_lookup` now
+caches `{company, name}` per users URL); a failed lookup patches nothing. Then the name pass:
+people without a name and never looked up, the newcomers (`name_first`) first, then by
+activity, at most `Run.names_left` profile calls. Last, every entry but `do_not_name` gets
+`name` (`people.display_name`) and `maintainer` / `maintainer_signal`
+(`people.maintainer_for(entry, "owner/repo")`: the operator's bool → `operator`; evidence →
+its signal; nothing → `false` / `none`). `acquire` calls `Run.save()` after the fact is
+built (before the fold). `lookup_state`: `never` without `looked_up_at` or label; `fresh`
+when younger than `refresh_days` (decided) or `unknown_retry_days` (`unknown`); else
+`stale`. Offline (`--people-offline`): no seam, no team expansion, no name pass.
+
+**Maintainer evidence** (`maintainer_evidence(prs, issues)`, pure): per merged PR, the merger
+→ `merged_others_pr` (author differs) or `merged_own_pr`; approving reviews (state
+`approved`, not by the author) of merged PRs counted per reviewer, `approving_reviewer` at
+`APPROVALS_MIN` = 3; `author_association` OWNER / COLLABORATOR on a person's PR, issue or
+comment records → `OWNER` / `COLLABORATOR`; bots and `ghost` out; the strongest signal wins
+(`MAINTAINER_SIGNALS`), `last_evidence` the latest day seen. `MEMBER` is not used.
+
+**Seeding** (`python3 people.py seed --people PATH STORE...`): `store_records` reads each
+store read-only (PR / issue social nodes with their `review-*` nodes attached, resolved
+commits, and any stored `affiliations` facts) per repository; `seed_patches` patches the seen
+dates, the maintainer evidence, an `author_association` OWNER / MEMBER / COLLABORATOR label
+and a stored fact's GitHub-data label (no `looked_up_at`); one `update_registry`.
+`summary` prints `summarize`: people, labels, named / tagged / `do_not_name`, lookup states
+and the maintainers per repository by signal.
 
 **Returning contributors (`find_newcomers`).** The search URL sorts by `created` descending,
 so `search_latest_created` reads the most recent earlier item from the same `per_page=1`
@@ -1474,7 +1543,12 @@ first, then their open PRs (`headline: unknown`: no file list), at most 10. `hea
 `person_reviews`: PRs reviewed and the module areas of the merged ones.
 `_affiliation_summary`: people per label, signals, merged PRs by author label and reviews
 (reviewer-PR pairs) by reviewer label, with shares of the human total, `unknown` separate and
-`bots_excluded`. `_community_summary`: `community`-labelled people only. Pure; no call.
+`bots_excluded`, plus `maintainers` (`_maintainer_summary`, only when people carry the
+maintainer property: maintainer / non_maintainer / unknown, by signal, crossed with the
+label, and the maintainers' logins). `_community_summary`: `community`-labelled people
+only. Rows that name a person (newcomers, hall, `halls`, a slice's `participants` from
+`slice_participants`) copy `derive.person_labels` (name, maintainer, maintainer_signal) when
+the person carries them. Pure; no call.
 
 ### 6.10 `derive.py` projections
 
@@ -1488,7 +1562,7 @@ first, then their open PRs (`headline: unknown`: no file list), at most 10. `hea
 | `unresolved_person_key` | person key | the git name of a commit author gather could not resolve to a login, `+ " (git)"` when login-shaped, so it never equals a login (#78) |
 | `is_bot_login` | `is_bot` | `*[bot]`, `github-actions`, `microsoft-github-policy-service`, `*-organizer`, `copilot-*`; git-name forms `GitHub Actions`, `Dependabot`, `Dependabot Preview`, `Renovate`, `Renovate Bot` (case/space-insensitive), each also with the `" (git)"` suffix |
 | `annotate_people_profile` | per-login metrics | prs authored (in scope) / opened in the window (`prs_opened`, when the view holds an earlier PR) / merged / reviewed, merge rate, commits and `own_pr_commits` (landing commits of their own merged PRs, when not 0), review latency (median), first/last active, examples/docs/symbols authored |
-| `annotate_people_affiliation` | `people[].affiliation` / `affiliation_signal` | only with a collected `affiliations` fact: the fact's entry, else `unknown` with `not_checked` / `not_looked_up`; bots untouched |
+| `annotate_people_affiliation` | `people[].affiliation` / `affiliation_signal` (+ `name`, `maintainer`, `maintainer_signal` when the entry has them: `PERSON_LABEL_KEYS`) | only with a collected `affiliations` fact: the fact's entry, else `unknown` with `not_checked` / `not_looked_up`; bots untouched |
 | `build_halls` | `halls.fame` (+ `community`, `maintainer_org`, `unranked_unknown`) | non-bots, `score = 2·prs_merged + prs_reviewed + commits_authored − own_pr_commits` (`hall_score`; a commit landing the person's own merged PR is not counted again), top 10; when people carry `affiliation`, the same ranking within `community` and within `maintainer_org`, and how many scoring people are `unknown` (never ranked); **no shame/blame** |
 | `build_flow` | `flow[]` | open issues: `blocked` (≥ 1 **open** blocker; closed blockers ignored, blockers absent from the bundle listed in `blocked_by_unknown` but not blocking) → `upvoted_but_ignored` (👍 ≥ 5, stale ≥ 30 d, no open PR) → `traction_then_abandoned` (≥ 5 comments, stale, no open PR) → `hung` (age ≥ 60 d **and** stale, no open PR) |
 | `build_blockers` | `blockers[]` | open blockers only, out-degree counting open blocked issues only, sorted desc; the raw `blocking`/`blocked_by` from extract stay unfiltered (`blocker_graph` applies the same open-only filter, #101) |
@@ -1812,7 +1886,9 @@ recomputed from the sums; `review_latency_days` is the median of every member's 
 `annotate_people_profile` takes the median of); `first_seen`/`last_active` are the min/max;
 `modules`/`areas` become `"<repo>::<area>"`; `is_bot` is OR'd, `login_resolved: false` wins;
 `affiliation` / `affiliation_signal` come from the member record with the most decisive
-signal (`derive.affiliation_rank`: `AFFILIATION_SIGNAL_ORDER`, a known label before unknown).
+signal (`derive.affiliation_rank`: `AFFILIATION_SIGNAL_ORDER`, a known label before unknown);
+`name` from the first member that has one; `maintainer` true when any member says so (that
+member's signal) with `maintainer_of` listing those members, else the first member's.
 `halls` is `derive.build_halls` over the merged people. Nothing is stored: the person nodes
 stay the fold's union, which `validate`'s `no_drift_people` checks.
 
@@ -1903,6 +1979,10 @@ diff-stable.
 | `ACTIVITY_RATE_LIMIT_MAX_WAIT` | 3600 | Longest single rate-limit wait in seconds (`0` = fail instead of waiting) |
 | `TF_PLUGIN_CACHE_DIR` | unset | Shared terraform provider cache (enables serial pre-warm) |
 | `ACTIVITY_AFFILIATION_MAX` | 300 | People looked up for the affiliation check per window (min 0; the rest `not_checked`) |
+| `ACTIVITY_PEOPLE_REFRESH_DAYS` | 120 | People registry: a decided label is reused this long after its lookup (min 1; `--people-refresh-days`) |
+| `ACTIVITY_PEOPLE_UNKNOWN_RETRY_DAYS` | 30 | People registry: an `unknown` label is retried after this long (min 1) |
+| `ACTIVITY_PEOPLE_REFRESH_MAX` | 50 | People registry: stale entries refreshed per run, oldest first (min 0) |
+| `ACTIVITY_PEOPLE_NAME_MAX` | 30 | People registry: profile calls per run made only for a display name (min 0) |
 | `ACTIVITY_BOARD_STALE_DAYS` | 365 | Board treated as deprecated beyond this |
 | `ACTIVITY_BOARD_MAX_ITEMS` | 5000 | Per-board item cap |
 | `ACTIVITY_MMDC_PUPPETEER_CONFIG` | unset | Puppeteer config file passed to `mmdc -p` (as root without it: generated `--no-sandbox` config) |
@@ -1990,7 +2070,9 @@ them; a possible returning contributor costs one more), plus, for the affiliatio
 public-membership call per home org (until one answers 204) and one profile call, capped by
 `ACTIVITY_AFFILIATION_MAX` and cached per URL for the run (`--no-affiliation` skips them; a
 September of Azure/bicep-registry-modules has about 230 people: with two home orgs and no
-free signal for most, up to about 660 core-API calls). Because **all open PRs and issues** are included every run, busy
+free signal for most, up to about 660 core-API calls; with the people registry (§4.7b) only
+the first gather pays that: later ones call for new people, at most 30 names and at most 50
+refreshes). Because **all open PRs and issues** are included every run, busy
 repos dominate the budget (a personal token's authenticated limit is 5,000 requests/hour; the
 workflow's built-in `GITHUB_TOKEN`, which the CI live jobs use by default, has a lower limit
 that its runs in one repository share, so a live gather in CI is likelier to wait for the

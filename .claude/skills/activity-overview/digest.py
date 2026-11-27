@@ -540,9 +540,13 @@ def _merge_people(members):
       is_bot                OR; login_resolved false when any member says so
       affiliation / affiliation_signal   the member record with the most
                             decisive signal (derive.affiliation_rank)
+      name                  the first member record that has one
+      maintainer / maintainer_signal   true when any member says so (that
+                            member's signal), with those members listed in
+                            `maintainer_of` (the property is per repository)
     Any other field is kept from the first member's record. Member records are
     not mutated. Order: first appearance over members in `members` order."""
-    people, samples, opened = {}, {}, {}
+    people, samples, opened, maint = {}, {}, {}, {}
     for m in members:
         repo, bundle = m["repo"], m["bundle"]
         latencies = derive.review_latency_samples(bundle.get("prs") or [])
@@ -583,7 +587,23 @@ def _merge_people(members):
                                          < derive.affiliation_rank(cur)):
                 cur["affiliation"] = rec["affiliation"]
                 cur["affiliation_signal"] = rec.get("affiliation_signal")
+            # display name: the first member's that has one; maintainer is
+            # per repository, so the project record says true when any
+            # member says so (with that member's signal) and lists those
+            # members in `maintainer_of`
+            if rec.get("name") and not cur.get("name"):
+                cur["name"] = rec["name"]
+            if "maintainer" in rec:
+                maint.setdefault(login, []).append(
+                    (repo, rec["maintainer"], rec.get("maintainer_signal")))
             samples.setdefault(login, []).extend(latencies.get(login, []))
+    for login, rows in maint.items():
+        cur = people[login]
+        yes = [r for r in rows if r[1]]
+        pick = yes[0] if yes else rows[0]
+        cur["maintainer"], cur["maintainer_signal"] = pick[1], pick[2]
+        if yes:
+            cur["maintainer_of"] = sorted({r[0] for r in yes})
     for login, cur in people.items():
         if any(seen for seen, _total in opened.values()):
             cur["prs_opened"] = opened[login][1]

@@ -40,7 +40,7 @@ renderer over that view; changelogs, dashboards or slide decks are others.
 | Progressive series | What's new vs carried over since last month? Did last month's forecast land? | `link --series` (`series.py`) |
 | Flow health | What is blocked, hung, upvoted-but-ignored? Who/what blocks the most? | `derive.build_flow` / `build_blockers` |
 | Recognition | Who moved the project (no blame board, by design)? | `derive.annotate_people_profile` / `build_halls` |
-| People and community | How much came from the maintaining organisation and how much from the community? Who is new, or back after 3 / 6 / 9 months, and what did their work land (a new module, a pattern, a change, plumbing)? | gather `affiliations` + `newcomers` → extract `prior_activity` → `link` `contributors`, halls by affiliation |
+| People and community | How much came from the maintaining organisation and how much from the community? Who maintains the repository? Who is new, or back after 3 / 6 / 9 months, and what did their work land (a new module, a pattern, a change, plumbing)? Who are they (display name), looked up once per person? | the people registry (`people.py`) → gather `affiliations` + `newcomers` → extract `prior_activity` → `link` `contributors`, halls by affiliation |
 | Feature ledger | Which params/outputs/resources/docs were added, changed, removed? | `code_events` + `feature_deltas` |
 | Module release notes | Which modules are new, what changed in each, what is breaking (declared vs candidate), what was deprecated, how much was plumbing? | gather `module_notes` (changelogs, version files, tags) → `link` `module_changes` |
 | Stories | Which work had the most to tell (a debate, a change request and the rework after it, a long silence), and what was said along the way, in order? | gather `pr_history` (PR head refs) → `link` `discussion` / `stories` / slice `conversation` |
@@ -661,6 +661,16 @@ nested Terraform areas, PR head repo, cross-repo mentions and UTC commit days);
     org membership, an unstated or stale employer, or a vendor relationship; the label is
     GitHub's answer when the window was gathered. Only the label and the signal are stored —
     no profile text, company or email — and `--no-affiliation` turns it off.
+23. **A person is looked up once; the owner's word wins; a report stays reproducible.** The
+    people registry (`people.json`, one per stream, outside the stores) keeps one record per
+    login across months and repositories: the label, the public display name (the owner's
+    choice), the maintainer property per repository, and the owner's own tags. A lookup is
+    reused for 120 days (`unknown` for 30), refreshes are bounded per run, and fields the
+    owner sets are never overwritten. The maintainer property is a role, not an employer:
+    derived from stored merges, approving reviews and OWNER / COLLABORATOR, never from
+    affiliation (nor the reverse). Each window's `affiliations` fact records the labels it
+    used, and views read only the fact, so editing the registry changes the next gather,
+    never an old report. `do_not_name` keeps a person to their login in every output.
 
 Item 7 is what USAGE §2.1 weighs when choosing between one accumulated store and one store
 per installment. Artifact folding is cumulative (#76): each fold rebuilds the artifacts it
