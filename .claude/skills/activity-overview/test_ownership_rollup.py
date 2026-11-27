@@ -28,8 +28,8 @@ def owner_file(module):
 
 
 # The history: (sha, commit time, path, change, owners before, owners after)
-A, B, C, D, E, F, G = ("avm/res/a/a", "avm/res/b/b", "avm/res/c/c", "avm/res/d/d",
-                       "avm/res/e/e", "avm/res/f/f", "avm/res/g/g")
+A, B, C, D, E, F, G, H = ("avm/res/a/a", "avm/res/b/b", "avm/res/c/c", "avm/res/d/d",
+                          "avm/res/e/e", "avm/res/f/f", "avm/res/g/g", "avm/res/h/h")
 CHANGES = [
     (1, "2026-10-03T08:00:00Z", B + "/ORPHANED.md", "add", None, None),
     (2, "2026-10-06T10:00:00Z", owner_file(A), "modify", ["o1"], []),
@@ -43,6 +43,10 @@ CHANGES = [
     # sha 0x0a sorts after 0x09, kind order would put owner_added first
     (9, "2026-10-09T10:00:00Z", owner_file(G), "modify", ["o6"], []),
     (10, "2026-10-09T10:00:00Z", owner_file(G), "modify", [], ["o7"]),
+    # a module removed: its populated owner file and its entry file deleted
+    # (never "without an owner")
+    (11, "2026-10-15T10:00:00Z", owner_file(H), "delete", ["alice"], None),
+    (12, "2026-10-15T10:00:00Z", H + "/main.bicep", "delete", None, None),
 ]
 LABEL = "Status: Module Orphaned"
 ISSUES = [
@@ -65,7 +69,8 @@ def blobs():
             out[(sha(n), path)] = "{ not json"
             continue
         out[(sha(n) + "^", path)] = meta(before)
-        out[(sha(n), path)] = meta(after)
+        if after is not None:
+            out[(sha(n), path)] = meta(after)
     return out
 
 
@@ -103,9 +108,17 @@ def start_state_at(day):
     state = {}
     for _n, at, path, change, before, after in sorted(CHANGES, key=lambda c: c[1]):
         module = path.rsplit("/", 1)[0]
-        if path.endswith("ORPHANED.md"):
+        if path.endswith("ORPHANED.md") or not path.endswith("/metadata.json"):
             continue
         if before == "UNREAD":
+            continue
+        if change == "delete":
+            if at[:10] < day:
+                state.pop(module, None)        # the file (and module) is gone
+            else:
+                state.setdefault(module, {"owner_file": "metadata.json",
+                                          "owners": list(before), "codeowners": [],
+                                          "orphan_marker": False})
             continue
         r = state.setdefault(module, {"owner_file": "metadata.json", "owners": list(before),
                                       "codeowners": [], "orphan_marker": False})
@@ -123,6 +136,20 @@ def start_state_at(day):
             else:
                 r.pop("marker_since", None)
     return state
+
+
+def partial(f):
+    """A fact gathered without the tree before its window: its start state
+    was never read completely (markers only)."""
+    f = json.loads(json.dumps(f))
+    f["start_state_source"] = "markers_only"
+    for k in ("owners_at_end", "modules_at_end", "deprecated_modules", "stub_modules",
+              "end_check"):
+        f.pop(k, None)
+    f["without_owner"] = []
+    f["without_owner_unavailable"] = extract.PARTIAL_START_REASON.format(
+        f["window"]["from"], f["window"]["to"])
+    return f
 
 
 def legacy(f):
@@ -148,6 +175,8 @@ STORAGES = {
     # a fact gathered before `at` / `seq`, and a refreshed overlapping window
     "legacy+refreshed": [("2026-10-01", "2026-10-31", legacy),
                          ("2026-10-26", "2026-11-30")],
+    # a month gathered without the tree before it: never known state
+    "no start tree": [("2026-10-01", "2026-10-31", partial)],
 }
 
 
@@ -176,6 +205,10 @@ def replay(day):
             (markers.add if change == "add" else markers.discard)(module)
             if change == "delete":
                 owned_since[module] = at[:10]
+        elif not path.endswith("/metadata.json"):
+            continue
+        elif change == "delete":
+            emptied.discard(module)            # removed, not without an owner
         elif before != "UNREAD":
             if before and not after:
                 emptied.add(module)
@@ -365,12 +398,49 @@ class TestSelfContainedWindows(unittest.TestCase):
                                                          read_blob=blobs)
         self.assertEqual(state, {
             A: {"owner_file": "metadata.json", "owners": ["o1"], "codeowners": ["lead"],
-                "orphan_marker": False, "owners_since": "2026-09-02"},
+                "orphan_marker": False, "owners_since": "2026-09-02",
+                "info": {"display_name": "X"}, "entry": True},
             B: {"owners": [], "codeowners": [], "orphan_marker": True,
-                "marker_since": "2026-09-02"},
+                "marker_since": "2026-09-02", "entry": False},
             C: {"owner_file": "metadata.json", "owners": [], "codeowners": [],
-                "orphan_marker": False, "owners_since": "2026-09-20"}})
+                "orphan_marker": False, "owners_since": "2026-09-20",
+                "info": {"display_name": "X"}, "entry": False}})
         self.assertEqual(unread, [])
+
+
+class TestProvenanceAndRemoval(unittest.TestCase):
+    """Review findings on the self-contained windows: a start state that was
+    not read completely is never known state; a deleted owner file (a
+    removed module) is never "without an owner"."""
+
+    def test_a_partial_start_state_is_unavailable(self):
+        conn = _store(("2026-10-01", "2026-10-31", partial(fact("2026-10-01", "2026-10-31"))))
+        for to in ("2026-10-07", "2026-10-31"):
+            mo = extract.extract(conn, "o", "r", "2026-10-01", to)["module_ownership"]
+            if to == "2026-10-31":        # the exact window: as gather stored it
+                g = gather.collect_module_ownership(
+                    [], [], [], [], Blobs({}), [], "2026-10-01", "2026-10-31",
+                    start_files=[])
+                self.assertEqual(g["start_state_source"], "markers_only")
+                self.assertEqual(g["without_owner"], [])
+                self.assertIn("never read", g["without_owner_unavailable"])
+                continue
+            self.assertEqual(mo["without_owner"], [])
+            self.assertIn("never read", mo["without_owner_unavailable"])
+            self.assertTrue(mo["events"])
+        self.assertIsNone(extract.ownership_state(
+            partial(fact("2026-10-01", "2026-10-31")), "2026-10-07"))
+
+    def test_a_deleted_owner_file_is_a_removed_module(self):
+        f = fact("2026-10-01", "2026-10-31")
+        ev = [e for e in f["events"] if e["module"] == H]
+        self.assertEqual(sorted((e["kind"], e.get("file_removed", False)) for e in ev),
+                         [("module_removed", False), ("owner_removed", True)])
+        st = extract.ownership_state(f, "2026-10-20")
+        self.assertNotIn(H, [w["module"] for w in st["without_owner"]])
+        self.assertEqual(st["modules"][H]["lifecycle"], "removed")
+        before = extract.ownership_state(f, "2026-10-14")
+        self.assertEqual(before["owners"][H], ["alice"])
 
 
 def _readers(g):
@@ -443,6 +513,13 @@ class TestEveryStorageReadsTheSame(unittest.TestCase):
                 got = [w["module"] for w in mo["without_owner"]]
                 without = mo["without_owner"]
                 events = strip_time(mo["events"])     # a legacy fact has no times
+                if name == "no start tree":
+                    self.assertEqual(without, [], (name, d))
+                    self.assertIn("never read", mo["without_owner_unavailable"], (name, d))
+                    self.assertNotIn("owners_at_end", mo)
+                    self.assertEqual(json.dumps(events, sort_keys=True), first[1][1],
+                                     (name, d, "events"))
+                    continue
                 if name == "legacy+refreshed" and d < "2026-10-26":
                     # only the legacy fact covers the day: it holds no start
                     # state, so the state of a day inside it is unavailable
@@ -466,9 +543,11 @@ class TestEveryStorageReadsTheSame(unittest.TestCase):
                     ref = json.loads(first[1][1])
 
                     def split(evs):
-                        return ([e for e in evs if e["module"] != G],
+                        # G and H changed twice within one second: a legacy
+                        # fact never recorded which came first
+                        return ([e for e in evs if e["module"] not in (G, H)],
                                 sorted(json.dumps(e, sort_keys=True) for e in evs
-                                       if e["module"] == G))
+                                       if e["module"] in (G, H)))
                     self.assertEqual(split(events), split(ref), (name, d, "events"))
                     continue
                 self.assertEqual(got, want, (name, d))

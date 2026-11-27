@@ -2446,7 +2446,24 @@ OWNERSHIP_LABEL_PATTERNS = {"owner_needed": (r"owner\W*needed",
                             # records as `owner_response_requested`)
                             "owner_response_requested": (r"needs\W*module\W*owner",)}
 OWNERSHIP_EVENT_KINDS = ("owner_needed", "owner_added", "owner_removed",
-                         "orphaned", "adopted")
+                         "orphaned", "adopted",
+                         # module lifecycle, from the tree
+                         "deprecated", "undeprecated", "module_added",
+                         "module_removed", "module_info_changed")
+# Module lifecycle markers and entry files (ACTIVITY_DEPRECATED_FILES /
+# ACTIVITY_ENTRY_FILES, comma-separated basenames): a module folder is
+# `live` with an entry file, `deprecated` with a deprecation marker,
+# `orphaned` with an orphan marker, a `stub` with its metadata only.
+DEPRECATED_MARKER_NAMES = ("DEPRECATED.md",)
+MODULE_ENTRY_FILES = ("main.bicep", "main.tf")
+MARKER_TEXT_LINES = 5          # lines of a deprecation marker kept verbatim
+MARKER_TEXT_CAP = 600
+_AVM_MODULE_FOLDER_RE = re.compile(r"^avm/(?:res|ptn|utl)/[^/]+/[^/]+$")
+# the module metadata an owner file carries, as the module rows name it
+MODULE_INFO_FIELDS = (("moduleDisplayName", "display_name"),
+                      ("moduleDescription", "description"),
+                      ("canonicalType", "resource_type"),
+                      ("alternativeNames", "alternative_names"))
 # the label kinds ACTIVITY_OWNERSHIP_LABELS may configure
 OWNERSHIP_LABEL_KINDS = OWNERSHIP_EVENT_KINDS + ("owner_response_requested",)
 _AVM_MODULE_REF_RE = re.compile(r"\b(?:avm/)?((?:res|ptn|utl)/[\w.-]+/[\w.-]+)")
@@ -2469,6 +2486,58 @@ def ownership_label_patterns(env=None):
         out.setdefault(kind, ())
         out[kind] += (rx.strip(),)
     return out
+
+
+def _name_list(env_key, default, env=None):
+    env = os.environ if env is None else env
+    raw = env.get(env_key)
+    if raw is None:
+        return tuple(default)
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
+def deprecated_marker_names(env=None):
+    return _name_list("ACTIVITY_DEPRECATED_FILES", DEPRECATED_MARKER_NAMES, env)
+
+
+def module_entry_names(env=None):
+    return _name_list("ACTIVITY_ENTRY_FILES", MODULE_ENTRY_FILES, env)
+
+
+def module_info_from_json(text):
+    """{display_name, description, resource_type, alternative_names} the
+    module's metadata (owner) file states, each only when it is there;
+    {} when the text is not a JSON object."""
+    try:
+        data = json.loads(text or "")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for src, dst in MODULE_INFO_FIELDS:
+        v = data.get(src)
+        if isinstance(v, str) and v.strip():
+            out[dst] = v.strip()
+        elif dst == "alternative_names" and isinstance(v, list):
+            names = [x for x in v if isinstance(x, str) and x.strip()]
+            if names:
+                out[dst] = names
+    return out
+
+
+def marker_text(text):
+    """A lifecycle marker's first non-empty lines, verbatim (a deprecation
+    marker usually names the replacement)."""
+    lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
+    return "\n".join(lines[:MARKER_TEXT_LINES])[:MARKER_TEXT_CAP]
+
+
+def is_module_folder(folder, entry_names=MODULE_ENTRY_FILES):
+    """A folder a module lives in: `avm/res|ptn|utl/<group>/<name>`, the
+    repository root of a Terraform module, or `modules/<name>`."""
+    return bool(_AVM_MODULE_FOLDER_RE.match(folder or "")) or folder == "" \
+        or bool(re.match(r"^modules/[^/]+$", folder or ""))
 
 
 def _owner_file_names(env=None):
@@ -2551,6 +2620,8 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
     over its readers."""
     patterns = label_patterns or ownership_label_patterns()
     owner_files = owner_files or _owner_file_names()
+    dep_names = deprecated_marker_names()
+    entry_names = module_entry_names()
     by_sha = {c.get("sha"): c for c in commits or []}
     walk = {c.get("sha"): i for i, c in enumerate(commits or [])}
     events, unread = [], []
@@ -2610,6 +2681,15 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                 continue
             old = _owners_from_json(before) if before else []
             new = _owners_from_json(after) if after else []
+            if old is not _UNPARSEABLE and new is not _UNPARSEABLE \
+                    and e.get("change") != "delete":
+                info_before, info_after = module_info_from_json(before), \
+                    module_info_from_json(after)
+                if info_after and info_after != info_before:
+                    events.append({"kind": "module_info_changed", "module": folder,
+                                   "people": [p for p in [e.get("author")] if p],
+                                   "date": e.get("date"), "source": src(e), "via": base,
+                                   "info": info_after})
             if old is _UNPARSEABLE or new is _UNPARSEABLE:
                 unread.append({"path": path, "commit": e.get("commit"),
                                "reason": "not valid JSON"})
@@ -2622,15 +2702,41 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
             r = [o for o in old if o not in new]
             for kind, people in (("owner_added", a), ("owner_removed", r)):
                 if people:
-                    events.append({"kind": kind, "module": module, "people": people,
-                                   "date": e.get("date"), "source": src(e),
-                                   "via": base})
+                    ev = {"kind": kind, "module": module, "people": people,
+                          "date": e.get("date"), "source": src(e), "via": base}
+                    if e.get("change") == "delete":
+                        # the owner FILE went away (often with the module): not
+                        # an owner list emptied
+                        ev["file_removed"] = True
+                    events.append(ev)
+            if not r and e.get("change") == "delete":
+                events.append({"kind": "owner_removed", "module": module, "people": [],
+                               "date": e.get("date"), "source": src(e), "via": base,
+                               "file_removed": True})
             if old and not new and e.get("change") != "delete":
                 events.append({"kind": "owner_needed", "module": module, "people": [],
                                "date": e.get("date"), "source": src(e), "via": base})
         if base in ORPHAN_MARKER_NAMES and e.get("change") in ("add", "delete"):
             events.append({"kind": "orphaned" if e["change"] == "add" else "adopted",
                            "module": folder, "people": [p for p in [e.get("author")] if p],
+                           "date": e.get("date"), "source": src(e), "via": base})
+        if base in dep_names and e.get("change") in ("add", "delete"):
+            ev = {"kind": "deprecated" if e["change"] == "add" else "undeprecated",
+                  "module": folder, "people": [p for p in [e.get("author")] if p],
+                  "date": e.get("date"), "source": src(e), "via": base}
+            if e["change"] == "add":
+                try:
+                    text = marker_text(read_blob(e["commit"], path) or "")
+                except BlobUnreadable:
+                    text = ""
+                if text:
+                    ev["marker_text"] = text
+            events.append(ev)
+        if base in entry_names and e.get("change") in ("add", "delete") \
+                and is_module_folder(folder):
+            events.append({"kind": "module_added" if e["change"] == "add"
+                           else "module_removed", "module": folder,
+                           "people": [p for p in [e.get("author")] if p],
                            "date": e.get("date"), "source": src(e), "via": base})
         # one change's own events (same instant) in kind order
         events[first:] = sorted(events[first:], key=lambda x: (x["kind"],
@@ -2713,12 +2819,22 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
            "start_state_source": start_source,
            "events": events, "labelled_items": labelled,
            "label_patterns": {k: list(v) for k, v in patterns.items()},
-           "owner_files": list(owner_files)}
+           "owner_files": list(owner_files),
+           "marker_files": {"orphaned": list(ORPHAN_MARKER_NAMES),
+                            "deprecated": list(dep_names)},
+           "entry_files": list(entry_names)}
     # the window's end, derived by the same replay every reader uses (kept
     # stored as a cross-check: validate replays it again)
     end = extract.ownership_state(out, (to or "")[:10])
-    out["without_owner"] = end["without_owner"]
-    out["owners_at_end"] = end["owners"]
+    if end is None:
+        # the owner files at the window's start were never read: the state
+        # is not known (the events are)
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = extract.PARTIAL_START_REASON.format(
+            (frm or "")[:10], (to or "")[:10])
+    else:
+        for key, val in extract.ownership_end_fields(end).items():
+            out[key] = val
     if end_rev and start_source == "complete":
         # an independent read of the end tree's owner files: what the replay
         # derived must match it (unread versions make it differ)
@@ -2811,7 +2927,10 @@ def ownership_start_state(clone_dir, from_date, owner_files=None, run=None,
     except RuntimeError:
         return None, []
     state, unread = {}, []
-    days = _last_change_days(clone_dir, sha, tuple(owner_files) + ORPHAN_MARKER_NAMES, run)
+    dep_names, entry_names = deprecated_marker_names(), module_entry_names()
+    days = _last_change_days(clone_dir, sha, tuple(owner_files) + ORPHAN_MARKER_NAMES
+                             + tuple(dep_names), run)
+    tracked = set(files)
     for f in files:
         folder, _, base = f.rpartition("/")
         if base in owner_files:
@@ -2831,12 +2950,34 @@ def ownership_start_state(clone_dir, from_date, owner_files=None, run=None,
             r["owners"] = got
             if days.get(f):
                 r["owners_since"] = days[f]
+            try:
+                info = module_info_from_json(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                info = {}
+            if info:
+                r["info"] = info
+        elif base in dep_names:
+            r = state.setdefault(folder, {"owners": [], "codeowners": [],
+                                          "orphan_marker": False})
+            r["deprecated"] = True
+            if days.get(f):
+                r["deprecated_since"] = days[f]
+            try:
+                text = marker_text(read_blob(sha, f) or "")
+            except BlobUnreadable:
+                text = ""
+            if text:
+                r["deprecated_text"] = text
         elif base in ORPHAN_MARKER_NAMES:
             r = state.setdefault(folder, {"owners": [], "codeowners": [],
                                           "orphan_marker": False})
             r["orphan_marker"] = True
             if days.get(f):
                 r["marker_since"] = days[f]
+    for folder, r in state.items():
+        # a live module has its entry file; metadata alone is a stub
+        r["entry"] = any((folder + "/" if folder else "") + n in tracked
+                         for n in entry_names)
     folders = {f.rpartition("/")[0] for f in files}
     for path in CODEOWNERS_PATHS:
         if path not in files:
@@ -6259,8 +6400,10 @@ def parse_args(argv):
                         "heads reach) and the comment / parameter walk over the "
                         "most discussed PRs' commits; the window's `pr_history` "
                         "fact then says it was not collected")
-    p.add_argument("--recompute-ownership", action="store_true", default=False,
-                   help="offline: recompute only the `module_ownership` fact of the "
+    p.add_argument("--recompute-ownership", "--recompute-modules",
+                   dest="recompute_ownership", action="store_true", default=False,
+                   help="offline: recompute only the `module_ownership` fact (module "
+                        "ownership, lifecycle and what each module is) of the "
                         "already gathered window --from..--to of --owner/--repo in "
                         "--store, from the clone at --clone-dir (no API call); the "
                         "window's other facts are kept")

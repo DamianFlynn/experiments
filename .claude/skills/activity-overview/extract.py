@@ -1531,6 +1531,11 @@ def _merged_pr_history(conn, project, repo, overlapping, recorded):
 ORPHAN_MARKER_NAMES = ("ORPHANED.md",)
 _OWNED_KINDS = ("owner_added", "adopted")
 _UNOWNED_KINDS = ("owner_needed", "orphaned")
+PARTIAL_START_REASON = (
+    "the window {}..{} was gathered without the tree before it, so the owner files "
+    "at its start were never read: its ownership state is not known (its events "
+    "are; gather.py ... --recompute-ownership with a clone holding that history "
+    "rewrites it)")
 LEGACY_OWNERSHIP_REASON = (
     "the window {}..{} was gathered before ownership could be reconstructed for a "
     "day inside it (no complete start state: only its own end day is known; "
@@ -1596,14 +1601,19 @@ def ownership_state(fact, day):
     an owner on or after the item opened), owners: {module: [login]}}; None
     for a fact without `start_state` (gathered before it was stored)."""
     start = fact.get("start_state")
-    if not isinstance(start, dict):
-        return None
+    if not isinstance(start, dict) or fact.get("start_state_source") not in (None, "complete"):
+        return None         # never read (or read partly): the state is not known
     mods = {m: {"owner_file": r.get("owner_file"),
                 "owners": list(r.get("owners") or []),
                 "codeowners": list(r.get("codeowners") or []),
                 "marker": bool(r.get("orphan_marker")),
                 "marker_since": r.get("marker_since"),
-                "owners_since": r.get("owners_since")}
+                "owners_since": r.get("owners_since"),
+                "entry": r.get("entry") if isinstance(r.get("entry"), bool) else None,
+                "deprecated": bool(r.get("deprecated")),
+                "deprecated_since": r.get("deprecated_since"),
+                "deprecated_text": r.get("deprecated_text"),
+                "info": dict(r.get("info")) if isinstance(r.get("info"), dict) else {}}
             for m, r in start.items() if isinstance(r, dict)}
     # the last ownership change before the window, as the start state dates
     # it (an owner file's last change; a marker's addition)
@@ -1617,7 +1627,9 @@ def ownership_state(fact, day):
     def mod(m):
         return mods.setdefault(m, {"owner_file": None, "owners": [], "codeowners": [],
                                    "marker": False, "marker_since": None,
-                                   "owners_since": None})
+                                   "owners_since": None, "entry": None,
+                                   "deprecated": False, "deprecated_since": None,
+                                   "deprecated_text": None, "info": {}})
     for e in sorted((e for e in fact.get("events") or [] if isinstance(e, dict)),
                     key=ownership_event_order):
         d = str(e.get("date") or "")[:10]
@@ -1628,6 +1640,19 @@ def ownership_state(fact, day):
             continue
         r = mod(m)
         people = [p for p in e.get("people") or [] if isinstance(p, str)]
+        if kind in ("deprecated", "undeprecated"):
+            r.update(deprecated=kind == "deprecated",
+                     deprecated_since=d if kind == "deprecated" else None,
+                     deprecated_text=e.get("marker_text") if kind == "deprecated" else None)
+            continue
+        if kind in ("module_added", "module_removed"):
+            r["entry"] = kind == "module_added"
+            r["removed"] = kind == "module_removed"
+            continue
+        if kind == "module_info_changed":
+            if isinstance(e.get("info"), dict):
+                r["info"] = dict(e["info"])
+            continue
         if via in ORPHAN_MARKER_NAMES:
             if kind == "orphaned":
                 r.update(marker=True, marker_since=d)
@@ -1647,6 +1672,11 @@ def ownership_state(fact, day):
             elif kind == "owner_removed":
                 r["owners"] = [p for p in r["owners"] if p not in people]
                 r["owners_since"] = d
+                if e.get("file_removed") is True:
+                    # the owner file itself was deleted: no owner file to be
+                    # empty (a removed module is never "without an owner")
+                    r["owner_file"] = None
+                    r["owners"] = []
             elif kind == "owner_needed":
                 r["owners"] = []
                 r["owners_since"] = d
@@ -1661,7 +1691,7 @@ def ownership_state(fact, day):
             if r["marker_since"]:
                 row["since"] = r["marker_since"]
             out[m] = row
-        elif r["owner_file"] and not r["owners"]:
+        elif r["owner_file"] and not r["owners"] and not r["codeowners"]:
             row = {"module": m, "marker": r["owner_file"]}
             if r["owners_since"]:
                 row["since"] = r["owners_since"]
@@ -1680,8 +1710,73 @@ def ownership_state(fact, day):
                            "source": it.get("source")})
     owners = {m: sorted(set(r["owners"]) | set(r["codeowners"]))
               for m, r in mods.items() if r["owners"] or r["codeowners"]}
-    return {"without_owner": [out[k] for k in sorted(out, key=lambda m: m or "")],
-            "owners": {m: owners[m] for m in sorted(owners)}}
+    modules = {}
+    for m, r in mods.items():
+        row = {"lifecycle": module_lifecycle(r)}
+        for k in ("display_name", "description", "resource_type", "alternative_names"):
+            if r["info"].get(k):
+                row[k] = r["info"][k]
+        if r["deprecated"]:
+            if r["deprecated_since"]:
+                row["deprecated_since"] = r["deprecated_since"]
+            if r["deprecated_text"]:
+                row["deprecated_text"] = r["deprecated_text"]
+        modules[m] = row
+    rows = []
+    for k in sorted(out, key=lambda m: m or ""):
+        row = dict(out[k])
+        info = modules.get(k) or {"lifecycle": "unknown"}
+        row["lifecycle"] = info["lifecycle"]
+        for f in ("display_name", "description", "resource_type"):
+            if info.get(f):
+                row[f] = info[f]
+        rows.append(row)
+    return {"without_owner": [r for r in rows if r["lifecycle"] in OWNERLESS_LIFECYCLES],
+            "deprecated_modules": [_lifecycle_row(m, modules[m]) for m in sorted(modules)
+                                   if modules[m]["lifecycle"] == "deprecated"],
+            "stub_modules": [_lifecycle_row(m, modules[m]) for m in sorted(modules)
+                             if modules[m]["lifecycle"] == "stub"],
+            "owners": {m: owners[m] for m in sorted(owners)},
+            "modules": {m: modules[m] for m in sorted(modules)}}
+
+
+# A module's lifecycle from the tree: `deprecated` (a deprecation marker),
+# `orphaned` (an orphan marker), `live` (its entry file), `stub` (metadata
+# only, no entry file), `removed` (its entry file removed in the window),
+# `unknown` (a start state read before entry files
+# were recorded). "Without an owner" is about live and orphaned modules
+# (and unknown ones, never hidden).
+MODULE_LIFECYCLES = ("live", "deprecated", "orphaned", "stub", "removed", "unknown")
+OWNERLESS_LIFECYCLES = ("live", "orphaned", "unknown")
+
+
+def module_lifecycle(r):
+    if r.get("removed"):
+        return "removed"
+    if r.get("deprecated"):
+        return "deprecated"
+    if r.get("marker"):
+        return "orphaned"
+    if r.get("entry") is True:
+        return "live"
+    if r.get("entry") is False:
+        return "stub"
+    return "unknown"
+
+
+def _lifecycle_row(m, info):
+    return dict({"module": m}, **info)
+
+
+def ownership_end_fields(end):
+    """The end-state fields a gathered fact stores (validate replays them):
+    without_owner, deprecated_modules, stub_modules, owners_at_end,
+    modules_at_end."""
+    return {"without_owner": end["without_owner"],
+            "deprecated_modules": end["deprecated_modules"],
+            "stub_modules": end["stub_modules"],
+            "owners_at_end": end["owners"],
+            "modules_at_end": end["modules"]}
 
 
 def standing_without_owner(fact, day):
@@ -1758,12 +1853,17 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
     fact = values[k]
     st = ownership_state(fact, end)
     if st is not None:
-        out["without_owner"] = st["without_owner"]
-        out["owners_at_end"] = st["owners"]
+        out.update(ownership_end_fields(st))
+    elif isinstance(fact.get("start_state"), dict):
+        # a start state that was not read completely: never presented as known
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = PARTIAL_START_REASON.format(k[0], k[1])
     elif end == k[1][:10]:
         out["without_owner"] = list(fact.get("without_owner") or [])
-        if isinstance(fact.get("owners_at_end"), dict):
-            out["owners_at_end"] = fact["owners_at_end"]
+        for key in ("owners_at_end", "modules_at_end", "deprecated_modules",
+                    "stub_modules"):
+            if key in fact:
+                out[key] = fact[key]
     else:
         out["without_owner"] = []
         out["without_owner_unavailable"] = LEGACY_OWNERSHIP_REASON.format(k[0], k[1])

@@ -4065,7 +4065,10 @@ def proposed_modules(bundle, pr, instant):
                                    instant):
         for path in c.get("added") or []:
             folder, _, base = path.rpartition("/")
-            if base in _MODULE_ENTRY_FILES and module_kind(folder, [path]) is not None:
+            # a module folder (gather.is_module_folder, the rule the tree's
+            # `module_added` events use): a test asset's main.bicep is not one
+            if base in _MODULE_ENTRY_FILES and gather.is_module_folder(folder) \
+                    and module_kind(folder, [path]) is not None:
                 out.add(folder)
     return sorted(out)
 
@@ -4163,6 +4166,65 @@ def _ownership_event_key(e):
             e.get("kind") or "", e.get("module") or "")
 
 
+LIFECYCLE_EVENT_KINDS = ("deprecated", "undeprecated", "module_added", "module_removed")
+MODULE_INFO_KEYS = ("display_name", "description", "resource_type", "lifecycle")
+
+
+def module_info(bundle, area):
+    """What a module IS, from the tree (the module's metadata file and
+    lifecycle markers, `module_ownership.modules_at_end`, the state at the
+    view's end): {display_name?, description?, resource_type?, lifecycle};
+    {} when not recorded."""
+    row = (((bundle or {}).get("module_ownership") or {}).get("modules_at_end")
+           or {}).get(area)
+    if not isinstance(row, dict):
+        return {}
+    return {k: row[k] for k in MODULE_INFO_KEYS if row.get(k)}
+
+
+def annotate_module_lifecycle(bundle):
+    """THE module lifecycle, from the tree (`module_ownership`: the state at
+    the view's end and the window's lifecycle events — deprecation markers
+    added / removed with their text, entry files added / removed on the
+    mainline). On each `module_changes.modules[]` row: what the module is
+    (module_info: display_name, description, resource_type) as
+    `module_lifecycle` plus those fields, and `lifecycle_events` (the
+    module's events in the view); `module_changes.lifecycle_check` compares
+    the module layer's own `new` / `removed` / `deprecated` statuses with
+    the tree's events: {agree, only_module_layer, only_tree} per status.
+    Nothing without the fact. In place."""
+    mo = bundle.get("module_ownership")
+    mc = bundle.get("module_changes")
+    if not isinstance(mo, dict) or not isinstance(mc, dict):
+        return bundle
+    evs = {}
+    for e in mo.get("events") or []:
+        if isinstance(e, dict) and e.get("kind") in LIFECYCLE_EVENT_KINDS:
+            evs.setdefault(e.get("module"), []).append(
+                {k: e[k] for k in ("kind", "date", "marker_text", "source", "people")
+                 if k in e})
+    for m in mc.get("modules") or []:
+        info = module_info(bundle, m.get("area"))
+        if info.get("lifecycle"):
+            m["module_lifecycle"] = info.pop("lifecycle")
+        m.update(info)
+        if evs.get(m.get("area")):
+            m["lifecycle_events"] = evs[m["area"]]
+    check = {}
+    for status, kinds in (("new", ("module_added",)), ("removed", ("module_removed",)),
+                          ("deprecated", ("deprecated",))):
+        layer = {m.get("area") for m in mc.get("modules") or [] if m.get("status") == status}
+        tree = {mod for mod, rows in evs.items()
+                if any(r["kind"] in kinds for r in rows)}
+        if layer or tree:
+            check[status] = {"agree": sorted(layer & tree),
+                             "only_module_layer": sorted(layer - tree),
+                             "only_tree": sorted(x for x in tree - layer if x)}
+    if check:
+        mc["lifecycle_check"] = check
+    return bundle
+
+
 def annotate_module_ownership(bundle):
     """On a view carrying `module_ownership`: the `owner_response_requested`
     events of the items opened in the window that carry the label (read off
@@ -4194,9 +4256,10 @@ def annotate_module_ownership(bundle):
     for e in events:
         if isinstance(e, dict) and e.get("module") and module_url(bundle, e["module"]):
             e["module_url"] = module_url(bundle, e["module"])
-    for r in mo.get("without_owner") or []:
-        if isinstance(r, dict) and r.get("module") and module_url(bundle, r["module"]):
-            r["module_url"] = module_url(bundle, r["module"])
+    for key in ("without_owner", "deprecated_modules", "stub_modules"):
+        for r in mo.get(key) or []:
+            if isinstance(r, dict) and r.get("module") and module_url(bundle, r["module"]):
+                r["module_url"] = module_url(bundle, r["module"])
     mo["events"] = sorted(events, key=_ownership_event_key)
     return bundle
 
@@ -4248,6 +4311,8 @@ def build_story_list(bundle):
                "title": first.get("title"),
                "modules": mods, "modules_source": source,
                "module_urls": module_urls(bundle, mods),
+               "module_info": {a: module_info(bundle, a) for a in mods
+                               if module_info(bundle, a)},
                "substance": story_substance(bundle, t, instant),
                "status_reason": status_reason(bundle, t, instant),
                "new_module_proposed": sorted({a for p in _train_items(bundle, t)[1]
@@ -6229,6 +6294,7 @@ def _outcome_modules(bundle, train):
             continue
         row = {"area": e.get("area"), "kind": e.get("kind"),
                "status": e.get("status")}
+        row.update(module_info(bundle, e.get("area")))
         if e.get("first_version"):
             row["first_version"] = e["first_version"]
         v = e.get("versions") or {}
@@ -6324,14 +6390,31 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
         mods, msrc = record_modules(bundle, ctx, typ, rec, instant)
         row.update(modules=mods, modules_source=msrc,
                    module_urls=module_urls(bundle, mods))
-        req = owner_response_request(bundle, ctx, typ, rec, instant, rxs) \
-            if rec.get("state") == "open" else None
+        if any(module_info(bundle, a) for a in mods):
+            row["module_info"] = {a: module_info(bundle, a) for a in mods
+                                  if module_info(bundle, a)}
+        if typ == "pr" and rec.get("proposes_new_module"):
+            row["proposes_new_module"] = rec["proposes_new_module"]
+        req = owner_response_request(bundle, ctx, typ, rec, instant, rxs)
         if req:
             w = {"item": req["item"], "module": req["module"], "label": req["via"],
-                 "since": req["date"], "waits_on": "the module owner"}
+                 "since": req["date"]}
+            if rec.get("state") == "open":
+                w["waits_on"] = "the module owner"
+            else:
+                # it waited on them until it closed / merged
+                w["waited_on"] = "the module owner"
+                w["until"] = rec.get("merged_at") or rec.get("closed_at")
             if req.get("owners"):
                 w["owners"] = req["owners"]
+                if req.get("owners_source"):
+                    w["owners_source"] = req["owners_source"]
             waits.append(w)
+            req = req if rec.get("state") == "open" else None
+        owners_of = {a: module_owners(bundle)[a] for a in mods
+                     if module_owners(bundle).get(a)}
+        if owners_of:
+            row["module_owners"] = owners_of      # who "the module's owner" is
         on_items = [it for it in items
                     if (it.get("on") or {}) == {"type": typ, "number": rec.get("number")}
                     and it["kind"] not in ("merged", "closed")
@@ -7201,6 +7284,7 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     build_plumbing_themes(bundle)
     annotate_issue_closing(bundle)
     annotate_module_ownership(bundle)
+    annotate_module_lifecycle(bundle)
     # The people layer: affiliation shares, community counts, newcomers /
     # returning contributors and the hall with what each person's work was
     # about (module layer). Only when the view carries the gathered

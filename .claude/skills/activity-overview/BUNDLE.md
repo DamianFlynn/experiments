@@ -1490,9 +1490,13 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
     `awaiting reporter`. `state` / `with` say who; `derived` is always true;
   - `waiting_on` (only when any) — open linked items that the PR author's latest message
     names (`{number, type, state, title, named_in}`);
-  - `owner_response_requested` (only when any) — the open items carrying the
-    owner-response label: **waits on the module owner** `[{item {type, number, url},
-    module, label, since, waits_on: "the module owner", owners?}]`;
+  - `owner_response_requested` (only when any) — the items carrying the owner-response
+    label: an open one **waits on the module owner** `[{item {type, number, url}, module,
+    label, since, waits_on: "the module owner", owners?, owners_source?}]`, a closed /
+    merged one **waited on them** (`waited_on`, `until`: its merge / close time); `owners`
+    are those an automation comment named, else the module's owners at the view's end
+    (`owners_source: "owner_file"`). Outcome items add `module_owners` `{module: [login]}`
+    (who "the module's owner" is), `module_info` and, for a PR, `proposes_new_module`;
   - every item row carries `modules`, `modules_source` and `module_urls`
     (`link.record_modules`: as `stories.all`, per item);
   - `released` (a shipped train) — as `stories.all[].released`;
@@ -1817,6 +1821,41 @@ window's events up to the day, in recorded order, plus its labelled items open o
 changed), or named by an open owner-needed / orphaned item unless its latest change by
 the day (or before the window, as `start_state` dates it) gave it an owner on or after
 the item opened; `owners` `{module: [login]}` (owner file and CODEOWNERS individuals).
+
+**Module lifecycle and what a module is** (the same fact, the same replay). A module
+folder's lifecycle comes from the tree (`extract.module_lifecycle`): `deprecated` (a
+deprecation marker, `ACTIVITY_DEPRECATED_FILES`, default `DEPRECATED.md`), `orphaned` (an
+orphan marker), `live` (its entry file, `ACTIVITY_ENTRY_FILES`, default `main.bicep` /
+`main.tf`), `stub` (its metadata file only: reserved, not yet published or removed), `removed`
+(its entry file deleted in the window), or `unknown` (a start state read before entry
+files were recorded). Deleting a populated owner file is `owner_removed` with
+`file_removed: true` — the file (often the module) is gone, not an owner list emptied —
+so a removed module is never "without an owner". Provenance is honoured: a fact whose
+`start_state_source` is not `complete` (no tree before the window was read) has NO known
+ownership state — gather stores `without_owner: []` with `without_owner_unavailable`, and
+a view of it says so; its events are still reported. `start_state` rows add
+`entry`, `deprecated`, `deprecated_since`, `deprecated_text` (the marker's first lines,
+verbatim: it usually names the replacement) and `info` — what the module's metadata
+(owner) file says it is: `display_name` (`moduleDisplayName`), `description`
+(`moduleDescription`), `resource_type` (`canonicalType`), `alternative_names`. Lifecycle
+events in the window: `deprecated` (with `marker_text`), `undeprecated`, `module_added`
+/ `module_removed` (an entry file added / removed on the mainline under a module folder —
+the authoritative "new module"), `module_info_changed` (with the metadata's new `info`).
+The standing lists split by lifecycle: `without_owner` holds live, orphaned (and unknown)
+modules only — each row with `lifecycle` and `display_name` / `description` /
+`resource_type`; `deprecated_modules` and `stub_modules` list the others
+`[{module, lifecycle, display_name?, ..., deprecated_since?, deprecated_text?}]`;
+`modules_at_end` `{module: {lifecycle, display_name?, description?, resource_type?,
+alternative_names?, ...}}`. ONE source of module lifecycle: this tree-derived state and
+its events. `module_changes.modules[]` rows take `module_lifecycle`, `display_name`,
+`description`, `resource_type` and `lifecycle_events` from it, and
+`module_changes.lifecycle_check` `{new | removed | deprecated: {agree, only_module_layer,
+only_tree}}` cross-checks the module layer's own window statuses against the tree's
+events. `stories.all[]` rows add `module_info` `{area: {display_name?, description?,
+resource_type?, lifecycle}}`, and slice outcome items and `outcome.modules[]` rows carry
+the same. Refresh offline from a clone (`--recompute-modules` is the same flag as
+`--recompute-ownership`): `python3 gather.py --owner O --repo R --from F --to T --store S
+--clone-dir C --recompute-modules`.
 
 **Views.** A view that is not exactly one gathered window reads its state from the ONE
 stored window covering its END day (`extract.covering_window`: the one gathered latest,

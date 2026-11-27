@@ -30,7 +30,45 @@ def meta(owners):
     return json.dumps({"moduleDisplayName": "X", "owners": owners})
 
 
+def implied_start_state(events, blobs, end_files=(), start_files=None):
+    """The COMPLETE start state a test's history implies (what gather reads
+    from the tree before the window): the orphan markers tracked then
+    (`start_files`, else the end files' markers minus those the window
+    added, plus those it removed) and every owner file the window changes,
+    with its owners before its first change. Nothing else existed."""
+    def folder(p):
+        return p.rsplit("/", 1)[0] if "/" in p else ""
+    if start_files is not None:
+        markers = {folder(f) for f in start_files if f.endswith("/ORPHANED.md")}
+    else:
+        markers = {folder(f) for f in end_files if f.endswith("/ORPHANED.md")}
+        for e in events:
+            if e.get("path", "").endswith("/ORPHANED.md"):
+                (markers.discard if e["change"] == "add" else markers.add)(
+                    folder(e["path"]))
+    state = {m: {"owners": [], "codeowners": [], "orphan_marker": True} for m in markers}
+    for e in sorted(events, key=lambda e: (e.get("date") or "", e.get("commit") or "")):
+        p = e.get("path", "")
+        if not p.endswith("/metadata.json") or folder(p) in state \
+                and state[folder(p)].get("owner_file"):
+            continue
+        if e.get("change") == "add":
+            continue
+        try:
+            before = json.loads(blobs.get((e["commit"] + "^", p)) or "null")
+        except (TypeError, ValueError):
+            continue                  # unreadable / not JSON: not known
+        if isinstance(before, dict) and isinstance(before.get("owners"), list):
+            r = state.setdefault(folder(p), {"owners": [], "codeowners": [],
+                                             "orphan_marker": False})
+            r.update(owner_file="metadata.json", owners=list(before["owners"]))
+    return state
+
+
 def collect(events, blobs, prs=(), issues=(), end_files=(), **kw):
+    if "start_state" not in kw:
+        kw["start_state"] = implied_start_state(events, blobs, end_files,
+                                                kw.pop("start_files", None))
     return gather.collect_module_ownership(
         events, [{"sha": S1, "pr": 7471}], list(prs), list(issues), Blobs(blobs),
         list(end_files), "2026-10-01", "2026-10-31", web="https://github.com/o/r", **kw)

@@ -1534,9 +1534,11 @@ _OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns"
                         "owner_files", "unread", "windows", "start_without_owner",
                         "labelled_items", "without_owner_unavailable",
                         "owners_at_end", "gathered_at", "start_state",
-                        "start_state_source", "end_check", "window", "as_of_window"}
+                        "start_state_source", "end_check", "window", "as_of_window",
+                        "marker_files", "entry_files", "deprecated_modules",
+                        "stub_modules", "modules_at_end"}
 _OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "at", "seq", "source",
-                         "quote", "via"}
+                         "quote", "via", "marker_text", "info", "file_removed"}
 
 
 # --- typed shapes of the fields readers touch ---------------------------------
@@ -1615,10 +1617,21 @@ PR_HISTORY_ADDED_SHAPE = ("obj", {"prs": (("list", ("obj", {
                                        "sha": (_SN, False), "subject": (_SN, False),
                                        "files": (_IN, False)})),
                                        False)})), False)})), False)})
+MODULE_INFO_SHAPE = ("obj", {"display_name": (_S, False), "description": (_S, False),
+                             "resource_type": (_S, False),
+                             "alternative_names": (("list", _S), False)})
 OWNERSHIP_STATE_SHAPE = ("map", ("obj", {
     "owner_file": (_SN, False), "owners": (("list", _S), False),
     "codeowners": (("list", _S), False), "orphan_marker": ("bool", False),
-    "marker_since": (_SN, False), "owners_since": (_SN, False)}))
+    "marker_since": (_SN, False), "owners_since": (_SN, False),
+    "entry": ("bool", False), "deprecated": ("bool", False),
+    "deprecated_since": (_SN, False), "deprecated_text": (_SN, False),
+    "info": (MODULE_INFO_SHAPE, False)}))
+LIFECYCLE_ROW_SHAPE = ("obj", {"module": (_S, True), "lifecycle": (_S, True),
+                               "display_name": (_S, False), "description": (_S, False),
+                               "resource_type": (_S, False),
+                               "deprecated_since": (_S, False),
+                               "deprecated_text": (_S, False)})
 
 
 _STR, _NONE = (str,), (type(None),)
@@ -1632,6 +1645,8 @@ _INT = (int,)
 # of strings (sorted); seq an integer (never a boolean).
 _OWNERSHIP_ROW_TYPES = {
     "events": {"kind": (_STR, True), "module": (_STR + _NONE, False),
+               "marker_text": (_STR, False), "info": ("info", False),
+               "file_removed": ("bool", False),
                "people": ("list_of_str", False), "date": (_STR, True),
                "at": (_STR + _NONE, False), "seq": ("int", False),
                "source": ("source", False), "via": (_STR + _NONE, False),
@@ -1651,10 +1666,14 @@ _OWNERSHIP_SOURCE_TYPES = {"type": _STR, "sha": _STR + _NONE, "number": _INT + _
 
 
 def _typed_ok(v, types):
+    if types == "bool":
+        return isinstance(v, bool)
     if types == "int":
         return isinstance(v, int) and not isinstance(v, bool)
     if types == "list_of_str":
         return isinstance(v, list) and all(isinstance(x, str) for x in v)
+    if types == "info":
+        return _typed(v, MODULE_INFO_SHAPE)
     if types == "source":
         return isinstance(v, dict) and all(
             k not in v or (isinstance(v[k], t) and not isinstance(v[k], bool))
@@ -1705,6 +1724,14 @@ def _module_ownership_problem(value):
     if files is not None and not (isinstance(files, list)
                                   and all(isinstance(x, str) for x in files)):
         return "module_ownership owner_files is not a list of names"
+    for key in ("deprecated_modules", "stub_modules"):
+        if key in value and not _typed(value[key], ("list", LIFECYCLE_ROW_SHAPE)):
+            return "module_ownership {} has a row gather does not write".format(key)
+    for key, spec in (("modules_at_end", ("map", ("obj", {"lifecycle": (_S, True)}))),
+                      ("marker_files", ("map", ("list", _S))),
+                      ("entry_files", ("list", _S))):
+        if key in value and not _typed(value[key], spec):
+            return "module_ownership {} is not what gather writes".format(key)
     if "start_state" in value and not _typed(value["start_state"], OWNERSHIP_STATE_SHAPE):
         return "module_ownership start_state is not {module: {owners, codeowners, " \
             "orphan_marker, ...}}"
@@ -1721,11 +1748,10 @@ def _module_ownership_problem(value):
             end = extract.ownership_state(value, win["to"][:10])
         except Exception:                  # noqa: BLE001 - reported, not raised
             return "module_ownership cannot be replayed"
-        if end is not None and (
-                json.dumps(end["without_owner"], sort_keys=True)
-                != json.dumps(value.get("without_owner"), sort_keys=True)
-                or ("owners_at_end" in value and json.dumps(end["owners"], sort_keys=True)
-                    != json.dumps(value["owners_at_end"], sort_keys=True))):
+        if end is not None and any(
+                key in value and json.dumps(v, sort_keys=True)
+                != json.dumps(value[key], sort_keys=True)
+                for key, v in extract.ownership_end_fields(end).items()):
             return "module_ownership end state does not match the replay of its " \
                 "start state and events"
     return None

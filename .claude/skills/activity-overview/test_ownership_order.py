@@ -18,9 +18,11 @@ P = "avm/res/x/y/metadata.json"
 
 
 def ownership(code_events, commits, blobs, frm="2026-10-01", to="2026-10-31"):
+    from test_module_ownership import implied_start_state
     return gather.collect_module_ownership(
         code_events, commits, [], [], Blobs(blobs), [], frm, to,
-        web="https://github.com/o/r", start_files=[])
+        web="https://github.com/o/r",
+        start_state=implied_start_state(code_events, blobs, start_files=[]))
 
 
 class TestA_SameDayOrder(unittest.TestCase):

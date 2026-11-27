@@ -148,7 +148,9 @@ class TestRecompute(unittest.TestCase):
         before = graphstore.get_window_facts(conn, "o", "r", "2026-10-01", "2026-10-31")
         fact = gather.recompute_module_ownership(
             conn, "o", "r", "2026-10-01", "2026-10-31", "/nonexistent",
-            read_blob=Blobs({}), end_files=["avm/res/a/b/ORPHANED.md"])
+            read_blob=Blobs({}), end_files=["avm/res/a/b/ORPHANED.md"],
+            start_state={"avm/res/a/b": {"owners": [], "codeowners": [],
+                                         "orphan_marker": True}})
         after = graphstore.get_window_facts(conn, "o", "r", "2026-10-01", "2026-10-31")
         self.assertEqual(after["facts"]["module_ownership"], fact)
         self.assertEqual([w["module"] for w in fact["without_owner"]], ["avm/res/a/b"])
