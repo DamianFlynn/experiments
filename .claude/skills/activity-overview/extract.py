@@ -1505,7 +1505,10 @@ def _merged_affiliations(conn, project, repo, overlapping, recorded, ts_from,
     gathered window overlapping it that collected one (by end day, then
     start day); `unknown` / `not_checked` are recomputed over the merged
     people (a person not checked in one window but decided in another is
-    decided). Returns {"collected": True, "home_orgs", "home_names",
+    decided). A label is relative to the home settings of its window: one
+    from a window whose settings differ from the latest window's is not
+    carried over (the person is unknown / not_checked, keeping the name and
+    the maintainer property; an operator override is kept). Returns {"collected": True, "home_orgs", "home_names",
     "home_email_domains" (the latest window's), "people", "unknown",
     "not_checked", "windows": [{from, to}], "covers_view"} or None when no
     overlapping window collected affiliations."""
@@ -1518,13 +1521,28 @@ def _merged_affiliations(conn, project, repo, overlapping, recorded, ts_from,
             values[k] = value
     if not values:
         return None
+    def home(v):
+        return tuple(sorted({str(x).lower() for x in v.get(key) or []})
+                     for key in ("home_orgs", "home_names", "home_email_domains"))
     people, not_checked, latest = {}, set(), None
-    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
+    order = sorted(values, key=lambda k: (k[1][:10], k[0][:10], k))
+    current = home(values[order[-1]])      # the settings the view reports
+    for k in order:
         v = values[k]                      # later windows replace earlier ones
         latest = v
+        foreign = home(v) != current
         for login, e in (v.get("people") or {}).items():
-            if isinstance(e, dict):
-                people[login] = e
+            if not isinstance(e, dict):
+                continue
+            if foreign and e.get("signal") not in ("override", "do_not_name",
+                                                   "not_checked"):
+                # decided against other home settings: the label does not
+                # carry over; the name and maintainer property do
+                e = dict({x: e[x] for x in ("name", "maintainer",
+                                            "maintainer_signal") if x in e},
+                         affiliation="unknown", signal="not_checked")
+                not_checked.add(login)
+            people[login] = e
         not_checked |= set(v.get("not_checked") or [])
     # a registry window lists its unchecked people in `people` too (signal
     # not_checked): only a later deciding entry takes them off the list

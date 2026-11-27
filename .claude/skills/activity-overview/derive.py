@@ -1197,11 +1197,12 @@ def person_labels(profile):
 
 def affiliation_rank(profile):
     """Sort key of a person record's affiliation: lower is more decisive;
-    a known label before `unknown`. Pure."""
+    the operator's override first (also an explicit `unknown`), then a
+    known label before `unknown`. Pure."""
     sig = profile.get("affiliation_signal")
     order = AFFILIATION_SIGNAL_ORDER.index(sig) \
         if sig in AFFILIATION_SIGNAL_ORDER else len(AFFILIATION_SIGNAL_ORDER)
-    return (profile.get("affiliation") == "unknown", order)
+    return (sig != "override", profile.get("affiliation") == "unknown", order)
 
 
 def hall_score(profile):

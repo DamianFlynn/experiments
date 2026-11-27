@@ -337,6 +337,63 @@ class TestRollUps(unittest.TestCase):
         self.assertNotIn("lou", roll["not_checked"])     # decided later
         self.assertEqual(roll["people"]["lou"]["affiliation"], "community")
 
+    def test_label_from_other_home_settings_is_not_carried_over(self):
+        """A label decided against a window's home settings must not appear
+        under the latest window's different settings in a roll-up."""
+        sep = self.affiliations(
+            {"pat": {"affiliation": "maintainer_org", "signal": "public_membership",
+                     "name": "Pat P", "maintainer": True,
+                     "maintainer_signal": "merged_others_pr"},
+             "ops": {"affiliation": "community", "signal": "override"},
+             "lou": {"affiliation": "maintainer_org", "signal": "public_membership"}})
+        sep["home_orgs"] = ["o", "bigco"]
+        octo = self.affiliations(
+            {"lou": {"affiliation": "community", "signal": "profile_company",
+                     "strength": "weak"}})
+        octo["home_orgs"] = ["o", "otherco"]
+        fold_into(self.store,
+                  _month("2026-09-01", "2026-09-30", affiliations=sep),
+                  _month("2026-10-01", "2026-10-31", affiliations=octo))
+        aff = _view(self.store, "2026-09-01", "2026-10-31")["affiliations"]
+        self.assertEqual(aff["home_orgs"], ["o", "otherco"])
+        self.assertEqual(aff["people"]["pat"],
+                         {"affiliation": "unknown", "signal": "not_checked",
+                          "name": "Pat P", "maintainer": True,
+                          "maintainer_signal": "merged_others_pr"})
+        self.assertIn("pat", aff["not_checked"])
+        self.assertIn("pat", aff["unknown"])
+        self.assertEqual(aff["people"]["ops"]["affiliation"], "community")
+        self.assertEqual(aff["people"]["lou"]["affiliation"], "community")
+        self.assertNotIn("lou", aff["not_checked"])
+
+    def test_same_home_settings_in_another_order_carry_over(self):
+        sep = self.affiliations(
+            {"pat": {"affiliation": "maintainer_org", "signal": "public_membership"}})
+        sep["home_orgs"] = ["O", "bigco"]
+        octo = self.affiliations({})
+        octo["home_orgs"] = ["bigco", "o"]
+        fold_into(self.store,
+                  _month("2026-09-01", "2026-09-30", affiliations=sep),
+                  _month("2026-10-01", "2026-10-31", affiliations=octo))
+        aff = _view(self.store, "2026-09-01", "2026-10-31")["affiliations"]
+        self.assertEqual(aff["people"]["pat"]["affiliation"], "maintainer_org")
+
+
+class TestOperatorUnknownWinsInProjectMerge(unittest.TestCase):
+    """An operator's explicit `unknown` is not undone by another member's
+    automatically derived label."""
+
+    def test_override_unknown_in_either_member_order(self):
+        op = {"affiliation": "unknown", "affiliation_signal": "override"}
+        auto = {"affiliation": "maintainer_org",
+                "affiliation_signal": "public_membership"}
+        for first, second in ((op, auto), (auto, op)):
+            members = [{"repo": r, "bundle": {"people": {"x": dict(p)}, "prs": []}}
+                       for r, p in (("o/a", first), ("o/b", second))]
+            got = digest._merge_people(members)["x"]
+            self.assertEqual((got["affiliation"], got["affiliation_signal"]),
+                             ("unknown", "override"))
+
 
 if __name__ == "__main__":
     unittest.main()
