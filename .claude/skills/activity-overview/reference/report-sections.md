@@ -360,14 +360,15 @@ notable discussion: <ids>"*. No story train → no stories, and nothing is said.
    The rules that refuse a statement of not-knowing — each scoped to the items the
    sentence names (`#N` or a link), refusing only when coverage of every one of them is
    complete — an item the slice holds no coverage for (a linked issue / PR outside the
-   train) is never covered, so a claim naming it always passes; a sentence naming none is
+   train, or any issue / PR of another repository — a link or `owner/repo#N`) is never
+   covered, so a claim naming it always passes; a sentence naming none is
    refused only when every PR of the slice is covered. The checker never forces a story
    to hide a real coverage limit (the full matrix is pinned in
    `test_story_check_truth_table.py`):
 
    | Rule | Refuses a sentence saying … is not in the record | Only when, for each item named |
    |---|---|---|
-   | `checks_said_unknown` | CI / checks / check results of a PR | its outcome `checks` are gathered with a result (`passing`, `failing`, `pending`, `none`; not `incomplete` / `unavailable`); for a sentence about earlier commits, pushes or runs, also every commit of the PR read (`commits_covered` = `commits_total`) with a complete result each (no `commits_incomplete`) |
+   | `checks_said_unknown` | CI / checks / check results of a PR | its outcome `checks` are gathered with a result (`passing`, `failing`, `pending`, `none`; not `incomplete` / `unavailable`); for a sentence about earlier commits, pushes or runs, or about commits a force-push replaced, also every commit of the PR read (`commits_covered` = `commits_total`) with a complete result each (no `commits_incomplete`) and no force-push recorded on the PR (the replaced commits' checks are never read, so such a history claim is never refused) |
    | `resolved_said_unknown` | whether a PR's review threads were resolved | every review thread of the PR in the ledger carries `resolved_on_github`, `thread_coverage` shows none omitted by gather, and the ledger cap hid none (a PR with no ledger entry is never covered) |
 
    No rule refuses a statement that commit evidence is missing (`evidence_omitted`,

@@ -4822,6 +4822,15 @@ _RESOLVED_WORD_RE = re.compile(r"\bresolved\b", re.I)
 # Roll-ups that state a result: `incomplete` / `unavailable` do not, so a
 # story may call those checks unknown.
 _CHECKS_KNOWN = ("passing", "failing", "pending", "none")
+# A sentence about commits a force-push replaced (history, not the head).
+_REPLACED_RE = re.compile(r"\b(?:force[- ]?push(?:ed|es)?|replaced|rewritten)\b",
+                          re.I)
+# Another repository's issue / PR: a github.com link outside the slice's
+# repository, or `owner/repo#N`; marked in the normalised sentence.
+_FOREIGN_ITEM_URL_RE = re.compile(
+    r"https://github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/\d+")
+_FOREIGN_SHORT_REF_RE = re.compile(r"(?<![\w/.])[\w.-]+/[\w.-]+#\d+\b")
+_FOREIGN_ITEM = "\x00foreign-item\x00"
 # A sentence about a PR's earlier commits / pushes (not its head).
 _EARLIER_COMMITS_RE = re.compile(
     r"\b(?:earl(?:y|ier|iest)|older|first|initial|previous|prior|preceding)\b"
@@ -4845,8 +4854,12 @@ def check_story_record_claims(slice_obj, text):
     `commits_incomplete`), not only its head. A sentence naming several items is
     refused only when all of them are covered (a linked item outside the
     outcome has no coverage, so a claim naming it passes); a general claim only when
-    every PR of the slice is. A true statement of a coverage limit always
-    passes. Pure."""
+    every PR of the slice is. An item of another repository (a link
+    outside the slice's repository, `owner/repo#N`) is never covered. A PR
+    with a recorded force-push never has covered history (the replaced
+    commits' checks were not read), so no claim about its earlier or
+    replaced commits is refused; a claim about its head still is. A true
+    statement of a coverage limit always passes. Pure."""
     conv = slice_obj.get("conversation") or {}
     oc = conv.get("outcome") or {}
     prs = [r.get("number") for r in oc.get("items") or [] if r.get("type") == "pr"]
@@ -4861,6 +4874,12 @@ def check_story_record_claims(slice_obj, text):
                             and r["checks"]["commits_total"]
                             > (r["checks"].get("commits_covered") or 0))
                    and not r["checks"].get("commits_incomplete")}
+    # a recorded force-push replaced commits whose checks were never read:
+    # such a PR's history is never covered, whatever its current commits
+    forced = {(it.get("on") or {}).get("number")
+              for it in conv.get("timeline") or []
+              if it.get("kind") == "head_ref_force_pushed"}
+    all_commits -= forced
     threads = {}
     for t in conv.get("threads") or []:
         if t.get("kind") == "review_thread":
@@ -4877,9 +4896,17 @@ def check_story_record_claims(slice_obj, text):
         if base else None
 
     def as_numbers(m):
+        """A link to the repository's item reads as `#N`; a link to another
+        repository's issue / PR as an item the slice never covers; any
+        other URL as blank."""
         hit = item_link.match(m.group(0)) if item_link else None
-        return " #{} ".format(hit.group(1)) if hit else " "
-    sentences = [_URL_IN_TEXT_RE.sub(as_numbers, x).strip()
+        if hit:
+            return " #{} ".format(hit.group(1))
+        if _FOREIGN_ITEM_URL_RE.match(m.group(0)):
+            return " " + _FOREIGN_ITEM + " "
+        return " "
+    sentences = [_FOREIGN_SHORT_REF_RE.sub(" " + _FOREIGN_ITEM + " ",
+                                           _URL_IN_TEXT_RE.sub(as_numbers, x)).strip()
                  for x in re.split(r"(?<=[.;!?])\s+|\n+", text or "") if x.strip()]
 
     def covered(sent, have, scope):
@@ -4891,6 +4918,8 @@ def check_story_record_claims(slice_obj, text):
         # every reference counts: a linked item outside the outcome has no
         # coverage in the slice, so a claim naming it is never refused
         named = [int(n) for n in re.findall(r"(?<![\w/.&])#(\d+)\b", sent)]
+        if _FOREIGN_ITEM in sent:
+            return False        # another repository's item: never covered
         return bool(named or scope) and all(n in have for n in named or scope)
     out = {"checks_said_unknown": [], "resolved_said_unknown": []}
     for sent in sentences:
@@ -4898,7 +4927,8 @@ def check_story_record_claims(slice_obj, text):
             continue
         # a claim about earlier commits needs every commit covered; one
         # about the checks (the head) needs the head's result
-        have = all_commits if _EARLIER_COMMITS_RE.search(sent) else known
+        have = all_commits if (_EARLIER_COMMITS_RE.search(sent)
+                               or _REPLACED_RE.search(sent)) else known
         if _CHECKS_WORD_RE.search(sent) and covered(sent, have, prs):
             out["checks_said_unknown"].append(sent)
         if _RESOLVED_WORD_RE.search(sent) and covered(sent, resolved, prs):
