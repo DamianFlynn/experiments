@@ -1561,6 +1561,43 @@ def _replay_ownership(events, after, until, markers, emptied, state):
             state[module] = ("unowned", d)
 
 
+def ownership_event_identity(e):
+    """What makes two stored ownership events the same change, whichever
+    window stored it: kind, module, people, the source commit / item, the
+    time and the marker / label (`via`) — never the window-local `seq`
+    (each gathered window numbers its own events from zero)."""
+    src = e.get("source") or {}
+    return json.dumps([e.get("kind"), e.get("module"), sorted(e.get("people") or []),
+                       src.get("type"), src.get("sha") or src.get("number"),
+                       e.get("at") or "", (e.get("date") or "")[:10], e.get("via")],
+                      sort_keys=True, default=str)
+
+
+def _merged_event_order(e):
+    src = e.get("source") or {}
+    return ((e.get("date") or "")[:10], e.get("at") or "", e.get("kind") or "",
+            e.get("module") or "", str(src.get("sha") or src.get("number") or ""))
+
+
+def merge_ownership_events(facts):
+    """The events of several windows' facts, each change once
+    (ownership_event_identity), in replay order — day, time, kind (one
+    change's own events), module — with `seq` renumbered over the merged
+    list when the events carry one."""
+    seen, out = set(), []
+    for f in facts:
+        for e in f.get("events") or []:
+            key = ownership_event_identity(e)
+            if key not in seen:
+                seen.add(key)
+                out.append(dict(e))
+    out.sort(key=_merged_event_order)
+    if any("seq" in e for e in out):
+        for i, e in enumerate(out):
+            e["seq"] = i
+    return out
+
+
 def carried_ownership(facts, before):
     """The commit-derived ownership state standing at the start of the
     day `before`, from the facts of EARLIER windows ([(window key, fact)],
@@ -1568,11 +1605,10 @@ def carried_ownership(facts, before):
     standing_without_owner's `carried` (an owner list emptied in an
     earlier window and not refilled stays emptied; a window's own start
     snapshot holds only the orphan markers)."""
-    emptied, state = {}, {}
-    for _k, f in sorted(facts, key=lambda kf: (kf[0][1][:10], kf[0][0][:10], kf[0])):
-        _replay_ownership(f.get("events") or [], None, _day_before(before), None,
-                          emptied, state)
-    return {"emptied": emptied, "state": state}
+    emptied, state, markers = {}, {}, {}
+    events = merge_ownership_events([f for _k, f in facts])
+    _replay_ownership(events, None, _day_before(before), markers, emptied, state)
+    return {"emptied": emptied, "state": state, "markers": markers}
 
 
 def _day_before(day):
@@ -1597,6 +1633,11 @@ def standing_without_owner(fact, day, carried=None):
     if "start_without_owner" not in fact or "labelled_items" not in fact:
         return None
     markers = {r["module"]: dict(r) for r in fact.get("start_without_owner") or []}
+    for m, r in markers.items():
+        # when an earlier window saw the marker added: since that day
+        since = (((carried or {}).get("markers") or {}).get(m) or {}).get("since")
+        if since and "since" not in r:
+            r["since"] = since
     emptied = dict((carried or {}).get("emptied") or {})
     state = dict((carried or {}).get("state") or {})
     _replay_ownership(fact.get("events") or [], None, day, markers, emptied, state)
@@ -1630,19 +1671,29 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
             values[k] = value
     if not values:
         return None
-    events, seen, latest = [], set(), None
-    for k in sorted(values, key=lambda k: (k[1][:10], k[0][:10], k)):
-        latest = values[k]
-        for e in latest.get("events") or []:
-            d = (e.get("date") or "")[:10]
-            if (ts_from and d and d < ts_from[:10]) or (ts_to and d and d > ts_to[:10]):
-                continue
-            key = json.dumps(e, sort_keys=True)
-            if key not in seen:
-                seen.add(key)
-                events.append(e)
-    out = dict(latest, events=sorted(events, key=ownership_event_order),
-        windows=[{"from": k[0], "to": k[1]} for k in sorted(values)])
+    ordered = sorted(values, key=lambda k: (k[1][:10], k[0][:10], k))
+    latest = values[ordered[-1]]
+    events = [e for e in merge_ownership_events([values[k] for k in ordered])
+              if not ((ts_from and (e.get("date") or "")[:10]
+                       and (e.get("date") or "")[:10] < ts_from[:10])
+                      or (ts_to and (e.get("date") or "")[:10]
+                          and (e.get("date") or "")[:10] > ts_to[:10]))]
+    if any("seq" in e for e in events):
+        for i, e in enumerate(events):
+            e["seq"] = i
+    out = dict(latest, events=events,
+               windows=[{"from": k[0], "to": k[1]} for k in sorted(values)])
+    # what could not be read, from every contributing window (each once)
+    unread, seen_u = [], set()
+    for k in ordered:
+        for u in values[k].get("unread") or []:
+            key = json.dumps(u, sort_keys=True)
+            if key not in seen_u:
+                seen_u.add(key)
+                unread.append(u)
+    out.pop("unread", None)
+    if unread:
+        out["unread"] = unread
     # the standing list as of the VIEW's end: reconstructed from the window
     # that contains that day (a week inside a gathered month), the latest
     # window that collected ownership even when it found nothing (an empty
@@ -1654,7 +1705,10 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
         max(values, key=lambda k: (k[1][:10], k[0][:10], k))
     fact = values[k]
     day = end if holder else k[1][:10]
-    earlier = [(w, f) for w, f in values.items() if w[1][:10] < k[0][:10]]
+    # the opening state of the selected window: every contributing window's
+    # commit events before its start (an overlapping window's too: its own
+    # start snapshot holds only the orphan markers), each change once
+    earlier = [(w, f) for w, f in values.items() if w != k and w[0][:10] < k[0][:10]]
     standing = standing_without_owner(
         fact, day, carried_ownership(earlier, k[0][:10]) if earlier else None)
     for key in ("start_without_owner", "labelled_items", "without_owner_unavailable"):

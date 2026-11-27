@@ -1422,7 +1422,7 @@ _PR_ACTIVITY_ROW_KEYS = {"number", "checks_status", "checks_reason", "head",
                          "commits_total", "commits", "threads_total", "threads",
                          "threads_omitted", "events", "events_omitted",
                          "gathered_at", "history_status", "history_reason",
-                         "head_repo", "is_fork"}
+                         "head_repo", "is_fork", "body_edited_at"}
 _PR_ACTIVITY_COMMIT_KEYS = {"sha", "committed_at", "rollup", "state", "checks",
                             "checks_omitted", "state_only"}
 _PR_ACTIVITY_CHECK_KEYS = {"name", "kind", "status", "conclusion", "started_at",
@@ -1547,6 +1547,15 @@ def _module_ownership_problem(value):
     for key in ("start_without_owner", "labelled_items"):
         if key in value and not _list_of_objects(value[key]):
             return "module_ownership {} is not a list of objects".format(key)
+    # the keys extract.standing_without_owner indexes
+    for r in value.get("start_without_owner") or []:
+        if not isinstance(r.get("module"), str):
+            return "module_ownership start_without_owner has a row without a module"
+    for r in value.get("labelled_items") or []:
+        if not isinstance(r.get("opened"), str) or \
+                not isinstance(r.get("closed", ""), (str, type(None))) or \
+                not isinstance(r.get("module", ""), (str, type(None))):
+            return "module_ownership labelled_items has a row gather does not write"
     for e in value["events"]:
         if not set(e) <= _OWNERSHIP_EVENT_KEYS or \
                 e.get("kind") not in gather.OWNERSHIP_EVENT_KINDS or \

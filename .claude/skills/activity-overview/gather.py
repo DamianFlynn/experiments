@@ -2805,7 +2805,7 @@ PR_HISTORY_PATCH_PATHSPECS = ("*CHANGELOG.md", ".github/", "utilities/",
 # Lines kept per file per commit (added + removed; `lines_omitted` the rest),
 # characters per line, and characters per PR (the newest excerpts are kept,
 # `patches_omitted` counts the oldest left out).
-PR_HISTORY_PATCH_LINES = 40
+PR_HISTORY_PATCH_LINES = 400
 PR_HISTORY_PATCH_LINE_CAP = 500
 PR_HISTORY_PATCH_CHARS = 200000
 # A git trailer line: a hyphenated token (`Co-authored-by`, `Signed-off-by`,
@@ -2848,13 +2848,19 @@ def pr_commit_body(text):
     return body[:PR_HISTORY_BODY_CAP], len(body)
 
 
+_NAME_STATUS_RE = re.compile(r"^([ACDMRTUXB])\d*\t(.+)$")
+
+
 def parse_pr_commits(raw):
-    """A `git log --format=PR_COMMIT_FORMAT --name-only` listing -> commits
+    """A `git log --format=PR_COMMIT_FORMAT --name-status` (or
+    `--name-only`) listing -> commits
     [{sha, parents, author, authored_at, committed_at, subject, files,
-    [paths], [paths_omitted], [body], [body_truncated_from]}] in the
+    [paths], [paths_omitted], [added], [body], [body_truncated_from]}] in the
     listing's order. `parents` is a count (2 for a merge), `files` the
     number of paths the commit changed (a merge lists none), `paths` those
-    paths (at most PR_HISTORY_PATHS_MAX), `body` the message body
+    paths (at most PR_HISTORY_PATHS_MAX), `added` the paths the commit
+    added (a `--name-status` listing only: a new module's entry file is
+    how a proposed module is recognised), `body` the message body
     (pr_commit_body); both omitted when empty. A listing in the older
     format (no body, no closing separator) still parses, without `paths`
     and `body`. Pure."""
@@ -2866,14 +2872,25 @@ def parse_pr_commits(raw):
             fields = head.split(FIELD_SEP, 6)
             if len(fields) < 7:
                 continue
-            paths = [ln.strip("\r") for ln in names.split("\n") if ln.strip()]
+            paths, added = [], []
+            for ln in names.split("\n"):
+                ln = ln.strip("\r")
+                if not ln.strip():
+                    continue
+                m = _NAME_STATUS_RE.match(ln)
+                if m:
+                    paths.append(m.group(2))
+                    if m.group(1) == "A":
+                        added.append(m.group(2))
+                else:
+                    paths.append(ln)
             body, body_len = pr_commit_body(fields[6])
             subject = fields[5]
         else:
             fields = lines[0].split(FIELD_SEP, 5)
             if len(fields) < 6:
                 continue
-            paths, body, body_len = None, "", 0
+            paths, added, body, body_len = None, [], "", 0
             subject = fields[5]
             names_count = len([ln for ln in lines[1:] if ln.strip()])
         sha, parents, author, authored, committed = (f.strip() for f in fields[:5])
@@ -2888,6 +2905,8 @@ def parse_pr_commits(raw):
             row["paths"] = paths[:PR_HISTORY_PATHS_MAX]
             if len(paths) > PR_HISTORY_PATHS_MAX:
                 row["paths_omitted"] = len(paths) - PR_HISTORY_PATHS_MAX
+        if added:
+            row["added"] = added[:PR_HISTORY_PATHS_MAX]
         if body:
             row["body"] = body
             if body_len > len(body):
@@ -3158,7 +3177,7 @@ def collect_pr_history(prs, clone_dir, base_ref="HEAD", run=None,
         try:
             listing = run(["git", "-C", clone_dir, "log", "--reverse",
                            "--date-order", "--format=" + PR_COMMIT_FORMAT,
-                           "--name-only", "--no-renames"] + list(_WALK_PIN_ARGS)
+                           "--name-status", "--no-renames"] + list(_WALK_PIN_ARGS)
                           + [ref, "--not", base_ref] + exclude + ["--"])
         except RuntimeError as exc:
             row.update(status="log_failed",
@@ -7833,12 +7852,14 @@ CHECK_PASSING = frozenset(("success", "neutral", "skipped"))
 CHECK_ROLLUPS = ("passing", "failing", "pending", "incomplete", "none")
 # The issue-timeline events kept as PR lifecycle events (`ready_for_review`
 # is already a `lifecycle` event of the PR record).
+# The label history of a PR record (`label_events`): labels read as of a day.
+PR_LABEL_EVENTS = ("labeled", "unlabeled")
 PR_TIMELINE_EVENTS = ("renamed", "convert_to_draft", "review_requested",
                       "review_request_removed", "review_dismissed",
                       "head_ref_force_pushed", "assigned")
 
 _PR_ACTIVITY_FIELDS = (
-    "number headRefOid "
+    "number headRefOid lastEditedAt "
     "commits(last: {commits}) {{ totalCount nodes {{ commit {{ oid committedDate "
     "statusCheckRollup {{ state contexts(first: {contexts}) {{ totalCount "
     "pageInfo {{ hasNextPage endCursor }} nodes {{ __typename "
@@ -8199,13 +8220,17 @@ def parse_pr_activity_node(pr_obj):
     commits: [{sha, committed_at, rollup, state, checks, [checks_omitted]}]
     (oldest first), threads_total, threads: [{comment_id, path, line,
     resolved, [resolved_by], outdated}], [threads_omitted], force_pushes:
-    [{at, actor, before, after}]}. `rollup` is checks_rollup over the
+    [{at, actor, before, after}], [body_edited_at]}. `rollup` is checks_rollup over the
     commit's contexts as gathered (over the contexts read only: a reader
     applies `checks_omitted`, checks_rollup(..., omitted=), so a partial
     page is never a pass), `state` GitHub's own roll-up state
     (lowercase; absent with no status at all). Pure."""
     pr_obj = pr_obj if isinstance(pr_obj, dict) else {}
     out = {"head": pr_obj.get("headRefOid")}
+    if pr_obj.get("lastEditedAt"):
+        # when the description was last edited: a body edited after a
+        # window's end is "as last gathered" for that window
+        out["body_edited_at"] = _utc_timestamp(pr_obj["lastEditedAt"])
     commits = pr_obj.get("commits") or {}
     out["commits_total"] = commits.get("totalCount")
     rows = []
@@ -8265,22 +8290,32 @@ def parse_pr_activity_node(pr_obj):
     return out
 
 
-def parse_timeline_pr_events(raw_timeline):
+def parse_timeline_pr_events(raw_timeline, kinds=None):
     """The PR lifecycle events a story needs from an issue timeline (the
     REST shapes of PR_TIMELINE_EVENTS), in timeline order: {id, event, at,
-    actor} plus `from` / `to` (renamed), `requested` (a login, or
+    actor, [actor_type] (GitHub's account type when not "User")} plus
+    `label` (labeled / unlabeled), `from` / `to` (renamed), `requested` (a login, or
     `team:<slug>`) and `by` (the requester) for review_requested /
     review_request_removed, `review_id` / `state` / `message` for
     review_dismissed. A force-push's before / after commits are not in the
-    REST event (parse_pr_activity_node reads them). Pure."""
+    REST event (parse_pr_activity_node reads them). `kinds`: the event kinds
+    kept (default PR_TIMELINE_EVENTS; PR_LABEL_EVENTS for the label
+    history). Pure."""
+    kinds = PR_TIMELINE_EVENTS if kinds is None else kinds
     out = []
     for ev in raw_timeline or []:
         kind = ev.get("event") if isinstance(ev, dict) else None
-        if kind not in PR_TIMELINE_EVENTS:
+        if kind not in kinds:
             continue
         row = {"id": ev.get("id"), "event": kind, "at": ev.get("created_at"),
                "actor": (ev.get("actor") or {}).get("login")}
-        if kind == "renamed":
+        typ = (ev.get("actor") or {}).get("type")
+        if typ and typ != "User":
+            row["actor_type"] = typ          # "Bot": automation, whatever its name
+        if kind in ("labeled", "unlabeled"):
+            # label history: a label's own time, so labels read as of a day
+            row["label"] = (ev.get("label") or {}).get("name")
+        elif kind == "renamed":
             ren = ev.get("rename") or {}
             row["from"], row["to"] = ren.get("from"), ren.get("to")
         elif kind in ("review_requested", "review_request_removed"):
@@ -9611,6 +9646,9 @@ def enrich_pr(pr, get_page, api, current_slug, events_out=None):
         pr["lifecycle"] = lifecycle
     if events_out is not None:
         events_out[num] = parse_timeline_pr_events(timeline)
+    labels = parse_timeline_pr_events(timeline, PR_LABEL_EVENTS)
+    if labels:
+        pr["label_events"] = labels      # when each label came and went
     if pr.get("merged") and not pr.get("merged_by"):
         pr["merged_by"] = parse_timeline_merged_by(timeline)
     review_comments = fetch_all(get_page, f"{api}/pulls/{num}/comments?per_page=100")
