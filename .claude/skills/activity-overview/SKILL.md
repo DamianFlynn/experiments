@@ -288,8 +288,9 @@ gated appendix, releases/CI/in-flight/rejected — is in **`reference/report-sec
 Read it when authoring the report.
 
 **Newsletter (reader-facing, release-notes style).** For the weekly or monthly issue written
-for the people who use the modules — breaking changes first, new modules, what changed, the
-stories, people, what is coming, plumbing and numbers last — follow
+for the people who use the modules — new modules, what changed, breaking changes, every
+story in full grouped by state, module ownership, people, what is coming, what the plumbing
+engineered and numbers last; no length target — follow
 **`reference/newsletter.md`**: `python3 newsletter.py <view> --outline` gives the ordered,
 pre-selected material per section, and `python3 newsletter.py <view> --check-newsletter
 ISSUE.md --slices DIR` checks the written issue against the view (a worked sample:

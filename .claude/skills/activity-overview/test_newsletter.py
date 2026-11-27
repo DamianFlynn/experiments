@@ -311,36 +311,58 @@ class TestOutline(unittest.TestCase):
         self.assertEqual(top["story"], "train-issue-5")
         self.assertEqual(mc["modules"][1]["breaking"], "candidate")
 
-    def test_weekly_caps_the_lead_modules(self):
+    def test_every_changed_module_is_listed_whatever_the_cadence(self):
+        # the owner: no length target; the cap is only a safety limit
         v = view()
         for i in range(10):
             v["module_changes"]["modules"].append(module("avm/res/x/m%d" % i, 1))
         month = section(newsletter.outline([v]), "module_changes")
         week = section(newsletter.outline([v], cadence="week"), "module_changes")
-        self.assertEqual(len(month["modules"]), newsletter.CADENCE["month"]["modules"])
-        self.assertEqual(len(week["modules"]), newsletter.CADENCE["week"]["modules"])
-        self.assertEqual(len(week["modules"]) + len(week["also"]), 13)
+        self.assertEqual(len(month["modules"]), 13)
+        self.assertEqual(len(week["modules"]), 13)
+        self.assertEqual(week["also"], [])
+        self.assertEqual(newsletter.CADENCE["month"]["modules"], newsletter.SAFETY_LIMIT)
 
-    def test_stories_full_and_pointers(self):
+    def test_every_story_in_full_grouped_by_state(self):
         st = section(newsletter.outline([view()]), "stories")
         self.assertEqual([s["id"] for s in st["full"]], ["train-issue-5", "train-pr-11"])
         self.assertEqual(st["full"][0]["title"], "Git config lost")
         self.assertIn("--slice train-issue-5", st["full"][0]["slice"])
+        self.assertEqual(st["group_source"], "provisional")
+        self.assertEqual([s["id"] for s in st["groups"]["landed"]],
+                         ["train-issue-5", "train-pr-11"])
+        self.assertNotIn("pointers", st)
         week = section(newsletter.outline([view()], cadence="week"), "stories")
-        self.assertEqual([s["id"] for s in week["full"]], ["train-issue-5"])
-        self.assertEqual([s["id"] for s in week["pointers"]], ["train-pr-11"])
+        self.assertEqual([s["id"] for s in week["full"]], ["train-issue-5", "train-pr-11"])
 
-    def test_story_choice_mixes_shipped_and_in_flight(self):
+    def test_provisional_groups_and_the_view_groups(self):
         v = view()
         v["trains"].append({"id": "train-pr-20", "outcome": "in_flight", "issues": [],
                             "prs": [10], "story": True, "story_rank": 4})
-        v["trains"].append({"id": "train-pr-21", "outcome": "shipped", "issues": [],
-                            "prs": [10], "story": True, "story_rank": 3})
+        v["trains"].append({"id": "train-pr-21", "outcome": "in_flight", "issues": [],
+                            "prs": [10], "story": True, "story_rank": 3,
+                            "effort": {"stalled": True}})
+        v["trains"].append({"id": "train-pr-22", "outcome": "shipped", "issues": [],
+                            "prs": [12], "story": True, "story_rank": 5})
         v["stories"]["selected"] += [{"id": "train-pr-21", "rank": 3, "score": 10},
-                                     {"id": "train-pr-20", "rank": 4, "score": 9}]
+                                     {"id": "train-pr-20", "rank": 4, "score": 9},
+                                     {"id": "train-pr-22", "rank": 5, "score": 8}]
+        v["stories"]["quiet"] = [{"id": "train-pr-20", "score": 3, "idle_days": 40}]
         st = section(newsletter.outline([v]), "stories")
-        self.assertEqual([s["id"] for s in st["full"]], ["train-issue-5", "train-pr-20"])
-        self.assertEqual([s["id"] for s in st["pointers"]], ["train-pr-11", "train-pr-21"])
+        g = {k: [x["id"] for x in rows] for k, rows in st["groups"].items() if rows}
+        self.assertEqual(g, {"landed": ["train-issue-5", "train-pr-11"],
+                             "in_flight": ["train-pr-20"], "stalled": ["train-pr-21"],
+                             "plumbing": ["train-pr-22"]})
+        self.assertIn("40 days", st["thin"][0]["reason"])
+        # the view's own grouping wins
+        v["stories"]["all"] = [{"id": "train-pr-20", "group": "stalled", "state": "stalled",
+                                "group_rule": "idle", "modules": ["avm/res/hci/cluster"],
+                                "score": 9}]
+        st = section(newsletter.outline([v]), "stories")
+        self.assertEqual(st["group_source"], "view")
+        self.assertEqual([x["id"] for x in st["groups"]["stalled"]], ["train-pr-20"])
+        self.assertEqual(st["full"][0]["modules"][0]["url"],
+                         "https://github.com/o/r/tree/main/avm/res/hci/cluster")
 
     def test_people_classify_contributions_and_hide_do_not_name(self):
         p = section(newsletter.outline([view()]), "people")
@@ -436,39 +458,51 @@ class TestComingAndStuck(unittest.TestCase):
 
 # --- the check --------------------------------------------------------------
 
+T = "https://github.com/o/r/tree/main/"
+DNS = "[`avm/ptn/net/dns`](" + T + "avm/ptn/net/dns)"
+DNS_V = "[0.7.4](https://github.com/o/r/tree/avm/ptn/net/dns/0.7.4)"
+
 GOOD = """# o/r — October 2026
 
-The data factory module changed how Git is configured, and one new module landed.
-
-## Breaking changes and deprecations
-
-- `avm/res/data/factory` 0.13.0: "The parameters `gitRepoType` and `gitAccountName` were removed." ([#10](https://github.com/o/r/pull/10))
-- `avm/res/hci/cluster`: a parameter was removed from the module file; check before upgrading.
+One new module landed, the data factory module changed how Git is configured
+(a breaking change, see below), and the DNS zones pattern gained a zone.
 
 ## New modules
 
-- `avm/res/new/thing` 0.1.0, delivered by Nik Peters (@nik): "Initial version: deploys a thing." ([#13](https://github.com/o/r/pull/13))
+- [`avm/res/new/thing`](https://github.com/o/r/tree/main/avm/res/new/thing) [0.1.0](https://github.com/o/r/tree/t/0.1.0), delivered by Nik Peters (@nik): "Initial version: deploys a thing." ([#13](https://github.com/o/r/pull/13))
 
 ## What changed in existing modules
 
-- `avm/ptn/net/dns` 0.7.4: "Added Redis zone `privatelink.redis.azure.net`" ([#11](https://github.com/o/r/pull/11))
+- """ + DNS + " " + DNS_V + """: "Added Redis zone `privatelink.redis.azure.net`" ([#11](https://github.com/o/r/pull/11))
+- [`avm/res/data/factory`](https://github.com/o/r/tree/main/avm/res/data/factory) [0.13.0](https://github.com/o/r/tree/avm/res/data/factory/0.13.0): "Replaced the flat `git*` parameters with `gitConfiguration`." ([#10](https://github.com/o/r/pull/10))
+
+## Breaking changes and deprecations
+
+- [`avm/res/data/factory`](https://github.com/o/r/tree/main/avm/res/data/factory) [0.13.0](https://github.com/o/r/tree/avm/res/data/factory/0.13.0): "The parameters `gitRepoType` and `gitAccountName` were removed." ([#10](https://github.com/o/r/pull/10))
+- [`avm/res/hci/cluster`](https://github.com/o/r/tree/main/avm/res/hci/cluster): a parameter was removed from the module file; check before upgrading.
 
 ## Stories
 
+### Landed
+
 <!-- story: train-issue-5 -->
-Something happened.
+Landed. Something happened.
 
 **What landed.** It landed.
 <!-- /story -->
 
+<!-- story pending: train-pr-11 — written from the next store -->
+
+<!-- omitted: ownership — needs a store gathered with module ownership -->
+
 ## People
 
-From the community, Tomaz M (@tomaz) landed the Git change on 5 October 2026.
-Nik Peters (@nik), whose affiliation is not known, landed a new module.
+From the community, Tomaz M (@tomaz) landed the Git change on 5 October 2026 ([#10](https://github.com/o/r/pull/10)). It was released as [0.13.0](https://github.com/o/r/tree/avm/res/data/factory/0.13.0).
+Nik Peters (@nik), whose affiliation is not known, landed a new module ([#13](https://github.com/o/r/pull/13)), published as [0.1.0](https://github.com/o/r/tree/t/0.1.0).
 
 <!-- omitted: coming — nothing open in the window -->
 
-## Plumbing
+## Plumbing: what was engineered
 
 One of the 4 merged pull requests was plumbing (25%).
 
@@ -493,7 +527,7 @@ class TestCheck(unittest.TestCase):
         self.assertTrue(r["ok"], json.dumps(r, indent=1))
 
     def test_unknown_module_version_number_and_person(self):
-        t = GOOD.replace("`avm/ptn/net/dns` 0.7.4", "`avm/ptn/net/dnz` 0.7.9") \
+        t = GOOD.replace(DNS + " " + DNS_V, "`avm/ptn/net/dnz` 0.7.9") \
             .replace("4 pull requests merged.", "47 pull requests merged.") \
             .replace("(@tomaz)", "(@ghost-user)")
         r = self.check(t)
@@ -503,7 +537,7 @@ class TestCheck(unittest.TestCase):
         self.assertIn("ghost-user", r["people_not_in_view"])
 
     def test_version_bound_to_its_module(self):
-        t = GOOD.replace("`avm/ptn/net/dns` 0.7.4", "`avm/ptn/net/dns` 0.13.0")
+        t = GOOD.replace(DNS + " " + DNS_V, DNS + " 0.13.0")
         r = self.check(t)
         self.assertIn({"module": "avm/ptn/net/dns", "version": "0.13.0"},
                       r["versions_not_in_view"])
@@ -615,7 +649,7 @@ class TestReviewFixes(unittest.TestCase):
     def test_multi_repo_story_identities_are_qualified(self):
         a, b = self._two_repos()
         st = section(newsletter.outline([a, b]), "stories")
-        keys = [x["key"] for x in st["full"]] + [x["key"] for x in st["pointers"]]
+        keys = [x["key"] for x in st["full"]]
         self.assertEqual(sorted(keys), ["o/r:train-issue-5", "o/r:train-pr-11",
                                         "o/s:train-issue-5", "o/s:train-pr-11"])
         self.assertIn("o__s__train-issue-5.slice.json",
@@ -628,7 +662,7 @@ class TestReviewFixes(unittest.TestCase):
         a, b = self._two_repos()
         bad = {"train": {"id": "train-issue-5", "outcome": "in_flight", "evidence": []},
                "conversation": {"timeline": [], "outcome": {"items": []}}}
-        block = "Something happened.\n\n**What landed.** It landed."
+        block = "Landed. Something happened.\n\n**What landed.** It landed."
         text = GOOD.replace(
             "<!-- story: train-issue-5 -->\n" + block + "\n<!-- /story -->",
             "<!-- story: o/r:train-issue-5 -->\n" + block + "\n<!-- /story -->\n\n"
@@ -862,7 +896,7 @@ class TestSweep(unittest.TestCase):
         lead = {x["fact"]: x for x in section(out, "intro")["lead_with"]}
         self.assertIn("o/s::avm/res/data/factory", lead["declared_breaking"]["areas"])
         self.assertIn("o/r::nik", lead["newcomers_landed_work"]["logins"])
-        self.assertEqual(lead["top_story"]["id"].split(":", 1)[1], "train-issue-5")
+        self.assertEqual(lead["stories"]["top_story"].split(":", 1)[1], "train-issue-5")
         # a single repository keeps plain names
         one = {x["fact"]: x for x in section(newsletter.outline([a]), "intro")["lead_with"]}
         self.assertEqual(one["declared_breaking"]["areas"], ["avm/res/data/factory"])
@@ -1155,6 +1189,169 @@ class TestFourthRound(unittest.TestCase):
         f = section(newsletter.outline([a, b]), "numbers")["facts"]
         self.assertEqual(f["versions_published"], 2)
         self.assertIs(f["versions_published_partial"], True)
+
+
+class TestOwnersLayout(unittest.TestCase):
+    """The owner's layout: new, changed, breaking; every story in full by
+    state; links and release status; plumbing themes; module ownership."""
+
+    def v(self):
+        v = view()
+        v["prs"][0]["closes"] = [5]
+        v["issues"][0]["body"] = "### Description\n\nThe Git settings are wiped."
+        v["people"]["helper[bot]"] = {"is_bot": True, "prs_authored": 1, "prs_merged": 1}
+        v["prs"].append({"number": 14, "title": "chore: sync list", "author": "helper[bot]",
+                         "url": R + "/pull/14", "state": "closed", "merged": True,
+                         "merged_at": "2026-10-08T10:00:00Z"})
+        return v
+
+    def check(self, text, v=None, **kw):
+        kw.setdefault("slices", {"train-issue-5": SLICE})
+        return newsletter.check_newsletter([v or self.v()], text, **kw)
+
+    def test_section_order_is_new_changed_breaking(self):
+        self.assertEqual(newsletter.SECTION_ORDER,
+                         ("intro", "new_modules", "module_changes", "breaking", "stories",
+                          "ownership", "people", "coming", "plumbing", "numbers"))
+
+    def test_change_rows_explain_themselves(self):
+        mc = section(newsletter.outline([self.v()]), "module_changes")
+        fac = mc["modules"][0]
+        self.assertEqual(fac["url"], "https://github.com/o/r/tree/main/avm/res/data/factory")
+        self.assertEqual(fac["release"][0]["status"], "published")
+        self.assertEqual(fac["release"][0]["url"],
+                         "https://github.com/o/r/tree/avm/res/data/factory/0.13.0")
+        self.assertEqual(fac["prompted_by"][0]["number"], 5)
+        self.assertEqual(fac["prompted_by"][0]["asked"], "The Git settings are wiped.")
+        self.assertEqual(fac["pr_details"][0]["author_name"], "Tomaz M")
+        hci = next(m for m in mc["modules"] if m["area"] == "avm/res/hci/cluster")
+        self.assertEqual(hci["release"], [{"module": "avm/res/hci/cluster", "version": "0.3.0",
+                                           "status": "declared_not_published"}])
+
+    def test_release_status_of_a_pr(self):
+        v = self.v()
+        self.assertEqual(newsletter.pr_release(v, 11)[0]["status"], "published")
+        self.assertEqual(newsletter.pr_release(v, 12), [{"status": "no_version_change"}])
+        self.assertEqual(newsletter.pr_release(v, 99), [{"status": "unknown"}])
+        v["module_changes"]["inputs"] = {"tags_collected": False}
+        self.assertEqual(newsletter.module_release(
+            v, v["module_changes"]["modules"][2])[0]["status"], "unknown")
+
+    def test_automation_accounts_listed_for_what_they_are(self):
+        out = newsletter.outline([self.v()])
+        people = section(out, "people")
+        self.assertEqual([b["login"] for b in people["automation"]], ["helper[bot]"])
+        self.assertEqual(people["automation"][0]["prs"][0]["number"], 14)
+        self.assertNotIn("helper[bot]", [r["login"] for r in people["top"]])
+        # an operator-declared automation account
+        out = newsletter.outline([self.v()], automation=["tomaz"])
+        self.assertIn("tomaz", [b["login"] for b in section(out, "people")["automation"]])
+
+    def test_ownership_section(self):
+        self.assertIn("module ownership", section(newsletter.outline([self.v()]),
+                                                  "ownership")["omit"])
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [
+            {"kind": "owner_needed", "module": "avm/res/hci/cluster", "date": "2026-10-03",
+             "source": {"type": "issue", "number": 5, "url": R + "/issues/5"}}],
+            "without_owner": [{"module": "avm/res/key/vault", "marker": "ORPHANED.md"}]}
+        own = section(newsletter.outline([v]), "ownership")
+        self.assertIsNone(own["omit"])
+        self.assertEqual(own["events"][0]["module_url"],
+                         "https://github.com/o/r/tree/main/avm/res/hci/cluster")
+        self.assertEqual(own["without_owner"][0]["module"], "avm/res/key/vault")
+
+    def test_plumbing_themes(self):
+        pl = section(newsletter.outline([self.v()]), "plumbing")
+        self.assertEqual([(t["id"], t["theme_source"]) for t in pl["themes"]],
+                         [("ci", "provisional")])
+        self.assertEqual(pl["themes"][0]["prs"][0]["number"], 12)
+        v = self.v()
+        v["plumbing_themes"] = [{"id": "test-env", "title_hint": "Test environment",
+                                 "paths": [".github/"], "prs": [{"number": 12}],
+                                 "stories": [], "people": ["jared"]}]
+        pl = section(newsletter.outline([v]), "plumbing")
+        self.assertEqual([(t["id"], t["theme_source"]) for t in pl["themes"]],
+                         [("test-env", "view")])
+        self.assertEqual(pl["themes"][0]["people"][0]["name"], "Jared Holt")
+
+    def test_untraceable_tag_makes_a_pr_release_unknown(self):
+        v = self.v()
+        hci = next(m for m in v["module_changes"]["modules"] if m["area"] == "avm/res/hci/cluster")
+        hci["changelog"] = []
+        hci["prs"] = [{"number": 11}]
+        hci["versions"] = {"published": [{"version": "0.3.1"}],
+                           "published_not_declared": ["0.3.1"]}
+        rows = newsletter.pr_release(v, 11)
+        self.assertIn({"module": "avm/res/hci/cluster", "status": "unknown",
+                       "note": "tagged 0.3.1 in the window without a changelog entry"}, rows)
+
+    def test_issue_form_module_for_trains_without_code_areas(self):
+        v = self.v()
+        v["issues"].append({"number": 50, "title": "Budget thresholds", "author": "kim",
+                            "url": R + "/issues/50", "state": "open",
+                            "body": "### Module Name\n\navm/res/consumption/budget\n"})
+        v["trains"].append({"id": "train-issue-50", "outcome": "in_flight", "root_issue": 50,
+                            "issues": [50], "prs": []})
+        v["stories"]["quiet"] = [{"id": "train-issue-50", "score": 5, "idle_days": 40}]
+        st = section(newsletter.outline([v]), "stories")
+        self.assertEqual(st["thin"][0]["modules"][0]["area"], "avm/res/consumption/budget")
+        self.assertEqual(st["thin"][0]["idle_days"], 40)
+        r = self.check(GOOD + "\nQuiet: [`avm/res/consumption/budget`](" + T +
+                       "avm/res/consumption/budget).\n", v=v)
+        self.assertEqual(r["modules_not_in_view"], [])
+
+    # the check
+    def test_good_passes_under_the_new_rules(self):
+        r = self.check(GOOD)
+        self.assertTrue(r["ok"], {k: x for k, x in r.items() if x and k != "cannot_check"})
+
+    def test_story_under_the_wrong_group_or_without_its_state(self):
+        r = self.check(GOOD.replace("### Landed", "### In flight"))
+        self.assertEqual(r["stories_misplaced"][0]["story"], "train-issue-5")
+        r = self.check(GOOD.replace("Landed. Something happened.", "Something happened."))
+        self.assertEqual(r["stories_state_missing"][0]["story"], "train-issue-5")
+
+    def test_every_story_written_or_pending(self):
+        r = self.check(GOOD.replace(
+            "<!-- story pending: train-pr-11 — written from the next store -->", ""))
+        self.assertEqual(r["stories_missing"], ["train-pr-11"])
+        self.assertFalse(r["ok"])
+
+    def test_module_mentions_are_links_and_published_versions_link_the_tag(self):
+        r = self.check(GOOD.replace(DNS + " " + DNS_V, "`avm/ptn/net/dns` 0.7.4"))
+        self.assertIn({"section": "module_changes", "module": "avm/ptn/net/dns"},
+                      r["modules_not_linked"])
+        self.assertIn({"section": "module_changes", "module": "avm/ptn/net/dns",
+                       "version": "0.7.4"}, r["versions_not_linked"])
+
+    def test_landed_work_states_its_release(self):
+        r = self.check(GOOD.replace(" It was released as [0.13.0]"
+                                    "(https://github.com/o/r/tree/avm/res/data/factory/0.13.0).",
+                                    "").replace(", published as [0.1.0]"
+                                                "(https://github.com/o/r/tree/t/0.1.0)", ""))
+        self.assertEqual([x["section"] for x in r["release_status_missing"]],
+                         ["people", "people"])
+
+    def test_ownership_rows_must_exist(self):
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [
+            {"kind": "owner_needed", "module": "avm/res/hci/cluster"}], "without_owner": []}
+        text = GOOD.replace(
+            "<!-- omitted: ownership — needs a store gathered with module ownership -->",
+            "## Module ownership\n\n- [`avm/res/hci/cluster`](" + T + "avm/res/hci/cluster)"
+            " needs an owner.\n- [`avm/ptn/net/dns`](" + T + "avm/ptn/net/dns) was adopted.")
+        r = self.check(text, v=v)
+        self.assertEqual(r["ownership_not_in_view"], [{"module": "avm/ptn/net/dns"}])
+
+    def test_automation_not_presented_as_a_person(self):
+        r = self.check(GOOD + "\nThanks to Helper (@helper[bot]).\n")
+        self.assertEqual(r["automation_as_person"][0]["login"], "helper[bot]")
+        r = self.check(GOOD + "\nThe automation account @helper[bot] synced the list.\n")
+        self.assertEqual(r["automation_as_person"], [])
+        self.assertEqual(r["people_not_in_view"], [])
+        r = self.check(GOOD + "\nTomaz M (@tomaz) synced it.\n", automation=["tomaz"])
+        self.assertTrue(r["automation_as_person"])
 
 
 class TestCli(unittest.TestCase):

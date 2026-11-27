@@ -19,9 +19,16 @@ python3 link.py view/bundle.json --slice train-issue-7503 > slices/train-issue-7
 python3 link.py view/bundle.json --slice train-issue-7342 > slices/train-issue-7342.slice.json
 ```
 
-The two full stories are the outline's `stories.full` (the top story, which is in flight, and
-the best shipped one, by the outline's mix rule); each passes `link.py --check-story`
-against its slice, and the whole issue passes
+**Restructured, not yet rewritten.** The issue follows the owner's layout (new, changed,
+breaking; every story by state; module ownership; people with automation; coming up;
+plumbing: what was engineered; numbers) with the data the October view has. Two stories are
+written in full — `train-issue-7342` under Landed and `train-issue-7503` under In flight, each
+passing `link.py --check-story` with its state in its first line; the other ten are marked
+`<!-- story pending: … -->` until a store gathered with full commit coverage exists, and the
+Module ownership section is omitted for the same reason. Module and tag links are derived
+from the repository and tag names (the view does not yet record them). The host pool row in
+"What changed" is the worked example of a change row that says what, why, for whom and
+released as what. The whole issue passes
 
 ```bash
 python3 newsletter.py view/bundle.json --check-newsletter avm-bicep-2026-10.md \
