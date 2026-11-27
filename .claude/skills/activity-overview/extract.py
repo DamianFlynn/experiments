@@ -1516,6 +1516,64 @@ def _merged_pr_history(conn, project, repo, overlapping, recorded):
     return out
 
 
+# Module ownership: the orphan-marker files (gather writes the fact; the
+# standing list is reconstructed here, as of any day of a window).
+ORPHAN_MARKER_NAMES = ("ORPHANED.md",)
+_OWNED_KINDS = ("owner_added", "adopted")
+_UNOWNED_KINDS = ("owner_needed", "orphaned")
+
+
+def standing_without_owner(fact, day):
+    """The modules without an owner at the end of `day` (YYYY-MM-DD) inside
+    the fact's window, reconstructed from what the fact stores: the orphan
+    markers standing at the window's START (`start_without_owner`), the
+    dated events up to `day` (a marker added / removed; an owner file
+    emptied / given owners again) and the labelled items open on `day`
+    (`labelled_items`: opened on or before it, not closed by it). A labelled
+    item no longer counts once the module's LATEST ownership state by `day`
+    (events in date order) is owned and was reached on or after the item
+    opened. Returns [{module, marker, [since], [source]}] sorted by module,
+    or None when the fact predates the start snapshot (older stores) and
+    `day` is not its window's end (then only the stored end list exists)."""
+    if "start_without_owner" not in fact or "labelled_items" not in fact:
+        return None
+    markers = {r["module"]: dict(r) for r in fact.get("start_without_owner") or []}
+    emptied, state = {}, {}
+    for e in sorted(fact.get("events") or [],
+                    key=lambda x: (x.get("date") or "", x.get("kind") or "")):
+        d = (e.get("date") or "")[:10]
+        if not d or d > day:
+            continue
+        module, kind = e.get("module"), e.get("kind")
+        from_commit = (e.get("source") or {}).get("type") == "commit"
+        if from_commit and e.get("via") in ORPHAN_MARKER_NAMES:
+            if kind == "orphaned":
+                markers[module] = {"module": module, "marker": e["via"], "since": d}
+            elif kind == "adopted":
+                markers.pop(module, None)
+        if from_commit and kind == "owner_needed":
+            emptied[module] = {"module": module, "marker": e.get("via"), "since": d}
+        if from_commit and kind == "owner_added":
+            emptied.pop(module, None)
+        if from_commit and kind in _OWNED_KINDS:
+            state[module] = ("owned", d)
+        elif from_commit and kind in _UNOWNED_KINDS:
+            state[module] = ("unowned", d)
+    out = dict(emptied)
+    out.update(markers)
+    for it in fact.get("labelled_items") or []:
+        opened, closed = it.get("opened") or "", it.get("closed")
+        if not opened or opened > day or (closed and closed <= day):
+            continue
+        module = it.get("module")
+        st = state.get(module)
+        if st and st[0] == "owned" and st[1] >= opened:
+            continue
+        out.setdefault(module, {"module": module, "marker": it.get("marker"),
+                                "source": it.get("source")})
+    return [out[k] for k in sorted(out, key=lambda m: m or "")]
+
+
 def _merged_module_ownership(conn, project, repo, overlapping, recorded,
                              ts_from, ts_to):
     """The `module_ownership` of a view that is not exactly one gathered
@@ -1545,6 +1603,29 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
     out = dict(latest, events=sorted(events, key=lambda e: (
         e.get("date") or "", e.get("kind") or "", e.get("module") or "")),
         windows=[{"from": k[0], "to": k[1]} for k in sorted(values)])
+    # the standing list as of the VIEW's end: reconstructed from the window
+    # that contains that day (a week inside a gathered month), the latest
+    # window that collected ownership even when it found nothing (an empty
+    # fact clears an earlier window's list); a window whose fact predates
+    # the start snapshot gives its stored list only for its own end day
+    end = (ts_to or "")[:10]
+    holder = [k for k in values if k[0][:10] <= end <= k[1][:10]] if end else []
+    k = max(holder, key=lambda k: (k[1][:10], k[0][:10], k)) if holder else \
+        max(values, key=lambda k: (k[1][:10], k[0][:10], k))
+    fact = values[k]
+    day = end if holder else k[1][:10]
+    standing = standing_without_owner(fact, day)
+    for key in ("start_without_owner", "labelled_items", "without_owner_unavailable"):
+        out.pop(key, None)
+    if standing is not None:
+        out["without_owner"] = standing
+    elif day == k[1][:10]:
+        out["without_owner"] = list(fact.get("without_owner") or [])
+    else:
+        out["without_owner"] = []
+        out["without_owner_unavailable"] = (
+            "the window {}..{} was gathered before ownership could be "
+            "reconstructed for a day inside it".format(k[0], k[1]))
     return out
 
 

@@ -1528,7 +1528,8 @@ def _pr_history_problem(value):
 
 
 _OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns",
-                        "owner_files", "unread", "windows"}
+                        "owner_files", "unread", "windows", "start_without_owner",
+                        "labelled_items", "without_owner_unavailable"}
 _OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "source", "quote", "via"}
 
 

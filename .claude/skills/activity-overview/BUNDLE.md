@@ -1550,8 +1550,9 @@ without the clone):
 - `replaced` — per force-push of the PR (from `pr_activity`): `{at, actor, before, after,
   status: read|unavailable, commits?, commits_omitted?, reason?}`: the commits the push
   replaced (reachable from `before`, not from `after` nor the walked branch; subject, body,
-  paths; at most `PR_HISTORY_REPLACED_MAX` 100), the `before` commit fetched by sha when
-  the clone lacks it; `unavailable` with the reason when GitHub no longer serves it.
+  paths; at most `PR_HISTORY_REPLACED_MAX` 100), the `before` and `after` commits fetched
+  by sha when the clone lacks them; `unavailable` with the reason when either end cannot
+  be established (without `after` the list could include commits the push retained).
 - `status` — `fetched`, `missing` (no `refs/pull/<N>/head` on the remote), `fetch_failed`
   / `log_failed` (with `reason`). `on_base: true` when the head is on the walked branch (a
   merge-commit merge: the base walk already has its commits).
@@ -1611,10 +1612,27 @@ of the latest overlapping window that collected one, and adds `windows`.
 
 Who owns which module and the window's changes to it — "maintainer needed / added /
 removed" (`gather.collect_module_ownership`; a per-window fact, carried into the view
-as is; a wider view takes the events of every overlapping window dated in it and the
-latest window's standing list). Omitted for a window with no ownership signal at all
-(no event, no module without an owner, nothing unreadable) and for stores gathered
-before it existed.
+as is for a view of exactly that window). Stored whenever ownership was collected, empty
+or not (an empty fact of a later window clears an earlier window's standing list); absent
+for stores gathered before it existed. Issues and PRs are read as they were at the
+window's end (`extract.record_as_of`: one created later is skipped, one closed later is
+open). Recompute it offline into an existing store from a clone of the repository with
+the window's history:
+`python3 gather.py --owner O --repo R --from F --to T --store S --clone-dir C --recompute-ownership`
+(no API call; the window's other facts are kept).
+
+**As of any day.** The fact stores what the standing list is reconstructed from
+(`extract.standing_without_owner`): `start_without_owner` (orphan markers at the window's
+start: the tree before `from`, else derived from the end tree and the window's marker
+events), the dated `events`, and `labelled_items` `[{module, marker, opened, closed?,
+source}]` (every owner-needed / orphaned item that existed at the window's end; a label's
+own time is not recorded, so an item counts from the day it opened). A view that is not
+exactly one gathered window — a week inside a gathered month, or several months — gets
+the events dated in it and `without_owner` reconstructed for its last day from the window
+containing that day. A module's latest ownership state, in event order, decides: an owner
+added and later removed again is without an owner. A fact gathered before this (no start
+snapshot) gives its stored list only for its own end day; for a day inside it the view
+says `without_owner_unavailable`.
 
 ```json
 {"collected": true,
@@ -1651,8 +1669,8 @@ before it existed.
   owner-needed / orphaned label unless the module gained an owner (or was adopted) on or
   after that item was opened. Modules whose owner file lists nobody but did not change in
   the window are not scanned (reading every owner file at the window's end is not done).
-- `unread` — owner-file / CODEOWNERS versions that could not be read; never read as "no
-  owners". A Terraform module repository has CODEOWNERS only: the other sources are
+- `unread` — owner-file / CODEOWNERS versions that could not be read or parsed (`reason`:
+  "not valid JSON"); no change is derived from them, never "no owners". A Terraform module repository has CODEOWNERS only: the other sources are
   simply absent.
 
 ### `pr_activity` (raw, from the store)

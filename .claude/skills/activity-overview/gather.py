@@ -2419,7 +2419,7 @@ def collect_module_notes(code_events, read_blob, list_tags, from_date, to_date):
 CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 # Per-module owner files (ACTIVITY_OWNER_FILES, comma-separated basenames).
 OWNER_FILE_NAMES = ("metadata.json",)
-ORPHAN_MARKER_NAMES = ("ORPHANED.md",)
+ORPHAN_MARKER_NAMES = extract.ORPHAN_MARKER_NAMES
 # Ownership labels by event kind, matched case-insensitively against label
 # names (ACTIVITY_OWNERSHIP_LABELS: `kind=regex;kind=regex`). The defaults
 # match "Status: Module Orphaned :yellow_circle:" style labels and "owner
@@ -2470,11 +2470,17 @@ def _codeowners_module(pattern):
     return p or "/"
 
 
+_UNPARSEABLE = object()
+
+
 def _owners_from_json(text):
+    """The `owners` list of an owner file's text: a list of logins; None when
+    the JSON has no `owners` list (not an owner file); _UNPARSEABLE when the
+    text is not JSON at all (never read as "no owners")."""
     try:
         data = json.loads(text)
     except (TypeError, ValueError):
-        return None
+        return _UNPARSEABLE
     owners = data.get("owners") if isinstance(data, dict) else None
     if not isinstance(owners, list):
         return None
@@ -2488,28 +2494,36 @@ def _module_of_item(rec):
 
 def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                              end_files, frm, to, web=None, label_patterns=None,
-                             owner_files=None):
+                             owner_files=None, start_files=None):
     """The window's `module_ownership` fact: {collected, events: [{kind,
     module, people, date, source: {type, number|sha, url, [pr]}, [quote],
-    [via]}], without_owner: [{module, marker, [since]}], label_patterns,
-    owner_files, [unread]}.
+    [via]}], start_without_owner, labelled_items, without_owner: [{module,
+    marker, [since], [source]}], label_patterns, owner_files, [unread]}.
     - CODEOWNERS (CODEOWNERS_PATHS) changed in the window: per pattern,
       owners added -> `owner_added`, removed -> `owner_removed` (module: the
       pattern as a path), via `codeowners`;
     - a per-module owner file (`owner_files`, default ACTIVITY_OWNER_FILES /
       OWNER_FILE_NAMES: JSON with an `owners` list) changed: owners added /
       removed, via that file; an `owners` list that became empty ->
-      `owner_needed`;
+      `owner_needed`. A version that is not JSON is `unread` and no change
+      is derived from it;
     - an orphan marker (ORPHAN_MARKER_NAMES) added -> `orphaned`, removed ->
-      `adopted` (people: the commit author);
-    - an issue / PR opened in the window with an ownership label
-      (`label_patterns` {kind: regexes}) -> that kind, its title as `quote`,
-      module from an `avm/res|ptn|utl/...` reference in the title.
-    `without_owner` — modules carrying an orphan marker at the window's end
-    (`end_files`: the paths tracked then) and modules of open items with an
-    `owner_needed` / `orphaned` label, unless the module gained an owner or
-    was adopted on or after the item was opened. A file version that cannot be read is
-    listed in `unread`, never read as "no owners". Pure over its readers."""
+      `adopted` (people: the commit author, as the store resolves it: pass
+      code events after author resolution);
+    - an issue / PR (as it was at the window's end: extract.record_as_of;
+      one created later is skipped) opened in the window with an ownership
+      label (`label_patterns` {kind: regexes}) -> that kind, its title as
+      `quote`, module from an `avm/res|ptn|utl/...` reference in the title.
+    Standing state, reconstructible as of any day of the window
+    (extract.standing_without_owner): `start_without_owner` — modules carrying an
+    orphan marker at the window's start (`start_files`: the paths tracked
+    then; None: derived from `end_files` and the window's marker events)
+    — and `labelled_items` — every
+    owner-needed / orphaned item that existed at the window's end, with the
+    day it opened and the day it closed (label times are not recorded: an
+    item counts from the day it opened). `without_owner` is that state at
+    the window's end. A file version that cannot be read is listed in
+    `unread`, never read as "no owners". Pure over its readers."""
     patterns = label_patterns or ownership_label_patterns()
     owner_files = owner_files or _owner_file_names()
     by_sha = {c.get("sha"): c for c in commits or []}
@@ -2562,6 +2576,10 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                 continue
             old = _owners_from_json(before) if before else []
             new = _owners_from_json(after) if after else []
+            if old is _UNPARSEABLE or new is _UNPARSEABLE:
+                unread.append({"path": path, "commit": e.get("commit"),
+                               "reason": "not valid JSON"})
+                continue
             if old is None and new is None:
                 continue                      # not an owner file after all
             old, new = old or [], new or []
@@ -2588,53 +2606,100 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                 if any(rx.search(lbl) for rx in compiled.get(kind, ())):
                     return kind, lbl
         return None, None
-    standing = {}
+    labelled = []
     for typ, recs in (("issue", issues or []), ("pr", prs or [])):
-        for rec in recs:
+        for raw in recs:
+            rec = extract.record_as_of(typ, raw, to)
+            if rec is None:
+                continue                  # created after the window's end
             kind, lbl = label_kind(rec.get("labels"))
             if not kind:
                 continue
+            source = {"type": typ, "number": rec.get("number"), "url": rec.get("url")}
             if in_window(rec.get("created_at"), frm, to):
                 events.append({"kind": kind, "module": _module_of_item(rec),
                                "people": [p for p in [rec.get("author")] if p],
                                "date": (rec.get("created_at") or "")[:10],
-                               "source": {"type": typ, "number": rec.get("number"),
-                                          "url": rec.get("url")},
-                               "quote": rec.get("title"), "via": lbl})
-            if rec.get("state") == "open" and kind in ("owner_needed", "orphaned") \
-                    and _module_of_item(rec):
-                standing.setdefault(_module_of_item(rec), {
-                    "module": _module_of_item(rec), "marker": lbl,
-                    "_at": (rec.get("created_at") or "")[:10],
-                    "source": {"type": typ, "number": rec.get("number"),
-                               "url": rec.get("url")}})
-    without = {}
-    for f in end_files or []:
-        base = f.rsplit("/", 1)[-1]
-        if base in ORPHAN_MARKER_NAMES:
-            module = f.rsplit("/", 1)[0] if "/" in f else ""
-            row = {"module": module, "marker": base}
-            since = [x["date"] for x in events if x["kind"] == "orphaned"
-                     and x["module"] == module]
-            if since:
-                row["since"] = since[-1]
-            without[module] = row
-    # a label on an open item is stale once the module gained an owner (or
-    # was adopted) on or after the item was opened
-    for module, row in standing.items():
-        at = row.pop("_at")
-        if any(x["kind"] in ("owner_added", "adopted") and x["module"] == module
-               and (x.get("date") or "") >= at for x in events):
-            continue
-        without.setdefault(module, row)
+                               "source": source, "quote": rec.get("title"),
+                               "via": lbl})
+            closed = (rec.get("closed_at") or "")[:10] \
+                if rec.get("state") == "closed" else None
+            if kind in extract._UNOWNED_KINDS and _module_of_item(rec) \
+                    and (closed is None or closed >= (frm or "")[:10]):
+                item = {"module": _module_of_item(rec), "marker": lbl,
+                        "opened": (rec.get("created_at") or "")[:10],
+                        "source": source}
+                if closed:
+                    item["closed"] = closed
+                labelled.append(item)
+    def markers_of(files):
+        return {f.rsplit("/", 1)[0] if "/" in f else "": f.rsplit("/", 1)[-1]
+                for f in files or [] if f.rsplit("/", 1)[-1] in ORPHAN_MARKER_NAMES}
+    if start_files is not None:
+        start = markers_of(start_files)
+    else:
+        # the start snapshot from the end tree and the window's marker
+        # events (the code events cover the whole window): the markers at
+        # the end, minus those added in it, plus those removed in it
+        start = markers_of(end_files)
+        for e in sorted(events, key=lambda x: x.get("date") or "", reverse=True):
+            if (e.get("source") or {}).get("type") != "commit" \
+                    or e.get("via") not in ORPHAN_MARKER_NAMES:
+                continue
+            if e["kind"] == "orphaned":
+                start.pop(e["module"], None)
+            elif e["kind"] == "adopted":
+                start[e["module"]] = e["via"]
     events.sort(key=lambda x: (x.get("date") or "", x["kind"], x.get("module") or ""))
+    labelled.sort(key=lambda x: (x["module"], x["opened"], x["source"]["number"] or 0))
     out = {"collected": True, "events": events,
-           "without_owner": [without[k] for k in sorted(without)],
+           "start_without_owner": [{"module": m, "marker": start[m]}
+                                   for m in sorted(start)],
+           "labelled_items": labelled,
            "label_patterns": {k: list(v) for k, v in patterns.items()},
            "owner_files": list(owner_files)}
+    out["without_owner"] = extract.standing_without_owner(out, (to or "")[:10])
     if unread:
         out["unread"] = unread
     return out
+
+
+def recompute_module_ownership(conn, project, repo, frm, to, clone_dir,
+                               read_blob=None, end_files=None, start_files=None,
+                               run=None):
+    """Recompute the `module_ownership` fact of an already gathered window
+    [frm, to] of a store, offline, from a clone of the repository holding
+    the window's history (`gather.py ... --recompute-ownership`): the
+    window's records and code events as stored, the end tree at the
+    window's stored clone sha, the start tree before `frm`. Only that fact
+    is replaced; the window's other facts are written back unchanged.
+    Returns the new fact."""
+    run = run or run_git
+    got = graphstore.get_window_facts(conn, project, repo, frm, to)
+    if got is None:
+        raise SystemExit("error: {}/{} has no gathered window {}..{} in this store"
+                         .format(project, repo, frm, to))
+    view = extract.extract(conn, project, repo, frm, to)
+    meta = view.get("meta") or {}
+    slug = meta.get("repo") if "/" in (meta.get("repo") or "") \
+        else "{}/{}".format(project, repo)
+    if end_files is None:
+        sha = got.get("clone_sha") or "HEAD"
+        end_files = [ln for ln in run(["git", "-C", clone_dir, "ls-tree", "-r",
+                                       "--name-only", sha]).split("\n") if ln]
+    if start_files is None:
+        start_files = window_start_files(clone_dir, frm, run)
+    fact = collect_module_ownership(
+        view.get("code_events") or [], view.get("commits") or [],
+        view.get("prs") or [], view.get("issues") or [],
+        read_blob or git_blob_reader(clone_dir, run), end_files, frm, to,
+        web="https://github.com/" + slug, start_files=start_files)
+    bundle = dict(got["facts"])
+    bundle["module_ownership"] = fact
+    bundle["meta"] = {"workflows_collected": got.get("ci_collected")}
+    graphstore.set_window_facts(conn, project, repo, frm, to, bundle,
+                                clone_sha=got.get("clone_sha"))
+    return fact
 
 
 # --- PR-internal history (per-window fact `pr_history`) ---------------------
@@ -2894,10 +2959,11 @@ def collect_replaced_commits(row, clone_dir, pushes, base_ref, exclude, run):
     with `before` / `after` commits, from `pr_activity`), the commits it
     replaced: reachable from `before` but not from `after` nor the walked
     branch, with their subject, body and paths (parse_pr_commits; at most
-    PR_HISTORY_REPLACED_MAX). A `before` commit not in the clone is fetched
-    by sha (`git fetch origin <sha>`: GitHub often still serves a PR's
-    replaced commits); one that cannot be had is `unavailable` with the
-    reason. Sets row["replaced"] = [{at, actor, before, after, status:
+    PR_HISTORY_REPLACED_MAX). A `before` or `after` commit not in the clone
+    is fetched by sha (`git fetch origin <sha>`: GitHub often still serves a
+    PR's replaced commits); when either end cannot be established the push
+    is `unavailable` with the reason (never a list that could include
+    retained commits). Sets row["replaced"] = [{at, actor, before, after, status:
     read|unavailable, [commits], [commits_omitted], [reason]}]."""
     out = []
     for e in pushes:
@@ -2920,12 +2986,27 @@ def collect_replaced_commits(row, clone_dir, pushes, base_ref, exclude, run):
                     (str(exc).splitlines() or ["?"])[-1][:200]))
                 out.append(rec)
                 continue
-        nots = [after] if after and re.fullmatch(r"[0-9a-f]{40}", after) else []
+        # both ends must be established: without the `after` commit the
+        # list would include commits the push retained
+        if not after or not re.fullmatch(r"[0-9a-f]{40}", after):
+            rec.update(status="unavailable", reason="the push's after commit is "
+                       "not recorded")
+            out.append(rec)
+            continue
         try:
-            for sha in nots:
-                run(["git", "-C", clone_dir, "cat-file", "-e", sha + "^{commit}"])
+            run(["git", "-C", clone_dir, "cat-file", "-e", after + "^{commit}"])
         except RuntimeError:
-            nots = []
+            try:
+                run(["git", "-C", clone_dir, "fetch", "--quiet", "--filter=blob:none",
+                     "--no-tags", "--no-write-fetch-head", "origin", after])
+                run(["git", "-C", clone_dir, "cat-file", "-e", after + "^{commit}"])
+            except RuntimeError as exc:
+                rec.update(status="unavailable", reason="the push's after commit is "
+                           "not fetchable: {}".format(
+                               (str(exc).splitlines() or ["?"])[-1][:200]))
+                out.append(rec)
+                continue
+        nots = [after]
         try:
             listing = run(["git", "-C", clone_dir, "log", "--date-order", "--reverse",
                            "--format=" + PR_COMMIT_FORMAT, "--name-only",
@@ -5920,6 +6001,11 @@ def parse_args(argv):
                         "heads reach) and the comment / parameter walk over the "
                         "most discussed PRs' commits; the window's `pr_history` "
                         "fact then says it was not collected")
+    p.add_argument("--recompute-ownership", action="store_true", default=False,
+                   help="offline: recompute only the `module_ownership` fact of the "
+                        "already gathered window --from..--to of --owner/--repo in "
+                        "--store, from the clone at --clone-dir (no API call); the "
+                        "window's other facts are kept")
     p.add_argument("--no-pr-checks", dest="pr_checks", action="store_false",
                    default=True,
                    help="skip the check results / review-thread state read "
@@ -6367,6 +6453,27 @@ def clone_head_sha(clone_dir, run=run_git):
         return run(["git", "-C", clone_dir, "rev-parse", "HEAD"]).strip() or None
     except Exception:
         return None
+
+
+def window_start_files(clone_dir, from_date, run=None):
+    """The paths tracked at the window's START: the tree of the newest
+    first-parent commit before `from_date`, or None when the bounded clone
+    holds none (the caller then derives what it needs from the end tree)."""
+    run = run or run_git
+    try:
+        raw = run(["git", "-C", clone_dir, "log", "--first-parent",
+                   f"--pretty=format:{LOG_FORMAT}"])
+    except RuntimeError:
+        return None
+    sha = next((rec["sha"] for rec in parse_git_log(raw)
+                if (rec.get("date") or "")[:10] < (from_date or "")[:10]), None)
+    if sha is None:
+        return None
+    try:
+        out = run(["git", "-C", clone_dir, "ls-tree", "-r", "--name-only", sha])
+    except RuntimeError:
+        return None
+    return [ln for ln in out.split("\n") if ln]
 
 
 def window_end_commit(clone_dir, to_date, run=None):
@@ -7802,8 +7909,15 @@ def _read_contexts(graphql, takes_errors, owner, repo, wanted, budget):
             continue
         budget.cost(data)
         for i, (sha, _cursor) in enumerate(batch):
-            node = repo_obj.get("c{}".format(i)) or {}
-            ctx = (node.get("statusCheckRollup") or {}).get("contexts") or {}
+            node = repo_obj.get("c{}".format(i))
+            ctx = ((node or {}).get("statusCheckRollup") or {}).get("contexts") \
+                if isinstance(node, dict) else None
+            if not isinstance(node, dict) or node.get("oid") != sha \
+                    or not isinstance(ctx, dict) \
+                    or not isinstance(ctx.get("nodes"), list):
+                # a missing / mismatched object or no context connection is
+                # not a read of zero checks: leave what is known as it is
+                continue
             got = [x for x in (normalize_check_context(n)
                                for n in ctx.get("nodes") or []) if x]
             prev, _ = out.get(sha, ([], 0))
@@ -7860,7 +7974,10 @@ def collect_check_history(row, n, graphql, owner, repo, budget, max_commits,
                 reason = (str(err).splitlines() or ["?"])[-1][:200]
                 break
             budget.cost(data)
-            page = ((repo_obj.get("pullRequest") or {}).get("commits")) or {}
+            page = ((repo_obj.get("pullRequest") or {}).get("commits"))
+            if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+                status, reason = "failed", "a page of commits came back without them"
+                break
             stop = False
             for node in page.get("nodes") or []:
                 c = (node or {}).get("commit") or {}
@@ -9864,20 +9981,6 @@ def acquire(args, env):
         # in the existing issue loop — see Step 3a); the classifier is pure.
         issue["kind"] = classify_issue_kind(issue, label_taxonomy, types_present)
 
-    # Module ownership (per-window fact `module_ownership`): CODEOWNERS and
-    # per-module owner-file changes, orphan markers, ownership labels; see
-    # collect_module_ownership. Needs the window's history on disk.
-    module_ownership = None
-    if walk_clone:
-        module_ownership = collect_module_ownership(
-            code_events, commits, prs, issues, git_blob_reader(clone_dir),
-            tracked or [], frm, to, web="https://github.com/{}/{}".format(owner, repo))
-        sys.stderr.write(
-            "module ownership: {}/{}: {} event(s), {} module(s) without an owner "
-            "at the window's end\n".format(owner, repo,
-                                          len(module_ownership["events"]),
-                                          len(module_ownership["without_owner"])))
-
     # People identity (#78): resolve each commit author (git name) to the GitHub
     # login PR/issue/review records use, so one person is one key. One paginated
     # commits-list listing (ceil(commits / 100) REST calls, none for an empty
@@ -9906,6 +10009,22 @@ def acquire(args, env):
             home_email=email_home)
         remap_event_authors(code_events, by_sha)
         remap_event_authors(symbol_events, by_sha)
+
+    # Module ownership (per-window fact `module_ownership`): CODEOWNERS and
+    # per-module owner-file changes, orphan markers, ownership labels; see
+    # collect_module_ownership. Needs the window's history on disk; after
+    # author resolution, so a marker commit's author is the store's identity.
+    module_ownership = None
+    if walk_clone:
+        module_ownership = collect_module_ownership(
+            code_events, commits, prs, issues, git_blob_reader(clone_dir),
+            tracked or [], frm, to, web="https://github.com/{}/{}".format(owner, repo),
+            start_files=window_start_files(clone_dir, frm))
+        sys.stderr.write(
+            "module ownership: {}/{}: {} event(s), {} module(s) without an owner "
+            "at the window's end\n".format(owner, repo,
+                                          len(module_ownership["events"]),
+                                          len(module_ownership["without_owner"])))
 
     workflows = []
     workflow_stats = {}
@@ -10035,11 +10154,9 @@ def acquire(args, env):
         bundle["pr_history"] = pr_history
     if pr_activity is not None:
         bundle["pr_activity"] = pr_activity
-    # only with something to say: a window with no ownership signal adds no
-    # fact, so every existing bundle and its golden stay as they were
-    if module_ownership is not None and (module_ownership["events"]
-                                         or module_ownership["without_owner"]
-                                         or module_ownership.get("unread")):
+    # always when collected, empty or not: a later window that collected
+    # nothing must clear an earlier window's standing list in a merged view
+    if module_ownership is not None:
         bundle["module_ownership"] = module_ownership
     bundle["code_events"] = code_events
     bundle["symbol_events"] = symbol_events
@@ -12018,6 +12135,18 @@ def main(argv=None):
         if people_run_from_args(args) is None and getattr(args, "people_offline", False):
             raise SystemExit("error: --people-offline needs a people registry "
                              "(--people PATH or the manifest's `people`)")
+    if getattr(args, "recompute_ownership", False):
+        conn = graphstore.open_store(args.store)
+        try:
+            fact = recompute_module_ownership(
+                conn, args.owner, args.repo, getattr(args, "from"), args.to,
+                args.clone_dir or f"workspace/{args.repo}-clone")
+        finally:
+            conn.close()
+        sys.stderr.write("module ownership recomputed: {} event(s), {} module(s) "
+                         "without an owner\n".format(len(fact["events"]),
+                                                     len(fact["without_owner"])))
+        return args.store
     os.makedirs(os.path.dirname(args.store) or ".", exist_ok=True)
     conn = graphstore.open_store(args.store)
     failures = []
