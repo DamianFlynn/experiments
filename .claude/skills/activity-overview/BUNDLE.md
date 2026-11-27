@@ -1882,9 +1882,15 @@ PR fills is `proposed`, not `stub`; `modules_at_end` rows add `proposed_by` [pr]
 `unknown` (a start state read before entry files were recorded). Every lifecycle marker's
 first lines are kept verbatim: `deprecated_text` for a deprecation marker and
 `marker_text` for an orphan marker (on `without_owner` rows too — it is the call to action).
-When several modules carry the SAME marker text (boilerplate), the rows say
-`marker_text_shared: true` and `marker_texts` `{deprecated | orphaned: {text, modules}}`
-holds the text once. A deprecated module's `replacement` `{module, quote, file}` comes only
+When several modules carry the SAME marker text (boilerplate, compared after
+normalising whitespace), the most-shared notice of each kind is said once:
+`marker_texts` `{deprecated | orphaned: {text, modules}}` holds it (`modules`: how many)
+and its rows say `marker_text_shared: true`; any other notice — another text shared by
+other modules included — stays on its own rows; `shared_marker_texts` `[{kind, text,
+modules: [module], count}]` lists every notice shared by more than one module. An owner
+file created with an empty `owners` list is an `owner_needed` event with `file_added:
+true` (metadata without an `owners` field is no owner file). A view that is not one
+stored window keeps the covering window's `proposed_modules` committed by its end. A deprecated module's `replacement` `{module, quote, file}` comes only
 from explicit text — its marker, README or CHANGELOG naming the module that replaces it
 ("replaced by / superseded by / moved to / migrate to <module>", "use <module> instead");
 on the October 2026 tree all 12 markers are the same boilerplate naming none, and no README

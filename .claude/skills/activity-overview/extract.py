@@ -1735,7 +1735,15 @@ def ownership_state(fact, day):
                 counts[(key, " ".join(r[key].split()))] = counts.get(
                     (key, " ".join(r[key].split())), 0) + 1
     shared = {k for k, n in counts.items() if n > 1}
+    # per kind, the ONE most-shared notice is said once in `marker_texts`
+    # (rows: `marker_text_shared`); any other notice keeps its own text on
+    # its rows; every shared notice is listed in `shared_marker_texts`
+    primary = {}
+    for (key, norm), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if n > 1:
+            primary.setdefault(key, norm)
     marker_texts = {}
+    shared_texts = {}
     modules = {}
     for m, r in mods.items():
         row = {"lifecycle": module_lifecycle(r)}
@@ -1748,9 +1756,13 @@ def ownership_state(fact, day):
             if not on or not r.get(key):
                 continue
             norm = " ".join(r[key].split())
+            kind = "deprecated" if key == "deprecated_text" else "orphaned"
             if (key, norm) in shared:
+                st = shared_texts.setdefault((kind, norm), {"kind": kind, "text": r[key],
+                                                            "modules": []})
+                st["modules"].append(m)
+            if primary.get(key) == norm:
                 row["marker_text_shared"] = True
-                kind = "deprecated" if key == "deprecated_text" else "orphaned"
                 marker_texts.setdefault(kind, {"text": r[key], "modules": 0})
                 marker_texts[kind]["modules"] += 1
             else:
@@ -1778,7 +1790,11 @@ def ownership_state(fact, day):
                              if modules[m]["lifecycle"] == "stub"],
             "owners": {m: owners[m] for m in sorted(owners)},
             "modules": {m: modules[m] for m in sorted(modules)},
-            "marker_texts": marker_texts}
+            "marker_texts": marker_texts,
+            "shared_marker_texts": sorted(
+                ({"kind": x["kind"], "text": x["text"], "modules": sorted(x["modules"]),
+                  "count": len(x["modules"])} for x in shared_texts.values()),
+                key=lambda x: (x["kind"], -x["count"], x["text"]))}
 
 
 # A module's lifecycle from the tree: `deprecated` (a deprecation marker),
@@ -1822,7 +1838,8 @@ def ownership_end_fields(end):
             "stub_modules": end["stub_modules"],
             "owners_at_end": end["owners"],
             "modules_at_end": end["modules"],
-            "marker_texts": end["marker_texts"]}
+            "marker_texts": end["marker_texts"],
+            "shared_marker_texts": end["shared_marker_texts"]}
 
 
 def standing_without_owner(fact, day):
@@ -1876,6 +1893,13 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
     latest = values[ordered[-1]]
     out = {k: v for k, v in latest.items()
            if k in ("collected", "label_patterns", "owner_files")}
+    covering = covering_window(values, hi) if hi else None
+    if covering is not None:
+        # the covering fact's proposals, those committed by the view's end
+        prop = {m: r for m, r in (values[covering].get("proposed_modules") or {}).items()
+                if isinstance(r, dict) and str(r.get("committed_at") or "")[:10] <= hi}
+        if prop:
+            out["proposed_modules"] = prop
     out["events"] = events
     out["windows"] = [{"from": k[0], "to": k[1]} for k in sorted(values)]
     unread, seen_u = [], set()
@@ -1907,7 +1931,7 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
     elif end == k[1][:10]:
         out["without_owner"] = list(fact.get("without_owner") or [])
         for key in ("owners_at_end", "modules_at_end", "deprecated_modules",
-                    "stub_modules", "marker_texts"):
+                    "stub_modules", "marker_texts", "shared_marker_texts"):
             if key in fact:
                 out[key] = fact[key]
     else:

@@ -2742,6 +2742,14 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
             if old and not new and e.get("change") != "delete":
                 events.append({"kind": "owner_needed", "module": module, "people": [],
                                "date": e.get("date"), "source": src(e), "via": base})
+            elif e.get("change") == "add" and isinstance(_owners_from_json(after), list) \
+                    and not new:
+                # an owner file created with an empty `owners` list (a new
+                # module nobody owns yet) — distinct from metadata without an
+                # `owners` field, which is no owner file at all
+                events.append({"kind": "owner_needed", "module": module, "people": [],
+                               "date": e.get("date"), "source": src(e), "via": base,
+                               "file_added": True})
         if base in ORPHAN_MARKER_NAMES and e.get("change") in ("add", "delete"):
             ev = {"kind": "orphaned" if e["change"] == "add" else "adopted",
                   "module": folder, "people": [p for p in [e.get("author")] if p],

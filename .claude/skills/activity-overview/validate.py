@@ -1537,10 +1537,10 @@ _OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns"
                         "start_state_source", "end_check", "window", "as_of_window",
                         "marker_files", "entry_files", "deprecated_modules",
                         "stub_modules", "modules_at_end", "proposed_modules",
-                        "marker_texts"}
+                        "marker_texts", "shared_marker_texts"}
 _OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "at", "seq", "source",
                          "quote", "via", "marker_text", "info", "file_removed",
-                         "replacement"}
+                         "replacement", "file_added"}
 
 
 # --- typed shapes of the fields readers touch ---------------------------------
@@ -1656,6 +1656,7 @@ _OWNERSHIP_ROW_TYPES = {
     "events": {"kind": (_STR, True), "module": (_STR + _NONE, False),
                "marker_text": (_STR, False), "info": ("info", False),
                "file_removed": ("bool", False),
+               "file_added": ("bool", False),
                "replacement": ("replacement", False),
                "people": ("list_of_str", False), "date": (_STR, True),
                "at": (_STR + _NONE, False), "seq": ("int", False),
@@ -1743,6 +1744,9 @@ def _module_ownership_problem(value):
     for key, spec in (("modules_at_end", ("map", ("obj", {"lifecycle": (_S, True)}))),
                       ("marker_files", ("map", ("list", _S))),
                       ("proposed_modules", PROPOSED_MODULES_SHAPE),
+                      ("shared_marker_texts", ("list", ("obj", {
+                          "kind": (_S, True), "text": (_S, True),
+                          "modules": (("list", _S), True), "count": (_I, True)}))),
                       ("marker_texts", ("map", ("obj", {"text": (_S, True),
                                                         "modules": (_I, True)}))),
                       ("entry_files", ("list", _S))):

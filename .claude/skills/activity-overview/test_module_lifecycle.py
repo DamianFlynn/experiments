@@ -379,5 +379,68 @@ class TestUnavailableEndToEnd(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestReviewRoundPr121(unittest.TestCase):
+    """Review findings on the lifecycle replay (PR #121)."""
+
+    def test_a_new_module_created_with_an_empty_owner_list_has_no_owner(self):
+        s1, new = "1" * 40, "avm/res/e/new"
+        evs = [{"commit": s1, "path": new + "/metadata.json", "change": "add",
+                "date": "2026-10-05", "author": "n"},
+               {"commit": s1, "path": new + "/main.bicep", "change": "add",
+                "date": "2026-10-05", "author": "n"},
+               {"commit": s1, "path": "avm/res/e/other/metadata.json", "change": "add",
+                "date": "2026-10-05", "author": "n"}]
+        blobs = {(s1, new + "/metadata.json"): meta([], "New One"),
+                 (s1, "avm/res/e/other/metadata.json"): json.dumps(
+                     {"moduleDisplayName": "No owners field"})}
+        f = gather.collect_module_ownership(
+            evs, [{"sha": s1, "committed_at": "2026-10-05T10:00:00Z"}], [], [],
+            Blobs(blobs), [], "2026-10-01", "2026-10-31", start_state=start_state())
+        ev = [e for e in f["events"] if e["kind"] == "owner_needed"]
+        self.assertEqual([(e["module"], e.get("file_added")) for e in ev], [(new, True)])
+        rows = {r["module"]: r for r in f["without_owner"]}
+        self.assertEqual((rows[new]["lifecycle"], rows[new]["marker"]), ("live", "metadata.json"))
+        self.assertNotIn("avm/res/e/other", rows)
+        self.assertIsNone(validate._fact_shape_problem("module_ownership", f))
+
+    def test_two_shared_notices_of_one_kind_are_not_merged(self):
+        st = start_state()
+        a, b_ = "NOTICE A: this module is deprecated.", "NOTICE B: use the other one."
+        for m, t in (("avm/ptn/x/a1", a), ("avm/ptn/x/a2", a), ("avm/ptn/x/a3", a),
+                     ("avm/ptn/x/b1", b_), ("avm/ptn/x/b2", b_)):
+            st[m] = {"owners": ["o"], "codeowners": [], "orphan_marker": False,
+                     "deprecated": True, "deprecated_text": t, "entry": True}
+        f = gather.collect_module_ownership([], [], [], [], Blobs({}), [], "2026-10-01",
+                                            "2026-10-31", start_state=st)
+        rows = {r["module"]: r for r in f["deprecated_modules"]}
+        self.assertEqual(f["marker_texts"]["deprecated"], {"text": a, "modules": 3})
+        self.assertTrue(all(rows[m].get("marker_text_shared") for m in
+                            ("avm/ptn/x/a1", "avm/ptn/x/a2", "avm/ptn/x/a3")))
+        self.assertEqual([rows[m].get("deprecated_text") for m in ("avm/ptn/x/b1", "avm/ptn/x/b2")],
+                         [b_, b_])
+        self.assertTrue(all(not rows[m].get("marker_text_shared")
+                            for m in ("avm/ptn/x/b1", "avm/ptn/x/b2")))
+        shared = {x["text"]: (x["count"], x["modules"]) for x in f["shared_marker_texts"]}
+        self.assertEqual(shared[b_], (2, ["avm/ptn/x/b1", "avm/ptn/x/b2"]))
+        self.assertEqual(shared[a][0], 3)
+        self.assertIsNone(validate._fact_shape_problem("module_ownership", f))
+
+    def test_a_week_view_keeps_the_proposals_made_by_its_end(self):
+        from test_review_fixes_ownership import _store
+        prop = {"avm/res/n/early": {"prs": [1], "commit": "a" * 40,
+                                    "committed_at": "2026-10-03T00:00:00Z",
+                                    "info": {"display_name": "Early"}},
+                "avm/res/n/late": {"prs": [2], "commit": "b" * 40,
+                                   "committed_at": "2026-10-20T00:00:00Z"}}
+        f = gather.collect_module_ownership([], [], [], [], Blobs({}), [], "2026-10-01",
+                                            "2026-10-31", start_state=start_state(),
+                                            proposed=prop)
+        conn = _store(("2026-10-01", "2026-10-31", f))
+        mo = extract.extract(conn, "o", "r", "2026-10-01", "2026-10-07")["module_ownership"]
+        self.assertEqual(sorted(mo["proposed_modules"]), ["avm/res/n/early"])
+        self.assertEqual(mo["modules_at_end"]["avm/res/n/early"]["lifecycle"], "proposed")
+        self.assertNotIn("avm/res/n/late", mo["modules_at_end"])
+
+
 if __name__ == "__main__":
     unittest.main()
