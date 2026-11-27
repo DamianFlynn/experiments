@@ -44,6 +44,9 @@ python3 newsletter.py workspace/view/bundle.json --outline > workspace/view/news
 python3 link.py workspace/view/bundle.json --slice <train-id> > workspace/slices/<train-id>.slice.json
 python3 link.py workspace/slices/<train-id>.slice.json --check-story workspace/slices/<train-id>.story.md
 
+# many stories: a work package for parallel writers (slices, rows, batches, manifest)
+python3 newsletter.py workspace/view/bundle.json --work-package workspace/wp
+
 # the mechanical check of the written issue (exit 0 = passes, 1 = lists, 2 = usage)
 python3 newsletter.py workspace/view/bundle.json --check-newsletter workspace/newsletter.md \
   --slices workspace/slices [--people ~/activity/people.json] [--automation LOGIN] [--weekly]
@@ -120,7 +123,7 @@ slice / check commands, and the **story plan**:
 |---|---|---|
 | `full` | every train landed, in flight or closed; every stalled train with a human turn or an event in the window (`worthy` is not "carried over"); every plumbing train with a real discussion in the window (a selected story with a turn in the window, or at least `STORY_MIN_EXCHANGES` turns in the window between two or more people) | the story in full, under its group (a plumbing story under its theme) |
 | `line` | a stalled train merely carried over | one line in the Stalled group: the root item linked, its module (linked), "stalled", days without recorded activity (`idle_days`) and the derived next move (`waits_on`) |
-| `in_theme` | every other plumbing train | named (a link to one of its PRs) in its theme's narrative (`theme`) |
+| `in_theme` | every other plumbing train, and every automation-only train of any group (every PR by an automation account, no human turn) | named (a link to one of its PRs) in its theme's narrative (`theme`) |
 
 `plan_counts` gives the counts per group and plan; `excluded` lists the trains the view left
 out (idle over its carry limit). Each story follows the story brief
@@ -134,12 +137,29 @@ is acknowledged with `<!-- story pending: <key> — <reason> -->`; a theme narra
 written with `<!-- theme pending: <theme id> — <reason> -->` (both listed as pending; anything
 neither written nor pending fails the check).
 
-**Writing many stories in parallel.** A month can hold dozens of `full` stories. Cut each
-story's slice once (`link.py --slice`, or `link.slice_train` on the linked view, adding
-`newsletter_links`), and hand writers batches of roughly equal slice size (a few to ten
-stories each), each with its slices, outline rows, the story brief and these rules, and one
-batch per plumbing theme (the theme row, the trains to name, the discussed trains' slices);
-each writer checks every story with `link.py --check-story` before handing it back.
+**Writing many stories in parallel.** A month can hold dozens of `full` stories.
+
+```bash
+python3 newsletter.py workspace/view/bundle.json --work-package workspace/wp
+```
+
+writes every `full` story's slice (with `newsletter_links`) and outline row (with
+`prompted_by`, `pr_details`, people), one theme file per plumbing theme, `manifest.json` (every
+story in issue order with its plan, slice size and batch) and batches for parallel writers:
+stories in batches of at most `WORK_PACKAGE_BATCH` (8) stories and `WORK_PACKAGE_BYTES`
+(1.5 MB) of slices, of roughly equal slice size, and one batch per plumbing theme. Each batch
+directory holds `BATCH.md` (the files to read, the files to write, the check command per story)
+and `STORY_BRIEF.md` (the story brief plus the newsletter rules below). A writer gets only the
+batch path; it checks every story with `link.py --check-story` before handing it back. The
+issue is then assembled: each pending marker replaced by its story (in its group, in
+`stories.all` order) or theme (in theme order), and `--check-newsletter` run on the whole.
+
+A **closed** story ends with "Where it stands" (what was decided, by whom, what is left), as an
+in-flight or stalled one does; only a landed story ends with "What landed".
+
+A train whose every PR is authored by an automation account and that has no human
+conversation turn is not a story, whatever group the view gives it: its plan is `in_theme`,
+and it is named in the plumbing theme of its PRs' author (`_theme_by_author`).
 
 **Module ownership** — `events` (owner_needed / owner_added / owner_removed / orphaned /
 adopted: module with `module_url`, people, date, source link, quote, `via`), `unattributed`
@@ -160,8 +180,8 @@ what it did (counts, PRs) — never hidden, never presented as a person.
 name whom the next move is with here.
 
 **Plumbing: what was engineered** — `themes`: the view's `plumbing_themes` (`theme_source:
-view`) or provisional themes by PR class (sweeps, CI, tests, docs, mixed). Per theme: a short
-narrative paragraph written from its PRs' descriptions (as last gathered), commit evidence and
+view`) or provisional themes by PR class (sweeps, CI, tests, docs, mixed). Per theme: an intro
+and one paragraph per strand of work (as long as the work needs), written from its PRs' descriptions (as last gathered), commit evidence and
 stories — what problem, what was built or changed, what it means for contributors (test
 environment, CI checks, README generation, …), who did it — naming every `in_theme` train of
 the theme by a link to one of its PRs — then the plumbing stories in full under the theme's

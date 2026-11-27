@@ -1435,6 +1435,8 @@ class TestDeliveredContract(unittest.TestCase):
         th = section(out, "plumbing")["themes"][0]
         self.assertEqual((th["id"], th["theme_source"], th["subjects"]),
                          ("ci_workflows", "view", ["ci"]))
+        self.assertEqual(th["counts"], {"prs": 1, "merged": 1, "closed_unmerged": 0,
+                                        "open": 0, "by_author": {"jared": 1}})
 
     def _text(self, extra_story="", theme=True):
         t = GOOD.replace("<!-- story pending: train-pr-11 — written from the next store -->",
@@ -1488,6 +1490,58 @@ class TestDeliveredContract(unittest.TestCase):
         self.assertEqual((r["modules_not_in_view"], r["urls_not_in_view"],
                           r["ownership_not_in_view"]), ([], [], []))
 
+    def test_automation_only_train_is_told_in_its_theme(self):
+        v = self.v()
+        v["people"]["bump[bot]"] = {"is_bot": True}
+        v["prs"].append({"number": 97, "title": "fix: bump x", "author": "bump[bot]",
+                         "url": R + "/pull/97", "state": "open", "merged": False})
+        v["trains"].append({"id": "train-pr-97", "outcome": "in_flight", "prs": [97],
+                            "issues": []})
+        v["stories"]["all"].append({"id": "train-pr-97", "group": "in_flight",
+                                    "state": "in_flight", "worthy": "PR #97 opened in the window"})
+        v["plumbing_themes"].append({"id": "deps", "title_hint": "Dependency updates",
+                                     "prs": [{"number": 97}], "stories": []})
+        st = section(newsletter.outline([v]), "stories")
+        row = next(r for r in st["all"] if r["key"] == "train-pr-97")
+        self.assertEqual((row["plan"], row["theme"]), ("in_theme", "deps"))
+        self.assertNotIn("train-pr-97", [r["key"] for r in st["full"]])
+        # a human turn keeps it a story
+        next(t for t in v["trains"] if t["id"] == "train-pr-97")["discussion"] = {
+            "comments": 1, "participants": 1}
+        st = section(newsletter.outline([v]), "stories")
+        self.assertEqual(next(r for r in st["all"] if r["key"] == "train-pr-97")["plan"], "full")
+
+    def test_story_may_link_any_module_the_view_knows(self):
+        t = self._text().replace(
+            "Landed. Something happened.",
+            "Landed. Something happened to [`avm/ptn/net/dns`](" + T + "avm/ptn/net/dns).")
+        v = self.v()
+        v["module_changes"] = view()["module_changes"]
+        r = newsletter.check_newsletter([v], t, slices={"train-issue-5": SLICE})
+        self.assertTrue(r["stories"]["train-issue-5"]["ok"], r["stories"])
+
+    def test_a_paragraph_may_state_what_its_linked_items_say(self):
+        v = self.v()
+        v["module_changes"] = view()["module_changes"]
+        v["prs"][2]["body"] = "Bumps the action from 5.0.0 to 7.0.1 for 403 errors, see #4242."
+        t = self._text() + ("\nIn [#12](https://github.com/o/r/pull/12) the action moved from "
+                            "5.0.0 to 7.0.1 after 403 errors (#4242), one item.\n")
+        r = newsletter.check_newsletter([v], t, slices={"train-issue-5": SLICE})
+        self.assertEqual((r["versions_not_in_view"], r["numbers_not_in_view"],
+                          r["items_not_in_view"]), ([], [], []))
+        t = self._text() + "\nThe action moved from 5.0.0 to 7.0.1 after 403 errors (#4242).\n"
+        r = newsletter.check_newsletter([v], t, slices={"train-issue-5": SLICE})
+        self.assertTrue(r["versions_not_in_view"] and r["items_not_in_view"]
+                        and "403" in r["numbers_not_in_view"])
+
+    def test_ignored_about_tests_is_not_a_characterisation(self):
+        r = newsletter.check_newsletter([view()], GOOD + "\nIgnored tests are skipped.\n",
+                                        slices={"train-issue-5": SLICE})
+        self.assertEqual(r["characterising_words"], [])
+        r = newsletter.check_newsletter([view()], GOOD + "\nThe request was ignored.\n",
+                                        slices={"train-issue-5": SLICE})
+        self.assertEqual(r["characterising_words"], ["was ignored"])
+
     def test_story_may_link_its_modules_and_tags(self):
         t = self._text().replace(
             "Landed. Something happened.",
@@ -1521,6 +1575,57 @@ class TestDeliveredContract(unittest.TestCase):
         r = newsletter.check_newsletter([self.v()], t, slices={"train-issue-5": SLICE})
         self.assertEqual(r["themes_missing"], [])
         self.assertEqual(r["themes_pending"], ["ci_workflows"])
+
+
+class TestWorkPackage(unittest.TestCase):
+    """newsletter.py --work-package DIR: the files a set of parallel writers
+    needs, one batch each."""
+
+    def test_package_files_manifest_and_batches(self):
+        with tempfile.TemporaryDirectory() as d:
+            doc = newsletter.work_package([view()], d)
+            self.assertEqual(doc["kind"], "newsletter_work_package")
+            self.assertEqual([(m["key"], m["plan"], m["batch"]) for m in doc["stories"]],
+                             [("train-issue-5", "full", "stories-01"),
+                              ("train-pr-11", "full", "stories-01")])
+            sl = json.load(open(os.path.join(d, "slices", "train-issue-5.slice.json")))
+            self.assertIn("newsletter_links", sl)
+            self.assertEqual(sl["train"]["id"], "train-issue-5")
+            row = json.load(open(os.path.join(d, "rows", "train-issue-5.row.json")))
+            self.assertEqual(row["prompted_by"], [])
+            self.assertTrue(os.path.exists(os.path.join(d, "rows", "theme-ci.json")))
+            batch = open(os.path.join(d, "batches", "stories-01", "BATCH.md")).read()
+            self.assertIn("--check-story", batch)
+            self.assertIn("**Landed — ", batch)
+            brief = open(os.path.join(d, "batches", "stories-01", "STORY_BRIEF.md")).read()
+            self.assertIn("Stories (the story brief)", brief)
+            self.assertIn("Where it stands", brief)
+
+    def test_batches_respect_the_story_limit(self):
+        v = view()
+        for n in range(20, 31):
+            v["trains"].append({"id": "train-pr-%d" % n, "outcome": "shipped", "issues": [],
+                                "prs": [10]})
+            v["stories"]["selected"].append({"id": "train-pr-%d" % n, "rank": n, "score": 1})
+        with tempfile.TemporaryDirectory() as d:
+            doc = newsletter.work_package([v], d)
+        sizes = [len(b["keys"]) for b in doc["batches"] if b["kind"] == "stories"]
+        self.assertEqual(sum(sizes), 13)
+        self.assertTrue(all(n <= newsletter.WORK_PACKAGE_BATCH for n in sizes), sizes)
+
+    def test_cli(self):
+        with tempfile.TemporaryDirectory() as d:
+            vp = os.path.join(d, "v.json")
+            json.dump(view(), open(vp, "w"))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                newsletter.main([vp, "--work-package", os.path.join(d, "wp")])
+            self.assertEqual(json.loads(buf.getvalue())["stories"], 2)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    newsletter.main([vp, "--work-package", d, "--outline"])
+            self.assertEqual(cm.exception.code, 2)
 
 
 class TestCli(unittest.TestCase):

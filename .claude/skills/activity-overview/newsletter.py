@@ -819,6 +819,32 @@ def story_plan(group, worthy, train, provisional=False):
     return "full", "ungrouped"
 
 
+def automation_only(view, train, automation=()):
+    """True when every PR of a train is authored by an automation account and
+    the train has no human conversation turn (it is told in a plumbing theme,
+    whatever group the view gives it)."""
+    prs = {p.get("number"): p for p in view.get("prs") or []}
+    numbers = train.get("prs") or []
+    if not numbers or not all(is_automation(view, (prs.get(n) or {}).get("author"), automation)
+                              for n in numbers):
+        return False
+    d = train.get("discussion") or {}
+    turns = (d.get("comments") or 0) + (d.get("review_comments") or 0) + \
+        sum((d.get("reviews") or {}).values())
+    return turns == 0
+
+
+def _theme_by_author(view, train):
+    """The plumbing theme an automation-only train belongs with: the view's
+    theme whose PRs share its PRs' author, if exactly one does."""
+    prs = {p.get("number"): p for p in view.get("prs") or []}
+    authors = {(prs.get(n) or {}).get("author") for n in train.get("prs") or []}
+    hits = [th.get("id") for th in view.get("plumbing_themes") or []
+            if authors & {(prs.get(x.get("number")) or {}).get("author")
+                          for x in th.get("prs") or []}]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _theme_index(view, multi):
     """{train id: theme id} from the view's plumbing_themes (else the
     provisional themes by PR class)."""
@@ -874,6 +900,10 @@ def section_stories(views, caps, multi=False):
             else:
                 plan, reason = story_plan(group, e.get("worthy"), t,
                                           provisional=not isinstance(alls, list))
+                if group != "plumbing" and automation_only(v, t):
+                    plan, reason = "in_theme", ("automation only (every PR by an automation "
+                                                "account, no human turn): told in its "
+                                                "plumbing theme")
             title, url = _train_title(v, t)
             key = story_key(v, e["id"], multi)
             sfile = slice_filename(key)
@@ -907,7 +937,7 @@ def section_stories(views, caps, multi=False):
                     sfile, sfile.replace(".slice.json", ".story.md")),
             }
             if group == "plumbing" or plan == "in_theme":
-                row["theme"] = themes.get(e["id"])
+                row["theme"] = themes.get(e["id"]) or _theme_by_author(v, t)
             if plan == "line":
                 try:
                     oc = link.slice_train(v, e["id"])["conversation"]["outcome"]
@@ -1287,6 +1317,7 @@ def section_plumbing(view, caps, multi=False, automation=()):
                 "prs": [_pr_row(view, n, automation) for n in numbers],
                 "stories": [story_key(view, x, multi) for x in th.get("stories") or []],
                 "people": people_of(numbers),
+                "counts": _theme_counts(view, numbers),
                 "subjects": th.get("subjects"), "issues": th.get("issues"),
                 "paths_more": th.get("paths_more"),
                 "evidence_counts": th.get("evidence_counts")}, _slug(view), multi))
@@ -1316,6 +1347,24 @@ def section_plumbing(view, caps, multi=False, automation=()):
            "omit": None}
     if not rows and not themes:
         out["omit"] = "no merged pull request was plumbing in the window"
+    return out
+
+
+def _theme_counts(view, numbers):
+    """How a theme's PRs ended as of the window's end: merged, closed without
+    merging, open; and how many each author opened."""
+    prs = {p.get("number"): p for p in view.get("prs") or []}
+    out = {"prs": len(numbers), "merged": 0, "closed_unmerged": 0, "open": 0, "by_author": {}}
+    for n in numbers:
+        p = prs.get(n) or {}
+        if p.get("merged"):
+            out["merged"] += 1
+        elif p.get("state") == "closed":
+            out["closed_unmerged"] += 1
+        elif p.get("state") == "open":
+            out["open"] += 1
+        if p.get("author"):
+            out["by_author"][p["author"]] = out["by_author"].get(p["author"], 0) + 1
     return out
 
 
@@ -1795,9 +1844,10 @@ _YEAR_RE = re.compile(r"^(19|20)\d\d$")
 # Words that characterise people, effort or mood (story brief rule 7,
 # reference/newsletter.md "What not to say"). Not exhaustive.
 CHARACTERISING_WORDS = ("finally", "frustrated", "frustrating", "sloppy", "patiently",
+                        "was ignored", "were ignored", "went ignored", "ignored by",
                         "tireless", "tirelessly", "heroic", "heroically", "lazy",
                         "careless", "unfortunately", "sadly", "pushed back hard",
-                        "ignored", "dragged", "struggled", "annoyed", "impatient",
+                        "dragged", "struggled", "annoyed", "impatient",
                         "rockstar", "amazing work", "stalled by")
 
 
@@ -2058,6 +2108,12 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     theme_titles = {t.get("id"): t.get("title_hint")
                     for t in sec["plumbing"].get("themes") or []}
     misplaced, state_missing = [], []
+    module_links = set()
+    for v_ in views:
+        _, paths_, _, _ = _module_index([v_])
+        for pth in paths_.get(_slug(v_), set()):
+            if _AVM_PATH_RE.fullmatch(pth) or pth.startswith("modules/"):
+                module_links.add(module_url(v_, pth)[0])
     for m in _STORY_BLOCK_RE.finditer(text):
         tid, body = m.group(1), m.group(2).strip()
         nk = story_key_norm(tid)
@@ -2094,9 +2150,12 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
             if tid not in not_checked:
                 not_checked.append(tid)
         else:
-            if row is not None and story_links(row):
+            if row is not None:
+                # the row's module and tag links, and the folder of any module
+                # the view knows (a story may name a module its row lacks)
                 sl = dict(sl, newsletter_links=sorted(
-                    set(sl.get("newsletter_links") or []) | set(story_links(row))))
+                    set(sl.get("newsletter_links") or []) | set(story_links(row)) |
+                    module_links))
             r = link.check_story_evidence(sl, body)
             r = {k: x for k, x in r.items() if x or k == "ok"}
             prev = stories.get(tid)
@@ -2201,6 +2260,18 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
         home_words |= {n.lower() for n in a.get("home_names") or [] if n.lower() != owner}
         home_words |= {n.lower() for n in a.get("home_orgs") or [] if n.lower() != owner}
     unresolved = []
+    item_text = {}
+    for v in views:
+        for x in (v.get("prs") or []) + (v.get("issues") or []):
+            if x.get("url"):
+                item_text[x["url"]] = "{}\n{}".format(x.get("title") or "", x.get("body") or "")
+
+    def linked_text(par):
+        """The titles and descriptions of the view's items a paragraph links."""
+        out = []
+        for u in re.findall(r"https://github\.com/[\w.-]+/[\w.-]+/(?:pull|issues)/\d+", par):
+            out.append(item_text.get(u, ""))
+        return "\n".join(out)
 
     def resolve(repo, what, **row):
         """The repositories a claim is checked against: the paragraph's own,
@@ -2293,6 +2364,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     for par, repo in scoped:
         par_c = _strip(_delink(par), code=False)
         toks = areas_named(_delink(par), None)
+        cited_text = linked_text(par)
         par_mods = {}
         for tok in toks:
             if tok not in named_mods:
@@ -2300,6 +2372,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
             known = resolve(repo, lambda sl, t=tok: t in paths[sl] or t in module_text[sl]
                             or _area_of(t, versions[sl]) is not None, module=tok)
             ok_repos = [sl for sl in known if tok in paths[sl] or tok in module_text[sl]]
+            if not ok_repos and tok in cited_text:
+                ok_repos = ["cited"]
             if not ok_repos:
                 row = tag({"module": tok}, repo) if multi else tok
                 if row not in bad_mods:
@@ -2318,6 +2392,11 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
         for vm in _VERSION_RE.finditer(par_c):
             ver = vm.group(1)
             attached = _attached_module(par_c, vm.start(), toks)
+            if attached is not None and not any(attached in own_versions.get(sl, {})
+                                                 for sl in slugs):
+                attached = None    # a module the window holds no versions of
+            if re.search(r"(?<![\w.])v?" + re.escape(ver) + r"(?![\w]|\.\d)", cited_text):
+                continue           # the version as a linked item states it
             if attached is not None:
                 pool = [repo] if repo is not None else \
                     [sl for sl in slugs if attached in own_versions.get(sl, {})
@@ -2353,6 +2432,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
             n = int(raw)
             if n in linked_nums:
                 continue
+            if re.search(r"#{}\b|/(?:pull|issues)/{}\b".format(n, n), cited_text):
+                continue           # an item a linked item itself refers to
             known = resolve(repo, lambda sl, n=n: n in items[sl], number=n)
             if not known:
                 row = tag({"number": n}, repo) if multi else n
@@ -2535,14 +2616,33 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     num_prose = link._DATE_IN_PROSE_RE.sub(lambda m: " " * len(m.group(0)), prose)
     num_prose = _VERSION_RE.sub(lambda m: " " * len(m.group(0)), num_prose)
     num_prose = re.sub(r"\b\d+\.\d+(?:\.\d+)*\b", lambda m: m.group(0)
-                       if m.group(0).replace(".", "", 1).isdigit() else " ", num_prose)
+                       if m.group(0).replace(".", "", 1).isdigit() else " " * len(m.group(0)),
+                       num_prose)
     num_prose = _ITEM_RE.sub(lambda m: " " * len(m.group(0)), num_prose)
     num_prose = re.sub(r"^\s*\d+\.\s", lambda m: " " * len(m.group(0)), num_prose,
                        flags=re.M)
     bad_nums = []
+    # a paragraph may also state what the items it links say (their title and
+    # description), and how many items it links
+    spans, last = [], 0
+    for m in re.finditer(r"\n\s*\n", no_quotes):
+        spans.append((last, m.start()))
+        last = m.end()
+    spans.append((last, len(no_quotes)))
+    local = []
+    for a, b in spans:
+        cited_par = linked_text(no_quotes[a:b])
+        toks_ = set(re.findall(r"\d[\d,]*(?:\.\d+)?", cited_par))
+        toks_ = {x.replace(",", "") for x in toks_}
+        n_items = len(set(re.findall(r"/(?:pull|issues)/(\d+)", no_quotes[a:b])))
+        if n_items:
+            toks_.add(str(n_items))
+        local.append((a, b, toks_))
     for m in _NUMBER_RE.finditer(num_prose):
         tok = m.group(1).replace(",", "")
         if _YEAR_RE.match(tok) or tok in allowed:
+            continue
+        if any(a <= m.start() < b and tok in t_ for a, b, t_ in local):
             continue
         if tok not in bad_nums:
             bad_nums.append(tok)
@@ -2594,12 +2694,209 @@ CANNOT_CHECK = (
 )
 
 
+
+# --- the work package (many stories written in parallel) ---------------------
+
+WORK_PACKAGE_RULES = """
+## Newsletter rules on top of the story brief (reference/newsletter.md)
+
+1. **First line states the state.** The bold headline starts with the story's state label:
+   `**Landed — …**`, `**In flight — …**`, `**Stalled — …**` or `**Closed — …**` (the `state` in
+   the story's row file). A plumbing story uses its own state the same way.
+2. **Closing part.** "What landed" for a landed story; "Where it stands" for every other one,
+   a closed one included (what was decided, by whom, and what is left).
+3. **Markers.** Write the story between `<!-- story: <key> -->` and `<!-- /story -->` on their
+   own lines, nothing else in the file. `<key>` is the `key` in the row file.
+4. **Links.** Name each module the story affects as a link to its folder (the row file's
+   `modules[].url`, or the folder of a module the record names). A published version stated
+   with a module links its tag (`released[].url`). No other URL that is not in the slice.
+5. **Release status.** Where the story says a PR landed / merged / shipped, say in the same or
+   the next sentence what that means for a reader, from `released[]`: "released as [X](tag)",
+   "declared in the changelog, not yet published", "no version change", or "release status
+   not known".
+6. **Who / why / state of play.** Answer, from the slice: which module or pattern (linked), why
+   it came up (`prompted_by` in the row file), what was decided or changed, the state of play,
+   where it is heading or what it waits on, how a reader can help (only actions the record
+   points to). Fork contributions are said as such (`pr_details[].is_fork`).
+7. **Automation accounts** (`[bot]` logins, `automation: true` in the row's people) are
+   named as automation, never as a person.
+8. **No tool, model or vendor names** that appear in the record (agent footers, assistant
+   account names): say "an automation account (a coding agent)".
+"""
+
+
+def work_package(views, out_dir, skill_dir=None, cadence="month", automation=()):
+    """Write the work package of one issue into `out_dir`: every `full`
+    story's slice (with `newsletter_links`) and outline row, one theme file
+    per plumbing theme, `manifest.json` (every story in issue order with its
+    plan, slice size and batch), and batches for parallel writers (stories in
+    batches of at most WORK_PACKAGE_BATCH stories and WORK_PACKAGE_BYTES of
+    slices, of roughly equal slice size; one batch per plumbing theme), each
+    with `BATCH.md` and `STORY_BRIEF.md`. Returns the manifest."""
+    views = list(views)
+    multi = len(views) > 1
+    skill_dir = skill_dir or os.path.dirname(os.path.abspath(__file__))
+    out = outline(views, cadence=cadence, automation=automation)
+    sec = {x["id"]: x for x in out["sections"]}
+    st = sec["stories"]
+    by_repo = {_slug(v): v for v in views}
+    for sub in ("slices", "rows", "out", "tmp", "batches"):
+        os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
+    guide = open(os.path.join(skill_dir, "reference", "report-sections.md"),
+                 encoding="utf-8").read()
+    i = guide.find("### Stories (the story brief)")
+    j = guide.find("## Next-release forecast", i)
+    brief = guide[i:j].strip() if i >= 0 else ""
+
+    def view_of(row):
+        return by_repo.get(row.get("repo")) if multi else views[0]
+
+    def write_story(row):
+        v = view_of(row)
+        sl = link.slice_train(v, row["id"])
+        sl["newsletter_links"] = story_links(row)
+        path = os.path.join(out_dir, "slices", slice_filename(row["key"]))
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(sl, fh, indent=1)
+        full = dict(row, prompted_by=prompted_by(v, row.get("prs") or []),
+                    pr_details=[_pr_row(v, n, automation) for n in row.get("prs") or []])
+        people = []
+        for login, pp in (sl.get("participants") or {}).items():
+            prow = {"login": login}
+            prow.update(pp if isinstance(pp, dict) else {})
+            if is_automation(v, login, automation):
+                prow["automation"] = True
+            people.append(prow)
+        full["people"] = people
+        rpath = os.path.join(out_dir, "rows", slice_filename(row["key"]).replace(
+            ".slice.json", ".row.json"))
+        with open(rpath, "w", encoding="utf-8") as fh:
+            json.dump(full, fh, indent=1)
+        return {"key": row["key"], "group": row["group"], "state": row["state"],
+                "plan": "full", "plan_reason": row.get("plan_reason"),
+                "title": row.get("title"), "theme": row.get("theme"),
+                "slice": os.path.relpath(path, out_dir),
+                "row": os.path.relpath(rpath, out_dir), "slice_bytes": os.path.getsize(path)}
+
+    manifest = [write_story(r) for r in st.get("full") or [] if r["group"] != "plumbing"]
+    total = sum(m["slice_bytes"] for m in manifest)
+    n_batches = max(1, -(-len(manifest) // WORK_PACKAGE_BATCH),
+                    -(-total // WORK_PACKAGE_BYTES)) if manifest else 0
+    bins = [[] for _ in range(n_batches)]
+    for m in sorted(manifest, key=lambda m: -m["slice_bytes"]):
+        open_bins = [k for k in range(n_batches) if len(bins[k]) < WORK_PACKAGE_BATCH] \
+            or list(range(n_batches))
+        k = min(open_bins, key=lambda k: (sum(x["slice_bytes"] for x in bins[k]), len(bins[k])))
+        bins[k].append(m)
+    batches = []
+    for k, items in enumerate(bins, 1):
+        bid = "stories-{:02d}".format(k)
+        items.sort(key=manifest.index)
+        for m in items:
+            m["batch"] = bid
+        batches.append({"id": bid, "kind": "stories", "keys": [m["key"] for m in items],
+                        "slice_bytes": sum(m["slice_bytes"] for m in items)})
+    rows_all = st.get("all") or []
+    for th in sec["plumbing"].get("themes") or []:
+        tid = th.get("id")
+        members = [r for r in rows_all if r.get("theme") == tid]
+        discussed = [r for r in members if r["plan"] == "full"]
+        named = [r for r in members if r["plan"] == "in_theme"]
+        items = []
+        for r in discussed:
+            m = write_story(r)
+            m["batch"] = "theme-" + tid
+            manifest.append(m)
+            items.append(m)
+        for r in named:
+            manifest.append({"key": r["key"], "group": r["group"], "state": r["state"],
+                             "plan": "in_theme", "plan_reason": r.get("plan_reason"),
+                             "title": r.get("title"), "theme": tid, "url": r.get("url"),
+                             "prs": r.get("prs"), "batch": "theme-" + tid})
+        v = by_repo.get(th.get("repo")) if multi else views[0]
+        tfile = os.path.join(out_dir, "rows", "theme-{}.json".format(tid))
+        with open(tfile, "w", encoding="utf-8") as fh:
+            json.dump({"theme": th, "discussed": discussed,
+                       "named": [dict(r, pr_details=[_pr_row(v, n, automation)
+                                                     for n in r.get("prs") or []])
+                                 for r in named]}, fh, indent=1)
+        batches.append({"id": "theme-" + tid, "kind": "theme", "theme": tid,
+                        "title_hint": th.get("title_hint"), "keys": [m["key"] for m in items],
+                        "named": [r["key"] for r in named],
+                        "slice_bytes": sum(m["slice_bytes"] for m in items)})
+    for r in st.get("lines") or []:
+        manifest.append({"key": r["key"], "group": r["group"], "state": r["state"],
+                         "plan": "line", "plan_reason": r.get("plan_reason"),
+                         "title": r.get("title"), "url": r.get("url"),
+                         "idle_days": r.get("idle_days"), "waits_on": r.get("waits_on"),
+                         "modules": r.get("modules")})
+    doc = {"kind": "newsletter_work_package", "repos": out["repos"], "period": out["period"],
+           "plan_counts": st.get("plan_counts"), "stories": manifest, "batches": batches}
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=1)
+    for b in batches:
+        _write_batch(out_dir, skill_dir, b, manifest, brief)
+    return doc
+
+
+WORK_PACKAGE_BATCH = 8           # stories per writer batch
+WORK_PACKAGE_BYTES = 1_500_000   # slice bytes per writer batch
+
+
+def _write_batch(out_dir, skill_dir, b, manifest, brief):
+    bdir = os.path.join(out_dir, "batches", b["id"])
+    os.makedirs(bdir, exist_ok=True)
+    with open(os.path.join(bdir, "STORY_BRIEF.md"), "w", encoding="utf-8") as fh:
+        fh.write(brief + "\n" + WORK_PACKAGE_RULES)
+    by_key = {m["key"]: m for m in manifest}
+
+    def check(key, src):
+        m = by_key[key]
+        return ("`sed -n '/<!-- story: {k}/,/<!-- \\/story/p' {src} | sed '/^<!-- \\/\\?story/d'"
+                " > {d}/tmp/{f}.md && python3 {s}/link.py {d}/{sl} --check-story {d}/tmp/{f}.md`"
+                .format(k=key, src=src, d=out_dir, f=slice_filename(key)[:-11], s=skill_dir,
+                        sl=m["slice"]))
+    lines = ["# Batch {}".format(b["id"]), "",
+             "Write from the files listed here ONLY: never outside knowledge, never an invented "
+             "fact, name, number or URL. Read `STORY_BRIEF.md` in this directory first.", "",
+             "Skill: `{}`. Output directory: `{}/out`.".format(skill_dir, out_dir), ""]
+    if b["kind"] == "stories":
+        for key in b["keys"]:
+            m = by_key[key]
+            dst = "{}/out/{}".format(out_dir, slice_filename(key).replace(".slice.json",
+                                                                          ".story.md"))
+            lines += ["## `{}` — {}: {}".format(key, m["state"], m.get("title")), "",
+                      "- slice: `{}/{}` ({} bytes); row: `{}/{}`".format(
+                          out_dir, m["slice"], m["slice_bytes"], out_dir, m["row"]),
+                      "- write `{}`: `<!-- story: {} -->`, the story (headline starting "
+                      "`**{} — `), `<!-- /story -->`".format(
+                          dst, key, STATE_LABELS.get(m["state"], m["state"])),
+                      "- check: " + check(key, dst), ""]
+    else:
+        dst = "{}/out/theme-{}.md".format(out_dir, b["theme"])
+        lines += ["## Theme `{}`".format(b["title_hint"]), "",
+                  "Read `{}/rows/theme-{}.json` (the theme, its PRs with descriptions as last "
+                  "gathered, people, the discussed trains and the trains to name).".format(
+                      out_dir, b["theme"]),
+                  "Write `{}`: first line `### {}`; an intro, then one paragraph per strand of "
+                  "work — what problem, what was built or changed, what it means for "
+                  "contributors, who did it; name EVERY train under `named` by a link to one of "
+                  "its PRs; then each discussed train's story in full between its markers."
+                  .format(dst, b["title_hint"]), ""]
+        for key in b["keys"]:
+            lines += ["- story `{}`: check: {}".format(key, check(key, dst))]
+        lines += ["", "Trains to name: " + ", ".join("`{}`".format(k) for k in b["named"]), ""]
+    with open(os.path.join(bdir, "BATCH.md"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
 # --- CLI ----------------------------------------------------------------------
 
 _USAGE = ("usage: newsletter.py VIEW.json [VIEW.json ...] --outline [--weekly] "
           "[--automation LOGIN ...]\n"
           "       newsletter.py VIEW.json [VIEW.json ...] --check-newsletter ISSUE.md "
-          "[--slices DIR] [--people PEOPLE.json] [--weekly]\n")
+          "[--slices DIR] [--people PEOPLE.json] [--weekly]\n"
+          "       newsletter.py VIEW.json [VIEW.json ...] --work-package DIR [--weekly] "
+          "[--automation LOGIN ...]\n")
 
 
 def _load(path):
@@ -2643,7 +2940,7 @@ def main(argv=None):
         argv.remove("--weekly")
         cadence = "week"
     opts = {}
-    for flag in ("--check-newsletter", "--slices", "--people"):
+    for flag in ("--check-newsletter", "--slices", "--people", "--work-package"):
         if flag in argv:
             i = argv.index(flag)
             if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
@@ -2655,6 +2952,19 @@ def main(argv=None):
     if do_outline:
         argv.remove("--outline")
     paths = argv
+    if "--work-package" in opts:
+        if not paths or any(x.startswith("-") for x in paths) or do_outline or \
+                "--check-newsletter" in opts:
+            sys.stderr.write(_USAGE)
+            raise SystemExit(2)
+        views = [_load(x) for x in paths]
+        doc = work_package(views, opts["--work-package"], cadence=cadence,
+                           automation=automation)
+        json.dump({"stories": len(doc["stories"]), "batches": [
+            {"id": b["id"], "stories": len(b["keys"]), "named": len(b.get("named") or []),
+             "slice_bytes": b["slice_bytes"]} for b in doc["batches"]]}, sys.stdout, indent=1)
+        sys.stdout.write("\n")
+        return 0
     if not paths or any(p.startswith("-") for p in paths) or \
             do_outline == ("--check-newsletter" in opts) or \
             (do_outline and ("--slices" in opts or "--people" in opts)):
