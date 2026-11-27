@@ -713,6 +713,161 @@ class TestReviewFixes(unittest.TestCase):
         self.assertEqual(r["name_mismatch"], [])
 
 
+class TestSuppressionEverywhere(unittest.TestCase):
+    """A do_not_name person is named nowhere in the issue: the check reads
+    the complete text (stories, quotes, inline and fenced code, comments,
+    headings, tables, link and image text, profile URLs)."""
+
+    def dnn(self, extra, story=None, **kw):
+        text = GOOD + extra
+        if story is not None:
+            text = text.replace("Something happened.", story)
+        r = newsletter.check_newsletter([view()], text,
+                                        slices={"train-issue-5": SLICE}, **kw)
+        return r["do_not_name_named"]
+
+    def test_story_block(self):
+        self.assertIn("kim", self.dnn("", story="Something happened, said @kim."))
+
+    def test_fenced_code(self):
+        self.assertIn("kim", self.dnn("\n```\nping @kim\n```\n"))
+
+    def test_inline_code(self):
+        self.assertIn("kim", self.dnn("\nSee `@kim`.\n"))
+
+    def test_every_other_place(self):
+        names = {"kim": "Kim Secret"}
+        for extra in ("\nThanks to kim.\n", "\nThanks to @KIM.\n",
+                      "\n<!-- thanks @kim -->\n", "\n### Thanks kim\n",
+                      "\n| who |\n|---|\n| kim |\n",
+                      "\nSee [Kim Secret](https://github.com/o/r/pull/12).\n",
+                      "\n![Kim Secret](x.png)\n",
+                      "\nSee [the profile](https://github.com/kim).\n",
+                      "\nThe fork https://github.com/kim/r was used.\n",
+                      '\nThey wrote "Kim Secret said so".\n'):
+            self.assertIn("kim", self.dnn(extra, registry_names=names), extra)
+
+    def test_links_and_words_that_do_not_name_them(self):
+        self.assertEqual(self.dnn("\nSee https://github.com/o/r/pull/12 and the kimono.\n"),
+                         [])
+
+
+class TestRepositoryScopedChecks(unittest.TestCase):
+    """Module areas, versions, declarations and #N are repository-local."""
+
+    def views(self):
+        a, b = view(), view()
+        b["meta"] = dict(b["meta"], repo="s")
+        for m in b["module_changes"]["modules"]:
+            if m["area"] == "avm/ptn/net/dns":
+                m["versions"] = {"changelog": ["0.9.0"]}
+                m["changelog"][0]["version"] = "0.9.0"
+            if m["area"] == "avm/res/data/factory":
+                m["breaking"].pop("declared")
+        b["prs"] = [p for p in b["prs"] if p["number"] != 13]
+        return a, b
+
+    def run_(self, extra):
+        return newsletter.check_newsletter(list(self.views()), GOOD + extra,
+                                           slices={"o/r:train-issue-5": SLICE})
+
+    def test_version_of_one_repository_does_not_validate_the_other(self):
+        r = self.run_("\n### o/s\n\n- `avm/ptn/net/dns` 0.7.4 changed.\n")
+        self.assertIn({"module": "avm/ptn/net/dns", "version": "0.7.4", "repo": "o/s"},
+                      r["versions_not_in_view"])
+        r = self.run_("\nIn https://github.com/o/s/pull/11, `avm/ptn/net/dns` 0.7.4.\n")
+        self.assertIn({"module": "avm/ptn/net/dns", "version": "0.7.4", "repo": "o/s"},
+                      r["versions_not_in_view"])
+        r = self.run_("\n### o/r\n\n- `avm/ptn/net/dns` 0.7.4 changed.\n")
+        self.assertNotIn("o/r", [x.get("repo") for x in r["versions_not_in_view"]])
+
+    def test_unresolved_repository_is_reported(self):
+        r = self.run_("\n- `avm/ptn/net/dns` 0.7.4 changed.\n")
+        self.assertTrue(any(u["module"] == "avm/ptn/net/dns"
+                            for u in r["repository_unresolved"]))
+
+    def test_declaration_in_one_repository_does_not_mask_a_candidate(self):
+        r = self.run_("\n### o/s\n\n- `avm/res/data/factory`: a breaking change.\n")
+        self.assertEqual([(c["module"], c["repo"]) for c in r["candidates_worded_as_declared"]],
+                         [("avm/res/data/factory", "o/s")])
+
+    def test_item_numbers_are_per_repository(self):
+        r = self.run_("\n### o/s\n\nSee #13.\n")
+        self.assertIn({"repo": "o/s", "number": 13}, r["items_not_in_view"])
+        r = self.run_("\n### o/r\n\nSee #13.\n")
+        self.assertNotIn({"repo": "o/r", "number": 13}, r["items_not_in_view"])
+
+    def test_single_repository_reports_plain_rows(self):
+        r = newsletter.check_newsletter([view()], GOOD + "\nSee #4242.\n",
+                                        slices={"train-issue-5": SLICE})
+        self.assertEqual(r["items_not_in_view"], [4242])
+        self.assertEqual(r["repository_unresolved"], [])
+
+
+class TestUnknownContributionAndVersionEvidence(unittest.TestCase):
+
+    def test_unknown_headline_is_its_own_class(self):
+        row = {"contributed": {"prs": [{"state": "merged", "headline": "unknown",
+                                        "class": "unknown"}]}}
+        self.assertEqual(newsletter.contribution_class(row), "unknown")
+        self.assertIn("unknown", newsletter.CONTRIBUTION_ORDER)
+
+    def test_child_version_files_and_release_tags_are_version_evidence(self):
+        v = view()
+        m = next(m for m in v["module_changes"]["modules"] if m["area"] == "avm/ptn/net/dns")
+        m["versions"]["child_version_files"] = [
+            {"module": "avm/ptn/net/dns/child", "from": "0.1.0", "to": "0.2.0"}]
+        m["versions"]["releases"] = [{"tag": "v1.2.0"}]
+        r = newsletter.check_newsletter(
+            [v], GOOD + "\n- `avm/ptn/net/dns/child` 0.2.0, and `avm/ptn/net/dns` 1.2.0.\n",
+            slices={"train-issue-5": SLICE})
+        self.assertEqual(r["versions_not_in_view"], [])
+        self.assertEqual(r["modules_not_in_view"], [])
+
+
+class TestSweep(unittest.TestCase):
+    """The deliberate sweep after the review rounds: suppression and
+    repository identity in every place the first rounds did not test."""
+
+    def test_registry_name_across_a_line_break(self):
+        r = newsletter.check_newsletter([view()], GOOD + "\nThanks to Pat\nHidden.\n",
+                                        slices={"train-issue-5": SLICE},
+                                        registry_names={"kim": "Pat Hidden"})
+        self.assertEqual(r["do_not_name_named"], ["kim"])
+
+    def test_version_at_the_end_of_a_sentence_is_checked(self):
+        r = newsletter.check_newsletter([view()], GOOD + "\nNow `avm/ptn/net/dns` 0.9.9.\n",
+                                        slices={"train-issue-5": SLICE})
+        self.assertIn({"module": "avm/ptn/net/dns", "version": "0.9.9"},
+                      r["versions_not_in_view"])
+
+    def test_quote_is_checked_against_its_paragraphs_repository(self):
+        a, b = view(), view()
+        b["meta"] = dict(b["meta"], repo="s")
+        a["issues"][0]["body"] = "only in r"
+        r = newsletter.check_newsletter([a, b], GOOD + '\n### o/s\n\nIt said "only in r".\n',
+                                        slices={"o/r:train-issue-5": SLICE})
+        self.assertIn("only in r", r["quotes_not_in_view"])
+        r = newsletter.check_newsletter([a, b], GOOD + '\n### o/r\n\nIt said "only in r".\n',
+                                        slices={"o/r:train-issue-5": SLICE})
+        self.assertNotIn("only in r", r["quotes_not_in_view"])
+
+    def test_multi_repo_outline_qualifies_repository_local_names(self):
+        a, b = view(), view()
+        b["meta"] = dict(b["meta"], repo="s")
+        out = newsletter.outline([a, b])
+        mc = section(out, "module_changes")
+        self.assertEqual(sorted(mc["plumbing_only"]),
+                         ["o/r::avm/res/key/vault", "o/s::avm/res/key/vault"])
+        lead = {x["fact"]: x for x in section(out, "intro")["lead_with"]}
+        self.assertIn("o/s::avm/res/data/factory", lead["declared_breaking"]["areas"])
+        self.assertIn("o/r::nik", lead["newcomers_landed_work"]["logins"])
+        self.assertEqual(lead["top_story"]["id"].split(":", 1)[1], "train-issue-5")
+        # a single repository keeps plain names
+        one = {x["fact"]: x for x in section(newsletter.outline([a]), "intro")["lead_with"]}
+        self.assertEqual(one["declared_breaking"]["areas"], ["avm/res/data/factory"])
+
+
 class TestCli(unittest.TestCase):
 
     def test_outline_and_check_commands(self):

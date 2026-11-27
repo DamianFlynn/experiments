@@ -73,6 +73,7 @@ CADENCE = {
 # What a person's work in the window is, best first: the module layer's PR
 # headline, `docs` split out of plumbing, then open work, then an issue.
 CONTRIBUTION_ORDER = ("new_module", "module_change", "release", "docs", "plumbing",
+                      "unknown",
                       "open_pr", "issue")
 
 _MONTHS = ("January", "February", "March", "April", "May", "June", "July",
@@ -418,7 +419,7 @@ def section_module_changes(view, caps, multi=False):
         if m.get("status") == "new":
             continue
         if m.get("plumbing_only"):
-            plumbing_only.append(m["area"])
+            plumbing_only.append(_qualified(repo, m["area"], multi))
             continue
         brk = m.get("breaking") or {}
         prs = [{"number": p.get("number"), "url": p.get("url"), "title": p.get("title"),
@@ -507,20 +508,19 @@ def section_stories(views, caps, multi=False):
 def contribution_class(row):
     """What a contributors row (newcomers / hall) contributed, best first
     (CONTRIBUTION_ORDER): from the module layer's PR headline of their merged
-    PRs, `docs` for a docs-only plumbing PR; `open_pr` with only open PRs;
-    `issue` with neither."""
+    PRs, `docs` for a docs-only plumbing PR, `unknown` for a merged PR whose
+    commits the view does not hold (no evidence of what it changed: never
+    read as plumbing); `open_pr` with only open PRs; `issue` with neither."""
     best = None
     for p in (row.get("contributed") or {}).get("prs") or []:
         if p.get("state") == "merged":
             h = p.get("headline")
             if h == "plumbing" and p.get("class") == "docs-only":
                 h = "docs"
-            if h not in CONTRIBUTION_ORDER:
-                h = "plumbing" if h == "unknown" else h
-            c = h if h in CONTRIBUTION_ORDER else None
+            c = h if h in CONTRIBUTION_ORDER else "unknown"
         else:
             c = "open_pr"
-        if c and (best is None or CONTRIBUTION_ORDER.index(c) < CONTRIBUTION_ORDER.index(best)):
+        if best is None or CONTRIBUTION_ORDER.index(c) < CONTRIBUTION_ORDER.index(best):
             best = c
     return best or "issue"
 
@@ -946,29 +946,39 @@ def section_numbers(views, multi=False):
             "omit": None}
 
 
+def _qualified(repo, name, multi):
+    """A repository-local name (module area, login in a repo role) as
+    `<owner/repo>::<name>` in a multi-repo outline; plain otherwise."""
+    return "{}::{}".format(repo, name) if multi and repo else name
+
+
 def section_intro(out):
     """What the intro leads with, in this order: declared breaking changes,
     new modules, the lead modules, newcomers who landed merged work, the top
     story, the plumbing share."""
     sec = {s["id"]: s for s in out["sections"]}
+    multi = len(out.get("repos") or []) > 1
+
+    def q(r, key):
+        return _qualified(r.get("repo"), r[key], multi)
     lead = []
     b = sec["breaking"]
     if b.get("declared"):
         lead.append({"fact": "declared_breaking",
-                     "areas": [d["area"] for d in b["declared"]]})
+                     "areas": [q(d, "area") for d in b["declared"]]})
     if sec["new_modules"].get("modules"):
         lead.append({"fact": "new_modules",
-                     "areas": [m["area"] for m in sec["new_modules"]["modules"]]})
+                     "areas": [q(m, "area") for m in sec["new_modules"]["modules"]]})
     mods = sec["module_changes"].get("modules") or []
     if mods:
-        lead.append({"fact": "lead_modules", "areas": [m["area"] for m in mods[:3]]})
-    landed = [r["login"] for r in sec["people"].get("newcomers") or []
+        lead.append({"fact": "lead_modules", "areas": [q(m, "area") for m in mods[:3]]})
+    landed = [q(r, "login") for r in sec["people"].get("newcomers") or []
               if r["contribution"] in ("new_module", "module_change", "release", "docs",
-                                       "plumbing")]
+                                       "plumbing", "unknown")]
     if landed:
         lead.append({"fact": "newcomers_landed_work", "logins": landed})
     if sec["stories"].get("full"):
-        lead.append({"fact": "top_story", "id": sec["stories"]["full"][0]["id"]})
+        lead.append({"fact": "top_story", "id": sec["stories"]["full"][0]["key"]})
     if sec["plumbing"].get("share") is not None:
         lead.append({"fact": "plumbing_share", "share": sec["plumbing"]["share"]})
     return {"lead_with": lead, "sentences": [3, 5], "omit": None}
@@ -1061,7 +1071,9 @@ _FENCE_RE = re.compile(r"```.*?```", re.S)
 _URL_RE = re.compile(r"https?://[^\s)\]>\"'`]+")
 _AVM_PATH_RE = re.compile(r"\bavm/(?:res|ptn|utl)/[a-z0-9-]+/[a-z0-9-]+(?:/[a-z0-9-]+)*")
 _PATHY_RE = re.compile(r"^[\w.-]+(?:/[\w.-]+)+$")
-_VERSION_RE = re.compile(r"(?<![\w.])v?(\d+\.\d+\.\d+)(?![\w.]|-\w)")
+# a version may end a sentence ("... 0.7.4."), but not continue as a longer
+# dotted number ("0.47.16.16243")
+_VERSION_RE = re.compile(r"(?<![\w.])v?(\d+\.\d+\.\d+)(?!\w|\.\d|-\w)")
 _ITEM_RE = re.compile(r"(?<![\w/.&])#(\d+)\b")
 _LOGIN_RE = re.compile(r"(?<![\w/.@`])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)\b")
 _NUMBER_RE = re.compile(r"(?<![\w.#/-])(\d[\d,]*(?:\.\d+)?)(%?)(?![\w.]\d|\w)")
@@ -1140,52 +1152,115 @@ def _numbers_in(obj, out):
 
 
 def _module_index(views):
-    """{area: set of versions it knows} over every module of the views
-    (changelog versions, tags, version files, children's), and the set of
-    every known module path (areas, children, code areas)."""
-    versions, paths, text = {}, set(), []
+    """Per repository (_slug): {area: set of versions it knows} over every
+    module (changelog versions, tags, version files, child version files,
+    release tags, children's), the set of every known module path (areas,
+    children, child version files, code areas) and the text a module path
+    may be named in (changelog items, PR titles). Module areas are
+    repository-local, so nothing is merged across repositories."""
+    versions, paths, text = {}, {}, {}
     for v in views:
+        repo = _slug(v)
+        rv = versions.setdefault(repo, {})
+        rp = paths.setdefault(repo, set())
+        rt = text.setdefault(repo, [])
         for a in (v.get("code_graph") or {}).get("areas") or []:
             if a.get("id"):
-                paths.add(a["id"])
+                rp.add(a["id"])
         mc = v.get("module_changes")
-        if not isinstance(mc, dict):
-            continue
-        for m in mc.get("modules") or []:
-            area = m["area"]
-            paths.add(area)
-            vs = versions.setdefault(area, set())
-            ver = m.get("versions") or {}
-            for k in ("changelog", "declared_not_published", "published_not_declared"):
-                vs.update(_bare(x) for x in ver.get(k) or [])
-            for p in ver.get("published") or []:
-                vs.add(_bare(p.get("version")))
-                if p.get("module"):
-                    paths.add(p["module"])
-            vf = ver.get("version_file") or {}
-            vs.update(_bare(x) for x in (vf.get("from"), vf.get("to")) if x)
-            if m.get("first_version"):
-                vs.add(_bare(m["first_version"]))
-            for c in m.get("changelog") or []:
-                vs.add(_bare(c.get("version")))
-                if c.get("module"):
-                    paths.add(c["module"])
-                for s in c.get("sections") or []:
-                    for t in _items_text(s.get("items")):
-                        text.append(t or "")
-                        vs.update(_VERSION_RE.findall(t or ""))
-            for ch in (m.get("structure") or {}).get("children") or []:
-                if ch.get("path"):
-                    paths.add(ch["path"])
-                if ch.get("from"):
-                    paths.add(ch["from"])
-            for c in (m.get("breaking") or {}).get("candidates") or []:
-                for part in str(c.get("subject") or "").split(" -> "):
-                    if "/" in part:
-                        paths.add(part.strip())
-            vs.discard(None)
-        text.extend(p.get("title") or "" for p in v.get("prs") or [])
-    return versions, paths, "\n".join(text)
+        if isinstance(mc, dict):
+            for m in mc.get("modules") or []:
+                area = m["area"]
+                rp.add(area)
+                vs = rv.setdefault(area, set())
+                ver = m.get("versions") or {}
+                for k in ("changelog", "declared_not_published", "published_not_declared"):
+                    vs.update(_bare(x) for x in ver.get(k) or [])
+                for pub in ver.get("published") or []:
+                    vs.add(_bare(pub.get("version")))
+                    if pub.get("module"):
+                        rp.add(pub["module"])
+                vf = ver.get("version_file") or {}
+                vs.update(_bare(x) for x in (vf.get("from"), vf.get("to")) if x)
+                for cv in ver.get("child_version_files") or []:
+                    if cv.get("module"):
+                        rp.add(cv["module"])
+                    vs.update(_bare(x) for x in (cv.get("from"), cv.get("to")) if x)
+                for rel in ver.get("releases") or []:
+                    tag = str(rel.get("tag") or "")
+                    if tag:
+                        vs.add(_bare(tag.rsplit("/", 1)[-1]))
+                if m.get("first_version"):
+                    vs.add(_bare(m["first_version"]))
+                for c in m.get("changelog") or []:
+                    vs.add(_bare(c.get("version")))
+                    if c.get("module"):
+                        rp.add(c["module"])
+                    for sec in c.get("sections") or []:
+                        for t in _items_text(sec.get("items")):
+                            rt.append(t or "")
+                            vs.update(_VERSION_RE.findall(t or ""))
+                for ch in (m.get("structure") or {}).get("children") or []:
+                    if ch.get("path"):
+                        rp.add(ch["path"])
+                    if ch.get("from"):
+                        rp.add(ch["from"])
+                for c in (m.get("breaking") or {}).get("candidates") or []:
+                    for part in str(c.get("subject") or "").split(" -> "):
+                        if "/" in part:
+                            rp.add(part.strip())
+                vs.discard(None)
+        rt.extend(pr.get("title") or "" for pr in v.get("prs") or [])
+    return versions, paths, {r: "\n".join(t) for r, t in text.items()}
+
+
+_REPO_LINK_RE = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/")
+_ITEM_LINK_RE = re.compile(r"\[#(\d+)\]\(https?://github\.com/([\w.-]+/[\w.-]+)/")
+
+
+def _scoped_paragraphs(text, slugs):
+    """[(paragraph, repo or None)] of the issue text: a paragraph's repository
+    is the one its github.com links name (when they name exactly one of the
+    views' repositories), else the one the nearest heading above it names
+    (`owner/repo` or the bare repository name); with a single repository,
+    always that one."""
+    if len(slugs) == 1:
+        return [(par, slugs[0]) for par in _paragraphs(text)]
+    bare = {sl.split("/", 1)[1].lower(): sl for sl in slugs}
+    low = {sl.lower(): sl for sl in slugs}
+    out, heading = [], None
+    for par in _paragraphs(text):
+        for line in par.split("\n"):
+            if re.match(r"^\s*#{1,6}\s", line):
+                heading = None
+                for tok in re.findall(r"[\w.-]+(?:/[\w.-]+)?", line):
+                    t = tok.lower()
+                    if t in low:
+                        heading = low[t]
+                    elif t in bare and heading is None:
+                        heading = bare[t]
+        linked = {low[x.lower()] for x in _REPO_LINK_RE.findall(par) if x.lower() in low}
+        out.append((par, next(iter(linked)) if len(linked) == 1 else heading))
+    return out
+
+
+def _suppression_hits(text, hidden, registry_names=None):
+    """The do_not_name logins the COMPLETE issue text names: `@login` (in
+    prose, quotes, inline or fenced code, story blocks, comments, headings,
+    tables, link or image text), the bare login as a word or a URL path
+    segment (a profile or fork link such as github.com/<login>), and a name
+    the registry holds for them. Case-insensitive, as logins are. A PR or
+    issue link does not contain its author's login and is not a hit."""
+    hits = set()
+    for login in hidden:
+        pat = r"(?<![A-Za-z0-9-])@?" + re.escape(login) + r"(?![A-Za-z0-9-])"
+        if re.search(pat, text, re.I):
+            hits.add(login)
+    for login, name in (registry_names or {}).items():
+        pat = r"\s+".join(re.escape(part) for part in name.split())
+        if pat and re.search(r"(?<!\w)" + pat + r"(?!\w)", text, re.I):
+            hits.add(login)
+    return sorted(hits)
 
 
 def _area_of(path, areas):
@@ -1269,27 +1344,49 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
     # 3. what the prose may name
     urls, texts = _view_strings(views)
     norm_texts = [link._norm_ws(t) for t in texts]
+    slugs = [_slug(v) for v in views]
     versions, paths, module_text = _module_index(views)
-    areas = sorted(versions)
-    global_versions = set().union(*versions.values()) if versions else set()
-    items = {(n) for v in views for n in [p.get("number") for p in v.get("prs") or []]
-             + [i.get("number") for i in v.get("issues") or []]}
-    people = {}
+    items = {sl: set() for sl in slugs}
+    people_by_repo = {sl: {} for sl in slugs}
     hidden = set(registry_names or {})
     for v in views:
+        sl = _slug(v)
+        items[sl] |= {p.get("number") for p in v.get("prs") or []} | \
+            {i.get("number") for i in v.get("issues") or []}
         hidden |= _do_not_name(v)
         for login in set((v.get("people") or {})) | set(((v.get("affiliations") or {})
                                                            .get("people") or {})):
-            people.setdefault(login, _person(v, login))
+            people_by_repo[sl].setdefault(login, _person(v, login))
         for p in v.get("prs") or []:
             if p.get("author"):
-                people.setdefault(p["author"], _person(v, p["author"]))
+                people_by_repo[sl].setdefault(p["author"], _person(v, p["author"]))
+    people = {}
+    for sl in slugs:
+        for login, row in people_by_repo[sl].items():
+            people.setdefault(login, row)
     home_words = set()
     for v in views:
         owner = ((v.get("meta") or {}).get("owner") or "").lower()
         a = v.get("affiliations") or {}
         home_words |= {n.lower() for n in a.get("home_names") or [] if n.lower() != owner}
         home_words |= {n.lower() for n in a.get("home_orgs") or [] if n.lower() != owner}
+    unresolved = []
+
+    def resolve(repo, what, **row):
+        """The repositories a claim is checked against: the paragraph's own,
+        else the only one that knows it (`what` is a predicate on a repo);
+        ambiguous claims are listed in repository_unresolved."""
+        if repo is not None:
+            return [repo] if what(repo) else []
+        knowing = [sl for sl in slugs if what(sl)]
+        if len(knowing) > 1:
+            entry = dict(row)
+            if entry not in unresolved:
+                unresolved.append(entry)
+        return knowing
+
+    def tag(row, repo):
+        return dict(row, repo=repo) if multi else row
 
     # URLs, quotes
     cited = []
@@ -1305,63 +1402,118 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
             quotes.append(q)
     res["quotes_not_in_view"] = [q for q in quotes
                                  if not any(link._norm_ws(q) in t for t in norm_texts)]
+    if multi:
+        # a quote in a paragraph about one repository must be that repository's
+        per_repo_texts = {}
+        for v in views:
+            u_, t_ = set(), []
+            link._slice_strings(v, u_, t_)
+            per_repo_texts[_slug(v)] = [link._norm_ws(x) for x in t_]
+        body_nc = _COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), body)
+        for par, repo in _scoped_paragraphs(body_nc, slugs):
+            if repo is None:
+                continue
+            for m in link._QUOTE_RE.finditer(par):
+                q = m.group(1) or m.group(2)
+                if q.startswith(("http://", "https://")) or q in res["quotes_not_in_view"]:
+                    continue
+                if not any(link._norm_ws(q) in t for t in per_repo_texts[repo]):
+                    res["quotes_not_in_view"].append(q)
     # strip quotes for the remaining prose checks (they are verified above)
     no_quotes = link._QUOTE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)),
                                    _COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ",
                                                                     m.group(0)), body))
-    with_code = _strip(no_quotes, code=False)
     prose = _strip(no_quotes, code=True)
-    # suppression reads the text with its quotations and code spans kept: a
-    # supported quote may still name a do_not_name person
-    quoted_prose = _strip(body, code=False)
+    scoped = _scoped_paragraphs(no_quotes, slugs)
+
+    def areas_named(par, repo_areas):
+        par_c = _strip(par, code=False)
+        toks = [m.group(0).rstrip("/.-") for m in _AVM_PATH_RE.finditer(par_c)]
+        toks += [m.group(0).strip("`") for m in _CODE_SPAN_RE.finditer(par)
+                 if m.group(0).strip("`").startswith("modules/")]
+        return toks
 
     # modules: an AVM module path (or a Terraform `modules/<name>` submodule)
-    # must be a module, child, code area or path the view's changelogs name
-    named_mods = []
-    for m in _AVM_PATH_RE.finditer(with_code):
-        tok = m.group(0).rstrip("/.-")
-        if tok not in named_mods:
-            named_mods.append(tok)
-    for m in _CODE_SPAN_RE.finditer(no_quotes):
-        tok = m.group(0).strip("`")
-        if tok.startswith("modules/") and _PATHY_RE.match(tok) and tok not in named_mods:
-            named_mods.append(tok)
-    res["modules_not_in_view"] = sorted({p for p in named_mods
-                                         if p not in paths and p not in module_text})
-
-    # versions, bound to the one module a paragraph names
-    bad_versions = []
-    for par in _paragraphs(no_quotes):
+    # must be a module, child, code area or path the repository's changelogs name
+    named_mods, bad_mods = [], []
+    bad_versions, bad_items, worded = [], [], []
+    cand = {(c.get("repo") or slugs[0], c["area"]): c
+            for c in sec["breaking"].get("candidates") or []}
+    declared = {(d.get("repo") or slugs[0], d["area"])
+                for d in sec["breaking"].get("declared") or []}
+    for par, repo in scoped:
         par_c = _strip(par, code=False)
-        mods = {_area_of(m.group(0), areas) for m in _AVM_PATH_RE.finditer(par_c)}
-        mods |= {_area_of(m.group(0).strip("`"), areas)
-                 for m in _CODE_SPAN_RE.finditer(par)}
-        mods.discard(None)
-        for ver in _VERSION_RE.findall(_strip(par, code=False)):
-            ok_set = versions[next(iter(mods))] if len(mods) == 1 else global_versions
-            if ver not in ok_set:
-                row = {"module": next(iter(mods)) if len(mods) == 1 else None,
-                       "version": ver}
-                if row not in bad_versions:
-                    bad_versions.append(row)
+        toks = areas_named(par, None)
+        par_mods = {}
+        for tok in toks:
+            if tok not in named_mods:
+                named_mods.append(tok)
+            known = resolve(repo, lambda sl, t=tok: t in paths[sl] or t in module_text[sl]
+                            or _area_of(t, versions[sl]) is not None, module=tok)
+            ok_repos = [sl for sl in known if tok in paths[sl] or tok in module_text[sl]]
+            if not ok_repos:
+                row = tag({"module": tok}, repo) if multi else tok
+                if row not in bad_mods:
+                    bad_mods.append(row)
+            for sl in known:
+                a = _area_of(tok, versions[sl])
+                if a is not None:
+                    par_mods.setdefault((sl, a), None)
+        # versions, bound to the one module a paragraph names
+        for ver in _VERSION_RE.findall(par_c):
+            if len(par_mods) == 1:
+                (sl, a), = par_mods
+                ok = ver in versions[sl][a]
+                row = tag({"module": a, "version": ver}, sl)
+            else:
+                pool = [repo] if repo is not None else slugs
+                ok = any(ver in vs for sl in pool for vs in versions[sl].values())
+                row = tag({"module": None, "version": ver}, repo)
+            if not ok and row not in bad_versions:
+                bad_versions.append(row)
+        # #N: a link's own repository, else the paragraph's
+        par_p = _strip(par, code=True)
+        linked_nums = []
+        for m in _ITEM_LINK_RE.finditer(par):
+            n, sl = int(m.group(1)), m.group(2)
+            sl = next((x for x in slugs if x.lower() == sl.lower()), sl)
+            linked_nums.append(n)
+            if n not in items.get(sl, set()):
+                row = tag({"number": n}, sl) if multi else n
+                if row not in bad_items:
+                    bad_items.append(row)
+        for raw in _ITEM_RE.findall(par_p):
+            n = int(raw)
+            if n in linked_nums:
+                continue
+            known = resolve(repo, lambda sl, n=n: n in items[sl], number=n)
+            if not known:
+                row = tag({"number": n}, repo) if multi else n
+                if row not in bad_items:
+                    bad_items.append(row)
+        # breaking candidates worded as declared (per repository and area)
+        if _BREAK_WORD_RE.search(_strip(par, code=True)) and not _HEDGE_RE.search(par_c):
+            for (sl, a) in sorted(par_mods):
+                c = cand.get((sl, a))
+                if c is None:
+                    continue
+                uncovered = [r["subject"] for r in c["rules"] if not r["covered_by_declared"]]
+                subj_named = [s_ for s_ in uncovered if s_ and s_.split(" ->")[0]
+                              .split("/")[-1] in par]
+                if (sl, a) not in declared or subj_named:
+                    worded.append(tag({"module": a, "subjects": subj_named or uncovered,
+                                       "paragraph": " ".join(par.split())[:200]}, sl))
+    res["modules_not_in_view"] = sorted(bad_mods, key=json.dumps) if multi else \
+        sorted(set(bad_mods))
     res["versions_not_in_view"] = bad_versions
+    res["items_not_in_view"] = bad_items if multi else sorted(set(bad_items))
+    res["candidates_worded_as_declared"] = worded
 
-    # items
-    res["items_not_in_view"] = sorted({int(n) for n in _ITEM_RE.findall(prose)
-                                       if int(n) not in items})
-
-    # people: known logins, names tied to their login, do_not_name, affiliation words
+    # people: known logins, names tied to their login, affiliation words
     mentioned = _LOGIN_RE.findall(prose)
     res["people_not_in_view"] = sorted({m for m in mentioned if m not in people})
-    dnn = sorted({m for m in _LOGIN_RE.findall(quoted_prose) if m in hidden})
-    for login, name in (registry_names or {}).items():
-        if name and re.search(r"\b" + re.escape(name) + r"\b", quoted_prose):
-            dnn.append(login)
-    for login in hidden:
-        if re.search(r"(?<![\w/@-])" + re.escape(login) + r"(?![\w-])", quoted_prose) \
-                and login not in dnn:
-            dnn.append(login)
-    res["do_not_name_named"] = sorted(set(dnn))
+    # suppression reads the COMPLETE issue (stories, quotes, code, comments)
+    res["do_not_name_named"] = _suppression_hits(text, hidden, registry_names)
     mismatch = []
     names = {p["name"]: login for login, p in people.items() if p.get("name")}
     for m in re.finditer(r"\(@([A-Za-z0-9-]+)[,)]", prose):
@@ -1380,8 +1532,8 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                 mismatch.append({"login": login, "name": None, "written": other})
     res["name_mismatch"] = mismatch
     aff_bad = []
-    for par in _paragraphs(prose):
-        for s in _sentences(par):
+    for par, repo in scoped:
+        for s in _sentences(_strip(par, code=True)):
             logins = [x for x in _LOGIN_RE.findall(s) if x in people]
             if not logins:
                 continue
@@ -1392,34 +1544,19 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                 says.append("maintainer_org")
             for said in says:
                 for lg in logins:
-                    if people[lg].get("affiliation") != said:
-                        aff_bad.append({"login": lg, "said": "community"
-                                        if said == "community" else "home organisation",
-                                        "label": people[lg].get("affiliation"),
-                                        "sentence": s.strip()[:200]})
+                    pool = [repo] if repo is not None else slugs
+                    labels = {people_by_repo[sl][lg].get("affiliation")
+                              for sl in pool if lg in people_by_repo[sl]} or \
+                        {people[lg].get("affiliation")}
+                    if labels != {said}:
+                        aff_bad.append(tag({"login": lg, "said": "community"
+                                            if said == "community" else "home organisation",
+                                            "label": sorted(x or "unknown" for x in labels)[0]
+                                            if len(labels) == 1 else sorted(
+                                                x or "unknown" for x in labels),
+                                            "sentence": s.strip()[:200]}, repo))
     res["affiliation_mismatch"] = aff_bad
-
-    # breaking candidates worded as declared
-    declared_areas = {d["area"] for d in sec["breaking"].get("declared") or []}
-    cand = {c["area"]: c for c in sec["breaking"].get("candidates") or []}
-    worded = []
-    for par in _paragraphs(no_quotes):
-        par_c = _strip(par, code=False)
-        if not _BREAK_WORD_RE.search(_strip(par, code=True)) or \
-                _HEDGE_RE.search(par_c):
-            continue
-        mods = {_area_of(m.group(0), areas) for m in _AVM_PATH_RE.finditer(par_c)}
-        mods |= {_area_of(m.group(0).strip("`"), areas)
-                 for m in _CODE_SPAN_RE.finditer(par)}
-        for a in sorted(x for x in mods if x in cand):
-            uncovered = [r["subject"] for r in cand[a]["rules"]
-                         if not r["covered_by_declared"]]
-            subj_named = [s_ for s_ in uncovered if s_ and s_.split(" ->")[0]
-                          .split("/")[-1] in par]
-            if a not in declared_areas or subj_named:
-                worded.append({"module": a, "subjects": subj_named or uncovered,
-                               "paragraph": " ".join(par.split())[:200]})
-    res["candidates_worded_as_declared"] = worded
+    res["repository_unresolved"] = unresolved
 
     # dates carry the year
     no_year = []
@@ -1461,6 +1598,7 @@ def check_newsletter(views, text, slices=None, registry_names=None, cadence="mon
                  "modules_not_in_view", "versions_not_in_view", "items_not_in_view",
                  "people_not_in_view", "do_not_name_named", "name_mismatch",
                  "affiliation_mismatch", "candidates_worded_as_declared",
+                 "repository_unresolved",
                  "dates_without_year", "numbers_not_in_view", "characterising_words")
     res["ok"] = not any(res[k] for k in fail_keys) and \
         all(r.get("ok") for r in stories.values())
