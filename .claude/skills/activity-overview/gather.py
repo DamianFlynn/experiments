@@ -910,10 +910,20 @@ def parse_blocks_refs(text):
     return out
 
 
+def _with_author_type(out, raw):
+    """`out` with `author_type`: the account type GitHub reports for the
+    record's author (`user.type`), kept only when it is not "User" (a
+    "Bot" account is automation whatever its login says). Pure."""
+    typ = (raw.get("user") or {}).get("type")
+    if typ and typ != "User":
+        out["author_type"] = typ
+    return out
+
+
 def normalize_pr(raw):
     """Map a GitHub REST PR object to the bundle's PR shape."""
     milestone = raw.get("milestone")
-    return {
+    return _with_author_type({
         "number": raw["number"],
         "title": raw.get("title", ""),
         "body": raw.get("body") or "",
@@ -948,7 +958,7 @@ def normalize_pr(raw):
         "crossref_issues": parse_listed_refs(_pr_text(raw), _pr_repo_slug(raw)),
         "closes": parse_closing_refs(_pr_text(raw), _pr_repo_slug(raw)),
         "url": raw.get("html_url"),
-    }
+    }, raw)
 
 
 def _pr_text(raw):
@@ -975,7 +985,7 @@ def select_merged_prs(prs, from_date, to_date):
 def normalize_issue(raw):
     """Map a GitHub REST issue object to the bundle's issue shape."""
     milestone = raw.get("milestone")
-    return {
+    return _with_author_type({
         "number": raw["number"],
         "title": raw.get("title", ""),
         "body": raw.get("body") or "",
@@ -997,7 +1007,7 @@ def normalize_issue(raw):
             (raw.get("title", "") or "") + "\n" + (raw.get("body") or "")
         ),
         "url": raw.get("html_url"),
-    }
+    }, raw)
 
 
 # Submitted review states (GitHub: APPROVED, CHANGES_REQUESTED, COMMENTED,
@@ -1069,14 +1079,14 @@ def normalize_review(raw):
     texture). A review's `html_url` is surfaced as `url` for provenance; when
     absent, the fold synthesizes a stable `<pr url>#pullrequestreview-<id>`
     ref (so check_provenance never fails)."""
-    return {
+    return _with_author_type({
         "id": raw.get("id"),
         "author": (raw.get("user") or {}).get("login"),
         "state": (raw.get("state") or "").lower() or None,
         "submitted_at": raw.get("submitted_at"),
         "body": raw.get("body"),
         "url": raw.get("html_url"),
-    }
+    }, raw)
 
 
 # Lifecycle events we persist as first-class `event` social nodes. Conservative
@@ -1421,14 +1431,14 @@ def normalize_milestone(raw):
 def _normalize_comment_obj(raw):
     """Shared mapping for conversation + review comments: the bundle's comment
     shape {id, author, author_association, body, url, created_at}. Pure, permissive."""
-    return {
+    return _with_author_type({
         "id": raw.get("id"),
         "author": (raw.get("user") or {}).get("login"),
         "author_association": raw.get("author_association"),
         "body": raw.get("body") or "",
         "url": raw.get("html_url"),
         "created_at": raw.get("created_at"),
-    }
+    }, raw)
 
 
 def normalize_comment(raw):
@@ -2430,9 +2440,15 @@ ORPHAN_MARKER_NAMES = extract.ORPHAN_MARKER_NAMES
 OWNERSHIP_LABEL_PATTERNS = {"owner_needed": (r"owner\W*needed",
                                              r"looking\W*for\W*(?:an?\W*)?owner",
                                              r"needs?\W*(?:a\W*)?new\W*owner"),
-                            "orphaned": (r"orphan",)}
+                            "orphaned": (r"orphan",),
+                            # asks the module's existing owner to respond: not
+                            # an ownership change (link reads it off the
+                            # records as `owner_response_requested`)
+                            "owner_response_requested": (r"needs\W*module\W*owner",)}
 OWNERSHIP_EVENT_KINDS = ("owner_needed", "owner_added", "owner_removed",
                          "orphaned", "adopted")
+# the label kinds ACTIVITY_OWNERSHIP_LABELS may configure
+OWNERSHIP_LABEL_KINDS = OWNERSHIP_EVENT_KINDS + ("owner_response_requested",)
 _AVM_MODULE_REF_RE = re.compile(r"\b(?:avm/)?((?:res|ptn|utl)/[\w.-]+/[\w.-]+)")
 
 
@@ -2446,10 +2462,10 @@ def ownership_label_patterns(env=None):
     for part in raw.split(";"):
         kind, _, rx = part.partition("=")
         kind = kind.strip()
-        if kind not in OWNERSHIP_EVENT_KINDS or not rx.strip():
+        if kind not in OWNERSHIP_LABEL_KINDS or not rx.strip():
             raise SystemExit("error: ACTIVITY_OWNERSHIP_LABELS: {!r} is not "
                              "kind=regex with a kind of {}".format(
-                                 part, ", ".join(OWNERSHIP_EVENT_KINDS)))
+                                 part, ", ".join(OWNERSHIP_LABEL_KINDS)))
         out.setdefault(kind, ())
         out[kind] += (rx.strip(),)
     return out
@@ -2523,11 +2539,21 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
     day it opened and the day it closed (label times are not recorded: an
     item counts from the day it opened). `without_owner` is that state at
     the window's end. A file version that cannot be read is listed in
-    `unread`, never read as "no owners". Pure over its readers."""
+    `unread`, never read as "no owners". Events from a commit carry `at`
+    (its commit time; a labelled item's: its opening time) and every event
+    `seq`, the order of the replay (day, time, then the walk's order; one
+    change's own events by kind): extract.ownership_event_order. The
+    `owner_response_requested` label kind is not an ownership change and
+    is not stored as an event (link reads it off the records). Pure over
+    its readers."""
     patterns = label_patterns or ownership_label_patterns()
     owner_files = owner_files or _owner_file_names()
     by_sha = {c.get("sha"): c for c in commits or []}
+    walk = {c.get("sha"): i for i, c in enumerate(commits or [])}
     events, unread = [], []
+
+    def at(e):
+        return (by_sha.get(e.get("commit")) or {}).get("committed_at")
 
     def src(e):
         out = {"type": "commit", "sha": e.get("commit")}
@@ -2549,9 +2575,14 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
             return None, None
         return before, after
 
-    for e in sorted(code_events or [], key=lambda x: (x.get("date") or "",
-                                                      x.get("commit") or "")):
+    # one day's changes replay in commit order (the commit time, then the
+    # walk's order), never by kind: emptied at 09:00 and refilled at 15:00
+    # ends the day owned
+    for e in sorted(code_events or [], key=lambda x: (
+            x.get("date") or "", at(x) or "", walk.get(x.get("commit"), -1),
+            x.get("commit") or "")):
         path = e.get("path") or ""
+        first = len(events)
         base = path.rsplit("/", 1)[-1]
         folder = path.rsplit("/", 1)[0] if "/" in path else ""
         if path in CODEOWNERS_PATHS:
@@ -2598,6 +2629,12 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
             events.append({"kind": "orphaned" if e["change"] == "add" else "adopted",
                            "module": folder, "people": [p for p in [e.get("author")] if p],
                            "date": e.get("date"), "source": src(e), "via": base})
+        # one change's own events (same instant) in kind order
+        events[first:] = sorted(events[first:], key=lambda x: (x["kind"],
+                                                               x.get("module") or ""))
+        if at(e):
+            for ev in events[first:]:
+                ev["at"] = at(e)
     compiled = {k: [re.compile(x, re.I) for x in v] for k, v in patterns.items()}
 
     def label_kind(labels):
@@ -2620,6 +2657,7 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                 events.append({"kind": kind, "module": _module_of_item(rec),
                                "people": [p for p in [rec.get("author")] if p],
                                "date": (rec.get("created_at") or "")[:10],
+                               "at": rec.get("created_at"),
                                "source": source, "quote": rec.get("title"),
                                "via": lbl})
             closed = (rec.get("closed_at") or "")[:10] \
@@ -2642,7 +2680,7 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
         # events (the code events cover the whole window): the markers at
         # the end, minus those added in it, plus those removed in it
         start = markers_of(end_files)
-        for e in sorted(events, key=lambda x: x.get("date") or "", reverse=True):
+        for e in reversed(events):            # code events: in commit order
             if (e.get("source") or {}).get("type") != "commit" \
                     or e.get("via") not in ORPHAN_MARKER_NAMES:
                 continue
@@ -2650,7 +2688,13 @@ def collect_module_ownership(code_events, commits, prs, issues, read_blob,
                 start.pop(e["module"], None)
             elif e["kind"] == "adopted":
                 start[e["module"]] = e["via"]
-    events.sort(key=lambda x: (x.get("date") or "", x["kind"], x.get("module") or ""))
+    # the replay order (extract.ownership_event_order): day, commit / item
+    # time, then the order emitted (`seq`: a commit's events in walk order)
+    order = sorted(range(len(events)), key=lambda i: (
+        (events[i].get("date") or "")[:10], events[i].get("at") or "", i))
+    events = [events[i] for i in order]
+    for i, e in enumerate(events):
+        e["seq"] = i
     labelled.sort(key=lambda x: (x["module"], x["opened"], x["source"]["number"] or 0))
     out = {"collected": True, "events": events,
            "start_without_owner": [{"module": m, "marker": start[m]}

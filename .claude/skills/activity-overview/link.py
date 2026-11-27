@@ -2028,14 +2028,10 @@ def _module_links(bundle, entries):
     web = _repo_web(bundle)
     if not web:
         return
-    ref = (bundle.get("meta") or {}).get("clone_sha") or \
-        (bundle.get("meta") or {}).get("base_branch") or "HEAD"
     for e in entries:
         area = e.get("area")
-        if area and area != "main.tf":
-            e["url"] = "{}/tree/{}/{}".format(web, ref, area)
-        elif area:
-            e["url"] = "{}/tree/{}".format(web, ref)
+        if area:
+            e["url"] = module_url(bundle, area)
         for p in (e.get("versions") or {}).get("published") or []:
             if p.get("tag"):
                 p["url"] = "{}/tree/{}".format(web, p["tag"])
@@ -3149,7 +3145,9 @@ def story_group(bundle, t, worthy, instant, module_changes):
     no story-worthy event of the window (carried over), (b) its last human
     event is more than STORY_STALLED_DAYS old at the instant, or (c) an
     open PR's head checks fail with no event by its author since; else
-    `in_flight`. Group: `plumbing` when every PR of the train is plumbing
+    `in_flight`. Group: `plumbing` when every PR of the train is authored
+    by an automation account and no person took a conversation turn
+    (_automation_only), or when every PR of the train is plumbing
     (_train_plumbing: the module layer's class, or a sweep), whatever the
     state; else the state."""
     outcome = t.get("outcome")
@@ -3174,6 +3172,11 @@ def story_group(bundle, t, worthy, instant, module_changes):
                     "event by its author".format(failing[0], failing[1][:10]))
         else:
             state, rule = "in_flight", "in_flight: open, active in the window"
+    auto = _automation_only(bundle, t, instant)
+    if auto:
+        return "plumbing", state, (
+            "plumbing: every PR is authored by an automation account ({}) and no "
+            "person took a conversation turn; ".format(", ".join(auto)) + rule)
     if t.get("prs") and _train_plumbing(t, module_changes, bundle):
         return "plumbing", state, "plumbing: every PR is plumbing; " + rule
     return state, state, rule
@@ -3298,9 +3301,409 @@ def annotate_issue_closing(bundle):
     return bundle
 
 
+# --- automation accounts, for what they are (issue #97) ----------------------
+#
+# Flagged from what the records hold, never from a display name: the operator's
+# registry tag (wins both ways), the account type the API reported for the
+# author (`author_type`, kept by gather when it is not "User"), else the
+# app-account login form (`name[bot]`) and the git names automation commits
+# under (derive.is_bot_login).
+
+AUTOMATION_TAG = "automation"          # people registry `tags`: is automation
+NOT_AUTOMATION_TAG = "not-automation"  # ... is a person, whatever the record says
+
+
+def registry_automation(source):
+    """{login: True | False} from the people registry's operator tags
+    (AUTOMATION_TAG / NOT_AUTOMATION_TAG) of `source` (link --people);
+    {} without one."""
+    out = {}
+    for login, e in sorted(((source or {}).get("registry") or {})
+                           .get("people", {}).items()):
+        tags = (e or {}).get("tags") or []
+        if NOT_AUTOMATION_TAG in tags:
+            out[login] = False
+        elif AUTOMATION_TAG in tags:
+            out[login] = True
+    return out
+
+
+def _account_types(bundle):
+    """{login: account type} the view's records keep (`author_type`)."""
+    out = {}
+    for key in ("prs", "issues"):
+        for rec in bundle.get(key) or []:
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("author") and rec.get("author_type"):
+                out.setdefault(rec["author"], rec["author_type"])
+            for k in ("comments_list", "review_comments", "reviews"):
+                for c in rec.get(k) or []:
+                    if isinstance(c, dict) and c.get("author") and c.get("author_type"):
+                        out.setdefault(c["author"], c["author_type"])
+    return out
+
+
+def _on_behalf_of(p, activity_row, instant):
+    """The person who handed an automation account PR `p` the work, when the
+    record shows it: the actor of an `assigned` event assigning it (basis
+    `assigned`), else the first person who requested a review on it (basis
+    `requested review`); None otherwise."""
+    evs = [e for e in (activity_row or {}).get("events") or []
+           if _not_after(e.get("at"), instant)]
+    return next(({"login": e.get("actor"), "basis": "assigned",
+                  "pr": p.get("number")} for e in evs
+                 if e.get("event") == "assigned"
+                 and e.get("assignee") == p.get("author")
+                 and e.get("actor") and e["actor"] != p.get("author")
+                 and not derive.is_bot_login(e["actor"])), None) or \
+        next(({"login": e.get("by"), "basis": "requested review",
+               "pr": p.get("number")} for e in evs
+              if e.get("event") == "review_requested" and e.get("by")
+              and e["by"] != p.get("author")
+              and not derive.is_bot_login(e["by"])), None)
+
+
+def annotate_automation(bundle, registry=None):
+    """`automation` on the people rows of the automation accounts:
+    {kind: registry (the operator's tag) | account_type (the API's account
+    type, `author_type` Bot) | app_login (a `name[bot]` login) |
+    automation_name (a git name automation commits under), [on_behalf_of]
+    {login, basis, pr} (_on_behalf_of over the PRs it opened)}. A login
+    the registry tags NOT_AUTOMATION_TAG gets `automation: null` (the
+    operator's word wins). In place."""
+    registry = registry or {}
+    people = bundle.setdefault("people", {})
+    types_ = _account_types(bundle)
+    activity = _pr_activity_index(bundle) or {}
+    instant = window_end_instant(bundle.get("meta"))
+    for login in sorted(set(people) | set(types_)):
+        if registry.get(login) is False:
+            people.setdefault(login, {})["automation"] = None
+            continue
+        if registry.get(login):
+            kind = "registry"
+        elif types_.get(login) == "Bot":
+            kind = "account_type"
+        elif derive.is_bot_login(login):
+            kind = "app_login" if login.endswith("[bot]") else "automation_name"
+        else:
+            continue
+        row = {"kind": kind}
+        for p in bundle.get("prs") or []:
+            if isinstance(p, dict) and p.get("author") == login:
+                by = _on_behalf_of(p, activity.get(p.get("number")), instant)
+                if by:
+                    row["on_behalf_of"] = by
+                    break
+        people.setdefault(login, {})["automation"] = row
+    return bundle
+
+
+def _is_automation(bundle, login):
+    """Is `login` an automation account in this view: its people row's
+    `automation` (annotate_automation) when set, else derive.is_bot_login."""
+    row = ((bundle or {}).get("people") or {}).get(login)
+    if isinstance(row, dict) and "automation" in row:
+        return row["automation"] is not None
+    return derive.is_bot_login(login)
+
+
+def _human_turns(bundle, t, instant):
+    """(text turns, verdicts) by people (not automation) on the train's
+    items by the instant: comments, review comments and reviews with text;
+    reviews that are only a verdict (approved / changes requested /
+    dismissed)."""
+    issues, prs = _train_items(bundle, t)
+    text = verdicts = 0
+    for rec in issues + prs:
+        for key in ("comments_list", "review_comments"):
+            for c in rec.get(key) or []:
+                if isinstance(c, dict) and c.get("author") \
+                        and not _is_automation(bundle, c["author"]) \
+                        and _not_after(c.get("created_at"), instant):
+                    text += 1
+        for r in rec.get("reviews") or []:
+            if not isinstance(r, dict) or not r.get("author") \
+                    or _is_automation(bundle, r["author"]) \
+                    or not _not_after(r.get("submitted_at"), instant):
+                continue
+            if (r.get("body") or "").strip():
+                text += 1
+            elif r.get("state") in ("approved", "changes_requested", "dismissed"):
+                verdicts += 1
+    return text, verdicts
+
+
+def _automation_only(bundle, t, instant):
+    """The automation accounts that authored EVERY PR of train `t`, when no
+    person took a conversation turn on its items; None otherwise."""
+    _issues, prs = _train_items(bundle, t)
+    if not t.get("prs") or len(prs) != len(t["prs"]):
+        return None
+    authors = sorted({p.get("author") for p in prs})
+    if not all(a and _is_automation(bundle, a) for a in authors):
+        return None
+    if _human_turns(bundle, t, instant)[0]:
+        return None
+    return authors
+
+
+def story_substance(bundle, t, instant):
+    """What the record of a story holds beyond its opening: `discussion`
+    (a person's comment, review comment or review text), `decision_only`
+    (no such turn, but a person's verdict review, or an item merged /
+    closed by the instant by someone who is not automation), else
+    `opening_only`."""
+    text, verdicts = _human_turns(bundle, t, instant)
+    if text:
+        return "discussion"
+    if verdicts:
+        return "decision_only"
+    issues, prs = _train_items(bundle, t)
+    for rec in issues + prs:
+        if rec.get("state") != "closed" or not _not_after(rec.get("closed_at"), instant):
+            continue
+        closer = rec.get("merged_by") if rec.get("merged") else None
+        ev = [e for e in rec.get("lifecycle") or [] if isinstance(e, dict)
+              and e.get("event") == "closed" and _not_after(e.get("created_at"), instant)]
+        closer = closer or (ev[-1].get("actor") if ev else None)
+        if not closer or not _is_automation(bundle, closer):
+            return "decision_only"
+    return "opening_only"
+
+
+# --- the module a story row is about -----------------------------------------
+
+_ISSUE_FORM_MODULE_RE = re.compile(
+    r"^#{2,4}[ \t]*Module Name[ \t]*\n(.*?)(?=^#{1,4}[ \t]|\Z)", re.M | re.S | re.I)
+_CC_SCOPE_RE = re.compile(r"^\s*[A-Za-z]+\(([^)]+)\)!?:")
+MODULES_SOURCES = ("merged_commits", "pr_commits", "issue_form", "title_scope",
+                   "none")
+
+
+def module_url(bundle, area):
+    """THE link of a module folder: its tree at the commit the view's
+    structure was read at (meta.clone_sha; the base branch when unknown),
+    the repository's tree for a repository-root module (`main.tf`). None
+    without the repository or an area."""
+    web = _repo_web(bundle)
+    if not web or not area:
+        return None
+    meta = (bundle or {}).get("meta") or {}
+    ref = meta.get("clone_sha") or meta.get("base_branch") or "HEAD"
+    if area == "main.tf":
+        return "{}/tree/{}".format(web, ref)
+    return "{}/tree/{}/{}".format(web, ref, area)
+
+
+def module_urls(bundle, areas):
+    """{area: module_url} of the areas that have one."""
+    out = {}
+    for a in areas or []:
+        u = module_url(bundle, a)
+        if u:
+            out[a] = u
+    return out
+
+
+def _as_module(text):
+    """A module area named in text (an issue form field, a title scope):
+    `avm/...` or `res|ptn|utl/...` (read as `avm/...`), kept only when it
+    is a module area by its path (module_kind); None otherwise."""
+    a = (text or "").strip().strip("`'\"").strip().rstrip("/")
+    if a.startswith(("res/", "ptn/", "utl/")):
+        a = "avm/" + a
+    return a if a and " " not in a and module_kind(a) is not None else None
+
+
+def _areas_of_paths(ctx, paths):
+    """The module areas (module_kind) of `paths`."""
+    files = sorted(set(ctx.seen_files) | set(paths))
+    out = set()
+    for p in paths:
+        a = ctx.area_of(p)
+        if a and module_kind(a, files) is not None:
+            out.add(a)
+    return sorted(out)
+
+
+def _form_modules(rec):
+    out = []
+    for m in _ISSUE_FORM_MODULE_RE.finditer((rec.get("body") or "").replace("\r\n", "\n")):
+        for line in m.group(1).splitlines():
+            a = _as_module(line)
+            if a and a not in out:
+                out.append(a)
+    return out
+
+
+def _scope_modules(rec):
+    m = _CC_SCOPE_RE.match(rec.get("title") or "")
+    if not m:
+        return []
+    return [a for a in (_as_module(s) for s in m.group(1).split(",")) if a]
+
+
+def _pr_own_paths(bundle, n, instant):
+    return sorted({x for c in _pr_commits_as_of(_pr_history_index(bundle).get(n), instant)
+                   for x in c.get("paths") or []})
+
+
+def record_modules(bundle, ctx, typ, rec, instant):
+    """(modules, modules_source) of one issue / PR: a PR with merged code
+    from its merged commits' paths; else a PR from its own commits' paths
+    (pr_history, as of the instant); an issue from its form's `Module Name`
+    field; else the title's conventional-commit scope; else ([], none).
+    Module areas only (module_kind)."""
+    if typ == "pr":
+        merged = [f for c in bundle.get("commits") or []
+                  if c.get("pr") == rec.get("number") for f in c.get("files") or []]
+        if merged:
+            return _areas_of_paths(ctx, merged), "merged_commits"
+        got = _areas_of_paths(ctx, _pr_own_paths(bundle, rec.get("number"), instant))
+        if got:
+            return got, "pr_commits"
+    else:
+        got = _form_modules(rec)
+        if got:
+            return got, "issue_form"
+    got = _scope_modules(rec)
+    return (got, "title_scope") if got else ([], "none")
+
+
+def train_modules(bundle, ctx, t, instant):
+    """(modules, modules_source) of a train: with merged code, the module
+    areas its merged commits touched (`merged_commits`); else the module
+    areas of its open PRs' own commits (`pr_commits`), else its issues'
+    form field (`issue_form`), else the conventional-commit scope of its
+    titles (`title_scope`), else ([], `none`). Never a guess from prose."""
+    if t.get("commits"):
+        by_sha = {c.get("sha"): c for c in bundle.get("commits") or []}
+        files = [f for s in t["commits"] for f in (by_sha.get(s) or {}).get("files") or []]
+        return _areas_of_paths(ctx, files), "merged_commits"
+    issues, prs = _train_items(bundle, t)
+    paths = sorted({x for p in prs for x in _pr_own_paths(bundle, p.get("number"), instant)})
+    got = _areas_of_paths(ctx, paths)
+    if got:
+        return got, "pr_commits"
+    got = sorted({a for i in issues for a in _form_modules(i)})
+    if got:
+        return got, "issue_form"
+    got = sorted({a for r in prs + issues for a in _scope_modules(r)})
+    return (got, "title_scope") if got else ([], "none")
+
+
+def _module_ctx(bundle):
+    rules = path_class_rules(((bundle.get("module_changes") or {})
+                              .get("path_rules")) or ())
+    return _ModuleCtx(bundle, rules)
+
+
+# --- owner response requested --------------------------------------------------
+
+def _owner_response_patterns(bundle):
+    """The label patterns of `owner_response_requested`: the gathered
+    fact's own (`module_ownership.label_patterns`), else the default."""
+    pats = ((bundle.get("module_ownership") or {}).get("label_patterns") or {})
+    rx = pats.get("owner_response_requested")
+    if rx is None:
+        rx = gather.OWNERSHIP_LABEL_PATTERNS["owner_response_requested"]
+    return [re.compile(x, re.I) for x in rx]
+
+
+def _owner_response_label(rec, rxs):
+    return next((lbl for lbl in rec.get("labels") or []
+                 if isinstance(lbl, str) and any(r.search(lbl) for r in rxs)), None)
+
+
+def _owners_named(bundle, rec, instant):
+    """The module owners an automation comment on the item names (@login,
+    in a comment that speaks of the module owner), when recorded."""
+    for c in rec.get("comments_list") or []:
+        if isinstance(c, dict) and _is_automation(bundle, c.get("author")) \
+                and _not_after(c.get("created_at"), instant) \
+                and re.search(r"\bmodule\W+owner", c.get("body") or "", re.I):
+            named = [m for m in _mentions(c.get("body"), exclude={c.get("author")})
+                     if m != rec.get("author")]
+            if named:
+                return named
+    return None
+
+
+def owner_response_request(bundle, ctx, typ, rec, instant, rxs):
+    """The owner response request an issue / PR carries (a label matching
+    the `owner_response_requested` patterns): {kind, module, item {type,
+    number, url}, date (the day it opened: label times are not recorded),
+    people [author], via (the label), source, [owners]}; None without
+    one."""
+    lbl = _owner_response_label(rec, rxs)
+    if not lbl:
+        return None
+    module = gather._module_of_item(rec)
+    if not module:
+        mods, _src = record_modules(bundle, ctx, typ, rec, instant)
+        module = mods[0] if len(mods) == 1 else None
+    item = {"type": typ, "number": rec.get("number"), "url": rec.get("url")}
+    out = {"kind": "owner_response_requested", "module": module, "item": item,
+           "date": (rec.get("created_at") or "")[:10],
+           "people": [p for p in [rec.get("author")] if p], "via": lbl,
+           "source": dict(item)}
+    owners = _owners_named(bundle, rec, instant)
+    if owners:
+        out["owners"] = owners
+    return out
+
+
+def _ownership_event_key(e):
+    return (e.get("date") or "", e.get("at") or "",
+            e.get("seq") if isinstance(e.get("seq"), int) else 0,
+            e.get("kind") or "", e.get("module") or "")
+
+
+def annotate_module_ownership(bundle):
+    """On a view carrying `module_ownership`: the `owner_response_requested`
+    events of the items opened in the window that carry the label (read off
+    the view's records, so an existing store needs no recompute), and
+    `module_url` (module_url) on every event and `without_owner` row naming
+    a module. In place."""
+    mo = bundle.get("module_ownership")
+    if not isinstance(mo, dict):
+        return bundle
+    ctx = _module_ctx(bundle)
+    instant = window_end_instant(bundle.get("meta"))
+    start = window_period(bundle.get("meta") or {}).get("from") or ""
+    rxs = _owner_response_patterns(bundle)
+    events = list(mo.get("events") or [])
+    have = {(e.get("kind"), json.dumps(e.get("item") or e.get("source"), sort_keys=True))
+            for e in events if isinstance(e, dict)}
+    for typ, key in (("issue", "issues"), ("pr", "prs")):
+        for rec in bundle.get(key) or []:
+            if not isinstance(rec, dict):
+                continue
+            e = owner_response_request(bundle, ctx, typ, rec, instant, rxs)
+            if e is None or e["date"] < start[:10] or \
+                    not _not_after(rec.get("created_at"), instant):
+                continue
+            k = (e["kind"], json.dumps(e["item"], sort_keys=True))
+            if k not in have:
+                have.add(k)
+                events.append(e)
+    for e in events:
+        if isinstance(e, dict) and e.get("module") and module_url(bundle, e["module"]):
+            e["module_url"] = module_url(bundle, e["module"])
+    for r in mo.get("without_owner") or []:
+        if isinstance(r, dict) and r.get("module") and module_url(bundle, r["module"]):
+            r["module_url"] = module_url(bundle, r["module"])
+    mo["events"] = sorted(events, key=_ownership_event_key)
+    return bundle
+
+
 def build_story_list(bundle):
     """`stories.all` — every story of the window: [{id, group, state,
-    group_rule, title, modules, score, worthy, released?}] ordered by
+    group_rule, title, modules (module areas only: train_modules),
+    modules_source, module_urls {area: module_url}, substance
+    (story_substance), score, worthy, released?}] ordered by
     STORY_GROUPS then score; `stories.excluded` [{id, reason}] — trains
     with conversation that are not stories (idle beyond
     STORY_CARRY_MAX_DAYS); `stories.groups` {group: count};
@@ -3321,6 +3724,7 @@ def build_story_list(bundle):
     history = _pr_history_index(bundle)
     mc = bundle.get("module_changes")
     pr_index = {p["number"]: p for p in bundle.get("prs", [])}
+    ctx = _module_ctx(bundle)
     rows, excluded = [], []
     for t in trains:
         worthy = story_worthy(bundle, t, start, end, history)
@@ -3337,9 +3741,12 @@ def build_story_list(bundle):
         _d, total, _r = story_score(t, mc, pr_index)
         issues, prs = _train_items(bundle, t)
         first = (issues + prs)[0] if issues + prs else {}
+        mods, source = train_modules(bundle, ctx, t, instant)
         row = {"id": t["id"], "group": group, "state": state, "group_rule": rule,
                "title": first.get("title"),
-               "modules": sorted(a for a in t.get("code_areas") or [] if a),
+               "modules": mods, "modules_source": source,
+               "module_urls": module_urls(bundle, mods),
+               "substance": story_substance(bundle, t, instant),
                "score": round(total, 1),
                "worthy": worthy or "carried over"}
         if state == "landed":
@@ -3401,12 +3808,15 @@ def _pr_paths(bundle, n, history, instant=None):
     return paths
 
 
-def plumbing_theme(pr, paths):
+def plumbing_theme(pr, paths, automated=None):
     """(id, title_hint) of one plumbing PR: `dependency_updates` for an
-    automation account's update PR, else the theme of PLUMBING_THEMES
+    automation account's update PR (`automated`: whether its author is
+    one, else derive.is_bot_login), else the theme of PLUMBING_THEMES
     covering most of its files (ties: the earlier theme), else
     `other_plumbing`."""
-    if derive.is_bot_login(pr.get("author")) and \
+    if automated is None:
+        automated = derive.is_bot_login(pr.get("author"))
+    if automated and \
             _DEPENDENCY_TITLE_RE.search(pr.get("title") or ""):
         return "dependency_updates", "Dependency updates by automation"
     counts = []
@@ -3425,7 +3835,10 @@ def build_plumbing_themes(bundle):
     `plumbing` true, or the PRs of a plumbing story) grouped by
     plumbing_theme: [{id, title_hint, paths (at most
     PLUMBING_THEME_PATHS_MAX; paths_more), prs: [{number, title, author,
-    state, merged_at, url}], stories, people, evidence_counts {commits,
+    state, merged_at, url}], stories (the trains of those PRs in the
+    `plumbing` story group), related_stories [{id, group}] (the trains of
+    those PRs in another group, or in none: group null), modules [{module,
+    url}] (the module areas of its paths), people, evidence_counts {commits,
     comments, docs, interface, patches}, subjects (commit subjects, at
     most PLUMBING_THEME_SUBJECTS_MAX), issues (linked closing issues)}].
     Omitted when there is none. In place."""
@@ -3444,7 +3857,7 @@ def build_plumbing_themes(bundle):
     for n in sorted(x for x in numbers if x in pr_index):
         p = pr_index[n]
         paths = _pr_paths(bundle, n, history, instant)
-        tid, hint = plumbing_theme(p, paths)
+        tid, hint = plumbing_theme(p, paths, _is_automation(bundle, p.get("author")))
         th = themes.setdefault(tid, {"id": tid, "title_hint": hint, "_paths": set(),
                                      "prs": [], "_stories": set(), "_people": set(),
                                      "evidence_counts": {"commits": 0, "comments": 0,
@@ -3473,6 +3886,9 @@ def build_plumbing_themes(bundle):
         ev["patches"] += len(row.get("patches") or [])
     if not themes:
         return bundle
+    group_of = {r.get("id"): r.get("group")
+                for r in (bundle.get("stories") or {}).get("all") or []}
+    ctx = _module_ctx(bundle)
     out = []
     for tid in sorted(themes, key=lambda k: (-len(themes[k]["prs"]), k)):
         th = themes[tid]
@@ -3480,7 +3896,14 @@ def build_plumbing_themes(bundle):
         th["paths"] = paths[:PLUMBING_THEME_PATHS_MAX]
         if len(paths) > PLUMBING_THEME_PATHS_MAX:
             th["paths_more"] = len(paths) - PLUMBING_THEME_PATHS_MAX
-        th["stories"] = sorted(th.pop("_stories"))
+        ids = sorted(th.pop("_stories"))
+        th["stories"] = [i for i in ids if group_of.get(i) == "plumbing"]
+        related = [{"id": i, "group": group_of.get(i)} for i in ids
+                   if group_of.get(i) != "plumbing"]
+        if related:
+            th["related_stories"] = related
+        th["modules"] = [{"module": a, "url": module_url(bundle, a)}
+                         for a in _areas_of_paths(ctx, paths)]
         th["people"] = sorted(x for x in th.pop("_people") if x)
         th["issues"] = sorted(th.pop("_issues"))
         out.append(th)
@@ -3866,7 +4289,8 @@ def story_material(bundle, train):
     thread_responses(threads, items, prs, history, instant)
     requests = _outcome_requests(threads)
     automation = _automation_accounts(issues + prs, prs, history, activity,
-                                      instant)
+                                      instant,
+                                      lambda x: _is_automation(bundle, x))
     out = {"timeline": items,
            "turning_points": turning,
            "truncation": truncation,
@@ -4017,16 +4441,18 @@ def _pr_history_status(prs, history):
     return out
 
 
-def _automation_accounts(records, prs, history, activity, instant=None):
+def _automation_accounts(records, prs, history, activity, instant=None,
+                         is_auto=None):
     """The automation accounts of a train, for what they are (issue #97):
     [{login, is_bot: true, comments, review_comments, reviews, commits,
     prs_opened: [n], on_behalf_of?: {login, basis, pr}}] — counts over the
     train's items (they stay out of the conversation timeline), the PRs
     they opened, their PR commits (git author names an automation account
     commits under), and for a PR an automation account opened, the person
-    who handed it the work when the record shows it: the actor of an
-    `assigned` event assigning it (basis `assigned`), else the first
-    person who requested a review on it (basis `requested review`)."""
+    who handed it the work when the record shows it (_on_behalf_of).
+    `is_auto(login)`: the view's automation flag (_is_automation), else
+    derive.is_bot_login."""
+    is_auto = is_auto or derive.is_bot_login
     acc = {}
 
     def get(login):
@@ -4038,24 +4464,13 @@ def _automation_accounts(records, prs, history, activity, instant=None):
                            ("review_comments", "review_comments"),
                            ("reviews", "reviews")):
             for c in rec.get(key) or []:
-                if isinstance(c, dict) and derive.is_bot_login(c.get("author")):
+                if isinstance(c, dict) and c.get("author") and is_auto(c["author"]):
                     get(c["author"])[field] += 1
     for p in prs:
-        if derive.is_bot_login(p.get("author")):
+        if p.get("author") and is_auto(p["author"]):
             row = get(p["author"])
             row["prs_opened"].append(p.get("number"))
-            evs = [e for e in ((activity or {}).get(p.get("number")) or {})
-                   .get("events") or [] if _not_after(e.get("at"), instant)]
-            by = next(({"login": e.get("actor"), "basis": "assigned",
-                        "pr": p.get("number")} for e in evs
-                       if e.get("event") == "assigned"
-                       and e.get("assignee") == p["author"]
-                       and e.get("actor") and not derive.is_bot_login(e["actor"])),
-                      None) or next(({"login": e.get("by"), "basis": "requested review",
-                                      "pr": p.get("number")} for e in evs
-                                     if e.get("event") == "review_requested"
-                                     and e.get("by")
-                                     and not derive.is_bot_login(e["by"])), None)
+            by = _on_behalf_of(p, (activity or {}).get(p.get("number")), instant)
             if by and "on_behalf_of" not in row:
                 row["on_behalf_of"] = by
         for c in _pr_commits_as_of(history.get(p.get("number")), instant):
@@ -4697,7 +5112,7 @@ def _event_ref(it, actor=None):
             "actor": actor or it.get("actor"), "url": it.get("url")}
 
 
-def ball_with(pr, pr_items, verdicts, reviewers, checks=None):
+def ball_with(pr, pr_items, verdicts, reviewers, checks=None, owner_request=None):
     """Who the next move on an open PR is with — DERIVED by rule from the
     sequence of its recorded events (`pr_items`, the timeline items on that
     PR in time order), never read from anyone's words. A PR commit counts
@@ -4718,6 +5133,11 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None):
     - R6 checks awaiting approval: as R5, but every failing check is one
       whose run waits for a maintainer's approval (`action_required`, e.g.
       a first-time contributor's fork) -> `awaiting maintainer`.
+    - R7 module owner response requested (only with `owner_request`, the
+      PR's owner_response_request): when R2 stands (the author moved, no
+      change request outstanding, checks not failing), the next move is
+      the module owner's -> `awaiting module owner` (the owners the
+      request names, when recorded; `owner_basis` {label, item}).
     Automation items (check results) are never the last event.
     Returns {state, with, rule, basis: {at, kind, actor, url}, derived:
     true}, or None when the PR has no recorded event."""
@@ -4763,6 +5183,12 @@ def ball_with(pr, pr_items, verdicts, reviewers, checks=None):
                    checks_basis={"head": checks.get("head"),
                                  "failing": checks.get("failing") or []})
         out["with"] = [author] if author else []
+    if owner_request and out["rule"] == "R2 author moved" and not outstanding:
+        out.update(state="awaiting module owner",
+                   rule="R7 module owner response requested",
+                   owner_basis={"label": owner_request.get("via"),
+                                "item": owner_request.get("item")})
+        out["with"] = list(owner_request.get("owners") or [])
     return out
 
 
@@ -5088,18 +5514,36 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
     latest message names), linked: [...] (_linked_items), [linked_omitted],
     [modules] (_outcome_modules: shipped work), [net_change] {pr number:
     {files, changelog / shared paths net of the PR's own reverts}} for open
-    PRs with stored patch excerpts}."""
+    PRs with stored patch excerpts}. Every item row carries `modules`,
+    `modules_source` and `module_urls` (record_modules); an open item
+    carrying the owner-response label is listed in
+    `owner_response_requested` [{item, module, label, since, waits_on:
+    "the module owner", [owners]}] and an open PR's ball follows R7."""
     pr_index = {p["number"]: p for p in bundle.get("prs", [])}
     issue_index = {i["number"]: i for i in bundle.get("issues", [])}
     issues, prs = _train_members(train, pr_index, issue_index)
     out = {"train_outcome": train.get("outcome"), "as_of": instant, "items": []}
     own = {r.get("number") for r in issues + prs}
+    ctx = _module_ctx(bundle)
+    rxs = _owner_response_patterns(bundle)
+    waits = []
     open_prs, open_issue_balls = [], []
     for rec in issues + prs:
         typ = "pr" if rec in prs else "issue"
         row = {"type": typ, "number": rec.get("number"), "title": rec.get("title"),
                "author": rec.get("author"), "state": rec.get("state"),
                "created_at": rec.get("created_at"), "url": rec.get("url")}
+        mods, msrc = record_modules(bundle, ctx, typ, rec, instant)
+        row.update(modules=mods, modules_source=msrc,
+                   module_urls=module_urls(bundle, mods))
+        req = owner_response_request(bundle, ctx, typ, rec, instant, rxs) \
+            if rec.get("state") == "open" else None
+        if req:
+            w = {"item": req["item"], "module": req["module"], "label": req["via"],
+                 "since": req["date"], "waits_on": "the module owner"}
+            if req.get("owners"):
+                w["owners"] = req["owners"]
+            waits.append(w)
         on_items = [it for it in items
                     if (it.get("on") or {}) == {"type": typ, "number": rec.get("number")}
                     and it["kind"] not in ("merged", "closed")
@@ -5133,7 +5577,7 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
                                     and it.get("actor") != rec.get("author")})
                 ball = ball_with(rec, on_items, verdicts, reviewers,
                                  row["checks"] if isinstance(row["checks"], dict)
-                                 else None)
+                                 else None, owner_request=req)
                 if ball:
                     row["ball"] = ball
                 open_prs.append((rec.get("created_at") or "", row))
@@ -5153,6 +5597,8 @@ def story_outcome(bundle, train, items, history, instant, texts, activity=None):
             out["ball"] = dict(main["ball"], pr=main["number"])
     elif open_issue_balls:
         out["ball"] = open_issue_balls[-1]
+    if waits:
+        out["owner_response_requested"] = waits   # waits on the module owner
     linked, more = _linked_items(bundle, texts, own)
     out["linked"] = linked
     if more:
@@ -5767,6 +6213,10 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     # selection (reads module_changes for product relevance / plumbing).
     # Omit-when-absent keys: a train with no human conversation, and a view
     # where no train qualifies, are unchanged.
+    if "pr_history" in bundle:
+        # automation accounts for what they are (story layer views only):
+        # the registry's operator tags win, then the stored account type
+        annotate_automation(bundle, registry_automation(people_source))
     annotate_train_discussion(bundle)
     select_story_trains(bundle)
     # Every story of the window, grouped (issue #97: "all the stories for
@@ -5775,6 +6225,7 @@ def enrich(bundle, priority_patterns=(), path_rules=(), people_source=None):
     build_story_list(bundle)
     build_plumbing_themes(bundle)
     annotate_issue_closing(bundle)
+    annotate_module_ownership(bundle)
     # The people layer: affiliation shares, community counts, newcomers /
     # returning contributors and the hall with what each person's work was
     # about (module layer). Only when the view carries the gathered

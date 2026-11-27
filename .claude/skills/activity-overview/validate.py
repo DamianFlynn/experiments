@@ -1530,7 +1530,8 @@ def _pr_history_problem(value):
 _OWNERSHIP_FACT_KEYS = {"collected", "events", "without_owner", "label_patterns",
                         "owner_files", "unread", "windows", "start_without_owner",
                         "labelled_items", "without_owner_unavailable"}
-_OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "source", "quote", "via"}
+_OWNERSHIP_EVENT_KEYS = {"kind", "module", "people", "date", "at", "seq", "source",
+                         "quote", "via"}
 
 
 def _module_ownership_problem(value):
@@ -1543,11 +1544,16 @@ def _module_ownership_problem(value):
     if not _list_of_objects(value.get("events")) or \
             not _list_of_objects(value.get("without_owner")):
         return "module_ownership events / without_owner is not a list of objects"
+    for key in ("start_without_owner", "labelled_items"):
+        if key in value and not _list_of_objects(value[key]):
+            return "module_ownership {} is not a list of objects".format(key)
     for e in value["events"]:
         if not set(e) <= _OWNERSHIP_EVENT_KEYS or \
                 e.get("kind") not in gather.OWNERSHIP_EVENT_KINDS or \
                 not isinstance(e.get("people", []), list) or \
-                not isinstance(e.get("source", {}), dict):
+                not isinstance(e.get("source", {}), dict) or \
+                not isinstance(e.get("seq", 0), int) or \
+                not isinstance(e.get("at", ""), (str, type(None))):
             return "module_ownership has an event gather does not write"
     return None
 

@@ -289,6 +289,9 @@ the rest (engagement, code areas, trains, people/flow).
   `author`.
 - `prs` — PRs in scope (merged-in-window, plus open and closed-unmerged PRs): `{ number, title, body, author, author_association,
   labels, merged, merged_by, merged_at, closed_at, state, base, head, head_repo, closes:[issue#], url }`.
+  PRs, issues, comments and reviews add `author_type` when GitHub's account type for the
+  author is not `User` (`Bot`: an automation account, whatever its login says; records
+  gathered before it lack it — a re-gather fills it).
   **`closes`** (#62, #105) = the same-repo issues the PR closes: the closing keywords in its
   title/body (text inside an HTML comment `<!-- … -->` is not read: PR templates carry
   examples such as `Fixes #123` there, #97; a store gathered before that needs a re-gather to
@@ -1185,9 +1188,22 @@ For a view of a gathered story layer (it carries `pr_history`; other views and f
 are unchanged), `link.build_story_list` adds **all** the stories, not a top N
 (`selected` / `more` / `quiet` stay as they were for older readers):
 
-- `stories.all` — `[{id, group, state, group_rule, title, modules, score, worthy,
-  released?}]`, ordered by group (`landed`, `in_flight`, `stalled`, `closed`,
-  `plumbing`), then score.
+- `stories.all` — `[{id, group, state, group_rule, title, modules, modules_source,
+  module_urls, substance, score, worthy, released?}]`, ordered by group (`landed`,
+  `in_flight`, `stalled`, `closed`, `plumbing`), then score.
+  - `modules` — module areas only (`link.module_kind`: never a CI or utilities folder),
+    from `link.train_modules`; `modules_source` says from what: `merged_commits` (the
+    train's merged commits), else for a train with no merged code `pr_commits` (its
+    open PRs' own commits in `pr_history`, as of the view's end), `issue_form` (an
+    issue form's `Module Name` field), `title_scope` (a conventional-commit scope that
+    is a module path, `fix(avm/res/sql/server): …`), or `none`. Never guessed from
+    prose. `module_urls` `{area: url}` — `link.module_url`, THE module link of every
+    view row (the folder's tree at `meta.clone_sha`).
+  - `substance` (`link.story_substance`) — `discussion` (a person's comment, review
+    comment or review text on the train's items), `decision_only` (no such turn, but a
+    person's verdict review or an item merged / closed by someone who is not
+    automation), `opening_only` (nothing beyond the opening posts). Automation
+    accounts never count.
   - **story-worthy** (`worthy`, `link.story_worthy`), in order: a human conversation
     turn in the window (`discussion.in_window`); an issue / PR of the train opened,
     merged, closed or reopened in it; a human commit on one of its PRs in it. An open
@@ -1200,8 +1216,11 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
     `STORY_STALLED_DAYS` (14) old at the view's end, or when an open PR's head checks
     fail (not only awaiting approval) with no comment by its author since the head
     commit; else `in_flight`. `group_rule` says which rule fired.
-  - **group** — `plumbing` when every PR of the train is plumbing (the module layer's
-    class, or a sweep), whatever its state (`state` keeps it); else the state. Every
+  - **group** — `plumbing` when every PR of the train is authored by an automation
+    account and no person took a conversation turn (`group_rule` names the accounts;
+    its theme comes from its paths, `dependency_updates` for an update PR), or when
+    every PR of the train is plumbing (the module layer's class, or a sweep), whatever
+    its state (`state` keeps it); else the state. Every
     PR must be classified: one the module layer did not classify (an open PR) is
     classified from its own commits' paths in `pr_history` committed by the view's end;
     a PR that cannot be classified keeps the train out of plumbing.
@@ -1223,16 +1242,28 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
 - `plumbing_themes` (`link.build_plumbing_themes`) — the window's plumbing PRs grouped
   by the shared paths they touch, so a writer can tell what was engineered: `[{id,
   title_hint, paths, paths_more?, prs: [{number, title, author, state, merged_at,
-  url}], stories, people, evidence_counts: {commits, comments, docs, interface,
-  patches}, subjects: [{pr, sha, subject}], issues}]`. Themes (`PLUMBING_THEMES`, the
+  url}], stories, related_stories?, modules, people, evidence_counts: {commits,
+  comments, docs, interface, patches}, subjects: [{pr, sha, subject}], issues}]`.
+  `stories` lists only the trains of the `plumbing` story group; a theme PR's train in
+  another group is in `related_stories` `[{id, group}]` (group null: not a story) — the
+  PR stays in the theme. `modules` `[{module, url}]` — the module areas of the theme's
+  paths, with `link.module_url`. Themes (`PLUMBING_THEMES`, the
   theme covering most of a PR's files): `ci_workflows` (`.github/workflows/`,
   `.github/actions/`, pipeline folders), `pipeline_utilities` (`utilities/`),
   `test_environment` (`tests/`, `e2e/`), `docs_generation` (READMEs, `docs/`, other
   Markdown), `repository_policy` (CODEOWNERS, LICENSE, `.github/` files, editor and
   tool configuration), `dependency_updates` (an automation account's update PR),
   `other_plumbing`. No prose: `title_hint` is a neutral label.
-- `module_changes.modules[]` gain `url` (the module folder at the commit the structure
-  was read at) and `versions.published[]` gain `url` (the tag's tree) and `registry`
+- People rows of automation accounts gain `automation` `{kind, on_behalf_of?}`
+  (`link.annotate_automation`): `kind` `registry` (the people registry's operator tag
+  `automation`; the tag `not-automation` sets `automation: null` and wins over
+  everything else), `account_type` (GitHub's account type for the author, kept by
+  gather as `author_type` on PRs, issues, comments and reviews when it is not `User`),
+  `app_login` (a `name[bot]` login) or `automation_name` (a git name automation commits
+  under). Never from a display name alone. `on_behalf_of` `{login, basis: assigned |
+  requested review, pr}` — who handed it the work on a PR it opened, when recorded.
+- `module_changes.modules[]` gain `url` (`link.module_url`: the module folder at the
+  commit the structure was read at) and `versions.published[]` gain `url` (the tag's tree) and `registry`
   (the public Bicep registry reference, where derivable).
 - Closed issues gain `closing` `{at, by, state_reason?, commit?, prs?, before_merge?}`:
   who closed it (the closing event's actor), GitHub's reason, the closing commit, the
@@ -1449,13 +1480,21 @@ are unchanged), `link.build_story_list` adds **all** the stories, not a top N
     instant (the item's `checks`), the next move is the author's: `awaiting author`, with
     `checks_basis` `{head, failing}` (R1 and R4 stand); **R6 checks awaiting approval** —
     as R5, but every failing check waits for a maintainer's approval to run: `awaiting
-    maintainer`. A `checks` item is never the last
+    maintainer`; **R7 module owner response requested** — when R2 stands (no change
+    request outstanding, checks not failing) and the PR carries the owner-response
+    label: `awaiting module owner` (the owners the request names, when recorded), with
+    `owner_basis` `{label, item}`. A `checks` item is never the last
     event; a `review_requested` event names its requested reviewer for R2. For an open
     issue with no open PR: **I1** the reporter moved last: `awaiting maintainer
     response`; **I2** someone else named people: `awaiting mentioned`; **I3** otherwise
     `awaiting reporter`. `state` / `with` say who; `derived` is always true;
   - `waiting_on` (only when any) — open linked items that the PR author's latest message
     names (`{number, type, state, title, named_in}`);
+  - `owner_response_requested` (only when any) — the open items carrying the
+    owner-response label: **waits on the module owner** `[{item {type, number, url},
+    module, label, since, waits_on: "the module owner", owners?}]`;
+  - every item row carries `modules`, `modules_source` and `module_urls`
+    (`link.record_modules`: as `stories.all`, per item);
   - `released` (a shipped train) — as `stories.all[].released`;
   - `linked` — the repository's issues / PRs named in the conversation (`#N`, or a
     github.com link to the repository's issue / pull; HTML comments — a template's
@@ -1663,7 +1702,26 @@ says `without_owner_unavailable`.
   `ACTIVITY_OWNERSHIP_LABELS="kind=regex;kind=regex"`): `orphan` for orphaned; "owner
   needed", "looking for an owner", "needs a new owner" for owner_needed. A label that asks
   the existing owner to respond (Azure/bicep-registry-modules' "Needs: Module Owner") is
-  deliberately not one: on the October 2026 records it sits on PRs of owned modules.
+  not an ownership change (on the October 2026 records it sits on PRs of owned modules):
+  its own kind `owner_response_requested` (pattern `needs\W*module\W*owner`,
+  configurable the same way) is never stored in `events` and never makes a module
+  without an owner. **In the view** (`link.annotate_module_ownership`, read off the
+  view's records, so a stored fact needs no recompute) each item opened in the window
+  carrying it adds an event `{kind: owner_response_requested, module, item {type,
+  number, url}, date (the day it opened: label times are not recorded), people, via,
+  source, owners?}` — `owners`: the people an automation comment on the item names as
+  the module owner, when recorded. Every event and `without_owner` row naming a module
+  gains `module_url` (`link.module_url`).
+- **Order within a day.** Each event gathered from a commit carries `at` (the commit
+  time) and a labelled item's `at` its opening time; `seq` is the order gather emitted
+  them in (commit time, then the walk's order; one change's own events by kind). The
+  reconstruction replays `(date, at, seq)` (`extract.ownership_event_order`): an owner
+  list emptied at 09:00 and refilled at 15:00 ends the day owned. Facts gathered before
+  `at` / `seq` replay by (date, kind) — recompute them with `--recompute-ownership`.
+- **Across windows.** Reconstructing from a later window's fact carries the
+  commit-derived state of the earlier windows of the view (`extract.carried_ownership`:
+  an owner list emptied in September and not refilled stands in October; the later
+  window's own start snapshot holds only the orphan markers).
 - `without_owner` — modules carrying an orphan marker at the window's end (`since`: the
   marker's date when added in the window), and modules named by an open item with an
   owner-needed / orphaned label unless the module gained an owner (or was adopted) on or

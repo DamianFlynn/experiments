@@ -1523,7 +1523,64 @@ _OWNED_KINDS = ("owner_added", "adopted")
 _UNOWNED_KINDS = ("owner_needed", "orphaned")
 
 
-def standing_without_owner(fact, day):
+def ownership_event_order(e):
+    """The replay order of ownership events: by day, then the commit time /
+    item time (`at`), then the order gather emitted them in (`seq`: one
+    commit's events in walk order); events stored before `at` / `seq`
+    existed fall back to (day, kind)."""
+    seq = e.get("seq")
+    return ((e.get("date") or "")[:10], e.get("at") or "",
+            seq if isinstance(seq, int) else -1, e.get("kind") or "",
+            e.get("module") or "")
+
+
+def _replay_ownership(events, after, until, markers, emptied, state):
+    """Replay the commit-derived ownership events dated after `after`
+    (exclusive; None: from the start) up to `until` (inclusive) into
+    `markers` (orphan markers standing), `emptied` (owner lists emptied)
+    and `state` ({module: (owned | unowned, day)}), in place."""
+    for e in sorted(events, key=ownership_event_order):
+        d = (e.get("date") or "")[:10]
+        if not d or d > until or (after and d <= after):
+            continue
+        module, kind = e.get("module"), e.get("kind")
+        if (e.get("source") or {}).get("type") != "commit":
+            continue
+        if e.get("via") in ORPHAN_MARKER_NAMES and markers is not None:
+            if kind == "orphaned":
+                markers[module] = {"module": module, "marker": e["via"], "since": d}
+            elif kind == "adopted":
+                markers.pop(module, None)
+        if kind == "owner_needed":
+            emptied[module] = {"module": module, "marker": e.get("via"), "since": d}
+        if kind == "owner_added":
+            emptied.pop(module, None)
+        if kind in _OWNED_KINDS:
+            state[module] = ("owned", d)
+        elif kind in _UNOWNED_KINDS:
+            state[module] = ("unowned", d)
+
+
+def carried_ownership(facts, before):
+    """The commit-derived ownership state standing at the start of the
+    day `before`, from the facts of EARLIER windows ([(window key, fact)],
+    replayed in window order): {emptied, state} for
+    standing_without_owner's `carried` (an owner list emptied in an
+    earlier window and not refilled stays emptied; a window's own start
+    snapshot holds only the orphan markers)."""
+    emptied, state = {}, {}
+    for _k, f in sorted(facts, key=lambda kf: (kf[0][1][:10], kf[0][0][:10], kf[0])):
+        _replay_ownership(f.get("events") or [], None, _day_before(before), None,
+                          emptied, state)
+    return {"emptied": emptied, "state": state}
+
+
+def _day_before(day):
+    from datetime import date, timedelta
+    return (date.fromisoformat(day[:10]) - timedelta(days=1)).isoformat()
+
+
+def standing_without_owner(fact, day, carried=None):
     """The modules without an owner at the end of `day` (YYYY-MM-DD) inside
     the fact's window, reconstructed from what the fact stores: the orphan
     markers standing at the window's START (`start_without_owner`), the
@@ -1534,31 +1591,15 @@ def standing_without_owner(fact, day):
     (events in date order) is owned and was reached on or after the item
     opened. Returns [{module, marker, [since], [source]}] sorted by module,
     or None when the fact predates the start snapshot (older stores) and
-    `day` is not its window's end (then only the stored end list exists)."""
+    `day` is not its window's end (then only the stored end list exists).
+    Events replay in ownership_event_order. `carried` (carried_ownership):
+    the commit-derived state of earlier windows at this window's start."""
     if "start_without_owner" not in fact or "labelled_items" not in fact:
         return None
     markers = {r["module"]: dict(r) for r in fact.get("start_without_owner") or []}
-    emptied, state = {}, {}
-    for e in sorted(fact.get("events") or [],
-                    key=lambda x: (x.get("date") or "", x.get("kind") or "")):
-        d = (e.get("date") or "")[:10]
-        if not d or d > day:
-            continue
-        module, kind = e.get("module"), e.get("kind")
-        from_commit = (e.get("source") or {}).get("type") == "commit"
-        if from_commit and e.get("via") in ORPHAN_MARKER_NAMES:
-            if kind == "orphaned":
-                markers[module] = {"module": module, "marker": e["via"], "since": d}
-            elif kind == "adopted":
-                markers.pop(module, None)
-        if from_commit and kind == "owner_needed":
-            emptied[module] = {"module": module, "marker": e.get("via"), "since": d}
-        if from_commit and kind == "owner_added":
-            emptied.pop(module, None)
-        if from_commit and kind in _OWNED_KINDS:
-            state[module] = ("owned", d)
-        elif from_commit and kind in _UNOWNED_KINDS:
-            state[module] = ("unowned", d)
+    emptied = dict((carried or {}).get("emptied") or {})
+    state = dict((carried or {}).get("state") or {})
+    _replay_ownership(fact.get("events") or [], None, day, markers, emptied, state)
     out = dict(emptied)
     out.update(markers)
     for it in fact.get("labelled_items") or []:
@@ -1600,8 +1641,7 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
             if key not in seen:
                 seen.add(key)
                 events.append(e)
-    out = dict(latest, events=sorted(events, key=lambda e: (
-        e.get("date") or "", e.get("kind") or "", e.get("module") or "")),
+    out = dict(latest, events=sorted(events, key=ownership_event_order),
         windows=[{"from": k[0], "to": k[1]} for k in sorted(values)])
     # the standing list as of the VIEW's end: reconstructed from the window
     # that contains that day (a week inside a gathered month), the latest
@@ -1614,7 +1654,9 @@ def _merged_module_ownership(conn, project, repo, overlapping, recorded,
         max(values, key=lambda k: (k[1][:10], k[0][:10], k))
     fact = values[k]
     day = end if holder else k[1][:10]
-    standing = standing_without_owner(fact, day)
+    earlier = [(w, f) for w, f in values.items() if w[1][:10] < k[0][:10]]
+    standing = standing_without_owner(
+        fact, day, carried_ownership(earlier, k[0][:10]) if earlier else None)
     for key in ("start_without_owner", "labelled_items", "without_owner_unavailable"):
         out.pop(key, None)
     if standing is not None:
