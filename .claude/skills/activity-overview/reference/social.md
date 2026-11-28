@@ -25,13 +25,21 @@ A story gets **one** post, at the first event a reader can act on. `trigger` say
 | `trigger` | When | What the post must state |
 |---|---|---|
 | `published` | a landed story whose module version was published (its release tied to the merge) within `SOCIAL_HOLD_DAYS` (3) days of its last merge: the day of the release | the module (path or link), the published version, "published" / "released", the tag link |
-| `merged_not_published` | a landed story with no release tied within the hold: three days after its last merge (it is `held` until then) | the module, "not yet published" (and the declared version when the changelog has one) |
+| `merged_not_published` | a landed story with no release tied within the hold: three days after its last merge (it is `held` until then) | the module, "not yet published", and every declared version in `must_state.declared` (declared and untagged, or published only after the hold; a version published before the merge is not one) |
+| `merged_release_unknown` | as `merged_not_published`, but a release row of the story is `unknown` (tag coverage incomplete, or the module layer unavailable): unknown does not prove unpublished, so the post keeps the uncertainty | the module, "release status not known", and no claim that it is or is not published |
 | `merged_no_release` | a landed story whose PRs change no version (documentation, metadata): its merge day | the module when there is one, "no version change" |
-| `new_module_proposed` | an open PR whose own commits add a module's entry file (`new_module_proposed`, the tree's `proposed` lifecycle): the later of that commit's day and the opening of the PR that adds it (the tree's `proposed_modules[].prs`, not any open PR of the train) | the proposed module, that the PR is open, not published |
+| `new_module_proposed` | an open PR whose own commits add a module's entry file (`new_module_proposed`, the tree's `proposed` lifecycle): the later of that commit's day and the opening of the PR that adds it (the tree's `proposed_modules[].prs`, not any open PR of the train) | the proposed module, that the PR is open (or proposed), and "not published" |
 | `breaking_declared_open` | an open PR whose own commits declare items under `### Breaking Changes` in a CHANGELOG (below): the later of that commit's day and the PR's opening | "breaking", that the PR is open (not merged) |
-| `owner_added` / `orphaned` / `deprecated` | a module event of `module_ownership` (one post per module and kind): the event's day; an `orphaned` signal that is only a label on a PR (no marker file in the module folder) is held `ORPHAN_LABEL_HOLD_DAYS` (7) and suppressed when the module gains an owner in that time | the module, the event in words ("owner", "orphaned", "deprecated"), a link to the event's source or the module; a deprecation states its replacement with its link when the record names one (`deprecated_modules[].replacement`, explicit text only), else that no replacement is named |
+| `owner_added` / `orphaned` / `deprecated` | a module event of `module_ownership` (one post per module and kind): the event's day; an `orphaned` signal that is only a label on a PR (no marker file in the module folder) is held `ORPHAN_LABEL_HOLD_DAYS` (7) and suppressed when the module gains an owner in that time | the module, the event in words ("owner", "orphaned", "deprecated"), a link to the event's source or the module; a deprecation states its replacement with its link when the record names one (`deprecated_modules[].replacement`, explicit text only), including the replacement's module link, else that no replacement is named; an `owner_added` post names each new owner (display name) |
 | `closed_not_planned` | a user-facing request or change (a story of the `closed` group: an issue or a PR touching a module, not plumbing) closed as not planned or without merging: the day it closed | that it was closed, the reason as stated (`closing.state_reason`, a PR's `superseded_by` with its link) or "no reason is stated", and where its content landed when the record shows it (`content_landed_in`: "its commit is part of #N"; never "superseded" without `superseded_by`) |
 | `closed_after_post` | closing the loop: a story that already had a post is closed without merging or withdrawn (every PR of the train closed unmerged, none open or merged): the day it closed. The one exception to one post per story: `post_id` is the first post's id plus `:closed`, with `first_post_id` | as for `closed_not_planned` |
+
+**Triggers as of their day.** A trigger is read from the PR's history, not its state at the
+window's end: a breaking declaration or a module proposal in a PR that was open on that day
+still makes the first post when the PR is closed unmerged later, and its closing then gets the
+`:closed` post (a merged PR is posted by its release instead). Who closed an item is the actor
+of its **final** `closed` lifecycle event; the closing post uses the final closure of the
+story. Closures folded into a weekly post stay in their own repository's weekly post.
 
 **Breaking declared across commits.** Patches carry no line positions, so the declaration is
 read per patch (items under an added `### Breaking Changes` heading) and across commits only
@@ -132,8 +140,10 @@ issue check's record rules on the text (`quotes_not_in_view`, `items_not_in_view
 `review_state_mismatch`, `pr_state_mismatch`, `release_status_mismatch`,
 `superseded_not_in_view`, `do_not_name_named`, `affiliation_mismatch`,
 `automation_as_person`, `dates_without_year`, `characterising_words`). Two record rules are
-read for posts: a release claim is read **as of the post's day** ("not yet published" is true
-before a later publication), and "community" in a sentence that names a person by display name
+read for posts: release, open / merged / closed and review-state claims are read **as of the
+post's day** ("not yet published" is true before a later publication — publication dates keyed
+by repository, module and version —; "open" is true for a PR open that day; a review state
+whose basis came after the post's day is not held against it), and "community" in a sentence that names a person by display name
 fails unless that person's affiliation is community. A do_not_name person's handle is never
 allowed, even when the registry marks it confirmed (logins compared case-insensitively).
 
