@@ -3162,6 +3162,18 @@ def _is_heading(par):
 
 # --- the record as of a day ------------------------------------------------------
 
+def absence_provable(view, day, tags=False):
+    """Whether the record can support a NEGATIVE for `day` ("not published",
+    "no owner was added", "nothing happened since"): the view's coverage
+    (its period) reaches the day, and, for a claim about tags, the tags were
+    read for the whole period (`_tags_complete`). Absence anywhere else is
+    not proof; the caller keeps the row pending or says "not known"."""
+    period = _period(view)
+    if not period[0] or not period[1] or day > period[1]:
+        return False
+    return _tags_complete(view) if tags else True
+
+
 def _instant(day):
     return "{}T23:59:59Z".format(day)
 
@@ -3197,9 +3209,8 @@ def release_on(view, module, version, day):
     when the tags were not read for the window or the day is past the view's
     coverage (its period end)."""
     mc = view.get("module_changes") or {}
-    inp = mc.get("inputs") or {}
     period = _period(view)
-    if not inp.get("tags_collected") or not period[1] or day > period[1]:
+    if not period[1]:
         return "unknown"
     vk = version_key(version)
     # every date the record gives the version's tag (the module layer's
@@ -3217,13 +3228,16 @@ def release_on(view, module, version, day):
                     dates.append(_day(pub["date"]))
                 else:
                     undated = True
-    if any(d <= day for d in dates):
+    # a tag dated on or before the day proves publication on its own
+    if any(d <= day for d in dates) and day <= period[1]:
         return "published"
-    if dates:
-        return "declared_not_published"     # tagged, but after the day
-    if undated:
-        # a tag without a date: published by the window's end, when not known
-        return "published" if day >= period[1] else "unknown"
+    if undated and day == period[1]:
+        return "published"   # a tag without a date: published by the window's end
+    # every negative needs complete tag coverage reaching the day
+    if not absence_provable(view, day, tags=True):
+        return "unknown"
+    if undated and not dates:
+        return "unknown"     # tagged at an unknown time: the day cannot be told
     return "declared_not_published"
 
 
@@ -3239,11 +3253,17 @@ class RecordAsOf:
         self.prs = {(_slug(v), p.get("number")): p for v in views for p in v.get("prs") or []}
 
     def pr_state(self, repo, number):
+        v = self.views.get(repo)
+        # "still open" or "not merged" past the coverage is not provable
+        if v is not None and not absence_provable(v, self.day):
+            return "unknown"
         return pr_state_on(self.prs.get((repo, number)), self.day)
 
     def review(self, repo, number):
         pr = self.prs.get((repo, number))
         v = self.views.get(repo)
+        if v is not None and not absence_provable(v, self.day):
+            return "unknown"
         if not pr or v is None or pr_state_on(pr, self.day) in (None, "not_opened"):
             return None
         return (link.review_state(v, pr, _instant(self.day)) or {}).get("state")
@@ -3725,6 +3745,12 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                              or (x.get("status") == "published" and _day(x.get("date"))
                                  and _day(x["date"]) > hold_end)]
                     unknown = [x for x in rel if x.get("status") == "unknown"]
+                    if not unknown and later and not absence_provable(v, hold_end, tags=True) \
+                            and hold_end <= (period[1] or hold_end):
+                        # tags not read for the whole period: "not yet published"
+                        # cannot be told even inside the coverage
+                        unknown = [dict(x, reason="tags not read for the whole period")
+                                   for x in later]
                     if unknown:
                         # incomplete tag coverage proves nothing: the post keeps the
                         # uncertainty ("release status not known")
@@ -3736,8 +3762,8 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                         st_ = dict(state, release="merged, not yet published",
                                    declared=[{k: x.get(k) for k in ("module", "version", "status")}
                                              for x in later], held_from=mday)
-                        if period[1] and hold_end > period[1]:
-                            # the view's tags end before the due day: "not yet
+                        if not absence_provable(v, hold_end, tags=True):
+                            # the view's tags do not reach the due day: "not yet
                             # published" cannot be told; pending until a view covers it
                             st_["pending"] = "the view's coverage ends {}; due {}".format(
                                 period[1], hold_end)
@@ -3840,6 +3866,7 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                 continue
             eday = _day(e.get("date") or e.get("at"))
             post_day = eday
+            orphan_pending = None
             if e["kind"] == "orphaned" and (e.get("source") or {}).get("type") == "pr":
                 # only a label on a PR (no marker file in the module folder): held
                 # ORPHAN_LABEL_HOLD_DAYS for an owner; an owner in that time
@@ -3850,6 +3877,10 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                                      "day": eday, "repo": sl})
                     continue
                 post_day = _add_days(eday, ORPHAN_LABEL_HOLD_DAYS)
+                if not absence_provable(v, post_day):
+                    # "no owner since" past the coverage is not proof: pending
+                    orphan_pending = "the view's coverage ends {}; due {}".format(
+                        period[1], post_day)
             seen.add(key)
             posts.append({"post_id": pid, "kind": "module_event", "day": post_day,
                           "trigger": e["kind"], "repo": sl if multi else None,
@@ -3868,6 +3899,8 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                                              or _person(v, x).get("do_not_name")),
                                          "source": e.get("source"), "via": e.get("via"),
                                          "marker_text": e.get("marker_text"),
+                                         **({"pending": orphan_pending} if orphan_pending
+                                            else {}),
                                          **({"replacement": (dict(
                                              replacements[e["module"]],
                                              module_url=module_url(
@@ -3896,7 +3929,11 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
                 weeks.setdefault((y, w), {})
         for (y, w), themes in sorted(weeks.items()):
             sunday = datetime.date.fromisocalendar(y, w, 7).isoformat()
-            day = min(sunday, period[1])
+            # the week's counts are complete only when the coverage reaches its
+            # Sunday; until then the post is pending (due on the Sunday)
+            day = sunday
+            week_pending = None if absence_provable(v, sunday) else \
+                "the view's coverage ends {}; the week ends {}".format(period[1], sunday)
             rows = sorted(themes.values(), key=lambda t: (-len(t["merged"]), -len(t["opened"]),
                                                          t["theme"]))
             folded = [x for x in mine if x.get("day") and x.get("exclusion") !=
@@ -3907,11 +3944,18 @@ def social_candidates(views, hold_days=SOCIAL_HOLD_DAYS, automation=()):
             weekly.append({"post_id": "weekly:{}:{}-W{:02d}".format(sl, y, w),
                            "kind": "weekly", "trigger": "weekly_engineered", "day": day,
                            "repo": sl if multi else None,
-                           "must_state": {"week": "{}-W{:02d}".format(y, w),
-                                          "themes": [dict(t, merged=sorted(t["merged"]),
-                                                          opened=sorted(t["opened"]))
-                                                     for t in rows],
-                                          "closures_not_posted": folded}})
+                           "must_state": dict({"week": "{}-W{:02d}".format(y, w),
+                                               # the span the counts cover: a week that
+                                               # starts before the view covers only part
+                                               "covers_from": max(datetime.date.fromisocalendar(
+                                                   y, w, 1).isoformat(), period[0]),
+                                               "covers_to": min(sunday, period[1]),
+                                               "themes": [dict(t, merged=sorted(t["merged"]),
+                                                               opened=sorted(t["opened"]))
+                                                          for t in rows],
+                                               "closures_not_posted": folded},
+                                              **({"pending": week_pending} if week_pending
+                                                 else {}))})
     return {"posts": posts + loops, "weekly": weekly, "excluded": excluded}
 
 
@@ -3942,7 +3986,8 @@ def daily_outline(views, day, posted=(), hold_days=SOCIAL_HOLD_DAYS, automation=
     posted = set(posted or ())
     pending = [p for p in cand["posts"] if p["day"] == day and p["must_state"].get("pending")]
     rows = [p for p in cand["posts"] if p["day"] == day and not p["must_state"].get("pending")]
-    weekly = [w for w in cand["weekly"] if w["day"] == day]
+    pending += [w for w in cand["weekly"] if w["day"] == day and w["must_state"].get("pending")]
+    weekly = [w for w in cand["weekly"] if w["day"] == day and not w["must_state"].get("pending")]
     held = [{"post_id": p["post_id"], "story": p.get("story"), "merged_on":
              p["must_state"].get("held_from"), "posts_on": p["day"]}
             for p in cand["posts"] if p["trigger"] in ("merged_not_published",
@@ -3980,6 +4025,41 @@ def _post_urls(text):
     """The URLs of a plain-text post, trailing sentence punctuation removed
     (as `post_facts` and the newsletter check read them)."""
     return [u.rstrip(".,;:!?)") for u in _URL_RE.findall(text or "")]
+
+
+_POST_MARKER_RE = re.compile(r"<!--\s*/?\s*post\b[^>]*?-->|<!--\s*/?\s*post\b", re.I)
+
+
+def post_file_problems(text):
+    """What the check cannot account for in a drafts file: a post marker
+    outside a well-formed block (malformed, unterminated, stray closing),
+    a duplicate (post_id, channel), and any other non-blank text outside
+    the blocks. [{problem, at, text}]."""
+    out, spans, seen = [], [], set()
+    for m in _POST_RE.finditer(text or ""):
+        spans.append((m.start(), m.end()))
+        key = (m.group(1), m.group(2).lower())
+        if key in seen:
+            out.append({"problem": "duplicate_post", "at": m.start(),
+                        "text": "{} {}".format(*key)})
+        seen.add(key)
+        if _POST_MARKER_RE.search(m.group(4)):
+            out.append({"problem": "marker_inside_post", "at": m.start(),
+                        "text": m.group(1)})
+    rest, last = [], 0
+    for a, b in spans:
+        rest.append((last, text[last:a]))
+        last = b
+    rest.append((last, text[last:]))
+    for off, chunk in rest:
+        for m in _POST_MARKER_RE.finditer(chunk):
+            out.append({"problem": "malformed_or_unterminated_marker", "at": off + m.start(),
+                        "text": m.group(0)[:80]})
+        stray = _POST_MARKER_RE.sub("", chunk).strip()
+        if stray:
+            out.append({"problem": "text_outside_posts", "at": off,
+                        "text": " ".join(stray.split())[:80]})
+    return out
 
 
 def x_length(text):
@@ -4066,6 +4146,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
         registry_names = {lg: (e or {}).get("name") for lg, e in (registry.get("people") or {}).items()
                           if isinstance(e, dict) and e.get("do_not_name")}
     names, people_rows, hidden_logins = {}, {}, set()
+    prs_url = {(_slug(v), x.get("number")): x.get("url") for v in views for x in v.get("prs") or []}
     for v in views:
         hidden_logins |= _do_not_name(v)
         for login in set(v.get("people") or {}) | set(((v.get("affiliations") or {})
@@ -4086,6 +4167,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
     blocks = list(_POST_RE.finditer(text or ""))
     if not blocks:
         return {"ok": False, "posts": [], "error": "no <!-- post: ID channel: C day: D --> block"}
+    file_errors = post_file_problems(text)
     for m in blocks:
         pid, ch, day, body = m.group(1), m.group(2).lower(), m.group(3), m.group(4).strip()
         r = {"post_id": pid, "channel": ch, "day": day}
@@ -4209,6 +4291,15 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
                     missing.append("'breaking'")
             elif re.search(r"\bbreak(s|ing)?\b", low):
                 r["breaking_not_declared"] = True
+            if row["kind"] == "weekly":
+                # the repository or one of the week's pull requests, in both forms
+                wrepo = row.get("repo") or pid.split(":")[1]
+                pr_urls = {(prs_url.get((wrepo, n))) for t in ms.get("themes") or []
+                           for n in (t.get("merged") or []) + (t.get("opened") or [])}
+                repo_url = "https://github.com/{}".format(wrepo)
+                if not (urls & (pr_urls - {None}) or any(
+                        u.rstrip("/") == repo_url for u in urls)):
+                    missing.append("a link to the repository or one of the week's pull requests")
             if row["kind"] != "weekly" and row.get("url") and row["url"] not in urls and \
                     not any((p or {}).get("url") in urls for p in ms.get("prs") or []) and \
                     not (ms.get("source") or {}).get("url") in urls and not \
@@ -4220,7 +4311,12 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
             r["must_state_missing"] = missing
         # the record checks of the issue, on the post's text
         plain = _HANDLE_RE.sub("", body)
-        issue = "# post\n\nIntro.\n\n## {}\n\n{}\n".format(HEADINGS["plumbing"][0], plain)
+        # the candidate's repository in a heading, so every paragraph of the
+        # post (linked or not) is scoped to it in a stream
+        prepo = (row or {}).get("repo") or (pid.split(":")[1] if ":" in pid else None) \
+            or _slug(views[0])
+        issue = "# post\n\nIntro.\n\n## {}\n\n### {}\n\n{}\n".format(
+            HEADINGS["plumbing"][0], prepo, plain)
         full = check_newsletter(views, issue, registry_names=registry_names,
                                 automation=automation)
         if full.get("quotes_not_in_view"):
@@ -4239,6 +4335,11 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
             # a count the row itself gives (a weekly item's PRs) is a fact too
             full["numbers_not_in_view"] = [x for x in full["numbers_not_in_view"]
                                            if x not in allowed]
+        if full.get("urls_not_in_view"):
+            # a repository's own page is a link every post may give
+            roots = {"https://github.com/{}".format(_slug(v_)).lower() for v_ in views}
+            full["urls_not_in_view"] = [u for u in full["urls_not_in_view"]
+                                        if u.rstrip("/").lower() not in roots]
         # every state, review and publication claim against the record as of
         # the post's day (one projection, not the window's end)
         full.update(state_claims(views, issue, as_of=day))
@@ -4276,7 +4377,9 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
                 results.append({"post_id": pid, "channel": ch, "facts_changed":
                                 "the post is missing from the new version", "ok": False})
                 ok = False
-    return {"ok": ok, "posts": results,
+    if file_errors:
+        ok = False
+    return {"ok": ok, "posts": results, "file_errors": file_errors,
             "voice_pass_may_change": VOICE_PASS_MAY_CHANGE}
 
 

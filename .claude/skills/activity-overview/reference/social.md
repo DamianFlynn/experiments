@@ -132,12 +132,18 @@ the text
 <!-- /post -->
 ```
 
+The whole file is accounted for (`file_errors`): a post marker outside a well-formed block
+(malformed, unterminated, a stray closing marker), a duplicate (post_id, channel), a marker
+inside a post, and any other text outside the blocks fail the file.
+
 Per block it fails and lists: `post_unknown` / `day_mismatch` (not a row of that day's
 outline); `too_long`, `too_many_hashtags`, `markdown`; `handles_not_confirmed`;
 `must_state_missing` (the table above, plus a link to the story, a pull request, the module or
 the tag — for `published`, the published version's tag; for a module event, its source or the
-module); `breaking_not_declared` ("breaking" in a post whose row declares none); and the
-issue check's record rules on the text (`quotes_not_in_view`, `items_not_in_view`,
+module; for a weekly post, in both forms, the repository's page or one of the week's pull
+requests); `breaking_not_declared` ("breaking" in a post whose row declares none); and the
+issue check's record rules on the text (run with the candidate's repository as a heading, so
+every paragraph of the post, linked or not, is read in that repository's scope) (`quotes_not_in_view`, `items_not_in_view`,
 `versions_not_in_view`, `numbers_not_in_view` — a count the row gives is allowed —,
 `review_state_mismatch`, `pr_state_mismatch`, `release_status_mismatch`,
 `superseded_not_in_view`, `do_not_name_named`, `affiliation_mismatch`,
@@ -153,6 +159,16 @@ of the record as of the post's day** (`RecordAsOf`), never against the window's 
 - a version is published when a tag of it is dated on or before the day; not published when it
   is not and the view's tags cover the day; **unknown** when the tags were not read or the day
   is past the view's coverage (`release_on`).
+
+**Absence is proof only where coverage is complete and reaches the day**
+(`absence_provable`): a negative — "not published", "no owner was added since", "still open",
+a week's counts — needs the view's period to reach the day and, for tags, the tags read for the
+whole period (no `windows_without_tags`). Everywhere else the projection says unknown and the
+outline keeps the row pending: the merged-release hold (a gap in tag coverage inside the period
+turns it into `merged_release_unknown`), the label-only orphan hold, and the weekly post (due on
+the week's Sunday, pending until a view covers it; its `covers_from` / `covers_to` give the span
+its counts cover when the week starts before the view). PR and review states past the coverage
+are unknown.
 
 The outline uses the same projection: a `merged_not_published` post due after the view's
 coverage ends is `pending` (listed under `pending` in the daily outline, `post_pending` in the

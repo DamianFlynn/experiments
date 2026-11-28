@@ -36,9 +36,9 @@ Drafts for the owner to approve, written neutral from the record of Azure/bicep-
 | Wed 2026-10-28 | 0 | 0 | 0 |
 | Thu 2026-10-29 | 0 | 0 | 0 |
 | Fri 2026-10-30 | 0 | 0 | 0 |
-| Sat 2026-10-31 | 0 | 1 | 0 |
+| Sat 2026-10-31 | 0 | 0 | 0 |
 
-Total: 23 story and module posts and 5 weekly posts in October 2026 (28 posts, each in two forms). Per trigger: published 12, new_module_proposed 4, merged_not_published 2, breaking_declared_open 2, owner_added 2, deprecated 1.
+Total: 23 story and module posts and 4 weekly posts in October 2026, the weekly post of week 44 pending until a view covers 1 November 2026 (27 posts, each in two forms). Per trigger: published 12, new_module_proposed 4, merged_not_published 2, breaking_declared_open 2, owner_added 2, deprecated 1.
 
 **Closed posts in October 2026: none.** The three user-facing closures of the month, #7541, #7542 and #7543, were closed as not planned by their own author on the day they were opened (`quick_own_close`), so they fold into the weekly post of week 42 as a count (written below). No story that had a post was withdrawn in October. Not posted either: the label-only orphan signal on `avm/res/sql/server` (2 October 2026), because the module gained an owner four days later (`orphan_label_then_owner`).
 
