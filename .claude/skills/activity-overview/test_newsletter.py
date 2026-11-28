@@ -2138,6 +2138,15 @@ class TestSocialPosts(unittest.TestCase):
         self.assertTrue(r["posts"][1]["breaking_not_declared"])
         self.assertFalse(r["ok"])
 
+    def test_quotes_are_plain_text_without_code_spans(self):
+        # the record's changelog has `privatelink.redis.azure.net` in backticks
+        t = self.POST.replace("It adds the Redis zone.",
+                              "Its changelog: \"Added Redis zone privatelink.redis.azure.net\".")
+        r = self.check(t)
+        self.assertTrue(r["ok"], r["posts"])
+        r = self.check(t.replace("privatelink.redis.azure.net\"", "privatelink.redis.example\""))
+        self.assertTrue(r["posts"][1]["quotes_not_in_view"])
+
     def test_handles_only_when_confirmed(self):
         t = self.POST.replace("with the Redis zone", "with the Redis zone by @nikp")
         self.assertEqual(self.check(t)["posts"][0]["handles_not_confirmed"], ["nikp"])

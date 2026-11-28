@@ -7,6 +7,9 @@ written for the people who **use** the modules: what is new, what changed, what 
 stories behind the changes, who owns and who built what, what is coming, and what was
 engineered underneath.
 
+Short daily posts for LinkedIn and X (one per story, drafts for approval) are written from the
+same view: `reference/social.md`.
+
 **Universal rules** (as for the digest): the view is the only source of truth; every claim
 links its item; a section with nothing behind it is omitted, never padded; the writer chooses
 words, the code chooses what goes in and in which order.

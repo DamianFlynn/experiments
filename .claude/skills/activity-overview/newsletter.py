@@ -3718,6 +3718,7 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
         before = {(m.group(1), m.group(2)): post_facts(m.group(4).strip())
                   for m in _POST_RE.finditer(against)}
     results, ok = [], True
+    code_free = None
     blocks = list(_POST_RE.finditer(text or ""))
     if not blocks:
         return {"ok": False, "posts": [], "error": "no <!-- post: ID channel: C day: D --> block"}
@@ -3796,6 +3797,16 @@ def check_posts(views, text, registry=None, against=None, hold_days=SOCIAL_HOLD_
         issue = "# post\n\nIntro.\n\n## {}\n\n{}\n".format(HEADINGS["plumbing"][0], plain)
         full = check_newsletter(views, issue, registry_names=registry_names,
                                 automation=automation)
+        if full.get("quotes_not_in_view"):
+            # plain text has no code spans: a quote is verbatim when it matches
+            # the record with the record's backticks dropped
+            if code_free is None:
+                u_, t_ = set(), []
+                for v_ in views:
+                    link._slice_strings(v_, u_, t_)
+                code_free = [link._norm_ws(x.replace("`", "")) for x in t_]
+            full["quotes_not_in_view"] = [q for q in full["quotes_not_in_view"]
+                                          if not any(link._norm_ws(q) in t for t in code_free)]
         allowed = set()
         _social_numbers(row.get("must_state") if row else None, allowed)
         if full.get("numbers_not_in_view"):
