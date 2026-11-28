@@ -12,6 +12,14 @@
   "env": {
     "TF_PLUGIN_CACHE_DIR": ".tfcache"
   },
+  "token": {
+    "store": "app",
+    "client_id": "REPLACE-WITH-THE-APP-CLIENT-ID",
+    "private_key_file": "~/.config/activity-overview/app.pem",
+    "probe_repo": "Azure/bicep-registry-modules",
+    "env_file": "~/.config/activity-overview/token.env",
+    "keychain_service": "activity-gh-token"
+  },
   "streams": [
     {
       "id": "avm-bicep",
@@ -59,33 +67,44 @@
       "enabled": true
     },
     {
-      "id": "ai-hub-gateway",
-      "title": "AI hub gateway landing zone",
-      "kind": "repo",
-      "owner": "Azure-Samples",
-      "repo": "ai-hub-gateway-solution-accelerator",
-      "home": {
-        "orgs": ["Azure", "Azure-Samples", "microsoft"],
-        "names": ["Microsoft"],
-        "email_domains": ["microsoft.com"]
-      },
-      "cadence": ["monthly"],
-      "gather_flags": ["--structural-iac", "--no-iac-build"],
-      "enabled": true
-    },
-    {
-      "id": "enterprise-scale",
-      "title": "Enterprise-scale landing zone",
+      "id": "deployment-stacks",
+      "title": "Deployment stacks",
       "kind": "repo",
       "owner": "Azure",
-      "repo": "Enterprise-Scale",
+      "repo": "deployment-stacks",
       "home": {
         "orgs": ["Azure", "microsoft"],
         "names": ["Microsoft"],
         "email_domains": ["microsoft.com"]
       },
       "cadence": ["monthly"],
-      "enabled": false
+      "enabled": true
+    },
+    {
+      "id": "enterprise-lz",
+      "title": "Enterprise Landing Zones",
+      "kind": "manifest",
+      "manifest": "enterprise-lz/manifest.json",
+      "home": {
+        "orgs": ["Azure", "microsoft"],
+        "names": ["Microsoft"],
+        "email_domains": ["microsoft.com"]
+      },
+      "cadence": ["monthly"],
+      "enabled": true
+    },
+    {
+      "id": "ai-lz",
+      "title": "AI Landing Zones",
+      "kind": "manifest",
+      "manifest": "ai-lz/manifest.json",
+      "home": {
+        "orgs": ["Azure", "Azure-Samples", "microsoft"],
+        "names": ["Microsoft"],
+        "email_domains": ["microsoft.com"]
+      },
+      "cadence": ["monthly"],
+      "enabled": true
     }
   ]
 }

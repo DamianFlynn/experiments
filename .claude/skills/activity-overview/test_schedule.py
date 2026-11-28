@@ -29,6 +29,15 @@ UTC = datetime.timezone.utc
 TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
 
 
+def _no_network(url, token, timeout=20):
+    """The runner's one API call, replaced for the whole module: no test
+    reaches the network (a test that needs answers passes its own seam)."""
+    return None, {}, "no network in tests"
+
+
+schedule.default_http_get = _no_network
+
+
 def D(text):
     return datetime.date.fromisoformat(text)
 
@@ -1197,6 +1206,1184 @@ class TestNextCommands(Case):
         self.assertIn(os.path.join("series", "o__b.json"), nxt["commands"][3])
         self.assertIn("o__a.json", nxt["commands"][4])
         self.assertIn("o__b.json", nxt["commands"][4])
+
+
+# --- the token: renew, status, expiry, reminder -------------------------------------------------
+
+NEW_TOKEN = "github_pat_" + "N3w7oKen" * 8
+OLD_TOKEN = "ghp_" + "0ld7oKen" * 5
+
+
+class FakeAPI:
+    """The API seam: answers per path, records every call (and the token
+    it carried, to prove which token was checked)."""
+
+    def __init__(self, user=200, probe=200, expiry="2026-12-05 10:00:00 UTC",
+                 probe_message="ok"):
+        self.calls = []
+        self.user, self.probe, self.expiry = user, probe, expiry
+        self.probe_message = probe_message
+
+    def __call__(self, url, token, timeout=20):
+        self.calls.append((url, token))
+        if url.endswith("/user"):
+            headers = {"github-authentication-token-expiration": self.expiry} \
+                if self.expiry else {}
+            if self.user != 200:
+                return self.user, {}, json.dumps({"message": "Bad credentials"})
+            return 200, headers, json.dumps({"login": "someone"})
+        if self.probe != 200:
+            return self.probe, {}, json.dumps({"message": self.probe_message})
+        return 200, {}, json.dumps({"full_name": "o/r"})
+
+
+class FakeSecurity:
+    """The `security` seam: a one-item keychain. Records argv and stdin."""
+
+    def __init__(self, stored=None, corrupt=False):
+        self.calls = []
+        self.items = {}
+        if stored:
+            self.items["activity-gh-token"] = stored
+        self.corrupt = corrupt
+
+    def __call__(self, argv, stdin_text=None):
+        self.calls.append((list(argv), stdin_text))
+        if argv == ["security", "-i"]:
+            words = stdin_text.split()
+            assert words[0] == "add-generic-password" and words[-2] == "-w", words
+            svc = words[words.index("-s") + 1]
+            self.items[svc] = "garbled" if self.corrupt else words[-1]
+            return 0, ""
+        if argv[1] == "find-generic-password":
+            svc = argv[argv.index("-s") + 1]
+            return (0, self.items[svc] + "\n") if svc in self.items else (44, "")
+        return 1, ""
+
+
+class TokenCliCase(Case):
+    """A streams file with an env-file token, and `token …` run with every
+    seam replaced."""
+
+    def setUp(self):
+        super().setUp()
+        self.env_file = os.path.join(self.tmp, "cfg", "token.env")
+        self.path = streams_file(self.tmp, token={"store": "env-file",
+                                                  "env_file": self.env_file})
+        self.clock = FakeClock(start=T("2026-11-28T10:00:00Z"))
+
+    def token_cli(self, *argv, api=None, prompt=NEW_TOKEN, security=None, browser=True,
+                  spawn=None, launch_code=0):
+        self.opened, self.prompts, self.spawned, self.launched = [], [], [], []
+
+        def launch(a):
+            self.launched.append(a)
+            return launch_code
+        out, err = io.StringIO(), io.StringIO()
+
+        def ask(text):
+            self.prompts.append(text)
+            return prompt
+
+        def open_browser(url):
+            self.opened.append(url)
+            return browser
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", *argv, "--streams", self.path],
+                                 http_get=api or FakeAPI(), prompt=ask,
+                                 open_browser=open_browser,
+                                 security=security or FakeSecurity(),
+                                 spawn=spawn or (lambda a, e: self.spawned.append((a, e))),
+                                 launch=launch, now=self.clock.now)
+        self.assertNotIn(NEW_TOKEN, out.getvalue() + err.getvalue())
+        self.assertNotIn(OLD_TOKEN, out.getvalue() + err.getvalue())
+        return code, out.getvalue(), err.getvalue()
+
+    def write_old(self):
+        schedule.write_env_file(self.env_file, OLD_TOKEN)
+
+    def stored(self):
+        with open(self.env_file, encoding="utf-8") as fh:
+            return fh.read()
+
+
+class TestTokenRenew(TokenCliCase):
+    def test_page_url_uses_only_documented_parameters(self):
+        url = schedule.token_page_url()
+        base, _sep, query = url.partition("?")
+        self.assertEqual(base, "https://github.com/settings/personal-access-tokens/new")
+        params = urllib_parse_qs(query)
+        self.assertEqual(sorted(params), ["description", "expires_in", "name"])
+        self.assertEqual(params["expires_in"], ["7"])
+        self.assertLessEqual(len(params["name"][0]), 40)
+        self.assertEqual(schedule.token_page_url(classic=True),
+                         "https://github.com/settings/tokens/new")
+
+    def test_renew_prompts_checks_then_stores_atomically(self):
+        self.write_old()
+        api = FakeAPI()
+        code, _out, err = self.token_cli("renew", api=api)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.stored(), "GITHUB_TOKEN={}\n".format(NEW_TOKEN))
+        self.assertEqual(os.stat(self.env_file).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(self.env_file)).st_mode & 0o777, 0o700)
+        self.assertEqual(os.listdir(os.path.dirname(self.env_file)), ["token.env"])
+        self.assertEqual(self.prompts, ["New token (input hidden): "])
+        self.assertEqual(len(self.opened), 1)
+        self.assertIn("Opened the new-token page", err)
+        self.assertEqual([u.rsplit("/", 2)[-2:] for u, _t in api.calls],
+                         [["api.github.com", "user"], ["o", "r"]])   # identity, then a read
+        self.assertTrue(all(t == NEW_TOKEN for _u, t in api.calls))
+        self.assertIn("someone - expires 2026-12-05T10:00:00Z (7.0 day(s) left)", err)
+
+    def test_a_refused_token_keeps_the_old_one(self):
+        self.write_old()
+        lifetime = ("The 'Org' enterprise forbids access via a personal access token "
+                    "whose lifetime is greater than 8 days.")
+        for api in (FakeAPI(user=401), FakeAPI(probe=403, probe_message=lifetime)):
+            with self.subTest(api=(api.user, api.probe)):
+                code, _out, err = self.token_cli("renew", api=api)
+                self.assertEqual(code, 1)
+                self.assertIn("NOT stored", err)
+                self.assertEqual(self.stored(), "GITHUB_TOKEN={}\n".format(OLD_TOKEN))
+        self.assertIn("lifetime is greater than 8 days", err)
+
+    def test_a_malformed_paste_is_refused_before_any_call(self):
+        self.write_old()
+        api = FakeAPI()
+        code, _out, err = self.token_cli("renew", api=api, prompt="not a token!")
+        self.assertEqual(code, 1)
+        self.assertEqual(api.calls, [])
+        self.assertIn("nothing changed", err)
+        self.assertEqual(self.stored(), "GITHUB_TOKEN={}\n".format(OLD_TOKEN))
+
+    def test_no_browser_prints_the_address(self):
+        code, _out, err = self.token_cli("renew", "--no-browser")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.opened, [])
+        self.assertIn("Open the new-token page:\n  https://github.com/settings/"
+                      "personal-access-tokens/new?", err)
+        _code, _out, err = self.token_cli("renew", browser=False)
+        self.assertIn("Open the new-token page", err)
+
+    def test_keychain_store_keeps_the_token_off_every_argv(self):
+        path = streams_file(self.tmp, token={"store": "keychain"})
+        self.path = path
+        sec = FakeSecurity(stored=OLD_TOKEN)
+        code, _out, err = self.token_cli("renew", security=sec)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sec.items["activity-gh-token"], NEW_TOKEN)
+        for argv, _stdin in sec.calls:
+            self.assertNotIn(NEW_TOKEN, " ".join(argv))
+        add = [c for c in sec.calls if c[0] == ["security", "-i"]]
+        self.assertEqual(len(add), 1)
+        self.assertIn("-U -a ", add[0][1])
+        self.assertIn("-T /usr/bin/security -w " + NEW_TOKEN, add[0][1])
+        # the item is read back and compared
+        self.assertEqual(sec.calls[-1][0][1], "find-generic-password")
+
+    def test_keychain_read_back_mismatch_fails(self):
+        self.path = streams_file(self.tmp, token={"store": "keychain"})
+        code, _out, err = self.token_cli("renew", security=FakeSecurity(corrupt=True))
+        self.assertEqual(code, 1)
+        self.assertIn("did not read back", err)
+
+    def test_kick_starts_a_run_with_the_token_in_the_environment_only(self):
+        with mock.patch.object(schedule.sys, "platform", "linux"):
+            code, _out, _err = self.token_cli("renew", "--kick")
+        self.assertEqual(code, 0)
+        (argv, env), = self.spawned
+        self.assertEqual(argv[2:], ["run", "--streams", self.path])
+        self.assertNotIn(NEW_TOKEN, " ".join(argv))
+        self.assertEqual(env["GITHUB_TOKEN"], NEW_TOKEN)
+        with mock.patch.object(schedule.sys, "platform", "darwin"):
+            code, _out, err = self.token_cli("renew", "--kick")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.spawned, [])
+        argv, = self.launched
+        self.assertEqual(argv[:2], ["launchctl", "kickstart"])
+        self.assertTrue(argv[2].endswith("/local.activity-overview.gather"))
+        self.assertIn("started the scheduled job", err)
+
+    def test_a_failed_kickstart_is_not_reported_as_started(self):
+        with mock.patch.object(schedule.sys, "platform", "darwin"):
+            code, _out, err = self.token_cli("renew", "--kick", launch_code=113)
+        self.assertEqual(code, 1)
+        self.assertIn("kickstart exited 113", err)
+        self.assertIn("was NOT started", err)
+        self.assertNotIn("started the scheduled job (", err)
+
+    def test_status_shows_expiry_and_warns_near_the_end(self):
+        self.write_old()
+        code, out, _err = self.token_cli("status", api=FakeAPI())
+        self.assertEqual(code, 0)
+        self.assertIn("expires 2026-12-05T10:00:00Z (7.0 day(s) left)", out)
+        self.assertNotIn("WARNING", out)
+        code, out, _err = self.token_cli(
+            "status", api=FakeAPI(expiry="2026-11-30 04:00:00 +0000"))
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: the token expires 2026-11-30T04:00:00Z (1.8 day(s) left)",
+                      out)
+        code, out, _err = self.token_cli("status", api=FakeAPI(user=401))
+        self.assertEqual(code, 1)
+        self.assertIn("refused", out)
+
+    def test_status_without_a_stored_token(self):
+        code, out, _err = self.token_cli("status")
+        self.assertEqual(code, 1)
+        self.assertIn("no stored token", out)
+
+    def test_parse_expiry(self):
+        want = T("2026-12-05T10:00:00Z")
+        self.assertEqual(schedule.parse_expiry("2026-12-05 10:00:00 UTC"), want)
+        self.assertEqual(schedule.parse_expiry("2026-12-05 10:00:00 +0000"), want)
+        self.assertEqual(schedule.parse_expiry("2026-12-05 11:00:00 +0100"), want)
+        self.assertEqual(schedule.parse_expiry("2026-12-05 02:00:00 -0800"), want)
+        self.assertEqual(schedule.parse_expiry("2026-12-05T10:00:00Z"), want)
+        for bad in ("", None, "soon", "2026-13-05 10:00:00 UTC"):
+            self.assertIsNone(schedule.parse_expiry(bad))
+
+    def test_unknown_token_settings_are_refused(self):
+        with self.assertRaises(schedule.ConfigError) as cm:
+            self.cfg(token={"value": "x"})
+        self.assertIn("never goes in this file", str(cm.exception))
+        with self.assertRaises(schedule.ConfigError):
+            self.cfg(token={"store": "vault"})
+
+
+class TestTokenInRuns(Case):
+    def run_with(self, api):
+        path = streams_file(self.tmp)
+        code, _out, _err = self.run_cli(["run", "--streams", path], http_get=api)
+        with open(os.path.join(self.ws, "status.json"), encoding="utf-8") as fh:
+            return code, path, json.load(fh)
+
+    def test_the_run_records_the_expiry(self):
+        code, _path, top = self.run_with(FakeAPI(expiry="2026-11-25 02:00:00 UTC"))
+        self.assertEqual(code, 0)
+        self.assertEqual(top["token_expires_at"], "2026-11-25T02:00:00Z")
+        self.assertEqual(top["token_days_left"], 5.0)
+        self.assertEqual(top["token"]["login"], "someone")
+        self.assertNotIn(TOKEN, json.dumps(top))
+
+    def test_status_latest_and_remind_warn_within_two_days(self):
+        _code, path, _top = self.run_with(FakeAPI(expiry="2026-11-22 02:00:00 UTC"))
+        code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertIn("TOKEN: the token expires 2026-11-22T02:00:00Z (2.0 day(s) left)", out)
+        clock = FakeClock(start=T("2026-11-20T08:00:00Z"))
+        lout, lerr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(lout), contextlib.redirect_stderr(lerr):
+            schedule.main(["latest", "--streams", path, "--stream", "demo",
+                           "--month", "2026-11"], now=clock.now)
+        self.assertIn("token expires", json.loads(lout.getvalue())["warnings"][0])
+        self.assertIn("latest: WARNING: the token expires", lerr.getvalue())
+        code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertEqual(code, 0)
+        self.assertIn("schedule.py token renew", out)
+        self.assertNotIn('"', out)
+
+    def test_no_reminder_with_days_to_spare(self):
+        _code, path, _top = self.run_with(FakeAPI(expiry="2026-11-27 02:00:00 UTC"))
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertEqual(out, "")
+        _code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertNotIn("TOKEN:", out)
+
+    def test_a_refused_token_is_reminded(self):
+        _code, path, top = self.run_with(FakeAPI(user=401))
+        self.assertIn("refused", top["token"]["error"])
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertIn("refused", out)
+
+    def test_an_unreachable_api_does_not_stop_the_run(self):
+        code, _path, top = self.run_with(None)          # the module's no-network seam
+        self.assertEqual(code, 0)
+        self.assertIn("could not be reached", top["token"]["error"])
+        self.assertIsNone(top["token_days_left"])
+
+
+# --- the app route --------------------------------------------------------------------------------
+
+APP_TOKEN_PREFIX = "ghs_" + "AppInst" * 5
+
+
+class FakeAppAPI:
+    """The app endpoints and the probe reads, scripted; records every call
+    with the credential it carried and any body."""
+
+    def __init__(self, installs=None, token_status=201, jwt_status=200, rest=200,
+                 graphql=None, search=200, inst_status=200):
+        self.calls = []
+        self.installs = [{"id": 42, "app_id": 7, "account": {"login": "owner"},
+                          "permissions": {"metadata": "read", "contents": "read",
+                                          "pull_requests": "write"}}] \
+            if installs is None else installs
+        self.token_status, self.jwt_status, self.inst_status = (
+            token_status, jwt_status, inst_status)
+        self.rest, self.search = rest, search
+        self.graphql = graphql if graphql is not None else {
+            "data": {"repository": {"nameWithOwner": "Azure/bicep-registry-modules",
+                                    "pullRequests": {"totalCount": 5000}},
+                     "rateLimit": {"limit": 5000, "remaining": 4999}}}
+        self.issued = []
+
+    def __call__(self, method, url, bearer, body=None, timeout=30):
+        self.calls.append((method, url, bearer, body))
+        path = url[len(schedule.API):]
+        if path.startswith("/app/"):
+            if self.jwt_status != 200:
+                return self.jwt_status, {}, json.dumps({"message": "'Expiration time' "
+                                                        "claim ('exp') is too far"})
+            if path == "/app/installations?per_page=100":
+                return 200, {}, json.dumps(self.installs)
+            if path.endswith("/access_tokens"):
+                if self.token_status != 201:
+                    return self.token_status, {}, json.dumps({"message": "denied"})
+                token = "{}{:04d}".format(APP_TOKEN_PREFIX, len(self.issued))
+                self.issued.append(token)
+                return 201, {}, json.dumps({"token": token,
+                                            "expires_at": "2026-11-20T03:00:00Z",
+                                            "permissions": body["permissions"]})
+            if self.inst_status != 200:
+                return self.inst_status, {}, json.dumps({"message": "Not Found"})
+            return 200, {}, json.dumps(self.installs[0])
+        if path == "/rate_limit":
+            return 200, {}, json.dumps({"resources": {
+                "core": {"limit": 5000, "remaining": 4990},
+                "graphql": {"limit": 5000, "remaining": 5000},
+                "search": {"limit": 30, "remaining": 30}}})
+        if path.startswith("/repos/"):
+            if self.rest != 200:
+                return self.rest, {}, json.dumps({"message": "Resource protected by "
+                                                  "organization policy"})
+            return 200, {}, json.dumps({"full_name": "Azure/bicep-registry-modules",
+                                        "visibility": "public", "default_branch": "main"})
+        if path == "/graphql":
+            return 200, {}, json.dumps(self.graphql)
+        if path.startswith("/search/"):
+            return (200, {}, json.dumps({"total_count": 5000})) if self.search == 200 \
+                else (self.search, {}, json.dumps({"message": "nope"}))
+        return 404, {}, "{}"
+
+
+def fake_sign(key, data):
+    return b"signature-of-" + data[:8]
+
+
+def make_key(folder):
+    """A throwaway RSA key via openssl, mode 600; None when there is no openssl."""
+    if not shutil.which("openssl"):
+        return None
+    path = os.path.join(folder, "app.pem")
+    subprocess.run(["openssl", "genrsa", "-out", path, "2048"], check=True,
+                   capture_output=True)
+    os.chmod(path, 0o600)
+    return path
+
+
+class AppCase(Case):
+    def setUp(self):
+        super().setUp()
+        self.keydir = os.path.join(self.tmp, "keys")
+        os.makedirs(self.keydir, mode=0o700)
+        self.key = os.path.join(self.keydir, "app.pem")
+        with open(self.key, "w") as fh:
+            fh.write("-----BEGIN PRIVATE KEY-----\nnot a real key\n-----END PRIVATE KEY-----\n")
+        os.chmod(self.key, 0o600)
+
+    def app_cfg(self, streams=None, **token):
+        block = {"store": "app", "client_id": "Iv23testclient",
+                 "private_key_file": self.key}
+        block.update(token)
+        return streams_file(self.tmp, streams, token=block)
+
+    def settings(self, path, **extra):
+        cfg = schedule.load_streams(path)
+        s = schedule.token_settings(cfg)
+        s.update(extra)
+        return s
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl is not on PATH")
+class TestAppJWT(Case):
+    def verify(self, key, jwt):
+        header, payload, sig = jwt.split(".")
+        pub = os.path.join(self.tmp, "pub.pem")
+        subprocess.run(["openssl", "rsa", "-in", key, "-pubout", "-out", pub],
+                       check=True, capture_output=True)
+        import base64
+        data = os.path.join(self.tmp, "input")
+        sigf = os.path.join(self.tmp, "sig")
+        with open(data, "w") as fh:
+            fh.write(header + "." + payload)
+        with open(sigf, "wb") as fh:
+            fh.write(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)))
+        proc = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pub,
+                               "-signature", sigf, data], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Verified OK", proc.stdout)
+
+        def part(p):
+            return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+        return part(header), part(payload)
+
+    def test_signed_with_a_real_key_and_verifiable(self):
+        key = make_key(self.tmp)
+        now = 1_800_000_000
+        jwt = schedule.make_jwt("Iv23testclient", ("file", key), now)
+        header, claims = self.verify(key, jwt)
+        self.assertEqual(header, {"alg": "RS256", "typ": "JWT"})
+        self.assertEqual(claims, {"iat": now - 60, "exp": now + 540, "iss": "Iv23testclient"})
+        self.assertLessEqual(claims["exp"] - now, 600)      # GitHub: at most 10 minutes
+
+    def test_the_pkcs1_form_github_downloads(self):
+        key = make_key(self.tmp)
+        pkcs1 = os.path.join(self.tmp, "pkcs1.pem")
+        proc = subprocess.run(["openssl", "rsa", "-in", key, "-traditional", "-out", pkcs1],
+                              capture_output=True)
+        if proc.returncode != 0:          # an openssl whose genrsa already writes PKCS#1
+            pkcs1 = key
+        os.chmod(pkcs1, 0o600)
+        with open(pkcs1, "rb") as fh:
+            head = fh.read(40)
+        if b"BEGIN RSA PRIVATE KEY" not in head:
+            self.skipTest("this openssl cannot write a PKCS#1 key")
+        self.assertEqual(schedule.load_app_key({"private_key_file": pkcs1},
+                                               isdir=lambda p: False), ("file", pkcs1))
+        _header, claims = self.verify(pkcs1, schedule.make_jwt(
+            "Iv23x", ("file", pkcs1), 1_800_000_000))
+        self.assertEqual(claims["iss"], "Iv23x")
+
+    def test_key_through_a_pipe(self):
+        key = make_key(self.tmp)
+        with open(key, "rb") as fh:
+            pem = fh.read()
+        jwt = schedule.make_jwt(12345, ("pem", pem), 1_800_000_000)
+        _header, claims = self.verify(key, jwt)
+        self.assertEqual(claims["iss"], "12345")
+
+    def test_a_bad_key_is_a_plain_error(self):
+        bad = os.path.join(self.tmp, "bad.pem")
+        with open(bad, "w") as fh:
+            fh.write("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.make_jwt("x", ("file", bad), 1_800_000_000)
+        self.assertIn("openssl could not sign", str(cm.exception))
+        self.assertNotIn("AAAA", str(cm.exception))
+
+
+class TestAppKey(AppCase):
+    def test_file_checks(self):
+        s = {"private_key_file": self.key, "workspace": self.ws}
+        self.assertEqual(schedule.load_app_key(s, isdir=lambda p: False), ("file", self.key))
+        os.chmod(self.key, 0o644)
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.load_app_key(s, isdir=lambda p: False)
+        self.assertIn("mode 644", str(cm.exception))
+        os.chmod(self.key, 0o600)
+        inside = os.path.join(self.ws, "app.pem")
+        os.makedirs(self.ws)
+        shutil.copy(self.key, inside)
+        os.chmod(inside, 0o600)
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.load_app_key({"private_key_file": inside, "workspace": self.ws},
+                                  isdir=lambda p: False)
+        self.assertIn("inside the workspace", str(cm.exception))
+        synced = os.path.join(self.tmp, "Dropbox")
+        os.makedirs(synced)
+        shutil.copy(self.key, os.path.join(synced, "k.pem"))
+        os.chmod(os.path.join(synced, "k.pem"), 0o600)
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.load_app_key({"private_key_file": os.path.join(synced, "k.pem")},
+                                  isdir=lambda p: False)
+        self.assertIn("synced", str(cm.exception))
+        with self.assertRaises(schedule.AuthError) as cm:
+            schedule.load_app_key({"private_key_file": self.key + ".gone"})
+        self.assertIn("does not exist", str(cm.exception))
+
+    def test_keychain_item(self):
+        import base64
+        pem = b"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"
+        sec = FakeSecurity()
+        sec.items["app-key"] = base64.b64encode(pem).decode()
+        s = {"private_key_keychain_service": "app-key", "account": "me"}
+        self.assertEqual(schedule.load_app_key(s, sec), ("pem", pem))
+        sec.items["app-key"] = "not base64 !"
+        with self.assertRaises(schedule.AuthError):
+            schedule.load_app_key(s, sec)
+        with self.assertRaises(schedule.AuthError):
+            schedule.load_app_key({"private_key_keychain_service": "missing",
+                                   "account": "me"}, sec)
+
+    def test_import_keeps_the_key_off_argv(self):
+        path = self.app_cfg(private_key_keychain_service="app-key")
+        sec = FakeSecurity()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", path,
+                                  "--import", self.key], security=sec)
+        self.assertEqual(code, 0, err.getvalue())
+        import base64
+        with open(self.key, "rb") as fh:
+            self.assertEqual(base64.b64decode(sec.items["app-key"]), fh.read())
+        for argv, _stdin in sec.calls:
+            self.assertNotIn(sec.items["app-key"], " ".join(argv))
+        self.assertNotIn("not a real key", out.getvalue() + err.getvalue())
+
+    def test_streams_file_rules(self):
+        with self.assertRaises(schedule.ConfigError) as cm:
+            self.cfg(token={"store": "app", "private_key_file": self.key})
+        self.assertIn("client_id", str(cm.exception))
+        with self.assertRaises(schedule.ConfigError) as cm:
+            self.cfg(token={"store": "app", "client_id": "x"})
+        self.assertIn("private_key", str(cm.exception))
+        with self.assertRaises(schedule.ConfigError) as cm:
+            self.cfg(token={"store": "app", "client_id": "x",
+                            "private_key_file": "-----BEGIN PRIVATE KEY-----"})
+        self.assertIn("never goes in this file", str(cm.exception))
+        with self.assertRaises(schedule.ConfigError):
+            self.cfg(token={"store": "app", "app_id": "7", "private_key_file": self.key})
+
+
+class TestAppMint(AppCase):
+    def tokens(self, api, **extra):
+        return schedule.AppTokens(self.settings(self.app_cfg(), **extra), api=api,
+                                  sign=fake_sign, isdir=lambda p: False,
+                                  now=FakeClock().now)
+
+    def test_mint_finds_the_installation_and_asks_for_read_only(self):
+        import base64
+        api = FakeAppAPI()
+        info = self.tokens(api).mint()
+        self.assertEqual(info["token"], APP_TOKEN_PREFIX + "0000")
+        self.assertEqual((info["installation_id"], info["account"], info["app_id"]),
+                         (42, "owner", 7))
+        post = [c for c in api.calls if c[0] == "POST"][0]
+        self.assertEqual(post[3], {"permissions": {"contents": "read", "metadata": "read",
+                                                   "pull_requests": "read"}})
+        jwt = post[2]
+        self.assertEqual(jwt.count("."), 2)
+        part = jwt.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        self.assertEqual(claims["iss"], "Iv23testclient")
+        self.assertEqual(claims["iat"], int(T("2026-11-20T02:00:00Z").timestamp()) - 60)
+        self.assertNotIn("token", schedule.AppTokens.public(info))
+
+    def test_configured_installation(self):
+        api = FakeAppAPI()
+        self.tokens(api, installation_id=42).mint()
+        self.assertEqual(api.calls[0][1], schedule.API + "/app/installations/42")
+        with self.assertRaises(schedule.AuthError) as cm:
+            self.tokens(FakeAppAPI(inst_status=404), installation_id=9).mint()
+        self.assertIn("installation 9 was not found", str(cm.exception))
+
+    def test_plain_errors(self):
+        cases = [(FakeAppAPI(installs=[]), "not installed anywhere"),
+                 (FakeAppAPI(installs=[{"id": 1, "account": {"login": "a"}},
+                                       {"id": 2, "account": {"login": "b"}}]),
+                  "2 installations (1 on a, 2 on b); set token.installation_id"),
+                 (FakeAppAPI(jwt_status=401), "refused the app's JWT (401"),
+                 (FakeAppAPI(token_status=403), "refused the installation token (403")]
+        for api, needle in cases:
+            with self.subTest(needle=needle):
+                with self.assertRaises(schedule.AuthError) as cm:
+                    self.tokens(api).mint()
+                self.assertIn(needle, str(cm.exception))
+                if "JWT" in needle:
+                    self.assertIn("the key and the clock", str(cm.exception))
+
+
+class TestAppRuns(AppCase):
+    def run_app(self, runner, api=None, streams=None, clock=None, **token):
+        path = self.app_cfg(streams, **token)
+        code, out, err = self.run_cli(["run", "--streams", path], runner=runner,
+                                      api=api or FakeAppAPI(), sign=fake_sign,
+                                      clock=clock, env={"PATH": "/bin"})
+        return code, path
+
+    def all_text(self):
+        text = ""
+        for root, _dirs, names in os.walk(self.ws):
+            for n in names:
+                if n.endswith((".json", ".log")):
+                    with open(os.path.join(root, n), encoding="utf-8") as fh:
+                        text += fh.read()
+        return text
+
+    def test_a_fresh_token_per_gather_and_no_secret_written(self):
+        runner = Runner()
+        api = FakeAppAPI()
+        code, path = self.run_app(runner, api, streams=[
+            {"id": "demo", "kind": "repo", "owner": "o", "repo": "r",
+             "cadence": ["weekly", "monthly"]}])
+        self.assertEqual(code, 0)
+        gather_tokens = [env["GITHUB_TOKEN"] for argv, env in runner.calls
+                         if argv[1].endswith("gather.py")]
+        self.assertEqual(len(gather_tokens), 2)                 # carried days + month
+        self.assertEqual(len(set(gather_tokens)), 2)            # one token each
+        self.assertTrue(all(t.startswith(APP_TOKEN_PREFIX) for t in gather_tokens))
+        for argv, env in runner.calls:
+            self.assertNotIn("GH_TOKEN", env)
+            if argv[1].endswith("validate.py"):
+                self.assertNotIn("GITHUB_TOKEN", env)
+        text = self.all_text()
+        for token in api.issued:
+            self.assertNotIn(token, text)
+        self.assertNotIn("not a real key", text)
+        with open(os.path.join(self.ws, "status.json"), encoding="utf-8") as fh:
+            top = json.load(fh)
+        self.assertEqual(top["token_kind"], "app")
+        self.assertEqual((top["token"]["installation_id"], top["token"]["account"]),
+                         (42, "owner"))
+        self.assertEqual(top["token_expires_at"], "2026-11-20T03:00:00Z")
+        self.assertIsNone(top["token_days_left"])
+        attempt = self.status()["windows"]["2026-11"]["last_success"]
+        self.assertEqual(attempt["token"]["minted"], 2)
+        code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertNotIn("TOKEN:", out)                         # no expiry warning
+        self.assertIn("installation token minted", out)
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertEqual(out, "")
+
+    def test_no_key_is_a_plain_auth_error(self):
+        os.remove(self.key)
+        runner = Runner()
+        code, path = self.run_app(runner)
+        self.assertEqual(code, 1)
+        self.assertEqual(runner.calls, [])
+        attempt = self.status()["windows"]["2026-11"]["last_attempt"]
+        self.assertEqual(attempt["result"], "token_failed")
+        self.assertIn("private key file", attempt["auth_error"])
+        _code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertIn("TOKEN: the app could not mint a token", out)
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertIn("app-check", out)
+
+    def test_refused_installation_token(self):
+        code, _path = self.run_app(Runner(), FakeAppAPI(token_status=403))
+        self.assertEqual(code, 1)
+        attempt = self.status()["windows"]["2026-11"]["last_attempt"]
+        self.assertIn("refused the installation token (403", attempt["auth_error"])
+
+    def manifest_streams(self):
+        os.makedirs(os.path.join(self.ws, "tf"), exist_ok=True)
+        with open(os.path.join(self.ws, "tf", "manifest.json"), "w") as fh:
+            json.dump({"project": "p", "window": {"from": "2026-11-01", "to": "2026-11-30"},
+                       "repos": [{"owner": "o", "repo": n} for n in ("a", "b", "c")]}, fh)
+        return [{"id": "tf", "kind": "manifest", "manifest": "tf/manifest.json"}]
+
+    def scripted(self, *results):
+        results = list(results)
+
+        def gather(argv):
+            failed = results.pop(0)
+            if failed:
+                return 1, "", "member o/a failed: x\ngather: {} of 3 member(s) failed " \
+                              "for project 'p' (2026-11-01..2026-11-30):\n".format(failed)
+            return 0, "", ""
+        return gather
+
+    def test_a_manifest_is_resumed_with_fresh_tokens_while_it_progresses(self):
+        runner = Runner(gather=self.scripted(2, 1, 0))
+        code, _path = self.run_app(runner, streams=self.manifest_streams())
+        self.assertEqual(code, 0)
+        gathers = [(a, e) for a, e in runner.calls if a[1].endswith("gather.py")]
+        self.assertEqual(["--resume" in a for a, _e in gathers], [False, True, True])
+        self.assertEqual(len({e["GITHUB_TOKEN"] for _a, e in gathers}), 3)
+        parts = [g["part"] for g in
+                 self.status("tf")["windows"]["2026-11"]["last_success"]["gathers"]]
+        self.assertEqual(parts, ["month", "month (resume 1)", "month (resume 2)"])
+
+    def test_no_progress_stops(self):
+        runner = Runner(gather=self.scripted(2, 2))
+        code, _path = self.run_app(runner, streams=self.manifest_streams())
+        self.assertEqual(code, 1)
+        self.assertEqual(len([a for a, _e in runner.calls if a[1].endswith("gather.py")]), 2)
+
+    def test_the_personal_token_path_does_not_resume(self):
+        runner = Runner(gather=self.scripted(2, 1, 0))
+        path = streams_file(self.tmp, self.manifest_streams())
+        code, _out, _err = self.run_cli(["run", "--streams", path], runner=runner)
+        self.assertEqual(code, 1)
+        self.assertEqual(len([a for a, _e in runner.calls if a[1].endswith("gather.py")]), 1)
+
+    def test_a_gather_that_outlives_the_hour_says_so(self):
+        clock = FakeClock()
+
+        def slow(argv):
+            clock.mono += 61 * 60
+            return 1, "", ("error: GitHub API 401 for https://api.github.com/x\n"
+                           "  message: Bad credentials\n")
+        self.run_app(Runner(gather=slow), clock=clock)
+        attempt = self.status()["windows"]["2026-11"]["last_attempt"]
+        self.assertIn("401", attempt["auth_error"])
+        self.assertIn("longer than the installation token's hour", attempt["auth_error"])
+
+
+class TestAppCheck(AppCase):
+    def check(self, api):
+        path = self.app_cfg(probe_repo="Azure/bicep-registry-modules")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-check", "--streams", path], api=api,
+                                 sign=fake_sign, now=FakeClock().now)
+        text = out.getvalue() + err.getvalue()
+        for token in api.issued:
+            self.assertNotIn(token, text)
+        return code, out.getvalue()
+
+    def test_usable(self):
+        code, out = self.check(FakeAppAPI())
+        self.assertEqual(code, 0, out)
+        self.assertIn("installation token: minted for app Iv23testclient installation 42 "
+                      "on owner", out)
+        self.assertIn("rate limit (REST GET /rate_limit): OK - HTTP 200; core 4990/5000", out)
+        self.assertIn("REST read (GET /repos/Azure/bicep-registry-modules): OK", out)
+        self.assertIn("GraphQL read (repository Azure/bicep-registry-modules): OK", out)
+        self.assertIn("5000 merged PRs", out)
+        self.assertIn("search (GET /search/issues, newcomers check only): OK", out)
+        self.assertIn("RESULT: USABLE", out)
+
+    def test_refused_by_rest_or_graphql(self):
+        code, out = self.check(FakeAppAPI(rest=403))
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED - HTTP 403; Resource protected by organization policy", out)
+        self.assertIn("RESULT: NOT USABLE", out)
+        code, out = self.check(FakeAppAPI(graphql={"errors": [
+            {"message": "Although you appear to have the correct authorization "
+                        "credentials, the organization has enabled OAuth App access "
+                        "restrictions"}]}))
+        self.assertEqual(code, 1)
+        self.assertIn("OAuth App access restrictions", out)
+
+    def test_search_alone_does_not_decide(self):
+        code, out = self.check(FakeAppAPI(search=403))
+        self.assertEqual(code, 0)
+        self.assertIn("search (GET /search/issues, newcomers check only): FAILED", out)
+
+    def test_no_token(self):
+        code, out = self.check(FakeAppAPI(installs=[]))
+        self.assertEqual(code, 1)
+        self.assertIn("installation token: FAILED - the app is not installed anywhere", out)
+
+    def test_kind_and_renew_with_the_app_route(self):
+        path = self.app_cfg()
+        code, out, _err = self.run_cli(["token", "kind", "--streams", path])
+        self.assertEqual(out, "app\n")
+        code, _out, err = self.run_cli(["token", "renew", "--streams", path],
+                                       prompt=lambda t: NEW_TOKEN)
+        self.assertEqual(code, 2)
+        self.assertIn("needs no weekly renewal", err)
+
+
+class TestReviewFindings(AppCase):
+    """PR review: the advice names the route in use, readers recompute the
+    days left from the expiry, and a bare env-file name works."""
+
+    def test_a_later_app_mint_failure_points_to_app_check(self):
+        mints = {"n": 0}
+        api = FakeAppAPI()
+        real = api.__call__
+
+        def flaky(method, url, bearer, body=None, timeout=30):
+            if url.endswith("/access_tokens"):
+                mints["n"] += 1
+                if mints["n"] > 1:              # the run's check succeeds, the gather's fails
+                    return 403, {}, json.dumps({"message": "denied"})
+            return real(method, url, bearer, body, timeout)
+        path = self.app_cfg()
+        code, _out, _err = self.run_cli(["run", "--streams", path], api=flaky,
+                                        sign=fake_sign, env={"PATH": "/bin"})
+        self.assertEqual(code, 1)
+        with open(os.path.join(self.ws, "status.json"), encoding="utf-8") as fh:
+            top = json.load(fh)
+        self.assertIsNone(top["token"]["error"])
+        self.assertIn("installation token", top["streams"]["demo"]["auth_error"])
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertIn("token app-check", out)
+        self.assertNotIn("token renew", out)
+        _code, out, _err = self.run_cli(["status", "--streams", path])
+        self.assertIn("token app-check", out)
+        self.assertNotIn("Keeping the token valid", out)
+
+    def test_the_personal_route_still_points_to_renew(self):
+        path = streams_file(self.tmp)
+        self.run_cli(["run", "--streams", path],
+                     runner=Runner(gather=lambda a: (1, "", LIFETIME_403)))
+        _code, out, _err = self.run_cli(["token", "remind", "--streams", path])
+        self.assertIn("token renew", out)
+
+    def test_readers_recompute_days_left_from_the_expiry(self):
+        path = streams_file(self.tmp)
+        # the last run, on 2026-11-20, saw 5 days left ...
+        self.run_cli(["run", "--streams", path],
+                     http_get=FakeAPI(expiry="2026-11-25 02:00:00 UTC"))
+        with open(os.path.join(self.ws, "status.json"), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["token_days_left"], 5.0)
+        # ... then runs stopped; on 2026-11-24 a day is left, on 2026-11-26 none
+        for when, needle in (("2026-11-24T02:00:00Z", "(1.0 day(s) left)"),
+                             ("2026-11-26T02:00:00Z", "expired 2026-11-25T02:00:00Z")):
+            clock = FakeClock(start=T(when))
+            with self.subTest(when=when):
+                _code, out, _err = self.run_cli(["status", "--streams", path], clock=clock)
+                self.assertIn(needle, out)
+                _code, out, _err = self.run_cli(["token", "remind", "--streams", path],
+                                                clock=clock)
+                self.assertIn(needle, out)
+                lout = io.StringIO()
+                with contextlib.redirect_stdout(lout), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    schedule.main(["latest", "--streams", path, "--stream", "demo",
+                                   "--month", "2026-11", "--accept-stale"], now=clock.now)
+                self.assertIn(needle, json.loads(lout.getvalue())["warnings"][0])
+        _code, out, _err = self.run_cli(["status", "--streams", path])   # 2026-11-20
+        self.assertNotIn("TOKEN:", out)
+
+    def test_a_bare_env_file_name(self):
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, old)
+        schedule.write_env_file("token.env", NEW_TOKEN)
+        with open(os.path.join(self.tmp, "token.env"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "GITHUB_TOKEN={}\n".format(NEW_TOKEN))
+        self.assertEqual(os.stat("token.env").st_mode & 0o777, 0o600)
+        path = streams_file(self.tmp)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "renew", "--streams", path, "--store", "env-file",
+                                  "--env-file", "renewed.env", "--no-browser"],
+                                 http_get=FakeAPI(), prompt=lambda t: NEW_TOKEN,
+                                 now=FakeClock().now)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp, "renewed.env")))
+
+
+class FlakySecurity(FakeSecurity):
+    """A keychain whose writes go wrong: the first `bad_writes` puts store a
+    garbled value (or, with `fail_exit`, exit non-zero and store nothing)."""
+
+    def __init__(self, stored=None, bad_writes=1, fail_exit=False):
+        super().__init__(stored=stored)
+        self.bad_writes, self.fail_exit = bad_writes, fail_exit
+
+    def __call__(self, argv, stdin_text=None):
+        if argv == ["security", "-i"] and self.bad_writes:
+            self.bad_writes -= 1
+            self.calls.append((list(argv), stdin_text))
+            if self.fail_exit:
+                return 1, ""
+            self.items[stdin_text.split()[stdin_text.split().index("-s") + 1]] = "garbled"
+            return 0, ""
+        return super().__call__(argv, stdin_text)
+
+
+class TestKeychainWriteFailures(TokenCliCase):
+    """Review: a keychain read-back failure must not claim the old token is
+    still there — `-U` has already replaced it."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = streams_file(self.tmp, token={"store": "keychain"})
+
+    def test_the_previous_token_is_written_back(self):
+        sec = FlakySecurity(stored=OLD_TOKEN)
+        code, _out, err = self.token_cli("renew", security=sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items["activity-gh-token"], OLD_TOKEN)
+        self.assertIn("the previous value was written back and reads back correctly", err)
+        self.assertNotIn("stays in place", err.split("storing failed")[-1])
+        for argv, _stdin in sec.calls:
+            self.assertNotIn(OLD_TOKEN, " ".join(argv))
+            self.assertNotIn(NEW_TOKEN, " ".join(argv))
+
+    def test_when_restoring_fails_too_it_says_to_check(self):
+        sec = FlakySecurity(stored=OLD_TOKEN, bad_writes=2)
+        code, _out, err = self.token_cli("renew", security=sec)
+        self.assertEqual(code, 1)
+        self.assertIn("may now hold a different or partial value: check it", err)
+        self.assertNotIn("stays in place", err.split("storing failed")[-1])
+
+    def test_a_first_store_that_fails(self):
+        code, _out, err = self.token_cli("renew", security=FlakySecurity())
+        self.assertEqual(code, 1)
+        self.assertIn("check it", err)
+        self.assertNotIn("stays in place", err.split("storing failed")[-1])
+
+    def test_a_refused_write_that_changed_nothing(self):
+        sec = FlakySecurity(stored=OLD_TOKEN, fail_exit=True)
+        code, _out, err = self.token_cli("renew", security=sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items["activity-gh-token"], OLD_TOKEN)
+        self.assertIn("security could not store it (exit 1); the item still holds its "
+                      "previous value", err)
+
+    def test_app_key_import_restores_the_previous_key_too(self):
+        import base64
+        key = os.path.join(self.tmp, "k.pem")
+        with open(key, "w") as fh:
+            fh.write("-----BEGIN RSA PRIVATE KEY-----\nnew\n-----END RSA PRIVATE KEY-----\n")
+        old = base64.b64encode(b"-----BEGIN RSA PRIVATE KEY-----\nold\n").decode()
+        sec = FlakySecurity()
+        sec.items["app-key"] = old
+        self.path = streams_file(self.tmp, token={
+            "store": "app", "client_id": "x", "private_key_keychain_service": "app-key"})
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = schedule.main(["token", "app-key", "--streams", self.path,
+                                  "--import", key], security=sec)
+        self.assertEqual(code, 1)
+        self.assertEqual(sec.items["app-key"], old)
+        self.assertIn("previous value was written back", err.getvalue())
+
+
+class TestTokenWhere(Case):
+    def where(self, path, field):
+        code, out, _err = self.run_cli(["token", "where", "--streams", path,
+                                        "--field", field])
+        self.assertEqual(code, 0)
+        return out.strip()
+
+    def test_the_settings_renewal_uses(self):
+        custom = os.path.join(self.tmp, "secrets", "gh.env")
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": custom,
+                                             "keychain_service": "my-gh"})
+        self.assertEqual(self.where(path, "store"), "env-file")
+        self.assertEqual(self.where(path, "env-file"), custom)
+        self.assertEqual(self.where(path, "keychain-service"), "my-gh")
+        cfg = schedule.load_streams(path)
+        self.assertEqual(self.where(path, "account"),
+                         schedule.token_settings(cfg)["account"])
+
+    def test_relative_paths_are_resolved_once(self):
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": "token.env",
+                                             "private_key_file": "../keys/app.pem"})
+        cfg = schedule.load_streams(path)
+        s = schedule.token_settings(cfg)
+        self.assertEqual(s["env_file"], os.path.join(self.ws, "token.env"))
+        self.assertEqual(s["private_key_file"], os.path.join(self.tmp, "keys", "app.pem"))
+        self.assertEqual(self.where(path, "env-file"), os.path.join(self.ws, "token.env"))
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, old)
+        args = mock.Mock(store=None, env_file="cli.env")
+        self.assertEqual(schedule.token_settings(cfg, args)["env_file"],
+                         os.path.join(self.tmp, "cli.env"))
+
+    def test_a_token_block_inside_a_stream_is_refused(self):
+        """Review (low): `token` is read only at the top level; inside a stream
+        it was silently ignored and the default store used."""
+        path = streams_file(self.tmp, [{"id": "demo", "kind": "repo", "owner": "o",
+                                        "repo": "r", "token": {"store": "env-file"}}])
+        code, _out, err = self.run_cli(["check", "--streams", path])
+        self.assertEqual(code, 2)
+        self.assertIn("'token' is a top-level setting", err)
+        code, _out, err = self.run_cli(["run", "--streams", path, "--dry-run"])
+        self.assertEqual(code, 2)
+
+    def test_renewing_somewhere_the_wrappers_do_not_read_is_flagged(self):
+        env_file = os.path.join(self.tmp, "cfg", "token.env")
+        path = streams_file(self.tmp, token={"store": "env-file", "env_file": env_file})
+        for extra, flagged in (([], False),
+                               (["--env-file", os.path.join(self.tmp, "other.env")], True),
+                               (["--store", "keychain"], True)):
+            with self.subTest(extra=extra):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = schedule.main(["token", "renew", "--streams", path,
+                                          "--no-browser", *extra],
+                                         http_get=FakeAPI(), prompt=lambda t: NEW_TOKEN,
+                                         security=FakeSecurity(), now=FakeClock().now)
+                self.assertEqual(code, 0, err.getvalue())
+                self.assertEqual("the wrappers" in err.getvalue(), flagged, err.getvalue())
+
+
+WRAPPER_SHIM = """\
+import os, sys
+sys.path.insert(0, {skill!r})
+if sys.argv[1] == "token":
+    import schedule
+    sys.exit(schedule.main(sys.argv[1:]))
+if sys.argv[1] == "run":
+    with open(os.environ["AO_SEEN"], "w") as fh:
+        fh.write(os.environ.get("GITHUB_TOKEN", "<none>"))
+"""
+
+FAKE_SECURITY = """#!/bin/sh
+# find-generic-password -a ACCT -s SVC -w: the value for exactly that item
+[ "$1" = find-generic-password ] || exit 1
+[ "$3" = "{acct}" ] && [ "$5" = "{svc}" ] && {{ echo "{value}"; exit 0; }}
+exit 44
+"""
+
+
+@unittest.skipUnless(shutil.which("sh") and shutil.which("git"), "needs sh and git")
+class TestWrappersFollowTheSettings(Case):
+    """Review: both wrappers find the token where the streams file says (the
+    settings `token renew` writes to), not at a fixed path or item name."""
+
+    VALUE = "fakevalue123456789"
+
+    def wrapper(self, which, token_block):
+        skill = os.path.join(self.tmp, "skill")
+        os.makedirs(skill)
+        with open(os.path.join(skill, "schedule.py"), "w") as fh:
+            fh.write(WRAPPER_SHIM.format(skill=HERE))
+        os.makedirs(self.ws)
+        path = streams_file(self.tmp, token=token_block)
+        with open(os.path.join(HERE, "examples", which, "activity-gather.sh")) as fh:
+            text = fh.read().replace("__SKILL_DIR__", skill)
+        text = text.replace("__WORKSPACE__/streams.json", path)
+        script = os.path.join(self.tmp, "w.sh")
+        with open(script, "w") as fh:
+            fh.write(text)
+        return script
+
+    def run_wrapper(self, script, extra_path=None, first_path=None, cwd=None):
+        seen = os.path.join(self.tmp, "seen")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GITHUB_TOKEN", "GH_TOKEN")}
+        env.update(HOME=self.tmp, AO_SEEN=seen, NOTIFY="0",
+                   USER=env.get("USER") or "tester")
+        if extra_path:
+            env["PATH"] = env.get("PATH", "") + os.pathsep + extra_path
+        if first_path:
+            env["PATH"] = first_path + os.pathsep + env.get("PATH", "")
+        if os.path.exists(seen):
+            os.remove(seen)
+        proc = subprocess.run(["sh", script], env=env, capture_output=True, text=True,
+                              cwd=cwd or self.tmp)
+        got = None
+        if os.path.exists(seen):
+            with open(seen) as fh:
+                got = fh.read()
+        return proc, got
+
+    def test_env_file_from_the_streams_file(self):
+        custom = os.path.join(self.tmp, "secrets", "gh.env")
+        schedule.write_env_file(custom, self.VALUE)
+        for which in ("cron", "launchd"):
+            with self.subTest(wrapper=which):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                script = self.wrapper(which, {"store": "env-file", "env_file": custom})
+                proc, got = self.run_wrapper(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(got, self.VALUE)
+
+    @unittest.skipIf(os.path.exists("/usr/bin/security"),
+                     "a real keychain tool is on this machine")
+    def test_keychain_item_from_the_streams_file(self):
+        acct = os.environ.get("USER") or "tester"
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir)
+        fake = os.path.join(bindir, "security")
+        with open(fake, "w") as fh:
+            fh.write(FAKE_SECURITY.format(acct=acct, svc="my-gh", value=self.VALUE))
+        os.chmod(fake, 0o755)
+        for which in ("cron", "launchd"):
+            with self.subTest(wrapper=which):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                script = self.wrapper(which, {"store": "keychain",
+                                              "keychain_service": "my-gh"})
+                proc, got = self.run_wrapper(script, extra_path=bindir)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(got, self.VALUE)
+
+    def test_the_app_route_reads_nothing(self):
+        for which in ("cron", "launchd"):
+            with self.subTest(wrapper=which):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                script = self.wrapper(which, {"store": "app", "client_id": "x",
+                                              "private_key_file": "~/k.pem"})
+                proc, got = self.run_wrapper(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(got, "<none>")
+
+    def test_a_bare_env_file_name_is_the_checked_file_not_one_on_path(self):
+        """Review (medium): `token.env` passed the mode check in one place
+        while POSIX `.` searched PATH for it. The streams file's relative
+        path now means the workspace's file, and the wrapper reads exactly
+        the file it checked, wherever it runs and whatever is on PATH."""
+        decoy_dir = os.path.join(self.tmp, "decoy")
+        os.makedirs(decoy_dir)
+        with open(os.path.join(decoy_dir, "token.env"), "w") as fh:
+            fh.write("GITHUB_TOKEN=decoyvalue000000000\n")
+        os.chmod(os.path.join(decoy_dir, "token.env"), 0o600)
+        for which in ("cron", "launchd"):
+            for cwd in ("tmp", "workspace"):
+                with self.subTest(wrapper=which, cwd=cwd):
+                    shutil.rmtree(self.ws, ignore_errors=True)
+                    shutil.rmtree(os.path.join(self.tmp, "skill"), ignore_errors=True)
+                    script = self.wrapper(which, {"store": "env-file",
+                                                  "env_file": "token.env"})
+                    schedule.write_env_file(os.path.join(self.ws, "token.env"), self.VALUE)
+                    proc, got = self.run_wrapper(
+                        script, first_path=decoy_dir,
+                        cwd=self.tmp if cwd == "tmp" else self.ws)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(got, self.VALUE)
+
+    def test_a_missing_env_file_stops_with_its_name(self):
+        missing = os.path.join(self.tmp, "nowhere", "gh.env")
+        script = self.wrapper("cron", {"store": "env-file", "env_file": missing})
+        proc, got = self.run_wrapper(script)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(missing, proc.stderr)
+        self.assertIsNone(got)
+
+
+class TestOwnersStreams(unittest.TestCase):
+    """examples/streams.json is the owner's stream list; the group streams'
+    manifests ship in examples/manifests/ and load as gather loads them."""
+
+    def setUp(self):
+        self.ex = os.path.join(HERE, "examples")
+        self.cfg = schedule.load_streams(os.path.join(self.ex, "streams.json"))
+
+    def test_the_list(self):
+        got = {s["id"]: (s["kind"], s["target"] if s["kind"] == "repo" else None,
+                         s["enabled"]) for s in self.cfg["streams"]}
+        self.assertEqual(got, {
+            "avm-bicep": ("repo", "Azure/bicep-registry-modules", True),
+            "avm-tf": ("manifest", None, True),
+            "bicep": ("repo", "Azure/bicep", True),
+            "deployment-stacks": ("repo", "Azure/deployment-stacks", True),
+            "enterprise-lz": ("manifest", None, True),
+            "ai-lz": ("manifest", None, True)})
+        ai = [s for s in self.cfg["streams"] if s["id"] == "ai-lz"][0]
+        self.assertIn("Azure-Samples", ai["home"]["orgs"])
+        self.assertEqual(schedule.probe_repo(self.cfg), "Azure/bicep-registry-modules")
+        # the owner chose the app route; the key is a path outside the workspace
+        tok = self.cfg["token"]
+        self.assertEqual(tok["store"], "app")
+        self.assertTrue(tok["private_key_file"].startswith("~/.config/"))
+        self.assertTrue(tok["client_id"].startswith("REPLACE-WITH"))
+
+    def test_group_manifests(self):
+        import manifest
+        want = {"enterprise-lz": ["Azure/Enterprise-Scale", "Azure/alz-bicep-accelerator"],
+                "ai-lz": ["Azure/AI-Landing-Zones", "Azure/agent-landing-zone",
+                          "Azure-Samples/ai-hub-gateway-solution-accelerator"]}
+        for sid, slugs in want.items():
+            with self.subTest(stream=sid):
+                man = manifest.load_manifest(os.path.join(self.ex, "manifests",
+                                                          sid + ".json"))
+                self.assertEqual(man["project"], sid)
+                self.assertEqual(["{}/{}".format(r["owner"], r["repo"])
+                                  for r in man["repos"]], slugs)
+                self.assertTrue(all(r["branch"] == "main" for r in man["repos"]))
+                stream = [s for s in self.cfg["streams"] if s["id"] == sid][0]
+                self.assertTrue(stream["manifest"].endswith(
+                    os.path.join(sid, "manifest.json")))
+        ai = manifest.load_manifest(os.path.join(self.ex, "manifests", "ai-lz.json"))
+        self.assertIn("Azure-Samples", ai["affiliation"]["home_orgs"])
+
+
+def urllib_parse_qs(query):
+    import urllib.parse
+    return urllib.parse.parse_qs(query)
 
 
 # --- no token on a command line in the docs and examples ---------------------------------------

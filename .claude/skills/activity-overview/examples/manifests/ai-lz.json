@@ -1,0 +1,30 @@
+{
+  "project": "ai-lz",
+  "window": {
+    "from": "2026-11-01",
+    "to": "2026-11-30"
+  },
+  "repos": [
+    {
+      "owner": "Azure",
+      "repo": "AI-Landing-Zones",
+      "branch": "main"
+    },
+    {
+      "owner": "Azure",
+      "repo": "agent-landing-zone",
+      "branch": "main"
+    },
+    {
+      "owner": "Azure-Samples",
+      "repo": "ai-hub-gateway-solution-accelerator",
+      "branch": "main"
+    }
+  ],
+  "affiliation": {
+    "home_orgs": ["Azure", "Azure-Samples", "microsoft"],
+    "home_names": ["Microsoft"],
+    "home_email_domains": ["microsoft.com"]
+  },
+  "people": "../people.json"
+}

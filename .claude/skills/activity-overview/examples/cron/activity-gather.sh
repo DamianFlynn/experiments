@@ -2,11 +2,21 @@
 # Nightly gather for the activity-overview streams on Linux (cron), or on
 # macOS without the keychain. docs/SCHEDULING.md explains it.
 #
-# The token comes from an env file only this user can read. Create it without
-# the token ever appearing on a command line (so not in shell history either):
-# in bash (type `bash` first if your shell is another one), paste the token at
-# the silent prompt of `read -rs`; printf is a bash builtin, so the value is not
-# in a process listing either:
+# The token follows the `token` block of the streams file (docs/SCHEDULING.md 7):
+# with `"store": "app"` (the example's setting) each gather gets its own
+# short-lived token and nothing below is needed; check it with
+#   python3 __SKILL_DIR__/schedule.py token app-check --streams __WORKSPACE__/streams.json
+#
+# Personal-token fallback (docs/SCHEDULING.md 7.2): FIRST set `"store": "env-file"`
+# in the streams file's `token` block, so this wrapper reads the env file. Then
+# store (and every week replace) the token with the script, which opens the
+# new-token page, reads the token at a hidden prompt, checks it, then writes the
+# file atomically, mode 600:
+#   python3 __SKILL_DIR__/schedule.py token renew --streams __WORKSPACE__/streams.json
+# Or by hand, without the token ever appearing on a command line (so not in
+# shell history either): in bash (type `bash` first if your shell is another
+# one), paste the token at the silent prompt of `read -rs`; printf is a bash
+# builtin, so the value is not in a process listing either:
 #   mkdir -p ~/.config/activity-overview && chmod 700 ~/.config/activity-overview
 #   ( umask 077; printf 'token: ' >&2; IFS= read -rs t; echo >&2;
 #     printf 'GITHUB_TOKEN=%s\n' "$t" > ~/.config/activity-overview/token.env )
@@ -14,21 +24,62 @@
 # `chmod 600` it). Keep it mode 600, outside any synced folder, the workspace
 # and any git checkout. The variable is exported for this process and its
 # children only.
+#
+# Reminder: after each run, `schedule.py token remind` prints one line when the
+# token expires within 2 days or was refused; it lands in the cron log (and in
+# cron's mail, where mail is set up).
 set -eu
 
 SKILL_DIR="__SKILL_DIR__"                        # the skill directory (USAGE 2: $AO)
 STREAMS="__WORKSPACE__/streams.json"             # your streams file
-TOKEN_FILE="${HOME}/.config/activity-overview/token.env"
+# Where the token is (env file, keychain item) comes from the streams file's
+# token block through `schedule.py token where`, the settings `token renew`
+# writes to; nothing about it is fixed in this script.
 
-PATH="/usr/local/bin:/usr/bin:/bin"
+# cron's PATH is minimal: the system directories first, then whatever it has
+PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 export PATH
+PY=python3
 
-if [ "$(stat -c %a "$TOKEN_FILE" 2>/dev/null || stat -f %Lp "$TOKEN_FILE")" != "600" ]; then
-  echo "activity-gather: $TOKEN_FILE must be mode 600" >&2
+# The token, for this process only, from where the streams file says:
+#   app       the runner mints its own token for every gather: nothing to read
+#   env-file  the mode-600 file token.env_file
+#   keychain  (macOS) the keychain item token.keychain_service
+where() { "$PY" "$SKILL_DIR/schedule.py" token where --streams "$STREAMS" --field "$1"; }
+if ! KIND="$(where store)"; then
+  echo "activity-gather: cannot read the token settings of $STREAMS" >&2
   exit 2
 fi
-set -a
-. "$TOKEN_FILE"
-set +a
+case "$KIND" in
+  app) ;;
+  env-file)
+    TOKEN_FILE="$(where env-file)"
+    # `where` prints an absolute path; a relative one is made explicit anyway,
+    # because `.` searches PATH for a name without a slash
+    case "$TOKEN_FILE" in /*) ;; *) TOKEN_FILE="./$TOKEN_FILE" ;; esac
+    if [ "$(stat -c %a "$TOKEN_FILE" 2>/dev/null || stat -f %Lp "$TOKEN_FILE" 2>/dev/null)" != "600" ]; then
+      echo "activity-gather: $TOKEN_FILE is missing or not mode 600 (schedule.py token renew writes it)" >&2
+      exit 2
+    fi
+    set -a; . "$TOKEN_FILE"; set +a ;;
+  keychain)
+    SVC="$(where keychain-service)"; ACCT="$(where account)"
+    GITHUB_TOKEN="$(security find-generic-password -a "$ACCT" -s "$SVC" -w 2>/dev/null || true)"
+    if [ -z "$GITHUB_TOKEN" ]; then
+      echo "activity-gather: no token in the keychain item '$SVC'" >&2
+      exit 2
+    fi
+    export GITHUB_TOKEN ;;
+  *)
+    echo "activity-gather: unknown token store '$KIND'" >&2
+    exit 2 ;;
+esac
 
-exec nice -n 10 python3 "$SKILL_DIR/schedule.py" run --streams "$STREAMS" "$@"
+rc=0
+nice -n 10 "$PY" "$SKILL_DIR/schedule.py" run --streams "$STREAMS" "$@" || rc=$?
+unset GITHUB_TOKEN GH_TOKEN
+MSG="$("$PY" "$SKILL_DIR/schedule.py" token remind --streams "$STREAMS" 2>/dev/null || true)"
+if [ -n "$MSG" ]; then
+  echo "activity-gather: REMINDER: $MSG" >&2
+fi
+exit "$rc"

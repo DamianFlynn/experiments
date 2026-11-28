@@ -40,11 +40,16 @@ skill directory is only read (it can be read-only); the workspace can be anywher
     stores/2026-11.db               the month store the skill reads
     stores/2026-11.db.prev          the store before the last successful run (one generation)
     clone/                          gather's reused clone (manifest streams: clone/<owner>/<repo>)
-  avm-tf/
+  avm-tf/  enterprise-lz/  ai-lz/   manifest streams:
     manifest.json                   your manifest (members; its window is ignored)
     run/manifest.2026-11-01_2026-11-30.json   the manifest with the window filled in
     stores/  clone/  status.json
+  bicep/  deployment-stacks/        single-repository streams, laid out like avm-bicep/
 ```
+
+No secret is in the workspace. The app's private key is `~/.config/activity-overview/app.pem`
+(or a keychain item); a fallback personal token lives in the keychain item
+`activity-gh-token` or in `~/.config/activity-overview/token.env` (§7).
 
 Reports and views are not part of the schedule: write them wherever you like (the notes
 vault is fine for finished Markdown).
@@ -65,6 +70,7 @@ directory; every other path is relative to the workspace. `~` is expanded.
 | `retention.log_days` | int ≥ 1 | `60` | run logs older than this are deleted |
 | `retention.store_months` | int ≥ 1 or `null` | `null` | keep only the newest N month stores (`null`: keep all) |
 | `env` | object | `{}` | env for every gather: `ACTIVITY_*` knobs (REFERENCE.md) and `TF_PLUGIN_CACHE_DIR` (made workspace-relative, created); never a credential |
+| `token` | object | `{}` | where the token comes from; ids and paths only, never a token or key. `store`: `app` (§7.1), or for a personal token `auto` (keychain on macOS, env file elsewhere), `keychain`, `env-file` (§7.2). App route: `client_id` (or `app_id`), optional `installation_id`, `private_key_file` (a mode-600 PEM outside the workspace; a relative path is relative to the workspace) and/or `private_key_keychain_service`. Personal token: `env_file` (default `~/.config/activity-overview/token.env`; a relative path is relative to the workspace, like the file's other paths), `keychain_service` (default `activity-gh-token`). Both: `probe_repo` (`owner/repo` read to prove a token; default the first enabled single-repository stream). Top level only: a `token` key inside a stream is refused |
 | `streams[]` | list | **required** | one entry per newsletter stream |
 
 Per stream:
@@ -84,12 +90,42 @@ Per stream:
 | `stale_after_hours` | int | global | per-stream staleness threshold |
 | `enabled` | bool | `true` | a disabled stream is skipped unless named with `--stream` |
 
-[`examples/streams.json`](../examples/streams.json) follows the owner's streams: AVM Bicep
-(`Azure/bicep-registry-modules`, weekly + monthly, `--structural-iac`), AVM Terraform (a
-manifest), `Azure/bicep`, the AI hub gateway landing zone
-(`Azure-Samples/ai-hub-gateway-solution-accelerator`), and an enterprise-scale landing zone
-(disabled until its repository is confirmed). `python3 schedule.py check --streams FILE`
-prints how the file resolves.
+[`examples/streams.json`](../examples/streams.json) is the owner's list, all enabled:
+
+| Stream | Kind | Repositories | Cadence | Newsletter |
+|---|---|---|---|---|
+| `avm-bicep` — AVM Bicep | repo, `--structural-iac` | `Azure/bicep-registry-modules` | weekly + monthly | one |
+| `avm-tf` — AVM Terraform | manifest (`avm-tf/manifest.json`, from `manifest_from_index.py`) | the AVM Terraform module repositories | monthly | one, all members |
+| `bicep` — Bicep | repo | `Azure/bicep` | weekly + monthly | one |
+| `deployment-stacks` — Deployment stacks | repo | `Azure/deployment-stacks` | monthly | one |
+| `enterprise-lz` — Enterprise Landing Zones | manifest ([`examples/manifests/enterprise-lz.json`](../examples/manifests/enterprise-lz.json)) | `Azure/Enterprise-Scale`, `Azure/alz-bicep-accelerator` | monthly | one per group |
+| `ai-lz` — AI Landing Zones | manifest ([`examples/manifests/ai-lz.json`](../examples/manifests/ai-lz.json)) | `Azure/AI-Landing-Zones`, `Azure/agent-landing-zone`, `Azure-Samples/ai-hub-gateway-solution-accelerator` | monthly | one per group |
+
+All seven new repositories' default branch is `main`, which the group manifests also name.
+The AI group's home organisations include `Azure-Samples` (stream `home` and manifest
+`affiliation`).
+
+**Groups are manifest streams.** The owner thinks in groups ("Enterprise Landing Zones",
+"AI related Landing Zones") and wants one newsletter per group. A manifest stream is the
+skill's existing form for "one logical project, several repositories": one store and one
+project per group, so cross-repository references between the members become trains and the
+people of the group are one project; `latest --stream ai-lz` answers for the whole group and
+its `next` commands already view every member and pass all the views to `newsletter.py`
+(the documented multi-repository newsletter). One stream per repository with a `group`
+label would need a new group reader that collects views from several stores, and would lose
+the cross-repository links; so no `group` field was added. What the manifest form costs, and
+when to choose otherwise:
+
+- a member that fails to gather blocks that night's swap for the whole group (validate's
+  `member_status`); the group keeps the previous store until the member gathers again;
+- `schedule.py recompute` works on single-repository streams only;
+- `gather_flags` and `home` apply to every member, and manifest members always get the
+  whole-tree module scan.
+
+If one repository of a group must be followed on its own (e.g. its own weekly issue), give
+it its own `repo` stream as well; the two stores are independent.
+
+`python3 schedule.py check --streams FILE` prints how the file resolves.
 
 ## 4. Which windows a run gathers
 
@@ -224,45 +260,243 @@ repository, the real gather and validate CLIs, the API stubbed empty; trimmed):
   changes), or `null` outside a git checkout.
 - `auth_error` (on a `gather_failed` attempt, else `null`) says when GitHub refused the
   token — 401, the lifetime policy, SAML SSO, or no token — read from gather's error lines;
-  also on the roll-up's stream entry, and printed by `status` as a `TOKEN:` line (§7.1).
+  also on the roll-up's stream entry, and printed by `status` as a `TOKEN:` line (§7.2).
+  With the app route a mint that fails ends the attempt as `token_failed`, with the
+  reason here (§7.1), and the attempt's `token` records `kind: app`, how many tokens it
+  `minted` and the last expiry.
 - `last_recompute` (beside `last_attempt`) is the last offline recompute of the month
   (§13a), with the same fields plus `what`.
 
 `<workspace>/status.json` is the roll-up: `last_run` (`run_id`, `today`, `result`,
 `exit_code`, `log`, `max_minutes`, `skipped_time_budget`, `backfill`), `code_version`,
-`workspace_warnings`, and per stream `{result, windows: {month: result}, last_success_at,
-status}`. `python3 schedule.py status --streams FILE` prints the last three months of each
+`workspace_warnings`, `token` (`{ok, login, expires_at, days_left, error, checked_at}`,
+from one identity call at the start of the run; never the token), `token_expires_at`,
+`token_days_left`, and per stream `{result, windows: {month: result}, last_success_at,
+auth_error, status}`. `python3 schedule.py status --streams FILE` prints the last three months of each
 stream; `--json` prints the roll-up.
 
 ## 7. The token
 
-gather reads **`GITHUB_TOKEN`**, else **`GH_TOKEN`**, from its environment (USAGE §1.1 for
-the scopes). The runner passes its own environment through to gather and nothing else: it
-never writes a token to the streams file, a log, a status file or a manifest, strips it from
-validate's environment, and replaces any token value (and anything shaped like a GitHub
-token) in captured output with `[REDACTED]`. The streams file refuses `env` names that
-look like credentials. Without a token `run` stops before doing anything (exit 2).
+gather reads **`GITHUB_TOKEN`**, else **`GH_TOKEN`**, from its environment (USAGE §1.1). There
+are two ways to give it one:
 
-**Never type the token into a command.** A value on a command line stays in shell history
-(and, for an external program, in the process list), whatever the mode of the file it is
-then written to. Every way of entering it below prompts for it instead; a test scans the
-docs and examples so a token-on-the-command-line instruction cannot come back.
+- **The app route (recommended, §7.1):** a GitHub App installed on your own account. The
+  runner signs a short JWT with the app's private key and gets a fresh **installation
+  token** for every gather. There is nothing to renew by hand.
+- **The personal-token fallback (§7.2):** a personal access token, replaced every week
+  with `schedule.py token renew`. Use it if `token app-check` shows the app route is refused.
+
+`token.store` in the streams file says which (`app`, or `keychain` / `env-file` / `auto`
+for a personal token). Whichever route, the runner never writes a token, a JWT or a key to
+the streams file, a log, a status file, a manifest or an argument list, strips the token
+from validate's environment, and replaces any token value (and anything shaped like a
+GitHub token) in captured output with `[REDACTED]`. The streams file refuses `env` names
+that look like credentials, and a `token` block holding anything but ids and paths.
+
+**Never type a token or key into a command.** A value on a command line stays in shell
+history (and, for an external program, in the process list), whatever the mode of the
+file it is then written to. Every way of entering one below reads a file or prompts; a test
+scans the docs and examples so a secret-on-the-command-line instruction cannot come back.
+
+### 7.1 The app route
+
+**How it works.** For each gather (each stream and window, and each `--resume` pass), the
+runner:
+
+1. reads the app's private key: a PEM file, mode 600, outside the workspace and any
+   synced folder (`token.private_key_file`), or a macOS keychain item
+   (`token.private_key_keychain_service`, filled by `token app-key`);
+2. builds the app's JWT: RS256, `iat` 60 seconds in the past and `exp` 9 minutes ahead
+   (GitHub: `iat` 60 s back against clock drift, `exp` no more than 10 minutes ahead),
+   `iss` the client ID (GitHub recommends it; `app_id` also works). The signature comes
+   from the system `openssl` (`openssl dgst -sha256 -sign`, standard input in, signature
+   out). The key reaches openssl as the file's path, or for a keychain item through a pipe
+   (`/dev/fd/N`), so it is never on a command line or written to another file;
+3. finds the installation (`token.installation_id`, else the app's installation list,
+   which must hold exactly one);
+4. asks for an installation token narrowed to **read** access: every permission the
+   installation holds, requested at `read` (GitHub allows narrowing; it never grants
+   more than the app has);
+5. starts gather with that token in `GITHUB_TOKEN` (and no `GH_TOKEN`) for that one
+   process.
+
+An installation token lasts **one hour** (GitHub's documented lifetime). One is minted per
+gather invocation, never one per run.
+
+**One-time setup** (GitHub's web pages; about ten minutes):
+
+1. Create the app: profile picture → **Settings** → **Developer settings** → **GitHub
+   Apps** → **New GitHub App**.
+   - *GitHub App name*: anything unique (at most 34 characters), e.g. `<you>-activity-reader`.
+   - *Homepage URL*: your profile or any repository URL.
+   - *Webhook*: clear **Active** (no webhook, no URL).
+   - *Permissions*: leave everything at **No access**. *Repository → Metadata:
+     Read-only* is set by GitHub on its own. The gather reads public repositories only.
+     Whether an installation token reads public repositories outside the installation is
+     the open question `app-check` answers (step 5).
+   - *Where can this GitHub App be installed?*: **Only on this account**.
+   - Click **Create GitHub App**, then note the **Client ID** shown on the app's page.
+2. Generate the private key: on the app's page, **Private keys** → **Generate a private
+   key**. GitHub downloads a PEM file. Move it out of Downloads and lock it down:
+   ```bash
+   mkdir -p ~/.config/activity-overview && chmod 700 ~/.config/activity-overview
+   mv ~/Downloads/*.private-key.pem ~/.config/activity-overview/app.pem
+   chmod 600 ~/.config/activity-overview/app.pem
+   ```
+   Optional (macOS): keep it in the login keychain instead of a file. Set
+   `"private_key_keychain_service": "activity-app-key"` in the token block, then run
+   ```bash
+   python3 $AO/schedule.py token app-key --streams $W/streams.json --import ~/.config/activity-overview/app.pem
+   ```
+   This stores the key base64-encoded through `security -i` (standard input), then reads it
+   back and compares. After that, remove `private_key_file` from the token block and
+   delete the file.
+3. Install it: on the app's page, **Install App** → your account → **Only select
+   repositories** (any one of your repositories) or **All repositories**. Neither choice
+   gives access to the Azure repositories; reading them as public repositories is what
+   step 5 checks.
+4. Put the ids in the streams file (`examples/streams.json` already has the block):
+   ```json
+   "token": {
+     "store": "app",
+     "client_id": "Iv23li…",
+     "private_key_file": "~/.config/activity-overview/app.pem",
+     "probe_repo": "Azure/bicep-registry-modules"
+   }
+   ```
+   `installation_id` is optional (the app's single installation is found by itself).
+   `app_id` (the numeric *App ID*) can replace `client_id`.
+5. Prove it against the real target, once, on the Mac:
+   ```bash
+   python3 $AO/schedule.py token app-check --streams $W/streams.json
+   ```
+   It mints a token and prints exactly what GitHub answered for:
+   - the installation token (app, installation, account, expiry, permissions);
+   - `GET /rate_limit` (core, GraphQL and search budgets);
+   - a REST read of `Azure/bicep-registry-modules`;
+   - a GraphQL read of the same repository;
+   - a search (used only by the newcomers check).
+
+   It ends with `RESULT: USABLE` (exit 0; the REST and GraphQL reads succeeded) or
+   `RESULT: NOT USABLE` (exit 1). It never prints the token.
+
+**If Azure refuses it.** The open question is whether the enterprise that owns `Azure/*`
+lets an installation token of an app installed on a personal account read its public
+repositories, by REST and by GraphQL. `app-check` answers it on the first run. If either
+read is refused (a 403 naming an organisation policy, or a GraphQL error), go back to the
+personal token: set `"store": "keychain"` (or `env-file`) in the token block, run
+`python3 $AO/schedule.py token renew --streams $W/streams.json` (§7.2), and keep the app in
+case the policy changes. The wrappers ask `schedule.py token where` (below) and fetch a
+personal token only when the store is not `app`.
+
+**Where the wrappers look.** Both wrappers (launchd and cron) take every credential
+location from the streams file's token block, through
+`schedule.py token where --streams FILE --field store|env-file|keychain-service|account`.
+That prints one setting, never the token, and they are the settings `token renew` writes
+to. Nothing about the location is fixed in a wrapper. Each wrapper handles all three stores:
+`app` (reads nothing), `keychain` (the item `token.keychain_service`), and `env-file` (the
+mode-600 file `token.env_file`). If `token renew` is pointed elsewhere with `--store` or
+`--env-file`, it warns that the wrappers will not look there until the streams file says so.
+
+**Gathers longer than the hour.** The token's hour starts just before its gather starts.
+- *Single repository.* The monorepo's month takes about 29 minutes, so it fits with room to
+  spare.
+- *Manifest streams* (AVM Terraform, the landing-zone groups) run all their members in one
+  gather process and may run longer. gather reads its token once, so it cannot switch
+  tokens mid-run. The runner instead uses gather's own `--resume`: when a manifest gather
+  ends with some members failed (those reached after the hour fail with 401), the runner
+  runs `gather --manifest … --resume` with a **fresh** token. `--resume` re-gathers only
+  the members that are not `ok` for the window, with the whole member list for
+  cross-repository links. It repeats while each pass leaves fewer members failed, up to 4
+  passes, all on the same working copy, then validates and swaps as usual.
+- *The limit.* A single repository or a single manifest member that by itself needs more
+  than an hour still fails. Its attempt is `gather_failed` with
+  `auth_error: GitHub refused the token (401…); the gather ran N minutes, longer than the
+  installation token's hour`, and the store stays as it was. Making gather re-read a
+  token on a 401 would lift that limit, but it is a change to gather's HTTP layer and is
+  not made here. If it is ever needed, use the personal token for that stream's run.
+
+**Status.** The run's roll-up records `token_kind: app` and a `token` entry from one mint at
+the start: app / client id, installation id, account, the token's expiry, permissions (all
+of them public facts, never the token). Each attempt's `token` holds `minted` (how many
+tokens it used) and the last expiry. The 2-day expiry warning does not apply to this kind.
+A missing, unreadable or loosely-moded key, an `openssl` failure, a refused JWT, no (or more
+than one) installation, and a refused installation token each end the attempt as
+`token_failed` with a plain `auth_error`. `status` then prints a `TOKEN:` line that names
+`schedule.py token app-check`, and so does `token remind` (the wrappers' notification).
+This holds also when the run's first mint succeeded and a later gather's mint failed.
+Under the app route the advice is never `token renew`, which refuses while
+`token.store` is `app`.
+
+**Rotating and revoking the key.** Keys do not expire, and an app can hold up to 25.
+- *Rotate:* generate a new key on the app's page, move it over `~/.config/activity-overview/app.pem`
+  (or re-run `token app-key --import`) and keep it mode 600. Run `token app-check`, then
+  delete the old key on the app's page (GitHub does not let you delete an app's only key
+  before a new one exists).
+- *Revoke at once* (a key leaked): delete the key on the app's page. Every JWT it signs is
+  refused from then on, and the next run records `token_failed`.
+- *Stop everything:* suspend or uninstall the installation, or delete the app. Installation
+  tokens already issued expire within the hour.
+
+**What is verified, tested here, and only the first Mac run can show.**
+- *From GitHub's documentation:*
+  - the JWT rules (RS256; `iat` 60 s back; `exp` ≤ 10 minutes; `iss` client ID or app ID;
+    Bearer);
+  - the endpoints `GET /app/installations`, `GET /app/installations/{id}` and
+    `POST /app/installations/{id}/access_tokens`, with its `permissions` narrowing;
+  - the one-hour lifetime; installation tokens working with REST and GraphQL;
+  - the app registration fields; up to 25 private keys, downloaded as PEM (PKCS#1), deleted
+    on the app's page.
+  - LibreSSL, which macOS ships, documents `openssl dgst [-digest] -sign file` with
+    standard input when no file is given (the OpenBSD manual).
+- *Tested here* (Linux, OpenSSL 3.0, the network and `security` replaced by seams):
+  - JWTs signed with a real throwaway RSA key (PKCS#8, and the PKCS#1 form GitHub
+    downloads), from the file and through the pipe; signatures verified with
+    `openssl dgst -verify`; claims checked;
+  - the key checks (mode, inside the workspace, synced folder, missing, not PEM);
+  - installation discovery and its errors; the read-only request body;
+  - a fresh token per gather, and none in validate's environment or in any file or output;
+  - the manifest `--resume` passes, stopping when no progress is made, and no resume on the
+    personal-token path;
+  - the over-an-hour `auth_error`; `app-check` output and exit codes; `token kind` and
+    `token where`;
+  - both wrappers, run by the test suite with a stub runner, finding the token where the
+    streams file says: a non-default env file, a non-default keychain item (a stand-in
+    `security` on Linux), and nothing on the app route;
+  - the keychain write's restore and its messages (a stand-in `security`).
+- *Not tested (no Mac, no real app):*
+  - whether the Azure enterprise accepts the installation token (`app-check` on the Mac
+    answers that);
+  - whether an installation token reads public repositories outside the installation at all
+    (indirect evidence that it does: this repository's CI reads public `Azure/*`
+    repositories with the workflow's built-in token, which is an installation token);
+  - LibreSSL actually signing (its manual documents the invocation; it was not run);
+  - `/dev/fd/N` key passing on macOS (keychain variant only);
+  - `security -i` storing a 2–3 KB base64 line (`token app-key`), and its read-back.
+
+  If the keychain variant misbehaves, use the key file.
+
+### 7.2 The personal-token fallback: keeping the token valid
+
+The usual way to store a personal token, first time and every week, is
+`schedule.py token renew` (below), which reads it at a hidden prompt, checks it, and writes
+it to the keychain or the env file. By hand:
 
 - **macOS:** keep it in the login keychain; the wrapper reads it for the one process:
   ```bash
   security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
   ```
-  `-w` given **last, with no value** makes `security` prompt for the password (as its manual
-  page, security(1), documents): paste the token at the prompt. Never write the token after
-  `-w`. `-U` updates an existing item (the weekly replacement, §7.1); `-T` lets the
-  `security` tool read it later without a dialog. A LaunchAgent runs in your login session,
-  so the login keychain is available once you have logged in after a reboot (enable
-  automatic login, or log in once, on a headless Mac mini).
+  `-w` given **last, with no value** makes `security` prompt for the password (the manual
+  page, security(1), says "Put at end of command to be prompted (recommended)"): paste the
+  token at the prompt. Never write the token after `-w`. `-U` updates an existing item;
+  `-T` lets the `security` tool read it later without a dialog. A LaunchAgent runs in your
+  login session, so the login keychain is available once you have logged in after a reboot
+  (enable automatic login, or log in once, on a headless Mac mini).
 - **Plain env file** (Linux, or macOS without the keychain): `~/.config/activity-overview/token.env`
-  holding one line `GITHUB_TOKEN=…`, mode **600**, outside the workspace, any synced folder
-  and any git checkout. Create it from a silent prompt in **bash** (type `bash` first if
-  your shell is another one); `printf` is a bash builtin, so the value is in no process
-  listing either:
+  holding one line `GITHUB_TOKEN=…`, mode **600** in a mode-700 directory, outside the
+  workspace, any synced folder and any git checkout. Create it from a silent prompt in
+  **bash** (type `bash` first if your shell is another one); `printf` is a bash builtin, so
+  the value is in no process listing either:
   ```bash
   mkdir -p ~/.config/activity-overview && chmod 700 ~/.config/activity-overview
   ( umask 077; printf 'token: ' >&2; IFS= read -rs t; echo >&2;
@@ -272,32 +506,102 @@ docs and examples so a token-on-the-command-line instruction cannot come back.
   [`examples/cron/activity-gather.sh`](../examples/cron/activity-gather.sh) refuses a file
   that is not 600.
 
-### 7.1 Keeping the token valid
-
 The enterprise that owns `Azure/*` refuses personal access tokens (classic or fine-grained)
-that live longer than **8 days** (USAGE §1.1), so a nightly job on a workstation needs a new
-token every week. There is no way around that with a personal token: plan for it.
+that live longer than **8 days** (USAGE §1.1), so this route needs a new token every week.
+A personal access token cannot be created through GitHub's API, so the one manual step,
+creating it on the web page, stays manual. `schedule.py token renew` scripts everything
+around it (`token renew` refuses to run while `token.store` is `app`, unless `--store` is
+given).
 
-- **The weekly step** (a calendar reminder; about two minutes): create a token with a
-  7-day expiry and the scopes of USAGE §1.1, then replace the stored one: run the
-  `security add-generic-password … -U -w` command above again (it updates the item) or
-  re-create the env file. Next, `python3 $AO/schedule.py run --streams $W/streams.json
-  --dry-run` checks nothing but the plan; `launchctl kickstart …` (or the wrapper) proves the
-  token with a real run.
-- **How an expired token shows.** Each gather fails at its first API call; the attempt is
-  `gather_failed`, and the runner reads gather's own error lines and records why in
-  `auth_error` (the attempt, and the roll-up's stream entry): a 401 (expired, revoked or
-  wrong), a 403 naming the lifetime policy, a 403 for SAML SSO, or no token at all.
-  `schedule.py status` then prints, under the month,
-  `TOKEN: GitHub refused the token (403: …): its lifetime is over the organisation's limit
-  - replace the token (docs/SCHEDULING.md "Keeping the token valid"), then re-run`.
-  The stores stay as they were (nothing is swapped), and after `stale_after_hours`
-  `latest` refuses the open month, so a newsletter is never written from silently old data.
-- **The alternative.** A GitHub App installed on your own account issues installation
-  tokens that last one hour and are not personal access tokens, minted per run from the
-  app's private key, which would remove the weekly step. It is not built or tested here,
-  including whether that organisation's policy accepts such tokens for reading its public
-  repositories; the CI route of §12 (the job's built-in token) is the other way out.
+**The weekly step** (about two minutes):
+
+```bash
+python3 $AO/schedule.py token renew --streams $W/streams.json --kick
+```
+
+1. It opens the browser on GitHub's fine-grained new-token page, prefilled through the
+   query parameters GitHub documents for that page: `name` (`activity-overview read-only`),
+   `description`, `expires_in=7`. No permission is added, and none is needed: GitHub states
+   that every token includes read-only access to all public repositories, which is all the
+   gather reads. Leave the resource owner as your own account (no organisation approval is
+   involved). Check the page and click *Generate token*. Without a browser (or with
+   `--no-browser`) it prints the address instead.
+   `--classic` opens the classic page instead; GitHub documents no query parameters for
+   that page, so nothing is prefilled there (set the note, 7 days, and the scopes
+   `public_repo` + `read:project`). Choose classic only if you need the Projects board
+   layer, which a public-only fine-grained token may not read (not verified here; without
+   it the board layer degrades to empty, SKILL.md step 1).
+2. It reads the token at a **hidden prompt** (`getpass`): never an argument, never echoed,
+   never logged. Anything that is not letters, digits and `_` is refused before any call.
+3. It checks the token with the API before touching the stored one: `GET /user` (the
+   login, and the expiry from the `github-authentication-token-expiration` response header;
+   GitHub does not document that header's format, so the forms `YYYY-MM-DD HH:MM:SS UTC`,
+   `… +0000` (any offset) and ISO are accepted), then a read of `token.probe_repo` (default
+   `Azure/bicep-registry-modules`), so the 8-day lifetime policy refuses a wrong token here
+   and now rather than at 02:40. A refusal prints GitHub's message and **the old token stays
+   in place**.
+4. Only then it stores it: in the keychain item `activity-gh-token` (macOS default) or the
+   env file (elsewhere, or `--store env-file`). The keychain is written with `security -i`,
+   which reads its commands from standard input (security(1): "Run security in interactive
+   mode … commands on stdin"), so the token goes through a pipe, not into `security`'s
+   argument list or the process listing; the item is then read back with
+   `find-generic-password -w` and compared. `add-generic-password -U` replaces the item
+   before that read-back can tell whether the write is right, so the previous value is read
+   first. If the read-back differs, the previous value is written back the same way (stdin)
+   and read back again. The message then says exactly what the item holds:
+   - unchanged (security refused before anything changed);
+   - restored (the previous token, read back);
+   - possibly a different or partial value, to check with `token status`.
+
+   It never claims the old token is still there unless that was read back. `token app-key`
+   writes the app's key the same way. The env file is written as a new mode-600 file in a
+   mode-700 directory, fsynced and renamed over the old one: until that rename, the old file
+   is untouched.
+5. `--kick` then starts a run: on macOS `launchctl kickstart gui/<uid>/local.activity-overview.gather`
+   (the scheduled job, which reads the new token where the streams file says). If
+   `launchctl` exits non-zero, `token renew` says the job was **not** started (e.g. it is not
+   installed) and exits 1. Elsewhere it starts a background `schedule.py run` with the token
+   in its environment only.
+
+```bash
+python3 $AO/schedule.py token status --streams $W/streams.json   # login, expiry, days left (one API call)
+```
+
+**Without a calendar.** Each nightly run makes one identity call and records
+`token_expires_at` and `token_days_left` in `status.json`; `schedule.py status` and
+`latest` print a warning when **2 days or fewer** remain (or the token has expired) or the
+token was refused. They and `token remind` count the days left from `token_expires_at` at
+the moment they are run, not from the last run's `token_days_left`. So a token that expires
+after the runs stopped is still caught.
+`schedule.py token remind` prints that warning as one line (no network, from
+`status.json`), and the wrappers call it after every run: the macOS wrapper posts it as a
+notification (`osascript … display notification`, the message passed as an argument), the
+cron wrapper writes it to the cron log. The identity call is the runner's only API call of
+its own; if GitHub cannot be reached the run carries on and records why.
+
+**How an expired token shows.** Each gather fails at its first API call; the attempt is
+`gather_failed`, and the runner reads gather's own error lines and records why in
+`auth_error` (the attempt, and the roll-up's stream entry): a 401 (expired, revoked or
+wrong), a 403 naming the lifetime policy, a 403 for SAML SSO, or no token at all.
+`schedule.py status` then prints, under the month,
+`TOKEN: GitHub refused the token (403: …): its lifetime is over the organisation's limit
+- replace the token (docs/SCHEDULING.md "Keeping the token valid"), then re-run`.
+The stores stay as they were (nothing is swapped), and after `stale_after_hours`
+`latest` refuses the open month, so a newsletter is never written from silently old data.
+
+**What is verified and what is not.** Verified here (Linux, tests with the network and
+`security` replaced by seams): the page address and its parameters (against GitHub's
+documentation), the hidden prompt path, that a refused or malformed token leaves the old
+one untouched, the env-file write and its modes, that the token never reaches an argv, a
+log, a status file or the output, the expiry parsing, the warning thresholds, the reminder
+text, and the cron wrapper (with a stub runner). **Not tested on macOS** (no Mac was
+available): `security -i` storing the item from standard input (the man page documents
+interactive mode reading stdin, not how it quotes; the token's alphabet — letters, digits,
+`_` — needs no quoting), the read-back, the keychain dialog behaviour of `-T
+/usr/bin/security`, `launchctl kickstart`, and the `osascript` notification. Run
+`token renew` once in Terminal and `token status` after it to confirm on the Mac; if
+`security -i` misbehaves there, store the token by hand with the prompting
+`add-generic-password … -w` command above.
 
 ## 8. Where the workspace lives
 
@@ -322,7 +626,8 @@ what must not happen is a copy taken while a run is writing.
   they stood), `people.json`, `people-activity.json`, `streams.json`, and the status files.
 - **Leave out:** `stores/.*.next` and `*.prev` (working copies), `*-wal` / `*-shm`,
   `.schedule.lock`, `logs/`, `.tfcache/` and each stream's `clone/` (all recreated).
-- **The token is not in the workspace** (§7) and should not be added to the backup.
+- **No secret is in the workspace** (§7): the app's private key and a fallback token live
+  elsewhere; do not add them to the workspace backup.
 - **Restore** by copying the files back while no run is going, then `schedule.py status`.
 
 ## 9. First-time setup on the Mac mini, step by step
@@ -338,15 +643,25 @@ workspace in your home directory (it is for `~/Desktop`, `~/Documents`, `~/Downl
 W=~/activity-data
 mkdir -p $W/bin $W/logs
 cp $AO/examples/streams.json $W/streams.json
-#   edit $W/streams.json: "workspace": "." (the file sits in the workspace), the streams you follow
-#   AVM Terraform: write its manifest ($W/avm-tf/manifest.json, e.g. with manifest_from_index.py)
+#   edit $W/streams.json: "workspace": "." (the file sits in the workspace)
+#   the group manifests, and the AVM Terraform one (e.g. from manifest_from_index.py):
+mkdir -p $W/enterprise-lz $W/ai-lz $W/avm-tf
+cp $AO/examples/manifests/enterprise-lz.json $W/enterprise-lz/manifest.json
+cp $AO/examples/manifests/ai-lz.json $W/ai-lz/manifest.json
+#   $W/avm-tf/manifest.json: write it before the first run (USAGE §7.3)
 python3 $AO/schedule.py check --streams $W/streams.json
 
-# 2 · the token (§7)
-security add-generic-password -a "$USER" -s activity-gh-token -T /usr/bin/security -U -w
+# 2 · the token, app route (§7.1): create and install the app on GitHub's pages, then
+mkdir -p ~/.config/activity-overview && chmod 700 ~/.config/activity-overview
+mv ~/Downloads/*.private-key.pem ~/.config/activity-overview/app.pem
+chmod 600 ~/.config/activity-overview/app.pem
+#   put the Client ID into the "token" block of $W/streams.json, then:
+python3 $AO/schedule.py token app-check --streams $W/streams.json
+#   RESULT: NOT USABLE -> the personal-token fallback (§7.2): set "store": "keychain", then
+#   python3 $AO/schedule.py token renew --streams $W/streams.json
 
 # 3 · the wrapper
-sed -e "s#__SKILL_DIR__#$AO#" -e "s#__WORKSPACE__#$W#" \
+sed -e "s#__SKILL_DIR__#$AO#g" -e "s#__WORKSPACE__#$W#g" \
   $AO/examples/launchd/activity-gather.sh > $W/bin/activity-gather.sh
 chmod 700 $W/bin/activity-gather.sh
 $W/bin/activity-gather.sh --dry-run             # the plan and the exact commands
@@ -401,10 +716,19 @@ macOS specifics:
 ## 11. Linux (cron)
 
 Copy [`examples/cron/activity-gather.sh`](../examples/cron/activity-gather.sh) to
-`$W/bin/` (fill `__SKILL_DIR__` / `__WORKSPACE__` as above), create the mode-600 env file
-(§7), and add the line from [`examples/cron/crontab.txt`](../examples/cron/crontab.txt)
-with `crontab -e` (absolute paths). The runner is the same file on both systems; cron's
-time is local, the plan is by UTC date: keep the run well clear of midnight UTC.
+`$W/bin/` (fill `__SKILL_DIR__` / `__WORKSPACE__` as above) and set up the token. The copied
+example selects the app route (`"store": "app"`), which works the same on Linux: the key
+file and `token app-check` (§7.1). For the personal-token fallback instead, **first** set
+`"store": "env-file"` in the streams file's token block. `token renew` refuses while the
+store is `app`, and a `--store env-file` on the command line alone would leave the wrapper,
+which follows the streams file, on the app route. Then run
+`python3 $AO/schedule.py token renew --streams $W/streams.json`, which writes the mode-600
+env file `token.env_file` (§7.2). Then add the line from
+[`examples/cron/crontab.txt`](../examples/cron/crontab.txt) with `crontab -e` (absolute
+paths). On a machine without a browser, `token renew` prints the page's address to open
+elsewhere. The runner is the same file on both systems; cron's time is local, the plan is
+by UTC date: keep the run well clear of midnight UTC. After each run the wrapper prints the
+`token remind` line (if any) to the cron log.
 
 ## 12. In a CI schedule
 
@@ -486,8 +810,9 @@ store as it was. `--what` offers what gather offers (`gather.py --help` lists it
 1. `python3 $AO/schedule.py status --streams $W/streams.json` names the stream, month,
    step and error; the run log (`last_run.log`) has gather's and validate's full output.
 2. By step: `gather_failed` — read gather's message in the log (a refused token is named
-   on a `TOKEN:` line by `status`: replace it, §7.1; a rate limit is waited out by gather
-   itself);
+   on a `TOKEN:` line by `status`: replace it, §7.2; a rate limit is waited out by gather
+   itself); `token_failed` — the app could not mint a token: `auth_error` says why, and
+   `token app-check` shows what GitHub answers (§7.1);
    `validate_failed` — USAGE §5.5 reads the report; `swap_failed` — something held the
    store open during the run (close it; the next run retries); `config_error` — fix the
    streams file or manifest (`schedule.py check`).
@@ -528,7 +853,9 @@ total.
 launchctl bootout gui/$(id -u)/local.activity-overview.gather          # macOS
 rm ~/Library/LaunchAgents/local.activity-overview.gather.plist
 crontab -e                                                             # Linux: delete the line
-security delete-generic-password -a "$USER" -s activity-gh-token       # the stored token
+security delete-generic-password -a "$USER" -s activity-gh-token       # a stored personal token
+rm ~/.config/activity-overview/app.pem                                 # the app's key (then delete the
+#   key, or the whole app, on the app's page on GitHub: Developer settings > GitHub Apps)
 sudo pmset repeat cancel                                               # if you scheduled a wake
 # the data: the workspace is self-contained; keep it (stores stay readable) or delete it
 rm -r ~/activity-data
