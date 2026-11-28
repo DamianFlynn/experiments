@@ -2056,8 +2056,10 @@ class TestSocialPosts(unittest.TestCase):
                          ("2026-10-09", "merged_no_release"))
         # plumbing: no daily post, one weekly item per theme with activity
         self.assertNotIn("train-pr-12", by)
+        # ONE weekly post per week (the owner's decision), every theme in it
         self.assertEqual([(w["post_id"], w["day"]) for w in c["weekly"]],
-                         [("weekly:o/r:ci:2026-W40", "2026-10-04")])
+                         [("weekly:o/r:2026-W40", "2026-10-04")])
+        self.assertEqual([t["theme"] for t in c["weekly"][0]["must_state"]["themes"]], ["ci"])
         d = newsletter.daily_outline([self.v()], "2026-10-06", candidates=c)
         self.assertEqual([h["story"] for h in d["held"]], ["train-issue-5"])
         self.assertEqual(d["posts"], [])
@@ -2186,6 +2188,234 @@ class TestSocialPosts(unittest.TestCase):
                 with self.assertRaises(SystemExit) as cm:
                     newsletter.main([vp, "--check-post", pp])
             self.assertEqual(cm.exception.code, 0)
+
+
+class TestSocialDecisionsAndReview(TestSocialPosts):
+    """The owner's decisions on social posts and the PR #122 review findings."""
+
+    def _closed_issue(self, v, n=40, created="2026-10-10T09:00:00Z", at="2026-10-14T09:00:00Z",
+                      by="kim", reason="not_planned"):
+        v["issues"].append({"number": n, "title": "[AVM Module Issue]: x", "author": "kim",
+                            "url": R + "/issues/%d" % n, "state": "closed", "created_at": created,
+                            "closing": {"at": at, "by": by, "state_reason": reason}})
+        v["trains"].append({"id": "train-issue-%d" % n, "outcome": "abandoned",
+                            "issues": [n], "prs": []})
+        v["stories"]["all"].append({"id": "train-issue-%d" % n, "group": "closed",
+                                    "state": "closed", "worthy": "x"})
+        return v
+
+    # owner's decisions
+    def test_one_weekly_post_biggest_theme_first_with_folded_closures(self):
+        v = self.v()
+        v["plumbing_themes"].append({"id": "docs", "title_hint": "Docs", "prs": [{"number": 13}],
+                                     "stories": [], "people": []})
+        v["plumbing_themes"][0]["prs"].append({"number": 10})
+        self._closed_issue(v, n=41, created="2026-10-01T09:00:00Z", at="2026-10-01T10:00:00Z")
+        c = self.cand(v)
+        w = [x for x in c["weekly"] if x["post_id"] == "weekly:o/r:2026-W40"]
+        self.assertEqual(len(w), 1)
+        self.assertEqual(w[0]["must_state"]["themes"][0]["theme"], "ci")
+        self.assertEqual(w[0]["must_state"]["closures_not_posted"][0]["exclusion"],
+                         "quick_own_close")
+
+    def test_closed_request_posts_with_its_reason_and_exclusions(self):
+        v = self._closed_issue(self.v())
+        p = next(x for x in self.cand(v)["posts"] if x.get("story") == "train-issue-40")
+        self.assertEqual((p["trigger"], p["day"], p["must_state"]["reason"]),
+                         ("closed_not_planned", "2026-10-14", "not_planned"))
+        post = ("<!-- post: story:o/r:train-issue-40 channel: x day: 2026-10-14 -->\n"
+                "A request for the data factory module was closed. " + R + "/issues/40\n"
+                "<!-- /post -->\n")
+        r = newsletter.check_posts([v], post)
+        self.assertIn("the stated reason 'not planned'", r["posts"][0]["must_state_missing"])
+        r = newsletter.check_posts([v], post.replace("was closed.", "was closed as not planned."))
+        self.assertTrue(r["ok"], r["posts"])
+        # closed by its own author within a day of opening: folded, not posted
+        v = self._closed_issue(self.v(), created="2026-10-14T01:00:00Z")
+        c = self.cand(v)
+        self.assertFalse(any(x.get("story") == "train-issue-40" for x in c["posts"]))
+        self.assertEqual(c["excluded"][0]["exclusion"], "quick_own_close")
+
+    def test_closing_the_loop_once_with_where_the_content_landed(self):
+        v = self.v()
+        v["prs"].append({"number": 30, "title": "feat: new module", "author": "sam",
+                         "url": R + "/pull/30", "state": "closed", "merged": False,
+                         "created_at": "2026-10-07T10:00:00Z", "closed_at": "2026-10-20T10:00:00Z",
+                         "closed_unmerged": {"close_reason": "not stated", "content_landed_in": [
+                             {"pr": 13, "basis": "same commit"}]}})
+        v["trains"].append({"id": "train-pr-30", "outcome": "rejected", "prs": [30], "issues": []})
+        v["stories"]["all"].append({"id": "train-pr-30", "group": "in_flight", "state": "in_flight",
+                                    "worthy": "x", "new_module_proposed": ["avm/res/x/new"]})
+        v["module_ownership"] = {"collected": True, "events": [], "proposed_modules": {
+            "avm/res/x/new": {"prs": [30], "committed_at": "2026-10-07T09:00:00Z"}}}
+        c = self.cand(v)
+        first = next(x for x in c["posts"] if x["post_id"] == "story:o/r:train-pr-30")
+        loop = next(x for x in c["posts"] if x["post_id"] == "story:o/r:train-pr-30:closed")
+        self.assertEqual((first["trigger"], loop["trigger"], loop["first_post_id"], loop["day"]),
+                         ("new_module_proposed", "closed_after_post", "story:o/r:train-pr-30",
+                          "2026-10-20"))
+        post = ("<!-- post: story:o/r:train-pr-30:closed channel: x day: 2026-10-20 -->\n"
+                "The proposal was closed without merging; no reason is stated. Its commit is part of "
+                "#13. " + R + "/pull/30\n<!-- /post -->\n")
+        self.assertTrue(newsletter.check_posts([v], post)["ok"])
+        r = newsletter.check_posts([v], post.replace(" Its commit is part of #13.", ""))
+        self.assertIn("where its content landed (#13)", r["posts"][0]["must_state_missing"])
+        r = newsletter.check_posts([v], post.replace("Its commit is part of #13.",
+                                                     "It was superseded by #13."))
+        self.assertTrue(r["posts"][0]["superseded_not_in_view"])
+
+    def test_label_only_orphan_is_suppressed_when_an_owner_follows(self):
+        v = self.v()
+        ev = {"kind": "orphaned", "module": "avm/res/hci/cluster", "date": "2026-10-02",
+              "source": {"type": "pr", "number": 10, "url": R + "/pull/10"}, "via": "label"}
+        own = {"kind": "owner_added", "module": "avm/res/hci/cluster", "date": "2026-10-06",
+               "people": ["alex"], "source": {"type": "commit", "url": R + "/commit/a"}}
+        v["module_ownership"] = {"collected": True, "events": [ev, own]}
+        kinds = [p["trigger"] for p in self.cand(v)["posts"] if p["kind"] == "module_event"]
+        self.assertEqual(kinds, ["owner_added"])
+        # no owner within ORPHAN_LABEL_HOLD_DAYS: the label-only signal posts after the hold
+        v["module_ownership"]["events"] = [ev]
+        p = next(p for p in self.cand(v)["posts"] if p["kind"] == "module_event")
+        self.assertEqual((p["trigger"], p["day"]), ("orphaned", "2026-10-09"))
+        ev2 = dict(ev, source={"type": "commit", "url": R + "/commit/b"}, via="ORPHANED.md")
+        v["module_ownership"]["events"] = [ev2, own]
+        kinds = [p["trigger"] for p in self.cand(v)["posts"] if p["kind"] == "module_event"]
+        self.assertEqual(sorted(kinds), ["orphaned", "owner_added"])
+
+    def test_deprecation_states_its_replacement_or_none(self):
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [
+            {"kind": "deprecated", "module": "avm/res/hci/cluster", "date": "2026-10-03",
+             "source": {"type": "commit", "url": R + "/commit/d"}}],
+            "deprecated_modules": [{"module": "avm/res/hci/cluster"}]}
+        url = T + "avm/res/hci/cluster"
+        post = ("<!-- post: deprecated:o/r:avm/res/hci/cluster:2026-10-03 channel: x "
+                "day: 2026-10-03 -->\nThe module avm/res/hci/cluster was deprecated. " + url +
+                "\n<!-- /post -->\n")
+        r = newsletter.check_posts([v], post)
+        self.assertIn("that no replacement is named", r["posts"][0]["must_state_missing"])
+        self.assertTrue(newsletter.check_posts([v], post.replace(
+            "was deprecated.", "was deprecated; no replacement is named."))["ok"])
+        v["module_ownership"]["deprecated_modules"][0]["replacement"] = {
+            "module": "avm/ptn/net/dns", "quote": "use avm/ptn/net/dns instead"}
+        r = newsletter.check_posts([v], post.replace("was deprecated.",
+                                                     "was deprecated; no replacement is named."))
+        self.assertIn("the replacement avm/ptn/net/dns", r["posts"][0]["must_state_missing"])
+
+    # review findings
+    def test_f1_suppressed_person_handle_never_allowed(self):
+        v = self.v()
+        v["affiliations"]["people"]["nik"] = {"signal": "do_not_name"}
+        reg = {"people": {"NIK": {"social": {"x": {"handle": "nikp", "confirmed": True}}}}}
+        t = self.POST.replace("with the Redis zone", "with the Redis zone by @nikp")
+        r = newsletter.check_posts([v], t, registry=reg)
+        self.assertEqual(r["posts"][0]["handles_not_confirmed"], ["nikp"])
+
+    def test_f2_breaking_heading_and_item_in_different_commits(self):
+        v = self.v()
+        v["prs"].append({"number": 30, "title": "fix", "author": "sam", "url": R + "/pull/30",
+                         "state": "open", "merged": False, "created_at": "2026-10-05T10:00:00Z"})
+        v["pr_history"] = {"prs": [{"number": 30, "commits": [
+            {"sha": "c1", "committed_at": "2026-10-06T10:00:00Z"},
+            {"sha": "c2", "committed_at": "2026-10-08T10:00:00Z"}], "patches": [
+            {"path": "x/CHANGELOG.md", "commit": "c1",
+             "added": ["## 0.4.0", "### Breaking Changes", "- None"]},
+            {"path": "x/CHANGELOG.md", "commit": "c2", "removed": ["- None"],
+             "added": ["- Removed `y`."]}]}]}
+        b = newsletter._open_pr_breaking(v, 30)
+        self.assertEqual((b[0]["items"], b[0]["commit"]), (["Removed `y`."], "c2"))
+        # a later item that removes no placeholder is not under the Breaking heading
+        hist = v["pr_history"]["prs"][0]["patches"]
+        hist[1] = {"path": "x/CHANGELOG.md", "commit": "c2", "added": ["- Fixed ordering."]}
+        self.assertEqual(newsletter._open_pr_breaking(v, 30), [])
+        # nor when another section's placeholder could be the removed one
+        hist[0]["added"] = ["## 0.4.0", "### Changes", "- None", "### Breaking Changes", "- None"]
+        hist[1] = {"path": "x/CHANGELOG.md", "commit": "c2", "removed": ["- None"],
+                   "added": ["- Fixed ordering."]}
+        self.assertEqual(newsletter._open_pr_breaking(v, 30), [])
+
+    def test_f3_breaking_only_from_this_trains_declarations(self):
+        v = self.v()
+        v["prs"].append({"number": 31, "title": "docs", "author": "sam", "url": R + "/pull/31",
+                         "state": "closed", "merged": True, "merged_at": "2026-10-09T10:00:00Z"})
+        v["trains"].append({"id": "train-pr-31", "outcome": "shipped", "prs": [31], "issues": []})
+        v["stories"]["all"].append({"id": "train-pr-31", "group": "landed", "state": "landed",
+                                    "worthy": "x", "modules": ["avm/res/data/factory"],
+                                    "released": [{"status": "no_version_change"}]})
+        p = next(x for x in self.cand(v)["posts"] if x.get("story") == "train-pr-31")
+        self.assertIsNone(p["must_state"]["breaking"])
+        p = next(x for x in self.cand(v)["posts"] if x.get("story") == "train-issue-5")
+        self.assertEqual(p["must_state"]["breaking"], "declared")
+
+    def test_f4_proposal_waits_for_its_own_pr(self):
+        v = self.v()
+        for n, created in ((30, "2026-10-02T10:00:00Z"), (31, "2026-10-12T10:00:00Z")):
+            v["prs"].append({"number": n, "title": "x", "author": "sam", "url": R + "/pull/%d" % n,
+                             "state": "open", "merged": False, "created_at": created})
+        v["trains"].append({"id": "train-pr-30", "outcome": "in_flight", "prs": [30, 31],
+                            "issues": []})
+        v["stories"]["all"].append({"id": "train-pr-30", "group": "in_flight", "state": "in_flight",
+                                    "worthy": "x", "new_module_proposed": ["avm/res/x/new"]})
+        v["module_ownership"] = {"collected": True, "events": [], "proposed_modules": {
+            "avm/res/x/new": {"prs": [31], "committed_at": "2026-10-03T09:00:00Z"}}}
+        p = next(x for x in self.cand(v)["posts"] if x.get("story") == "train-pr-30")
+        self.assertEqual(p["day"], "2026-10-12")
+
+    def test_f5_voice_pass_may_not_swap_a_person(self):
+        a = self.POST.replace("It adds the Redis zone.", "Nik Peters added the Redis zone.")
+        b = a.replace("Nik Peters", "Alex Sehr")
+        r = self.check(b, against=a)
+        self.assertEqual(r["posts"][1]["facts_changed"]["people"],
+                         {"added": ["alex"], "removed": ["nik"]})
+
+    def test_f6_module_event_must_state_the_event(self):
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [
+            {"kind": "owner_added", "module": "avm/res/hci/cluster", "date": "2026-10-06",
+             "people": ["alex"], "source": {"type": "commit", "url": R + "/commit/abc"}}]}
+        post = ("<!-- post: owner_added:o/r:avm/res/hci/cluster:2026-10-06 channel: x "
+                "day: 2026-10-06 -->\navm/res/hci/cluster " + R + "/commit/abc\n<!-- /post -->\n")
+        r = newsletter.check_posts([v], post)
+        self.assertIn("the event (owner added)", r["posts"][0]["must_state_missing"])
+        self.assertTrue(newsletter.check_posts([v], post.replace(
+            "avm/res/hci/cluster ", "avm/res/hci/cluster has a new owner, Alex Sehr. "))["ok"])
+
+    def test_f7_not_yet_published_is_true_before_a_later_release(self):
+        v = self.v()
+        v["stories"]["all"][0]["released"][0]["date"] = "2026-10-20T00:00:00Z"
+        v["module_changes"]["modules"][0]["versions"]["published"][0]["date"] = "2026-10-20T00:00:00Z"
+        post = ("<!-- post: story:o/r:train-pr-11 channel: x day: 2026-10-09 -->\n"
+                "Merged: avm/ptn/net/dns 0.7.4 is not yet published. " + R + "/pull/11\n"
+                "<!-- /post -->\n")
+        r = newsletter.check_posts([v], post)
+        self.assertTrue(r["ok"], r["posts"])
+
+    def test_f8_published_post_links_the_tag(self):
+        r = self.check(self.POST.replace("https://github.com/o/r/tree/avm/ptn/net/dns/0.7.4",
+                                         R + "/pull/11"))
+        self.assertIn("the published version's tag link", r["posts"][0]["must_state_missing"])
+
+    def test_f9_module_event_links_are_validated(self):
+        v = self.v()
+        v["module_ownership"] = {"collected": True, "events": [
+            {"kind": "owner_added", "module": "avm/res/hci/cluster", "date": "2026-10-06",
+             "people": ["alex"], "source": {"type": "commit", "url": R + "/commit/abc"}}]}
+        post = ("<!-- post: owner_added:o/r:avm/res/hci/cluster:2026-10-06 channel: x "
+                "day: 2026-10-06 -->\navm/res/hci/cluster has a new owner. " + R + "/pull/11\n"
+                "<!-- /post -->\n")
+        r = newsletter.check_posts([v], post)
+        self.assertIn("a link to the event's source or the module", r["posts"][0]["must_state_missing"])
+
+    def test_f10_a_removed_block_fails_the_voice_pass(self):
+        one = self.POST.split("<!-- post: story:o/r:train-pr-11 channel: linkedin")[0]
+        r = self.check(one, against=self.POST)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["posts"][-1]["channel"], "linkedin")
+
+    def test_f11_community_by_display_name(self):
+        r = self.check(self.POST.replace("It adds the Redis zone.",
+                                         "Community contributor Nik Peters added the Redis zone."))
+        self.assertEqual(r["posts"][1]["affiliation_mismatch"][0]["name"], "Nik Peters")
 
 
 class TestThemeCheck(unittest.TestCase):

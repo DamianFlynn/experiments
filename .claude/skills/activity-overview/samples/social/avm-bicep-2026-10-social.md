@@ -1,44 +1,48 @@
 # Daily social posts — October 2026 (sample drafts)
 
-Drafts for the owner to approve, written neutral from the record of Azure/bicep-registry-modules for October 2026 (store recomputed on 27 November 2026). Nothing here is scheduled or published. One post per story, at the first event a reader can act on; plumbing rolls into one weekly item per theme. The rules are in `reference/social.md`; the checkable drafts of week 41 are `avm-bicep-2026-10-week41.posts.md`.
+Drafts for the owner to approve, written neutral from the record of Azure/bicep-registry-modules for October 2026 (store recomputed on 27 November 2026). Nothing here is scheduled or published. One post per story, at the first event a reader can act on; plumbing rolls into one weekly item per theme. The rules are in `reference/social.md`; the checkable drafts are `avm-bicep-2026-10-week41.posts.md`.
 
 ## Posts per day, October 2026
 
-| Day | Story / module posts | Weekly plumbing items | Held for a release |
+| Day | Story / module posts | Weekly post | Held for a release |
 |---|---|---|---|
 | Thu 2026-10-01 | 3 | 0 | 1 |
-| Fri 2026-10-02 | 1 | 0 | 1 |
+| Fri 2026-10-02 | 0 | 0 | 1 |
 | Sat 2026-10-03 | 2 | 0 | 1 |
-| Sun 2026-10-04 | 1 | 4 | 0 |
+| Sun 2026-10-04 | 1 | 1 | 0 |
 | Mon 2026-10-05 | 1 | 0 | 0 |
 | Tue 2026-10-06 | 3 | 0 | 1 |
 | Wed 2026-10-07 | 1 | 0 | 1 |
 | Thu 2026-10-08 | 0 | 0 | 1 |
 | Fri 2026-10-09 | 2 | 0 | 0 |
 | Sat 2026-10-10 | 0 | 0 | 0 |
-| Sun 2026-10-11 | 0 | 5 | 0 |
+| Sun 2026-10-11 | 0 | 1 | 0 |
 | Mon 2026-10-12 | 1 | 0 | 0 |
 | Tue 2026-10-13 | 0 | 0 | 0 |
 | Wed 2026-10-14 | 3 | 0 | 0 |
 | Thu 2026-10-15 | 0 | 0 | 0 |
 | Fri 2026-10-16 | 0 | 0 | 0 |
 | Sat 2026-10-17 | 0 | 0 | 0 |
-| Sun 2026-10-18 | 2 | 3 | 0 |
+| Sun 2026-10-18 | 2 | 1 | 0 |
 | Mon 2026-10-19 | 1 | 0 | 0 |
 | Tue 2026-10-20 | 0 | 0 | 0 |
 | Wed 2026-10-21 | 1 | 0 | 0 |
 | Thu 2026-10-22 | 1 | 0 | 0 |
 | Fri 2026-10-23 | 1 | 0 | 0 |
 | Sat 2026-10-24 | 0 | 0 | 0 |
-| Sun 2026-10-25 | 0 | 5 | 0 |
+| Sun 2026-10-25 | 0 | 1 | 0 |
 | Mon 2026-10-26 | 0 | 0 | 0 |
 | Tue 2026-10-27 | 0 | 0 | 0 |
 | Wed 2026-10-28 | 0 | 0 | 0 |
 | Thu 2026-10-29 | 0 | 0 | 0 |
 | Fri 2026-10-30 | 0 | 0 | 0 |
-| Sat 2026-10-31 | 0 | 3 | 0 |
+| Sat 2026-10-31 | 0 | 1 | 0 |
 
-Total: 24 story and module posts and 20 weekly plumbing items in October 2026 (44 posts, each in two forms). Week 41 (5–11 October 2026) is the busiest full week and is written out below.
+Total: 23 story and module posts and 5 weekly posts in October 2026 (28 posts, each in two forms). Per trigger: published 12, new_module_proposed 4, merged_not_published 2, breaking_declared_open 2, owner_added 2, deprecated 1.
+
+**Closed posts in October 2026: none.** The three user-facing closures of the month, #7541, #7542 and #7543, were closed as not planned by their own author on the day they were opened (`quick_own_close`), so they fold into the weekly post of week 42 as a count (written below). No story that had a post was withdrawn in October. Not posted either: the label-only orphan signal on `avm/res/sql/server` (2 October 2026), because the module gained an owner four days later (`orphan_label_then_owner`).
+
+Week 41 (5–11 October 2026) is the busiest full week and is written out below; the weekly post of week 42 follows it.
 
 ## Monday 2026-10-05
 
@@ -221,122 +225,72 @@ https://github.com/Azure/bicep-registry-modules/pull/7504
 Nothing became postable.
 ## Sunday 2026-10-11
 
-### `weekly:Azure/bicep-registry-modules:pipeline_utilities:2026-W41`
+### `weekly:Azure/bicep-registry-modules:2026-W41`
 
-- Trigger: **weekly_theme**
-- Must state: 12 merged, 20 opened in 2026-W41
+- Trigger: **weekly_engineered**
+- Must state, biggest first: Shared pipeline utilities 12 merged / 20 opened; Test fixtures and test environment 3 merged / 4 opened; CI workflows 2 merged / 4 opened; Other plumbing 2 merged / 2 opened; Repository policy files 1 merged / 1 opened
 
-**X** — check: pass, length 203 (weighted, links count 23)
+**X** — check: pass, length 250 (weighted, links count 23)
 
 ```text
-What was engineered, week to 11 October 2026: shared pipeline utilities. 12 pull requests merged, among them the consolidation of CI reliability fixes in #7517. No module changes. https://github.com/Azure/bicep-registry-modules/pull/7517
+What was engineered, week to 11 October 2026: 20 merged pull requests on the shared test pipeline and environment, led by the consolidation of CI reliability fixes in #7517 and a reusable Azure Local host-image builder, #7491. https://github.com/Azure/bicep-registry-modules/pull/7517
 ```
 
-**LinkedIn** — check: pass, length 370
+**LinkedIn** — check: pass, length 1178
 
 ```text
-What was engineered in the week to 11 October 2026: the shared pipeline utilities every module's test pipeline runs.
+What was engineered in the week to 11 October 2026, the work underneath the modules, biggest first.
 
-20 pull requests were opened and 12 merged. Among them, #7517 consolidated separately proposed CI reliability fixes into one change. None of them changed a module.
+Shared pipeline utilities: 12 pull requests merged and 20 opened. #7517 consolidated separately proposed CI reliability fixes into one change, and #7464 and #7492 did the same for capacity classifiers and dependency bootstrap.
+
+Test fixtures and the test environment: 3 merged. #7491 added a reusable host-image builder for the Azure Local module tests, #7505 separated its build and replication regions, and #7458 replaced tenant-specific CI inputs in the test entrypoints of nine modules.
+
+CI workflows: 2 merged. #7482 removed the last exception to OIDC sign-in from module deployment tests, and #7507 fixed how the workflow selects the changes of a pull request.
+
+Module metadata: 2 merged. #7493 fixed a typo in the API Management metadata that made the README check fail, and #7471 added a module owner.
+
+Repository policy: an automation account merged #7473, which keeps the module list of the issue form in line with the published catalog.
+
+None of these changed a module version.
 
 https://github.com/Azure/bicep-registry-modules/pull/7517
 
 #Bicep #AzureVerifiedModules
 ```
 
-### `weekly:Azure/bicep-registry-modules:ci_workflows:2026-W41`
+## Sunday 2026-10-18
 
-- Trigger: **weekly_theme**
-- Must state: 2 merged, 4 opened in 2026-W41
+(Only the weekly post of week 42 is shown for this day.)
 
-**X** — check: pass, length 182 (weighted, links count 23)
+### `weekly:Azure/bicep-registry-modules:2026-W42`
+
+- Trigger: **weekly_engineered**
+- Must state, biggest first: Shared pipeline utilities 5 merged / 6 opened; Test fixtures and test environment 2 merged / 1 opened; CI workflows 1 merged / 2 opened
+- Closures folded in: #7541 (quick_own_close), #7542 (quick_own_close), #7543 (quick_own_close)
+
+**X** — check: pass, length 232 (weighted, links count 23)
 
 ```text
-What was engineered, week to 11 October 2026: CI workflows. 2 pull requests merged; #7482 removed the last stored-secret sign-in from module deployment tests. https://github.com/Azure/bicep-registry-modules/pull/7482
+What was engineered, week to 18 October 2026: 8 merged pull requests on the shared test pipeline, test environment and CI workflows. 3 module requests were closed by their own author the day they were opened. https://github.com/Azure/bicep-registry-modules
 ```
 
-**LinkedIn** — check: pass, length 352
+**LinkedIn** — check: pass, length 439
 
 ```text
-What was engineered in the week to 11 October 2026: the CI workflows.
+What was engineered in the week to 18 October 2026, biggest first.
 
-4 pull requests were opened and 2 merged. #7482 removed the last exception to OIDC sign-in from module deployment tests, and #7507 fixed how the workflow selects the changes of a pull request.
+Shared pipeline utilities: 5 pull requests merged and 6 opened. Test fixtures and the test environment: 2 merged. CI workflows: 1 merged and 2 opened.
 
-https://github.com/Azure/bicep-registry-modules/pull/7482
+Not posted on their own: 3 module requests, #7541, #7542 and #7543, were closed as not planned by their own author the day they were opened.
 
-#Bicep #AzureVerifiedModules
-```
-
-### `weekly:Azure/bicep-registry-modules:test_environment:2026-W41`
-
-- Trigger: **weekly_theme**
-- Must state: 3 merged, 4 opened in 2026-W41
-
-**X** — check: pass, length 208 (weighted, links count 23)
-
-```text
-What was engineered, week to 11 October 2026: test fixtures and the test environment. 3 pull requests merged, among them a reusable host-image builder for the Azure Local tests, #7491. https://github.com/Azure/bicep-registry-modules/pull/7491
-```
-
-**LinkedIn** — check: pass, length 436
-
-```text
-What was engineered in the week to 11 October 2026: test fixtures and the test environment.
-
-4 pull requests were opened and 3 merged. #7491 added a reusable host-image builder for the Azure Local module tests, #7505 separated its build and replication regions, and #7458 replaced tenant-specific CI inputs in the test entrypoints of nine modules.
-
-https://github.com/Azure/bicep-registry-modules/pull/7491
-
-#Bicep #AzureVerifiedModules
-```
-
-### `weekly:Azure/bicep-registry-modules:other_plumbing:2026-W41`
-
-- Trigger: **weekly_theme**
-- Must state: 2 merged, 2 opened in 2026-W41
-
-**X** — check: pass, length 195 (weighted, links count 23)
-
-```text
-What was engineered, week to 11 October 2026: 2 metadata fixes merged, a typo that broke README generation for API Management (#7493) and a new module owner entry (#7471). https://github.com/Azure/bicep-registry-modules/pull/7493
-```
-
-**LinkedIn** — check: pass, length 342
-
-```text
-What was engineered in the week to 11 October 2026: two small changes to module metadata files.
-
-#7493 fixed a typo in the API Management metadata that made the README check fail for any pull request touching that module, and #7471 added a module owner.
-
-https://github.com/Azure/bicep-registry-modules/pull/7493
-
-#Bicep #AzureVerifiedModules
-```
-
-### `weekly:Azure/bicep-registry-modules:repository_policy:2026-W41`
-
-- Trigger: **weekly_theme**
-- Must state: 1 merged, 1 opened in 2026-W41
-
-**X** — check: pass, length 169 (weighted, links count 23)
-
-```text
-What was engineered, week to 11 October 2026: an automation account kept the issue form's module list in sync with the published catalog (#7473). https://github.com/Azure/bicep-registry-modules/pull/7473
-```
-
-**LinkedIn** — check: pass, length 294
-
-```text
-What was engineered in the week to 11 October 2026: an automation account opened and merged #7473, which keeps the "Module Name" dropdown of the module issue form in line with the published module catalog.
-
-https://github.com/Azure/bicep-registry-modules/pull/7473
+https://github.com/Azure/bicep-registry-modules
 
 #Bicep #AzureVerifiedModules
 ```
 
 ## A voice pass, checked again
 
-A voice pass may change wording, order and person, add a greeting or emoji, within the limits; it may not change a fact. Two voiced versions of posts above, checked with `--check-post VOICED.md --against DRAFTS.md`:
+A voice pass may change wording, order and person, add a greeting or emoji, within the limits; it may not change a fact. Two voiced versions of posts above, checked with `--check-post VOICED.md --against DRAFTS.md` (a real voice pass returns every post; a post missing from it fails):
 
 `story:Azure/bicep-registry-modules:train-issue-7459` (x): **pass**
 

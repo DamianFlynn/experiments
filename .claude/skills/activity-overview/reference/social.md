@@ -27,16 +27,37 @@ A story gets **one** post, at the first event a reader can act on. `trigger` say
 | `published` | a landed story whose module version was published (its release tied to the merge) within `SOCIAL_HOLD_DAYS` (3) days of its last merge: the day of the release | the module (path or link), the published version, "published" / "released", the tag link |
 | `merged_not_published` | a landed story with no release tied within the hold: three days after its last merge (it is `held` until then) | the module, "not yet published" (and the declared version when the changelog has one) |
 | `merged_no_release` | a landed story whose PRs change no version (documentation, metadata): its merge day | the module when there is one, "no version change" |
-| `new_module_proposed` | an open PR whose own commits add a module's entry file (`new_module_proposed`, the tree's `proposed` lifecycle): the later of that commit's day and the PR's opening | the proposed module, that the PR is open, not published |
-| `breaking_declared_open` | an open PR whose own commits add items under `### Breaking Changes` in a CHANGELOG (a stacked copy of another PR's commit does not count): the later of that commit's day and the PR's opening | "breaking", that the PR is open (not merged) |
-| `owner_added` / `orphaned` / `deprecated` | a module event of `module_ownership` (one post per module and kind): the event's day | the module, what happened, the source link |
+| `new_module_proposed` | an open PR whose own commits add a module's entry file (`new_module_proposed`, the tree's `proposed` lifecycle): the later of that commit's day and the opening of the PR that adds it (the tree's `proposed_modules[].prs`, not any open PR of the train) | the proposed module, that the PR is open, not published |
+| `breaking_declared_open` | an open PR whose own commits declare items under `### Breaking Changes` in a CHANGELOG (below): the later of that commit's day and the PR's opening | "breaking", that the PR is open (not merged) |
+| `owner_added` / `orphaned` / `deprecated` | a module event of `module_ownership` (one post per module and kind): the event's day; an `orphaned` signal that is only a label on a PR (no marker file in the module folder) is held `ORPHAN_LABEL_HOLD_DAYS` (7) and suppressed when the module gains an owner in that time | the module, the event in words ("owner", "orphaned", "deprecated"), a link to the event's source or the module; a deprecation states its replacement with its link when the record names one (`deprecated_modules[].replacement`, explicit text only), else that no replacement is named |
+| `closed_not_planned` | a user-facing request or change (a story of the `closed` group: an issue or a PR touching a module, not plumbing) closed as not planned or without merging: the day it closed | that it was closed, the reason as stated (`closing.state_reason`, a PR's `superseded_by` with its link) or "no reason is stated", and where its content landed when the record shows it (`content_landed_in`: "its commit is part of #N"; never "superseded" without `superseded_by`) |
+| `closed_after_post` | closing the loop: a story that already had a post is closed without merging or withdrawn (every PR of the train closed unmerged, none open or merged): the day it closed. The one exception to one post per story: `post_id` is the first post's id plus `:closed`, with `first_post_id` | as for `closed_not_planned` |
 
-The earliest trigger of a story wins; a later event never makes a second post. Stories that
-are only in flight, stalled or closed without one of these events get no post (there is
-nothing for a reader to do yet). **Plumbing gets no daily post**: each plumbing theme with a PR
-merged or opened in an ISO week gets one **weekly** item ("what was engineered"), due on that
-week's Sunday (or the window's last day): `post_id` `weekly:<repo>:<theme>:<YYYY>-W<ww>`,
-`must_state` the PRs merged and opened that week.
+**Breaking declared across commits.** Patches carry no line positions, so the declaration is
+read per patch (items under an added `### Breaking Changes` heading) and across commits only
+where it is unambiguous: a later patch that removes the "- None" placeholder of a Breaking
+heading an earlier commit added, and adds items under no heading of its own, declares them —
+only when every open placeholder of that file is under a Breaking heading. A merged story is
+`breaking: declared` only when a declared breaking item's source PR is in **this** train.
+
+**Closures that are not posted** fold into the weekly post as a count
+(`closures_not_posted`), each with how the record shows it: `automation_pr` (the PR's author
+is an automation account, `is_automation`), `duplicate_by_automation` (an issue whose
+`closing.state_reason` is duplicate and whose `closing.by` is an automation account),
+`quick_own_close` (`closing.by` — for a PR, the actor of its `closed` lifecycle event — is the
+item's own author, within `CLOSED_QUICK_HOURS` (24) of `created_at`). Plumbing closures (a
+story of the plumbing group or an `in_theme` train) never post and are already in the weekly
+theme counts.
+
+The earliest trigger of a story wins; a later event never makes a second post (except the
+closing post above). Stories that are only in flight or stalled without one of these events get
+no post (there is nothing for a reader to do yet). **Plumbing gets no daily post**: ONE weekly
+post per ISO week ("what was engineered"), due on that week's Sunday (or the window's last
+day), covering every plumbing theme with a PR merged or opened that week, biggest first
+(`must_state.themes`, by merged then opened), plus the closures not posted
+(`closures_not_posted`): `post_id` `weekly:<repo>:<YYYY>-W<ww>`. The LinkedIn form may use its
+full length; the X form names the one or two main things and links the repository or the main
+pull request.
 
 Every row carries a stable **`post_id`**: `story:<owner/repo>:<train id>` for a story,
 `<kind>:<owner/repo>:<module>:<day>` for a module event, the weekly id above for plumbing. It
@@ -104,19 +125,26 @@ the text
 Per block it fails and lists: `post_unknown` / `day_mismatch` (not a row of that day's
 outline); `too_long`, `too_many_hashtags`, `markdown`; `handles_not_confirmed`;
 `must_state_missing` (the table above, plus a link to the story, a pull request, the module or
-the tag); `breaking_not_declared` ("breaking" in a post whose row declares none); and the
+the tag — for `published`, the published version's tag; for a module event, its source or the
+module); `breaking_not_declared` ("breaking" in a post whose row declares none); and the
 issue check's record rules on the text (`quotes_not_in_view`, `items_not_in_view`,
 `versions_not_in_view`, `numbers_not_in_view` — a count the row gives is allowed —,
 `review_state_mismatch`, `pr_state_mismatch`, `release_status_mismatch`,
 `superseded_not_in_view`, `do_not_name_named`, `affiliation_mismatch`,
-`automation_as_person`, `dates_without_year`, `characterising_words`).
+`automation_as_person`, `dates_without_year`, `characterising_words`). Two record rules are
+read for posts: a release claim is read **as of the post's day** ("not yet published" is true
+before a later publication), and "community" in a sentence that names a person by display name
+fails unless that person's affiliation is community. A do_not_name person's handle is never
+allowed, even when the registry marks it confirmed (logins compared case-insensitively).
 
 **The voice pass.** It may change wording and sentence order, the person (first person
 plural, "we"), greeting and closing lines that state no fact, hashtags and emoji within the
 limits (`VOICE_PASS_MAY_CHANGE`). It may not change a fact. The check is written for that: it
 asks for facts, not wording, so it runs unchanged on the voiced text; with `--against` the
 earlier drafts file, it also fails `facts_changed` when a post's URLs, versions, item numbers,
-other numbers, quotes, dates or handles differ from its earlier version (`post_facts`). A voice
+other numbers, quotes, dates, handles or the people it names (display names resolved to their
+logins) differ from its earlier version (`post_facts`), and when a post or channel of the
+earlier file is missing from the new one. A voice
 pass that turns "not yet published" into "published" fails the record check even when no
 listed fact changed.
 

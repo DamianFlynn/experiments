@@ -94,70 +94,42 @@ https://github.com/Azure/bicep-registry-modules/pull/7504
 #Bicep #AzureVerifiedModules
 <!-- /post -->
 
-<!-- post: weekly:Azure/bicep-registry-modules:pipeline_utilities:2026-W41 channel: x day: 2026-10-11 -->
-What was engineered, week to 11 October 2026: shared pipeline utilities. 12 pull requests merged, among them the consolidation of CI reliability fixes in #7517. No module changes. https://github.com/Azure/bicep-registry-modules/pull/7517
+<!-- post: weekly:Azure/bicep-registry-modules:2026-W41 channel: x day: 2026-10-11 -->
+What was engineered, week to 11 October 2026: 20 merged pull requests on the shared test pipeline and environment, led by the consolidation of CI reliability fixes in #7517 and a reusable Azure Local host-image builder, #7491. https://github.com/Azure/bicep-registry-modules/pull/7517
 <!-- /post -->
 
-<!-- post: weekly:Azure/bicep-registry-modules:pipeline_utilities:2026-W41 channel: linkedin day: 2026-10-11 -->
-What was engineered in the week to 11 October 2026: the shared pipeline utilities every module's test pipeline runs.
+<!-- post: weekly:Azure/bicep-registry-modules:2026-W41 channel: linkedin day: 2026-10-11 -->
+What was engineered in the week to 11 October 2026, the work underneath the modules, biggest first.
 
-20 pull requests were opened and 12 merged. Among them, #7517 consolidated separately proposed CI reliability fixes into one change. None of them changed a module.
+Shared pipeline utilities: 12 pull requests merged and 20 opened. #7517 consolidated separately proposed CI reliability fixes into one change, and #7464 and #7492 did the same for capacity classifiers and dependency bootstrap.
+
+Test fixtures and the test environment: 3 merged. #7491 added a reusable host-image builder for the Azure Local module tests, #7505 separated its build and replication regions, and #7458 replaced tenant-specific CI inputs in the test entrypoints of nine modules.
+
+CI workflows: 2 merged. #7482 removed the last exception to OIDC sign-in from module deployment tests, and #7507 fixed how the workflow selects the changes of a pull request.
+
+Module metadata: 2 merged. #7493 fixed a typo in the API Management metadata that made the README check fail, and #7471 added a module owner.
+
+Repository policy: an automation account merged #7473, which keeps the module list of the issue form in line with the published catalog.
+
+None of these changed a module version.
 
 https://github.com/Azure/bicep-registry-modules/pull/7517
 
 #Bicep #AzureVerifiedModules
 <!-- /post -->
 
-<!-- post: weekly:Azure/bicep-registry-modules:ci_workflows:2026-W41 channel: x day: 2026-10-11 -->
-What was engineered, week to 11 October 2026: CI workflows. 2 pull requests merged; #7482 removed the last stored-secret sign-in from module deployment tests. https://github.com/Azure/bicep-registry-modules/pull/7482
+<!-- post: weekly:Azure/bicep-registry-modules:2026-W42 channel: x day: 2026-10-18 -->
+What was engineered, week to 18 October 2026: 8 merged pull requests on the shared test pipeline, test environment and CI workflows. 3 module requests were closed by their own author the day they were opened. https://github.com/Azure/bicep-registry-modules
 <!-- /post -->
 
-<!-- post: weekly:Azure/bicep-registry-modules:ci_workflows:2026-W41 channel: linkedin day: 2026-10-11 -->
-What was engineered in the week to 11 October 2026: the CI workflows.
+<!-- post: weekly:Azure/bicep-registry-modules:2026-W42 channel: linkedin day: 2026-10-18 -->
+What was engineered in the week to 18 October 2026, biggest first.
 
-4 pull requests were opened and 2 merged. #7482 removed the last exception to OIDC sign-in from module deployment tests, and #7507 fixed how the workflow selects the changes of a pull request.
+Shared pipeline utilities: 5 pull requests merged and 6 opened. Test fixtures and the test environment: 2 merged. CI workflows: 1 merged and 2 opened.
 
-https://github.com/Azure/bicep-registry-modules/pull/7482
+Not posted on their own: 3 module requests, #7541, #7542 and #7543, were closed as not planned by their own author the day they were opened.
 
-#Bicep #AzureVerifiedModules
-<!-- /post -->
-
-<!-- post: weekly:Azure/bicep-registry-modules:test_environment:2026-W41 channel: x day: 2026-10-11 -->
-What was engineered, week to 11 October 2026: test fixtures and the test environment. 3 pull requests merged, among them a reusable host-image builder for the Azure Local tests, #7491. https://github.com/Azure/bicep-registry-modules/pull/7491
-<!-- /post -->
-
-<!-- post: weekly:Azure/bicep-registry-modules:test_environment:2026-W41 channel: linkedin day: 2026-10-11 -->
-What was engineered in the week to 11 October 2026: test fixtures and the test environment.
-
-4 pull requests were opened and 3 merged. #7491 added a reusable host-image builder for the Azure Local module tests, #7505 separated its build and replication regions, and #7458 replaced tenant-specific CI inputs in the test entrypoints of nine modules.
-
-https://github.com/Azure/bicep-registry-modules/pull/7491
-
-#Bicep #AzureVerifiedModules
-<!-- /post -->
-
-<!-- post: weekly:Azure/bicep-registry-modules:other_plumbing:2026-W41 channel: x day: 2026-10-11 -->
-What was engineered, week to 11 October 2026: 2 metadata fixes merged, a typo that broke README generation for API Management (#7493) and a new module owner entry (#7471). https://github.com/Azure/bicep-registry-modules/pull/7493
-<!-- /post -->
-
-<!-- post: weekly:Azure/bicep-registry-modules:other_plumbing:2026-W41 channel: linkedin day: 2026-10-11 -->
-What was engineered in the week to 11 October 2026: two small changes to module metadata files.
-
-#7493 fixed a typo in the API Management metadata that made the README check fail for any pull request touching that module, and #7471 added a module owner.
-
-https://github.com/Azure/bicep-registry-modules/pull/7493
-
-#Bicep #AzureVerifiedModules
-<!-- /post -->
-
-<!-- post: weekly:Azure/bicep-registry-modules:repository_policy:2026-W41 channel: x day: 2026-10-11 -->
-What was engineered, week to 11 October 2026: an automation account kept the issue form's module list in sync with the published catalog (#7473). https://github.com/Azure/bicep-registry-modules/pull/7473
-<!-- /post -->
-
-<!-- post: weekly:Azure/bicep-registry-modules:repository_policy:2026-W41 channel: linkedin day: 2026-10-11 -->
-What was engineered in the week to 11 October 2026: an automation account opened and merged #7473, which keeps the "Module Name" dropdown of the module issue form in line with the published module catalog.
-
-https://github.com/Azure/bicep-registry-modules/pull/7473
+https://github.com/Azure/bicep-registry-modules
 
 #Bicep #AzureVerifiedModules
 <!-- /post -->
